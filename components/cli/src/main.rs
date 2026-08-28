@@ -406,6 +406,25 @@ pub enum CloudTenantCmd {
         description: Option<String>,
     },
     Ls,
+    /// What this tenant may hold. Admin-only, and not by a rule written into
+    /// the verb: `tenants` is not a resource a member may write at all, so a
+    /// member raising their own ceiling is refused by the API guard.
+    ///
+    /// A limit that is not named is left as it stands; `--unlimited` takes
+    /// all three off. Counted over every phase, Pending included.
+    Quota {
+        name: String,
+        #[arg(long)]
+        max_vms: Option<u32>,
+        #[arg(long)]
+        max_vcpus: Option<u32>,
+        #[arg(long)]
+        max_mem_mib: Option<u64>,
+        /// Take the whole quota off — the inverse of setting one, and the
+        /// only way back to "unlimited", which is what a limit of 0 is not.
+        #[arg(long, conflicts_with_all = ["max_vms", "max_vcpus", "max_mem_mib"])]
+        unlimited: bool,
+    },
     Rm {
         name: String,
     },

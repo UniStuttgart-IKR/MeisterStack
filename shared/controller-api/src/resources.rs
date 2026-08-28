@@ -504,6 +504,11 @@ pub type Image = Object<ImageSpec, ImageStatus>;
 pub struct TenantSpec {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// How much this tenant may hold. Every field absent = unlimited, which
+    /// is what every tenant written before this milestone says and therefore
+    /// exactly what every one of them keeps doing.
+    #[serde(default, skip_serializing_if = "TenantQuota::is_unset")]
+    pub quota: TenantQuota,
     /// The tenant's overlay network, allocated by the cloud at create time
     /// and never afterwards. Server-owned and immutable, for the reason every
     /// identifier that names a wire is: two tenants sharing a VNI is not a
@@ -517,13 +522,70 @@ pub struct TenantSpec {
     pub labels: BTreeMap<String, String>,
 }
 
-/// Empty, and deliberately so. The design gives a tenant `clusters` and
-/// `vmCount`, and neither is computable while VMs are not tenant-bound — that
-/// is M5. An empty status that grows one is honest; a zero somebody would
-/// read as a count is not.
+/// The ceiling on what a tenant may hold, one number per thing that runs out.
+///
+/// Every field optional, and absent means unlimited rather than zero. That is
+/// the whole compatibility story: `floatingpool quota` was the only quota in
+/// this system, so nothing else here was ever bounded, and a default of
+/// anything but "unlimited" would stop a running fleet the moment this
+/// milestone rolled out.
+///
+/// Set by an admin and by nobody else. Not a rule written here — the
+/// middleware already says it, because `tenants` is not among the resources a
+/// member may write (`auth::TENANT_SCOPED`), so a member raising their own
+/// ceiling never reaches a handler at all.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenantQuota {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_vcpus: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mem_mib: Option<u64>,
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl TenantQuota {
+    /// No ceiling of any kind — the shape every tenant had before this
+    /// existed, and the one that is not serialised at all.
+    pub fn is_unset(&self) -> bool {
+        self.max_vms.is_none() && self.max_vcpus.is_none() && self.max_mem_mib.is_none()
+    }
+}
+
+/// What a tenant is holding right now.
+///
+/// Computed where it is read and never stored, for the reason a candidate's
+/// free capacity is: both halves are objects the server already has, and a
+/// second copy in etcd would be a number that can be wrong — here in the
+/// direction that lets a tenant past its own ceiling.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenantUsage {
+    #[serde(default)]
+    pub vms: u32,
+    #[serde(default)]
+    pub vcpus: u32,
+    #[serde(default)]
+    pub mem_mib: u64,
+}
+
+/// What the tenant is using, filled in by the read that hands the object out.
+///
+/// The design gave a tenant `clusters` and `vmCount` and neither was
+/// computable while VMs were not tenant-bound; they are now. Nothing writes
+/// this to the store — a `Tenant` read back out of etcd carries zeros, and
+/// the API is what puts the truth in it.
 #[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct TenantStatus {}
+#[serde(rename_all = "camelCase")]
+pub struct TenantStatus {
+    #[serde(default)]
+    pub used: TenantUsage,
+}
 
 /// No finalizer: a tenant owns no resource anywhere yet, so DELETE can mean
 /// delete — the same reason an Image has none.

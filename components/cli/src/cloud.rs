@@ -411,6 +411,8 @@ struct Tenant {
     metadata: Meta,
     #[serde(default)]
     spec: TenantSpec,
+    #[serde(default)]
+    status: TenantStatus,
 }
 
 #[derive(Deserialize, Default)]
@@ -421,6 +423,54 @@ struct TenantSpec {
     /// tenant from before overlays existed.
     #[serde(default)]
     vni: Option<u32>,
+    #[serde(default)]
+    quota: TenantQuota,
+}
+
+/// Every field absent = unlimited, which is what a tenant from before quotas
+/// existed says and therefore what it goes on meaning.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct TenantQuota {
+    #[serde(default)]
+    max_vms: Option<u32>,
+    #[serde(default)]
+    max_vcpus: Option<u32>,
+    #[serde(default)]
+    max_mem_mib: Option<u64>,
+}
+
+/// What the server computed this tenant is holding. Never stored anywhere —
+/// the read that hands the object out is what fills it in.
+#[derive(Deserialize, Default)]
+struct TenantStatus {
+    #[serde(default)]
+    used: TenantUsage,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct TenantUsage {
+    #[serde(default)]
+    vms: u32,
+    #[serde(default)]
+    vcpus: u32,
+    #[serde(default)]
+    mem_mib: u64,
+}
+
+/// `used/limit`, or just the number when there is no limit.
+///
+/// One cell rather than two columns per dimension: what an operator asks of
+/// `tenant ls` is "how close is this tenant to its ceiling", and the answer is
+/// a fraction. A tenant with no quota shows the count alone, because `4/-`
+/// reads like a limit somebody forgot to set rather than one nobody wanted.
+#[generated(model = ClaudeOpus, version = "5")]
+fn used_of(used: u64, limit: Option<u64>) -> String {
+    match limit {
+        Some(limit) => format!("{used}/{limit}"),
+        None => used.to_string(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -522,17 +572,81 @@ async fn run_tenant(client: &Client, cmd: &CloudTenantCmd, global: &GlobalArgs) 
                 output::table_of(
                     body,
                     "parsing tenant list",
-                    &["tenant", "vni", "description"],
+                    &["tenant", "vni", "vms", "vcpus", "mem", "description"],
                     "no tenants",
                     |t: Tenant| {
                         vec![
                             t.metadata.name,
                             or_dash(t.spec.vni.map(|v| v.to_string())),
+                            used_of(
+                                t.status.used.vms as u64,
+                                t.spec.quota.max_vms.map(u64::from),
+                            ),
+                            used_of(
+                                t.status.used.vcpus as u64,
+                                t.spec.quota.max_vcpus.map(u64::from),
+                            ),
+                            used_of(t.status.used.mem_mib, t.spec.quota.max_mem_mib),
                             t.spec.description,
                         ]
                     },
                 )
             })
+        }
+        CloudTenantCmd::Quota {
+            name,
+            max_vms,
+            max_vcpus,
+            max_mem_mib,
+            unlimited,
+        } => {
+            if *unlimited && max_vms.is_none() && max_vcpus.is_none() && max_mem_mib.is_none() {
+                // nothing to do beyond clearing, handled below
+            } else if !*unlimited
+                && max_vms.is_none()
+                && max_vcpus.is_none()
+                && max_mem_mib.is_none()
+            {
+                anyhow::bail!(
+                    "name at least one of --max-vms, --max-vcpus, --max-mem-mib, or --unlimited"
+                );
+            }
+            let body = client
+                .patch_spec(
+                    &format!("{TENANTS}/{name}"),
+                    "parsing the tenant object",
+                    &format!("tenant {name}"),
+                    &|spec| {
+                        // Read-edit-write over the WHOLE quota object, so a
+                        // limit nobody named keeps the value it had. The
+                        // alternative — sending only the named ones — would
+                        // silently drop the others every time.
+                        let mut quota = if *unlimited {
+                            json!({})
+                        } else {
+                            spec.get("quota").cloned().unwrap_or_else(|| json!({}))
+                        };
+                        for (key, value) in [
+                            ("maxVms", max_vms.map(|v| json!(v))),
+                            ("maxVcpus", max_vcpus.map(|v| json!(v))),
+                            ("maxMemMib", max_mem_mib.map(|v| json!(v))),
+                        ] {
+                            if let Some(value) = value {
+                                quota[key] = value;
+                            }
+                        }
+                        spec.insert("quota".to_string(), quota);
+                        Ok(())
+                    },
+                )
+                .await?;
+            output::emit_note(
+                global,
+                &body,
+                name,
+                "note: the quota counts every phase, pending vms included, and a vm that is \
+                 terminating still counts until its object is gone",
+            )
         }
         CloudTenantCmd::Rm { name } => {
             remove(client, global, &format!("{TENANTS}/{name}"), name).await

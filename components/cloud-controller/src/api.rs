@@ -15,10 +15,10 @@ use axum::routing::{get, put};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use controller_api::{
-    API_VERSION, ApiError, Caller, CallerRole, CallerTenant, CertificateSigningRequest, Cluster,
-    ClusterSpec, EtcdStore, FloatingIp, FloatingPool, Image, ImageSpec, Resource, Role,
+    API_VERSION, ApiError, Caller, CallerRole, CallerTenant, Capacity, CertificateSigningRequest,
+    Cluster, ClusterSpec, EtcdStore, FloatingIp, FloatingPool, Image, ImageSpec, Resource, Role,
     RoutedSubnet, Scope, SpecUpdate, StoreError, Tenant, User, Verb, Vm, VmSpec, apply_spec_update,
-    check_envelope, conflict, floating, forbidden, invalid, permits_object,
+    check_envelope, conflict, floating, forbidden, invalid, permits_object, quota,
     resources::{
         CsrCondition, CsrConditionType, CsrSpec, IssuedCertificate, SIGNER_USER_CLIENT, new_vm,
     },
@@ -326,6 +326,49 @@ async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result<(), ApiErr
     Ok(())
 }
 
+/// Would this tenant still be inside its quota afterwards?
+///
+/// Run from POST and from PUT both, and that is the half that gets forgotten:
+/// a PUT that raises an existing VM's vCPUs is the same act as creating one
+/// that size, and a control plane that only guards the create is a control
+/// plane whose quota is a suggestion.
+///
+/// A tenant with no quota costs nothing at all — no listing, no arithmetic —
+/// which is what keeps every create in a fleet that has never set one exactly
+/// as cheap as it was. An unscoped VM (an admin's, belonging to nobody) has
+/// no tenant and therefore no ceiling; that is the shape every VM had before
+/// M5 and the one an admin still gets by naming none.
+///
+/// `except` is the VM being changed, taken out of the sum so the caller can
+/// put it back at its new size. `None` on a create.
+///
+/// The listing is guarded the way `delete_image`'s is: `list` drops what it
+/// cannot decode, and a VM not seen is usage not counted — which would let a
+/// tenant past its ceiling by exactly the size of whatever failed to parse.
+/// Refusing to answer beats answering from a list that is not all of them.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn check_quota(
+    st: &ApiState,
+    tenant: Option<&str>,
+    adding: Capacity,
+    except: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(tenant) = tenant else { return Ok(()) };
+    let object: Tenant = st.store.get(tenant).await?;
+    if object.spec.quota.is_unset() {
+        return Ok(());
+    }
+    let vms = st.store.list::<Vm>().await?;
+    if vms.len() != st.store.count::<Vm>().await? {
+        return Err(conflict(
+            "cannot tell how much this tenant is holding (some vm objects did not decode); \
+             refusing to let it grow",
+        ));
+    }
+    let after = quota::Usage::of(tenant, &vms, except).plus(adding);
+    quota::check(&object.spec.quota, tenant, after).map_err(invalid)
+}
+
 /// A member sees its own tenant's VMs and nothing else. Filtering the list
 /// rather than only guarding the individual GET is the point: a name is an
 /// inventory, and handing over the whole one is the leak that matters.
@@ -393,6 +436,15 @@ async fn create_vm_traced(
     if let Some(t) = &owner {
         check_tenant(&st, t).await?;
     }
+    // Before the create and not after: a VM that was written and then found
+    // to be over the ceiling is a VM somebody has to go and delete.
+    check_quota(
+        &st,
+        owner.as_deref(),
+        Capacity::wanted_by_spec(&body.spec.vm),
+        None,
+    )
+    .await?;
 
     // Server-owned metadata; client keeps name + labels.
     let mut vm = new_vm(
@@ -463,6 +515,17 @@ async fn update_vm(
     // for a VNI it no longer belongs to. Whose it is, is decided once.
     body.spec.tenant = current.spec.tenant;
     body.status = current.status;
+    // The half that gets forgotten. A PUT that raises this VM's vcpus is the
+    // same act as creating one that size, and it goes through the same
+    // arithmetic: the object as it stands comes out of the sum (`except`),
+    // and its new size goes back in.
+    check_quota(
+        &st,
+        body.spec.tenant.as_deref(),
+        Capacity::wanted_by_spec(&body.spec.vm),
+        Some(&name),
+    )
+    .await?;
     Ok(Json(st.store.update(&body).await?))
 }
 
@@ -769,8 +832,24 @@ async fn delete_image(
 
 // --- tenants ---------------------------------------------------------------
 
+/// The tenants, each with what it is holding right now.
+///
+/// The usage is computed here and never stored, for the reason a candidate's
+/// free capacity is: both halves are objects this server already has, and a
+/// stored copy would be a number that can be wrong — here in the direction
+/// that lets a tenant past its own ceiling.
+///
+/// Computed at the SERVER and not in the CLI, and that is a scoping decision
+/// rather than a convenience: `list_vms` filters to a member's own tenant, so
+/// a client-side aggregation would show that member every other tenant using
+/// nothing.
+#[generated(model = ClaudeOpus, version = "5")]
 async fn list_tenants(State(st): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
-    let items = st.store.list::<Tenant>().await?;
+    let mut items = st.store.list::<Tenant>().await?;
+    let vms = st.store.list::<Vm>().await?;
+    for tenant in &mut items {
+        tenant.status.used = quota::Usage::of(&tenant.metadata.name, &vms, None).reported();
+    }
     Ok(Json(
         json!({ "apiVersion": API_VERSION, "kind": "TenantList", "items": items }),
     ))
@@ -817,7 +896,10 @@ async fn get_tenant(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<Tenant>, ApiError> {
-    Ok(Json(st.store.get(&name).await?))
+    let mut tenant: Tenant = st.store.get(&name).await?;
+    let vms = st.store.list::<Vm>().await?;
+    tenant.status.used = quota::Usage::of(&name, &vms, None).reported();
+    Ok(Json(tenant))
 }
 
 #[generated(model = ClaudeOpus, version = "5")]
@@ -831,6 +913,10 @@ async fn update_tenant(
     }
     let current: Tenant = st.store.get(&name).await?;
     keep_server_owned(&mut body.metadata, &current.metadata);
+    // `spec.quota` is the operator's and travels through untouched. Who may
+    // write it is not decided here and does not have to be: `tenants` is not
+    // among the resources a member may write (auth::TENANT_SCOPED), so a
+    // member raising its own ceiling never reaches this handler.
     // Immutable, and not merely server-owned: every node that has ever built
     // a bridge for this tenant built it for THIS number, and a tenant that
     // changed VNI would leave its running VMs on the old overlay while new

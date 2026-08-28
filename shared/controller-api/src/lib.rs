@@ -15,6 +15,7 @@ pub mod heartbeat;
 pub mod lifecycle;
 pub mod mirror;
 pub mod object;
+pub mod quota;
 pub mod requeue;
 pub mod resources;
 pub mod rest;
@@ -40,8 +41,8 @@ pub use resources::{
     FloatingIpSpec, FloatingIpStatus, FloatingPool, FloatingPoolSpec, FloatingPoolStatus, Image,
     ImageFormat, ImageSpec, ImageStatus, IssuedCertificate, LABEL_CLOUD_UID, LABEL_MANAGED_BY,
     MANAGED_BY_CLOUD, Node, NodeCapacity, NodeSpec, NodeStatus, RoutedSubnet, RoutedSubnetSpec,
-    RoutedSubnetStatus, RunStrategy, SIGNER_USER_CLIENT, Tenant, TenantSpec, TenantStatus, User,
-    UserSpec, UserStatus, Vm, VmPhase, VmSpec, VmStatus,
+    RoutedSubnetStatus, RunStrategy, SIGNER_USER_CLIENT, Tenant, TenantQuota, TenantSpec,
+    TenantStatus, TenantUsage, User, UserSpec, UserStatus, Vm, VmPhase, VmSpec, VmStatus,
 };
 pub use rest::{
     ApiError, AuthState, Caller, CallerRole, CallerTenant, PeerCerts, SpecUpdate,

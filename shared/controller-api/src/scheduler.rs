@@ -43,7 +43,16 @@ impl Capacity {
     /// serde is the validating authority for the rest of the document, and a
     /// spec that names no vcpus does not get past it.
     pub fn wanted_by(vm: &Vm) -> Self {
-        let number = |field: &str| vm.spec.vm.get(field).and_then(serde_json::Value::as_u64);
+        Self::wanted_by_spec(&vm.spec.vm)
+    }
+
+    /// The same reading, of a spec that is not on an object yet. What an
+    /// admission or a quota check at a create edge has in hand is a POST
+    /// body, and it has to be measured by the same function that measures the
+    /// object afterwards — two readings of "how big is this VM" are two
+    /// readings that start disagreeing.
+    pub fn wanted_by_spec(spec: &serde_json::Value) -> Self {
+        let number = |field: &str| spec.get(field).and_then(serde_json::Value::as_u64);
         Self {
             vcpus: number("vcpus").unwrap_or(0).min(u32::MAX as u64) as u32,
             mem_mib: number("memory_mib").unwrap_or(0),
