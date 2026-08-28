@@ -18,15 +18,15 @@
 //! expiring a heartbeat — goes through a compare-and-swap, and the store is
 //! the arbiter: one writer wins, the loser sees a Conflict and drops it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use controller_api::{
-    Candidate, Capacity, EtcdStore, Lifecycle, Node, Overcommit, PassTrigger, PendingTally,
-    RequeuePolicy, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhase, heartbeat_expired,
-    lifecycle_command,
+    Candidate, CandidateKind, Capacity, EtcdStore, Lifecycle, Node, Overcommit, PassTrigger,
+    PendingTally, RequeuePolicy, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhase,
+    heartbeat_expired, lifecycle_command,
 };
 use macros::generated;
 use proto::command;
@@ -213,6 +213,25 @@ fn free_on(
         .minus(bound)
 }
 
+/// The label sets of the VMs already bound to `on` — what anti-affinity is
+/// measured against.
+///
+/// Every phase counts, exactly as `free_on` counts them: a VM that has been
+/// bound and not yet started is already there as far as "do not put these two
+/// together" is concerned, and skipping it is how two replicas land on one
+/// machine in a single burst of creates.
+#[generated(model = ClaudeOpus, version = "5")]
+fn hosted_on(
+    on: &str,
+    vms: &[Vm],
+    bound: fn(&Vm) -> Option<&str>,
+) -> Vec<BTreeMap<String, String>> {
+    vms.iter()
+        .filter(|v| bound(v) == Some(on))
+        .map(|v| v.metadata.labels.clone())
+        .collect()
+}
+
 /// How many VMs there are, and how they are spread over the phases.
 ///
 /// Every phase every time, zero included: a phase that stops being written
@@ -335,6 +354,9 @@ async fn expire_and_collect_nodes(
             schedulable: node.spec.schedulable,
             free: free_on(&name, &node.status.capacity, vms, overcommit),
             catalogue: node.status.capacity.capabilities,
+            kind: CandidateKind::Node,
+            hosted: hosted_on(&name, vms, |v| v.spec.node_name.as_deref()),
+            labels: node.spec.labels,
             name,
         });
     }
@@ -801,6 +823,9 @@ mod tests {
         controller_api::resources::new_vm(
             "t",
             controller_api::VmSpec {
+                cluster_selector: Default::default(),
+                node_selector: Default::default(),
+                anti_affinity: Vec::new(),
                 node_name: node.map(str::to_string),
                 cluster_name: None,
                 run_strategy: RunStrategy::Running,
@@ -851,6 +876,9 @@ mod tests {
         assert!(may_reconcile(&running, &mine));
 
         let drained = Candidate {
+            kind: controller_api::CandidateKind::Node,
+            labels: Default::default(),
+            hosted: Vec::new(),
             name: "manacor".into(),
             connected: true,
             schedulable: false,
@@ -1213,6 +1241,9 @@ mod tests {
         controller_api::resources::new_vm(
             "t",
             controller_api::VmSpec {
+                cluster_selector: Default::default(),
+                node_selector: Default::default(),
+                anti_affinity: Vec::new(),
                 node_name: None,
                 cluster_name: None,
                 run_strategy,

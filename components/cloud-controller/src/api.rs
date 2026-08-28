@@ -2622,6 +2622,9 @@ mod tests {
         let vm = new_vm(
             "web",
             VmSpec {
+                cluster_selector: Default::default(),
+                node_selector: Default::default(),
+                anti_affinity: Vec::new(),
                 cluster_name: None,
                 node_name: None,
                 tenant: Some("acme".into()),

@@ -23,15 +23,16 @@
 //! still share — binding an unbound VM, expiring a heartbeat — goes through a
 //! compare-and-swap with the store as the arbiter.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::bail;
 use chrono::{DateTime, Utc};
 use controller_api::{
-    Ack, Candidate, Capacity, Cluster, EtcdStore, Overcommit, PassTrigger, PendingTally, Resource,
-    RunStrategy, Scheduler, StoreError, Vm, VmPhase, heartbeat_expired, lifecycle_command,
+    Ack, Candidate, CandidateKind, Capacity, Cluster, EtcdStore, Overcommit, PassTrigger,
+    PendingTally, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhase, heartbeat_expired,
+    lifecycle_command,
 };
 use macros::generated;
 use proto::cloud_command;
@@ -192,6 +193,20 @@ fn free_on(
         .minus(bound)
 }
 
+/// The label sets of the VMs already bound to `on` — what anti-affinity is
+/// measured against. Every phase counts, exactly as `free_on` counts them.
+#[generated(model = ClaudeOpus, version = "5")]
+fn hosted_on(
+    on: &str,
+    vms: &[Vm],
+    bound: fn(&Vm) -> Option<&str>,
+) -> Vec<BTreeMap<String, String>> {
+    vms.iter()
+        .filter(|v| bound(v) == Some(on))
+        .map(|v| v.metadata.labels.clone())
+        .collect()
+}
+
 /// How many VMs there are, and how they are spread over the phases. Every
 /// phase every time, zero included — see the cluster tier's twin: a phase
 /// that stops being written looks exactly like a controller that stopped
@@ -279,6 +294,9 @@ async fn expire_and_collect_clusters(
             schedulable: cluster.spec.schedulable,
             free: free_on(&name, &cluster.status.capacity, vms, overcommit),
             catalogue: cluster.status.capacity.capabilities,
+            kind: CandidateKind::Cluster,
+            hosted: hosted_on(&name, vms, |v| v.spec.cluster_name.as_deref()),
+            labels: cluster.spec.labels,
             name,
         });
     }
@@ -813,6 +831,9 @@ mod tests {
         new_vm(
             "t",
             VmSpec {
+                cluster_selector: Default::default(),
+                node_selector: Default::default(),
+                anti_affinity: Vec::new(),
                 node_name: None,
                 cluster_name: Some("cluster-1".into()),
                 run_strategy: RunStrategy::Running,
@@ -826,6 +847,9 @@ mod tests {
         new_vm(
             "t",
             VmSpec {
+                cluster_selector: Default::default(),
+                node_selector: Default::default(),
+                anti_affinity: Vec::new(),
                 node_name: None,
                 cluster_name: cluster.map(str::to_string),
                 run_strategy: RunStrategy::Running,
@@ -923,6 +947,9 @@ mod tests {
         new_vm(
             name,
             VmSpec {
+                cluster_selector: Default::default(),
+                node_selector: Default::default(),
+                anti_affinity: Vec::new(),
                 node_name: None,
                 cluster_name: Some("cluster-1".into()),
                 run_strategy: RunStrategy::Running,

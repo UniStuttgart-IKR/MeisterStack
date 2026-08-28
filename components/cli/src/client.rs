@@ -184,7 +184,49 @@ impl Client {
         edit(spec)?;
         self.put(path, Some(serde_json::to_vec(&object)?)).await
     }
+}
 
+/// Apply `set` (`k=v`) and `rm` (`k`) to an object's `spec.labels`.
+///
+/// The edit half of `meister ... label`, written once because a node label and
+/// a cluster label are the same act against two inventories. Set before
+/// remove, so `--rm k k=v` is not an order-dependent riddle: naming a key in
+/// both means it goes.
+///
+/// The map is created if the object has none, and removed entirely when the
+/// last pair goes — an empty map and no map mean the same thing to the
+/// scheduler, and leaving `"labels": {}` behind makes a diff look like a
+/// change that is not one.
+#[generated(model = ClaudeOpus, version = "5")]
+pub fn edit_labels(
+    spec: &mut serde_json::Map<String, serde_json::Value>,
+    set: &[String],
+    rm: &[String],
+) -> Result<()> {
+    let mut labels = match spec.remove("labels") {
+        Some(serde_json::Value::Object(m)) => m,
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(other) => anyhow::bail!("spec.labels is {other}, not an object"),
+    };
+    for pair in set {
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("{pair:?} is not a label: write it as key=value"))?;
+        if k.is_empty() {
+            anyhow::bail!("{pair:?} has an empty key");
+        }
+        labels.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+    }
+    for key in rm {
+        labels.remove(key.as_str());
+    }
+    if !labels.is_empty() {
+        spec.insert("labels".to_string(), serde_json::Value::Object(labels));
+    }
+    Ok(())
+}
+
+impl Client {
     #[generated(model = ClaudeFable, version = "5")]
     pub async fn request(
         &self,
@@ -414,5 +456,61 @@ mod tests {
         assert!(transport_for("ftp://nope").is_err());
         assert!(transport_for("unix://").is_err());
         assert!(transport_for("https://").is_err());
+    }
+
+    /// The edit half of `meister ... label`. Set wins over nothing, remove
+    /// wins over set, and an object that ends up with no labels loses the key
+    /// entirely — `"labels": {}` and no labels mean the same thing to the
+    /// scheduler, and one of them makes a diff look like a change.
+    #[test]
+    fn labels_are_set_then_removed_and_an_empty_map_leaves_no_key_behind() {
+        let mut spec = serde_json::Map::new();
+        edit_labels(&mut spec, &["zone=a".into(), "disk=nvme".into()], &[]).unwrap();
+        assert_eq!(spec["labels"]["zone"], "a");
+        assert_eq!(spec["labels"]["disk"], "nvme");
+
+        // Setting an existing key replaces it.
+        edit_labels(&mut spec, &["zone=b".into()], &[]).unwrap();
+        assert_eq!(spec["labels"]["zone"], "b");
+
+        // Remove runs after set, so naming a key in both means it goes.
+        edit_labels(&mut spec, &["zone=c".into()], &["zone".into()]).unwrap();
+        assert!(spec["labels"].get("zone").is_none());
+
+        // And the last one takes the key with it.
+        edit_labels(&mut spec, &[], &["disk".into()]).unwrap();
+        assert!(spec.get("labels").is_none(), "no empty map left behind");
+
+        // Removing what is not there is not an error: `label --rm x` twice is
+        // an operator making sure, not a mistake.
+        edit_labels(&mut spec, &[], &["gone".into()]).unwrap();
+    }
+
+    /// A pair that is not one is refused with the shape it should have had,
+    /// rather than silently becoming a label named after the whole argument.
+    #[test]
+    fn a_pair_without_an_equals_sign_is_refused_and_says_what_was_wanted() {
+        let mut spec = serde_json::Map::new();
+        let e = edit_labels(&mut spec, &["zone".into()], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("key=value"), "{e}");
+        assert!(
+            edit_labels(&mut spec, &["=a".into()], &[]).is_err(),
+            "an empty key is not a label"
+        );
+        // A value may contain an equals sign; only the first one splits.
+        edit_labels(&mut spec, &["expr=a=b".into()], &[]).unwrap();
+        assert_eq!(spec["labels"]["expr"], "a=b");
+    }
+
+    /// An object whose labels are not an object at all is a refusal and not a
+    /// silent overwrite: somebody hand-edited it, and throwing that away is
+    /// how an operator loses something they meant.
+    #[test]
+    fn labels_that_are_not_an_object_are_refused_rather_than_replaced() {
+        let mut spec = serde_json::Map::new();
+        spec.insert("labels".into(), serde_json::json!("zone=a"));
+        assert!(edit_labels(&mut spec, &["zone=b".into()], &[]).is_err());
     }
 }

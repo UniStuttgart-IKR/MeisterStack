@@ -145,9 +145,22 @@ fn node_row(node: Node, now: DateTime<Utc>) -> Vec<String> {
 /// the loser is told rather than silently overwriting.
 #[generated(model = ClaudeOpus, version = "5")]
 async fn run_node(client: &Client, cmd: &ClusterNodeCmd, global: &GlobalArgs) -> Result<()> {
+    if let ClusterNodeCmd::Label { name, pairs, rm } = cmd {
+        let body = client
+            .patch_spec(
+                &format!("{NODES}/{name}"),
+                "parsing the node object",
+                &format!("node {name}"),
+                &|spec| crate::client::edit_labels(spec, pairs, rm),
+            )
+            .await?;
+        return output::emit_line(global, &body, "labelled");
+    }
     let (name, schedulable) = match cmd {
         ClusterNodeCmd::Cordon { name } => (name, false),
         ClusterNodeCmd::Uncordon { name } => (name, true),
+        // Handled above; the binding below is about schedulability only.
+        ClusterNodeCmd::Label { .. } => unreachable!("returned above"),
     };
     let body = client
         .patch_spec(

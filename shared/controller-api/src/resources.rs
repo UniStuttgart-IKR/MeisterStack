@@ -188,8 +188,56 @@ pub struct VmSpec {
     /// cluster is where the tenant's VNI is injected into the NIC specs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// Which clusters this VM may go to: every pair must be present in the
+    /// cluster's `spec.labels`. Empty — the default and every VM written
+    /// before this — means no constraint at all.
+    ///
+    /// Two selectors and not one, because a selector names properties of a
+    /// MACHINE and those differ by tier: `disk=nvme` is a node's business and
+    /// `region=stuttgart` a cluster's. One field matched at both ends would
+    /// make a node label into something the cloud tier has to carry, which is
+    /// the union-catalogue problem this stack already has once and does not
+    /// need twice.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cluster_selector: BTreeMap<String, String>,
+    /// The same, one tier down, against `NodeSpec.labels`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_selector: BTreeMap<String, String>,
+    /// VMs this one must not sit beside. Matched against the `metadata.labels`
+    /// of whatever is already bound to a candidate — so ONE field serves both
+    /// tiers, unlike the selectors: "not in the same cluster" and "not on the
+    /// same node" are the same sentence about other VMs, asked of different
+    /// inventories.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anti_affinity: Vec<AntiAffinity>,
     /// The agent's NewVmSpec as raw JSON (same serde as the agent API).
     pub vm: serde_json::Value,
+}
+
+/// "Do not place me with these." One label set, and how hard it is meant.
+///
+/// `required` defaults to TRUE, and that is the safe direction: somebody who
+/// writes an anti-affinity term and forgets the flag meant to keep two
+/// replicas apart, and a preference that silently was not one is a failure
+/// nobody sees until the machine it was guarding against goes down.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AntiAffinity {
+    /// Every pair must be present in another VM's `metadata.labels` for it to
+    /// count as one of the VMs meant. An EMPTY selector matches every VM, and
+    /// that is a real ask — "not with anything else at all".
+    #[serde(default)]
+    pub selector: BTreeMap<String, String>,
+    /// Hard: a candidate that collides is not a candidate. False makes it a
+    /// preference, honoured when it can be and dropped when honouring it
+    /// would mean not placing the VM at all.
+    #[serde(default = "required_default")]
+    pub required: bool,
+}
+
+fn required_default() -> bool {
+    true
 }
 
 #[generated(model = ClaudeFable, version = "5")]

@@ -16,7 +16,9 @@ use macros::generated;
 use common::capability::{self, offers};
 use tracing::debug;
 
-use crate::resources::Vm;
+use std::collections::BTreeMap;
+
+use crate::resources::{AntiAffinity, Vm};
 
 /// What a machine has, and what a VM wants of it. Two numbers, because those
 /// are the two a node can run out of.
@@ -163,6 +165,21 @@ impl Default for Overcommit {
     }
 }
 
+/// Which inventory a candidate came out of: a node under a cluster, or a
+/// cluster under the cloud.
+///
+/// It sits on the candidate because the selector to enforce depends on it —
+/// see `VmSpec::node_selector`. A list never mixes the two, so this is
+/// redundant in the sense that a caller always knows; it is here so that the
+/// functions reading it are total and cannot be called with the wrong tier's
+/// question.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateKind {
+    Node,
+    Cluster,
+}
+
 /// What the scheduler knows about a placement candidate, assembled from the
 /// Node (or Cluster) objects in etcd rather than from the session map alone.
 #[derive(Clone, Debug)]
@@ -193,6 +210,107 @@ pub struct Candidate {
     /// `NodeCapacity.capabilities` is a wire name (design §2, control.proto)
     /// and stays, but nothing in the scheduler is about GPUs.
     pub catalogue: Vec<String>,
+    /// Which tier's inventory this came from, and therefore which of the VM's
+    /// two selectors applies.
+    pub kind: CandidateKind,
+    /// `spec.labels` off the Node or Cluster object — what an operator wrote
+    /// on this machine, and the half of a selector that lives on the
+    /// inventory.
+    pub labels: BTreeMap<String, String>,
+    /// The `metadata.labels` of every VM already bound here.
+    ///
+    /// What anti-affinity is measured against, and derived per pass from the
+    /// same VM listing `free` is: two VMs are "together" exactly when one is
+    /// bound to the candidate the other is being placed on. Not stored, for
+    /// the same reason `free` is not — a second copy in etcd is a number that
+    /// can be wrong.
+    pub hosted: Vec<BTreeMap<String, String>>,
+}
+
+/// Does every pair of `selector` appear in `labels`?
+///
+/// An empty selector matches everything, which is what makes "no selector"
+/// and "a selector nobody wrote" the same thing and keeps every VM written
+/// before this feature placed exactly where it was.
+#[generated(model = ClaudeOpus, version = "5")]
+pub fn selects(selector: &BTreeMap<String, String>, labels: &BTreeMap<String, String>) -> bool {
+    selector.iter().all(|(k, v)| labels.get(k) == Some(v))
+}
+
+/// The selector this candidate is measured against — the node one for a node,
+/// the cluster one for a cluster.
+#[generated(model = ClaudeOpus, version = "5")]
+pub fn selector_for(vm: &Vm, kind: CandidateKind) -> &BTreeMap<String, String> {
+    match kind {
+        CandidateKind::Node => &vm.spec.node_selector,
+        CandidateKind::Cluster => &vm.spec.cluster_selector,
+    }
+}
+
+/// Does this candidate already hold a VM that `term` says to stay away from?
+#[generated(model = ClaudeOpus, version = "5")]
+fn collides(term: &AntiAffinity, candidate: &Candidate) -> bool {
+    candidate
+        .hosted
+        .iter()
+        .any(|labels| selects(&term.selector, labels))
+}
+
+/// Every candidate this VM may be placed on at all.
+///
+/// The conjunction of every rule that is NOT a matter of strategy: up,
+/// willing, roomy, offers what is asked for, carries the labels selected, and
+/// holds nothing a required anti-affinity term forbids. A bin-packer and a
+/// first-fit may disagree about which of these to take and must not disagree
+/// about which of them are allowed — the same argument `Candidate::free`
+/// makes, extended to the rest of the question.
+///
+/// Order is preserved, so a strategy that wants "the first" gets the first in
+/// inventory order and stays deterministic.
+#[generated(model = ClaudeOpus, version = "5")]
+pub fn feasible<'a>(vm: &Vm, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
+    let wanted = DevicePolicy::of(vm);
+    let size = Capacity::wanted_by(vm);
+    candidates
+        .iter()
+        .filter(|c| c.connected && c.schedulable)
+        .filter(|c| size.fits_in(c.free))
+        .filter(|c| selects(selector_for(vm, c.kind), &c.labels))
+        .filter(|c| wanted.met_by(&c.catalogue))
+        .filter(|c| {
+            !vm.spec
+                .anti_affinity
+                .iter()
+                .filter(|t| t.required)
+                .any(|t| collides(t, c))
+        })
+        .collect()
+}
+
+/// Narrow a feasible set to those that also honour the PREFERRED terms — or
+/// leave it alone, if honouring them would mean placing nothing.
+///
+/// That fallback is the whole difference between a preference and a
+/// requirement, and it is why the two are separate flags rather than one
+/// knob: a preference that can strand a VM is a requirement whose author did
+/// not know they were writing one.
+#[generated(model = ClaudeOpus, version = "5")]
+pub fn preferred<'a>(vm: &Vm, feasible: Vec<&'a Candidate>) -> Vec<&'a Candidate> {
+    let soft: Vec<&AntiAffinity> = vm
+        .spec
+        .anti_affinity
+        .iter()
+        .filter(|t| !t.required)
+        .collect();
+    if soft.is_empty() {
+        return feasible;
+    }
+    let clean: Vec<&Candidate> = feasible
+        .iter()
+        .copied()
+        .filter(|c| !soft.iter().any(|t| collides(t, c)))
+        .collect();
+    if clean.is_empty() { feasible } else { clean }
 }
 
 pub trait Scheduler: Send + Sync {
@@ -219,8 +337,9 @@ impl SchedulerConfig {
     pub fn into_scheduler(this: Option<Self>) -> anyhow::Result<std::sync::Arc<dyn Scheduler>> {
         Ok(match this.as_ref().map(|s| s.0.as_str()) {
             None | Some("first-fit") => std::sync::Arc::new(FirstFit),
+            Some("spread") => std::sync::Arc::new(Spread),
             Some(other) => {
-                anyhow::bail!("scheduler = {other:?}, expected \"first-fit\"")
+                anyhow::bail!("scheduler = {other:?}, expected \"first-fit\" or \"spread\"")
             }
         })
     }
@@ -379,11 +498,16 @@ pub enum PendingReason {
     /// case, and without it a full cluster looks from the API exactly like a
     /// cluster where nothing is happening.
     NoCapacity,
+    /// Room enough, and nothing carries the labels the VM selects.
+    SelectorUnmatched,
     /// Something the VM asks for is offered by nobody at all.
     Unserved,
     /// Every part of the ask is served somewhere, and no single candidate
     /// serves all of it at once.
     Split,
+    /// Everything that would otherwise do already holds a VM this one is
+    /// required to stay away from.
+    AntiAffinity,
 }
 
 #[generated(model = ClaudeOpus, version = "5")]
@@ -392,12 +516,14 @@ impl PendingReason {
     /// pass walks to publish a zero for the reasons nothing is pending for,
     /// so that a reason with no VMs stays a flat line in a dashboard rather
     /// than a series that vanishes.
-    pub const ALL: [PendingReason; 5] = [
+    pub const ALL: [PendingReason; 7] = [
         PendingReason::NoCandidates,
         PendingReason::NoneUsable,
         PendingReason::NoCapacity,
+        PendingReason::SelectorUnmatched,
         PendingReason::Unserved,
         PendingReason::Split,
+        PendingReason::AntiAffinity,
     ];
 
     /// Where this variant sits in `ALL` — the slot a `PendingTally` counts
@@ -418,8 +544,10 @@ impl PendingReason {
             PendingReason::NoCandidates => "no-candidates",
             PendingReason::NoneUsable => "none-usable",
             PendingReason::NoCapacity => "no-capacity",
+            PendingReason::SelectorUnmatched => "selector-unmatched",
             PendingReason::Unserved => "unserved-request",
             PendingReason::Split => "split-request",
+            PendingReason::AntiAffinity => "anti-affinity",
         }
     }
 }
@@ -520,10 +648,67 @@ pub fn pending_reason_of(vm: &Vm, candidates: &[Candidate]) -> (PendingReason, S
             ),
         );
     }
+    // Selector before catalogue: an unmatched selector is something the
+    // operator wrote down a moment ago and can fix by reading it again, and
+    // it is a cruder cut than the device catalogue. Saying "nobody offers
+    // nvrm/4q" to somebody whose typo was `zone=stutgart` sends them to the
+    // wrong problem.
+    let selected: Vec<Candidate> = roomy
+        .iter()
+        .filter(|c| !(c.connected && c.schedulable) || selects(selector_for(vm, c.kind), &c.labels))
+        .cloned()
+        .collect();
+    if !selected.iter().any(|c| c.connected && c.schedulable) {
+        // The kind is the same for every candidate of one list, so the first
+        // usable one names the tier this sentence is about.
+        let kind = roomy
+            .iter()
+            .find(|c| c.connected && c.schedulable)
+            .map(|c| c.kind)
+            .unwrap_or(CandidateKind::Node);
+        let asked = selector_for(vm, kind)
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return (
+            PendingReason::SelectorUnmatched,
+            format!("no candidate carries the labels this vm selects [{asked}]"),
+        );
+    }
+    let roomy = selected;
     let candidates = &roomy;
     let wanted = DevicePolicy::of(vm);
     let unmet = wanted.unmet(candidates);
     if unmet.is_empty() {
+        // Last, and last on purpose: anti-affinity is the subtlest of the
+        // cuts, and blaming it while a GPU is also missing would be true and
+        // useless. By here everything else fits, so if a required term is
+        // what empties the set, it really is the reason.
+        let survivors: Vec<&Candidate> = candidates
+            .iter()
+            .filter(|c| c.connected && c.schedulable)
+            .filter(|c| wanted.met_by(&c.catalogue))
+            .filter(|c| {
+                !vm.spec
+                    .anti_affinity
+                    .iter()
+                    .filter(|t| t.required)
+                    .any(|t| collides(t, c))
+            })
+            .collect();
+        if survivors.is_empty()
+            && vm.spec.anti_affinity.iter().any(|t| t.required)
+            && candidates
+                .iter()
+                .any(|c| c.connected && c.schedulable && wanted.met_by(&c.catalogue))
+        {
+            return (
+                PendingReason::AntiAffinity,
+                "every candidate that would otherwise do already holds a vm this one must                  stay away from"
+                    .to_string(),
+            );
+        }
         // Every request IS served somewhere, so the ask is servable in
         // principle and the split is what defeated it: no single candidate
         // holds the whole set. Worth its own sentence, because the operator
@@ -578,26 +763,47 @@ pub struct FirstFit;
 #[generated(model = ClaudeFable, version = "5")]
 impl Scheduler for FirstFit {
     fn assign(&self, vm: &Vm, candidates: &[Candidate]) -> Option<String> {
-        let wanted = DevicePolicy::of(vm);
-        let size = Capacity::wanted_by(vm);
-        let placed = candidates
-            .iter()
-            .filter(|c| c.connected && c.schedulable)
-            // Room before catalogue, deliberately: a machine that cannot hold
-            // this VM is not a candidate at all, whatever it offers.
-            .filter(|c| size.fits_in(c.free))
-            .find(|c| wanted.met_by(&c.catalogue))
+        let placed = preferred(vm, feasible(vm, candidates))
+            .first()
             .map(|c| c.name.clone());
-        // The "clear message" for a request nobody serves: candidates were up
-        // and willing, the catalogue is what said no.
-        if placed.is_none()
-            && !wanted.is_empty()
-            && candidates.iter().any(|c| c.connected && c.schedulable)
-        {
-            debug!(vm = %vm.metadata.name, requests = ?wanted.requests(),
-                   "no candidate offers everything this vm asks for");
+        if placed.is_none() {
+            let wanted = DevicePolicy::of(vm);
+            if !wanted.is_empty() && candidates.iter().any(|c| c.connected && c.schedulable) {
+                debug!(vm = %vm.metadata.name, requests = ?wanted.requests(),
+                       "no candidate offers everything this vm asks for");
+            }
         }
         placed
+    }
+}
+
+/// The other strategy: of everything that fits, the one carrying the least.
+///
+/// The counterpart to First-Fit rather than a replacement for it. First-Fit
+/// fills a machine before it touches the next, which is what one wants when
+/// the machines cost money; this spreads, which is what one wants when the
+/// VMs are meant to survive one of them going away. Anti-affinity states that
+/// intent per VM and exactly; this is the blunt version for a whole cluster,
+/// and the two compose — `feasible` has already cut what must not be, and
+/// this only chooses among what may.
+///
+/// Ties break on the name, so two passes over the same inventory place the
+/// same way and a test can say which.
+#[generated(model = ClaudeOpus, version = "5")]
+pub struct Spread;
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl Scheduler for Spread {
+    fn assign(&self, vm: &Vm, candidates: &[Candidate]) -> Option<String> {
+        preferred(vm, feasible(vm, candidates))
+            .into_iter()
+            .min_by(|a, b| {
+                a.hosted
+                    .len()
+                    .cmp(&b.hosted.len())
+                    .then_with(|| a.name.cmp(&b.name))
+            })
+            .map(|c| c.name.clone())
     }
 }
 
@@ -618,6 +824,9 @@ mod tests {
 
     fn candidate(name: &str, connected: bool, schedulable: bool) -> Candidate {
         Candidate {
+            kind: CandidateKind::Node,
+            labels: Default::default(),
+            hosted: Vec::new(),
             free: ROOMY,
             name: name.into(),
             connected,
@@ -628,6 +837,9 @@ mod tests {
 
     fn gpu_candidate(name: &str, profiles: &[&str]) -> Candidate {
         Candidate {
+            kind: CandidateKind::Node,
+            labels: Default::default(),
+            hosted: Vec::new(),
             free: ROOMY,
             name: name.into(),
             connected: true,
@@ -644,11 +856,42 @@ mod tests {
     fn sized(vcpus: u32, mem_mib: u64) -> Vm {
         vm_asking(serde_json::json!({"vcpus": vcpus, "memory_mib": mem_mib}))
     }
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+    /// A usable, roomy candidate carrying `on` and already holding VMs
+    /// labelled `holding`.
+    fn labelled(name: &str, on: &[(&str, &str)], holding: &[&[(&str, &str)]]) -> Candidate {
+        Candidate {
+            labels: labels(on),
+            hosted: holding.iter().map(|h| labels(h)).collect(),
+            ..candidate(name, true, true)
+        }
+    }
+    fn selecting(pairs: &[(&str, &str)]) -> Vm {
+        let mut v = vm();
+        v.spec.node_selector = labels(pairs);
+        v
+    }
+    fn avoiding(pairs: &[(&str, &str)], required: bool) -> Vm {
+        let mut v = vm();
+        v.spec.anti_affinity = vec![AntiAffinity {
+            selector: labels(pairs),
+            required,
+        }];
+        v
+    }
 
     fn vm_asking(spec: serde_json::Value) -> Vm {
         new_vm(
             "t",
             VmSpec {
+                cluster_selector: Default::default(),
+                node_selector: Default::default(),
+                anti_affinity: Vec::new(),
                 node_name: None,
                 cluster_name: None,
                 run_strategy: Default::default(),
@@ -758,6 +1001,9 @@ mod tests {
 
     fn volume_candidate(name: &str, backends: &[&str]) -> Candidate {
         Candidate {
+            kind: CandidateKind::Node,
+            labels: Default::default(),
+            hosted: Vec::new(),
             free: ROOMY,
             name: name.into(),
             connected: true,
@@ -852,6 +1098,9 @@ mod tests {
 
     fn overlay_candidate(name: &str, vxlan: bool) -> Candidate {
         Candidate {
+            kind: CandidateKind::Node,
+            labels: Default::default(),
+            hosted: Vec::new(),
             free: ROOMY,
             name: name.into(),
             connected: true,
@@ -1230,6 +1479,209 @@ mod tests {
         assert_eq!(FirstFit.assign(&vm(), &mixed).as_deref(), Some("ibiza"));
     }
 
+    /// A selector is an AND over pairs, and an empty one is not a constraint.
+    /// The second half is the compatibility promise: every VM written before
+    /// this feature existed carries no selector and must place exactly where
+    /// it always did.
+    #[test]
+    fn a_selector_narrows_to_the_machines_that_carry_it_and_an_empty_one_narrows_nothing() {
+        let inventory = [
+            labelled("agent-1a", &[("zone", "a"), ("disk", "nvme")], &[]),
+            labelled("agent-1b", &[("zone", "b"), ("disk", "nvme")], &[]),
+        ];
+        assert_eq!(
+            FirstFit.assign(&selecting(&[("zone", "b")]), &inventory),
+            Some("agent-1b".into())
+        );
+        // Both pairs must match, not either.
+        assert_eq!(
+            FirstFit.assign(&selecting(&[("zone", "b"), ("disk", "sata")]), &inventory),
+            None
+        );
+        assert_eq!(
+            FirstFit.assign(&vm(), &inventory),
+            Some("agent-1a".into()),
+            "no selector is no constraint"
+        );
+    }
+
+    /// The two selectors are answered by different tiers, and that is the
+    /// whole point of there being two: a node label is not something the
+    /// cloud tier should have to know about.
+    #[test]
+    fn each_tier_answers_only_its_own_selector() {
+        let node = labelled("agent-1a", &[("zone", "a")], &[]);
+        let cluster = Candidate {
+            kind: CandidateKind::Cluster,
+            ..labelled("cluster-1", &[("region", "stuttgart")], &[])
+        };
+
+        let mut wants_node = vm();
+        wants_node.spec.node_selector = labels(&[("zone", "a")]);
+        assert_eq!(
+            FirstFit.assign(&wants_node, std::slice::from_ref(&node)),
+            Some("agent-1a".into())
+        );
+        assert_eq!(
+            FirstFit.assign(&wants_node, std::slice::from_ref(&cluster)),
+            Some("cluster-1".into()),
+            "a node selector says nothing about a cluster"
+        );
+
+        let mut wants_region = vm();
+        wants_region.spec.cluster_selector = labels(&[("region", "muenchen")]);
+        assert_eq!(FirstFit.assign(&wants_region, &[cluster]), None);
+        assert_eq!(
+            FirstFit.assign(&wants_region, &[node]),
+            Some("agent-1a".into()),
+            "a cluster selector says nothing about a node"
+        );
+    }
+
+    /// The case the feature exists for: two replicas of one service must not
+    /// share a machine, so the second goes elsewhere even though the first
+    /// machine still has room.
+    #[test]
+    fn a_required_term_moves_the_second_replica_off_the_machine_holding_the_first() {
+        let inventory = [
+            labelled("agent-1a", &[], &[&[("app", "web")]]),
+            labelled("agent-1b", &[], &[]),
+        ];
+        assert_eq!(
+            FirstFit.assign(&avoiding(&[("app", "web")], true), &inventory),
+            Some("agent-1b".into())
+        );
+        // And when the only machine left is the one it must avoid, it waits
+        // rather than sitting down beside it.
+        let only = [labelled("agent-1a", &[], &[&[("app", "web")]])];
+        assert_eq!(
+            FirstFit.assign(&avoiding(&[("app", "web")], true), &only),
+            None
+        );
+        // A term whose selector matches nothing there is not a constraint.
+        assert_eq!(
+            FirstFit.assign(&avoiding(&[("app", "db")], true), &only),
+            Some("agent-1a".into())
+        );
+    }
+
+    /// The difference between a preference and a requirement, in one test: it
+    /// is honoured when it can be, and it is dropped rather than stranding
+    /// the VM. A preference that can leave a VM Pending is a requirement
+    /// whose author did not know they were writing one.
+    #[test]
+    fn a_preferred_term_gives_way_rather_than_leaving_the_vm_pending() {
+        let roomier = [
+            labelled("agent-1a", &[], &[&[("app", "web")]]),
+            labelled("agent-1b", &[], &[]),
+        ];
+        assert_eq!(
+            FirstFit.assign(&avoiding(&[("app", "web")], false), &roomier),
+            Some("agent-1b".into()),
+            "honoured when it can be"
+        );
+        let only = [labelled("agent-1a", &[], &[&[("app", "web")]])];
+        assert_eq!(
+            FirstFit.assign(&avoiding(&[("app", "web")], false), &only),
+            Some("agent-1a".into()),
+            "and dropped rather than refusing to place"
+        );
+    }
+
+    /// First-Fit fills a machine before it touches the next; Spread does the
+    /// opposite. Both are legitimate and the choice is the operator's, which
+    /// is what the `scheduler = ...` line is for.
+    #[test]
+    fn spread_takes_the_least_loaded_and_first_fit_takes_the_first() {
+        let inventory = [
+            labelled("agent-1a", &[], &[&[("app", "web")], &[("app", "db")]]),
+            labelled("agent-1b", &[], &[&[("app", "web")]]),
+            labelled("agent-1c", &[], &[]),
+        ];
+        assert_eq!(FirstFit.assign(&vm(), &inventory), Some("agent-1a".into()));
+        assert_eq!(Spread.assign(&vm(), &inventory), Some("agent-1c".into()));
+
+        // Ties break on the name, so two passes over one inventory place the
+        // same way and this test can say which.
+        let tied = [
+            labelled("agent-2b", &[], &[]),
+            labelled("agent-2a", &[], &[]),
+        ];
+        assert_eq!(Spread.assign(&vm(), &tied), Some("agent-2a".into()));
+    }
+
+    /// The invariant `Candidate::free` states, extended to every rule that is
+    /// not a matter of strategy: two strategies may disagree about WHERE and
+    /// must never disagree about WHETHER.
+    #[test]
+    fn the_strategies_disagree_about_where_and_never_about_whether() {
+        let cases: [(&str, Vm, Vec<Candidate>); 5] = [
+            ("empty", vm(), vec![]),
+            ("all down", vm(), vec![candidate("gone", false, true)]),
+            (
+                "selector unmatched",
+                selecting(&[("zone", "a")]),
+                vec![labelled("agent-1a", &[("zone", "b")], &[])],
+            ),
+            (
+                "anti-affinity",
+                avoiding(&[("app", "web")], true),
+                vec![labelled("agent-1a", &[], &[&[("app", "web")]])],
+            ),
+            (
+                "placeable",
+                vm(),
+                vec![
+                    labelled("agent-1a", &[], &[]),
+                    labelled("agent-1b", &[], &[]),
+                ],
+            ),
+        ];
+        for (what, vm, inventory) in cases {
+            let a = FirstFit.assign(&vm, &inventory).is_some();
+            let b = Spread.assign(&vm, &inventory).is_some();
+            assert_eq!(a, b, "{what}: the strategies disagreed about whether");
+            // And the third narrowing, the one that writes the sentence, has
+            // to agree with both — three filter chains that can drift apart
+            // are three chances to tell an operator something untrue.
+            let feasible_here = !feasible(&vm, &inventory).is_empty();
+            assert_eq!(a, feasible_here, "{what}: feasible disagreed with assign");
+        }
+    }
+
+    /// A second strategy is a config line and not an edit in two `main`s —
+    /// which was the claim `SchedulerConfig` was written to make, and this is
+    /// the first time there is a second strategy to make it with.
+    #[test]
+    fn the_scheduler_is_chosen_by_name_and_an_unknown_name_is_refused() {
+        let named = |s: &str| SchedulerConfig::into_scheduler(Some(SchedulerConfig(s.into())));
+        let inventory = [
+            labelled("agent-1a", &[], &[&[("app", "web")]]),
+            labelled("agent-1b", &[], &[]),
+        ];
+        assert_eq!(
+            named("first-fit").unwrap().assign(&vm(), &inventory),
+            Some("agent-1a".into())
+        );
+        assert_eq!(
+            named("spread").unwrap().assign(&vm(), &inventory),
+            Some("agent-1b".into())
+        );
+        // Absent still means first-fit, so a config that never mentioned a
+        // scheduler places exactly where it always did.
+        assert_eq!(
+            SchedulerConfig::into_scheduler(None)
+                .unwrap()
+                .assign(&vm(), &inventory),
+            Some("agent-1a".into())
+        );
+        let e = match named("bin-packing") {
+            Ok(_) => panic!("an unknown scheduler name must not resolve"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("first-fit") && e.contains("spread"), "{e}");
+    }
+
     /// The category behind the sentence: a closed set, because the sentence
     /// itself counts candidates and names capabilities and is therefore
     /// exactly the kind of string that must never become a metric label.
@@ -1270,6 +1722,17 @@ mod tests {
             pending_reason_of(&vm_asking(split), &union).0,
             PendingReason::Split
         );
+        // Room and catalogue are fine and the labels are not.
+        let unlabelled = [labelled("agent-1a", &[("zone", "b")], &[])];
+        let (why, sentence) = pending_reason_of(&selecting(&[("zone", "a")]), &unlabelled);
+        assert_eq!(why, PendingReason::SelectorUnmatched);
+        assert!(sentence.contains("zone=a"), "{sentence}");
+        // Everything fits and the neighbour is the problem.
+        let occupied = [labelled("agent-1a", &[], &[&[("app", "web")]])];
+        assert_eq!(
+            pending_reason_of(&avoiding(&[("app", "web")], true), &occupied).0,
+            PendingReason::AntiAffinity
+        );
 
         // The label spellings are what a dashboard is written against, so
         // they are asserted rather than left to the Debug impl. Distinct,
@@ -1281,8 +1744,10 @@ mod tests {
                 "no-candidates",
                 "none-usable",
                 "no-capacity",
+                "selector-unmatched",
                 "unserved-request",
-                "split-request"
+                "split-request",
+                "anti-affinity"
             ]
         );
         // and the sentence is still the sentence

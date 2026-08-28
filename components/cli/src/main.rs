@@ -196,6 +196,18 @@ pub enum ClusterNodeCmd {
     Cordon { name: String },
     /// Take the drain off (spec.schedulable = true)
     Uncordon { name: String },
+    /// Write labels on it. They are what `spec.nodeSelector` on a vm selects
+    /// against, and they mean whatever an operator decides they mean.
+    Label {
+        name: String,
+        /// `key=value`, repeatable. Setting a key that is already there
+        /// replaces it.
+        pairs: Vec<String>,
+        /// Take a key off, repeatable. Applied after the pairs, so naming a
+        /// key in both means it goes.
+        #[arg(long = "rm")]
+        rm: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -312,6 +324,18 @@ pub enum CloudClusterCmd {
     Cordon { name: String },
     /// Take the drain off (spec.schedulable = true)
     Uncordon { name: String },
+    /// Write labels on it. They are what `spec.clusterSelector` on a vm selects
+    /// against, and they mean whatever an operator decides they mean.
+    Label {
+        name: String,
+        /// `key=value`, repeatable. Setting a key that is already there
+        /// replaces it.
+        pairs: Vec<String>,
+        /// Take a key off, repeatable. Applied after the pairs, so naming a
+        /// key in both means it goes.
+        #[arg(long = "rm")]
+        rm: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]

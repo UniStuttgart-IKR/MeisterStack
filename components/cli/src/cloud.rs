@@ -266,9 +266,22 @@ fn cluster_row(c: Cluster, now: DateTime<Utc>) -> Vec<String> {
 /// the Cluster object, through the same read-edit-write compare-and-swap.
 #[generated(model = ClaudeOpus, version = "5")]
 async fn run_cluster(client: &Client, cmd: &CloudClusterCmd, global: &GlobalArgs) -> Result<()> {
+    if let CloudClusterCmd::Label { name, pairs, rm } = cmd {
+        let body = client
+            .patch_spec(
+                &format!("{CLUSTERS}/{name}"),
+                "parsing the cluster object",
+                &format!("cluster {name}"),
+                &|spec| crate::client::edit_labels(spec, pairs, rm),
+            )
+            .await?;
+        return output::emit_line(global, &body, "labelled");
+    }
     let (name, schedulable) = match cmd {
         CloudClusterCmd::Cordon { name } => (name, false),
         CloudClusterCmd::Uncordon { name } => (name, true),
+        // Handled above; the binding below is about schedulability only.
+        CloudClusterCmd::Label { .. } => unreachable!("returned above"),
     };
     let body = client
         .patch_spec(

@@ -122,6 +122,9 @@ mod tests {
         new_vm(
             name,
             VmSpec {
+                cluster_selector: Default::default(),
+                node_selector: Default::default(),
+                anti_affinity: Vec::new(),
                 node_name: None,
                 cluster_name: None,
                 run_strategy: Default::default(),
