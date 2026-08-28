@@ -892,6 +892,7 @@ mod tests {
                 volumes: vec![],
                 nics: vec![],
                 devices: vec![],
+                images: Vec::new(),
             },
             desired,
             phase,

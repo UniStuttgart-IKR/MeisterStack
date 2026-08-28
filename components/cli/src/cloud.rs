@@ -108,6 +108,8 @@ struct Image {
 struct ImageSpec {
     source: String,
     #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
     format: Option<String>,
     #[serde(default)]
     size_bytes: u64,
@@ -120,8 +122,14 @@ struct ImageSpec {
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ImageStatus {
+    /// `availableOn` is deliberately not read: it has meant "not tracked"
+    /// since v1 and the column over it was always empty, while `phase` says
+    /// the thing an operator was hoping to read there.
+    ///
+    /// Pending / Ready / Failed. A path image is Ready the moment it is
+    /// registered; a fetchable one waits for a node to say.
     #[serde(default)]
-    available_on: Vec<String>,
+    phase: Option<String>,
 }
 
 /// Every verb of this tier that destroys something, and the whole list of it.
@@ -344,11 +352,26 @@ async fn run_image(client: &Client, cmd: &CloudImageCmd, global: &GlobalArgs) ->
         CloudImageCmd::Create {
             name,
             source,
+            from_url,
+            sha256,
             format,
             size,
             tenant,
             public,
         } => {
+            // `source` is what a node looks the image up as, and for a
+            // fetched one that is the catalogue name itself: the bytes land
+            // under it. So one of the two has to be given and only one can
+            // be, which clap already enforces — this turns it into the field
+            // the server takes.
+            let source = match (source, from_url) {
+                (Some(path), _) => path.clone(),
+                (None, Some(_)) => name.clone(),
+                (None, None) => anyhow::bail!(
+                    "say where the image is with --source <path>, or where to fetch it from \
+                     with --from-url <url> --sha256 <hex>"
+                ),
+            };
             let mut object = json!({
                 "apiVersion": "meister.io/v1",
                 "kind": "Image",
@@ -360,6 +383,16 @@ async fn run_image(client: &Client, cmd: &CloudImageCmd, global: &GlobalArgs) ->
                     "public": public,
                 },
             });
+            // Omitted rather than sent as null, for the reason `tenant` is:
+            // an absent key and a key saying "nothing" are different
+            // requests, and the second one would make every path image look
+            // like a fetchable one whose url somebody forgot.
+            if let Some(url) = from_url {
+                object["spec"]["url"] = json!(url);
+            }
+            if let Some(sha256) = sha256 {
+                object["spec"]["sha256"] = json!(sha256);
+            }
             // Omitted rather than sent as null when nobody named one: the
             // server fills a member's own tenant in, and a key that is there
             // saying "nothing" is not the same request as one that is absent.
@@ -378,14 +411,17 @@ async fn run_image(client: &Client, cmd: &CloudImageCmd, global: &GlobalArgs) ->
                     // operator can put a space in: it is a path they chose.
                     // Everything before it stays one token, so `awk` can cut
                     // this table up.
+                    //
+                    // `phase` takes the place `available-on` had. That column
+                    // has meant "not tracked" since v1 and was always empty,
+                    // while this says the thing somebody was hoping to read
+                    // there. WHY a Failed image failed is deliberately not a
+                    // column: it is a server sentence with spaces in it and
+                    // the last column is spoken for. It comes out with
+                    // `-o json`, and — where it is actually met — in the 422
+                    // that refuses a vm naming an unusable image.
                     &[
-                        "name",
-                        "tenant",
-                        "scope",
-                        "format",
-                        "size",
-                        "available-on",
-                        "source",
+                        "name", "tenant", "scope", "format", "size", "phase", "source",
                     ],
                     "no images in this catalogue",
                     image_row,
@@ -409,10 +445,11 @@ fn image_row(img: Image) -> Vec<String> {
         if img.spec.public { "public" } else { "private" }.to_string(),
         or_dash(img.spec.format),
         size(img.spec.size_bytes),
-        // Empty means "not tracked": v1 distributes by reference and nothing
-        // fills this in yet.
-        joined(&img.status.available_on),
-        img.spec.source,
+        or_dash(img.status.phase),
+        // For a fetchable image the url is where the bytes come from and the
+        // name is where they land; showing the url is what an operator wants
+        // to check.
+        img.spec.url.unwrap_or(img.spec.source),
     ]
 }
 
@@ -1232,7 +1269,10 @@ mod tests {
         assert_eq!(row[1], "ops");
         assert_eq!(row[2], "public");
         assert_eq!(row[4], "2.0Gi");
-        assert_eq!(row[5], "-");
+        assert_eq!(
+            row[5], "-",
+            "no phase on an object written before they existed"
+        );
         // The only cell an operator can put a space in is the last one.
         for cell in &row[..row.len() - 1] {
             assert!(!cell.contains(' '), "{cell:?} carries a raw space");

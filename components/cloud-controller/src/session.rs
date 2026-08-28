@@ -41,7 +41,7 @@ use controller_api::events::{self, Happening};
 use controller_api::{
     Ack, Cluster, ClusterSpec, EtcdStore, Observation, Peer, Pending, StoreError, Vm,
 };
-use controller_api::{EventType, Resource, VmPhase};
+use controller_api::{EventType, Image, ImagePhase, Resource, VmPhase};
 
 /// Shorter than the agent tier's, and deliberately: a cluster answers a command
 /// with a single store write, so a minute of patience would only mean a minute
@@ -360,6 +360,8 @@ async fn ingest_status(
         })
         .await?;
 
+    ingest_images(store, cluster, &status.images).await;
+
     if status.vms.is_empty() {
         return Ok(());
     }
@@ -508,6 +510,58 @@ struct Connection {
     tx: CommandTx,
     /// Who the certificate said dialled in — checked against every Hello.
     who: controller_api::Authenticated,
+}
+
+/// What the fleet has learned about a base image, onto the Image object.
+///
+/// This is the whole reason the phase is not something the cloud decides by
+/// itself: the NODE is what fetches a URL image, so whether the bytes are
+/// obtainable and hash to what the spec said is a fact only a node can
+/// establish. The report is that fact travelling up.
+///
+/// Written only when it CHANGED. A cluster reports every ten seconds and says
+/// the same thing every time; a write per report would churn etcd revisions
+/// and wake the image watch for nothing — the same rule
+/// `controller_api::mirror` applies to a VM phase, applied by hand here
+/// because there is one field and no index to build.
+///
+/// An image the cloud does not know is skipped rather than created: a cluster
+/// naming one is a cluster with a stale spec or a node with a leftover cache
+/// entry, and inventing a catalogue entry for it would be this control plane
+/// making up an image nobody registered.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn ingest_images(store: &EtcdStore, cluster: &str, reports: &[proto::ImageStateReport]) {
+    for report in reports {
+        let Some(phase) = ImagePhase::parse(&report.phase) else {
+            // A drifting peer should be visible, not silently "Pending" —
+            // the rule VmPhase::parse states one tier down.
+            warn!(cluster, image = %report.name, phase = %report.phase,
+                  "unknown image phase from cluster");
+            continue;
+        };
+        let message = (!report.message.is_empty()).then(|| report.message.clone());
+        match store.get::<Image>(&report.name).await {
+            Ok(image) if image.status.phase == phase && image.status.message == message => {}
+            Ok(_) => {
+                let result = store
+                    .mutate::<Image, _>(&report.name, |i| {
+                        i.status.phase = phase;
+                        i.status.message = message.clone();
+                    })
+                    .await;
+                match result {
+                    Ok(_) => info!(image = %report.name, ?phase, cluster, "image phase observed"),
+                    Err(e) => warn!(image = %report.name, error = format!("{e:#}"),
+                                    "writing image status failed"),
+                }
+            }
+            Err(StoreError::NotFound(_)) => {
+                debug!(cluster, image = %report.name, "status for an image this cloud has not got")
+            }
+            Err(e) => warn!(image = %report.name, error = format!("{e:#}"),
+                            "reading the image failed"),
+        }
+    }
 }
 
 #[generated(model = ClaudeOpus, version = "5")]
@@ -701,6 +755,7 @@ mod tests {
                 })
                 .collect(),
             vms_complete: complete,
+            images: Vec::new(),
         }
     }
 

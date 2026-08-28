@@ -47,9 +47,64 @@ const VM_INDEX_TTL: Duration = Duration::from_secs(1);
 
 type CommandTx = mpsc::Sender<Result<ControllerMessage, Status>>;
 
+/// What the cluster's nodes have said about base images, by name.
+///
+/// In memory beside the session map and not in the store, and that is the
+/// same shape the VM index has: it is a summary of what peers are saying
+/// right now, it is rebuilt from their reports, and a second copy in etcd
+/// would be a number nobody recomputed. Failed wins over Ready where two
+/// nodes disagree — a checksum that did not match is a fact about the bytes,
+/// not about the node that read them.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Default)]
+pub struct ImageView(std::sync::Mutex<HashMap<String, (String, String)>>);
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl ImageView {
+    /// Take in one node's opinions.
+    pub fn observe(&self, reports: &[proto::ImageStateReport]) {
+        let mut held = self.0.lock().unwrap();
+        for report in reports {
+            match held.get(&report.name) {
+                // Already known to be bad: a node that can read it does not
+                // undo a node that read the wrong bytes.
+                Some((phase, _)) if phase == "Failed" && report.phase != "Failed" => {}
+                _ => {
+                    held.insert(
+                        report.name.clone(),
+                        (report.phase.clone(), report.message.clone()),
+                    );
+                }
+            }
+        }
+    }
+
+    /// What to tell the cloud.
+    pub fn report(&self) -> Vec<proto::ImageStateReport> {
+        let held = self.0.lock().unwrap();
+        let mut out: Vec<proto::ImageStateReport> = held
+            .iter()
+            .map(|(name, (phase, message))| proto::ImageStateReport {
+                name: name.clone(),
+                phase: phase.clone(),
+                message: message.clone(),
+            })
+            .collect();
+        // Sorted, so two consecutive reports of the same facts are the same
+        // message.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+}
+
 pub struct SessionRegistry {
     nodes: Mutex<HashMap<String, CommandTx>>,
     pending: Pending,
+    /// What the nodes have said about base images. On the registry because
+    /// that is where the other summary of what peers are saying lives, and
+    /// because the cloud session reads it from a different task than the one
+    /// that fills it.
+    pub images: ImageView,
 }
 
 #[generated(model = ClaudeOpus, version = "5")]
@@ -65,6 +120,7 @@ impl SessionRegistry {
         Self {
             nodes: Mutex::default(),
             pending: Pending::new(ACK_TIMEOUT),
+            images: ImageView::default(),
         }
     }
 
@@ -543,6 +599,11 @@ async fn pump(session: Session, mut inbound: Streaming<AgentMessage>) {
                     warn!("status report before hello, ignoring");
                     continue;
                 };
+                // What the node says about base images goes into the
+                // cluster-wide view, whatever the rest of the ingest does:
+                // it is a fact about that node's disk and does not depend on
+                // any VM object being readable.
+                session.registry.images.observe(&report.images);
                 if let Err(e) = ingest_status(&session.store, &session.vms, id, &report).await {
                     warn!(node = id, error = format!("{e:#}"), "status ingest failed");
                 }

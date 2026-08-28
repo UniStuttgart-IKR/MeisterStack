@@ -74,6 +74,27 @@ message DriverInfo {
 message StatusReport {
   NodeStatus node = 1;
   repeated VmStatusReport vms = 2;
+  // What this node has learned about the base images it was asked to fetch.
+  // Only the ones it has an opinion about: a path-based image is somebody
+  // else's file on shared storage and this node has never claimed to know
+  // anything about it.
+  //
+  // Upwards on the status road rather than as an answer to a command,
+  // because that is what the fact IS: whether an image is usable is not a
+  // question the cloud can answer by itself once the NODE is what fetches it,
+  // and a node's continuous statement about its own disk is exactly what a
+  // status report is for.
+  repeated ImageStateReport images = 3;
+}
+
+message ImageStateReport {
+  // The catalogue name, which is what the cloud's Image object is called.
+  string name = 1;
+  // One of the cloud's ImagePhase variants, spelled exactly: Ready, Failed.
+  // A node never says Pending — an image it has no opinion about is simply
+  // not in the list.
+  string phase = 2;
+  string message = 3;
 }
 
 message NodeStatus {
@@ -221,6 +242,11 @@ message ClusterStatus {
   // exactly as one tier down it is the uid the controller handed the agent:
   // the name is what people call a VM, the uid is which VM it is.
   repeated VmStatusReport vms = 4;
+  // The union of what this cluster's nodes said about base images, the same
+  // road one tier up. Failed wins over Ready where two nodes disagree: a
+  // checksum that did not match is a fact about the bytes and not about the
+  // node that read them.
+  repeated ImageStateReport images = 6;
   // False says "this list is not the whole truth" — a cluster that could not
   // read all of its own objects says so instead of shipping a short list. The
   // difference matters because absence from this list is what the cloud

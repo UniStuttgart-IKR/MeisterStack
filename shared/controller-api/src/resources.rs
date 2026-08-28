@@ -449,7 +449,21 @@ pub enum ImageFormat {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageSpec {
+    /// The file name a node looks up under its own image_dir, and what a VM's
+    /// `base_image` says. For a URL image this is the name the fetched bytes
+    /// land under; for a path image it is where they already are.
     pub source: String,
+    /// Where the bytes can be fetched from, if nobody has put them there by
+    /// hand. Absent = the catalogue entry over existing shared storage this
+    /// resource has always been, unchanged in every respect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// What those bytes must hash to, lowercase hex. Mandatory with `url` and
+    /// meaningless without one — checked at the create edge, because an image
+    /// fetched over a network and not checked is an image somebody else can
+    /// choose the contents of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     #[serde(default)]
     pub format: ImageFormat,
     #[serde(default)]
@@ -472,6 +486,42 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Whether the bytes are there and are the right bytes.
+///
+/// A path image is `Ready` the moment it is registered: it is a catalogue
+/// entry over storage somebody else already filled, and this control plane
+/// has never claimed to check it. A URL image starts `Pending` — nobody has
+/// fetched it yet — and moves when a node says what happened.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImagePhase {
+    #[default]
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl ImagePhase {
+    pub const ALL: [ImagePhase; 3] = [ImagePhase::Pending, ImagePhase::Ready, ImagePhase::Failed];
+
+    /// The spelling that goes on the wire (control.proto: ImageStateReport).
+    /// `parse` is its inverse and the tests hold them to it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImagePhase::Pending => "Pending",
+            ImagePhase::Ready => "Ready",
+            ImagePhase::Failed => "Failed",
+        }
+    }
+
+    /// Unknown input is rejected rather than defaulted — a drifting node
+    /// should be visible, not silently "Pending". The rule VmPhase follows.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+}
+
 #[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -481,6 +531,8 @@ pub struct ImageStatus {
     /// is better than writing a number nobody computed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_on: Vec<String>,
+    #[serde(default)]
+    pub phase: ImagePhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }

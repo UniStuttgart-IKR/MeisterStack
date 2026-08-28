@@ -315,8 +315,21 @@ async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result<(), ApiErr
         ));
     }
     check_owned_nic_fields(&spec.vm)?;
+    check_owned_volume_fields(&spec.vm)?;
     for image in base_images(&spec.vm) {
         match store.get::<Image>(&image).await {
+            Ok(image) if image.status.phase == controller_api::ImagePhase::Failed => {
+                // A Failed image is one a node has already tried and could
+                // not use — a checksum that did not match, a url that did not
+                // answer. Refusing the create is the whole point of the
+                // phase: the alternative is a VM that is accepted, placed,
+                // and then fails at provision on every node it is offered to.
+                return Err(invalid(format!(
+                    "base_image {:?} is not usable: {}",
+                    image.metadata.name,
+                    image.status.message.as_deref().unwrap_or("unknown reason")
+                )));
+            }
             Ok(_) => {}
             Err(StoreError::NotFound(_)) => {
                 return Err(invalid(format!(
@@ -325,6 +338,83 @@ async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result<(), ApiErr
             }
             Err(e) => return Err(e.into()),
         }
+    }
+    Ok(())
+}
+
+/// Fields on a volume that the control plane owns, refused when a client
+/// sends them.
+///
+/// The same boundary `check_owned_nic_fields` guards, one field-list over.
+/// Where a base image is fetched from and what it must hash to come out of
+/// the Image OBJECT, resolved by the cloud — a client that could write them
+/// into its own spec could point a `base_image` name at bytes of its own
+/// choosing while the catalogue entry everybody else reads says something
+/// different.
+#[generated(model = ClaudeOpus, version = "5")]
+fn check_owned_volume_fields(vm: &serde_json::Value) -> Result<(), ApiError> {
+    let volumes = vm
+        .get("volumes")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for (i, volume) in volumes.iter().enumerate() {
+        for field in ["base_image_url", "base_image_sha256"] {
+            if volume.get(field).is_some_and(|v| !v.is_null()) {
+                return Err(invalid(format!(
+                    "spec.vm.volumes[{i}].{field} is control-plane-owned; the cloud fills it in \
+                     from the image catalogue"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write the catalogue's answer into the spec: where each base image comes
+/// from, and what it must hash to.
+///
+/// At the create edge and once, so the VM keeps the image it was created
+/// against even if somebody re-registers the name later — which is the same
+/// promise the tenant and the VNI make on this object.
+///
+/// Only for images that HAVE a url. A path-based image gets nothing written
+/// into its volume at all, so its spec is byte for byte the spec it has
+/// always been and the node looks the name up locally exactly as before.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn resolve_base_images(
+    store: &EtcdStore,
+    vm: &mut serde_json::Value,
+) -> Result<(), ApiError> {
+    let mut sources: std::collections::BTreeMap<String, (String, String)> = Default::default();
+    for name in base_images(vm) {
+        let image: Image = match store.get(&name).await {
+            Ok(image) => image,
+            // Already refused by `validate_vm_spec`; nothing to resolve.
+            Err(_) => continue,
+        };
+        if let (Some(url), Some(sha256)) = (image.spec.url, image.spec.sha256) {
+            sources.insert(name, (url, sha256));
+        }
+    }
+    if sources.is_empty() {
+        return Ok(());
+    }
+    let Some(volumes) = vm.get_mut("volumes").and_then(|v| v.as_array_mut()) else {
+        return Ok(());
+    };
+    for volume in volumes.iter_mut() {
+        let Some(name) = volume.get("base_image").and_then(|b| b.as_str()) else {
+            continue;
+        };
+        let Some((url, sha256)) = sources.get(name).cloned() else {
+            continue;
+        };
+        let Some(volume) = volume.as_object_mut() else {
+            continue;
+        };
+        volume.insert("base_image_url".into(), json!(url));
+        volume.insert("base_image_sha256".into(), json!(sha256));
     }
     Ok(())
 }
@@ -471,6 +561,8 @@ async fn create_vm_traced(
     .await?;
 
     // Server-owned metadata; client keeps name + labels.
+    let mut spec = body.spec;
+    resolve_base_images(&st.store, &mut spec.vm).await?;
     let mut vm = new_vm(
         &body.metadata.name,
         VmSpec {
@@ -479,7 +571,7 @@ async fn create_vm_traced(
             cluster_name: None,
             node_name: None,
             tenant: owner,
-            ..body.spec
+            ..spec
         },
     );
     vm.metadata.labels = body.metadata.labels;
@@ -519,6 +611,10 @@ async fn update_vm(
         return Err(invalid("metadata.name does not match the path"));
     }
     validate_vm_spec(&st.store, &body.spec).await?;
+    // Resolved again, for the same reason it is validated again: the spec on
+    // a PUT is a document the client wrote, so whatever the cloud filled in
+    // last time is not in it.
+    resolve_base_images(&st.store, &mut body.spec.vm).await?;
 
     // Server-owned fields survive the round-trip untouched — the binding
     // among them. A VM that could be re-pointed at another cluster by editing
@@ -765,6 +861,55 @@ fn check_image_name(name: &str, source: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// The two rules a fetchable image has to obey, and both are about the
+/// checksum rather than about the URL.
+///
+/// A URL without one is refused because an image fetched over a network and
+/// not checked is an image whose contents somebody else chooses — every VM in
+/// the fleet booting whatever answered. And a checksum without a URL is
+/// refused because it would be a promise nobody checks: nothing fetches a
+/// path image, so nothing would ever compare it, and an operator reading the
+/// object would believe otherwise.
+///
+/// The shape is validated here rather than at the node for the reason every
+/// other spec rule is: the node is the last place to find out, and by then
+/// somebody is waiting for a VM.
+#[generated(model = ClaudeOpus, version = "5")]
+fn check_fetchable(spec: &ImageSpec) -> Result<(), ApiError> {
+    match (&spec.url, &spec.sha256) {
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(invalid(
+            "spec.sha256 is required with spec.url; an image fetched over a network and not \
+             checked is an image somebody else chooses the contents of",
+        )),
+        (None, Some(_)) => Err(invalid(
+            "spec.sha256 without spec.url is a promise nobody checks; nothing fetches a \
+             path-based image",
+        )),
+        (Some(url), Some(sha256)) => {
+            if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(invalid(format!(
+                    "spec.sha256 {sha256:?} must be 64 hex characters"
+                )));
+            }
+            if sha256.bytes().any(|b| b.is_ascii_uppercase()) {
+                return Err(invalid("spec.sha256 must be lowercase"));
+            }
+            // The node runs `curl`, which speaks more than http. A scheme
+            // this control plane has not thought about is refused here rather
+            // than discovered on a node — `file://` in particular would make
+            // an image mean something different on every machine.
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(invalid(
+                    "spec.url must be http:// or https://; a node fetches this, and a scheme \
+                     that means something different on every machine is not an image",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// A member's catalogue is its own images plus the public ones — which is
 /// what a shared base image is for, and why the list is not simply filtered
 /// to one tenant the way the VM list is.
@@ -798,6 +943,7 @@ async fn create_image(
         return Err(invalid("spec.source must say where the image already is"));
     }
     check_image_name(&body.metadata.name, &body.spec.source)?;
+    check_fetchable(&body.spec)?;
 
     let who = Grant::new(caller, role, tenant);
     let owner = who.tenant_for_create(body.spec.tenant.clone());
@@ -812,6 +958,7 @@ async fn create_image(
         check_tenant(&st, t).await?;
     }
 
+    let url = body.spec.url.clone();
     let mut image = Image::declare(
         &body.metadata.name,
         ImageSpec {
@@ -820,6 +967,19 @@ async fn create_image(
         },
     );
     image.metadata.labels = body.metadata.labels;
+    // A path image is Ready the moment it is registered: it is a catalogue
+    // entry over storage somebody else already filled, and this control plane
+    // has never claimed to check it — saying anything else would be inventing
+    // a promise where there was none. A URL image is Pending until a node
+    // that has fetched it says otherwise, because the node is what fetches.
+    image.status.phase = if url.is_some() {
+        controller_api::ImagePhase::Pending
+    } else {
+        controller_api::ImagePhase::Ready
+    };
+    image.status.message = url
+        .is_some()
+        .then(|| "not fetched by any node yet".to_string());
     let created = st.store.create(&image).await?;
     info!(image = %created.metadata.name, tenant = ?created.spec.tenant,
           public = created.spec.public, "image registered");

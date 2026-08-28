@@ -7,6 +7,7 @@ pub mod api;
 pub mod config;
 pub mod console;
 pub mod drivers;
+pub mod images;
 pub mod provision;
 pub mod reconcile;
 pub mod store;
@@ -76,6 +77,9 @@ fn heals_without_an_operator(e: &anyhow::Error) -> bool {
 
 pub struct Agent {
     provisioner: Arc<Provisioner>,
+    /// The base image cache, for the half of the status report that is about
+    /// this node's disk rather than about its VMs.
+    images: Arc<crate::images::Cache>,
     store: Arc<Store>,
     reconciler: Arc<Reconciler>,
     ops: Arc<tokio::sync::Mutex<()>>,
@@ -312,6 +316,19 @@ impl Agent {
         Ok(StatusReport {
             node: Some(self.node),
             vms,
+            // What this node has learned about the base images it was asked
+            // to fetch. Empty on a node that has only ever seen path-based
+            // images, which is every node before this milestone.
+            images: self
+                .images
+                .report()
+                .into_iter()
+                .map(|(name, state)| proto::ImageStateReport {
+                    name,
+                    phase: state.phase().to_string(),
+                    message: state.message().to_string(),
+                })
+                .collect(),
         })
     }
 
@@ -425,9 +442,13 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
         );
     }
 
+    // One cache per agent, over the configured image directory: what it puts
+    // there is exactly what the volume drivers look up.
+    let images = Arc::new(crate::images::Cache::new(cfg.paths.image_dir.clone()));
     let provisioner = Arc::new(Provisioner::new(
         store.clone(),
         drivers.clone(),
+        images.clone(),
         cfg.paths.image_dir.clone(),
         cfg.network.default_bridge.clone(),
         bridge_addr,
@@ -510,6 +531,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
 
     let agent = Arc::new(Agent {
         provisioner,
+        images,
         store,
         reconciler,
         ops,
@@ -670,6 +692,10 @@ async fn status_loop(
                 StatusReport {
                     node: Some(agent.node),
                     vms: Vec::new(),
+                    // Empty for the same reason `vms` is: this is the
+                    // heartbeat only, and a short list must not be read as a
+                    // statement.
+                    images: Vec::new(),
                 }
             }
         };

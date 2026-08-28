@@ -75,6 +75,18 @@ pub struct AgentVmSpec {
     pub volumes: Vec<VolumeWithId>,
     pub nics: Vec<NicWithId>,
     pub devices: Vec<DeviceWithId>,
+    /// Where the base images this VM names can be fetched from, if this node
+    /// does not have them yet. Beside the volumes rather than inside their
+    /// specs, and that is the point: a `VolumeSpec` is the contract three
+    /// storage drivers implement, all three resolve `base_image` by joining
+    /// the name onto their own image_dir, and none of them has to learn what
+    /// a URL is for this to work. The agent puts the bytes there first.
+    ///
+    /// Empty for every spec written before this existed, and empty for every
+    /// path-based image afterwards — so a record written yesterday loads
+    /// unchanged and behaves unchanged.
+    #[serde(default)]
+    pub images: Vec<crate::images::Source>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -153,6 +165,19 @@ pub struct NewVmSpec {
 pub struct NewVolume {
     #[serde(default)]
     pub base_image: Option<String>,
+    /// Where `base_image` can be fetched from if this node does not have it,
+    /// and what the bytes must hash to. Both control-plane-owned: the cloud
+    /// resolves them from the Image object and writes them into the spec, and
+    /// the create edge refuses them from a client — a URL somebody else chose
+    /// is a base image somebody else chose.
+    ///
+    /// Both default, so every spec ever written is still exactly the spec it
+    /// was: a `base_image` with no url beside it is looked up under the
+    /// node's image_dir exactly as it always has been.
+    #[serde(default)]
+    pub base_image_url: Option<String>,
+    #[serde(default)]
+    pub base_image_sha256: Option<String>,
     pub size_bytes: u64,
     /// None = the node's default, `filesystem`.
     #[serde(default)]
@@ -231,6 +256,11 @@ impl TryFrom<proto::VmSpec> for AgentVmSpec {
                 .map(TryInto::try_into)
                 .collect::<Result<Vec<_>, _>>()
                 .context("invalid nic spec")?,
+            // The proto path carries no fetchable image, the same way it
+            // carries neither driver nor params: the controller sends
+            // spec_json (control-plane.md §6), and that is where anything
+            // beyond the four original fields travels.
+            images: Vec::new(),
             devices: p
                 .devices
                 .into_iter()
@@ -335,6 +365,30 @@ impl NewVmSpec {
         }
         let vm_id = Uuid::new_v4();
 
+        // The fetchable half, lifted out of the volumes and deduplicated:
+        // two volumes off one base image are one download.
+        let mut images: Vec<crate::images::Source> = Vec::new();
+        for v in &self.volumes {
+            let (Some(name), Some(url), Some(sha256)) = (
+                v.base_image.as_deref(),
+                v.base_image_url.as_deref(),
+                v.base_image_sha256.as_deref(),
+            ) else {
+                // A url without a checksum, or either without a base_image,
+                // asks for nothing: the create edge refuses that shape, and
+                // here it simply means "look this name up locally", which is
+                // what a path-based image has always meant.
+                continue;
+            };
+            if !images.iter().any(|s| s.name == name) {
+                images.push(crate::images::Source {
+                    name: name.to_string(),
+                    url: url.to_string(),
+                    sha256: sha256.to_string(),
+                });
+            }
+        }
+
         let volumes = self
             .volumes
             .into_iter()
@@ -408,6 +462,7 @@ impl NewVmSpec {
                 volumes,
                 nics,
                 devices,
+                images,
             },
             self.desired,
         ))

@@ -146,6 +146,7 @@ pub fn blank_record() -> VmRecord {
             volumes: vec![],
             nics: vec![],
             devices: vec![],
+            images: Vec::new(),
         },
         desired: Desired::Running,
         phase: Phase::Provisioned,

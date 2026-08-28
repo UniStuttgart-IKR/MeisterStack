@@ -236,7 +236,7 @@ async fn session(
                 }
                 // The commands just changed what this cluster looks like; say
                 // so instead of letting the cloud wait out the tick.
-                if acted && !send_status(store, &tx).await {
+                if acted && !send_status(store, registry, &tx).await {
                     return Ok(Ended::Stream);
                 }
                 if ended {
@@ -244,7 +244,7 @@ async fn session(
                 }
             }
             _ = tick.tick() => {
-                if !send_status(store, &tx).await {
+                if !send_status(store, registry, &tx).await {
                     return Ok(Ended::Stream);
                 }
             }
@@ -569,8 +569,12 @@ async fn handle_destroy(store: &EtcdStore, d: proto::DestroyVm) -> anyhow::Resul
 /// the cluster could read its own store. Missing beats wrong, and a heartbeat
 /// that stops is exactly the signal a cluster in that state should be giving.
 #[generated(model = ClaudeOpus, version = "5")]
-async fn send_status(store: &EtcdStore, tx: &mpsc::Sender<ClusterMessage>) -> bool {
-    match build_status(store).await {
+async fn send_status(
+    store: &EtcdStore,
+    registry: &SessionRegistry,
+    tx: &mpsc::Sender<ClusterMessage>,
+) -> bool {
+    match build_status(store, registry).await {
         Ok(status) => tx
             .send(ClusterMessage {
                 kind: Some(cluster_message::Kind::Status(status)),
@@ -589,7 +593,10 @@ async fn send_status(store: &EtcdStore, tx: &mpsc::Sender<ClusterMessage>) -> bo
 /// do not, and it is precisely their disappearance from here that tells the
 /// cloud the teardown finished.
 #[generated(model = ClaudeOpus, version = "5")]
-async fn build_status(store: &EtcdStore) -> anyhow::Result<ClusterStatus> {
+async fn build_status(
+    store: &EtcdStore,
+    registry: &SessionRegistry,
+) -> anyhow::Result<ClusterStatus> {
     let nodes = store.list::<Node>().await?;
     let mut nodes_ready = 0u32;
     let mut vcpus = 0u32;
@@ -623,6 +630,10 @@ async fn build_status(store: &EtcdStore) -> anyhow::Result<ClusterStatus> {
         }),
         vms: reported,
         vms_complete: complete,
+        // Passed through unchanged: this tier keeps no Image objects, and a
+        // cluster that reworded what its nodes said would be a tier that
+        // could get it wrong.
+        images: registry.images.report(),
     })
 }
 

@@ -51,6 +51,9 @@ const NETWORKING: &str = "network";
 pub struct Provisioner {
     store: Arc<Store>,
     drivers: Drivers,
+    /// The node-local base image cache. Its directory is `image_dir`, so what
+    /// it puts there is exactly what the volume drivers look up.
+    images: Arc<crate::images::Cache>,
     image_dir: PathBuf,
     default_bridge: String,
     bridge_addr: Option<(IpAddr, u8)>,
@@ -124,9 +127,11 @@ fn widen_for_storage_backends(base: &ResourceLimits, volumes: &[Volume]) -> Opti
 
 #[generated(model = ClaudeFable, version = "5")]
 impl Provisioner {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Store>,
         drivers: Drivers,
+        images: Arc<crate::images::Cache>,
         image_dir: PathBuf,
         default_bridge: String,
         bridge_addr: Option<(IpAddr, u8)>,
@@ -135,6 +140,7 @@ impl Provisioner {
         Self {
             store,
             drivers,
+            images,
             image_dir,
             default_bridge,
             bridge_addr,
@@ -257,6 +263,19 @@ impl Provisioner {
                                   devices = record.spec.devices.len()))]
     async fn run_chain(&self, id: &VmId, record: &mut VmRecord) -> Result<()> {
         let spec = record.spec.clone();
+
+        // Before the cgroup and before the volumes: a base image this node
+        // does not have yet has to be here before any driver goes looking for
+        // it, and a fetch that fails must fail the provision rather than
+        // producing a VM that boots off a blank disk. Nothing at all happens
+        // for a path-based image — the list is empty and this loop does not
+        // run — so the node's behaviour is byte for byte what it was.
+        for source in &spec.images {
+            self.images
+                .ensure(source)
+                .await
+                .with_context(|| format!("base image {}", source.name))?;
+        }
 
         let mut limits = Self::limits_for(&spec);
         limits.cpuset = self.cpuset.clone();
@@ -668,6 +687,7 @@ mod tests {
             volumes: vec![],
             nics: vec![],
             devices,
+            images: Vec::new(),
         }
     }
 

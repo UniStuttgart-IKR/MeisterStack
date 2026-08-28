@@ -546,9 +546,21 @@ pub enum CloudImageCmd {
     Create {
         /// The file name nodes look up — and what a VM's base_image says
         name: String,
-        /// Where the image already is (shared storage path)
+        /// Where the image already is (shared storage path). Leave it out
+        /// when using --from-url: the name is where the fetched bytes land.
         #[arg(long)]
-        source: String,
+        source: Option<String>,
+        /// Fetch the image from here instead of expecting somebody to have
+        /// put it on shared storage. The NODE fetches, on first use, into a
+        /// cache of its own keyed by the checksum — so it works with and
+        /// without shared storage, and a second use costs nothing.
+        #[arg(long, conflicts_with = "source", requires = "sha256")]
+        from_url: Option<String>,
+        /// What the fetched bytes must hash to, lowercase hex. Mandatory with
+        /// --from-url and refused without it: an image fetched over a network
+        /// and not checked is an image somebody else chooses the contents of.
+        #[arg(long)]
+        sha256: Option<String>,
         /// raw | qcow2
         #[arg(long, default_value = "raw")]
         format: String,

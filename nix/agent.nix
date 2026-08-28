@@ -128,6 +128,13 @@ in
       #               by [volume.nfs] with manage_mount = true, which is the
       #               shape where the driver mounts the share itself.
       #   frr         vtysh, only with [network.bgp].
+      #   curl        fetching a base image registered with `image create
+      #               --from-url`. Missed only by a node asked to boot such an
+      #               image, and then it is a named error at the point of use
+      #               ("is curl on the agent's PATH?") rather than a mystery:
+      #               the vm goes Failed with that sentence, and the Image
+      #               object goes Failed with it too, which is what the whole
+      #               fetch-and-report road exists for.
       #   virtiofsd   NOT resolved over PATH by the driver: [volume.nfs]
       #               names a path to it. It is here so that a config may name
       #               the bare word, and in systemPackages above so that
@@ -140,7 +147,7 @@ in
       # best-effort to warn about persistence mode, and these lab nodes are
       # GPU-less by design; a node with a card gets the NVIDIA packages from
       # its own configuration, not from this role.
-      path = with pkgs; [ nftables frr lvm2 virtiofsd qemu-utils util-linux nfs-utils ];
+      path = with pkgs; [ nftables frr lvm2 virtiofsd qemu-utils util-linux nfs-utils curl ];
       unitConfig = {
         # both must have been pushed before the agent can do anything
         ConditionPathExists = [

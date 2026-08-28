@@ -26,6 +26,9 @@ clap = { workspace = true }
 tracing = { workspace = true }
 axum = { workspace = true, optional = true} 
 nix = { workspace = true }
+# Hashing a fetched base image while it streams past. Already in the tree as
+# the pki crate's dependency, so it costs nothing to build.
+sha2 = { workspace = true }
 tonic = { workspace = true }
 
 # Local dependencies
