@@ -949,7 +949,19 @@ mod tests {
     #[test]
     fn every_backend_process_counts_and_nothing_else_does() {
         use agent_api::device::Device;
-        use agent_api::storage::{Volume, VolumeAttachment};
+        use agent_api::storage::{Volume, VolumeAttachment, VolumeHandle};
+
+        fn volume(attachment: VolumeAttachment) -> Volume {
+            Volume {
+                handle: VolumeHandle {
+                    id: uuid::Uuid::nil(),
+                    backend: "/vol/a.raw".into(),
+                    size_bytes: 1,
+                    params: None,
+                },
+                attachment,
+            }
+        }
 
         let mut r = record(Desired::Running, Phase::Provisioned);
         r.devices = vec![
@@ -970,30 +982,18 @@ mod tests {
             },
         ];
         r.volumes = vec![
-            Volume {
-                id: uuid::Uuid::nil(),
-                attachment: VolumeAttachment::Path("/vol/a.raw".into()),
-                size_bytes: 1,
-            },
-            Volume {
-                id: uuid::Uuid::nil(),
-                attachment: VolumeAttachment::FsShare {
-                    socket: "/run/fs.sock".into(),
-                    tag: "share".into(),
-                    pid: 200,
-                },
-                size_bytes: 0,
-            },
+            volume(VolumeAttachment::Path("/vol/a.raw".into())),
+            volume(VolumeAttachment::FsShare {
+                socket: "/run/fs.sock".into(),
+                tag: "share".into(),
+                pid: 200,
+            }),
         ];
         assert_eq!(backend_pids(&r).collect::<Vec<_>>(), vec![100, 200]);
 
         // A VM with nothing but a plain disk has no backend to lose.
         let mut plain = record(Desired::Running, Phase::Provisioned);
-        plain.volumes = vec![Volume {
-            id: uuid::Uuid::nil(),
-            attachment: VolumeAttachment::Path("/vol/a.raw".into()),
-            size_bytes: 1,
-        }];
+        plain.volumes = vec![volume(VolumeAttachment::Path("/vol/a.raw".into()))];
         assert_eq!(backend_pids(&plain).count(), 0);
     }
 

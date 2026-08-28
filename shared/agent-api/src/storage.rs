@@ -2,34 +2,44 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Storage as the agent sees it: a volume is created for one VM, lives as
-//! long as that VM's record, and reaches the VMM as an attachment.
+//! Storage as the agent sees it: a volume is PROVISIONED, and separately
+//! ATTACHED to whatever is going to read it.
 //!
-//! # Where this form ends
+//! # The two verbs, and why they had to come apart
 //!
-//! A volume here has no life of its own. It is named inside a VM spec, it is
-//! created by the node the VM was scheduled onto, and `destroy` runs when
-//! that VM is torn down — there is no `Volume` object in etcd, nothing to
-//! attach to a second VM, and nothing that survives the node. That is the
-//! whole of what this file models, deliberately: every backend below it
-//! (files, LVM-thin, a share) is local to the node, so a volume that outlived
-//! its node would be a promise the storage cannot keep.
+//! There used to be one trait and one verb. `BlockDriver::create` took the
+//! VM's cgroup handle, because a backend process belongs in the VM's slice
+//! from the moment it is spawned; `destroy` took an attachment, because that
+//! is where the record remembered which device the data was on. Both are
+//! true of a CONNECTION and neither is true of a VOLUME, and together they
+//! made "delete this VM" and "delete this disk" the same act. A volume could
+//! not outlive its VM because the trait had no way to say what a volume was
+//! when no VM was holding it.
 //!
-//! The next form is the one Mayastor and SPDK are built for: a Volume as a
-//! first-class resource with its own lifecycle, replicated across storage
-//! nodes, attached and detached over a network protocol (NVMe-oF, iSCSI) and
-//! served into the guest by a vhost-user-blk backend. The seam for it is
-//! already here and is exactly one variant wide: `VhostUserBlk` is what such
-//! a backend hands over, and `needs_shared_memory` is the one thing the
-//! hypervisor has to be told about it. What is missing is above this file —
-//! a Volume resource, a scheduler that places replicas, a controller that
-//! attaches a volume to a node rather than creating one on it.
+//! So: [`VolumeProvider`] makes and unmakes the data, and knows nothing about
+//! any consumer. [`VolumeAttacher`] makes and unmakes the connection, and the
+//! cgroup lives here — virtiofsd, a vhost-user-blk backend, an `nvme connect`
+//! session are properties of the attachment and go when it does. A driver
+//! implements one or both; all three in this tree implement both, which makes
+//! them the degenerate case (provision and attach land on the same node) and
+//! is exactly what the split has to keep cheap.
 //!
-//! Until that exists, this is enough, and it is enough for a reason worth
-//! writing down: a VM's disk lives where the VM runs, so a node that is up
-//! can always start its own VMs, and a node that is gone takes nothing with
-//! it that another node was relying on. Live migration is what first needs
-//! more than that, and it is what should force the change.
+//! # One consumer at a time
+//!
+//! RWO, written down rather than half-supported. Multi-attach needs reference
+//! counting at detach — without it the one VM that stops tears the device out
+//! from under the other — and a `VolumeHandle` therefore identifies at most
+//! one live attachment. That is what lets [`VolumeAttacher::detach`] take the
+//! handle beside the attachment: under RWO the volume names its connection.
+//!
+//! # What is still missing above this file
+//!
+//! A `Volume` resource with its own lifecycle, a scheduler that picks where a
+//! volume is provisioned, a controller that attaches one to a node rather
+//! than creating one on it. This file is the seam those need and not the
+//! thing itself. The next backend the shape is for is the replicated one:
+//! `VhostUserBlk` is what an SPDK-style backend hands over, and
+//! `needs_shared_memory` is the one thing the hypervisor has to be told.
 
 use uuid::Uuid;
 
@@ -145,24 +155,97 @@ impl VolumeAttachment {
     }
 }
 
-/// A created volume, as the record remembers it.
+/// A provisioned volume: what exists on a backend, named the way that backend
+/// names it, with no consumer implied.
 ///
-/// Read through `VolumeRepr` so that records written before volumes had an
-/// attachment kind still load: a bare `path` was the only thing a volume
-/// could be then, and it means `Path` now. Written in the current shape
-/// always — one restart migrates the store, and nothing has to be told to.
+/// The thing the old trait had no word for. It is what `provision` hands back
+/// and what `deprovision` takes — so deleting the data needs no attachment,
+/// which is the whole point: when a volume outlives its VM there is no
+/// attachment at that moment to hand anybody.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct VolumeHandle {
+    /// The control plane's name for the volume.
+    pub id: VolumeId,
+    /// What the BACKEND calls it — `/var/lib/meister/volumes/<id>.raw`,
+    /// `/dev/vg0/vm-<id>`, a share directory. A path for every backend in
+    /// this tree and a `String` all the same, because the next one names its
+    /// volumes and does not path them (a LINSTOR resource, an NVMe subsystem
+    /// NQN).
+    ///
+    /// Every backend here derives it from `id`, and that is not a
+    /// coincidence: a `provision` that succeeds and whose handle is then lost
+    /// must not produce a second volume on the next try. Written down as a
+    /// rule where the Volume object gets its name.
+    pub backend: String,
+    pub size_bytes: u64,
+    /// The spec's `params`, carried forward.
+    ///
+    /// Attaching needs the half of the request the volume itself does not
+    /// remember — virtiofs's tag is the one today, and it is a property of
+    /// the connection rather than of the bytes. Kept on the handle rather
+    /// than passed beside it so that `attach` needs nothing but a handle and
+    /// a cgroup, which is what makes an attacher usable by something that
+    /// never saw the spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+impl VolumeHandle {
+    /// `backend` as a path, for the backends whose name for a volume is one.
+    pub fn path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(&self.backend)
+    }
+}
+
+/// What a backend can say about a volume that is there.
+///
+/// Absence is `StorageError::NotFound` and not a field in here: a caller
+/// asking about a volume wants the answer or the error, and a struct with a
+/// `present: false` in it is an answer every caller has to remember to check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VolumeState {
+    pub size_bytes: u64,
+}
+
+/// A volume that is provisioned AND attached — what a VM's record holds for
+/// as long as the VM is holding it.
+///
+/// Two fields and no third: `id` and `size_bytes` are the handle's, asked
+/// through it rather than copied beside it, because a second copy in a record
+/// is a value that can be wrong.
+///
+/// Read through `VolumeRepr` so that every record ever written still loads.
+/// Three shapes so far, each one a strictly smaller statement than the next:
+/// a bare path, then a path-or-socket attachment, and now an attachment with
+/// the provisioned volume behind it. Written in the current shape always —
+/// one restart migrates the store, and nothing has to be told to.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(from = "VolumeRepr")]
 pub struct Volume {
-    pub id: VolumeId,
+    pub handle: VolumeHandle,
     pub attachment: VolumeAttachment,
-    pub size_bytes: u64,
+}
+
+impl Volume {
+    pub fn id(&self) -> VolumeId {
+        self.handle.id
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.handle.size_bytes
+    }
 }
 
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
 enum VolumeRepr {
     Current {
+        handle: VolumeHandle,
+        attachment: VolumeAttachment,
+    },
+    /// Records from before provisioning and attaching came apart: one
+    /// attachment, and whatever the backend had made behind it left unsaid.
+    Attached {
         id: VolumeId,
         attachment: VolumeAttachment,
         size_bytes: u64,
@@ -177,68 +260,150 @@ enum VolumeRepr {
 
 impl From<VolumeRepr> for Volume {
     fn from(repr: VolumeRepr) -> Self {
-        match repr {
-            VolumeRepr::Current {
+        // What a migrated record can say about the volume behind its
+        // attachment, which is: where it was, when the attachment was a path.
+        //
+        // Enough, and it is worth saying why. `backend` is read by exactly one
+        // deprovision path — lvm-thin, recovering the volume group from the
+        // device path, which a `Path` attachment carries. Every other backend
+        // derives its own name from the id and asks the handle for nothing.
+        // A share's backend directory is derived from the id too, so an
+        // FsShare record losing its path here costs nothing.
+        let migrate = |id, attachment: VolumeAttachment, size_bytes| Volume {
+            handle: VolumeHandle {
                 id,
-                attachment,
+                backend: match &attachment {
+                    VolumeAttachment::Path(p) => p.to_string_lossy().into_owned(),
+                    _ => String::new(),
+                },
                 size_bytes,
-            } => Volume {
-                id,
-                attachment,
-                size_bytes,
+                // The spec is where params come from, and a re-provision reads
+                // it again. Nothing on the teardown path wants them.
+                params: None,
             },
+            attachment,
+        };
+        match repr {
+            VolumeRepr::Current { handle, attachment } => Volume { handle, attachment },
+            VolumeRepr::Attached {
+                id,
+                attachment,
+                size_bytes,
+            } => migrate(id, attachment, size_bytes),
             VolumeRepr::Legacy {
                 id,
                 path,
                 size_bytes,
-            } => Volume {
-                id,
-                attachment: VolumeAttachment::Path(path),
-                size_bytes,
-            },
+            } => migrate(id, VolumeAttachment::Path(path), size_bytes),
         }
     }
 }
 
-/// The storage backend behind a volume.
+/// The half that owns the DATA. Knows about no consumer at all.
 ///
-/// Shaped like `DeviceDriver`, and for the reasons that trait states: a
-/// backend process belongs in the VM's cgroup slice from the moment it is
-/// spawned (`cgroup`), and teardown has to reach a backend the agent did not
-/// itself start (`attachment`, read back off the record after a restart). A
-/// driver that spawns nothing ignores both.
+/// No cgroup anywhere in it, and that absence is the trait's whole content: a
+/// volume is not a process, so there is no slice for it to belong to. A
+/// backend that spawns something to SERVE the volume spawns it in
+/// [`VolumeAttacher::attach`], where there is a consumer whose slice it
+/// belongs in.
 #[async_trait::async_trait]
-pub trait BlockDriver: Send + Sync {
-    async fn create(
-        &self,
-        id: &VolumeId,
-        spec: &VolumeSpec,
-        cgroup: Option<&CgroupHandle>,
-    ) -> Result<Volume>;
-
-    /// Destroy the volume AND its data. Must be idempotent: destroying an
-    /// already-gone volume is Ok.
-    async fn destroy(&self, id: &VolumeId, attachment: &VolumeAttachment) -> Result<()>;
-
-    /// Liveness probe: Ok if the volume behind this attachment is still
-    /// present and usable, NotFound otherwise.
-    async fn get(&self, id: &VolumeId, attachment: &VolumeAttachment) -> Result<Volume>;
-
-    /// Stop the backend process serving this volume, keeping the data.
+pub trait VolumeProvider: Send + Sync {
+    /// Make the volume, or hand back the one that is already there.
     ///
-    /// What `stop` needs and `destroy` is too much for: a stopped VM keeps
-    /// its volumes but must not keep a virtiofsd running for a VM that is not
-    /// there. A driver whose volumes are plain paths has no process to stop
-    /// and says so by doing nothing.
-    async fn detach(&self, id: &VolumeId, attachment: &VolumeAttachment) -> Result<()> {
-        let _ = (id, attachment);
+    /// Idempotent by contract, and the contract is load-bearing: a provision
+    /// that succeeds and whose handle is then lost — a controller that dies
+    /// before writing it down — must be found again by the next call rather
+    /// than answered with a second volume. Every backend here manages that by
+    /// deriving its name from `id`.
+    async fn provision(&self, id: &VolumeId, spec: &VolumeSpec) -> Result<VolumeHandle>;
+
+    /// Destroy the volume AND its data. Idempotent: deprovisioning an
+    /// already-gone volume is Ok.
+    ///
+    /// No attachment, which is the point of the split. A volume that outlived
+    /// its VM has none at the moment it is deleted, and a signature that
+    /// asked for one made "tear down this VM" and "delete this disk" the same
+    /// act.
+    async fn deprovision(&self, handle: &VolumeHandle) -> Result<()>;
+
+    /// What is there, or `NotFound`. Asked of the DATA — no attachment
+    /// needed, so it can be asked of a volume nobody is holding.
+    async fn describe(&self, handle: &VolumeHandle) -> Result<VolumeState>;
+}
+
+/// The half that owns the CONNECTION, and everything that lives as long as
+/// one: virtiofsd, a vhost-user-blk backend, an `nvme connect` session.
+///
+/// The cgroup is here and only here. A backend process belongs in the
+/// consumer's slice from the moment it is spawned, and the consumer is what
+/// an attachment has and a volume does not.
+///
+/// `handle` beside `attachment` on the teardown methods is RWO written into
+/// the signature: one consumer at a time, so the volume names its connection.
+/// The day multi-attach arrives, the second consumer needs an attachment
+/// identity of its own AND reference counting at detach — which is why it is
+/// declared unsupported here rather than half-built.
+#[async_trait::async_trait]
+pub trait VolumeAttacher: Send + Sync {
+    /// Make the volume reachable, and say how.
+    async fn attach(
+        &self,
+        handle: &VolumeHandle,
+        cgroup: Option<&CgroupHandle>,
+    ) -> Result<VolumeAttachment>;
+
+    /// Take the connection down, keeping the data.
+    ///
+    /// What a stopped VM needs and `deprovision` is far too much for: the
+    /// volume stays, only the process serving it goes. A backend whose
+    /// attachment is a plain path has nothing to do here and says so by
+    /// doing nothing.
+    async fn detach(&self, handle: &VolumeHandle, attachment: &VolumeAttachment) -> Result<()> {
+        let _ = (handle, attachment);
         Ok(())
     }
+
+    /// Liveness of the CONNECTION: Ok if what this attachment names is still
+    /// there and usable, `NotFound` otherwise. The mirror of `describe`, one
+    /// layer out — a share whose virtiofsd died is gone by this question and
+    /// perfectly present by that one.
+    async fn stat(
+        &self,
+        handle: &VolumeHandle,
+        attachment: &VolumeAttachment,
+    ) -> Result<VolumeState>;
 }
+
+/// A backend that does both halves on one node.
+///
+/// A blanket supertrait, the same shape `NetworkDriver` has and for the same
+/// reason: the agent's driver table registers one row per driver and hands
+/// back one `Arc`. Every backend in this tree is one of these — which is the
+/// degenerate case the split has to keep cheap, and the thing position 6 of
+/// the storage brief measures.
+///
+/// A provider-only backend (LINSTOR on a node with no VMs) does not implement
+/// this, and registering one is a second table rather than a change here.
+pub trait VolumeDriver: VolumeProvider + VolumeAttacher {}
+
+impl<T: VolumeProvider + VolumeAttacher + ?Sized> VolumeDriver for T {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A volume as a record holds it: provisioned somewhere, attached here.
+    fn attached(attachment: VolumeAttachment, size_bytes: u64) -> Volume {
+        Volume {
+            handle: VolumeHandle {
+                id: Uuid::nil(),
+                backend: "/backend/name".to_string(),
+                size_bytes,
+                params: None,
+            },
+            attachment,
+        }
+    }
 
     /// The whole point of the serde defaults: a spec written before storage
     /// had a driver field means exactly what it meant.
@@ -270,7 +435,8 @@ mod tests {
         let legacy = r#"{"id":"00000000-0000-0000-0000-000000000001",
                          "path":"/var/lib/meister/volumes/x.raw","size_bytes":42}"#;
         let vol: Volume = serde_json::from_str(legacy).expect("legacy record loads");
-        assert_eq!(vol.size_bytes, 42);
+        assert_eq!(vol.size_bytes(), 42);
+        assert_eq!(vol.handle.backend, "/var/lib/meister/volumes/x.raw");
         match vol.attachment {
             VolumeAttachment::Path(p) => {
                 assert_eq!(
@@ -292,21 +458,26 @@ mod tests {
         let round: serde_json::Value = serde_json::to_value(&vol).unwrap();
         assert_eq!(round["attachment"]["Path"], "/x.raw");
         assert!(round.get("path").is_none());
+        assert!(
+            round.get("size_bytes").is_none(),
+            "it lives on the handle now"
+        );
+        assert_eq!(round["handle"]["backend"], "/x.raw");
         // and the current shape reads back unchanged
         let again: Volume = serde_json::from_value(round).unwrap();
         assert!(matches!(again.attachment, VolumeAttachment::Path(_)));
+        assert_eq!(again.size_bytes(), 42);
     }
 
     #[test]
     fn a_vhost_user_volume_round_trips_and_asks_for_shared_memory() {
-        let vol = Volume {
-            id: Uuid::nil(),
-            attachment: VolumeAttachment::VhostUserBlk {
+        let vol = attached(
+            VolumeAttachment::VhostUserBlk {
                 socket: "/run/blk.sock".into(),
                 pid: 7,
             },
-            size_bytes: 1,
-        };
+            1,
+        );
         assert!(vol.attachment.needs_shared_memory());
         let json = serde_json::to_string(&vol).unwrap();
         let back: Volume = serde_json::from_str(&json).unwrap();
@@ -326,15 +497,14 @@ mod tests {
     /// is not a store break.
     #[test]
     fn a_share_round_trips_through_the_migrating_repr() {
-        let vol = Volume {
-            id: Uuid::nil(),
-            attachment: VolumeAttachment::FsShare {
+        let vol = attached(
+            VolumeAttachment::FsShare {
                 socket: "/run/fs.sock".into(),
                 tag: "share".into(),
                 pid: 11,
             },
-            size_bytes: 0,
-        };
+            0,
+        );
         let json = serde_json::to_string(&vol).unwrap();
         let back: Volume = serde_json::from_str(&json).unwrap();
         match back.attachment {
@@ -345,6 +515,78 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The record shape that existed between the attachment split and the
+    /// provider/attacher one: an attachment and a size, with nothing said
+    /// about the volume behind it. It has to keep loading, and what it turns
+    /// into has to be enough to DELETE the volume — which for the one backend
+    /// that reads `backend` (lvm-thin, recovering its volume group) means the
+    /// device path off the attachment.
+    #[test]
+    fn a_pre_handle_record_loads_and_keeps_the_path_its_backend_needs() {
+        let attached = r#"{"id":"00000000-0000-0000-0000-000000000001",
+                           "attachment":{"Path":"/dev/vg0/vm-x"},
+                           "size_bytes":4096}"#;
+        let vol: Volume = serde_json::from_str(attached).expect("a pre-handle record loads");
+        assert_eq!(vol.handle.backend, "/dev/vg0/vm-x");
+        assert_eq!(vol.size_bytes(), 4096);
+        assert!(vol.handle.params.is_none());
+        assert_eq!(vol.handle.path(), std::path::PathBuf::from("/dev/vg0/vm-x"));
+    }
+
+    /// A migrated share record carries no backend path, and that is not a
+    /// loss: a share directory is derived from the volume id, so the backend
+    /// that owns it never asks the handle where it is. Stated here because
+    /// the alternative — guessing a path — would delete the wrong directory.
+    #[test]
+    fn a_migrated_share_record_keeps_no_path_and_needs_none() {
+        let attached = r#"{"id":"00000000-0000-0000-0000-000000000001",
+                           "attachment":{"FsShare":{"socket":"/run/x.sock",
+                                                    "tag":"share","pid":11}},
+                           "size_bytes":0}"#;
+        let vol: Volume = serde_json::from_str(attached).unwrap();
+        assert!(vol.handle.backend.is_empty());
+        assert_eq!(
+            vol.id(),
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+        );
+        assert!(vol.attachment.backend_pid() == Some(11));
+    }
+
+    /// The handle is what `deprovision` gets, and it carries no attachment.
+    /// Stated as a round trip because that is the promise the whole split
+    /// rests on: a volume can be described, and deleted, with no consumer in
+    /// the picture at all.
+    #[test]
+    fn a_handle_round_trips_without_an_attachment_anywhere_in_it() {
+        let handle = VolumeHandle {
+            id: Uuid::nil(),
+            backend: "/dev/vg0/vm-x".into(),
+            size_bytes: 8,
+            params: Some(serde_json::json!({"kind": "share", "tag": "data"})),
+        };
+        let json = serde_json::to_value(&handle).unwrap();
+        assert!(json.get("attachment").is_none());
+        let back: VolumeHandle = serde_json::from_value(json).unwrap();
+        assert_eq!(back.backend, "/dev/vg0/vm-x");
+        assert_eq!(back.params.unwrap()["tag"], "data");
+
+        // No params is the ordinary case and must not become `null` on disk.
+        let plain = VolumeHandle {
+            id: Uuid::nil(),
+            backend: "/x.raw".into(),
+            size_bytes: 1,
+            params: None,
+        };
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("params").is_none());
+        assert!(
+            serde_json::from_value::<VolumeHandle>(json)
+                .unwrap()
+                .params
+                .is_none()
+        );
     }
 
     /// A share is a vhost-user backend, so the VM's memory has to be

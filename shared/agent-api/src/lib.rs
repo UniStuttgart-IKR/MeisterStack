@@ -16,11 +16,13 @@ pub use hypervisor::{
     BootSource, ConsoleStream, HotPluggable, Hypervisor, HypervisorError, InstanceSpec, Migratable,
     Pausable, Snapshottable, VmId, VmState,
 };
-pub use networking::{BridgeDriver, NetworkError, Nic, NicAttachment, NicDriver, NicId, NicSpec};
+pub use networking::{
+    BridgeDriver, NetworkDriver, NetworkError, Nic, NicAttachment, NicDriver, NicId, NicSpec,
+};
 pub use resource_limits::{
     CgroupHandle, ConfinerError, ConfinerResult, ResourceConfiner, ResourceLimits,
 };
 pub use storage::{
-    BlockDriver, StorageError, Volume, VolumeAttachment, VolumeId, VolumeSpec,
-    default_volume_driver,
+    StorageError, Volume, VolumeAttacher, VolumeAttachment, VolumeDriver, VolumeHandle, VolumeId,
+    VolumeProvider, VolumeSpec, VolumeState, default_volume_driver,
 };

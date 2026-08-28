@@ -15,7 +15,7 @@ use agent_api::{
     Hypervisor, ResourceConfiner,
     device::DeviceDriver,
     networking::{BridgeDriver, NetworkDriver, NicDriver, RouteAnnouncer},
-    storage::BlockDriver,
+    storage::VolumeDriver,
 };
 use anyhow::bail;
 use crosvm_gpu_driver::CrosvmGpuDriver;
@@ -66,7 +66,7 @@ pub struct DriverEntry<T: ?Sized + 'static> {
 /// The storage backends this agent has. `filesystem` is the default driver
 /// and the one row that registers with or without a section.
 #[generated(model = ClaudeOpus, version = "5")]
-static VOLUME_DRIVERS: &[DriverEntry<dyn BlockDriver>] = &[
+static VOLUME_DRIVERS: &[DriverEntry<dyn VolumeDriver>] = &[
     DriverEntry {
         name: DRIVER_FILESYSTEM,
         keys: &[DRIVER_FILESYSTEM],
@@ -145,7 +145,7 @@ static NETWORK_DRIVERS: &[DriverEntry<dyn NetworkDriver>] = &[DriverEntry {
 /// Build every driver in `entries` that this node's config asks for, keyed
 /// by the name a spec routes on.
 ///
-/// Both halves of the seam come through here — `T` is `dyn BlockDriver` for
+/// Both halves of the seam come through here — `T` is `dyn VolumeDriver` for
 /// `[volume]` and `dyn DeviceDriver` for `[device]`, and the table is the
 /// only difference between them.
 #[generated(model = ClaudeOpus, version = "5")]
@@ -228,7 +228,7 @@ fn register_one<T: ?Sized>(
 fn build_filesystem(
     sections: &Sections,
     cfg: &AgentConfig,
-) -> anyhow::Result<Option<Arc<dyn BlockDriver>>> {
+) -> anyhow::Result<Option<Arc<dyn VolumeDriver>>> {
     let fs: Option<FilesystemVolumeConfig> = section(sections, "volume", DRIVER_FILESYSTEM)?;
     let driver = FilesystemBlockDriver::new(filesystem_driver::FilesystemDriverConfig {
         image_dir: fs
@@ -247,7 +247,7 @@ fn build_filesystem(
 fn build_lvm_thin(
     sections: &Sections,
     cfg: &AgentConfig,
-) -> anyhow::Result<Option<Arc<dyn BlockDriver>>> {
+) -> anyhow::Result<Option<Arc<dyn VolumeDriver>>> {
     let Some(l): Option<LvmThinVolumeConfig> = section(sections, "volume", DRIVER_LVM_THIN)? else {
         return Ok(None);
     };
@@ -269,7 +269,7 @@ fn build_lvm_thin(
 fn build_nfs(
     sections: &Sections,
     cfg: &AgentConfig,
-) -> anyhow::Result<Option<Arc<dyn BlockDriver>>> {
+) -> anyhow::Result<Option<Arc<dyn VolumeDriver>>> {
     let Some(n): Option<NfsVolumeConfig> = section(sections, "volume", DRIVER_NFS)? else {
         return Ok(None);
     };
@@ -481,7 +481,7 @@ pub struct Drivers {
     pub hypervisor_name: Option<String>,
     /// Keyed by driver name, exactly as `devices` is: `spec.driver` routes,
     /// `None` means `default_volume_driver()`, and that entry always exists.
-    pub storage: HashMap<String, Arc<dyn BlockDriver>>,
+    pub storage: HashMap<String, Arc<dyn VolumeDriver>>,
     /// `None` = this node makes no taps. Both of these are upcasts of one
     /// `Arc<dyn NetworkDriver>` and are therefore Some together or None
     /// together; see `agent_api::networking::NetworkDriver`.
@@ -672,7 +672,7 @@ pub struct VolumeCatalog {
 
 #[generated(model = ClaudeOpus, version = "5")]
 impl VolumeCatalog {
-    pub fn new(storage: &HashMap<String, Arc<dyn BlockDriver>>) -> Self {
+    pub fn new(storage: &HashMap<String, Arc<dyn VolumeDriver>>) -> Self {
         let mut drivers: Vec<String> = storage.keys().cloned().collect();
         drivers.sort_unstable();
         Self { drivers }
@@ -783,38 +783,49 @@ impl DeviceCatalog {
 mod tests {
     use super::*;
     use crate::types::VolumeWithId;
-    use agent_api::storage::{Volume, VolumeSpec};
+    use agent_api::storage::{
+        VolumeAttacher, VolumeHandle, VolumeProvider, VolumeSpec, VolumeState,
+    };
 
     struct Stub;
 
     #[async_trait::async_trait]
-    impl BlockDriver for Stub {
-        async fn create(
+    impl VolumeProvider for Stub {
+        async fn provision(
             &self,
             _: &agent_api::VolumeId,
             _: &VolumeSpec,
-            _: Option<&agent_api::CgroupHandle>,
-        ) -> agent_api::storage::Result<Volume> {
-            unreachable!("the catalogue never creates anything")
+        ) -> agent_api::storage::Result<VolumeHandle> {
+            unreachable!("the catalogue never provisions anything")
         }
-        async fn destroy(
-            &self,
-            _: &agent_api::VolumeId,
-            _: &agent_api::VolumeAttachment,
-        ) -> agent_api::storage::Result<()> {
+        async fn deprovision(&self, _: &VolumeHandle) -> agent_api::storage::Result<()> {
             unreachable!()
         }
-        async fn get(
+        async fn describe(&self, _: &VolumeHandle) -> agent_api::storage::Result<VolumeState> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VolumeAttacher for Stub {
+        async fn attach(
             &self,
-            _: &agent_api::VolumeId,
+            _: &VolumeHandle,
+            _: Option<&agent_api::CgroupHandle>,
+        ) -> agent_api::storage::Result<agent_api::VolumeAttachment> {
+            unreachable!()
+        }
+        async fn stat(
+            &self,
+            _: &VolumeHandle,
             _: &agent_api::VolumeAttachment,
-        ) -> agent_api::storage::Result<Volume> {
+        ) -> agent_api::storage::Result<VolumeState> {
             unreachable!()
         }
     }
 
     fn catalogue(names: &[&str]) -> VolumeCatalog {
-        let mut map: HashMap<String, Arc<dyn BlockDriver>> = HashMap::new();
+        let mut map: HashMap<String, Arc<dyn VolumeDriver>> = HashMap::new();
         for n in names {
             map.insert(n.to_string(), Arc::new(Stub));
         }
@@ -1082,7 +1093,7 @@ mod tests {
     /// not something a node's behaviour may depend on.
     #[test]
     fn two_drivers_in_a_single_slot_are_refused_rather_than_picked_between() {
-        static TWO: &[DriverEntry<dyn BlockDriver>] = &[
+        static TWO: &[DriverEntry<dyn VolumeDriver>] = &[
             DriverEntry {
                 name: "a",
                 keys: &["a"],

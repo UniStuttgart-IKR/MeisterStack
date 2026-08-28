@@ -21,6 +21,13 @@
 //! * `share` — `<share_root>/shares/<id>/`, served by one virtiofsd per VM
 //!   attachment. Attachment: `FsShare`.
 //!
+//! Share mode is where the provider/attacher split stops being bookkeeping
+//! and starts being the design: the DIRECTORY is the volume and survives
+//! everything, and the virtiofsd is the connection and lives exactly as long
+//! as one consumer holds it. `provision` makes the directory, `attach`
+//! spawns the process into that consumer's cgroup slice, `detach` kills it
+//! and leaves every byte where it was.
+//!
 //! The virtiofsd half follows the device-backend pattern to the letter (see
 //! `nvrm_driver`): one process per attachment, its own session so it cannot
 //! die with a parent shell, room for a file descriptor per open guest file,
@@ -34,7 +41,8 @@ use std::time::Duration;
 
 use agent_api::CgroupHandle;
 use agent_api::storage::{
-    self, BlockDriver, StorageError, Volume, VolumeAttachment, VolumeId, VolumeSpec,
+    self, StorageError, VolumeAttacher, VolumeAttachment, VolumeHandle, VolumeId, VolumeProvider,
+    VolumeSpec, VolumeState,
 };
 use backend::{Backend, BackendIo, BackendKind};
 use filesystem_driver::{FilesystemBlockDriver, FilesystemDriverConfig};
@@ -351,17 +359,35 @@ impl NfsDriver {
         let _ = backend::remove_if_present(&self.socket_lock_path(id)).await;
     }
 
-    async fn create_share(
+    /// The same params, read off a handle instead of a spec.
+    ///
+    /// `attach` gets no spec, by design: an attacher has to be usable by
+    /// something that never saw the request. What it needs from the request
+    /// — the virtiofs tag, and which mode this volume is — travels on the
+    /// handle, which is what `VolumeHandle::params` is for.
+    fn handle_params(handle: &VolumeHandle) -> storage::Result<NfsParams> {
+        match &handle.params {
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| StorageError::InvalidSpec(format!("invalid nfs params: {e}"))),
+            None => Ok(NfsParams::default()),
+        }
+    }
+
+    /// One virtiofsd for one consumer, in that consumer's cgroup slice.
+    ///
+    /// The directory is already there — `provision` made it, and it is the
+    /// volume. This is only the process, which is why it is here and not
+    /// there: it lives as long as the attachment and not a moment longer.
+    async fn attach_share(
         &self,
-        id: &VolumeId,
-        params: &NfsParams,
+        handle: &VolumeHandle,
         cgroup: Option<&CgroupHandle>,
-    ) -> storage::Result<Volume> {
-        let tag = params
+    ) -> storage::Result<VolumeAttachment> {
+        let id = &handle.id;
+        let tag = Self::handle_params(handle)?
             .tag
-            .clone()
             .unwrap_or_else(|| DEFAULT_TAG.to_string());
-        let dir = self.share_dir(id);
+        let dir = handle.path();
 
         // A live backend for this volume is reusable; a dead one is not, ever.
         {
@@ -369,23 +395,15 @@ impl NfsDriver {
             if let Some(running) = active.get_mut(id) {
                 let socket = self.socket_path(id);
                 if running.child.is_reusable(&socket) {
-                    return Ok(Volume {
-                        id: *id,
-                        attachment: VolumeAttachment::FsShare {
-                            socket,
-                            tag: running.tag.clone(),
-                            pid: running.child.pid().unwrap_or(0),
-                        },
-                        size_bytes: 0,
+                    return Ok(VolumeAttachment::FsShare {
+                        socket,
+                        tag: running.tag.clone(),
+                        pid: running.child.pid().unwrap_or(0),
                     });
                 }
                 active.remove(id);
             }
         }
-
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| StorageError::Backend(e.into()))?;
 
         let (pid, child) = self.spawn_virtiofsd(id, &dir, &tag, cgroup).await?;
         self.active.lock().await.insert(
@@ -397,60 +415,122 @@ impl NfsDriver {
         );
 
         info!(pid, tag = %tag, dir = %dir.display(), "virtiofs share ready");
-        Ok(Volume {
-            id: *id,
-            // A share has no size the guest can be told about — it is a
-            // filesystem, and how much room is in it is the share's business.
-            size_bytes: 0,
-            attachment: VolumeAttachment::FsShare {
-                socket: self.socket_path(id),
-                tag,
-                pid,
-            },
+        Ok(VolumeAttachment::FsShare {
+            socket: self.socket_path(id),
+            tag,
+            pid,
         })
     }
 }
 
 #[generated(model = ClaudeOpus, version = "5")]
 #[async_trait::async_trait]
-impl BlockDriver for NfsDriver {
+impl VolumeProvider for NfsDriver {
     #[instrument(skip_all, fields(volume_id = %id, size_bytes = spec.size_bytes))]
-    async fn create(
-        &self,
-        id: &VolumeId,
-        spec: &VolumeSpec,
-        cgroup: Option<&CgroupHandle>,
-    ) -> storage::Result<Volume> {
+    async fn provision(&self, id: &VolumeId, spec: &VolumeSpec) -> storage::Result<VolumeHandle> {
         let params = Self::params(spec)?;
         match params.kind {
-            VolumeKind::File => self.files.create(id, spec, cgroup).await,
-            VolumeKind::Share => self.create_share(id, &params, cgroup).await,
-        }
-    }
-
-    #[instrument(skip_all, fields(volume_id = %id))]
-    async fn destroy(&self, id: &VolumeId, attachment: &VolumeAttachment) -> storage::Result<()> {
-        match attachment {
-            VolumeAttachment::FsShare { .. } => {
-                self.stop_backend(id, attachment).await;
-                let _ = tokio::fs::remove_file(self.log_path(id)).await;
-                // The share's contents go with the VM: this directory was
-                // made for it and nothing else can reach it.
-                match tokio::fs::remove_dir_all(self.share_dir(id)).await {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(StorageError::Backend(e.into())),
-                }
-                Ok(())
+            VolumeKind::File => self.files.provision(id, spec).await,
+            VolumeKind::Share => {
+                let dir = self.share_dir(id);
+                tokio::fs::create_dir_all(&dir)
+                    .await
+                    .map_err(|e| StorageError::Backend(e.into()))?;
+                Ok(VolumeHandle {
+                    id: *id,
+                    backend: dir.to_string_lossy().into_owned(),
+                    // A share has no size the guest can be told about — it is
+                    // a filesystem, and how much room is in it is the share's
+                    // business.
+                    size_bytes: 0,
+                    params: spec.params.clone(),
+                })
             }
-            _ => self.files.destroy(id, attachment).await,
         }
     }
 
-    #[instrument(level = "trace", skip_all, fields(volume_id = %id))]
-    async fn get(&self, id: &VolumeId, attachment: &VolumeAttachment) -> storage::Result<Volume> {
-        let VolumeAttachment::FsShare { socket, tag, pid } = attachment else {
-            return self.files.get(id, attachment).await;
+    /// Both candidates, unconditionally, and neither decided from `params`.
+    ///
+    /// Two directories under `share_root` are named after this volume's id
+    /// and at most one of them exists — `volumes/<id>.raw` in file mode,
+    /// `shares/<id>/` in share mode. Removing both is idempotent, costs one
+    /// extra syscall, and needs nothing remembered about which mode the
+    /// volume was: a record migrated from before handles existed carries no
+    /// params, and a `deprovision` that guessed `file` for it would leave the
+    /// share directory behind forever.
+    ///
+    /// The virtiofsd is NOT stopped here. That is `detach`'s job, and the
+    /// provisioner calls it first — deleting data out from under a live
+    /// backend is exactly the ordering this trait split exists to make
+    /// impossible to get wrong.
+    #[instrument(skip_all, fields(volume_id = %handle.id))]
+    async fn deprovision(&self, handle: &VolumeHandle) -> storage::Result<()> {
+        let id = &handle.id;
+        let _ = tokio::fs::remove_file(self.log_path(id)).await;
+        match tokio::fs::remove_dir_all(self.share_dir(id)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StorageError::Backend(e.into())),
+        }
+        self.files.deprovision(handle).await
+    }
+
+    #[instrument(level = "trace", skip_all, fields(volume_id = %handle.id))]
+    async fn describe(&self, handle: &VolumeHandle) -> storage::Result<VolumeState> {
+        // Asked of the filesystem rather than of `params`, for the reason
+        // `deprovision` gives: the directory that is there is the answer.
+        if tokio::fs::metadata(self.share_dir(&handle.id))
+            .await
+            .is_ok()
+        {
+            return Ok(VolumeState { size_bytes: 0 });
+        }
+        self.files.describe(handle).await
+    }
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+#[async_trait::async_trait]
+impl VolumeAttacher for NfsDriver {
+    #[instrument(skip_all, fields(volume_id = %handle.id))]
+    async fn attach(
+        &self,
+        handle: &VolumeHandle,
+        cgroup: Option<&CgroupHandle>,
+    ) -> storage::Result<VolumeAttachment> {
+        match Self::handle_params(handle)?.kind {
+            VolumeKind::File => self.files.attach(handle, cgroup).await,
+            VolumeKind::Share => self.attach_share(handle, cgroup).await,
+        }
+    }
+
+    /// A stopped VM keeps its share directory and everything in it; what it
+    /// must not keep is a virtiofsd serving a VM that is not running. The
+    /// next start spawns a fresh one, which is the same rule the device
+    /// backends follow.
+    #[instrument(skip_all, fields(volume_id = %handle.id))]
+    async fn detach(
+        &self,
+        handle: &VolumeHandle,
+        attachment: &VolumeAttachment,
+    ) -> storage::Result<()> {
+        // Decided from the ATTACHMENT and not from the handle: what has to go
+        // is a process, and whether there is one is what the attachment says.
+        if matches!(attachment, VolumeAttachment::FsShare { .. }) {
+            self.stop_backend(&handle.id, attachment).await;
+        }
+        Ok(())
+    }
+
+    #[instrument(level = "trace", skip_all, fields(volume_id = %handle.id))]
+    async fn stat(
+        &self,
+        handle: &VolumeHandle,
+        attachment: &VolumeAttachment,
+    ) -> storage::Result<VolumeState> {
+        let id = &handle.id;
+        let VolumeAttachment::FsShare { pid, .. } = attachment else {
+            return self.files.stat(handle, attachment).await;
         };
 
         // Our own child first — `try_wait` is the only answer that cannot be
@@ -464,27 +544,7 @@ impl BlockDriver for NfsDriver {
         if !backend::pid_is_alive(*pid) {
             return Err(StorageError::NotFound(*id));
         }
-        Ok(Volume {
-            id: *id,
-            attachment: VolumeAttachment::FsShare {
-                socket: socket.clone(),
-                tag: tag.clone(),
-                pid: *pid,
-            },
-            size_bytes: 0,
-        })
-    }
-
-    /// A stopped VM keeps its share directory and everything in it; what it
-    /// must not keep is a virtiofsd serving a VM that is not running. The
-    /// next start spawns a fresh one, which is the same rule the device
-    /// backends follow.
-    #[instrument(skip_all, fields(volume_id = %id))]
-    async fn detach(&self, id: &VolumeId, attachment: &VolumeAttachment) -> storage::Result<()> {
-        if matches!(attachment, VolumeAttachment::FsShare { .. }) {
-            self.stop_backend(id, attachment).await;
-        }
-        Ok(())
+        Ok(VolumeState { size_bytes: 0 })
     }
 }
 

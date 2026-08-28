@@ -13,3 +13,6 @@ anyhow = { workspace = true }
 nix = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

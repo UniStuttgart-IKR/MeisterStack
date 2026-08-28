@@ -302,14 +302,21 @@ impl Provisioner {
                      on this node"
                 )
             })?;
-            let vol = timed_driver(
+            // Two calls where there was one, and the order is the whole
+            // point: the data first, with no consumer in sight, then the
+            // connection into THIS VM's slice. Nothing between them belongs
+            // to the volume, and nothing in the first call knows a VM exists.
+            let handle = timed_driver(&driver_name, "provision", driver.provision(&v.id, &v.spec))
+                .await
+                .with_context(|| format!("provisioning volume {} via {driver_name}", v.id))?;
+            let attachment = timed_driver(
                 &driver_name,
-                "create",
-                driver.create(&v.id, &v.spec, Some(&cgroup)),
+                "attach",
+                driver.attach(&handle, Some(&cgroup)),
             )
             .await
-            .with_context(|| format!("creating volume {} via {driver_name}", v.id))?;
-            record.volumes.push(vol);
+            .with_context(|| format!("attaching volume {} via {driver_name}", v.id))?;
+            record.volumes.push(Volume { handle, attachment });
         }
         record.phase = Phase::VolumesDone;
         self.store.put(id, record)?;
@@ -607,19 +614,32 @@ impl Provisioner {
             }
         }
 
+        // Detach before deprovision, always. Deleting the bytes out from
+        // under a live backend process is the one ordering that can lose data
+        // rather than merely leak it, and this is the loop that used to do
+        // both in one call — the nfs driver stopped its virtiofsd inside
+        // `destroy` and nothing outside said so.
+        //
+        // A failed detach does NOT skip the deprovision. It could not before
+        // either: `stop_backend` returned nothing and its outcome never
+        // reached this loop, so the data went whatever happened to the
+        // process. Both failures are recorded, which is more than the old
+        // shape could say.
         for v in &record.volumes {
-            let name = volume_driver_name(&record, &v.id);
+            let id = v.id();
+            let name = volume_driver_name(&record, &id);
             let Some(driver) = self.drivers.storage.get(&name) else {
-                failures.push(format!(
-                    "volume {}: driver {name:?} is not configured",
-                    v.id
-                ));
+                failures.push(format!("volume {id}: driver {name:?} is not configured"));
                 continue;
             };
             if let Err(e) =
-                timed_driver(&name, "destroy", driver.destroy(&v.id, &v.attachment)).await
+                timed_driver(&name, "detach", driver.detach(&v.handle, &v.attachment)).await
             {
-                failures.push(format!("volume {}: {e}", v.id));
+                failures.push(format!("volume {id}: detach: {e}"));
+            }
+            if let Err(e) = timed_driver(&name, "deprovision", driver.deprovision(&v.handle)).await
+            {
+                failures.push(format!("volume {id}: {e}"));
             }
         }
 
@@ -689,17 +709,18 @@ impl Provisioner {
         // data stays, only the process serving it goes — and a driver whose
         // volumes are plain paths has nothing to do here.
         for v in &record.volumes {
-            let name = volume_driver_name(&record, &v.id);
+            let id = v.id();
+            let name = volume_driver_name(&record, &id);
             match self.drivers.storage.get(&name) {
                 Some(driver) => {
                     if let Err(e) =
-                        timed_driver(&name, "detach", driver.detach(&v.id, &v.attachment)).await
+                        timed_driver(&name, "detach", driver.detach(&v.handle, &v.attachment)).await
                     {
-                        warn!(volume = %v.id, error = %format!("{e:#}"),
+                        warn!(volume = %id, error = %format!("{e:#}"),
                               "detaching volume backend failed");
                     }
                 }
-                None => warn!(volume = %v.id, driver = %name,
+                None => warn!(volume = %id, driver = %name,
                               "volume driver not configured, skipping"),
             }
         }
@@ -794,10 +815,126 @@ mod tests {
 
     fn volume(attachment: VolumeAttachment) -> Volume {
         Volume {
-            id: uuid::Uuid::nil(),
+            handle: agent_api::VolumeHandle {
+                id: uuid::Uuid::nil(),
+                backend: "/vol/a.raw".into(),
+                size_bytes: 0,
+                params: None,
+            },
             attachment,
-            size_bytes: 0,
         }
+    }
+
+    /// The claim this whole refactor is judged on: a VM gets the same
+    /// configuration it got before.
+    ///
+    /// It goes through the real thing rather than a stub. A real filesystem
+    /// backend provisions a real file and attaches it, the attachment goes
+    /// into a real `VmRecord`, and `build_instance_spec` — the one function
+    /// that turns a record into what the hypervisor is told — produces the
+    /// list. What it must produce is exactly one `Path` volume, which is what
+    /// a single `create` produced before there were two calls.
+    ///
+    /// The chain closes below this: `VolumeAttachment` did not change, and
+    /// the cloud-hypervisor driver's own tests pin the VMM config it builds
+    /// from a `Path`. So an unchanged attachment here IS an unchanged config
+    /// there, and the two halves together are the "byte for byte" claim.
+    #[tokio::test]
+    async fn a_vm_is_built_from_the_same_attachments_two_calls_now_produce() {
+        let dir = std::env::temp_dir().join(format!("meister-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("images")).expect("a temp image dir");
+        let d = dir.display();
+        let cfg: crate::config::AgentConfig = toml::from_str(&format!(
+            r#"node_id = "n1"
+               [paths]
+               db_path     = "{d}/a.redb"
+               run_dir     = "{d}/run"
+               image_dir   = "{d}/images"
+               volume_dir  = "{d}/volumes"
+               cgroup_root = "{d}/cgroup"
+               [volume.filesystem]"#
+        ))
+        .expect("the test config parses");
+
+        // A storage node's driver set: no hypervisor and no network, which is
+        // exactly what `build_instance_spec` needs none of.
+        let drivers = Drivers::from_config(&cfg).await.expect("drivers build");
+        let provisioner = Provisioner::new(
+            Arc::new(Store::open(&cfg.paths.db_path).expect("a store")),
+            drivers.clone(),
+            Arc::new(crate::images::Cache::new(cfg.paths.image_dir.clone())),
+            cfg.paths.image_dir.clone(),
+            cfg.paths.run_dir.clone(),
+            String::new(),
+            None,
+            None,
+        );
+
+        let vol_id = uuid::Uuid::new_v4();
+        let vspec = agent_api::storage::VolumeSpec {
+            base_image: None,
+            size_bytes: 4096,
+            driver: None,
+            params: None,
+        };
+        let backend = drivers
+            .storage
+            .get(&default_volume_driver())
+            .expect("the default backend is always registered");
+
+        // The two calls, in the order `run_chain` makes them.
+        let handle = backend
+            .provision(&vol_id, &vspec)
+            .await
+            .expect("provisioned");
+        let attachment = backend.attach(&handle, None).await.expect("attached");
+
+        let mut vm_spec = spec(2, 2048, vec![]);
+        vm_spec.volumes = vec![crate::types::VolumeWithId {
+            id: vol_id,
+            spec: vspec,
+        }];
+        let mut record = crate::types::VmRecord {
+            spec: vm_spec.clone(),
+            desired: Desired::Running,
+            phase: Phase::VolumesDone,
+            operation: None,
+            stop_deadline: None,
+            unhealthy: None,
+            managed_by_controller: false,
+            volumes: vec![Volume {
+                handle: handle.clone(),
+                attachment: attachment.clone(),
+            }],
+            nics: vec![],
+            devices: vec![],
+            vmm_pid: None,
+        };
+        record.phase = Phase::VolumesDone;
+
+        let ispec = provisioner
+            .build_instance_spec(&uuid::Uuid::new_v4(), &vm_spec, &record)
+            .expect("a vm with one block volume builds");
+
+        assert_eq!(ispec.volumes.len(), 1);
+        match &ispec.volumes[0] {
+            VolumeAttachment::Path(p) => {
+                assert_eq!(p, &cfg.paths.volume_dir.join(format!("{vol_id}.raw")))
+            }
+            other => panic!("a plain disk is a path, not {other:?}"),
+        }
+        // Nothing about the VM grew a backend process, so the slice is not
+        // widened and the guest memory does not have to be shareable —
+        // exactly the three answers a one-call `create` produced.
+        assert!(
+            widen_for_storage_backends(&Provisioner::limits_for(&vm_spec), &record.volumes)
+                .is_none()
+        );
+        assert!(!ispec.volumes[0].needs_shared_memory());
+        assert!(ispec.volumes[0].is_block());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The gap this closes: an `[volume.nfs]` share is a virtiofsd in the

@@ -16,11 +16,12 @@
 //! cloud-hypervisor opens itself. No backend process, so no cgroup and
 //! nothing to keep alive.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agent_api::CgroupHandle;
 use agent_api::storage::{
-    self, BlockDriver, StorageError, Volume, VolumeAttachment, VolumeId, VolumeSpec,
+    self, StorageError, VolumeAttacher, VolumeAttachment, VolumeHandle, VolumeId, VolumeProvider,
+    VolumeSpec, VolumeState,
 };
 use macros::generated;
 use tracing::{debug, error, info, instrument, warn};
@@ -186,6 +187,32 @@ impl LvmThinDriver {
         PathBuf::from(format!("/dev/{vg}/{lv}"))
     }
 
+    /// The handle for an LV at `dev`. One place, so that `provision`'s two
+    /// exits cannot describe the same volume differently.
+    fn handle(id: &VolumeId, dev: &Path, size_bytes: u64, spec: &VolumeSpec) -> VolumeHandle {
+        VolumeHandle {
+            id: *id,
+            backend: dev.to_string_lossy().into_owned(),
+            size_bytes,
+            params: spec.params.clone(),
+        }
+    }
+
+    /// Which volume group this handle's LV is in: the parent directory of
+    /// `/dev/<vg>/<lv>`, falling back to the configured one for a handle that
+    /// carries no path (a record migrated from before handles existed, whose
+    /// attachment was not a path).
+    fn vg_of(&self, handle: &VolumeHandle) -> String {
+        handle
+            .path()
+            .parent()
+            .and_then(|d| d.file_name())
+            .and_then(|s| s.to_str())
+            .filter(|s| *s != "dev")
+            .unwrap_or(&self.config.vg)
+            .to_string()
+    }
+
     fn params(spec: &VolumeSpec) -> storage::Result<LvmThinParams> {
         match &spec.params {
             Some(v) => serde_json::from_value(v.clone())
@@ -327,14 +354,9 @@ impl LvmThinDriver {
 
 #[generated(model = ClaudeOpus, version = "5")]
 #[async_trait::async_trait]
-impl BlockDriver for LvmThinDriver {
+impl VolumeProvider for LvmThinDriver {
     #[instrument(skip_all, fields(volume_id = %id, size_bytes = spec.size_bytes))]
-    async fn create(
-        &self,
-        id: &VolumeId,
-        spec: &VolumeSpec,
-        _cgroup: Option<&CgroupHandle>,
-    ) -> storage::Result<Volume> {
+    async fn provision(&self, id: &VolumeId, spec: &VolumeSpec) -> storage::Result<VolumeHandle> {
         let params = Self::params(spec)?;
         let (vg, pool) = resolve_pool(&params, &self.config.vg, &self.config.thin_pool)?;
         let lv = lv_name(id);
@@ -344,11 +366,7 @@ impl BlockDriver for LvmThinDriver {
         // the same volume finds its LV and is done.
         if let Some(size) = self.lv_size_bytes(&vg, &lv).await? {
             debug!(size_bytes = size, "thin volume already exists");
-            return Ok(Volume {
-                id: *id,
-                attachment: VolumeAttachment::Path(dev),
-                size_bytes: size,
-            });
+            return Ok(Self::handle(id, &dev, size, spec));
         }
 
         let fill = self.pool_data_percent(&vg, &pool).await?;
@@ -409,55 +427,65 @@ impl BlockDriver for LvmThinDriver {
             .await?
             .unwrap_or(spec.size_bytes);
         info!(dev = %dev.display(), size_bytes, "thin volume ready");
-        Ok(Volume {
-            id: *id,
-            attachment: VolumeAttachment::Path(dev),
-            size_bytes,
-        })
+        Ok(Self::handle(id, &dev, size_bytes, spec))
     }
 
-    #[instrument(skip_all, fields(volume_id = %id))]
-    async fn destroy(&self, id: &VolumeId, attachment: &VolumeAttachment) -> storage::Result<()> {
-        // The attachment is where the record remembers which VG the LV was
-        // cut from — a spec that named a pool of its own may have put it
-        // somewhere the config no longer points.
-        let lv = lv_name(id);
-        let vg = match attachment {
-            VolumeAttachment::Path(p) => p
-                .parent()
-                .and_then(|d| d.file_name())
-                .and_then(|s| s.to_str())
-                .filter(|s| *s != "dev")
-                .unwrap_or(&self.config.vg)
-                .to_string(),
-            _ => self.config.vg.clone(),
-        };
+    #[instrument(skip_all, fields(volume_id = %handle.id))]
+    async fn deprovision(&self, handle: &VolumeHandle) -> storage::Result<()> {
+        // The handle is where the record remembers which VG the LV was cut
+        // from — a spec that named a pool of its own may have put it
+        // somewhere the config no longer points. It used to be read off the
+        // attachment, which is the sentence this whole split is about: the VG
+        // is a property of the VOLUME, and reading it out of a connection
+        // meant the data could not be deleted without one.
+        let lv = lv_name(&handle.id);
+        let vg = self.vg_of(handle);
         self.remove_lv(&vg, &lv).await?;
         debug!(vg = %vg, lv = %lv, "thin volume removed");
         Ok(())
     }
 
-    #[instrument(level = "trace", skip_all, fields(volume_id = %id))]
-    async fn get(&self, id: &VolumeId, attachment: &VolumeAttachment) -> storage::Result<Volume> {
-        let VolumeAttachment::Path(dev) = attachment else {
-            return Err(StorageError::NotFound(*id));
-        };
-        let lv = lv_name(id);
-        let vg = dev
-            .parent()
-            .and_then(|d| d.file_name())
-            .and_then(|s| s.to_str())
-            .filter(|s| *s != "dev")
-            .unwrap_or(&self.config.vg)
-            .to_string();
-        match self.lv_size_bytes(&vg, &lv).await? {
-            Some(size_bytes) => Ok(Volume {
-                id: *id,
-                attachment: attachment.clone(),
-                size_bytes,
-            }),
-            None => Err(StorageError::NotFound(*id)),
+    #[instrument(level = "trace", skip_all, fields(volume_id = %handle.id))]
+    async fn describe(&self, handle: &VolumeHandle) -> storage::Result<VolumeState> {
+        match self
+            .lv_size_bytes(&self.vg_of(handle), &lv_name(&handle.id))
+            .await?
+        {
+            Some(size_bytes) => Ok(VolumeState { size_bytes }),
+            None => Err(StorageError::NotFound(handle.id)),
         }
+    }
+}
+
+/// The second degenerate case, and the plainest: a thin LV is a block device
+/// the VMM opens itself. Attaching is naming the device node, detaching is
+/// nothing, and no process is spawned — so no cgroup is taken.
+///
+/// The day this backend grows an NVMe-oF export, THIS is the impl that gets a
+/// target session and a cgroup, and `VolumeProvider` above does not change a
+/// line. That is what the split was for.
+#[generated(model = ClaudeOpus, version = "5")]
+#[async_trait::async_trait]
+impl VolumeAttacher for LvmThinDriver {
+    #[instrument(level = "trace", skip_all, fields(volume_id = %handle.id))]
+    async fn attach(
+        &self,
+        handle: &VolumeHandle,
+        _cgroup: Option<&CgroupHandle>,
+    ) -> storage::Result<VolumeAttachment> {
+        Ok(VolumeAttachment::Path(handle.path()))
+    }
+
+    #[instrument(level = "trace", skip_all, fields(volume_id = %handle.id))]
+    async fn stat(
+        &self,
+        handle: &VolumeHandle,
+        attachment: &VolumeAttachment,
+    ) -> storage::Result<VolumeState> {
+        if !matches!(attachment, VolumeAttachment::Path(_)) {
+            return Err(StorageError::NotFound(handle.id));
+        }
+        self.describe(handle).await
     }
 }
 

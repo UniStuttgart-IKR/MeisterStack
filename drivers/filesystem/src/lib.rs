@@ -5,7 +5,8 @@
 use agent_api::CgroupHandle;
 use agent_api::storage;
 use agent_api::storage::{
-    BlockDriver, StorageError, Volume, VolumeAttachment, VolumeId, VolumeSpec,
+    StorageError, VolumeAttacher, VolumeAttachment, VolumeHandle, VolumeId, VolumeProvider,
+    VolumeSpec, VolumeState,
 };
 use macros::generated;
 use std::io::ErrorKind;
@@ -43,6 +44,19 @@ impl FilesystemBlockDriver {
 
     fn tmp_path(&self, id: &VolumeId) -> PathBuf {
         self.config.volume_dir.join(format!("{id}.tmp"))
+    }
+
+    /// How big the file is, or `NotFound`. One implementation behind both
+    /// `describe` and `stat`, because for this backend they are one question:
+    /// there is no connection to be down while the data is up.
+    async fn measure(&self, id: &VolumeId) -> storage::Result<VolumeState> {
+        match tokio::fs::metadata(self.volume_path(id)).await {
+            Ok(meta) => Ok(VolumeState {
+                size_bytes: meta.len(),
+            }),
+            Err(e) if e.kind() == ErrorKind::NotFound => Err(StorageError::NotFound(*id)),
+            Err(e) => Err(StorageError::Backend(e.into())),
+        }
     }
 
     #[generated(model = ClaudeFable, version = "5")]
@@ -83,28 +97,28 @@ impl FilesystemBlockDriver {
     }
 }
 
+/// The volume half. `spec.driver` has already routed the call here and
+/// `spec.params` is a backend's business — this one has no options, so it
+/// takes none.
 #[async_trait::async_trait]
-impl BlockDriver for FilesystemBlockDriver {
-    /// `spec.driver` has already routed the call here and `spec.params` is a
-    /// backend's business — this one has no options, so it takes none. And no
-    /// cgroup: a file is not a process, so there is nothing to confine.
+impl VolumeProvider for FilesystemBlockDriver {
     #[instrument(skip_all, fields(volume_id = %id, size_bytes = spec.size_bytes))]
-    async fn create(
-        &self,
-        id: &VolumeId,
-        spec: &VolumeSpec,
-        _cgroup: Option<&CgroupHandle>,
-    ) -> storage::Result<Volume> {
+    async fn provision(&self, id: &VolumeId, spec: &VolumeSpec) -> storage::Result<VolumeHandle> {
         let path = self.volume_path(id);
+        let handle = |size_bytes| VolumeHandle {
+            id: *id,
+            backend: path.to_string_lossy().into_owned(),
+            size_bytes,
+            params: spec.params.clone(),
+        };
 
         match tokio::fs::metadata(&path).await {
             Ok(meta) => {
+                // The idempotence the provider contract asks for, and the one
+                // this backend has always had: the file IS the volume, and it
+                // is named after the id.
                 debug!(size_bytes = meta.len(), "volume already exists");
-                return Ok(Volume {
-                    id: *id,
-                    attachment: VolumeAttachment::Path(path),
-                    size_bytes: meta.len(),
-                });
+                return Ok(handle(meta.len()));
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(StorageError::Backend(e.into())),
@@ -156,15 +170,12 @@ impl BlockDriver for FilesystemBlockDriver {
         .map_err(|e| StorageError::Backend(e.into()))?;
 
         info!("volume ready");
-        Ok(Volume {
-            id: *id,
-            attachment: VolumeAttachment::Path(path),
-            size_bytes: size,
-        })
+        Ok(handle(size))
     }
 
-    #[instrument(skip_all, fields(volume_id = %id))]
-    async fn destroy(&self, id: &VolumeId, _attachment: &VolumeAttachment) -> storage::Result<()> {
+    #[instrument(skip_all, fields(volume_id = %handle.id))]
+    async fn deprovision(&self, handle: &VolumeHandle) -> storage::Result<()> {
+        let id = &handle.id;
         for p in [self.tmp_path(id), self.volume_path(id)] {
             match tokio::fs::remove_file(&p).await {
                 Ok(()) => debug!(path = %p.display(), "volume file removed"),
@@ -175,17 +186,172 @@ impl BlockDriver for FilesystemBlockDriver {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip_all, fields(volume_id = %id))]
-    async fn get(&self, id: &VolumeId, _attachment: &VolumeAttachment) -> storage::Result<Volume> {
-        let path = self.volume_path(id);
-        match tokio::fs::metadata(&path).await {
-            Ok(meta) => Ok(Volume {
-                id: *id,
-                attachment: VolumeAttachment::Path(path),
-                size_bytes: meta.len(),
-            }),
-            Err(e) if e.kind() == ErrorKind::NotFound => Err(StorageError::NotFound(*id)),
-            Err(e) => Err(StorageError::Backend(e.into())),
+    #[instrument(level = "trace", skip_all, fields(volume_id = %handle.id))]
+    async fn describe(&self, handle: &VolumeHandle) -> storage::Result<VolumeState> {
+        self.measure(&handle.id).await
+    }
+}
+
+/// The connection half, and the degenerate case the whole split has to keep
+/// cheap: a file is not a process, so attaching one is naming it and
+/// detaching one is nothing at all. No cgroup is taken because there is
+/// nothing to confine, and `stat` and `describe` give the same answer because
+/// for this backend the volume and the connection are the same object.
+#[async_trait::async_trait]
+impl VolumeAttacher for FilesystemBlockDriver {
+    #[instrument(level = "trace", skip_all, fields(volume_id = %handle.id))]
+    async fn attach(
+        &self,
+        handle: &VolumeHandle,
+        _cgroup: Option<&CgroupHandle>,
+    ) -> storage::Result<VolumeAttachment> {
+        Ok(VolumeAttachment::Path(handle.path()))
+    }
+
+    #[instrument(level = "trace", skip_all, fields(volume_id = %handle.id))]
+    async fn stat(
+        &self,
+        handle: &VolumeHandle,
+        _attachment: &VolumeAttachment,
+    ) -> storage::Result<VolumeState> {
+        self.measure(&handle.id).await
+    }
+}
+
+#[cfg(test)]
+#[generated(model = ClaudeOpus, version = "5")]
+mod tests {
+    use super::*;
+    use agent_api::storage::VolumeSpec;
+    use uuid::Uuid;
+
+    fn driver(tag: &str) -> (FilesystemBlockDriver, PathBuf) {
+        let root = std::env::temp_dir().join(format!("meister-fs-{tag}-{}", std::process::id()));
+        let images = root.join("images");
+        let volumes = root.join("volumes");
+        std::fs::create_dir_all(&images).expect("a temp image dir");
+        let _ = std::fs::remove_dir_all(&volumes);
+        let driver = FilesystemBlockDriver::new(FilesystemDriverConfig {
+            image_dir: images,
+            volume_dir: volumes.clone(),
+        })
+        .expect("the driver builds");
+        (driver, volumes)
+    }
+
+    fn spec(size_bytes: u64) -> VolumeSpec {
+        VolumeSpec {
+            base_image: None,
+            size_bytes,
+            driver: None,
+            params: None,
         }
+    }
+
+    /// The degeneration probe, and the reason it is in the plainest backend:
+    /// splitting one verb into two must not change what a VM gets.
+    ///
+    /// `create` used to return `Path(<volume_dir>/<id>.raw)` and a size, in
+    /// one call. Provision and attach now produce exactly that — the same
+    /// path, the same file, the same length — and `VolumeAttachment` did not
+    /// change, so an `InstanceSpec` built from it is the same list of the
+    /// same variants and the VMM config below it is byte for byte the config
+    /// it was.
+    #[tokio::test]
+    async fn provision_then_attach_is_what_one_create_used_to_return() {
+        let (driver, volumes) = driver("degenerate");
+        let id = Uuid::new_v4();
+
+        let handle = driver
+            .provision(&id, &spec(4096))
+            .await
+            .expect("provisioned");
+        assert_eq!(handle.id, id);
+        assert_eq!(handle.size_bytes, 4096);
+        assert_eq!(handle.path(), volumes.join(format!("{id}.raw")));
+
+        // The bytes are there before anything is attached to them: that is
+        // the sentence the split exists to make true.
+        let meta = std::fs::metadata(handle.path()).expect("the file exists after provision alone");
+        assert_eq!(meta.len(), 4096);
+
+        let attachment = driver.attach(&handle, None).await.expect("attached");
+        match &attachment {
+            VolumeAttachment::Path(p) => assert_eq!(p, &volumes.join(format!("{id}.raw"))),
+            other => panic!("a file is a path, not {other:?}"),
+        }
+        // And what the VMM is told is the same shape it was told before: a
+        // block volume, no shared memory, no backend process to keep alive.
+        assert!(attachment.is_block());
+        assert!(!attachment.needs_shared_memory());
+        assert_eq!(attachment.backend_pid(), None);
+    }
+
+    /// Attaching takes no cgroup because a file is not a process, and
+    /// detaching is nothing at all. The two halves of "this backend
+    /// degenerates cleanly": a volume that outlives its VM loses nothing when
+    /// the VM goes, because the attachment held nothing.
+    #[tokio::test]
+    async fn a_file_survives_a_detach_untouched() {
+        let (driver, _) = driver("detach");
+        let id = Uuid::new_v4();
+        let handle = driver.provision(&id, &spec(2048)).await.unwrap();
+        let attachment = driver.attach(&handle, None).await.unwrap();
+
+        driver
+            .detach(&handle, &attachment)
+            .await
+            .expect("nothing to do");
+        assert_eq!(
+            driver.describe(&handle).await.expect("still there"),
+            VolumeState { size_bytes: 2048 },
+            "detaching a file must not touch the file"
+        );
+        // stat asks the same question one layer out, and for this backend
+        // gets the same answer: there is no connection to be down.
+        assert_eq!(
+            driver.stat(&handle, &attachment).await.unwrap(),
+            VolumeState { size_bytes: 2048 }
+        );
+    }
+
+    /// Deleting the data needs a handle and nothing else — no attachment
+    /// anywhere in the call. This is the signature the old trait could not
+    /// write, and the one a volume outliving its VM needs.
+    #[tokio::test]
+    async fn deprovision_needs_no_attachment_and_is_idempotent() {
+        let (driver, _) = driver("deprovision");
+        let id = Uuid::new_v4();
+        let handle = driver.provision(&id, &spec(1024)).await.unwrap();
+
+        driver.deprovision(&handle).await.expect("removed");
+        assert!(matches!(
+            driver.describe(&handle).await,
+            Err(StorageError::NotFound(gone)) if gone == id
+        ));
+        // Twice is Ok: teardown runs again after a crash between the two
+        // halves of it.
+        driver.deprovision(&handle).await.expect("idempotent");
+    }
+
+    /// Provisioning twice is one volume. The rule the whole idempotence
+    /// contract rests on: a provision whose handle is lost — a controller
+    /// that died before writing it down — must be FOUND again rather than
+    /// answered with a second volume, and the name derived from the id is
+    /// what makes that true.
+    #[tokio::test]
+    async fn a_lost_handle_finds_the_same_volume_rather_than_making_a_second() {
+        let (driver, _) = driver("idempotent");
+        let id = Uuid::new_v4();
+
+        let first = driver.provision(&id, &spec(4096)).await.unwrap();
+        // The size the second call asks for is deliberately different: what
+        // comes back has to be the volume that EXISTS, not a new one.
+        let again = driver.provision(&id, &spec(8192)).await.unwrap();
+        assert_eq!(first.backend, again.backend);
+        assert_eq!(
+            again.size_bytes, 4096,
+            "the volume that is there is the answer"
+        );
     }
 }
