@@ -1,0 +1,23 @@
+[package]
+name = "meister-pki"
+version = "0.1.0"
+edition = "2024"
+
+# The X.509 half of the control plane, in its own crate for one reason: the
+# CLI needs it too. It generates a key pair and a CSR, it builds a client TLS
+# config, and it reads what a certificate says — the same three things the
+# controllers do from the other side. Putting this in controller-api would
+# have dragged etcd into `meister`.
+
+[dependencies]
+macros = { package = "meister-macros", path = "../macros" }
+
+anyhow = { workspace = true }
+chrono = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true }
+x509-parser = { workspace = true }
+sha2 = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }

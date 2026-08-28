@@ -1,0 +1,136 @@
+# meister-agent — the hardened profile.
+#
+# /etc/meisterstack/agent.toml. See ./README.md for the profile as a whole;
+# see ../agent.toml for what every key means and for the storage, device and
+# overlay sections this file deliberately does not repeat.
+#
+# Same comment convention as the plain examples: prose is a hash and a space,
+# a commented-out setting is a hash and the key with no space between.
+
+# --- the part that needs no configuration ----------------------------------
+#
+# This file has no `listen_*` key, and that is the single most important thing
+# about the agent's exposure: it has NO listening TCP socket. None. Its own
+# API is a unix socket at <run_dir>/agent.sock, created mode 0600 and reachable
+# only by a process on this machine that can open that path; its link to the
+# control plane is an OUTBOUND dial to the cluster's session port, which it
+# re-establishes itself when it drops.
+#
+# So a node running this agent needs no inbound permit for MeisterStack at
+# all. A firewall on this host can drop every unsolicited inbound packet and
+# nothing in this stack notices. The surfaces a node still has are the ones it
+# had anyway — sshd, and whatever the VMs on it are given — and the second of
+# those is what `guarded_ranges` below is about.
+#
+# The corollary is that the unix socket IS the local root API: anyone who can
+# open it can create and destroy VMs on this node. It is mode 0600 for that
+# reason and is not made group-readable "for convenience".
+
+# Stable across restarts, unique in the cluster, and — because this node has a
+# certificate — the same string as the CN in controller_cert below
+# (CN=system:node:manacor). The cluster matches the two against each other, so
+# one node's key cannot ask to be told about another node's VMs.
+node_id = "manacor"
+
+# --- the session, and the trap in it ---------------------------------------
+#
+# https:// and not http://, and this is load-bearing rather than decoration:
+# TLS is applied to a session only when its URL says so. The three PEM keys
+# below with an http:// address here would dial PLAINTEXT, silently, with the
+# credential never used and nothing in any log to say so. That is the one
+# mistake in this file that looks like nothing at all.
+#
+# Order in the list does not matter — each agent derives its own preference
+# order over it by rendezvous hashing — and failover walks that order one dial
+# each, three seconds per blackholed endpoint.
+controller_addrs = ["https://10.128.1.104:50051", "https://10.128.1.110:50051"]
+
+# The older single-address spelling. `controller_addrs` wins outright when
+# both are set, so this stays commented out rather than half-agreeing.
+#controller_addr = "https://10.128.1.104:50051"
+
+# PEM paths, never PEM, resolved against THIS file — so the config and its
+# pki/ directory travel as one unit. All three, not one:
+#
+#   controller_ca alone is one-way TLS. The session is encrypted and the
+#   cluster learns nothing about who dialled it, which in a hardened
+#   deployment means any process that can reach the session port can register
+#   as any node.
+#
+#   All three is mutual. The certificate's CN is system:node:<node_id>, the
+#   cluster checks it against the Hello, and that check is the whole reason
+#   for putting a certificate on a session that was already encrypted.
+#
+# A certificate without a CA is refused at start-up rather than ignored: it
+# would present this node's key to whoever answered on that address.
+#
+#   tools/meister-ca --node manacor
+#
+# The key is mode 0600 or the agent refuses to read it. That check is in the
+# code, not in this comment.
+controller_ca = "pki/ca.crt"
+controller_cert = "pki/system-node-manacor.crt"
+controller_key = "pki/system-node-manacor.key"
+
+# --- the addresses no tap may source from -----------------------------------
+#
+# The union of every floating pool, in the cloud's own spelling: a cidr, a
+# single address, or `a-b`. Every tap on this node gets an nftables rule that
+# DROPS any frame or ARP claiming a source address inside these, except the
+# addresses that tap's own VM holds a reservation for.
+#
+# This is the node's half of the tenant-isolation story and the reason it
+# belongs in a hardened example rather than in the optional pile: without it a
+# guest can claim any address in the pool and be believed. Deliberate
+# duplication of `meister cloud floatingpool ls` — keep the two in step, and
+# remember that a range missing here is a range nobody guards.
+#
+# MAC pinning needs no configuration and applies to every VM either way.
+guarded_ranges = ["10.255.0.0/16", "203.0.113.7", "203.0.113.16-203.0.113.19"]
+
+# Where `nft` is. Unset = PATH, which is right on a NixOS node. nftables is
+# NOT optional: an agent that cannot program rules refuses to start rather
+# than boot VMs it promised to pin and did not.
+#nft = "/run/current-system/sw/bin/nft"
+
+# How long a guest gets to power itself off after a Stop before the VMM is
+# killed. The node's business, never the controller's.
+#stop_grace_secs = 30
+
+# Where to send spans — one more outbound destination on a hardened host, so
+# worth naming rather than discovering when traces do not arrive.
+#otlp_endpoint = "http://127.0.0.1:4317"
+
+[paths]
+# The agent's own record of every VM it holds, and what makes a VM survive a
+# `kill -9` of the agent. It names volumes, taps and pids: readable only by
+# root, like everything else under /var/lib here.
+db_path = "/var/lib/meisterstack/agent.redb"
+# Sockets and per-VM scratch — including agent.sock itself. Fine on tmpfs.
+run_dir = "/run/meisterstack"
+# Read-only to the agent: the block driver clones out of here.
+image_dir = "/var/lib/meisterstack/images"
+volume_dir = "/var/lib/meisterstack/volumes"
+# The cgroup v2 subtree this agent owns. One slice per VM underneath, holding
+# the VMM and every device backend it spawned, so a teardown cannot leave a
+# backend process running with a guest's memory mapped.
+cgroup_root = "/sys/fs/cgroup/meisterstack"
+
+[hypervisor.cloud-hypervisor]
+binary = "/opt/meisterstack/bin/cloud-hypervisor"
+# A local unix socket to the VMM; anything slower than a second or two means
+# it is wedged, not busy.
+timeout_ms = 5000
+
+[network]
+default_bridge = "meister_br0"
+# No bridge_addr on purpose. It puts an address on the default bridge and
+# makes this host a gateway for the guests on it, which is what a lab wants
+# and what a hardened node should have to ask for explicitly.
+#bridge_addr = "192.168.100.1/24"
+
+# Tenant overlays, floating addresses, BGP, and the storage and device
+# backends are all unchanged by this profile — none of them adds a listening
+# port, and every one of them is documented key by key in ../agent.toml. The
+# one paragraph there worth re-reading before going live is the overlay's
+# `evpn`, which is a CLUSTER-wide decision that nothing enforces.

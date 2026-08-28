@@ -1,0 +1,5677 @@
+# MeisterStack — 2026-08-19 @ 63055c5
+
+## Dateien
+```
+Cargo.toml
+components/agent/Cargo.toml
+components/agent/src/api.rs
+components/agent/src/config.rs
+components/agent/src/drivers.rs
+components/agent/src/lib.rs
+components/agent/src/main.rs
+components/agent/src/provision.rs
+components/agent/src/reconcile.rs
+components/agent/src/store.rs
+components/agent/src/types.rs
+components/cli/Cargo.toml
+components/cli/src/agent.rs
+components/cli/src/client.rs
+components/cli/src/config.rs
+components/cli/src/main.rs
+components/cloud-controller/Cargo.toml
+components/cloud-controller/src/main.rs
+components/cluster-controller/Cargo.toml
+components/cluster-controller/src/main.rs
+config/agent.dev.toml
+config/cli.dev.toml
+drivers/cgroup/Cargo.toml
+drivers/cgroup/src/lib.rs
+drivers/cloud-hypervisor/Cargo.toml
+drivers/cloud-hypervisor/src/lib.rs
+drivers/crosvm-gpu/Cargo.toml
+drivers/crosvm-gpu/src/lib.rs
+drivers/filesystem/Cargo.toml
+drivers/filesystem/src/lib.rs
+drivers/linux-network/Cargo.toml
+drivers/linux-network/src/lib.rs
+plugins/nfs/Cargo.toml
+plugins/nfs/src/lib.rs
+shared/agent-api/Cargo.toml
+shared/agent-api/src/device.rs
+shared/agent-api/src/hypervisor.rs
+shared/agent-api/src/lib.rs
+shared/agent-api/src/networking.rs
+shared/agent-api/src/resource_limits.rs
+shared/agent-api/src/storage.rs
+shared/agent-api/src/types/mac_addr.rs
+shared/agent-api/src/types/mod.rs
+shared/agent-api/src/types/pci.rs
+shared/common/Cargo.toml
+shared/common/src/attribution.rs
+shared/common/src/lib.rs
+shared/controller-api/Cargo.toml
+shared/controller-api/src/lib.rs
+shared/macros/Cargo.toml
+shared/macros/src/lib.rs
+shared/proto/Cargo.toml
+shared/proto/build.rs
+shared/proto/src/lib.rs
+```
+
+## Cargo.toml
+```toml
+[workspace]
+resolver = "2"
+members = [
+	"shared/*",
+	"components/*",
+	"drivers/*",
+	"plugins/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "TODO_LICENSE"
+authors = [ "Silas Müller <st187141@stud.uni-stuttgart.de>" ]
+
+[workspace.dependencies]
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-stream = "0.1.18"
+async-trait = "0.1.89"
+
+# gRPC
+tonic = "0.14"
+tonic-prost-build = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error Handling
+anyhow = "1"
+thiserror = "2"
+
+# Persistant data
+redb = "4.1.0"
+etcd-client = "0.19.0"
+
+# REST utilities: Hyper
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+axum = { version = "0.8" }
+
+# Utils
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+bytes = { version = "1", default-features = false }
+futures = "0.3"
+toml = "1.1"
+
+# networking
+rtnetlink = "0.21"
+
+# telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# os utils
+nix = { version = "0.31", features = ["fs", "zerocopy", "ioctl", "process", "signal"] }
+libc = "0.2"
+
+```
+
+## components/agent/Cargo.toml
+```toml
+[package]
+name = "meister-agent"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["http-api", "debug-mutations"]
+http-api = ["dep:axum"]
+debug-mutations = ["http-api"]
+
+[[bin]]
+name = "meister-agent"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["process", "fs"] }
+async-trait = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+redb = { workspace = true }
+uuid = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true, optional = true} 
+nix = { workspace = true }
+
+# Local dependencies
+common = { package = "meister-common", path = "../../shared/common" }
+agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
+proto = { package = "meister-proto", path = "../../shared/proto" }
+macros = { package = "meister-macros", path = "../../shared/macros" }
+
+# Local drivers
+cgroup-driver = { package = "meister-cgroup-driver", path = "../../drivers/cgroup" }
+cloud-hypervisor-driver = { package = "meister-cloud-hypervisor-driver", path = "../../drivers/cloud-hypervisor" }
+crosvm-gpu-driver = { package = "meister-crosvm-gpu-driver", path = "../../drivers/crosvm-gpu" }
+linux-network-driver = { package = "meister-linux-network-driver", path = "../../drivers/linux-network" }
+filesystem-driver = { package = "meister-filesystem-driver", path = "../../drivers/filesystem" }
+vfio-driver = { package = "meister-vfio-driver", path = "../../drivers/vfio" }
+
+```
+
+## components/agent/src/api.rs
+```rs
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::Arc;
+ 
+use anyhow::Context as _;
+use axum::{
+    extract::{Path, Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+    extract::{rejection::JsonRejection, FromRequest},
+};
+use macros::generated;
+use serde::{Deserialize, Serialize};
+use tracing::{info, instrument, warn};
+ 
+use agent_api::VmId;
+ 
+use crate::drivers::DeviceCatalog;
+use crate::reconcile::{Reconciler, Trigger};
+use crate::store::Store;
+use crate::types::{Desired, Phase};
+use crate::provision::Provisioner;
+use crate::types::NewVmSpec;
+
+#[derive(Serialize)]
+struct CreatedResponse {
+    id: String,
+}
+ 
+#[derive(Clone)]
+pub struct ApiState {
+    pub store: Arc<Store>,
+    pub reconciler: Arc<Reconciler>,
+    pub provisioner: Arc<Provisioner>,
+    pub ops: Arc<tokio::sync::Mutex<()>>,
+    pub pause_supported: bool,
+    pub stop_grace: std::time::Duration,
+    pub catalog: DeviceCatalog,
+    pub default_bridge: String,
+}
+ 
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+ 
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self { status, message: message.into() }
+    }
+ 
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, message)
+    }
+ 
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message)
+    }
+}
+ 
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+    }
+}
+ 
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        #[derive(Serialize)]
+        struct Body {
+            error: String,
+        }
+        (self.status, Json(Body { error: self.message })).into_response()
+    }
+}
+
+pub struct ApiJson<T>(pub T);
+
+#[generated(model = ClaudeOpus, version = "4.8")]
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    axum::Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => Err(ApiError::bad_request(rejection.body_text())),
+        }
+    }
+}
+
+fn parse_id(raw: &str) -> Result<VmId, ApiError> {
+    raw.parse()
+        .map_err(|e| ApiError::bad_request(format!("invalid vm id {raw:?}: {e}")))
+}
+ 
+#[generated(model = ClaudeOpus, version = "4.8")]
+pub fn router(state: ApiState) -> Router {
+    let router = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/vms", get(list_vms).post(create_vm))
+        .route("/vms/{id}", get(inspect_vm).delete(destroy_vm))
+        .route("/vms/{id}/observe", get(observe_vm))
+        .route("/vms/{id}/state", get(vm_state))
+        .route("/vms/{id}/reconcile", post(reconcile_vm))
+        .route("/vms/{id}/start", post(start_vm))
+        .route("/vms/{id}/stop", post(stop_vm))
+        .route("/vms/{id}/pause", post(pause_vm))
+        .route("/vms/{id}/resume", post(resume_vm));
+
+    #[cfg(feature = "debug-mutations")]
+    let router = router
+        .route("/vms/{id}/record", axum::routing::delete(delete_record))
+        .route("/vms/{id}/phase", axum::routing::put(set_phase));
+ 
+    router.with_state(state)
+}
+ 
+#[generated(model = ClaudeOpus, version = "4.8")]
+#[instrument(skip_all, fields(socket = %socket_path.display()))]
+pub async fn serve(socket_path: PathBuf, state: ApiState) -> anyhow::Result<()> {
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating socket dir {}", parent.display()))?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 on {}", parent.display()))?;
+    }
+ 
+    match std::fs::remove_file(&socket_path) {
+        Ok(()) => warn!("removed stale socket from a previous run"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("removing {}", socket_path.display()))
+        }
+    }
+ 
+    let listener = tokio::net::UnixListener::bind(&socket_path)
+        .with_context(|| format!("binding {}", socket_path.display()))?;
+ 
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 on {}", socket_path.display()))?;
+ 
+    info!("http api listening");
+    axum::serve(listener, router(state))
+        .await
+        .context("http api server")
+}
+ 
+async fn healthz() -> &'static str {
+    "ok\n"
+}
+ 
+#[derive(Deserialize)]
+struct ListProbe {
+    phase: Phase,
+    #[serde(default)]
+    desired: Desired,
+    #[serde(default)]
+    unhealthy: Option<String>,
+}
+ 
+#[derive(Serialize)]
+struct VmListEntry {
+    id: String,
+    desired: Option<Desired>,
+    phase: Option<Phase>,
+    unhealthy: Option<String>,
+    readable: bool,
+}
+ 
+#[generated(model = ClaudeFable, version = "5")]
+#[instrument(level = "debug", skip_all)]
+async fn list_vms(State(st): State<ApiState>) -> Result<Json<Vec<VmListEntry>>, ApiError> {
+    let entries = st
+        .store
+        .list_raw()?
+        .into_iter()
+        .map(|(id, bytes)| match serde_json::from_slice::<ListProbe>(&bytes) {
+            Ok(p) => VmListEntry {
+                id,
+                desired: Some(p.desired),
+                phase: Some(p.phase),
+                unhealthy: p.unhealthy,
+                readable: true,
+            },
+            Err(_) => VmListEntry {
+                id,
+                desired: None,
+                phase: None,
+                unhealthy: None,
+                readable: false,
+            },
+        })
+        .collect();
+    Ok(Json(entries))
+}
+ 
+#[generated(model = ClaudeOpus, version = "4.8")]
+#[instrument(level = "debug", skip_all, fields(vm_id = %id))]
+async fn inspect_vm(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let vm_id = parse_id(&id)?;
+    let Some(bytes) = st.store.get_raw(&vm_id)? else {
+        return Err(ApiError::not_found(format!("no record for vm {id}")));
+    };
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        bytes,
+    )
+        .into_response())
+}
+ 
+#[derive(Serialize)]
+struct ObserveResponse {
+    desired: Desired,
+    phase: Phase,
+    unhealthy: Option<String>,
+    observed: crate::reconcile::Observed,
+    action: String,
+}
+ 
+#[generated(model = ClaudeFable, version = "5")]
+#[instrument(level = "debug", skip_all, fields(vm_id = %id))]
+async fn observe_vm(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ObserveResponse>, ApiError> {
+    let vm_id = parse_id(&id)?;
+    let Some((desired, phase, unhealthy, observed, action)) =
+        st.reconciler.dry_run(&vm_id).await?
+    else {
+        return Err(ApiError::not_found(format!("no record for vm {id}")));
+    };
+    Ok(Json(ObserveResponse {
+        desired,
+        phase,
+        unhealthy,
+        observed,
+        action: format!("{action:?}"),
+    }))
+}
+ 
+#[derive(Serialize)]
+struct ReconcileResponse {
+    action: String,
+}
+ 
+#[generated(model = ClaudeOpus, version = "4.8")]
+#[instrument(skip_all, fields(vm_id = %id))]
+async fn reconcile_vm(State(st): State<ApiState>, Path(id): Path<String>) -> Result<Json<ReconcileResponse>, ApiError> {
+    let vm_id = parse_id(&id)?;
+    if st.store.get_raw(&vm_id)?.is_none() {
+        return Err(ApiError::not_found(format!("no record for vm {id}")));
+    }
+    let action = st.reconciler.reconcile(vm_id, Trigger::Manual).await?;
+    Ok(Json(ReconcileResponse { action: format!("{action:?}") }))
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[instrument(level = "debug", skip_all, fields(vm_id = %id))]
+async fn vm_state(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ObserveResponse>, ApiError> {
+    observe_vm(State(st), Path(id)).await
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+async fn set_desired_and_reconcile(
+    st: &ApiState,
+    id: &str,
+    desired: Desired,
+    stop_deadline: Option<std::time::SystemTime>,
+) -> Result<Json<ReconcileResponse>, ApiError> {
+    let vm_id = parse_id(id)?;
+    {
+        let _guard = st.ops.lock().await;
+        let Some(mut record) = st.store.get(&vm_id)? else {
+            return Err(ApiError::not_found(format!("no record for vm {id}")));
+        };
+        info!(from = ?record.desired, to = ?desired, "setting desired via api");
+        record.desired = desired;
+        record.stop_deadline = stop_deadline;
+        if record.unhealthy.take().is_some() {
+            info!("clearing unhealthy marker (manual lifecycle action)");
+        }
+        st.store.put(&vm_id, &record)?;
+    }
+    let action = st.reconciler.reconcile(vm_id, Trigger::Manual).await?;
+    Ok(Json(ReconcileResponse { action: format!("{action:?}") }))
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[instrument(skip_all, fields(vm_id = %id))]
+async fn start_vm(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ReconcileResponse>, ApiError> {
+    set_desired_and_reconcile(&st, &id, Desired::Running, None).await
+}
+
+#[derive(Deserialize)]
+struct StopParams {
+    grace_secs: Option<u64>,
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[instrument(skip_all, fields(vm_id = %id))]
+async fn stop_vm(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<StopParams>,
+) -> Result<Json<ReconcileResponse>, ApiError> {
+    let grace = params
+        .grace_secs
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(st.stop_grace);
+    let deadline = std::time::SystemTime::now() + grace;
+    set_desired_and_reconcile(&st, &id, Desired::Stopped, Some(deadline)).await
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[instrument(skip_all, fields(vm_id = %id))]
+async fn pause_vm(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ReconcileResponse>, ApiError> {
+    if !st.pause_supported {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "hypervisor driver does not support pausing",
+        ));
+    }
+    set_desired_and_reconcile(&st, &id, Desired::Paused, None).await
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[instrument(skip_all, fields(vm_id = %id))]
+async fn resume_vm(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ReconcileResponse>, ApiError> {
+    set_desired_and_reconcile(&st, &id, Desired::Running, None).await
+}
+
+#[derive(Serialize)]
+struct OkResponse {
+    ok: bool,
+}
+ 
+#[cfg(feature = "debug-mutations")]
+#[generated(model = ClaudeOpus, version = "4.8")]
+#[instrument(skip_all, fields(vm_id = %id))]
+async fn delete_record(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<OkResponse>, ApiError> {
+    let vm_id = parse_id(&id)?;
+    let _guard = st.ops.lock().await;
+    if st.store.get_raw(&vm_id)?.is_none() {
+        return Err(ApiError::not_found(format!("no record for vm {id}")));
+    }
+    warn!("deleting record via http api; resources may be orphaned");
+    st.store.delete(&vm_id)?;
+    Ok(Json(OkResponse { ok: true }))
+}
+ 
+#[cfg(feature = "debug-mutations")]
+#[derive(Deserialize)]
+struct SetPhaseRequest {
+    phase: Phase,
+}
+ 
+#[cfg(feature = "debug-mutations")]
+#[generated(model = ClaudeOpus, version = "4.8")]
+#[instrument(skip_all, fields(vm_id = %id))]
+async fn set_phase(State(st): State<ApiState>, Path(id): Path<String>, ApiJson(req): ApiJson<SetPhaseRequest>) -> Result<Json<OkResponse>, ApiError> {
+    let vm_id = parse_id(&id)?;
+    let _guard = st.ops.lock().await;
+    let Some(mut record) = st.store.get(&vm_id)? else {
+        return Err(ApiError::not_found(format!("no readable record for vm {id}")));
+    };
+    warn!(from = ?record.phase, to = ?req.phase, "overriding phase via http api");
+    record.phase = req.phase;
+    st.store.put(&vm_id, &record)?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[instrument(skip_all)]
+async fn create_vm(State(st): State<ApiState>, ApiJson(req): ApiJson<NewVmSpec>) -> Result<(StatusCode, Json<CreatedResponse>), ApiError> {
+    let (id, spec, desired) = req
+        .into_spec(&st.default_bridge)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+
+    st.catalog
+        .validate(&spec.devices)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+
+    let _guard = st.ops.lock().await;
+    info!(vm_id = %id, desired = ?desired, "creating vm via api");
+    st.provisioner.provision(id, spec, desired).await?;
+
+    Ok((StatusCode::CREATED, Json(CreatedResponse { id: id.to_string() })))
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[instrument(skip_all, fields(vm_id = %id))]
+async fn destroy_vm(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ReconcileResponse>, ApiError> {
+    let vm_id = parse_id(&id)?;
+
+    {
+        let _guard = st.ops.lock().await;
+        let Some(mut record) = st.store.get(&vm_id)? else {
+            return Ok(Json(ReconcileResponse { action: "None".into() }));
+        };
+        info!("destroy requested, setting desired = Absent");
+        record.desired = Desired::Absent;
+        record.stop_deadline = None;
+        st.store.put(&vm_id, &record)?;
+    }
+
+    let action = st.reconciler.reconcile(vm_id, Trigger::Manual).await?;
+    Ok(Json(ReconcileResponse { action: format!("{action:?}") }))
+}
+
+```
+
+## components/agent/src/config.rs
+```rs
+use serde::{Deserialize,};
+use std::collections::HashMap;
+use std::fs::{read_to_string};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use anyhow::{bail, Context};
+use toml::from_str;
+use macros::generated;
+use crosvm_gpu_driver::GpuParams;
+use agent_api::types::pci::PciAddress;
+
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+   pub node_id: String,
+   pub controller_addr: Option<String>,
+   #[serde(default = "default_stop_grace_secs")]
+   pub stop_grace_secs: u64,
+   pub paths: PathsConfig,
+   pub hypervisor: HypervisorConfig,
+   pub network: NetworkConfig,
+   pub device: DeviceConfig,
+}
+
+fn default_stop_grace_secs() -> u64 { 30 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathsConfig {
+    pub db_path: PathBuf,
+    pub run_dir: PathBuf,
+    pub image_dir: PathBuf,
+    pub volume_dir: PathBuf,
+    pub cgroup_root: PathBuf,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HypervisorConfig {
+    #[serde(rename_all = "snake_case")]
+    CloudHypervisor {
+        binary: PathBuf,
+        timeout_ms: u64,
+    },
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfig {
+    pub default_bridge: String,
+    #[serde(default)]
+    pub bridge_addr: Option<String>,
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl NetworkConfig {
+    pub fn parsed_bridge_addr(&self) -> anyhow::Result<Option<(IpAddr, u8)>> {
+        let Some(raw) = &self.bridge_addr else {
+            return Ok(None);
+        };
+        let (ip, prefix) = raw.split_once('/').ok_or_else(|| {
+            anyhow::anyhow!("bridge_addr {raw:?} must be CIDR notation, e.g. 10.42.0.1/24")
+        })?;
+        let ip: IpAddr = ip
+            .parse()
+            .with_context(|| format!("bridge_addr {raw:?}: invalid ip address"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .with_context(|| format!("bridge_addr {raw:?}: invalid prefix length"))?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        if prefix > max {
+            bail!("bridge_addr {raw:?}: prefix length {prefix} out of range (max {max})");
+        }
+        Ok(Some((ip, prefix)))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceConfig {
+    #[serde(rename = "crosvm-gpu")]
+    pub crosvm_gpu: Option<CrosvmGpuConfig>,
+
+    #[serde(default)]
+    pub managed: Vec<ManagedDevice>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ManagedDevice {
+    NicSriov { pci_address: PciAddress },
+    Passthrough { pci_address: PciAddress },
+}
+
+impl ManagedDevice {
+    pub fn pci_address(&self) -> PciAddress {
+        match self {
+            ManagedDevice::NicSriov { pci_address } => *pci_address,
+            ManagedDevice::Passthrough { pci_address } => *pci_address,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrosvmGpuConfig {
+    pub binary: PathBuf,
+    pub socket_timeout_ms: u64,
+    pub defaults: GpuParams,
+    #[serde(default)]
+    pub profiles: HashMap<String, serde_json::Value>,
+}
+
+impl AgentConfig {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let raw = read_to_string(path)
+            .with_context(|| format!("reading config file {}", path.display()))?;
+        let mut config: AgentConfig = from_str(&raw)
+            .with_context(|| format!("parsing config file {}", path.display()))?;
+
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let base = std::path::absolute(dir)
+            .with_context(|| format!("resolving config directory {}", dir.display()))?;
+        config.paths.resolve_against(&base);
+
+        Ok(config)
+    }
+}
+
+impl PathsConfig {
+    fn resolve_against(&mut self, base: &Path) {
+        for p in [
+            &mut self.db_path,
+            &mut self.run_dir,
+            &mut self.image_dir,
+            &mut self.volume_dir,
+            &mut self.cgroup_root,
+        ] {
+            if !p.is_absolute() {
+                *p = base.join(&*p);
+            }
+        }
+    }
+}
+
+```
+
+## components/agent/src/drivers.rs
+```rs
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent_api::{
+    device::DeviceDriver, networking::{BridgeDriver, NicDriver},
+    storage::BlockDriver, Hypervisor, ResourceConfiner,
+};
+use anyhow::bail;
+use macros::generated;
+use crate::config::AgentConfig;
+use crate::config::HypervisorConfig;
+use crate::types::DeviceWithId;
+use filesystem_driver::FilesystemBlockDriver;
+use linux_network_driver::LinuxNetworkDriver;
+use crosvm_gpu_driver::CrosvmGpuDriver;
+use vfio_driver::VfioPciDriver;
+
+pub const DRIVER_CROSVM_GPU: &str = "crosvm-gpu";
+pub const DRIVER_VFIO: &str = "vfio";
+
+#[derive(Clone)]
+pub struct Drivers {
+    pub confiner: Arc<dyn ResourceConfiner>,
+    pub hypervisor: Arc<dyn Hypervisor>,
+    pub storage: Arc<dyn BlockDriver>,
+    pub networking: Arc<dyn NicDriver>,
+    pub bridge: Arc<dyn BridgeDriver>,
+    pub devices: HashMap<String, Arc<dyn DeviceDriver>>,
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl Drivers {
+    pub fn from_config(cfg: &AgentConfig) -> anyhow::Result<Self> {
+        let confiner = Arc::new(cgroup_driver::CgroupV2::new(cfg.paths.cgroup_root.clone()));
+
+        let hypervisor: Arc<dyn Hypervisor> = match &cfg.hypervisor {
+            HypervisorConfig::CloudHypervisor { binary, timeout_ms } => {
+                Arc::new(cloud_hypervisor_driver::CloudHypervisorDriver::new(
+                    binary.clone(),
+                    cfg.paths.run_dir.join("vms"),
+                    Duration::from_millis(*timeout_ms),
+                )?)
+            }
+        };
+
+        let storage: Arc<dyn BlockDriver> = Arc::new(
+            FilesystemBlockDriver::new(filesystem_driver::FilesystemDriverConfig {
+                image_dir: cfg.paths.image_dir.clone(),
+                volume_dir: cfg.paths.volume_dir.clone(),
+            })?
+        );
+
+        let net = Arc::new(LinuxNetworkDriver::new()?);
+        let networking: Arc<dyn NicDriver> = net.clone();
+        let bridge: Arc<dyn BridgeDriver> = net;
+
+        let mut devices: HashMap<String, Arc<dyn DeviceDriver>> = HashMap::new();
+
+        if let Some(g) = &cfg.device.crosvm_gpu {
+            let driver = CrosvmGpuDriver::new(crosvm_gpu_driver::CrosvmGpuDriverConfig {
+                crosvm_bin: g.binary.clone(),
+                run_dir: cfg.paths.run_dir.join("gpu"),
+                defaults: g.defaults.clone(),
+                profiles: g.profiles.clone(),
+                socket_timeout: Duration::from_millis(g.socket_timeout_ms),
+            })?;
+            devices.insert(DRIVER_CROSVM_GPU.to_string(), Arc::new(driver));
+        }
+
+        let inventory: Vec<_> = cfg.device.managed.iter().map(|m| m.pci_address()).collect();
+        if !inventory.is_empty() {
+            devices.insert(
+                DRIVER_VFIO.to_string(),
+                Arc::new(VfioPciDriver::new(inventory)?),
+            );
+        }
+
+        Ok(Self { confiner, hypervisor, storage, networking, bridge, devices })
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[derive(Clone, Debug)]
+pub struct DeviceCatalog {
+    profiles: HashMap<String, Vec<String>>,
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl DeviceCatalog {
+    pub fn new(devices: &HashMap<String, Arc<dyn DeviceDriver>>) -> Self {
+        Self {
+            profiles: devices
+                .iter()
+                .map(|(name, driver)| (name.clone(), driver.profiles()))
+                .collect(),
+        }
+    }
+
+    fn driver_names(&self) -> String {
+        let mut names: Vec<&str> = self.profiles.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        if names.is_empty() {
+            "<none>".to_string()
+        } else {
+            names.join(", ")
+        }
+    }
+
+    pub fn validate(&self, devices: &[DeviceWithId]) -> anyhow::Result<()> {
+        for d in devices {
+            let Some(profiles) = self.profiles.get(&d.spec.driver) else {
+                bail!(
+                    "device driver {:?} is not configured on this node; available: [{}]",
+                    d.spec.driver,
+                    self.driver_names()
+                );
+            };
+            if let Some(profile) = &d.spec.profile {
+                if !profiles.iter().any(|p| p == profile) {
+                    bail!(
+                        "device driver {:?} has no profile {:?}; configured profiles: [{}]",
+                        d.spec.driver,
+                        profile,
+                        profiles.join(", ")
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+```
+
+## components/agent/src/lib.rs
+```rs
+pub mod config;
+pub mod drivers;
+pub mod types;
+pub mod store;
+pub mod provision;
+pub mod reconcile;
+#[cfg(feature = "http-api")]
+pub mod api;
+
+use std::time::Duration;
+use tracing::{instrument, info, warn, error};
+use anyhow::{anyhow, Context};
+use tokio::sync::mpsc;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+
+use agent_api::VmId;
+use macros::generated;
+use proto::{
+    agent_message, command, command_result, controller_message,
+    control_plane_client::ControlPlaneClient, AgentMessage, CommandResult, Hello,
+};
+
+use config::AgentConfig;
+use drivers::{DeviceCatalog, Drivers};
+use provision::Provisioner;
+use store::Store;
+use types::{AgentVmSpec, Desired};
+use reconcile::{Reconciler, Trigger};
+use tracing::{info_span, Instrument};
+use std::sync::Arc;
+
+pub struct Agent {
+    provisioner: Arc<Provisioner>,
+    store: Arc<Store>,
+    reconciler: Arc<Reconciler>,
+    ops: Arc<tokio::sync::Mutex<()>>,
+    catalog: DeviceCatalog,
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl Agent {
+    async fn handle_create(&self, c: proto::CreateInstance) -> anyhow::Result<()> {
+        let id: VmId = c.id.parse().context("invalid vm id")?;
+        let spec = c.spec.ok_or_else(|| anyhow!("create without spec"))?;
+        let spec: AgentVmSpec = spec.try_into().context("invalid vm spec")?;
+        self.catalog.validate(&spec.devices).context("invalid device spec")?;
+        let _guard = self.ops.lock().await;
+        self.provisioner.provision(id, spec, Desired::Running).await
+    }
+
+    async fn handle_destroy(&self, d: proto::DestroyInstance) -> anyhow::Result<()> {
+        let id: VmId = d.id.parse().context("invalid vm id")?;
+        {
+            let _guard = self.ops.lock().await;
+            let Some(mut record) = self.store.get(&id)? else {
+                return Ok(());
+            };
+            record.desired = Desired::Absent;
+            record.stop_deadline = None;
+            self.store.put(&id, &record)?;
+        }
+        self.reconciler.reconcile(id, Trigger::Manual).await.map(|_| ())
+    }
+    
+    #[instrument(skip(self, cmd), fields(request_id = %cmd.request_id))]
+    async fn dispatch(&self, cmd: proto::Command) -> CommandResult {
+        let request_id = cmd.request_id.clone();
+        let op_result = match cmd.op {
+            Some(command::Op::Create(c)) => self.handle_create(c).await,
+            Some(command::Op::Destroy(d)) => self.handle_destroy(d).await,
+            None => Err(anyhow!("command without op")),
+        };
+        let outcome = match op_result {
+            Ok(()) => {
+                info!("command ok");
+                command_result::Outcome::Ok(proto::Ack {})
+            } 
+            Err(e) => {
+                error!(error = format!("{e:#}"), "command failed");
+                command_result::Outcome::Error(proto::ErrorMsg { message: format!("{e:#}") })
+            }
+        };
+        CommandResult { request_id, outcome: Some(outcome) }
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
+    let store = Arc::new(Store::open(&cfg.paths.db_path)?);
+    let drivers = Drivers::from_config(&cfg)?;
+    let pause_supported = drivers.hypervisor.as_pausable().is_some();
+    let ops = Arc::new(tokio::sync::Mutex::new(()));
+
+    let bridge_addr = cfg.network.parsed_bridge_addr()?;
+    let catalog = DeviceCatalog::new(&drivers.devices);
+
+    let provisioner = Arc::new(Provisioner::new(
+        store.clone(),
+        drivers.clone(),
+        cfg.paths.image_dir.clone(),
+        cfg.network.default_bridge.clone(),
+        bridge_addr,
+    ));
+    let reconciler = Arc::new(Reconciler::new(
+        store.clone(),
+        drivers,
+        provisioner.clone(),
+        ops.clone(),
+    ));
+
+    if let Err(e) = reconciler.reconcile_all(Trigger::Startup).await {
+        error!(error = format!("{e:#}"), "startup reconcile failed, continuing degraded");
+    }
+
+    #[cfg(feature = "http-api")]
+    {
+        let state = api::ApiState {
+            store: store.clone(),
+            reconciler: reconciler.clone(),
+            provisioner: provisioner.clone(),
+            ops: ops.clone(),
+            pause_supported,
+            stop_grace: Duration::from_secs(cfg.stop_grace_secs),
+            catalog: catalog.clone(),
+            default_bridge: cfg.network.default_bridge.clone(),
+        };
+        let sock = cfg.paths.run_dir.join("agent.sock");
+        tokio::spawn(async move {
+            if let Err(e) = api::serve(sock, state).await {
+                error!(error = format!("{e:#}"), "http api stopped");
+            }
+        });
+    }
+
+    {
+        let reconciler = reconciler.clone();
+        tokio::spawn(
+            async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(30));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = reconciler.reconcile_all(Trigger::Periodic).await {
+                        warn!(error = format!("{e:#}"), "periodic reconcile pass failed");
+                    }
+                }
+            }
+            .instrument(info_span!("periodic_reconcile")),
+        );
+    }
+
+    let Some(controller_addr) = cfg.controller_addr.clone() else {
+        info!("no controller configured, running standalone");
+        std::future::pending::<()>().await;
+        unreachable!("pending() never resolves");
+    };
+
+    let agent = Agent { provisioner, store, reconciler, ops, catalog };
+
+    let mut backoff = Duration::from_millis(500);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+    loop {
+        match run_session(&agent, &controller_addr, &cfg).await {
+            Ok(()) => {
+                info!("controller session ended, reconnecting");
+                backoff = Duration::from_millis(500);
+            }
+            Err(e) => {
+                warn!(error = format!("{e:#}"), ?backoff, "controller session failed; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+#[generated(model = ClaudeOpus, version = "4.8")]
+#[instrument(skip_all, fields(controller = %controller_addr))]
+async fn run_session(agent: &Agent, controller_addr: &str, cfg: &AgentConfig) -> anyhow::Result<()> {
+    let mut client = ControlPlaneClient::connect(controller_addr.to_string())
+        .await
+        .context("connecting to controller")?; 
+    let (tx, rx) = mpsc::channel::<AgentMessage>(64);
+    tx.send(AgentMessage {
+        kind: Some(agent_message::Kind::Hello(Hello { node_id: cfg.node_id.clone() })),
+    })
+    .await
+    .map_err(|_| anyhow!("session closed before hello"))?;
+
+    let mut inbound = client.session(ReceiverStream::new(rx)).await?.into_inner();
+
+    while let Some(msg) = inbound.next().await {
+        let msg = match msg {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "stream error");
+                return Ok(());
+            }
+        };
+        if let Some(controller_message::Kind::Command(cmd)) = msg.kind {
+            let result = agent.dispatch(cmd).await;
+            if tx
+                .send(AgentMessage { kind: Some(agent_message::Kind::Result(result)) })
+                .await
+                .is_err()
+            {
+                return Ok(()); 
+            }
+        }
+    }
+    Ok(())
+}
+
+```
+
+## components/agent/src/main.rs
+```rs
+use std::{path::PathBuf,};
+use clap::Parser;
+use meister_agent::config::AgentConfig;
+
+#[derive(Parser)]
+#[command(name = "meister-agent", about = "MeisterStack node agent")]
+struct Args {
+    /// Agent-Config path
+    #[arg(long, default_value = "/etc/meisterstack/agent.toml")]
+    config: PathBuf,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    tracing_subscriber::fmt()
+    .with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,meister_agent=debug".into()),
+    )
+    .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+    .init();
+    let config = AgentConfig::load(&args.config)?;
+
+    meister_agent::run_agent(config).await
+}
+
+```
+
+## components/agent/src/provision.rs
+```rs
+use std::collections::HashSet;
+use std::net::IpAddr;
+use std::path::{PathBuf};
+use tracing::{info, debug, warn, instrument};
+use agent_api::hypervisor::{InstanceSpec, BootSource};
+use agent_api::networking::{NicAttachment};
+use agent_api::device::DeviceId;
+use agent_api::types::pci::PciAddress;
+use agent_api::{HypervisorError, ResourceLimits, VmId};
+use anyhow::{anyhow, bail, Context, Result};
+use macros::generated;
+
+use crate::drivers::{Drivers, DRIVER_VFIO};
+use crate::store::Store;
+use crate::types::{AgentVmSpec, Desired, Phase, VmRecord, BootSourceSpec};
+use std::sync::Arc;
+
+pub struct Provisioner {
+    store: Arc<Store>,
+    drivers: Drivers,
+    image_dir: PathBuf,
+    default_bridge: String,
+    bridge_addr: Option<(IpAddr, u8)>,
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+fn device_driver_name<'a>(record: &'a VmRecord, id: &DeviceId) -> &'a str {
+    record
+        .spec
+        .devices
+        .iter()
+        .find(|d| &d.id == id)
+        .map(|d| d.spec.driver.as_str())
+        .unwrap_or("crosvm-gpu")
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+fn vfio_addresses(spec: &AgentVmSpec, strict: bool) -> Result<Vec<(DeviceId, String)>> {
+    let mut out = Vec::new();
+    for d in spec.devices.iter().filter(|d| d.spec.driver == DRIVER_VFIO) {
+        let addr = d
+            .spec
+            .params
+            .as_ref()
+            .and_then(|p| p.get("pci_address"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.parse::<PciAddress>());
+        match addr {
+            Some(Ok(addr)) => out.push((d.id, addr.to_string())),
+            Some(Err(e)) if strict => {
+                bail!("device {}: invalid pci_address: {e}", d.id)
+            }
+            None if strict => bail!(
+                "device {}: vfio requires params.pci_address (e.g. \"0000:23:00.0\")",
+                d.id
+            ),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl Provisioner {
+    pub fn new(
+        store: Arc<Store>,
+        drivers: Drivers,
+        image_dir: PathBuf,
+        default_bridge: String,
+        bridge_addr: Option<(IpAddr, u8)>,
+    ) -> Self {
+        Self { store, drivers, image_dir, default_bridge, bridge_addr }
+    }
+
+    #[generated(model = ClaudeFable, version = "5")]
+    fn check_exclusive_devices(&self, id: &VmId, spec: &AgentVmSpec) -> Result<()> {
+        let requested = vfio_addresses(spec, true)?;
+        if requested.is_empty() {
+            return Ok(());
+        }
+
+        let mut seen = HashSet::new();
+        for (dev_id, addr) in &requested {
+            if !seen.insert(addr.clone()) {
+                bail!("pci device {addr} is requested twice in this spec (device {dev_id})");
+            }
+        }
+
+        for (other_id, record) in self.store.list()? {
+            if &other_id == id {
+                continue;
+            }
+            for (_, addr) in vfio_addresses(&record.spec, false)? {
+                if seen.contains(&addr) {
+                    bail!("pci device {addr} is already assigned to vm {other_id}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[generated(model = ClaudeFable, version = "5")]
+    #[instrument(skip(self, spec), fields(vm_id = %id))]
+    pub async fn provision(&self, id: VmId, spec: AgentVmSpec, desired: Desired) -> Result<()> {
+        if let Some(mut existing) = self.store.get(&id)? {
+            info!(desired = ?desired, "vm record exists, updating desired only");
+            existing.desired = desired;
+            self.store.put(&id, &existing)?;
+            return Ok(());
+        }
+
+        self.check_exclusive_devices(&id, &spec)?;
+
+        let mut record = VmRecord {
+            spec,
+            desired,
+            vmm_pid: None,
+            phase: Phase::Provisioning,
+            operation: None,
+            stop_deadline: None,
+            unhealthy: None,
+            volumes: vec![],
+            nics: vec![],
+            devices: vec![],
+        };
+        self.store.put(&id, &record)?;
+
+        match self.run_chain(&id, &mut record).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = self.store.put(&id, &record);
+                warn!(error = format!("{e:#}"), "provisioning failed, tearing down");
+                if let Err(td) = self.teardown(&id).await {
+                    return Err(e.context(format!(
+                        "teardown after failed provision also failed: {td:#}"
+                    )));
+                }
+                Err(e)
+            }
+        }
+    }
+    
+    #[generated(model = ClaudeFable, version = "5")]
+    async fn run_chain(&self, id: &VmId, record: &mut VmRecord) -> Result<()> {
+        let spec = record.spec.clone();
+
+        let limits = Self::limits_for(&spec);
+        debug!(?limits, "creating cgroup slice");
+        let cgroup = self
+            .drivers
+            .confiner
+            .create_slice(&id.to_string(), None, &limits)
+            .map_err(|e| anyhow!("creating cgroup slice: {e}"))?;
+
+        for v in &spec.volumes {
+            debug!(volume_id = %v.id, base_image = ?v.spec.base_image, "creating volume");
+            let vol = self
+                .drivers
+                .storage
+                .create(&v.id, &v.spec)
+                .await
+                .with_context(|| format!("creating volume {}", v.id))?;
+            record.volumes.push(vol);
+        }
+        record.phase = Phase::VolumesDone;
+        self.store.put(id, record)?;
+        info!(count = record.volumes.len(), "volumes ready");
+
+        for n in &spec.nics {
+            self.drivers
+                .bridge
+                .ensure(&n.spec.bridge)
+                .await
+                .with_context(|| format!("ensuring bridge {}", n.spec.bridge))?;
+            if n.spec.bridge == self.default_bridge {
+                if let Some((ip, prefix)) = self.bridge_addr {
+                    self.drivers
+                        .bridge
+                        .ensure_address(&n.spec.bridge, ip, prefix)
+                        .await
+                        .with_context(|| {
+                            format!("assigning {ip}/{prefix} to bridge {}", n.spec.bridge)
+                        })?;
+                }
+            }
+            let nic = self
+                .drivers
+                .networking
+                .create(&n.id, &n.spec)
+                .await
+                .with_context(|| format!("creating nic {}", n.id))?;
+            record.nics.push(nic);
+        }
+        record.phase = Phase::NetworkDone;
+        self.store.put(id, record)?;
+        info!(count = record.nics.len(), "nics ready");
+
+        for d in &spec.devices {
+            let driver = self.drivers.devices.get(&d.spec.driver).ok_or_else(|| {
+                anyhow!(
+                    "vm spec requests device driver {:?} which is not configured on this node",
+                    d.spec.driver
+                )
+            })?;
+            let dev = driver
+                .create(&d.id, &d.spec, Some(&cgroup))
+                .await
+                .with_context(|| format!("creating device {} via {}", d.id, d.spec.driver))?;
+            record.devices.push(dev);
+        }
+        record.phase = Phase::DevicesDone;
+        self.store.put(id, record)?;
+        info!(count = record.devices.len(), "devices ready");
+        
+        let ispec = self.build_instance_spec(&spec, record)?;
+        debug!(?ispec, "creating hypervisor");
+        let vmm_pid = self
+            .drivers
+            .hypervisor
+            .create(id, &ispec, Some(&cgroup))
+            .await
+            .context("hypervisor create")?;
+        record.vmm_pid = Some(vmm_pid);
+        self.store.put(id, record)?;
+
+        debug!(?ispec, "starting hypervisor");
+        self.drivers.hypervisor.start(id).await.context("hypervisor start")?;
+
+        record.phase = Phase::Provisioned;
+        self.store.put(id, record)?;
+        info!("vm provisioned and running");
+        Ok(())
+    }
+
+    fn build_instance_spec(&self, spec: &AgentVmSpec, record: &VmRecord) -> Result<InstanceSpec> {
+        let disk = match record.volumes.as_slice() {
+            [] => bail!("vm spec contains no volume; a boot disk is required"),
+            [one] => one.path.clone(),
+            more => bail!(
+                "multiple volumes ({}) not yet supported by the hypervisor integration",
+                more.len()
+            ),
+        };
+
+        let nics = record
+            .nics
+            .iter()
+            .zip(spec.nics.iter())
+            .map(|(created, requested)| NicAttachment {
+                tap_name: created.tap_name.clone(),
+                mac: requested.spec.mac,
+            })
+            .collect();
+
+        let devices = record.devices.iter().map(|d| d.attachment.clone()).collect();
+
+        let boot = match &spec.boot {
+            BootSourceSpec::DirectKernel { kernel, cmdline, initramfs } => {
+                BootSource::DirectKernel {
+                    kernel: self.image_dir.join(kernel),
+                    cmdline: cmdline.clone(),
+                    initramfs: initramfs.as_ref().map(|n| self.image_dir.join(n)),
+                }
+            }
+            BootSourceSpec::Firmware { firmware } => BootSource::Firmware {
+                firmware: self.image_dir.join(firmware),
+            },
+        };
+
+        Ok(InstanceSpec {
+            boot,
+            disk,
+            vcpus: spec.vcpus,
+            memory_mib: spec.memory_mib,
+            nics,
+            devices,
+        })
+    }
+
+    fn limits_for(spec: &AgentVmSpec) -> ResourceLimits {
+        let vmm_overhead_mib = 64 + (8 * spec.vcpus as u64) + 32;
+        ResourceLimits {
+            memory_max: Some((spec.memory_mib + vmm_overhead_mib) * 1024 * 1024),
+            cpu_quota: Some(spec.vcpus * 100 + 50),
+        }
+    }
+   
+    #[generated(model = ClaudeFable, version = "5")]
+    #[instrument(skip(self), fields(vm_id = %id))]
+    pub async fn teardown(&self, id: &VmId) -> Result<()> {
+        let Some(record) = self.store.get(id)? else {
+            return Ok(());
+        };
+
+        let mut failures: Vec<String> = Vec::new();
+        
+        if let Err(e) = self.drivers.confiner.kill_slice(&id.to_string()) {
+            failures.push(format!("cgroup kill: {e}"));
+        }
+
+        match self.drivers.hypervisor.destroy(id).await {
+            Ok(()) | Err(HypervisorError::NotFound(_)) => {}
+            Err(e) => failures.push(format!("hypervisor destroy: {e}")),
+        }
+
+        for d in &record.devices {
+            let name = device_driver_name(&record, &d.id);
+            match self.drivers.devices.get(name) {
+                Some(driver) => {
+                    if let Err(e) = driver.destroy(&d.id).await {
+                        failures.push(format!("device {}: {e}", d.id));
+                    }
+                }
+                None => failures.push(format!(
+                    "device {}: driver {name:?} is not configured",
+                    d.id
+                )),
+            }
+        }
+
+        for n in &record.nics {
+            if let Err(e) = self.drivers.networking.destroy(&n.id).await {
+                failures.push(format!("nic {}: {e}", n.id));
+            }
+        }
+
+        for v in &record.volumes {
+            if let Err(e) = self.drivers.storage.destroy(&v.id).await {
+                failures.push(format!("volume {}: {e}", v.id));
+            }
+        }
+
+        let cg = self.drivers.confiner.open_slice(&id.to_string());
+        if let Err(e) = self.drivers.confiner.destroy_slice(&cg) {
+            failures.push(format!("cgroup slice: {e}"));
+        }
+
+
+        if failures.is_empty() {
+            self.store.delete(id)?;
+            Ok(())
+        } else {
+            bail!("teardown of vm {id} incomplete: {}", failures.join("; "))
+        }
+    }
+
+    #[generated(model = ClaudeFable, version = "5")]
+    #[instrument(skip(self, record), fields(vm_id = %id))]
+    pub(crate) async fn stop(&self, id: &VmId, mut record: VmRecord) -> Result<()> {
+        match self.drivers.hypervisor.destroy(id).await {
+            Ok(()) | Err(HypervisorError::NotFound(_)) => {}
+            Err(e) => bail!("stopping vmm: {e}"),
+        }
+
+        if let Some(pid) = record.vmm_pid {
+            let in_slice = self
+                .drivers
+                .confiner
+                .pids_in_slice(&id.to_string())
+                .map(|pids| pids.contains(&pid))
+                .unwrap_or(false);
+            if in_slice {
+                warn!(pid, "vmm survived destroy (untracked), killing directly");
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+
+        for d in &record.devices {
+            let name = device_driver_name(&record, &d.id);
+            match self.drivers.devices.get(name) {
+                Some(driver) => {
+                    if let Err(e) = driver.destroy(&d.id).await {
+                        warn!(device = %d.id, error = format!("{e:#}"), "stopping device backend failed");
+                    }
+                }
+                None => warn!(device = %d.id, driver = name, "device driver not configured, skipping"),
+            }
+        }
+        record.devices.clear();
+
+        record.vmm_pid = None;
+        record.stop_deadline = None;
+        record.unhealthy = None;
+        self.store.put(id, &record)?;
+        info!("vm stopped; volumes and taps kept");
+        Ok(())
+    }
+
+    #[generated(model = ClaudeFable, version = "5")]
+    #[instrument(skip(self, record), fields(vm_id = %id))]
+    pub(crate) async fn resume(&self, id: &VmId, mut record: VmRecord) -> Result<()> {
+        record.phase = Phase::Provisioning;
+        record.volumes.clear();
+        record.nics.clear();
+        record.devices.clear();
+        record.vmm_pid = None;
+        record.unhealthy = None;
+        self.store.put(id, &record)?;
+
+        let result = self.run_chain(id, &mut record).await;
+        if result.is_err() {
+            let _ = self.store.put(id, &record);
+        }
+        result
+    } 
+}
+
+```
+
+## components/agent/src/reconcile.rs
+```rs
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
+use anyhow::Result;
+use macros::generated;
+use tokio::time::Instant;
+use tracing::{debug, info, instrument, trace, warn};
+
+use agent_api::{DeviceAttachment, VmId, VmState};
+
+use crate::drivers::Drivers;
+use crate::provision::Provisioner;
+use crate::store::Store;
+use crate::types::{Desired, Phase, VmRecord};
+use serde::Serialize;
+
+#[derive(Debug, Clone, Copy)]
+pub enum Trigger {
+    Startup,
+    Periodic,
+    Manual, // only for HTTP-endpoint
+}
+
+#[derive(Debug, Serialize)]
+pub struct Observed {
+    pub tracked: bool,
+    pub vmm_alive: bool,
+    pub socket_responsive: bool,
+    /// All device backend processes (vhost-user) are still in the slice.
+    /// Passthrough attachments have no process and are always "alive".
+    pub devices_alive: bool,
+    pub guest: Option<VmState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    None,
+    Blocked,
+    /// VM carries an unhealthy marker: the reconciler must not repair it
+    /// automatically. Manual lifecycle actions (start/stop/destroy) clear the
+    /// marker.
+    Quarantined,
+    Adopt { vmm_pid: u32 },
+    Provision,
+    Start,
+    SignalShutdown,
+    Stop,
+    Pause,
+    Resume,
+    Teardown,
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+pub fn plan(record: &VmRecord, obs: &Observed, now: SystemTime) -> Action {
+    if record.operation.is_some() {
+        return Action::Blocked;
+    }
+
+    if record.desired == Desired::Absent {
+        return Action::Teardown;
+    }
+
+    if record.desired == Desired::Stopped {
+        if !obs.vmm_alive {
+            return Action::None;
+        }
+        return match obs.guest {
+            Some(VmState::Defined) | Some(VmState::Stopped) => Action::Stop,
+            _ => match record.stop_deadline {
+                Some(deadline) if now < deadline => Action::SignalShutdown,
+                _ => Action::Stop,
+            },
+        };
+    }
+
+    // Quarantine gate: teardown and stop above stay allowed (that IS the
+    // manual maintenance path), but no automatic provision/start/resume.
+    if record.unhealthy.is_some() {
+        return Action::Quarantined;
+    }
+
+    if record.desired == Desired::Halted {
+        return Action::None;
+    }
+
+    if record.phase != Phase::Provisioned {
+        return Action::Provision;
+    }
+
+    if !obs.vmm_alive || !obs.socket_responsive {
+        return Action::Provision;
+    }
+
+    if !obs.tracked {
+        return match record.vmm_pid {
+            Some(pid) => Action::Adopt { vmm_pid: pid },
+            None => Action::Provision,
+        };
+    }
+
+    let Some(guest) = obs.guest else {
+        return Action::None;
+    };
+    match (record.desired, guest) {
+        (Desired::Running, VmState::Defined | VmState::Stopped) => Action::Start,
+        (Desired::Running, VmState::Paused)                     => Action::Resume,
+        (Desired::Running, VmState::Running)                    => Action::None,
+        (Desired::Paused,  VmState::Running)                    => Action::Pause,
+        (Desired::Paused,  VmState::Paused)                     => Action::None,
+        (Desired::Paused,  VmState::Defined | VmState::Stopped) => Action::Start,
+        _ => Action::None,
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ReconcileSummary {
+    pub total: usize,
+    pub adopted: usize,
+    pub provisioned: usize,
+    pub lifecycle: usize,
+    pub torn_down: usize,
+    pub blocked: usize,
+    pub quarantined: usize,
+    pub failed: usize,
+}
+
+impl ReconcileSummary {
+    fn had_events(&self) -> bool {
+        self.adopted
+            + self.provisioned
+            + self.lifecycle
+            + self.torn_down
+            + self.blocked
+            + self.quarantined
+            + self.failed
+            > 0
+    }
+}
+
+struct FailureState {
+    failures: u32,
+    next_attempt: Instant,
+}
+
+const BACKOFF_BASE: Duration = Duration::from_secs(30);
+const BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
+
+const MAX_CONVERGE_STEPS: usize = 4;
+
+pub struct Reconciler {
+    store: Arc<Store>,
+    drivers: Drivers,
+    provisioner: Arc<Provisioner>,
+    ops: Arc<tokio::sync::Mutex<()>>,
+    failures: Mutex<HashMap<VmId, FailureState>>,
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl Reconciler {
+    pub fn new(
+        store: Arc<Store>,
+        drivers: Drivers,
+        provisioner: Arc<Provisioner>,
+        ops: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
+        Self {
+            store,
+            drivers,
+            provisioner,
+            ops,
+            failures: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[instrument(skip_all, fields(?trigger))]
+    pub async fn reconcile_all(&self, trigger: Trigger) -> Result<ReconcileSummary> {
+        let mut summary = ReconcileSummary::default();
+        let vms = self.store.list()?;
+        summary.total = vms.len();
+
+        for (id, _) in vms {
+            match self.reconcile(id, trigger).await {
+                Ok(Action::None) => {}
+                Ok(Action::Blocked) => summary.blocked += 1,
+                Ok(Action::Quarantined) => summary.quarantined += 1,
+                Ok(Action::Adopt { .. }) => summary.adopted += 1,
+                Ok(Action::Provision) => summary.provisioned += 1,
+                Ok(Action::Teardown) => summary.torn_down += 1,
+                Ok(_) => summary.lifecycle += 1,
+                Err(_) => summary.failed += 1,
+            }
+        }
+
+        if matches!(trigger, Trigger::Startup) || summary.had_events() {
+            info!(
+                total = summary.total,
+                adopted = summary.adopted,
+                provisioned = summary.provisioned,
+                lifecycle = summary.lifecycle,
+                torn_down = summary.torn_down,
+                blocked = summary.blocked,
+                quarantined = summary.quarantined,
+                failed = summary.failed,
+                "reconcile pass complete"
+            );
+        } else {
+            trace!(total = summary.total, "reconcile pass complete, all converged");
+        }
+        Ok(summary)
+    }
+
+    #[instrument(skip_all, fields(vm_id = %id, ?trigger))]
+    pub async fn reconcile(&self, id: VmId, trigger: Trigger) -> Result<Action> {
+        if self.in_backoff(&id) {
+            trace!("in backoff, skipping");
+            return Ok(Action::None);
+        }
+
+        let mut first_action: Option<Action> = None;
+
+        for step in 0..MAX_CONVERGE_STEPS {
+            let Some(mut record) = self.store.get(&id)? else {
+                break;
+            };
+
+            if step == 0 && matches!(trigger, Trigger::Startup) {
+                if let Some(op) = record.operation.take() {
+                    warn!(?op, "clearing orphaned operation after restart");
+                    self.store.put(&id, &record)?;
+                }
+            }
+
+            let observed = self.observe(&id, &record).await;
+
+            // Unhealthy detection: a device backend died while the VMM is
+            // still running. Cloud Hypervisor cannot reconnect a vhost-user
+            // gpu backend, and restarting the VM automatically is not wanted
+            // here — mark the VM and quarantine it until a human acts
+            // (start/stop/destroy via the API clears the marker).
+            if record.unhealthy.is_none()
+                && record.phase == Phase::Provisioned
+                && matches!(record.desired, Desired::Running | Desired::Paused)
+                && observed.vmm_alive
+                && !observed.devices_alive
+            {
+                let reason = "device backend process died while the vmm is running; \
+                              automatic restart is disabled — use start/stop/destroy \
+                              to repair"
+                    .to_string();
+                warn!(%reason, "marking vm unhealthy");
+                record.unhealthy = Some(reason);
+                self.store.put(&id, &record)?;
+            }
+
+            let action = plan(&record, &observed, SystemTime::now());
+
+            if observed.tracked && observed.socket_responsive && observed.guest.is_none() {
+                warn!("vmm responsive but guest state unreadable; waiting");
+            }
+            if record.desired == Desired::Halted {
+                warn!("desired = Halted is reserved and not implemented; treating as no-op");
+            }
+
+            match action {
+                Action::None => trace!(?observed, "converged"),
+                a => info!(
+                    step,
+                    action = ?a,
+                    desired = ?record.desired,
+                    phase = ?record.phase,
+                    ?observed,
+                    "reconcile decision"
+                ),
+            }
+
+            if first_action.is_none() {
+                first_action = Some(action);
+            }
+
+            if matches!(action, Action::None | Action::Blocked | Action::Quarantined) {
+                break;
+            }
+
+            if let Err(e) = self.execute(&id, (record.phase, record.desired), action).await {
+                let retry_in = self.register_failure(&id);
+                warn!(error = format!("{e:#}"), ?retry_in, "reconcile failed");
+                return Err(e);
+            }
+
+            if matches!(action, Action::SignalShutdown | Action::Teardown) {
+                break;
+            }
+        }
+
+        self.clear_failure(&id);
+        Ok(first_action.unwrap_or(Action::None))
+    }
+
+    #[instrument(level = "debug", skip_all, fields(vm_id = %id))]
+    pub async fn dry_run(
+        &self,
+        id: &VmId,
+    ) -> Result<Option<(Desired, Phase, Option<String>, Observed, Action)>> {
+        let Some(record) = self.store.get(id)? else {
+            return Ok(None);
+        };
+        let observed = self.observe(id, &record).await;
+        let action = plan(&record, &observed, SystemTime::now());
+        Ok(Some((
+            record.desired,
+            record.phase,
+            record.unhealthy.clone(),
+            observed,
+            action,
+        )))
+    }
+
+    async fn observe(&self, id: &VmId, record: &VmRecord) -> Observed {
+        let tracked = self.drivers.hypervisor.is_tracked(id);
+
+        let slice_pids = self
+            .drivers
+            .confiner
+            .pids_in_slice(&id.to_string())
+            .unwrap_or_default();
+
+        let vmm_alive = match record.vmm_pid {
+            Some(pid) => slice_pids.contains(&pid),
+            None => false,
+        };
+
+        let devices_alive = record.devices.iter().all(|d| match &d.attachment {
+            DeviceAttachment::VhostUser { pid, .. } => slice_pids.contains(pid),
+            // Passthrough and mdev attachments have no host process.
+            _ => true,
+        });
+
+        let socket_responsive = self.drivers.hypervisor.probe(id).await;
+
+        let guest = if tracked && socket_responsive {
+            self.drivers.hypervisor.get_state(id).await.ok()
+        } else {
+            None
+        };
+
+        Observed { tracked, vmm_alive, socket_responsive, devices_alive, guest }
+    }
+
+    async fn execute(
+        &self,
+        id: &VmId,
+        planned: (Phase, Desired),
+        action: Action,
+    ) -> Result<()> {
+        if matches!(action, Action::None | Action::Blocked | Action::Quarantined) {
+            return Ok(());
+        }
+
+        let _guard = self.ops.lock().await;
+
+        let Some(current) = self.store.get(id)? else {
+            debug!("record gone before execute, skipping");
+            return Ok(());
+        };
+        if (current.phase, current.desired) != planned {
+            debug!(
+                phase = ?current.phase,
+                desired = ?current.desired,
+                "record changed before execute, skipping"
+            );
+            return Ok(());
+        }
+
+        match action {
+            Action::None | Action::Blocked | Action::Quarantined => Ok(()),
+
+            Action::Adopt { vmm_pid } => {
+                self.drivers
+                    .hypervisor
+                    .adopt(id, vmm_pid)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("adopting vmm: {e}"))
+            }
+
+            Action::Provision => {
+                self.drivers
+                    .confiner
+                    .kill_slice(&id.to_string())
+                    .map_err(|e| anyhow::anyhow!("killing cgroup slice: {e}"))?;
+                self.provisioner.resume(id, current).await
+            }
+
+            Action::Start => self
+                .drivers
+                .hypervisor
+                .start(id)
+                .await
+                .map_err(|e| anyhow::anyhow!("starting vm: {e}")),
+
+            Action::SignalShutdown => self
+                .drivers
+                .hypervisor
+                .power_button(id)
+                .await
+                .map_err(|e| anyhow::anyhow!("sending power button: {e}")),
+
+            Action::Stop => self.provisioner.stop(id, current).await,
+
+            Action::Pause => {
+                let p = self
+                    .drivers
+                    .hypervisor
+                    .as_pausable()
+                    .ok_or_else(|| anyhow::anyhow!("hypervisor driver does not support pausing"))?;
+                p.pause(id).await.map_err(|e| anyhow::anyhow!("pausing vm: {e}"))
+            }
+
+            Action::Resume => {
+                let p = self
+                    .drivers
+                    .hypervisor
+                    .as_pausable()
+                    .ok_or_else(|| anyhow::anyhow!("hypervisor driver does not support pausing"))?;
+                p.resume(id).await.map_err(|e| anyhow::anyhow!("resuming vm: {e}"))
+            }
+
+            Action::Teardown => self.provisioner.teardown(id).await,
+        }
+    }
+
+    fn in_backoff(&self, id: &VmId) -> bool {
+        self.failures
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|st| Instant::now() < st.next_attempt)
+    }
+
+    fn register_failure(&self, id: &VmId) -> Duration {
+        let mut map = self.failures.lock().unwrap();
+        let st = map.entry(*id).or_insert(FailureState {
+            failures: 0,
+            next_attempt: Instant::now(),
+        });
+        st.failures += 1;
+        let delay = BACKOFF_BASE
+            .saturating_mul(2u32.saturating_pow(st.failures.min(5)))
+            .min(BACKOFF_MAX);
+        st.next_attempt = Instant::now() + delay;
+        delay
+    }
+
+    fn clear_failure(&self, id: &VmId) {
+        self.failures.lock().unwrap().remove(id);
+    }
+}
+
+```
+
+## components/agent/src/store.rs
+```rs
+use std::path::Path;
+
+use agent_api::VmId;
+use anyhow::Context;
+use macros::generated;
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+
+use crate::types::VmRecord;
+use tracing::{error};
+
+const VMS: TableDefinition<&str, &[u8]> = TableDefinition::new("vms");
+
+pub struct Store {
+    db: Database,
+}
+
+impl Store {
+    #[generated(model = ClaudeFable, version = "5")]
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating db directory {}", parent.display()))?;
+        }
+
+        let db = Database::create(path)
+            .with_context(|| format!("opening agent db {}", path.display()))?;
+        
+        // Create DB if not already existing
+        let tx = db.begin_write().context("initializing vms table")?;
+        tx.open_table(VMS).context("initializing vms table")?;
+        tx.commit().context("initializing vms table")?;
+
+        Ok(Self { db })
+    }
+
+    #[generated(model = ClaudeFable, version = "5")]
+    pub fn put(&self, id: &VmId, record: &VmRecord) -> anyhow::Result<()> {
+       let bytes = serde_json::to_vec(record).context("serializing vm record")?;
+       let id_str = id.to_string();
+
+       let tx = self.db.begin_write().context("begin write")?;
+       {
+           let mut table = tx.open_table(VMS).context("open vms table")?;
+           table.insert(id_str.as_str(), bytes.as_slice())
+                .with_context(|| format!("storing record for vm {id_str}"))?; 
+       }
+       tx.commit().context("commit")?;
+       Ok(())
+    }
+    
+    #[generated(model = ClaudeFable, version = "5")]
+    pub fn get(&self, id: &VmId) -> anyhow::Result<Option<VmRecord>> {
+        let id_str = id.to_string();
+        let tx = self.db.begin_read().context("begin read")?;
+        let table = tx.open_table(VMS).context("open vms table")?;
+
+        match table.get(id_str.as_str()).context("reading record")? {
+            Some(guard) => {
+                let record: VmRecord = serde_json::from_slice(guard.value())
+                    .with_context(|| format!("corrupt record for vm {id_str}"))?;
+                Ok(Some(record))
+            }
+            None => Ok(None)
+        }
+    }
+
+    #[generated(model = ClaudeFable, version = "5")]
+    pub fn list(&self) -> anyhow::Result<Vec<(VmId, VmRecord)>> {
+        let tx = self.db.begin_read().context("begin read")?;
+        let table = tx.open_table(VMS).context("open vms table")?;
+
+        let mut out = Vec::new();
+        for item in table.iter().context("iterating vms table")? {
+            let (key, value) = item.context("reading table entry")?;
+
+            let id: VmId = match key.value().parse() {
+                Ok(id) => id,
+                Err(e) => {
+                    // excludes corrupt data, for example outdated structs in the db
+                    // to debug data use the non-serde list_raw()
+                    error!(key = ?key.value(), error = %e, "corrupt key, skipping");
+                    continue;
+                }
+            };
+
+            let record: VmRecord = match serde_json::from_slice(value.value()) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(vm_id = %id, error = %e, "corrupt record, skipping");
+                    continue;
+                }
+            };
+
+            out.push((id, record));
+        }
+        Ok(out)
+    }
+    
+    #[generated(model = ClaudeFable, version = "5")]
+    pub fn delete(&self, id: &VmId) -> anyhow::Result<()> {
+        let id_str = id.to_string();
+        let tx = self.db.begin_write().context("begin write")?;
+        {
+            let mut table = tx.open_table(VMS).context("open vms table")?;
+            table.remove(id_str.as_str()).with_context(|| format!("deleting record for vm {id_str}"))?;
+        }
+        tx.commit().context("commit")?;
+        Ok(())
+    }
+
+    #[generated(model = ClaudeOpus, version = "4.8")]
+    pub fn get_raw(&self, id: &VmId) -> anyhow::Result<Option<Vec<u8>>> {
+        let id_str = id.to_string();
+        let tx = self.db.begin_read().context("begin read")?;
+        let table = tx.open_table(VMS).context("open vms table")?;
+        Ok(table
+            .get(id_str.as_str())
+            .context("reading record")?
+            .map(|g| g.value().to_vec()))
+    }
+
+    #[generated(model = ClaudeOpus, version = "4.8")]
+    pub fn list_raw(&self) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+        let tx = self.db.begin_read().context("begin read")?;
+        let table = tx.open_table(VMS).context("open vms table")?;
+        let mut out = Vec::new();
+        for item in table.iter().context("iterating vms table")? {
+            let (key, value) = item.context("reading table entry")?;
+            out.push((key.value().to_string(), value.value().to_vec()));
+        }
+        Ok(out)
+    }
+}
+
+```
+
+## components/agent/src/types.rs
+```rs
+use agent_api::{
+    device::{default_device_driver, DeviceId, DeviceSpec, PartitionSpec},
+    networking::{NicSpec, NicId},
+    storage::{Volume, VolumeId, VolumeSpec},
+    Nic, Device,
+    types::mac_addr::{MacAddr},
+    hypervisor::VmId,
+};
+use macros::generated;
+use anyhow::{bail, Context};
+use uuid::Uuid;
+
+// reconcile alibi-state-machine
+/// Intention of the owner of the VM.
+/// Owner is here the http-api or the controller.
+#[derive(Clone, Copy, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Desired {
+    #[default]
+    Running,
+    /// VMM stopped, memory freed, volumes and nics stay existend.
+    Stopped,
+    Paused,
+    Absent,
+    /// Reserved for guest shutdown. VMM stays in RAM;
+    /// Reconciler knows there is a state transition.
+    Halted,
+}
+
+/// Process that requires ownership of the VM.
+/// This is required to let the reconciler know to not start/stop the VM while its in one of these
+/// states.
+/// If one of those actions is found on startup the VM is considered orphaned.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Operation {
+    Snapshotting { target: String },
+    Restoring    { source: String },
+    MigratingOut { peer: String },
+    MigratingIn  { peer: String },
+}
+
+/// Process of the resource creation. Only for journaling.
+/// For decision-making its only relevant `Provisioned` (finished) or else (not finished).
+/// This is to track the creation phase of a VM.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Phase {
+    Provisioning,
+    VolumesDone,
+    NetworkDone,
+    DevicesDone,
+    Provisioned,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BootSourceSpec {
+    DirectKernel {
+        kernel: String,
+        cmdline: String,
+        initramfs: Option<String>,
+    },
+    Firmware {
+        firmware: String,
+    },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AgentVmSpec {
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    pub boot: BootSourceSpec,
+    pub volumes: Vec<VolumeWithId>,
+    pub nics: Vec<NicWithId>,
+    pub devices: Vec<DeviceWithId>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct VolumeWithId {
+    pub id: VolumeId,
+    pub spec: VolumeSpec,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NicWithId {
+    pub id: NicId,
+    pub spec: NicSpec,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DeviceWithId {
+    pub id: DeviceId,
+    pub spec: DeviceSpec,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct VmRecord {
+   pub spec: AgentVmSpec,
+    #[serde(default)]
+    pub desired: Desired,
+    pub phase: Phase,
+    #[serde(default)]
+    pub operation: Option<Operation>,
+    /// `time::SystemTime` to make the deadline surrive an agent restart.
+    #[serde(default)]
+    pub stop_deadline: Option<std::time::SystemTime>,
+    /// Set by the reconciler when it detects a condition it must not repair
+    /// automatically (e.g. a dead device backend under a live VMM). While set,
+    /// the reconciler quarantines the VM: no automatic Provision/Start.
+    /// Cleared by explicit lifecycle actions (start/stop/destroy via API) or
+    /// by a successful re-provision.
+    #[serde(default)]
+    pub unhealthy: Option<String>,
+    pub volumes: Vec<Volume>,
+    pub nics: Vec<Nic>,
+    pub devices: Vec<Device>,
+    #[serde(default)]
+    pub vmm_pid: Option<u32>, 
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewVmSpec {
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    pub boot: BootSourceSpec,
+    #[serde(default)]
+    pub desired: Desired,
+    #[serde(default)]
+    pub volumes: Vec<NewVolume>,
+    #[serde(default)]
+    pub nics: Vec<NewNic>,
+    #[serde(default)]
+    pub devices: Vec<NewDevice>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewVolume {
+    #[serde(default)]
+    pub base_image: Option<String>,
+    pub size_bytes: u64,
+}
+ 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewNic {
+    #[serde(default)]
+    pub bridge: Option<String>,
+    #[serde(default)]
+    pub mac: Option<String>,
+}
+ 
+#[generated(model = ClaudeFable, version = "5")]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewDevice {
+    #[serde(default, alias = "driver_name")]
+    pub driver: Option<String>,
+    pub partition: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
+}
+
+
+#[generated(model = ClaudeFable, version = "5")]
+impl TryFrom<proto::VmSpec> for AgentVmSpec {
+    type Error = anyhow::Error;
+    fn try_from(p: proto::VmSpec) -> Result<Self, Self::Error> {
+        let boot = match p.boot {
+            Some(proto::vm_spec::Boot::DirectKernel(dk)) => BootSourceSpec::DirectKernel { 
+                kernel: non_empty(dk.kernel).context("kernel must be set")?,
+                cmdline: dk.cmdline,
+                initramfs: non_empty(dk.initramfs)
+            },
+            Some(proto::vm_spec::Boot::Firmware(fw)) => BootSourceSpec::Firmware {
+                firmware: non_empty(fw.firmware).context("firmware must be set")?,
+            },
+            None => bail!("vm spec has no boot source"),
+        };
+
+        Ok(Self {
+            vcpus: p.vcpus,
+            memory_mib: p.memory_mib,
+            boot: boot,
+            volumes: p.volumes.into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()
+                .context("invalid volume spec")?,
+            nics: p.nics.into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()
+                .context("invalid nic spec")?,
+            devices: p.devices.into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()
+                .context("invalid device spec")?,
+        })
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl TryFrom<proto::VolumeSpec> for VolumeWithId {
+    type Error = anyhow::Error;
+    fn try_from(p: proto::VolumeSpec) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: parse_uuid(&p.id).context("volume id")?,
+            spec: VolumeSpec {
+                base_image: non_empty(p.base_image),
+                size_bytes: p.size_bytes,
+            },
+        })
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl TryFrom<proto::NicSpec> for NicWithId {
+    type Error = anyhow::Error;
+    fn try_from(p: proto::NicSpec) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: parse_uuid(&p.id).context("nic id")?,
+            spec: NicSpec {
+                bridge: non_empty(p.bridge).context("bridge must be set")?, // controller
+                                                                            // sends explicit
+                                                                            // bridges
+                mac: p.mac.parse::<MacAddr>()
+                    .map_err(|e| anyhow::anyhow!("invalid mac {:?}: {e}", p.mac))?,
+            },
+        })
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl TryFrom<proto::DeviceSpec> for DeviceWithId {
+    type Error = anyhow::Error;
+    fn try_from(p: proto::DeviceSpec) -> Result<Self, Self::Error> {
+        let partition = match p.partition.as_str() {
+            "exclusive" => PartitionSpec::Exclusive,
+            "mediated" => PartitionSpec::Mediated,
+            other => bail!("unknown partition type {other:?}"),
+        };
+        let params = non_empty(p.params_json)
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .context("device params_json")?;
+        Ok(Self {
+            id: parse_uuid(&p.id).context("device id")?,
+            // TODO(proto): driver and profile are not in the proto yet; extend
+            // control.proto when the controller learns about device routing.
+            spec: DeviceSpec {
+                driver: default_device_driver(),
+                partition,
+                profile: None,
+                params,
+            },
+        })
+    }
+}
+
+impl NewVmSpec {
+    #[generated(model = ClaudeFable, version = "5")]
+    pub fn into_spec(self, default_bridge: &str) -> anyhow::Result<(VmId, AgentVmSpec, Desired)> {
+        if self.vcpus == 0 {
+            bail!("vcpus must be greater than zero");
+        }
+        if matches!(self.desired, Desired::Absent | Desired::Halted) {
+            bail!("desired {:?} is not a valid creation target", self.desired);
+        }
+        if self.volumes.is_empty() {
+            bail!("a vm needs at least one volume as boot disk");
+        }
+        let vm_id = Uuid::new_v4();
+ 
+        let volumes = self
+            .volumes
+            .into_iter()
+            .map(|v| VolumeWithId {
+                id: Uuid::new_v4(),
+                spec: VolumeSpec { base_image: v.base_image, size_bytes: v.size_bytes },
+            })
+            .collect();
+ 
+        let nics = self
+            .nics
+            .into_iter()
+            .map(|n| {
+                let id = Uuid::new_v4();
+                let mac = n.mac.unwrap_or_else(|| {
+                    let b = id.as_bytes();
+                    format!("52:54:00:{:02x}:{:02x}:{:02x}", b[0], b[1], b[2])
+                });
+                let mac: MacAddr = mac
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid mac {mac:?}: {e}"))?;
+                let bridge = match n.bridge {
+                    Some(b) if !b.is_empty() => b,
+                    _ => default_bridge.to_string(),
+                };
+                Ok(NicWithId { id, spec: NicSpec { bridge, mac } })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+ 
+        let devices = self
+            .devices
+            .into_iter()
+            .map(|d| {
+                let partition = match d.partition.as_str() {
+                    "exclusive" => PartitionSpec::Exclusive,
+                    "mediated" => PartitionSpec::Mediated,
+                    other => anyhow::bail!("unknown partition type {other:?}"),
+                };
+                Ok(DeviceWithId {
+                    id: Uuid::new_v4(),
+                    spec: DeviceSpec {
+                        driver: d.driver.unwrap_or_else(default_device_driver),
+                        partition,
+                        profile: d.profile,
+                        params: d.params,
+                    },
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+ 
+        Ok((
+            vm_id,
+            AgentVmSpec {
+                vcpus: self.vcpus,
+                memory_mib: self.memory_mib,
+                boot: self.boot,
+                volumes,
+                nics,
+                devices,
+            },
+            self.desired,
+        ))
+    }
+}
+
+fn parse_uuid(s: &str) -> anyhow::Result<uuid::Uuid> {
+    s.parse().with_context(|| format!("invalid uuid: {s:?}"))
+}
+
+fn non_empty(s: String) -> Option<String> {
+    (!s.is_empty()).then_some(s)
+}
+
+```
+
+## components/cli/Cargo.toml
+```toml
+[package]
+name = "meister-cli"
+version = "0.1.0"
+edition = "2024"
+
+# binary name commands: 'meister vm create ...'
+[[bin]]
+name = "meister"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+
+macros = { package = "meister-macros", path = "../../shared/macros" }
+
+```
+
+## components/cli/src/agent.rs
+```rs
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use macros::generated;
+use serde::Deserialize;
+ 
+use crate::client::{print_json, print_table, Client};
+use crate::config::Target;
+use crate::{AgentCmd, GlobalArgs, OutputFormat};
+ 
+#[derive(Deserialize)]
+struct VmListEntry {
+    id: String,
+    #[serde(default)]
+    desired: Option<String>,
+    phase: Option<String>,
+    #[serde(default)]
+    unhealthy: Option<String>,
+    readable: bool,
+}
+ 
+#[derive(Deserialize)]
+struct ObserveResponse {
+    #[serde(default)]
+    desired: Option<String>,
+    phase: String,
+    #[serde(default)]
+    unhealthy: Option<String>,
+    observed: Observed,
+    action: String,
+}
+ 
+#[derive(Deserialize)]
+struct Observed {
+    tracked: bool,
+    vmm_alive: bool,
+    socket_responsive: bool,
+    #[serde(default)]
+    devices_alive: bool,
+    #[serde(default)]
+    guest: Option<String>,
+}
+ 
+#[derive(Deserialize)]
+struct ActionResponse {
+    action: String,
+}
+ 
+#[derive(Deserialize)]
+struct CreatedResponse {
+    id: String,
+}
+ 
+#[generated(model = ClaudeOpus, version = "4.8")]
+pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result<()> {
+    if let AgentCmd::Destroy { id } = cmd {
+        if !global.yes
+            && !confirm(&format!(
+                "destroy vm {id} on {} (profile {})?",
+                target.endpoint, target.profile_name
+            ))?
+        {
+            anyhow::bail!("aborted");
+        }
+    }
+ 
+    let client = Client::new(target)?;
+ 
+    match cmd {
+        AgentCmd::Ls => {
+            let body = client.get("/vms").await?;
+            match global.output {
+                OutputFormat::Json => print_json(&body),
+                OutputFormat::Table => {
+                    let vms: Vec<VmListEntry> =
+                        serde_json::from_slice(&body).context("parsing /vms response")?;
+                    if vms.is_empty() {
+                        eprintln!("no vms on this node");
+                        return Ok(());
+                    }
+                    let rows: Vec<Vec<String>> = vms
+                        .iter()
+                        .map(|v| {
+                            vec![
+                                v.id.clone(),
+                                v.desired.clone().unwrap_or_else(|| "-".into()),
+                                v.phase.clone().unwrap_or_else(|| "-".into()),
+                                if v.unhealthy.is_some() { "unhealthy".into() } else { "ok".into() },
+                                if v.readable { "".into() } else { "unreadable".into() },
+                            ]
+                        })
+                        .collect();
+                    print_table(&["id", "desired", "phase", "health", "note"], &rows);
+                }
+            }
+        }
+ 
+        AgentCmd::Inspect { id } => {
+            let body = client.get(&format!("/vms/{id}")).await?;
+            print_json(&body);
+        }
+ 
+        AgentCmd::Observe { id } => {
+            let body = client.get(&format!("/vms/{id}/observe")).await?;
+            match global.output {
+                OutputFormat::Json => print_json(&body),
+                OutputFormat::Table => {
+                    let o: ObserveResponse =
+                        serde_json::from_slice(&body).context("parsing observe response")?;
+                    print_table(
+                        &["field", "value"],
+                        &[
+                            vec!["desired".into(), o.desired.unwrap_or_else(|| "-".into())],
+                            vec!["phase".into(), o.phase],
+                            vec!["unhealthy".into(), o.unhealthy.unwrap_or_else(|| "-".into())],
+                            vec!["tracked".into(), o.observed.tracked.to_string()],
+                            vec!["vmm_alive".into(), o.observed.vmm_alive.to_string()],
+                            vec![
+                                "socket_responsive".into(),
+                                o.observed.socket_responsive.to_string(),
+                            ],
+                            vec!["devices_alive".into(), o.observed.devices_alive.to_string()],
+                            vec!["guest".into(), o.observed.guest.unwrap_or_else(|| "-".into())],
+                            vec!["action".into(), o.action],
+                        ],
+                    );
+                }
+            }
+        }
+ 
+        AgentCmd::Reconcile { id } => {
+            let body = client.post(&format!("/vms/{id}/reconcile"), None).await?;
+            match global.output {
+                OutputFormat::Json => print_json(&body),
+                OutputFormat::Table => {
+                    let r: ActionResponse =
+                        serde_json::from_slice(&body).context("parsing reconcile response")?;
+                    println!("{}", r.action);
+                }
+            }
+        }
+ 
+        AgentCmd::Create { spec } => {
+            let raw = std::fs::read(spec)
+                .with_context(|| format!("reading spec file {}", spec.display()))?;
+            serde_json::from_slice::<serde_json::Value>(&raw)
+                .with_context(|| format!("spec file {} is not valid json", spec.display()))?;
+ 
+            let body = client.post("/vms", Some(raw)).await?;
+            match global.output {
+                OutputFormat::Json => print_json(&body),
+                OutputFormat::Table => {
+                    let c: CreatedResponse =
+                        serde_json::from_slice(&body).context("parsing create response")?;
+                    println!("{}", c.id);
+                }
+            }
+        }
+ 
+        AgentCmd::Destroy { id } => {
+            let body: Bytes = client.delete(&format!("/vms/{id}")).await?;
+            match global.output {
+                OutputFormat::Json => print_json(&body),
+                OutputFormat::Table => match serde_json::from_slice::<ActionResponse>(&body) {
+                    Ok(r) => println!("{}", r.action),
+                    Err(_) => println!("ok"),
+                },
+            }
+        }
+
+        AgentCmd::Start { id } => lifecycle(&client, global, &format!("/vms/{id}/start")).await?,
+        AgentCmd::Stop { id, grace } => {
+            let path = match grace {
+                Some(g) => format!("/vms/{id}/stop?grace_secs={g}"),
+                None => format!("/vms/{id}/stop"),
+            };
+            lifecycle(&client, global, &path).await?;
+        }
+        AgentCmd::Pause { id } => lifecycle(&client, global, &format!("/vms/{id}/pause")).await?,
+        AgentCmd::Resume { id } => lifecycle(&client, global, &format!("/vms/{id}/resume")).await?,
+    }
+    Ok(())
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+async fn lifecycle(client: &Client, global: &GlobalArgs, path: &str) -> Result<()> {
+    let body = client.post(path, None).await?;
+    match global.output {
+        OutputFormat::Json => print_json(&body),
+        OutputFormat::Table => {
+            let r: ActionResponse =
+                serde_json::from_slice(&body).context("parsing lifecycle response")?;
+            println!("{}", r.action);
+        }
+    }
+    Ok(())
+}
+ 
+#[generated(model = ClaudeOpus, version = "4.8")]
+fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+ 
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("{prompt} — refusing without a tty; pass --yes");
+    }
+    eprint!("{prompt} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+}
+
+```
+
+## components/cli/src/client.rs
+```rs
+use std::path::PathBuf;
+use std::time::Duration;
+ 
+use anyhow::{bail, Context, Result};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{Method, Request, StatusCode};
+use hyper_util::rt::TokioIo;
+use macros::generated;
+use tokio::net::UnixStream;
+ 
+use crate::config::{Credential, Target};
+ 
+pub enum Transport {
+    Unix(PathBuf),
+    Https(String),
+}
+ 
+#[generated(model = ClaudeOpus, version = "4.8")]
+pub fn transport_for(endpoint: &str) -> Result<Transport> {
+    if let Some(path) = endpoint.strip_prefix("unix://") {
+        if path.is_empty() {
+            bail!("endpoint {endpoint:?} has no socket path");
+        }
+        return Ok(Transport::Unix(PathBuf::from(path)));
+    }
+    if endpoint.starts_with("https://") || endpoint.starts_with("http://") {
+        return Ok(Transport::Https(endpoint.trim_end_matches('/').to_string()));
+    }
+    bail!("unsupported endpoint scheme in {endpoint:?}; expected unix:// or https://")
+}
+ 
+pub struct Client {
+    transport: Transport,
+    /// Fertiger `Authorization`-Wert, oder `None`.
+    auth: Option<String>,
+    timeout: Duration,
+}
+ 
+impl Client {
+    #[generated(model = ClaudeOpus, version = "4.8")]
+    pub fn new(target: &Target) -> Result<Self> {
+        let auth = match &target.credential {
+            Credential::None => None,
+            Credential::Bearer(token) => Some(format!("Bearer {token}")),
+            Credential::Mtls { .. } => {
+                bail!("mTLS is not supported yet")
+            }
+        };
+        Ok(Self {
+            transport: transport_for(&target.endpoint)?,
+            auth,
+            timeout: Duration::from_secs(target.timeout_secs),
+        })
+    }
+ 
+    pub async fn get(&self, path: &str) -> Result<Bytes> {
+        self.request(Method::GET, path, None).await
+    }
+ 
+    pub async fn post(&self, path: &str, body: Option<Vec<u8>>) -> Result<Bytes> {
+        self.request(Method::POST, path, body).await
+    }
+ 
+    pub async fn delete(&self, path: &str) -> Result<Bytes> {
+        self.request(Method::DELETE, path, None).await
+    }
+ 
+    #[generated(model = ClaudeOpus, version = "4.8")]
+    pub async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<Bytes> {
+        let socket = match &self.transport {
+            Transport::Unix(p) => p.clone(),
+            Transport::Https(_) => {
+                bail!("https endpoints are not supported yet (no controller to talk to)")
+            }
+        };
+ 
+        let auth = self.auth.clone();
+        let path = path.to_string();
+        let label = path.clone();
+ 
+        tokio::time::timeout(self.timeout, async move {
+            let stream = UnixStream::connect(&socket).await.with_context(|| {
+                format!(
+                    "connecting to {} — is the agent running, and do you have \
+                     permission on the socket?",
+                    socket.display()
+                )
+            })?;
+ 
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+ 
+            let payload = body.map(Bytes::from).unwrap_or_default();
+            let has_body = !payload.is_empty();
+ 
+            let mut req = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("Host", "localhost")
+                .header("Accept", "application/json");
+            if has_body {
+                req = req.header("Content-Type", "application/json");
+            }
+            if let Some(a) = &auth {
+                req = req.header("Authorization", a);
+            }
+ 
+            let res = sender.send_request(req.body(Full::new(payload))?).await?;
+            let status = res.status();
+            let bytes = res.into_body().collect().await?.to_bytes();
+ 
+            if !status.is_success() {
+                bail!("{}", describe_error(status, &bytes, &path));
+            }
+            Ok(bytes)
+        })
+        .await
+        .with_context(|| format!("request to {label} timed out"))?
+    }
+}
+ 
+#[generated(model = ClaudeOpus, version = "4.8")]
+fn describe_error(status: StatusCode, body: &Bytes, path: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct ErrBody {
+        error: String,
+    }
+    match serde_json::from_slice::<ErrBody>(body) {
+        Ok(e) => format!("{status}: {}", e.error),
+        Err(_) if body.is_empty() => format!("{status} for {path}"),
+        Err(_) => format!("{status}: {}", String::from_utf8_lossy(body).trim()),
+    }
+}
+ 
+#[generated(model = ClaudeOpus, version = "4.8")]
+pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < widths.len() {
+                widths[i] = widths[i].max(cell.chars().count());
+            }
+        }
+    }
+ 
+    let line = |cells: &[String]| {
+        let rendered: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let pad = widths.get(i).copied().unwrap_or(0);
+                format!("{c:<pad$}")
+            })
+            .collect();
+        println!("{}", rendered.join("  ").trim_end());
+    };
+ 
+    line(&headers.iter().map(|h| h.to_uppercase()).collect::<Vec<_>>());
+    for row in rows {
+        line(row);
+    }
+}
+ 
+pub fn print_json(bytes: &Bytes) {
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+        Err(_) => println!("{}", String::from_utf8_lossy(bytes)),
+    }
+}
+
+```
+
+## components/cli/src/config.rs
+```rs
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+ 
+use anyhow::{bail, Context, Result};
+use macros::generated;
+use serde::{Deserialize, Serialize};
+ 
+pub const ENV_CONFIG: &str = "MEISTER_CONFIG";
+pub const ENV_PROFILE: &str = "MEISTER_PROFILE";
+pub const ENV_ENDPOINT: &str = "MEISTER_ENDPOINT";
+pub const ENV_TOKEN: &str = "MEISTER_TOKEN";
+ 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    Agent,
+    Cluster,
+    Cloud,
+}
+ 
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Tier::Agent => "agent",
+            Tier::Cluster => "cluster",
+            Tier::Cloud => "cloud",
+        };
+        f.write_str(s)
+    }
+}
+ 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CredentialSource {
+    None,
+    TokenFile { path: PathBuf },
+    Env { var: String },
+    Command { command: Vec<String> },
+    Mtls { cert: PathBuf, key: PathBuf },
+}
+ 
+impl Default for CredentialSource {
+    fn default() -> Self {
+        CredentialSource::None
+    }
+}
+ 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    pub tier: Tier,
+    pub endpoint: String,
+    #[serde(default)]
+    pub ca_cert: Option<PathBuf>,
+    #[serde(default)]
+    pub credential: CredentialSource,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+ 
+fn default_timeout_secs() -> u64 {
+    30
+}
+ 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default)]
+    pub default_profile: Option<String>,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, Profile>,
+    #[serde(skip)]
+    pub dir: Option<PathBuf>,
+}
+
+/// Default config Paths are $MESTER_CONFIG >> $XDG_CONFIG_HOME/meisterstack/config.toml >>
+/// ~/.config/meisterstack/config.toml 
+#[generated(model = ClaudeOpus, version = "4.8")]
+pub fn default_config_path() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var(ENV_CONFIG) {
+        return Ok(PathBuf::from(p));
+    }
+    let base = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => {
+            let home = std::env::var("HOME").context("neither XDG_CONFIG_HOME nor HOME is set")?;
+            PathBuf::from(home).join(".config")
+        }
+    };
+    Ok(base.join("meisterstack").join("config.toml"))
+}
+ 
+impl Config {
+    #[generated(model = ClaudeOpus, version = "4.8")]
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => {
+                let mut cfg: Config = toml::from_str(&raw)
+                    .with_context(|| format!("parsing config file {}", path.display()))?;
+                cfg.dir = path.parent().map(Path::to_path_buf);
+                Ok(cfg)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => {
+                Err(e).with_context(|| format!("reading config file {}", path.display()))
+            }
+        }
+    }
+}
+ 
+#[derive(Debug, Default)]
+pub struct Overrides {
+    pub profile: Option<String>,
+    pub endpoint: Option<String>,
+}
+ 
+#[derive(Debug)]
+pub struct Target {
+    pub profile_name: String,
+    pub tier: Tier,
+    pub endpoint: String,
+    pub ca_cert: Option<PathBuf>,
+    pub credential: Credential,
+    pub timeout_secs: u64,
+}
+ 
+pub enum Credential {
+    None,
+    Bearer(String),
+    Mtls { cert: PathBuf, key: PathBuf },
+}
+ 
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credential::None => f.write_str("None"),
+            Credential::Bearer(_) => f.write_str("Bearer(<redacted>)"),
+            Credential::Mtls { cert, .. } => {
+                write!(f, "Mtls {{ cert: {} }}", cert.display())
+            }
+        }
+    }
+}
+ 
+#[generated(model = ClaudeOpus, version = "4.8")]
+pub fn resolve(config: &Config, expected_tier: Tier, ov: &Overrides) -> Result<Target> {
+    let profile_name = ov
+        .profile
+        .clone()
+        .or_else(|| std::env::var(ENV_PROFILE).ok().filter(|s| !s.is_empty()))
+        .or_else(|| config.default_profile.clone());
+ 
+    let endpoint_override = ov
+        .endpoint
+        .clone()
+        .or_else(|| std::env::var(ENV_ENDPOINT).ok().filter(|s| !s.is_empty()));
+ 
+    let (name, profile) = match &profile_name {
+        Some(name) => {
+            let p = config.profiles.get(name).ok_or_else(|| {
+                let known: Vec<&str> = config.profiles.keys().map(String::as_str).collect();
+                anyhow::anyhow!(
+                    "unknown profile {name:?}; configured profiles: {}",
+                    if known.is_empty() { "<none>".into() } else { known.join(", ") }
+                )
+            })?;
+            (name.clone(), Some(p))
+        }
+        None => ("<flags>".to_string(), None),
+    };
+ 
+    if let Some(p) = profile {
+        if p.tier != expected_tier {
+            bail!(
+                "profile {name:?} targets the {} tier, but this command talks to the {} tier",
+                p.tier,
+                expected_tier
+            );
+        }
+    }
+ 
+    let endpoint = endpoint_override
+        .or_else(|| profile.map(|p| p.endpoint.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no endpoint: pass --endpoint, set {ENV_ENDPOINT}, or select a profile"
+            )
+        })?;
+ 
+    let credential = match std::env::var(ENV_TOKEN).ok().filter(|s| !s.is_empty()) {
+        Some(token) => Credential::Bearer(token),
+        None => match profile.map(|p| &p.credential) {
+            Some(src) => load_credential(src, config.dir.as_deref())?,
+            None => Credential::None,
+        },
+    };
+ 
+    Ok(Target {
+        profile_name: name,
+        tier: expected_tier,
+        endpoint,
+        ca_cert: profile.and_then(|p| p.ca_cert.clone()).map(|p| resolve_path(config.dir.as_deref(), p)),
+        credential,
+        timeout_secs: profile.map(|p| p.timeout_secs).unwrap_or_else(default_timeout_secs),
+    })
+}
+ 
+#[generated(model = ClaudeOpus, version = "4.8")]
+fn load_credential(src: &CredentialSource, base: Option<&Path>) -> Result<Credential> {
+    match src {
+        CredentialSource::None => Ok(Credential::None),
+ 
+        CredentialSource::Env { var } => {
+            let token = std::env::var(var)
+                .with_context(|| format!("credential env var {var} is not set"))?;
+            Ok(Credential::Bearer(token.trim().to_string()))
+        }
+ 
+        CredentialSource::TokenFile { path } => {
+            let path = resolve_path(base, path.clone());
+            check_secret_permissions(&path)?; 
+            let token = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading token file {}", path.display()))?;
+            Ok(Credential::Bearer(token.trim().to_string()))
+        }
+ 
+        CredentialSource::Command { command } => {
+            let Some((bin, args)) = command.split_first() else {
+                bail!("credential command is empty");
+            };
+            let out = std::process::Command::new(bin)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .with_context(|| format!("running credential command {bin}"))?;
+            if !out.status.success() {
+                bail!(
+                    "credential command {bin} failed with {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            let token = String::from_utf8(out.stdout)
+                .context("credential command produced non-utf8 output")?;
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                bail!("credential command {bin} produced no output");
+            }
+            Ok(Credential::Bearer(token))
+        }
+ 
+        CredentialSource::Mtls { cert, key } => {
+            let cert = resolve_path(base, cert.clone());
+            let key = resolve_path(base, key.clone());
+            check_secret_permissions(&key)?;
+            Ok(Credential::Mtls { cert, key })
+        }    
+    }
+}
+ 
+#[cfg(unix)]
+#[generated(model = ClaudeOpus, version = "4.8")]
+fn check_secret_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+ 
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "permissions {:04o} on {} are too open; run: chmod 600 {}",
+            mode,
+            path.display(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+ 
+#[cfg(not(unix))]
+fn check_secret_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn resolve_path(base: Option<&Path>, path: PathBuf) -> PathBuf {
+    let path = expand_tilde(path);
+    if path.is_absolute() {
+        return path;
+    }
+    match base {
+        Some(b) => b.join(path),
+        None => path,
+    }
+}
+ 
+fn expand_tilde(path: PathBuf) -> PathBuf {
+    let Ok(rest) = path.strip_prefix("~") else {
+        return path;
+    };
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join(rest),
+        Err(_) => path,
+    }
+}
+ 
+
+```
+
+## components/cli/src/main.rs
+```rs
+use anyhow::Result;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use tracing::{debug};
+ 
+mod config;
+mod client;
+mod agent;
+
+use config::{Config, Overrides, Tier};
+ 
+#[derive(Parser)]
+#[command(
+    name = "meister",
+    about = "MeisterStack control CLI",
+    version,
+    arg_required_else_help = true
+)]
+struct Cli {
+    #[command(flatten)]
+    global: GlobalArgs,
+    #[command(subcommand)]
+    cmd: TierCmd,
+}
+ 
+#[derive(Args, Debug)]
+pub struct GlobalArgs {
+    #[arg(long, short = 'p', global = true)]
+    profile: Option<String>,
+ 
+    #[arg(long, global = true)]
+    endpoint: Option<String>,
+ 
+    #[arg(long, global = true)]
+    config: Option<std::path::PathBuf>,
+ 
+    #[arg(long, short = 'o', global = true, default_value = "table")]
+    output: OutputFormat,
+ 
+    #[arg(long, global = true)]
+    yes: bool,
+ 
+    #[arg(long, short = 'v', global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+}
+ 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum OutputFormat {
+    Table,
+    Json,
+}
+ 
+#[derive(Subcommand)]
+enum TierCmd {
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    },
+    Cluster {
+        #[command(subcommand)]
+        cmd: ClusterCmd,
+    },
+    Cloud {
+        #[command(subcommand)]
+        cmd: CloudCmd,
+    },
+}
+ 
+#[derive(Subcommand)]
+pub enum AgentCmd {
+    Ls,
+    Inspect { id: String },
+    Observe { id: String },
+    Reconcile { id: String },
+    Create {
+        #[arg(long)]
+        spec: std::path::PathBuf,
+    },
+    Destroy { id: String },
+    Start { id: String },
+    Stop {
+        id: String,
+        #[arg(long)]
+        grace: Option<u64>,
+    },
+    Pause { id: String },
+    Resume { id: String },
+}
+ 
+#[derive(Subcommand)]
+enum ClusterCmd {
+    Nodes,
+}
+ 
+#[derive(Subcommand)]
+enum CloudCmd {
+    Clusters,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+ 
+    let filter = match cli.global.verbose {
+        0 => "warn",
+        1 => "info",
+        _ => "debug",
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| filter.into()),
+        )
+        .with_writer(std::io::stderr)
+        .without_time()
+        .init();
+ 
+    let config_path = match &cli.global.config {
+        Some(p) => p.clone(),
+        None => config::default_config_path()?,
+    };
+    let cfg = Config::load(&config_path)?;
+ 
+    let overrides = Overrides {
+        profile: cli.global.profile.clone(),
+        endpoint: cli.global.endpoint.clone(),
+    };
+ 
+    match &cli.cmd {
+        TierCmd::Agent { cmd } => {
+            let target = config::resolve(&cfg, Tier::Agent, &overrides)?;
+            debug!(profile = %target.profile_name, endpoint = %target.endpoint, "resolved target");
+            agent::run(&target, cmd, &cli.global).await
+        }
+        TierCmd::Cluster { .. } => {
+            let _ = config::resolve(&cfg, Tier::Cluster, &overrides)?;
+            anyhow::bail!("the cluster controller is not implemented yet")
+        }
+        TierCmd::Cloud { .. } => {
+            let _ = config::resolve(&cfg, Tier::Cloud, &overrides)?;
+            anyhow::bail!("the cloud controller is not implemented yet")
+        }
+    }
+}
+ 
+fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::{BufRead, Write};
+ 
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        anyhow::bail!("{prompt} — refusing without a tty; pass --yes");
+    }
+    eprint!("{prompt} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+}
+
+```
+
+## components/cloud-controller/Cargo.toml
+```toml
+[package]
+name = "meister-cloud-controller"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+```
+
+## components/cloud-controller/src/main.rs
+```rs
+fn main() {
+    println!("Hello, world!");
+}
+
+```
+
+## components/cluster-controller/Cargo.toml
+```toml
+[package]
+name = "meister-cluster-controller"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+```
+
+## components/cluster-controller/src/main.rs
+```rs
+fn main() {
+    println!("Hello, world!");
+}
+
+```
+
+## config/agent.dev.toml
+```toml
+node_id = "manacor"
+#controller_addr = "http://127.0.0.1:50051"
+
+[paths]
+db_path = "../data/lib/meisterstack/agent.redb"
+run_dir = "/tmp/run/meisterstack"
+image_dir = "../images"
+volume_dir = "../data/lib/meisterstack/volumes"
+cgroup_root = "/sys/fs/cgroup/meisterstack"
+
+[hypervisor.cloud-hypervisor]
+binary = "./bin/cloud-hypervisor"
+timeout_ms = 5000
+
+[network]
+default_bridge = "meister_br0"
+bridge_addr = "192.168.100.1/24" # optional, only required when no cntroller is active, overridden by controller
+
+[device.crosvm-gpu]
+binary = "./bin/crosvm"
+socket_timeout_ms = 5000
+
+[device.crosvm-gpu.defaults]
+backend = "virglrenderer"
+vulkan = true
+context_types = "venus"
+external_blob = true
+pci_bar_size = 2147483648 # in bytes 2048 * 1024 * 1024
+implicit_render_server = true
+# render_device = "/dev/dri/renderD128" //TODO multi-gpu support? scheduling over multiple GPUs is not supported atm
+
+[device.crosvm-gpu.profiles.venus]
+context_types = "venus"
+
+[device.crosvm-gpu.profiles.gfxstream]
+backend = "gfxstream"
+context_types = "gfxstream-vulkan"
+
+[[device.managed]]
+kind = "nic-sriov"
+pci_address = "0000:23:00.0"
+
+```
+
+## config/cli.dev.toml
+```toml
+default_profile = "lab"
+
+[profiles.lab]
+tier = "agent"
+endpoint = "unix:///tmp/run/meisterstack/agent.sock"
+credential = { type = "none" }
+
+[profiles.cluster-a]
+tier = "cluster"
+endpoint = "https://cluster-a.lab.internal:8443"
+ca_cert = "data/meisterstack/ca.pem"
+credential = { type = "token_file", path = "token" }
+
+[profiles.cloud]
+tier = "cloud"
+endpoint = "https://cloud.example.com"
+credential = { type = "command", command = ["pass", "show", "meisterstack/cloud"] }
+
+```
+
+## drivers/cgroup/Cargo.toml
+```toml
+[package]
+name = "meister-cgroup-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+agent-api = { package = "meister-agent-api", path = "../../shared/agent-api/" }
+macros = { package = "meister-macros", path = "../../shared/macros/" }
+libc = { workspace = true }
+tracing = { workspace = true }
+
+```
+
+## drivers/cgroup/src/lib.rs
+```rs
+use std::path::{PathBuf};
+use agent_api::{ResourceConfiner, ResourceLimits, CgroupHandle, ConfinerResult};
+use macros::{generated};
+use tracing::{warn};
+
+/// This driver only supports Linux cgroups_v2
+pub struct CgroupV2 {
+    root: PathBuf,
+}
+
+impl CgroupV2 {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into()
+        }
+    }
+}
+
+#[generated(model = ClaudeOpus, version = "4.8")]
+impl ResourceConfiner for CgroupV2 {
+    fn create_slice(&self, name: &str, parent: Option<&CgroupHandle>, limits: &ResourceLimits) -> ConfinerResult<CgroupHandle> {
+        let parent_dir = parent.map(|p| p.path.clone()).unwrap_or_else(|| self.root.clone());
+        std::fs::create_dir_all(&parent_dir)?;
+
+        std::fs::write(parent_dir.join("cgroup.subtree_control"), "+cpu +memory")?;
+
+        let dir = parent_dir.join(name);
+        std::fs::create_dir_all(&dir)?;
+
+        if let Some(bytes) = limits.memory_max {
+            std::fs::write(dir.join("memory.max"), bytes.to_string())?;
+        }
+
+        if let Some(pct) = limits.cpu_quota {
+            let period = 100_000u64;                    // µs
+            let quota = period * pct as u64 / 100;      // 200% -> "200000 100000"
+            std::fs::write(dir.join("cpu.max"), format!("{quota} {period}"))?;
+        }
+        Ok(CgroupHandle { path: dir })
+    }
+
+    fn open_slice(&self, name: &str) -> CgroupHandle {
+        CgroupHandle { path: self.root.join(name) }
+    }
+
+    fn destroy_slice(&self, cg: &CgroupHandle) -> ConfinerResult<()> {
+        use std::io::ErrorKind;
+        for attempt in 0..10 {
+            match std::fs::remove_dir(&cg.path) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) && attempt < 9 => {
+                    warn!(path = %cg.path.display(), attempt, "cgroup busy, retrying");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        unreachable!()
+    }
+
+    #[generated(model = ClaudeFable, version = "5")]
+    fn pids_in_slice(&self, name: &str) -> ConfinerResult<Vec<u32>> {
+        match std::fs::read_to_string(self.root.join(name).join("cgroup.procs")) {
+            Ok(s) => Ok(s.lines().filter_map(|l| l.trim().parse().ok()).collect()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    #[generated(model = ClaudeFable, version = "5")]
+    fn kill_slice(&self, name: &str) -> ConfinerResult<()> {
+        match std::fs::write(self.root.join(name).join("cgroup.kill"), "1") {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+} 
+
+```
+
+## drivers/cloud-hypervisor/Cargo.toml
+```toml
+[package]
+name = "meister-cloud-hypervisor-driver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+macros = { package = "meister-macros", path = "../../shared/macros/" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
+uuid = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true } 
+http-body-util = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true }
+
+```
+
+## drivers/cloud-hypervisor/src/lib.rs
+```rs
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
+use tokio::process::{Child, Command};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::{Method, Request};
+use tokio::net::UnixStream;
+use anyhow::{bail, Context};
+use hyper_util::rt::TokioIo;
+use std::process::Stdio;
+use agent_api::{Hypervisor, HypervisorError, InstanceSpec, VmId, VmState, CgroupHandle, DeviceAttachment, BootSource, Pausable};
+use agent_api::hypervisor;
+use macros::{generated};
+use tracing::{instrument, info, warn, debug};
+
+enum VmProcess {
+    Owned(Child),
+    Adopted { pid: u32 },
+}
+
+struct RunningVm {
+    process: VmProcess,
+}
+
+pub struct CloudHypervisorDriver {
+    binary: PathBuf,
+    socket_dir: PathBuf,
+    vms: Mutex<HashMap<VmId, RunningVm>>,
+    ch_timeout: Duration
+}
+
+impl CloudHypervisorDriver {
+    pub fn new(binary: PathBuf, socket_dir: PathBuf, ch_timeout: Duration) -> hypervisor::Result<Self> {
+        std::fs::create_dir_all(&socket_dir).map_err(|e| {
+            HypervisorError::Backend(anyhow::anyhow!(
+                "creating socket dir {}: {e}",
+                socket_dir.display()
+            ))
+        })?;
+        Ok(Self {
+            binary,
+            socket_dir,
+            vms: Mutex::new(HashMap::new()),
+            ch_timeout,
+        })
+    }
+
+    fn vm_socket_path(&self, id: &VmId) -> PathBuf {
+        self.socket_dir.join(format!("{id}.sock"))
+    }
+
+    fn vm_known(&self, id: &VmId) -> hypervisor::Result<()> {
+        if self.vms.lock().unwrap().contains_key(id) {
+            Ok(())
+        } else {
+            Err(HypervisorError::NotFound(*id))
+        }
+    }
+    
+    async fn api(&self, id: &VmId, method: Method, endpoint: &str, body: Option<serde_json::Value>) -> hypervisor::Result<Bytes> {
+        let socket = self.vm_socket_path(id);
+        ch_api(&socket, method, endpoint, body, self.ch_timeout).await.map_err(HypervisorError::Backend)
+    }
+}
+
+#[async_trait::async_trait]
+impl Hypervisor for CloudHypervisorDriver {
+    #[instrument(skip_all, fields(vm_id = %id))]
+    async fn create(&self, id: &VmId, spec: &InstanceSpec, cgroup: Option<&CgroupHandle>) -> hypervisor::Result<u32> {
+        // vm logs into file
+        let log = std::fs::File::create(self.socket_dir.join(format!("{id}.log")))
+            .map_err(|e| HypervisorError::Backend(e.into()))?;
+        let log2 = log.try_clone().map_err(|e| HypervisorError::Backend(e.into()))?;
+        let console_path = self.socket_dir.join(format!("{id}.console"));
+        let serial_path = self. socket_dir.join(format!("{id}.serial"));
+
+        let config = build_vm_config(spec, &console_path, &serial_path)?;
+        let socket = self.vm_socket_path(id);
+        let _ = std::fs::remove_file(&socket);
+
+        // create process without booting VM
+        let mut process = Command::new(&self.binary)
+            .arg("--api-socket").arg(&socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log2))
+            .spawn()
+            .map_err(|e| HypervisorError::Backend(e.into()))?;
+        let pid = process.id().ok_or_else(|| {
+            HypervisorError::Backend(anyhow::anyhow!("cloud-hypervisor exited before pid could be read"))
+        })?;
+        debug!(pid, "cloud-hypervisor spawned");
+
+        // put process into cgroup before VM boot
+        if let Some(cg) = cgroup {
+            if let Err(e) = cg.attach_pid(pid) {
+                let _ = process.kill().await;
+                return Err(HypervisorError::Backend(e.into()));
+            }
+        }
+
+        // wait for API to be ready, if not ready after ch_timeout -> kill process
+        let mut ready = false;
+        for attempt in 0..100 {
+            if self.api(id, Method::GET, "vmm.ping", None).await.is_ok() {
+                debug!(attempt, "vmm api ready");
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !ready {
+            warn!("vmm api not reachable, killing process");
+            let _ = process.kill().await;
+            return Err(HypervisorError::Backend(anyhow::anyhow!("Cloud-Hypervisor API not reachable for socket: {socket:?}")));
+        }
+        
+        // create VM itself
+        if let Err(e) = self.api(id, Method::PUT, "vm.create", Some(config)).await {
+            let _ = process.kill().await;
+            return Err(e);
+        }
+        
+        self.vms.lock().unwrap().insert(*id, RunningVm { process: VmProcess::Owned(process) });
+        debug!("vm created, not booted");
+        Ok(pid)
+    }
+   
+    #[instrument(skip_all, fields(vm_id = %id))]
+    async fn start(&self, id: &VmId) -> hypervisor::Result<()> {
+        self.vm_known(id)?;
+        self.api(id, Method::PUT, "vm.boot", None).await.map(|_| ())
+    }
+    
+    #[instrument(skip_all, fields(vm_id = %id))]
+    async fn shutdown(&self, id: &VmId) -> hypervisor::Result<()> {
+        self.vm_known(id)?;
+        self.api(id, Method::PUT, "vm.shutdown", None).await.map(|_| ())
+    }
+    #[instrument(skip_all, fields(vm_id = %id))]
+    async fn power_button(&self, id: &VmId) -> hypervisor::Result<()> {
+        self.vm_known(id)?;
+        self.api(id, Method::PUT, "vm.power-button", None).await.map(|_| ())
+    }
+    // telemetry with RUST_LOG=...=trace
+    #[instrument(level = "trace", skip_all, fields(vm_id = %id))]
+    async fn get_state(&self, id: &VmId) -> hypervisor::Result<VmState> {
+        self.vm_known(id)?;
+        let bytes = self.api(id, Method::GET, "vm.info", None).await?;
+        let info: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| HypervisorError::Backend(e.into()))?;
+
+        match info.get("state").and_then(|s| s.as_str()).unwrap_or("") {
+            "Created"  => Ok(VmState::Defined),
+            "Running"  => Ok(VmState::Running),
+            "Paused"   => Ok(VmState::Paused),
+            "Shutdown" => Ok(VmState::Stopped),
+            other => Err(HypervisorError::Backend(anyhow::anyhow!(
+                "unknown Cloud-Hypervisor state: {other}"))),
+        }
+    }
+    
+    #[instrument(skip_all, fields(vm_id = %id))]
+    async fn destroy(&self, id: &VmId) -> hypervisor::Result<()> {
+        let vm = self.vms.lock().unwrap().remove(id);
+        let vm = vm.ok_or(HypervisorError::NotFound(*id))?;
+
+        if let Err(e) = self.api(id, Method::PUT, "vmm.shutdown", None).await {
+            debug!(error = %e, "vmm.shutdown failed, killing process anyway");
+        }
+
+        match vm.process {
+            VmProcess::Owned(mut child) => {
+                let _ = child.kill().await;
+            }
+            VmProcess::Adopted { pid } => {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(self.vm_socket_path(id));
+        Ok(())
+    }
+
+    #[generated(model = ClaudeFable, version = "5")]
+    async fn adopt(&self, id: &VmId, pid: u32) -> hypervisor::Result<()> {
+        if self.vms.lock().unwrap().contains_key(id) {
+            return Ok(()); // idempotent; Owned nie überschreiben
+        }
+        if !self.probe(id).await {
+            return Err(HypervisorError::Backend(anyhow::anyhow!(
+                "vmm api not responsive, cannot adopt"
+            )));
+        }
+        self.vms.lock().unwrap()
+            .insert(*id, RunningVm { process: VmProcess::Adopted { pid } });
+        info!(vm_id = %id, pid, "adopted running vmm");
+        Ok(())
+    }
+
+    async fn probe(&self, id: &VmId) -> bool {
+        self.api(id, Method::GET, "vmm.ping", None).await.is_ok()
+    }
+
+    fn is_tracked(&self, id: &VmId) -> bool {
+        self.vms.lock().unwrap().contains_key(id)
+    }
+
+    fn as_pausable(&self) -> Option<&dyn Pausable> {
+        Some(self)
+    }
+}
+
+fn build_vm_config(spec: &InstanceSpec, console_path: &PathBuf, serial_path: &PathBuf) -> hypervisor::Result<serde_json::Value> {
+    let has_vhost_user = spec
+        .devices
+        .iter()
+        .any(|d| matches!(d, DeviceAttachment::VhostUser { .. }));
+
+    // handle optional kernel & initramfs for direct-kernel boot, not required for UEFI boot
+    let payload = match &spec.boot {
+        BootSource::DirectKernel { kernel, cmdline, initramfs } => {
+            let mut p = serde_json::json!({ "kernel": kernel, "cmdline": cmdline });
+            if let Some(i) = initramfs {
+                p["initramfs"] = serde_json::json!(i);
+            }
+            p
+        }
+        BootSource::Firmware { firmware } => serde_json::json!({ "firmware": firmware }),
+    };
+
+    let mut config = serde_json::json!({
+        "cpus":   { "boot_vcpus": spec.vcpus, "max_vcpus": spec.vcpus },
+        "memory": {
+            "size": spec.memory_mib * 1024 * 1024,
+            "shared": has_vhost_user,
+        },
+        "payload": payload, 
+        "disks":  [ { "path": spec.disk } ],
+        "console": { "mode": "File", "file": console_path },
+        "serial": { "mode": "File", "file": serial_path }
+        
+    });
+    
+    if !spec.nics.is_empty() {
+        config["net"] = spec.nics.iter().map(|n| {
+            serde_json::json!({ "tap": n.tap_name, "mac": n.mac.to_string() })
+        }).collect::<Vec<_>>().into();
+    }
+
+    let mut gpu_devices = Vec::new();
+    let mut vfio_devices = Vec::new();
+    for dev in &spec.devices {
+        match dev {
+            DeviceAttachment::VhostUser { socket, .. } => {
+                gpu_devices.push(serde_json::json!({ "socket": socket }));
+            }
+            DeviceAttachment::VfioPci { sysfs_path } => {
+                vfio_devices.push(serde_json::json!({ "path": sysfs_path }));
+            }
+            other => {
+                return Err(HypervisorError::InvalidSpec(format!(
+                    "attachment type not yet supported by CH driver: {other:?}"
+                )));
+            }
+        }
+    }
+    if !gpu_devices.is_empty() {
+        config["gpu"] = gpu_devices.into();
+    }
+    if !vfio_devices.is_empty() {
+        config["devices"] = vfio_devices.into();
+    }
+    Ok(config)
+}
+
+#[async_trait::async_trait]
+impl Pausable for CloudHypervisorDriver {
+
+    #[instrument(skip_all, fields(vm_id = %id))]
+    async fn pause(&self, id: &VmId) -> hypervisor::Result<()> {
+        self.vm_known(id)?;
+        self.api(id, Method::PUT, "vm.pause", None).await.map(|_| ())
+    }
+
+    #[instrument(skip_all, fields(vm_id = %id))]
+    async fn resume(&self, id: &VmId) -> hypervisor::Result<()> {
+        self.vm_known(id)?;
+        self.api(id, Method::PUT, "vm.resume", None).await.map(|_| ())
+    }
+}
+
+
+// tracing here via ENV: RUST_LOG=cloud_hypervisor_driver=trace
+#[generated(model = ClaudeOpus, version = "4.8")]
+#[instrument(level = "trace", skip(socket, body, ch_timeout), fields(%endpoint))]
+async fn ch_api(socket: &Path, method: Method, endpoint: &str, body: Option<serde_json::Value>, ch_timeout: Duration) -> anyhow::Result<Bytes> {
+    tokio::time::timeout(ch_timeout, async move {   // times out after ch_timeout
+        let stream = UnixStream::connect(socket).await
+            .with_context(|| format!("connect {}", socket.display()))?;
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        tokio::spawn(async move { let _ = conn.await; });
+
+        let payload = match &body {
+            Some(v) => Bytes::from(serde_json::to_vec(v)?),
+            None => Bytes::new(),
+        };
+        let req = Request::builder()
+            .method(method)
+            .uri(format!("/api/v1/{endpoint}"))
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json")
+            .body(Full::new(payload))?;
+
+        let res = sender.send_request(req).await?;
+        let status = res.status();
+        let bytes = res.into_body().collect().await?.to_bytes();
+        if !status.is_success() {
+            bail!("ch {endpoint} -> {status}: {}", String::from_utf8_lossy(&bytes));
+        }
+        Ok(bytes)
+    })
+    .await
+    .with_context(|| format!("ch {endpoint} timeout"))?
+}
+
+```
+
+## drivers/crosvm-gpu/Cargo.toml
+```toml
+[package]
+name = "meister-crosvm-gpu-driver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
+macros = { package = "meister-macros", path = "../../shared/macros" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+nix = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+```
+
+## drivers/crosvm-gpu/src/lib.rs
+```rs
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
+use tracing::{instrument, info, warn, debug};
+use agent_api::device::{self, Device, DeviceAttachment, DeviceDriver, DeviceError, DeviceId, DeviceSpec, PartitionSpec};
+use agent_api::CgroupHandle;
+use tokio::sync::Mutex;
+
+use macros::generated;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuParams {
+    pub backend: String, // virglrenderer or gfxstream
+    pub vulkan: bool,
+    pub context_types: String,
+    pub external_blob: bool,
+    pub pci_bar_size: u64, // basically VRAM
+    pub implicit_render_server: bool,
+}
+
+impl Default for GpuParams {
+    fn default() -> Self {
+        Self {
+            backend: "virglrenderer".into(),
+            vulkan: true,
+            context_types: "venus".into(),
+            external_blob: true,
+            pci_bar_size: 256 * 1024 * 1024, 
+            implicit_render_server: true,
+        }
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+fn crosvm_params_json(params: &GpuParams) -> device::Result<String> {
+    let value = serde_json::to_value(params)
+        .map_err(|e| DeviceError::Backend(e.into()))?;
+    let obj = value
+        .as_object()
+        .expect("GpuParams serializes to a JSON object");
+    let kebab: serde_json::Map<String, serde_json::Value> = obj
+        .iter()
+        .map(|(k, v)| (k.replace('_', "-"), v.clone()))
+        .collect();
+    serde_json::to_string(&serde_json::Value::Object(kebab))
+        .map_err(|e| DeviceError::Backend(e.into()))
+}
+
+pub struct CrosvmGpuDriverConfig {
+    pub crosvm_bin: PathBuf,
+    pub run_dir: PathBuf,
+    pub defaults: GpuParams,
+    pub profiles: HashMap<String, serde_json::Value>,
+    pub socket_timeout: Duration,
+}
+
+pub struct CrosvmGpuDriver {
+    config: CrosvmGpuDriverConfig,
+    children: Mutex<HashMap<DeviceId, tokio::process::Child>>,
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl CrosvmGpuDriver {
+    pub fn new(config: CrosvmGpuDriverConfig) -> device::Result<Self> {
+        std::fs::create_dir_all(&config.run_dir)
+            .map_err(|e| DeviceError::Backend(e.into()))?;
+
+        for (name, overrides) in &config.profiles {
+            Self::merge_params(&config.defaults, Some(overrides), None).map_err(|e| {
+                DeviceError::InvalidSpec(format!("gpu profile {name:?} is invalid: {e}"))
+            })?;
+        }
+
+        Ok(Self { config, children: Mutex::new(HashMap::new()) })
+    }
+
+    fn socket_path(&self, id: &DeviceId) -> PathBuf {
+        self.config.run_dir.join(format!("{id}.sock"))
+    }
+
+    fn log_path(&self, id: &DeviceId) -> PathBuf {
+        self.config.run_dir.join(format!("{id}.log"))
+    }
+
+    fn merge_params(
+        defaults: &GpuParams,
+        profile: Option<&serde_json::Value>,
+        spec_params: Option<&serde_json::Value>,
+    ) -> anyhow::Result<GpuParams> {
+        let mut value = serde_json::to_value(defaults)?;
+        let obj = value.as_object_mut().expect("GpuParams serializes to an object");
+
+        for (layer, overrides) in [("profile", profile), ("params", spec_params)] {
+            let Some(overrides) = overrides else { continue };
+            let ov = overrides.as_object().ok_or_else(|| {
+                anyhow::anyhow!("{layer} override must be a JSON object")
+            })?;
+            for (k, v) in ov {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+
+        serde_json::from_value(value).map_err(|e| anyhow::anyhow!("invalid gpu params: {e}"))
+    }
+
+    fn effective_params(&self, spec: &DeviceSpec) -> device::Result<GpuParams> {
+        let profile = match &spec.profile {
+            Some(name) => Some(self.config.profiles.get(name).ok_or_else(|| {
+                let mut known: Vec<&str> =
+                    self.config.profiles.keys().map(String::as_str).collect();
+                known.sort_unstable();
+                DeviceError::InvalidSpec(format!(
+                    "unknown gpu profile {name:?}; configured profiles: [{}]",
+                    known.join(", ")
+                ))
+            })?),
+            None => None,
+        };
+
+        Self::merge_params(&self.config.defaults, profile, spec.params.as_ref())
+            .map_err(|e| DeviceError::InvalidSpec(e.to_string()))
+    }
+
+    fn tail_log(&self, id: &DeviceId) -> String {
+        std::fs::read_to_string(self.log_path(id))
+            .map(|s| s.chars().rev().take(800).collect::<String>()
+                      .chars().rev().collect())
+            .unwrap_or_else(|_| "<no log>".into())
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[async_trait::async_trait]
+impl DeviceDriver for CrosvmGpuDriver {
+    #[instrument(skip_all, fields(device_id = %id))]
+    async fn create(&self, id: &DeviceId, spec: &DeviceSpec, cgroup: Option<&CgroupHandle>) -> device::Result<Device> {
+        if spec.partition != PartitionSpec::Mediated {
+            return Err(DeviceError::InvalidSpec(format!(
+                "crosvm-gpu driver only supports Mediated, got {:?}",
+                spec.partition
+            )));
+        }
+
+        let socket = self.socket_path(id);
+
+        {
+            let children = self.children.lock().await;
+            if children.contains_key(id) && socket.exists() {
+                let pid = children[id].id().unwrap_or(0);
+                return Ok(Device {
+                    id: *id,
+                    attachment: DeviceAttachment::VhostUser { socket, pid },
+                });
+            }
+        }
+        let _ = tokio::fs::remove_file(&socket).await;
+
+        let params = self.effective_params(spec)?;
+        debug!(
+            backend = %params.backend,
+            vulkan = params.vulkan,
+            profile = spec.profile.as_deref().unwrap_or("-"),
+            "starting crosvm gpu backend"
+        );
+
+        let params_json = crosvm_params_json(&params)?;
+
+        let log = std::fs::File::create(self.log_path(id))
+            .map_err(|e| DeviceError::Backend(e.into()))?;
+        let log2 = log.try_clone().map_err(|e| DeviceError::Backend(e.into()))?;
+
+        let mut child = tokio::process::Command::new(&self.config.crosvm_bin)
+            .args(["device", "gpu", "--socket-path"])
+            .arg(&socket)
+            .arg("--params")
+            .arg(&params_json)
+            .stdout(log)
+            .stderr(log2)
+            .spawn()
+            .map_err(|e| DeviceError::Backend(e.into()))?;
+        debug!(pid = child.id(), "crosvm spawned, waiting for socket");    
+
+        let pid = child.id().ok_or_else(|| {
+            DeviceError::BackendDied("exited before pid could be read".into())
+        })?;
+
+        if let Some(cg) = cgroup {
+            cg.attach_pid(pid)
+                .map_err(|e| DeviceError::Backend(anyhow::anyhow!("cgroup attach: {e}")))?;
+        }
+
+        let deadline = tokio::time::Instant::now() + self.config.socket_timeout;
+        loop {
+            if socket.exists() {
+                debug!("gpu backend already running");
+                break;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(DeviceError::BackendDied(format!(
+                    "crosvm exited with {status} before socket appeared; log tail:\n{}",
+                    self.tail_log(id)
+                )));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = child.start_kill();
+                return Err(DeviceError::BackendDied(format!(
+                    "socket did not appear within {:?}; log tail:\n{}",
+                    self.config.socket_timeout,
+                    self.tail_log(id)
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        info!(pid, "gpu backend ready");
+
+        self.children.lock().await.insert(*id, child);
+
+        Ok(Device {
+            id: *id,
+            attachment: DeviceAttachment::VhostUser { socket, pid },
+        })
+    }
+    
+    #[instrument(skip_all, fields(device_id = %id))]
+    async fn destroy(&self, id: &DeviceId) -> device::Result<()> {
+        let child = self.children.lock().await.remove(id);
+
+        if let Some(mut child) = child {
+            if let Some(pid) = child.id() {
+                debug!(pid, "sending SIGTERM to gpu backend");
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+            }
+            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(_) => {}
+                Err(_) => {
+                    warn!("gpu backend ignored SIGTERM, sending SIGKILL");
+                    let _ = child.kill().await; // SIGKILL + reap
+                }
+            }
+        }
+
+        for p in [self.socket_path(id), self.log_path(id)] {
+            match tokio::fs::remove_file(&p).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(DeviceError::Backend(e.into())),
+            }
+        }
+        Ok(())
+    }
+
+    async fn get(&self, id: &DeviceId) -> device::Result<Device> {
+        let children = self.children.lock().await;
+        match children.get(id) {
+            Some(child) => Ok(Device {
+                id: *id,
+                attachment: DeviceAttachment::VhostUser {
+                    socket: self.socket_path(id),
+                    pid: child.id().unwrap_or(0),
+                },
+            }),
+            None => Err(DeviceError::NotFound(*id)),
+        }
+    }
+
+    fn profiles(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.config.profiles.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+}
+
+```
+
+## drivers/filesystem/Cargo.toml
+```toml
+[package]
+name = "meister-filesystem-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
+macros = { package = "meister-macros", path = "../../shared/macros" }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+nix = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+```
+
+## drivers/filesystem/src/lib.rs
+```rs
+use agent_api::storage::{BlockDriver, StorageError, Volume, VolumeId, VolumeSpec};
+use agent_api::storage;
+use std::path::{Path, PathBuf};
+use macros::generated;
+use std::io::ErrorKind;
+use tracing::{instrument, debug, Span, info};
+
+pub struct FilesystemDriverConfig {
+    /// Path where images are stored. Read-only.
+    pub image_dir: PathBuf, // should be something like /var/lib/meister-agent/<uuid>/images
+    /// Directory where .raw files as images are saved.
+    pub volume_dir: PathBuf, // should be something like /var/lib/meister-agent/<uuid>/volumes
+
+}
+
+/// FileSystemBlockDriver manages <vm_id>.raw files in a specified directory to support block
+/// devices for MeisterStack it is the basic implementation and should be used as fallback.
+pub struct FilesystemBlockDriver {
+    config: FilesystemDriverConfig,
+}
+
+impl FilesystemBlockDriver {
+    pub fn new(config: FilesystemDriverConfig) -> storage::Result<Self> {
+        if !config.image_dir.is_dir() {
+            return Err(StorageError::Backend(anyhow::anyhow!(
+                "image_dir does not exist: {}",
+                config.image_dir.display()
+                )));
+        }
+        std::fs::create_dir_all(&config.volume_dir)
+            .map_err(|e| StorageError::Backend(e.into()))?;
+        Ok(Self { config })
+    }
+
+    fn volume_path(&self, id: &VolumeId) -> PathBuf {
+        self.config.volume_dir.join(format!("{id}.raw"))
+    }
+    
+    fn tmp_path(&self, id: &VolumeId) -> PathBuf {
+        self.config.volume_dir.join(format!("{id}.tmp"))
+    }
+    
+    #[generated(model = ClaudeFable, version = "5")]
+    fn clone_or_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
+        use nix::errno::Errno;
+        use nix::fcntl::copy_file_range;
+
+        let src_file = std::fs::File::open(src)?;
+        let dst_file = std::fs::File::create(dst)?;
+        let total = src_file.metadata()?.len();
+
+        let mut remaining = total as usize;
+        let mut first_call = true;
+
+        while remaining > 0 {
+            match copy_file_range(&src_file, None, &dst_file, None, remaining) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "copy_file_range returned 0 before EOF",
+                    ));
+                }
+                Ok(n) => {
+                    remaining -= n;
+                    first_call = false;
+                }
+                Err(e @ (Errno::EOPNOTSUPP | Errno::EXDEV | Errno::EINVAL))
+                    if first_call => {
+                        let _ = e;
+                        drop(dst_file);
+                        let mut s = std::fs::File::open(src)?;
+                        let mut d = std::fs::File::create(dst)?;
+                        return std::io::copy(&mut s, &mut d);
+                    }
+                Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+        Ok(total)
+    }
+}
+
+#[async_trait::async_trait]
+impl BlockDriver for FilesystemBlockDriver {
+    #[instrument(skip_all, fields(volume_id = %id, size_bytes = spec.size_bytes))]
+    async fn create(&self, id: &VolumeId, spec: &VolumeSpec) -> storage::Result<Volume> {
+        let path = self.volume_path(id);
+
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) => {
+                debug!(size_bytes = meta.len(), "volume already exists");
+                return Ok(Volume { id: *id, path, size_bytes: meta.len() });
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(StorageError::Backend(e.into())),
+        }
+
+        let src = match &spec.base_image {
+            Some(name) => {
+                let src = self.config.image_dir.join(name);
+                let meta = tokio::fs::metadata(&src).await
+                    .map_err(|_| StorageError::ImageNotFound(name.clone()))?;
+                if meta.len() > spec.size_bytes {
+                    return Err(StorageError::InvalidSpec(format!(
+                        "size_bytes {} smaller than base image {} ({} bytes)",
+                        spec.size_bytes, name, meta.len()
+                    )));
+                }
+                Some(src)
+            }
+            None => None,
+        };
+        let tmp = self.tmp_path(id);
+        let final_path = path.clone();
+        let size = spec.size_bytes;
+        
+        let span = Span::current();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            span.in_scope(|| {
+                 match &src {
+                    Some(s) => {
+                        debug!(base = %s.display(), "cloning base image");
+                        Self::clone_or_copy(s, &tmp)?; 
+                    }
+                    None => {
+                        std::fs::File::create(&tmp)?;
+                    }
+                }
+                let f = std::fs::OpenOptions::new().write(true).open(&tmp)?;
+                f.set_len(size)?;
+                f.sync_all()?;
+                std::fs::rename(&tmp, &final_path)?;
+                Ok(())
+            })
+        }).await
+            .map_err(|e| StorageError::Backend(anyhow::anyhow!("blocking task failed: {e}")))?
+            .map_err(|e| StorageError::Backend(e.into()))?;
+
+        info!("volume ready");
+        Ok(Volume { id: *id, path, size_bytes: size })
+    }
+
+    #[instrument(skip_all, fields(volume_id = %id))]
+    async fn destroy(&self, id: &VolumeId) -> storage::Result<()> {
+        for p in [self.tmp_path(id), self.volume_path(id)] {
+            match tokio::fs::remove_file(&p).await {
+                Ok(()) => debug!(path = %p.display(), "removed"),
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(StorageError::Backend(e.into())),
+            }
+        }
+        Ok(())
+    }
+
+    async fn get(&self, id: &VolumeId) -> storage::Result<Volume> {
+        let path = self.volume_path(id);
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) => Ok(Volume { id: *id, path, size_bytes: meta.len() }),
+            Err(e) if e.kind() == ErrorKind::NotFound => Err(StorageError::NotFound(*id)),
+            Err(e) => Err(StorageError::Backend(e.into())),
+        }
+    }
+}
+
+```
+
+## drivers/linux-network/Cargo.toml
+```toml
+[package]
+name = "meister-linux-network-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
+macros = { package = "meister-macros", path = "../../shared/macros" }
+rtnetlink = { workspace = true }
+futures = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+```
+
+## drivers/linux-network/src/lib.rs
+```rs
+use futures::TryStreamExt;
+use agent_api::networking::{self, BridgeDriver, NetworkError, Nic, NicDriver, NicId, NicSpec};
+use macros::generated;
+use rtnetlink::{LinkBridge, LinkUnspec};
+use tracing::{instrument, info, debug};
+
+#[generated(model = ClaudeFable, version = "5")]
+mod tun {
+    use std::os::fd::AsRawFd;
+    nix::ioctl_write_ptr_bad!(
+        tunsetiff,
+        nix::request_code_write!(b'T', 202, std::mem::size_of::<libc::c_int>()),
+        libc::ifreq
+    );
+    nix::ioctl_write_int!(tunsetpersist, b'T', 203);
+
+    pub fn create_persistent_tap(name: &str) -> std::io::Result<()> {
+        if name.len() >= libc::IFNAMSIZ {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("tap name too long: {name}"),
+            ));
+        }
+
+        let tunfd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")?;
+
+        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (dst, src) in ifr.ifr_name.iter_mut().zip(name.as_bytes()) {
+            *dst = *src as libc::c_char;
+        }
+        ifr.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+
+        unsafe { tunsetiff(tunfd.as_raw_fd(), &ifr) }
+            .map_err(std::io::Error::from)?;
+        unsafe { tunsetpersist(tunfd.as_raw_fd(), 1) }
+            .map_err(std::io::Error::from)?;
+
+        Ok(())
+    }
+}
+
+pub struct LinuxNetworkDriver {
+    handle: rtnetlink::Handle,
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl LinuxNetworkDriver {
+    pub fn new() -> networking::Result<Self> {
+        let (connection, handle, _) = rtnetlink::new_connection()
+            .map_err(|e| NetworkError::Backend(e.into()))?;
+        tokio::spawn(connection);
+        Ok(Self { handle })
+    }
+
+    fn tap_name(id: &NicId) -> String {
+        format!("msk{}", &id.simple().to_string()[..8])
+    }
+
+    async fn link_index(&self, name: &str) -> networking::Result<Option<u32>> {
+        let mut links = self
+            .handle
+            .link()
+            .get()
+            .match_name(name.to_string())
+            .execute();
+        match links.try_next().await {
+            Ok(Some(link)) => Ok(Some(link.header.index)),
+            Ok(None) => Ok(None),
+            Err(rtnetlink::Error::NetlinkError(err))
+                if err.raw_code() == -libc::ENODEV =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(NetworkError::Backend(e.into())),
+        }
+    }
+
+    async fn set_up(&self, index: u32) -> networking::Result<()> {
+        self.handle
+            .link()
+            .set(LinkUnspec::new_with_index(index).up().build())
+            .execute()
+            .await
+            .map_err(|e| NetworkError::Backend(e.into()))
+    } 
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[async_trait::async_trait]
+impl BridgeDriver for LinuxNetworkDriver {
+    async fn ensure(&self, name: &str) -> networking::Result<()> {
+        if let Some(index) = self.link_index(name).await? {
+            return self.set_up(index).await;
+        }
+        info!(bridge = %name, "creating bridge");
+        self.handle
+            .link()
+            .add(LinkBridge::new(name).build())
+            .execute()
+            .await
+            .map_err(|e| NetworkError::Backend(e.into()))?;
+        let index = self.link_index(name).await?.ok_or_else(|| {
+            NetworkError::Backend(anyhow::anyhow!("bridge {name} vanished after create"))
+        })?;
+        self.set_up(index).await
+    }
+
+    #[instrument(skip_all, fields(bridge = %name, addr = %addr, prefix = prefix_len))]
+    async fn ensure_address(&self, name: &str, addr: std::net::IpAddr, prefix_len: u8) -> networking::Result<()> {
+        let index = self.link_index(name).await?
+            .ok_or_else(|| NetworkError::BridgeNotFound(name.to_string()))?;
+
+        match self.handle.address().add(index, addr, prefix_len).execute().await {
+            Ok(()) => {
+                info!("assigned address to bridge");
+                Ok(())
+            }
+            Err(rtnetlink::Error::NetlinkError(err))
+                if err.raw_code() == -libc::EEXIST =>
+            {
+                debug!("address already present on bridge");
+                Ok(())
+            }
+            Err(e) => Err(NetworkError::Backend(e.into())),
+        }
+    }
+
+    async fn destroy(&self, name: &str) -> networking::Result<()> {
+        match self.link_index(name).await? {
+            Some(index) => self
+                .handle
+                .link()
+                .del(index)
+                .execute()
+                .await
+                .map_err(|e| NetworkError::Backend(e.into())),
+            None => Ok(()),
+        }
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[async_trait::async_trait]
+impl NicDriver for LinuxNetworkDriver {
+    #[instrument(skip_all, fields(nic_id = %id, bridge = %spec.bridge))]
+    async fn create(&self, id: &NicId, spec: &NicSpec) -> networking::Result<Nic> {
+        let tap = Self::tap_name(id);
+
+        let bridge_index = self
+            .link_index(&spec.bridge)
+            .await?
+            .ok_or_else(|| NetworkError::BridgeNotFound(spec.bridge.clone()))?;
+
+        if self.link_index(&tap).await?.is_none() {
+            let name = tap.clone();
+            tokio::task::spawn_blocking(move || tun::create_persistent_tap(&name))
+                .await
+                .map_err(|e| {
+                    NetworkError::Backend(anyhow::anyhow!("blocking task failed: {e}"))
+                })?
+                .map_err(|e| NetworkError::Backend(e.into()))?;
+        }
+
+        let tap_index = self.link_index(&tap).await?.ok_or_else(|| {
+            NetworkError::Backend(anyhow::anyhow!("tap {tap} vanished after create"))
+        })?;
+        debug!(tap = %tap, "tap attached to bridge");
+
+        self.handle
+            .link()
+            .set(
+                LinkUnspec::new_with_index(tap_index)
+                    .controller(bridge_index)
+                    .up()
+                    .build(),
+            )
+            .execute()
+            .await
+            .map_err(|e| NetworkError::Backend(e.into()))?;
+
+        Ok(Nic { id: *id, tap_name: tap })
+    }
+    
+    #[tracing::instrument(skip_all, fields(nic_id = %id))]
+    async fn destroy(&self, id: &NicId) -> networking::Result<()> {
+        let tap = Self::tap_name(id);
+        match self.link_index(&tap).await? {
+            Some(index) => self
+                .handle
+                .link()
+                .del(index)
+                .execute()
+                .await
+                .map_err(|e| NetworkError::Backend(e.into())),
+            None => Ok(()),
+        }
+    }
+
+    async fn get(&self, id: &NicId) -> networking::Result<Nic> {
+        let tap = Self::tap_name(id);
+        match self.link_index(&tap).await? {
+            Some(_) => Ok(Nic { id: *id, tap_name: tap }),
+            None => Err(NetworkError::NicNotFound(*id)),
+        }
+    }
+}
+
+```
+
+## plugins/nfs/Cargo.toml
+```toml
+[package]
+name = "meister-nfs-plugin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+```
+
+## plugins/nfs/src/lib.rs
+```rs
+pub fn add(left: u64, right: u64) -> u64 {
+    left + right
+}
+
+
+```
+
+## shared/agent-api/Cargo.toml
+```toml
+[package]
+name = "meister-agent-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+uuid = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+macros = { package = "meister-macros", path = "../macros"}
+
+```
+
+## shared/agent-api/src/device.rs
+```rs
+use uuid::Uuid;
+use crate::{CgroupHandle, VmId};
+use serde_json;
+
+pub type DeviceId = Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum DeviceError {
+    #[error("device not found: {0}")]
+    NotFound(DeviceId),
+    #[error("invalid device spec: {0}")]
+    InvalidSpec(String),
+    #[error("backend process died during startup: {0}")]
+    BackendDied(String),
+    #[error("device backend failure: {0}")]
+    Backend(anyhow::Error),
+}
+
+pub type Result<T> = std::result::Result<T, DeviceError>;
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum PartitionSpec {
+    /// VFIO-Passthrough.
+    Exclusive,
+    /// Cooperative shared device via vhost-user, mps...
+    Mediated,
+    // TODO: more MIG, SR-IOV, vGPU...
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DeviceSpec {
+    /// Device driver that handles this device for example 'crosvm-gpu', 'vfio'
+    pub driver: String,
+    pub partition: PartitionSpec,
+    #[serde(default)]
+    pub profile: Option<String>,
+    pub params: Option<serde_json::Value>,
+}
+
+pub fn default_device_driver() -> String {
+    "crosvm-gpu".to_string()
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum DeviceAttachment {
+    VfioPci { sysfs_path: std::path::PathBuf },
+    VfioMdev { mdev_uuid: Uuid },
+    VhostUser { socket: std::path::PathBuf, pid: u32 },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Device {
+    pub id: DeviceId,
+    pub attachment: DeviceAttachment,
+}
+
+
+#[async_trait::async_trait]
+pub trait DeviceDriver: Send + Sync {
+    async fn create(
+        &self,
+        id: &DeviceId,
+        spec: &DeviceSpec,
+        cgroup: Option<&CgroupHandle>,
+    ) -> Result<Device>;
+
+    async fn destroy(&self, id: &DeviceId) -> Result<()>;
+
+    async fn get(&self, id: &DeviceId) -> Result<Device>;
+
+    fn profiles(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+```
+
+## shared/agent-api/src/hypervisor.rs
+```rs
+use uuid::Uuid;
+use serde::{Serialize, Deserialize};
+
+use crate::CgroupHandle;
+use crate::DeviceAttachment;
+use crate::NicAttachment;
+use crate::ResourceLimits;
+
+pub type VmId = Uuid;
+
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub enum VmState {
+    Defined,
+    Running,
+    Paused,
+    Stopped
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HypervisorError {
+    #[error("vm not found: {0}")]
+    NotFound(VmId),
+
+    #[error("invalid state for {id}: is {current:?}")]
+    InvalidState { id: VmId, current: VmState },
+
+    #[error("invalid instance spec: {0}")]
+    InvalidSpec(String),
+
+    #[error("hypervisor backend failure: {0}")]
+    Backend(anyhow::Error), 
+}
+
+pub type Result<T> = std::result::Result<T, HypervisorError>;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InstanceSpec {
+    pub boot: BootSource,
+    pub disk: std::path::PathBuf,
+    pub vcpus: u32,
+    pub memory_mib: u64,
+    pub nics: Vec<NicAttachment>,
+    pub devices: Vec<DeviceAttachment>,
+}
+
+#[async_trait::async_trait]
+pub trait Pausable: Send + Sync {
+    async fn pause(&self, id: &VmId) -> Result<()>;
+    async fn resume(&self, id: &VmId) -> Result<()>;
+}
+
+// for later
+#[async_trait::async_trait]
+pub trait Snapshottable: Send + Sync {
+    async fn snapshot(&self, id: &VmId, target: &str) -> Result<()>;
+    async fn restore(&self, id: &VmId, source: &str) -> Result<()>;
+}
+// for later
+#[async_trait::async_trait]
+pub trait Migratable: Send + Sync {
+    async fn migrate_out(&self, id: &VmId, peer: &str) -> Result<()>;
+    async fn migrate_in(&self, id: &VmId, peer: &str) -> Result<()>;
+}
+// for later
+#[async_trait::async_trait]
+pub trait HotPluggable: Send + Sync {
+    async fn hotplug_device(&self, id: &VmId) -> Result<()>;
+    async fn unplug_device(&self, id: &VmId) -> Result<()>;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum BootSource {
+    DirectKernel { kernel: std::path::PathBuf, cmdline: String, initramfs: Option<std::path::PathBuf> },
+    Firmware { firmware: std::path::PathBuf },
+}
+
+/// Helper function to calculate cgroup resource-limits for a specific VM spec.
+/// The current implementation is very generouse.
+// TODO: Implement hypervisor levels for 'generousity' of the cgroup. For example very tight
+// fittings or no cgroups at all for uncritical workloads. And a real-time setting for hard more
+// generouse limits core pinning etc.
+// This is for later for now we go with this.
+impl From<&InstanceSpec> for ResourceLimits {
+    fn from(spec: &InstanceSpec) -> Self {
+        ResourceLimits::for_vm(spec.vcpus, spec.memory_mib)
+    }
+}
+
+#[async_trait::async_trait]
+pub trait Hypervisor: Send + Sync {
+    async fn create(&self, id: &VmId, spec: &InstanceSpec, cgroup: Option<&CgroupHandle>) -> Result<u32>;
+    async fn destroy(&self, id: &VmId) -> Result<()>;
+    async fn start (&self, id: &VmId) -> Result<()>;
+    async fn shutdown(&self, id: &VmId) -> Result<()>;
+    async fn power_button(&self, id: &VmId) -> Result<()>;
+    async fn get_state(&self, id: &VmId) -> Result<VmState>;
+
+    // Methods required by the reconcile
+    async fn adopt(&self, id: &VmId, pid: u32) -> Result<()>;
+    async fn probe(&self, id: &VmId) -> bool;
+    fn is_tracked(&self, id: &VmId) -> bool;
+
+    // optional capabilities
+    fn as_pausable(&self)      -> Option<&dyn Pausable>      { None }
+    fn as_snapshottable(&self) -> Option<&dyn Snapshottable> { None }
+    fn as_migratable(&self)    -> Option<&dyn Migratable>    { None }
+    fn as_hotpluggable(&self)  -> Option<&dyn HotPluggable>  { None }
+}
+
+```
+
+## shared/agent-api/src/lib.rs
+```rs
+pub mod hypervisor;
+pub mod resource_limits;
+pub mod storage;
+pub mod networking;
+pub mod device;
+pub mod types;
+
+pub use hypervisor::{Hypervisor, HypervisorError, InstanceSpec, VmId, VmState, BootSource, Pausable, Snapshottable, Migratable, HotPluggable};
+pub use resource_limits::{ResourceLimits, CgroupHandle,ConfinerError, ConfinerResult, ResourceConfiner};
+pub use storage::{VolumeId, StorageError, VolumeSpec, Volume, BlockDriver};
+pub use networking::{NicId, NetworkError, NicSpec, Nic, NicDriver, BridgeDriver, NicAttachment};
+pub use device::{DeviceId, DeviceError, PartitionSpec, DeviceSpec, DeviceAttachment, Device, DeviceDriver};
+
+
+```
+
+## shared/agent-api/src/networking.rs
+```rs
+use uuid::Uuid;
+use crate::types::mac_addr::MacAddr;
+
+pub type NicId = Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum NetworkError {
+    #[error("nic not found: {0}")]
+    NicNotFound(NicId),
+    #[error("bridge not found: {0}")]
+    BridgeNotFound(String),
+    #[error("invalid nic spec: {0}")]
+    InvalidSpec(String),
+    #[error("network backend failure: {0}")]
+    Backend(anyhow::Error),
+}
+
+pub type Result<T> = std::result::Result<T, NetworkError>;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NicSpec {
+    pub bridge: String,
+    pub mac: MacAddr,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Nic {
+    pub id: NicId,
+    pub tap_name: String,
+}
+
+#[async_trait::async_trait]
+pub trait NicDriver: Send + Sync {
+    async fn create(&self, id: &NicId, spec: &NicSpec) -> Result<Nic>;
+    async fn destroy(&self, id: &NicId) -> Result<()>;
+    async fn get(&self, id: &NicId) -> Result<Nic>;
+}
+
+#[async_trait::async_trait]
+pub trait BridgeDriver: Send + Sync {
+    async fn ensure(&self, name: &str) -> Result<()>;
+    async fn ensure_address(&self, name: &str, addr: std::net::IpAddr, prefix_len: u8) -> Result<()>;
+    async fn destroy(&self, name: &str) -> Result<()>;
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NicAttachment {
+    pub tap_name: String,
+    pub mac: MacAddr,
+}
+
+```
+
+## shared/agent-api/src/resource_limits.rs
+```rs
+use std::path::PathBuf;
+
+/// Set resource limits for the host process. This is different from Hypervisors InstanceSpec. The
+/// InstanceSpec is what is visible to the VM for example 4GiB RAM, this resource limit is the true
+/// limit for the hypervisor that means the guests memory + vmm-overhead
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ResourceLimits {
+    pub memory_max: Option<u64>,
+    pub cpu_quota: Option<u32>, // in percent: like OpenNebula 100 = 1 vCore, 200 = 2vCores...
+}
+impl ResourceLimits {
+    /// Calculate cgroup resource limits for a VM: guest memory plus VMM overhead.
+    /// The current implementation is very generous.
+    // TODO in hypervisor driver -> ch-driver moven mit spezifischeren overhead
+    pub fn for_vm(vcpus: u32, memory_mib: u64) -> Self {
+        let vmm_overhead_mib = 64 + (8 * vcpus as u64) + 32;
+        let memory_bytes = (memory_mib + vmm_overhead_mib) * 1024 * 1024;
+        let cpu = vcpus * 100 + 50; // +50 vermutlich viel zu viel...
+        Self {
+            memory_max: Some(memory_bytes),
+            cpu_quota: Some(cpu),
+            // TODO: more quotas, more specific
+        }
+    }
+}
+
+/// Handle for an existing cgroup for example "/sys/fs/cgroup/meisterstack/<id>"
+#[derive(Clone, Debug)]
+pub struct CgroupHandle {
+    pub path: PathBuf,
+}
+
+impl CgroupHandle {
+    pub fn attach_pid(&self, pid: u32) -> std::io::Result<()> {
+        std::fs::write(self.path.join("cgroup.procs"), pid.to_string())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfinerError {
+    #[error("cgroup io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+pub type ConfinerResult<T> = std::result::Result<T, ConfinerError>;
+
+pub trait ResourceConfiner: Send + Sync {
+    /// create cgroup.
+    /// If nested croups are necessary use the @parent attribute, if the cgroup has no parents leave
+    /// it empty.
+    fn create_slice(&self, name: &str, parent: Option<&CgroupHandle>, limits: &ResourceLimits) -> ConfinerResult<CgroupHandle>;
+    
+    /// destroy cgroup. 
+    /// cgroup must be empty, ergo no processes and childs.
+    fn destroy_slice(&self, cg: &CgroupHandle) -> ConfinerResult<()>;
+    
+    /// Handle for an existing Cgroup, by name.
+    fn open_slice(&self, name: &str) -> CgroupHandle;
+
+    // Reconcile requirements
+    fn pids_in_slice(&self, name: &str) -> ConfinerResult<Vec<u32>>;
+    fn kill_slice(&self, name: &str) -> ConfinerResult<()>;
+}
+
+```
+
+## shared/agent-api/src/storage.rs
+```rs
+use uuid::Uuid;
+use crate::VmId;
+
+pub type VolumeId = Uuid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError {
+    #[error("volume not found: {0}")]
+    NotFound(VolumeId),
+    #[error("base image not found: {0}")]
+    ImageNotFound(String),
+    #[error("invalid volume spec: {0}")]
+    InvalidSpec(String),
+    #[error("storage backend failure: {0}")]
+    Backend(anyhow::Error),
+}
+
+pub type Result<T> = std::result::Result<T, StorageError>;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct VolumeSpec {
+    pub base_image: Option<String>,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Volume {
+    pub id: VolumeId,
+    pub path: std::path::PathBuf,
+    pub size_bytes: u64,
+}
+
+#[async_trait::async_trait]
+pub trait BlockDriver: Send + Sync {
+    async fn create(&self, id: &VolumeId, spec: &VolumeSpec) -> Result<Volume>;
+
+    async fn destroy(&self, id: &VolumeId) -> Result<()>;
+
+    async fn get(&self, id: &VolumeId) -> Result<Volume>;
+}
+
+```
+
+## shared/agent-api/src/types/mac_addr.rs
+```rs
+use std::fmt;
+use std::str::FromStr;
+use macros::generated;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MacAddr(pub [u8; 6]);
+
+#[derive(Debug, thiserror::Error)]
+pub enum MacAddrError {
+    #[error("invalid mac address `{0}`: expected 6 colon-separated hex octets (aa:bb:cc:dd:ee:ff)")]
+    Malformed(String),
+    #[error("invalid mac address `{input}`: octet `{octet}` is not two hex digits")]
+    BadOctet { input: String, octet: String },
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl FromStr for MacAddr {
+    type Err = MacAddrError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let sep = if s.contains('-') { '-' } else { ':' };
+        let mut bytes = [0u8; 6];
+        let mut count = 0;
+
+        for part in s.split(sep) {
+            if count == 6 {
+                return Err(MacAddrError::Malformed(s.to_string()));
+            }
+            if part.len() != 2 {
+                return Err(MacAddrError::BadOctet {
+                    input: s.to_string(),
+                    octet: part.to_string(),
+                });
+            }
+            bytes[count] = u8::from_str_radix(part, 16).map_err(|_| {
+                MacAddrError::BadOctet {
+                    input: s.to_string(),
+                    octet: part.to_string(),
+                }
+            })?;
+            count += 1;
+        }
+
+        if count != 6 {
+            return Err(MacAddrError::Malformed(s.to_string()));
+        }
+        Ok(MacAddr(bytes))
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl fmt::Display for MacAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let b = &self.0;
+        write!(
+            f,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            b[0], b[1], b[2], b[3], b[4], b[5]
+        )
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MacAddr {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl serde::Serialize for MacAddr {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        ser.collect_str(self)
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+
+```
+
+## shared/agent-api/src/types/mod.rs
+```rs
+pub mod pci;
+pub mod mac_addr;
+
+```
+
+## shared/agent-api/src/types/pci.rs
+```rs
+use std::fmt;
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use macros::generated;
+
+#[generated(model = ClaudeFable, version = "5")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PciAddress {
+    pub domain: u16,
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+#[derive(Debug, thiserror::Error)]
+pub enum PciAddressError {
+    #[error("invalid pci address `{0}`: expected [dddd:]bb:dd.f (hex)")]
+    Malformed(String),
+    #[error("invalid pci address `{input}`: {field} `{value}` is not valid hex")]
+    BadHex {
+        input: String,
+        field: &'static str,
+        value: String,
+    },
+    #[error("invalid pci address `{input}`: device {device:#x} out of range (max 0x1f)")]
+    DeviceOutOfRange { input: String, device: u32 },
+    #[error("invalid pci address `{input}`: function {function:#x} out of range (max 0x7)")]
+    FunctionOutOfRange { input: String, function: u32 },
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl FromStr for PciAddress {
+    type Err = PciAddressError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let malformed = || PciAddressError::Malformed(s.to_string());
+
+        let (front, func_str) = s.rsplit_once('.').ok_or_else(malformed)?;
+
+        let parts: Vec<&str> = front.split(':').collect();
+        let (dom_str, bus_str, dev_str) = match parts.as_slice() {
+            [bus, dev] => ("0", *bus, *dev),
+            [dom, bus, dev] => (*dom, *bus, *dev),
+            _ => return Err(malformed()),
+        };
+
+        if dom_str.is_empty() || bus_str.is_empty() || dev_str.is_empty() || func_str.is_empty() {
+            return Err(malformed());
+        }
+
+        let parse = |field: &'static str, v: &str| -> Result<u32, PciAddressError> {
+            u32::from_str_radix(v, 16).map_err(|_| PciAddressError::BadHex {
+                input: s.to_string(),
+                field,
+                value: v.to_string(),
+            })
+        };
+
+        let domain = parse("domain", dom_str)?;
+        let bus = parse("bus", bus_str)?;
+        let device = parse("device", dev_str)?;
+        let function = parse("function", func_str)?;
+
+        if domain > u16::MAX as u32 {
+            return Err(malformed());
+        }
+        if bus > u8::MAX as u32 {
+            return Err(malformed());
+        }
+        if device > 0x1f {
+            return Err(PciAddressError::DeviceOutOfRange { input: s.to_string(), device });
+        }
+        if function > 0x7 {
+            return Err(PciAddressError::FunctionOutOfRange { input: s.to_string(), function });
+        }
+
+        Ok(Self {
+            domain: domain as u16,
+            bus: bus as u8,
+            device: device as u8,
+            function: function as u8,
+        })
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl fmt::Display for PciAddress {
+    /// Immer volle, normalisierte Form — identisch zum sysfs-Namen.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:04x}:{:02x}:{:02x}.{}",
+            self.domain, self.bus, self.device, self.function
+        )
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl PciAddress {
+    pub fn sysfs_path(&self) -> PathBuf {
+        PathBuf::from(format!("/sys/bus/pci/devices/{self}"))
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl<'de> serde::Deserialize<'de> for PciAddress {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[generated(model = ClaudeFable, version = "5")]
+impl serde::Serialize for PciAddress {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.collect_str(self)
+    }
+}
+
+// TESTS
+// Generated by Claude
+
+#[generated(model = ClaudeFable, version = "5")]
+
+```
+
+## shared/common/Cargo.toml
+```toml
+[package]
+name = "meister-common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+```
+
+## shared/common/src/attribution.rs
+```rs
+// shared/common/src/attribution.rs
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiModel {
+    ClaudeOpus,
+    ClaudeSonnet,
+    ClaudeHaiku,
+    ClaudeFable,
+    ClaudeMythos,
+    Gpt,
+    Gemini,
+}
+
+impl AiModel {
+    pub const ALL: &'static [(&'static str, Self)] = &[
+        ("ClaudeOpus", Self::ClaudeOpus),
+        ("ClaudeSonnet", Self::ClaudeSonnet),
+        ("ClaudeHaiku", Self::ClaudeHaiku),
+        ("ClaudeFable", Self::ClaudeFable),
+        ("Gpt", Self::Gpt),
+        ("Gemini", Self::Gemini),
+    ];
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(name, _)| *name == s).map(|(_, m)| *m)
+    }
+
+    pub fn names() -> impl Iterator<Item = &'static str> {
+        Self::ALL.iter().map(|(name, _)| *name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum License {
+    Mit,
+    Apache2,
+    CcBySa4,
+    Unlicense,
+    Gpl3,
+    Gpl2,
+}
+
+impl License {
+    pub const ALL: &'static [(&'static str, Self)] = &[
+        ("MIT", Self::Mit),
+        ("Apache2", Self::Apache2),
+        ("CcBySa4", Self::CcBySa4),
+        ("Unlicense", Self::Unlicense),
+        ("Gpl3", Self::Gpl3),
+        ("Gpl2", Self::Gpl2),
+    ];
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Self::ALL.iter().find(|(name, _)| *name == s).map(|(_, l)| *l)
+    }
+
+    pub fn names() -> impl Iterator<Item = &'static str> {
+        Self::ALL.iter().map(|(name, _)| *name)
+    }
+}
+
+```
+
+## shared/common/src/lib.rs
+```rs
+// shared/common/src/lib.rs
+
+pub mod attribution;
+
+```
+
+## shared/controller-api/Cargo.toml
+```toml
+[package]
+name = "meister-controller-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+```
+
+## shared/controller-api/src/lib.rs
+```rs
+pub fn add(left: u64, right: u64) -> u64 {
+    left + right
+}
+
+
+```
+
+## shared/macros/Cargo.toml
+```toml
+[package]
+name = "meister-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+meister-common = { path = "../common" }
+
+proc-macro2 = "1.0"
+quote = "1.0.46"
+syn = { version = "2.0.118", features = ["full"] }
+
+```
+
+## shared/macros/src/lib.rs
+```rs
+// shared/macros/src/lib.rs
+//
+// For the sake of the idea, this macro and the ../common/src/attribution.rs are completly vibe
+// coded. Let's see if this works.
+use proc_macro::TokenStream;
+use proc_macro2::Span;
+use syn::{
+    parse::{Parse, ParseStream},
+    parse_macro_input, Ident, LitStr, Token,
+};
+
+use meister_common::attribution::{AiModel, License};
+
+fn validate_date(date: &LitStr) -> syn::Result<()> {
+    let v = date.value();
+    let ok = (v.len() == 7 || v.len() == 10)
+        && v.as_bytes().get(4) == Some(&b'-')
+        && v[..4].bytes().all(|b| b.is_ascii_digit())
+        && v[5..7].bytes().all(|b| b.is_ascii_digit());
+
+    if ok {
+        Ok(())
+    } else {
+        Err(syn::Error::new(
+            date.span(),
+            "`date` must be in the format \"YYYY-MM\" or \"YYYY-MM-DD\"",
+        ))
+    }
+}
+
+struct GeneratedArgs {
+    model: Ident,
+    version: LitStr,
+    date: Option<LitStr>,
+}
+
+impl Parse for GeneratedArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let (mut model, mut version, mut date) = (None, None, None);
+
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "model" => model = Some(input.parse()?),
+                "version" => version = Some(input.parse()?),
+                "date" => date = Some(input.parse()?),
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!("unkown argument `{other}`, expected: model, version, date"),
+                    ))
+                }
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        Ok(GeneratedArgs {
+            model: model.ok_or_else(|| {
+                syn::Error::new(Span::call_site(), "`model` is required")
+            })?,
+            version: version.ok_or_else(|| {
+                syn::Error::new(Span::call_site(), "`version` is required")
+            })?,
+            date,
+        })
+    }
+}
+
+#[proc_macro_attribute]
+pub fn generated(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as GeneratedArgs);
+
+    let model_name = args.model.to_string();
+    if AiModel::from_str(&model_name).is_none() {
+        let known: Vec<_> = AiModel::names().collect();
+        return syn::Error::new(
+            args.model.span(),
+            format!("unknown model `{model_name}`. Known models: {}", known.join(", ")),
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    if let Some(date) = &args.date {
+        if let Err(e) = validate_date(date) {
+            return e.to_compile_error().into();
+        }
+    }
+
+    item
+}
+
+struct SourcedArgs {
+    site: LitStr,
+    url: LitStr,
+    date: LitStr,
+    license: Option<Ident>,
+    author: Option<LitStr>,
+}
+
+impl Parse for SourcedArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let (mut site, mut url, mut date, mut license, mut author) =
+            (None, None, None, None, None);
+
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "site" => site = Some(input.parse()?),
+                "url" => url = Some(input.parse()?),
+                "date" => date = Some(input.parse()?),
+                "license" => license = Some(input.parse()?),
+                "author" => author = Some(input.parse()?),
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!(
+                            "unkonw argument `{other}`, expected are: site, url, date, license, author"
+                        ),
+                    ))
+                }
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        Ok(SourcedArgs {
+            site: site.ok_or_else(|| syn::Error::new(Span::call_site(), "`site` is required"))?,
+            url: url.ok_or_else(|| syn::Error::new(Span::call_site(), "`url` is required"))?,
+            date: date.ok_or_else(|| syn::Error::new(Span::call_site(), "`date` is required"))?,
+            license,
+            author,
+        })
+    }
+}
+
+#[proc_macro_attribute]
+pub fn sourced(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as SourcedArgs);
+
+    if let Err(e) = validate_date(&args.date) {
+        return e.to_compile_error().into();
+    }
+
+    if let Some(license) = &args.license {
+        let name = license.to_string();
+        if License::from_str(&name).is_none() {
+            let known: Vec<_> = License::names().collect();
+            return syn::Error::new(
+                license.span(),
+                format!("unknown license `{name}`. Known are: {}", known.join(", ")),
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
+    item
+}
+
+```
+
+## shared/proto/Cargo.toml
+```toml
+[package]
+name = "meister-proto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+```
+
+## shared/proto/build.rs
+```rs
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_prost_build::compile_protos("proto/control.proto")?;
+    Ok(())
+}
+
+```
+
+## shared/proto/src/lib.rs
+```rs
+tonic::include_proto!("meisterstack.v1");
+
+```

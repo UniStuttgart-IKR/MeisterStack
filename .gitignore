@@ -1,0 +1,25 @@
+/target
+/bin/*
+/data
+/images/*
+config/token
+ctx.sh
+/tmp
+
+# local dev environments
+deploy/env
+deploy/env.*
+!deploy/env.example
+
+# Nix-Build-Ausgaben
+/result
+/result-*
+
+# KI-Arbeitsdokumente -- ausgelagert nach ../MeisterStack-Journal (privat).
+# Nicht wieder hier anlegen: Briefs, Journals, Berichte gehoeren ins Journal-Repo.
+docs/claude/
+docs/design/
+
+# Repowise-Index und -Caches (regenerierbar, binaer)
+.repowise/
+.repowise-workspace/

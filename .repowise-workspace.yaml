@@ -1,0 +1,20 @@
+version: 1
+default_repo: meisterstack
+repos:
+- path: .
+  alias: meisterstack
+  is_primary: true
+  indexed_at: '2026-08-25T02:01:17.212357+00:00'
+  last_commit_at_index: 7be1e070087609959a58660de946599131cdeff5
+- path: bin/dependencies/cloud-hypervisor
+  alias: cloud-hypervisor
+  indexed_at: '2026-08-26T11:08:33.143462+00:00'
+  last_commit_at_index: 9ed824d6d08df3e96f7d5f50795d9449ac99f431
+- path: bin/dependencies/crosvm
+  alias: crosvm
+  indexed_at: '2026-08-26T11:08:44.062783+00:00'
+  last_commit_at_index: 8be640000662beb921bb1a718eb96935fcc6785a
+- path: bin/dependencies/vhost
+  alias: vhost
+  indexed_at: '2026-08-25T02:06:40.680652+00:00'
+  last_commit_at_index: 220ab2a936596187b7908030eefc9ae3b498b86d

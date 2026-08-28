@@ -1,0 +1,30 @@
+[package]
+name = "meister-cluster-controller"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+controller-api = { package = "meister-controller-api", path = "../../shared/controller-api" }
+proto = { package = "meister-proto", path = "../../shared/proto" }
+macros = { package = "meister-macros", path = "../../shared/macros" }
+common = { package = "meister-common", path = "../../shared/common" }
+pki = { package = "meister-pki", path = "../../shared/pki" }
+telemetry = { package = "meister-telemetry", path = "../../shared/telemetry" }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+# `start_paused` for the VM index's window: it states what a one-second cache
+# does over time without spending the second. Same reason as controller-api.
+tokio = { workspace = true, features = ["test-util"] }

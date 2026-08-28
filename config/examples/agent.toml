@@ -1,0 +1,495 @@
+# meister-agent — the node agent.
+#
+# One file per node, normally /etc/meisterstack/agent.toml. Relative paths are
+# resolved against THIS file's directory, so a config next to its data
+# directory travels as a unit.
+#
+# Reading it: a live key is either required — node_id, [paths],
+# [hypervisor.cloud-hypervisor] and [network].default_bridge are the whole
+# list — or a choice this file makes on purpose, the way controller_addrs
+# below does. A commented-out key is optional, and its line carries either
+# the default or the value that makes the paragraph above it true.
+#
+# The comment convention is mechanical because a test enforces it: prose is
+# a hash and a space, a commented-out setting is a hash and the key with no
+# space between. "Uncomment the settings, leave the prose" is therefore one
+# rule, and a key renamed in the code fails in CI rather than on a node.
+#
+# For the locked-down variant of this file — loopback REST, mTLS sessions,
+# exactly one public edge — see examples/hardened/.
+
+# What this node is called, everywhere: in `meister cluster nodes`, in the
+# Node object in etcd, and in the hash that picks which controller replica
+# this agent dials. It has to be stable across restarts and unique in the
+# cluster — a second node with this name would take over the first one's
+# session.
+node_id = "manacor"
+
+# --- the controller, if there is one ---------------------------------------
+#
+# Neither key: the agent runs standalone. Its unix socket still works and
+# `meister agent …` still drives it; it simply has nobody to report to.
+#
+# `controller_addrs` is the newer and more complete statement and wins
+# outright when both are set. Order in the list does not matter: each agent
+# derives its own preference order over it by rendezvous hashing, so the
+# replicas need no registry of who serves whom (see shared/common/src/hrw.rs).
+# Failover walks down that order, one dial each; a blackholed endpoint costs
+# three seconds, not the kernel's two minutes.
+#controller_addr  = "http://10.128.1.104:50051"
+controller_addrs = ["http://10.128.1.104:50051", "http://10.128.1.110:50051"]
+
+# How long a guest gets to power itself off after a Stop before the VMM is
+# killed. The controller does not override this — how long a guest may take is
+# the node's business.
+#stop_grace_secs = 30
+
+# Where to send spans. Unset = log to stdout and nothing else, which is how
+# this runs unless somebody is looking. Set, and one trace reaches from
+# `POST /vms` at the controller down to the backend spawn on this node.
+#otlp_endpoint = "http://127.0.0.1:4317"
+
+# --- the session credential -------------------------------------------------
+#
+# PEM paths, never PEM, resolved against THIS file — so a config and its pki/
+# directory travel as one unit, exactly as the two controllers' configs do and
+# exactly as [paths] below does. All three unset is a plain gRPC session,
+# which is what this agent has opened since M1 and what the lab still runs.
+#
+# controller_ca alone is one-way TLS: the session is encrypted and the
+# controller learns nothing about who dialled it. Add the other two and the
+# controller can tell: the certificate's CN is `system:node:<node_id>`, and
+# the cluster matches that name against the node_id in the Hello — so one
+# node's key cannot ask to be told about another node's VMs. Both files come
+# out of `tools/meister-ca` alongside the controllers' own.
+#controller_ca   = "pki/ca.crt"
+#controller_cert = "pki/system-node-manacor.crt"
+#controller_key  = "pki/system-node-manacor.key"
+
+# --- two agents on one host (the NUMA recipe) -------------------------------
+#
+# A NUMA machine has no NUMA awareness in this stack and does not need one:
+# run TWO agents on it, each pinned to one socket, and the cluster sees two
+# ordinary nodes. What that needs from this file is only the two keys below,
+# and a second config with its own node_id and its own [paths] — separate
+# db_path, run_dir and cgroup_root, or the two agents adopt each other's VMs.
+#
+# capacity_* is the CEILING on what this agent REPORTS. Both processes read
+# the whole host out of /proc, so without it the cluster would schedule
+# against twice the hardware that exists. It only ever lowers what was
+# measured: a config copied onto a smaller machine cannot claim more than is
+# there.
+#
+# cgroup_cpuset is the other half, and the one that is actually enforced: it
+# is written to `cpuset.cpus` on the slice every VM of this agent lands under,
+# and cgroup v2 gives each VM slice its parent's set. A ceiling without the
+# pinning would be a promise the scheduler believes and the kernel does not
+# keep. Read the socket's CPU list off `lscpu -p=CPU,NODE` (or
+# /sys/devices/system/node/node0/cpulist) — hyperthread siblings included.
+#
+# Socket 0 of a 2x16-core machine with SMT, and half its RAM:
+#capacity_vcpus   = 32
+#capacity_mem_mib = 128000
+#cgroup_cpuset    = "0-15,32-47"
+# Socket 1 would be the same file with node_id = "manacor-b",
+# cgroup_cpuset = "16-31,48-63", and its own [paths].
+
+# --- the addresses no tap may source from -----------------------------------
+#
+# The floating pools, in the same spelling the cloud stores them: a cidr, a
+# single address, or `a-b`. Every tap on this node gets an nftables rule that
+# DROPS any frame or ARP claiming a source address inside these — except the
+# addresses the tap's own VM holds a reservation for, which arrive in the VM
+# spec (`nics[].floating_ips`) and become an accept in front of the ban.
+#
+# This is deliberate duplication of `meister cloud floatingpool ls`, and the
+# honest v1 trade: the rule needs the whole union on the node, and the session
+# carries commands about VMs rather than a catalogue of pools. Keep the two in
+# step; a range missing here is a range nobody guards, and a range here that no
+# pool contains only forbids addresses nobody was going to get.
+#
+# Empty (the default, and every config written before M5.1) guards nothing.
+# Taps still get their MAC pinned — that needs no configuration and applies to
+# every VM this stack boots.
+#
+# TOP-LEVEL and not under [network] on purpose: the lab's context rendering
+# prepends top-level keys in front of this template, and a prepended [network]
+# table would be a TOML duplicate of the one below.
+#guarded_ranges = ["10.255.0.0/16", "203.0.113.7", "203.0.113.16-203.0.113.19"]
+
+# Where `nft` is. Unset = PATH, which is right on a NixOS node. nftables is
+# NOT optional: MAC pinning applies to every VM, so an agent that cannot
+# program it refuses to start rather than pretend.
+#nft = "/run/current-system/sw/bin/nft"
+
+# --- how a floating address is reached from outside -------------------------
+#
+# Nothing in this stack routes a packet to one, and that is the design: we
+# reserve the address, we enforce who may use it, and (with [network.bgp]
+# below) we announce it. Getting traffic there is the environment's, and there
+# are exactly two shapes:
+#
+#   Static. The environment routes the whole pool towards the hosts —
+#   `ip route add 10.255.0.0/16 via <this-node>` on the upstream router, or a
+#   route per node — and the tenant's own appliance claims its addresses by
+#   ARP on the bridge. Nothing here has to know anything. This is the hoster
+#   mode: tenant behind its own NAT appliance, floating address on the
+#   appliance's outside leg.
+#
+#   Announced. [network.bgp] below, and the upstream learns a /32 per address
+#   from whichever node the VM is on. This is the lab mode, and it is what
+#   makes moving a VM move its address without anybody reconfiguring a router.
+#
+# A LATER alternative worth naming and NOT built: the node itself could claim
+# a floating address by ARP on behalf of the VM (gratuitous ARP on the tenant
+# bridge) instead of relying on the guest to do it. That is what makes an
+# address reachable in the second between "the VM booted" and "the guest
+# configured its interface", and it is a smaller version of what BGP does
+# here — worth having only if the announcement turns out not to be enough.
+
+[paths]
+# The agent's own record of every VM it holds: desired state, phase, the
+# volumes and taps it created, the VMM's pid. It is what makes a VM survive
+# `kill -9` of the agent — on restart the reconciler reads this and adopts
+# what is still running.
+db_path    = "/var/lib/meisterstack/agent.redb"
+# Sockets and per-VM scratch (CH api socket, console and serial files, device
+# backend sockets). Fine on tmpfs: nothing here has to survive a reboot.
+run_dir    = "/run/meisterstack"
+# Read-only. `base_image` in a VM spec names a file in here.
+image_dir  = "/var/lib/meisterstack/images"
+# Where the filesystem block driver puts the per-VM disks it clones.
+volume_dir = "/var/lib/meisterstack/volumes"
+# The cgroup v2 subtree this agent owns. One slice per VM underneath, holding
+# the VMM and every device backend it spawned, so a teardown cannot leave
+# orphans behind.
+cgroup_root = "/sys/fs/cgroup/meisterstack"
+
+[hypervisor.cloud-hypervisor]
+# The patched build (see get_patched_binaries.sh) — stock cloud-hypervisor
+# does not have the generic-vhost-user device the GPU backends need.
+binary     = "/opt/meisterstack/bin/cloud-hypervisor"
+# How long one call to CH's API socket may take. This is a local unix socket;
+# anything slower than a second or two means the VMM is wedged, not busy.
+timeout_ms = 5000
+
+[network]
+# Every NIC that names no bridge of its own lands here. The agent creates it
+# if it does not exist.
+default_bridge = "meister_br0"
+# Optional: an address for default_bridge itself, so the host is a gateway
+# for the guests sitting on it. It is written to the bridge whenever a VM
+# lands on default_bridge — with a controller exactly as without one — which
+# makes it the right key for a lab whose nested guests need a route out, and
+# the wrong one wherever the addressing belongs to somebody else. The lab
+# image sets 10.42.0.1/24 here (nix/agent.nix); a VM on a tenant overlay
+# never touches this bridge at all.
+#bridge_addr = "192.168.100.1/24"
+
+# Tenant overlays. Present = this node can carry them and says so in its
+# Hello (`network/vxlan`), so the scheduler may place a tenant's VM here.
+# Absent — which is every config written before M5 — means it cannot, and a
+# spec naming a `vxlan_id` is refused by name rather than quietly put on the
+# default bridge, where it would reach every other tenant on this host.
+#
+# Per tenant the agent then makes one bridge (`meister-vx<vni>`) and one
+# VXLAN device (`mvx<vni>`) in it, and the tenant's taps join that bridge
+# instead of default_bridge. Peers find each other by multicast on a group
+# DERIVED from the VNI (239.<b1>.<b2>.<b3>), so nothing has to be configured
+# per node and nothing has to be told when one joins — but the uplink's
+# network has to pass multicast. On a switch that does not, the alternative is
+# static FDB entries per peer; see the module doc in drivers/linux-network.
+#[network.vxlan]
+# The interface encapsulated frames leave by. Its address is what other nodes
+# see as this tunnel endpoint, so it has to be the one on the network they are
+# on — the lab's management NIC, not a bridge. On a single host with no peers
+# a `dummy0` is enough to prove the encapsulation happens (`ip link add dummy0
+# type dummy && ip link set dummy0 up`).
+#
+# Pick the NIC that can OFFLOAD the encapsulation. VXLAN is the overlay nearly
+# every server NIC of the last decade does in hardware, and that is most of
+# the reason it was chosen: in software, encapsulation costs a per-packet trip
+# through the stack and gives up TSO/GRO on the inner frames — the difference
+# between line rate and one core pegged at a few Gbit/s. Check with
+#
+#   ethtool -k <uplink> | grep udp_tnl
+#
+# and look for `tx-udp_tnl-segmentation: on` and
+# `tx-udp_tnl-csum-segmentation: on`. Off means this node pays for its overlay
+# in CPU. The agent uses the IANA port 4789 and sets no source-port range
+# precisely so that a NIC which CAN offload will: a custom port falls off the
+# hardware path silently, and a pinned source port collapses every tenant flow
+# between two nodes onto one receive queue.
+#uplink = "eno1"
+# VXLAN costs 50 bytes per frame: 14 inner Ethernet + 8 VXLAN + 8 UDP + 20
+# outer IPv4. On the usual 1500-byte uplink that leaves 1450, which is the
+# default and what this line repeats. Raise it only where the UPLINK is
+# bigger: with jumbo frames (uplink 9000) this becomes 8950, which is the
+# shape to aim for on a cluster fabric — six sevenths of the per-packet
+# overhead and most of the segmentation work simply stop existing.
+#
+# Lowering the uplink below 1500 without lowering this is the failure worth
+# naming: the guest sends 1500-byte frames, the encap makes them 1550, and
+# they are dropped with nothing in any log to say why.
+#mtu = 1450
+# Distribute the overlay's MAC addresses over BGP instead of flooding for
+# them. With it on the VXLAN device gets NO multicast group and no kernel
+# learning: it gets a `local` address (this node's VTEP identity, read off the
+# uplink) and FRR — told `advertise-all-vni` below — advertises the MACs
+# behind it as EVPN type-2 routes and this VTEP as type-3, programming the FDB
+# from what its peers send back. What was a multicast group is a BGP session,
+# which is the answer for every network that does not carry multicast: most
+# clouds, and some switches.
+#
+# Needs [network.bgp]; the agent refuses to start with one and not the other.
+#
+# CLUSTER-WIDE, not per node. Two nodes of one overlay disagreeing about this
+# never learn each other's MACs — one floods into a group nobody is in, the
+# other waits for routes nobody sends. Nothing enforces it, because a VM asks
+# for an overlay and not for how the overlay finds its peers; what the stack
+# does instead is SHOW it, as the `network/evpn` entry in
+# `meister cluster nodes`.
+#
+# Off is M5's behaviour byte for byte: a derived multicast group, kernel
+# learning, and no daemon anywhere.
+#evpn = false
+
+# --- bgp: announcing what lives on this node --------------------------------
+#
+# Present = this node runs a BGP session and announces a /32 for every
+# floating address whose VM is RUNNING HERE. Absent (every config before
+# M5.1) = it announces nothing; the addresses are still reserved and still
+# enforced at the tap, and they are reached by the static route above.
+#
+# FRR does the protocol. It is an external daemon out of nixpkgs, exactly as
+# virtiofsd is on the storage side: the agent renders a config fragment and
+# hands it to `vtysh -f`. A section here without a running FRR (bgpd and
+# zebra) is a hard start-up error — a node that claimed to announce its
+# addresses and announced nothing is the failure worth being loud about.
+#
+# The set is recomputed on every reconcile pass and applied whole, so a VM
+# that stops, is torn down or MOVES has its address withdrawn by the same
+# mechanism — and the node it moved to announces the same /32 on its own next
+# pass. Nobody coordinates that; the upstream's best path simply moves.
+#[network.bgp]
+# This node's autonomous system. A private ASN unless somebody gave the lab a
+# real one: 64512-65534, or the 32-bit block 4200000000-4294967294.
+#asn = 65001
+# The BGP identifier. Set it explicitly — FRR would otherwise pick the highest
+# address on the box, which on a node full of bridges and taps is whatever the
+# last VM created.
+#router_id = "10.128.1.10"
+# Where vtysh is, and where FRR's vty sockets are. Both optional: PATH and
+# /var/run/frr. The socket path matters for a second agent on one host, and
+# for an FRR in a network namespace.
+#vtysh      = "/run/current-system/sw/bin/vtysh"
+#vty_socket = "/run/frr"
+# Where the rendered fragment is written before vtysh reads it. Unset =
+# <run_dir>/meister-bgp.conf. A file rather than a pipe so that an operator
+# debugging a session can read exactly what this node asked FRR for.
+#fragment = "/run/meisterstack/meister-bgp.conf"
+
+# The peers: the rack switch, a route reflector, or in a lab an FRR in a
+# namespace. One table per neighbour.
+#
+# Unnumbered eBGP (`neighbor <interface> interface remote-as external`, which
+# needs no addresses at all and is what a modern fabric uses) is the obvious
+# next shape and is NOT built: it carries IPv4 routes over IPv6 link-local
+# next hops (RFC 5549), which is a second code path through everything below
+# and buys nothing in a lab whose switch has a management address anyway.
+#[[network.bgp.neighbors]]
+#address    = "10.128.1.1"
+#remote_asn = 65000
+
+# --- routed subnets: the NAT-free half --------------------------------------
+#
+# Nothing about them is configured on a node. A tenant's subnets arrive in the
+# VM spec (`nics[].routed_subnets`), injected by the control plane exactly as
+# the vxlan_id is, and they turn this node's tap rule from a DENY into an
+# ALLOWLIST: a tenant whose address space is written down may source from it
+# and from its floating addresses, and from nothing else.
+#
+# How a routed subnet is REACHED is, again, the environment's, and again there
+# are two shapes — with one difference from a floating address:
+#
+#   Static. A route for the subnet towards the hosts, and the tenant's own
+#   router VM (or the guests' own default gateway inside the overlay) does the
+#   rest. This is what the lab does.
+#
+#   Appliance. The tenant's own VM speaks for its own space — a gateway
+#   appliance with a leg in the overlay and a leg on a provider bridge.
+#
+# What does NOT happen is this stack announcing the subnet per host. A subnet
+# spans hosts by definition, so every node announcing it would be every node
+# claiming the whole prefix and the upstream load-balancing onto hosts that
+# hold none of it. Only /32s of locally running VMs are ever announced.
+
+# --- storage backends ------------------------------------------------------
+#
+# One section per backend, keyed by the name a volume spec puts in `driver`.
+# A volume that names no driver gets "filesystem", which is registered whether
+# or not this section exists — so a node that only ever wants files needs
+# nothing here at all.
+#
+#[volume.filesystem]
+# Both default to the [paths] entries above; name them only to put volumes
+# somewhere other than the images they are cloned from.
+#image_dir  = "/srv/images"
+#volume_dir = "/srv/volumes"
+
+# One thin LV per volume, on real block storage. The pool has to exist before
+# the agent starts — the driver checks at start-up rather than at the first VM
+# boot, so a missing pool is a start-up error and not a mysteriously failing
+# VM. Make one with: pvcreate /dev/sdb; vgcreate meister /dev/sdb;
+# lvcreate -T meister/thin -l 100%FREE
+#[volume.lvm-thin]
+#vg        = "meister"
+#thin_pool = "thin"
+# Refuse a create while the pool is fuller than this. A thin pool is
+# overprovisioned on purpose, so what is watched is its real fill and not the
+# sum of what its LVs were asked for: when a thin pool runs out of data space
+# EVERY vm on it takes I/O errors, not just the one that pushed it over.
+#max_data_percent = 90.0
+# Both default to [paths].image_dir and to PATH. bin_dir is for a host where
+# lvm2 is not on the agent's PATH; qemu_img writes the base image onto the LV
+# and reads qcow2 as well as raw.
+#image_dir = "/srv/images"
+#bin_dir   = "/run/current-system/sw/bin"
+#qemu_img  = "qemu-img"
+
+# Files on a mounted share, or a directory handed to the guest whole over
+# virtiofs. Named for NFS because that is what the lab uses it for; the rule
+# is broader — anything the HOST can mount can be a share, so a CephFS or an
+# SMB share_root is this same section with another fs_type.
+#[volume.nfs]
+# The mounted share everything lives under: <share_root>/volumes/<id>.raw for
+# a spec with `"kind": "file"` (the default), <share_root>/shares/<id>/ for
+# `"kind": "share"`.
+#share_root = "/srv/meister-share"
+# One of these is spawned per share attachment and dies with its VM.
+#virtiofsd  = "/opt/meisterstack/bin/virtiofsd"
+# Defaults to [paths].image_dir: images are the node's, and copying them onto
+# the share to copy them straight back off it would be work for nothing.
+#image_dir  = "/srv/images"
+# How long to wait for virtiofsd to put its socket down. Cloud-hypervisor
+# connects to it during vm.create, so a socket that is not there yet is a
+# failed VM, not a slow one.
+#socket_timeout_ms = 5000
+# Extra virtiofsd flags, verbatim and last. --sandbox=none is the one most
+# nodes end up wanting; the default (namespace) needs privileges the agent
+# may not have where you run it.
+#virtiofsd_args = ["--sandbox=none", "--cache=auto"]
+# false: share_root is already mounted, by fstab or a systemd unit, and the
+# driver only checks it is there (and warns if it is not a mount point at all
+# — that would make every "shared" volume private to this node). true: the
+# driver mounts it at start-up, and then it needs a server and an export.
+#manage_mount = true
+#server     = "10.0.8.21"
+#export     = "/exports/meister"
+#mount_opts = "vers=4.2,hard,noatime"
+#fs_type    = "nfs"
+
+# --- images on a share, which is the whole image "distribution" -------------
+#
+# v1 moves no bytes and is not going to: `meister cloud image create` records
+# where an image ALREADY is, every node looks that name up under its own
+# image_dir, and the catalogue is only worth its 422 if those two namespaces
+# line up. The way to make them line up on more than one node is not a
+# transfer protocol — it is one directory that every node can open:
+#
+#   [paths]
+#   image_dir = "/srv/meister-share/images"    # the SAME path on every node
+#
+# In the lab that path is an NFS mount (an fstab line, or [volume.nfs] with
+# manage_mount = true above); locally it is one directory two agent processes
+# both point at, which is the same thing with a shorter cable. Either way the
+# image exists once, `--source /srv/meister-share/images/nixos.raw` in the
+# catalogue is literally true, and a VM boots from it on whichever node the
+# scheduler picked.
+#
+# Note image_dir is READ-ONLY to the agent: the block driver clones out of it
+# into volume_dir, which stays node-local unless you are also using the nfs
+# volume backend. Two agents sharing image_dir do not share volumes, and
+# should not.
+
+# --- device backends -------------------------------------------------------
+#
+# Also config-keyed: a section that is absent means the driver is not loaded,
+# and a spec asking for it is refused with a message naming what IS available
+# — which is how a GPU-less node in the lab runs the same binary as manacor.
+#
+# Section name and driver name are the same string for every backend but one.
+# The exception is the vfio driver, configured by [[device.managed]] below:
+# its configuration is an INVENTORY of host devices rather than a setting of
+# itself, so the section is named for what it holds while a spec still says
+# `"driver": "vfio"` (config/json/passthrough.json is one). The agent owns
+# that mapping — a section no driver claims is refused at start-up by name,
+# with the list of what this binary actually has.
+
+#[device.crosvm-gpu]
+# Patched crosvm, from the same script.
+#binary = "/opt/meisterstack/bin/crosvm"
+# How long to wait for the backend's socket to appear before giving up. A cold
+# GPU takes seconds.
+#socket_timeout_ms = 5000
+
+# What every crosvm-gpu device gets unless its profile or its spec says
+# otherwise.
+#[device.crosvm-gpu.defaults]
+#backend                 = "virglrenderer"
+#vulkan                  = true
+#context_types           = "venus"
+#external_blob           = true
+#pci_bar_size            = 2147483648   # bytes; effectively the guest's VRAM
+#implicit_render_server  = true
+
+# Named profiles. A VM spec asks for one by name (`devices[].profile`), and
+# the node advertises `crosvm-gpu/<profile>` as capacity so the scheduler can
+# place a VM that needs it. Profile over defaults, spec params over both.
+#[device.crosvm-gpu.profiles.venus]
+#context_types = "venus"
+#[device.crosvm-gpu.profiles.gfxstream]
+#backend       = "gfxstream"
+#context_types = "gfxstream-vulkan"
+
+#[device.nvrm]
+#binary      = "/opt/meisterstack/bin/vhost-user-nvrm"
+# Resolves a vGPU type against the actual card at startup — the profile's
+# memory sizes and its max_instance come from here, not from this file.
+#vgpuprofile = "/opt/meisterstack/bin/vgpuprofile"
+#socket_timeout_ms = 5000
+# Optional hard admission: refuse a vGPU whose profile would take the node
+# over this budget. Unset = warn only, which is what the backend itself does
+# (it overprovisions by design). max_instance is enforced either way — it is
+# the card's own per-type limit and exceeding it fails at boot anyway.
+#vram_budget_mib = 8192
+
+# What every nvrm device gets unless its profile or its spec says otherwise;
+# the merge is defaults < profile < spec params, exactly as for crosvm-gpu.
+#
+# `env` is the fifth field of this table and deliberately has no line: it
+# hands arbitrary LEA_* knobs to the backend verbatim and wins over the typed
+# fields, so a knob name invented for an example is a knob name somebody
+# would copy. vram_limit_mib has none either — it is a hard cap, vgpu_type
+# resolves to a profile, and the backend refuses to start with both.
+#[device.nvrm.defaults]
+#vgpu_type        = "RTX2070-4Q"
+#vram_reserve_mib = 256
+#managed_compat   = true
+#admin_priv       = false
+
+# Named profiles, the same shape crosvm-gpu's have: a spec asks for one by
+# name and the node advertises `nvrm/<profile>` as capacity.
+#[device.nvrm.profiles.2q]
+#vgpu_type = "RTX2070-2Q"
+#[device.nvrm.profiles.4q]
+#vgpu_type = "RTX2070-4Q"
+#[device.nvrm.profiles.8q]
+#vgpu_type = "RTX2070-8Q"
+
+# PCI devices this node may hand to a guest whole. Nothing else is passthrough-
+# able: a spec naming an address that is not in this list is refused, and the
+# list is what keeps a VM from being given the NIC the lab runs on.
+#[[device.managed]]
+#kind        = "passthrough"      # or "nic-sriov"
+#pci_address = "0000:23:00.0"

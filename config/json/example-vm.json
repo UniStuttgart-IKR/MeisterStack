@@ -1,0 +1,22 @@
+{
+  "vcpus": 2,
+  "memory_mib": 2048,
+  "boot": {
+    "kind": "direct_kernel",
+    "kernel": "vmlinux.elf",
+    "cmdline": "init=/nix/store/fbs2jiqbi2gj3ps41dfsv1qld1j3z65w-nixos-system-gpu-worker-0-26.05.20260608.bd0ff2d/init console=ttyS0 loglevel=4 root=fstab",
+    "initramfs": "initrd"
+  },
+  "volumes": [
+    {
+      "base_image": "nixos.raw",
+      "size_bytes": 10737418240
+    }
+  ],
+  "nics": [
+    {
+      "bridge": "meister_br0"
+    }
+  ],
+  "devices": []
+}

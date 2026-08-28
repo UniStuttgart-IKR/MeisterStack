@@ -1,0 +1,47 @@
+[package]
+name = "meister-agent"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["http-api", "debug-mutations"]
+http-api = ["dep:axum"]
+debug-mutations = ["http-api"]
+
+[[bin]]
+name = "meister-agent"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["process", "fs"] }
+async-trait = { workspace = true }
+tokio-stream = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+redb = { workspace = true }
+uuid = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true, optional = true} 
+nix = { workspace = true }
+tonic = { workspace = true }
+
+# Local dependencies
+common = { package = "meister-common", path = "../../shared/common" }
+telemetry = { package = "meister-telemetry", path = "../../shared/telemetry" }
+agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
+proto = { package = "meister-proto", path = "../../shared/proto" }
+macros = { package = "meister-macros", path = "../../shared/macros" }
+
+# Local drivers
+cgroup-driver = { package = "meister-cgroup-driver", path = "../../drivers/cgroup" }
+cloud-hypervisor-driver = { package = "meister-cloud-hypervisor-driver", path = "../../drivers/cloud-hypervisor" }
+crosvm-gpu-driver = { package = "meister-crosvm-gpu-driver", path = "../../drivers/crosvm-gpu" }
+linux-network-driver = { package = "meister-linux-network-driver", path = "../../drivers/linux-network" }
+filesystem-driver = { package = "meister-filesystem-driver", path = "../../drivers/filesystem" }
+lvm-thin-driver = { package = "meister-lvm-thin-driver", path = "../../drivers/lvm-thin" }
+nfs-driver = { package = "meister-nfs-driver", path = "../../drivers/nfs" }
+vfio-driver = { package = "meister-vfio-driver", path = "../../drivers/vfio" }
+nvrm-driver = { package = "meister-nvrm-driver", path = "../../drivers/nvrm" }

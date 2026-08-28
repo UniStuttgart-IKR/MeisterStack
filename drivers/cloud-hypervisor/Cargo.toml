@@ -1,0 +1,18 @@
+[package]
+name = "meister-cloud-hypervisor-driver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+macros = { package = "meister-macros", path = "../../shared/macros/" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
+hyper = { workspace = true }
+hyper-util = { workspace = true } 
+http-body-util = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true }

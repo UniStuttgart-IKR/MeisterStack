@@ -1,0 +1,24 @@
+[package]
+name = "meister-linux-network-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
+macros = { package = "meister-macros", path = "../../shared/macros" }
+# `net`: what a cidr means, shared with the cloud that hands out the same
+# addresses. `capability`: the catalogue entries this node claims.
+common = { package = "meister-common", path = "../../shared/common" }
+rtnetlink = { workspace = true }
+futures = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+# `nft -j list table` is the one place this driver reads a machine format
+# back; the shape is asserted in the tests rather than assumed.
+serde_json = { workspace = true }

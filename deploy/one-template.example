@@ -1,0 +1,63 @@
+# OpenNebula VM template for a MeisterStack control-plane VM.
+# Import the built qcow2 first, e.g.:
+#   oneimage create --name meister-cp --path /mnt/vmstore/MeisterStack/control-plane-image/nixos.qcow2 \
+#                   --datastore <your-image-ds> --prefix vd
+# One persistent datablock PER VM keeps /var/lib/etcd across image swaps and
+# re-instantiation (the image mounts /dev/vdb nofail):
+#   oneimage create --name meister-cloud-etcd   --type DATABLOCK --size 4096 \
+#                   --datastore <your-image-ds> --prefix vd --persistent
+#   oneimage create --name meister-cluster-etcd --type DATABLOCK --size 4096 \
+#                   --datastore <your-image-ds> --prefix vd --persistent
+# First boot only: mkfs.ext4 /dev/vdb in the guest, then reboot the VM
+# (or set --fs ext4 at creation if your ONE version pre-formats datablocks).
+# Then one template per role. RAM-frugal on purpose: etcd + one static binary.
+
+NAME   = "meister-cloud"          # or meister-cluster
+CPU    = "1"
+VCPU   = "2"
+MEMORY = "2048"
+
+DISK = [ IMAGE = "meister-cp" ]
+DISK = [ IMAGE = "meister-cloud-etcd" ]   # or meister-cluster-etcd
+
+NIC = [ NETWORK = "<your-lab-network>" ]
+
+CONTEXT = [
+  NETWORK        = "YES",
+  SET_HOSTNAME   = "meister-cloud",           # or meister-cluster
+  SSH_PUBLIC_KEY = "$USER[SSH_PUBLIC_KEY]",
+  MEISTER_ROLE   = "cloud"                    # or "cluster" — picks the unit
+]
+
+GRAPHICS = [ TYPE = "vnc", LISTEN = "0.0.0.0" ]
+
+# ---------------------------------------------------------------------------
+# Agent VM (testenv): same image, role via context. NEEDS nested virt on the
+# host (kvm nested=1) and the host CPU model, or /dev/kvm is missing inside:
+#   CPU_MODEL = [ MODEL = "host-passthrough" ]
+# One VM per line in deploy/env MEISTER_AGENT_IPS afterwards; binaries and
+# guest assets arrive via `deploy/push.sh agents`.
+#
+# NAME   = "meister-agent-1a"
+# CPU    = "1"
+# VCPU   = "2"
+# MEMORY = "2048"
+# CPU_MODEL = [ MODEL = "host-passthrough" ]
+# DISK = [ IMAGE = "meister-cp" ]
+# NIC  = [ NETWORK = "<your-lab-network>" ]
+# CONTEXT = [
+#   NETWORK        = "YES",
+#   SET_HOSTNAME   = "agent-1a",                      # becomes the node_id
+#   SSH_PUBLIC_KEY = "$USER[SSH_PUBLIC_KEY]",
+#   MEISTER_ROLE   = "agent",
+#   MEISTER_CONTROLLER_ADDR = "http://10.128.1.104:50051"   # its cluster
+# ]
+#
+# Second cluster controller: MEISTER_ROLE = "cluster" plus
+#   MEISTER_CLUSTER_NAME = "cluster-2"
+# (set cluster_name ONLY via context or only via settings — never both,
+# duplicate TOML keys are a parse error).
+#
+# A cluster joins the cloud tier by naming its session; without it the
+# cluster-controller runs standalone exactly as before:
+#   MEISTER_CLOUD_ADDR = "http://10.128.1.103:50050"

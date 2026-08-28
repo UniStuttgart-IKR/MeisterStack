@@ -1,0 +1,20 @@
+[package]
+name = "meister-proto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+# The generated client/server code names tonic_prost::ProstCodec directly, so
+# this is a dependency of the OUTPUT rather than of anything written here.
+tonic-prost = { workspace = true }
+anyhow = { workspace = true }
+macros = { package = "meister-macros", path = "../macros" }
+# tonic's tls-ring asks for the process-wide crypto provider and panics
+# without one; `client_tls` installs it. Already in the tree under tonic, so
+# naming it costs nothing but the line.
+rustls = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

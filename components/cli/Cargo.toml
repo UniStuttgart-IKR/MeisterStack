@@ -1,0 +1,29 @@
+[package]
+name = "meister-cli"
+version = "0.1.0"
+edition = "2024"
+
+# binary name commands: 'meister vm create ...'
+[[bin]]
+name = "meister"
+path = "src/main.rs"
+
+[dependencies]
+telemetry = { package = "meister-telemetry", path = "../../shared/telemetry" }
+pki = { package = "meister-pki", path = "../../shared/pki" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+tokio-rustls = { workspace = true }
+
+macros = { package = "meister-macros", path = "../../shared/macros" }

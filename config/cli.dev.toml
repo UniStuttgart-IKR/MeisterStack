@@ -1,0 +1,29 @@
+# LOCAL DEV CONFIG — not a template. See config/README.md.
+#
+# The profiles this repository is driven with by hand: the agent on the
+# socket agent.dev.toml creates under /tmp, the lab cloud over plain http,
+# and one https/token cluster kept as a live check that the TLS path is
+# still wired. The paths in it (data/, token) are relative to THIS file and
+# so to this checkout. Nothing here is a shape to copy onto a workstation —
+# the file to copy is config/examples/cli.toml, or, for a control plane that
+# asks who you are, config/examples/hardened/cli.toml.
+#
+# Point the CLI at it with MEISTER_CONFIG=config/cli.dev.toml.
+
+default_profile = "lab"
+
+[profiles.lab]
+tier = "agent"
+endpoint = "unix:///tmp/run/meisterstack/agent.sock"
+credential = { type = "none" }
+
+[profiles.cluster-a]
+tier = "cluster"
+endpoint = "https://cluster-a.lab.internal:8443"
+ca_cert = "data/meisterstack/ca.pem"
+credential = { type = "token_file", path = "token" }
+
+[profiles.cloud]
+tier = "cloud"
+endpoint = "http://10.128.1.103:3000"
+credential = { type = "none" }

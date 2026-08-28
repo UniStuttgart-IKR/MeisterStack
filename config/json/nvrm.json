@@ -1,0 +1,17 @@
+{
+  "vcpus": 4,
+  "memory_mib": 4096,
+  "boot": {
+    "kind": "direct_kernel",
+    "kernel": "vmlinux.elf",
+    "initramfs": "initrd",
+    "cmdline": "console=ttyS0 loglevel=4 root=fstab"
+  },
+  "volumes": [
+    { "base_image": "nixos.raw", "size_bytes": 10737418240 }
+  ],
+  "nics": [ {} ],
+  "devices": [
+    { "driver": "nvrm", "partition": "mediated", "profile": "4q" }
+  ]
+}

@@ -1,0 +1,68 @@
+# LOCAL DEV CONFIG — not a template. See config/README.md.
+#
+# This is what the repository runs against ITSELF: paths point into this
+# checkout (../data, ../images, ./bin), the socket lands under /tmp, and
+# there is no controller, no TLS and no credential anywhere in it. Copying it
+# onto a node gives an agent whose database is two directories above wherever
+# you put it.
+#
+# It is loaded by a test (agent config::tests::the_dev_config_in_the_repo_
+# still_loads) and named by scripts/smoke.sh, so it keeps this path and this
+# name. The file to copy is config/examples/agent.toml — or, for anything
+# reachable from outside a lab, config/examples/hardened/agent.toml.
+
+node_id = "manacor"
+#controller_addr = "http://127.0.0.1:50051"
+
+[paths]
+db_path = "../data/lib/meisterstack/agent.redb"
+run_dir = "/tmp/run/meisterstack"
+image_dir = "../images"
+volume_dir = "../data/lib/meisterstack/volumes"
+cgroup_root = "/sys/fs/cgroup/meisterstack"
+
+[hypervisor.cloud-hypervisor]
+binary = "./bin/cloud-hypervisor"
+timeout_ms = 5000
+
+[network]
+default_bridge = "meister_br0"
+bridge_addr = "192.168.100.1/24" # optional, only required when no cntroller is active, overridden by controller
+
+[device.crosvm-gpu]
+binary = "./bin/crosvm"
+socket_timeout_ms = 5000
+
+[device.crosvm-gpu.defaults]
+backend = "virglrenderer"
+vulkan = true
+context_types = "venus"
+external_blob = true
+pci_bar_size = 2147483648 # in bytes 2048 * 1024 * 1024
+implicit_render_server = true
+# render_device = "/dev/dri/renderD128" //TODO multi-gpu support? scheduling over multiple GPUs is not supported atm
+
+[device.crosvm-gpu.profiles.venus]
+context_types = "venus"
+
+[device.crosvm-gpu.profiles.gfxstream]
+backend = "gfxstream"
+context_types = "gfxstream-vulkan"
+
+[device.nvrm]
+binary = "./bin/vhost-user-nvrm"       # symlink to ~/git/Leandro/target/release
+vgpuprofile = "./bin/vgpuprofile"
+# vram_budget_mib = 8192               # optional hard admission; unset = warn-only (Leandro overprovisions by design)
+
+[device.nvrm.profiles.2q]
+vgpu_type = "RTX2070-2Q"
+
+[device.nvrm.profiles.4q]
+vgpu_type = "RTX2070-4Q"
+
+[device.nvrm.profiles.8q]
+vgpu_type = "RTX2070-8Q"
+
+[[device.managed]]
+kind = "nic-sriov"
+pci_address = "0000:23:00.0"

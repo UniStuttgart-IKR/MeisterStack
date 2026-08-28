@@ -1,0 +1,15 @@
+[package]
+name = "meister-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
+macros = { package = "meister-macros", path = "../../shared/macros" }
+anyhow = { workspace = true }
+nix = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

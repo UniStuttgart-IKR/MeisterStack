@@ -1,0 +1,19 @@
+# Local key material, not configuration.
+#
+# Relative paths in a config resolve against THAT CONFIG FILE'S directory
+# (components/agent/src/config.rs::load, components/cli/src/config.rs::
+# resolve_path), so both of these land HERE and nowhere else:
+#
+#   data/  — cli.dev.toml's cluster-a profile names ca_cert =
+#            "data/meisterstack/ca.pem", i.e. config/data/. The lab CA is
+#            copied in by hand; it is not ours to publish.
+#   pki/   — `meister login` puts <config dir>/pki/<profile>.{key,crt} for
+#            any profile that names no mtls credential yet, and cli.dev.toml
+#            has two such profiles. That directory holds PRIVATE KEYS.
+#
+# The agent's own runtime tree is NOT here: agent.dev.toml says
+# "../data/lib/meisterstack", which resolves to <repo>/data and is covered
+# by the root .gitignore's /data entry. config/data/ never appears from
+# running the agent, which is what an earlier version of this file claimed.
+data/
+pki/

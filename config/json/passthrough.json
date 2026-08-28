@@ -1,0 +1,27 @@
+{
+  "vcpus": 2,
+  "memory_mib": 1024,
+  "boot": {
+    "kind": "direct_kernel",
+    "kernel": "vmlinux",
+    "cmdline": "console=ttyS0 root=/dev/vda3 rw net.ifnames=0 ip=192.168.100.100::192.168.100.1:255.255.255.0::eth0:off"
+  },
+  "volumes": [
+    {
+      "base_image": "nixos.raw",
+      "size_bytes": 10737418240
+    }
+  ],
+  "nics": [
+    {}
+  ],
+  "devices": [
+    {
+      "driver": "vfio",
+      "partition": "exclusive",
+      "params": {
+        "pci_address": "0000:23:00.0"
+      }
+    }
+  ]
+}

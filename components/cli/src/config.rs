@@ -1,0 +1,530 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+// SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use macros::generated;
+use serde::{Deserialize, Serialize};
+
+pub const ENV_CONFIG: &str = "MEISTER_CONFIG";
+pub const ENV_PROFILE: &str = "MEISTER_PROFILE";
+pub const ENV_ENDPOINT: &str = "MEISTER_ENDPOINT";
+pub const ENV_TOKEN: &str = "MEISTER_TOKEN";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    Agent,
+    Cluster,
+    Cloud,
+}
+
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Tier::Agent => "agent",
+            Tier::Cluster => "cluster",
+            Tier::Cloud => "cloud",
+        };
+        f.write_str(s)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
+pub enum CredentialSource {
+    #[default]
+    None,
+    TokenFile {
+        path: PathBuf,
+    },
+    Env {
+        var: String,
+    },
+    Command {
+        command: Vec<String>,
+    },
+    Mtls {
+        cert: PathBuf,
+        key: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    pub tier: Tier,
+    pub endpoint: String,
+    #[serde(default)]
+    pub ca_cert: Option<PathBuf>,
+    #[serde(default)]
+    pub credential: CredentialSource,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_timeout_secs() -> u64 {
+    30
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default)]
+    pub default_profile: Option<String>,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, Profile>,
+    #[serde(skip)]
+    pub dir: Option<PathBuf>,
+}
+
+/// Default config Paths are $MEISTER_CONFIG >> $XDG_CONFIG_HOME/meisterstack/config.toml >>
+/// ~/.config/meisterstack/config.toml
+#[generated(model = ClaudeOpus, version = "4.8")]
+pub fn default_config_path() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var(ENV_CONFIG) {
+        return Ok(PathBuf::from(p));
+    }
+    let base = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => {
+            let home = std::env::var("HOME").context("neither XDG_CONFIG_HOME nor HOME is set")?;
+            PathBuf::from(home).join(".config")
+        }
+    };
+    Ok(base.join("meisterstack").join("config.toml"))
+}
+
+impl Config {
+    /// The certificate and key a profile DECLARES, whether or not they exist
+    /// and whatever credential this particular call ended up resolving to.
+    ///
+    /// `meister login` needs the declaration rather than the resolution, and
+    /// the difference is exactly the bootstrap case: the first login is made
+    /// with a bearer token — `MEISTER_TOKEN` wins over the profile — and the
+    /// resolved credential is then a token, while the two paths the
+    /// certificate belongs in are still the profile's.
+    #[generated(model = ClaudeOpus, version = "5")]
+    pub fn declared_mtls(&self, profile: &str) -> Option<(PathBuf, PathBuf)> {
+        match &self.profiles.get(profile)?.credential {
+            CredentialSource::Mtls { cert, key } => Some((
+                resolve_path(self.dir.as_deref(), cert.clone()),
+                resolve_path(self.dir.as_deref(), key.clone()),
+            )),
+            _ => None,
+        }
+    }
+
+    #[generated(model = ClaudeOpus, version = "4.8")]
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => {
+                let mut cfg: Config = toml::from_str(&raw)
+                    .with_context(|| format!("parsing config file {}", path.display()))?;
+                cfg.dir = path.parent().map(Path::to_path_buf);
+                Ok(cfg)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading config file {}", path.display())),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Overrides {
+    pub profile: Option<String>,
+    pub endpoint: Option<String>,
+    /// `meister login` sets this, and only it.
+    ///
+    /// A profile that names an mtls credential whose files do not exist yet
+    /// is the normal state before the first login — the whole point of the
+    /// command is to create them. Refusing to resolve such a profile would
+    /// mean the one command that fills it in could never be run against it.
+    /// Every other command still fails, loudly, because for them a missing
+    /// certificate is exactly the problem it looks like.
+    pub tolerate_missing_credential: bool,
+}
+
+#[derive(Debug)]
+/// A resolved target: what the client needs and nothing else.
+///
+/// `tier` is deliberately not here — it is checked against the command on the
+/// Profile, before this is built, and carrying the answer past the check only
+/// invites a second one. `ca_cert` was in the same position until this
+/// milestone and was taken out for it; it is back because there is now
+/// something to hand it to. It is the CA an `https://` endpoint is verified
+/// against, and it is required for one — a lab CA is in nobody's system trust
+/// store, so falling back to those would only turn a clear error into an
+/// obscure handshake failure.
+pub struct Target {
+    pub profile_name: String,
+    pub endpoint: String,
+    pub ca_cert: Option<PathBuf>,
+    pub credential: Credential,
+    pub timeout_secs: u64,
+}
+
+pub enum Credential {
+    None,
+    Bearer(String),
+    Mtls { cert: PathBuf, key: PathBuf },
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credential::None => f.write_str("None"),
+            Credential::Bearer(_) => f.write_str("Bearer(<redacted>)"),
+            Credential::Mtls { cert, .. } => {
+                write!(f, "Mtls {{ cert: {} }}", cert.display())
+            }
+        }
+    }
+}
+
+#[generated(model = ClaudeOpus, version = "4.8")]
+pub fn resolve(config: &Config, expected_tier: Tier, ov: &Overrides) -> Result<Target> {
+    let profile_name = ov
+        .profile
+        .clone()
+        .or_else(|| std::env::var(ENV_PROFILE).ok().filter(|s| !s.is_empty()))
+        .or_else(|| config.default_profile.clone());
+
+    let endpoint_override = ov
+        .endpoint
+        .clone()
+        .or_else(|| std::env::var(ENV_ENDPOINT).ok().filter(|s| !s.is_empty()));
+
+    let (name, profile) = match &profile_name {
+        Some(name) => {
+            let p = config.profiles.get(name).ok_or_else(|| {
+                let known: Vec<&str> = config.profiles.keys().map(String::as_str).collect();
+                anyhow::anyhow!(
+                    "unknown profile {name:?}; configured profiles: {}",
+                    if known.is_empty() {
+                        "<none>".into()
+                    } else {
+                        known.join(", ")
+                    }
+                )
+            })?;
+            (name.clone(), Some(p))
+        }
+        None => ("<flags>".to_string(), None),
+    };
+
+    if let Some(p) = profile
+        && p.tier != expected_tier
+    {
+        bail!(
+            "profile {name:?} targets the {} tier, but this command talks to the {} tier",
+            p.tier,
+            expected_tier
+        );
+    }
+
+    let endpoint = endpoint_override
+        .or_else(|| profile.map(|p| p.endpoint.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no endpoint: pass --endpoint, set {ENV_ENDPOINT}, or select a profile")
+        })?;
+
+    let credential = match std::env::var(ENV_TOKEN).ok().filter(|s| !s.is_empty()) {
+        Some(token) => Credential::Bearer(token),
+        None => match profile.map(|p| &p.credential) {
+            Some(src) => load_credential(src, config.dir.as_deref(), ov)?,
+            None => Credential::None,
+        },
+    };
+
+    Ok(Target {
+        profile_name: name,
+        endpoint,
+        ca_cert: profile
+            .and_then(|p| p.ca_cert.clone())
+            .map(|p| resolve_path(config.dir.as_deref(), p)),
+        credential,
+        timeout_secs: profile
+            .map(|p| p.timeout_secs)
+            .unwrap_or_else(default_timeout_secs),
+    })
+}
+
+#[generated(model = ClaudeOpus, version = "4.8")]
+fn load_credential(
+    src: &CredentialSource,
+    base: Option<&Path>,
+    ov: &Overrides,
+) -> Result<Credential> {
+    match src {
+        CredentialSource::None => Ok(Credential::None),
+
+        CredentialSource::Env { var } => {
+            let token = std::env::var(var)
+                .with_context(|| format!("credential env var {var} is not set"))?;
+            Ok(Credential::Bearer(token.trim().to_string()))
+        }
+
+        CredentialSource::TokenFile { path } => {
+            let path = resolve_path(base, path.clone());
+            check_secret_permissions(&path)?;
+            let token = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading token file {}", path.display()))?;
+            Ok(Credential::Bearer(token.trim().to_string()))
+        }
+
+        CredentialSource::Command { command } => {
+            let Some((bin, args)) = command.split_first() else {
+                bail!("credential command is empty");
+            };
+            let out = std::process::Command::new(bin)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .with_context(|| format!("running credential command {bin}"))?;
+            if !out.status.success() {
+                bail!(
+                    "credential command {bin} failed with {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            let token = String::from_utf8(out.stdout)
+                .context("credential command produced non-utf8 output")?;
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                bail!("credential command {bin} produced no output");
+            }
+            Ok(Credential::Bearer(token))
+        }
+
+        CredentialSource::Mtls { cert, key } => {
+            let cert = resolve_path(base, cert.clone());
+            let key = resolve_path(base, key.clone());
+            if ov.tolerate_missing_credential && (!cert.exists() || !key.exists()) {
+                // The state a profile is in before its first login. Going on
+                // without a credential is right: against a controller with no
+                // chain this simply works, and against one with a chain it
+                // earns a 401 that says what is missing — both better answers
+                // than refusing to run the command that would fix it.
+                return Ok(Credential::None);
+            }
+            check_secret_permissions(&key)?;
+            Ok(Credential::Mtls { cert, key })
+        }
+    }
+}
+
+#[cfg(unix)]
+#[generated(model = ClaudeOpus, version = "4.8")]
+fn check_secret_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "permissions {:04o} on {} are too open; run: chmod 600 {}",
+            mode,
+            path.display(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_secret_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn resolve_path(base: Option<&Path>, path: PathBuf) -> PathBuf {
+    let path = expand_tilde(path);
+    if path.is_absolute() {
+        return path;
+    }
+    match base {
+        Some(b) => b.join(path),
+        None => path,
+    }
+}
+
+fn expand_tilde(path: PathBuf) -> PathBuf {
+    let Ok(rest) = path.strip_prefix("~") else {
+        return path;
+    };
+    match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join(rest),
+        Err(_) => path,
+    }
+}
+
+#[cfg(test)]
+#[generated(model = ClaudeOpus, version = "4.8")]
+mod tests {
+    use super::*;
+
+    /// The example, live and commented-out halves both. Same rule as the
+    /// other three: prose is `# text`, a commented-out setting is `#key = …`
+    /// with no space, and an example that does not parse is worse than none.
+    ///
+    /// `Profile` is `deny_unknown_fields`, so this also catches a profile key
+    /// renamed in the code and left behind here.
+    #[test]
+    fn the_example_config_parses_commented_keys_included() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/examples/cli.toml");
+        let raw = std::fs::read_to_string(&path).expect("the example is where it says");
+        let live: Config =
+            toml::from_str(&raw).expect("config/examples/cli.toml parses as written");
+        assert_eq!(live.default_profile.as_deref(), Some("lab"));
+        assert_eq!(live.profiles.len(), 4);
+        assert_eq!(live.profiles["lab"].tier, Tier::Agent);
+        assert_eq!(live.profiles["cluster-a"].tier, Tier::Cluster);
+        assert_eq!(live.profiles["cloud"].tier, Tier::Cloud);
+        // The mTLS profile is the one an operator copies; if its shape ever
+        // stops being the shape the client accepts, this is where it shows.
+        let mtls = &live.profiles["cloud-mtls"];
+        assert!(mtls.endpoint.starts_with("https://"));
+        assert!(mtls.ca_cert.is_some(), "an https profile needs its CA");
+        assert!(matches!(mtls.credential, CredentialSource::Mtls { .. }));
+
+        // The credential shapes at the bottom are prose, deliberately: they
+        // are alternatives for one field, and uncommenting them all at once
+        // would be four values for `credential`. Each is parsed on its own.
+        for line in raw
+            .lines()
+            .filter(|l| l.trim_start().starts_with("#   { type ="))
+        {
+            let value = line.trim_start().trim_start_matches('#').trim();
+            let doc = format!(
+                "default_profile = \"p\"\n[profiles.p]\ntier = \"agent\"\n\
+                 endpoint = \"unix:///x.sock\"\ncredential = {value}"
+            );
+            toml::from_str::<Config>(&doc)
+                .unwrap_or_else(|e| panic!("credential example {value:?} does not parse: {e}"));
+        }
+
+        let uncommented: String = raw
+            .lines()
+            .map(|l| match l.strip_prefix('#') {
+                Some(rest) if !rest.starts_with(' ') && !rest.is_empty() => rest,
+                _ if l.starts_with('#') => "",
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        toml::from_str::<Config>(&uncommented)
+            .expect("every commented key in the example is a real one");
+    }
+
+    fn config_with(tier: Tier) -> Config {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "p".to_string(),
+            Profile {
+                tier,
+                endpoint: "https://example:8443".into(),
+                ca_cert: None,
+                credential: CredentialSource::None,
+                timeout_secs: 30,
+            },
+        );
+        Config {
+            default_profile: Some("p".into()),
+            profiles,
+            dir: None,
+        }
+    }
+
+    #[test]
+    fn tier_mismatch_is_rejected() {
+        let cfg = config_with(Tier::Cloud);
+        let err = resolve(&cfg, Tier::Agent, &Overrides::default()).unwrap_err();
+        assert!(err.to_string().contains("tier"), "{err}");
+    }
+
+    #[test]
+    fn unknown_profile_lists_known_ones() {
+        let cfg = config_with(Tier::Agent);
+        let ov = Overrides {
+            profile: Some("nope".into()),
+            ..Default::default()
+        };
+        let err = resolve(&cfg, Tier::Agent, &ov).unwrap_err();
+        assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn flag_endpoint_beats_profile() {
+        let cfg = config_with(Tier::Agent);
+        let ov = Overrides {
+            endpoint: Some("unix:///tmp/a.sock".into()),
+            ..Default::default()
+        };
+        let t = resolve(&cfg, Tier::Agent, &ov).unwrap();
+        assert_eq!(t.endpoint, "unix:///tmp/a.sock");
+    }
+
+    #[test]
+    fn works_without_config_file() {
+        let cfg = Config::default();
+        let ov = Overrides {
+            endpoint: Some("unix:///tmp/a.sock".into()),
+            ..Default::default()
+        };
+        let t = resolve(&cfg, Tier::Agent, &ov).unwrap();
+        assert_eq!(t.profile_name, "<flags>");
+        assert!(matches!(t.credential, Credential::None));
+        assert!(t.ca_cert.is_none());
+    }
+
+    /// The state every mtls profile is in before its first login. Only
+    /// `meister login` gets this pass; for anything else a missing
+    /// certificate is the problem it looks like.
+    #[test]
+    fn login_may_resolve_a_profile_whose_certificate_does_not_exist_yet() {
+        let mut cfg = config_with(Tier::Cloud);
+        cfg.profiles.get_mut("p").unwrap().credential = CredentialSource::Mtls {
+            cert: PathBuf::from("/nonexistent/x.crt"),
+            key: PathBuf::from("/nonexistent/x.key"),
+        };
+        assert!(resolve(&cfg, Tier::Cloud, &Overrides::default()).is_err());
+
+        let ov = Overrides {
+            tolerate_missing_credential: true,
+            ..Default::default()
+        };
+        let t = resolve(&cfg, Tier::Cloud, &ov).unwrap();
+        assert!(matches!(t.credential, Credential::None));
+    }
+
+    /// The CA a profile names travels with the target now, resolved against
+    /// the config file so that a config and its pki/ directory move as one.
+    #[test]
+    fn the_profiles_ca_reaches_the_client_as_an_absolute_path() {
+        let mut cfg = config_with(Tier::Cloud);
+        cfg.dir = Some(PathBuf::from("/etc/meisterstack"));
+        cfg.profiles.get_mut("p").unwrap().ca_cert = Some(PathBuf::from("pki/ca.crt"));
+        let t = resolve(&cfg, Tier::Cloud, &Overrides::default()).unwrap();
+        assert_eq!(
+            t.ca_cert.as_deref(),
+            Some(Path::new("/etc/meisterstack/pki/ca.crt"))
+        );
+    }
+
+    #[test]
+    fn missing_endpoint_is_an_error() {
+        let cfg = Config::default();
+        assert!(resolve(&cfg, Tier::Agent, &Overrides::default()).is_err());
+    }
+
+    #[test]
+    fn bearer_is_redacted_in_debug() {
+        let c = Credential::Bearer("super-secret".into());
+        assert!(!format!("{c:?}").contains("super-secret"));
+    }
+}

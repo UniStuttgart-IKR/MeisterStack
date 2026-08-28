@@ -1,0 +1,98 @@
+# meister — the CLI's profiles, hardened.
+#
+# $MEISTER_CONFIG, else ~/.config/meisterstack/cli.toml. See ./README.md for
+# the exposure profile these three profiles are the client side of; see
+# ../cli.toml for what every key means and for the other credential shapes.
+#
+# Same comment convention as the plain examples: prose is a hash and a space,
+# a commented-out setting is a hash and the key with no space between.
+#
+# Nothing in this file is a secret. `credential` names PATHS; the key stays a
+# file with mode 0600, which the CLI checks before it reads it and refuses if
+# the group or the world can see it.
+
+# The public tier, and for a user the only one. Everything about a VM — create,
+# stop, destroy — goes through here.
+default_profile = "cloud"
+
+# --- the one public edge ---------------------------------------------------
+#
+# https, a client certificate, and a CA that is named rather than inherited.
+#
+# `ca_cert` is required for an https endpoint and is not optional the way it
+# looks: a lab CA is in nobody's system trust store, so falling back to those
+# would turn a config mistake into an opaque handshake failure. Relative paths
+# resolve against this config file's directory.
+#
+# `meister login --profile cloud` writes a fresh key and certificate to
+# exactly the two paths named here and never edits this file, so running it
+# again is a renewal in place. Against a hardened cloud the FIRST login needs
+# a certificate already — see the bootstrap note in ./README.md.
+[profiles.cloud]
+tier = "cloud"
+endpoint = "https://cloud.example.net:3000"
+ca_cert = "pki/ca.crt"
+credential = { type = "mtls", cert = "pki/alice.crt", key = "pki/alice.key" }
+# How long one request may take before the CLI gives up. 30 is the default;
+# it is spelled out here because a public endpoint is the one that will
+# actually hang one day.
+timeout_secs = 30
+
+# --- the operator's door ---------------------------------------------------
+#
+# The cluster REST API bound to 127.0.0.1 on its own host, reached through an
+# SSH tunnel:
+#
+#   ssh -L 3001:127.0.0.1:3001 cluster-1
+#
+# The endpoint is https://127.0.0.1:3001 and the certificate still verifies,
+# because `meister-ca` always adds localhost and 127.0.0.1 to a serving
+# certificate's SANs. The tunnel does not weaken the mTLS — it carries it.
+#
+# `tier` is checked against the command, so this profile serves
+# `meister cluster …` and a `meister cloud …` against it is refused rather
+# than sent to a server that would not understand it.
+[profiles.cluster-1]
+tier = "cluster"
+endpoint = "https://127.0.0.1:3001"
+ca_cert = "pki/ca.crt"
+credential = { type = "mtls", cert = "pki/admin.crt", key = "pki/admin.key" }
+
+# The other shape from ./README.md, for a team where a jump host is the wrong
+# tool: the cluster binds its management address instead of loopback, and the
+# profile names it directly. Same certificate, same CA, no tunnel.
+#[profiles.cluster-1-mgmt]
+#tier = "cluster"
+#endpoint = "https://10.128.1.104:3001"
+#ca_cert = "pki/ca.crt"
+#credential = { type = "mtls", cert = "pki/admin.crt", key = "pki/admin.key" }
+
+# --- the node, from the node -----------------------------------------------
+#
+# The agent's unix socket. There is no network endpoint to point at and no
+# credential to present: reaching the socket at all IS the authorisation, it
+# is mode 0600, and this profile therefore only works in a session on that
+# node. `meister agent …` against it is the local debugging path — the
+# control plane drives the same node over its own outbound session.
+[profiles.node-local]
+tier = "agent"
+endpoint = "unix:///run/meisterstack/agent.sock"
+credential = { type = "none" }
+
+# The credential shapes this profile deliberately does not use:
+#
+#   { type = "none" }
+#   { type = "token_file", path = "token" }
+#   { type = "env",     var = "MEISTER_TOKEN" }
+#   { type = "command", command = ["pass", "show", "meisterstack/token"] }
+#
+# All four are bearer-token shapes, and a hardened control plane has no bearer
+# link in its authenticator chain — a token would be sent and ignored. They
+# are the development and bootstrap path; `command` is the least bad of them
+# where one is unavoidable, because it keeps the secret in whatever store the
+# operator already trusts instead of in a file beside this one.
+#
+# MEISTER_TOKEN in the environment overrides the profile's credential, which
+# is worth knowing here for the opposite of the usual reason: on a host where
+# it is set for some other tool, it silently replaces the certificate below
+# with a token the server will reject.

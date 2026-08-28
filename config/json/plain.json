@@ -1,0 +1,15 @@
+{
+  "vcpus": 2,
+  "memory_mib": 2048,
+  "boot": {
+    "kind": "direct_kernel",
+    "kernel": "vmlinux.elf",
+    "initramfs": "initrd",
+    "cmdline": "console=ttyS0 loglevel=4 root=fstab"
+  },
+  "volumes": [
+    { "base_image": "nixos.raw", "size_bytes": 10737418240 }
+  ],
+  "nics": [ {} ],
+  "devices": []
+}

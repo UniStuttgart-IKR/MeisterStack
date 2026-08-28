@@ -1,0 +1,285 @@
+syntax = "proto3";
+
+package meisterstack.v1;
+
+message VmSpec {
+  uint32 vcpus = 1;
+  uint64 memory_mib = 2;
+  oneof boot {
+    DirectKernelBoot direct_kernel = 3;
+    FirmwareBoot firmware = 4;
+  }
+  repeated VolumeSpec volumes = 5;
+  repeated NicSpec nics = 6;
+  repeated DeviceSpec devices = 7;
+}
+
+message DirectKernelBoot {
+  string kernel = 1;
+  string cmdline = 2;
+  string initramfs = 3;
+}
+
+message FirmwareBoot {
+  string firmware = 1;
+}
+
+message VolumeSpec {
+  string id = 1;
+  string base_image = 2;
+  uint64 size_bytes = 3;
+}
+
+message NicSpec {
+  string id = 1;
+  string bridge = 2;
+  string mac = 3;
+}
+
+message DeviceSpec {
+  string id = 1;
+  string driver_name = 2;
+  string partition = 3;
+  string params_json = 4;
+}
+
+service ControlPlane {
+  rpc Session(stream AgentMessage) returns (stream ControllerMessage);
+}
+
+message AgentMessage {
+  oneof kind {
+    Hello hello = 1;
+    CommandResult result = 2;
+    StatusReport status = 3;
+  }
+}
+
+message Hello {
+  string node_id = 1;
+  string agent_version = 2;
+  // What this node can host: the agent's configured device drivers and the
+  // profiles each of them resolves. The controller keeps them as the node's
+  // capacity so scheduling can look at them without asking the agent.
+  repeated DriverInfo drivers = 3;
+}
+
+message DriverInfo {
+  string name = 1;
+  repeated string profiles = 2;
+}
+
+// Sent every few seconds and after every command the agent processed: it is
+// both the heartbeat and the only path a VM phase takes upwards.
+message StatusReport {
+  NodeStatus node = 1;
+  repeated VmStatusReport vms = 2;
+}
+
+message NodeStatus {
+  uint32 vcpus = 1;
+  uint64 mem_mib = 2;
+}
+
+message VmStatusReport {
+  // The uuid the controller handed out as metadata.uid on CreateInstance.
+  string id = 1;
+  // One of the controller's VmPhase variants, spelled exactly.
+  string phase = 2;
+  string message = 3;
+}
+
+message ControllerMessage {
+  oneof kind {
+    Command command = 1;
+    SyncState sync = 2;
+  }
+}
+
+// The complete desired state of one node, sent right after Hello and before
+// anything else. Every entry is the CreateInstance the controller would send
+// anyway (create is idempotent by id), so applying the snapshot needs no
+// second code path. What is NOT in the list is the other half of the
+// message: a managed record the controller no longer knows about is gone and
+// the agent tears it down. VMs on their way out (deletionTimestamp set) are
+// deliberately absent here — they keep going through Destroy so the
+// finalizer stays the single teardown path.
+message SyncState {
+  repeated CreateInstance desired = 1;
+}
+
+message Command {
+  string request_id = 1;
+  // W3C traceparent of the request this command descends from, so one trace
+  // reaches from `POST /vms` through both gRPC hops into the driver spans.
+  // Empty = no context; the node then starts its own rather than guessing.
+  string traceparent = 8;
+  oneof op {
+    CreateInstance create = 2;
+    DestroyInstance destroy = 3;
+    StartInstance start = 4;
+    StopInstance stop = 5;
+    PauseInstance pause = 6;
+    ResumeInstance resume = 7;
+  }
+}
+
+message DestroyInstance { string id = 1; }
+
+// The four runtime transitions, same semantics as the agent's own REST
+// endpoints: they set the record's desired state and let the reconciler
+// converge. Derived level-triggered from spec.runStrategy vs status.phase,
+// so the controller repeats them until the phase moves.
+message StartInstance { string id = 1; }
+
+message StopInstance {
+  string id = 1;
+  // Grace period for the guest to power off before the vmm is killed.
+  // Unset = the agent's configured default (stop_grace_secs).
+  optional uint64 grace_secs = 2;
+}
+
+message PauseInstance { string id = 1; }
+message ResumeInstance { string id = 1; }
+
+message CommandResult {
+  string request_id = 1;
+  oneof outcome {
+    Ack ok = 2;
+    ErrorMsg error = 3;
+  }
+}
+
+message Ack {}
+message ErrorMsg { string message = 1; }
+
+message CreateInstance {
+  string id = 1;
+  VmSpec spec = 2;
+  // NewVmSpec as JSON, verbatim what the agent's REST API accepts. When set
+  // it wins over `spec`: one spec format everywhere, and driver/profile/
+  // params travel without proto modelling.
+  string spec_json = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Cluster -> Cloud: the same session one tier up. The cluster-controller dials
+// out, says which cluster it is, and from then on the stream carries its
+// status upwards and the cloud's VM assignments downwards. No store is ever
+// shared between the tiers; this session is the only place they meet.
+
+service ClusterPlane {
+  rpc Session(stream ClusterMessage) returns (stream CloudMessage);
+}
+
+message ClusterMessage {
+  oneof kind {
+    ClusterHello hello = 1;
+    CommandResult result = 2;
+    ClusterStatus status = 3;
+  }
+}
+
+message ClusterHello {
+  string cluster_name = 1;
+  string version = 2;
+}
+
+// Sent every ten seconds and right after every command the cluster processed:
+// the heartbeat, the aggregate the cloud places against, and the only path a
+// cloud-managed VM's phase takes upwards.
+message ClusterStatus {
+  uint32 nodes_ready = 1;
+  uint32 nodes_total = 2;
+  ClusterCapacity capacity = 3;
+  // Only the VMs this cluster holds for the cloud (the ones labelled
+  // meister.io/managed-by=cloud), the ones on their way out included — they
+  // exist until they do not, and the cloud reads their absence as proof of
+  // teardown. VmStatusReport.id is the uid the CLOUD handed out on CreateVm,
+  // exactly as one tier down it is the uid the controller handed the agent:
+  // the name is what people call a VM, the uid is which VM it is.
+  repeated VmStatusReport vms = 4;
+  // False says "this list is not the whole truth" — a cluster that could not
+  // read all of its own objects says so instead of shipping a short list. The
+  // difference matters because absence from this list is what the cloud
+  // accepts as proof that a VM was torn down.
+  bool vms_complete = 5;
+}
+
+// The ready nodes' capacity, summed; capabilities is their union. Both are
+// what this cluster can host at all, which is the granularity a decision one
+// tier up can actually use — the node-exact fit is the cluster's own business.
+message ClusterCapacity {
+  uint32 vcpus = 1;
+  uint64 mem_mib = 2;
+  repeated string capabilities = 3;
+}
+
+message CloudMessage {
+  oneof kind {
+    CloudCommand command = 1;
+  }
+}
+
+message CloudCommand {
+  string request_id = 1;
+  // Same field, one tier up. See Command.traceparent.
+  string traceparent = 4;
+  oneof op {
+    CreateVm create = 2;
+    DestroyVm destroy = 3;
+  }
+}
+
+// Idempotent by name and acked after the cluster wrote its object, not after
+// the VM boots — the phase travels up through ClusterStatus, exactly as it
+// travels up to the cluster through StatusReport.
+message CreateVm {
+  string name = 1;
+  // The cluster tier's VmSpec as JSON: runStrategy plus the agent's NewVmSpec
+  // verbatim under `vm`. One spec format the whole way down.
+  string spec_json = 2;
+  // The cloud object's metadata.uid. The cluster keeps it on the object it
+  // writes, and a create only ever adopts an object carrying this exact uid:
+  // a name is a label people reuse, and adopting on the name alone would hand
+  // a new VM somebody else's disk.
+  string uid = 3;
+  // The VXLAN network of the tenant this VM belongs to, resolved by the cloud
+  // because the cloud is where the Tenant object lives. The CLUSTER is what
+  // writes it into the NIC entries of the spec before anything reaches a
+  // node — the truth is made at the edge, and the agent stays dumb and only
+  // checks types. Unset = no tenant, or a tenant from before overlays: the
+  // VM lands on the node's default bridge exactly as it always did.
+  //
+  // A standalone cluster with no cloud above it has the other road: a NIC in
+  // the spec may name its own `vxlan_id`, and an explicit one is never
+  // overwritten by this.
+  optional uint32 vni = 4;
+  // The floating addresses reserved for this VM, resolved by the cloud
+  // because the FloatingIp objects live there. Same road as `vni` and for the
+  // same reason: the cluster writes them into the NIC entries of the spec
+  // before anything reaches a node, and the node turns them into the one
+  // exception to its "nobody sources from the pool" rule.
+  //
+  // Empty = this VM holds none, which is every VM before this milestone and
+  // every VM whose tenant never asked for an address.
+  repeated string floating_ips = 5;
+  // And its tenant's routed subnets, which is what turns the node's rule from
+  // "not out of the pool" into "these and nothing else": a tenant whose
+  // address space is written down can be held to it, and one whose is not
+  // cannot. Empty = a tenant with no routed subnet, which is the hoster mode
+  // (private space behind the tenant's own NAT appliance) and the shape of
+  // every tenant before Part B.
+  repeated string routed_subnets = 6;
+}
+
+// Sets the object's deletionTimestamp at the cluster; the finalizer flow there
+// is unchanged, and the cloud's own object goes only once the cluster stops
+// naming the VM in its status.
+message DestroyVm {
+  string name = 1;
+  // Same rule as CreateVm: only the object carrying this uid is ours to stamp.
+  // Anything else — a cluster-local VM of the same name, a leftover from an
+  // older incarnation — is acked untouched rather than torn down.
+  string uid = 2;
+}

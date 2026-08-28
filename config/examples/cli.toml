@@ -1,0 +1,67 @@
+# meister — the CLI's profiles.
+#
+# Looked for at $MEISTER_CONFIG, else ~/.config/meisterstack/config.toml. A
+# profile bundles "which endpoint, which tier, which credential" under a name;
+# `--profile` picks one, `--endpoint` bypasses them entirely, and
+# MEISTER_PROFILE / MEISTER_ENDPOINT / MEISTER_TOKEN do the same from the
+# environment.
+#
+# For the client side of a locked-down control plane — mTLS everywhere, an
+# SSH tunnel to the cluster tier, and why the bearer shapes at the bottom of
+# this file stop working there — see hardened/cli.toml.
+
+# Used when neither --profile nor --endpoint says otherwise.
+default_profile = "lab"
+
+# The agent's own unix socket. `tier` is checked against the command: this
+# profile serves `meister agent …` and a `meister cluster …` against it is
+# refused rather than sent somewhere that would not understand it.
+[profiles.lab]
+tier       = "agent"
+endpoint   = "unix:///run/meisterstack/agent.sock"
+credential = { type = "none" }
+
+# A cluster's sub-API. Plain http is the lab-internal shape and still the
+# default one; an https endpoint works too and needs a ca_cert (below).
+[profiles.cluster-a]
+tier       = "cluster"
+endpoint   = "http://10.128.1.104:3001"
+# How long one request may take before the CLI gives up.
+timeout_secs = 30
+# The token is read from this file at call time, not stored here. Relative
+# paths resolve against this config file's directory.
+credential = { type = "token_file", path = "token" }
+
+# The public tier.
+[profiles.cloud]
+tier       = "cloud"
+endpoint   = "http://10.128.1.103:3000"
+credential = { type = "none" }
+
+# The same tier with TLS and a client certificate — what a controller
+# configured with tls_cert/client_ca expects, and what `tools/meister-ca` and
+# `meister login` produce between them.
+#
+# `ca_cert` is required for an https endpoint and is not optional the way it
+# looks: a lab CA is in nobody's system trust store, so falling back to those
+# would turn a config mistake into an opaque handshake failure.
+#
+# `meister login --profile cloud-mtls` writes a fresh key and certificate to
+# exactly the two paths named here and never edits this file. Running it
+# again is a renewal in place.
+[profiles.cloud-mtls]
+tier       = "cloud"
+endpoint   = "https://10.128.1.103:3000"
+ca_cert    = "pki/ca.crt"
+credential = { type = "mtls", cert = "pki/cloud-mtls.crt", key = "pki/cloud-mtls.key" }
+
+# The other credential shapes:
+#
+#   { type = "env",     var = "MEISTER_TOKEN" }
+#   { type = "command", command = ["pass", "show", "meisterstack/token"] }
+#   { type = "mtls",    cert = "client.pem", key = "client-key.pem" }
+#
+# A bearer token authenticates against the controller's `[auth]` chain — the
+# development path, one static string, and the way a brand new user gets far
+# enough to ask for a certificate. A client certificate over a plain http
+# endpoint is refused at construction rather than silently unsent.

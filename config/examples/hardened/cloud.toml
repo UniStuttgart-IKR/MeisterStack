@@ -1,0 +1,135 @@
+# meister-cloud-controller — the hardened profile.
+#
+# /etc/meisterstack/cloud.toml. This is the ONE component of the stack with a
+# public port, so it is the one whose configuration is worth reading twice.
+# See ./README.md for the profile as a whole; see ../cloud.toml for what every
+# key means when it is not being hardened.
+#
+# Same comment convention as the plain examples: prose is a hash and a space,
+# a commented-out setting is a hash and the key with no space between.
+
+# --- the two ports ---------------------------------------------------------
+#
+# The public edge, and the only one in the stack. It terminates TLS (tls_cert
+# below) and asks every caller for a client certificate. Bind it to the
+# interface that faces users and to nothing else; 0.0.0.0 is right on a host
+# whose only other addresses are already private, and wrong on a host that
+# also carries the node network.
+listen_api = "0.0.0.0:3000"
+
+# Where the cluster-controllers dial in. NOT public: this carries a control
+# plane talking to itself, so it belongs on the address the clusters reach and
+# on no other. An explicit address rather than 0.0.0.0 is the whole hardening
+# here — the port is mTLS either way, but a port that is not bound to the
+# public interface cannot be probed from it.
+listen_session = "10.128.1.103:50050"
+
+# --- the store -------------------------------------------------------------
+#
+# Loopback, and this is not a hardening decision so much as the design: each
+# tier's etcd is private to its controller, and in the HA shape every replica
+# talks to its own local member while Raft carries the rest between them over
+# the members' own peer port. Nothing outside this box speaks to this etcd.
+etcd_endpoints = "http://127.0.0.1:2379"
+etcd_prefix = "/cloud"
+
+# --- tls: the serving certificate ------------------------------------------
+#
+# PEM paths, never PEM — a key that can be pasted into a TOML file is a key
+# that ends up in a git history. Relative to THIS file, so the config and its
+# pki/ directory travel as one unit.
+#
+# One certificate serves BOTH ports, so its SANs have to cover both the public
+# name users dial and the internal address the clusters dial:
+#
+#   tools/meister-ca --cloud meister-cloud:cloud.example.net,10.128.1.103
+#
+# Set both or neither. A certificate without its key is refused at start-up
+# rather than quietly downgraded to plain http, because that is precisely the
+# mistake that leaves a public API server open while its operator believes the
+# opposite.
+tls_cert = "pki/meister-cloud.crt"
+tls_key = "pki/meister-cloud.key"
+
+# The CA that client certificates must chain to. Setting it makes both ports
+# ASK for a certificate and puts the mTLS authenticator in the chain below.
+#
+# Asking rather than requiring is deliberate and stays deliberate here: a
+# caller with no certificate has to get far enough to be told 401 in words.
+# What makes this profile hard is not the TLS layer refusing the handshake, it
+# is `auth.chain` at the bottom of this file having no second link.
+client_ca = "pki/ca.crt"
+
+# --- tls: the CA this controller signs with --------------------------------
+#
+# Usually the same file as client_ca, because it is the same CA. Named
+# separately because a deployment may verify against a bundle and sign with
+# one member of it.
+#
+# The key is the crown jewel of the deployment: whoever holds it can mint an
+# identity in any group, `system:masters` included. It belongs on this host
+# only, mode 0600, and ideally on a controller that is not also the public
+# API — the two roles are separate keys in this file precisely so they can one
+# day be separate hosts.
+ca_cert = "pki/ca.crt"
+ca_key = "pki/ca.key"
+
+# How long an issued client certificate lives. Ninety days is the default and
+# a reasonable hardened value in both directions: short enough that a
+# forgotten certificate expires on its own, long enough that renewal is a
+# routine rather than an emergency. `meister login` run again is a renewal in
+# place, so shortening this is cheap.
+cert_ttl_days = 90
+
+# Signing every request the moment it arrives, with no human in the loop.
+# LEFT OFF, and spelled out rather than omitted so that nobody has to check
+# whether it was forgotten: with it on, the only thing between a caller and a
+# certificate is the authenticator chain. An administrator runs
+# `meister cloud csr approve <name>` instead, which is a person looking at a
+# name before it becomes an identity.
+#csr_auto_approve = false
+
+# --- everything else is unchanged ------------------------------------------
+#
+# Tenants, VNIs, floating pools and routed subnets are not part of the
+# exposure profile: a pool is an object created with a verb, not a key here,
+# and the VNI floor is a numbering choice. See ../cloud.toml for all of them.
+# The two that are worth carrying over into a real deployment:
+#vni_base = 10000
+#routed_pools = ["10.7.0.0/16"]
+
+# Which strategy binds an unbound VM to a cluster. One value today.
+#scheduler = "first-fit"
+
+# Where to send spans. A collector endpoint is a place this controller talks
+# to, so on a hardened host it is one more outbound permit — worth naming
+# rather than leaving to be discovered when traces do not arrive.
+#otlp_endpoint = "http://127.0.0.1:4317"
+
+# --- the authenticator chain -----------------------------------------------
+#
+# One link, and that is the hardening. The default chain is
+# ["mtls", "bearer"], where "bearer" contributes nothing unless a token file
+# is configured — but naming only "mtls" says it rather than relying on it,
+# and a chain that NAMES a link it cannot build is refused at start-up. So
+# this line is also an assertion: if client_ca above ever goes missing, this
+# controller does not come up anonymous, it does not come up at all.
+#
+# The price is the bootstrap. There is no way to earn a first certificate over
+# an API that requires one, so the first administrator identity is issued out
+# of band:
+#
+#   tools/meister-ca --admin root
+#
+# and copied to the operator by hand. Once. Every user after that goes through
+# `meister login` against the certificate that admin holds.
+[auth]
+chain = ["mtls"]
+# The development bearer token — one static string, no expiry, no rotation.
+# It exists for the bootstrap above and it is exactly what this profile is
+# doing without. Left here, commented, because an operator debugging a locked
+# out control plane will want to know it is a deliberate absence and not an
+# oversight. Treat any leak of one as permanent.
+#bearer_token_file = "pki/dev-token"
+#bearer_identity = "dev-admin"
+#bearer_groups = ["system:masters"]

@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+#
+# meister-ca — the lab's certificate authority, in one file.
+#
+# Everything this control plane authenticates with comes out of here: the
+# controllers' serving certificates, the nodes' and clusters' system
+# identities, the break-glass admin, and ordinary users. openssl rather than
+# a Rust binary on purpose — this is the one tool an operator has to be able
+# to read line by line before trusting it with a CA key, and `nix shell
+# nixpkgs#openssl` is the only prerequisite.
+#
+# Idempotent by design: an existing CA is reused, an existing identity is
+# left exactly as it is, and re-running with more --node/--user adds only
+# what is missing. Nothing here ever overwrites a private key without
+# --force, because the certificate that key belongs to is deployed somewhere.
+#
+# The identity model is Kubernetes': CN is the name, O is the group.
+#
+#   controllers  CN=<name>              O=system:controllers   (serverAuth+clientAuth)
+#   nodes        CN=system:node:<id>    O=system:nodes
+#   clusters     CN=system:cluster:<n>  O=system:clusters
+#   admin        CN=<name>              O=system:masters       (break glass)
+#   users        CN=<name>              O=meister:admins|meister:members
+#
+# `system:masters` is above the user directory and answers to no User object.
+# It exists because the directory has a bootstrap problem — somebody has to
+# create the first user — and it is meant to be used twice and then left
+# alone. Ordinary users get their certificates from `meister login`; the
+# --user form here is for a lab that wants one without a running API.
+
+set -euo pipefail
+
+DIR="pki"
+CA_DAYS=3650
+DAYS=90
+FORCE=0
+CURVE="prime256v1"
+
+CLOUDS=(); CLUSTERS=(); NODES=(); ADMINS=(); USERS=()
+
+usage() {
+	cat <<'USAGE'
+usage: meister-ca [options]
+
+  --dir DIR              where the CA and the certificates live (default: pki)
+  --days N               lifetime of issued certificates (default: 90)
+  --ca-days N            lifetime of the CA itself (default: 3650)
+  --force                reissue identities that already exist
+  --curve NAME           EC curve (default: prime256v1)
+
+  --cloud   NAME[:SAN,...]   a cloud-controller's serving certificate
+  --cluster NAME[:SAN,...]   a cluster-controller: serving certificate AND the
+                             system:cluster identity it dials the cloud with
+  --node    NODE_ID          an agent's system:node identity
+  --admin   NAME             a break-glass system:masters certificate
+  --user    NAME[:ROLE]      a user certificate (ROLE: admin|member, default member)
+
+SANs are the addresses clients will use: bare names become DNS entries,
+anything that parses as an address becomes an IP entry. "localhost" and
+"127.0.0.1" are always added, because that is how the local recipes reach it.
+
+Every identity gets <dir>/<name>.key, <dir>/<name>.crt and a copy-paste
+bundle at <dir>/bundle/<name>.md holding the TOML fragment and the NixOS
+snippet for it.
+
+examples:
+  meister-ca --cloud meister-cloud:10.128.1.103 \
+             --cluster cluster-1:10.128.1.104 \
+             --node manacor --admin root --user alice:member
+USAGE
+}
+
+die() { printf 'meister-ca: %s\n' "$*" >&2; exit 1; }
+note() { printf '  %s\n' "$*" >&2; }
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--dir)     DIR="$2"; shift 2 ;;
+		--days)    DAYS="$2"; shift 2 ;;
+		--ca-days) CA_DAYS="$2"; shift 2 ;;
+		--curve)   CURVE="$2"; shift 2 ;;
+		--force)   FORCE=1; shift ;;
+		--cloud)   CLOUDS+=("$2"); shift 2 ;;
+		--cluster) CLUSTERS+=("$2"); shift 2 ;;
+		--node)    NODES+=("$2"); shift 2 ;;
+		--admin)   ADMINS+=("$2"); shift 2 ;;
+		--user)    USERS+=("$2"); shift 2 ;;
+		-h|--help) usage; exit 0 ;;
+		*) die "unknown option $1 (try --help)" ;;
+	esac
+done
+
+command -v openssl >/dev/null || die "openssl is not on PATH (try: nix shell nixpkgs#openssl)"
+
+mkdir -p "$DIR" "$DIR/bundle"
+CA_KEY="$DIR/ca.key"
+CA_CRT="$DIR/ca.crt"
+
+# --- the CA ----------------------------------------------------------------
+#
+# Reused if it is there. This is the half of "idempotent" that matters: every
+# certificate already deployed chains to this key, and replacing it would
+# quietly invalidate all of them.
+if [ -f "$CA_KEY" ] && [ -f "$CA_CRT" ]; then
+	note "ca: reusing $CA_CRT"
+elif [ -f "$CA_KEY" ] || [ -f "$CA_CRT" ]; then
+	die "half a CA in $DIR (one of ca.key/ca.crt is missing); refusing to guess"
+else
+	note "ca: creating $CA_CRT"
+	( umask 077; openssl genpkey -quiet -algorithm EC \
+		-pkeyopt "ec_paramgen_curve:$CURVE" -out "$CA_KEY" )
+	openssl req -x509 -new -key "$CA_KEY" -sha256 -days "$CA_DAYS" -out "$CA_CRT" \
+		-subj "/CN=meister-ca" \
+		-addext "basicConstraints=critical,CA:TRUE" \
+		-addext "keyUsage=critical,keyCertSign,cRLSign" \
+		-addext "subjectKeyIdentifier=hash"
+fi
+
+# issue <file-stem> <subject> <extensions-block>
+issue() {
+	local stem="$1" subj="$2" exts="$3"
+	local key="$DIR/$stem.key" crt="$DIR/$stem.crt"
+
+	if [ -f "$crt" ] && [ "$FORCE" -eq 0 ]; then
+		note "$stem: already there ($(openssl x509 -in "$crt" -noout -enddate | cut -d= -f2))"
+		return 0
+	fi
+	( umask 077; openssl genpkey -quiet -algorithm EC \
+		-pkeyopt "ec_paramgen_curve:$CURVE" -out "$key" )
+	local csr ext
+	csr="$(mktemp)"; ext="$(mktemp)"
+	printf '%s\n' "$exts" > "$ext"
+	openssl req -new -key "$key" -out "$csr" -subj "$subj"
+	openssl x509 -req -in "$csr" -CA "$CA_CRT" -CAkey "$CA_KEY" -CAcreateserial \
+		-out "$crt" -days "$DAYS" -sha256 -extfile "$ext" 2>/dev/null
+	rm -f "$csr" "$ext"
+	note "$stem: issued, $subj"
+}
+
+# Bare names become DNS entries, anything that looks like an address an IP
+# entry. Both loopbacks are always in, because that is how every local recipe
+# in this repo reaches a controller.
+sans_of() {
+	local list="$1" out="DNS:localhost,IP:127.0.0.1" san
+	IFS=',' read -r -a extra <<< "${list:-}"
+	for san in "${extra[@]:-}"; do
+		[ -n "$san" ] || continue
+		if [[ "$san" =~ ^[0-9.]+$ || "$san" == *:* ]]; then
+			out="$out,IP:$san"
+		else
+			out="$out,DNS:$san"
+		fi
+	done
+	printf '%s' "$out"
+}
+
+SERVER_EXTS='basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth,clientAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer'
+
+CLIENT_EXTS='basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=clientAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer'
+
+bundle() { printf '%s\n' "$*" >> "$BUNDLE"; }
+
+start_bundle() {
+	BUNDLE="$DIR/bundle/$1.md"
+	: > "$BUNDLE"
+	bundle "# $1"
+	bundle ""
+	bundle "Files: \`$DIR/$1.crt\`, \`$DIR/$1.key\` (0600), CA \`$CA_CRT\`."
+	bundle ""
+}
+
+toml_block() {
+	bundle '## TOML'
+	bundle ''
+	bundle '```toml'
+	printf '%s\n' "$@" >> "$BUNDLE"
+	bundle '```'
+	bundle ''
+}
+
+nix_block() {
+	bundle '## NixOS'
+	bundle ''
+	bundle '```nix'
+	printf '%s\n' "$@" >> "$BUNDLE"
+	bundle '```'
+	bundle ''
+	bundle "The three PEM files are not in the Nix store — a key in the store is"
+	bundle "world-readable. Ship them the way \`deploy/push.sh\` ships binaries, to"
+	bundle "\`/etc/meisterstack/pki/\`, mode 0600 on the key."
+}
+
+# --- controllers -----------------------------------------------------------
+
+for entry in "${CLOUDS[@]:-}"; do
+	[ -n "$entry" ] || continue
+	name="${entry%%:*}"; sans="${entry#"$name"}"; sans="${sans#:}"
+	issue "$name" "/CN=$name/O=system:controllers" \
+		"$SERVER_EXTS
+subjectAltName=$(sans_of "$sans")"
+	start_bundle "$name"
+	toml_block \
+		'# /etc/meisterstack/cloud.toml' \
+		"tls_cert = \"pki/$name.crt\"" \
+		"tls_key  = \"pki/$name.key\"" \
+		'client_ca = "pki/ca.crt"' \
+		'ca_cert   = "pki/ca.crt"' \
+		'ca_key    = "pki/ca.key"' \
+		'#csr_auto_approve = true   # lab only: signs every request that gets past the chain'
+	nix_block \
+		'meisterstack.cloud.settings = {' \
+		"  tls_cert = \"/etc/meisterstack/pki/$name.crt\";" \
+		"  tls_key = \"/etc/meisterstack/pki/$name.key\";" \
+		'  client_ca = "/etc/meisterstack/pki/ca.crt";' \
+		'  ca_cert = "/etc/meisterstack/pki/ca.crt";' \
+		'  ca_key = "/etc/meisterstack/pki/ca.key";' \
+		'};'
+done
+
+for entry in "${CLUSTERS[@]:-}"; do
+	[ -n "$entry" ] || continue
+	name="${entry%%:*}"; sans="${entry#"$name"}"; sans="${sans#:}"
+	# Two certificates, because they are two identities. The serving one is
+	# "this host"; the system:cluster one is "this cluster", and it is what
+	# the cloud checks the Hello against.
+	issue "$name" "/CN=$name/O=system:controllers" \
+		"$SERVER_EXTS
+subjectAltName=$(sans_of "$sans")"
+	issue "system-cluster-$name" "/CN=system:cluster:$name/O=system:clusters" "$CLIENT_EXTS"
+	start_bundle "$name"
+	toml_block \
+		'# /etc/meisterstack/cluster.toml' \
+		"cluster_name = \"$name\"" \
+		"tls_cert = \"pki/$name.crt\"" \
+		"tls_key  = \"pki/$name.key\"" \
+		'client_ca = "pki/ca.crt"' \
+		'# dialling the cloud, as system:cluster:'"$name" \
+		'cloud_ca   = "pki/ca.crt"' \
+		"cloud_cert = \"pki/system-cluster-$name.crt\"" \
+		"cloud_key  = \"pki/system-cluster-$name.key\""
+	nix_block \
+		'meisterstack.cluster.settings = {' \
+		"  cluster_name = \"$name\";" \
+		"  tls_cert = \"/etc/meisterstack/pki/$name.crt\";" \
+		"  tls_key = \"/etc/meisterstack/pki/$name.key\";" \
+		'  client_ca = "/etc/meisterstack/pki/ca.crt";' \
+		'  cloud_ca = "/etc/meisterstack/pki/ca.crt";' \
+		"  cloud_cert = \"/etc/meisterstack/pki/system-cluster-$name.crt\";" \
+		"  cloud_key = \"/etc/meisterstack/pki/system-cluster-$name.key\";" \
+		'};'
+done
+
+# --- nodes -----------------------------------------------------------------
+
+for node in "${NODES[@]:-}"; do
+	[ -n "$node" ] || continue
+	stem="system-node-$node"
+	issue "$stem" "/CN=system:node:$node/O=system:nodes" "$CLIENT_EXTS"
+	start_bundle "$stem"
+	bundle "The cluster-controller checks this CN against the node_id in the"
+	bundle "agent's Hello: this certificate speaks for \`$node\` and for nothing else."
+	bundle ""
+	toml_block \
+		'# /etc/meisterstack/agent.toml' \
+		"node_id = \"$node\"" \
+		'controller_ca   = "pki/ca.crt"' \
+		"controller_cert = \"pki/$stem.crt\"" \
+		"controller_key  = \"pki/$stem.key\"" \
+		'# and the session address becomes https/grpcs at the controller end:' \
+		'#controller_addrs = ["https://10.128.1.104:50051"]'
+	nix_block \
+		'meisterstack.agent.settings = {' \
+		"  node_id = \"$node\";" \
+		'  controller_ca = "/etc/meisterstack/pki/ca.crt";' \
+		"  controller_cert = \"/etc/meisterstack/pki/$stem.crt\";" \
+		"  controller_key = \"/etc/meisterstack/pki/$stem.key\";" \
+		'};'
+	bundle ""
+	bundle "> The agent does not read these keys yet — its dial-out is still plain"
+	bundle "> gRPC (M4.5 stopped at the controller side of that session). The"
+	bundle "> certificate is here so the rollout is one config change, not a build."
+done
+
+# --- people ----------------------------------------------------------------
+
+cli_bundle() {
+	local stem="$1" who="$2"
+	start_bundle "$stem"
+	bundle "$who"
+	bundle ""
+	toml_block \
+		'# ~/.config/meisterstack/config.toml' \
+		"[profiles.$stem]" \
+		'tier       = "cloud"' \
+		'endpoint   = "https://10.128.1.103:3000"' \
+		'ca_cert    = "pki/ca.crt"' \
+		"credential = { type = \"mtls\", cert = \"pki/$stem.crt\", key = \"pki/$stem.key\" }"
+	bundle "Renew with \`meister login --profile $stem\` — it writes a fresh pair to"
+	bundle "exactly these two paths and never touches the config file."
+}
+
+for name in "${ADMINS[@]:-}"; do
+	[ -n "$name" ] || continue
+	issue "$name" "/CN=$name/O=system:masters" "$CLIENT_EXTS"
+	cli_bundle "$name" \
+		"Break glass: \`system:masters\` is above the user directory and answers to
+no User object. Use it to create the first tenant and the first user, then
+work as an ordinary admin."
+done
+
+for entry in "${USERS[@]:-}"; do
+	[ -n "$entry" ] || continue
+	name="${entry%%:*}"; role="${entry#"$name"}"; role="${role#:}"; role="${role:-member}"
+	case "$role" in
+		admin)  group="meister:admins" ;;
+		member) group="meister:members" ;;
+		*) die "unknown role $role for user $name (admin|member)" ;;
+	esac
+	issue "$name" "/CN=$name/O=$group" "$CLIENT_EXTS"
+	cli_bundle "$name" \
+		"Role \`$role\` (\`$group\`). The certificate carries the role; the \`User\`
+object at the cloud is what the cloud actually consults, so create it too:
+
+    meister cloud user create $name --tenant <tenant> --role $role"
+done
+
+printf '\n' >&2
+note "ca:      $CA_CRT"
+note "bundles: $DIR/bundle/"

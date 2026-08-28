@@ -1,0 +1,120 @@
+# meister-cluster-controller — the hardened profile.
+#
+# /etc/meisterstack/cluster.toml. This tier has NO public surface: its REST
+# API is an operator's door and its session port is a control plane talking to
+# itself. See ./README.md for the profile as a whole; see ../cluster.toml for
+# what every key means when it is not being hardened.
+#
+# Same comment convention as the plain examples: prose is a hash and a space,
+# a commented-out setting is a hash and the key with no space between.
+
+# The identity the cloud keeps this cluster's object under, and the name in
+# this cluster's own certificate (CN=system:cluster:cluster-1). The cloud
+# matches the two against each other, so the string here, the string in
+# cloud_cert below and the string given to `meister-ca --cluster` are one
+# string in three places and must not drift.
+cluster_name = "cluster-1"
+
+# --- the two ports ---------------------------------------------------------
+#
+# The REST API. NOT public and not even on the management network by default:
+# users reach their VMs through the cloud tier, and this door is for an
+# operator and a debugger. Loopback means reaching it is an SSH session:
+#
+#   ssh -L 3001:127.0.0.1:3001 cluster-1
+#   meister --profile cluster-1 cluster vm ls
+#
+# The alternative, when a jump host is the wrong shape for the team, is to
+# bind the management address instead — "10.128.1.104:3001". That is still not
+# public, and it is still mTLS; it is one address wider, and the certificate
+# below already covers it.
+listen_api = "127.0.0.1:3001"
+
+# Where the agents dial in. The node network and nothing else: this port
+# carries the commands that create VMs, so an address on it is an address that
+# matters. mTLS on top (client_ca below), so a reachable port is still not an
+# open one — but a port bound to one interface cannot be probed from another.
+listen_session = "10.128.1.104:50051"
+
+# --- the store -------------------------------------------------------------
+#
+# Loopback: this tier's etcd is private to this controller. In the HA shape
+# each replica talks to its own local member and Raft carries the rest between
+# the members over their own peer port.
+etcd_endpoints = "http://127.0.0.1:2379"
+etcd_prefix = "/cluster"
+
+# --- serving: tls and who may call -----------------------------------------
+#
+# PEM paths, never PEM, relative to THIS file. One certificate serves BOTH
+# ports, so its SANs have to cover every address a caller uses — the
+# management address for the agents, and localhost for the tunnel above,
+# which `meister-ca` always adds:
+#
+#   tools/meister-ca --cluster cluster-1:10.128.1.104
+#
+# Set both or neither; half a pair is a start-up error rather than a silent
+# downgrade to plain http.
+tls_cert = "pki/cluster-1.crt"
+tls_key = "pki/cluster-1.key"
+
+# The CA that client certificates must chain to: an operator's, and the
+# agents'. Setting it makes both ports ask for one and puts the mTLS
+# authenticator in the chain.
+#
+# There is deliberately no user directory at this tier — the users live at the
+# cloud, once — so the role comes out of the certificate here. The price is
+# honest and worth naming in a hardened deployment especially: a demotion
+# takes effect at the cloud on the next request, and here only when the
+# certificate is re-issued. Keep cert_ttl_days at the cloud short enough that
+# "re-issued" means "soon".
+client_ca = "pki/ca.crt"
+
+# --- dialling the cloud ----------------------------------------------------
+#
+# The other direction, and separate keys because it is a separate decision.
+#
+# The address is https:// and that is load-bearing, not decoration: TLS is
+# applied to a session only when its URL says so. cloud_ca/cloud_cert/cloud_key
+# set and an http:// address here would dial PLAINTEXT, silently, with the
+# credential simply never used — the one mistake in this file that looks like
+# nothing at all.
+#
+# cloud_cert is this cluster's own identity. The cloud checks its CN against
+# the name in the Hello, so one cluster's key cannot speak for another's VMs.
+cloud_addrs = ["https://10.128.1.103:50050", "https://10.128.1.112:50050"]
+cloud_ca = "pki/ca.crt"
+cloud_cert = "pki/system-cluster-cluster-1.crt"
+cloud_key = "pki/system-cluster-cluster-1.key"
+
+# The older single-address spelling. `cloud_addrs` wins outright when both are
+# set, so this stays commented out rather than half-agreeing with the list.
+#cloud_addr = "https://10.128.1.103:50050"
+
+# --- everything else is unchanged ------------------------------------------
+#
+# Neither key below is part of the exposure profile; both are here because a
+# real deployment sets them. See ../cluster.toml.
+
+# What to do about a VM whose phase is Failed: "none", a retry count, or the
+# default backoff curve.
+#retry = "crash-loop-backoff"
+
+# Which strategy binds an unbound VM to a node. One value today.
+#scheduler = "first-fit"
+
+# Where to send spans — one more outbound permit on a hardened host.
+#otlp_endpoint = "http://127.0.0.1:4317"
+
+# --- the authenticator chain -----------------------------------------------
+#
+# One link, for the same reason as at the cloud: naming it makes this
+# controller refuse to start if client_ca above ever goes missing, instead of
+# coming up anonymous. There is no CSR flow at this tier and therefore no
+# bootstrap argument for a bearer token — the operator certificate that opens
+# this API was issued at the cloud, or by `meister-ca --admin`.
+[auth]
+chain = ["mtls"]
+#bearer_token_file = "pki/dev-token"
+#bearer_identity = "dev-admin"
+#bearer_groups = ["system:masters"]

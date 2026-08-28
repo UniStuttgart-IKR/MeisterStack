@@ -1,0 +1,41 @@
+[package]
+name = "meister-controller-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+macros = { package = "meister-macros", path = "../macros" }
+common = { package = "meister-common", path = "../common" }
+pki = { package = "meister-pki", path = "../pki" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+etcd-client = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+tonic = { workspace = true }
+# For `proto::client_tls`: the session TLS builder is shared with the agent
+# tier, which does not depend on this crate.
+proto = { package = "meister-proto", path = "../proto" }
+
+[dev-dependencies]
+toml = { workspace = true }
+# The mTLS authenticator is only worth testing against real certificates —
+# one from our CA, one from somebody else's, one that has expired — and
+# minting those is what rcgen is for. Test-only: nothing in this crate issues
+# a certificate, that is the cloud-controller's CA.
+rcgen = { workspace = true }
+time = { workspace = true }
+# `start_paused` for the store's timeout tests: they assert a five-second
+# bound without spending five seconds on it.
+tokio = { workspace = true, features = ["test-util"] }
