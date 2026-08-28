@@ -15,7 +15,7 @@ use serde::Deserialize;
 use crate::client::Client;
 use crate::config::Target;
 use crate::output::{self, View, or_dash};
-use crate::{AgentCmd, GlobalArgs};
+use crate::{AgentCmd, GlobalArgs, vm};
 
 #[derive(Deserialize)]
 struct VmListEntry {
@@ -112,6 +112,10 @@ pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result
                 Ok(View::line(created.id))
             })
         }
+
+        // The node's own ring, read straight off it — one hop instead of the
+        // two a controller tier takes, and the same document either way.
+        AgentCmd::Logs { id, lines } => vm::logs(&client, global, "/vms", id, *lines).await,
 
         AgentCmd::Inspect { id } => {
             output::print_json(&client.get(&format!("/vms/{id}")).await?);

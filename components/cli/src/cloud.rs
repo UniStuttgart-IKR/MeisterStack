@@ -314,6 +314,7 @@ async fn run_vm(client: &Client, cmd: &CloudVmCmd, global: &GlobalArgs) -> Resul
             )
             .await
         }
+        CloudVmCmd::Logs { name, lines } => vm::logs(client, global, vm::VMS, name, *lines).await,
         CloudVmCmd::Inspect { name } => vm::inspect(client, name).await,
         CloudVmCmd::Destroy { name } => vm::destroy(client, global, name).await,
         CloudVmCmd::Start { name } => vm::run_strategy(client, name, "Running", global).await,

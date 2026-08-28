@@ -125,6 +125,15 @@ pub struct LoginArgs {
 
 #[derive(Subcommand)]
 pub enum AgentCmd {
+    /// What the guest printed. Same one-way read as the two tiers above,
+    /// straight off this node's own ring.
+    Logs {
+        id: String,
+        /// How many lines from the END (default 200)
+        #[arg(long)]
+        lines: Option<u32>,
+    },
+
     Ls,
     Inspect {
         id: String,
@@ -189,6 +198,16 @@ pub enum ClusterNodeCmd {
 
 #[derive(Subcommand)]
 pub enum ClusterVmCmd {
+    /// What the guest printed before anything inside it was reachable:
+    /// firmware, bootloader, kernel, panic, emergency shell. One way — there
+    /// is deliberately no attach, no input and no --follow.
+    Logs {
+        name: String,
+        /// How many lines from the END (default 200). The node keeps a
+        /// bounded ring per stream, so this only shortens what comes out.
+        #[arg(long)]
+        lines: Option<u32>,
+    },
     Create {
         name: String,
         /// The agent's NewVmSpec JSON (same file `meister agent create` takes)
@@ -438,6 +457,16 @@ pub enum CloudCsrCmd {
 
 #[derive(Subcommand)]
 pub enum CloudVmCmd {
+    /// What the guest printed before anything inside it was reachable:
+    /// firmware, bootloader, kernel, panic, emergency shell. One way — there
+    /// is deliberately no attach, no input and no --follow.
+    Logs {
+        name: String,
+        /// How many lines from the END (default 200). The node keeps a
+        /// bounded ring per stream, so this only shortens what comes out.
+        #[arg(long)]
+        lines: Option<u32>,
+    },
     Create {
         name: String,
         /// The agent's NewVmSpec JSON (same file every tier takes)

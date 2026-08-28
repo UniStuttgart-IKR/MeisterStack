@@ -121,7 +121,24 @@ message Command {
     StopInstance stop = 5;
     PauseInstance pause = 6;
     ResumeInstance resume = 7;
+    FetchLogs logs = 9;
   }
+}
+
+// The one command that is a QUESTION. Everything else here tells a node to
+// change something and is answered with "done"; this asks for what the guest
+// printed and is answered with it, in Ack.payload.
+//
+// It rides on the same command channel rather than getting a session verb of
+// its own for one reason: the channel already solves the hard part. The
+// controller does not dial the node — the node dialled it — so there is no
+// second direction to open, and Pending already matches a request_id to the
+// result that carries it back.
+message FetchLogs {
+  string id = 1;
+  // How many lines from the END. The node keeps a bounded ring per stream
+  // and this only shortens what comes out of it; 0 = the node's default.
+  uint32 lines = 2;
 }
 
 message DestroyInstance { string id = 1; }
@@ -150,7 +167,12 @@ message CommandResult {
   }
 }
 
-message Ack {}
+// An empty Ack is "done", which is what every command that CHANGES something
+// answers with. `payload` is for the ones that answer a question instead:
+// bytes rather than a typed field, because what is in it is decided by the op
+// that was sent and modelling one message per answer would put the same union
+// in the proto twice. Today there is one such op and it answers JSON.
+message Ack { bytes payload = 1; }
 message ErrorMsg { string message = 1; }
 
 message CreateInstance {
@@ -228,7 +250,21 @@ message CloudCommand {
   oneof op {
     CreateVm create = 2;
     DestroyVm destroy = 3;
+    FetchVmLogs logs = 5;
   }
+}
+
+// The same question one tier up. The cloud names the VM the way it knows it
+// — by name and uid — and the cluster resolves that to the node the VM is
+// bound to and asks IT, so the payload that comes back is the node's,
+// unchanged, through two hops.
+message FetchVmLogs {
+  string name = 1;
+  // Same rule as CreateVm and DestroyVm: only the object carrying this uid is
+  // the one being asked about. A cluster-local VM that happens to share the
+  // name is not.
+  string uid = 2;
+  uint32 lines = 3;
 }
 
 // Idempotent by name and acked after the cluster wrote its object, not after

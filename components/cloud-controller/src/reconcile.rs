@@ -409,7 +409,7 @@ async fn dispatch_create(
     });
 
     match registry.send_command(cluster, traceparent, op).await {
-        Ok(Ack::Acked) => {
+        Ok(Ack::Acked(_)) => {
             store
                 .mutate::<Vm, _>(&name, |v| {
                     // Stamped whatever the phase does: this is the last moment
@@ -490,7 +490,7 @@ async fn teardown(
             )
             .await
         {
-            Ok(Ack::Acked) => {
+            Ok(Ack::Acked(_)) => {
                 store
                     .mutate::<Vm, _>(&name, |v| {
                         v.status.observed_at = Some(Utc::now());

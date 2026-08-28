@@ -175,6 +175,55 @@ pub async fn list(
     })
 }
 
+/// One stream of a guest's one-way output, as every tier serves it.
+#[derive(Deserialize)]
+pub struct LogStream {
+    pub stream: String,
+    pub text: String,
+}
+
+/// `vm logs`, at whichever tier the client is pointed at.
+///
+/// Printed as text and not as a table: a console is lines, and a table cell
+/// with a kernel oops in it is a table nobody can read. Under `-o json` the
+/// document goes out as the server sent it, which is what a script wants.
+///
+/// A VM that has printed nothing prints nothing — an empty answer is an
+/// answer, and it is the commonest one for a VM that has only just been
+/// created.
+#[generated(model = ClaudeOpus, version = "5")]
+pub async fn logs(
+    client: &Client,
+    global: &GlobalArgs,
+    path: &str,
+    name: &str,
+    lines: Option<u32>,
+) -> Result<()> {
+    let query = match lines {
+        Some(n) => format!("?lines={n}"),
+        None => String::new(),
+    };
+    let body = client.get(&format!("{path}/{name}/logs{query}")).await?;
+    output::emit(global, &body, |body| {
+        let streams: Vec<LogStream> =
+            serde_json::from_slice(body).context("parsing the console output")?;
+        let spoken: Vec<&LogStream> = streams.iter().filter(|s| !s.text.is_empty()).collect();
+        // A header per stream, but only when there is more than one: a
+        // direct-kernel boot puts everything on `console`, and a lone banner
+        // over the whole output is noise.
+        let named = spoken.len() > 1;
+        let mut out = String::new();
+        for stream in spoken {
+            if named {
+                out.push_str(&format!("=== {} ===\n", stream.stream));
+            }
+            out.push_str(&stream.text);
+            out.push('\n');
+        }
+        Ok(output::View::text(out))
+    })
+}
+
 /// The whole object, at either tier, and only ever as json: an inspect is
 /// what an operator reads when the table left something out.
 pub async fn inspect(client: &Client, name: &str) -> Result<()> {

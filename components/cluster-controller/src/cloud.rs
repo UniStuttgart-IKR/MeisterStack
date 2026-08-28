@@ -34,6 +34,9 @@ use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::logs::{self, Logs};
+use crate::session::SessionRegistry;
+
 /// How often the cluster reports even when nothing happened. Doubles as the
 /// heartbeat: the cloud expires a cluster after 30s without one, so this has
 /// to stay comfortably below that.
@@ -98,8 +101,12 @@ async fn better_endpoint(
 }
 
 #[generated(model = ClaudeOpus, version = "5")]
+/// `registry` is this cluster's own agent sessions. The cloud can ask for a
+/// VM's console and the only party that has one is the node, so the answer to
+/// a command arriving on THIS session is fetched over one of those.
 pub async fn run(
     store: Arc<EtcdStore>,
+    registry: Arc<SessionRegistry>,
     cloud_addrs: Vec<String>,
     cluster_name: String,
     tls: Option<tonic::transport::ClientTlsConfig>,
@@ -119,6 +126,7 @@ pub async fn run(
         let mut established = false;
         let outcome = session(
             &store,
+            &registry,
             &addr,
             &cluster_name,
             redial.ahead(),
@@ -145,8 +153,10 @@ pub async fn run(
 
 #[generated(model = ClaudeOpus, version = "5")]
 #[instrument(skip_all, fields(endpoint = %cloud_addr, cluster = %cluster_name))]
+#[allow(clippy::too_many_arguments)]
 async fn session(
     store: &Arc<EtcdStore>,
+    registry: &SessionRegistry,
     cloud_addr: &str,
     cluster_name: &str,
     ahead: &[String],
@@ -214,7 +224,7 @@ async fn session(
                 let ended = drain_ready(&mut inbound, &mut batch, MAX_BATCH).await;
                 let mut acted = false;
                 for cmd in commands(batch) {
-                    let result = dispatch(store, cmd).await;
+                    let result = dispatch(store, registry, cmd).await;
                     if tx
                         .send(ClusterMessage { kind: Some(cluster_message::Kind::Result(result)) })
                         .await
@@ -300,7 +310,11 @@ fn commands(batch: Vec<proto::CloudMessage>) -> Vec<proto::CloudCommand> {
 /// The cloud's context, if it sent one; its own root if not. Recorded on the
 /// span so the fmt log carries it either way, and attached as the real parent
 /// before the span starts (`telemetry::in_trace`).
-async fn dispatch(store: &EtcdStore, cmd: proto::CloudCommand) -> CommandResult {
+async fn dispatch(
+    store: &EtcdStore,
+    registry: &SessionRegistry,
+    cmd: proto::CloudCommand,
+) -> CommandResult {
     let context = telemetry::TraceParent::parse(&cmd.traceparent)
         .unwrap_or_else(telemetry::TraceParent::root);
     let span = tracing::info_span!(
@@ -308,12 +322,18 @@ async fn dispatch(store: &EtcdStore, cmd: proto::CloudCommand) -> CommandResult 
         request_id = %cmd.request_id,
         trace_id = %context.trace_id_hex()
     );
-    telemetry::in_trace(span, &context, dispatch_traced(store, cmd, context)).await
+    telemetry::in_trace(
+        span,
+        &context,
+        dispatch_traced(store, registry, cmd, context),
+    )
+    .await
 }
 
 #[generated(model = ClaudeOpus, version = "5")]
 async fn dispatch_traced(
     store: &EtcdStore,
+    registry: &SessionRegistry,
     cmd: proto::CloudCommand,
     context: telemetry::TraceParent,
 ) -> CommandResult {
@@ -321,15 +341,20 @@ async fn dispatch_traced(
     // What this tier stamps onto its own object, so the cluster's reconciler
     // finds its way back to the same trace.
     let traceparent = telemetry::outgoing(&context).to_string();
+    // Same shape as one tier down: the arms that CHANGE something answer
+    // "done" with an empty payload, and the one that asks a question answers
+    // with the node's own document, passed through unopened.
+    let done = |r: anyhow::Result<()>| r.map(|()| Vec::new());
     let outcome = match cmd.op {
-        Some(cloud_command::Op::Create(c)) => handle_create(store, c, &traceparent).await,
-        Some(cloud_command::Op::Destroy(d)) => handle_destroy(store, d).await,
+        Some(cloud_command::Op::Create(c)) => done(handle_create(store, c, &traceparent).await),
+        Some(cloud_command::Op::Destroy(d)) => done(handle_destroy(store, d).await),
+        Some(cloud_command::Op::Logs(l)) => handle_logs(store, registry, l, &traceparent).await,
         None => Err(anyhow!("command without op")),
     };
     let outcome = match outcome {
-        Ok(()) => {
+        Ok(payload) => {
             info!("command ok");
-            proto::command_result::Outcome::Ok(proto::Ack {})
+            proto::command_result::Outcome::Ok(proto::Ack { payload })
         }
         Err(e) => {
             // Warn, not error: the failure travels back to the cloud in the
@@ -397,6 +422,36 @@ fn bind_nics(c: &proto::CreateVm, vm_spec: &mut serde_json::Value) {
 /// Acked after the store write, never after the boot — the phase makes its own
 /// way back up through ClusterStatus, exactly as the agent's phase makes its
 /// way up to here.
+/// The cloud asked what a VM printed; the node is what has it.
+///
+/// The uid guard is the same one `handle_create` and `handle_destroy` carry
+/// and for the same reason: a name is a label people reuse, and answering
+/// about a cluster-local VM that happens to share one would hand the cloud
+/// somebody else's console. A VM that is not placed yet, or one this cluster
+/// does not have at all, answers with an empty document rather than an error
+/// — there is genuinely nothing to show, and that is not a failure.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn handle_logs(
+    store: &EtcdStore,
+    registry: &SessionRegistry,
+    cmd: proto::FetchVmLogs,
+    traceparent: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let vm: Vm = match store.get(&cmd.name).await {
+        Ok(vm) => vm,
+        Err(StoreError::NotFound(_)) => return Ok(logs::NO_STREAMS.to_vec()),
+        Err(e) => return Err(e.into()),
+    };
+    if vm.metadata.cloud_uid() != Some(cmd.uid.as_str()) {
+        debug!(vm = %cmd.name, "the local vm of that name is not the cloud's, no console");
+        return Ok(logs::NO_STREAMS.to_vec());
+    }
+    match logs::fetch(registry, &vm, cmd.lines, traceparent).await? {
+        Logs::From(payload) => Ok(payload),
+        Logs::NotYet(_) => Ok(logs::NO_STREAMS.to_vec()),
+    }
+}
+
 #[generated(model = ClaudeOpus, version = "5")]
 async fn handle_create(
     store: &EtcdStore,

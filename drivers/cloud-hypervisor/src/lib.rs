@@ -4,8 +4,8 @@
 
 use agent_api::hypervisor;
 use agent_api::{
-    BootSource, CgroupHandle, DeviceAttachment, Hypervisor, HypervisorError, InstanceSpec,
-    Pausable, VmId, VmState, VolumeAttachment,
+    BootSource, CgroupHandle, ConsoleStream, DeviceAttachment, Hypervisor, HypervisorError,
+    InstanceSpec, Pausable, VmId, VmState, VolumeAttachment,
 };
 use anyhow::{Context, bail};
 use http_body_util::{BodyExt, Full};
@@ -62,6 +62,20 @@ impl CloudHypervisorDriver {
         self.socket_dir.join(format!("{id}.sock"))
     }
 
+    /// The guest's own two output files, named once. `create` builds the VM
+    /// config from these and `console_paths` hands them to the agent, so
+    /// there is one spelling of where they are rather than two that can drift.
+    fn console_path(&self, id: &VmId, stream: ConsoleStream) -> PathBuf {
+        self.socket_dir.join(format!("{id}.{}", stream.as_str()))
+    }
+
+    /// Where cloud-hypervisor's OWN stdout and stderr go — the VMM's
+    /// diagnostics, not the guest's. Not part of `console_paths`: it is not
+    /// the guest's output and `vm logs` must not mix the two.
+    fn vmm_log_path(&self, id: &VmId) -> PathBuf {
+        self.socket_dir.join(format!("{id}.log"))
+    }
+
     fn vm_known(&self, id: &VmId) -> hypervisor::Result<()> {
         if self.vms.lock().unwrap().contains_key(id) {
             Ok(())
@@ -94,13 +108,13 @@ impl Hypervisor for CloudHypervisorDriver {
         cgroup: Option<&CgroupHandle>,
     ) -> hypervisor::Result<u32> {
         // vm logs into file
-        let log = std::fs::File::create(self.socket_dir.join(format!("{id}.log")))
+        let log = std::fs::File::create(self.vmm_log_path(id))
             .map_err(|e| HypervisorError::Backend(e.into()))?;
         let log2 = log
             .try_clone()
             .map_err(|e| HypervisorError::Backend(e.into()))?;
-        let console_path = self.socket_dir.join(format!("{id}.console"));
-        let serial_path = self.socket_dir.join(format!("{id}.serial"));
+        let console_path = self.console_path(id, ConsoleStream::Console);
+        let serial_path = self.console_path(id, ConsoleStream::Serial);
 
         let config = build_vm_config(spec, &console_path, &serial_path)?;
         let socket = self.vm_socket_path(id);
@@ -225,7 +239,23 @@ impl Hypervisor for CloudHypervisorDriver {
         }
 
         let _ = std::fs::remove_file(self.vm_socket_path(id));
+        // Everything this driver put in the run directory for this VM, and
+        // not only the api socket. Until now the two console files and the
+        // vmm's own log stayed behind for ever, one set per vm id that ever
+        // existed on the node — nothing in the tree read them, nothing
+        // rotated them and nothing removed them.
+        for stream in ConsoleStream::ALL {
+            let _ = std::fs::remove_file(self.console_path(id, stream));
+        }
+        let _ = std::fs::remove_file(self.vmm_log_path(id));
         Ok(())
+    }
+
+    fn console_paths(&self, id: &VmId) -> Vec<(ConsoleStream, PathBuf)> {
+        ConsoleStream::ALL
+            .into_iter()
+            .map(|s| (s, self.console_path(id, s)))
+            .collect()
     }
 
     #[generated(model = ClaudeFable, version = "5")]

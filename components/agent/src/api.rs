@@ -139,6 +139,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/vms", get(list_vms).post(create_vm))
         .route("/vms/{id}", get(inspect_vm).delete(destroy_vm))
         .route("/vms/{id}/observe", get(observe_vm))
+        .route("/vms/{id}/logs", get(vm_logs))
         .route("/vms/{id}/state", get(vm_state))
         .route("/vms/{id}/reconcile", post(reconcile_vm))
         .route("/vms/{id}/start", post(start_vm))
@@ -277,6 +278,55 @@ async fn observe_vm(
         observed: preview.observed,
         action: format!("{:?}", preview.action),
     }))
+}
+
+/// One stream's worth of what the guest printed.
+#[derive(Serialize)]
+struct LogStream {
+    stream: &'static str,
+    text: String,
+}
+
+/// How many lines the caller wants, from the end.
+#[derive(Deserialize)]
+struct LogQuery {
+    #[serde(default)]
+    lines: Option<usize>,
+}
+
+/// What the guest printed before anything inside it was reachable.
+///
+/// One way, and deliberately only that: no input channel, no attach, no
+/// follow. An interactive console is a different feature with different
+/// questions — exactly one attach at a time, a controller that pipes without
+/// storing, an audit line per session — and none of them are answered by a
+/// read of a ring buffer.
+///
+/// A VM with no output at all answers with an empty list rather than a 404:
+/// "it printed nothing" is the commonest true answer there is, and it is not
+/// an error. A vm id this node has no record of still is.
+#[generated(model = ClaudeOpus, version = "5")]
+#[instrument(level = "debug", skip_all, fields(vm_id = %id))]
+async fn vm_logs(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+    Query(q): Query<LogQuery>,
+) -> Result<Json<Vec<LogStream>>, ApiError> {
+    let vm_id = parse_id(&id)?;
+    if st.store.get_raw(&vm_id)?.is_none() {
+        return Err(ApiError::not_found(format!("no record for vm {id}")));
+    }
+    let lines = q.lines.unwrap_or(crate::console::DEFAULT_LINES);
+    Ok(Json(
+        st.reconciler
+            .console(&vm_id, lines)
+            .into_iter()
+            .map(|(stream, text)| LogStream {
+                stream: stream.as_str(),
+                text,
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Serialize)]

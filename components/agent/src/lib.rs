@@ -5,6 +5,7 @@
 #[cfg(feature = "http-api")]
 pub mod api;
 pub mod config;
+pub mod console;
 pub mod drivers;
 pub mod provision;
 pub mod reconcile;
@@ -314,6 +315,36 @@ impl Agent {
         })
     }
 
+    /// The end of a VM's one-way output, as the JSON the whole way up.
+    ///
+    /// The same document the node's own REST API serves, passed through the
+    /// cluster and the cloud without either of them opening it: what a
+    /// console printed is the node's answer, and a tier that reformatted it
+    /// would be a tier that could get it wrong.
+    ///
+    /// A vm this node has no record of is `NoSuchVm` — the same error every
+    /// other command gives for the same thing, so it is logged at the same
+    /// level and repaired by the same SyncState. A vm that has simply printed
+    /// nothing answers with an empty list.
+    #[generated(model = ClaudeOpus, version = "5")]
+    fn handle_logs(&self, cmd: proto::FetchLogs) -> anyhow::Result<Vec<u8>> {
+        let id: VmId = cmd.id.parse().context("invalid vm id")?;
+        if self.store.get(&id)?.is_none() {
+            return Err(NoSuchVm(id).into());
+        }
+        let lines = match cmd.lines {
+            0 => crate::console::DEFAULT_LINES,
+            n => n as usize,
+        };
+        let streams: Vec<serde_json::Value> = self
+            .reconciler
+            .console(&id, lines)
+            .into_iter()
+            .map(|(stream, text)| serde_json::json!({"stream": stream.as_str(), "text": text}))
+            .collect();
+        Ok(serde_json::to_vec(&streams)?)
+    }
+
     /// One command, under the trace of whatever asked for it. Everything the
     /// dispatch reaches — provision, the volume and device drivers, the CH
     /// API calls — is a child span of this one, so `POST /vms` at the cloud
@@ -336,22 +367,27 @@ impl Agent {
 
     async fn dispatch_traced(&self, cmd: proto::Command) -> CommandResult {
         let request_id = cmd.request_id.clone();
+        // Every command that CHANGES something answers with "done" and an
+        // empty payload; the one that asks a question answers with bytes.
+        // `done` is what makes the six mutating arms read as they always did.
+        let done = |r: anyhow::Result<()>| r.map(|()| Vec::new());
         let op_result = match cmd.op {
-            Some(command::Op::Create(c)) => self.handle_create(c).await,
-            Some(command::Op::Destroy(d)) => self.handle_destroy(d).await,
-            Some(command::Op::Start(s)) => self.lifecycle(&s.id, Desired::Running).await,
-            Some(command::Op::Stop(s)) => self.handle_stop(s).await,
-            Some(command::Op::Pause(p)) => self.handle_pause(p).await,
+            Some(command::Op::Create(c)) => done(self.handle_create(c).await),
+            Some(command::Op::Destroy(d)) => done(self.handle_destroy(d).await),
+            Some(command::Op::Start(s)) => done(self.lifecycle(&s.id, Desired::Running).await),
+            Some(command::Op::Stop(s)) => done(self.handle_stop(s).await),
+            Some(command::Op::Pause(p)) => done(self.handle_pause(p).await),
             // Resume is Start under another name — the REST path does not gate
             // it on pause support either, and a vm that is not paused simply
             // converges to Running.
-            Some(command::Op::Resume(r)) => self.lifecycle(&r.id, Desired::Running).await,
+            Some(command::Op::Resume(r)) => done(self.lifecycle(&r.id, Desired::Running).await),
+            Some(command::Op::Logs(l)) => self.handle_logs(l),
             None => Err(anyhow!("command without op")),
         };
         let outcome = match op_result {
-            Ok(()) => {
+            Ok(payload) => {
                 info!("command ok");
-                command_result::Outcome::Ok(proto::Ack {})
+                command_result::Outcome::Ok(proto::Ack { payload })
             }
             Err(e) => {
                 let message = format!("{e:#}");

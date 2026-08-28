@@ -9,6 +9,7 @@
 
 mod api;
 mod cloud;
+mod logs;
 mod reconcile;
 mod session;
 
@@ -322,7 +323,8 @@ async fn main() -> anyhow::Result<()> {
         let cluster_name = cfg.cluster_name.clone();
         let addrs = cfg.cloud_addrs.clone();
         let tls = cloud_tls.clone();
-        tokio::spawn(async move { cloud::run(store, addrs, cluster_name, tls).await });
+        let registry = registry.clone();
+        tokio::spawn(async move { cloud::run(store, registry, addrs, cluster_name, tls).await });
     }
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen_api)
@@ -333,7 +335,7 @@ async fn main() -> anyhow::Result<()> {
     // No directory at this tier — the users live at the cloud, once — so the
     // role comes off the certificate. See `AuthState::directory`.
     let router = controller_api::rest::guard(
-        api::router(store),
+        api::router(store, registry),
         controller_api::rest::AuthState {
             chain,
             directory: None,

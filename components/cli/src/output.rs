@@ -42,6 +42,12 @@ pub enum View {
     /// optionally a caveat on stderr. stdout stays pipeable either way.
     Line(String, Option<&'static str>),
     Table(Table),
+    /// Lines of somebody else's text — a guest's console, and nothing else so
+    /// far. Its own variant rather than a `Line` with newlines in it because
+    /// the two have opposite rules: a token is one word this CLI chose and is
+    /// safe to put in a cell, and this is arbitrary bytes a guest emitted,
+    /// which no table can hold and which must reach stdout unchanged.
+    Text(String),
 }
 
 /// Columns, rows, and what to say when there are no rows.
@@ -62,6 +68,10 @@ impl View {
     /// the token. The note is stderr, so stdout is still just the token.
     pub fn note(token: impl Into<String>, note: &'static str) -> Self {
         Self::Line(token.into(), Some(note))
+    }
+
+    pub fn text(body: impl Into<String>) -> Self {
+        Self::Text(body.into())
     }
 
     pub fn table(
@@ -85,6 +95,10 @@ impl View {
                 }
             }
             Self::Table(table) => table.print(),
+            // Printed as it stands. The server already ended it with a
+            // newline per stream, and adding another would put a blank line
+            // under every `vm logs`.
+            Self::Text(body) => print!("{body}"),
         }
     }
 }

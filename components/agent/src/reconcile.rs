@@ -11,7 +11,7 @@ use macros::generated;
 use tokio::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 
-use agent_api::{DeviceAttachment, VmId, VmState};
+use agent_api::{ConsoleStream, DeviceAttachment, VmId, VmState};
 
 use crate::drivers::Drivers;
 use crate::provision::Provisioner;
@@ -411,6 +411,16 @@ impl Reconciler {
         }
     }
 
+    /// The end of this VM's one-way output, both streams of it.
+    ///
+    /// On the reconciler because the reconciler is what holds the drivers,
+    /// and the hypervisor driver is the only party that knows where its
+    /// console files are. Read-only in every sense: no attach, no input, no
+    /// follow — see `crate::console`.
+    pub fn console(&self, id: &VmId, lines: usize) -> Vec<(ConsoleStream, String)> {
+        crate::console::read_all(self.drivers.hypervisor.console_paths(id), lines)
+    }
+
     #[instrument(skip_all, fields(?trigger))]
     pub async fn reconcile_all(&self, trigger: Trigger) -> Result<ReconcileSummary> {
         let clock = telemetry::metrics::Timer::start();
@@ -434,6 +444,12 @@ impl Reconciler {
         summary.total = vms.len();
 
         for (id, _) in vms {
+            // Level-triggered, like everything else in this pass: the guest's
+            // output files are bounded here because this is the one loop that
+            // runs over every VM this node has, whatever else is happening to
+            // them. A VM that is converged still prints, and a boot loop is
+            // precisely the case where nothing else in this pass would fire.
+            crate::console::trim_all(&self.drivers.hypervisor.console_paths(&id));
             match self.reconcile(id, trigger).await {
                 Ok(Action::None) => {}
                 Ok(Action::Blocked) => summary.blocked += 1,

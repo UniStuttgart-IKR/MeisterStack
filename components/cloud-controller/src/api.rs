@@ -25,6 +25,7 @@ use controller_api::{
     vni,
 };
 use macros::generated;
+use proto::cloud_command;
 use serde_json::json;
 use tracing::{error, info, warn};
 
@@ -47,6 +48,9 @@ pub struct Signing {
 #[derive(Clone)]
 pub struct ApiState {
     store: Arc<EtcdStore>,
+    /// The cluster sessions, for the one route whose answer lives on a node
+    /// two tiers down rather than in this store.
+    sessions: Arc<crate::session::SessionRegistry>,
     signing: Option<Arc<Signing>>,
     /// Where tenant VNI allocation starts. See `controller_api::vni`.
     vni_base: u32,
@@ -60,12 +64,14 @@ pub struct ApiState {
 
 pub fn router(
     store: Arc<EtcdStore>,
+    sessions: Arc<crate::session::SessionRegistry>,
     signing: Option<Arc<Signing>>,
     vni_base: u32,
     routed_pools: Vec<String>,
 ) -> Router {
     let state = ApiState {
         store,
+        sessions,
         signing,
         vni_base,
         routed_pools: Arc::new(routed_pools),
@@ -78,6 +84,7 @@ pub fn router(
             "/apis/meister.io/v1/vms/{name}",
             get(get_vm).put(update_vm).delete(delete_vm),
         )
+        .route("/apis/meister.io/v1/vms/{name}/logs", get(vm_logs))
         .route("/apis/meister.io/v1/clusters", get(list_clusters))
         .route(
             "/apis/meister.io/v1/clusters/{name}",
@@ -479,6 +486,78 @@ async fn delete_vm(
         })
         .await?;
     Ok(Json(vm))
+}
+
+/// How many lines the caller wants, from the end.
+#[derive(serde::Deserialize)]
+struct LogQuery {
+    #[serde(default)]
+    lines: Option<u32>,
+}
+
+/// The empty console document, in the shape a node would have sent it.
+const NO_STREAMS: &[u8] = b"[]";
+
+/// What the guest printed, fetched through the cluster from the node.
+///
+/// Tenant-scoped exactly as the VM is, and through the same `Grant::allows`
+/// every other object route uses: a console is the most revealing thing a VM
+/// has, and reading somebody else's would be worse than reading their object.
+///
+/// One way and only that — no attach, no input, no follow. See the cluster
+/// tier's twin.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn vm_logs(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+    caller: Caller,
+    role: CallerRole,
+    tenant: CallerTenant,
+    axum::extract::Query(q): axum::extract::Query<LogQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let vm: Vm = st.store.get(&name).await?;
+    Grant::new(caller, role, tenant).allows(Scope::of(vm.spec.tenant.as_deref()), Verb::Read)?;
+
+    let Some(cluster) = vm.spec.cluster_name.as_deref() else {
+        // Not placed on a cluster: nothing has started, so nothing has
+        // printed. An answer, not a failure.
+        return Ok(json_passthrough(NO_STREAMS.to_vec()));
+    };
+    let op = cloud_command::Op::Logs(proto::FetchVmLogs {
+        name: name.clone(),
+        // The uid, for the reason CreateVm and DestroyVm carry one: a name is
+        // a label people reuse, and a cluster-local VM sharing it is not this
+        // VM.
+        uid: vm.metadata.uid.clone(),
+        lines: q.lines.unwrap_or(0),
+    });
+    match st.sessions.send_command(cluster, "", op).await {
+        Ok(controller_api::Ack::Acked(payload)) => Ok(json_passthrough(payload)),
+        // The cluster's own refusal is an answer about this VM, and there is
+        // nothing here to retry against it.
+        Ok(controller_api::Ack::Rejected(msg)) => Err(conflict(msg)),
+        // Reaching the cluster failed. The store answered and the object is
+        // there; the party that holds the console is out of reach right now,
+        // and a caller that retries is right.
+        Err(e) => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Unavailable",
+            format!("{e:#}"),
+        )),
+    }
+}
+
+/// The node's JSON, handed on as the bytes it is — see the cluster tier's
+/// twin. Two tiers of deserialise-and-reserialise would be two chances to
+/// change what a console said, for no gain.
+#[generated(model = ClaudeOpus, version = "5")]
+fn json_passthrough(payload: Vec<u8>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        payload,
+    )
+        .into_response()
 }
 
 // --- clusters --------------------------------------------------------------

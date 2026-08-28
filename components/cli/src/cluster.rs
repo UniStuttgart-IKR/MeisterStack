@@ -190,6 +190,7 @@ async fn run_vm(client: &Client, cmd: &ClusterVmCmd, global: &GlobalArgs) -> Res
             )
             .await
         }
+        ClusterVmCmd::Logs { name, lines } => vm::logs(client, global, vm::VMS, name, *lines).await,
         ClusterVmCmd::Inspect { name } => vm::inspect(client, name).await,
         ClusterVmCmd::Destroy { name } => vm::destroy(client, global, name).await,
         ClusterVmCmd::Start { name } => vm::run_strategy(client, name, "Running", global).await,

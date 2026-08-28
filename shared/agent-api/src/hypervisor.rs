@@ -88,6 +88,29 @@ pub enum BootSource {
     },
 }
 
+/// The two one-way streams a guest writes before anything inside it is
+/// reachable. Named separately because they are separately useful: a
+/// direct-kernel boot puts the kernel on `console`, firmware and a bootloader
+/// put their prompts on `serial`, and "the VM printed nothing" means
+/// different things depending on which of the two is empty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConsoleStream {
+    Console,
+    Serial,
+}
+
+impl ConsoleStream {
+    pub const ALL: [ConsoleStream; 2] = [ConsoleStream::Console, ConsoleStream::Serial];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConsoleStream::Console => "console",
+            ConsoleStream::Serial => "serial",
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Hypervisor: Send + Sync {
     async fn create(
@@ -101,6 +124,21 @@ pub trait Hypervisor: Send + Sync {
     async fn shutdown(&self, id: &VmId) -> Result<()>;
     async fn power_button(&self, id: &VmId) -> Result<()>;
     async fn get_state(&self, id: &VmId) -> Result<VmState>;
+
+    /// Where this VM's one-way output is kept, if this hypervisor keeps it
+    /// anywhere.
+    ///
+    /// The agent bounds and reads those files (`crate::console` one crate
+    /// over is not a thing — it is `meister_agent::console`); the driver only
+    /// says where they are, because only the driver decided. An empty list is
+    /// the honest answer for a hypervisor that writes none, and it makes
+    /// "this VM has no output" a fact rather than an error.
+    ///
+    /// A path here does not promise the file exists: a VM that has been
+    /// created but never started has none yet.
+    fn console_paths(&self, _id: &VmId) -> Vec<(ConsoleStream, std::path::PathBuf)> {
+        Vec::new()
+    }
 
     // Methods required by the reconcile
     async fn adopt(&self, id: &VmId, pid: u32) -> Result<()>;

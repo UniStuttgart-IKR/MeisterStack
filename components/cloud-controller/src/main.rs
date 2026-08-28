@@ -337,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
     let router = controller_api::rest::guard(
         api::router(
             store.clone(),
+            registry.clone(),
             signing,
             cfg.vni_base,
             cfg.routed_pools.clone(),

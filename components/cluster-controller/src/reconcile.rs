@@ -420,7 +420,10 @@ async fn dispatch_create(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> a
         )
         .await;
     let (phase, message) = match &outcome {
-        Ok(()) => (VmPhase::Provisioning, None),
+        // The payload of an ack is empty for every command that only changes
+        // something, which is all of these; only the console fetch answers
+        // with anything, and no reconcile pass sends one.
+        Ok(_) => (VmPhase::Provisioning, None),
         Err(e) => (VmPhase::Failed, Some(format!("{e:#}"))),
     };
     p.store
@@ -465,6 +468,7 @@ async fn send_lifecycle(
     p.registry
         .send_command(node, outgoing, lifecycle_op(action, &vm.metadata.uid))
         .await
+        .map(|_| ())
 }
 
 /// Failed is no longer anybody's last word (config `retry`, default
@@ -534,7 +538,7 @@ async fn kick(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> anyhow::Resu
         )
         .await;
     match outcome {
-        Ok(()) => {
+        Ok(_) => {
             // The agent took it this time; let its report say the rest.
             p.store
                 .mutate::<Vm, _>(name, |v| {

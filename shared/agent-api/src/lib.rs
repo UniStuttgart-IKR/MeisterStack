@@ -13,8 +13,8 @@ pub use device::{
     Device, DeviceAttachment, DeviceDriver, DeviceError, DeviceId, DeviceSpec, PartitionSpec,
 };
 pub use hypervisor::{
-    BootSource, HotPluggable, Hypervisor, HypervisorError, InstanceSpec, Migratable, Pausable,
-    Snapshottable, VmId, VmState,
+    BootSource, ConsoleStream, HotPluggable, Hypervisor, HypervisorError, InstanceSpec, Migratable,
+    Pausable, Snapshottable, VmId, VmState,
 };
 pub use networking::{BridgeDriver, NetworkError, Nic, NicAttachment, NicDriver, NicId, NicSpec};
 pub use resource_limits::{

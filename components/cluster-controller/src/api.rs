@@ -23,10 +23,13 @@ use tracing::info;
 #[derive(Clone)]
 pub struct ApiState {
     store: Arc<EtcdStore>,
+    /// The agent sessions, for the one route whose answer lives on a node
+    /// rather than in the store.
+    registry: Arc<crate::session::SessionRegistry>,
 }
 
-pub fn router(store: Arc<EtcdStore>) -> Router {
-    let state = ApiState { store };
+pub fn router(store: Arc<EtcdStore>, registry: Arc<crate::session::SessionRegistry>) -> Router {
+    let state = ApiState { store, registry };
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(healthz))
@@ -35,6 +38,7 @@ pub fn router(store: Arc<EtcdStore>) -> Router {
             "/apis/meister.io/v1/vms/{name}",
             get(get_vm).put(update_vm).delete(delete_vm),
         )
+        .route("/apis/meister.io/v1/vms/{name}/logs", get(vm_logs))
         .route("/apis/meister.io/v1/nodes", get(list_nodes))
         .route(
             "/apis/meister.io/v1/nodes/{name}",
@@ -162,6 +166,67 @@ async fn get_vm(
     Path(name): Path<String>,
 ) -> Result<Json<Vm>, ApiError> {
     Ok(Json(st.store.get(&name).await?))
+}
+
+/// How many lines the caller wants, from the end. Absent = the node's own
+/// default; the ring is bounded either way, so this only shortens.
+#[derive(serde::Deserialize)]
+struct LogQuery {
+    #[serde(default)]
+    lines: Option<u32>,
+}
+
+/// What the guest printed, from the node that has it.
+///
+/// One way and only that: no attach, no input channel, no follow. The
+/// interactive console is a separate feature with separate questions — one
+/// attach at a time, a controller that pipes without storing, an audit line
+/// per session — and none of them are answered by reading a ring buffer.
+///
+/// The node's document is served through unopened. A VM that has printed
+/// nothing, and one that is not placed yet, both answer with an empty list
+/// and a 200: "nothing to show" is an answer. A node that cannot be reached
+/// is a 503, because that is a different sentence.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn vm_logs(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<LogQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let vm: Vm = st.store.get(&name).await?;
+    let payload = match crate::logs::fetch(&st.registry, &vm, q.lines.unwrap_or(0), "").await {
+        Ok(crate::logs::Logs::From(payload)) => payload,
+        Ok(crate::logs::Logs::NotYet(why)) => {
+            info!(vm = %name, reason = %why, "no console yet");
+            crate::logs::NO_STREAMS.to_vec()
+        }
+        // Reaching the node failed. Not 500 and not 404: the store answered,
+        // the object is there, and the one party that holds the console is
+        // out of reach right now. A caller that retries is right.
+        Err(e) => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Unavailable",
+                format!("{e:#}"),
+            ));
+        }
+    };
+    Ok(json_passthrough(payload))
+}
+
+/// The node's JSON, handed on as the bytes it is.
+///
+/// Deserialising it here to serialise it again would be two chances to change
+/// what a console said, in the two tiers between the node and the person
+/// reading it, for no gain at all.
+#[generated(model = ClaudeOpus, version = "5")]
+pub(crate) fn json_passthrough(payload: Vec<u8>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        payload,
+    )
+        .into_response()
 }
 
 #[generated(model = ClaudeFable, version = "5")]

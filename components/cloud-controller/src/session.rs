@@ -567,7 +567,9 @@ impl Connection {
     /// so it needs nothing from the session state at all.
     fn result(&self, result: proto::CommandResult) {
         let outcome = match result.outcome {
-            Some(command_result::Outcome::Ok(_)) => Ok(()),
+            // The peer's payload travels back with the ack. Empty for every
+            // command that only changed something.
+            Some(command_result::Outcome::Ok(ack)) => Ok(ack.payload),
             Some(command_result::Outcome::Error(e)) => Err(e.message),
             None => Err("result without outcome".to_string()),
         };

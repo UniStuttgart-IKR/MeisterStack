@@ -24,10 +24,17 @@ use tracing::warn;
 /// What came back from the peer. `Rejected` is the peer's own answer and
 /// therefore a fact about the VM; every other failure is a fact about the
 /// session, and a session that broke says nothing about any VM.
+///
+/// `Acked` carries the peer's payload, which is empty for every command that
+/// only changes something and says "done". One command asks a question
+/// instead — the console fetch — and its answer comes back here rather than
+/// through a second channel: the session is already the only direction that
+/// works (the node dialled us), and `Pending` already matches a request to
+/// the result that carries its id.
 #[derive(Debug)]
 #[generated(model = ClaudeOpus, version = "5")]
 pub enum Ack {
-    Acked,
+    Acked(Vec<u8>),
     Rejected(String),
 }
 
@@ -45,9 +52,14 @@ pub struct Peer<'a> {
 /// Owns the ack timeout as well, because a registry that could be asked to
 /// wait a different length of time per call is a registry whose patience is
 /// an accident of the call site rather than a property of the tier.
+/// What one waiting caller is handed: the peer's payload, or the peer's own
+/// refusal. Named because the map below is otherwise four nested generics
+/// deep and says nothing at a glance.
+type Answer = Result<Vec<u8>, String>;
+
 #[generated(model = ClaudeOpus, version = "5")]
 pub struct Pending {
-    waiting: Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>,
+    waiting: Mutex<HashMap<String, oneshot::Sender<Answer>>>,
     timeout: Duration,
 }
 
@@ -103,7 +115,7 @@ impl Pending {
         }
 
         match tokio::time::timeout(timeout, ack_rx).await {
-            Ok(Ok(Ok(()))) => Ok(Ack::Acked),
+            Ok(Ok(Ok(payload))) => Ok(Ack::Acked(payload)),
             Ok(Ok(Err(msg))) => Ok(Ack::Rejected(msg)),
             Ok(Err(_)) => bail!("session to {name} dropped before the result"),
             Err(_) => {
@@ -114,7 +126,7 @@ impl Pending {
     }
 
     /// A CommandResult arrived: hand it to whoever is waiting for it.
-    pub fn resolve(&self, request_id: &str, outcome: Result<(), String>) {
+    pub fn resolve(&self, request_id: &str, outcome: Answer) {
         if let Some(tx) = self.waiting.lock().unwrap().remove(request_id) {
             let _ = tx.send(outcome);
         } else {
@@ -156,7 +168,7 @@ mod tests {
         let answering = pending.clone();
         tokio::spawn(async move {
             let id = rx.recv().await.unwrap().unwrap();
-            answering.resolve(&id, Ok(()));
+            answering.resolve(&id, Ok(Vec::new()));
         });
         let peer = Peer {
             kind: "agent",
@@ -164,7 +176,7 @@ mod tests {
         };
         assert!(matches!(
             pending.send(peer, &tx, |id| id).await.unwrap(),
-            Ack::Acked
+            Ack::Acked(p) if p.is_empty()
         ));
         assert_eq!(in_flight(&pending), 0);
     }

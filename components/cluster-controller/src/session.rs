@@ -104,12 +104,15 @@ impl SessionRegistry {
     /// `traceparent` rides on the envelope so the node's work lands in the
     /// trace of the request that asked for it; empty means "no context", and
     /// the node then starts its own rather than guessing.
+    /// The payload the agent sent back with its ack — empty for every
+    /// command that only changes something, and the console document for the
+    /// one that asks a question.
     pub async fn send_command(
         &self,
         node_id: &str,
         traceparent: &str,
         op: command::Op,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<u8>> {
         // Found before anything is registered to wait on it, so the "no
         // session" path has nothing to clean up — see `Pending::send`.
         let tx = self
@@ -135,7 +138,7 @@ impl SessionRegistry {
             })
             .await?;
         match answer {
-            Ack::Acked => Ok(()),
+            Ack::Acked(payload) => Ok(payload),
             // A refusal is the agent's own answer about this VM, and at this
             // tier there is nothing else to do with one: the caller is a
             // reconcile pass that will derive the same command again next
@@ -512,7 +515,9 @@ async fn pump(session: Session, mut inbound: Streaming<AgentMessage>) {
             }
             Some(agent_message::Kind::Result(result)) => {
                 let outcome = match result.outcome {
-                    Some(command_result::Outcome::Ok(_)) => Ok(()),
+                    // The peer's payload travels back with the ack. Empty
+                    // for every command that only changed something.
+                    Some(command_result::Outcome::Ok(ack)) => Ok(ack.payload),
                     Some(command_result::Outcome::Error(e)) => Err(e.message),
                     None => Err("result without outcome".to_string()),
                 };
