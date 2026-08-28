@@ -7,14 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{
-    AgentConfig, CrosvmGpuConfig, FilesystemVolumeConfig, HypervisorConfig, LvmThinVolumeConfig,
-    ManagedDevice, NfsVolumeConfig, NvrmConfig, Sections, section,
+    AgentConfig, CloudHypervisorConfig, CrosvmGpuConfig, FilesystemVolumeConfig,
+    LvmThinVolumeConfig, ManagedDevice, NfsVolumeConfig, NvrmConfig, Sections, section,
 };
 use crate::types::{DeviceWithId, VolumeWithId};
 use agent_api::{
     Hypervisor, ResourceConfiner,
     device::DeviceDriver,
-    networking::{BridgeDriver, NicDriver, RouteAnnouncer},
+    networking::{BridgeDriver, NetworkDriver, NicDriver, RouteAnnouncer},
     storage::BlockDriver,
 };
 use anyhow::bail;
@@ -32,6 +32,10 @@ pub const DRIVER_NVRM: &str = "nvrm";
 pub const DRIVER_VFIO: &str = "vfio";
 pub const DRIVER_LVM_THIN: &str = "lvm-thin";
 pub const DRIVER_NFS: &str = "nfs";
+pub const DRIVER_CLOUD_HYPERVISOR: &str = "cloud-hypervisor";
+/// The one networking driver there is — and the one driver name in this file
+/// that is not also a config key. See `NETWORK_DRIVERS`.
+pub const DRIVER_LINUX_NETWORK: &str = "linux";
 /// The same string `agent_api::default_volume_driver()` returns — taken from
 /// `common` so the name a spec omits and the name this table registers
 /// cannot drift apart.
@@ -100,6 +104,44 @@ static DEVICE_DRIVERS: &[DriverEntry<dyn DeviceDriver>] = &[
     },
 ];
 
+/// The hypervisors this agent has.
+///
+/// One row, and a table anyway. Before this the choice was a `match` on a
+/// config enum inside `from_config`, which is exactly the two-places shape
+/// the volume and device tables were built to kill: a second hypervisor meant
+/// an enum variant, a match arm, and a builder — three edits, of which the
+/// forgotten one silently did nothing. Here it is a row, and the row is the
+/// seam a container runtime (podman, LXC) docks onto without an
+/// architectural change, because from this side "start this instance, under
+/// this cgroup, with these attachments" is the same sentence either way.
+#[generated(model = ClaudeOpus, version = "5")]
+static HYPERVISOR_DRIVERS: &[DriverEntry<dyn Hypervisor>] = &[DriverEntry {
+    name: DRIVER_CLOUD_HYPERVISOR,
+    keys: &[DRIVER_CLOUD_HYPERVISOR],
+    build: build_cloud_hypervisor,
+}];
+
+/// The networking drivers this agent has.
+///
+/// `keys` is EMPTY, and this is the one row in the file where that is right:
+/// `[network]` is a single section with a `default_bridge` in it, not a table
+/// of one section per driver, and pretending otherwise would rename a key in
+/// every config that exists. So this row owns no key, `register` finds no
+/// unknown section to complain about, and what decides whether the driver is
+/// built is the presence of `[network]` itself.
+///
+/// The row still earns its place. What varies between nodes today is the
+/// uplink and the overlay, not which kernel does the bridging — but the next
+/// driver (an OVN integration, a DPU offload) becomes a row here plus the
+/// `[network.ovn]` section it owns, rather than a second `match` in
+/// `from_config`.
+#[generated(model = ClaudeOpus, version = "5")]
+static NETWORK_DRIVERS: &[DriverEntry<dyn NetworkDriver>] = &[DriverEntry {
+    name: DRIVER_LINUX_NETWORK,
+    keys: &[],
+    build: build_linux_network,
+}];
+
 /// Build every driver in `entries` that this node's config asks for, keyed
 /// by the name a spec routes on.
 ///
@@ -144,6 +186,33 @@ fn register<T: ?Sized>(
         }
     }
     Ok(built)
+}
+
+/// The single-slot half of `register`: a node has at most ONE hypervisor and
+/// at most one network driver.
+///
+/// Two configured rows is a refusal and not a coin toss — `register` returns
+/// a map, and which of two entries a `HashMap` hands back first is not
+/// something a node's behaviour may depend on. `None` is a node that
+/// configured neither, which is now a legal thing for a node to be.
+#[generated(model = ClaudeOpus, version = "5")]
+fn register_one<T: ?Sized>(
+    entries: &[DriverEntry<T>],
+    sections: &Sections,
+    cfg: &AgentConfig,
+    what: &str,
+) -> anyhow::Result<Option<Arc<T>>> {
+    let built = register(entries, sections, cfg, what)?;
+    if built.len() > 1 {
+        let mut names: Vec<&str> = built.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        bail!(
+            "this node configures {} {what} drivers ({}); exactly one may be configured",
+            names.len(),
+            names.join(", ")
+        );
+    }
+    Ok(built.into_values().next())
 }
 
 /// The default backend, and the one builder that never returns `None`: a
@@ -270,6 +339,48 @@ fn build_vfio(
     Ok(Some(Arc::new(VfioPciDriver::new(inventory)?)))
 }
 
+#[generated(model = ClaudeOpus, version = "5")]
+fn build_cloud_hypervisor(
+    sections: &Sections,
+    cfg: &AgentConfig,
+) -> anyhow::Result<Option<Arc<dyn Hypervisor>>> {
+    let Some(h): Option<CloudHypervisorConfig> =
+        section(sections, "hypervisor", DRIVER_CLOUD_HYPERVISOR)?
+    else {
+        return Ok(None);
+    };
+    let driver = cloud_hypervisor_driver::CloudHypervisorDriver::new(
+        h.binary.clone(),
+        cfg.paths.run_dir.join("vms"),
+        Duration::from_millis(h.timeout_ms),
+    )?;
+    Ok(Some(Arc::new(driver)))
+}
+
+/// The one builder whose `Ok(None)` is decided by a section its table does
+/// not own: `[network]`. See `NETWORK_DRIVERS`.
+#[generated(model = ClaudeOpus, version = "5")]
+fn build_linux_network(
+    _sections: &Sections,
+    cfg: &AgentConfig,
+) -> anyhow::Result<Option<Arc<dyn NetworkDriver>>> {
+    let Some(network) = &cfg.network else {
+        return Ok(None);
+    };
+    let vxlan = network
+        .vxlan
+        .as_ref()
+        .map(|v| linux_network_driver::VxlanConfig {
+            uplink: v.uplink.clone(),
+            mtu: v.mtu,
+            evpn: v.evpn,
+        });
+    Ok(Some(Arc::new(LinuxNetworkDriver::build(
+        vxlan,
+        cfg.nft_config()?,
+    )?)))
+}
+
 /// Which network capabilities this node has, for the same two reasons the
 /// volume catalogue exists: an unservable spec should be a rejected spec at
 /// the edge rather than a VM torn down halfway through, and the scheduler one
@@ -286,9 +397,14 @@ pub struct NetworkCatalog {
 
 #[generated(model = ClaudeOpus, version = "5")]
 impl NetworkCatalog {
-    pub fn new(cfg: &crate::config::NetworkConfig) -> Self {
+    /// `None` — a node with no `[network]` section — claims nothing, which
+    /// is the same answer a node with a section and no overlay gives. The two
+    /// are different configurations and the same capability: neither can
+    /// carry a tenant overlay, and the catalogue is about what a node can
+    /// serve rather than about how it is written down.
+    pub fn new(cfg: Option<&crate::config::NetworkConfig>) -> Self {
         let mut profiles = Vec::new();
-        if let Some(vxlan) = &cfg.vxlan {
+        if let Some(vxlan) = cfg.and_then(|c| c.vxlan.as_ref()) {
             profiles.push(common::capability::VXLAN.to_string());
             // A second entry beside `vxlan` and never instead of it: a VM asks
             // for an overlay, and a node that dropped `network/vxlan` when it
@@ -347,13 +463,21 @@ impl NetworkCatalog {
 
 #[derive(Clone)]
 pub struct Drivers {
+    /// The one slot that stays mandatory. A storage node wants its NVMe-oF
+    /// target process inside a cgroup exactly as a compute node wants its
+    /// VMMs there, so there is no configuration in which confinement is
+    /// optional.
     pub confiner: Arc<dyn ResourceConfiner>,
-    pub hypervisor: Arc<dyn Hypervisor>,
+    /// `None` = this node runs no VMs. See `Drivers::hypervisor`.
+    pub hypervisor: Option<Arc<dyn Hypervisor>>,
     /// Keyed by driver name, exactly as `devices` is: `spec.driver` routes,
     /// `None` means `default_volume_driver()`, and that entry always exists.
     pub storage: HashMap<String, Arc<dyn BlockDriver>>,
-    pub networking: Arc<dyn NicDriver>,
-    pub bridge: Arc<dyn BridgeDriver>,
+    /// `None` = this node makes no taps. Both of these are upcasts of one
+    /// `Arc<dyn NetworkDriver>` and are therefore Some together or None
+    /// together; see `agent_api::networking::NetworkDriver`.
+    pub networking: Option<Arc<dyn NicDriver>>,
+    pub bridge: Option<Arc<dyn BridgeDriver>>,
     /// Who to tell which addresses live on this node. `None` = no
     /// `[network.bgp]` section, which is every node before M5.1: the floating
     /// addresses are still reserved and still enforced at the tap, and how
@@ -366,40 +490,56 @@ pub struct Drivers {
 #[generated(model = ClaudeFable, version = "5")]
 impl Drivers {
     pub async fn from_config(cfg: &AgentConfig) -> anyhow::Result<Self> {
+        // What a node is FOR: it runs VMs, or it serves volumes, or both.
+        //
+        // Asked of the CONFIG and before anything is built, because it is a
+        // question about the config: a node that serves nothing should not
+        // spend a start-up finding drivers for it.
+        //
+        // The storage half is `[volume.*]` and not the built `storage` map,
+        // which would always be non-empty — `filesystem` registers on every
+        // node whether or not it is configured, so that `driver: None` in a
+        // VM spec keeps meaning something everywhere. That default exists for
+        // VMs; a node with no hypervisor has none, and an unconfigured
+        // fallback backend is not a declaration that this machine serves
+        // storage to anybody.
+        //
+        // Fail fast, the same sort as the missing `nft`: a node that comes up
+        // serving nothing is one an operator finds out about from a VM that
+        // never gets placed, days later, on a cluster where it looks like a
+        // scheduling problem.
+        //
+        // Devices and networking alone are deliberately NOT a node. That
+        // changes the day PCIe-over-fabric arrives, and it changes by adding
+        // one disjunct here.
+        if cfg.hypervisor.is_empty() && cfg.volume.is_empty() {
+            bail!(
+                "this agent serves nothing: it has no [hypervisor.*] section, so it runs no \
+                 vms, and no [volume.*] section, so it offers no storage. Configure one or \
+                 the other"
+            );
+        }
+
         let confiner = Arc::new(cgroup_driver::CgroupV2::new(cfg.paths.cgroup_root.clone()));
 
-        let hypervisor: Arc<dyn Hypervisor> = match &cfg.hypervisor {
-            HypervisorConfig::CloudHypervisor { binary, timeout_ms } => {
-                Arc::new(cloud_hypervisor_driver::CloudHypervisorDriver::new(
-                    binary.clone(),
-                    cfg.paths.run_dir.join("vms"),
-                    Duration::from_millis(*timeout_ms),
-                )?)
-            }
-        };
-
+        // All four slots come out of tables now, and the two that used to be
+        // hard-wired are the reason: a node used to be assumed to run VMs and
+        // to make taps, and that assumption is what kept a volume tied to the
+        // VM it was made for. A storage node has neither.
+        let hypervisor = register_one(HYPERVISOR_DRIVERS, &cfg.hypervisor, cfg, "hypervisor")?;
         let storage = register(VOLUME_DRIVERS, &cfg.volume, cfg, "volume")?;
-
-        // The hypervisor above and the networking below deliberately stay out
-        // of the tables: neither has the many-of-them shape the tables exist
-        // for. There is one hypervisor, picked by which `[hypervisor.*]`
-        // variant the config names, and one network driver that every node
-        // runs unconditionally. A row for either would register nothing that
-        // is not already here and would cost a `dyn` hop to read.
-        let vxlan = cfg
-            .network
-            .vxlan
-            .as_ref()
-            .map(|v| linux_network_driver::VxlanConfig {
-                uplink: v.uplink.clone(),
-                mtu: v.mtu,
-                evpn: v.evpn,
-            });
-        let net = Arc::new(LinuxNetworkDriver::build(vxlan, cfg.nft_config()?)?);
-        let networking: Arc<dyn NicDriver> = net.clone();
-        let bridge: Arc<dyn BridgeDriver> = net;
-
         let devices = register(DEVICE_DRIVERS, &cfg.device, cfg, "device")?;
+        // `[network]` is not a table of sections, so there is none to check
+        // against; the row's own builder reads `cfg.network`. See
+        // `NETWORK_DRIVERS`.
+        let net: Option<Arc<dyn NetworkDriver>> =
+            register_one(NETWORK_DRIVERS, &Sections::new(), cfg, "network")?;
+        // One pointer, two views of it. Upcasts rather than two registrations:
+        // a tap and the bridge it joins are made by the same driver on the
+        // same node, and two independently configured halves would be a state
+        // this node can be in and cannot recover from.
+        let networking: Option<Arc<dyn NicDriver>> = net.clone().map(|n| n as Arc<dyn NicDriver>);
+        let bridge: Option<Arc<dyn BridgeDriver>> = net.map(|n| n as Arc<dyn BridgeDriver>);
 
         // Built here and not lazily, so a node whose config claims it
         // announces routes finds out at start-up that FRR is not answering —
@@ -417,6 +557,42 @@ impl Drivers {
             bridge,
             announcer,
             devices,
+        })
+    }
+
+    /// The hypervisor, or the sentence this node owes whoever asked it to run
+    /// a VM.
+    ///
+    /// Every VM path goes through here rather than through an `expect`: a
+    /// node without one is a legal configuration now, so the absence is an
+    /// answer to give and not an invariant to assert. The message names the
+    /// section, because the fix is one.
+    #[generated(model = ClaudeOpus, version = "5")]
+    pub fn hypervisor(&self) -> anyhow::Result<&Arc<dyn Hypervisor>> {
+        self.hypervisor.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this node has no [hypervisor.*] section and so runs no vms; it was asked to                  run one anyway"
+            )
+        })
+    }
+
+    /// The tap half of the networking driver, or the same kind of sentence.
+    #[generated(model = ClaudeOpus, version = "5")]
+    pub fn networking(&self) -> anyhow::Result<&Arc<dyn NicDriver>> {
+        self.networking.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this node has no [network] section and so makes no taps; a vm with a nic                  cannot run here"
+            )
+        })
+    }
+
+    /// The bridge half. Some exactly when `networking` is — see the field.
+    #[generated(model = ClaudeOpus, version = "5")]
+    pub fn bridge(&self) -> anyhow::Result<&Arc<dyn BridgeDriver>> {
+        self.bridge.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this node has no [network] section and so makes no bridges; a vm with a nic                  cannot run here"
+            )
         })
     }
 }
@@ -649,7 +825,9 @@ mod tests {
         } else {
             r#"default_bridge = "br0""#
         };
-        NetworkCatalog::new(&toml::from_str(raw).expect("the network section parses"))
+        NetworkCatalog::new(Some(
+            &toml::from_str(raw).expect("the network section parses"),
+        ))
     }
 
     fn tenant_nic(vxlan_id: Option<u32>) -> crate::types::NicWithId {
@@ -727,6 +905,21 @@ mod tests {
     /// filesystem backend checks at start-up, which is the point of it — so
     /// everything in [paths] lives under one temp directory.
     fn config(sections: &str) -> AgentConfig {
+        raw_config(&format!(
+            r#"[hypervisor.cloud-hypervisor]
+               binary = "/usr/bin/cloud-hypervisor"
+               timeout_ms = 5000
+               [network]
+               default_bridge = "br0"
+               {sections}"#
+        ))
+    }
+
+    /// The same thing without the hypervisor and network sections baked in:
+    /// what a node IS is now a question the config answers, so a test about
+    /// that question has to be able to leave them out.
+    #[generated(model = ClaudeOpus, version = "5")]
+    fn raw_config(sections: &str) -> AgentConfig {
         let dir = std::env::temp_dir().join("meister-agent-drivers-test");
         std::fs::create_dir_all(&dir).expect("a temp directory");
         let dir = dir.display();
@@ -738,11 +931,6 @@ mod tests {
                image_dir   = "{dir}"
                volume_dir  = "{dir}/vol"
                cgroup_root = "/sys/fs/cgroup/x"
-               [hypervisor.cloud-hypervisor]
-               binary = "/usr/bin/cloud-hypervisor"
-               timeout_ms = 5000
-               [network]
-               default_bridge = "br0"
                {sections}"#
         ))
         .expect("the test config parses")
@@ -783,6 +971,136 @@ mod tests {
                 devices.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// The hypervisor came out of a `match` on a config enum and is now a
+    /// row, and this is the round trip that says the file on disk did not
+    /// move: the same two keys under the same section name build the same
+    /// driver, and the section is now optional.
+    #[test]
+    fn the_hypervisor_section_still_names_the_driver_it_always_named() {
+        let cfg = config("");
+        let built = register_one(HYPERVISOR_DRIVERS, &cfg.hypervisor, &cfg, "hypervisor")
+            .expect("the example's hypervisor section builds");
+        assert!(built.is_some(), "[hypervisor.cloud-hypervisor] builds one");
+
+        let none = raw_config(r#"[volume.filesystem]"#);
+        assert!(
+            register_one(HYPERVISOR_DRIVERS, &none.hypervisor, &none, "hypervisor")
+                .expect("no section is not an error")
+                .is_none(),
+            "a node with no [hypervisor.*] section runs no vms"
+        );
+    }
+
+    /// A section no row owns goes through the same message `[volume.ceph]`
+    /// gets — which is the whole reason the hypervisor is a table now: the
+    /// enum could say the variant was unknown, but not what this agent has.
+    #[test]
+    fn an_unknown_hypervisor_section_is_refused_by_name() {
+        let cfg = raw_config(
+            r#"[hypervisor.qemu]
+                                binary = "/usr/bin/qemu-system-x86_64""#,
+        );
+        let Err(err) = register_one(HYPERVISOR_DRIVERS, &cfg.hypervisor, &cfg, "hypervisor") else {
+            panic!("qemu is a typo, not a hypervisor this agent has");
+        };
+        let err = err.to_string();
+        assert!(err.contains("[hypervisor.qemu]"), "{err}");
+        assert!(
+            err.contains("cloud-hypervisor"),
+            "the message says what IS built in: {err}"
+        );
+    }
+
+    /// Two configured rows in a single-slot table is a refusal. `register`
+    /// returns a `HashMap`, and which of two entries it hands back first is
+    /// not something a node's behaviour may depend on.
+    #[test]
+    fn two_drivers_in_a_single_slot_are_refused_rather_than_picked_between() {
+        static TWO: &[DriverEntry<dyn BlockDriver>] = &[
+            DriverEntry {
+                name: "a",
+                keys: &["a"],
+                build: |_, _| Ok(Some(Arc::new(Stub))),
+            },
+            DriverEntry {
+                name: "b",
+                keys: &["b"],
+                build: |_, _| Ok(Some(Arc::new(Stub))),
+            },
+        ];
+        let cfg = config("");
+        let Err(err) = register_one(TWO, &Sections::new(), &cfg, "hypervisor") else {
+            panic!("two configured rows in a single slot is not a choice to make");
+        };
+        let err = err.to_string();
+        assert!(err.contains("2 hypervisor drivers"), "{err}");
+        assert!(err.contains("a, b"), "the message names both: {err}");
+    }
+
+    /// The validity rule, and the reason it is asked of the CONFIG: a node
+    /// with neither section serves nothing, and refusing at start-up is the
+    /// difference between an operator reading one sentence now and reading a
+    /// scheduler's Pending reason in three days.
+    #[tokio::test]
+    async fn an_agent_that_serves_neither_vms_nor_volumes_refuses_to_start() {
+        let nothing = raw_config("");
+        assert!(nothing.hypervisor.is_empty() && nothing.volume.is_empty());
+
+        let Err(err) = Drivers::from_config(&nothing).await else {
+            panic!("a node with neither section serves nothing");
+        };
+        let err = err.to_string();
+        assert!(err.contains("serves nothing"), "{err}");
+        assert!(
+            err.contains("[hypervisor.*]") && err.contains("[volume.*]"),
+            "{err}"
+        );
+    }
+
+    /// And the shape this whole position exists for: a node with storage and
+    /// no hypervisor comes up. No VMM, no taps, and a confiner all the same —
+    /// a storage node wants its backend process in a cgroup exactly as a
+    /// compute node wants its VMMs there.
+    #[tokio::test]
+    async fn a_storage_node_comes_up_without_a_hypervisor_or_a_network() {
+        let cfg = raw_config("[volume.filesystem]");
+        let drivers = Drivers::from_config(&cfg)
+            .await
+            .expect("storage alone is a node");
+
+        assert!(drivers.hypervisor.is_none(), "no [hypervisor.*] section");
+        assert!(drivers.networking.is_none() && drivers.bridge.is_none());
+        assert!(drivers.storage.contains_key(DRIVER_FILESYSTEM));
+
+        // And the absence is an answer rather than a panic, in words that
+        // name the section an operator would have to add.
+        fn said<T: ?Sized>(r: anyhow::Result<&Arc<T>>) -> String {
+            match r {
+                Ok(_) => panic!("this node has neither a hypervisor nor a network"),
+                Err(e) => format!("{e:#}"),
+            }
+        }
+        let err = said(drivers.hypervisor());
+        assert!(
+            err.contains("[hypervisor.*]") && err.contains("runs no vms"),
+            "{err}"
+        );
+        assert!(said(drivers.networking()).contains("[network]"));
+        assert!(said(drivers.bridge()).contains("[network]"));
+    }
+
+    /// A node with no `[network]` section claims exactly what a node with one
+    /// and no overlay claims: nothing. Two configurations, one capability.
+    #[test]
+    fn a_node_without_a_network_section_claims_no_overlay() {
+        let cat = NetworkCatalog::new(None);
+        assert!(cat.inventory().is_empty());
+        assert!(!cat.serves_overlays());
+        cat.validate(&[tenant_nic(None)])
+            .expect("a plain nic constrains nothing here either");
+        assert_eq!(cat.inventory(), network(false).inventory());
     }
 
     /// A section no driver owns used to be `deny_unknown_fields` on a config

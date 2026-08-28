@@ -315,6 +315,18 @@ impl Provisioner {
         self.store.put(id, record)?;
         info!(count = record.volumes.len(), "volumes ready");
 
+        // Asked once for the whole loop rather than per call: a node with no
+        // `[network]` section cannot serve any of these NICs, and finding
+        // that out on the second one would leave a tap behind from the first.
+        // A VM with no NICs never asks, which is what lets one run on a node
+        // that makes no taps at all.
+        let (nic_driver, bridge) = match spec.nics.is_empty() {
+            true => (None, None),
+            false => (
+                Some(self.drivers.networking()?),
+                Some(self.drivers.bridge()?),
+            ),
+        };
         for n in &spec.nics {
             // A tenant NIC lands on the tenant's own bridge; the one the spec
             // names is the default it WOULD have taken, and stays on record
@@ -322,24 +334,23 @@ impl Provisioner {
             // bridge: the host is not on the tenant's network, and giving it
             // an address there would be the one hole the isolation is for.
             if let Some(vni) = n.spec.vxlan_id {
-                let bridge = self
-                    .drivers
-                    .bridge
+                let bridge = bridge
+                    .expect("the nic list is not empty, so the bridge driver was asked for")
                     .ensure_overlay(vni)
                     .await
                     .with_context(|| format!("ensuring the overlay for vxlan {vni}"))?;
                 debug!(nic_id = %n.id, vni, bridge = %bridge, "nic joins a tenant overlay");
             } else {
-                self.drivers
-                    .bridge
+                bridge
+                    .expect("the nic list is not empty, so the bridge driver was asked for")
                     .ensure(&n.spec.bridge)
                     .await
                     .with_context(|| format!("ensuring bridge {}", n.spec.bridge))?;
                 if n.spec.bridge == self.default_bridge
                     && let Some((ip, prefix)) = self.bridge_addr
                 {
-                    self.drivers
-                        .bridge
+                    bridge
+                        .expect("the nic list is not empty, so the bridge driver was asked for")
                         .ensure_address(&n.spec.bridge, ip, prefix)
                         .await
                         .with_context(|| {
@@ -350,7 +361,9 @@ impl Provisioner {
             let nic = timed_driver(
                 NETWORKING,
                 "create",
-                self.drivers.networking.create(&n.id, &n.spec),
+                nic_driver
+                    .expect("the nic list is not empty, so the nic driver was asked for")
+                    .create(&n.id, &n.spec),
             )
             .await
             .with_context(|| format!("creating nic {}", n.id))?;
@@ -408,7 +421,7 @@ impl Provisioner {
         let vmm_pid = timed_driver(
             HYPERVISOR,
             "create",
-            self.drivers.hypervisor.create(id, &ispec, Some(&cgroup)),
+            self.drivers.hypervisor()?.create(id, &ispec, Some(&cgroup)),
         )
         .await
         .context("hypervisor create")?;
@@ -416,7 +429,7 @@ impl Provisioner {
         self.store.put(id, record)?;
 
         debug!(?ispec, "starting hypervisor");
-        timed_driver(HYPERVISOR, "start", self.drivers.hypervisor.start(id))
+        timed_driver(HYPERVISOR, "start", self.drivers.hypervisor()?.start(id))
             .await
             .context("hypervisor start")?;
 
@@ -546,9 +559,16 @@ impl Provisioner {
             failures.push(format!("cgroup kill: {e}"));
         }
 
-        match timed_driver(HYPERVISOR, "destroy", self.drivers.hypervisor.destroy(id)).await {
-            Ok(()) | Err(HypervisorError::NotFound(_)) => {}
-            Err(e) => failures.push(format!("hypervisor destroy: {e}")),
+        // A record exists, so this node HAD a hypervisor when the VM was
+        // provisioned. Not having one now means somebody removed the section
+        // under a running VM, and that is a failure like any other in this
+        // list: the VMM is still there and nobody can reach it.
+        match self.drivers.hypervisor() {
+            Ok(hv) => match timed_driver(HYPERVISOR, "destroy", hv.destroy(id)).await {
+                Ok(()) | Err(HypervisorError::NotFound(_)) => {}
+                Err(e) => failures.push(format!("hypervisor destroy: {e}")),
+            },
+            Err(e) => failures.push(format!("hypervisor destroy: {e:#}")),
         }
 
         // Flat on purpose: every one of these three loops is "find the driver
@@ -573,13 +593,16 @@ impl Provisioner {
         }
 
         for n in &record.nics {
-            if let Err(e) = timed_driver(
-                NETWORKING,
-                "destroy",
-                self.drivers.networking.destroy(&n.id),
-            )
-            .await
-            {
+            let driver = match self.drivers.networking() {
+                Ok(driver) => driver,
+                // Same shape as the missing volume driver below: the tap is
+                // still on the host and nobody can take it down.
+                Err(e) => {
+                    failures.push(format!("nic {}: {e:#}", n.id));
+                    continue;
+                }
+            };
+            if let Err(e) = timed_driver(NETWORKING, "destroy", driver.destroy(&n.id)).await {
                 failures.push(format!("nic {}: {e}", n.id));
             }
         }
@@ -621,7 +644,8 @@ impl Provisioner {
     #[generated(model = ClaudeFable, version = "5")]
     #[instrument(skip(self, record), fields(vm_id = %id))]
     pub(crate) async fn stop(&self, id: &VmId, mut record: VmRecord) -> Result<()> {
-        match timed_driver(HYPERVISOR, "destroy", self.drivers.hypervisor.destroy(id)).await {
+        let hypervisor = self.drivers.hypervisor()?;
+        match timed_driver(HYPERVISOR, "destroy", hypervisor.destroy(id)).await {
             Ok(()) | Err(HypervisorError::NotFound(_)) => {}
             Err(e) => bail!("stopping vmm: {e}"),
         }

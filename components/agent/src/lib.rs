@@ -429,13 +429,16 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
     let store = Arc::new(Store::open(&cfg.paths.db_path)?);
     let drivers = Drivers::from_config(&cfg).await?;
     let networking_driver = drivers.networking.clone();
-    let pause_supported = drivers.hypervisor.as_pausable().is_some();
+    let pause_supported = drivers
+        .hypervisor
+        .as_ref()
+        .is_some_and(|h| h.as_pausable().is_some());
     let ops = Arc::new(tokio::sync::Mutex::new(()));
 
-    let bridge_addr = cfg.network.parsed_bridge_addr()?;
+    let bridge_addr = cfg.parsed_bridge_addr()?;
     let catalog = DeviceCatalog::new(&drivers.devices);
     let volumes = VolumeCatalog::new(&drivers.storage);
-    let network = NetworkCatalog::new(&cfg.network);
+    let network = NetworkCatalog::new(cfg.network.as_ref());
     if network.serves_overlays() {
         info!(
             capability = "network/vxlan",
@@ -452,7 +455,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
         images.clone(),
         cfg.paths.image_dir.clone(),
         cfg.paths.run_dir.clone(),
-        cfg.network.default_bridge.clone(),
+        cfg.default_bridge(),
         bridge_addr,
         cfg.cgroup_cpuset.clone(),
     ));
@@ -472,7 +475,10 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
         .iter()
         .flat_map(|(_, record)| record.nics.iter().map(|n| n.tap_name.clone()))
         .collect();
-    networking_driver.reap(&live_taps).await;
+    // Nothing to reap on a node that makes no taps, and nobody to ask.
+    if let Some(driver) = &networking_driver {
+        driver.reap(&live_taps).await;
+    }
 
     if let Err(e) = reconciler.reconcile_all(Trigger::Startup).await {
         // Warn and not error: the periodic pass hands the same records to the
@@ -496,7 +502,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
             catalog: catalog.clone(),
             volumes: volumes.clone(),
             network: network.clone(),
-            default_bridge: cfg.network.default_bridge.clone(),
+            default_bridge: cfg.default_bridge(),
         };
         let sock = cfg.paths.run_dir.join("agent.sock");
         tokio::spawn(async move {
@@ -540,7 +546,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
         catalog,
         volumes,
         network,
-        default_bridge: cfg.network.default_bridge.clone(),
+        default_bridge: cfg.default_bridge(),
         stop_grace: Duration::from_secs(cfg.stop_grace_secs),
         pause_supported,
         node: cfg.capped(node_facts()),

@@ -125,8 +125,19 @@ pub struct AgentConfig {
     pub nft: Option<String>,
 
     pub paths: PathsConfig,
-    pub hypervisor: HypervisorConfig,
-    pub network: NetworkConfig,
+    /// `[hypervisor.*]` — at most one, keyed by driver name exactly as
+    /// `[volume.*]` and `[device.*]` are. Optional in full: a node that names
+    /// none runs no VMs, which is half of what a storage node is. Every
+    /// config written so far names `cloud-hypervisor` and parses byte for
+    /// byte the same — the section was an enum variant and is now a table
+    /// key, and both spell `[hypervisor.cloud-hypervisor]`.
+    #[serde(default)]
+    pub hypervisor: Sections,
+    /// `[network]` — this node makes taps and bridges. Absent means it does
+    /// not, which is the other half: no VMs, so no NICs. Present is every
+    /// config written so far.
+    #[serde(default)]
+    pub network: Option<NetworkConfig>,
     /// `[device.*]` — one section per device backend. Optional: a GPU-less
     /// agent (lab VM) has no device section at all.
     #[serde(default)]
@@ -153,11 +164,16 @@ pub struct PathsConfig {
     pub cgroup_root: PathBuf,
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HypervisorConfig {
-    #[serde(rename_all = "snake_case")]
-    CloudHypervisor { binary: PathBuf, timeout_ms: u64 },
+/// `[hypervisor.cloud-hypervisor]`. Was an enum variant; the two keys under
+/// it are unchanged, and `deny_unknown_fields` still catches a typo INSIDE
+/// the section while `drivers::register` catches one in the section NAME —
+/// and, unlike the enum, can say which hypervisors this agent actually has.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudHypervisorConfig {
+    pub binary: PathBuf,
+    pub timeout_ms: u64,
 }
 
 #[generated(model = ClaudeFable, version = "5")]
@@ -512,8 +528,11 @@ impl AgentConfig {
     /// rather than at the first tenant VM.
     #[generated(model = ClaudeOpus, version = "5")]
     pub fn bgp_config(&self) -> anyhow::Result<Option<linux_network_driver::frr::BgpConfig>> {
-        let evpn = self.network.vxlan.as_ref().is_some_and(|v| v.evpn);
-        let Some(bgp) = &self.network.bgp else {
+        let Some(network) = &self.network else {
+            return Ok(None);
+        };
+        let evpn = network.vxlan.as_ref().is_some_and(|v| v.evpn);
+        let Some(bgp) = &network.bgp else {
             if evpn {
                 bail!(
                     "[network.vxlan] evpn = true needs a [network.bgp] section: evpn is BGP \
@@ -543,6 +562,31 @@ impl AgentConfig {
                 .unwrap_or_else(|| self.paths.run_dir.join("meister-bgp.conf")),
             evpn,
         }))
+    }
+
+    /// The bridge a NIC lands on when its spec names none.
+    ///
+    /// Empty on a node with no `[network]` section — a node that makes no
+    /// taps, and whose VMs (if it runs any at all) therefore have no NICs to
+    /// give a bridge to. The one caller that would notice, `into_spec`, reads
+    /// it per NIC, and a NIC on such a node is refused one layer down by
+    /// `Drivers::networking` in words rather than landing on `""`.
+    #[generated(model = ClaudeOpus, version = "5")]
+    pub fn default_bridge(&self) -> String {
+        self.network
+            .as_ref()
+            .map(|n| n.default_bridge.clone())
+            .unwrap_or_default()
+    }
+
+    /// `[network].bridge_addr`, parsed — or nothing, which is both "no
+    /// address configured" and "no `[network]` section at all".
+    #[generated(model = ClaudeOpus, version = "5")]
+    pub fn parsed_bridge_addr(&self) -> anyhow::Result<Option<(IpAddr, u8)>> {
+        match &self.network {
+            Some(n) => n.parsed_bridge_addr(),
+            None => Ok(None),
+        }
     }
 
     /// The credential for the controller session, if this node has one.
@@ -742,8 +786,11 @@ mod tests {
         // The M5 half of the example: the overlay section and the two-agents
         // recipe are commented-out KEYS, so uncommenting them has to give a
         // config that means what the prose above them says.
-        let vxlan = cfg
+        let network = cfg
             .network
+            .as_ref()
+            .expect("[network] is a real section in the example");
+        let vxlan = network
             .vxlan
             .as_ref()
             .expect("[network.vxlan] is a real section");
@@ -772,7 +819,7 @@ mod tests {
         assert!(guarded.binary.ends_with("nft"));
 
         assert!(
-            cfg.network.vxlan.as_ref().unwrap().evpn.eq(&false),
+            network.vxlan.as_ref().unwrap().evpn.eq(&false),
             "off is M5's behaviour"
         );
         let bgp = cfg
@@ -795,7 +842,7 @@ mod tests {
     /// silently, which is the worst way for an overlay to be broken.
     #[test]
     fn evpn_without_a_bgp_section_is_refused_at_start_up() {
-        let orphan = config_with("").network.vxlan.is_none();
+        let orphan = config_with("").network.is_none_or(|n| n.vxlan.is_none());
         assert!(orphan, "the bare test config has no overlay at all");
 
         let cfg: AgentConfig = from_str(

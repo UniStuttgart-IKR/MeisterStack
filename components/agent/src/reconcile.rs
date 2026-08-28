@@ -418,7 +418,10 @@ impl Reconciler {
     /// console files are. Read-only in every sense: no attach, no input, no
     /// follow — see `crate::console`.
     pub fn console(&self, id: &VmId, lines: usize) -> Vec<(ConsoleStream, String)> {
-        crate::console::read_all(self.drivers.hypervisor.console_paths(id), lines)
+        let Some(hypervisor) = &self.drivers.hypervisor else {
+            return Vec::new();
+        };
+        crate::console::read_all(hypervisor.console_paths(id), lines)
     }
 
     #[instrument(skip_all, fields(?trigger))]
@@ -449,13 +452,15 @@ impl Reconciler {
             // runs over every VM this node has, whatever else is happening to
             // them. A VM that is converged still prints, and a boot loop is
             // precisely the case where nothing else in this pass would fire.
-            crate::console::trim_all(&self.drivers.hypervisor.console_paths(&id));
-            // The VMM's own log is bounded here too and read nowhere: it is
-            // the driver's diagnostics, not the guest's output, and `vm logs`
-            // must not mix them. `destroy` removes it; without this nothing
-            // stopped it growing while the VM lived.
-            for path in self.drivers.hypervisor.diagnostic_paths(&id) {
-                crate::console::trim(&path);
+            if let Some(hypervisor) = &self.drivers.hypervisor {
+                crate::console::trim_all(&hypervisor.console_paths(&id));
+                // The VMM's own log is bounded here too and read nowhere: it is
+                // the driver's diagnostics, not the guest's output, and `vm logs`
+                // must not mix them. `destroy` removes it; without this nothing
+                // stopped it growing while the VM lived.
+                for path in hypervisor.diagnostic_paths(&id) {
+                    crate::console::trim(&path);
+                }
             }
             match self.reconcile(id, trigger).await {
                 Ok(Action::None) => {}
@@ -736,7 +741,12 @@ impl Reconciler {
     }
 
     async fn observe(&self, id: &VmId, record: &VmRecord) -> Observed {
-        let tracked = self.drivers.hypervisor.is_tracked(id);
+        // A node with no hypervisor tracks nothing, answers no socket and has
+        // no guest to ask — which is what these three already mean when the
+        // VMM is gone, so the record converges the way it does after a crash
+        // rather than through a path of its own.
+        let hypervisor = self.drivers.hypervisor.as_ref();
+        let tracked = hypervisor.is_some_and(|h| h.is_tracked(id));
 
         let slice_pids = self
             .drivers
@@ -751,12 +761,14 @@ impl Reconciler {
 
         let backends_alive = backend_pids(record).all(|pid| slice_pids.contains(&pid));
 
-        let socket_responsive = self.drivers.hypervisor.probe(id).await;
+        let socket_responsive = match hypervisor {
+            Some(h) => h.probe(id).await,
+            None => false,
+        };
 
-        let guest = if tracked && socket_responsive {
-            self.drivers.hypervisor.get_state(id).await.ok()
-        } else {
-            None
+        let guest = match hypervisor.filter(|_| tracked && socket_responsive) {
+            Some(h) => h.get_state(id).await.ok(),
+            None => None,
         };
 
         Observed {
@@ -793,7 +805,7 @@ impl Reconciler {
 
             Action::Adopt { vmm_pid } => self
                 .drivers
-                .hypervisor
+                .hypervisor()?
                 .adopt(id, vmm_pid)
                 .await
                 .map_err(|e| anyhow::anyhow!("adopting vmm: {e}")),
@@ -808,14 +820,14 @@ impl Reconciler {
 
             Action::Start => self
                 .drivers
-                .hypervisor
+                .hypervisor()?
                 .start(id)
                 .await
                 .map_err(|e| anyhow::anyhow!("starting vm: {e}")),
 
             Action::SignalShutdown => self
                 .drivers
-                .hypervisor
+                .hypervisor()?
                 .power_button(id)
                 .await
                 .map_err(|e| anyhow::anyhow!("sending power button: {e}")),
@@ -824,7 +836,7 @@ impl Reconciler {
 
             Action::Pause => {
                 let p =
-                    self.drivers.hypervisor.as_pausable().ok_or_else(|| {
+                    self.drivers.hypervisor()?.as_pausable().ok_or_else(|| {
                         anyhow::anyhow!("hypervisor driver does not support pausing")
                     })?;
                 p.pause(id)
@@ -834,7 +846,7 @@ impl Reconciler {
 
             Action::Resume => {
                 let p =
-                    self.drivers.hypervisor.as_pausable().ok_or_else(|| {
+                    self.drivers.hypervisor()?.as_pausable().ok_or_else(|| {
                         anyhow::anyhow!("hypervisor driver does not support pausing")
                     })?;
                 p.resume(id)

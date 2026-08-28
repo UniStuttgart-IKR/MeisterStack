@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
+use macros::generated;
+
 use crate::types::mac_addr::MacAddr;
 use uuid::Uuid;
 
@@ -120,6 +122,22 @@ pub trait BridgeDriver: Send + Sync {
         )))
     }
 }
+
+/// Both halves of the networking seam in one driver.
+///
+/// A blanket supertrait and nothing else: every implementation of the two
+/// above is automatically one of these, and no driver has to say so. It
+/// exists because the agent's driver TABLE registers one row per driver and
+/// hands back one `Arc` — and taps and bridges are two faces of one kernel
+/// object, made by one implementation, on one node. The two fields on
+/// `Drivers` are upcasts of the same pointer, which is what they always held;
+/// before this they were two `Arc::clone`s of a concrete type, at the one
+/// call site that still knew which type it was.
+#[generated(model = ClaudeOpus, version = "5")]
+pub trait NetworkDriver: NicDriver + BridgeDriver {}
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl<T: NicDriver + BridgeDriver + ?Sized> NetworkDriver for T {}
 
 /// Something that tells the outside world which addresses live on this node.
 ///
