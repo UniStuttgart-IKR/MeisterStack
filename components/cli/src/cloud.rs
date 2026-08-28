@@ -171,6 +171,9 @@ pub async fn run(target: &Target, cmd: &CloudCmd, global: &GlobalArgs) -> Result
     let client = Client::new(target)?;
     match cmd {
         CloudCmd::Clusters => clusters(&client, global).await,
+        CloudCmd::Events => {
+            vm::events(&client, global, vm::EVENTS, "nothing has happened recently").await
+        }
         CloudCmd::Cluster { cmd } => run_cluster(&client, cmd, global).await,
         CloudCmd::Vm { cmd } => run_vm(&client, cmd, global).await,
         CloudCmd::Image { cmd } => run_image(&client, cmd, global).await,
@@ -315,6 +318,15 @@ async fn run_vm(client: &Client, cmd: &CloudVmCmd, global: &GlobalArgs) -> Resul
             .await
         }
         CloudVmCmd::Logs { name, lines } => vm::logs(client, global, vm::VMS, name, *lines).await,
+        CloudVmCmd::Events { name } => {
+            vm::events(
+                client,
+                global,
+                &format!("{}/{name}/events", vm::VMS),
+                "nothing has happened to this vm recently",
+            )
+            .await
+        }
         CloudVmCmd::Inspect { name } => vm::inspect(client, name).await,
         CloudVmCmd::Destroy { name } => vm::destroy(client, global, name).await,
         CloudVmCmd::Start { name } => vm::run_strategy(client, name, "Running", global).await,

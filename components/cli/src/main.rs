@@ -170,6 +170,8 @@ pub enum AgentCmd {
 #[derive(Subcommand)]
 pub enum ClusterCmd {
     Nodes,
+    /// Everything that happened in this cluster recently, newest first.
+    Events,
     /// Draining a node: what an operator decides about it, as opposed to what
     /// the agent reports. Listing them is still `meister cluster nodes`.
     Node {
@@ -198,6 +200,11 @@ pub enum ClusterNodeCmd {
 
 #[derive(Subcommand)]
 pub enum ClusterVmCmd {
+    /// What happened to this vm recently: placements, refusals, phase
+    /// changes. They expire, so this is "lately" and not "ever".
+    Events {
+        name: String,
+    },
     /// What the guest printed before anything inside it was reachable:
     /// firmware, bootloader, kernel, panic, emergency shell. One way — there
     /// is deliberately no attach, no input and no --follow.
@@ -246,6 +253,9 @@ pub enum ClusterVmCmd {
 pub enum CloudCmd {
     /// The clusters this cloud knows about, ready or not
     Clusters,
+    /// Everything that happened recently, newest first — scoped to the
+    /// caller's own tenant for a member, as every listing here is.
+    Events,
     /// Draining a cluster — the same verb one tier up. Listing them is still
     /// `meister cloud clusters`.
     Cluster {
@@ -476,6 +486,11 @@ pub enum CloudCsrCmd {
 
 #[derive(Subcommand)]
 pub enum CloudVmCmd {
+    /// What happened to this vm recently: placements, refusals, phase
+    /// changes. They expire, so this is "lately" and not "ever".
+    Events {
+        name: String,
+    },
     /// What the guest printed before anything inside it was reachable:
     /// firmware, bootloader, kernel, panic, emergency shell. One way — there
     /// is deliberately no attach, no input and no --follow.

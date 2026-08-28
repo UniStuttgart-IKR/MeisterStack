@@ -13,8 +13,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
 use controller_api::{
-    API_VERSION, ApiError, EtcdStore, Node, NodeSpec, SpecUpdate, Vm, VmSpec, apply_spec_update,
-    check_envelope, conflict, invalid, resources::new_vm,
+    API_VERSION, ApiError, EtcdStore, Node, NodeSpec, Resource, SpecUpdate, Vm, VmSpec,
+    apply_spec_update, check_envelope, conflict, invalid, resources::new_vm,
 };
 use macros::generated;
 use serde_json::json;
@@ -39,6 +39,8 @@ pub fn router(store: Arc<EtcdStore>, registry: Arc<crate::session::SessionRegist
             get(get_vm).put(update_vm).delete(delete_vm),
         )
         .route("/apis/meister.io/v1/vms/{name}/logs", get(vm_logs))
+        .route("/apis/meister.io/v1/vms/{name}/events", get(vm_events))
+        .route("/apis/meister.io/v1/events", get(list_events))
         .route("/apis/meister.io/v1/nodes", get(list_nodes))
         .route(
             "/apis/meister.io/v1/nodes/{name}",
@@ -270,6 +272,38 @@ async fn delete_vm(
         })
         .await?;
     Ok(Json(vm))
+}
+
+/// Everything that happened to one VM, recently.
+///
+/// No tenant filter here, and that is not an omission: this tier keeps no
+/// user directory (one directory, and it is the cloud's), so a member reading
+/// it is read-only over everything exactly as they are over the VM objects
+/// themselves.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn vm_events(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let vm: Vm = st.store.get(&name).await?;
+    let items = controller_api::events::about(&st.store, Vm::KIND, &vm.metadata.uid, &name).await;
+    Ok(Json(json!({
+        "apiVersion": API_VERSION,
+        "kind": "EventList",
+        "items": items,
+    })))
+}
+
+/// The whole log of this cluster: its VMs' transitions and its nodes' coming
+/// and going.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn list_events(State(st): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let items = controller_api::events::all(&st.store).await;
+    Ok(Json(json!({
+        "apiVersion": API_VERSION,
+        "kind": "EventList",
+        "items": items,
+    })))
 }
 
 /// The inventory is the Node objects, not the live session map: a node that

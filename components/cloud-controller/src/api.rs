@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
+use controller_api::events;
 use controller_api::{
     API_VERSION, ApiError, Caller, CallerRole, CallerTenant, Capacity, CertificateSigningRequest,
     Cluster, ClusterSpec, EtcdStore, FloatingIp, FloatingPool, Image, ImageSpec, Resource, Role,
@@ -85,6 +86,8 @@ pub fn router(
             get(get_vm).put(update_vm).delete(delete_vm),
         )
         .route("/apis/meister.io/v1/vms/{name}/logs", get(vm_logs))
+        .route("/apis/meister.io/v1/vms/{name}/events", get(vm_events))
+        .route("/apis/meister.io/v1/events", get(list_events))
         .route("/apis/meister.io/v1/clusters", get(list_clusters))
         .route(
             "/apis/meister.io/v1/clusters/{name}",
@@ -366,7 +369,28 @@ async fn check_quota(
         ));
     }
     let after = quota::Usage::of(tenant, &vms, except).plus(adding);
-    quota::check(&object.spec.quota, tenant, after).map_err(invalid)
+    let Err(why) = quota::check(&object.spec.quota, tenant, after) else {
+        return Ok(());
+    };
+    // On the TENANT and not on a VM: the VM this was about is being refused
+    // and will not exist, so an event pointing at it would point at nothing.
+    // What an operator wants to see is that this tenant has been hitting its
+    // ceiling — which is exactly what the aggregation on (tenant, reason)
+    // gives, one object with a count rather than one per attempt.
+    events::record(
+        &st.store,
+        events::Happening {
+            kind: Tenant::KIND,
+            name: tenant,
+            uid: &object.metadata.uid,
+            reason: events::reason::QUOTA_EXCEEDED,
+            message: why.clone(),
+            event_type: controller_api::EventType::Warning,
+            tenant: Some(tenant),
+        },
+    )
+    .await;
+    Err(invalid(why))
 }
 
 /// A member sees its own tenant's VMs and nothing else. Filtering the list
@@ -621,6 +645,56 @@ fn json_passthrough(payload: Vec<u8>) -> axum::response::Response {
         payload,
     )
         .into_response()
+}
+
+// --- events ----------------------------------------------------------------
+
+/// Everything that happened to one VM, recently.
+///
+/// Scoped through the VM, not through the events: the caller has to be
+/// allowed to read the OBJECT, and then it gets the object's history. Doing
+/// it the other way round — filtering the event list by the caller's tenant —
+/// would answer 200 with an empty list for somebody else's VM, and "there is
+/// nothing" is a different and less honest sentence than "that is not yours".
+#[generated(model = ClaudeOpus, version = "5")]
+async fn vm_events(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+    caller: Caller,
+    role: CallerRole,
+    tenant: CallerTenant,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let vm: Vm = st.store.get(&name).await?;
+    Grant::new(caller, role, tenant).allows(Scope::of(vm.spec.tenant.as_deref()), Verb::Read)?;
+    let items = events::about(&st.store, Vm::KIND, &vm.metadata.uid, &name).await;
+    Ok(Json(
+        json!({ "apiVersion": API_VERSION, "kind": "EventList", "items": items }),
+    ))
+}
+
+/// The whole log, filtered to what the caller may see.
+///
+/// A member gets its own tenant's and nothing else — the same rule the VM
+/// list follows, and for the same reason: a listing is an inventory, and an
+/// event names the object it is about. Events with no tenant are the
+/// operator's estate (a node's heartbeat, a cluster reconnecting) and only an
+/// admin sees them, which is the conservative direction and the one an
+/// unscoped VM already takes.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn list_events(
+    State(st): State<ApiState>,
+    caller: Caller,
+    role: CallerRole,
+    tenant: CallerTenant,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let who = Grant::new(caller, role, tenant);
+    let mut items = events::all(&st.store).await;
+    if let Some(mine) = who.confined_to() {
+        items.retain(|e| e.spec.tenant.as_deref() == Some(mine));
+    }
+    Ok(Json(
+        json!({ "apiVersion": API_VERSION, "kind": "EventList", "items": items }),
+    ))
 }
 
 // --- clusters --------------------------------------------------------------

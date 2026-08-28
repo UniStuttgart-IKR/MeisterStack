@@ -37,9 +37,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
+use controller_api::events::{self, Happening};
 use controller_api::{
     Ack, Cluster, ClusterSpec, EtcdStore, Observation, Peer, Pending, StoreError, Vm,
 };
+use controller_api::{EventType, Resource, VmPhase};
 
 /// Shorter than the agent tier's, and deliberately: a cluster answers a command
 /// with a single store write, so a minute of patience would only mean a minute
@@ -395,6 +397,10 @@ async fn ingest_status(
             Observation::Changed(vm, phase, message) => (vm, phase, message),
         };
         let name = vm.metadata.name.clone();
+        // Read off the object before the mutate borrows it: the tenant is on
+        // the spec and travels with the event, so a member sees its own VMs'
+        // history and nobody else's.
+        let vm_tenant = vm.spec.tenant.clone();
         let result = store
             .mutate::<Vm, _>(&name, |v| {
                 v.status.phase = phase;
@@ -411,7 +417,35 @@ async fn ingest_status(
             })
             .await;
         match result {
-            Ok(_) => info!(vm = %name, vm_id = %reported.id, ?phase, "phase observed"),
+            Ok(_) => {
+                // In the arm where the write LANDED, and only for a report
+                // that `observe` already called a change — a peer reports
+                // every ten seconds and says the same thing nearly every
+                // time, and the one that matters is the one that is
+                // different. Warning for the two phases nothing automatic
+                // leaves on its own; Normal for every ordinary transition.
+                let kind = match phase {
+                    VmPhase::Failed | VmPhase::Quarantined => EventType::Warning,
+                    _ => EventType::Normal,
+                };
+                events::record(
+                    store,
+                    Happening {
+                        kind: Vm::KIND,
+                        name: &name,
+                        uid: &reported.id,
+                        reason: events::reason::PHASE_CHANGED,
+                        message: match &message {
+                            Some(said) => format!("{} ({said})", phase.as_str()),
+                            None => phase.as_str().to_string(),
+                        },
+                        event_type: kind,
+                        tenant: vm_tenant.as_deref(),
+                    },
+                )
+                .await;
+                info!(vm = %name, vm_id = %reported.id, ?phase, "phase observed")
+            }
             Err(e) => warn!(vm = %name, error = format!("{e:#}"), "writing vm status failed"),
         }
     }
@@ -535,6 +569,22 @@ impl Connection {
             warn!(cluster = %hello.cluster_name, error = format!("{e:#}"),
                   "recording the cluster failed");
         }
+        // Once per session, so a transition by construction — see the twin
+        // one tier down. A cluster that reconnects in a loop aggregates into
+        // one object with a count.
+        events::record(
+            &self.store,
+            Happening {
+                kind: Cluster::KIND,
+                name: &hello.cluster_name,
+                uid: "",
+                reason: events::reason::PEER_READY,
+                message: format!("cluster {} connected", hello.version),
+                event_type: EventType::Normal,
+                tenant: None,
+            },
+        )
+        .await;
         live.id = Some(
             self.registry
                 .open(live.id, &hello.cluster_name, &self.tx, Utc::now()),

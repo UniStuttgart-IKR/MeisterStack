@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod command;
+pub mod events;
 pub mod floating;
 pub mod grpc;
 pub mod heartbeat;
@@ -37,12 +38,13 @@ pub use requeue::{RequeueConfig, RequeuePolicy};
 pub use resources::{
     API_VERSION, CertificateSigningRequest, Cluster, ClusterCapacity, ClusterSpec, ClusterStatus,
     Counter, CounterSpec, CsrCondition, CsrConditionType, CsrSpec, CsrStatus,
-    DEFAULT_QUOTA_PRIVATE, DEFAULT_QUOTA_PUBLIC, DEFAULT_ROUTED_PREFIX_LEN, FloatingIp,
-    FloatingIpSpec, FloatingIpStatus, FloatingPool, FloatingPoolSpec, FloatingPoolStatus, Image,
-    ImageFormat, ImageSpec, ImageStatus, IssuedCertificate, LABEL_CLOUD_UID, LABEL_MANAGED_BY,
-    MANAGED_BY_CLOUD, Node, NodeCapacity, NodeSpec, NodeStatus, RoutedSubnet, RoutedSubnetSpec,
-    RoutedSubnetStatus, RunStrategy, SIGNER_USER_CLIENT, Tenant, TenantQuota, TenantSpec,
-    TenantStatus, TenantUsage, User, UserSpec, UserStatus, Vm, VmPhase, VmSpec, VmStatus,
+    DEFAULT_QUOTA_PRIVATE, DEFAULT_QUOTA_PUBLIC, DEFAULT_ROUTED_PREFIX_LEN, Event, EventSpec,
+    EventType, FloatingIp, FloatingIpSpec, FloatingIpStatus, FloatingPool, FloatingPoolSpec,
+    FloatingPoolStatus, Image, ImageFormat, ImageSpec, ImageStatus, IssuedCertificate,
+    LABEL_CLOUD_UID, LABEL_MANAGED_BY, MANAGED_BY_CLOUD, Node, NodeCapacity, NodeSpec, NodeStatus,
+    RoutedSubnet, RoutedSubnetSpec, RoutedSubnetStatus, RunStrategy, SIGNER_USER_CLIENT, Tenant,
+    TenantQuota, TenantSpec, TenantStatus, TenantUsage, User, UserSpec, UserStatus, Vm, VmPhase,
+    VmSpec, VmStatus,
 };
 pub use rest::{
     ApiError, AuthState, Caller, CallerRole, CallerTenant, PeerCerts, SpecUpdate,

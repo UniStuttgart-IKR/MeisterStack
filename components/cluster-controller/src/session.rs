@@ -31,9 +31,11 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
 use common::capability;
+use controller_api::events::{self, Happening};
 use controller_api::{
     Ack, Authenticated, EtcdStore, Node, NodeSpec, Observation, Peer, Pending, StoreError, Vm,
 };
+use controller_api::{EventType, Resource, VmPhase};
 
 use crate::reconcile::build_spec_json;
 
@@ -386,6 +388,10 @@ async fn ingest_status(
             Observation::Changed(vm, phase, message) => (vm, phase, message),
         };
         let name = vm.metadata.name.clone();
+        // Read off the object before the mutate borrows it: the tenant is on
+        // the spec and travels with the event, so a member sees its own VMs'
+        // history and nobody else's.
+        let vm_tenant = vm.spec.tenant.clone();
         let result = store
             .mutate::<Vm, _>(&name, |v| {
                 v.status.phase = phase;
@@ -403,7 +409,35 @@ async fn ingest_status(
             })
             .await;
         match result {
-            Ok(_) => info!(vm = %name, vm_id = %reported.id, ?phase, "phase observed"),
+            Ok(_) => {
+                // In the arm where the write LANDED, and only for a report
+                // that `observe` already called a change — a peer reports
+                // every ten seconds and says the same thing nearly every
+                // time, and the one that matters is the one that is
+                // different. Warning for the two phases nothing automatic
+                // leaves on its own; Normal for every ordinary transition.
+                let kind = match phase {
+                    VmPhase::Failed | VmPhase::Quarantined => EventType::Warning,
+                    _ => EventType::Normal,
+                };
+                events::record(
+                    store,
+                    Happening {
+                        kind: Vm::KIND,
+                        name: &name,
+                        uid: &reported.id,
+                        reason: events::reason::PHASE_CHANGED,
+                        message: match &message {
+                            Some(said) => format!("{} ({said})", phase.as_str()),
+                            None => phase.as_str().to_string(),
+                        },
+                        event_type: kind,
+                        tenant: vm_tenant.as_deref(),
+                    },
+                )
+                .await;
+                info!(vm = %name, vm_id = %reported.id, ?phase, "phase observed")
+            }
             Err(e) => warn!(vm = %name, error = format!("{e:#}"), "writing vm status failed"),
         }
     }
@@ -561,6 +595,23 @@ async fn on_hello(session: &Session, hello: Hello) -> Option<String> {
     if let Err(e) = ingest_hello(&session.store, &hello).await {
         warn!(node = %hello.node_id, error = format!("{e:#}"), "recording the node failed");
     }
+    // A Hello happens once per session, so this is a transition by
+    // construction and needs no guard the way a reconcile branch does. An
+    // agent that reconnects in a loop aggregates into one object with a count,
+    // which is exactly the shape that story should have.
+    events::record(
+        &session.store,
+        Happening {
+            kind: Node::KIND,
+            name: &hello.node_id,
+            uid: "",
+            reason: events::reason::PEER_READY,
+            message: format!("agent {} connected", hello.agent_version),
+            event_type: EventType::Normal,
+            tenant: None,
+        },
+    )
+    .await;
     // Snapshot first, registry second. The reconciler dispatches through the
     // registry, so a node that is not in it yet cannot be sent a command —
     // which is what keeps a Create issued right now from arriving ahead of a

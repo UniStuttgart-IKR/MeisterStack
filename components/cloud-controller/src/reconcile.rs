@@ -38,6 +38,9 @@ use proto::cloud_command;
 use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 
+use controller_api::EventType;
+use controller_api::events::{self, Happening};
+
 use crate::session::SessionRegistry;
 
 const TICK: Duration = Duration::from_secs(5);
@@ -143,6 +146,21 @@ async fn pass(
     Ok(())
 }
 
+/// One event about a VM. The tenant travels with it, so a member sees its
+/// own VMs' history and nobody else's.
+#[generated(model = ClaudeOpus, version = "5")]
+fn about<'a>(vm: &'a Vm, reason: &'a str, message: String, kind: EventType) -> Happening<'a> {
+    Happening {
+        kind: Vm::KIND,
+        name: &vm.metadata.name,
+        uid: &vm.metadata.uid,
+        reason,
+        message,
+        event_type: kind,
+        tenant: vm.spec.tenant.as_deref(),
+    }
+}
+
 /// What is still free on one cluster: the allowance its reported capacity
 /// gives under the configured overcommit, minus everything already bound to
 /// it.
@@ -233,7 +251,25 @@ async fn expire_and_collect_clusters(
                 .mutate::<Cluster, _>(&name, |c| c.status.connected = false)
                 .await
             {
-                Ok(_) => connected = false,
+                Ok(_) => {
+                    // The transition, not the state: this branch has already
+                    // established that the cluster WAS connected and is not
+                    // any more.
+                    events::record(
+                        store,
+                        Happening {
+                            kind: Cluster::KIND,
+                            name: &name,
+                            uid: "",
+                            reason: events::reason::PEER_LOST,
+                            message: format!("heartbeat expired, last seen {last}"),
+                            event_type: EventType::Warning,
+                            tenant: None,
+                        },
+                    )
+                    .await;
+                    connected = false
+                }
                 Err(e) => warn!(cluster = %name, error = format!("{e:#}"),
                                 "marking the cluster down failed"),
             }
@@ -365,6 +401,18 @@ async fn reconcile_vm_traced(
                 match store.update(&bound).await {
                     Ok(_) => {
                         telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLOUD);
+                        // In the arm where the compare-and-swap SUCCEEDED —
+                        // the replica that lost the race records nothing.
+                        events::record(
+                            store,
+                            about(
+                                &bound,
+                                events::reason::SCHEDULED,
+                                format!("bound to cluster {pick}"),
+                                EventType::Normal,
+                            ),
+                        )
+                        .await;
                         info!(cluster = %pick, "scheduled")
                     }
                     Err(StoreError::Conflict(_)) => {
@@ -389,12 +437,27 @@ async fn reconcile_vm_traced(
                     reason = %reason,
                     "no schedulable cluster, staying pending"
                 );
+                // Only when the answer CHANGED, and the event with it: a
+                // level-triggered pass reaches this conclusion every five
+                // seconds for as long as the VM is unplaceable, and an event
+                // per pass would be a store filling at one write per VM per
+                // tick.
                 if vm.status.message.as_deref() != Some(reason.as_str()) {
                     store
                         .mutate::<Vm, _>(&vm.metadata.name, |v| {
                             v.status.message = Some(reason.clone());
                         })
                         .await?;
+                    events::record(
+                        store,
+                        about(
+                            &vm,
+                            events::reason::FAILED_SCHEDULING,
+                            reason,
+                            EventType::Warning,
+                        ),
+                    )
+                    .await;
                 }
             }
         }

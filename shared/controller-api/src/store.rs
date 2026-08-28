@@ -13,8 +13,8 @@ use std::future::Future;
 use std::time::Duration;
 
 use etcd_client::{
-    Client, Compare, CompareOp, ConnectOptions, EventType, GetOptions, Txn, TxnOp, TxnResponse,
-    WatchOptions,
+    Client, Compare, CompareOp, ConnectOptions, EventType, GetOptions, PutOptions, Txn, TxnOp,
+    TxnResponse, WatchOptions,
 };
 use macros::generated;
 use tracing::{error, info, warn};
@@ -272,10 +272,36 @@ impl EtcdStore {
 
     /// Create fails if the key exists (like a POST).
     pub async fn create<T: Resource>(&self, obj: &T) -> Result<T> {
+        self.create_inner(obj, None).await
+    }
+
+    /// Create an object that etcd itself will delete again after `ttl_secs`.
+    ///
+    /// The one resource that expires — events. A lease is granted for this
+    /// object alone and etcd reaps the key when it runs out, so the expiry
+    /// needs no sweeper task, no reconcile pass and nobody alive at all: a
+    /// control plane that is down for two hours comes back to an event log
+    /// that has already tidied itself.
+    ///
+    /// One grant per created object rather than a shared one per process or
+    /// per time bucket. A shared lease would take every event with it when
+    /// the process holding it stopped renewing, and a bucketed one would give
+    /// the last object of each bucket a shorter life than it was promised.
+    /// Objects that expire are rare by construction — see `events`, which
+    /// writes one only when something CHANGED — so the extra round trip is
+    /// paid about as often as something happens.
+    #[generated(model = ClaudeOpus, version = "5")]
+    pub async fn create_with_ttl<T: Resource>(&self, obj: &T, ttl_secs: i64) -> Result<T> {
+        let lease = timed("lease_grant", self.handle().lease_grant(ttl_secs, None)).await?;
+        self.create_inner(obj, Some(lease.id())).await
+    }
+
+    async fn create_inner<T: Resource>(&self, obj: &T, lease: Option<i64>) -> Result<T> {
         let name = obj.metadata().name.clone();
         Self::check_name(&name)?;
         let key = self.key(T::RESOURCE, &name);
         let value = Self::encode(obj)?;
+        let options = lease.map(|id| PutOptions::new().with_lease(id));
         let txn = Txn::new()
             .when(vec![Compare::create_revision(
                 key.clone(),
@@ -285,7 +311,7 @@ impl EtcdStore {
             // The put takes the bytes and `written` decodes the result from
             // them, so one of the two gets a copy. One allocation against the
             // read-back round trip it replaces.
-            .and_then(vec![TxnOp::put(key.clone(), value.clone(), None)]);
+            .and_then(vec![TxnOp::put(key.clone(), value.clone(), options)]);
         let resp = timed("create", self.handle().txn(txn)).await?;
         if !resp.succeeded() {
             return Err(StoreError::AlreadyExists(format!(
@@ -347,7 +373,18 @@ impl EtcdStore {
                 rev,
             )])
             // A copy for the same reason `create` makes one.
-            .and_then(vec![TxnOp::put(key.clone(), value.clone(), None)]);
+            //
+            // `ignore_lease` is what lets an expiring object be UPDATED
+            // without stopping expiring: a put with no lease named would
+            // otherwise take the key's lease off and make it permanent, which
+            // for an event that is being aggregated is exactly the wrong
+            // direction. Harmless on every other resource — a key with no
+            // lease has none to keep.
+            .and_then(vec![TxnOp::put(
+                key.clone(),
+                value.clone(),
+                Some(PutOptions::new().with_ignore_lease()),
+            )]);
         let resp = timed("update", self.handle().txn(txn)).await?;
         if !resp.succeeded() {
             return Err(StoreError::Conflict(format!(

@@ -32,6 +32,9 @@ use macros::generated;
 use proto::command;
 use tracing::{debug, info, warn};
 
+use controller_api::EventType;
+use controller_api::events::{self, Happening};
+
 use crate::session::SessionRegistry;
 
 const TICK: Duration = Duration::from_secs(5);
@@ -150,6 +153,32 @@ async fn pass(
     // pending for which reason. See `PendingTally`.
     pass.pending.publish(telemetry::metrics::TIER_CLUSTER);
     Ok(())
+}
+
+/// One event about a VM, in the two shapes this tier makes.
+///
+/// The tenant travels with it because the cloud handed it down on the object;
+/// a VM created straight at this tier has none, and its events are unscoped
+/// exactly as it is.
+#[generated(model = ClaudeOpus, version = "5")]
+fn about<'a>(vm: &'a Vm, reason: &'a str, message: String, kind: EventType) -> Happening<'a> {
+    Happening {
+        kind: Vm::KIND,
+        name: &vm.metadata.name,
+        uid: &vm.metadata.uid,
+        reason,
+        message,
+        event_type: kind,
+        tenant: vm.spec.tenant.as_deref(),
+    }
+}
+
+fn normal<'a>(vm: &'a Vm, reason: &'a str, message: String) -> Happening<'a> {
+    about(vm, reason, message, EventType::Normal)
+}
+
+fn warning<'a>(vm: &'a Vm, reason: &'a str, message: String) -> Happening<'a> {
+    about(vm, reason, message, EventType::Warning)
 }
 
 /// What is still free on one node: the allowance its reported capacity gives
@@ -274,7 +303,29 @@ async fn expire_and_collect_nodes(
                 .mutate::<Node, _>(&name, |n| n.status.ready = false)
                 .await
             {
-                Ok(_) => ready = false,
+                Ok(_) => {
+                    // Inside the branch that already established the node WAS
+                    // ready and is not any more, so this fires on the
+                    // transition rather than on every pass that finds it
+                    // still gone. A Node has no uid of its own here; its name
+                    // is its identity, and `name_of` knows that.
+                    events::record(
+                        store,
+                        Happening {
+                            kind: Node::KIND,
+                            name: &name,
+                            uid: "",
+                            reason: events::reason::PEER_LOST,
+                            message: format!("heartbeat expired, last seen {last}"),
+                            event_type: EventType::Warning,
+                            // A node is the operator's estate and belongs to
+                            // no tenant; only an admin sees this.
+                            tenant: None,
+                        },
+                    )
+                    .await;
+                    ready = false
+                }
                 Err(e) => warn!(node = %name, error = format!("{e:#}"),
                                 "marking the node not ready failed"),
             }
@@ -441,12 +492,24 @@ async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
             // Only when it CHANGED: peers report every few seconds and a pass runs
             // on every tick, so writing the same sentence again would wake the vm
             // watch for nothing.
+            //
+            // The event rides in the same branch, and for a sharper version
+            // of the same reason: a level-triggered pass reaches this
+            // conclusion every five seconds for as long as the VM is
+            // unplaceable, and an event per pass would be a store filling at
+            // one write per VM per tick. What is worth recording is the
+            // moment the answer CHANGED.
             if vm.status.message.as_deref() != Some(reason.as_str()) {
                 p.store
                     .mutate::<Vm, _>(&vm.metadata.name, |v| {
                         v.status.message = Some(reason.clone());
                     })
                     .await?;
+                events::record(
+                    p.store,
+                    warning(&vm, events::reason::FAILED_SCHEDULING, reason),
+                )
+                .await;
             }
             return Ok(());
         }
@@ -465,6 +528,18 @@ async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     match p.store.update(&bound).await {
         Ok(_) => {
             telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLUSTER);
+            // Inside the arm where the compare-and-swap SUCCEEDED, which is
+            // what makes this an event rather than a pass: the replica that
+            // lost the race takes the other arm and records nothing.
+            events::record(
+                p.store,
+                normal(
+                    &bound,
+                    events::reason::SCHEDULED,
+                    format!("bound to node {node}"),
+                ),
+            )
+            .await;
             info!(node = %node, "scheduled")
         }
         Err(StoreError::Conflict(_)) => {

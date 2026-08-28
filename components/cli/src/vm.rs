@@ -224,6 +224,65 @@ pub async fn logs(
     })
 }
 
+/// The path every tier serves the log under.
+pub const EVENTS: &str = "/apis/meister.io/v1/events";
+
+/// One recorded happening, as every tier serves it.
+#[derive(Deserialize)]
+pub struct Event {
+    pub spec: EventSpec,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventSpec {
+    pub involved_kind: String,
+    pub involved_name: String,
+    pub reason: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub event_type: String,
+    #[serde(default)]
+    pub count: u32,
+    pub last_seen: chrono::DateTime<chrono::Utc>,
+}
+
+/// The event log, at whichever tier the client is pointed at.
+///
+/// `count` has a column of its own because it is the difference between "this
+/// went wrong" and "this went wrong twenty times", and the message is last
+/// because it is the one cell that carries a server sentence with spaces in
+/// it.
+#[generated(model = ClaudeOpus, version = "5")]
+pub async fn events(
+    client: &Client,
+    global: &GlobalArgs,
+    path: &str,
+    empty_note: &'static str,
+) -> Result<()> {
+    let body = client.get(path).await?;
+    let now = chrono::Utc::now();
+    output::emit(global, &body, |body| {
+        output::table_of(
+            body,
+            "parsing the event log",
+            &["age", "type", "object", "reason", "count", "message"],
+            empty_note,
+            |e: Event| {
+                vec![
+                    output::age(Some(e.spec.last_seen), now),
+                    e.spec.event_type,
+                    format!("{}/{}", e.spec.involved_kind, e.spec.involved_name),
+                    e.spec.reason,
+                    e.spec.count.to_string(),
+                    e.spec.message,
+                ]
+            },
+        )
+    })
+}
+
 /// The whole object, at either tier, and only ever as json: an inspect is
 /// what an operator reads when the table left something out.
 pub async fn inspect(client: &Client, name: &str) -> Result<()> {
