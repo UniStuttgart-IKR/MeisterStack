@@ -30,8 +30,8 @@ use std::time::Duration;
 use anyhow::bail;
 use chrono::{DateTime, Utc};
 use controller_api::{
-    Ack, Candidate, Cluster, EtcdStore, PassTrigger, PendingTally, Resource, RunStrategy,
-    Scheduler, StoreError, Vm, VmPhase, heartbeat_expired, lifecycle_command,
+    Ack, Candidate, Capacity, Cluster, EtcdStore, Overcommit, PassTrigger, PendingTally, Resource,
+    RunStrategy, Scheduler, StoreError, Vm, VmPhase, heartbeat_expired, lifecycle_command,
 };
 use macros::generated;
 use proto::cloud_command;
@@ -81,12 +81,13 @@ pub async fn run(
     store: Arc<EtcdStore>,
     registry: Arc<SessionRegistry>,
     scheduler: Arc<dyn Scheduler>,
+    overcommit: Overcommit,
 ) {
     let mut trigger = PassTrigger::<Vm>::new(&store, TICK).await;
     loop {
         trigger.wait(&store).await;
         let clock = telemetry::metrics::Timer::start();
-        let outcome = pass(&store, &registry, scheduler.as_ref()).await;
+        let outcome = pass(&store, &registry, scheduler.as_ref(), overcommit).await;
         // Around the whole pass, and a failed pass still took the time it
         // took — the same measurement as one tier down, so a slow lap can be
         // compared between the two.
@@ -107,20 +108,25 @@ async fn pass(
     store: &EtcdStore,
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
+    overcommit: Overcommit,
 ) -> anyhow::Result<()> {
     // One reading of the session map for the whole pass: what this replica
     // owns must not change halfway through the list it is deciding about.
     let sessions = registry.connected();
     telemetry::metrics::sessions()
         .set_connected(telemetry::metrics::PEER_CLUSTER, sessions.len() as i64);
-    let clusters = expire_and_collect_clusters(store, &sessions).await?;
+    // The VMs first: what is already bound to a cluster is half of what
+    // "free" means, and the candidates cannot be built without it.
+    let vms = store.list::<Vm>().await?;
+    publish_vm_gauges(&vms);
+    let clusters = expire_and_collect_clusters(store, &sessions, &vms, overcommit).await?;
     telemetry::metrics::objects().set_count(Cluster::KIND, clusters.len() as i64);
+    // Behind a mutex because a pass SPENDS it — see the cluster tier's twin.
+    let clusters = std::sync::Mutex::new(clusters);
     // And one reading of the address book, but only if somebody asks for it:
     // most passes dispatch nothing, and those must go on costing nothing.
     let book = OnceCell::new();
     let pending = PendingTally::new();
-    let vms = store.list::<Vm>().await?;
-    publish_vm_gauges(&vms);
     for vm in vms {
         let name = vm.metadata.name.clone();
         if let Err(e) = reconcile_vm(
@@ -135,6 +141,37 @@ async fn pass(
     // for which reason. See `PendingTally`.
     pending.publish(telemetry::metrics::TIER_CLOUD);
     Ok(())
+}
+
+/// What is still free on one cluster: the allowance its reported capacity
+/// gives under the configured overcommit, minus everything already bound to
+/// it.
+///
+/// The aggregate the cluster reports is the sum over its READY nodes and is
+/// deliberately coarse — which node inside it ends up carrying a VM is the
+/// cluster's own decision, and the check one tier down is the exact one. What
+/// this prevents is the coarse mistake: handing a cluster more than it has at
+/// all, and then watching every one of those VMs sit Pending down there with
+/// nobody up here able to see why.
+#[generated(model = ClaudeOpus, version = "5")]
+fn free_on(
+    cluster: &str,
+    capacity: &controller_api::ClusterCapacity,
+    vms: &[Vm],
+    overcommit: Overcommit,
+) -> Capacity {
+    let bound = vms
+        .iter()
+        .filter(|v| v.spec.cluster_name.as_deref() == Some(cluster))
+        .fold(Capacity::default(), |sum, vm| {
+            sum.plus(Capacity::wanted_by(vm))
+        });
+    overcommit
+        .allowance(Capacity {
+            vcpus: capacity.vcpus,
+            mem_mib: capacity.mem_mib,
+        })
+        .minus(bound)
 }
 
 /// How many VMs there are, and how they are spread over the phases. Every
@@ -164,6 +201,8 @@ fn publish_vm_gauges(vms: &[Vm]) {
 async fn expire_and_collect_clusters(
     store: &EtcdStore,
     sessions: &HashSet<String>,
+    vms: &[Vm],
+    overcommit: Overcommit,
 ) -> anyhow::Result<Vec<Candidate>> {
     let now = Utc::now();
     let mut out = Vec::new();
@@ -202,6 +241,7 @@ async fn expire_and_collect_clusters(
         out.push(Candidate {
             connected: connected && sessions.contains(&name),
             schedulable: cluster.spec.schedulable,
+            free: free_on(&name, &cluster.status.capacity, vms, overcommit),
             catalogue: cluster.status.capacity.capabilities,
             name,
         });
@@ -221,7 +261,7 @@ async fn reconcile_vm(
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
     sessions: &HashSet<String>,
-    clusters: &[Candidate],
+    clusters: &std::sync::Mutex<Vec<Candidate>>,
     book: &OnceCell<AddressBook>,
     pending: &PendingTally,
     vm: Vm,
@@ -269,7 +309,7 @@ async fn reconcile_vm_traced(
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
     sessions: &HashSet<String>,
-    clusters: &[Candidate],
+    clusters: &std::sync::Mutex<Vec<Candidate>>,
     book: &OnceCell<AddressBook>,
     pending: &PendingTally,
     vm: Vm,
@@ -293,8 +333,24 @@ async fn reconcile_vm_traced(
     }
 
     let Some(cluster) = vm.spec.cluster_name.clone() else {
-        match scheduler.assign(&vm, clusters) {
-            Some(pick) => {
+        // Decide and SPEND under one lock, and let go before anything awaits
+        // — see the cluster tier's `place` for why the binding and not the
+        // API edge is the authority.
+        let decision = {
+            let mut clusters = clusters.lock().unwrap();
+            match scheduler.assign(&vm, &clusters) {
+                Some(pick) => {
+                    controller_api::deduct(&mut clusters, &pick, Capacity::wanted_by(&vm));
+                    Ok(pick)
+                }
+                None => Err((
+                    clusters.len(),
+                    controller_api::pending_reason_of(&vm, &clusters),
+                )),
+            }
+        };
+        match decision {
+            Ok(pick) => {
                 // A plain CAS on the object this pass read, not a
                 // read-modify-write: with several replicas scheduling at once
                 // the binding is exactly what must NOT be retried onto a newer
@@ -318,7 +374,7 @@ async fn reconcile_vm_traced(
                     Err(e) => return Err(e.into()),
                 }
             }
-            None => {
+            Err((known, (category, reason))) => {
                 // Say WHY on the object and not only in this replica's debug
                 // log — see the cluster tier's `place`. One floor up the
                 // sentence is worth even more: a cluster catalogue is the
@@ -327,10 +383,9 @@ async fn reconcile_vm_traced(
                 // The sentence goes on the object, the CATEGORY into the
                 // tally: the sentence names capabilities and counts
                 // candidates, and is the string that must never be a label.
-                let (category, reason) = controller_api::pending_reason_of(&vm, clusters);
                 pending.note(category);
                 debug!(
-                    known = clusters.len(),
+                    known,
                     reason = %reason,
                     "no schedulable cluster, staying pending"
                 );

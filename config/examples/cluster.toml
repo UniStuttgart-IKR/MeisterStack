@@ -126,6 +126,38 @@ etcd_prefix = "/cluster"
 # The authenticator chain, in order; see the cloud example for what each link
 # is and why the order matters. An [auth] table that configures nothing is
 # still the anonymous mode.
+# --- admission: does the machine actually have room ------------------------
+#
+# Until this existed the scheduler filtered on connected and schedulable and
+# then placed, without ever asking whether the node could carry the VM. So
+# `schedulable` was half a truth: the node was placeable until it OOMed. In
+# the lab, three nodes with the same catalogue took EVERY overlay vm onto
+# whichever sorted first.
+#
+# What is free is derived per pass and never stored: the reported capacity,
+# times the factors below, minus everything already bound there — Pending vms
+# included, because a vm that is bound and not yet started is a claim.
+#
+# The verdict is made at the BINDING and not at the API edge, and the reason
+# is arithmetic rather than taste: at the edge the objects that would have to
+# be counted do not exist yet, so two creates in one breath would both be told
+# there is space. A pass places one after another and spends as it goes.
+#
+# The two factors are asymmetric on purpose. Overcommitting MEMORY means the
+# OOM killer picks a vm and ends it; overcommitting vCPU means the guests wait
+# for each other. One is a lost vm, the other is a slow one. So memory is 1.0
+# and this control plane refuses to start with anything above it, while vcpu
+# defaults to 4.0 — the one number here that is a judgement rather than a
+# derivation. A fleet that was relying on the unlimited placement this stack
+# had before admission existed raises it.
+#
+# A vm that fits nowhere stays Pending with `no candidate has room for N vcpu
+# and M MiB` on the object, and shows up in
+# meister_scheduler_pending_vms{reason="no-capacity"}.
+[admission]
+#vcpu = 4.0
+#memory = 1.0
+
 [auth]
 #chain = ["mtls", "bearer"]
 #bearer_token_file = "pki/dev-token"

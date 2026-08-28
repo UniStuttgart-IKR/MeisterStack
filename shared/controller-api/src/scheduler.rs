@@ -18,6 +18,142 @@ use tracing::debug;
 
 use crate::resources::Vm;
 
+/// What a machine has, and what a VM wants of it. Two numbers, because those
+/// are the two a node can run out of.
+///
+/// Disk is deliberately not here. A volume is provisioned by a driver that
+/// knows its own backend — thin pool, NFS export, a file on a filesystem —
+/// and the honest answer to "how much room is left" is a different question
+/// per backend. A number this control plane invented for it would be wrong on
+/// most nodes and would refuse VMs for a reason that is not true.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Capacity {
+    pub vcpus: u32,
+    pub mem_mib: u64,
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl Capacity {
+    /// What one VM asks for, out of the agent's own spec.
+    ///
+    /// Absent fields are zero, and that is the conservative direction: a spec
+    /// this controller cannot read the size of asks for nothing and is
+    /// therefore never REFUSED for a reason nobody can check. The agent's
+    /// serde is the validating authority for the rest of the document, and a
+    /// spec that names no vcpus does not get past it.
+    pub fn wanted_by(vm: &Vm) -> Self {
+        let number = |field: &str| vm.spec.vm.get(field).and_then(serde_json::Value::as_u64);
+        Self {
+            vcpus: number("vcpus").unwrap_or(0).min(u32::MAX as u64) as u32,
+            mem_mib: number("memory_mib").unwrap_or(0),
+        }
+    }
+
+    /// Saturating, because a node whose reported capacity shrank under the
+    /// VMs already on it is a real state — an operator lowering
+    /// `capacity_vcpus` on a running node does exactly that — and the answer
+    /// to it is "nothing is free", not an overflow.
+    pub fn minus(self, other: Self) -> Self {
+        Self {
+            vcpus: self.vcpus.saturating_sub(other.vcpus),
+            mem_mib: self.mem_mib.saturating_sub(other.mem_mib),
+        }
+    }
+
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            vcpus: self.vcpus.saturating_add(other.vcpus),
+            mem_mib: self.mem_mib.saturating_add(other.mem_mib),
+        }
+    }
+
+    /// Does this fit in `room`? Both dimensions, and neither is optional.
+    pub fn fits_in(self, room: Self) -> bool {
+        self.vcpus <= room.vcpus && self.mem_mib <= room.mem_mib
+    }
+}
+
+/// How much more than it has a machine may be asked to carry.
+///
+/// The asymmetry is the whole point and it is not a preference: overcommitting
+/// MEMORY means the OOM killer picks a VM and ends it, and overcommitting
+/// vCPU means the guests wait for each other. One is a lost VM, the other is
+/// a slow one, and a control plane that cannot tell those apart will
+/// eventually do the first while believing it did the second.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Overcommit {
+    /// Guests wait for each other. Four is the usual starting point and the
+    /// only number here that is a judgement rather than a derivation; a fleet
+    /// that was relying on the unlimited placement this stack had before
+    /// admission existed raises it.
+    #[serde(default = "Overcommit::default_vcpu")]
+    pub vcpu: f64,
+    /// One, and it may not become more than one by accident. See the type's
+    /// own doc: the failure mode on this axis is an OOM kill, which is a VM
+    /// somebody loses rather than a VM that is slow.
+    #[serde(default = "Overcommit::default_memory")]
+    pub memory: f64,
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl Overcommit {
+    pub const VCPU_DEFAULT: f64 = 4.0;
+    pub const MEMORY_DEFAULT: f64 = 1.0;
+
+    fn default_vcpu() -> f64 {
+        Self::VCPU_DEFAULT
+    }
+    fn default_memory() -> f64 {
+        Self::MEMORY_DEFAULT
+    }
+
+    /// Refuse a configuration that would let the OOM killer decide which VM
+    /// survives, and one that would make a factor meaningless.
+    ///
+    /// Loud at start-up rather than quietly clamped: an operator who wrote
+    /// `memory = 1.5` believes something about their fleet that this control
+    /// plane will not do, and finding that out from a VM that died at three in
+    /// the morning is the worst possible way to learn it.
+    pub fn check(&self) -> anyhow::Result<()> {
+        if !(self.memory.is_finite() && self.memory > 0.0) {
+            anyhow::bail!("admission.memory must be a positive number");
+        }
+        if self.memory > Self::MEMORY_DEFAULT {
+            anyhow::bail!(
+                "admission.memory = {} would overcommit memory; this control plane does not, \
+                 because the failure mode is the OOM killer choosing which vm survives",
+                self.memory
+            );
+        }
+        if !(self.vcpu.is_finite() && self.vcpu > 0.0) {
+            anyhow::bail!("admission.vcpu must be a positive number");
+        }
+        Ok(())
+    }
+
+    /// What a machine of this capacity may be asked to carry.
+    pub fn allowance(&self, capacity: Capacity) -> Capacity {
+        // Truncating, not rounding: half a vCPU of allowance is not a vCPU,
+        // and the direction to be wrong in is downwards.
+        Capacity {
+            vcpus: (capacity.vcpus as f64 * self.vcpu) as u32,
+            mem_mib: (capacity.mem_mib as f64 * self.memory) as u64,
+        }
+    }
+}
+
+impl Default for Overcommit {
+    fn default() -> Self {
+        Self {
+            vcpu: Self::VCPU_DEFAULT,
+            memory: Self::MEMORY_DEFAULT,
+        }
+    }
+}
+
 /// What the scheduler knows about a placement candidate, assembled from the
 /// Node (or Cluster) objects in etcd rather than from the session map alone.
 #[derive(Clone, Debug)]
@@ -27,6 +163,19 @@ pub struct Candidate {
     pub connected: bool,
     /// `spec.schedulable` — an operator draining it without stopping it.
     pub schedulable: bool,
+    /// What is still free here: the allowance this candidate's capacity gives
+    /// under the configured overcommit, minus everything already bound to it.
+    ///
+    /// On the Candidate and not behind a `Scheduler` parameter, so that the
+    /// rule reaches every strategy that will ever be written. Whether a VM
+    /// FITS is not a matter of strategy — a bin-packer and a first-fit may
+    /// disagree about where to put it and must not disagree about whether the
+    /// machine can hold it.
+    ///
+    /// Derived per pass and never stored: it is capacity minus a sum over the
+    /// VM objects, both of which the controller already has in hand, and a
+    /// second copy in etcd would be a number that can be wrong.
+    pub free: Capacity,
     /// The candidate's device catalogue, spelled by `common::capability`
     /// — the same function the node's own capacity is built with, so the two
     /// halves of the sentence cannot drift apart. Empty = no devices offered.
@@ -217,6 +366,10 @@ pub enum PendingReason {
     /// Some are known; none is both connected and schedulable — everything is
     /// down, or everything is drained.
     NoneUsable,
+    /// Everything is up and willing and none of it has room. The fourth
+    /// case, and without it a full cluster looks from the API exactly like a
+    /// cluster where nothing is happening.
+    NoCapacity,
     /// Something the VM asks for is offered by nobody at all.
     Unserved,
     /// Every part of the ask is served somewhere, and no single candidate
@@ -230,9 +383,10 @@ impl PendingReason {
     /// pass walks to publish a zero for the reasons nothing is pending for,
     /// so that a reason with no VMs stays a flat line in a dashboard rather
     /// than a series that vanishes.
-    pub const ALL: [PendingReason; 4] = [
+    pub const ALL: [PendingReason; 5] = [
         PendingReason::NoCandidates,
         PendingReason::NoneUsable,
+        PendingReason::NoCapacity,
         PendingReason::Unserved,
         PendingReason::Split,
     ];
@@ -254,6 +408,7 @@ impl PendingReason {
         match self {
             PendingReason::NoCandidates => "no-candidates",
             PendingReason::NoneUsable => "none-usable",
+            PendingReason::NoCapacity => "no-capacity",
             PendingReason::Unserved => "unserved-request",
             PendingReason::Split => "split-request",
         }
@@ -330,6 +485,33 @@ pub fn pending_reason_of(vm: &Vm, candidates: &[Candidate]) -> (PendingReason, S
             ),
         );
     }
+    // Room before capability, the same order FirstFit filters in: a VM that
+    // fits nowhere is not a VM whose device request went unserved, and
+    // telling an operator to add a GPU when what is missing is memory sends
+    // them to the wrong machine.
+    let size = Capacity::wanted_by(vm);
+    let roomy: Vec<Candidate> = candidates
+        .iter()
+        .filter(|c| !(c.connected && c.schedulable) || size.fits_in(c.free))
+        .cloned()
+        .collect();
+    if !roomy.iter().any(|c| c.connected && c.schedulable) {
+        let biggest = candidates
+            .iter()
+            .filter(|c| c.connected && c.schedulable)
+            .map(|c| c.free)
+            .max_by_key(|f| (f.mem_mib, f.vcpus))
+            .unwrap_or_default();
+        return (
+            PendingReason::NoCapacity,
+            format!(
+                "no candidate has room for {} vcpu and {} MiB; the roomiest has {} vcpu and \
+                 {} MiB free",
+                size.vcpus, size.mem_mib, biggest.vcpus, biggest.mem_mib
+            ),
+        );
+    }
+    let candidates = &roomy;
     let wanted = DevicePolicy::of(vm);
     let unmet = wanted.unmet(candidates);
     if unmet.is_empty() {
@@ -363,6 +545,24 @@ pub fn pending_reason(vm: &Vm, candidates: &[Candidate]) -> String {
     pending_reason_of(vm, candidates).1
 }
 
+/// Spend a candidate's room on a VM that was just bound to it.
+///
+/// Called by a pass the moment it decides, and that timing is the whole
+/// point: a pass places VMs one after another out of one listing, so without
+/// this the second VM of a pass would be measured against a machine that
+/// still looks empty. An API-edge check cannot do this at all — the objects
+/// it would have to count do not exist yet when it runs.
+///
+/// A binding whose write then loses its compare-and-swap leaves this pass
+/// with one candidate too poor, which costs at most one VM one tick: the next
+/// pass derives `free` from the store again and the deduction is gone.
+#[generated(model = ClaudeOpus, version = "5")]
+pub fn deduct(candidates: &mut [Candidate], name: &str, spent: Capacity) {
+    if let Some(c) = candidates.iter_mut().find(|c| c.name == name) {
+        c.free = c.free.minus(spent);
+    }
+}
+
 #[generated(model = ClaudeFable, version = "5")]
 pub struct FirstFit;
 
@@ -370,9 +570,13 @@ pub struct FirstFit;
 impl Scheduler for FirstFit {
     fn assign(&self, vm: &Vm, candidates: &[Candidate]) -> Option<String> {
         let wanted = DevicePolicy::of(vm);
+        let size = Capacity::wanted_by(vm);
         let placed = candidates
             .iter()
             .filter(|c| c.connected && c.schedulable)
+            // Room before catalogue, deliberately: a machine that cannot hold
+            // this VM is not a candidate at all, whatever it offers.
+            .filter(|c| size.fits_in(c.free))
             .find(|c| wanted.met_by(&c.catalogue))
             .map(|c| c.name.clone());
         // The "clear message" for a request nobody serves: candidates were up
@@ -394,8 +598,18 @@ mod tests {
     use super::*;
     use crate::resources::{VmSpec, new_vm};
 
+    /// Room enough that these tests are about what they say they are about.
+    /// Admission has tests of its own; everywhere else a candidate is assumed
+    /// to have space, exactly as every one of these tests did before it
+    /// existed.
+    const ROOMY: Capacity = Capacity {
+        vcpus: 64,
+        mem_mib: 65536,
+    };
+
     fn candidate(name: &str, connected: bool, schedulable: bool) -> Candidate {
         Candidate {
+            free: ROOMY,
             name: name.into(),
             connected,
             schedulable,
@@ -405,6 +619,7 @@ mod tests {
 
     fn gpu_candidate(name: &str, profiles: &[&str]) -> Candidate {
         Candidate {
+            free: ROOMY,
             name: name.into(),
             connected: true,
             schedulable: true,
@@ -414,6 +629,11 @@ mod tests {
 
     fn vm() -> Vm {
         vm_asking(serde_json::json!({}))
+    }
+
+    /// A VM that asks for room and nothing else.
+    fn sized(vcpus: u32, mem_mib: u64) -> Vm {
+        vm_asking(serde_json::json!({"vcpus": vcpus, "memory_mib": mem_mib}))
     }
 
     fn vm_asking(spec: serde_json::Value) -> Vm {
@@ -529,6 +749,7 @@ mod tests {
 
     fn volume_candidate(name: &str, backends: &[&str]) -> Candidate {
         Candidate {
+            free: ROOMY,
             name: name.into(),
             connected: true,
             schedulable: true,
@@ -622,6 +843,7 @@ mod tests {
 
     fn overlay_candidate(name: &str, vxlan: bool) -> Candidate {
         Candidate {
+            free: ROOMY,
             name: name.into(),
             connected: true,
             schedulable: true,
@@ -821,6 +1043,157 @@ mod tests {
         assert!(msg.contains("nvrm/4q"), "{msg}");
     }
 
+    // --- admission ----------------------------------------------------------
+
+    fn room(name: &str, vcpus: u32, mem_mib: u64) -> Candidate {
+        Candidate {
+            free: Capacity { vcpus, mem_mib },
+            ..candidate(name, true, true)
+        }
+    }
+
+    /// The measured lab behaviour this position exists to end: three nodes
+    /// with the same catalogue took EVERY overlay VM onto whichever sorted
+    /// first, because the scheduler never asked whether it could carry them.
+    /// Now the first one fills up and the next VM goes to the second.
+    #[test]
+    fn a_full_candidate_is_passed_over_for_one_that_has_room() {
+        let nodes = [room("agent-1a", 0, 0), room("agent-1b", 8, 8192)];
+        assert_eq!(
+            FirstFit.assign(&sized(2, 2048), &nodes).as_deref(),
+            Some("agent-1b")
+        );
+        // and with nowhere to go it waits, with the reason on the object
+        let full = [room("agent-1a", 0, 0)];
+        assert_eq!(FirstFit.assign(&sized(2, 2048), &full), None);
+        let (why, sentence) = pending_reason_of(&sized(2, 2048), &full);
+        assert_eq!(why, PendingReason::NoCapacity);
+        assert!(sentence.contains("2 vcpu and 2048 MiB"), "{sentence}");
+        assert!(sentence.contains("roomiest"), "{sentence}");
+    }
+
+    /// Both dimensions, and neither is optional: a machine with cores and no
+    /// memory is as full as one with memory and no cores.
+    #[test]
+    fn a_vm_has_to_fit_in_both_dimensions() {
+        let want = Capacity {
+            vcpus: 4,
+            mem_mib: 4096,
+        };
+        assert!(want.fits_in(Capacity {
+            vcpus: 4,
+            mem_mib: 4096
+        }));
+        assert!(!want.fits_in(Capacity {
+            vcpus: 3,
+            mem_mib: 4096
+        }));
+        assert!(!want.fits_in(Capacity {
+            vcpus: 4,
+            mem_mib: 4095
+        }));
+
+        // What a spec asks for, and what a spec that says nothing asks for.
+        assert_eq!(Capacity::wanted_by(&sized(2, 512)).vcpus, 2);
+        assert_eq!(Capacity::wanted_by(&sized(2, 512)).mem_mib, 512);
+        assert_eq!(Capacity::wanted_by(&vm()), Capacity::default());
+    }
+
+    /// The DoD case, and the one an API-edge check cannot answer: two VMs
+    /// created in the same breath, each of which fits and which together do
+    /// not.
+    ///
+    /// This is what makes the binding and not the edge the authority. The
+    /// pass places them one after another and DEDUCTS as it goes, so the
+    /// second one asks a candidate that has already been spent. Both being
+    /// bound is not a race that is unlikely here — it is arithmetic that
+    /// cannot happen.
+    #[test]
+    fn two_vms_that_together_do_not_fit_cannot_both_be_bound() {
+        let mut nodes = vec![room("agent-1a", 4, 4096)];
+        let first = sized(2, 3072);
+        let second = sized(2, 3072);
+
+        let placed_first = FirstFit.assign(&first, &nodes).expect("the first one fits");
+        assert_eq!(placed_first, "agent-1a");
+        // What the pass does the moment it decides, before it looks at the
+        // next VM: see `deduct` in both reconcilers.
+        deduct(&mut nodes, &placed_first, Capacity::wanted_by(&first));
+
+        assert_eq!(
+            FirstFit.assign(&second, &nodes),
+            None,
+            "the room the first one took is gone"
+        );
+        assert_eq!(
+            pending_reason_of(&second, &nodes).0,
+            PendingReason::NoCapacity
+        );
+    }
+
+    /// Memory is never overcommitted, and a config that says otherwise is an
+    /// error at start-up rather than a fleet that finds out at three in the
+    /// morning which VM the OOM killer picked.
+    #[test]
+    fn the_memory_factor_may_not_be_raised() {
+        let parse = |s: &str| toml::from_str::<Overcommit>(s).expect("parses");
+        assert_eq!(parse("").memory, 1.0);
+        assert_eq!(parse("").vcpu, Overcommit::VCPU_DEFAULT);
+        assert!(parse("").check().is_ok());
+
+        let err = parse("memory = 1.5").check().unwrap_err();
+        assert!(err.to_string().contains("OOM"), "{err}");
+        assert!(parse("memory = 0.9").check().is_ok(), "lower is allowed");
+        assert!(parse("memory = 0").check().is_err());
+        assert!(parse("vcpu = 0").check().is_err());
+        assert!(parse("vcpu = 16").check().is_ok());
+    }
+
+    /// What the factors do to a machine's allowance. vCPU is stretched, RAM
+    /// is not, and the stretch truncates rather than rounds — half a vCPU of
+    /// allowance is not a vCPU.
+    #[test]
+    fn the_allowance_stretches_vcpu_and_leaves_memory_alone() {
+        let host = Capacity {
+            vcpus: 8,
+            mem_mib: 16384,
+        };
+        let default = Overcommit::default().allowance(host);
+        assert_eq!(default.vcpus, 32);
+        assert_eq!(default.mem_mib, 16384);
+
+        let tight = Overcommit {
+            vcpu: 1.0,
+            memory: 1.0,
+        }
+        .allowance(host);
+        assert_eq!(tight, host);
+
+        let odd = Overcommit {
+            vcpu: 1.5,
+            memory: 1.0,
+        }
+        .allowance(Capacity {
+            vcpus: 3,
+            mem_mib: 1,
+        });
+        assert_eq!(odd.vcpus, 4, "4.5 truncates down");
+
+        // And a node whose reported capacity shrank under what is on it has
+        // nothing free rather than an overflow.
+        assert_eq!(
+            Capacity {
+                vcpus: 2,
+                mem_mib: 1024
+            }
+            .minus(Capacity {
+                vcpus: 8,
+                mem_mib: 8192
+            }),
+            Capacity::default()
+        );
+    }
+
     /// Draining, as the whole round trip: a cordoned candidate takes nothing
     /// new, the sentence and the category say why, and uncordoning makes it
     /// take the VM again. Nothing here is about the VMs already on it — the
@@ -871,6 +1244,14 @@ mod tests {
             pending_reason_of(&vm_asking(nvrm_4q()), &plain).0,
             PendingReason::Unserved
         );
+        let full = [Candidate {
+            free: Capacity::default(),
+            ..candidate("agent-1a", true, true)
+        }];
+        assert_eq!(
+            pending_reason_of(&sized(2, 2048), &full).0,
+            PendingReason::NoCapacity
+        );
         let union = [gpu_candidate("cluster-1", &["nvrm/4q", "network/vxlan"])];
         let split = serde_json::json!({
             "devices": [{"driver": "nvrm", "profile": "4q"}],
@@ -890,6 +1271,7 @@ mod tests {
             [
                 "no-candidates",
                 "none-usable",
+                "no-capacity",
                 "unserved-request",
                 "split-request"
             ]

@@ -24,8 +24,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use controller_api::{
-    Candidate, EtcdStore, Lifecycle, Node, PassTrigger, PendingTally, RequeuePolicy, Resource,
-    RunStrategy, Scheduler, StoreError, Vm, VmPhase, heartbeat_expired, lifecycle_command,
+    Candidate, Capacity, EtcdStore, Lifecycle, Node, Overcommit, PassTrigger, PendingTally,
+    RequeuePolicy, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhase, heartbeat_expired,
+    lifecycle_command,
 };
 use macros::generated;
 use proto::command;
@@ -82,12 +83,20 @@ pub async fn run(
     registry: Arc<SessionRegistry>,
     scheduler: Arc<dyn Scheduler>,
     requeue: Arc<dyn RequeuePolicy>,
+    overcommit: Overcommit,
 ) {
     let mut trigger = PassTrigger::<Vm>::new(&store, TICK).await;
     loop {
         trigger.wait(&store).await;
         let clock = telemetry::metrics::Timer::start();
-        let outcome = pass(&store, &registry, scheduler.as_ref(), requeue.as_ref()).await;
+        let outcome = pass(
+            &store,
+            &registry,
+            scheduler.as_ref(),
+            requeue.as_ref(),
+            overcommit,
+        )
+        .await;
         // Measured around the whole pass and not around its parts: what an
         // operator is asking when a cluster feels slow is how long one lap of
         // the loop takes, and a pass that FAILED still took the time it took.
@@ -109,13 +118,18 @@ async fn pass(
     registry: &SessionRegistry,
     scheduler: &dyn Scheduler,
     requeue: &dyn RequeuePolicy,
+    overcommit: Overcommit,
 ) -> anyhow::Result<()> {
     // One reading of the session map for the whole pass: what this replica
     // owns must not change halfway through the list it is deciding about.
     let sessions = registry.connected();
     telemetry::metrics::sessions()
         .set_connected(telemetry::metrics::PEER_NODE, sessions.len() as i64);
-    let nodes = expire_and_collect_nodes(store, &sessions).await?;
+    // The VMs first: what is already bound to a node is half of what "free"
+    // means, and the candidates cannot be built without it.
+    let vms = store.list::<Vm>().await?;
+    publish_vm_gauges(&vms);
+    let nodes = expire_and_collect_nodes(store, &sessions, &vms, overcommit).await?;
     telemetry::metrics::objects().set_count(Node::KIND, nodes.len() as i64);
     let pass = Pass {
         store,
@@ -123,11 +137,9 @@ async fn pass(
         scheduler,
         requeue,
         sessions: &sessions,
-        nodes: &nodes,
+        nodes: std::sync::Mutex::new(nodes),
         pending: PendingTally::new(),
     };
-    let vms = store.list::<Vm>().await?;
-    publish_vm_gauges(&vms);
     for vm in vms {
         let name = vm.metadata.name.clone();
         if let Err(e) = reconcile_vm(&pass, vm).await {
@@ -138,6 +150,38 @@ async fn pass(
     // pending for which reason. See `PendingTally`.
     pass.pending.publish(telemetry::metrics::TIER_CLUSTER);
     Ok(())
+}
+
+/// What is still free on one node: the allowance its reported capacity gives
+/// under the configured overcommit, minus everything already bound to it.
+///
+/// Both halves are things the controller already has in hand — the Node
+/// object and the VM listing this pass made anyway — which is why nothing is
+/// stored. A second copy of this number in etcd would be a number that can be
+/// wrong, and it would be wrong in the direction that fills a node.
+///
+/// Every phase counts, a Pending one included. A VM that has been bound and
+/// not yet started is a claim on this node, and leaving it out is how a node
+/// takes on twice its memory in one burst of creates.
+#[generated(model = ClaudeOpus, version = "5")]
+fn free_on(
+    node: &str,
+    capacity: &controller_api::NodeCapacity,
+    vms: &[Vm],
+    overcommit: Overcommit,
+) -> Capacity {
+    let bound = vms
+        .iter()
+        .filter(|v| v.spec.node_name.as_deref() == Some(node))
+        .fold(Capacity::default(), |sum, vm| {
+            sum.plus(Capacity::wanted_by(vm))
+        });
+    overcommit
+        .allowance(Capacity {
+            vcpus: capacity.vcpus,
+            mem_mib: capacity.mem_mib,
+        })
+        .minus(bound)
 }
 
 /// How many VMs there are, and how they are spread over the phases.
@@ -173,7 +217,12 @@ struct Pass<'a> {
     /// Read once for the whole pass; see `pass`.
     sessions: &'a HashSet<String>,
     /// What is left after the heartbeat expiry, as the scheduler wants it.
-    nodes: &'a [Candidate],
+    ///
+    /// Behind a mutex because a pass SPENDS it: every binding takes room off
+    /// the candidate it went to, so the next VM of the same pass is measured
+    /// against what is actually left. Never held across an await — see
+    /// `place`, which locks, decides, deducts and lets go.
+    nodes: std::sync::Mutex<Vec<Candidate>>,
     /// Filled in by `place`, published once at the end of the pass.
     pending: PendingTally,
 }
@@ -192,6 +241,8 @@ struct Pass<'a> {
 async fn expire_and_collect_nodes(
     store: &EtcdStore,
     sessions: &HashSet<String>,
+    vms: &[Vm],
+    overcommit: Overcommit,
 ) -> anyhow::Result<Vec<Candidate>> {
     let now = Utc::now();
     let mut out = Vec::new();
@@ -231,6 +282,7 @@ async fn expire_and_collect_nodes(
         out.push(Candidate {
             connected: ready && sessions.contains(&name),
             schedulable: node.spec.schedulable,
+            free: free_on(&name, &node.status.capacity, vms, overcommit),
             catalogue: node.status.capacity.capabilities,
             name,
         });
@@ -348,34 +400,56 @@ async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::Result<()> 
 /// Bind an unbound VM to a node, or leave it Pending for the next pass.
 #[generated(model = ClaudeOpus, version = "5")]
 async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
-    let Some(node) = p.scheduler.assign(&vm, p.nodes) else {
-        // Say WHY on the object, not only in this process's debug log. A
-        // Pending VM was a dead end for anybody holding the API: `vm ls` and
-        // `vm inspect` both showed the phase and nothing else, while the one
-        // explanation lived in a `debug!` line inside whichever replica
-        // happened to run the pass.
-        //
-        // The sentence goes on the object and the CATEGORY goes in the
-        // tally: the sentence counts candidates and names capabilities, and
-        // is exactly the string that must never become a metric label.
-        let (category, reason) = controller_api::pending_reason_of(&vm, p.nodes);
-        p.pending.note(category);
-        debug!(
-            known = p.nodes.len(),
-            reason = %reason,
-            "no schedulable node here, staying pending"
-        );
-        // Only when it CHANGED: peers report every few seconds and a pass runs
-        // on every tick, so writing the same sentence again would wake the vm
-        // watch for nothing.
-        if vm.status.message.as_deref() != Some(reason.as_str()) {
-            p.store
-                .mutate::<Vm, _>(&vm.metadata.name, |v| {
-                    v.status.message = Some(reason.clone());
-                })
-                .await?;
+    // Decide and SPEND under one lock, and let go before anything awaits: the
+    // room this VM takes has to be gone before the next VM of the same pass
+    // is measured against the node, or two creates in one breath would both
+    // be told there is space for them. See `controller_api::deduct`.
+    //
+    // An API-edge check cannot do this and that is why it is not the
+    // authority: the objects it would have to count do not exist yet when it
+    // runs. The edge may still refuse early — it just never decides.
+    let decision = {
+        let mut nodes = p.nodes.lock().unwrap();
+        match p.scheduler.assign(&vm, &nodes) {
+            Some(node) => {
+                controller_api::deduct(&mut nodes, &node, Capacity::wanted_by(&vm));
+                Ok(node)
+            }
+            // Sentence and category together, from the same candidate list
+            // this decision was made against.
+            None => Err((nodes.len(), controller_api::pending_reason_of(&vm, &nodes))),
         }
-        return Ok(());
+    };
+    let node = match decision {
+        Ok(node) => node,
+        Err((known, (category, reason))) => {
+            // Say WHY on the object, not only in this process's debug log. A
+            // Pending VM was a dead end for anybody holding the API: `vm ls` and
+            // `vm inspect` both showed the phase and nothing else, while the one
+            // explanation lived in a `debug!` line inside whichever replica
+            // happened to run the pass.
+            //
+            // The sentence goes on the object and the CATEGORY goes in the
+            // tally: the sentence counts candidates and names capabilities, and
+            // is exactly the string that must never become a metric label.
+            p.pending.note(category);
+            debug!(
+                known,
+                reason = %reason,
+                "no schedulable node here, staying pending"
+            );
+            // Only when it CHANGED: peers report every few seconds and a pass runs
+            // on every tick, so writing the same sentence again would wake the vm
+            // watch for nothing.
+            if vm.status.message.as_deref() != Some(reason.as_str()) {
+                p.store
+                    .mutate::<Vm, _>(&vm.metadata.name, |v| {
+                        v.status.message = Some(reason.clone());
+                    })
+                    .await?;
+            }
+            return Ok(());
+        }
     };
     // A plain CAS on the object this pass read, not a read-modify-write:
     // with several replicas scheduling at once the binding is exactly what
@@ -689,6 +763,11 @@ mod tests {
             name: "manacor".into(),
             connected: true,
             schedulable: false,
+            // Room to spare: this test is about the drain and nothing else.
+            free: controller_api::Capacity {
+                vcpus: 64,
+                mem_mib: 65536,
+            },
             catalogue: Vec::new(),
         };
         // Nothing NEW goes there, and the sentence on the object says which

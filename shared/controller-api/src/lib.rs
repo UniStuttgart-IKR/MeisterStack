@@ -48,7 +48,7 @@ pub use rest::{
     apply_spec_update, check_envelope, conflict, forbidden, guard, invalid, serve,
 };
 pub use scheduler::{
-    Candidate, DevicePolicy, FirstFit, PendingReason, PendingTally, Scheduler, SchedulerConfig,
-    pending_reason, pending_reason_of,
+    Candidate, Capacity, DevicePolicy, FirstFit, Overcommit, PendingReason, PendingTally,
+    Scheduler, SchedulerConfig, deduct, pending_reason, pending_reason_of,
 };
 pub use store::{EtcdStore, PassTrigger, StoreError};

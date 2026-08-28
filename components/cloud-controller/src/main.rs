@@ -103,6 +103,12 @@ struct FileConfig {
     /// to be named, which is the honest default: this control plane does not
     /// know which prefixes an operator was actually given.
     routed_pools: Option<Vec<String>>,
+    /// How much more than it has a machine may be asked to carry. Absent =
+    /// vcpu 4.0, memory 1.0 — and memory may not be raised, because the
+    /// failure mode on that axis is the OOM killer choosing which vm
+    /// survives. See controller_api::scheduler::Overcommit.
+    #[serde(default)]
+    admission: controller_api::Overcommit,
     /// Which placement strategy binds a VM to a cluster: "first-fit"
     /// (default). See controller_api::scheduler.
     scheduler: Option<controller_api::SchedulerConfig>,
@@ -134,6 +140,8 @@ struct Config {
     cert_ttl_days: i64,
     vni_base: u32,
     routed_pools: Vec<String>,
+    /// The overcommit factors admission applies (config `[admission]`).
+    admission: controller_api::Overcommit,
     /// The resolved placement strategy (config `scheduler`).
     scheduler: Arc<dyn controller_api::Scheduler>,
     auth: controller_api::rest::AuthConfig,
@@ -182,6 +190,14 @@ fn resolve_config(args: &Args) -> anyhow::Result<Config> {
             .vni_base
             .unwrap_or(controller_api::vni::DEFAULT_VNI_BASE),
         routed_pools: file.routed_pools.unwrap_or_default(),
+        admission: {
+            // Checked here and not at the first placement: an operator who
+            // wrote a factor this control plane will not honour should learn
+            // it from the process refusing to start, not from a vm that died
+            // at three in the morning.
+            file.admission.check()?;
+            file.admission
+        },
         scheduler: controller_api::SchedulerConfig::into_scheduler(file.scheduler)?,
         auth: file.auth,
     })
@@ -321,8 +337,9 @@ async fn main() -> anyhow::Result<()> {
         let store = store.clone();
         let registry = registry.clone();
         let scheduler = cfg.scheduler.clone();
+        let overcommit = cfg.admission;
         tokio::spawn(async move {
-            reconcile::run(store, registry, scheduler).await;
+            reconcile::run(store, registry, scheduler, overcommit).await;
         });
     }
 

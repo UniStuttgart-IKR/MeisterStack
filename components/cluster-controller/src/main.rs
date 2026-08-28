@@ -86,6 +86,12 @@ struct FileConfig {
     /// What to do about Failed VMs: "none", "crash-loop-backoff" (default),
     /// or a number of retries. See controller_api::requeue.
     retry: Option<controller_api::RequeueConfig>,
+    /// How much more than it has a machine may be asked to carry. Absent =
+    /// vcpu 4.0, memory 1.0 — and memory may not be raised, because the
+    /// failure mode on that axis is the OOM killer choosing which vm
+    /// survives. See controller_api::scheduler::Overcommit.
+    #[serde(default)]
+    admission: controller_api::Overcommit,
     /// Which placement strategy binds a VM to a node: "first-fit" (default).
     /// See controller_api::scheduler.
     scheduler: Option<controller_api::SchedulerConfig>,
@@ -128,6 +134,8 @@ struct Config {
     cloud_addrs: Vec<String>,
     /// The resolved Failed-VM policy (config `retry`).
     requeue: std::sync::Arc<dyn controller_api::RequeuePolicy>,
+    /// The overcommit factors admission applies (config `[admission]`).
+    admission: controller_api::Overcommit,
     /// The resolved placement strategy (config `scheduler`).
     scheduler: std::sync::Arc<dyn controller_api::Scheduler>,
     /// The directory the config was read from; PEM paths in it are relative
@@ -172,6 +180,14 @@ fn resolve_config(args: &Args) -> anyhow::Result<Config> {
         metrics_listen: args.metrics_listen.clone().or(file.metrics_listen),
         cloud_addrs,
         requeue: controller_api::RequeueConfig::into_policy(file.retry)?,
+        admission: {
+            // Checked here and not at the first placement: an operator who
+            // wrote a factor this control plane will not honour should learn
+            // it from the process refusing to start, not from a vm that died
+            // at three in the morning.
+            file.admission.check()?;
+            file.admission
+        },
         scheduler: controller_api::SchedulerConfig::into_scheduler(file.scheduler)?,
         config_dir: args.config.parent().map(std::path::Path::to_path_buf),
         tls_cert: file.tls_cert,
@@ -310,8 +326,9 @@ async fn main() -> anyhow::Result<()> {
         let registry = registry.clone();
         let requeue = cfg.requeue.clone();
         let scheduler = cfg.scheduler.clone();
+        let overcommit = cfg.admission;
         tokio::spawn(async move {
-            reconcile::run(store, registry, scheduler, requeue).await;
+            reconcile::run(store, registry, scheduler, requeue, overcommit).await;
         });
     }
 
