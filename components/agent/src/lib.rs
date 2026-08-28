@@ -4,6 +4,7 @@
 
 #[cfg(feature = "http-api")]
 pub mod api;
+pub mod cloudinit;
 pub mod config;
 pub mod console;
 pub mod drivers;
@@ -450,6 +451,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
         drivers.clone(),
         images.clone(),
         cfg.paths.image_dir.clone(),
+        cfg.paths.run_dir.clone(),
         cfg.network.default_bridge.clone(),
         bridge_addr,
         cfg.cgroup_cpuset.clone(),

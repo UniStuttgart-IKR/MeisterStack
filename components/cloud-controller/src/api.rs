@@ -316,6 +316,24 @@ async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result<(), ApiErr
     }
     check_owned_nic_fields(&spec.vm)?;
     check_owned_volume_fields(&spec.vm)?;
+    // The seed's hostname is the control plane's: it comes from the object's
+    // own name one tier down, and a client that could set it would be a
+    // client whose VM calls itself something the API never agreed to.
+    // Everything else in the block — user_data above all — is the client's,
+    // untouched and unread: what is valid cloud-init is cloud-init's
+    // question, and a control plane that validated it would be one that
+    // rejects next year's syntax.
+    if spec
+        .vm
+        .get("cloud_init")
+        .and_then(|c| c.get("local_hostname"))
+        .is_some_and(|v| !v.is_null())
+    {
+        return Err(invalid(
+            "spec.vm.cloud_init.local_hostname is control-plane-owned; it comes from the vm's \
+             own name. Write a meta_data of your own to say something else",
+        ));
+    }
     for image in base_images(&spec.vm) {
         match store.get::<Image>(&image).await {
             Ok(image) if image.status.phase == controller_api::ImagePhase::Failed => {

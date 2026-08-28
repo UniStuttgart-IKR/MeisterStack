@@ -760,6 +760,22 @@ pub(crate) fn build_spec_json(vm: &Vm) -> anyhow::Result<String> {
     let obj = doc
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("spec.vm must be a JSON object"))?;
+    // What the guest should call itself, from the object's own name. This
+    // tier is where that is filled in because it is the last one that knows
+    // it: a node holds a uid and nothing else, so a seed built down there
+    // could only ever derive a uuid for a hostname. Only when the VM asked
+    // for cloud-init at all, and only when nobody named one — a meta_data
+    // written by hand outranks this and is left alone.
+    if let Some(config) = obj
+        .get_mut("cloud_init")
+        .and_then(serde_json::Value::as_object_mut)
+        && !config.contains_key("local_hostname")
+    {
+        config.insert(
+            "local_hostname".to_string(),
+            serde_json::Value::String(vm.metadata.name.clone()),
+        );
+    }
     let desired = match vm.spec.run_strategy {
         RunStrategy::Running => "Running",
         RunStrategy::Stopped => "Stopped",
@@ -1222,5 +1238,46 @@ mod tests {
             // and nothing else about the spec is touched on the way through
             assert_eq!(doc["vcpus"], 1);
         }
+    }
+
+    /// The guest's hostname comes from the object's own name, and this tier
+    /// is where it is filled in because it is the last one that knows it: a
+    /// node holds a uid and nothing else, so a seed built down there could
+    /// only ever derive a uuid for a hostname.
+    ///
+    /// And it is filled in only where it was left out. A VM with no
+    /// cloud-init block gets nothing added to its spec at all, which is the
+    /// property the whole feature is judged on.
+    #[test]
+    fn the_seeds_hostname_comes_from_the_vm_object_and_only_when_it_was_left_out() {
+        let seeded = |cloud_init: serde_json::Value| {
+            let mut vm = bound_to(None);
+            vm.metadata.name = "web-1".into();
+            vm.spec.vm = serde_json::json!({"vcpus": 1, "cloud_init": cloud_init});
+            let doc: serde_json::Value =
+                serde_json::from_str(&build_spec_json(&vm).unwrap()).unwrap();
+            doc
+        };
+
+        let filled = seeded(serde_json::json!({"user_data": "x"}));
+        assert_eq!(filled["cloud_init"]["local_hostname"], "web-1");
+        assert_eq!(filled["cloud_init"]["user_data"], "x", "untouched");
+
+        // Somebody who said one keeps it.
+        let theirs = seeded(serde_json::json!({"user_data": "x", "local_hostname": "chosen"}));
+        assert_eq!(theirs["cloud_init"]["local_hostname"], "chosen");
+
+        // No block, nothing added: the spec that goes down is the spec that
+        // came in, plus the `desired` this function has always written.
+        let mut plain = bound_to(None);
+        plain.spec.vm = serde_json::json!({"vcpus": 1});
+        let doc: serde_json::Value =
+            serde_json::from_str(&build_spec_json(&plain).unwrap()).unwrap();
+        assert!(doc.get("cloud_init").is_none());
+        assert_eq!(
+            doc.as_object().map(|o| o.len()),
+            Some(2),
+            "vcpus and desired, and nothing invented"
+        );
     }
 }

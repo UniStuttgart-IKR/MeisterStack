@@ -75,6 +75,10 @@ pub struct AgentVmSpec {
     pub volumes: Vec<VolumeWithId>,
     pub nics: Vec<NicWithId>,
     pub devices: Vec<DeviceWithId>,
+    /// What the guest configures itself from at first boot. `None` is a VM
+    /// with no seed, which is every VM this stack has booted so far.
+    #[serde(default)]
+    pub cloud_init: Option<crate::cloudinit::CloudInit>,
     /// Where the base images this VM names can be fetched from, if this node
     /// does not have them yet. Beside the volumes rather than inside their
     /// specs, and that is the point: a `VolumeSpec` is the contract three
@@ -154,6 +158,11 @@ pub struct NewVmSpec {
     pub nics: Vec<NewNic>,
     #[serde(default)]
     pub devices: Vec<NewDevice>,
+    /// The NoCloud seed this VM boots with, if it has one. Absent — which is
+    /// every spec ever written before this — means no second disk is built
+    /// and no line of the VM's configuration changes.
+    #[serde(default)]
+    pub cloud_init: Option<crate::cloudinit::CloudInit>,
 }
 
 /// The volume half of a NewVmSpec. `driver` and `params` mirror `NewDevice`:
@@ -256,10 +265,11 @@ impl TryFrom<proto::VmSpec> for AgentVmSpec {
                 .map(TryInto::try_into)
                 .collect::<Result<Vec<_>, _>>()
                 .context("invalid nic spec")?,
-            // The proto path carries no fetchable image, the same way it
-            // carries neither driver nor params: the controller sends
-            // spec_json (control-plane.md §6), and that is where anything
-            // beyond the four original fields travels.
+            // The proto path carries neither a fetchable image nor a seed,
+            // the same way it carries neither driver nor params: the
+            // controller sends spec_json (control-plane.md §6), and that is
+            // where anything beyond the four original fields travels.
+            cloud_init: None,
             images: Vec::new(),
             devices: p
                 .devices
@@ -462,6 +472,7 @@ impl NewVmSpec {
                 volumes,
                 nics,
                 devices,
+                cloud_init: self.cloud_init,
                 images,
             },
             self.desired,
@@ -529,6 +540,37 @@ mod tests {
             let (_, _, desired) = spec.into_spec("br0").expect("spec is valid");
             assert_eq!(desired, expected);
         }
+    }
+
+    /// The cloud-init block: a spec without one is byte for byte the spec it
+    /// always was, and a spec with one carries it through to the agent's own
+    /// type. `NewVmSpec` is `deny_unknown_fields`, so this also holds the
+    /// spelling of every key in it — a rename here would be a spec file that
+    /// stops parsing on a node.
+    #[test]
+    fn a_cloud_init_block_travels_and_its_absence_changes_nothing() {
+        let plain = r#"{"vcpus":1,"memory_mib":256,
+                        "boot":{"kind":"firmware","firmware":"fw"},
+                        "volumes":[{"size_bytes":1}]}"#;
+        let spec: NewVmSpec = serde_json::from_str(plain).unwrap();
+        let (_, agent, _) = spec.into_spec("br0").unwrap();
+        assert_eq!(agent.cloud_init, None, "no block, no seed, no second disk");
+
+        // The `##` is not decoration: user_data starts with `#cloud-config`,
+        // and `"#` inside an `r#"…"#` would end the literal.
+        let seeded = r##"{"vcpus":1,"memory_mib":256,
+                          "boot":{"kind":"firmware","firmware":"fw"},
+                          "volumes":[{"size_bytes":1}],
+                          "cloud_init":{"user_data":"#cloud-config\n",
+                                        "network_config":"version: 2\n",
+                                        "local_hostname":"web-1"}}"##;
+        let spec: NewVmSpec = serde_json::from_str(seeded).unwrap();
+        let (_, agent, _) = spec.into_spec("br0").unwrap();
+        let config = agent.cloud_init.expect("the block travels");
+        assert_eq!(config.user_data, "#cloud-config\n");
+        assert_eq!(config.network_config.as_deref(), Some("version: 2\n"));
+        assert_eq!(config.local_hostname.as_deref(), Some("web-1"));
+        assert_eq!(config.meta_data, None, "derived, not carried");
     }
 
     /// A create carrying runStrategy=Stopped provisions the VM without it

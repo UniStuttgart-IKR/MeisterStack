@@ -147,6 +147,7 @@ pub fn blank_record() -> VmRecord {
             nics: vec![],
             devices: vec![],
             images: Vec::new(),
+            cloud_init: None,
         },
         desired: Desired::Running,
         phase: Phase::Provisioned,

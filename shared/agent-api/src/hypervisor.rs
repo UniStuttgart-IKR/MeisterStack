@@ -49,6 +49,19 @@ pub struct InstanceSpec {
     pub memory_mib: u64,
     pub nics: Vec<NicAttachment>,
     pub devices: Vec<DeviceAttachment>,
+    /// A second, read-only disk holding the cloud-init NoCloud seed.
+    ///
+    /// Beside `volumes` rather than inside it, and that is the point: a
+    /// volume is something a storage driver made and will unmake, with a
+    /// lifecycle and an attachment kind. This is a file the agent wrote out
+    /// of the spec, it is always a plain path, and it is always read-only —
+    /// putting it in the list would make all three of those a special case
+    /// every storage driver had to know about.
+    ///
+    /// `None` is every VM this stack has booted so far, and its config comes
+    /// out byte for byte the same.
+    #[serde(default)]
+    pub cloud_init_seed: Option<std::path::PathBuf>,
 }
 
 #[async_trait::async_trait]

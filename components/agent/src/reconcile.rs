@@ -893,6 +893,7 @@ mod tests {
                 nics: vec![],
                 devices: vec![],
                 images: Vec::new(),
+                cloud_init: None,
             },
             desired,
             phase,

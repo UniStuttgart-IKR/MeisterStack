@@ -312,6 +312,26 @@ fn disk_config(disk: &VolumeAttachment) -> Option<serde_json::Value> {
     }
 }
 
+/// The VM's disks, in order, with the cloud-init seed last.
+///
+/// Order is load-bearing: the guest's boot disk is the first block volume of
+/// the spec, and appending rather than prepending the seed is what keeps it
+/// that way. A firmware boot picks the first bootable disk, and a seed that
+/// came first would be a VM that tries to boot off a 1 MiB FAT volume with no
+/// bootloader on it.
+///
+/// Read-only, and that is not tidiness: the seed is derived from the spec and
+/// rewritten on every provision, so a guest that wrote to it would be a guest
+/// whose changes vanish at the next re-provision without anybody being told.
+#[generated(model = ClaudeOpus, version = "5")]
+fn disks(spec: &InstanceSpec) -> Vec<serde_json::Value> {
+    let mut disks: Vec<serde_json::Value> = spec.volumes.iter().filter_map(disk_config).collect();
+    if let Some(seed) = &spec.cloud_init_seed {
+        disks.push(serde_json::json!({ "path": seed, "readonly": true }));
+    }
+    disks
+}
+
 /// One entry of CH's `fs` array: virtiofsd is already listening on `socket`,
 /// and `tag` is the name the guest mounts (`mount -t virtiofs <tag> /mnt`).
 /// `num_queues` and `queue_size` are CH's own defaults and are left to it.
@@ -367,7 +387,7 @@ fn build_vm_config(
             "shared": has_vhost_user,
         },
         "payload": payload,
-        "disks":  spec.volumes.iter().filter_map(disk_config).collect::<Vec<_>>(),
+        "disks":  disks(spec),
         "console": { "mode": "File", "file": console_path },
         "serial": { "mode": "File", "file": serial_path }
 
@@ -530,11 +550,58 @@ mod tests {
             memory_mib: 1024,
             nics: Vec::<NicAttachment>::new(),
             devices,
+            cloud_init_seed: None,
         }
     }
 
     fn config(spec: &InstanceSpec) -> serde_json::Value {
         build_vm_config(spec, &PathBuf::from("/c"), &PathBuf::from("/s")).expect("config builds")
+    }
+
+    /// The seed is an ADDITIONAL disk, it is read-only, and it comes last.
+    ///
+    /// All three matter and the last one most: the guest boots off the first
+    /// bootable disk, so a seed in front of the boot volume would be a VM
+    /// trying to boot a 1 MiB FAT image with no bootloader on it.
+    #[test]
+    fn the_cloud_init_seed_is_an_extra_read_only_disk_after_the_boot_volume() {
+        let boot = VolumeAttachment::Path("/vol/root.raw".into());
+        let mut with_seed = spec(vec![boot.clone()], vec![]);
+        with_seed.cloud_init_seed = Some("/run/vm.cidata.img".into());
+        let disks = config(&with_seed)["disks"].clone();
+
+        assert_eq!(disks.as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            disks[0]["path"], "/vol/root.raw",
+            "the boot disk stays first"
+        );
+        assert!(disks[0].get("readonly").is_none(), "and stays writable");
+        assert_eq!(disks[1]["path"], "/run/vm.cidata.img");
+        assert_eq!(disks[1]["readonly"], true);
+    }
+
+    /// The property this whole feature is judged on: a VM with no cloud-init
+    /// block produces the configuration it always did, byte for byte.
+    #[test]
+    fn a_vm_without_a_seed_gets_exactly_the_config_it_had_before() {
+        let volumes = vec![VolumeAttachment::Path("/vol/root.raw".into())];
+        let without = config(&spec(volumes.clone(), vec![]));
+
+        let mut with_seed = spec(volumes, vec![]);
+        with_seed.cloud_init_seed = Some("/run/vm.cidata.img".into());
+        let with = config(&with_seed);
+
+        // Everything except the disk list is the same document.
+        for key in ["cpus", "memory", "payload", "console", "serial"] {
+            assert_eq!(without[key], with[key], "{key}");
+        }
+        assert_eq!(without["disks"].as_array().map(Vec::len), Some(1));
+        assert_ne!(without["disks"], with["disks"]);
+        // And no key appeared or vanished.
+        assert_eq!(
+            without.as_object().map(|o| o.keys().collect::<Vec<_>>()),
+            with.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        );
     }
 
     fn vhost_gpu() -> DeviceAttachment {

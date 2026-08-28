@@ -55,6 +55,10 @@ pub struct Provisioner {
     /// it puts there is exactly what the volume drivers look up.
     images: Arc<crate::images::Cache>,
     image_dir: PathBuf,
+    /// Where a VM's cloud-init seed is written. The run directory and not the
+    /// volume one, because that is what a seed IS: state derived from the
+    /// spec, rebuilt on every provision, and gone with the VM.
+    run_dir: PathBuf,
     default_bridge: String,
     bridge_addr: Option<(IpAddr, u8)>,
     /// `cgroup_cpuset` from the config, carried into every `create_slice`
@@ -133,6 +137,7 @@ impl Provisioner {
         drivers: Drivers,
         images: Arc<crate::images::Cache>,
         image_dir: PathBuf,
+        run_dir: PathBuf,
         default_bridge: String,
         bridge_addr: Option<(IpAddr, u8)>,
         cpuset: Option<String>,
@@ -142,6 +147,7 @@ impl Provisioner {
             drivers,
             images,
             image_dir,
+            run_dir,
             default_bridge,
             bridge_addr,
             cpuset,
@@ -386,7 +392,18 @@ impl Provisioner {
                 .map_err(|e| anyhow!("widening cgroup slice for storage backends: {e}"))?;
         }
 
-        let ispec = self.build_instance_spec(&spec, record)?;
+        // The seed, written before the VMM is created and rebuilt every time
+        // this chain runs: it is derived from the spec, so a re-provision
+        // after a dead VMM produces the same bytes and nothing has to be
+        // remembered about it.
+        if let Some(config) = &spec.cloud_init {
+            let seed = crate::cloudinit::seed_path(&self.run_dir, id);
+            crate::cloudinit::write_seed(&seed, id, config)
+                .context("building the cloud-init seed")?;
+            info!(path = %seed.display(), "cloud-init seed ready");
+        }
+
+        let ispec = self.build_instance_spec(id, &spec, record)?;
         debug!(?ispec, "creating hypervisor");
         let vmm_pid = timed_driver(
             HYPERVISOR,
@@ -409,7 +426,21 @@ impl Provisioner {
         Ok(())
     }
 
-    fn build_instance_spec(&self, spec: &AgentVmSpec, record: &VmRecord) -> Result<InstanceSpec> {
+    /// Where this VM's seed lives, and `None` for a VM that has no
+    /// cloud-init block — which is what keeps such a VM's hypervisor config
+    /// byte for byte what it was.
+    fn seed_path(&self, id: &VmId, spec: &AgentVmSpec) -> Option<PathBuf> {
+        spec.cloud_init
+            .as_ref()
+            .map(|_| crate::cloudinit::seed_path(&self.run_dir, id))
+    }
+
+    fn build_instance_spec(
+        &self,
+        id: &VmId,
+        spec: &AgentVmSpec,
+        record: &VmRecord,
+    ) -> Result<InstanceSpec> {
         let volumes: Vec<VolumeAttachment> = record
             .volumes
             .iter()
@@ -460,6 +491,7 @@ impl Provisioner {
             memory_mib: spec.memory_mib,
             nics,
             devices,
+            cloud_init_seed: self.seed_path(id, spec),
         })
     }
 
@@ -567,6 +599,11 @@ impl Provisioner {
                 failures.push(format!("volume {}: {e}", v.id));
             }
         }
+
+        // The seed goes with the VM. Written from the spec on every
+        // provision, so nothing is lost by removing it and a file per vm id
+        // that ever existed is what keeping it would cost.
+        let _ = std::fs::remove_file(crate::cloudinit::seed_path(&self.run_dir, id));
 
         let cg = self.drivers.confiner.open_slice(&id.to_string());
         if let Err(e) = self.drivers.confiner.destroy_slice(&cg) {
@@ -688,6 +725,7 @@ mod tests {
             nics: vec![],
             devices,
             images: Vec::new(),
+            cloud_init: None,
         }
     }
 
