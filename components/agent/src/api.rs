@@ -21,7 +21,7 @@ use tracing::{info, instrument, warn};
 
 use agent_api::VmId;
 
-use crate::drivers::{DeviceCatalog, NetworkCatalog, VolumeCatalog};
+use crate::drivers::{DeviceCatalog, HypervisorCatalog, NetworkCatalog, VolumeCatalog};
 use crate::provision::Provisioner;
 use crate::reconcile::{Action, Reconciler, Trigger};
 use crate::store::Store;
@@ -43,6 +43,7 @@ pub struct ApiState {
     pub stop_grace: std::time::Duration,
     pub catalog: DeviceCatalog,
     pub volumes: VolumeCatalog,
+    pub hypervisor: HypervisorCatalog,
     pub network: NetworkCatalog,
     pub default_bridge: String,
 }
@@ -494,6 +495,9 @@ async fn create_vm(
         .into_spec(&st.default_bridge)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
 
+    st.hypervisor
+        .validate()
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     st.catalog
         .validate(&spec.devices)
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;

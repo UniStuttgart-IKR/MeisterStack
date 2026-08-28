@@ -30,6 +30,23 @@
 /// looks for it.
 pub const VOLUME: &str = "volume";
 
+/// The catalogue driver every HYPERVISOR is a profile of: a node running the
+/// cloud-hypervisor driver claims `hypervisor/cloud-hypervisor`.
+///
+/// New with the storage split, and it exists because a node stopped being
+/// synonymous with "machine that runs VMs". A storage node has no hypervisor
+/// at all, and without this entry it would look to a scheduler like an
+/// ordinary candidate — the first VM asking for nothing in particular would
+/// land there and fail at the first `create`.
+///
+/// The other half of the sentence — that every VM implicitly REQUESTS one —
+/// is deliberately NOT built yet. It may only ship once no node in the
+/// cluster runs an agent that predates this entry: such a node claims no
+/// `hypervisor/*`, and a VM that required one would go Pending on it
+/// forever. Claiming is additive and safe on a mixed-version cluster;
+/// requiring is not, and a rollout is the normal state.
+pub const HYPERVISOR: &str = "hypervisor";
+
 /// The catalogue driver every NETWORK capability is a profile of. A node
 /// with a `[network.vxlan]` section claims `network/vxlan`, and a VM whose
 /// spec puts a `vxlan_id` on any NIC only fits where that claim is.
@@ -175,6 +192,26 @@ mod tests {
         // and a backend name never stands alone, so it cannot be mistaken
         // for a device driver of the same name
         assert!(!offers(&catalogue, "lvm-thin", None));
+    }
+
+    /// And the hypervisor half, through the same two functions again. Four
+    /// kinds of capability now, one spelling — which is the whole reason
+    /// there is no second catalogue: nothing had to learn a new rule to
+    /// carry the entry that says a node runs VMs at all.
+    #[test]
+    fn a_hypervisor_is_a_profile_of_the_hypervisor_driver() {
+        let catalogue = vec![entry(HYPERVISOR, Some("cloud-hypervisor"))];
+        assert_eq!(catalogue[0], "hypervisor/cloud-hypervisor");
+        assert!(offers(&catalogue, HYPERVISOR, Some("cloud-hypervisor")));
+        assert!(
+            offers(&catalogue, HYPERVISOR, None),
+            "a bare request is answered by any hypervisor, because the node picks"
+        );
+        assert!(!offers(&catalogue, HYPERVISOR, Some("qemu")));
+        // A storage node claims none of it, and answers neither request.
+        assert!(!offers(&[], HYPERVISOR, None));
+        // ... and never mistakable for a device driver of that name.
+        assert!(!offers(&catalogue, "cloud-hypervisor", None));
     }
 
     /// The network half goes through the same two functions as the storage

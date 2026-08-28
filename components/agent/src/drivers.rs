@@ -195,13 +195,18 @@ fn register<T: ?Sized>(
 /// a map, and which of two entries a `HashMap` hands back first is not
 /// something a node's behaviour may depend on. `None` is a node that
 /// configured neither, which is now a legal thing for a node to be.
+///
+/// The row's NAME comes back with the driver. It is what the node claims in
+/// its Hello (`hypervisor/cloud-hypervisor`), and taking it from the table
+/// rather than asking the driver keeps one authority for the name: the same
+/// string routes the config section and lands in the catalogue.
 #[generated(model = ClaudeOpus, version = "5")]
 fn register_one<T: ?Sized>(
     entries: &[DriverEntry<T>],
     sections: &Sections,
     cfg: &AgentConfig,
     what: &str,
-) -> anyhow::Result<Option<Arc<T>>> {
+) -> anyhow::Result<Option<(String, Arc<T>)>> {
     let built = register(entries, sections, cfg, what)?;
     if built.len() > 1 {
         let mut names: Vec<&str> = built.keys().map(String::as_str).collect();
@@ -212,7 +217,7 @@ fn register_one<T: ?Sized>(
             names.join(", ")
         );
     }
-    Ok(built.into_values().next())
+    Ok(built.into_iter().next())
 }
 
 /// The default backend, and the one builder that never returns `None`: a
@@ -470,6 +475,10 @@ pub struct Drivers {
     pub confiner: Arc<dyn ResourceConfiner>,
     /// `None` = this node runs no VMs. See `Drivers::hypervisor`.
     pub hypervisor: Option<Arc<dyn Hypervisor>>,
+    /// Which row of `HYPERVISOR_DRIVERS` built it — `Some` exactly when
+    /// `hypervisor` is, both set from one `register_one` call. The catalogue
+    /// claims it as `hypervisor/<name>`.
+    pub hypervisor_name: Option<String>,
     /// Keyed by driver name, exactly as `devices` is: `spec.driver` routes,
     /// `None` means `default_volume_driver()`, and that entry always exists.
     pub storage: HashMap<String, Arc<dyn BlockDriver>>,
@@ -526,14 +535,15 @@ impl Drivers {
         // hard-wired are the reason: a node used to be assumed to run VMs and
         // to make taps, and that assumption is what kept a volume tied to the
         // VM it was made for. A storage node has neither.
-        let hypervisor = register_one(HYPERVISOR_DRIVERS, &cfg.hypervisor, cfg, "hypervisor")?;
+        let (hypervisor_name, hypervisor) =
+            register_one(HYPERVISOR_DRIVERS, &cfg.hypervisor, cfg, "hypervisor")?.unzip();
         let storage = register(VOLUME_DRIVERS, &cfg.volume, cfg, "volume")?;
         let devices = register(DEVICE_DRIVERS, &cfg.device, cfg, "device")?;
         // `[network]` is not a table of sections, so there is none to check
         // against; the row's own builder reads `cfg.network`. See
         // `NETWORK_DRIVERS`.
         let net: Option<Arc<dyn NetworkDriver>> =
-            register_one(NETWORK_DRIVERS, &Sections::new(), cfg, "network")?;
+            register_one(NETWORK_DRIVERS, &Sections::new(), cfg, "network")?.map(|(_, n)| n);
         // One pointer, two views of it. Upcasts rather than two registrations:
         // a tap and the bridge it joins are made by the same driver on the
         // same node, and two independently configured halves would be a state
@@ -552,6 +562,7 @@ impl Drivers {
         Ok(Self {
             confiner,
             hypervisor,
+            hypervisor_name,
             storage,
             networking,
             bridge,
@@ -594,6 +605,59 @@ impl Drivers {
                 "this node has no [network] section and so makes no bridges; a vm with a nic                  cannot run here"
             )
         })
+    }
+}
+
+/// Whether this node runs VMs at all, and with what.
+///
+/// The thinnest of the four catalogues, and the one whose ABSENCE carries the
+/// information. Before the driver slots became optional, every node ran VMs,
+/// so there was nothing to claim and nothing that could be missing. Now a
+/// storage node exists, and without an entry it would look to a scheduler
+/// exactly like a compute node with room: the first VM asking for nothing in
+/// particular would be placed there and fail at the first `create`.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Debug, Default)]
+pub struct HypervisorCatalog {
+    /// The configured driver's name, or `None` on a node that runs no VMs.
+    driver: Option<String>,
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl HypervisorCatalog {
+    /// From the registered slot rather than from the config, so that what a
+    /// node CLAIMS is what it actually built. A section that failed to
+    /// produce a driver never reaches here at all — `from_config` refuses to
+    /// start — and the name is the table row's, which is also the config key
+    /// that selected it.
+    pub fn new(name: Option<&str>) -> Self {
+        Self {
+            driver: name.map(str::to_string),
+        }
+    }
+
+    /// What this node claims about its hypervisor, for the Hello: one profile
+    /// or none at all. Shaped like the volume catalogue's, so the flattening
+    /// one tier up needs no new rule — `hypervisor/cloud-hypervisor` goes
+    /// through exactly the path `volume/lvm-thin` goes through.
+    pub fn inventory(&self) -> Vec<String> {
+        self.driver.iter().cloned().collect()
+    }
+
+    /// A VM on a node that runs none is a refused spec at the edge rather
+    /// than a VM whose volumes and taps are built and then torn down again.
+    /// Same trade the other three catalogues make.
+    ///
+    /// Takes no spec because there is nothing in a spec to check: a VM needs
+    /// a hypervisor, all of them do, and which one is the node's business.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.driver.is_none() {
+            bail!(
+                "this node has no [hypervisor.*] section and so runs no vms; it offers \
+                 storage only"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1089,6 +1153,67 @@ mod tests {
         );
         assert!(said(drivers.networking()).contains("[network]"));
         assert!(said(drivers.bridge()).contains("[network]"));
+    }
+
+    /// The claim a compute node makes, through the same `common::capability`
+    /// round trip the volume and device catalogues make — which is the whole
+    /// reason there is no separate hypervisor catalogue on the wire: the
+    /// entry flattens one tier up exactly as `volume/lvm-thin` does.
+    #[tokio::test]
+    async fn a_compute_node_claims_the_hypervisor_a_scheduler_would_match() {
+        // No `[network]`: a node that runs VMs without making taps is a legal
+        // shape too, and the one this test can build without nftables.
+        let cfg = raw_config(
+            r#"[hypervisor.cloud-hypervisor]
+               binary = "/usr/bin/cloud-hypervisor"
+               timeout_ms = 5000"#,
+        );
+        let drivers = Drivers::from_config(&cfg)
+            .await
+            .expect("a hypervisor and the default backend");
+        let cat = HypervisorCatalog::new(drivers.hypervisor_name.as_deref());
+        cat.validate().expect("this node runs vms");
+        assert_eq!(cat.inventory(), vec![DRIVER_CLOUD_HYPERVISOR.to_string()]);
+
+        let catalogue: Vec<String> = cat
+            .inventory()
+            .iter()
+            .map(|d| common::capability::entry(common::capability::HYPERVISOR, Some(d)))
+            .collect();
+        assert_eq!(catalogue, vec!["hypervisor/cloud-hypervisor".to_string()]);
+        assert!(common::capability::offers(
+            &catalogue,
+            common::capability::HYPERVISOR,
+            None
+        ));
+    }
+
+    /// And the claim a storage node does NOT make. The empty inventory is the
+    /// whole point: an entry with no profiles would flatten to the bare
+    /// driver name `hypervisor`, which answers a bare request for one — so
+    /// the Hello leaves the entry out entirely rather than sending an empty
+    /// one, the same rule the network half follows.
+    #[tokio::test]
+    async fn a_storage_node_claims_no_hypervisor_and_refuses_a_vm_in_words() {
+        let drivers = Drivers::from_config(&raw_config("[volume.filesystem]"))
+            .await
+            .expect("storage alone is a node");
+        let cat = HypervisorCatalog::new(drivers.hypervisor_name.as_deref());
+        assert!(cat.inventory().is_empty());
+
+        let err = match cat.validate() {
+            Ok(()) => panic!("a node with no hypervisor cannot run a vm"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("[hypervisor.*]"), "{err}");
+        assert!(err.contains("storage only"), "{err}");
+
+        // Nothing an empty inventory produces answers a request, bare or not.
+        assert!(!common::capability::offers(
+            &[],
+            common::capability::HYPERVISOR,
+            None
+        ));
     }
 
     /// A node with no `[network]` section claims exactly what a node with one

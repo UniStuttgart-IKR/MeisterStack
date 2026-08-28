@@ -1264,6 +1264,43 @@ mod tests {
         assert!(DevicePolicy::of(&vm()).met_by(&[]));
     }
 
+    /// The half of the hypervisor capability that is deliberately NOT built,
+    /// pinned so that building it is a deliberate act rather than an
+    /// accident.
+    ///
+    /// A node claims `hypervisor/<name>` from the agent side already, so a
+    /// storage node is distinguishable from a compute one. Making every VM
+    /// REQUEST one is the other half, and it may only ship once no node in
+    /// the cluster runs an agent that predates the claim: such a node claims
+    /// nothing, and a VM requiring `hypervisor/*` would go Pending there and
+    /// stay there. Claiming is additive and safe during a rollout; requiring
+    /// is not, and a rollout is the normal state of a cluster.
+    ///
+    /// When the condition is met, this test is what changes — and the release
+    /// that changes it is the release that ships the requirement.
+    #[test]
+    fn no_vm_asks_for_a_hypervisor_yet() {
+        let plain = DevicePolicy::of(&vm());
+        assert!(plain.is_empty(), "a plain vm still constrains nothing");
+        // Even the fully loaded spec asks for the three it always asked for.
+        let loaded = DevicePolicy::of(&vm_asking(serde_json::json!({
+            "devices": [{"driver": "nvrm", "profile": "4q"}],
+            "volumes": [{"size_bytes": 1, "driver": "lvm-thin"}],
+            "nics": [{"vxlan_id": 10000}],
+        })));
+        assert!(
+            !loaded
+                .requests()
+                .iter()
+                .any(|(driver, _)| driver == capability::HYPERVISOR),
+            "requiring a hypervisor would strand every vm on a node whose agent \
+             predates the claim; see common::capability::HYPERVISOR"
+        );
+        // And the consequence that makes it safe: a node claiming nothing at
+        // all is still a candidate for an ordinary VM.
+        assert!(plain.met_by(&[]));
+    }
+
     /// The config seam: nothing configured is the FirstFit both controllers
     /// were wired to by hand, and a name nobody serves is an error at
     /// start-up rather than a silently different placement.

@@ -30,7 +30,7 @@ use proto::{
 };
 
 use config::AgentConfig;
-use drivers::{DeviceCatalog, Drivers, NetworkCatalog, VolumeCatalog};
+use drivers::{DeviceCatalog, Drivers, HypervisorCatalog, NetworkCatalog, VolumeCatalog};
 use provision::Provisioner;
 use reconcile::{Reconciler, Trigger, sync_orphans};
 use std::sync::Arc;
@@ -86,6 +86,7 @@ pub struct Agent {
     ops: Arc<tokio::sync::Mutex<()>>,
     catalog: DeviceCatalog,
     volumes: VolumeCatalog,
+    hypervisor: HypervisorCatalog,
     network: NetworkCatalog,
     default_bridge: String,
     /// The grace a Stop gives the guest when the controller names none.
@@ -121,6 +122,9 @@ impl Agent {
             return self.set_desired(id, desired).await.map(|_| ());
         }
 
+        self.hypervisor
+            .validate()
+            .context("this node cannot run a vm")?;
         self.catalog
             .validate(&spec.devices)
             .context("invalid device spec")?;
@@ -275,6 +279,24 @@ impl Agent {
             name: common::capability::VOLUME.to_string(),
             profiles: self.volumes.inventory(),
         });
+        // Whether this node runs VMs at all, claimed the same way and for a
+        // sharper reason than the rest: a storage node has room, is connected
+        // and is schedulable, so without this entry it is indistinguishable
+        // from a compute node and the first ordinary VM lands on it.
+        //
+        // The `if` is the same one the network half has, and matters more
+        // here: an entry with no profiles flattens to the bare driver name,
+        // and a bare `hypervisor` in the catalogue would answer a bare
+        // request for it — which is exactly the request the FOLLOW-UP step
+        // will introduce. A storage node answering it would undo the whole
+        // point of the entry.
+        let hypervisors = self.hypervisor.inventory();
+        if !hypervisors.is_empty() {
+            drivers.push(DriverInfo {
+                name: common::capability::HYPERVISOR.to_string(),
+                profiles: hypervisors,
+            });
+        }
         // Networking rides in the same way and for the same reason, with one
         // difference: a node with no overlay claims NOTHING here rather than
         // an empty `network` entry. An entry with no profiles is the bare
@@ -438,6 +460,10 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
     let bridge_addr = cfg.parsed_bridge_addr()?;
     let catalog = DeviceCatalog::new(&drivers.devices);
     let volumes = VolumeCatalog::new(&drivers.storage);
+    let hypervisor = HypervisorCatalog::new(drivers.hypervisor_name.as_deref());
+    if hypervisor.validate().is_err() {
+        info!("this node runs no vms and offers storage only; it claims no hypervisor capability");
+    }
     let network = NetworkCatalog::new(cfg.network.as_ref());
     if network.serves_overlays() {
         info!(
@@ -501,6 +527,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
             stop_grace: Duration::from_secs(cfg.stop_grace_secs),
             catalog: catalog.clone(),
             volumes: volumes.clone(),
+            hypervisor: hypervisor.clone(),
             network: network.clone(),
             default_bridge: cfg.default_bridge(),
         };
@@ -545,6 +572,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
         ops,
         catalog,
         volumes,
+        hypervisor,
         network,
         default_bridge: cfg.default_bridge(),
         stop_grace: Duration::from_secs(cfg.stop_grace_secs),
