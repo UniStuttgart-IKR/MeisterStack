@@ -25,8 +25,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use controller_api::{
     Candidate, CandidateKind, Capacity, EtcdStore, Lifecycle, Node, Overcommit, PassTrigger,
-    PendingTally, RequeuePolicy, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhase,
-    heartbeat_expired, lifecycle_command,
+    PendingTally, RequeuePolicy, Resource, RunStrategy, Scheduler, StoragePool, StoreError, Vm,
+    VmPhase, Volume, VolumePhase, heartbeat_expired, lifecycle_command,
+    scheduler::{StoragePolicy, feasible_for_storage, storage_pending_reason},
 };
 use macros::generated;
 use proto::command;
@@ -149,9 +150,221 @@ async fn pass(
             warn!(vm = %name, error = format!("{e:#}"), "vm reconcile failed");
         }
     }
+
+    // After the VMs and out of the same candidate list. A volume takes no
+    // room off a node — see `feasible_for_storage` — so the order between the
+    // two loops decides nothing, and it is this way round because a VM
+    // waiting for a placement is the more urgent of the two.
+    if let Err(e) = place_volumes(&pass).await {
+        warn!(error = format!("{e:#}"), "volume reconcile pass failed");
+    }
     // After the loop, because until it has run nobody knows how many VMs are
     // pending for which reason. See `PendingTally`.
     pass.pending.publish(telemetry::metrics::TIER_CLUSTER);
+    Ok(())
+}
+
+/// Every volume this cluster holds, once per pass: bind the unbound, and let
+/// go of the released.
+///
+/// The pools are read once and shared, for the reason the VM half reads its
+/// nodes once: a pool that is edited halfway through a listing would place
+/// two volumes of the same pass against two different statements about the
+/// same wiring.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn place_volumes(p: &Pass<'_>) -> anyhow::Result<()> {
+    let volumes = p.store.list::<Volume>().await?;
+    if volumes.is_empty() {
+        return Ok(());
+    }
+    let pools = p.store.list::<StoragePool>().await?;
+    telemetry::metrics::objects().set_count(Volume::KIND, volumes.len() as i64);
+    for volume in volumes {
+        let name = volume.metadata.name.clone();
+        if let Err(e) = reconcile_volume(p, &pools, volume).await {
+            warn!(volume = %name, error = format!("{e:#}"), "volume reconcile failed");
+        }
+    }
+    Ok(())
+}
+
+/// One volume, as the ordered sequence of concerns it is:
+///
+/// release -> placement.
+///
+/// Release first, and for the same reason teardown comes before placement on
+/// a VM: a volume on its way out is not a volume to place. Everything after
+/// it needs a volume that is staying.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn reconcile_volume(
+    p: &Pass<'_>,
+    pools: &[StoragePool],
+    volume: Volume,
+) -> anyhow::Result<()> {
+    if volume.metadata.deletion_timestamp.is_some() {
+        return release(p, &volume).await;
+    }
+    if volume.status.node.is_some() {
+        return Ok(());
+    }
+    place_volume(p, pools, volume).await
+}
+
+/// The finalizer flow, and the one place "detach before delete" is actually
+/// carried out.
+///
+/// A volume somebody is holding keeps everything. The object stays, the data
+/// stays, and the pass comes back in five seconds — because the consumer
+/// letting go is an event that happens on a node, and no amount of deciding
+/// here can make it happen sooner. Only when nothing holds it does the
+/// finalizer come off and the object go.
+///
+/// A volume that was never placed has no data anywhere and goes at once: the
+/// node that would have provisioned it never did.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn release(p: &Pass<'_>, volume: &Volume) -> anyhow::Result<()> {
+    let name = &volume.metadata.name;
+    match release_action(volume) {
+        Release::HeldBy(vm) => {
+            debug!(volume = %name, vm, "still attached, keeping the data");
+            Ok(())
+        }
+        Release::WaitingForNode(node) => {
+            debug!(volume = %name, node, "released, waiting for the node to deprovision it");
+            Ok(())
+        }
+        Release::Drop => {
+            p.store
+                .mutate::<Volume, _>(name, |v| {
+                    v.metadata
+                        .finalizers
+                        .retain(|f| f != controller_api::VOLUME_RELEASE_FINALIZER);
+                })
+                .await?;
+            p.store.delete::<Volume>(name).await?;
+            info!(volume = %name, "volume released; it was never provisioned anywhere");
+            Ok(())
+        }
+    }
+}
+
+/// What a deleted volume's state calls for, as a value rather than as control
+/// flow.
+///
+/// Pure and separate because it is the rule with the most at stake in this
+/// file: getting it wrong once means data that is gone, and a rule that can
+/// only be exercised through an etcd is a rule that gets exercised by the
+/// lab. The executor above does nothing but carry each answer out.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Debug, PartialEq, Eq)]
+enum Release<'a> {
+    /// Somebody is using it. Everything stays — the object, the data, the
+    /// finalizer — and the pass comes back: the consumer letting go happens
+    /// on a node, and no amount of deciding here makes it sooner.
+    HeldBy(&'a str),
+    /// Nobody holds it, but a node has the bytes. Sending that node the
+    /// deprovision is the step that follows this one; until then the object
+    /// stays, because an object removed while its LV is still in the volume
+    /// group is a volume nobody will ever find again.
+    WaitingForNode(&'a str),
+    /// No consumer and no node: this volume was never provisioned anywhere,
+    /// so there is nothing to lose and the object goes.
+    Drop,
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+fn release_action(volume: &Volume) -> Release<'_> {
+    // Consumer before node, and the order is the rule: a volume that is BOTH
+    // attached and provisioned must report the attachment, because that is
+    // what has to end first.
+    if let Some(vm) = volume.status.attached_to.as_deref() {
+        return Release::HeldBy(vm);
+    }
+    match volume.status.node.as_deref() {
+        Some(node) => Release::WaitingForNode(node),
+        None => Release::Drop,
+    }
+}
+
+/// Pick a node that can provision this volume.
+///
+/// The second application of `feasible`, and the reason it is one rather than
+/// "send a command to some agent": the pool's reachability is the same KIND
+/// of cut a VM's device request is, and it belongs beside it rather than in a
+/// dispatcher. What is deliberately NOT shared is capacity — see
+/// `feasible_for_storage`.
+///
+/// A plain compare-and-swap on the object this pass read, exactly as `place`
+/// does for a VM and for the same reason: with several replicas scheduling at
+/// once, the binding is the one write that must not be retried onto a newer
+/// object.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn place_volume(p: &Pass<'_>, pools: &[StoragePool], volume: Volume) -> anyhow::Result<()> {
+    let name = volume.metadata.name.clone();
+    let Some(pool) = pools.iter().find(|p| p.metadata.name == volume.spec.pool) else {
+        // The pool a volume names is checked at the API edge, so reaching
+        // this means it was deleted afterwards — which the delete handler
+        // refuses while volumes point at it. Say so and wait rather than
+        // placing the volume somewhere arbitrary.
+        return note_pending(
+            p,
+            &volume,
+            format!(
+                "storage pool {:?} does not exist here; the volume cannot be placed",
+                volume.spec.pool
+            ),
+        )
+        .await;
+    };
+
+    let policy = StoragePolicy::of(pool);
+    let decision = {
+        let nodes = p.nodes.lock().unwrap();
+        match feasible_for_storage(&policy, &nodes).first() {
+            Some(node) => Ok(node.name.clone()),
+            None => Err(storage_pending_reason(&policy, &pool.metadata.name, &nodes)),
+        }
+    };
+    let node = match decision {
+        Ok(node) => node,
+        Err((category, reason)) => {
+            p.pending.note(category);
+            return note_pending(p, &volume, reason).await;
+        }
+    };
+
+    let mut bound = volume;
+    bound.status.node = Some(node.clone());
+    bound.status.phase = VolumePhase::Provisioning;
+    bound.status.message = None;
+    match p.store.update(&bound).await {
+        Ok(_) => info!(volume = %name, node = %node, pool = %bound.spec.pool,
+                       "volume placed"),
+        Err(StoreError::Conflict(_)) => {
+            debug!(volume = %name, node = %node, "lost the placement race")
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+/// Say WHY on the object, and only when it changed.
+///
+/// The same rule the VM half follows: a level-triggered pass reaches this
+/// conclusion every five seconds for as long as the volume is unplaceable,
+/// and writing the same sentence again would wake the watch for nothing.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn note_pending(p: &Pass<'_>, volume: &Volume, reason: String) -> anyhow::Result<()> {
+    debug!(volume = %volume.metadata.name, reason = %reason, "volume stays pending");
+    if volume.status.message.as_deref() == Some(reason.as_str()) {
+        return Ok(());
+    }
+    p.store
+        .mutate::<Volume, _>(&volume.metadata.name, |v| {
+            v.status.message = Some(reason.clone());
+            v.status.phase = VolumePhase::Pending;
+        })
+        .await?;
     Ok(())
 }
 
@@ -814,6 +1027,63 @@ pub(crate) fn build_spec_json(vm: &Vm) -> anyhow::Result<String> {
 #[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
+
+    fn released(node: Option<&str>, vm: Option<&str>) -> Volume {
+        let mut v = controller_api::resources::new_volume(
+            "data",
+            controller_api::VolumeSpec {
+                pool: "fast".into(),
+                size_gib: 10,
+                ..Default::default()
+            },
+        );
+        v.metadata.deletion_timestamp = Some(Utc::now());
+        v.status.phase = VolumePhase::Releasing;
+        v.status.node = node.map(str::to_string);
+        v.status.attached_to = vm.map(str::to_string);
+        v
+    }
+
+    /// Detach before delete, as the one rule with data on the other side of
+    /// it.
+    ///
+    /// A volume somebody holds keeps everything and the pass comes back. A
+    /// volume nobody holds but a node made keeps everything too, because this
+    /// tier cannot make bytes go away — the deprovision is a command to that
+    /// node. Only a volume that was never provisioned anywhere goes at once,
+    /// and it goes because there is nothing to lose.
+    #[test]
+    fn a_released_volume_only_goes_when_nothing_is_left_to_lose() {
+        assert_eq!(
+            release_action(&released(Some("manacor"), Some("web"))),
+            Release::HeldBy("web"),
+            "a consumer outranks everything: that is what has to end first"
+        );
+        assert_eq!(
+            release_action(&released(None, Some("web"))),
+            Release::HeldBy("web")
+        );
+        assert_eq!(
+            release_action(&released(Some("manacor"), None)),
+            Release::WaitingForNode("manacor")
+        );
+        assert_eq!(release_action(&released(None, None)), Release::Drop);
+    }
+
+    /// And the finalizer is what makes any of that possible: without it the
+    /// store would have dropped the object on the DELETE and the rule above
+    /// would never get a chance to run.
+    #[test]
+    fn a_volume_carries_the_finalizer_that_holds_it_back() {
+        let v = released(Some("manacor"), Some("web"));
+        assert!(
+            v.metadata
+                .finalizers
+                .contains(&controller_api::VOLUME_RELEASE_FINALIZER.to_string()),
+            "{:?}",
+            v.metadata.finalizers
+        );
+    }
 
     fn at(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap()

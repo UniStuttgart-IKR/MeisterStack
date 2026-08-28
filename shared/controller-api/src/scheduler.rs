@@ -18,7 +18,7 @@ use tracing::debug;
 
 use std::collections::BTreeMap;
 
-use crate::resources::{AntiAffinity, Vm};
+use crate::resources::{AntiAffinity, StoragePool, Vm};
 
 /// What a machine has, and what a VM wants of it. Two numbers, because those
 /// are the two a node can run out of.
@@ -271,9 +271,7 @@ fn collides(term: &AntiAffinity, candidate: &Candidate) -> bool {
 pub fn feasible<'a>(vm: &Vm, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
     let wanted = DevicePolicy::of(vm);
     let size = Capacity::wanted_by(vm);
-    candidates
-        .iter()
-        .filter(|c| c.connected && c.schedulable)
+    usable(candidates)
         .filter(|c| size.fits_in(c.free))
         .filter(|c| selects(selector_for(vm, c.kind), &c.labels))
         .filter(|c| wanted.met_by(&c.catalogue))
@@ -285,6 +283,176 @@ pub fn feasible<'a>(vm: &Vm, candidates: &'a [Candidate]) -> Vec<&'a Candidate> 
                 .any(|t| collides(t, c))
         })
         .collect()
+}
+
+/// Up and willing — the two cuts that are about the MACHINE and about nothing
+/// that is being placed on it.
+///
+/// Its own function because there is a second thing being placed now. A
+/// volume asks for no vCPUs, carries no anti-affinity and matches no VM
+/// selector, but a node that is down or drained is no more a candidate to
+/// provision on than it is to run on. Sharing the predicate is what keeps
+/// "drained" from meaning two different things depending on what is being
+/// scheduled.
+#[generated(model = ClaudeOpus, version = "5")]
+fn usable(candidates: &[Candidate]) -> impl Iterator<Item = &Candidate> {
+    candidates.iter().filter(|c| c.connected && c.schedulable)
+}
+
+/// What a volume demands of the machine that would PROVISION it.
+///
+/// The storage mirror of `DevicePolicy`, and deliberately the same shape: a
+/// policy derived once from the objects, then asked as often as a scheduler
+/// likes. Two conjuncts, and they are different KINDS of fact, which is why
+/// neither can stand in for the other:
+///
+///   * the backend — `volume/lvm-thin` in the node's own catalogue, the same
+///     entry a VM asking for that driver already matches. A node without the
+///     driver cannot make the volume whatever an object says.
+///   * reachability — `StoragePoolSpec.nodes`, which is an operator's
+///     statement about wiring. A volume group is on ONE machine and an export
+///     is mounted by a handful; no catalogue entry can say which, because the
+///     agent does not know what a pool is.
+///
+/// An empty node list is every node — see the field. That is the
+/// single-machine lab, and there the policy degenerates to the catalogue
+/// check the VM half already does.
+#[generated(model = ClaudeOpus, version = "5")]
+pub struct StoragePolicy {
+    driver: String,
+    nodes: Vec<String>,
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl StoragePolicy {
+    /// From the pool a volume was reserved out of. The VOLUME contributes
+    /// nothing to the demand today — size is the pool's own admission
+    /// question and mode is the driver's — so this takes the pool alone and
+    /// says so, rather than taking a volume it would not read.
+    pub fn of(pool: &StoragePool) -> Self {
+        Self {
+            driver: pool.spec.driver.clone(),
+            nodes: pool.spec.nodes.clone(),
+        }
+    }
+
+    /// The catalogue entry a candidate has to carry, spelled the one way
+    /// `common::capability` spells everything.
+    pub fn wanted(&self) -> String {
+        capability::entry(capability::VOLUME, Some(&self.driver))
+    }
+
+    /// Can this candidate provision out of the pool?
+    pub fn met_by(&self, candidate: &Candidate) -> bool {
+        self.reaches(&candidate.name)
+            && offers(&candidate.catalogue, capability::VOLUME, Some(&self.driver))
+    }
+
+    fn reaches(&self, name: &str) -> bool {
+        self.nodes.is_empty() || self.nodes.iter().any(|n| n == name)
+    }
+}
+
+/// Every candidate this volume may be provisioned on at all.
+///
+/// The second application of the same idea `feasible` is, and it shares the
+/// half that is about the machine (`usable`) rather than restating it. What
+/// it does NOT share is everything that is about a VM: a volume asks for no
+/// vCPUs and no memory, so `Capacity` does not appear here — how much room is
+/// left on a thin pool is the backend's own admission question, asked at
+/// `provision` time by the driver that owns the pool, and a controller
+/// second-guessing it would be a second answer that goes stale.
+///
+/// Order is preserved, so a strategy that wants "the first" stays
+/// deterministic — the same promise `feasible` makes.
+#[generated(model = ClaudeOpus, version = "5")]
+pub fn feasible_for_storage<'a>(
+    policy: &StoragePolicy,
+    candidates: &'a [Candidate],
+) -> Vec<&'a Candidate> {
+    usable(candidates).filter(|c| policy.met_by(c)).collect()
+}
+
+/// Narrow a feasible set to the candidates that already hold the data — or
+/// leave it alone, if honouring that would mean placing nothing.
+///
+/// SOFT, and never anything else. A VM whose volume lives on node A runs best
+/// on node A, and the day the storage is rebalanced — a node drained, a
+/// replica moved, a pool re-cut — a hard rule would strand every VM that had
+/// been placed by it. The fallback is the whole difference, and it is the
+/// same one `preferred` makes for anti-affinity: a preference that can strand
+/// a VM is a requirement whose author did not know they were writing one.
+///
+/// `holders` is where the data actually is, by candidate name. Empty — which
+/// is every VM whose disks are declared in its own spec rather than reserved
+/// as objects — leaves the set exactly as it was.
+#[generated(model = ClaudeOpus, version = "5")]
+pub fn prefer_local<'a>(feasible: Vec<&'a Candidate>, holders: &[String]) -> Vec<&'a Candidate> {
+    if holders.is_empty() {
+        return feasible;
+    }
+    let local: Vec<&Candidate> = feasible
+        .iter()
+        .copied()
+        .filter(|c| holders.iter().any(|h| h == &c.name))
+        .collect();
+    if local.is_empty() { feasible } else { local }
+}
+
+/// Why this volume found no candidate, in a sentence and a category.
+///
+/// The same two-part answer `pending_reason_of` gives a VM and for the same
+/// two reasons: an operator reads the sentence off the object, and the
+/// category is what may become a metric label. The order of the cuts is the
+/// order that sends an operator to the right machine — nobody is here, nobody
+/// is willing, nobody has the backend, nobody the pool named is here.
+#[generated(model = ClaudeOpus, version = "5")]
+pub fn storage_pending_reason(
+    policy: &StoragePolicy,
+    pool: &str,
+    candidates: &[Candidate],
+) -> (PendingReason, String) {
+    if candidates.is_empty() {
+        return (
+            PendingReason::NoCandidates,
+            "no candidates are known here yet".to_string(),
+        );
+    }
+    let usable: Vec<&Candidate> = usable(candidates).collect();
+    if usable.is_empty() {
+        return (
+            PendingReason::NoneUsable,
+            format!(
+                "none of the {} known candidates is both connected and schedulable",
+                candidates.len()
+            ),
+        );
+    }
+    // Backend before wiring. "Nobody has this driver" is a different operator
+    // problem from "the machines that do are not the ones the pool names",
+    // and only the second is about something written in the pool object.
+    let with_driver: Vec<&&Candidate> = usable
+        .iter()
+        .filter(|c| offers(&c.catalogue, capability::VOLUME, Some(&policy.driver)))
+        .collect();
+    if with_driver.is_empty() {
+        return (
+            PendingReason::Unserved,
+            format!(
+                "no connected candidate offers [{}], which storage pool {pool} is made of",
+                policy.wanted()
+            ),
+        );
+    }
+    (
+        PendingReason::Unserved,
+        format!(
+            "storage pool {pool} names [{}], and none of them is a connected candidate that \
+             offers {}",
+            policy.nodes.join(", "),
+            policy.wanted()
+        ),
+    )
 }
 
 /// Narrow a feasible set to those that also honour the PREFERRED terms — or
@@ -1299,6 +1467,181 @@ mod tests {
         // And the consequence that makes it safe: a node claiming nothing at
         // all is still a candidate for an ordinary VM.
         assert!(plain.met_by(&[]));
+    }
+
+    fn storage_candidate(name: &str, drivers: &[&str]) -> Candidate {
+        Candidate {
+            kind: CandidateKind::Node,
+            labels: Default::default(),
+            hosted: Vec::new(),
+            free: ROOMY,
+            name: name.into(),
+            connected: true,
+            schedulable: true,
+            catalogue: drivers
+                .iter()
+                .map(|d| capability::entry(capability::VOLUME, Some(d)))
+                .collect(),
+        }
+    }
+
+    fn storage_pool(driver: &str, nodes: &[&str]) -> StoragePool {
+        StoragePool::declare(
+            "fast",
+            crate::resources::StoragePoolSpec {
+                driver: driver.into(),
+                nodes: nodes.iter().map(|n| n.to_string()).collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The second application of `feasible`, and the point of building it as
+    /// one: a node that is down or drained is no more a candidate to
+    /// provision on than it is to run on, and that predicate is shared rather
+    /// than restated. If "drained" ever means two different things depending
+    /// on what is being placed, this test is what notices.
+    #[test]
+    fn a_volume_is_placed_by_the_same_rules_about_the_machine() {
+        let policy = StoragePolicy::of(&storage_pool("lvm-thin", &[]));
+        let mut fleet = vec![
+            storage_candidate("a", &["lvm-thin"]),
+            storage_candidate("b", &["lvm-thin"]),
+        ];
+        assert_eq!(feasible_for_storage(&policy, &fleet).len(), 2);
+
+        fleet[0].connected = false;
+        fleet[1].schedulable = false;
+        assert!(
+            feasible_for_storage(&policy, &fleet).is_empty(),
+            "down and drained are not candidates for a volume either"
+        );
+
+        // ... and the VM half agrees about the very same fleet.
+        assert!(feasible(&vm(), &fleet).is_empty());
+    }
+
+    /// Two conjuncts and neither stands in for the other. A node with the
+    /// driver that the pool does not name cannot reach the volume group; a
+    /// node the pool names without the driver cannot make the LV.
+    #[test]
+    fn a_candidate_needs_both_the_backend_and_the_wiring() {
+        let policy = StoragePolicy::of(&storage_pool("lvm-thin", &["a"]));
+        let fleet = vec![
+            storage_candidate("a", &["lvm-thin"]),
+            // has the driver, is not named by the pool
+            storage_candidate("b", &["lvm-thin"]),
+            // is named by the pool in another world, has no driver
+            storage_candidate("c", &["filesystem"]),
+        ];
+        let fits = feasible_for_storage(&policy, &fleet);
+        assert_eq!(fits.len(), 1);
+        assert_eq!(fits[0].name, "a");
+        assert_eq!(policy.wanted(), "volume/lvm-thin");
+    }
+
+    /// An empty node list is every node, which is the single-machine lab and
+    /// the compatibility direction: a pool nobody restricted narrows nothing,
+    /// and the policy degenerates to the catalogue check the VM half already
+    /// does.
+    #[test]
+    fn a_pool_that_names_no_nodes_is_reachable_from_all_of_them() {
+        let policy = StoragePolicy::of(&storage_pool("filesystem", &[]));
+        let fleet = vec![
+            storage_candidate("a", &["filesystem"]),
+            storage_candidate("b", &["filesystem", "lvm-thin"]),
+        ];
+        assert_eq!(feasible_for_storage(&policy, &fleet).len(), 2);
+    }
+
+    /// Locality is SOFT and never anything else.
+    ///
+    /// Among the candidates that can serve, the ones already holding the data
+    /// win. When none of them can serve — the node was drained, the pool
+    /// re-cut, the replica moved — the set is left exactly as it was, because
+    /// a hard rule would strand every VM that a previous placement had put
+    /// next to its disk. That fallback is the whole difference between a
+    /// preference and a requirement.
+    #[test]
+    fn locality_prefers_the_holder_and_never_strands_anything() {
+        let fleet = vec![
+            storage_candidate("a", &["lvm-thin"]),
+            storage_candidate("b", &["lvm-thin"]),
+            storage_candidate("c", &["lvm-thin"]),
+        ];
+        let all: Vec<&Candidate> = fleet.iter().collect();
+
+        let local = prefer_local(all.clone(), &["b".to_string()]);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].name, "b");
+
+        // Nobody holds it: every VM whose disks are declared in its own spec.
+        assert_eq!(prefer_local(all.clone(), &[]).len(), 3);
+
+        // The holder cannot serve any more — storage moved, or the node was
+        // drained out from under it. Everything still fits.
+        let holder_gone = prefer_local(all.clone(), &["elsewhere".to_string()]);
+        assert_eq!(
+            holder_gone.len(),
+            3,
+            "a soft rule that can empty the set is a hard rule nobody meant to write"
+        );
+
+        // Several holders, and the order of the feasible list survives.
+        let two = prefer_local(all, &["c".to_string(), "a".to_string()]);
+        assert_eq!(
+            two.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "c"]
+        );
+    }
+
+    /// Why a volume is stuck, in the order that sends an operator to the
+    /// right machine: nobody is here, nobody is willing, nobody has the
+    /// backend, and only then "the ones the pool names are not among them".
+    #[test]
+    fn an_unplaceable_volume_says_which_of_the_four_things_is_wrong() {
+        let policy = StoragePolicy::of(&storage_pool("lvm-thin", &["a"]));
+
+        let (why, msg) = storage_pending_reason(&policy, "fast", &[]);
+        assert_eq!(why, PendingReason::NoCandidates);
+        assert!(msg.contains("no candidates"), "{msg}");
+
+        let mut down = vec![storage_candidate("a", &["lvm-thin"])];
+        down[0].connected = false;
+        let (why, msg) = storage_pending_reason(&policy, "fast", &down);
+        assert_eq!(why, PendingReason::NoneUsable);
+        assert!(msg.contains("1 known candidates"), "{msg}");
+
+        // Up and willing, wrong backend everywhere.
+        let no_driver = vec![storage_candidate("a", &["filesystem"])];
+        let (why, msg) = storage_pending_reason(&policy, "fast", &no_driver);
+        assert_eq!(why, PendingReason::Unserved);
+        assert!(msg.contains("volume/lvm-thin"), "{msg}");
+        assert!(msg.contains("storage pool fast"), "{msg}");
+
+        // The backend is out there, just not on a machine the pool names.
+        let elsewhere = vec![storage_candidate("b", &["lvm-thin"])];
+        let (why, msg) = storage_pending_reason(&policy, "fast", &elsewhere);
+        assert_eq!(why, PendingReason::Unserved);
+        assert!(msg.contains("storage pool fast names [a]"), "{msg}");
+    }
+
+    /// No `Capacity` anywhere in the storage half, and that is a decision
+    /// rather than an omission: how much room is left on a thin pool is the
+    /// backend's own admission question, asked by the driver that owns the
+    /// pool at the moment it provisions. A controller carrying a second
+    /// answer would be carrying one that goes stale between passes.
+    #[test]
+    fn a_volume_asks_for_no_vcpus_and_no_memory() {
+        let policy = StoragePolicy::of(&storage_pool("lvm-thin", &[]));
+        let mut broke = storage_candidate("a", &["lvm-thin"]);
+        broke.free = Capacity {
+            vcpus: 0,
+            mem_mib: 0,
+        };
+        assert_eq!(feasible_for_storage(&policy, &[broke.clone()]).len(), 1);
+        // ... and the same candidate holds no VM at all.
+        assert!(feasible(&sized(1, 1), &[broke]).is_empty());
     }
 
     /// The config seam: nothing configured is the FirstFit both controllers

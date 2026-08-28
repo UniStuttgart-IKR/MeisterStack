@@ -13,8 +13,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
 use controller_api::{
-    API_VERSION, ApiError, EtcdStore, Node, NodeSpec, Resource, SpecUpdate, Vm, VmSpec,
-    apply_spec_update, check_envelope, conflict, invalid, resources::new_vm,
+    API_VERSION, ApiError, EtcdStore, Node, NodeSpec, Resource, SpecUpdate, StoragePool, Vm,
+    VmSpec, Volume, VolumePhase, apply_spec_update, check_envelope, conflict, invalid,
+    resources::{backend_name, new_vm, new_volume},
 };
 use macros::generated;
 use serde_json::json;
@@ -41,6 +42,22 @@ pub fn router(store: Arc<EtcdStore>, registry: Arc<crate::session::SessionRegist
         .route("/apis/meister.io/v1/vms/{name}/logs", get(vm_logs))
         .route("/apis/meister.io/v1/vms/{name}/events", get(vm_events))
         .route("/apis/meister.io/v1/events", get(list_events))
+        .route(
+            "/apis/meister.io/v1/storagepools",
+            get(list_storage_pools).post(create_storage_pool),
+        )
+        .route(
+            "/apis/meister.io/v1/storagepools/{name}",
+            get(get_storage_pool).delete(delete_storage_pool),
+        )
+        .route(
+            "/apis/meister.io/v1/volumes",
+            get(list_volumes).post(create_volume),
+        )
+        .route(
+            "/apis/meister.io/v1/volumes/{name}",
+            get(get_volume).delete(delete_volume),
+        )
         .route("/apis/meister.io/v1/nodes", get(list_nodes))
         .route(
             "/apis/meister.io/v1/nodes/{name}",
@@ -272,6 +289,170 @@ async fn delete_vm(
         })
         .await?;
     Ok(Json(vm))
+}
+
+// --- storage, cluster-local -------------------------------------------------
+//
+// The same two objects the cloud tier keeps, at the tier that has NODES —
+// which is the tier that can answer "who provisions this". A cluster with no
+// cloud above it declares its own pools and holds its own volumes, exactly as
+// it creates its own VMs; a cluster under a cloud will be handed them down the
+// session, and that hop is the step after this one.
+//
+// No tenancy here, and that is the design rule rather than an omission: this
+// tier keeps no user directory (one directory, and it is the cloud's), so
+// `spec.tenant` is carried and never enforced — the same thing a
+// cluster-local VM does with the field.
+
+async fn list_storage_pools(
+    State(st): State<ApiState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let items = st.store.list::<StoragePool>().await?;
+    Ok(Json(
+        json!({ "apiVersion": API_VERSION, "kind": "StoragePoolList", "items": items }),
+    ))
+}
+
+async fn get_storage_pool(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<StoragePool>, ApiError> {
+    Ok(Json(st.store.get(&name).await?))
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+async fn create_storage_pool(
+    State(st): State<ApiState>,
+    Json(body): Json<StoragePool>,
+) -> Result<(StatusCode, Json<StoragePool>), ApiError> {
+    check_envelope(&body)?;
+    if body.metadata.name.is_empty() {
+        return Err(invalid("metadata.name must be set"));
+    }
+    if body.spec.driver.is_empty() {
+        return Err(invalid(
+            "spec.driver must name a storage backend, e.g. \"lvm-thin\"",
+        ));
+    }
+    let mut pool = StoragePool::declare(&body.metadata.name, body.spec);
+    pool.metadata.labels = body.metadata.labels;
+    let created = st.store.create(&pool).await?;
+    info!(pool = %created.metadata.name, driver = %created.spec.driver,
+          nodes = created.spec.nodes.len(), "storage pool created");
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// A pool with volumes in it stays — the invariant "every volume came out of
+/// a pool that exists" is worth what the refusal that keeps it true is worth.
+/// `place_volume` reads it back on every pass and would have nowhere to put a
+/// volume whose pool had vanished.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn delete_storage_pool(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let _: StoragePool = st.store.get(&name).await?;
+    let held: Vec<String> = st
+        .store
+        .list::<Volume>()
+        .await?
+        .into_iter()
+        .filter(|v| v.spec.pool == name)
+        .map(|v| v.metadata.name)
+        .collect();
+    if !held.is_empty() {
+        return Err(conflict(format!(
+            "storage pool {name} still has volumes: {}",
+            held.join(", ")
+        )));
+    }
+    st.store.delete::<StoragePool>(&name).await?;
+    Ok(Json(json!({ "deleted": name })))
+}
+
+async fn list_volumes(State(st): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let items = st.store.list::<Volume>().await?;
+    Ok(Json(
+        json!({ "apiVersion": API_VERSION, "kind": "VolumeList", "items": items }),
+    ))
+}
+
+async fn get_volume(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<Volume>, ApiError> {
+    Ok(Json(st.store.get(&name).await?))
+}
+
+/// Reserve storage here. Nothing is provisioned: the reconcile pass picks a
+/// node that can reach the pool, and the volume is `Pending` and says why
+/// until one is found.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn create_volume(
+    State(st): State<ApiState>,
+    Json(body): Json<Volume>,
+) -> Result<(StatusCode, Json<Volume>), ApiError> {
+    check_envelope(&body)?;
+    if body.metadata.name.is_empty() {
+        return Err(invalid("metadata.name must be set"));
+    }
+    if body.spec.size_gib == 0 {
+        return Err(invalid("spec.sizeGib must be greater than zero"));
+    }
+    if body.status.node.is_some() || !body.status.backend.is_empty() {
+        return Err(invalid(
+            "status is controller-owned; it says where the volume actually is",
+        ));
+    }
+    let pools = st.store.list::<StoragePool>().await?;
+    let pool = match body.spec.pool.as_str() {
+        "" => pools
+            .iter()
+            .find(|p| p.spec.default)
+            .ok_or_else(|| invalid("no storage pool is marked default; name one with spec.pool"))?,
+        named => pools
+            .iter()
+            .find(|p| p.metadata.name == named)
+            .ok_or_else(|| invalid(format!("no storage pool {named:?} in this cluster")))?,
+    };
+
+    let mut spec = body.spec;
+    spec.pool = pool.metadata.name.clone();
+    let created = st
+        .store
+        .create(&new_volume(&body.metadata.name, spec))
+        .await?;
+    // Derived from the uid, which only exists once the object does. See
+    // `controller_api::resources::backend_name` — this is the rule that keeps
+    // a lost handle from producing a second volume.
+    let named = st
+        .store
+        .mutate::<Volume, _>(&created.metadata.name, |v| {
+            v.status.backend = backend_name(&v.metadata.uid);
+        })
+        .await?;
+    info!(volume = %named.metadata.name, pool = %named.spec.pool,
+          size_gib = named.spec.size_gib, backend = %named.status.backend, "volume reserved");
+    Ok((StatusCode::CREATED, Json(named)))
+}
+
+/// Mark it for release. Never a hard delete: the finalizer comes off in the
+/// reconcile pass, and only once nothing holds the volume. See `release`.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn delete_volume(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<Volume>, ApiError> {
+    let volume = st
+        .store
+        .mutate::<Volume, _>(&name, |v| {
+            if v.metadata.deletion_timestamp.is_none() {
+                v.metadata.deletion_timestamp = Some(Utc::now());
+            }
+            v.status.phase = VolumePhase::Releasing;
+        })
+        .await?;
+    Ok(Json(volume))
 }
 
 /// Everything that happened to one VM, recently.
