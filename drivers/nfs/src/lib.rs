@@ -553,6 +553,174 @@ impl VolumeAttacher for NfsDriver {
 mod tests {
     use super::*;
 
+    /// A driver over a temp directory, with a `virtiofsd` that exists and is
+    /// never run. Every test below stops short of spawning one — what they
+    /// are about is the half that has no process in it, which is exactly the
+    /// half the provider/attacher split created.
+    fn driver(tag: &str) -> (NfsDriver, PathBuf) {
+        let root = std::env::temp_dir().join(format!("meister-nfs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let share = root.join("share");
+        let images = root.join("images");
+        std::fs::create_dir_all(&share).expect("a temp share root");
+        std::fs::create_dir_all(&images).expect("a temp image dir");
+        let d = NfsDriver::new(NfsDriverConfig {
+            share_root: share.clone(),
+            image_dir: images,
+            // Exists, so the driver builds; never spawned by these tests.
+            virtiofsd: PathBuf::from("/bin/sh"),
+            run_dir: root.join("run"),
+            socket_timeout: Duration::from_millis(10),
+            virtiofsd_args: Vec::new(),
+            manage_mount: false,
+            mount: None,
+        })
+        .expect("the driver builds over a plain directory");
+        (d, share)
+    }
+
+    fn spec(kind: &str) -> VolumeSpec {
+        VolumeSpec {
+            base_image: None,
+            size_bytes: 4096,
+            driver: Some("nfs".into()),
+            params: Some(serde_json::json!({ "kind": kind })),
+        }
+    }
+
+    /// The degeneration probe for file mode, and the sentence the brief makes
+    /// about it: no loop device anywhere. The driver puts a raw file on the
+    /// mounted share and hands over a `Path` to it, and cloud-hypervisor
+    /// opens that file directly.
+    ///
+    /// Provision makes the bytes and attach names them — the same two calls
+    /// one `create` used to be, and the same `Path` at the end of it.
+    #[tokio::test]
+    async fn a_file_volume_is_a_path_on_the_share_and_nothing_else() {
+        let (d, share) = driver("file");
+        let id = uuid::Uuid::new_v4();
+
+        let handle = d.provision(&id, &spec("file")).await.expect("provisioned");
+        let expected = share.join("volumes").join(format!("{id}.raw"));
+        assert_eq!(handle.path(), expected);
+        assert_eq!(
+            std::fs::metadata(&expected)
+                .expect("the file is there")
+                .len(),
+            4096
+        );
+
+        let attachment = d.attach(&handle, None).await.expect("no cgroup needed");
+        match &attachment {
+            VolumeAttachment::Path(p) => assert_eq!(p, &expected),
+            other => panic!("no loop device, no backend: {other:?}"),
+        }
+        assert!(attachment.is_block());
+        assert!(!attachment.needs_shared_memory());
+        assert_eq!(attachment.backend_pid(), None);
+
+        // And detaching a path is nothing at all, so the file survives it.
+        d.detach(&handle, &attachment).await.expect("nothing to do");
+        assert!(expected.exists());
+    }
+
+    /// The interesting half, and the one the whole split is for: in share
+    /// mode `provision` makes a DIRECTORY and starts no process.
+    ///
+    /// That is the claim. The directory is the volume and outlives every
+    /// consumer; the virtiofsd is the connection and belongs to one. Before
+    /// the split, asking for the volume spawned the process — which is why a
+    /// volume could not exist without a VM to spawn it into.
+    #[tokio::test]
+    async fn provisioning_a_share_makes_a_directory_and_starts_nothing() {
+        let (d, share) = driver("share");
+        let id = uuid::Uuid::new_v4();
+
+        let handle = d.provision(&id, &spec("share")).await.expect("provisioned");
+        let dir = share.join("shares").join(id.to_string());
+        assert_eq!(handle.path(), dir);
+        assert!(dir.is_dir(), "the directory IS the volume");
+        assert_eq!(handle.size_bytes, 0, "a filesystem has no size to promise");
+
+        // No socket, no pid file, no child: nothing here spawned anything.
+        assert!(d.active.lock().await.is_empty());
+        assert!(!d.socket_path(&id).exists());
+
+        // The attach-time half of the request travels on the handle, because
+        // an attacher never sees a spec.
+        assert_eq!(
+            NfsDriver::handle_params(&handle).unwrap().kind,
+            VolumeKind::Share
+        );
+
+        // And describing it needs no consumer either — asked of the
+        // filesystem, which is what makes it answerable for a volume nobody
+        // is holding.
+        assert_eq!(
+            d.describe(&handle).await.expect("it is there"),
+            VolumeState { size_bytes: 0 }
+        );
+    }
+
+    /// Deprovision clears both candidates and asks `params` nothing.
+    ///
+    /// A record migrated from before handles existed carries no params, and a
+    /// deprovision that guessed `file` for it would leave the share directory
+    /// standing forever. Both paths are named after the id, at most one
+    /// exists, and removing both is idempotent — one extra syscall against a
+    /// leak nobody would ever find.
+    #[tokio::test]
+    async fn deprovision_clears_either_shape_without_being_told_which() {
+        let (d, share) = driver("deprovision");
+
+        for kind in ["file", "share"] {
+            let id = uuid::Uuid::new_v4();
+            let handle = d.provision(&id, &spec(kind)).await.expect("provisioned");
+            assert!(handle.path().exists(), "{kind}");
+
+            // The params stripped, exactly as a migrated record has them.
+            let blind = VolumeHandle {
+                params: None,
+                ..handle.clone()
+            };
+            d.deprovision(&blind).await.expect("removed");
+            assert!(!handle.path().exists(), "{kind} was not removed");
+            assert!(matches!(
+                d.describe(&blind).await,
+                Err(StorageError::NotFound(gone)) if gone == id
+            ));
+            // Twice is Ok: a teardown runs again after a crash between its
+            // two halves.
+            d.deprovision(&blind).await.expect("idempotent");
+        }
+
+        // Neither directory was taken with it — only what belonged to the
+        // volume went.
+        assert!(share.join("volumes").is_dir());
+        assert!(share.join("shares").is_dir());
+    }
+
+    /// A share directory survives its consumer, which is the whole point of
+    /// the object above it: detach decides from the ATTACHMENT (a process is
+    /// what goes) and touches no byte on the share.
+    #[tokio::test]
+    async fn detaching_a_share_leaves_every_byte_where_it_was() {
+        let (d, _) = driver("detach");
+        let id = uuid::Uuid::new_v4();
+        let handle = d.provision(&id, &spec("share")).await.unwrap();
+        std::fs::write(handle.path().join("payload"), b"tenant data").expect("a file in the share");
+
+        // A `Path` attachment on a share handle: no process, so nothing to
+        // stop, and detach must not reach for the directory anyway.
+        d.detach(&handle, &VolumeAttachment::Path(handle.path()))
+            .await
+            .expect("nothing to detach");
+        assert_eq!(
+            std::fs::read(handle.path().join("payload")).unwrap(),
+            b"tenant data"
+        );
+    }
+
     /// `file` is the default so that a spec that says nothing gets a boot
     /// disk, which is what a volume has always been. `share` has to be asked
     /// for by name.

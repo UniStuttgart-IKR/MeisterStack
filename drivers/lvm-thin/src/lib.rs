@@ -494,6 +494,111 @@ impl VolumeAttacher for LvmThinDriver {
 mod tests {
     use super::*;
 
+    fn driver(vg: &str) -> LvmThinDriver {
+        LvmThinDriver {
+            config: LvmThinDriverConfig {
+                vg: vg.into(),
+                thin_pool: "thin".into(),
+                max_data_percent: DEFAULT_MAX_DATA_PERCENT,
+                image_dir: PathBuf::from("/var/lib/meister/images"),
+                bin_dir: None,
+                qemu_img: PathBuf::from("qemu-img"),
+            },
+        }
+    }
+
+    fn spec() -> VolumeSpec {
+        VolumeSpec {
+            base_image: None,
+            size_bytes: 1 << 30,
+            driver: Some("lvm-thin".into()),
+            params: None,
+        }
+    }
+
+    /// The degeneration probe for this backend, and it is the plainest of the
+    /// three: a thin LV is a block device the VMM opens itself, so attaching
+    /// is naming the device node and detaching is nothing.
+    ///
+    /// No cgroup is taken and none is offered, which is the claim that
+    /// matters: `provision` and `attach` land on the same node here and the
+    /// split has to cost that case nothing. The day this backend grows an
+    /// NVMe-oF export, THIS impl gets a target session and a cgroup and the
+    /// provider half does not change a line.
+    #[tokio::test]
+    async fn attaching_a_thin_lv_is_naming_its_device_node() {
+        let d = driver("vg0");
+        let id = uuid::Uuid::new_v4();
+        let dev = PathBuf::from(format!("/dev/vg0/vm-{id}"));
+        let handle = LvmThinDriver::handle(&id, &dev, 1 << 30, &spec());
+
+        assert_eq!(handle.backend, dev.to_string_lossy());
+        match d
+            .attach(&handle, None)
+            .await
+            .expect("no cgroup, no process")
+        {
+            VolumeAttachment::Path(p) => assert_eq!(p, dev),
+            other => panic!("a block device is a path, not {other:?}"),
+        }
+        d.detach(&handle, &VolumeAttachment::Path(dev.clone()))
+            .await
+            .expect("nothing to detach");
+
+        // And what the VMM is told is what it was always told.
+        let attachment = VolumeAttachment::Path(dev);
+        assert!(attachment.is_block());
+        assert!(!attachment.needs_shared_memory());
+        assert_eq!(attachment.backend_pid(), None);
+    }
+
+    /// The volume group comes off the HANDLE now and used to come off the
+    /// attachment. Same answer, and that is the point of the probe: a spec
+    /// that named a pool of its own put the LV somewhere the config no longer
+    /// points, and deprovision has to find it there with no consumer in the
+    /// picture.
+    #[test]
+    fn the_volume_group_is_recovered_from_the_handle_and_not_from_a_connection() {
+        let d = driver("vg0");
+        let id = uuid::Uuid::new_v4();
+
+        let elsewhere = PathBuf::from(format!("/dev/nvme-vg/vm-{id}"));
+        let handle = LvmThinDriver::handle(&id, &elsewhere, 1, &spec());
+        assert_eq!(d.vg_of(&handle), "nvme-vg");
+
+        // A handle with no path at all — a record migrated from before
+        // handles existed, whose attachment was not a path — falls back to
+        // the configured group rather than to nothing.
+        let bare = VolumeHandle {
+            id,
+            backend: String::new(),
+            size_bytes: 0,
+            params: None,
+        };
+        assert_eq!(d.vg_of(&bare), "vg0");
+
+        // `/dev/<lv>` with no group in it is not a group called "dev".
+        let flat = VolumeHandle {
+            id,
+            backend: format!("/dev/vm-{id}"),
+            size_bytes: 0,
+            params: None,
+        };
+        assert_eq!(d.vg_of(&flat), "vg0");
+    }
+
+    /// The name is derived from the id, on this backend as on every other.
+    /// The idempotence rule stated where it actually lives: `lvcreate` for a
+    /// volume that is already there is what `provision` finds, and it finds
+    /// it because nothing about the name was allocated.
+    #[test]
+    fn the_lv_name_is_derived_from_the_id_and_nothing_else() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(lv_name(&id), lv_name(&id));
+        assert!(lv_name(&id).contains(&id.to_string()));
+        assert_ne!(lv_name(&id), lv_name(&uuid::Uuid::new_v4()));
+    }
+
     #[test]
     fn an_lv_is_named_after_its_volume() {
         let id: VolumeId = "6f1a2b3c-0000-0000-0000-00000000000a".parse().unwrap();

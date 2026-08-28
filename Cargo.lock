@@ -1206,6 +1206,7 @@ dependencies = [
  "nix 0.31.3",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1238,6 +1239,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1263,6 +1265,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
