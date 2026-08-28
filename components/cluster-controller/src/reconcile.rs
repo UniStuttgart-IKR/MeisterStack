@@ -663,6 +663,55 @@ mod tests {
         assert!(may_reconcile(&bound_to(None), &sessions(&["node-a"])));
     }
 
+    /// Draining is one bit and it belongs to the scheduler alone.
+    ///
+    /// The session is what decides who reconciles a VM and what makes a
+    /// candidate `connected`; `spec.schedulable` is a separate field that
+    /// only ever narrows the set FirstFit may pick from. So a cordoned node
+    /// goes on owning, running and reconciling everything already bound to
+    /// it, and the only thing that changes is that nothing new lands there —
+    /// which is why cordon cannot evict, migrate or stop anything, and why
+    /// there is nothing in this file that would have to be careful not to.
+    #[test]
+    fn draining_a_node_changes_only_what_the_scheduler_may_pick() {
+        let mine = sessions(&["manacor"]);
+        let running = bound_to(Some("manacor"));
+        // Bound: still this replica's, drained or not — `may_reconcile` does
+        // not look at the node object at all, only at the session map, and
+        // cordoning writes neither.
+        assert!(may_reconcile(&running, &mine));
+
+        let drained = Candidate {
+            name: "manacor".into(),
+            connected: true,
+            schedulable: false,
+            catalogue: Vec::new(),
+        };
+        // Nothing NEW goes there, and the sentence on the object says which
+        // of the reasons it is.
+        let waiting = bound_to(None);
+        assert_eq!(
+            controller_api::FirstFit.assign(&waiting, std::slice::from_ref(&drained)),
+            None
+        );
+        let (why, sentence) =
+            controller_api::pending_reason_of(&waiting, std::slice::from_ref(&drained));
+        assert_eq!(why, controller_api::PendingReason::NoneUsable);
+        assert!(sentence.contains("connected and schedulable"), "{sentence}");
+
+        // Uncordon: the same candidate, the same VM, placed.
+        let back = Candidate {
+            schedulable: true,
+            ..drained
+        };
+        assert_eq!(
+            controller_api::FirstFit
+                .assign(&waiting, std::slice::from_ref(&back))
+                .as_deref(),
+            Some("manacor")
+        );
+    }
+
     /// Deleting changes nothing about who acts: only the node's own replica
     /// can order the teardown, so a deleting VM on a foreign node waits.
     #[test]

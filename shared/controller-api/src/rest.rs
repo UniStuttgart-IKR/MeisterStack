@@ -247,6 +247,91 @@ where
     Ok(())
 }
 
+// --- the spec-only PUT ------------------------------------------------------
+
+/// A PUT body for a resource whose STATUS belongs to a controller.
+///
+/// Deliberately not the resource's own `Object` type. What separates a client
+/// that round-trips an object it just read from one that is trying to write
+/// status is whether it SAID anything about status, and a typed `St` cannot
+/// tell "absent" from "the default" — every field of a NodeStatus defaults,
+/// so an omitted status deserialises into a perfectly good "not ready, no
+/// capacity, no heartbeat" that would then be a write of exactly that.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecUpdate<S> {
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: crate::object::Metadata,
+    pub spec: S,
+    /// What the client said about status, if it said anything. `None` is
+    /// "did not mention it", which is the only shape that is not a write.
+    #[serde(default)]
+    pub status: Option<serde_json::Value>,
+}
+
+/// Apply a spec-only PUT onto the object as it is stored.
+///
+/// The one write path for the fields an operator owns on a controller-owned
+/// object: `spec.schedulable` on a Node, the same on a Cluster. Everything
+/// else about the object is server-owned and survives the round trip
+/// untouched — uid, creation, deletion, finalizers, and status.
+///
+/// Status is REFUSED rather than silently kept, which is the one place this
+/// differs from `update_vm`. The difference is who is being talked to: a VM
+/// spec is a document a client authored and re-sends whole, so quietly
+/// keeping the server's half is the only way a client can round-trip one at
+/// all. A Node object is authored by the controller from what an agent
+/// reported, and the only reason to PUT one is to flip a field of `spec` — so
+/// a body that also carries a different status is a client that believes it
+/// can set `ready` or `capacity`, and telling it no is worth more than
+/// accepting the write and discarding half of it. A body that repeats the
+/// status it just read is not that, and passes.
+///
+/// The resourceVersion is the CLIENT's, exactly as in `update_vm`: it is what
+/// makes the store's compare-and-swap a compare-and-swap. A body without one
+/// is refused by the store with the same message every other update gets.
+#[generated(model = ClaudeOpus, version = "5")]
+pub fn apply_spec_update<S, St>(
+    body: SpecUpdate<S>,
+    name: &str,
+    current: Object<S, St>,
+) -> std::result::Result<Object<S, St>, ApiError>
+where
+    Object<S, St>: Resource,
+    St: serde::Serialize,
+{
+    let expected = <Object<S, St> as Resource>::KIND;
+    if body.api_version != API_VERSION || body.kind != expected {
+        return Err(invalid(format!(
+            "expected apiVersion {API_VERSION}, kind {expected}"
+        )));
+    }
+    if body.metadata.name != name {
+        return Err(invalid("metadata.name does not match the path"));
+    }
+    if let Some(sent) = &body.status {
+        let held = serde_json::to_value(&current.status).map_err(|e| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal", e.to_string())
+        })?;
+        if sent != &held {
+            return Err(invalid(format!(
+                "status belongs to the controller; send this {expected} back with the status it \
+                 was read with, or leave status out"
+            )));
+        }
+    }
+    let mut next = current;
+    next.spec = body.spec;
+    // The client's half of metadata, and only that half.
+    next.metadata.labels = body.metadata.labels;
+    next.metadata.annotations = body.metadata.annotations;
+    // What makes the write a compare-and-swap rather than a last-writer-wins.
+    next.metadata.resource_version = body.metadata.resource_version;
+    Ok(next)
+}
+
 /// Authenticate, then authorize, then hand the identity to the handler.
 #[generated(model = ClaudeOpus, version = "5")]
 async fn authorize(State(st): State<AuthState>, mut req: Request, next: Next) -> Response {
@@ -758,6 +843,79 @@ mod tests {
             demoted.may_act_for(Some(Role::Member), "ops"),
             "still itself"
         );
+    }
+
+    /// The spec-only PUT, as the two draining routes use it: spec is taken,
+    /// server-owned metadata survives, the client's resourceVersion is what
+    /// the store will compare against, and a status that differs from the one
+    /// held is refused rather than dropped on the floor.
+    #[test]
+    fn a_spec_only_put_takes_the_spec_and_refuses_a_written_status() {
+        use crate::resources::{Node, NodeSpec, NodeStatus};
+
+        let mut current = Node::declare(
+            "manacor",
+            NodeSpec {
+                schedulable: true,
+                ..NodeSpec::default()
+            },
+        );
+        current.metadata.uid = "the-uid".into();
+        current.metadata.resource_version = "41".into();
+        current.metadata.finalizers.push("keep-me".into());
+        current.status = NodeStatus {
+            ready: true,
+            vms: 3,
+            ..NodeStatus::default()
+        };
+
+        let put = |status: Option<serde_json::Value>, version: &str| SpecUpdate {
+            api_version: API_VERSION.into(),
+            kind: "Node".into(),
+            metadata: crate::object::Metadata {
+                name: "manacor".into(),
+                resource_version: version.into(),
+                // A client that sends back what it read sends uid and
+                // creation too; both are the server's and are ignored.
+                uid: "somebody-elses-uid".into(),
+                ..Default::default()
+            },
+            spec: NodeSpec {
+                schedulable: false,
+                ..NodeSpec::default()
+            },
+            status,
+        };
+
+        // Status left out: the drain lands, everything server-owned survives,
+        // and the version that goes to the store is the CLIENT's.
+        let next =
+            apply_spec_update(put(None, "42"), "manacor", current.clone()).expect("accepted");
+        assert!(!next.spec.schedulable);
+        assert_eq!(next.metadata.uid, "the-uid");
+        assert_eq!(next.metadata.finalizers, vec!["keep-me".to_string()]);
+        assert_eq!(next.metadata.resource_version, "42");
+        assert!(next.status.ready, "status is untouched");
+        assert_eq!(next.status.vms, 3);
+
+        // Status echoed back unchanged: a round trip, not a write.
+        let echoed = serde_json::to_value(&current.status).unwrap();
+        assert!(apply_spec_update(put(Some(echoed), "41"), "manacor", current.clone()).is_ok());
+
+        // Status changed: refused, and the sentence says whose it is.
+        let forged = serde_json::json!({"ready": true, "vms": 999});
+        let err = apply_spec_update(put(Some(forged), "41"), "manacor", current.clone())
+            .expect_err("a written status is not silently dropped");
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err.message.contains("belongs to the controller"), "{err:?}");
+
+        // And the envelope is checked here as it is at every other write edge.
+        let mut wrong = put(None, "41");
+        wrong.kind = "Vm".into();
+        assert!(apply_spec_update(wrong, "manacor", current.clone()).is_err());
+        let mut renamed = put(None, "41");
+        renamed.metadata.name = "elsewhere".into();
+        assert!(apply_spec_update(renamed, "manacor", current).is_err());
     }
 
     /// Half a TLS config is the mistake worth catching: an API server that

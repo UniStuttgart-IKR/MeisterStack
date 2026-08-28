@@ -13,8 +13,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
 use controller_api::{
-    API_VERSION, ApiError, EtcdStore, Node, Vm, VmSpec, check_envelope, conflict, invalid,
-    resources::new_vm,
+    API_VERSION, ApiError, EtcdStore, Node, NodeSpec, SpecUpdate, Vm, VmSpec, apply_spec_update,
+    check_envelope, conflict, invalid, resources::new_vm,
 };
 use macros::generated;
 use serde_json::json;
@@ -36,7 +36,10 @@ pub fn router(store: Arc<EtcdStore>) -> Router {
             get(get_vm).put(update_vm).delete(delete_vm),
         )
         .route("/apis/meister.io/v1/nodes", get(list_nodes))
-        .route("/apis/meister.io/v1/nodes/{name}", get(get_node))
+        .route(
+            "/apis/meister.io/v1/nodes/{name}",
+            get(get_node).put(update_node),
+        )
         .with_state(state)
 }
 
@@ -221,4 +224,41 @@ async fn get_node(
     Path(name): Path<String>,
 ) -> Result<Json<Node>, ApiError> {
     Ok(Json(st.store.get(&name).await?))
+}
+
+/// The only write on a Node, and the reason this route exists: `spec` is what
+/// an operator decides and `status` is what the agent reported.
+///
+/// `spec.schedulable` has been read by the scheduler at both tiers since it
+/// was added, and `pending_reason` has been able to say "none of the known
+/// candidates is both connected and schedulable" for as long — but nothing
+/// could ever set it to false. Draining a node meant writing into etcd by
+/// hand. This is the door.
+///
+/// Draining blocks NEW placements and nothing else. The VMs already on the
+/// node go on running and go on being reconciled, the session stays up, and
+/// no eviction and no migration happens: those are separate things with
+/// separate questions, and quietly starting to move somebody's VM because a
+/// flag was flipped would be the worst possible answer to both.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn update_node(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+    Json(body): Json<SpecUpdate<NodeSpec>>,
+) -> Result<Json<Node>, ApiError> {
+    let current: Node = st.store.get(&name).await?;
+    let was = current.spec.schedulable;
+    // The same compare-and-swap every other update at this tier goes through:
+    // the client's resourceVersion is what the store compares, and a loser is
+    // told rather than overwritten. See `apply_spec_update`.
+    let next = apply_spec_update(body, &name, current)?;
+    let now = next.spec.schedulable;
+    let updated = st.store.update(&next).await?;
+    if was != now {
+        // A state change, so INFO — and one worth having in the log of the
+        // replica that made it: a drained node stops taking work silently
+        // everywhere else.
+        info!(node = %name, schedulable = now, "node schedulability changed");
+    }
+    Ok(Json(updated))
 }

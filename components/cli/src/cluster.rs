@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::client::Client;
 use crate::config::Target;
 use crate::output::{self, age, joined, mem, readiness};
-use crate::{ClusterCmd, ClusterVmCmd, GlobalArgs, vm};
+use crate::{ClusterCmd, ClusterNodeCmd, ClusterVmCmd, GlobalArgs, vm};
 
 const NODES: &str = "/apis/meister.io/v1/nodes";
 
@@ -100,6 +100,7 @@ pub async fn run(target: &Target, cmd: &ClusterCmd, global: &GlobalArgs) -> Resu
     let client = Client::new(target)?;
     match cmd {
         ClusterCmd::Nodes => nodes(&client, global).await,
+        ClusterCmd::Node { cmd } => run_node(&client, cmd, global).await,
         ClusterCmd::Vm { cmd } => run_vm(&client, cmd, global).await,
     }
 }
@@ -132,6 +133,40 @@ fn node_row(node: Node, now: DateTime<Utc>) -> Vec<String> {
         mem(cap.mem_mib),
         joined(&cap.capabilities),
     ]
+}
+
+/// Cordon and uncordon, through the same read-edit-write every other spec
+/// change in this CLI goes through: the object is read, one field of its spec
+/// is set, and the whole thing goes back with the resourceVersion it was read
+/// at. That is the compare-and-swap — two operators cordoning at once, and
+/// the loser is told rather than silently overwriting.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn run_node(client: &Client, cmd: &ClusterNodeCmd, global: &GlobalArgs) -> Result<()> {
+    let (name, schedulable) = match cmd {
+        ClusterNodeCmd::Cordon { name } => (name, false),
+        ClusterNodeCmd::Uncordon { name } => (name, true),
+    };
+    let body = client
+        .patch_spec(
+            &format!("{NODES}/{name}"),
+            "parsing the node object",
+            &format!("node {name}"),
+            &|spec| {
+                spec.insert("schedulable".to_string(), serde_json::json!(schedulable));
+                Ok(())
+            },
+        )
+        .await?;
+    output::emit_note(
+        global,
+        &body,
+        if schedulable {
+            "uncordoned"
+        } else {
+            "cordoned"
+        },
+        "note: draining stops new placements only; the vms already on this node keep running",
+    )
 }
 
 /// The same eight verbs the cloud tier has, over the same object — the tier

@@ -161,10 +161,30 @@ pub enum AgentCmd {
 #[derive(Subcommand)]
 pub enum ClusterCmd {
     Nodes,
+    /// Draining a node: what an operator decides about it, as opposed to what
+    /// the agent reports. Listing them is still `meister cluster nodes`.
+    Node {
+        #[command(subcommand)]
+        cmd: ClusterNodeCmd,
+    },
     Vm {
         #[command(subcommand)]
         cmd: ClusterVmCmd,
     },
+}
+
+/// Cordon and uncordon, and deliberately nothing else.
+///
+/// Draining stops NEW placements. It evicts nothing, migrates nothing and
+/// stops nothing: the VMs on the node go on running and go on being
+/// reconciled. `meister cluster nodes` shows a drained node as `drained` in
+/// the ready column.
+#[derive(Subcommand)]
+pub enum ClusterNodeCmd {
+    /// Stop placing new vms here (spec.schedulable = false)
+    Cordon { name: String },
+    /// Take the drain off (spec.schedulable = true)
+    Uncordon { name: String },
 }
 
 #[derive(Subcommand)]
@@ -207,6 +227,12 @@ pub enum ClusterVmCmd {
 pub enum CloudCmd {
     /// The clusters this cloud knows about, ready or not
     Clusters,
+    /// Draining a cluster — the same verb one tier up. Listing them is still
+    /// `meister cloud clusters`.
+    Cluster {
+        #[command(subcommand)]
+        cmd: CloudClusterCmd,
+    },
     Vm {
         #[command(subcommand)]
         cmd: CloudVmCmd,
@@ -247,6 +273,16 @@ pub enum CloudCmd {
         #[command(subcommand)]
         cmd: CloudRoutedSubnetCmd,
     },
+}
+
+/// The Node verbs one tier up, over the Cluster object, with the same narrow
+/// meaning: no new placements, and nothing already there is touched.
+#[derive(Subcommand)]
+pub enum CloudClusterCmd {
+    /// Stop placing new vms on this cluster (spec.schedulable = false)
+    Cordon { name: String },
+    /// Take the drain off (spec.schedulable = true)
+    Uncordon { name: String },
 }
 
 #[derive(Subcommand)]

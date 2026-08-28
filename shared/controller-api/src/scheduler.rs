@@ -821,6 +821,33 @@ mod tests {
         assert!(msg.contains("nvrm/4q"), "{msg}");
     }
 
+    /// Draining, as the whole round trip: a cordoned candidate takes nothing
+    /// new, the sentence and the category say why, and uncordoning makes it
+    /// take the VM again. Nothing here is about the VMs already on it — the
+    /// scheduler is only ever asked about UNBOUND ones, which is the whole of
+    /// why draining cannot evict anything.
+    #[test]
+    fn a_drained_candidate_takes_nothing_new_until_it_is_undrained() {
+        let drained = [candidate("manacor", true, false)];
+        assert_eq!(FirstFit.assign(&vm(), &drained), None);
+        let (why, sentence) = pending_reason_of(&vm(), &drained);
+        assert_eq!(why, PendingReason::NoneUsable);
+        assert!(sentence.contains("connected and schedulable"), "{sentence}");
+
+        // The one field, flipped back.
+        let mut back = drained;
+        back[0].schedulable = true;
+        assert_eq!(FirstFit.assign(&vm(), &back).as_deref(), Some("manacor"));
+
+        // And with somewhere else to go, the drained one is simply passed
+        // over rather than being the reason for anything.
+        let mixed = [
+            candidate("manacor", true, false),
+            candidate("ibiza", true, true),
+        ];
+        assert_eq!(FirstFit.assign(&vm(), &mixed).as_deref(), Some("ibiza"));
+    }
+
     /// The category behind the sentence: a closed set, because the sentence
     /// itself counts candidates and names capabilities and is therefore
     /// exactly the kind of string that must never become a metric label.

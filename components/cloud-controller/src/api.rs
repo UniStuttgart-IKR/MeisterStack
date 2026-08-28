@@ -16,9 +16,9 @@ use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use controller_api::{
     API_VERSION, ApiError, Caller, CallerRole, CallerTenant, CertificateSigningRequest, Cluster,
-    EtcdStore, FloatingIp, FloatingPool, Image, ImageSpec, Resource, Role, RoutedSubnet, Scope,
-    StoreError, Tenant, User, Verb, Vm, VmSpec, check_envelope, conflict, floating, forbidden,
-    invalid, permits_object,
+    ClusterSpec, EtcdStore, FloatingIp, FloatingPool, Image, ImageSpec, Resource, Role,
+    RoutedSubnet, Scope, SpecUpdate, StoreError, Tenant, User, Verb, Vm, VmSpec, apply_spec_update,
+    check_envelope, conflict, floating, forbidden, invalid, permits_object,
     resources::{
         CsrCondition, CsrConditionType, CsrSpec, IssuedCertificate, SIGNER_USER_CLIENT, new_vm,
     },
@@ -79,7 +79,10 @@ pub fn router(
             get(get_vm).put(update_vm).delete(delete_vm),
         )
         .route("/apis/meister.io/v1/clusters", get(list_clusters))
-        .route("/apis/meister.io/v1/clusters/{name}", get(get_cluster))
+        .route(
+            "/apis/meister.io/v1/clusters/{name}",
+            get(get_cluster).put(update_cluster),
+        )
         .route(
             "/apis/meister.io/v1/images",
             get(list_images).post(create_image),
@@ -495,6 +498,30 @@ async fn get_cluster(
     Path(name): Path<String>,
 ) -> Result<Json<Cluster>, ApiError> {
     Ok(Json(st.store.get(&name).await?))
+}
+
+/// The Node route one tier up, over the object one tier up, with the same
+/// rule and the same narrow meaning: `spec.schedulable = false` stops NEW
+/// placements onto this cluster and touches nothing that is already on it.
+///
+/// Not tenant-scoped and not a member's: a cluster is a piece of the
+/// operator's estate, and the middleware already says so (`clusters` is
+/// outside `TENANT_SCOPED`, so a member reads and an admin writes).
+#[generated(model = ClaudeOpus, version = "5")]
+async fn update_cluster(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+    Json(body): Json<SpecUpdate<ClusterSpec>>,
+) -> Result<Json<Cluster>, ApiError> {
+    let current: Cluster = st.store.get(&name).await?;
+    let was = current.spec.schedulable;
+    let next = apply_spec_update(body, &name, current)?;
+    let now = next.spec.schedulable;
+    let updated = st.store.update(&next).await?;
+    if was != now {
+        info!(cluster = %name, schedulable = now, "cluster schedulability changed");
+    }
+    Ok(Json(updated))
 }
 
 // --- images ----------------------------------------------------------------

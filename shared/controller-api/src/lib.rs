@@ -44,8 +44,8 @@ pub use resources::{
     UserSpec, UserStatus, Vm, VmPhase, VmSpec, VmStatus,
 };
 pub use rest::{
-    ApiError, AuthState, Caller, CallerRole, CallerTenant, PeerCerts, check_envelope, conflict,
-    forbidden, guard, invalid, serve,
+    ApiError, AuthState, Caller, CallerRole, CallerTenant, PeerCerts, SpecUpdate,
+    apply_spec_update, check_envelope, conflict, forbidden, guard, invalid, serve,
 };
 pub use scheduler::{
     Candidate, DevicePolicy, FirstFit, PendingReason, PendingTally, Scheduler, SchedulerConfig,

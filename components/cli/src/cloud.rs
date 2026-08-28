@@ -20,8 +20,8 @@ use crate::client::Client;
 use crate::config::Target;
 use crate::output::{self, View, age, age_until, joined, mem, or_dash, readiness, size};
 use crate::{
-    CloudCmd, CloudCsrCmd, CloudFloatingIpCmd, CloudFloatingPoolCmd, CloudImageCmd,
-    CloudRoutedSubnetCmd, CloudTenantCmd, CloudUserCmd, CloudVmCmd, GlobalArgs, vm,
+    CloudClusterCmd, CloudCmd, CloudCsrCmd, CloudFloatingIpCmd, CloudFloatingPoolCmd,
+    CloudImageCmd, CloudRoutedSubnetCmd, CloudTenantCmd, CloudUserCmd, CloudVmCmd, GlobalArgs, vm,
 };
 
 const CLUSTERS: &str = "/apis/meister.io/v1/clusters";
@@ -171,6 +171,7 @@ pub async fn run(target: &Target, cmd: &CloudCmd, global: &GlobalArgs) -> Result
     let client = Client::new(target)?;
     match cmd {
         CloudCmd::Clusters => clusters(&client, global).await,
+        CloudCmd::Cluster { cmd } => run_cluster(&client, cmd, global).await,
         CloudCmd::Vm { cmd } => run_vm(&client, cmd, global).await,
         CloudCmd::Image { cmd } => run_image(&client, cmd, global).await,
         CloudCmd::Tenant { cmd } => run_tenant(&client, cmd, global).await,
@@ -248,6 +249,37 @@ fn cluster_row(c: Cluster, now: DateTime<Utc>) -> Vec<String> {
         joined(&cap.capabilities),
         c.status.vms.to_string(),
     ]
+}
+
+/// Cordon and uncordon at the cloud tier: the Node verbs one floor up, over
+/// the Cluster object, through the same read-edit-write compare-and-swap.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn run_cluster(client: &Client, cmd: &CloudClusterCmd, global: &GlobalArgs) -> Result<()> {
+    let (name, schedulable) = match cmd {
+        CloudClusterCmd::Cordon { name } => (name, false),
+        CloudClusterCmd::Uncordon { name } => (name, true),
+    };
+    let body = client
+        .patch_spec(
+            &format!("{CLUSTERS}/{name}"),
+            "parsing the cluster object",
+            &format!("cluster {name}"),
+            &|spec| {
+                spec.insert("schedulable".to_string(), json!(schedulable));
+                Ok(())
+            },
+        )
+        .await?;
+    output::emit_note(
+        global,
+        &body,
+        if schedulable {
+            "uncordoned"
+        } else {
+            "cordoned"
+        },
+        "note: draining stops new placements only; the vms already on this cluster keep running",
+    )
 }
 
 /// The same eight verbs as one tier down, over the same object, through the
