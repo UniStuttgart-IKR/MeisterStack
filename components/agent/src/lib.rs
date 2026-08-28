@@ -292,10 +292,15 @@ impl Agent {
     /// Node facts plus one phase per VM, all derived from the reconciler's own
     /// observation — see `reconcile::report_status`.
     async fn status_report(&self) -> anyhow::Result<StatusReport> {
-        let vms = self
-            .reconciler
-            .report()
-            .await?
+        let reported = self.reconciler.report().await?;
+        // The same view the controller gets, published as a gauge. Every
+        // phase every time, zero included, so that a phase nothing is in
+        // stays a flat line rather than a series that vanishes from a panel.
+        for phase in crate::reconcile::ReportedPhase::ALL {
+            let n = reported.iter().filter(|r| r.phase == phase).count();
+            telemetry::metrics::agent().set_vms(phase.as_str(), n as i64);
+        }
+        let vms = reported
             .into_iter()
             .map(|r| VmStatusReport {
                 id: r.id.to_string(),

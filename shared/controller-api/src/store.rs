@@ -48,6 +48,27 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+#[generated(model = ClaudeOpus, version = "5")]
+impl StoreError {
+    /// One word for the KIND of failure, for the `result` label on
+    /// `meister_etcd_errors_total`.
+    ///
+    /// The variant and never the message: the messages name keys, object
+    /// names and whole sentences, and a label built from one of those is the
+    /// unbounded label that takes a Prometheus down. Six words, one per
+    /// variant, and adding a variant is a compile error here.
+    pub fn metric_result(&self) -> &'static str {
+        match self {
+            StoreError::NotFound(_) => "not-found",
+            StoreError::AlreadyExists(_) => "already-exists",
+            StoreError::Conflict(_) => "conflict",
+            StoreError::Invalid(_) => "invalid",
+            StoreError::Backend(_) => "backend",
+            StoreError::Timeout(..) => "timeout",
+        }
+    }
+}
+
 pub struct EtcdStore {
     client: Client,
     prefix: String,
@@ -93,9 +114,29 @@ async fn timed<T, E>(
 where
     StoreError: From<E>,
 {
-    match tokio::time::timeout(REQUEST_TIMEOUT, fut).await {
+    let clock = telemetry::metrics::Timer::start();
+    let outcome = match tokio::time::timeout(REQUEST_TIMEOUT, fut).await {
         Ok(result) => result.map_err(StoreError::from),
         Err(_) => Err(StoreError::Timeout(what, REQUEST_TIMEOUT)),
+    };
+    // Every store operation in the process passes through here, which is what
+    // makes this the one place the latency and the failure rate can be
+    // measured without an argument about which call sites were instrumented.
+    telemetry::metrics::etcd().observe(what, clock.seconds());
+    if let Err(e) = &outcome {
+        telemetry::metrics::etcd().failed(what, e.metric_result());
+    }
+    outcome
+}
+
+/// Where this process is in the store's history, from whatever answer just
+/// came back. Every etcd response carries the revision it was served at, so
+/// this costs nothing beyond the read — and a controller whose observed
+/// revision stops moving while another replica's climbs is a controller that
+/// has been partitioned off, which is not visible from anything else here.
+fn observe_revision(header: Option<&etcd_client::ResponseHeader>) {
+    if let Some(header) = header {
+        telemetry::metrics::etcd().saw_revision(header.revision());
     }
 }
 
@@ -164,6 +205,7 @@ impl EtcdStore {
     pub async fn get<T: Resource>(&self, name: &str) -> Result<T> {
         let key = self.key(T::RESOURCE, name);
         let resp = timed("get", self.handle().get(key.clone(), None)).await?;
+        observe_revision(resp.header());
         let kv = resp.kvs().first().ok_or_else(|| {
             StoreError::NotFound(format!("{resource}/{name}", resource = T::RESOURCE))
         })?;
@@ -178,6 +220,7 @@ impl EtcdStore {
                 .get(dir, Some(GetOptions::new().with_prefix())),
         )
         .await?;
+        observe_revision(resp.header());
         let mut out = Vec::with_capacity(resp.kvs().len());
         for kv in resp.kvs() {
             match Self::decode(kv.value(), kv.mod_revision()) {
@@ -201,6 +244,7 @@ impl EtcdStore {
         let dir = self.dir(T::RESOURCE);
         let opts = GetOptions::new().with_prefix().with_count_only();
         let resp = timed("count", self.handle().get(dir, Some(opts))).await?;
+        observe_revision(resp.header());
         Ok(resp.count().max(0) as usize)
     }
 
@@ -278,6 +322,7 @@ impl EtcdStore {
         value: &[u8],
         resp: &TxnResponse,
     ) -> Result<T> {
+        observe_revision(resp.header());
         match resp.header() {
             Some(header) => Self::decode(value, header.revision()),
             None => self.get(name).await,

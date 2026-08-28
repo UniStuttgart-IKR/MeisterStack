@@ -48,6 +48,16 @@ pub struct AgentConfig {
     /// the fmt subscriber and nothing else, which is how this has always run.
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
+    /// Where to serve the Prometheus exposition, e.g. "127.0.0.1:9100".
+    /// Absent = nothing listens, which is how every node has run so far.
+    ///
+    /// Its own listener and not the `http-api` one: that socket is the node's
+    /// local admin API, this port is a scrape target, and a node that serves
+    /// metrics should not have to serve mutations to do it. On a box that
+    /// also runs a controller the two need different ports — which is the
+    /// reason there is no single hard default for the whole stack.
+    #[serde(default)]
+    pub metrics_listen: Option<String>,
 
     // --- the session credential. PEM paths, never PEM. -----------------------
     //

@@ -48,6 +48,7 @@ pub use rest::{
     forbidden, guard, invalid, serve,
 };
 pub use scheduler::{
-    Candidate, DevicePolicy, FirstFit, Scheduler, SchedulerConfig, pending_reason,
+    Candidate, DevicePolicy, FirstFit, PendingReason, PendingTally, Scheduler, SchedulerConfig,
+    pending_reason, pending_reason_of,
 };
 pub use store::{EtcdStore, PassTrigger, StoreError};

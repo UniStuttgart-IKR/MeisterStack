@@ -50,6 +50,11 @@ struct Args {
     /// over --cloud-addr; which one this cluster prefers is its own HRW order.
     #[arg(long)]
     cloud_addrs: Option<String>,
+    /// Prometheus exposition address. Given bare it is 127.0.0.1:9090;
+    /// absent, nothing listens. The endpoint is unauthenticated and its
+    /// series name objects across every tenant, so off is the default.
+    #[arg(long, num_args = 0..=1, default_missing_value = telemetry::metrics::DEFAULT_LISTEN)]
+    metrics_listen: Option<String>,
 }
 
 /// The central cluster setup file — written by the NixOS module in the lab,
@@ -66,6 +71,10 @@ struct FileConfig {
     etcd_prefix: Option<String>,
     /// OTLP collector for span export. Absent = fmt only.
     otlp_endpoint: Option<String>,
+    /// Where to serve the Prometheus exposition, e.g. "127.0.0.1:9090".
+    /// Absent = nothing listens. Its own port and never the API router: that
+    /// one is authenticated and tenant-scoped, and this one is neither.
+    metrics_listen: Option<String>,
     cloud_addr: Option<String>,
     /// The cloud replicas to choose between (HA, leaderless). Order here is
     /// irrelevant — this cluster derives its own preference order over the
@@ -109,6 +118,9 @@ struct Config {
     /// Where spans go, if anywhere. Resolved like every other key: flag over
     /// file, and absent means the fmt subscriber alone.
     otlp_endpoint: Option<String>,
+    /// Where the Prometheus exposition listens, if anywhere. Resolved like
+    /// every other key: flag over file, and absent means nothing listens.
+    metrics_listen: Option<String>,
     /// Where the cloud tier is, if there is one — every replica of it. Empty
     /// is not a degraded mode: a cluster without a cloud is the standalone
     /// cluster of M1-M3.
@@ -156,6 +168,7 @@ fn resolve_config(args: &Args) -> anyhow::Result<Config> {
         ),
         etcd_prefix: pick(&args.etcd_prefix, file.etcd_prefix, "/cluster"),
         otlp_endpoint: args.otlp_endpoint.clone().or(file.otlp_endpoint),
+        metrics_listen: args.metrics_listen.clone().or(file.metrics_listen),
         cloud_addrs,
         requeue: controller_api::RequeueConfig::into_policy(file.retry)?,
         scheduler: controller_api::SchedulerConfig::into_scheduler(file.scheduler)?,
@@ -206,6 +219,10 @@ async fn main() -> anyhow::Result<()> {
         otlp_endpoint: &cfg.otlp_endpoint,
     })?;
     info!(cluster = %cfg.cluster_name, "cluster-controller starting");
+    // Before everything else, so that a misspelled address fails at start-up
+    // rather than at the first scrape that never arrives. Its own listener:
+    // /metrics is unauthenticated and the series behind it name every node.
+    telemetry::metrics::serve(cfg.metrics_listen.as_deref()).await?;
 
     // Before anything builds a TLS config — tonic asks for the process
     // default and panics without one.

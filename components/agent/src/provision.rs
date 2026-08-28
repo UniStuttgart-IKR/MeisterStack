@@ -24,6 +24,30 @@ use std::sync::Arc;
 /// hook.
 const BACKEND_OVERHEAD_MIB: u64 = 512;
 
+/// One driver call, timed into `meister_agent_driver_operation_duration_seconds`.
+///
+/// Wrapped here rather than inside each driver because this is the layer that
+/// knows which driver it is talking to: below it a `BlockDriver` is a trait
+/// object with no name of its own, and above it nobody sees the individual
+/// calls. Both labels are bounded — a configured backend name and one of a
+/// handful of verbs — so the rule in `telemetry::metrics` holds.
+///
+/// The duration is recorded whether the call succeeded or not: a driver that
+/// fails after thirty seconds is exactly the case this is for.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn timed_driver<F: std::future::Future>(driver: &str, operation: &str, work: F) -> F::Output {
+    let clock = telemetry::metrics::Timer::start();
+    let out = work.await;
+    telemetry::metrics::agent().driver_op(driver, operation, clock.seconds());
+    out
+}
+
+/// What the hypervisor and the networking drivers are called in those labels.
+/// Neither is looked up by name in a configured map the way storage and
+/// devices are, so the name has to come from somewhere — here, once.
+const HYPERVISOR: &str = "hypervisor";
+const NETWORKING: &str = "network";
+
 pub struct Provisioner {
     store: Arc<Store>,
     drivers: Drivers,
@@ -253,10 +277,13 @@ impl Provisioner {
                      on this node"
                 )
             })?;
-            let vol = driver
-                .create(&v.id, &v.spec, Some(&cgroup))
-                .await
-                .with_context(|| format!("creating volume {} via {driver_name}", v.id))?;
+            let vol = timed_driver(
+                &driver_name,
+                "create",
+                driver.create(&v.id, &v.spec, Some(&cgroup)),
+            )
+            .await
+            .with_context(|| format!("creating volume {} via {driver_name}", v.id))?;
             record.volumes.push(vol);
         }
         record.phase = Phase::VolumesDone;
@@ -295,12 +322,13 @@ impl Provisioner {
                         })?;
                 }
             }
-            let nic = self
-                .drivers
-                .networking
-                .create(&n.id, &n.spec)
-                .await
-                .with_context(|| format!("creating nic {}", n.id))?;
+            let nic = timed_driver(
+                NETWORKING,
+                "create",
+                self.drivers.networking.create(&n.id, &n.spec),
+            )
+            .await
+            .with_context(|| format!("creating nic {}", n.id))?;
             record.nics.push(nic);
         }
         record.phase = Phase::NetworkDone;
@@ -314,10 +342,13 @@ impl Provisioner {
                     d.spec.driver
                 )
             })?;
-            let dev = driver
-                .create(&d.id, &d.spec, Some(&cgroup))
-                .await
-                .with_context(|| format!("creating device {} via {}", d.id, d.spec.driver))?;
+            let dev = timed_driver(
+                &d.spec.driver,
+                "create",
+                driver.create(&d.id, &d.spec, Some(&cgroup)),
+            )
+            .await
+            .with_context(|| format!("creating device {} via {}", d.id, d.spec.driver))?;
             record.devices.push(dev);
         }
         record.phase = Phase::DevicesDone;
@@ -338,19 +369,18 @@ impl Provisioner {
 
         let ispec = self.build_instance_spec(&spec, record)?;
         debug!(?ispec, "creating hypervisor");
-        let vmm_pid = self
-            .drivers
-            .hypervisor
-            .create(id, &ispec, Some(&cgroup))
-            .await
-            .context("hypervisor create")?;
+        let vmm_pid = timed_driver(
+            HYPERVISOR,
+            "create",
+            self.drivers.hypervisor.create(id, &ispec, Some(&cgroup)),
+        )
+        .await
+        .context("hypervisor create")?;
         record.vmm_pid = Some(vmm_pid);
         self.store.put(id, record)?;
 
         debug!(?ispec, "starting hypervisor");
-        self.drivers
-            .hypervisor
-            .start(id)
+        timed_driver(HYPERVISOR, "start", self.drivers.hypervisor.start(id))
             .await
             .context("hypervisor start")?;
 
@@ -465,7 +495,7 @@ impl Provisioner {
             failures.push(format!("cgroup kill: {e}"));
         }
 
-        match self.drivers.hypervisor.destroy(id).await {
+        match timed_driver(HYPERVISOR, "destroy", self.drivers.hypervisor.destroy(id)).await {
             Ok(()) | Err(HypervisorError::NotFound(_)) => {}
             Err(e) => failures.push(format!("hypervisor destroy: {e}")),
         }
@@ -484,13 +514,21 @@ impl Provisioner {
                 ));
                 continue;
             };
-            if let Err(e) = driver.destroy(&d.id, &d.attachment).await {
+            if let Err(e) =
+                timed_driver(&name, "destroy", driver.destroy(&d.id, &d.attachment)).await
+            {
                 failures.push(format!("device {}: {e}", d.id));
             }
         }
 
         for n in &record.nics {
-            if let Err(e) = self.drivers.networking.destroy(&n.id).await {
+            if let Err(e) = timed_driver(
+                NETWORKING,
+                "destroy",
+                self.drivers.networking.destroy(&n.id),
+            )
+            .await
+            {
                 failures.push(format!("nic {}: {e}", n.id));
             }
         }
@@ -504,7 +542,9 @@ impl Provisioner {
                 ));
                 continue;
             };
-            if let Err(e) = driver.destroy(&v.id, &v.attachment).await {
+            if let Err(e) =
+                timed_driver(&name, "destroy", driver.destroy(&v.id, &v.attachment)).await
+            {
                 failures.push(format!("volume {}: {e}", v.id));
             }
         }
@@ -525,7 +565,7 @@ impl Provisioner {
     #[generated(model = ClaudeFable, version = "5")]
     #[instrument(skip(self, record), fields(vm_id = %id))]
     pub(crate) async fn stop(&self, id: &VmId, mut record: VmRecord) -> Result<()> {
-        match self.drivers.hypervisor.destroy(id).await {
+        match timed_driver(HYPERVISOR, "destroy", self.drivers.hypervisor.destroy(id)).await {
             Ok(()) | Err(HypervisorError::NotFound(_)) => {}
             Err(e) => bail!("stopping vmm: {e}"),
         }
@@ -550,7 +590,9 @@ impl Provisioner {
             let name = device_driver_name(&record, &d.id);
             match self.drivers.devices.get(&name) {
                 Some(driver) => {
-                    if let Err(e) = driver.destroy(&d.id, &d.attachment).await {
+                    if let Err(e) =
+                        timed_driver(&name, "destroy", driver.destroy(&d.id, &d.attachment)).await
+                    {
                         warn!(device = %d.id, error = %format!("{e:#}"),
                               "stopping device backend failed");
                     }
@@ -570,7 +612,9 @@ impl Provisioner {
             let name = volume_driver_name(&record, &v.id);
             match self.drivers.storage.get(&name) {
                 Some(driver) => {
-                    if let Err(e) = driver.detach(&v.id, &v.attachment).await {
+                    if let Err(e) =
+                        timed_driver(&name, "detach", driver.detach(&v.id, &v.attachment)).await
+                    {
                         warn!(volume = %v.id, error = %format!("{e:#}"),
                               "detaching volume backend failed");
                     }

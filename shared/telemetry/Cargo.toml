@@ -15,3 +15,10 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+
+# The metrics half. `prometheus` carries the registry and the text exposition
+# format; `axum` and `tokio` are the listener that serves it, which is its own
+# port and never the tenant router (see `metrics::serve`).
+prometheus = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }

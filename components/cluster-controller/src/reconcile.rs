@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use controller_api::{
-    Candidate, EtcdStore, Lifecycle, Node, PassTrigger, RequeuePolicy, RunStrategy, Scheduler,
-    StoreError, Vm, VmPhase, heartbeat_expired, lifecycle_command,
+    Candidate, EtcdStore, Lifecycle, Node, PassTrigger, PendingTally, RequeuePolicy, Resource,
+    RunStrategy, Scheduler, StoreError, Vm, VmPhase, heartbeat_expired, lifecycle_command,
 };
 use macros::generated;
 use proto::command;
@@ -86,7 +86,18 @@ pub async fn run(
     let mut trigger = PassTrigger::<Vm>::new(&store, TICK).await;
     loop {
         trigger.wait(&store).await;
-        if let Err(e) = pass(&store, &registry, scheduler.as_ref(), requeue.as_ref()).await {
+        let clock = telemetry::metrics::Timer::start();
+        let outcome = pass(&store, &registry, scheduler.as_ref(), requeue.as_ref()).await;
+        // Measured around the whole pass and not around its parts: what an
+        // operator is asking when a cluster feels slow is how long one lap of
+        // the loop takes, and a pass that FAILED still took the time it took.
+        telemetry::metrics::reconcile().pass(
+            telemetry::metrics::TIER_CLUSTER,
+            Vm::KIND,
+            clock.seconds(),
+            outcome.is_ok(),
+        );
+        if let Err(e) = outcome {
             warn!(error = format!("{e:#}"), "reconcile pass failed");
         }
     }
@@ -102,7 +113,10 @@ async fn pass(
     // One reading of the session map for the whole pass: what this replica
     // owns must not change halfway through the list it is deciding about.
     let sessions = registry.connected();
+    telemetry::metrics::sessions()
+        .set_connected(telemetry::metrics::PEER_NODE, sessions.len() as i64);
     let nodes = expire_and_collect_nodes(store, &sessions).await?;
+    telemetry::metrics::objects().set_count(Node::KIND, nodes.len() as i64);
     let pass = Pass {
         store,
         registry,
@@ -110,14 +124,35 @@ async fn pass(
         requeue,
         sessions: &sessions,
         nodes: &nodes,
+        pending: PendingTally::new(),
     };
-    for vm in store.list::<Vm>().await? {
+    let vms = store.list::<Vm>().await?;
+    publish_vm_gauges(&vms);
+    for vm in vms {
         let name = vm.metadata.name.clone();
         if let Err(e) = reconcile_vm(&pass, vm).await {
             warn!(vm = %name, error = format!("{e:#}"), "vm reconcile failed");
         }
     }
+    // After the loop, because until it has run nobody knows how many VMs are
+    // pending for which reason. See `PendingTally`.
+    pass.pending.publish(telemetry::metrics::TIER_CLUSTER);
     Ok(())
+}
+
+/// How many VMs there are, and how they are spread over the phases.
+///
+/// Every phase every time, zero included: a phase that stops being written
+/// while nothing is in it looks, in a dashboard, exactly like a controller
+/// that stopped reporting. Derived from the listing the pass already made —
+/// this costs no etcd round trip of its own.
+#[generated(model = ClaudeOpus, version = "5")]
+fn publish_vm_gauges(vms: &[Vm]) {
+    telemetry::metrics::objects().set_count(Vm::KIND, vms.len() as i64);
+    for phase in VmPhase::ALL {
+        let n = vms.iter().filter(|v| v.status.phase == phase).count();
+        telemetry::metrics::objects().set_vms(phase.as_str(), n as i64);
+    }
 }
 
 /// Everything one pass carries from VM to VM, in one place: the store it
@@ -139,6 +174,8 @@ struct Pass<'a> {
     sessions: &'a HashSet<String>,
     /// What is left after the heartbeat expiry, as the scheduler wants it.
     nodes: &'a [Candidate],
+    /// Filled in by `place`, published once at the end of the pass.
+    pending: PendingTally,
 }
 
 /// Expire stale heartbeats and hand the scheduler what is left. Both halves
@@ -158,8 +195,20 @@ async fn expire_and_collect_nodes(
 ) -> anyhow::Result<Vec<Candidate>> {
     let now = Utc::now();
     let mut out = Vec::new();
+    // The whole per-node series set is rebuilt from this listing. A node that
+    // has been removed from the inventory has to LOSE its age rather than
+    // keep the last one for ever — frozen, and indistinguishable from a node
+    // whose heartbeat merely stopped.
+    telemetry::metrics::sessions().reset_heartbeats();
     for node in store.list::<Node>().await? {
         let name = node.metadata.name;
+        if let Some(last) = node.status.last_heartbeat {
+            telemetry::metrics::sessions().set_heartbeat_age(
+                telemetry::metrics::PEER_NODE,
+                &name,
+                (now - last).num_milliseconds() as f64 / 1000.0,
+            );
+        }
         let mut ready = node.status.ready;
         if ready && heartbeat_expired(node.status.last_heartbeat, now) {
             // ISO-8601 UTC rather than the Debug of an Option: the instant
@@ -305,7 +354,12 @@ async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
         // `vm inspect` both showed the phase and nothing else, while the one
         // explanation lived in a `debug!` line inside whichever replica
         // happened to run the pass.
-        let reason = controller_api::pending_reason(&vm, p.nodes);
+        //
+        // The sentence goes on the object and the CATEGORY goes in the
+        // tally: the sentence counts candidates and names capabilities, and
+        // is exactly the string that must never become a metric label.
+        let (category, reason) = controller_api::pending_reason_of(&vm, p.nodes);
+        p.pending.note(category);
         debug!(
             known = p.nodes.len(),
             reason = %reason,
@@ -335,8 +389,12 @@ async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     // it could not be placed.
     bound.status.message = None;
     match p.store.update(&bound).await {
-        Ok(_) => info!(node = %node, "scheduled"),
+        Ok(_) => {
+            telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLUSTER);
+            info!(node = %node, "scheduled")
+        }
         Err(StoreError::Conflict(_)) => {
+            telemetry::metrics::scheduling().conflict(telemetry::metrics::TIER_CLUSTER);
             debug!(node = %node, "lost the scheduling race, another writer bound it")
         }
         Err(e) => return Err(e.into()),

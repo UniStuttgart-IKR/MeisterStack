@@ -89,6 +89,11 @@ opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.33"
+# Metrics are the second signal and a separate one: traces leave over OTLP,
+# time series are SCRAPED. No default features — the protobuf exposition and
+# the process collector are both off, which leaves the registry and the text
+# encoder, and the text format is the only one a Prometheus needs.
+prometheus = { version = "0.14", default-features = false }
 
 # os utils
 nix = { version = "0.31", features = ["fs", "zerocopy", "ioctl", "process", "signal", "resource"] }

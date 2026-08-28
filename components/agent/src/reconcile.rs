@@ -250,6 +250,19 @@ pub enum ReportedPhase {
 }
 
 impl ReportedPhase {
+    /// Every variant, in declaration order. What the status report walks to
+    /// publish a zero for the phases nothing is in — a phase that stops being
+    /// written looks, in a dashboard, exactly like an agent that stopped
+    /// reporting.
+    pub const ALL: [ReportedPhase; 6] = [
+        ReportedPhase::Provisioning,
+        ReportedPhase::Running,
+        ReportedPhase::Stopped,
+        ReportedPhase::Paused,
+        ReportedPhase::Failed,
+        ReportedPhase::Quarantined,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             ReportedPhase::Provisioning => "Provisioning",
@@ -400,6 +413,22 @@ impl Reconciler {
 
     #[instrument(skip_all, fields(?trigger))]
     pub async fn reconcile_all(&self, trigger: Trigger) -> Result<ReconcileSummary> {
+        let clock = telemetry::metrics::Timer::start();
+        let outcome = self.reconcile_all_inner(trigger).await;
+        // "Vm" spelled out rather than taken from a constant: the agent does
+        // not depend on controller-api, and the kind is the wire contract
+        // either way (control.proto). Same series as the two tiers above, so
+        // one panel shows all three.
+        telemetry::metrics::reconcile().pass(
+            telemetry::metrics::TIER_AGENT,
+            "Vm",
+            clock.seconds(),
+            outcome.is_ok(),
+        );
+        outcome
+    }
+
+    async fn reconcile_all_inner(&self, trigger: Trigger) -> Result<ReconcileSummary> {
         let mut summary = ReconcileSummary::default();
         let vms = self.store.list()?;
         summary.total = vms.len();
@@ -528,6 +557,11 @@ impl Reconciler {
                 // only start/stop/destroy clears the marker, and all three
                 // need a human.
                 error!(reason = BACKEND_DIED_REASON, "marking vm unhealthy");
+                // Counted where the marker is SET and not where it is
+                // reported: the report repeats the same quarantine every ten
+                // seconds, and a counter fed from there would measure the
+                // reporting interval rather than the events.
+                telemetry::metrics::agent().quarantined();
                 // Through `mutate` and NOT `put`: `observe` above awaited a
                 // probe of the VMM's socket, so the record in hand is a
                 // snapshot from before that wait. Writing the whole thing back

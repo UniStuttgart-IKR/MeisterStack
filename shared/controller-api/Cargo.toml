@@ -7,6 +7,9 @@ edition = "2024"
 macros = { package = "meister-macros", path = "../macros" }
 common = { package = "meister-common", path = "../common" }
 pki = { package = "meister-pki", path = "../pki" }
+# The metrics registry. The store is one of the three places that writes to
+# it, and the only one that can say what an etcd operation cost.
+telemetry = { package = "meister-telemetry", path = "../telemetry" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

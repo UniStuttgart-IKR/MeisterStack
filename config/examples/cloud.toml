@@ -33,6 +33,23 @@ etcd_prefix = "/cloud"
 # in the agent's log three hops down.
 #otlp_endpoint = "http://127.0.0.1:4317"
 
+# --- metrics ---------------------------------------------------------------
+#
+# Where the Prometheus exposition listens. Absent — the default — means
+# NOTHING listens, and that is a security decision rather than caution: the
+# REST edge is authenticated and tenant-scoped, /metrics is neither, and the
+# series behind it name clusters and objects across every tenant. A stock Prometheus
+# scrapes it and a stock Grafana draws it; there is no glue in between,
+# because every name carries the meister_ prefix, its unit (_seconds, _total)
+# and only labels whose value ranges are bounded.
+#
+# Loopback, because the scraper should be on the box or reach it through
+# something that already decides who may ask. One port per PROCESS: an
+# all-in-one box runs three of these and they cannot share 9090.
+#
+# The flag `--metrics-listen` with no value takes 127.0.0.1:9090.
+#metrics_listen = "127.0.0.1:9090"
+
 # --- tenants --------------------------------------------------------------
 #
 # Every tenant gets a VXLAN network identifier when it is created, allocated

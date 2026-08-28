@@ -30,8 +30,8 @@ use std::time::Duration;
 use anyhow::bail;
 use chrono::{DateTime, Utc};
 use controller_api::{
-    Ack, Candidate, Cluster, EtcdStore, PassTrigger, RunStrategy, Scheduler, StoreError, Vm,
-    VmPhase, heartbeat_expired, lifecycle_command,
+    Ack, Candidate, Cluster, EtcdStore, PassTrigger, PendingTally, Resource, RunStrategy,
+    Scheduler, StoreError, Vm, VmPhase, heartbeat_expired, lifecycle_command,
 };
 use macros::generated;
 use proto::cloud_command;
@@ -85,7 +85,18 @@ pub async fn run(
     let mut trigger = PassTrigger::<Vm>::new(&store, TICK).await;
     loop {
         trigger.wait(&store).await;
-        if let Err(e) = pass(&store, &registry, scheduler.as_ref()).await {
+        let clock = telemetry::metrics::Timer::start();
+        let outcome = pass(&store, &registry, scheduler.as_ref()).await;
+        // Around the whole pass, and a failed pass still took the time it
+        // took — the same measurement as one tier down, so a slow lap can be
+        // compared between the two.
+        telemetry::metrics::reconcile().pass(
+            telemetry::metrics::TIER_CLOUD,
+            Vm::KIND,
+            clock.seconds(),
+            outcome.is_ok(),
+        );
+        if let Err(e) = outcome {
             warn!(error = format!("{e:#}"), "reconcile pass failed");
         }
     }
@@ -100,19 +111,43 @@ async fn pass(
     // One reading of the session map for the whole pass: what this replica
     // owns must not change halfway through the list it is deciding about.
     let sessions = registry.connected();
+    telemetry::metrics::sessions()
+        .set_connected(telemetry::metrics::PEER_CLUSTER, sessions.len() as i64);
     let clusters = expire_and_collect_clusters(store, &sessions).await?;
+    telemetry::metrics::objects().set_count(Cluster::KIND, clusters.len() as i64);
     // And one reading of the address book, but only if somebody asks for it:
     // most passes dispatch nothing, and those must go on costing nothing.
     let book = OnceCell::new();
-    for vm in store.list::<Vm>().await? {
+    let pending = PendingTally::new();
+    let vms = store.list::<Vm>().await?;
+    publish_vm_gauges(&vms);
+    for vm in vms {
         let name = vm.metadata.name.clone();
-        if let Err(e) =
-            reconcile_vm(store, registry, scheduler, &sessions, &clusters, &book, vm).await
+        if let Err(e) = reconcile_vm(
+            store, registry, scheduler, &sessions, &clusters, &book, &pending, vm,
+        )
+        .await
         {
             warn!(vm = %name, error = format!("{e:#}"), "vm reconcile failed");
         }
     }
+    // After the loop: until it has run nobody knows how many VMs are pending
+    // for which reason. See `PendingTally`.
+    pending.publish(telemetry::metrics::TIER_CLOUD);
     Ok(())
+}
+
+/// How many VMs there are, and how they are spread over the phases. Every
+/// phase every time, zero included — see the cluster tier's twin: a phase
+/// that stops being written looks exactly like a controller that stopped
+/// reporting.
+#[generated(model = ClaudeOpus, version = "5")]
+fn publish_vm_gauges(vms: &[Vm]) {
+    telemetry::metrics::objects().set_count(Vm::KIND, vms.len() as i64);
+    for phase in VmPhase::ALL {
+        let n = vms.iter().filter(|v| v.status.phase == phase).count();
+        telemetry::metrics::objects().set_vms(phase.as_str(), n as i64);
+    }
 }
 
 /// Expire stale heartbeats and hand the scheduler what is left. Both halves
@@ -132,8 +167,18 @@ async fn expire_and_collect_clusters(
 ) -> anyhow::Result<Vec<Candidate>> {
     let now = Utc::now();
     let mut out = Vec::new();
+    // Rebuilt from this listing every pass: a cluster taken out of the
+    // inventory must LOSE its age rather than keep the last one for ever.
+    telemetry::metrics::sessions().reset_heartbeats();
     for cluster in store.list::<Cluster>().await? {
         let name = cluster.metadata.name;
+        if let Some(last) = cluster.status.last_heartbeat {
+            telemetry::metrics::sessions().set_heartbeat_age(
+                telemetry::metrics::PEER_CLUSTER,
+                &name,
+                (now - last).num_milliseconds() as f64 / 1000.0,
+            );
+        }
         let mut connected = cluster.status.connected;
         if connected && heartbeat_expired(cluster.status.last_heartbeat, now) {
             // ISO-8601 UTC rather than the Debug of an Option: the instant
@@ -178,6 +223,7 @@ async fn reconcile_vm(
     sessions: &HashSet<String>,
     clusters: &[Candidate],
     book: &OnceCell<AddressBook>,
+    pending: &PendingTally,
     vm: Vm,
 ) -> anyhow::Result<()> {
     let context = birth_trace(&vm).unwrap_or_else(telemetry::TraceParent::root);
@@ -191,7 +237,7 @@ async fn reconcile_vm(
         span,
         &context,
         reconcile_vm_traced(
-            store, registry, scheduler, sessions, clusters, book, vm, context,
+            store, registry, scheduler, sessions, clusters, book, pending, vm, context,
         ),
     )
     .await
@@ -225,6 +271,7 @@ async fn reconcile_vm_traced(
     sessions: &HashSet<String>,
     clusters: &[Candidate],
     book: &OnceCell<AddressBook>,
+    pending: &PendingTally,
     vm: Vm,
     context: telemetry::TraceParent,
 ) -> anyhow::Result<()> {
@@ -260,8 +307,12 @@ async fn reconcile_vm_traced(
                 // why there was none.
                 bound.status.message = None;
                 match store.update(&bound).await {
-                    Ok(_) => info!(cluster = %pick, "scheduled"),
+                    Ok(_) => {
+                        telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLOUD);
+                        info!(cluster = %pick, "scheduled")
+                    }
                     Err(StoreError::Conflict(_)) => {
+                        telemetry::metrics::scheduling().conflict(telemetry::metrics::TIER_CLOUD);
                         debug!(cluster = %pick, "lost the scheduling race, another writer bound it")
                     }
                     Err(e) => return Err(e.into()),
@@ -273,7 +324,11 @@ async fn reconcile_vm_traced(
                 // sentence is worth even more: a cluster catalogue is the
                 // UNION of its nodes', so "each part is served somewhere" is
                 // a real and otherwise invisible outcome here.
-                let reason = controller_api::pending_reason(&vm, clusters);
+                // The sentence goes on the object, the CATEGORY into the
+                // tally: the sentence names capabilities and counts
+                // candidates, and is the string that must never be a label.
+                let (category, reason) = controller_api::pending_reason_of(&vm, clusters);
+                pending.note(category);
                 debug!(
                     known = clusters.len(),
                     reason = %reason,

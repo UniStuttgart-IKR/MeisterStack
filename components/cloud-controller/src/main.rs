@@ -48,6 +48,11 @@ struct Args {
     /// the fmt subscriber and nothing else, which is how this has always run.
     #[arg(long)]
     otlp_endpoint: Option<String>,
+    /// Prometheus exposition address. Given bare it is 127.0.0.1:9090;
+    /// absent, nothing listens. The endpoint is unauthenticated and its
+    /// series name objects across every tenant, so off is the default.
+    #[arg(long, num_args = 0..=1, default_missing_value = telemetry::metrics::DEFAULT_LISTEN)]
+    metrics_listen: Option<String>,
 }
 
 /// The central cloud setup file — written by the NixOS module in the lab,
@@ -63,6 +68,10 @@ struct FileConfig {
     etcd_prefix: Option<String>,
     /// OTLP collector for span export. Absent = fmt only.
     otlp_endpoint: Option<String>,
+    /// Where to serve the Prometheus exposition, e.g. "127.0.0.1:9090".
+    /// Absent = nothing listens. Its own port and never the API router: that
+    /// one is authenticated and tenant-scoped, and this one is neither.
+    metrics_listen: Option<String>,
 
     // --- tls and auth. Every one of these is a PEM path, never PEM. ---
     //
@@ -110,6 +119,9 @@ struct Config {
     /// Where spans go, if anywhere. Resolved like every other key: flag over
     /// file, and absent means the fmt subscriber alone.
     otlp_endpoint: Option<String>,
+    /// Where the Prometheus exposition listens, if anywhere. Resolved like
+    /// every other key: flag over file, and absent means nothing listens.
+    metrics_listen: Option<String>,
     /// The directory the config file was read from; PEM paths in it are
     /// relative to that, so a bundle stays a bundle when it moves.
     config_dir: Option<PathBuf>,
@@ -157,6 +169,7 @@ fn resolve_config(args: &Args) -> anyhow::Result<Config> {
         ),
         etcd_prefix: pick(&args.etcd_prefix, file.etcd_prefix, "/cloud"),
         otlp_endpoint: args.otlp_endpoint.clone().or(file.otlp_endpoint),
+        metrics_listen: args.metrics_listen.clone().or(file.metrics_listen),
         config_dir: args.config.parent().map(std::path::Path::to_path_buf),
         tls_cert: file.tls_cert,
         tls_key: file.tls_key,
@@ -225,6 +238,11 @@ async fn main() -> anyhow::Result<()> {
         otlp_endpoint: &cfg.otlp_endpoint,
     })?;
     info!("cloud-controller starting");
+    // Before the store, the sessions and the API, so that a misspelled
+    // address fails at start-up rather than at the first scrape that never
+    // arrives. Its own listener: /metrics is unauthenticated, and the series
+    // behind it name clusters and objects across every tenant.
+    telemetry::metrics::serve(cfg.metrics_listen.as_deref()).await?;
 
     // Before anything builds a TLS config; tonic asks for the process default
     // and panics without one, and the first gRPC handshake is a bad place to

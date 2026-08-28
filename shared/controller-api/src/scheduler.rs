@@ -200,30 +200,134 @@ impl DevicePolicy {
     }
 }
 
-/// Why a VM found no placement, in one sentence an operator can act on.
+/// The CATEGORY of why a VM found no placement — the same question
+/// `pending_reason` answers in a sentence, in a form that can be a label.
+///
+/// The two exist together and neither replaces the other. The sentence names
+/// the capabilities nobody offers and counts the candidates it looked at, and
+/// that is what an operator reads off the object; it is also, for exactly
+/// those reasons, unbounded, and a metric label with an unbounded value range
+/// is what takes a Prometheus down. This is the closed set behind it, so that
+/// "how many VMs are pending, and why" is a time series rather than a string.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingReason {
+    /// Nothing has ever dialled in here.
+    NoCandidates,
+    /// Some are known; none is both connected and schedulable — everything is
+    /// down, or everything is drained.
+    NoneUsable,
+    /// Something the VM asks for is offered by nobody at all.
+    Unserved,
+    /// Every part of the ask is served somewhere, and no single candidate
+    /// serves all of it at once.
+    Split,
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl PendingReason {
+    /// Every variant, in declaration order — see `RunStrategy::ALL`. What a
+    /// pass walks to publish a zero for the reasons nothing is pending for,
+    /// so that a reason with no VMs stays a flat line in a dashboard rather
+    /// than a series that vanishes.
+    pub const ALL: [PendingReason; 4] = [
+        PendingReason::NoCandidates,
+        PendingReason::NoneUsable,
+        PendingReason::Unserved,
+        PendingReason::Split,
+    ];
+
+    /// Where this variant sits in `ALL` — the slot a `PendingTally` counts
+    /// into. Derived from the table rather than written twice, so the two
+    /// cannot drift.
+    pub fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|r| *r == self)
+            .expect("ALL names every variant")
+    }
+
+    /// The label value. Kebab-case and stable: a dashboard is written against
+    /// these words, and renaming one silently breaks every query that names
+    /// it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PendingReason::NoCandidates => "no-candidates",
+            PendingReason::NoneUsable => "none-usable",
+            PendingReason::Unserved => "unserved-request",
+            PendingReason::Split => "split-request",
+        }
+    }
+}
+
+/// How many VMs are pending for each reason, over one reconcile pass.
+///
+/// A gauge cannot be incremented from inside the per-VM step and be right:
+/// what a dashboard needs is "how many are pending for this reason NOW", so
+/// the pass counts and publishes once at the end — including the zeros, so
+/// that a reason nothing is pending for stays a flat line rather than a
+/// series that disappears while the panel is being read.
+///
+/// Atomics rather than a `Cell`, because the pass holds this behind a shared
+/// reference across an await and the future has to stay `Send`. There is no
+/// contention: one pass, one task.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Debug, Default)]
+pub struct PendingTally([std::sync::atomic::AtomicI64; PendingReason::ALL.len()]);
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl PendingTally {
+    pub fn new() -> Self {
+        Self(std::array::from_fn(|_| {
+            std::sync::atomic::AtomicI64::new(0)
+        }))
+    }
+
+    pub fn note(&self, reason: PendingReason) {
+        self.0[reason.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Publish every reason for this tier, zero included.
+    pub fn publish(&self, tier: &str) {
+        for reason in PendingReason::ALL {
+            let n = self.0[reason.index()].load(std::sync::atomic::Ordering::Relaxed);
+            telemetry::metrics::scheduling().set_pending(tier, reason.as_str(), n);
+        }
+    }
+}
+
+/// Why a VM found no placement: the category, and one sentence an operator
+/// can act on.
 ///
 /// The scheduler's `None` is the whole of what the reconciler learns, and
-/// until now the explanation existed only as a `debug!` line inside a
+/// until this existed the explanation lived only as a `debug!` line inside a
 /// controller — so a Pending VM was a dead end for anybody holding only the
-/// API. This turns the same three cases into a sentence that can be stored on
-/// the object and read back with `vm inspect`.
+/// API. This turns the same cases into a sentence that can be stored on the
+/// object and read back with `vm inspect`, and into a category that can be a
+/// metric label.
 ///
 /// The order matters: "nobody is here" and "nobody is willing" are different
-/// operator problems from "nobody can", and only the third one is about the
-/// VM's own demands.
+/// operator problems from "nobody can", and only the last is about the VM's
+/// own demands.
 #[generated(model = ClaudeFable, version = "5")]
-pub fn pending_reason(vm: &Vm, candidates: &[Candidate]) -> String {
+pub fn pending_reason_of(vm: &Vm, candidates: &[Candidate]) -> (PendingReason, String) {
     if candidates.is_empty() {
-        return "no candidates are known here yet".to_string();
+        return (
+            PendingReason::NoCandidates,
+            "no candidates are known here yet".to_string(),
+        );
     }
     let usable = candidates
         .iter()
         .filter(|c| c.connected && c.schedulable)
         .count();
     if usable == 0 {
-        return format!(
-            "none of the {} known candidates is both connected and schedulable",
-            candidates.len()
+        return (
+            PendingReason::NoneUsable,
+            format!(
+                "none of the {} known candidates is both connected and schedulable",
+                candidates.len()
+            ),
         );
     }
     let wanted = DevicePolicy::of(vm);
@@ -234,17 +338,29 @@ pub fn pending_reason(vm: &Vm, candidates: &[Candidate]) -> String {
         // holds the whole set. Worth its own sentence, because the operator
         // fix is different (put the capabilities on one machine, or ask for
         // less on one vm).
-        return format!(
-            "no single candidate offers all of [{}] at once, though each part is served somewhere",
-            wanted
-                .requests()
-                .iter()
-                .map(|(d, p)| capability::entry(d, p.as_deref()))
-                .collect::<Vec<_>>()
-                .join(", ")
+        return (
+            PendingReason::Split,
+            format!(
+                "no single candidate offers all of [{}] at once, though each part is served \
+                 somewhere",
+                wanted
+                    .requests()
+                    .iter()
+                    .map(|(d, p)| capability::entry(d, p.as_deref()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         );
     }
-    format!("no connected candidate offers [{}]", unmet.join(", "))
+    (
+        PendingReason::Unserved,
+        format!("no connected candidate offers [{}]", unmet.join(", ")),
+    )
+}
+
+/// Just the sentence, for the callers that only put it on the object.
+pub fn pending_reason(vm: &Vm, candidates: &[Candidate]) -> String {
+    pending_reason_of(vm, candidates).1
 }
 
 #[generated(model = ClaudeFable, version = "5")]
@@ -703,6 +819,59 @@ mod tests {
         let plain = [gpu_candidate("agent-1a", &[])];
         let msg = pending_reason(&vm_asking(nvrm_4q()), &plain);
         assert!(msg.contains("nvrm/4q"), "{msg}");
+    }
+
+    /// The category behind the sentence: a closed set, because the sentence
+    /// itself counts candidates and names capabilities and is therefore
+    /// exactly the kind of string that must never become a metric label.
+    #[test]
+    fn every_sentence_carries_the_category_it_belongs_to() {
+        let nothing: [Candidate; 0] = [];
+        assert_eq!(
+            pending_reason_of(&vm(), &nothing).0,
+            PendingReason::NoCandidates
+        );
+        let asleep = [
+            candidate("gone", false, true),
+            candidate("draining", true, false),
+        ];
+        assert_eq!(
+            pending_reason_of(&vm(), &asleep).0,
+            PendingReason::NoneUsable
+        );
+        let plain = [gpu_candidate("agent-1a", &[])];
+        assert_eq!(
+            pending_reason_of(&vm_asking(nvrm_4q()), &plain).0,
+            PendingReason::Unserved
+        );
+        let union = [gpu_candidate("cluster-1", &["nvrm/4q", "network/vxlan"])];
+        let split = serde_json::json!({
+            "devices": [{"driver": "nvrm", "profile": "4q"}],
+            "nics": [{"vxlan_id": 10000}],
+        });
+        assert_eq!(
+            pending_reason_of(&vm_asking(split), &union).0,
+            PendingReason::Split
+        );
+
+        // The label spellings are what a dashboard is written against, so
+        // they are asserted rather than left to the Debug impl. Distinct,
+        // and every variant is in ALL.
+        let words: Vec<&str> = PendingReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            words,
+            [
+                "no-candidates",
+                "none-usable",
+                "unserved-request",
+                "split-request"
+            ]
+        );
+        // and the sentence is still the sentence
+        assert_eq!(
+            pending_reason(&vm(), &nothing),
+            pending_reason_of(&vm(), &nothing).1
+        );
     }
 
     /// The trap the lab walked into, and the reason this function has a third

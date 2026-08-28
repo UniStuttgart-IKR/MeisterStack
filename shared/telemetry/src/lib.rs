@@ -12,6 +12,7 @@
 //! turned on, and nothing about how it traces is lost when it is turned off:
 //! the trace id is a span field either way (see `traceparent`).
 
+pub mod metrics;
 pub mod traceparent;
 
 use std::time::Duration;

@@ -27,6 +27,10 @@ async fn main() -> anyhow::Result<()> {
         otlp_endpoint: &config.otlp_endpoint,
     })?;
 
+    // Before the agent comes up, so that a misspelled address fails at
+    // start-up rather than at the first scrape that never arrives.
+    telemetry::metrics::serve(config.metrics_listen.as_deref()).await?;
+
     let result = meister_agent::run_agent(config).await;
     telemetry::shutdown();
     result
