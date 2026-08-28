@@ -258,6 +258,10 @@ impl Hypervisor for CloudHypervisorDriver {
             .collect()
     }
 
+    fn diagnostic_paths(&self, id: &VmId) -> Vec<PathBuf> {
+        vec![self.vmm_log_path(id)]
+    }
+
     #[generated(model = ClaudeFable, version = "5")]
     #[instrument(skip_all, fields(vm_id = %id, pid))]
     async fn adopt(&self, id: &VmId, pid: u32) -> hypervisor::Result<()> {
@@ -300,10 +304,30 @@ impl Hypervisor for CloudHypervisorDriver {
 ///
 /// None for an attachment that is not a disk at all: a share is a `fs` entry,
 /// and `split_volumes` is what sorts the two apart.
+///
+/// `image_type` is stated and not left to CH, for two reasons that both bite.
+/// Unset is `ImageType::Unknown`, and v53 answers that by auto-detecting, by
+/// logging a DEPRECATION warning saying the auto-detection will be removed —
+/// and, on detecting raw, by turning OFF sector 0 writes. A guest that writes
+/// its own partition table or a bootloader then takes an
+/// `I/O error, dev vda, sector 0 op WRITE` for something it is entitled to do.
+///
+/// `Raw` is right for every path this driver is ever handed, by construction:
+/// `lvm-thin` writes the base image onto the LV with `qemu-img convert -O raw`
+/// and `filesystem` creates `<id>.raw`. A block driver that ever hands over a
+/// qcow2 has to say so here, and this comment is where it will look.
+///
+/// The spelling is the VARIANT name and not the `Display` one: CH's
+/// `ImageType` derives `Deserialize` with no rename, so it reads `"Raw"` and
+/// not `"raw"` — the lowercase form is what `Display` prints into its logs,
+/// and sending it would fail the whole `vm.create` body.
 #[generated(model = ClaudeOpus, version = "5")]
 fn disk_config(disk: &VolumeAttachment) -> Option<serde_json::Value> {
     match disk {
-        VolumeAttachment::Path(path) => Some(serde_json::json!({ "path": path })),
+        VolumeAttachment::Path(path) => Some(serde_json::json!({
+            "path": path,
+            "image_type": "Raw",
+        })),
         VolumeAttachment::VhostUserBlk { socket, .. } => Some(serde_json::json!({
             "vhost_user": true,
             "vhost_socket": socket,
@@ -327,7 +351,14 @@ fn disk_config(disk: &VolumeAttachment) -> Option<serde_json::Value> {
 fn disks(spec: &InstanceSpec) -> Vec<serde_json::Value> {
     let mut disks: Vec<serde_json::Value> = spec.volumes.iter().filter_map(disk_config).collect();
     if let Some(seed) = &spec.cloud_init_seed {
-        disks.push(serde_json::json!({ "path": seed, "readonly": true }));
+        // Raw for the same reason the volumes are, and stated for the same
+        // reason: a FAT12 image is raw, and an unstated type is a deprecation
+        // warning per boot.
+        disks.push(serde_json::json!({
+            "path": seed,
+            "readonly": true,
+            "image_type": "Raw",
+        }));
     }
     disks
 }
@@ -640,6 +671,75 @@ mod tests {
         let cfg = config(&plain);
         assert_eq!(cfg["net"][0]["mac"], "52:54:00:00:00:01");
         assert!(cfg["net"][0].get("mtu").is_none(), "no key, not a null");
+    }
+
+    /// Unset means `ImageType::Unknown`, and v53 answers that by detecting the
+    /// type, warning that the detection is deprecated, and — on raw — turning
+    /// OFF sector 0 writes. A guest writing its own partition table then takes
+    /// an I/O error for something it is entitled to do.
+    ///
+    /// The capital R is the point of the second half of this test: CH's
+    /// `ImageType` derives `Deserialize` with no rename, so the wire form is
+    /// the VARIANT name. `"raw"` is what its `Display` prints into a log, and
+    /// sending that would fail the whole `vm.create` body — which is a far
+    /// worse failure than the one being fixed.
+    #[test]
+    fn a_file_backed_disk_states_its_image_type_and_states_it_the_way_ch_reads_it() {
+        let cfg = config(&spec(
+            vec![VolumeAttachment::Path("/vol/a.raw".into())],
+            vec![],
+        ));
+        assert_eq!(cfg["disks"][0]["image_type"], "Raw");
+
+        // The seed is a FAT12 file and just as raw, and an unstated type there
+        // is the same deprecation warning once per boot.
+        let mut with_seed = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
+        with_seed.cloud_init_seed = Some("/run/seed.img".into());
+        let cfg = config(&with_seed);
+        assert_eq!(cfg["disks"][1]["image_type"], "Raw");
+
+        // A vhost-user disk is a backend CH connects to, not a file it opens,
+        // so it has no image type to state.
+        let cfg = config(&spec(
+            vec![VolumeAttachment::VhostUserBlk {
+                socket: "/run/blk.sock".into(),
+                pid: 9,
+            }],
+            vec![],
+        ));
+        assert_eq!(cfg["disks"][0].get("image_type"), None);
+    }
+
+    /// The VMM's own log is bounded like the guest's streams and served like
+    /// none of them. Both halves matter: without the first it grows until the
+    /// node's disk is gone, and without the second `vm logs` would answer a
+    /// question about a guest with hypervisor noise.
+    #[test]
+    fn the_vmm_log_is_bounded_but_never_part_of_the_guests_output() {
+        let dir = std::env::temp_dir().join(format!("mstest-ch-{}", std::process::id()));
+        let d = CloudHypervisorDriver::new(
+            "/nonexistent/cloud-hypervisor".into(),
+            dir.clone(),
+            Duration::from_secs(1),
+        )
+        .expect("the driver only needs its socket dir to exist");
+        let id = VmId::new_v4();
+
+        let diagnostics = d.diagnostic_paths(&id);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0], d.vmm_log_path(&id));
+
+        let served: Vec<_> = d.console_paths(&id).into_iter().map(|(_, p)| p).collect();
+        assert!(
+            !served.contains(&d.vmm_log_path(&id)),
+            "the VMM's log must not reach vm logs"
+        );
+        assert!(
+            !served.is_empty(),
+            "the guest's own streams are still served"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

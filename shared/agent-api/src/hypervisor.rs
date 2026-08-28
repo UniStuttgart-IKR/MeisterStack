@@ -153,6 +153,23 @@ pub trait Hypervisor: Send + Sync {
         Vec::new()
     }
 
+    /// Files the driver writes that must be BOUNDED but are never served.
+    ///
+    /// Deliberately separate from `console_paths` rather than folded into it,
+    /// because the two answer different questions. `console_paths` is the
+    /// guest's output and `vm logs` serves it; this is the driver's own
+    /// diagnostics — a VMM's stdout and stderr — and mixing the two into one
+    /// answer would put hypervisor noise in front of somebody reading their
+    /// guest's boot.
+    ///
+    /// They still need the ring: unbounded is unbounded whoever wrote it, and
+    /// a VMM that logs on every guest write fills the same disk.
+    ///
+    /// A path here does not promise the file exists.
+    fn diagnostic_paths(&self, _id: &VmId) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+
     // Methods required by the reconcile
     async fn adopt(&self, id: &VmId, pid: u32) -> Result<()>;
     async fn probe(&self, id: &VmId) -> bool;

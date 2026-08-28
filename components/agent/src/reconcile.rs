@@ -450,6 +450,13 @@ impl Reconciler {
             // them. A VM that is converged still prints, and a boot loop is
             // precisely the case where nothing else in this pass would fire.
             crate::console::trim_all(&self.drivers.hypervisor.console_paths(&id));
+            // The VMM's own log is bounded here too and read nowhere: it is
+            // the driver's diagnostics, not the guest's output, and `vm logs`
+            // must not mix them. `destroy` removes it; without this nothing
+            // stopped it growing while the VM lived.
+            for path in self.drivers.hypervisor.diagnostic_paths(&id) {
+                crate::console::trim(&path);
+            }
             match self.reconcile(id, trigger).await {
                 Ok(Action::None) => {}
                 Ok(Action::Blocked) => summary.blocked += 1,
