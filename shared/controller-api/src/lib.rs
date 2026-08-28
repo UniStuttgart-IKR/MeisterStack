@@ -36,15 +36,17 @@ pub use mirror::{Observation, observe};
 pub use object::{ANNOTATION_TRACEPARENT, Metadata, Object, Resource};
 pub use requeue::{RequeueConfig, RequeuePolicy};
 pub use resources::{
-    API_VERSION, CertificateSigningRequest, Cluster, ClusterCapacity, ClusterSpec, ClusterStatus,
-    Counter, CounterSpec, CsrCondition, CsrConditionType, CsrSpec, CsrStatus,
-    DEFAULT_QUOTA_PRIVATE, DEFAULT_QUOTA_PUBLIC, DEFAULT_ROUTED_PREFIX_LEN, Event, EventSpec,
-    EventType, FloatingIp, FloatingIpSpec, FloatingIpStatus, FloatingPool, FloatingPoolSpec,
-    FloatingPoolStatus, Image, ImageFormat, ImagePhase, ImageSpec, ImageStatus, IssuedCertificate,
-    LABEL_CLOUD_UID, LABEL_MANAGED_BY, MANAGED_BY_CLOUD, Node, NodeCapacity, NodeSpec, NodeStatus,
-    RoutedSubnet, RoutedSubnetSpec, RoutedSubnetStatus, RunStrategy, SIGNER_USER_CLIENT, Tenant,
-    TenantQuota, TenantSpec, TenantStatus, TenantUsage, User, UserSpec, UserStatus, Vm, VmPhase,
-    VmSpec, VmStatus,
+    API_VERSION, AccessMode, CertificateSigningRequest, Cluster, ClusterCapacity, ClusterSpec,
+    ClusterStatus, Counter, CounterSpec, CsrCondition, CsrConditionType, CsrSpec, CsrStatus,
+    DEFAULT_QUOTA_PRIVATE, DEFAULT_QUOTA_PUBLIC, DEFAULT_QUOTA_STORAGE_GIB,
+    DEFAULT_ROUTED_PREFIX_LEN, Event, EventSpec, EventType, FloatingIp, FloatingIpSpec,
+    FloatingIpStatus, FloatingPool, FloatingPoolSpec, FloatingPoolStatus, Image, ImageFormat,
+    ImagePhase, ImageSpec, ImageStatus, IssuedCertificate, LABEL_CLOUD_UID, LABEL_MANAGED_BY,
+    MANAGED_BY_CLOUD, Node, NodeCapacity, NodeSpec, NodeStatus, RoutedSubnet, RoutedSubnetSpec,
+    RoutedSubnetStatus, RunStrategy, SIGNER_USER_CLIENT, StoragePool, StoragePoolSpec,
+    StoragePoolStatus, Tenant, TenantQuota, TenantSpec, TenantStatus, TenantUsage, User, UserSpec,
+    UserStatus, VOLUME_RELEASE_FINALIZER, Vm, VmPhase, VmSpec, VmStatus, Volume, VolumeMode,
+    VolumePhase, VolumeSpec, VolumeStatus, backend_name, new_volume,
 };
 pub use rest::{
     ApiError, AuthState, Caller, CallerRole, CallerTenant, PeerCerts, SpecUpdate,

@@ -26,7 +26,7 @@ use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 
 use crate::object::Resource;
-use crate::resources::{CertificateSigningRequest, FloatingIp, Image, Vm};
+use crate::resources::{CertificateSigningRequest, FloatingIp, Image, Vm, Volume};
 
 /// Groups whose name starts with this are the stack's own machinery — nodes,
 /// controllers — rather than people. Kubernetes' convention, and its meaning:
@@ -435,7 +435,20 @@ pub fn classify<'a>(method: &str, path: &'a str) -> Option<Attempt<'a>> {
 /// which defaults to zero on a public pool. So a member reaching this door
 /// still meets the quota behind it; the door being open is what makes a lab
 /// usable without a ticket per address.
-const TENANT_SCOPED: [&str; 3] = [Vm::RESOURCE, Image::RESOURCE, FloatingIp::RESOURCE];
+///
+/// `volumes` is here and `storagepools` is not, which is the same split with
+/// storage nouns and for the same reason: which disks EXIST is an
+/// administrator's decision, taking room out of one is self-service inside
+/// that pool's per-tenant ceiling. A volume is the first tenant-scoped object
+/// whose deletion can destroy something irreplaceable, which is a reason to
+/// be careful in the HANDLER (see the release finalizer) and not a reason to
+/// shut this door — a member who cannot make a disk cannot make a VM.
+const TENANT_SCOPED: [&str; 4] = [
+    Vm::RESOURCE,
+    Image::RESOURCE,
+    FloatingIp::RESOURCE,
+    Volume::RESOURCE,
+];
 
 /// Whether a resource is one whose objects belong to a tenant.
 pub fn is_tenant_scoped(resource: &str) -> bool {

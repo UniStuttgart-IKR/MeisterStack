@@ -62,6 +62,13 @@ resources! {
     /// A real subnet a tenant owns — the NAT-free half of the story. See
     /// `RoutedSubnetSpec`.
     RoutedSubnet => "routedsubnets", "RoutedSubnet";
+    /// The storage side of the same shape the network side has: what EXISTS
+    /// is an administrator's decision, and taking room out of it is
+    /// self-service inside a quota. See `StoragePoolSpec`.
+    StoragePool => "storagepools", "StoragePool";
+    /// A volume with a life of its own — the object that lets a disk outlive
+    /// the VM that was using it. See `VolumeSpec`.
+    Volume => "volumes", "Volume";
     /// The only resource here that expires by itself. See `EventSpec`.
     Event => "events", "Event";
 }
@@ -939,6 +946,303 @@ pub const DEFAULT_ROUTED_PREFIX_LEN: u32 = 24;
 pub struct RoutedSubnetStatus {}
 
 pub type RoutedSubnet = Object<RoutedSubnetSpec, RoutedSubnetStatus>;
+
+// --- the storage a tenant may claim -----------------------------------------
+//
+// The same two-object shape the addresses have, and deliberately so: a pool an
+// administrator declares, and a reservation a member takes out of it inside a
+// quota. Reading `FloatingPoolSpec` and `FloatingIpSpec` above is reading this
+// pair with different nouns.
+//
+// One difference is worth naming before the code, because it changes what the
+// refusals are worth. At the end of a confused floating address is a tenant
+// that cannot be reached. At the end of a confused volume is data that is
+// gone. That is why `Volume` carries a finalizer and `FloatingIp` does not,
+// and why the backend name is derived rather than allocated.
+
+/// Where volumes come from: a backend, the nodes that can reach it, and how
+/// much of it each tenant may hold.
+///
+/// `nodes` is a list and not a label selector, and that is the honest shape
+/// for what it describes: an LVM volume group is on ONE machine and an NFS
+/// export is reachable from the handful that mount it. Which nodes reach a
+/// pool is a fact an operator knows and writes down; deriving it from labels
+/// would be inferring a physical connection from a piece of metadata.
+///
+/// Empty `nodes` means every node — the compatibility direction, and the one a
+/// single-machine lab wants: a pool nobody restricted is a pool the scheduler
+/// does not use to narrow anything.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoragePoolSpec {
+    /// The agent-side backend name — `lvm-thin`, `filesystem`, `nfs`. The
+    /// same string a node claims as `volume/<driver>` in its catalogue, which
+    /// is what lets the scheduler ask whether a candidate can serve this pool
+    /// without learning anything new.
+    pub driver: String,
+    /// Which nodes can reach it. Empty = all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+    /// Backend options, handed to the driver untouched — `{"pool":
+    /// "vg0/thin"}` for lvm-thin, and whatever the next backend wants. The
+    /// same pass-through `VolumeSpec.params` is at the agent, one tier up:
+    /// this control plane routes on `driver` and reads nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    /// The pool a volume lands in when it names none. At most one may say
+    /// true, checked at write time — two defaults would make "which pool did
+    /// my disk come out of" a question about ordering.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub default: bool,
+    /// Per-tenant ceiling in GiB out of THIS pool. A tenant not named here
+    /// gets `DEFAULT_QUOTA_STORAGE_GIB`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quota: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// How much a tenant may hold in a pool nobody set a number for.
+///
+/// Not zero, and the difference from `DEFAULT_QUOTA_PUBLIC` next door is the
+/// point: a routable address is something an operator was given by somebody
+/// else and hands out one at a time, while disk is something the machine has.
+/// A hundred GiB is a lab's worth — a few root disks and room to be wrong —
+/// and an admin who wants a ticket per volume sets the number to zero.
+pub const DEFAULT_QUOTA_STORAGE_GIB: u64 = 100;
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl StoragePoolSpec {
+    /// What this tenant may hold here: the named ceiling, or the default.
+    pub fn quota_for(&self, tenant: &str) -> u64 {
+        self.quota
+            .get(tenant)
+            .copied()
+            .unwrap_or(DEFAULT_QUOTA_STORAGE_GIB)
+    }
+
+    /// Whether this pool is reachable from `node`. An empty list is every
+    /// node — see the field.
+    pub fn reaches(&self, node: &str) -> bool {
+        self.nodes.is_empty() || self.nodes.iter().any(|n| n == node)
+    }
+}
+
+/// Empty, and honestly so: how much room is left is a question about the
+/// volumes, which are their own objects and are counted when asked. A number
+/// cached here would be a number that is wrong after every create.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StoragePoolStatus {}
+
+/// No finalizer: a pool owns nothing. What keeps it from vanishing under a
+/// volume is the delete handler's refusal, exactly as with a floating pool.
+pub type StoragePool = Object<StoragePoolSpec, StoragePoolStatus>;
+
+/// What a volume IS, from the guest's side. Two products, not one setting.
+///
+/// A block device and a mounted directory are different things to ask for and
+/// different things to attach: "attach" means `Path`/`VhostUserBlk` for the
+/// first and `FsShare` for the second, and the guest either boots from it or
+/// mounts it by tag. Naming it on the object is what stops "attach this
+/// volume" from being a sentence whose meaning depends on which backend
+/// happened to serve it.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VolumeMode {
+    /// A block device. The default, because it is what a disk has always
+    /// been here and what a VM boots from.
+    #[default]
+    Block,
+    /// A directory the guest mounts. `nfs` in share mode today.
+    Filesystem,
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl VolumeMode {
+    pub const ALL: [VolumeMode; 2] = [VolumeMode::Block, VolumeMode::Filesystem];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VolumeMode::Block => "Block",
+            VolumeMode::Filesystem => "Filesystem",
+        }
+    }
+}
+
+/// How many consumers a volume admits at once.
+///
+/// One, and it is written down rather than left to be discovered. Multi-attach
+/// needs reference counting at detach — without it the one VM that stops tears
+/// the device out from under the other — and a field with one variant is what
+/// says the second one was considered and refused, rather than forgotten.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccessMode {
+    /// Read-write by one consumer at a time.
+    #[default]
+    ReadWriteOnce,
+}
+
+/// Where a volume is in its own life. Its OWN phase, and that is the whole
+/// point of the object: a volume is Ready with no VM anywhere near it, and a
+/// VM being torn down does not move it.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VolumePhase {
+    /// Reserved, not yet placed on a node that can provision it.
+    #[default]
+    Pending,
+    /// A node was chosen and is making it.
+    Provisioning,
+    /// The data exists. Attached or not — that is `status.attachedTo`.
+    Ready,
+    /// Deleted while a consumer still held it. The data is still there and
+    /// goes when the last one lets go. See the finalizer on `new_volume`.
+    Releasing,
+    /// The backend refused, and said why in `status.message`.
+    Failed,
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+impl VolumePhase {
+    pub const ALL: [VolumePhase; 5] = [
+        VolumePhase::Pending,
+        VolumePhase::Provisioning,
+        VolumePhase::Ready,
+        VolumePhase::Releasing,
+        VolumePhase::Failed,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VolumePhase::Pending => "Pending",
+            VolumePhase::Provisioning => "Provisioning",
+            VolumePhase::Ready => "Ready",
+            VolumePhase::Releasing => "Releasing",
+            VolumePhase::Failed => "Failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+}
+
+/// A volume a tenant holds: a size, a pool, a kind, and a life of its own.
+///
+/// The object the whole brief is about. Everything a `VmSpec`'s embedded
+/// volume entry says is about a disk that is made for one VM and unmade with
+/// it; this says the same things about something that exists on its own, and
+/// the difference is entirely in who deletes it.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeSpec {
+    /// Whose it is. Never empty on a STORED object, defaulted on the way in
+    /// for the same reason `FloatingIpSpec.tenant` is: the request a member
+    /// sends names no tenant, and the server fills in their own. A required
+    /// field would make the self-service path a deserialization error.
+    #[serde(default)]
+    pub tenant: String,
+    /// Which pool it came out of. Server-set at create (the named pool, or
+    /// the default one) and immutable afterwards — a volume that could be
+    /// re-pointed at another pool would be a volume whose data is in a place
+    /// its object does not name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pool: String,
+    /// How big, in GiB. The unit an operator writes on a whiteboard, and the
+    /// same unit the pool's quota is in so that neither has to convert.
+    #[serde(default)]
+    pub size_gib: u64,
+    #[serde(default, skip_serializing_if = "is_block_mode")]
+    pub mode: VolumeMode,
+    #[serde(default)]
+    pub access_mode: AccessMode,
+    /// The base image to clone in, by catalogue name. `None` = an empty
+    /// volume, which is what a data disk is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_image: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+fn is_block_mode(mode: &VolumeMode) -> bool {
+    matches!(mode, VolumeMode::Block)
+}
+
+/// What the control plane observed about a volume.
+#[generated(model = ClaudeOpus, version = "5")]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeStatus {
+    #[serde(default)]
+    pub phase: VolumePhase,
+    /// The name the BACKEND knows this volume by, derived from
+    /// `metadata.uid`. See `backend_name` — this field is a cache of a pure
+    /// function and exists so that an operator can read it, never so that a
+    /// second answer can be stored.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub backend: String,
+    /// The node that provisioned it. `None` while Pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// The VM holding it, by name, inside the same tenant. `None` = nobody
+    /// is, which is a perfectly good state and the one the whole object
+    /// exists to make possible.
+    ///
+    /// Singular because `AccessMode` has one variant. The day it has two,
+    /// this becomes a list AND detach starts counting — both together or
+    /// neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// The name a backend gives a volume, derived from the object's uid.
+///
+/// The most important detail in the whole storage brief, and it is four
+/// lines. `provision` succeeds, the controller dies before writing the handle
+/// back, and the next pass asks again: with a derived name it finds the
+/// volume that is there, and with an allocated one it makes a second one that
+/// nobody will ever know about. Every backend in this tree already derives
+/// its own name from a uuid — this is that rule, moved up to where the
+/// identity actually lives.
+///
+/// The uid and not `metadata.name`: names are what people call volumes, and
+/// people reuse names. Two volumes called `data` in one tenant, a year apart,
+/// must not be one volume on the backend.
+pub fn backend_name(uid: &str) -> String {
+    format!("vol-{uid}")
+}
+
+/// A volume, with the finalizer that makes "detach before delete" the one
+/// path out.
+///
+/// The same shape `new_vm` has and for a sharper reason. A DELETE on a volume
+/// somebody is holding must not take the data: it marks the object
+/// `Releasing`, the consumer lets go in its own time, and the deprovision
+/// happens then. At the end of getting this wrong for a floating address is a
+/// tenant that cannot be reached; at the end of getting it wrong here is data
+/// that is gone.
+pub fn new_volume(name: &str, spec: VolumeSpec) -> Volume {
+    let mut volume = Volume::declare(name, spec);
+    volume
+        .metadata
+        .finalizers
+        .push(VOLUME_RELEASE_FINALIZER.to_string());
+    volume
+}
+
+/// The finalizer `new_volume` puts on, spelled once.
+pub const VOLUME_RELEASE_FINALIZER: &str = "meister.io/release";
+
+pub type Volume = Object<VolumeSpec, VolumeStatus>;
 
 /// A person. The object is the authorization side of an identity: the
 /// certificate says who somebody is, this says what they may do and whose

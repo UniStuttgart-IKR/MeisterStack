@@ -18,10 +18,12 @@ use controller_api::events;
 use controller_api::{
     API_VERSION, ApiError, Caller, CallerRole, CallerTenant, Capacity, CertificateSigningRequest,
     Cluster, ClusterSpec, EtcdStore, FloatingIp, FloatingPool, Image, ImageSpec, Resource, Role,
-    RoutedSubnet, Scope, SpecUpdate, StoreError, Tenant, User, Verb, Vm, VmSpec, apply_spec_update,
-    check_envelope, conflict, floating, forbidden, invalid, permits_object, quota,
+    RoutedSubnet, Scope, SpecUpdate, StoragePool, StoreError, Tenant, User, Verb, Vm, VmSpec,
+    Volume, VolumePhase, apply_spec_update, check_envelope, conflict, floating, forbidden, invalid,
+    permits_object, quota,
     resources::{
-        CsrCondition, CsrConditionType, CsrSpec, IssuedCertificate, SIGNER_USER_CLIENT, new_vm,
+        CsrCondition, CsrConditionType, CsrSpec, IssuedCertificate, SIGNER_USER_CLIENT,
+        backend_name, new_vm, new_volume,
     },
     vni,
 };
@@ -128,6 +130,24 @@ pub fn router(
             get(get_floating_ip)
                 .put(update_floating_ip)
                 .delete(delete_floating_ip),
+        )
+        .route(
+            "/apis/meister.io/v1/storagepools",
+            get(list_storage_pools).post(create_storage_pool),
+        )
+        .route(
+            "/apis/meister.io/v1/storagepools/{name}",
+            get(get_storage_pool)
+                .put(update_storage_pool)
+                .delete(delete_storage_pool),
+        )
+        .route(
+            "/apis/meister.io/v1/volumes",
+            get(list_volumes).post(create_volume),
+        )
+        .route(
+            "/apis/meister.io/v1/volumes/{name}",
+            get(get_volume).put(update_volume).delete(delete_volume),
         )
         .route(
             "/apis/meister.io/v1/routedsubnets",
@@ -335,29 +355,38 @@ async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result<(), ApiErr
         ));
     }
     for image in base_images(&spec.vm) {
-        match store.get::<Image>(&image).await {
-            Ok(image) if image.status.phase == controller_api::ImagePhase::Failed => {
-                // A Failed image is one a node has already tried and could
-                // not use — a checksum that did not match, a url that did not
-                // answer. Refusing the create is the whole point of the
-                // phase: the alternative is a VM that is accepted, placed,
-                // and then fails at provision on every node it is offered to.
-                return Err(invalid(format!(
-                    "base_image {:?} is not usable: {}",
-                    image.metadata.name,
-                    image.status.message.as_deref().unwrap_or("unknown reason")
-                )));
-            }
-            Ok(_) => {}
-            Err(StoreError::NotFound(_)) => {
-                return Err(invalid(format!(
-                    "unknown base_image {image:?}; register it first (cloud image create)"
-                )));
-            }
-            Err(e) => return Err(e.into()),
-        }
+        check_base_image(store, &image).await?;
     }
     Ok(())
+}
+
+/// That base image is registered here and is usable.
+///
+/// One function because there are two callers now — a VM's embedded volumes
+/// and a `Volume` object — and two copies of "is this image usable" would be
+/// two answers to give a tenant about the same image.
+///
+/// A Failed image is one a node has already tried and could not use: a
+/// checksum that did not match, a url that did not answer. Refusing here is
+/// the whole point of the phase — the alternative is an object that is
+/// accepted, placed, and then fails at provision on every node it is offered
+/// to.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn check_base_image(store: &EtcdStore, name: &str) -> Result<(), ApiError> {
+    match store.get::<Image>(name).await {
+        Ok(image) if image.status.phase == controller_api::ImagePhase::Failed => {
+            Err(invalid(format!(
+                "base_image {:?} is not usable: {}",
+                image.metadata.name,
+                image.status.message.as_deref().unwrap_or("unknown reason")
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(StoreError::NotFound(_)) => Err(invalid(format!(
+            "unknown base_image {name:?}; register it first (cloud image create)"
+        ))),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Fields on a volume that the control plane owns, refused when a client
@@ -384,6 +413,28 @@ fn check_owned_volume_fields(vm: &serde_json::Value) -> Result<(), ApiError> {
                      from the image catalogue"
                 )));
             }
+        }
+        // A reference to a `Volume` OBJECT, refused outright rather than
+        // ignored.
+        //
+        // The object exists now and the attach path does not: nothing between
+        // here and the agent resolves the name, and the agent's `VolumeSpec`
+        // takes unknown fields without complaint. So a spec naming one would
+        // be accepted and would boot the VM on a fresh blank disk instead of
+        // the tenant's data — which is the one failure mode in this file
+        // worth a hard refusal.
+        //
+        // When resolution lands, this door becomes the tenancy check rather
+        // than disappearing: the volume named has to be one this VM's tenant
+        // owns, checked HERE for the reason `check_owned_nic_fields` gives —
+        // at this edge the spec is a member's POST body, and a member naming
+        // somebody else's volume would be reading somebody else's disk.
+        if volume.get("volume").is_some_and(|v| !v.is_null()) {
+            return Err(invalid(format!(
+                "spec.vm.volumes[{i}].volume names a volume object; attaching one to a vm is \
+                 not built yet, and a spec that named one would silently get a blank disk \
+                 instead. Declare the disk in the spec, or wait for volume attachment"
+            )));
         }
     }
     Ok(())
@@ -1832,6 +1883,512 @@ async fn delete_floating_pool(
     Ok(Json(json!({ "deleted": name })))
 }
 
+// --- the storage a tenant may claim ------------------------------------------
+//
+// The same section the floating pools have, one noun over, and the rule runs
+// through both: what EXISTS is an administrator's decision and taking room out
+// of it is self-service inside a quota. Reading the block above is reading this
+// one with different words.
+//
+// What is different is what a mistake costs. At the end of a confused address
+// is a tenant that cannot be reached; at the end of a confused volume is data
+// that is gone. Two rules carry the difference and both live here:
+//
+//   * the backend name is DERIVED from the object's uid, never allocated, so a
+//     provision whose handle is lost finds its volume instead of making a
+//     second one nobody knows about;
+//   * a volume somebody is holding is not deleted. DELETE marks it Releasing
+//     and the finalizer keeps the object until the consumer lets go.
+//
+// Nothing here provisions anything. What comes out is a RESERVATION — who owns
+// how much room in which pool — and choosing the node that makes it real is
+// the reconciler's, through the same `feasible()` a VM goes through.
+
+/// The pools, with one thing hidden: a member sees its own quota and not
+/// everybody else's. The mirror of `redact_quota` next door, and the same
+/// argument — a member has to be able to see which pool is the default and
+/// how much they may take out of it, and what another tenant was granted is
+/// none of their business.
+#[generated(model = ClaudeOpus, version = "5")]
+fn redact_storage_quota(pool: &mut StoragePool, mine: &str) {
+    pool.spec.quota.retain(|tenant, _| tenant == mine);
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+async fn list_storage_pools(
+    State(st): State<ApiState>,
+    caller: Caller,
+    role: CallerRole,
+    tenant: CallerTenant,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let who = Grant::new(caller, role, tenant);
+    let mut items = st.store.list::<StoragePool>().await?;
+    if let Some(mine) = who.confined_to() {
+        for pool in &mut items {
+            redact_storage_quota(pool, mine);
+        }
+    }
+    Ok(Json(
+        json!({ "apiVersion": API_VERSION, "kind": "StoragePoolList", "items": items }),
+    ))
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+async fn get_storage_pool(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+    caller: Caller,
+    role: CallerRole,
+    tenant: CallerTenant,
+) -> Result<Json<StoragePool>, ApiError> {
+    let mut pool: StoragePool = st.store.get(&name).await?;
+    if let Some(mine) = Grant::new(caller, role, tenant).confined_to() {
+        redact_storage_quota(&mut pool, mine);
+    }
+    Ok(Json(pool))
+}
+
+/// Everything about a pool that has to be true before it is stored.
+///
+/// `driver` is checked for being SET and not for being a driver this cloud
+/// has heard of, which is deliberate: the catalogue lives on the nodes, an
+/// admin may declare a pool before the node that serves it has ever dialled
+/// in, and a cloud with an allowlist of backend names would be a second place
+/// to add a driver.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn check_storage_pool(
+    st: &ApiState,
+    pool: &StoragePool,
+    updating: Option<&str>,
+) -> Result<(), ApiError> {
+    if pool.spec.driver.is_empty() {
+        return Err(invalid(
+            "spec.driver must name a storage backend, e.g. \"lvm-thin\"",
+        ));
+    }
+    if !pool.spec.default {
+        return Ok(());
+    }
+    // At most one default, checked here and again from inside the store after
+    // the create. Two defaults would make "which pool did my disk come out
+    // of" a question about ordering.
+    let others: Vec<String> = st
+        .store
+        .list::<StoragePool>()
+        .await?
+        .into_iter()
+        .filter(|p| p.spec.default)
+        .map(|p| p.metadata.name)
+        .filter(|n| Some(n.as_str()) != updating)
+        .collect();
+    if !others.is_empty() {
+        return Err(conflict(format!(
+            "storage pool {} is already marked default; exactly one may be",
+            others.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+async fn create_storage_pool(
+    State(st): State<ApiState>,
+    Json(body): Json<StoragePool>,
+) -> Result<(StatusCode, Json<StoragePool>), ApiError> {
+    check_envelope(&body)?;
+    if body.metadata.name.is_empty() {
+        return Err(invalid("metadata.name must be set"));
+    }
+    let mut pool = StoragePool::declare(&body.metadata.name, body.spec);
+    pool.metadata.labels = body.metadata.labels;
+    check_storage_pool(&st, &pool, None).await?;
+    let created = st.store.create(&pool).await?;
+
+    // And the same question again, from inside the store — the create is what
+    // makes a race visible. No retry: an admin marked this pool default
+    // outright, so there is nothing for the server to pick differently.
+    if created.spec.default
+        && let Err(why) = check_storage_pool(&st, &created, Some(&created.metadata.name)).await
+    {
+        take_back::<StoragePool>(&st, &created.metadata.name, "storage pool").await;
+        return Err(why);
+    }
+
+    info!(pool = %created.metadata.name, driver = %created.spec.driver,
+          nodes = created.spec.nodes.len(), default = created.spec.default,
+          "storage pool created");
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// Quotas, the node list, the default mark and the description all move. The
+/// DRIVER does not: a pool that changed backend would be a pool whose live
+/// volumes are on a backend its object does not name, and no reconciler could
+/// ever explain where the data went.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn update_storage_pool(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+    Json(mut body): Json<StoragePool>,
+) -> Result<Json<StoragePool>, ApiError> {
+    if body.metadata.name != name {
+        return Err(invalid("metadata.name does not match the path"));
+    }
+    let current: StoragePool = st.store.get(&name).await?;
+    keep_server_owned(&mut body.metadata, &current.metadata);
+    body.status = current.status.clone();
+    if body.spec.driver != current.spec.driver {
+        return Err(conflict(format!(
+            "storage pool {name} is a {:?} pool and cannot become a {:?} one; its volumes are \
+             on the backend it names",
+            current.spec.driver, body.spec.driver
+        )));
+    }
+    check_storage_pool(&st, &body, Some(&name)).await?;
+
+    // A node list cannot be narrowed out from under a volume that lives on a
+    // node it would drop: the volume's data is there, and an object saying
+    // otherwise is worse than no object.
+    let stranded: Vec<String> = st
+        .store
+        .list::<Volume>()
+        .await?
+        .into_iter()
+        .filter(|v| v.spec.pool == name)
+        .filter(|v| {
+            v.status
+                .node
+                .as_deref()
+                .is_some_and(|n| !body.spec.reaches(n))
+        })
+        .map(|v| v.metadata.name)
+        .collect();
+    if !stranded.is_empty() {
+        return Err(conflict(format!(
+            "these volumes live on nodes the new list drops: {}",
+            stranded.join(", ")
+        )));
+    }
+    Ok(Json(st.store.update(&body).await?))
+}
+
+/// A pool with volumes in it stays. The same rule and the same reason as a
+/// floating pool with reservations: the invariant "every volume came out of a
+/// pool that exists" is worth exactly what the refusal that keeps it true is
+/// worth.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn delete_storage_pool(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let _: StoragePool = st.store.get(&name).await?;
+    let held: Vec<String> = st
+        .store
+        .list::<Volume>()
+        .await?
+        .into_iter()
+        .filter(|v| v.spec.pool == name)
+        .map(|v| v.metadata.name)
+        .collect();
+    if !held.is_empty() {
+        return Err(conflict(format!(
+            "storage pool {name} still has volumes: {}",
+            held.join(", ")
+        )));
+    }
+    st.store.delete::<StoragePool>(&name).await?;
+    Ok(Json(json!({ "deleted": name })))
+}
+
+/// The pool a volume belongs to: the one it named, or the one marked default.
+///
+/// The mirror of `floating::pick_pool`, refusal wording included. "No pool" is
+/// the state a cloud is in before an administrator has declared any storage at
+/// all, and the useful answer to a member asking for a disk on such a cloud is
+/// what the administrator has to do, not `404`.
+#[generated(model = ClaudeOpus, version = "5")]
+fn pick_storage_pool<'a>(
+    pools: &'a [StoragePool],
+    named: Option<&str>,
+) -> Result<&'a StoragePool, ApiError> {
+    if let Some(name) = named.filter(|n| !n.is_empty()) {
+        return pools
+            .iter()
+            .find(|p| p.metadata.name == name)
+            .ok_or_else(|| invalid(format!("no storage pool {name:?} in this cloud")));
+    }
+    let defaults: Vec<&StoragePool> = pools.iter().filter(|p| p.spec.default).collect();
+    match defaults.as_slice() {
+        [one] => Ok(one),
+        [] if pools.is_empty() => Err(invalid(
+            "this cloud has no storage pool; an administrator creates one with \
+             `meister cloud storagepool create`",
+        )),
+        [] => Err(invalid(format!(
+            "no storage pool is marked default; name one with --pool (have: {})",
+            pools
+                .iter()
+                .map(|p| p.metadata.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+        // Refused at write time, so reaching this means somebody edited etcd
+        // by hand. Saying so beats picking one and being unable to explain
+        // which pool the data ended up on.
+        many => Err(conflict(format!(
+            "{} storage pools are marked default ({}); exactly one may be",
+            many.len(),
+            many.iter()
+                .map(|p| p.metadata.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// Every volume, refusing to answer from a partial list.
+///
+/// `list` drops what it cannot decode, and a dropped volume is room this
+/// tenant is holding that nobody counted. The same guard
+/// `floating::all_reservations` applies and for a sharper reason: there the
+/// cost of undercounting is two tenants on one address, here it is a pool
+/// quietly overcommitted past the disk that is actually in the machine.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn all_volumes(st: &ApiState) -> Result<Vec<Volume>, ApiError> {
+    let volumes = st.store.list::<Volume>().await?;
+    if volumes.len() != st.store.count::<Volume>().await? {
+        return Err(conflict(
+            "some volume objects did not decode, so how much storage is held cannot be \
+             established; refusing rather than handing out room twice",
+        ));
+    }
+    Ok(volumes)
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+async fn list_volumes(
+    State(st): State<ApiState>,
+    caller: Caller,
+    role: CallerRole,
+    tenant: CallerTenant,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let who = Grant::new(caller, role, tenant);
+    let mut items = st.store.list::<Volume>().await?;
+    if let Some(mine) = who.confined_to() {
+        items.retain(|v| v.spec.tenant == mine);
+    }
+    Ok(Json(
+        json!({ "apiVersion": API_VERSION, "kind": "VolumeList", "items": items }),
+    ))
+}
+
+#[generated(model = ClaudeOpus, version = "5")]
+async fn get_volume(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+    caller: Caller,
+    role: CallerRole,
+    tenant: CallerTenant,
+) -> Result<Json<Volume>, ApiError> {
+    let volume: Volume = st.store.get(&name).await?;
+    Grant::new(caller, role, tenant)
+        .allows(Scope::of(Some(volume.spec.tenant.as_str())), Verb::Read)?;
+    Ok(Json(volume))
+}
+
+/// Reserve storage.
+///
+/// The tenant is the caller's own unless an admin says otherwise, the pool is
+/// resolved here and frozen, and `status` is entirely the server's — a client
+/// that could write `status.backend` could point its object at another
+/// tenant's data, which is the whole of what `check_owned_volume_status`
+/// refuses.
+///
+/// Nothing is provisioned. What this writes down is a RESERVATION against a
+/// pool's quota; a node that can reach the pool makes it real, and until then
+/// the volume is `Pending` and says so.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn create_volume(
+    State(st): State<ApiState>,
+    caller: Caller,
+    role: CallerRole,
+    tenant: CallerTenant,
+    Json(body): Json<Volume>,
+) -> Result<(StatusCode, Json<Volume>), ApiError> {
+    check_envelope(&body)?;
+    check_owned_volume_status(&body)?;
+    if body.metadata.name.is_empty() {
+        return Err(invalid("metadata.name must be set"));
+    }
+    let who = Grant::new(caller, role, tenant);
+    let owner = who
+        .tenant_for_create(Some(body.spec.tenant.clone()))
+        .ok_or_else(|| invalid("spec.tenant must name a tenant"))?;
+    who.allows(Scope::of(Some(owner.as_str())), Verb::Write)?;
+    check_tenant(&st, &owner).await?;
+
+    if body.spec.size_gib == 0 {
+        return Err(invalid("spec.sizeGib must be greater than zero"));
+    }
+    if let Some(image) = body.spec.base_image.as_deref().filter(|i| !i.is_empty()) {
+        check_base_image(&st.store, image).await?;
+    }
+
+    let pools = st.store.list::<StoragePool>().await?;
+    let pool = pick_storage_pool(&pools, Some(body.spec.pool.as_str()))?;
+
+    // One rejection path, and it is the one in `controller_api::quota`. A
+    // second sum computed here would be a second answer to "is this tenant
+    // over its limit", and the wrong one is whichever an operator is not
+    // looking at.
+    let held = quota::StorageUsage::of(&owner, &pool.metadata.name, &all_volumes(&st).await?, None);
+    if let Err(why) = quota::check_storage(pool, &owner, held.plus(body.spec.size_gib)) {
+        return Err(conflict(why));
+    }
+
+    let mut spec = body.spec;
+    spec.tenant = owner.clone();
+    spec.pool = pool.metadata.name.clone();
+    let created = st
+        .store
+        .create(&new_volume(&body.metadata.name, spec))
+        .await?;
+
+    // The backend name is derived from the uid, which only exists once the
+    // object does — so it is written on the way back out rather than on the
+    // way in. Derived and not allocated: a provision whose handle is lost has
+    // to find its volume rather than make a second one.
+    let named = st
+        .store
+        .mutate::<Volume, _>(&created.metadata.name, |v| {
+            v.status.backend = backend_name(&v.metadata.uid);
+        })
+        .await?;
+
+    info!(volume = %named.metadata.name, tenant = %owner, pool = %named.spec.pool,
+          size_gib = named.spec.size_gib, backend = %named.status.backend,
+          "volume reserved");
+    Ok((StatusCode::CREATED, Json(named)))
+}
+
+/// What a client may never write on a volume.
+///
+/// `check_owned_nic_fields` one object over, and the same argument: every one
+/// of these is the control plane's answer about where the DATA is, and a
+/// client that could set them could point its own object at somebody else's
+/// bytes — `status.backend` most directly of all, since that string is what a
+/// node hands its driver.
+#[generated(model = ClaudeOpus, version = "5")]
+fn check_owned_volume_status(volume: &Volume) -> Result<(), ApiError> {
+    let owned = [
+        ("status.backend", !volume.status.backend.is_empty()),
+        ("status.node", volume.status.node.is_some()),
+        ("status.attachedTo", volume.status.attached_to.is_some()),
+        (
+            "status.phase",
+            volume.status.phase != VolumePhase::default(),
+        ),
+    ];
+    if let Some((field, _)) = owned.into_iter().find(|(_, set)| *set) {
+        return Err(invalid(format!(
+            "{field} is control-plane-owned; the cloud fills it in from where the volume \
+             actually is"
+        )));
+    }
+    Ok(())
+}
+
+/// The description moves and nothing else does.
+///
+/// Size, pool, mode, access mode and base image are what the volume IS. A
+/// resize is a real operation on a live filesystem and is explicitly out of
+/// scope until the object stands; letting the field move without it would be
+/// an object that lies about how big its data is.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn update_volume(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+    caller: Caller,
+    role: CallerRole,
+    tenant: CallerTenant,
+    Json(mut body): Json<Volume>,
+) -> Result<Json<Volume>, ApiError> {
+    if body.metadata.name != name {
+        return Err(invalid("metadata.name does not match the path"));
+    }
+    let current: Volume = st.store.get(&name).await?;
+    let who = Grant::new(caller, role, tenant);
+    who.allows(Scope::of(Some(current.spec.tenant.as_str())), Verb::Write)?;
+
+    if body.spec.size_gib != current.spec.size_gib {
+        return Err(conflict(format!(
+            "volume {name} is {} GiB; growing a volume is a live filesystem operation and is \
+             not supported yet",
+            current.spec.size_gib
+        )));
+    }
+    keep_server_owned(&mut body.metadata, &current.metadata);
+    body.spec.tenant = current.spec.tenant.clone();
+    body.spec.pool = current.spec.pool.clone();
+    body.spec.mode = current.spec.mode;
+    body.spec.access_mode = current.spec.access_mode;
+    body.spec.base_image = current.spec.base_image.clone();
+    body.status = current.status.clone();
+    Ok(Json(st.store.update(&body).await?))
+}
+
+/// Give the storage back — or say so, and wait.
+///
+/// The one delete in this API that does not delete. A volume somebody is
+/// holding keeps its data: the object is marked `Releasing`, the finalizer
+/// keeps it in the store, and the deprovision happens when the consumer lets
+/// go. That is not politeness about ordering, it is the difference between a
+/// tenant losing a VM and a tenant losing the contents of a disk.
+///
+/// A volume nobody holds goes the ordinary way: `Releasing` and the finalizer
+/// all the same, because the bytes are still on a node and it is the node
+/// saying they are gone that removes the object — not this handler saying they
+/// should be.
+#[generated(model = ClaudeOpus, version = "5")]
+async fn delete_volume(
+    State(st): State<ApiState>,
+    Path(name): Path<String>,
+    caller: Caller,
+    role: CallerRole,
+    tenant: CallerTenant,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let current: Volume = st.store.get(&name).await?;
+    Grant::new(caller, role, tenant)
+        .allows(Scope::of(Some(current.spec.tenant.as_str())), Verb::Write)?;
+
+    let held_by = current.status.attached_to.clone();
+    let released = st
+        .store
+        .mutate::<Volume, _>(&name, |v| {
+            if v.metadata.deletion_timestamp.is_none() {
+                v.metadata.deletion_timestamp = Some(chrono::Utc::now());
+            }
+            v.status.phase = VolumePhase::Releasing;
+        })
+        .await?;
+
+    match &held_by {
+        Some(vm) => info!(volume = %name, tenant = %released.spec.tenant, vm = %vm,
+                          "volume marked for release; it is still attached and keeps its data"),
+        None => info!(volume = %name, tenant = %released.spec.tenant,
+                      "volume marked for release"),
+    }
+    Ok(Json(json!({
+        "releasing": name,
+        "attachedTo": held_by,
+        "message": match held_by {
+            Some(vm) => format!(
+                "volume {name} is attached to vm {vm}; its data stays until that vm lets go"
+            ),
+            None => format!("volume {name} will be deprovisioned by the node holding it"),
+        }
+    })))
+}
+
 /// A member sees its own tenant's subnets. Read-only for them by the verb
 /// rule; whether a tenant gets a routed subnet at all is an admin's decision,
 /// because it is a piece of the operator's own address space.
@@ -2423,6 +2980,181 @@ async fn check_tenant(st: &ApiState, tenant: &str) -> Result<(), ApiError> {
 #[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
+
+    /// Where a base image comes from is the catalogue's answer, and a
+    /// reference to a `Volume` object is refused outright — not ignored.
+    ///
+    /// The second half is the one worth a test. The object exists, the attach
+    /// path does not, and the agent's volume spec takes unknown fields
+    /// quietly: a VM naming a volume would be accepted and would boot on a
+    /// blank disk instead of the tenant's data. When resolution lands, this
+    /// refusal becomes the tenancy check and the test changes with it.
+    #[test]
+    fn a_client_may_not_name_the_volume_fields_the_cloud_owns() {
+        for field in ["base_image_url", "base_image_sha256"] {
+            let spec = json!({ "volumes": [{}, { field: "x" }] });
+            let msg = format!("{:?}", check_owned_volume_fields(&spec).unwrap_err());
+            assert!(msg.contains(field), "{msg}");
+            assert!(msg.contains("volumes[1]"), "and which volume: {msg}");
+        }
+
+        let spec = json!({ "volumes": [{ "volume": "acme-data" }] });
+        let msg = format!("{:?}", check_owned_volume_fields(&spec).unwrap_err());
+        assert!(msg.contains("volumes[0].volume"), "{msg}");
+        assert!(msg.contains("not built yet"), "{msg}");
+        assert!(
+            msg.contains("blank disk"),
+            "it says what would go wrong: {msg}"
+        );
+
+        // And an ordinary declared disk is untouched.
+        check_owned_volume_fields(&json!({
+            "volumes": [{ "size_bytes": 1, "base_image": "debian.raw" }]
+        }))
+        .expect("nothing control-plane-owned here");
+    }
+
+    /// `status` is the cloud's answer about where the DATA is, and a client
+    /// that could write it could point its own object at somebody else's
+    /// bytes. `status.backend` most directly of all: that string is what a
+    /// node hands to its driver.
+    #[test]
+    fn a_client_may_not_write_a_volumes_status() {
+        type Setter = fn(&mut Volume);
+        let owned: [(&str, Setter); 4] = [
+            ("status.backend", |v| {
+                v.status.backend = "vol-someone-else".into()
+            }),
+            ("status.node", |v| v.status.node = Some("manacor".into())),
+            ("status.attachedTo", |v| {
+                v.status.attached_to = Some("web".into())
+            }),
+            ("status.phase", |v| v.status.phase = VolumePhase::Ready),
+        ];
+        for (field, set) in owned {
+            let mut volume = Volume::declare("data", controller_api::VolumeSpec::default());
+            set(&mut volume);
+            let msg = format!("{:?}", check_owned_volume_status(&volume).unwrap_err());
+            assert!(msg.contains(field), "the message names the field: {msg}");
+        }
+        // The shape a client actually sends: a size, a pool, nothing else.
+        let mut plain = Volume::declare("data", controller_api::VolumeSpec::default());
+        plain.spec.size_gib = 10;
+        check_owned_volume_status(&plain).expect("nothing status-owned here");
+    }
+
+    fn pool(name: &str, default: bool) -> StoragePool {
+        StoragePool::declare(
+            name,
+            controller_api::StoragePoolSpec {
+                driver: "lvm-thin".into(),
+                default,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The refusals a member reads when a cloud has no storage, or has
+    /// several pools and no default. Wordy on purpose and for the reason
+    /// `floating::pick_pool` is wordy: "no pool" is the state a cloud is in
+    /// before an administrator has declared any storage at all, and the
+    /// useful answer is what the administrator has to do.
+    #[test]
+    fn picking_a_pool_says_what_an_administrator_would_have_to_do() {
+        let msg = format!("{:?}", pick_storage_pool(&[], None).unwrap_err());
+        assert!(msg.contains("no storage pool"), "{msg}");
+        assert!(msg.contains("storagepool create"), "{msg}");
+
+        let pools = vec![pool("fast", false), pool("bulk", false)];
+        let msg = format!("{:?}", pick_storage_pool(&pools, None).unwrap_err());
+        assert!(msg.contains("no storage pool is marked default"), "{msg}");
+        assert!(msg.contains("fast, bulk"), "it lists them: {msg}");
+
+        // A named pool is taken as named, and an unknown name is refused
+        // rather than quietly replaced — a caller who asked for `fast` asked
+        // for the disk they meant.
+        assert_eq!(
+            pick_storage_pool(&pools, Some("bulk"))
+                .unwrap()
+                .metadata
+                .name,
+            "bulk"
+        );
+        let msg = format!("{:?}", pick_storage_pool(&pools, Some("nvme")).unwrap_err());
+        assert!(
+            msg.contains("nvme") && msg.contains("no storage pool"),
+            "{msg}"
+        );
+
+        // With exactly one default, saying nothing takes it.
+        let pools = vec![pool("fast", true), pool("bulk", false)];
+        assert_eq!(
+            pick_storage_pool(&pools, None).unwrap().metadata.name,
+            "fast"
+        );
+
+        // Two defaults is a store somebody edited by hand, and saying so
+        // beats picking one and being unable to explain where the data went.
+        let pools = vec![pool("fast", true), pool("bulk", true)];
+        let msg = format!("{:?}", pick_storage_pool(&pools, None).unwrap_err());
+        assert!(msg.contains("2 storage pools are marked default"), "{msg}");
+    }
+
+    /// A member sees its own ceiling and not everybody else's — the quota map
+    /// is the only field on a pool that names other tenants at all.
+    #[test]
+    fn a_member_sees_its_own_storage_quota_and_no_one_elses() {
+        let mut p = pool("fast", true);
+        p.spec.quota = [("acme".to_string(), 500), ("globex".to_string(), 20)]
+            .into_iter()
+            .collect();
+        redact_storage_quota(&mut p, "acme");
+        assert_eq!(p.spec.quota.len(), 1);
+        assert_eq!(p.spec.quota.get("acme"), Some(&500));
+        // and everything else about the pool is still readable: a member has
+        // to be able to see which pool is the default and what backs it.
+        assert!(p.spec.default);
+        assert_eq!(p.spec.driver, "lvm-thin");
+    }
+
+    /// The most important detail in the storage brief, as a test.
+    ///
+    /// Derived from the uid and never allocated: a provision that succeeds
+    /// and whose handle is then lost has to FIND its volume on the next try,
+    /// not make a second one nobody will ever know about. And derived from
+    /// the uid rather than the name, because people reuse names — two volumes
+    /// called `data` in one tenant, a year apart, must not be one volume on
+    /// the backend.
+    #[test]
+    fn a_backend_name_is_derived_from_the_uid_and_is_stable() {
+        let uid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+        assert_eq!(backend_name(uid), backend_name(uid), "a pure function");
+        assert!(backend_name(uid).contains(uid), "and it carries the uid");
+
+        let recreated = "9c5b94b1-35ad-49bb-b118-8e8fc24abf80";
+        assert_ne!(
+            backend_name(uid),
+            backend_name(recreated),
+            "the same name a year later is a different volume"
+        );
+    }
+
+    /// A volume carries the finalizer that makes "detach before delete" the
+    /// one path out. The mirror of what `new_vm` does, for a reason with more
+    /// at stake: at the end of getting this wrong is data that is gone.
+    #[test]
+    fn a_volume_is_born_with_the_release_finalizer_on_it() {
+        let v = new_volume("data", controller_api::VolumeSpec::default());
+        assert!(
+            v.metadata
+                .finalizers
+                .contains(&controller_api::VOLUME_RELEASE_FINALIZER.to_string()),
+            "{:?}",
+            v.metadata.finalizers
+        );
+        assert_eq!(v.status.phase, VolumePhase::Pending);
+        assert!(v.status.attached_to.is_none());
+    }
 
     /// A member's POST body is not allowed to name its own overlay, its own
     /// floating addresses or its own allowlist. All three injectors skip a NIC
