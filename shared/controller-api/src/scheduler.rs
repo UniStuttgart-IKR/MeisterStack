@@ -705,7 +705,7 @@ pub fn pending_reason_of(vm: &Vm, candidates: &[Candidate]) -> (PendingReason, S
         {
             return (
                 PendingReason::AntiAffinity,
-                "every candidate that would otherwise do already holds a vm this one must                  stay away from"
+                "every candidate that would otherwise do already holds a vm this one must stay away from"
                     .to_string(),
             );
         }
@@ -1680,6 +1680,34 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(e.contains("first-fit") && e.contains("spread"), "{e}");
+    }
+
+    /// Every sentence an operator reads, checked for the artefact that has
+    /// bitten this repository before: a string literal broken over two source
+    /// lines whose continuation keeps the indentation. It compiles, it passes
+    /// every test that greps for a word, and it puts a run of spaces in the
+    /// middle of a sentence on somebody's terminal.
+    #[test]
+    fn no_sentence_carries_a_run_of_spaces_from_the_source_that_wrote_it() {
+        let occupied = [labelled("agent-1a", &[], &[&[("app", "web")]])];
+        let unlabelled = [labelled("agent-1a", &[("zone", "b")], &[])];
+        let full = [Candidate {
+            free: Capacity::default(),
+            ..candidate("agent-1a", true, true)
+        }];
+        let sentences = [
+            pending_reason(&vm(), &[]),
+            pending_reason(&vm(), &[candidate("gone", false, true)]),
+            pending_reason(&sized(2, 2048), &full),
+            pending_reason(&selecting(&[("zone", "a")]), &unlabelled),
+            pending_reason(&avoiding(&[("app", "web")], true), &occupied),
+            pending_reason(&vm_asking(nvrm_4q()), &[gpu_candidate("agent-1a", &[])]),
+        ];
+        for s in sentences {
+            assert!(!s.contains("  "), "run of spaces in: {s:?}");
+            assert!(!s.contains('\n'), "newline in: {s:?}");
+            assert!(s.is_ascii(), "non-ascii in: {s:?}");
+        }
     }
 
     /// The category behind the sentence: a closed set, because the sentence
