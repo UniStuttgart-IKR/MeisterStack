@@ -264,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
         &cfg.auth,
         cfg.client_ca.as_deref(),
         base,
+        controller_api::rest::Tier::Cluster,
     )?);
     if chain.is_empty() {
         // Warn, as `csr_auto_approve` and the static bearer token are: a
@@ -350,6 +351,9 @@ async fn main() -> anyhow::Result<()> {
         controller_api::rest::AuthState {
             chain,
             directory: None,
+            // No directory means nothing to provision into, and no oidc link
+            // to provision for -- `build_chain` refuses one at this tier.
+            provision_oidc_users: false,
         },
     );
     controller_api::rest::serve(listener, router, api_tls).await

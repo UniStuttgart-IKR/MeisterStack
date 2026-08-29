@@ -6,6 +6,10 @@ edition = "2024"
 [dependencies]
 common = { package = "meister-common", path = "../common" }
 pki = { package = "meister-pki", path = "../pki" }
+# The token half of `auth`: JWT verification and the provider's key cache.
+# Its own crate because the CLI needs the login half of it and does not
+# need etcd -- the same reason `pki` is one.
+meister-oidc = { path = "../oidc" }
 # The metrics registry. The store is one of the three places that writes to
 # it, and the only one that can say what an etcd operation cost.
 telemetry = { package = "meister-telemetry", path = "../telemetry" }
@@ -32,6 +36,11 @@ proto = { package = "meister-proto", path = "../proto" }
 
 [dev-dependencies]
 toml = { workspace = true }
+# The in-process identity provider: a real key pair, a real JWKS and real
+# signatures, so that every refusal in `oidc` is proved against a token
+# somebody actually signed. Resolver 2 keeps this feature out of a plain
+# `cargo build`.
+meister-oidc = { path = "../oidc", features = ["testing"] }
 # The mTLS authenticator is only worth testing against real certificates —
 # one from our CA, one from somebody else's, one that has expired — and
 # minting those is what rcgen is for. Test-only: nothing in this crate issues

@@ -212,7 +212,7 @@ etcd_prefix = "/cloud"
 #memory = 1.0
 
 [auth]
-#chain = ["mtls", "bearer"]
+#chain = ["mtls", "oidc", "bearer"]
 
 # The development bearer token: one static string, no expiry, no rotation,
 # read from a file at start-up. It exists because the CSR flow has a
@@ -225,3 +225,76 @@ etcd_prefix = "/cloud"
 # answers to no User object, which is what the bootstrap needs — until the
 # first user exists there is no directory entry for an ordinary admin.
 #bearer_groups = ["system:masters"]
+
+# --- the identity provider -------------------------------------------------
+#
+# Certificates are for things that have no browser, OIDC is for people, and
+# not mixing those two is the decision this whole section rests on. Nodes and
+# clusters authenticate with mTLS and always will; `system:node:<name>` comes
+# out of a certificate this stack's own CA issued, and no token is ever
+# allowed to name one.
+#
+# Cloud only. The cluster tier keeps no user directory, and without one a
+# token authenticates somebody it could then permit nothing — so a
+# [auth.oidc] table there is a start-up error rather than a quiet no-op.
+#
+# What a token settles is WHO. What somebody may do stays the directory's
+# answer: the role is read off the User object on every request, so a
+# demotion there takes effect at once, and no claim in any token becomes a
+# role or a permission. A token for a name the directory does not know is
+# therefore worth nothing — the same answer somebody whose account was
+# deleted gets.
+#
+# The order in `chain` matters more here than anywhere else. Both bearer
+# links read the same Authorization header and the chain stops at the first
+# hard no, so "bearer" in front of "oidc" makes the oidc link unreachable.
+# That configuration is refused at start-up rather than accepted quietly.
+#[auth.oidc]
+# The issuer, exactly as the provider spells it. `.well-known/
+# openid-configuration` is appended to it, and the document that comes back
+# has to name this same string or its keys are not taken — a document that
+# disowns its issuer gets to choose our signing keys otherwise.
+#issuer = "https://idp.example.org/realms/lab"
+#client_id = "meisterstack"
+# Which audiences a token may carry. Defaults to [client_id]. A token issued
+# for Grafana is not a token for this API, however impeccably it is signed.
+#audience = ["meisterstack"]
+# Which claim is the username. Default `sub`, and that default is a decision:
+# `sub` is the one claim OIDC requires to be stable and never reassigned,
+# while `email` changes when somebody marries or moves team — and a name that
+# changes silently detaches a person from everything they own here, or worse,
+# attaches them to what the last holder of that address owned.
+#username_claim = "sub"
+# The algorithm pin. What the provider ADVERTISES is not what we accept:
+# without this list an attacker chooses the algorithm their token is checked
+# under. Asymmetric only — there is no symmetric code path in this stack to
+# confuse a public key into being an HMAC secret with.
+#allowed_algorithms = ["RS256", "ES256"]
+# Clock drift on exp and nbf, seconds.
+#leeway_secs = 60
+# The floor between two key fetches asked for by a request that met an
+# unknown key id. This is a rate limit and not a tuning knob: without it a
+# token carrying a random `kid` is one request to the provider, and tokens
+# are free to make.
+#min_refetch_interval_secs = 60
+# And how often to refetch with nobody asking, so a key rotation is usually
+# picked up before any request meets an unknown key at all.
+#refresh_interval_secs = 3600
+# The CA that signed the provider, for a provider that is not on the public
+# internet. Absent = the platform's own roots, which is right for a real
+# provider and wrong for a lab one.
+#ca_cert = "pki/idp-ca.crt"
+#
+# Create a User for somebody the provider knows and the directory does not.
+#
+# Switched on, this means that everybody the identity provider knows has a
+# foot in the door.
+#
+# Off by default, and that default is the recommendation: with it on, the
+# directory stops being a list an administrator wrote. Three things bound it
+# and none is decoration — the role is always `member` and is never read from
+# a claim, the tenant comes from the claim below and has no default, and that
+# tenant has to exist already. So what a stranger gets a foot into is a room
+# an administrator has built and named.
+#provision_unknown_users = false
+#tenant_claim = "meister_tenant"

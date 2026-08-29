@@ -275,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
         &cfg.auth,
         cfg.client_ca.as_deref(),
         base,
+        controller_api::rest::Tier::Cloud,
     )?);
     if chain.is_empty() {
         // Warn, as `csr_auto_approve` and the static bearer token are: a
@@ -356,6 +357,12 @@ async fn main() -> anyhow::Result<()> {
         controller_api::rest::AuthState {
             chain,
             directory: Some(store),
+            provision_oidc_users: cfg
+                .auth
+                .oidc
+                .as_ref()
+                .and_then(|o| o.provision_unknown_users)
+                .unwrap_or(false),
         },
     );
     controller_api::rest::serve(listener, router, api_tls).await

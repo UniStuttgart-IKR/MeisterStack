@@ -1152,6 +1152,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "meister-common",
+ "meister-oidc",
  "meister-pki",
  "meister-proto",
  "meister-telemetry",

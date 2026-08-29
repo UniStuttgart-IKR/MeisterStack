@@ -151,6 +151,36 @@ struct Header {
     crit: Option<Vec<String>>,
 }
 
+/// Whether a bearer value is a signed JWT at all.
+///
+/// This exists so that two links of the same authenticator chain can share
+/// the `Authorization: Bearer` header without fighting over it. The chain's
+/// contract is that `Err` ends the walk, so an OIDC link that refused every
+/// bearer value it could not verify would take the static development token
+/// down with it — the token would never reach the link that knows it. A JWT
+/// is recognisable by shape, so the OIDC link claims what is one and passes
+/// on what is not.
+///
+/// Deliberately a shape test and not a validity test: something that IS a
+/// JWT and is broken must be REFUSED by the OIDC link, not handed on to a
+/// weaker one. Only things that were never JWTs get passed along.
+pub fn looks_like_a_jwt(token: &str) -> bool {
+    let mut parts = token.split('.');
+    let (Some(header), Some(payload), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if header.is_empty() || payload.is_empty() {
+        return false;
+    }
+    // A JOSE header is base64url json with an `alg`. Anything that decodes
+    // that far was meant to be a token, whatever else is wrong with it.
+    let Ok(raw) = b64(header) else { return false };
+    serde_json::from_slice::<serde_json::Map<String, Value>>(&raw)
+        .is_ok_and(|h| h.get("alg").is_some_and(Value::is_string))
+}
+
 /// Check one token against one set of keys.
 pub fn verify(
     token: &str,
@@ -610,6 +640,34 @@ mod tests {
         );
         let err = verify(&token, &idp.keys(), &validation(), now()).unwrap_err();
         assert!(err.to_string().contains("critical"), "{err}");
+    }
+
+    /// The shape test that lets the OIDC link and the static bearer token
+    /// share one header. Anything that was never a JWT is passed on; a
+    /// broken JWT is not, because passing that on would mean a token the
+    /// OIDC link refused getting a second opinion from a weaker link.
+    #[test]
+    fn a_jwt_is_recognisable_by_shape_and_an_opaque_token_is_not() {
+        let idp = TestIdp::new("k1");
+        assert!(looks_like_a_jwt(&good(&idp)));
+        assert!(looks_like_a_jwt(&unsigned(&claims(ISS, AUD, "u", EXP))));
+        // Broken in every way but still a jwt: the OIDC link owns these.
+        assert!(looks_like_a_jwt(&idp.tampered(&claims(ISS, AUD, "u", EXP))));
+        assert!(looks_like_a_jwt(&idp.token(&json!({}))));
+
+        for opaque in [
+            "",
+            "s3cr3t",
+            "dev-token-for-the-lab",
+            "a.b.c",
+            "a.b",
+            "..",
+            "eyJhbGciOiJFUzI1NiJ9..",
+            // Valid base64url json, but no `alg`: not a JOSE header.
+            &format!("{}.x.y", crate::testing::b64(b"{\"typ\":\"JWT\"}")),
+        ] {
+            assert!(!looks_like_a_jwt(opaque), "{opaque:?} was claimed as a jwt");
+        }
     }
 
     /// The RSA path, against RFC 7515's own worked example — key, signing

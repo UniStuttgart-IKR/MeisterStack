@@ -16,6 +16,7 @@ pub mod heartbeat;
 pub mod lifecycle;
 pub mod mirror;
 pub mod object;
+pub mod oidc;
 pub mod quota;
 pub mod requeue;
 pub mod resources;
@@ -34,6 +35,7 @@ pub use heartbeat::{HEARTBEAT_TIMEOUT_SECS, expired as heartbeat_expired};
 pub use lifecycle::{Lifecycle, lifecycle_command};
 pub use mirror::{Observation, observe};
 pub use object::{ANNOTATION_TRACEPARENT, Metadata, Object, Resource};
+pub use oidc::{GROUP_OIDC, GROUP_OIDC_TENANT_PREFIX, OidcAuthenticator, claimed_tenant};
 pub use requeue::{RequeueConfig, RequeuePolicy};
 pub use resources::{
     API_VERSION, AccessMode, CertificateSigningRequest, Cluster, ClusterCapacity, ClusterSpec,

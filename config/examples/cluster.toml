@@ -158,6 +158,11 @@ etcd_prefix = "/cluster"
 #vcpu = 4.0
 #memory = 1.0
 
+# No [auth.oidc] here, and that is not an omission. This tier keeps no user
+# directory — the users live at the cloud, once — so it cannot turn a token's
+# name into a role, and a token would authenticate somebody it could then
+# permit nothing. An [auth.oidc] table at this tier is a start-up error. What
+# talks to a cluster controller is machinery, and machinery has certificates.
 [auth]
 #chain = ["mtls", "bearer"]
 #bearer_token_file = "pki/dev-token"

@@ -133,3 +133,18 @@ chain = ["mtls"]
 #bearer_token_file = "pki/dev-token"
 #bearer_identity = "dev-admin"
 #bearer_groups = ["system:masters"]
+
+# The identity provider, for a profile that has people in it as well as
+# machines. `chain = ["mtls", "oidc"]` above is what turns it on, and the
+# order is the security-relevant part: with a static token link configured it
+# has to come LAST, because both read the same header and the chain stops at
+# the first hard no.
+#
+# What stays true with it on: the role is read off the User object on every
+# request and never out of a claim, a token for a name the directory does not
+# know may do nothing, and no token may name itself `system:*`. See
+# config/examples/cloud.toml for the whole table with its reasoning.
+#[auth.oidc]
+#issuer = "https://idp.example.org/realms/lab"
+#client_id = "meisterstack"
+#allowed_algorithms = ["RS256", "ES256"]

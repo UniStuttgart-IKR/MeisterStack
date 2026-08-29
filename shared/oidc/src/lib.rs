@@ -30,4 +30,4 @@ pub mod testing;
 pub use cache::{KeyCache, RefreshHandle};
 pub use discovery::{Discovery, HttpKeySource, KeySource, Provider};
 pub use jwks::{Alg, Curve, Jwk, JwkSet, Keys, PublicKey};
-pub use jwt::{Claims, Validation, Verified, verify};
+pub use jwt::{Claims, Validation, Verified, VerifyError, looks_like_a_jwt, verify};

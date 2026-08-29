@@ -19,6 +19,7 @@
 //! without auth or (with a bearer token) auth without TLS.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::extract::{Request, State};
@@ -131,6 +132,10 @@ pub struct AuthState {
     /// one truth), and the price is that a demotion reaches it when the
     /// certificate is re-issued.
     pub directory: Option<Arc<EtcdStore>>,
+    /// Create a `User` for an identity out of a token that the directory
+    /// does not know yet. `auth.oidc.provision_unknown_users`, off by
+    /// default. See `provision`.
+    pub provision_oidc_users: bool,
 }
 
 impl AuthState {
@@ -138,6 +143,7 @@ impl AuthState {
         Self {
             chain: Arc::new(AuthChain::default()),
             directory: None,
+            provision_oidc_users: false,
         }
     }
 }
@@ -433,10 +439,34 @@ async fn grant_of(
             let tenant = Some(user.spec.tenant).filter(|t| !t.is_empty());
             Ok((Some(user.spec.role), tenant))
         }
-        // A valid certificate for a name the directory does not know. Not an
+        // A valid credential for a name the directory does not know. Not an
         // error: it is somebody whose account was removed, and the honest
         // answer is that they may do nothing, said in words.
-        Err(StoreError::NotFound(_)) => Ok((None, None)),
+        //
+        // It is also every OIDC user's first request, which is why the one
+        // switch that can change this answer is here. Off, the answer stays
+        // "nothing", and a token for somebody an administrator has not
+        // entered in the directory is worth exactly as much as a certificate
+        // for a deleted account.
+        Err(StoreError::NotFound(_)) => match provision(st, identity).await {
+            Ok(Some(user)) => Ok((
+                Some(user.spec.role),
+                Some(user.spec.tenant).filter(|t| !t.is_empty()),
+            )),
+            Ok(None) => Ok((None, None)),
+            Err(e) => {
+                // Not fatal to the request: it falls back to the answer it
+                // would have had, which is "you may do nothing". Warn,
+                // because an operator who switched this on wants to know it
+                // is not working.
+                warn!(
+                    identity = %identity,
+                    error = %format!("{e:#}"),
+                    "could not provision a user for a token this provider vouched for"
+                );
+                Ok((None, None))
+            }
+        },
         // The directory is unreachable. Refusing beats guessing: this is the
         // only thing standing between a certificate and a write.
         Err(e) => Err(deny(
@@ -444,6 +474,77 @@ async fn grant_of(
             "Timeout",
             format!("cannot reach the user directory: {e}"),
         )),
+    }
+}
+
+/// Make a `User` for somebody the identity provider vouched for and the
+/// directory has never seen.
+///
+/// **Switched on, this means that everybody the identity provider knows has
+/// a foot in the door.** That sentence is the switch's whole risk and it is
+/// why the default is off: with it on, the directory stops being a list an
+/// administrator wrote and becomes a list the provider writes.
+///
+/// Four things bound it, and none of them is decoration:
+///
+/// * Only an identity out of a token. A certificate for an unknown name is
+///   still nobody — that path has its own bootstrap (`system:masters`) and
+///   does not need a second one.
+/// * The role is always `Member`, hard-coded here, never read from a claim.
+///   Deriving a role from a token would contradict the invariant the rest of
+///   this file is built on: the directory is the truth about what somebody
+///   may do.
+/// * The tenant comes from the claim the operator nominated. There is no
+///   default tenant, because a default would be one room everybody the
+///   provider knows shares.
+/// * That tenant has to EXIST. This is the bound that makes the switch
+///   defensible: what a stranger gets a foot into is a room an administrator
+///   has already built and named, not one their own token invented.
+///
+/// Yes, this writes during a GET. It is the one write in the request path
+/// and it happens once per person, ever; the alternative — provisioning from
+/// a background task — would mean the first command after a login failing
+/// for reasons nobody could act on.
+async fn provision(st: &AuthState, identity: &Identity) -> anyhow::Result<Option<User>> {
+    if !st.provision_oidc_users || !identity.has_group(crate::oidc::GROUP_OIDC) {
+        return Ok(None);
+    }
+    let Some(store) = &st.directory else {
+        return Ok(None);
+    };
+    let Some(tenant) = crate::oidc::claimed_tenant(identity) else {
+        anyhow::bail!("the token carries no tenant claim, so there is no tenant to put them in");
+    };
+    if let Err(e) = store.get::<crate::resources::Tenant>(tenant).await {
+        anyhow::bail!("the token claims tenant {tenant:?}, which does not exist here: {e}");
+    }
+
+    let mut user = User::new(
+        API_VERSION,
+        User::KIND,
+        &identity.name,
+        crate::resources::UserSpec {
+            tenant: tenant.to_string(),
+            role: Role::Member,
+            description: "created at first login from an oidc token".into(),
+        },
+    );
+    match store.create(&user).await {
+        Ok(created) => {
+            info!(
+                identity = %identity,
+                tenant = %tenant,
+                "created a user at first login"
+            );
+            Ok(Some(created))
+        }
+        // Two of this person's requests raced and the other one won. That is
+        // a success, not a conflict: read what it wrote.
+        Err(StoreError::AlreadyExists(_)) => {
+            user = store.get::<User>(&identity.name).await?;
+            Ok(Some(user))
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -576,9 +677,93 @@ pub struct AuthConfig {
     /// tenant and the first user, and until those exist there is no directory
     /// entry for an ordinary admin to be found in.
     pub bearer_groups: Option<Vec<String>>,
+    /// The identity provider, when this tier has one. See `OidcConfig`.
+    pub oidc: Option<OidcConfig>,
 }
 
-const DEFAULT_CHAIN: [&str; 2] = ["mtls", "bearer"];
+/// The `[auth.oidc]` table.
+///
+/// Cloud only. The cluster tier keeps no user directory — that is a design
+/// decision of this stack and `auth::permits` says why — and without one it
+/// cannot turn a name into a role, so a token would authenticate somebody it
+/// could then permit nothing. It stays on certificates.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcConfig {
+    /// The issuer url, exactly as the provider spells it in its own
+    /// documents. `.well-known/openid-configuration` is appended to it and
+    /// the document that comes back has to name this same string, or the
+    /// keys it points at are not taken.
+    pub issuer: String,
+    /// Who we are to the provider. Also the default audience, because for
+    /// most providers those are the same string.
+    pub client_id: String,
+    /// Which audiences a token may carry. Defaults to `[client_id]`. A token
+    /// issued for another service is not a token for this one.
+    pub audience: Option<Vec<String>>,
+    /// Which claim is the username. Defaults to `sub`.
+    ///
+    /// Worth a deliberate answer rather than a default accepted by silence:
+    /// providers put it in different places, and `email` — the tempting one
+    /// — is a trap, because an address changes and a name that changes
+    /// silently detaches a person from everything they own here.
+    pub username_claim: Option<String>,
+    /// Which signature algorithms are accepted. Defaults to RS256 and
+    /// ES256, both asymmetric.
+    ///
+    /// What the provider ADVERTISES is not what we accept: this is the pin,
+    /// and without one an attacker gets to choose the algorithm their token
+    /// is checked under.
+    pub allowed_algorithms: Option<Vec<String>>,
+    /// Clock drift allowed on `exp` and `nbf`, seconds. Default 60.
+    pub leeway_secs: Option<u64>,
+    /// The floor between two key fetches asked for by a request that met an
+    /// unknown key id, seconds. Default 60.
+    ///
+    /// This is a rate limit and not a tuning knob: without it a token with a
+    /// random `kid` is one request to the identity provider, and tokens are
+    /// free to make.
+    pub min_refetch_interval_secs: Option<u64>,
+    /// How often to refetch the keys with nobody asking, seconds. Default
+    /// 3600, so that a rotation is usually picked up before any request
+    /// meets an unknown key at all.
+    pub refresh_interval_secs: Option<u64>,
+    /// The CA that signed the provider, for a provider that is not on the
+    /// public internet. Absent = the platform's own roots, which is right
+    /// for a real provider and wrong for a lab one.
+    pub ca_cert: Option<std::path::PathBuf>,
+    /// Create a `User` for somebody the directory does not know yet.
+    ///
+    /// Switched on, this means that everybody the identity provider knows
+    /// has a foot in the door.
+    ///
+    /// Off by default, and that default is the recommendation. What it buys
+    /// is that a new colleague does not need an admin before their first
+    /// command; what it costs is that the directory stops being a list an
+    /// administrator wrote. Three things bound it, and all three are
+    /// deliberate: the role is always `member` and is never read from a
+    /// claim, the tenant must come from `oidc_tenant_claim`, and the tenant
+    /// must already exist — so what somebody gets a foot into is a room an
+    /// administrator has already built.
+    pub provision_unknown_users: Option<bool>,
+    /// Which claim names the tenant a provisioned user lands in. Required
+    /// for `provision_unknown_users`, and useless without it.
+    pub tenant_claim: Option<String>,
+}
+
+const DEFAULT_CHAIN: [&str; 3] = ["mtls", "oidc", "bearer"];
+
+/// Which tier is assembling a chain.
+///
+/// One difference and only one: the cloud keeps the user directory and the
+/// cluster does not. Everything that needs to know a caller's ROLE needs the
+/// directory, so an authenticator that establishes only a name is usable at
+/// one tier and not at the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tier {
+    Cloud,
+    Cluster,
+}
 
 /// Assemble the authenticator chain the config asks for.
 ///
@@ -590,6 +775,7 @@ pub fn build_chain(
     cfg: &AuthConfig,
     client_ca: Option<&std::path::Path>,
     base: Option<&std::path::Path>,
+    tier: Tier,
 ) -> Result<AuthChain> {
     let explicit = cfg.chain.is_some();
     let names: Vec<String> = cfg
@@ -597,9 +783,40 @@ pub fn build_chain(
         .clone()
         .unwrap_or_else(|| DEFAULT_CHAIN.iter().map(|s| s.to_string()).collect());
 
+    // Both bearer links read the same header, and the chain stops at the
+    // first hard no: a static-token link in front of the oidc link refuses
+    // every JWT before the oidc link ever sees one, so the oidc link is not
+    // merely deprioritised, it is unreachable. An operator who has written
+    // that has configured a door they believe is open and is not, which is
+    // the same mistake this function already refuses in the other direction.
+    let position = |want: &str| names.iter().position(|n| n == want);
+    if let (Some(bearer), Some(oidc)) = (position("bearer"), position("oidc"))
+        && bearer < oidc
+    {
+        anyhow::bail!(
+            "auth.chain puts \"bearer\" before \"oidc\"; the static token link refuses \
+             every bearer value it does not recognise and the chain stops there, so no \
+             token would ever reach the oidc link. Put \"oidc\" first."
+        );
+    }
+
     let mut links: Vec<Box<dyn crate::auth::Authenticator>> = Vec::new();
     for name in &names {
         match name.as_str() {
+            "oidc" => match &cfg.oidc {
+                Some(oidc) if tier == Tier::Cloud => {
+                    links.push(Box::new(build_oidc(oidc, base)?));
+                }
+                Some(_) => anyhow::bail!(
+                    "auth.oidc is configured at the cluster tier, which keeps no user \
+                     directory and so cannot turn a token's name into a role. Machines \
+                     authenticate here with certificates."
+                ),
+                None if explicit => {
+                    anyhow::bail!("auth.chain names \"oidc\" but no [auth.oidc] is configured")
+                }
+                None => {}
+            },
             "mtls" => match client_ca {
                 Some(ca) => {
                     let ca = pki::pem::resolve(base, ca);
@@ -648,6 +865,136 @@ pub fn build_chain(
         }
     }
     Ok(AuthChain::new(links))
+}
+
+/// One `OidcAuthenticator`, plus the background task that keeps its keys
+/// current.
+///
+/// The task is spawned here rather than handed back for a caller to spawn,
+/// because there is nothing a caller could usefully decide about it: it
+/// lives exactly as long as the authenticator it feeds, and stops on its own
+/// when the last one is dropped.
+///
+/// Nothing is fetched before this returns, and that is deliberate. A
+/// controller that refused to start because the identity provider was down
+/// would be a controller that cannot be restarted during somebody else's
+/// outage. Until the first fetch lands, tokens are refused with a sentence
+/// saying so, and certificates and the static token still work.
+fn build_oidc(
+    cfg: &OidcConfig,
+    base: Option<&std::path::Path>,
+) -> Result<crate::oidc::OidcAuthenticator> {
+    use meister_oidc::cache::{DEFAULT_MIN_REFETCH_INTERVAL, DEFAULT_REFRESH_INTERVAL, KeyCache};
+    use meister_oidc::jwks::Alg;
+    use meister_oidc::jwt::{DEFAULT_LEEWAY, DEFAULT_USERNAME_CLAIM, Validation};
+
+    if cfg.issuer.trim().is_empty() {
+        anyhow::bail!("auth.oidc.issuer is empty");
+    }
+    if cfg.client_id.trim().is_empty() {
+        anyhow::bail!("auth.oidc.client_id is empty");
+    }
+    let audience = cfg
+        .audience
+        .clone()
+        .unwrap_or_else(|| vec![cfg.client_id.clone()]);
+    if audience.iter().all(|a| a.trim().is_empty()) {
+        // An empty audience is not a permissive setting, it is no check at
+        // all: every token the provider ever minted, for any service it
+        // serves, would be accepted here.
+        anyhow::bail!("auth.oidc.audience is empty; a token for any service would be accepted");
+    }
+
+    let allowed = match &cfg.allowed_algorithms {
+        None => Alg::DEFAULT_ALLOWED.to_vec(),
+        Some(names) => {
+            let mut out = Vec::new();
+            for name in names {
+                let alg = Alg::parse(name).with_context(|| {
+                    format!(
+                        "auth.oidc.allowed_algorithms names {name:?}; only asymmetric \
+                         algorithms are accepted (RS256, RS384, RS512, ES256, ES384)"
+                    )
+                })?;
+                out.push(alg);
+            }
+            if out.is_empty() {
+                anyhow::bail!("auth.oidc.allowed_algorithms is empty; no token could be checked");
+            }
+            out
+        }
+    };
+
+    let mut validation = Validation::new(cfg.issuer.trim(), audience);
+    validation.allowed = allowed;
+    validation.username_claim = cfg
+        .username_claim
+        .clone()
+        .unwrap_or_else(|| DEFAULT_USERNAME_CLAIM.to_string());
+    validation.leeway = cfg
+        .leeway_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_LEEWAY);
+
+    // Provisioning needs a tenant and refuses to guess one: without the
+    // claim there is nothing to put in the `User` object, and a default
+    // tenant would be a room everybody the provider knows shares.
+    let provision = cfg.provision_unknown_users.unwrap_or(false);
+    let tenant_claim = cfg.tenant_claim.clone().filter(|c| !c.trim().is_empty());
+    if provision && tenant_claim.is_none() {
+        anyhow::bail!(
+            "auth.oidc.provision_unknown_users is on but no auth.oidc.tenant_claim is set; \
+             there would be no tenant to put a new user in"
+        );
+    }
+    if provision {
+        warn!(
+            issuer = %cfg.issuer,
+            tenant_claim = tenant_claim.as_deref().unwrap_or(""),
+            "first-login provisioning is on: everybody the identity provider knows has a \
+             foot in the door"
+        );
+    }
+
+    let ca = cfg.ca_cert.as_ref().map(|p| pki::pem::resolve(base, p));
+    let (cache, handle) = KeyCache::new(
+        cfg.min_refetch_interval_secs
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_MIN_REFETCH_INTERVAL),
+    );
+    let cache = Arc::new(cache);
+    let source: Arc<dyn meister_oidc::discovery::KeySource> = Arc::new(
+        meister_oidc::discovery::HttpKeySource::new(cfg.issuer.trim(), ca.clone()),
+    );
+    let interval = cfg
+        .refresh_interval_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_REFRESH_INTERVAL);
+    tokio::spawn(meister_oidc::discovery::refresh_forever(
+        cache.clone(),
+        source,
+        handle,
+        interval,
+        DEFAULT_MIN_REFETCH_INTERVAL,
+    ));
+
+    info!(
+        issuer = %cfg.issuer,
+        username_claim = %validation.username_claim,
+        algorithms = %validation
+            .allowed
+            .iter()
+            .map(|a| a.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        provision_unknown_users = provision,
+        "oidc authenticator"
+    );
+    Ok(crate::oidc::OidcAuthenticator::new(
+        validation,
+        cache,
+        tenant_claim.filter(|_| provision),
+    ))
 }
 
 /// Build the server TLS config, if the operator asked for one.
@@ -759,7 +1106,7 @@ mod tests {
     /// and nothing is the anonymous mode.
     #[test]
     fn an_auth_table_with_nothing_in_it_is_still_anonymous() {
-        let chain = build_chain(&cfg(""), None, None).unwrap();
+        let chain = build_chain(&cfg(""), None, None, Tier::Cloud).unwrap();
         assert!(chain.is_empty());
         assert_eq!(
             chain.authenticate(&AuthRequest::default()).unwrap(),
@@ -771,12 +1118,113 @@ mod tests {
     /// the door is shut. Loud, not silent.
     #[test]
     fn naming_an_authenticator_that_cannot_be_built_is_an_error() {
-        let err = build_chain(&cfg(r#"chain = ["mtls"]"#), None, None).unwrap_err();
+        let err = build_chain(&cfg(r#"chain = ["mtls"]"#), None, None, Tier::Cloud).unwrap_err();
         assert!(err.to_string().contains("client_ca"), "{err}");
-        let err = build_chain(&cfg(r#"chain = ["bearer"]"#), None, None).unwrap_err();
+        let err = build_chain(&cfg(r#"chain = ["bearer"]"#), None, None, Tier::Cloud).unwrap_err();
         assert!(err.to_string().contains("bearer_token_file"), "{err}");
-        let err = build_chain(&cfg(r#"chain = ["magic"]"#), None, None).unwrap_err();
+        let err = build_chain(&cfg(r#"chain = ["magic"]"#), None, None, Tier::Cloud).unwrap_err();
         assert!(err.to_string().contains("magic"), "{err}");
+        let err = build_chain(&cfg(r#"chain = ["oidc"]"#), None, None, Tier::Cloud).unwrap_err();
+        assert!(err.to_string().contains("auth.oidc"), "{err}");
+    }
+
+    fn oidc_cfg(extra: &str) -> AuthConfig {
+        oidc_chain(r#"["oidc"]"#, extra)
+    }
+
+    fn oidc_chain(chain: &str, extra: &str) -> AuthConfig {
+        cfg(&format!(
+            "chain = {chain}\n[oidc]\nissuer = \"https://idp.example.org\"\n\
+             client_id = \"meisterstack\"\n{extra}"
+        ))
+    }
+
+    /// The tier split, which is not a policy choice but an arithmetic one:
+    /// authorization needs a role, a role needs the directory, and the
+    /// cluster has no directory. A token there would authenticate somebody
+    /// the tier could then permit nothing, which is worse than refusing the
+    /// configuration.
+    #[tokio::test]
+    async fn the_cluster_tier_refuses_an_oidc_link_because_it_has_no_directory() {
+        let err = build_chain(&oidc_cfg(""), None, None, Tier::Cluster).unwrap_err();
+        assert!(err.to_string().contains("user directory"), "{err}");
+        // And the same table at the cloud is simply a chain of one.
+        let chain = build_chain(&oidc_cfg(""), None, None, Tier::Cloud).unwrap();
+        assert_eq!(chain.len(), 1);
+    }
+
+    /// Both bearer links read the same header and the chain stops at the
+    /// first hard no, so a static-token link in front of the oidc link does
+    /// not deprioritise it — it makes it unreachable. The default order has
+    /// oidc first for exactly this reason.
+    #[tokio::test]
+    async fn a_static_token_link_in_front_of_the_oidc_link_is_refused() {
+        let err = build_chain(
+            &oidc_chain(r#"["mtls", "bearer", "oidc"]"#, ""),
+            None,
+            None,
+            Tier::Cloud,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("would ever reach"), "{err}");
+        assert_eq!(DEFAULT_CHAIN, ["mtls", "oidc", "bearer"]);
+    }
+
+    /// The pin is a list of algorithms WE accept, so a name that is not one
+    /// has to be an error at start-up rather than a token refused later.
+    #[tokio::test]
+    async fn only_asymmetric_algorithms_may_be_configured() {
+        let err = build_chain(
+            &oidc_cfg("allowed_algorithms = [\"HS256\"]"),
+            None,
+            None,
+            Tier::Cloud,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("asymmetric"), "{err:#}");
+
+        assert!(
+            build_chain(
+                &oidc_cfg("allowed_algorithms = [\"RS256\", \"ES384\"]"),
+                None,
+                None,
+                Tier::Cloud
+            )
+            .is_ok()
+        );
+    }
+
+    /// A token with no audience check is a token issued for some other
+    /// service that this one accepts. Refused as a configuration.
+    #[tokio::test]
+    async fn an_empty_audience_is_a_configuration_error_and_not_a_permissive_setting() {
+        let err = build_chain(&oidc_cfg("audience = []"), None, None, Tier::Cloud).unwrap_err();
+        assert!(err.to_string().contains("any service"), "{err}");
+    }
+
+    /// Provisioning without a tenant claim has nothing to put in the object
+    /// it would create, and a default tenant would be one room everybody the
+    /// provider knows shares.
+    #[tokio::test]
+    async fn first_login_provisioning_refuses_to_guess_a_tenant() {
+        let err = build_chain(
+            &oidc_cfg("provision_unknown_users = true"),
+            None,
+            None,
+            Tier::Cloud,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tenant_claim"), "{err}");
+
+        assert!(
+            build_chain(
+                &oidc_cfg("provision_unknown_users = true\ntenant_claim = \"groups\""),
+                None,
+                None,
+                Tier::Cloud
+            )
+            .is_ok()
+        );
     }
 
     /// The check that keeps certificatesigningrequests from being a way up.
