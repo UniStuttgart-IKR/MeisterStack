@@ -290,6 +290,19 @@ pub fn resolve(config: &Config, expected_tier: Tier, ov: &Overrides) -> Result<T
 
     let oidc = profile.and_then(|p| oidc_source(&p.credential, config.dir.as_deref(), &name));
 
+    // The same shape of refusal `Client::new` makes for a client certificate
+    // over plain http, and for a sharper reason. A static lab token over
+    // http is a lab operator's decision about a string they minted. An OIDC
+    // access token is a live credential from somebody else's identity
+    // provider, good for whatever else that provider protects, and putting
+    // one on the wire in clear is not a configuration anybody means.
+    if oidc.is_some() && endpoint.starts_with("http://") {
+        bail!(
+            "profile {name:?} logs in at an identity provider but its endpoint {endpoint} is \
+             plain http; the access token would be readable by anything on the path"
+        );
+    }
+
     let credential = match std::env::var(ENV_TOKEN).ok().filter(|s| !s.is_empty()) {
         Some(token) => Credential::Bearer(token),
         None => match profile.map(|p| &p.credential) {
@@ -677,6 +690,25 @@ mod tests {
             t.oidc.unwrap().tokens,
             Path::new("/etc/meisterstack/sessions/x.json")
         );
+    }
+
+    /// An access token from somebody else's identity provider is good for
+    /// whatever else that provider protects. It does not go on the wire in
+    /// clear, whatever the profile says.
+    #[test]
+    fn an_oidc_profile_refuses_a_plain_http_endpoint() {
+        let mut cfg = oidc_config(None);
+        cfg.profiles.get_mut("p").unwrap().endpoint = "http://10.128.1.103:3000".into();
+        let ov = Overrides {
+            tolerate_missing_credential: true,
+            ..Default::default()
+        };
+        let err = resolve(&cfg, Tier::Cloud, &ov).unwrap_err();
+        assert!(err.to_string().contains("plain http"), "{err}");
+
+        // https is what the example uses, and it resolves.
+        cfg.profiles.get_mut("p").unwrap().endpoint = "https://10.128.1.103:3000".into();
+        assert!(resolve(&cfg, Tier::Cloud, &ov).is_ok());
     }
 
     /// The state every oidc profile is in before its first login. `meister

@@ -141,12 +141,19 @@ pub async fn freshen(target: &mut Target) -> Result<()> {
 /// `meister login --oidc`.
 pub async fn login(target: &Target, global: &GlobalArgs) -> Result<()> {
     let Some(src) = target.oidc.clone() else {
-        bail!(
-            "profile {:?} names no identity provider; add:\n\n\
+        // The fragment goes to stderr rather than into the error, because
+        // the house error format is one line however many contexts it
+        // passed -- and a TOML fragment collapsed onto one line is a
+        // fragment nobody can paste.
+        eprintln!(
+            "profile {:?} names no identity provider. Add:\n\n\
              [profiles.{}]\n\
              credential = {{ type = \"oidc\", issuer = \"https://idp.example.org\", \
              client_id = \"meisterstack\" }}\n",
-            target.profile_name,
+            target.profile_name, target.profile_name
+        );
+        bail!(
+            "profile {:?} has no oidc credential to log in with",
             target.profile_name
         );
     };

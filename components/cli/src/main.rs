@@ -98,8 +98,9 @@ enum TierCmd {
         #[command(subcommand)]
         cmd: CloudCmd,
     },
-    /// Get a client certificate from the cloud: generate a key pair here,
-    /// send only the request, collect the certificate.
+    /// Get a credential for the cloud. Without `--oidc`: generate a key pair
+    /// here, send only the request, collect the certificate. With it: log in
+    /// at the profile's identity provider and store the session.
     Login(LoginArgs),
 }
 
