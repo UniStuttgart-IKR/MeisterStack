@@ -878,7 +878,7 @@ pub fn pending_reason(vm: &Vm, candidates: &[Candidate]) -> String {
     pending_reason_of(vm, candidates).1
 }
 
-/// Spend a candidate's room on a VM that was just bound to it.
+/// Put a VM onto a candidate, in the pass's own picture of the world.
 ///
 /// Called by a pass the moment it decides, and that timing is the whole
 /// point: a pass places VMs one after another out of one listing, so without
@@ -886,12 +886,22 @@ pub fn pending_reason(vm: &Vm, candidates: &[Candidate]) -> String {
 /// still looks empty. An API-edge check cannot do this at all — the objects
 /// it would have to count do not exist yet when it runs.
 ///
+/// **Both halves, in one call, on purpose.** A placement changes two things
+/// about a candidate — it has less room, and it now holds something. The
+/// first was booked here from the beginning and the second was not, and the
+/// consequence was measured in the lab: a burst of creates that one pass sees
+/// together stacked five VMs with a `required` anti-affinity term onto one
+/// node while free nodes stood beside it, because `collides()` was asking an
+/// inventory from before the pass. Two functions to call in the right order
+/// is an invitation to call one; there is one.
+///
 /// A binding whose write then loses its compare-and-swap leaves this pass
-/// with one candidate too poor, which costs at most one VM one tick: the next
-/// pass derives `free` from the store again and the deduction is gone.
-pub fn deduct(candidates: &mut [Candidate], name: &str, spent: Capacity) {
+/// with one candidate too poor and one label too many, which costs at most
+/// one VM one tick: the next pass derives both from the store again.
+pub fn spend(candidates: &mut [Candidate], name: &str, vm: &Vm) {
     if let Some(c) = candidates.iter_mut().find(|c| c.name == name) {
-        c.free = c.free.minus(spent);
+        c.free = c.free.minus(Capacity::wanted_by(vm));
+        c.hosted.push(vm.metadata.labels.clone());
     }
 }
 
@@ -1720,8 +1730,8 @@ mod tests {
         let placed_first = FirstFit.assign(&first, &nodes).expect("the first one fits");
         assert_eq!(placed_first, "agent-1a");
         // What the pass does the moment it decides, before it looks at the
-        // next VM: see `deduct` in both reconcilers.
-        deduct(&mut nodes, &placed_first, Capacity::wanted_by(&first));
+        // next VM: see `spend` in both reconcilers.
+        spend(&mut nodes, &placed_first, &first);
 
         assert_eq!(
             FirstFit.assign(&second, &nodes),
@@ -2053,6 +2063,53 @@ mod tests {
             assert!(!s.contains('\n'), "newline in: {s:?}");
             assert!(s.is_ascii(), "non-ascii in: {s:?}");
         }
+    }
+
+    /// The bug the lab found, as a test: a burst of creates that ONE pass
+    /// sees together used to stack onto one node while free nodes stood
+    /// beside it. `spend` booked the room and not the occupancy, so
+    /// `collides` asked an inventory from before the pass — and five VMs that
+    /// were required to stay apart landed on one machine.
+    ///
+    /// Written against `spend` and not against a reconciler on purpose: this
+    /// is the contract a pass relies on, and both tiers rely on it the same
+    /// way.
+    #[test]
+    fn a_burst_of_creates_in_one_pass_does_not_stack_what_must_stay_apart() {
+        let mut inv = vec![
+            labelled("agent-1a", &[], &[]),
+            labelled("agent-1b", &[], &[]),
+            labelled("agent-1c", &[], &[]),
+        ];
+        let replica = |n: u32| {
+            let mut v = avoiding(&[("app", "web")], true);
+            v.metadata.name = format!("web-{n}");
+            v.metadata.labels = labels(&[("app", "web")]);
+            v
+        };
+
+        let mut placed = Vec::new();
+        for n in 1..=3 {
+            let vm = replica(n);
+            let node = FirstFit
+                .assign(&vm, &inv)
+                .unwrap_or_else(|| panic!("web-{n} found no node"));
+            spend(&mut inv, &node, &vm);
+            placed.push(node);
+        }
+        placed.sort();
+        placed.dedup();
+        assert_eq!(placed.len(), 3, "three replicas, three nodes");
+
+        // And the fourth waits rather than joining one of them.
+        assert_eq!(FirstFit.assign(&replica(4), &inv), None);
+
+        // The other half of what `spend` books is still booked: room.
+        let sized_vm = sized(2, 1024);
+        let mut room = vec![labelled("agent-1a", &[], &[])];
+        let before = room[0].free;
+        spend(&mut room, "agent-1a", &sized_vm);
+        assert!(room[0].free.mem_mib < before.mem_mib, "room is spent too");
     }
 
     /// The category behind the sentence: a closed set, because the sentence

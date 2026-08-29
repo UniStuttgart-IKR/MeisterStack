@@ -384,7 +384,7 @@ async fn reconcile_vm_traced(
             let mut clusters = clusters.lock().unwrap();
             match scheduler.assign(&vm, &clusters) {
                 Some(pick) => {
-                    controller_api::deduct(&mut clusters, &pick, Capacity::wanted_by(&vm));
+                    controller_api::spend(&mut clusters, &pick, &vm);
                     Ok(pick)
                 }
                 None => Err((

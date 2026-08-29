@@ -56,7 +56,7 @@ pub use rest::{
 };
 pub use scheduler::{
     Candidate, CandidateKind, Capacity, DevicePolicy, FirstFit, Overcommit, PendingReason,
-    PendingTally, Scheduler, SchedulerConfig, Spread, deduct, feasible, pending_reason,
-    pending_reason_of, preferred, selector_for, selects,
+    PendingTally, Scheduler, SchedulerConfig, Spread, feasible, pending_reason, pending_reason_of,
+    preferred, selector_for, selects, spend,
 };
 pub use store::{EtcdStore, PassTrigger, StoreError};

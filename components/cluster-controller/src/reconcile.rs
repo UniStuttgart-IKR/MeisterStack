@@ -465,7 +465,7 @@ struct Pass<'a> {
     /// Behind a mutex because a pass SPENDS it: every binding takes room off
     /// the candidate it went to, so the next VM of the same pass is measured
     /// against what is actually left. Never held across an await — see
-    /// `place`, which locks, decides, deducts and lets go.
+    /// `place`, which locks, decides, spends and lets go.
     nodes: std::sync::Mutex<Vec<Candidate>>,
     /// Filled in by `place`, published once at the end of the pass.
     pending: PendingTally,
@@ -667,7 +667,8 @@ async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     // Decide and SPEND under one lock, and let go before anything awaits: the
     // room this VM takes has to be gone before the next VM of the same pass
     // is measured against the node, or two creates in one breath would both
-    // be told there is space for them. See `controller_api::deduct`.
+    // be told there is space for them, and no VM that must stay away from
+    // them would be told they are empty. See `controller_api::spend`.
     //
     // An API-edge check cannot do this and that is why it is not the
     // authority: the objects it would have to count do not exist yet when it
@@ -676,7 +677,7 @@ async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
         let mut nodes = p.nodes.lock().unwrap();
         match p.scheduler.assign(&vm, &nodes) {
             Some(node) => {
-                controller_api::deduct(&mut nodes, &node, Capacity::wanted_by(&vm));
+                controller_api::spend(&mut nodes, &node, &vm);
                 Ok(node)
             }
             // Sentence and category together, from the same candidate list
