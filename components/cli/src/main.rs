@@ -14,10 +14,11 @@ mod cloud;
 mod cluster;
 mod config;
 mod login;
+mod oidc;
 mod output;
 mod vm;
 
-use config::{Config, Overrides, Tier};
+use config::{Config, Overrides, Target, Tier};
 
 #[derive(Parser)]
 #[command(
@@ -107,6 +108,16 @@ enum TierCmd {
 /// make by hand.
 #[derive(Args, Debug)]
 pub struct LoginArgs {
+    /// Log in at the profile's identity provider instead of asking for a
+    /// certificate: the device grant, a code to type into a browser
+    /// anywhere, and a session stored at 0600 next to the profile.
+    ///
+    /// The two are not alternatives for the same thing. A certificate is
+    /// what a machine presents and what keeps working with no provider
+    /// reachable; a token is what a person gets, and it expires. Whichever
+    /// the profile's `credential` names is the one the other commands use.
+    #[arg(long)]
+    pub oidc: bool,
     /// Who to ask for a certificate for. Defaults to $USER.
     #[arg(long)]
     pub user: Option<String>,
@@ -669,26 +680,46 @@ async fn run() -> Result<()> {
 
     match &cli.cmd {
         TierCmd::Agent { cmd } => {
-            let target = config::resolve(&cfg, Tier::Agent, &overrides)?;
-            debug!(profile = %target.profile_name, endpoint = %target.endpoint, "resolved target");
+            let target = target_for(&cfg, Tier::Agent, &overrides).await?;
             agent::run(&target, cmd, &cli.global).await
         }
         TierCmd::Cluster { cmd } => {
-            let target = config::resolve(&cfg, Tier::Cluster, &overrides)?;
-            debug!(profile = %target.profile_name, endpoint = %target.endpoint, "resolved target");
+            let target = target_for(&cfg, Tier::Cluster, &overrides).await?;
             cluster::run(&target, cmd, &cli.global).await
         }
         TierCmd::Cloud { cmd } => {
-            let target = config::resolve(&cfg, Tier::Cloud, &overrides)?;
-            debug!(profile = %target.profile_name, endpoint = %target.endpoint, "resolved target");
+            let target = target_for(&cfg, Tier::Cloud, &overrides).await?;
             cloud::run(&target, cmd, &cli.global).await
         }
-        TierCmd::Login(args) => {
+        // Deliberately NOT through `target_for`: that renews an expired
+        // session before running, and this is the command whose whole job is
+        // to replace one. A revoked refresh token would otherwise fail the
+        // renewal and take the login that would have fixed it with it.
+        TierCmd::Login(args) if args.oidc => {
             let target = config::resolve(&cfg, Tier::Cloud, &overrides)?;
-            debug!(profile = %target.profile_name, endpoint = %target.endpoint, "resolved target");
+            debug!(profile = %target.profile_name, "resolved target");
+            oidc::login(&target, &cli.global).await
+        }
+        TierCmd::Login(args) => {
+            let target = target_for(&cfg, Tier::Cloud, &overrides).await?;
             login::run(&cfg, &target, args, &cli.global).await
         }
     }
+}
+
+/// Resolve a profile and make its credential usable.
+///
+/// The second half is the reason this is a function rather than three lines
+/// repeated four times: an expired OIDC session is renewed here, once, for
+/// every command. Reading the credential cannot do it — renewing is a call
+/// to the identity provider and the credential is read synchronously — so
+/// there has to be exactly one place between resolving and sending, and
+/// this is it.
+async fn target_for(cfg: &Config, tier: Tier, ov: &Overrides) -> anyhow::Result<Target> {
+    let mut target = config::resolve(cfg, tier, ov)?;
+    debug!(profile = %target.profile_name, endpoint = %target.endpoint, "resolved target");
+    oidc::freshen(&mut target).await?;
+    Ok(target)
 }
 
 #[cfg(test)]

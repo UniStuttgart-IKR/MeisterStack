@@ -99,6 +99,15 @@ impl Client {
         match &target.credential {
             Credential::None => {}
             Credential::Bearer(token) => auth = Some(format!("Bearer {token}")),
+            // Unreachable in practice and refused rather than assumed:
+            // `main::target_for` renews an expired session before any
+            // command runs. If this ever fires, a code path has started
+            // building a client without going through it, and sending a
+            // dead token would be a 401 nobody could explain.
+            Credential::StaleOidc => bail!(
+                "internal: profile {} has an expired oidc session that was never renewed",
+                target.profile_name
+            ),
             Credential::Mtls { cert, key } => {
                 if !tls_endpoint {
                     bail!(

@@ -51,6 +51,48 @@ pub enum CredentialSource {
         cert: PathBuf,
         key: PathBuf,
     },
+    /// A person, logged in at an identity provider.
+    ///
+    /// The two paths of this file are the whole difference from the shapes
+    /// above it: `issuer` and `client_id` say WHO issues tokens, and
+    /// `tokens` says where the ones this machine holds are kept. Nothing
+    /// secret is in here -- the same rule the token file and the certificate
+    /// follow -- and the file `tokens` names is written at 0600 by
+    /// `meister login --oidc`.
+    Oidc {
+        issuer: String,
+        client_id: String,
+        /// Where the access and refresh tokens live. Defaults to
+        /// `<config dir>/oidc/<profile>.json`.
+        #[serde(default)]
+        tokens: Option<PathBuf>,
+        /// The CA that signed the provider, for one that is not on the
+        /// public internet. Absent = the platform's own roots.
+        #[serde(default)]
+        ca_cert: Option<PathBuf>,
+        /// What to ask the provider for. Defaults to
+        /// `openid profile email offline_access` -- and `offline_access` is
+        /// the part that matters, because it is what makes a refresh token
+        /// appear. Without one a person logs in again every few minutes,
+        /// which they will not do; they will use the static token instead.
+        #[serde(default)]
+        scope: Option<String>,
+    },
+}
+
+/// Everything `meister login --oidc` and the refresh need, resolved.
+///
+/// It travels on the `Target` rather than only inside the credential
+/// because it is needed exactly when there is no credential yet: the whole
+/// job of `meister login --oidc` is to create the file the credential would
+/// have been read from.
+#[derive(Debug, Clone)]
+pub struct OidcSource {
+    pub tokens: PathBuf,
+    pub issuer: String,
+    pub client_id: String,
+    pub ca_cert: Option<PathBuf>,
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,12 +204,29 @@ pub struct Target {
     pub ca_cert: Option<PathBuf>,
     pub credential: Credential,
     pub timeout_secs: u64,
+    /// The identity provider this profile logs in at, if it names one.
+    ///
+    /// Present whether or not there is a session yet: `meister login --oidc`
+    /// needs it precisely when there is none.
+    pub oidc: Option<OidcSource>,
 }
 
 pub enum Credential {
     None,
     Bearer(String),
-    Mtls { cert: PathBuf, key: PathBuf },
+    Mtls {
+        cert: PathBuf,
+        key: PathBuf,
+    },
+    /// An OIDC session whose access token has run out.
+    ///
+    /// Its own state rather than "no credential" because the two need
+    /// different things done about them: this one is renewed silently from
+    /// the refresh token, and that renewal is a network call, so it cannot
+    /// happen where the credential is read. `oidc::freshen` is the one thing
+    /// that turns this into a `Bearer`, and `Client::new` refuses to send a
+    /// request that still holds one.
+    StaleOidc,
 }
 
 impl std::fmt::Debug for Credential {
@@ -178,6 +237,7 @@ impl std::fmt::Debug for Credential {
             Credential::Mtls { cert, .. } => {
                 write!(f, "Mtls {{ cert: {} }}", cert.display())
             }
+            Credential::StaleOidc => f.write_str("StaleOidc"),
         }
     }
 }
@@ -228,10 +288,12 @@ pub fn resolve(config: &Config, expected_tier: Tier, ov: &Overrides) -> Result<T
             anyhow::anyhow!("no endpoint: pass --endpoint, set {ENV_ENDPOINT}, or select a profile")
         })?;
 
+    let oidc = profile.and_then(|p| oidc_source(&p.credential, config.dir.as_deref(), &name));
+
     let credential = match std::env::var(ENV_TOKEN).ok().filter(|s| !s.is_empty()) {
         Some(token) => Credential::Bearer(token),
         None => match profile.map(|p| &p.credential) {
-            Some(src) => load_credential(src, config.dir.as_deref(), ov)?,
+            Some(src) => load_credential(src, config.dir.as_deref(), ov, oidc.as_ref())?,
             None => Credential::None,
         },
     };
@@ -246,6 +308,44 @@ pub fn resolve(config: &Config, expected_tier: Tier, ov: &Overrides) -> Result<T
         timeout_secs: profile
             .map(|p| p.timeout_secs)
             .unwrap_or_else(default_timeout_secs),
+        oidc,
+    })
+}
+
+/// The identity provider a profile names, with every path made absolute.
+///
+/// The default token path hangs off the config file, exactly as the default
+/// certificate path does, so that a config directory and the credentials it
+/// refers to move as one.
+fn oidc_source(src: &CredentialSource, base: Option<&Path>, profile: &str) -> Option<OidcSource> {
+    let CredentialSource::Oidc {
+        issuer,
+        client_id,
+        tokens,
+        ca_cert,
+        scope,
+    } = src
+    else {
+        return None;
+    };
+    let tokens = match tokens.clone() {
+        Some(p) => resolve_path(base, p),
+        None => match base {
+            Some(dir) => dir.join("oidc").join(format!("{profile}.json")),
+            // No config file to hang it off. `~/.config/meisterstack` is
+            // where one would have been.
+            None => resolve_path(
+                None,
+                PathBuf::from("~/.config/meisterstack/oidc").join(format!("{profile}.json")),
+            ),
+        },
+    };
+    Some(OidcSource {
+        tokens,
+        issuer: issuer.clone(),
+        client_id: client_id.clone(),
+        ca_cert: ca_cert.clone().map(|p| resolve_path(base, p)),
+        scope: scope.clone(),
     })
 }
 
@@ -253,9 +353,36 @@ fn load_credential(
     src: &CredentialSource,
     base: Option<&Path>,
     ov: &Overrides,
+    oidc: Option<&OidcSource>,
 ) -> Result<Credential> {
     match src {
         CredentialSource::None => Ok(Credential::None),
+
+        CredentialSource::Oidc { .. } => {
+            let Some(oidc) = oidc else {
+                bail!("internal: an oidc credential without a resolved source");
+            };
+            if !oidc.tokens.exists() {
+                if ov.tolerate_missing_credential {
+                    // The state every oidc profile is in before its first
+                    // login, and `meister login --oidc` is the command that
+                    // ends it. Same pass the mtls arm gets, for the same
+                    // reason.
+                    return Ok(Credential::None);
+                }
+                bail!(
+                    "no session at {}; run: meister login --oidc",
+                    oidc.tokens.display()
+                );
+            }
+            check_secret_permissions(&oidc.tokens)?;
+            // Whether it is still usable is read here; RENEWING it is not,
+            // because renewing is a network call. See `Credential::StaleOidc`.
+            match crate::oidc::Session::load(&oidc.tokens)?.usable_now() {
+                Some(access) => Ok(Credential::Bearer(access)),
+                None => Ok(Credential::StaleOidc),
+            }
+        }
 
         CredentialSource::Env { var } => {
             let token = std::env::var(var)
@@ -373,7 +500,7 @@ mod tests {
         let live: Config =
             toml::from_str(&raw).expect("config/examples/cli.toml parses as written");
         assert_eq!(live.default_profile.as_deref(), Some("lab"));
-        assert_eq!(live.profiles.len(), 4);
+        assert_eq!(live.profiles.len(), 5);
         assert_eq!(live.profiles["lab"].tier, Tier::Agent);
         assert_eq!(live.profiles["cluster-a"].tier, Tier::Cluster);
         assert_eq!(live.profiles["cloud"].tier, Tier::Cloud);
@@ -383,6 +510,9 @@ mod tests {
         assert!(mtls.endpoint.starts_with("https://"));
         assert!(mtls.ca_cert.is_some(), "an https profile needs its CA");
         assert!(matches!(mtls.credential, CredentialSource::Mtls { .. }));
+        let oidc = &live.profiles["cloud-oidc"];
+        assert_eq!(oidc.tier, Tier::Cloud);
+        assert!(matches!(oidc.credential, CredentialSource::Oidc { .. }));
 
         // The credential shapes at the bottom are prose, deliberately: they
         // are alternatives for one field, and uncommenting them all at once
@@ -512,6 +642,94 @@ mod tests {
     fn missing_endpoint_is_an_error() {
         let cfg = Config::default();
         assert!(resolve(&cfg, Tier::Agent, &Overrides::default()).is_err());
+    }
+
+    fn oidc_config(tokens: Option<&str>) -> Config {
+        let mut cfg = config_with(Tier::Cloud);
+        cfg.dir = Some(PathBuf::from("/etc/meisterstack"));
+        cfg.profiles.get_mut("p").unwrap().credential = CredentialSource::Oidc {
+            issuer: "https://idp.example.org".into(),
+            client_id: "meisterstack".into(),
+            tokens: tokens.map(PathBuf::from),
+            ca_cert: None,
+            scope: None,
+        };
+        cfg
+    }
+
+    /// The session file hangs off the config file by default, exactly as the
+    /// certificate does, so that a config directory and the credentials it
+    /// refers to move as one.
+    #[test]
+    fn an_oidc_profile_keeps_its_session_next_to_the_config() {
+        let ov = Overrides {
+            tolerate_missing_credential: true,
+            ..Default::default()
+        };
+        let t = resolve(&oidc_config(None), Tier::Cloud, &ov).unwrap();
+        let src = t.oidc.expect("the profile names a provider");
+        assert_eq!(src.tokens, Path::new("/etc/meisterstack/oidc/p.json"));
+        assert_eq!(src.issuer, "https://idp.example.org");
+
+        // A named path is still resolved against the config file.
+        let t = resolve(&oidc_config(Some("sessions/x.json")), Tier::Cloud, &ov).unwrap();
+        assert_eq!(
+            t.oidc.unwrap().tokens,
+            Path::new("/etc/meisterstack/sessions/x.json")
+        );
+    }
+
+    /// The state every oidc profile is in before its first login. `meister
+    /// login` gets the same pass the mtls arm gets, because it is the one
+    /// command that can end that state; everything else says what to run.
+    #[test]
+    fn login_may_resolve_an_oidc_profile_that_has_never_logged_in() {
+        let cfg = oidc_config(Some("/nonexistent/session.json"));
+        let err = resolve(&cfg, Tier::Cloud, &Overrides::default()).unwrap_err();
+        assert!(err.to_string().contains("login --oidc"), "{err}");
+
+        let ov = Overrides {
+            tolerate_missing_credential: true,
+            ..Default::default()
+        };
+        let t = resolve(&cfg, Tier::Cloud, &ov).unwrap();
+        assert!(matches!(t.credential, Credential::None));
+        // And the source is there anyway -- which is the whole reason it is
+        // on the Target: `login --oidc` needs it precisely now.
+        assert!(t.oidc.is_some());
+    }
+
+    /// A live session is a bearer token; a dead one is its own state, so
+    /// that the one place that may renew it is forced to be a place that
+    /// can await.
+    #[test]
+    fn a_session_is_a_token_while_it_lasts_and_a_renewal_afterwards() {
+        let dir = std::env::temp_dir().join(format!("meister-cfg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.json");
+
+        let write = |secs: i64| {
+            let s = crate::oidc::Session {
+                issuer: "https://idp.example.org".into(),
+                client_id: "meisterstack".into(),
+                access_token: "at-1".into(),
+                refresh_token: Some("rt-1".into()),
+                expires_at: chrono::Utc::now() + chrono::TimeDelta::seconds(secs),
+                scope: None,
+            };
+            s.save(&path).unwrap();
+        };
+
+        let cfg = oidc_config(Some(path.to_str().unwrap()));
+        write(3600);
+        let t = resolve(&cfg, Tier::Cloud, &Overrides::default()).unwrap();
+        assert!(matches!(&t.credential, Credential::Bearer(a) if a == "at-1"));
+
+        write(-1);
+        let t = resolve(&cfg, Tier::Cloud, &Overrides::default()).unwrap();
+        assert!(matches!(t.credential, Credential::StaleOidc));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

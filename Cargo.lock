@@ -1063,6 +1063,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "meister-oidc",
  "meister-pki",
  "meister-telemetry",
  "serde",

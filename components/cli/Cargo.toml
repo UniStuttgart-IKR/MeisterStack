@@ -11,6 +11,10 @@ path = "src/main.rs"
 [dependencies]
 telemetry = { package = "meister-telemetry", path = "../../shared/telemetry" }
 pki = { package = "meister-pki", path = "../../shared/pki" }
+# The login half of oidc: discovery, the device grant and the refresh. The
+# same crate the cloud controller verifies tokens with, which is why it is a
+# crate rather than two half-implementations.
+meister-oidc = { path = "../../shared/oidc" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

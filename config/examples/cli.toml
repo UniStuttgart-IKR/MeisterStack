@@ -55,11 +55,35 @@ endpoint   = "https://10.128.1.103:3000"
 ca_cert    = "pki/ca.crt"
 credential = { type = "mtls", cert = "pki/cloud-mtls.crt", key = "pki/cloud-mtls.key" }
 
+# The same tier again, for a person rather than a machine.
+#
+# `meister login --oidc --profile cloud-oidc` prints a code and a url, waits
+# for somebody to approve it in a browser -- on any device, which is the
+# point of the device grant over a redirect to localhost -- and writes the
+# session to `oidc/cloud-oidc.json` at 0600. Every command after that renews
+# the access token from the refresh token without asking.
+#
+# A token settles WHO you are and nothing else. What you may do is the
+# cloud's user directory's answer: if it does not know the name in the token,
+# every command is a 403 until an administrator runs
+# `meister cloud user create`.
+#
+# `tokens` defaults to `<config dir>/oidc/<profile>.json` and `scope` to
+# "openid profile email offline_access". Keep `offline_access` in whatever
+# you set: it is what makes a refresh token appear, and without one this
+# profile needs a fresh browser login every few minutes.
+[profiles.cloud-oidc]
+tier       = "cloud"
+endpoint   = "https://10.128.1.103:3000"
+ca_cert    = "pki/ca.crt"
+credential = { type = "oidc", issuer = "https://idp.example.org/realms/lab", client_id = "meisterstack" }
+
 # The other credential shapes:
 #
 #   { type = "env",     var = "MEISTER_TOKEN" }
 #   { type = "command", command = ["pass", "show", "meisterstack/token"] }
 #   { type = "mtls",    cert = "client.pem", key = "client-key.pem" }
+#   { type = "oidc",    issuer = "https://idp.example.org", client_id = "meisterstack", tokens = "oidc/p.json", ca_cert = "pki/idp-ca.crt", scope = "openid offline_access" }
 #
 # A bearer token authenticates against the controller's `[auth]` chain — the
 # development path, one static string, and the way a brand new user gets far
