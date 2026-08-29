@@ -11,7 +11,6 @@ use agent_api::{
     types::mac_addr::MacAddr,
 };
 use anyhow::{Context, bail};
-use macros::generated;
 use uuid::Uuid;
 
 // reconcile alibi-state-machine
@@ -168,7 +167,6 @@ pub struct NewVmSpec {
 /// The volume half of a NewVmSpec. `driver` and `params` mirror `NewDevice`:
 /// both default, so every spec written before storage had more than one
 /// backend is still exactly the spec it was.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewVolume {
@@ -220,7 +218,6 @@ pub struct NewNic {
     pub routed_subnets: Vec<String>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewDevice {
@@ -233,7 +230,6 @@ pub struct NewDevice {
     pub params: Option<serde_json::Value>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl TryFrom<proto::VmSpec> for AgentVmSpec {
     type Error = anyhow::Error;
     fn try_from(p: proto::VmSpec) -> Result<Self, Self::Error> {
@@ -281,7 +277,6 @@ impl TryFrom<proto::VmSpec> for AgentVmSpec {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl TryFrom<proto::VolumeSpec> for VolumeWithId {
     type Error = anyhow::Error;
     fn try_from(p: proto::VolumeSpec) -> Result<Self, Self::Error> {
@@ -301,7 +296,6 @@ impl TryFrom<proto::VolumeSpec> for VolumeWithId {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl TryFrom<proto::NicSpec> for NicWithId {
     type Error = anyhow::Error;
     fn try_from(p: proto::NicSpec) -> Result<Self, Self::Error> {
@@ -327,7 +321,6 @@ impl TryFrom<proto::NicSpec> for NicWithId {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl TryFrom<proto::DeviceSpec> for DeviceWithId {
     type Error = anyhow::Error;
     fn try_from(p: proto::DeviceSpec) -> Result<Self, Self::Error> {
@@ -362,7 +355,6 @@ impl TryFrom<proto::DeviceSpec> for DeviceWithId {
 }
 
 impl NewVmSpec {
-    #[generated(model = ClaudeFable, version = "5")]
     pub fn into_spec(self, default_bridge: &str) -> anyhow::Result<(VmId, AgentVmSpec, Desired)> {
         if self.vcpus == 0 {
             bail!("vcpus must be greater than zero");
@@ -489,7 +481,6 @@ fn non_empty(s: String) -> Option<String> {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 
@@ -498,7 +489,6 @@ mod tests {
     /// driver. Unset stays unset: proto3 has no absent string, and an empty
     /// one still means "whatever this node defaults to".
     #[test]
-    #[generated(model = ClaudeOpus, version = "5")]
     fn a_device_is_routed_to_the_driver_the_controller_named() {
         let named = DeviceWithId::try_from(proto::DeviceSpec {
             id: uuid::Uuid::nil().to_string(),

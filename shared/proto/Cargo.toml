@@ -10,7 +10,6 @@ prost = { workspace = true }
 # this is a dependency of the OUTPUT rather than of anything written here.
 tonic-prost = { workspace = true }
 anyhow = { workspace = true }
-macros = { package = "meister-macros", path = "../macros" }
 # tonic's tls-ring asks for the process-wide crypto provider and panics
 # without one; `client_tls` installs it. Already in the tree under tonic, so
 # naming it costs nothing but the line.

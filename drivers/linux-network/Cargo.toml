@@ -7,7 +7,6 @@ authors.workspace = true
 
 [dependencies]
 agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
-macros = { package = "meister-macros", path = "../../shared/macros" }
 # `net`: what a cidr means, shared with the cloud that hands out the same
 # addresses. `capability`: the catalogue entries this node claims.
 common = { package = "meister-common", path = "../../shared/common" }

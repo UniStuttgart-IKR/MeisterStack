@@ -42,7 +42,6 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use agent_api::ConsoleStream;
-use macros::generated;
 use tracing::{debug, warn};
 
 /// How much of each stream is kept. One wants the END of a console log
@@ -60,7 +59,6 @@ pub const RING_BYTES: u64 = 256 * 1024;
 /// still small, one `fallocate` for one that is not. Never an error a pass
 /// has to handle — an output file that cannot be bounded is a degradation,
 /// not a reason to stop reconciling the VM it belongs to.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn trim(path: &Path) {
     let file = match std::fs::OpenOptions::new().write(true).open(path) {
         Ok(f) => f,
@@ -123,7 +121,6 @@ pub fn trim_all(paths: &[(ConsoleStream, std::path::PathBuf)]) {
 /// alone, and reading further back would be reading a hole. `None` for a file
 /// that is not there — a VM that has never started — which the caller renders
 /// as empty rather than as an error.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn tail(path: &Path, lines: usize) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -163,7 +160,6 @@ pub fn tail(path: &Path, lines: usize) -> Option<String> {
 /// A VM with no output at all comes back as an empty list and not as an
 /// error: "it printed nothing" is an answer, and the commonest one for a VM
 /// that has just been created.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn read_all(
     paths: Vec<(ConsoleStream, std::path::PathBuf)>,
     lines: usize,
@@ -179,7 +175,6 @@ pub fn read_all(
 pub const DEFAULT_LINES: usize = 200;
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use std::io::Write;

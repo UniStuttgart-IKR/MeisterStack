@@ -20,7 +20,6 @@
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use macros::generated;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
@@ -36,7 +35,6 @@ pub struct List<T> {
 }
 
 /// What a command has to say once the server has answered.
-#[generated(model = ClaudeOpus, version = "5")]
 pub enum View {
     /// One token on stdout — the id, the name, the state now in force — and
     /// optionally a caveat on stderr. stdout stays pipeable either way.
@@ -51,14 +49,12 @@ pub enum View {
 }
 
 /// Columns, rows, and what to say when there are no rows.
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct Table {
     headers: &'static [&'static str],
     rows: Vec<Vec<String>>,
     empty_note: &'static str,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl View {
     pub fn line(token: impl Into<String>) -> Self {
         Self::Line(token.into(), None)
@@ -103,7 +99,6 @@ impl View {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Table {
     /// The rendered lines, header row first. Separate from printing them so
     /// the layout is testable without capturing stdout.
@@ -156,7 +151,6 @@ impl Table {
 /// The table view is built lazily and only when it is asked for: a body the
 /// table side cannot parse still comes out under `-o json`, which is exactly
 /// where an operator looks when the table gave up.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn emit(
     global: &GlobalArgs,
     body: &Bytes,
@@ -171,19 +165,16 @@ pub fn emit(
 
 /// The common case: under `-o table` the answer is one token the caller
 /// already holds, and under `-o json` it is still the whole object.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn emit_line(global: &GlobalArgs, body: &Bytes, token: &str) -> Result<()> {
     emit(global, body, |_| Ok(View::line(token)))
 }
 
 /// [`emit_line`] plus a caveat on stderr.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn emit_note(global: &GlobalArgs, body: &Bytes, token: &str, note: &'static str) -> Result<()> {
     emit(global, body, |_| Ok(View::note(token, note)))
 }
 
 /// A listing, from the `{"items": [...]}` every controller serves.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn table_of<T: DeserializeOwned>(
     body: &Bytes,
     parsing: &'static str,
@@ -201,7 +192,6 @@ pub fn table_of<T: DeserializeOwned>(
 
 /// A listing from a bare array — the agent's REST api, which has no list
 /// object around its items.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn table_of_array<T: DeserializeOwned>(
     body: &Bytes,
     parsing: &'static str,
@@ -218,7 +208,6 @@ pub fn table_of_array<T: DeserializeOwned>(
 }
 
 /// A fixed two-column table: what a single object says about itself.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn fields(rows: Vec<Vec<String>>) -> View {
     View::table(&["field", "value"], rows, "nothing to report")
 }
@@ -236,7 +225,6 @@ pub fn print_json(bytes: &Bytes) {
 /// a prompt on `vm destroy` and nothing at all on the seven `rm`s beside it,
 /// one of which cascades. `--yes` is the way to mean it, and a pipe with no
 /// tty is refused rather than answered for.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn confirm_destructive(
     global: &GlobalArgs,
     target: &Target,
@@ -256,7 +244,6 @@ pub fn confirm_destructive(
     Ok(())
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn ask(prompt: &str) -> Result<bool> {
     use std::io::{BufRead, IsTerminal, Write};
 
@@ -277,7 +264,6 @@ fn ask(prompt: &str) -> Result<bool> {
 
 /// Drained is worth its own word: the node is up and reporting, the
 /// scheduler just will not place anything new on it.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn readiness(ready: bool, schedulable: bool) -> &'static str {
     match (ready, schedulable) {
         (false, _) => "no",
@@ -286,7 +272,6 @@ pub fn readiness(ready: bool, schedulable: bool) -> &'static str {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn age(ts: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     let Some(ts) = ts else {
         return "never".to_string();
@@ -300,7 +285,6 @@ pub fn age(ts: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
 }
 
 /// How long until something, in the same shape `age` reads backwards.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn age_until(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let secs = ts.signed_duration_since(now).num_seconds();
     if secs <= 0 {
@@ -313,7 +297,6 @@ pub fn age_until(ts: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn mem(mib: u64) -> String {
     match mib {
         0 => "-".to_string(),
@@ -324,7 +307,6 @@ pub fn mem(mib: u64) -> String {
 
 /// Sizes are recorded as bytes and read by humans. Binary units, because that
 /// is what every other size in this stack means.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn size(n: u64) -> String {
     const UNITS: [(&str, u64); 3] = [("Gi", 1 << 30), ("Mi", 1 << 20), ("Ki", 1 << 10)];
     if n == 0 {
@@ -353,7 +335,6 @@ pub fn joined(values: &[String]) -> String {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

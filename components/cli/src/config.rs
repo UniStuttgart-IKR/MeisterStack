@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use macros::generated;
 use serde::{Deserialize, Serialize};
 
 pub const ENV_CONFIG: &str = "MEISTER_CONFIG";
@@ -84,7 +83,6 @@ pub struct Config {
 
 /// Default config Paths are $MEISTER_CONFIG >> $XDG_CONFIG_HOME/meisterstack/config.toml >>
 /// ~/.config/meisterstack/config.toml
-#[generated(model = ClaudeOpus, version = "4.8")]
 pub fn default_config_path() -> Result<PathBuf> {
     if let Ok(p) = std::env::var(ENV_CONFIG) {
         return Ok(PathBuf::from(p));
@@ -108,7 +106,6 @@ impl Config {
     /// with a bearer token — `MEISTER_TOKEN` wins over the profile — and the
     /// resolved credential is then a token, while the two paths the
     /// certificate belongs in are still the profile's.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn declared_mtls(&self, profile: &str) -> Option<(PathBuf, PathBuf)> {
         match &self.profiles.get(profile)?.credential {
             CredentialSource::Mtls { cert, key } => Some((
@@ -119,7 +116,6 @@ impl Config {
         }
     }
 
-    #[generated(model = ClaudeOpus, version = "4.8")]
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(raw) => {
@@ -186,7 +182,6 @@ impl std::fmt::Debug for Credential {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "4.8")]
 pub fn resolve(config: &Config, expected_tier: Tier, ov: &Overrides) -> Result<Target> {
     let profile_name = ov
         .profile
@@ -254,7 +249,6 @@ pub fn resolve(config: &Config, expected_tier: Tier, ov: &Overrides) -> Result<T
     })
 }
 
-#[generated(model = ClaudeOpus, version = "4.8")]
 fn load_credential(
     src: &CredentialSource,
     base: Option<&Path>,
@@ -320,7 +314,6 @@ fn load_credential(
 }
 
 #[cfg(unix)]
-#[generated(model = ClaudeOpus, version = "4.8")]
 fn check_secret_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -364,7 +357,6 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "4.8")]
 mod tests {
     use super::*;
 

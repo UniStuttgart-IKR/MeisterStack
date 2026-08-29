@@ -13,7 +13,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use macros::generated;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -68,13 +67,11 @@ struct Status {
 
 /// The one column the two tiers do not share.
 #[derive(Copy, Clone)]
-#[generated(model = ClaudeOpus, version = "5")]
 pub enum Placement {
     Node,
     Cluster,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Placement {
     const fn headers(self) -> &'static [&'static str] {
         match self {
@@ -86,7 +83,6 @@ impl Placement {
 
 /// The listing row. `note` is last on purpose: it is the only cell here that
 /// can carry a server sentence, spaces and all.
-#[generated(model = ClaudeOpus, version = "5")]
 fn row(placement: Placement, vm: Vm) -> Vec<String> {
     // Terminating is a fact about the object, and it outranks whatever phase
     // the tier below last reported for it.
@@ -116,7 +112,6 @@ fn row(placement: Placement, vm: Vm) -> Vec<String> {
 /// server fills a member's own tenant in, and a key that is there saying
 /// "nothing" is not the same request as one that is absent. The cluster tier
 /// never names one at all.
-#[generated(model = ClaudeOpus, version = "5")]
 fn object(
     name: &str,
     spec: &Path,
@@ -142,7 +137,6 @@ fn object(
     Ok(object)
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn create(
     client: &Client,
     global: &GlobalArgs,
@@ -156,7 +150,6 @@ pub async fn create(
     output::emit_line(global, &body, name)
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn list(
     client: &Client,
     global: &GlobalArgs,
@@ -191,7 +184,6 @@ pub struct LogStream {
 /// A VM that has printed nothing prints nothing — an empty answer is an
 /// answer, and it is the commonest one for a VM that has only just been
 /// created.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn logs(
     client: &Client,
     global: &GlobalArgs,
@@ -254,7 +246,6 @@ pub struct EventSpec {
 /// went wrong" and "this went wrong twenty times", and the message is last
 /// because it is the one cell that carries a server sentence with spaces in
 /// it.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn events(
     client: &Client,
     global: &GlobalArgs,
@@ -293,7 +284,6 @@ pub async fn inspect(client: &Client, name: &str) -> Result<()> {
 /// Terminating is what a delete answers with, never "gone": the object is
 /// marked and the tier below acts on it, which is the same promise the phase
 /// column makes in `vm ls`.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn destroy(client: &Client, global: &GlobalArgs, name: &str) -> Result<()> {
     let body = client.delete(&format!("{VMS}/{name}")).await?;
     output::emit_line(global, &body, "Terminating")
@@ -308,7 +298,6 @@ pub async fn destroy(client: &Client, global: &GlobalArgs, name: &str) -> Result
 /// Shared by both tiers verbatim, because the two really do serve the same
 /// path: `vms/<name>` with a runStrategy in the spec. One function, and the
 /// sentence above is true at both of them.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn run_strategy(
     client: &Client,
     name: &str,
@@ -343,7 +332,6 @@ pub async fn run_strategy(
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

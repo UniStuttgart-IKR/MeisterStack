@@ -10,10 +10,8 @@ use agent_api::device::{
     self, Device, DeviceAttachment, DeviceDriver, DeviceError, DeviceId, DeviceSpec, PartitionSpec,
 };
 use agent_api::types::pci::PciAddress;
-use macros::generated;
 use tracing::{debug, info, instrument, warn};
 
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VfioParams {
@@ -26,7 +24,6 @@ pub struct VfioPciDriver {
     inventory: HashSet<PciAddress>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl VfioPciDriver {
     pub fn new(inventory: Vec<PciAddress>) -> device::Result<Self> {
         for addr in &inventory {
@@ -75,7 +72,6 @@ impl VfioPciDriver {
     /// `create` makes. Admission is about which VM may have the device;
     /// whether the host can hand it over at all is a question for the moment
     /// it is handed over.
-    #[generated(model = ClaudeOpus, version = "5")]
     fn requested_address(spec: &DeviceSpec) -> device::Result<PciAddress> {
         let params = spec.params.as_ref().ok_or_else(|| {
             DeviceError::InvalidSpec(
@@ -194,7 +190,6 @@ impl VfioPciDriver {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[async_trait::async_trait]
 impl DeviceDriver for VfioPciDriver {
     #[instrument(skip_all, fields(device_id = %id))]
@@ -272,7 +267,6 @@ impl DeviceDriver for VfioPciDriver {
     /// Specs already on the node are read leniently on purpose: one stored
     /// spec that no longer parses is not a reason to refuse the VM being
     /// created now, and the address it names is one nothing can be using.
-    #[generated(model = ClaudeOpus, version = "5")]
     fn admit(
         &self,
         requested: &[(DeviceId, DeviceSpec)],
@@ -308,7 +302,6 @@ impl DeviceDriver for VfioPciDriver {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use uuid::Uuid;

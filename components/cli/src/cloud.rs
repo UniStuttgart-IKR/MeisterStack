@@ -12,7 +12,6 @@
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use macros::generated;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -139,7 +138,6 @@ struct ImageStatus {
 /// it — one of which cascades through everything a tenant owns — did not,
 /// because nothing made that omission visible. A verb missing from this list
 /// is now a hole somebody can see.
-#[generated(model = ClaudeOpus, version = "5")]
 fn destructive(cmd: &CloudCmd) -> Option<(&'static str, &str)> {
     match cmd {
         CloudCmd::Vm {
@@ -170,7 +168,6 @@ fn destructive(cmd: &CloudCmd) -> Option<(&'static str, &str)> {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn run(target: &Target, cmd: &CloudCmd, global: &GlobalArgs) -> Result<()> {
     if let Some((kind, name)) = destructive(cmd) {
         output::confirm_destructive(global, target, kind, name)?;
@@ -197,7 +194,6 @@ pub async fn run(target: &Target, cmd: &CloudCmd, global: &GlobalArgs) -> Result
 // --- the two shapes every noun in this tier is created and removed in -------
 
 /// Create one object and answer with the name the caller already gave it.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create(
     client: &Client,
     global: &GlobalArgs,
@@ -213,7 +209,6 @@ async fn create(
 
 /// Remove one object and answer with its name. The confirmation happened in
 /// [`destructive`], before any of this tier's verbs ran.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn remove(client: &Client, global: &GlobalArgs, path: &str, name: &str) -> Result<()> {
     let body = client.delete(path).await?;
     output::emit_line(global, &body, name)
@@ -223,7 +218,6 @@ async fn remove(client: &Client, global: &GlobalArgs, path: &str, name: &str) ->
 
 /// The inventory, not the live sessions: a cluster that is down stays listed
 /// as not ready, with the capacity it last had.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn clusters(client: &Client, global: &GlobalArgs) -> Result<()> {
     let body = client.get(CLUSTERS).await?;
     let now = Utc::now();
@@ -247,7 +241,6 @@ async fn clusters(client: &Client, global: &GlobalArgs) -> Result<()> {
     })
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn cluster_row(c: Cluster, now: DateTime<Utc>) -> Vec<String> {
     let cap = c.status.capacity;
     vec![
@@ -264,7 +257,6 @@ fn cluster_row(c: Cluster, now: DateTime<Utc>) -> Vec<String> {
 
 /// Cordon and uncordon at the cloud tier: the Node verbs one floor up, over
 /// the Cluster object, through the same read-edit-write compare-and-swap.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn run_cluster(client: &Client, cmd: &CloudClusterCmd, global: &GlobalArgs) -> Result<()> {
     if let CloudClusterCmd::Label { name, pairs, rm } = cmd {
         let body = client
@@ -310,7 +302,6 @@ async fn run_cluster(client: &Client, cmd: &CloudClusterCmd, global: &GlobalArgs
 /// same functions. What differs is only how far the intent has to travel
 /// before something acts on it — and that this tier has a directory, so a VM
 /// created here can be created for somebody.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn run_vm(client: &Client, cmd: &CloudVmCmd, global: &GlobalArgs) -> Result<()> {
     match cmd {
         CloudVmCmd::Create {
@@ -359,7 +350,6 @@ async fn run_vm(client: &Client, cmd: &CloudVmCmd, global: &GlobalArgs) -> Resul
 
 // --- the image catalogue ----------------------------------------------------
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn run_image(client: &Client, cmd: &CloudImageCmd, global: &GlobalArgs) -> Result<()> {
     match cmd {
         CloudImageCmd::Create {
@@ -450,7 +440,6 @@ async fn run_image(client: &Client, cmd: &CloudImageCmd, global: &GlobalArgs) ->
 /// Who owns it and who may read it are two facts, so they are two columns.
 /// One column saying `tenant (public)` put a raw space in the middle of the
 /// table and shifted every field behind it.
-#[generated(model = ClaudeOpus, version = "5")]
 fn image_row(img: Image) -> Vec<String> {
     vec![
         img.metadata.name,
@@ -527,7 +516,6 @@ struct TenantUsage {
 /// `tenant ls` is "how close is this tenant to its ceiling", and the answer is
 /// a fraction. A tenant with no quota shows the count alone, because `4/-`
 /// reads like a limit somebody forgot to set rather than one nobody wanted.
-#[generated(model = ClaudeOpus, version = "5")]
 fn used_of(used: u64, limit: Option<u64>) -> String {
     match limit {
         Some(limit) => format!("{used}/{limit}"),
@@ -600,7 +588,6 @@ struct CsrCondition {
 /// worthless if it says Pending about a request that has a certificate on it.
 /// Same precedence as `CsrStatus::phase` in controller-api: a denial outranks
 /// an approval that produced nothing, a certificate outranks its approval.
-#[generated(model = ClaudeOpus, version = "5")]
 fn csr_phase(status: &CsrStatus) -> &'static str {
     let has = |k: &str| status.conditions.iter().any(|c| c.kind == k);
     if has("Denied") {
@@ -616,7 +603,6 @@ fn csr_phase(status: &CsrStatus) -> &'static str {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn run_tenant(client: &Client, cmd: &CloudTenantCmd, global: &GlobalArgs) -> Result<()> {
     match cmd {
         CloudTenantCmd::Create { name, description } => {
@@ -716,7 +702,6 @@ async fn run_tenant(client: &Client, cmd: &CloudTenantCmd, global: &GlobalArgs) 
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn run_user(client: &Client, cmd: &CloudUserCmd, global: &GlobalArgs) -> Result<()> {
     match cmd {
         CloudUserCmd::Create {
@@ -784,7 +769,6 @@ async fn run_user(client: &Client, cmd: &CloudUserCmd, global: &GlobalArgs) -> R
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn user_row(u: User, now: DateTime<Utc>) -> Vec<String> {
     // Live ones only: an expired fingerprint is history, not a credential
     // somebody holds.
@@ -810,7 +794,6 @@ fn user_row(u: User, now: DateTime<Utc>) -> Vec<String> {
     ]
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn run_csr(client: &Client, cmd: &CloudCsrCmd, global: &GlobalArgs) -> Result<()> {
     match cmd {
         CloudCsrCmd::Ls => {
@@ -858,7 +841,6 @@ async fn run_csr(client: &Client, cmd: &CloudCsrCmd, global: &GlobalArgs) -> Res
 
 /// Saying yes or no is one subresource and one verb; which of the two it was
 /// is the answer.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn approval(
     client: &Client,
     global: &GlobalArgs,
@@ -875,7 +857,6 @@ async fn approval(
     output::emit_line(global, &body, said)
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn csr_row(c: Csr) -> Vec<String> {
     let by = c
         .status
@@ -958,7 +939,6 @@ struct RoutedSubnetSpec {
 /// One line per object and no raw spaces in a value, which is the house rule
 /// — the map is what makes a public pool auditable at a glance, and a column
 /// that wrapped would make `floatingpool ls | grep` useless.
-#[generated(model = ClaudeOpus, version = "5")]
 fn quota_column(quota: &std::collections::BTreeMap<String, u32>) -> String {
     if quota.is_empty() {
         return "-".to_string();
@@ -970,7 +950,6 @@ fn quota_column(quota: &std::collections::BTreeMap<String, u32>) -> String {
         .join(",")
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn run_floating_pool(
     client: &Client,
     cmd: &CloudFloatingPoolCmd,
@@ -1049,7 +1028,6 @@ async fn run_floating_pool(
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn run_floating_ip(
     client: &Client,
     cmd: &CloudFloatingIpCmd,
@@ -1160,7 +1138,6 @@ async fn run_floating_ip(
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn run_routed_subnet(
     client: &Client,
     cmd: &CloudRoutedSubnetCmd,
@@ -1227,7 +1204,6 @@ async fn run_routed_subnet(
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

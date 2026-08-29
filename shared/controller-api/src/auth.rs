@@ -20,7 +20,6 @@
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use macros::generated;
 use pki::CertInfo;
 use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
@@ -54,7 +53,6 @@ pub const GROUP_MASTERS: &str = "system:masters";
 /// the truth is — and the signer stamps the matching group into the
 /// certificate it issues so that a tier without the directory (the cluster)
 /// can still tell an admin from a member.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -63,7 +61,6 @@ pub enum Role {
     Member,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Role {
     pub const ALL: [Role; 2] = [Role::Admin, Role::Member];
 
@@ -104,7 +101,6 @@ pub struct Identity {
     pub groups: Vec<String>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Identity {
     pub fn new(name: impl Into<String>, groups: Vec<String>) -> Self {
         Self {
@@ -154,7 +150,6 @@ impl Identity {
     /// that names a peer at all therefore has to name THIS kind and THIS
     /// peer; a name with no `system:<kind>:<peer>` shape names no peer and
     /// keeps the shared identity it always had.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn may_speak_for(&self, kind: &str, peer: &str) -> bool {
         let Some(rest) = self.name.strip_prefix(SYSTEM_PREFIX) else {
             return true;
@@ -241,7 +236,6 @@ impl std::fmt::Debug for AuthChain {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl AuthChain {
     pub fn new(links: Vec<Box<dyn Authenticator>>) -> Self {
         Self { links }
@@ -286,7 +280,6 @@ pub struct MtlsAuthenticator {
     cas: Vec<CertificateDer<'static>>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl MtlsAuthenticator {
     pub fn new(cas: Vec<CertificateDer<'static>>) -> Self {
         Self { cas }
@@ -342,7 +335,6 @@ pub struct BearerAuthenticator {
     identity: Identity,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl BearerAuthenticator {
     pub fn new(token: impl Into<String>, identity: Identity) -> Self {
         Self {
@@ -353,7 +345,6 @@ impl BearerAuthenticator {
 }
 
 impl Authenticator for BearerAuthenticator {
-    #[generated(model = ClaudeOpus, version = "5")]
     fn authenticate(&self, req: &AuthRequest) -> anyhow::Result<Option<Identity>> {
         let Some(header) = &req.authorization else {
             return Ok(None);
@@ -404,7 +395,6 @@ pub struct Attempt<'a> {
 /// `None` means the path is not an API object route at all — /healthz and
 /// /readyz — and those are never gated: a probe that needs a certificate is a
 /// probe that cannot tell "down" from "not invited".
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn classify<'a>(method: &str, path: &'a str) -> Option<Attempt<'a>> {
     let rest = path.strip_prefix("/apis/meister.io/v1/")?;
     let rest = rest.split('?').next().unwrap_or(rest);
@@ -474,7 +464,6 @@ pub fn is_tenant_scoped(resource: &str) -> bool {
 /// the directory, the directory is the cloud's, and a cluster inventing a
 /// second answer to "whose VM is this" is the failure mode the one-directory
 /// rule exists to prevent.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn permits(
     identity: &Identity,
     role: Option<Role>,
@@ -542,7 +531,6 @@ impl<'a> Scope<'a> {
 /// has, which is why every one of them asks through this one function and why
 /// the list handlers filter through it too — an object a member may not read
 /// must not appear in a list either, or the name alone leaks the inventory.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn permits_object(
     identity: &Identity,
     role: Option<Role>,
@@ -570,7 +558,6 @@ pub fn permits_object(
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use crate::resources::{FloatingPool, RoutedSubnet, Tenant, User};

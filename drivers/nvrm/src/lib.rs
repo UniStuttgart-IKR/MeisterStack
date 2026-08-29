@@ -19,7 +19,6 @@ use agent_api::device::{
     self, Device, DeviceAttachment, DeviceDriver, DeviceError, DeviceId, DeviceSpec, PartitionSpec,
 };
 use backend::{Backend, BackendIo, BackendKind};
-use macros::generated;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -36,7 +35,6 @@ const NOFILE_LIMIT: u64 = 65536;
 /// Typed fields are the ones this driver has to reason about (validation,
 /// vGPU resolution, admission); `env` passes any LEA_* knob through verbatim
 /// and wins over the typed fields, so new backend knobs need no driver change.
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NvrmParams {
@@ -51,7 +49,6 @@ pub struct NvrmParams {
     pub env: HashMap<String, String>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl NvrmParams {
     fn overlay(&self, over: &NvrmParams) -> NvrmParams {
         let mut merged = self.clone();
@@ -88,7 +85,6 @@ impl NvrmParams {
 }
 
 /// What `vgpuprofile --select <type>` reports for one type on this card.
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VgpuType {
     pub vgpu_type: String,
@@ -132,7 +128,6 @@ pub struct NvrmDriver {
     active: Mutex<HashMap<DeviceId, ActiveBackend>>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl NvrmDriver {
     pub fn new(config: NvrmDriverConfig) -> device::Result<Self> {
         std::fs::create_dir_all(&config.run_dir).map_err(|e| DeviceError::Backend(e.into()))?;
@@ -307,7 +302,6 @@ impl NvrmDriver {
 /// Best-effort host preflight; hard failures belong to the backend, which
 /// asserts the exact driver version itself. These only make problems
 /// visible at agent start instead of at the first VM boot.
-#[generated(model = ClaudeFable, version = "5")]
 fn host_checks() {
     match std::fs::read_to_string("/sys/module/nvidia/version") {
         Ok(v) => info!(nvidia_driver = %v.trim(), "host nvidia driver detected"),
@@ -344,7 +338,6 @@ fn host_checks() {
 ///
 /// The blocking form, for `new()` — agent start-up has no runtime to starve
 /// and is the right place to find out that a configured type does not exist.
-#[generated(model = ClaudeFable, version = "5")]
 fn resolve_vgpu_type(bin: &Path, vtype: &str) -> anyhow::Result<VgpuType> {
     let out = std::process::Command::new(bin)
         .args(["--select", vtype])
@@ -356,7 +349,6 @@ fn resolve_vgpu_type(bin: &Path, vtype: &str) -> anyhow::Result<VgpuType> {
 /// The same query on the async path. `vgpuprofile` talks to the card and can
 /// take its time about it; a blocking `output()` here would park a runtime
 /// worker for that whole time and serialize every other VM's create behind it.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn resolve_vgpu_type_async(bin: &Path, vtype: &str) -> anyhow::Result<VgpuType> {
     let out = tokio::process::Command::new(bin)
         .args(["--select", vtype])
@@ -366,7 +358,6 @@ async fn resolve_vgpu_type_async(bin: &Path, vtype: &str) -> anyhow::Result<Vgpu
     vgpu_from_output(vtype, &out)
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn vgpu_from_output(vtype: &str, out: &std::process::Output) -> anyhow::Result<VgpuType> {
     if !out.status.success() {
         anyhow::bail!(
@@ -378,7 +369,6 @@ fn vgpu_from_output(vtype: &str, out: &std::process::Output) -> anyhow::Result<V
 }
 
 /// Parse the KEY=VALUE stdout of `vgpuprofile --select`.
-#[generated(model = ClaudeFable, version = "5")]
 fn parse_vgpu_select(stdout: &str) -> anyhow::Result<VgpuType> {
     let mut kv = HashMap::new();
     for line in stdout.lines() {
@@ -405,7 +395,6 @@ fn parse_vgpu_select(stdout: &str) -> anyhow::Result<VgpuType> {
     })
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[async_trait::async_trait]
 impl DeviceDriver for NvrmDriver {
     #[instrument(skip_all, fields(device_id = %id))]
@@ -566,7 +555,6 @@ impl DeviceDriver for NvrmDriver {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeFable, version = "5")]
 mod tests {
     use super::*;
 

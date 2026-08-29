@@ -16,7 +16,6 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
-use macros::generated;
 use rcgen::{
     CertificateSigningRequestParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose,
@@ -52,7 +51,6 @@ pub struct Ca {
     roots: Vec<CertificateDer<'static>>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Ca {
     /// Load the CA from the two paths the config names. Both are paths and
     /// never inline PEM: a key that can be pasted into a TOML file is a key
@@ -142,7 +140,6 @@ fn offset(at: DateTime<Utc>) -> Result<time::OffsetDateTime> {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use crate::csr::generate_key_and_csr;

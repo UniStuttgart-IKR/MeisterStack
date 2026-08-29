@@ -12,11 +12,6 @@
 //! losing a replica moves only the diallers that were on it: the relative
 //! order of the survivors cannot change, which is exactly what HRW buys over
 //! hashing modulo the number of replicas.
-//!
-//! No `#[generated]` attribution here, and it is not an oversight: the macro
-//! crate depends on this one, so this one cannot depend on the macro crate.
-//! For the record, this file was written by Claude Opus 5 like the rest of the
-//! HA work — the attribution simply has to live in prose.
 
 /// FNV-1a by hand, and that is the point: `DefaultHasher` is seeded per
 /// process, so the same agent would draw a different order after every

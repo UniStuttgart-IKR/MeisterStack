@@ -8,7 +8,6 @@ controller-api = { package = "meister-controller-api", path = "../../shared/cont
 proto = { package = "meister-proto", path = "../../shared/proto" }
 telemetry = { package = "meister-telemetry", path = "../../shared/telemetry" }
 pki = { package = "meister-pki", path = "../../shared/pki" }
-macros = { package = "meister-macros", path = "../../shared/macros" }
 # `net`: the address-range parser shared with the node that guards the same
 # ranges. One spelling of what a cidr means, on both sides of the sentence.
 common = { package = "meister-common", path = "../../shared/common" }

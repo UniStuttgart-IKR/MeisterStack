@@ -11,8 +11,6 @@
 //! so the candidate is named for what it is to the scheduler, not for which
 //! tier it happens to live on.
 
-use macros::generated;
-
 use common::capability::{self, offers};
 use tracing::debug;
 
@@ -28,14 +26,12 @@ use crate::resources::{AntiAffinity, StoragePool, Vm};
 /// and the honest answer to "how much room is left" is a different question
 /// per backend. A number this control plane invented for it would be wrong on
 /// most nodes and would refuse VMs for a reason that is not true.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capacity {
     pub vcpus: u32,
     pub mem_mib: u64,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Capacity {
     /// What one VM asks for, out of the agent's own spec.
     ///
@@ -92,7 +88,6 @@ impl Capacity {
 /// vCPU means the guests wait for each other. One is a lost VM, the other is
 /// a slow one, and a control plane that cannot tell those apart will
 /// eventually do the first while believing it did the second.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Overcommit {
@@ -109,7 +104,6 @@ pub struct Overcommit {
     pub memory: f64,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Overcommit {
     pub const VCPU_DEFAULT: f64 = 4.0;
     pub const MEMORY_DEFAULT: f64 = 1.0;
@@ -173,7 +167,6 @@ impl Default for Overcommit {
 /// redundant in the sense that a caller always knows; it is here so that the
 /// functions reading it are total and cannot be called with the wrong tier's
 /// question.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateKind {
     Node,
@@ -232,14 +225,12 @@ pub struct Candidate {
 /// An empty selector matches everything, which is what makes "no selector"
 /// and "a selector nobody wrote" the same thing and keeps every VM written
 /// before this feature placed exactly where it was.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn selects(selector: &BTreeMap<String, String>, labels: &BTreeMap<String, String>) -> bool {
     selector.iter().all(|(k, v)| labels.get(k) == Some(v))
 }
 
 /// The selector this candidate is measured against — the node one for a node,
 /// the cluster one for a cluster.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn selector_for(vm: &Vm, kind: CandidateKind) -> &BTreeMap<String, String> {
     match kind {
         CandidateKind::Node => &vm.spec.node_selector,
@@ -248,7 +239,6 @@ pub fn selector_for(vm: &Vm, kind: CandidateKind) -> &BTreeMap<String, String> {
 }
 
 /// Does this candidate already hold a VM that `term` says to stay away from?
-#[generated(model = ClaudeOpus, version = "5")]
 fn collides(term: &AntiAffinity, candidate: &Candidate) -> bool {
     candidate
         .hosted
@@ -267,7 +257,6 @@ fn collides(term: &AntiAffinity, candidate: &Candidate) -> bool {
 ///
 /// Order is preserved, so a strategy that wants "the first" gets the first in
 /// inventory order and stays deterministic.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn feasible<'a>(vm: &Vm, candidates: &'a [Candidate]) -> Vec<&'a Candidate> {
     let wanted = DevicePolicy::of(vm);
     let size = Capacity::wanted_by(vm);
@@ -294,7 +283,6 @@ pub fn feasible<'a>(vm: &Vm, candidates: &'a [Candidate]) -> Vec<&'a Candidate> 
 /// provision on than it is to run on. Sharing the predicate is what keeps
 /// "drained" from meaning two different things depending on what is being
 /// scheduled.
-#[generated(model = ClaudeOpus, version = "5")]
 fn usable(candidates: &[Candidate]) -> impl Iterator<Item = &Candidate> {
     candidates.iter().filter(|c| c.connected && c.schedulable)
 }
@@ -317,13 +305,11 @@ fn usable(candidates: &[Candidate]) -> impl Iterator<Item = &Candidate> {
 /// An empty node list is every node — see the field. That is the
 /// single-machine lab, and there the policy degenerates to the catalogue
 /// check the VM half already does.
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct StoragePolicy {
     driver: String,
     nodes: Vec<String>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl StoragePolicy {
     /// From the pool a volume was reserved out of. The VOLUME contributes
     /// nothing to the demand today — size is the pool's own admission
@@ -365,7 +351,6 @@ impl StoragePolicy {
 ///
 /// Order is preserved, so a strategy that wants "the first" stays
 /// deterministic — the same promise `feasible` makes.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn feasible_for_storage<'a>(
     policy: &StoragePolicy,
     candidates: &'a [Candidate],
@@ -386,7 +371,6 @@ pub fn feasible_for_storage<'a>(
 /// `holders` is where the data actually is, by candidate name. Empty — which
 /// is every VM whose disks are declared in its own spec rather than reserved
 /// as objects — leaves the set exactly as it was.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn prefer_local<'a>(feasible: Vec<&'a Candidate>, holders: &[String]) -> Vec<&'a Candidate> {
     if holders.is_empty() {
         return feasible;
@@ -406,7 +390,6 @@ pub fn prefer_local<'a>(feasible: Vec<&'a Candidate>, holders: &[String]) -> Vec
 /// category is what may become a metric label. The order of the cuts is the
 /// order that sends an operator to the right machine — nobody is here, nobody
 /// is willing, nobody has the backend, nobody the pool named is here.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn storage_pending_reason(
     policy: &StoragePolicy,
     pool: &str,
@@ -462,7 +445,6 @@ pub fn storage_pending_reason(
 /// requirement, and it is why the two are separate flags rather than one
 /// knob: a preference that can strand a VM is a requirement whose author did
 /// not know they were writing one.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn preferred<'a>(vm: &Vm, feasible: Vec<&'a Candidate>) -> Vec<&'a Candidate> {
     let soft: Vec<&AntiAffinity> = vm
         .spec
@@ -494,10 +476,8 @@ pub trait Scheduler: Send + Sync {
 /// scheduler through here, so a second strategy is a new arm and a new line in
 /// a config file rather than an edit in two `main`s.
 #[derive(Debug, Clone, serde::Deserialize)]
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct SchedulerConfig(pub String);
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl SchedulerConfig {
     /// Default when the config says nothing: First-Fit — what both tiers were
     /// wired to outright before this was a choice, so a config that does not
@@ -539,7 +519,6 @@ impl SchedulerConfig {
 /// refusing would be a tenant's VM on the shared default bridge. A NIC that
 /// names no overlay asks for nothing, so a plain VM still lands on any node,
 /// including one whose agent predates all of this.
-#[generated(model = ClaudeFable, version = "5")]
 fn resource_requests(vm: &Vm) -> Vec<(String, Option<String>)> {
     let array = |field: &str| -> &[serde_json::Value] {
         vm.spec
@@ -593,10 +572,8 @@ fn resource_requests(vm: &Vm) -> Vec<(String, Option<String>)> {
 /// volume driver or a vxlan nic is a property of the spec, not of whichever
 /// strategy is looking at it, and two strategies deriving it separately is how
 /// they start disagreeing about where an lvm-thin VM may run.
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct DevicePolicy(Vec<(String, Option<String>)>);
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl DevicePolicy {
     pub fn of(vm: &Vm) -> Self {
         Self(resource_requests(vm))
@@ -627,7 +604,6 @@ impl DevicePolicy {
     /// Not "which candidate fell short" but "what nobody has": a VM needs ALL
     /// of its requests on ONE candidate, so the useful answer to an operator
     /// is the part of the ask that no single machine can serve.
-    #[generated(model = ClaudeFable, version = "5")]
     pub fn unmet(&self, candidates: &[Candidate]) -> Vec<String> {
         let usable: Vec<&Candidate> = candidates
             .iter()
@@ -654,7 +630,6 @@ impl DevicePolicy {
 /// those reasons, unbounded, and a metric label with an unbounded value range
 /// is what takes a Prometheus down. This is the closed set behind it, so that
 /// "how many VMs are pending, and why" is a time series rather than a string.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PendingReason {
     /// Nothing has ever dialled in here.
@@ -678,7 +653,6 @@ pub enum PendingReason {
     AntiAffinity,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl PendingReason {
     /// Every variant, in declaration order — see `RunStrategy::ALL`. What a
     /// pass walks to publish a zero for the reasons nothing is pending for,
@@ -731,11 +705,9 @@ impl PendingReason {
 /// Atomics rather than a `Cell`, because the pass holds this behind a shared
 /// reference across an await and the future has to stay `Send`. There is no
 /// contention: one pass, one task.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, Default)]
 pub struct PendingTally([std::sync::atomic::AtomicI64; PendingReason::ALL.len()]);
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl PendingTally {
     pub fn new() -> Self {
         Self(std::array::from_fn(|_| {
@@ -769,7 +741,6 @@ impl PendingTally {
 /// The order matters: "nobody is here" and "nobody is willing" are different
 /// operator problems from "nobody can", and only the last is about the VM's
 /// own demands.
-#[generated(model = ClaudeFable, version = "5")]
 pub fn pending_reason_of(vm: &Vm, candidates: &[Candidate]) -> (PendingReason, String) {
     if candidates.is_empty() {
         return (
@@ -918,17 +889,14 @@ pub fn pending_reason(vm: &Vm, candidates: &[Candidate]) -> String {
 /// A binding whose write then loses its compare-and-swap leaves this pass
 /// with one candidate too poor, which costs at most one VM one tick: the next
 /// pass derives `free` from the store again and the deduction is gone.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn deduct(candidates: &mut [Candidate], name: &str, spent: Capacity) {
     if let Some(c) = candidates.iter_mut().find(|c| c.name == name) {
         c.free = c.free.minus(spent);
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 pub struct FirstFit;
 
-#[generated(model = ClaudeFable, version = "5")]
 impl Scheduler for FirstFit {
     fn assign(&self, vm: &Vm, candidates: &[Candidate]) -> Option<String> {
         let placed = preferred(vm, feasible(vm, candidates))
@@ -957,10 +925,8 @@ impl Scheduler for FirstFit {
 ///
 /// Ties break on the name, so two passes over the same inventory place the
 /// same way and a test can say which.
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct Spread;
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Scheduler for Spread {
     fn assign(&self, vm: &Vm, candidates: &[Candidate]) -> Option<String> {
         preferred(vm, feasible(vm, candidates))
@@ -976,7 +942,6 @@ impl Scheduler for Spread {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use crate::resources::{VmSpec, new_vm};

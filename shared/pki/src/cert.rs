@@ -11,7 +11,6 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeZone, Utc};
-use macros::generated;
 use rustls_pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::*;
@@ -23,7 +22,6 @@ use x509_parser::prelude::*;
 /// statement here — what a name may *do* is an object in etcd, and keeping
 /// those two apart is what makes a role change something other than a
 /// re-issue.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertInfo {
     pub common_name: String,
@@ -38,7 +36,6 @@ pub struct CertInfo {
 
 /// `sha256:<hex>` over the DER bytes. The same string OpenSSL prints for
 /// `-fingerprint -sha256`, lowercased and without the colons.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn fingerprint(der: &[u8]) -> String {
     let digest = Sha256::digest(der);
     let mut out = String::with_capacity(7 + digest.len() * 2);
@@ -49,7 +46,6 @@ pub fn fingerprint(der: &[u8]) -> String {
     out
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl CertInfo {
     /// Read a certificate. Says nothing about whether it is trusted — that is
     /// `verified_by`.

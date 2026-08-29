@@ -22,7 +22,6 @@ use crosvm_gpu_driver::CrosvmGpuDriver;
 use filesystem_driver::FilesystemBlockDriver;
 use linux_network_driver::LinuxNetworkDriver;
 use lvm_thin_driver::LvmThinDriver;
-use macros::generated;
 use nfs_driver::NfsDriver;
 use nvrm_driver::NvrmDriver;
 use vfio_driver::VfioPciDriver;
@@ -50,7 +49,6 @@ const KEY_MANAGED: &str = "managed";
 /// this there were two — a field on a config struct and an if-let in
 /// `from_config` — and a driver wired into one but not the other was a
 /// config key that parsed and then did nothing at all.
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct DriverEntry<T: ?Sized + 'static> {
     /// The name a spec uses.
     pub name: &'static str,
@@ -65,7 +63,6 @@ pub struct DriverEntry<T: ?Sized + 'static> {
 
 /// The storage backends this agent has. `filesystem` is the default driver
 /// and the one row that registers with or without a section.
-#[generated(model = ClaudeOpus, version = "5")]
 static VOLUME_DRIVERS: &[DriverEntry<dyn VolumeDriver>] = &[
     DriverEntry {
         name: DRIVER_FILESYSTEM,
@@ -85,7 +82,6 @@ static VOLUME_DRIVERS: &[DriverEntry<dyn VolumeDriver>] = &[
 ];
 
 /// The device backends this agent has.
-#[generated(model = ClaudeOpus, version = "5")]
 static DEVICE_DRIVERS: &[DriverEntry<dyn DeviceDriver>] = &[
     DriverEntry {
         name: DRIVER_CROSVM_GPU,
@@ -114,7 +110,6 @@ static DEVICE_DRIVERS: &[DriverEntry<dyn DeviceDriver>] = &[
 /// seam a container runtime (podman, LXC) docks onto without an
 /// architectural change, because from this side "start this instance, under
 /// this cgroup, with these attachments" is the same sentence either way.
-#[generated(model = ClaudeOpus, version = "5")]
 static HYPERVISOR_DRIVERS: &[DriverEntry<dyn Hypervisor>] = &[DriverEntry {
     name: DRIVER_CLOUD_HYPERVISOR,
     keys: &[DRIVER_CLOUD_HYPERVISOR],
@@ -135,7 +130,6 @@ static HYPERVISOR_DRIVERS: &[DriverEntry<dyn Hypervisor>] = &[DriverEntry {
 /// driver (an OVN integration, a DPU offload) becomes a row here plus the
 /// `[network.ovn]` section it owns, rather than a second `match` in
 /// `from_config`.
-#[generated(model = ClaudeOpus, version = "5")]
 static NETWORK_DRIVERS: &[DriverEntry<dyn NetworkDriver>] = &[DriverEntry {
     name: DRIVER_LINUX_NETWORK,
     keys: &[],
@@ -148,7 +142,6 @@ static NETWORK_DRIVERS: &[DriverEntry<dyn NetworkDriver>] = &[DriverEntry {
 /// Both halves of the seam come through here — `T` is `dyn VolumeDriver` for
 /// `[volume]` and `dyn DeviceDriver` for `[device]`, and the table is the
 /// only difference between them.
-#[generated(model = ClaudeOpus, version = "5")]
 fn register<T: ?Sized>(
     entries: &[DriverEntry<T>],
     sections: &Sections,
@@ -200,7 +193,6 @@ fn register<T: ?Sized>(
 /// its Hello (`hypervisor/cloud-hypervisor`), and taking it from the table
 /// rather than asking the driver keeps one authority for the name: the same
 /// string routes the config section and lands in the catalogue.
-#[generated(model = ClaudeOpus, version = "5")]
 fn register_one<T: ?Sized>(
     entries: &[DriverEntry<T>],
     sections: &Sections,
@@ -224,7 +216,6 @@ fn register_one<T: ?Sized>(
 /// spec that names no driver has to keep meaning what it means on every
 /// node, so this registers whether or not `[volume.filesystem]` is there.
 /// The section only overrides where its files live.
-#[generated(model = ClaudeOpus, version = "5")]
 fn build_filesystem(
     sections: &Sections,
     cfg: &AgentConfig,
@@ -243,7 +234,6 @@ fn build_filesystem(
     Ok(Some(Arc::new(driver)))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn build_lvm_thin(
     sections: &Sections,
     cfg: &AgentConfig,
@@ -265,7 +255,6 @@ fn build_lvm_thin(
     Ok(Some(Arc::new(driver)))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn build_nfs(
     sections: &Sections,
     cfg: &AgentConfig,
@@ -289,7 +278,6 @@ fn build_nfs(
     Ok(Some(Arc::new(driver)))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn build_crosvm_gpu(
     sections: &Sections,
     cfg: &AgentConfig,
@@ -307,7 +295,6 @@ fn build_crosvm_gpu(
     Ok(Some(Arc::new(driver)))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn build_nvrm(
     sections: &Sections,
     cfg: &AgentConfig,
@@ -331,7 +318,6 @@ fn build_nvrm(
 /// setting of its own, so it owns the key `managed`. No inventory, or an
 /// empty one, means nothing on this node is passthrough-able — which is not
 /// the same as a driver that failed to configure, so it is `Ok(None)`.
-#[generated(model = ClaudeOpus, version = "5")]
 fn build_vfio(
     sections: &Sections,
     _cfg: &AgentConfig,
@@ -344,7 +330,6 @@ fn build_vfio(
     Ok(Some(Arc::new(VfioPciDriver::new(inventory)?)))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn build_cloud_hypervisor(
     sections: &Sections,
     cfg: &AgentConfig,
@@ -364,7 +349,6 @@ fn build_cloud_hypervisor(
 
 /// The one builder whose `Ok(None)` is decided by a section its table does
 /// not own: `[network]`. See `NETWORK_DRIVERS`.
-#[generated(model = ClaudeOpus, version = "5")]
 fn build_linux_network(
     _sections: &Sections,
     cfg: &AgentConfig,
@@ -394,13 +378,11 @@ fn build_linux_network(
 /// One entry so far. It is a list and not a bool because the next one —
 /// Geneve, an OVN integration, whatever the DPU track wants — is a profile
 /// beside it and not a second mechanism.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default)]
 pub struct NetworkCatalog {
     profiles: Vec<String>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl NetworkCatalog {
     /// `None` — a node with no `[network]` section — claims nothing, which
     /// is the same answer a node with a section and no overlay gives. The two
@@ -496,7 +478,6 @@ pub struct Drivers {
     pub devices: HashMap<String, Arc<dyn DeviceDriver>>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl Drivers {
     pub async fn from_config(cfg: &AgentConfig) -> anyhow::Result<Self> {
         // What a node is FOR: it runs VMs, or it serves volumes, or both.
@@ -578,7 +559,6 @@ impl Drivers {
     /// node without one is a legal configuration now, so the absence is an
     /// answer to give and not an invariant to assert. The message names the
     /// section, because the fix is one.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn hypervisor(&self) -> anyhow::Result<&Arc<dyn Hypervisor>> {
         self.hypervisor.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -588,7 +568,6 @@ impl Drivers {
     }
 
     /// The tap half of the networking driver, or the same kind of sentence.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn networking(&self) -> anyhow::Result<&Arc<dyn NicDriver>> {
         self.networking.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -598,7 +577,6 @@ impl Drivers {
     }
 
     /// The bridge half. Some exactly when `networking` is — see the field.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn bridge(&self) -> anyhow::Result<&Arc<dyn BridgeDriver>> {
         self.bridge.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -616,14 +594,12 @@ impl Drivers {
 /// storage node exists, and without an entry it would look to a scheduler
 /// exactly like a compute node with room: the first VM asking for nothing in
 /// particular would be placed there and fail at the first `create`.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default)]
 pub struct HypervisorCatalog {
     /// The configured driver's name, or `None` on a node that runs no VMs.
     driver: Option<String>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl HypervisorCatalog {
     /// From the registered slot rather than from the config, so that what a
     /// node CLAIMS is what it actually built. A section that failed to
@@ -664,13 +640,11 @@ impl HypervisorCatalog {
 /// Which storage backends this node has, for the same reason `DeviceCatalog`
 /// exists: an unknown driver name should be a rejected spec at the edge, not
 /// a VM that gets half-provisioned and then torn down again.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug)]
 pub struct VolumeCatalog {
     drivers: Vec<String>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl VolumeCatalog {
     pub fn new(storage: &HashMap<String, Arc<dyn VolumeDriver>>) -> Self {
         let mut drivers: Vec<String> = storage.keys().cloned().collect();
@@ -688,7 +662,6 @@ impl VolumeCatalog {
     /// in there too: every node has it, so it never decides a placement, but
     /// leaving it out would make `meister cluster nodes` lie about what a
     /// node can do.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn inventory(&self) -> Vec<String> {
         self.drivers.clone()
     }
@@ -710,13 +683,11 @@ impl VolumeCatalog {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Clone, Debug)]
 pub struct DeviceCatalog {
     profiles: HashMap<String, Vec<String>>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl DeviceCatalog {
     pub fn new(devices: &HashMap<String, Arc<dyn DeviceDriver>>) -> Self {
         Self {
@@ -729,7 +700,6 @@ impl DeviceCatalog {
 
     /// The node's device capability, sorted for a stable Hello: every
     /// configured driver with the profiles it can resolve.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn inventory(&self) -> Vec<(String, Vec<String>)> {
         let mut out: Vec<(String, Vec<String>)> = self
             .profiles
@@ -779,7 +749,6 @@ impl DeviceCatalog {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use crate::types::VolumeWithId;
@@ -993,7 +962,6 @@ mod tests {
     /// The same thing without the hypervisor and network sections baked in:
     /// what a node IS is now a question the config answers, so a test about
     /// that question has to be able to leave them out.
-    #[generated(model = ClaudeOpus, version = "5")]
     fn raw_config(sections: &str) -> AgentConfig {
         let dir = std::env::temp_dir().join("meister-agent-drivers-test");
         std::fs::create_dir_all(&dir).expect("a temp directory");

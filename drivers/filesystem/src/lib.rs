@@ -8,7 +8,6 @@ use agent_api::storage::{
     StorageError, VolumeAttacher, VolumeAttachment, VolumeHandle, VolumeId, VolumeProvider,
     VolumeSpec, VolumeState,
 };
-use macros::generated;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tracing::{Span, debug, info, instrument};
@@ -59,7 +58,6 @@ impl FilesystemBlockDriver {
         }
     }
 
-    #[generated(model = ClaudeFable, version = "5")]
     fn clone_or_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
         use nix::errno::Errno;
         use nix::fcntl::copy_file_range;
@@ -219,7 +217,6 @@ impl VolumeAttacher for FilesystemBlockDriver {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use agent_api::storage::VolumeSpec;

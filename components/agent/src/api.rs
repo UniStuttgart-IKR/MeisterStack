@@ -15,7 +15,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use macros::generated;
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument, warn};
 
@@ -112,7 +111,6 @@ impl IntoResponse for ApiError {
 
 pub struct ApiJson<T>(pub T);
 
-#[generated(model = ClaudeOpus, version = "4.8")]
 impl<S, T> FromRequest<S> for ApiJson<T>
 where
     axum::Json<T>: FromRequest<S, Rejection = JsonRejection>,
@@ -133,7 +131,6 @@ fn parse_id(raw: &str) -> Result<VmId, ApiError> {
         .map_err(|e| ApiError::bad_request(format!("invalid vm id {raw:?}: {e}")))
 }
 
-#[generated(model = ClaudeOpus, version = "4.8")]
 pub fn router(state: ApiState) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
@@ -156,7 +153,6 @@ pub fn router(state: ApiState) -> Router {
     router.with_state(state)
 }
 
-#[generated(model = ClaudeOpus, version = "4.8")]
 #[instrument(skip_all, fields(socket = %socket_path.display()))]
 pub async fn serve(socket_path: PathBuf, state: ApiState) -> anyhow::Result<()> {
     if let Some(parent) = socket_path.parent() {
@@ -206,7 +202,6 @@ struct VmListEntry {
     readable: bool,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[instrument(level = "debug", skip_all)]
 async fn list_vms(State(st): State<ApiState>) -> Result<Json<Vec<VmListEntry>>, ApiError> {
     let entries = st
@@ -235,7 +230,6 @@ async fn list_vms(State(st): State<ApiState>) -> Result<Json<Vec<VmListEntry>>, 
     Ok(Json(entries))
 }
 
-#[generated(model = ClaudeOpus, version = "4.8")]
 #[instrument(level = "debug", skip_all, fields(vm_id = %id))]
 async fn inspect_vm(
     State(st): State<ApiState>,
@@ -262,7 +256,6 @@ struct ObserveResponse {
     action: String,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[instrument(level = "debug", skip_all, fields(vm_id = %id))]
 async fn observe_vm(
     State(st): State<ApiState>,
@@ -306,7 +299,6 @@ struct LogQuery {
 /// A VM with no output at all answers with an empty list rather than a 404:
 /// "it printed nothing" is the commonest true answer there is, and it is not
 /// an error. A vm id this node has no record of still is.
-#[generated(model = ClaudeOpus, version = "5")]
 #[instrument(level = "debug", skip_all, fields(vm_id = %id))]
 async fn vm_logs(
     State(st): State<ApiState>,
@@ -335,7 +327,6 @@ struct ReconcileResponse {
     action: String,
 }
 
-#[generated(model = ClaudeOpus, version = "4.8")]
 #[instrument(skip_all, fields(vm_id = %id))]
 async fn reconcile_vm(
     State(st): State<ApiState>,
@@ -351,7 +342,6 @@ async fn reconcile_vm(
     }))
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[instrument(level = "debug", skip_all, fields(vm_id = %id))]
 async fn vm_state(
     State(st): State<ApiState>,
@@ -363,7 +353,6 @@ async fn vm_state(
 /// Every lifecycle endpoint is the reconciler's one transition plus the HTTP
 /// shape around it; the semantics live in `Reconciler::set_desired`, shared
 /// with the controller session.
-#[generated(model = ClaudeFable, version = "5")]
 async fn set_desired_and_reconcile(
     st: &ApiState,
     id: &str,
@@ -383,7 +372,6 @@ async fn set_desired_and_reconcile(
     }))
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[instrument(skip_all, fields(vm_id = %id))]
 async fn start_vm(
     State(st): State<ApiState>,
@@ -397,7 +385,6 @@ struct StopParams {
     grace_secs: Option<u64>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[instrument(skip_all, fields(vm_id = %id))]
 async fn stop_vm(
     State(st): State<ApiState>,
@@ -412,7 +399,6 @@ async fn stop_vm(
     set_desired_and_reconcile(&st, &id, Desired::Stopped, Some(deadline)).await
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[instrument(skip_all, fields(vm_id = %id))]
 async fn pause_vm(
     State(st): State<ApiState>,
@@ -427,7 +413,6 @@ async fn pause_vm(
     set_desired_and_reconcile(&st, &id, Desired::Paused, None).await
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[instrument(skip_all, fields(vm_id = %id))]
 async fn resume_vm(
     State(st): State<ApiState>,
@@ -442,7 +427,6 @@ struct OkResponse {
 }
 
 #[cfg(feature = "debug-mutations")]
-#[generated(model = ClaudeOpus, version = "4.8")]
 #[instrument(skip_all, fields(vm_id = %id))]
 async fn delete_record(
     State(st): State<ApiState>,
@@ -465,7 +449,6 @@ struct SetPhaseRequest {
 }
 
 #[cfg(feature = "debug-mutations")]
-#[generated(model = ClaudeOpus, version = "4.8")]
 #[instrument(skip_all, fields(vm_id = %id))]
 async fn set_phase(
     State(st): State<ApiState>,
@@ -485,7 +468,6 @@ async fn set_phase(
     Ok(Json(OkResponse { ok: true }))
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[instrument(skip_all)]
 async fn create_vm(
     State(st): State<ApiState>,
@@ -520,7 +502,6 @@ async fn create_vm(
     ))
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[instrument(skip_all, fields(vm_id = %id))]
 async fn destroy_vm(
     State(st): State<ApiState>,

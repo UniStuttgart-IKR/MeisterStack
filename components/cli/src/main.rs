@@ -6,7 +6,6 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use macros::generated;
 use tracing::debug;
 
 mod agent;
@@ -607,7 +606,6 @@ pub enum CloudImageCmd {
 }
 
 #[tokio::main]
-#[generated(model = ClaudeOpus, version = "5")]
 async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
@@ -622,7 +620,6 @@ async fn main() -> ExitCode {
 /// on the way up added a `.context()`, and an operator reading a terminal
 /// gets one error per line or none. Whitespace inside a message collapses
 /// too, so a literal wrapped across source lines stays one line here.
-#[generated(model = ClaudeOpus, version = "5")]
 fn one_line(e: &anyhow::Error) -> String {
     let mut parts: Vec<String> = Vec::new();
     for cause in e.chain() {
@@ -640,7 +637,6 @@ fn one_line(e: &anyhow::Error) -> String {
     parts.join(": ")
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -696,7 +692,6 @@ async fn run() -> Result<()> {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

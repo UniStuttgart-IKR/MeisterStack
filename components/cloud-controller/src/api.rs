@@ -27,7 +27,6 @@ use controller_api::{
     },
     vni,
 };
-use macros::generated;
 use proto::cloud_command;
 use serde_json::json;
 use tracing::{error, info, warn};
@@ -196,7 +195,6 @@ struct Grant {
     tenant: Option<String>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Grant {
     fn new(
         caller: Caller,
@@ -269,7 +267,6 @@ async fn healthz() -> &'static str {
 /// references nothing. The boot source resolves against the same node-local
 /// directory but is deliberately not catalogued in v1 — the check covers disk
 /// base images, which is what the design put in the catalogue.
-#[generated(model = ClaudeOpus, version = "5")]
 fn base_images(vm: &serde_json::Value) -> BTreeSet<String> {
     vm.get("volumes")
         .and_then(|v| v.as_array())
@@ -296,7 +293,6 @@ fn base_images(vm: &serde_json::Value) -> BTreeSet<String> {
 /// enough to source from anywhere (the tap rules are built from these lists).
 /// Nobody needs to set them here: the cloud resolves all three from the
 /// tenant, and refusing is the difference between a rule and a suggestion.
-#[generated(model = ClaudeFable, version = "5")]
 fn check_owned_nic_fields(vm: &serde_json::Value) -> Result<(), ApiError> {
     let nics = vm
         .get("nics")
@@ -324,7 +320,6 @@ fn check_owned_nic_fields(vm: &serde_json::Value) -> Result<(), ApiError> {
 /// and from PUT both. A document that is only checked on the way in is a
 /// document that gets edited afterwards, and it is the edited one that
 /// travels down to the agent.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result<(), ApiError> {
     if !spec.vm.is_object() {
         return Err(invalid("spec.vm must be the agent's NewVmSpec object"));
@@ -371,7 +366,6 @@ async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result<(), ApiErr
 /// the whole point of the phase — the alternative is an object that is
 /// accepted, placed, and then fails at provision on every node it is offered
 /// to.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn check_base_image(store: &EtcdStore, name: &str) -> Result<(), ApiError> {
     match store.get::<Image>(name).await {
         Ok(image) if image.status.phase == controller_api::ImagePhase::Failed => {
@@ -398,7 +392,6 @@ async fn check_base_image(store: &EtcdStore, name: &str) -> Result<(), ApiError>
 /// into its own spec could point a `base_image` name at bytes of its own
 /// choosing while the catalogue entry everybody else reads says something
 /// different.
-#[generated(model = ClaudeOpus, version = "5")]
 fn check_owned_volume_fields(vm: &serde_json::Value) -> Result<(), ApiError> {
     let volumes = vm
         .get("volumes")
@@ -450,7 +443,6 @@ fn check_owned_volume_fields(vm: &serde_json::Value) -> Result<(), ApiError> {
 /// Only for images that HAVE a url. A path-based image gets nothing written
 /// into its volume at all, so its spec is byte for byte the spec it has
 /// always been and the node looks the name up locally exactly as before.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn resolve_base_images(
     store: &EtcdStore,
     vm: &mut serde_json::Value,
@@ -508,7 +500,6 @@ async fn resolve_base_images(
 /// cannot decode, and a VM not seen is usage not counted — which would let a
 /// tenant past its ceiling by exactly the size of whatever failed to parse.
 /// Refusing to answer beats answering from a list that is not all of them.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn check_quota(
     st: &ApiState,
     tenant: Option<&str>,
@@ -555,7 +546,6 @@ async fn check_quota(
 /// A member sees its own tenant's VMs and nothing else. Filtering the list
 /// rather than only guarding the individual GET is the point: a name is an
 /// inventory, and handing over the whole one is the leak that matters.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn list_vms(
     State(st): State<ApiState>,
     caller: Caller,
@@ -572,7 +562,6 @@ async fn list_vms(
     ))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 /// The edge is where the trace is decided: continue the caller's if it sent a
 /// readable one, start a new one if it did not. The span is built and given
 /// its parent before it starts — see `telemetry::in_trace` — because a parent
@@ -667,7 +656,6 @@ async fn get_vm(
     Ok(Json(vm))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn update_vm(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -718,7 +706,6 @@ async fn update_vm(
     Ok(Json(st.store.update(&body).await?))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn delete_vm(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -758,7 +745,6 @@ const NO_STREAMS: &[u8] = b"[]";
 ///
 /// One way and only that — no attach, no input, no follow. See the cluster
 /// tier's twin.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn vm_logs(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -802,7 +788,6 @@ async fn vm_logs(
 /// The node's JSON, handed on as the bytes it is — see the cluster tier's
 /// twin. Two tiers of deserialise-and-reserialise would be two chances to
 /// change what a console said, for no gain.
-#[generated(model = ClaudeOpus, version = "5")]
 fn json_passthrough(payload: Vec<u8>) -> axum::response::Response {
     use axum::response::IntoResponse;
     (
@@ -821,7 +806,6 @@ fn json_passthrough(payload: Vec<u8>) -> axum::response::Response {
 /// it the other way round — filtering the event list by the caller's tenant —
 /// would answer 200 with an empty list for somebody else's VM, and "there is
 /// nothing" is a different and less honest sentence than "that is not yours".
-#[generated(model = ClaudeOpus, version = "5")]
 async fn vm_events(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -845,7 +829,6 @@ async fn vm_events(
 /// operator's estate (a node's heartbeat, a cluster reconnecting) and only an
 /// admin sees them, which is the conservative direction and the one an
 /// unscoped VM already takes.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn list_events(
     State(st): State<ApiState>,
     caller: Caller,
@@ -888,7 +871,6 @@ async fn get_cluster(
 /// Not tenant-scoped and not a member's: a cluster is a piece of the
 /// operator's estate, and the middleware already says so (`clusters` is
 /// outside `TENANT_SCOPED`, so a member reads and an admin writes).
-#[generated(model = ClaudeOpus, version = "5")]
 async fn update_cluster(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -913,7 +895,6 @@ async fn update_cluster(
 /// for the name to be the file name — and a catalogue entry that cannot line
 /// up would be worse than no entry at all, because the 422 it buys is a
 /// promise the agent goes on to break.
-#[generated(model = ClaudeOpus, version = "5")]
 fn check_image_name(name: &str, source: &str) -> Result<(), ApiError> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err(invalid(
@@ -943,7 +924,6 @@ fn check_image_name(name: &str, source: &str) -> Result<(), ApiError> {
 /// The shape is validated here rather than at the node for the reason every
 /// other spec rule is: the node is the last place to find out, and by then
 /// somebody is waiting for a VM.
-#[generated(model = ClaudeOpus, version = "5")]
 fn check_fetchable(spec: &ImageSpec) -> Result<(), ApiError> {
     match (&spec.url, &spec.sha256) {
         (None, None) => Ok(()),
@@ -982,7 +962,6 @@ fn check_fetchable(spec: &ImageSpec) -> Result<(), ApiError> {
 /// A member's catalogue is its own images plus the public ones — which is
 /// what a shared base image is for, and why the list is not simply filtered
 /// to one tenant the way the VM list is.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn list_images(
     State(st): State<ApiState>,
     caller: Caller,
@@ -999,7 +978,6 @@ async fn list_images(
     ))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create_image(
     State(st): State<ApiState>,
     caller: Caller,
@@ -1075,7 +1053,6 @@ async fn get_image(
 /// catalogue's whole job is that "every base_image names an Image" holds, and
 /// deleting out from under a VM would break it silently, at the exact moment
 /// nobody is looking.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn delete_image(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -1146,7 +1123,6 @@ async fn delete_image(
 /// rather than a convenience: `list_vms` filters to a member's own tenant, so
 /// a client-side aggregation would show that member every other tenant using
 /// nothing.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn list_tenants(State(st): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
     let mut items = st.store.list::<Tenant>().await?;
     let vms = st.store.list::<Vm>().await?;
@@ -1172,7 +1148,6 @@ async fn list_tenants(State(st): State<ApiState>) -> Result<Json<serde_json::Val
 /// the cost of a leaked VNI is one number out of sixteen million, and the
 /// cost of the other order — a tenant object that exists with no network —
 /// is a tenant whose VMs quietly land on the default bridge.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create_tenant(
     State(st): State<ApiState>,
     Json(body): Json<Tenant>,
@@ -1205,7 +1180,6 @@ async fn get_tenant(
     Ok(Json(tenant))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn update_tenant(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -1244,7 +1218,6 @@ async fn update_tenant(
 ///
 /// Pure, and taking the four lists rather than the store, so the rule is one
 /// readable thing instead of four repetitions inside a handler.
-#[generated(model = ClaudeOpus, version = "5")]
 fn tenant_still_holds(
     tenant: &str,
     users: &[User],
@@ -1298,7 +1271,6 @@ fn tenant_still_holds(
 /// and nothing of it is left. The same rule and the same reason as an image
 /// with a VM on it: the invariant "everything that names a tenant names one
 /// that exists" is worth exactly as much as the refusal that keeps it true.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn delete_tenant(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -1357,7 +1329,6 @@ async fn delete_tenant(
 
 /// A member sees its own tenant's reservations. Same filter and same reason as
 /// `list_vms`: the addresses somebody holds are an inventory.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn list_floating_ips(
     State(st): State<ApiState>,
     caller: Caller,
@@ -1383,7 +1354,6 @@ async fn list_floating_ips(
 /// or refused with the reason — never quietly replaced by another address,
 /// because a caller who asked for `203.0.113.7` asked for the one their DNS
 /// already points at.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create_floating_ip(
     State(st): State<ApiState>,
     caller: Caller,
@@ -1461,7 +1431,6 @@ async fn get_floating_ip(
 /// stopping and starting it keeps the same tap and the same rules. Making a
 /// re-home live is a documented nice-to-have and not this milestone's job; see
 /// `floating::inject_nic_list`.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn update_floating_ip(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -1501,7 +1470,6 @@ async fn update_floating_ip(
 /// gets its own rules at its own create. Two VMs briefly permitted the same
 /// address is the same window a DHCP lease has, and the way to close it is the
 /// runtime re-home above.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn delete_floating_ip(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -1525,12 +1493,10 @@ async fn delete_floating_ip(
 /// addresses they are allowed out of it. What another tenant was granted is
 /// none of their business, and the map is the only field on the object that
 /// names other tenants at all.
-#[generated(model = ClaudeOpus, version = "5")]
 fn redact_quota(pool: &mut FloatingPool, mine: &str) {
     pool.spec.quota.retain(|tenant, _| tenant == mine);
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn list_floating_pools(
     State(st): State<ApiState>,
     caller: Caller,
@@ -1569,7 +1535,6 @@ async fn get_floating_pool(
 ///
 /// `except` is the pool being updated, which must not be found to overlap
 /// itself.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn check_pool(
     st: &ApiState,
     pool: &FloatingPool,
@@ -1630,7 +1595,6 @@ async fn check_pool(
 
 /// One thing already in the store that a claim collides with: what to call it
 /// in the refusal, and the revision of the write that put it there.
-#[generated(model = ClaudeOpus, version = "5")]
 struct Collision {
     what: String,
     revision: String,
@@ -1639,7 +1603,6 @@ struct Collision {
 /// Whose post-write scan this is, so that it does not find itself. A pool and
 /// a subnet may carry the same name, so which resource it is has to travel
 /// with the name.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy)]
 enum Claimant<'a> {
     Pool(&'a str),
@@ -1658,7 +1621,6 @@ enum Claimant<'a> {
 /// "yes". Two claimants that both take themselves back cost a retry and an
 /// honest refusal; two that both keep theirs cost an overlap that nothing
 /// afterwards can explain or repair.
-#[generated(model = ClaudeOpus, version = "5")]
 fn arrived_after(mine: &str, theirs: &str) -> bool {
     match (mine.parse::<i64>(), theirs.parse::<i64>()) {
         (Ok(mine), Ok(theirs)) => mine > theirs,
@@ -1673,7 +1635,6 @@ fn arrived_after(mine: &str, theirs: &str) -> bool {
 /// first. A collision with something that arrived AFTER us is not ours to act
 /// on: that writer is running this same function right now and will take
 /// itself back.
-#[generated(model = ClaudeOpus, version = "5")]
 fn lost_to<'a>(mine: &str, hits: &'a [Collision]) -> Option<&'a Collision> {
     hits.iter().find(|c| arrived_after(mine, &c.revision))
 }
@@ -1683,7 +1644,6 @@ fn lost_to<'a>(mine: &str, hits: &'a [Collision]) -> Option<&'a Collision> {
 ///
 /// `floating::occupied` answers the same question and throws the revision
 /// away, and the revision is precisely what the arbitration needs.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn collisions(
     st: &ApiState,
     ranges: &[common::net::Ipv4Range],
@@ -1736,7 +1696,6 @@ async fn collisions(
 /// A failure here is an ERROR: what stays behind is a pool or a subnet lying
 /// on top of another one, and no pass, retry or reconnect ever clears it —
 /// only a person does.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn take_back<T: Resource>(st: &ApiState, name: &str, kind: &str) {
     if let Err(e) = st.store.delete::<T>(name).await {
         error!(name, kind, error = %format!("{e:#}"),
@@ -1758,7 +1717,6 @@ const MAX_CLAIM_ROUNDS: usize = 8;
 /// default in it and both wrote one — which is not a hand-edited etcd, it is
 /// two administrators and one second, and `floating::pick_pool` then refuses
 /// every allocation on this cloud until somebody deletes one by hand.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn pool_lost_claim(st: &ApiState, pool: &FloatingPool) -> Result<Option<String>, ApiError> {
     let mine = pool.metadata.resource_version.as_str();
 
@@ -1794,7 +1752,6 @@ async fn pool_lost_claim(st: &ApiState, pool: &FloatingPool) -> Result<Option<St
     }))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create_floating_pool(
     State(st): State<ApiState>,
     Json(body): Json<FloatingPool>,
@@ -1826,7 +1783,6 @@ async fn create_floating_pool(
 /// out from under a live reservation, because the reservation would then name
 /// an address the pool no longer contains and no allocator could ever explain
 /// where it came from.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn update_floating_pool(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -1861,7 +1817,6 @@ async fn update_floating_pool(
 /// A pool with reservations in it stays. The same rule and the same reason as
 /// a tenant with users: the invariant "every reservation came out of a pool
 /// that exists" is worth exactly what the refusal that keeps it true is worth.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn delete_floating_pool(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -1909,12 +1864,10 @@ async fn delete_floating_pool(
 /// argument — a member has to be able to see which pool is the default and
 /// how much they may take out of it, and what another tenant was granted is
 /// none of their business.
-#[generated(model = ClaudeOpus, version = "5")]
 fn redact_storage_quota(pool: &mut StoragePool, mine: &str) {
     pool.spec.quota.retain(|tenant, _| tenant == mine);
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn list_storage_pools(
     State(st): State<ApiState>,
     caller: Caller,
@@ -1933,7 +1886,6 @@ async fn list_storage_pools(
     ))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn get_storage_pool(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -1955,7 +1907,6 @@ async fn get_storage_pool(
 /// admin may declare a pool before the node that serves it has ever dialled
 /// in, and a cloud with an allowlist of backend names would be a second place
 /// to add a driver.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn check_storage_pool(
     st: &ApiState,
     pool: &StoragePool,
@@ -1990,7 +1941,6 @@ async fn check_storage_pool(
     Ok(())
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create_storage_pool(
     State(st): State<ApiState>,
     Json(body): Json<StoragePool>,
@@ -2024,7 +1974,6 @@ async fn create_storage_pool(
 /// DRIVER does not: a pool that changed backend would be a pool whose live
 /// volumes are on a backend its object does not name, and no reconciler could
 /// ever explain where the data went.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn update_storage_pool(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -2075,7 +2024,6 @@ async fn update_storage_pool(
 /// floating pool with reservations: the invariant "every volume came out of a
 /// pool that exists" is worth exactly what the refusal that keeps it true is
 /// worth.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn delete_storage_pool(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -2105,7 +2053,6 @@ async fn delete_storage_pool(
 /// the state a cloud is in before an administrator has declared any storage at
 /// all, and the useful answer to a member asking for a disk on such a cloud is
 /// what the administrator has to do, not `404`.
-#[generated(model = ClaudeOpus, version = "5")]
 fn pick_storage_pool<'a>(
     pools: &'a [StoragePool],
     named: Option<&str>,
@@ -2152,7 +2099,6 @@ fn pick_storage_pool<'a>(
 /// `floating::all_reservations` applies and for a sharper reason: there the
 /// cost of undercounting is two tenants on one address, here it is a pool
 /// quietly overcommitted past the disk that is actually in the machine.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn all_volumes(st: &ApiState) -> Result<Vec<Volume>, ApiError> {
     let volumes = st.store.list::<Volume>().await?;
     if volumes.len() != st.store.count::<Volume>().await? {
@@ -2164,7 +2110,6 @@ async fn all_volumes(st: &ApiState) -> Result<Vec<Volume>, ApiError> {
     Ok(volumes)
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn list_volumes(
     State(st): State<ApiState>,
     caller: Caller,
@@ -2181,7 +2126,6 @@ async fn list_volumes(
     ))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn get_volume(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -2206,7 +2150,6 @@ async fn get_volume(
 /// Nothing is provisioned. What this writes down is a RESERVATION against a
 /// pool's quota; a node that can reach the pool makes it real, and until then
 /// the volume is `Pending` and says so.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create_volume(
     State(st): State<ApiState>,
     caller: Caller,
@@ -2277,7 +2220,6 @@ async fn create_volume(
 /// client that could set them could point its own object at somebody else's
 /// bytes — `status.backend` most directly of all, since that string is what a
 /// node hands its driver.
-#[generated(model = ClaudeOpus, version = "5")]
 fn check_owned_volume_status(volume: &Volume) -> Result<(), ApiError> {
     let owned = [
         ("status.backend", !volume.status.backend.is_empty()),
@@ -2303,7 +2245,6 @@ fn check_owned_volume_status(volume: &Volume) -> Result<(), ApiError> {
 /// resize is a real operation on a live filesystem and is explicitly out of
 /// scope until the object stands; letting the field move without it would be
 /// an object that lies about how big its data is.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn update_volume(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -2348,7 +2289,6 @@ async fn update_volume(
 /// all the same, because the bytes are still on a node and it is the node
 /// saying they are gone that removes the object — not this handler saying they
 /// should be.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn delete_volume(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -2392,7 +2332,6 @@ async fn delete_volume(
 /// A member sees its own tenant's subnets. Read-only for them by the verb
 /// rule; whether a tenant gets a routed subnet at all is an admin's decision,
 /// because it is a piece of the operator's own address space.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn list_routed_subnets(
     State(st): State<ApiState>,
     caller: Caller,
@@ -2432,7 +2371,6 @@ async fn get_routed_subnet(
 /// pool, because a subnet containing a pool address would put that address on
 /// its tenant's allowlist and punch a hole in the pool guard the size of the
 /// subnet.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn choose_subnet_cidr(
     st: &ApiState,
     spec: &controller_api::RoutedSubnetSpec,
@@ -2483,7 +2421,6 @@ async fn choose_subnet_cidr(
 /// same retry `floating::allocate` runs for the same reason. A named CIDR has
 /// nowhere else to go and is refused, which is what an admin who wrote an
 /// address plan wants to hear.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create_routed_subnet(
     State(st): State<ApiState>,
     Json(body): Json<RoutedSubnet>,
@@ -2538,7 +2475,6 @@ async fn create_routed_subnet(
 /// tenant's running VMs. Silently kept rather than refused, the same way a
 /// tenant's VNI is — a client that round-trips the object must not have to
 /// strip fields it did not write.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn update_routed_subnet(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -2560,7 +2496,6 @@ async fn update_routed_subnet(
 /// subnet away NARROWS what its tenant's taps may send from, and it takes
 /// effect when each of its VMs is next recreated. Nothing is left dangling and
 /// nothing keeps working that should not.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn delete_routed_subnet(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -2578,7 +2513,6 @@ fn first_non_empty<const N: usize>(candidates: [&str; N]) -> Option<&str> {
 }
 
 /// That VM exists and belongs to this tenant.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn check_vm_of_tenant(st: &ApiState, vm: &str, tenant: &str) -> Result<(), ApiError> {
     match st.store.get::<Vm>(vm).await {
         Ok(found) if found.spec.tenant.as_deref() == Some(tenant) => Ok(()),
@@ -2599,7 +2533,6 @@ async fn list_users(State(st): State<ApiState>) -> Result<Json<serde_json::Value
     ))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create_user(
     State(st): State<ApiState>,
     Json(body): Json<User>,
@@ -2628,7 +2561,6 @@ async fn get_user(
     Ok(Json(st.store.get(&name).await?))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn update_user(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -2657,7 +2589,6 @@ async fn update_user(
 /// That is the whole revocation story of this milestone, and it is worth
 /// saying out loud rather than implying: it works at the cloud, and the
 /// cluster tier keeps honouring the certificate until it expires.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn delete_user(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -2711,7 +2642,6 @@ async fn list_csrs(State(st): State<ApiState>) -> Result<Json<serde_json::Value>
 ///   - a caller who is not an admin may only ask for its own name. This is
 ///     the one that matters: without it, `auto_approve` plus any member's
 ///     certificate is a path to the administrator's.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create_csr(
     State(st): State<ApiState>,
     caller: Caller,
@@ -2814,7 +2744,6 @@ async fn delete_csr(
 /// holds the key and serves the API, so splitting them would be ceremony
 /// around a boundary that does not exist. The condition still records who
 /// approved, which is the part of the split that carries the meaning.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn approve_csr(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -2862,7 +2791,6 @@ async fn approve_csr(
 /// The subject comes from the directory and nowhere else: the common name is
 /// the user object's name and the one group is the role it carries. Nothing a
 /// client wrote reaches the certificate.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn approve_and_sign(
     st: &ApiState,
     csr: &mut CertificateSigningRequest,
@@ -2942,7 +2870,6 @@ async fn approve_and_sign(
 /// Creating one takes an admin, which makes this a way to keep access rather
 /// than to gain it; that is exactly the kind of door worth not leaving open.
 /// Kubernetes reserves the same prefix for the same reason.
-#[generated(model = ClaudeOpus, version = "5")]
 fn check_user_name(name: &str) -> Result<(), ApiError> {
     if name.starts_with(controller_api::auth::SYSTEM_PREFIX) {
         return Err(invalid(format!(
@@ -2977,7 +2904,6 @@ async fn check_tenant(st: &ApiState, tenant: &str) -> Result<(), ApiError> {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

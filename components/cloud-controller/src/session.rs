@@ -25,7 +25,6 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use macros::generated;
 use proto::cluster_plane_server::{ClusterPlane, ClusterPlaneServer};
 use proto::{
     CloudCommand, CloudMessage, ClusterHello, ClusterMessage, ClusterStatus, cloud_command,
@@ -89,14 +88,12 @@ pub struct SessionRegistry {
     pending: Pending,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Default for SessionRegistry {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl SessionRegistry {
     pub fn new() -> Self {
         Self {
@@ -287,7 +284,6 @@ impl SessionRegistry {
 /// the inventory survive the cluster — one that is down is disconnected, not
 /// absent — and it is also what keeps the first status from writing into
 /// nothing, because `mutate` does not create.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn ingest_hello(store: &EtcdStore, hello: &ClusterHello) -> anyhow::Result<()> {
     let name = hello.cluster_name.as_str();
     if matches!(
@@ -322,7 +318,6 @@ async fn ingest_hello(store: &EtcdStore, hello: &ClusterHello) -> anyhow::Result
 /// etcd, so its aggregate is not wrong — it is merely a second, slightly older
 /// account of the same thing, and letting two accounts write the same fields
 /// buys nothing but a phase that walks backwards for one interval.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn ingest_status(
     store: &EtcdStore,
     cluster: &str,
@@ -478,7 +473,6 @@ pub struct ClusterPlaneService {
 /// and the id the registry knows it by. Both None until Hello, and that is
 /// the whole reason they are a pair — a status before Hello has nothing to be
 /// filed against and nobody to be filed as.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Default)]
 struct Live {
     cluster: Option<String>,
@@ -488,7 +482,6 @@ struct Live {
 /// Whether the stream goes on. A refused Hello is the only thing that ends a
 /// session from this side; everything else it can be told is either handled or
 /// logged and survived.
-#[generated(model = ClaudeOpus, version = "5")]
 enum Step {
     Continue,
     Stop,
@@ -503,7 +496,6 @@ enum Step {
 /// status ingest and the teardown at once. Split into named steps, each of
 /// them is a paragraph that can be read on its own, and the loop below says
 /// only what the loop actually decides: read, dispatch, stop or go on.
-#[generated(model = ClaudeOpus, version = "5")]
 struct Connection {
     registry: std::sync::Arc<SessionRegistry>,
     store: std::sync::Arc<EtcdStore>,
@@ -529,7 +521,6 @@ struct Connection {
 /// naming one is a cluster with a stale spec or a node with a leftover cache
 /// entry, and inventing a catalogue entry for it would be this control plane
 /// making up an image nobody registered.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn ingest_images(store: &EtcdStore, cluster: &str, reports: &[proto::ImageStateReport]) {
     for report in reports {
         let Some(phase) = ImagePhase::parse(&report.phase) else {
@@ -564,7 +555,6 @@ async fn ingest_images(store: &EtcdStore, cluster: &str, reports: &[proto::Image
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Connection {
     /// One session, message by message, until the stream ends or a Hello is
     /// refused. Whatever ends it, the close runs.
@@ -705,7 +695,6 @@ impl Connection {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[tonic::async_trait]
 impl ClusterPlane for ClusterPlaneService {
     type SessionStream = ReceiverStream<Result<CloudMessage, Status>>;
@@ -736,7 +725,6 @@ impl ClusterPlane for ClusterPlaneService {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use proto::{ClusterCapacity, VmStatusReport};

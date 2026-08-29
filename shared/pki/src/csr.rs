@@ -11,7 +11,6 @@
 //! is free to distrust. Nothing in this module can send anything anywhere.
 
 use anyhow::{Result, anyhow, bail};
-use macros::generated;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls_pki_types::CertificateSigningRequestDer;
 use rustls_pki_types::pem::PemObject;
@@ -32,7 +31,6 @@ pub struct KeyAndCsr {
 /// The name in the request is a courtesy: it is what the operator typed, it
 /// travels so the server can compare it against what it was told, and the
 /// server overwrites it in the certificate either way (`ca::Ca::sign_csr`).
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn generate_key_and_csr(common_name: &str) -> Result<KeyAndCsr> {
     if common_name.is_empty() {
         bail!("a certificate request needs a name");
@@ -65,7 +63,6 @@ pub fn generate_key_and_csr(common_name: &str) -> Result<KeyAndCsr> {
 ///
 /// What comes back is a claim and is treated as one: the server compares it
 /// against the name being asked for, and then writes its own subject anyway.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn requested_name(csr_pem: &str) -> Result<String> {
     let der = CertificateSigningRequestDer::from_pem_slice(csr_pem.as_bytes())
         .map_err(|e| anyhow!("not a PEM certificate request: {e}"))?;
@@ -85,7 +82,6 @@ pub fn requested_name(csr_pem: &str) -> Result<String> {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

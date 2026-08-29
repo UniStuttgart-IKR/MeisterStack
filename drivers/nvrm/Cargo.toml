@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
 backend = { package = "meister-backend", path = "../backend" }
-macros = { package = "meister-macros", path = "../../shared/macros" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }

@@ -9,7 +9,6 @@
 //! and nowhere above because they are questions about one node's processes.
 
 use anyhow::{Context, Result};
-use macros::generated;
 use serde::Deserialize;
 
 use crate::client::Client;
@@ -66,7 +65,6 @@ struct CreatedResponse {
 
 /// Every verb of this tier that destroys something, and the whole list of it.
 /// See the same function at the two tiers above.
-#[generated(model = ClaudeOpus, version = "5")]
 fn destructive(cmd: &AgentCmd) -> Option<(&'static str, &str)> {
     match cmd {
         AgentCmd::Destroy { id } => Some(("vm", id)),
@@ -74,7 +72,6 @@ fn destructive(cmd: &AgentCmd) -> Option<(&'static str, &str)> {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "4.8")]
 pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result<()> {
     if let Some((kind, name)) = destructive(cmd) {
         output::confirm_destructive(global, target, kind, name)?;
@@ -172,7 +169,6 @@ pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result
 
 /// The listing row. `note` is last on purpose: see the rule in
 /// [`crate::output`].
-#[generated(model = ClaudeOpus, version = "5")]
 fn vm_row(v: VmListEntry) -> Vec<String> {
     vec![
         v.id,
@@ -193,7 +189,6 @@ fn vm_row(v: VmListEntry) -> Vec<String> {
     ]
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn observe_rows(o: ObserveResponse) -> Vec<Vec<String>> {
     let field = |name: &str, value: String| vec![name.to_string(), value];
     vec![
@@ -214,7 +209,6 @@ fn observe_rows(o: ObserveResponse) -> Vec<Vec<String>> {
 
 /// What the node did, or would have done. Every verb of this tier that acts
 /// answers in this one shape.
-#[generated(model = ClaudeOpus, version = "5")]
 fn action(global: &GlobalArgs, body: &bytes::Bytes, parsing: &'static str) -> Result<()> {
     output::emit(global, body, |body| {
         let r: ActionResponse = serde_json::from_slice(body).context(parsing)?;
@@ -222,14 +216,12 @@ fn action(global: &GlobalArgs, body: &bytes::Bytes, parsing: &'static str) -> Re
     })
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 async fn lifecycle(client: &Client, global: &GlobalArgs, path: &str) -> Result<()> {
     let body = client.post(path, None).await?;
     action(global, &body, "parsing lifecycle response")
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

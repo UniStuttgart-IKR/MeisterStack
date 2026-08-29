@@ -27,7 +27,6 @@ use std::time::Duration;
 use agent_api::CgroupHandle;
 use agent_api::device::DeviceError;
 use agent_api::storage::StorageError;
-use macros::generated;
 use nix::sys::signal::Signal;
 use tracing::{Instrument, debug, info, warn};
 
@@ -46,7 +45,6 @@ const TAIL_CHARS: usize = 800;
 
 /// What went wrong with a backend process, in the two shapes every driver
 /// needs: the process is gone, or the machinery around it failed.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     /// The backend exited, or never came up. Carries the log tail, because
@@ -63,7 +61,6 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 /// The device and storage halves of the agent API keep their own error enums,
 /// and both have exactly these two variants for a backend. Converting here
 /// rather than at every call site is what lets a driver write `?`.
-#[generated(model = ClaudeOpus, version = "5")]
 impl From<BackendError> for DeviceError {
     fn from(e: BackendError) -> Self {
         match e {
@@ -73,7 +70,6 @@ impl From<BackendError> for DeviceError {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl From<BackendError> for StorageError {
     fn from(e: BackendError) -> Self {
         match e {
@@ -88,7 +84,6 @@ impl From<BackendError> for StorageError {
 ///
 /// A driver builds one of these at construction time and keeps it; it is the
 /// only place the three drivers' deliberate differences are written down.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug)]
 pub struct BackendKind {
     /// Names the process in errors and logs. The binary's own name, so a
@@ -105,7 +100,6 @@ pub struct BackendKind {
     stdin_null: bool,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl BackendKind {
     /// A backend that gets a session of its own.
     ///
@@ -315,7 +309,6 @@ impl BackendKind {
 }
 
 /// Where one backend's files live and how long it gets to come up.
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct BackendIo<'a> {
     /// The socket the backend is expected to listen on. Also the readiness
     /// signal: the backend creates it when, and only when, it is serving.
@@ -330,12 +323,10 @@ pub struct BackendIo<'a> {
 }
 
 /// A running backend process this driver owns.
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct Backend {
     child: tokio::process::Child,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Backend {
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
@@ -359,13 +350,11 @@ impl Backend {
 
 /// Liveness of a process we may not own: `kill(pid, 0)`. It answers for an
 /// adopted backend, which `try_wait` cannot.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn pid_is_alive(pid: u32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
 
 /// The tail of a backend's log, for the error that reports its death.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn tail_log(path: &Path) -> String {
     std::fs::read_to_string(path)
         .map(|s| {
@@ -381,7 +370,6 @@ pub fn tail_log(path: &Path) -> String {
 }
 
 /// Teardown is idempotent: a file that is already gone is a file removed.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn remove_if_present(path: &Path) -> std::io::Result<()> {
     match tokio::fs::remove_file(path).await {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -394,7 +382,6 @@ fn truncate_comm(comm: &str) -> String {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

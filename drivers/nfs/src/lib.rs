@@ -46,7 +46,6 @@ use agent_api::storage::{
 };
 use backend::{Backend, BackendIo, BackendKind};
 use filesystem_driver::{FilesystemBlockDriver, FilesystemDriverConfig};
-use macros::generated;
 use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
 
@@ -147,7 +146,6 @@ pub struct NfsDriver {
 /// Whether `path` is a mount point, read from the kernel rather than guessed.
 /// `/proc/self/mounts` and not `/etc/mtab`: what is actually mounted is the
 /// question, not what somebody meant to mount.
-#[generated(model = ClaudeOpus, version = "5")]
 fn is_mount_point(mounts: &str, path: &Path) -> bool {
     let want = path.to_string_lossy();
     mounts.lines().any(|line| {
@@ -161,7 +159,6 @@ fn is_mount_point(mounts: &str, path: &Path) -> bool {
 
 /// The mount(8) argument list. A function of its own because it is the one
 /// thing here worth testing without a real NFS server in the room.
-#[generated(model = ClaudeOpus, version = "5")]
 fn mount_args(spec: &MountSpec, share_root: &Path) -> Vec<String> {
     let mut args = vec!["-t".to_string(), spec.fs_type.clone()];
     if let Some(opts) = &spec.options
@@ -175,7 +172,6 @@ fn mount_args(spec: &MountSpec, share_root: &Path) -> Vec<String> {
     args
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl NfsDriver {
     /// mount(8) off PATH, which is what every config written so far expects.
     pub fn new(config: NfsDriverConfig) -> storage::Result<Self> {
@@ -423,7 +419,6 @@ impl NfsDriver {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[async_trait::async_trait]
 impl VolumeProvider for NfsDriver {
     #[instrument(skip_all, fields(volume_id = %id, size_bytes = spec.size_bytes))]
@@ -489,7 +484,6 @@ impl VolumeProvider for NfsDriver {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[async_trait::async_trait]
 impl VolumeAttacher for NfsDriver {
     #[instrument(skip_all, fields(volume_id = %handle.id))]
@@ -549,7 +543,6 @@ impl VolumeAttacher for NfsDriver {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

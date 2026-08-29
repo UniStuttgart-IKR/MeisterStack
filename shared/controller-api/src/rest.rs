@@ -26,7 +26,6 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
-use macros::generated;
 use rustls::ServerConfig;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -52,7 +51,6 @@ pub struct PeerCerts(pub Vec<Vec<u8>>);
 /// The plain path is the same `axum::serve` call this has always been. The
 /// TLS path is a hand-rolled accept loop for one reason only: it is the only
 /// way to get the peer's certificate onto the request.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn serve(
     listener: TcpListener,
     router: Router,
@@ -171,14 +169,12 @@ fn deny(status: StatusCode, reason: &'static str, message: String) -> Response {
 /// this is. It prints the fields; the constructors stay the only way to make
 /// one.
 #[derive(Debug)]
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct ApiError {
     status: StatusCode,
     reason: &'static str,
     message: String,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl ApiError {
     pub fn new(status: StatusCode, reason: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -189,7 +185,6 @@ impl ApiError {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl From<StoreError> for ApiError {
     fn from(e: StoreError) -> Self {
         let (status, reason) = match &e {
@@ -206,7 +201,6 @@ impl From<StoreError> for ApiError {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         deny(self.status, self.reason, self.message)
@@ -233,7 +227,6 @@ pub fn forbidden(message: impl Into<String>) -> ApiError {
 /// body that names another kind is a client sending the wrong document to the
 /// right URL — and the fields it does not know about would be defaulted away
 /// silently.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn check_envelope<S, St>(body: &Object<S, St>) -> std::result::Result<(), ApiError>
 where
     Object<S, St>: Resource,
@@ -257,7 +250,6 @@ where
 /// tell "absent" from "the default" — every field of a NodeStatus defaults,
 /// so an omitted status deserialises into a perfectly good "not ready, no
 /// capacity, no heartbeat" that would then be a write of exactly that.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpecUpdate<S> {
@@ -292,7 +284,6 @@ pub struct SpecUpdate<S> {
 /// The resourceVersion is the CLIENT's, exactly as in `update_vm`: it is what
 /// makes the store's compare-and-swap a compare-and-swap. A body without one
 /// is refused by the store with the same message every other update gets.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn apply_spec_update<S, St>(
     body: SpecUpdate<S>,
     name: &str,
@@ -333,7 +324,6 @@ where
 }
 
 /// Authenticate, then authorize, then hand the identity to the handler.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn authorize(State(st): State<AuthState>, mut req: Request, next: Next) -> Response {
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
@@ -422,7 +412,6 @@ async fn authorize(State(st): State<AuthState>, mut req: Request, next: Next) ->
 /// The two travel together because they come out of the same object and are
 /// worth exactly nothing apart: a role without a tenant cannot scope, and a
 /// tenant without a role cannot decide.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn grant_of(
     st: &AuthState,
     identity: &Identity,
@@ -564,7 +553,6 @@ impl Caller {
 /// Nothing in here is a secret: a token lives in a file whose path is named
 /// here, exactly as every certificate does. A credential that can be pasted
 /// into a TOML file is a credential that ends up in a git history.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
@@ -598,7 +586,6 @@ const DEFAULT_CHAIN: [&str; 2] = ["mtls", "bearer"];
 /// left useless — but only when the chain was defaulted. A chain that NAMES
 /// an authenticator it cannot build is an operator who thinks a door is shut
 /// that is not, and that is an error, loudly.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn build_chain(
     cfg: &AuthConfig,
     client_ca: Option<&std::path::Path>,
@@ -670,7 +657,6 @@ pub fn build_chain(
 /// error rather than a silent downgrade to plain: that is precisely the
 /// mistake that would leave an API server open while its operator believes
 /// otherwise.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn server_tls(
     cert: Option<&std::path::Path>,
     key: Option<&std::path::Path>,
@@ -700,7 +686,6 @@ pub fn server_tls(
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

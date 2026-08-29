@@ -10,8 +10,6 @@
 //! "hand the spec down again and let the cluster do the arguing". Same table,
 //! one place, so the two tiers can never disagree about what drift is.
 
-use macros::generated;
-
 use crate::resources::{RunStrategy, VmPhase};
 
 /// A runtime transition the node has to be told about.
@@ -33,7 +31,6 @@ pub enum Lifecycle {
 /// agent's own backoff doing its job; Quarantined exists precisely so that
 /// nothing automatic touches the VM. All four converge to a stable phase or
 /// to a human, and the drift is decided then.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn lifecycle_command(strategy: RunStrategy, phase: VmPhase) -> Option<Lifecycle> {
     Some(match (strategy, phase) {
         (RunStrategy::Running, VmPhase::Stopped) => Lifecycle::Start,
@@ -50,7 +47,6 @@ pub fn lifecycle_command(strategy: RunStrategy, phase: VmPhase) -> Option<Lifecy
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

@@ -13,8 +13,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument};
 
-use macros::generated;
-
 /// Virtio device id for gpu; crosvm's backend serves a control and a cursor queue.
 const VIRTIO_ID_GPU: u32 = 16;
 const GPU_QUEUE_SIZES: [u16; 2] = [512, 16];
@@ -43,7 +41,6 @@ impl Default for GpuParams {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 fn crosvm_params_json(params: &GpuParams) -> device::Result<String> {
     let value = serde_json::to_value(params).map_err(|e| DeviceError::Backend(e.into()))?;
     let obj = value
@@ -74,7 +71,6 @@ pub struct CrosvmGpuDriver {
     children: Mutex<HashMap<DeviceId, Backend>>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl CrosvmGpuDriver {
     pub fn new(config: CrosvmGpuDriverConfig) -> device::Result<Self> {
         std::fs::create_dir_all(&config.run_dir).map_err(|e| DeviceError::Backend(e.into()))?;
@@ -161,7 +157,6 @@ impl CrosvmGpuDriver {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[async_trait::async_trait]
 impl DeviceDriver for CrosvmGpuDriver {
     #[instrument(skip_all, fields(device_id = %id))]

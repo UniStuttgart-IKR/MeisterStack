@@ -17,7 +17,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::bail;
-use macros::generated;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
@@ -32,7 +31,6 @@ use tracing::warn;
 /// works (the node dialled us), and `Pending` already matches a request to
 /// the result that carries its id.
 #[derive(Debug)]
-#[generated(model = ClaudeOpus, version = "5")]
 pub enum Ack {
     Acked(Vec<u8>),
     Rejected(String),
@@ -41,7 +39,6 @@ pub enum Ack {
 /// Who the command is going to, as the error a person reads names them: an
 /// `agent` one tier down, a `cluster` one tier up. The noun is the whole of
 /// the difference between the two tiers' sentences.
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct Peer<'a> {
     pub kind: &'a str,
     pub name: &'a str,
@@ -57,13 +54,11 @@ pub struct Peer<'a> {
 /// deep and says nothing at a glance.
 type Answer = Result<Vec<u8>, String>;
 
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct Pending {
     waiting: Mutex<HashMap<String, oneshot::Sender<Answer>>>,
     timeout: Duration,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Pending {
     pub fn new(timeout: Duration) -> Self {
         Self {
@@ -142,7 +137,6 @@ impl Pending {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

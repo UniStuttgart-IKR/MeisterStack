@@ -13,8 +13,6 @@
 
 use std::time::Duration;
 
-use macros::generated;
-
 pub trait RequeuePolicy: Send + Sync {
     /// Delay before attempt number `attempts + 1`; None = leave it Failed.
     fn next_delay(&self, attempts: u32) -> Option<Duration>;
@@ -23,7 +21,6 @@ pub trait RequeuePolicy: Send + Sync {
 /// 10s, 20s, 40s … capped at 5 minutes — the CrashLoopBackOff curve. Slow
 /// enough that a genuinely broken spec ticks instead of thrashing, fast
 /// enough that a transient host problem heals within a tick or two.
-#[generated(model = ClaudeFable, version = "5")]
 fn backoff(attempts: u32) -> Duration {
     Duration::from_secs(10)
         .saturating_mul(2u32.saturating_pow(attempts.min(5)))
@@ -40,21 +37,18 @@ pub struct RetryCount(pub u32);
 /// `retry = "crash-loop-backoff"` — never final, always slower.
 pub struct CrashLoopBackoff;
 
-#[generated(model = ClaudeFable, version = "5")]
 impl RequeuePolicy for NoRequeue {
     fn next_delay(&self, _attempts: u32) -> Option<Duration> {
         None
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl RequeuePolicy for RetryCount {
     fn next_delay(&self, attempts: u32) -> Option<Duration> {
         (attempts < self.0).then(|| backoff(attempts))
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl RequeuePolicy for CrashLoopBackoff {
     fn next_delay(&self, attempts: u32) -> Option<Duration> {
         Some(backoff(attempts))
@@ -64,13 +58,11 @@ impl RequeuePolicy for CrashLoopBackoff {
 /// The TOML spelling: `retry = "none" | 5 | "crash-loop-backoff"`.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(untagged)]
-#[generated(model = ClaudeFable, version = "5")]
 pub enum RequeueConfig {
     Count(u32),
     Named(String),
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl RequeueConfig {
     /// Default when the config says nothing: CrashLoopBackOff — a transient
     /// failure healing itself is the behaviour a K8s-shaped stack owes its
@@ -91,7 +83,6 @@ impl RequeueConfig {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeFable, version = "5")]
 mod tests {
     use super::*;
 

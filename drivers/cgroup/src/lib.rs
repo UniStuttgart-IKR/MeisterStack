@@ -3,7 +3,6 @@
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
 use agent_api::{CgroupHandle, ConfinerResult, ResourceConfiner, ResourceLimits};
-use macros::generated;
 use std::path::PathBuf;
 use tracing::{debug, instrument, warn};
 
@@ -18,7 +17,6 @@ impl CgroupV2 {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "4.8")]
 impl ResourceConfiner for CgroupV2 {
     #[instrument(skip_all, fields(slice = %name, ?limits))]
     fn create_slice(
@@ -122,7 +120,6 @@ impl ResourceConfiner for CgroupV2 {
         unreachable!()
     }
 
-    #[generated(model = ClaudeFable, version = "5")]
     #[instrument(level = "trace", skip_all, fields(slice = %name))]
     fn pids_in_slice(&self, name: &str) -> ConfinerResult<Vec<u32>> {
         match std::fs::read_to_string(self.root.join(name).join("cgroup.procs")) {
@@ -132,7 +129,6 @@ impl ResourceConfiner for CgroupV2 {
         }
     }
 
-    #[generated(model = ClaudeFable, version = "5")]
     #[instrument(skip_all, fields(slice = %name))]
     fn kill_slice(&self, name: &str) -> ConfinerResult<()> {
         match std::fs::write(self.root.join(name).join("cgroup.kill"), "1") {

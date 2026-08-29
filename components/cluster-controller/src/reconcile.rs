@@ -29,7 +29,6 @@ use controller_api::{
     VmPhase, Volume, VolumePhase, heartbeat_expired, lifecycle_command,
     scheduler::{StoragePolicy, feasible_for_storage, storage_pending_reason},
 };
-use macros::generated;
 use proto::command;
 use tracing::{debug, info, warn};
 
@@ -55,7 +54,6 @@ const TICK: Duration = Duration::from_secs(5);
 /// no replica at all is reconciled by nobody. It waits — including a deleting
 /// one, which stays Terminating until its node comes back, because tearing a
 /// VM down is something only its agent can do.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn may_reconcile(vm: &Vm, sessions: &HashSet<String>) -> bool {
     match vm.spec.node_name.as_deref() {
         Some(node) => sessions.contains(node),
@@ -65,7 +63,6 @@ pub fn may_reconcile(vm: &Vm, sessions: &HashSet<String>) -> bool {
 
 /// The shared drift table says what has to happen; this is the only part that
 /// is the agent protocol's business, and so the only part that stays here.
-#[generated(model = ClaudeOpus, version = "5")]
 fn lifecycle_op(action: Lifecycle, uid: &str) -> command::Op {
     let id = uid.to_string();
     match action {
@@ -81,7 +78,6 @@ fn lifecycle_op(action: Lifecycle, uid: &str) -> command::Op {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 pub async fn run(
     store: Arc<EtcdStore>,
     registry: Arc<SessionRegistry>,
@@ -116,7 +112,6 @@ pub async fn run(
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 async fn pass(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -171,7 +166,6 @@ async fn pass(
 /// nodes once: a pool that is edited halfway through a listing would place
 /// two volumes of the same pass against two different statements about the
 /// same wiring.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn place_volumes(p: &Pass<'_>) -> anyhow::Result<()> {
     let volumes = p.store.list::<Volume>().await?;
     if volumes.is_empty() {
@@ -195,7 +189,6 @@ async fn place_volumes(p: &Pass<'_>) -> anyhow::Result<()> {
 /// Release first, and for the same reason teardown comes before placement on
 /// a VM: a volume on its way out is not a volume to place. Everything after
 /// it needs a volume that is staying.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn reconcile_volume(
     p: &Pass<'_>,
     pools: &[StoragePool],
@@ -221,7 +214,6 @@ async fn reconcile_volume(
 ///
 /// A volume that was never placed has no data anywhere and goes at once: the
 /// node that would have provisioned it never did.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn release(p: &Pass<'_>, volume: &Volume) -> anyhow::Result<()> {
     let name = &volume.metadata.name;
     match release_action(volume) {
@@ -255,7 +247,6 @@ async fn release(p: &Pass<'_>, volume: &Volume) -> anyhow::Result<()> {
 /// file: getting it wrong once means data that is gone, and a rule that can
 /// only be exercised through an etcd is a rule that gets exercised by the
 /// lab. The executor above does nothing but carry each answer out.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, PartialEq, Eq)]
 enum Release<'a> {
     /// Somebody is using it. Everything stays — the object, the data, the
@@ -272,7 +263,6 @@ enum Release<'a> {
     Drop,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn release_action(volume: &Volume) -> Release<'_> {
     // Consumer before node, and the order is the rule: a volume that is BOTH
     // attached and provisioned must report the attachment, because that is
@@ -298,7 +288,6 @@ fn release_action(volume: &Volume) -> Release<'_> {
 /// does for a VM and for the same reason: with several replicas scheduling at
 /// once, the binding is the one write that must not be retried onto a newer
 /// object.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn place_volume(p: &Pass<'_>, pools: &[StoragePool], volume: Volume) -> anyhow::Result<()> {
     let name = volume.metadata.name.clone();
     let Some(pool) = pools.iter().find(|p| p.metadata.name == volume.spec.pool) else {
@@ -353,7 +342,6 @@ async fn place_volume(p: &Pass<'_>, pools: &[StoragePool], volume: Volume) -> an
 /// The same rule the VM half follows: a level-triggered pass reaches this
 /// conclusion every five seconds for as long as the volume is unplaceable,
 /// and writing the same sentence again would wake the watch for nothing.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn note_pending(p: &Pass<'_>, volume: &Volume, reason: String) -> anyhow::Result<()> {
     debug!(volume = %volume.metadata.name, reason = %reason, "volume stays pending");
     if volume.status.message.as_deref() == Some(reason.as_str()) {
@@ -373,7 +361,6 @@ async fn note_pending(p: &Pass<'_>, volume: &Volume, reason: String) -> anyhow::
 /// The tenant travels with it because the cloud handed it down on the object;
 /// a VM created straight at this tier has none, and its events are unscoped
 /// exactly as it is.
-#[generated(model = ClaudeOpus, version = "5")]
 fn about<'a>(vm: &'a Vm, reason: &'a str, message: String, kind: EventType) -> Happening<'a> {
     Happening {
         kind: Vm::KIND,
@@ -405,7 +392,6 @@ fn warning<'a>(vm: &'a Vm, reason: &'a str, message: String) -> Happening<'a> {
 /// Every phase counts, a Pending one included. A VM that has been bound and
 /// not yet started is a claim on this node, and leaving it out is how a node
 /// takes on twice its memory in one burst of creates.
-#[generated(model = ClaudeOpus, version = "5")]
 fn free_on(
     node: &str,
     capacity: &controller_api::NodeCapacity,
@@ -433,7 +419,6 @@ fn free_on(
 /// bound and not yet started is already there as far as "do not put these two
 /// together" is concerned, and skipping it is how two replicas land on one
 /// machine in a single burst of creates.
-#[generated(model = ClaudeOpus, version = "5")]
 fn hosted_on(
     on: &str,
     vms: &[Vm],
@@ -451,7 +436,6 @@ fn hosted_on(
 /// while nothing is in it looks, in a dashboard, exactly like a controller
 /// that stopped reporting. Derived from the listing the pass already made —
 /// this costs no etcd round trip of its own.
-#[generated(model = ClaudeOpus, version = "5")]
 fn publish_vm_gauges(vms: &[Vm]) {
     telemetry::metrics::objects().set_count(Vm::KIND, vms.len() as i64);
     for phase in VmPhase::ALL {
@@ -469,7 +453,6 @@ fn publish_vm_gauges(vms: &[Vm]) {
 /// six were the same six at every step of every VM, and the only thing that
 /// actually changes between the steps below is the VM itself. What the steps
 /// take is what they are about.
-#[generated(model = ClaudeOpus, version = "5")]
 struct Pass<'a> {
     store: &'a EtcdStore,
     registry: &'a SessionRegistry,
@@ -498,7 +481,6 @@ struct Pass<'a> {
 /// two replicas reaching it at once cost one redundant write and nothing else.
 /// `connected` stays strictly local, though: a node with a live session
 /// *somewhere* is still not a node this replica can send anything to.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn expire_and_collect_nodes(
     store: &EtcdStore,
     sessions: &HashSet<String>,
@@ -576,7 +558,6 @@ async fn expire_and_collect_nodes(
     Ok(out)
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 /// The trace of the request this VM came from is on the object, because there
 /// is no call stack from that request to here. The span is built and given
 /// its parent BEFORE it starts — see `telemetry::in_trace`; attaching from
@@ -629,7 +610,6 @@ fn birth_trace(vm: &Vm) -> Option<telemetry::TraceParent> {
 /// next pass reads the binding back out of the store and goes on from there.
 /// Everything after it needs a bound VM, which is why the node is resolved
 /// once, right here, instead of being unwrapped in three places.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn reconcile_vm_traced(
     p: &Pass<'_>,
     vm: Vm,
@@ -663,7 +643,6 @@ async fn reconcile_vm_traced(
 
 /// Finalizer flow: tear down on the bound node (idempotent at the agent),
 /// then the object really goes away.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::Result<()> {
     if let Some(node) = vm.spec.node_name.as_deref()
         && vm.status.phase != VmPhase::Pending
@@ -684,7 +663,6 @@ async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::Result<()> 
 }
 
 /// Bind an unbound VM to a node, or leave it Pending for the next pass.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     // Decide and SPEND under one lock, and let go before anything awaits: the
     // room this VM takes has to be gone before the next VM of the same pass
@@ -788,7 +766,6 @@ async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
 
 /// A Pending VM on a node that has not been told about it yet: send the spec
 /// and record what came back.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn dispatch_create(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> anyhow::Result<()> {
     let spec_json = build_spec_json(vm)?;
     let outcome = p
@@ -835,7 +812,6 @@ async fn dispatch_create(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> a
 /// ack writes nothing back — dispatching is a guess about the future, a
 /// status report is the present, and anticipation never overwrites
 /// observation. The next pass re-derives from what the node reported.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn send_lifecycle(
     p: &Pass<'_>,
     vm: &Vm,
@@ -861,7 +837,6 @@ async fn send_lifecycle(
 /// which also heals the backoff state an agent restart forgets. The
 /// bookkeeping lives in status so a controller three seconds old kicks
 /// exactly when one up for a week would. Quarantined stays untouched.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn heal_if_failed(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> anyhow::Result<()> {
     let name = &vm.metadata.name;
     match requeue_decision(vm, p.requeue, Utc::now()) {
@@ -892,7 +867,6 @@ async fn heal_if_failed(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> an
 
 /// The kick itself: count the attempt, re-send the intent, and let the
 /// agent's own report say the rest.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn kick(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> anyhow::Result<()> {
     let name = &vm.metadata.name;
     let attempt = vm.status.requeue_attempts + 1;
@@ -960,7 +934,6 @@ pub enum Requeue {
     Reset,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 pub fn requeue_decision(vm: &Vm, policy: &dyn RequeuePolicy, now: DateTime<Utc>) -> Requeue {
     if vm.status.phase != VmPhase::Failed {
         return if vm.status.requeue_attempts > 0 || vm.status.last_requeue.is_some() {
@@ -989,7 +962,6 @@ pub fn requeue_decision(vm: &Vm, policy: &dyn RequeuePolicy, now: DateTime<Utc>)
 
 /// The agent's NewVmSpec JSON, with `desired` derived from runStrategy —
 /// the same document the agent's own REST API accepts.
-#[generated(model = ClaudeFable, version = "5")]
 pub(crate) fn build_spec_json(vm: &Vm) -> anyhow::Result<String> {
     let mut doc = vm.spec.vm.clone();
     let obj = doc
@@ -1024,7 +996,6 @@ pub(crate) fn build_spec_json(vm: &Vm) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

@@ -6,7 +6,6 @@ use std::path::Path;
 
 use agent_api::VmId;
 use anyhow::Context;
-use macros::generated;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::types::VmRecord;
@@ -19,7 +18,6 @@ pub struct Store {
 }
 
 impl Store {
-    #[generated(model = ClaudeFable, version = "5")]
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -37,7 +35,6 @@ impl Store {
         Ok(Self { db })
     }
 
-    #[generated(model = ClaudeFable, version = "5")]
     pub fn put(&self, id: &VmId, record: &VmRecord) -> anyhow::Result<()> {
         let bytes = serde_json::to_vec(record).context("serializing vm record")?;
         let id_str = id.to_string();
@@ -64,7 +61,6 @@ impl Store {
     /// stale by the time the same transaction commits.
     ///
     /// `Ok(None)` if the record is gone; the closure is then not called.
-    #[generated(model = ClaudeFable, version = "5")]
     pub fn mutate(
         &self,
         id: &VmId,
@@ -98,7 +94,6 @@ impl Store {
         Ok(updated)
     }
 
-    #[generated(model = ClaudeFable, version = "5")]
     pub fn get(&self, id: &VmId) -> anyhow::Result<Option<VmRecord>> {
         let id_str = id.to_string();
         let tx = self.db.begin_read().context("begin read")?;
@@ -114,7 +109,6 @@ impl Store {
         }
     }
 
-    #[generated(model = ClaudeFable, version = "5")]
     pub fn list(&self) -> anyhow::Result<Vec<(VmId, VmRecord)>> {
         let tx = self.db.begin_read().context("begin read")?;
         let table = tx.open_table(VMS).context("open vms table")?;
@@ -146,7 +140,6 @@ impl Store {
         Ok(out)
     }
 
-    #[generated(model = ClaudeFable, version = "5")]
     pub fn delete(&self, id: &VmId) -> anyhow::Result<()> {
         let id_str = id.to_string();
         let tx = self.db.begin_write().context("begin write")?;
@@ -160,7 +153,6 @@ impl Store {
         Ok(())
     }
 
-    #[generated(model = ClaudeOpus, version = "4.8")]
     pub fn get_raw(&self, id: &VmId) -> anyhow::Result<Option<Vec<u8>>> {
         let id_str = id.to_string();
         let tx = self.db.begin_read().context("begin read")?;
@@ -171,7 +163,6 @@ impl Store {
             .map(|g| g.value().to_vec()))
     }
 
-    #[generated(model = ClaudeOpus, version = "4.8")]
     pub fn list_raw(&self) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
         let tx = self.db.begin_read().context("begin read")?;
         let table = tx.open_table(VMS).context("open vms table")?;

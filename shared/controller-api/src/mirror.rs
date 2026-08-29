@@ -19,7 +19,6 @@
 
 use std::collections::HashMap;
 
-use macros::generated;
 use proto::VmStatusReport;
 
 use crate::resources::{Vm, VmPhase};
@@ -29,7 +28,6 @@ use crate::resources::{Vm, VmPhase};
 /// needs no answer — a report that says exactly what is already stored — is
 /// not in the list, because `observe` drops it.
 #[derive(Debug)]
-#[generated(model = ClaudeOpus, version = "5")]
 pub enum Observation<'a> {
     /// No stored VM carries this uid. Whether that is remarkable depends on
     /// the tier: an agent may be running VMs created straight on its own API,
@@ -56,7 +54,6 @@ pub enum Observation<'a> {
 /// A report that changes nothing yields nothing. Peers report every 10s, and
 /// a write per report would churn etcd revisions — and wake the vm watch —
 /// while nothing about the VM actually happened.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn observe<'a>(
     known: &'a [Vm],
     reported: &'a [VmStatusReport],
@@ -82,7 +79,6 @@ pub fn observe<'a>(
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use crate::resources::{VmSpec, new_vm};

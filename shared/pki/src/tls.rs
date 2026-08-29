@@ -13,7 +13,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use macros::generated;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::CertificateDer;
 
@@ -31,7 +30,6 @@ const ALPN_HTTP11: &[u8] = b"http/1.1";
 /// no certificate has to reach the authenticator chain to be told 401 in
 /// words, and a handshake that fails instead would leave `meister login` — a
 /// client that by definition has no certificate yet — with nothing to talk to.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn server_config(
     cert: &Path,
     key: &Path,
@@ -65,7 +63,6 @@ pub fn server_config(
 }
 
 /// Client TLS: whom to trust, and — for mTLS — who we are.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn client_config(
     ca: Option<&Path>,
     identity: Option<(&Path, &Path)>,
@@ -94,7 +91,6 @@ pub fn client_config(
 }
 
 /// Every certificate in a bundle, as a trust root.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn roots(path: &Path) -> Result<RootCertStore> {
     let mut store = RootCertStore::empty();
     for cert in load_certs(path)? {

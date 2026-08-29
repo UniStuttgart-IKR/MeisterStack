@@ -48,7 +48,6 @@ pub async fn dial(addr: &str) -> Result<Channel, tonic::transport::Error> {
 /// stack ran that way for five milestones and the lab still does. It lives
 /// here for the same reason `dial` does — all three tiers that dial out are
 /// the same loop, and by M5 all three of them can carry a certificate.
-#[macros::generated(model = ClaudeOpus, version = "5")]
 pub async fn dial_tls(addr: &str, tls: Option<&ClientTlsConfig>) -> anyhow::Result<Channel> {
     let mut endpoint = Endpoint::from_shared(addr.to_string())?.connect_timeout(DIAL_TIMEOUT);
     if let Some(tls) = tls {
@@ -70,7 +69,6 @@ pub async fn dial_tls(addr: &str, tls: Option<&ClientTlsConfig>) -> anyhow::Resu
 /// key the group can read is a key that has left the machine already —
 /// same rule and same message as `pki::load_private_key`, which the tiers
 /// that depend on `pki` go through instead.
-#[macros::generated(model = ClaudeOpus, version = "5")]
 pub fn client_tls(ca: &Path, identity: Option<(&Path, &Path)>) -> anyhow::Result<ClientTlsConfig> {
     // tonic's tls-ring path asks for the process-wide default provider and
     // panics without one. Idempotent, and the first gRPC handshake is a bad

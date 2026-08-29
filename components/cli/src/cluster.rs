@@ -11,7 +11,6 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use macros::generated;
 use serde::Deserialize;
 
 use crate::client::Client;
@@ -81,7 +80,6 @@ struct Capacity {
 /// Naming them here rather than guarding inside each verb is the point: a
 /// verb missing from this list is a verb that deletes without asking, and
 /// that is now a visible omission instead of an invisible one.
-#[generated(model = ClaudeOpus, version = "5")]
 fn destructive(cmd: &ClusterCmd) -> Option<(&'static str, &str)> {
     match cmd {
         ClusterCmd::Vm {
@@ -91,7 +89,6 @@ fn destructive(cmd: &ClusterCmd) -> Option<(&'static str, &str)> {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 pub async fn run(target: &Target, cmd: &ClusterCmd, global: &GlobalArgs) -> Result<()> {
     if let Some((kind, name)) = destructive(cmd) {
         output::confirm_destructive(global, target, kind, name)?;
@@ -110,7 +107,6 @@ pub async fn run(target: &Target, cmd: &ClusterCmd, global: &GlobalArgs) -> Resu
 
 /// The inventory, not the live sessions: a node that is down stays listed as
 /// not ready, with the capacity it last had.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn nodes(client: &Client, global: &GlobalArgs) -> Result<()> {
     let body = client.get(NODES).await?;
     let now = Utc::now();
@@ -125,7 +121,6 @@ async fn nodes(client: &Client, global: &GlobalArgs) -> Result<()> {
     })
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn node_row(node: Node, now: DateTime<Utc>) -> Vec<String> {
     let cap = node.status.capacity;
     vec![
@@ -143,7 +138,6 @@ fn node_row(node: Node, now: DateTime<Utc>) -> Vec<String> {
 /// is set, and the whole thing goes back with the resourceVersion it was read
 /// at. That is the compare-and-swap — two operators cordoning at once, and
 /// the loser is told rather than silently overwriting.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn run_node(client: &Client, cmd: &ClusterNodeCmd, global: &GlobalArgs) -> Result<()> {
     if let ClusterNodeCmd::Label { name, pairs, rm } = cmd {
         let body = client
@@ -189,7 +183,6 @@ async fn run_node(client: &Client, cmd: &ClusterNodeCmd, global: &GlobalArgs) ->
 /// is the difference, and it is the whole difference. What this tier cannot
 /// do is name a tenant: there is no user directory here to name one from, so
 /// a VM created straight at a cluster belongs to nobody.
-#[generated(model = ClaudeFable, version = "5")]
 async fn run_vm(client: &Client, cmd: &ClusterVmCmd, global: &GlobalArgs) -> Result<()> {
     match cmd {
         ClusterVmCmd::Create {
@@ -226,7 +219,6 @@ async fn run_vm(client: &Client, cmd: &ClusterVmCmd, global: &GlobalArgs) -> Res
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

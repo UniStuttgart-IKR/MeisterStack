@@ -38,14 +38,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use macros::generated;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 /// What the guest is configured with. Absent from a spec entirely means the
 /// VM gets no seed and its configuration is byte for byte what it was — which
 /// is the most important property this feature has.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloudInit {
@@ -81,14 +79,12 @@ pub const LABEL: &str = "CIDATA";
 /// machine, run the per-instance modules again" — so it has to be the VM's
 /// identity and not something regenerated per boot. `local-hostname` is what
 /// the guest calls itself.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn meta_data_for(vm_id: &uuid::Uuid, hostname: Option<&str>) -> String {
     let hostname = hostname.unwrap_or(&vm_id.to_string()).to_string();
     format!("instance-id: {vm_id}\nlocal-hostname: {hostname}\n")
 }
 
 /// Build the seed image for one VM and write it to `path`.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn write_seed(path: &Path, vm_id: &uuid::Uuid, config: &CloudInit) -> Result<()> {
     let meta_data = config
         .meta_data
@@ -142,7 +138,6 @@ const ROOT_SECTORS: usize = ROOT_ENTRIES * 32 / SECTOR;
 const MIN_CLUSTERS: usize = 2000;
 
 /// A whole FAT12 volume with these files in its root directory.
-#[generated(model = ClaudeOpus, version = "5")]
 fn fat12(files: &[(&str, &[u8])]) -> Vec<u8> {
     let needed: usize = files
         .iter()
@@ -201,7 +196,6 @@ fn fat12(files: &[(&str, &[u8])]) -> Vec<u8> {
 
 /// The BIOS parameter block. Every field here is either a constant of the
 /// shape this writer produces or computed above; nothing is negotiable.
-#[generated(model = ClaudeOpus, version = "5")]
 fn boot_sector(sector: &mut [u8], total_sectors: usize, fat_sectors: usize) {
     // A jump nothing executes — this volume is never booted from — followed
     // by the OEM name every tool expects to find something in.
@@ -234,7 +228,6 @@ fn boot_sector(sector: &mut [u8], total_sectors: usize, fat_sectors: usize) {
 
 /// Write one 12-bit FAT entry. Two entries share three bytes, which is the
 /// whole of what makes FAT12 different from its successors.
-#[generated(model = ClaudeOpus, version = "5")]
 fn set_fat(fat: &mut [u8], cluster: usize, value: u16) {
     let at = cluster * 3 / 2;
     if cluster % 2 == 0 {
@@ -267,7 +260,6 @@ fn short_name(index: usize) -> String {
 }
 
 /// One 32-byte directory entry.
-#[generated(model = ClaudeOpus, version = "5")]
 fn dir_entry(name: &str, attr: u8, first_cluster: u16, size: u32) -> [u8; 32] {
     let mut e = [0u8; 32];
     e[0..11].copy_from_slice(&padded(name));
@@ -290,7 +282,6 @@ fn dir_entry(name: &str, attr: u8, first_cluster: u16, size: u32) -> [u8; 32] {
 /// one with the highest OR'd with 0x40, and a checksum of the short name in
 /// every one of them — which is how a reader knows the run belongs to the
 /// entry that follows it rather than to a stale one.
-#[generated(model = ClaudeOpus, version = "5")]
 fn long_name_entries(name: &str, short: &str) -> Vec<u8> {
     let checksum = short_checksum(&padded(short));
     let units: Vec<u16> = name.encode_utf16().collect();
@@ -346,7 +337,6 @@ pub fn seed_path(run_dir: &Path, vm_id: &uuid::Uuid) -> PathBuf {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

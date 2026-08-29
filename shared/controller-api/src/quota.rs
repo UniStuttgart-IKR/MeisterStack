@@ -44,8 +44,6 @@
 //! deprovision finishing rather than by the DELETE being accepted — the same
 //! sentence the VM half makes, with more at stake.
 
-use macros::generated;
-
 use crate::resources::{StoragePool, TenantQuota, TenantUsage, Vm, Volume, VolumePhase};
 use crate::scheduler::Capacity;
 
@@ -55,14 +53,12 @@ use crate::scheduler::Capacity;
 /// take the usage, put the change into it, and ask whether the result is
 /// inside the ceiling. A create is "plus this VM", an update is "minus the
 /// old size, plus the new one", and neither needs a rule of its own.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
     pub vms: u32,
     pub size: Capacity,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Usage {
     /// What this tenant holds, out of the whole VM listing.
     ///
@@ -103,7 +99,6 @@ impl Usage {
 /// The message says the number that was hit and the number that stands, both,
 /// because "quota exceeded" sends an operator to look up what their quota
 /// actually is and a sentence that says it does not.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn check(quota: &TenantQuota, tenant: &str, after: Usage) -> Result<(), String> {
     let over = |what: &str, want: u64, limit: u64| {
         format!("tenant {tenant} would hold {want} {what}, and its quota is {limit}")
@@ -132,14 +127,12 @@ pub fn check(quota: &TenantQuota, tenant: &str, after: Usage) -> Result<(), Stri
 /// administrator wrote lives: a tenant with a hundred GiB on the fast NVMe
 /// pool and a terabyte on the spinning one is an ordinary thing to configure,
 /// and one tenant-wide ceiling could not say it.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StorageUsage {
     pub volumes: u32,
     pub gib: u64,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl StorageUsage {
     /// What this tenant holds in this pool, out of the whole volume listing.
     ///
@@ -179,7 +172,6 @@ impl StorageUsage {
 /// The message says the number that was hit and the number that stands, both,
 /// exactly as [`check`] does: "quota exceeded" sends an operator to look up
 /// what their quota is, and a sentence that says it does not.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn check_storage(pool: &StoragePool, tenant: &str, after: StorageUsage) -> Result<(), String> {
     let limit = pool.spec.quota_for(tenant);
     if after.gib > limit {
@@ -198,7 +190,6 @@ pub fn check_storage(pool: &StoragePool, tenant: &str, after: StorageUsage) -> R
 /// than to filter: a `Failed` volume may have got half-way, a `Releasing` one
 /// is definitely still there, and a `Pending` one is what the tenant asked
 /// for. If a phase ever stops counting, it stops counting here.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn holds_room(phase: VolumePhase) -> bool {
     match phase {
         VolumePhase::Pending
@@ -210,7 +201,6 @@ pub fn holds_room(phase: VolumePhase) -> bool {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use crate::resources::{VmSpec, new_vm};

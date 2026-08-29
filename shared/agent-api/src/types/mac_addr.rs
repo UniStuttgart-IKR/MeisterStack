@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-use macros::generated;
 use std::fmt;
 use std::str::FromStr;
 
@@ -17,7 +16,6 @@ pub enum MacAddrError {
     BadOctet { input: String, octet: String },
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl FromStr for MacAddr {
     type Err = MacAddrError;
 
@@ -50,7 +48,6 @@ impl FromStr for MacAddr {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl fmt::Display for MacAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let b = &self.0;
@@ -75,7 +72,6 @@ impl serde::Serialize for MacAddr {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[cfg(test)]
 mod mac_tests {
     use super::*;

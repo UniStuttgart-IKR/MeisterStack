@@ -14,7 +14,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use macros::generated;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity as TlsIdentity, ServerTlsConfig};
 use tracing::info;
 
@@ -26,7 +25,6 @@ use crate::auth::{AuthChain, AuthRequest, Authenticated, GROUP_ADMINS};
 /// at the REST edge: a peer with no certificate has to get far enough to be
 /// told so in words. The chain is what refuses it, and a refusal that names
 /// the reason is worth more than a handshake that resets.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn server_tls(
     cert: Option<&Path>,
     key: Option<&Path>,
@@ -76,7 +74,6 @@ pub fn server_tls(
 /// that named them — and building the thing out of PEM is `proto`'s, because
 /// the agent tier dials with a certificate too and does not depend on this
 /// crate. One builder, three tiers.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn client_tls(
     ca: Option<&Path>,
     identity: Option<(&Path, &Path)>,
@@ -99,7 +96,6 @@ pub fn client_tls(
 }
 
 /// Who opened this session, by the same chain the REST edge uses.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn authenticate_session<T>(
     chain: &AuthChain,
     request: &tonic::Request<T>,
@@ -137,7 +133,6 @@ fn bearer_of<T>(request: &tonic::Request<T>) -> Option<String> {
 /// as the node whose VMs it wants to be told about.
 ///
 /// Anonymous mode is anonymous mode: no chain, no check, exactly as before.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn check_session_identity(
     who: &Authenticated,
     kind: &str,
@@ -165,7 +160,6 @@ pub fn check_session_identity(
 pub type SessionAuth = Arc<AuthChain>;
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use crate::auth::{GROUP_MEMBERS, GROUP_NODES, Identity};

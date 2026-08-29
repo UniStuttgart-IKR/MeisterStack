@@ -14,7 +14,6 @@
 //! tier that could get it wrong, and there are two of them above the node.
 
 use controller_api::Vm;
-use macros::generated;
 use proto::command;
 
 use crate::session::SessionRegistry;
@@ -22,7 +21,6 @@ use crate::session::SessionRegistry;
 /// What the fetch found. Not being placed yet is an ANSWER and not a failure:
 /// a Pending VM has printed nothing because nothing has started, which is the
 /// commonest true thing to say about one.
-#[generated(model = ClaudeOpus, version = "5")]
 pub enum Logs {
     /// The node's JSON document, verbatim.
     From(Vec<u8>),
@@ -41,7 +39,6 @@ pub const NO_STREAMS: &[u8] = b"[]";
 /// about the VM. The caller turns that into a 503, because "I could not reach
 /// the thing that has the answer" is a different sentence from "there is no
 /// answer".
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn fetch(
     registry: &SessionRegistry,
     vm: &Vm,

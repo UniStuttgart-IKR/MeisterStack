@@ -36,7 +36,6 @@ common = { package = "meister-common", path = "../../shared/common" }
 telemetry = { package = "meister-telemetry", path = "../../shared/telemetry" }
 agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
 proto = { package = "meister-proto", path = "../../shared/proto" }
-macros = { package = "meister-macros", path = "../../shared/macros" }
 
 # Local drivers
 cgroup-driver = { package = "meister-cgroup-driver", path = "../../drivers/cgroup" }

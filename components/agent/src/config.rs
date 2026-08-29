@@ -4,7 +4,6 @@
 
 use anyhow::{Context, bail};
 use crosvm_gpu_driver::GpuParams;
-use macros::generated;
 use nvrm_driver::NvrmParams;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -168,7 +167,6 @@ pub struct PathsConfig {
 /// it are unchanged, and `deny_unknown_fields` still catches a typo INSIDE
 /// the section while `drivers::register` catches one in the section NAME —
 /// and, unlike the enum, can say which hypervisors this agent actually has.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloudHypervisorConfig {
@@ -176,7 +174,6 @@ pub struct CloudHypervisorConfig {
     pub timeout_ms: u64,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
@@ -207,7 +204,6 @@ pub struct NetworkConfig {
 /// side. A section here without a running FRR is a hard start-up error, for
 /// the same reason a `[volume.lvm-thin]` without its pool is: the node would
 /// claim to announce its addresses and announce nothing.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BgpNetworkConfig {
@@ -243,7 +239,6 @@ pub struct BgpNetworkConfig {
     pub fragment: Option<PathBuf>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BgpNeighborConfig {
@@ -253,7 +248,6 @@ pub struct BgpNeighborConfig {
 
 /// `[network.vxlan]`. Config-keyed exactly as `[volume.*]` and `[device.*]`
 /// are: the section is what turns the capability on.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VxlanNetworkConfig {
@@ -275,7 +269,6 @@ fn default_vxlan_mtu() -> u32 {
     linux_network_driver::DEFAULT_VXLAN_MTU
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl NetworkConfig {
     pub fn parsed_bridge_addr(&self) -> anyhow::Result<Option<(IpAddr, u8)>> {
         let Some(raw) = &self.bridge_addr else {
@@ -311,7 +304,6 @@ impl NetworkConfig {
 /// and keep their `deny_unknown_fields`, so a typo INSIDE a section still
 /// fails; a typo in a SECTION NAME is caught by `drivers::register`, which
 /// unlike serde can say which drivers this agent actually has.
-#[generated(model = ClaudeOpus, version = "5")]
 pub type Sections = HashMap<String, toml::Value>;
 
 /// One section of `[volume]`/`[device]`, as the type its driver wants, or
@@ -321,7 +313,6 @@ pub type Sections = HashMap<String, toml::Value>;
 /// section is parsed out of a `toml::Value` rather than straight out of the
 /// file, so serde's "unknown field" still comes through but its line number
 /// does not.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn section<T: serde::de::DeserializeOwned>(
     sections: &Sections,
     what: &str,
@@ -339,7 +330,6 @@ pub fn section<T: serde::de::DeserializeOwned>(
 
 /// `[volume.lvm-thin]`. The pool has to exist on this node — the driver
 /// checks at start-up rather than at the first VM boot.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LvmThinVolumeConfig {
@@ -361,7 +351,6 @@ pub struct LvmThinVolumeConfig {
 
 /// `[volume.nfs]`. `share_root` is the mounted share everything lives under;
 /// whether the driver is the one mounting it is `manage_mount`.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NfsVolumeConfig {
@@ -393,7 +382,6 @@ pub struct NfsVolumeConfig {
     pub fs_type: String,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl NfsVolumeConfig {
     /// What to mount, or nothing to mount. `manage_mount = true` without a
     /// server and an export is a config that cannot be carried out, and the
@@ -421,7 +409,6 @@ impl NfsVolumeConfig {
 /// The default driver is registered with or without this section, because
 /// `driver: None` in a spec has to keep meaning something on every node; see
 /// `drivers::build_filesystem`.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemVolumeConfig {
@@ -505,7 +492,6 @@ impl AgentConfig {
     /// reason the lvm-thin driver looks for its pool at start-up: a typo in a
     /// cidr is a config error, and finding it out when somebody's VM will not
     /// come up helps nobody.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn nft_config(&self) -> anyhow::Result<linux_network_driver::nftables::NftConfig> {
         let guarded =
             common::net::Ipv4Ranges::parse(&self.guarded_ranges).context("guarded_ranges")?;
@@ -526,7 +512,6 @@ impl AgentConfig {
     /// over BGP, and this section is only the session they travel on. A node
     /// that asks for evpn without a BGP peer to send it to is refused here
     /// rather than at the first tenant VM.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn bgp_config(&self) -> anyhow::Result<Option<linux_network_driver::frr::BgpConfig>> {
         let Some(network) = &self.network else {
             return Ok(None);
@@ -571,7 +556,6 @@ impl AgentConfig {
     /// give a bridge to. The one caller that would notice, `into_spec`, reads
     /// it per NIC, and a NIC on such a node is refused one layer down by
     /// `Drivers::networking` in words rather than landing on `""`.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn default_bridge(&self) -> String {
         self.network
             .as_ref()
@@ -581,7 +565,6 @@ impl AgentConfig {
 
     /// `[network].bridge_addr`, parsed — or nothing, which is both "no
     /// address configured" and "no `[network]` section at all".
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn parsed_bridge_addr(&self) -> anyhow::Result<Option<(IpAddr, u8)>> {
         match &self.network {
             Some(n) => n.parsed_bridge_addr(),
@@ -595,7 +578,6 @@ impl AgentConfig {
     /// is refused rather than quietly ignored: it would authenticate this
     /// node to whoever answered on that address, which is the one mistake in
     /// this file worth failing at start-up over.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn session_tls(&self) -> anyhow::Result<Option<tonic::transport::ClientTlsConfig>> {
         let identity = match (&self.controller_cert, &self.controller_key) {
             (None, None) => None,
@@ -660,7 +642,6 @@ impl PathsConfig {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

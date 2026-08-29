@@ -23,7 +23,6 @@ use agent_api::storage::{
     self, StorageError, VolumeAttacher, VolumeAttachment, VolumeHandle, VolumeId, VolumeProvider,
     VolumeSpec, VolumeState,
 };
-use macros::generated;
 use tracing::{debug, error, info, instrument, warn};
 
 /// The default admission limit, in percent of the thin pool's data space.
@@ -67,7 +66,6 @@ fn lv_name(id: &VolumeId) -> String {
 /// The pool a spec asks for: `params.pool` if it names one, the configured
 /// pair otherwise. Split here rather than at the call sites so that a
 /// malformed `pool` is one message and not three.
-#[generated(model = ClaudeOpus, version = "5")]
 fn resolve_pool(
     params: &LvmThinParams,
     default_vg: &str,
@@ -98,7 +96,6 @@ fn resolve_pool(
 /// takes I/O errors — including the ones that were there first. So the number
 /// admission looks at is the pool's real fill, and the limit is the distance
 /// this driver insists on keeping from the cliff.
-#[generated(model = ClaudeOpus, version = "5")]
 fn admits(data_percent: f64, max_data_percent: f64) -> storage::Result<()> {
     if data_percent > max_data_percent {
         return Err(StorageError::InvalidSpec(format!(
@@ -113,7 +110,6 @@ fn admits(data_percent: f64, max_data_percent: f64) -> storage::Result<()> {
 /// One field of `lvs --noheadings`, which pads every line with leading
 /// whitespace and hands back an empty string for a field a segment type does
 /// not have (`data_percent` on a plain LV, for instance).
-#[generated(model = ClaudeOpus, version = "5")]
 fn parse_lvs_field(stdout: &str) -> Option<&str> {
     stdout.lines().map(str::trim).find(|l| !l.is_empty())
 }
@@ -131,13 +127,11 @@ fn parse_number(stdout: &str, what: &str) -> storage::Result<f64> {
 
 /// Whether an `lvs`/`lvremove` failure means "there is no such thing" rather
 /// than "something went wrong". LVM says so in prose and in no other way.
-#[generated(model = ClaudeOpus, version = "5")]
 fn means_absent(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
     s.contains("failed to find") || s.contains("not found") || s.contains("no such")
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl LvmThinDriver {
     pub fn new(config: LvmThinDriverConfig) -> storage::Result<Self> {
         if config.vg.is_empty() || config.thin_pool.is_empty() {
@@ -352,7 +346,6 @@ impl LvmThinDriver {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[async_trait::async_trait]
 impl VolumeProvider for LvmThinDriver {
     #[instrument(skip_all, fields(volume_id = %id, size_bytes = spec.size_bytes))]
@@ -464,7 +457,6 @@ impl VolumeProvider for LvmThinDriver {
 /// The day this backend grows an NVMe-oF export, THIS is the impl that gets a
 /// target session and a cgroup, and `VolumeProvider` above does not change a
 /// line. That is what the split was for.
-#[generated(model = ClaudeOpus, version = "5")]
 #[async_trait::async_trait]
 impl VolumeAttacher for LvmThinDriver {
     #[instrument(level = "trace", skip_all, fields(volume_id = %handle.id))]
@@ -490,7 +482,6 @@ impl VolumeAttacher for LvmThinDriver {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

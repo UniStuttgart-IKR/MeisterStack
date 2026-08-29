@@ -33,7 +33,6 @@
 //! was stored. The rule is written into the tests those call sites have.
 
 use chrono::Utc;
-use macros::generated;
 use tracing::warn;
 
 use crate::object::Resource;
@@ -79,7 +78,6 @@ pub mod reason {
 }
 
 /// What is being written down. Built by the caller, spent by `record`.
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct Happening<'a> {
     /// The kind of the object this is about, spelled as its envelope does.
     pub kind: &'a str,
@@ -109,7 +107,6 @@ pub struct Happening<'a> {
 /// Lowercased and joined with `-`, so the result is one path segment and
 /// therefore a name the store accepts (`EtcdStore::check_name`). A uid is a
 /// uuid and a reason is a CamelCase word, so neither can contain a slash.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn name_of(kind: &str, uid: &str, name: &str, reason: &str) -> String {
     // The uid where there is one, the name where there is not — a Node has no
     // uid of its own in this control plane, and its name IS its identity.
@@ -134,7 +131,6 @@ pub fn name_of(kind: &str, uid: &str, name: &str, reason: &str) -> String {
 /// Create first and fall back to aggregating, rather than the other way
 /// round: the first occurrence is the common case for a given key, and
 /// `AlreadyExists` is exactly the signal that this has happened before.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn record(store: &EtcdStore, happening: Happening<'_>) {
     let now = Utc::now();
     let name = name_of(
@@ -193,7 +189,6 @@ pub async fn record(store: &EtcdStore, happening: Happening<'_>) {
 /// Filtered by the involved object rather than looked up by key: one object
 /// has one event per reason, and what a person asking `vm events` wants is
 /// all of them.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn about(store: &EtcdStore, kind: &str, uid: &str, name: &str) -> Vec<Event> {
     let mut all = all(store).await;
     all.retain(|e| {
@@ -212,7 +207,6 @@ pub async fn about(store: &EtcdStore, kind: &str, uid: &str, name: &str) -> Vec<
 /// A read that fails is an empty list and a warning rather than an error: an
 /// event log is the one resource whose absence must not stop anybody from
 /// looking at the objects it is about.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn all(store: &EtcdStore) -> Vec<Event> {
     let mut events = match store.list::<Event>().await {
         Ok(events) => events,
@@ -233,7 +227,6 @@ pub fn kind_of<T: Resource>() -> &'static str {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

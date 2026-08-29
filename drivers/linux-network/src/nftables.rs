@@ -63,7 +63,6 @@ use std::process::Stdio;
 
 use agent_api::networking::{NetworkError, NicSpec};
 use common::net::{Ipv4Ranges, RangeError};
-use macros::generated;
 use tracing::{debug, info, instrument, warn};
 
 /// The table this driver owns. Nothing else writes into it, and a `nft list
@@ -109,7 +108,6 @@ pub struct NftConfig {
 /// Pure and returned as text rather than executed, because the interesting
 /// part of this driver is WHICH rules a spec produces and that is worth
 /// asserting without a kernel. The runner below is four lines around a pipe.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn ruleset(tap: &str, spec: &NicSpec, guarded: &Ipv4Ranges) -> Result<String, RangeError> {
     let chain = chain_name(tap);
     let mut s = String::new();
@@ -192,7 +190,6 @@ pub struct Nft {
     binary: String,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Nft {
     /// Check at start-up that this node can actually program nftables, exactly
     /// as the lvm-thin driver checks its pool there rather than at the first
@@ -369,7 +366,6 @@ impl Nft {
 /// json_schema_version has moved before and this is the one place a change
 /// would be silent — a reap that finds nothing looks exactly like a node with
 /// nothing to reap.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn chain_names(json: &str) -> Vec<String> {
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
         return Vec::new();
@@ -387,7 +383,6 @@ pub fn chain_names(json: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use agent_api::types::mac_addr::MacAddr;

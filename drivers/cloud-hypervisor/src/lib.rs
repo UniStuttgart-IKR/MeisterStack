@@ -12,7 +12,6 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
-use macros::generated;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -262,7 +261,6 @@ impl Hypervisor for CloudHypervisorDriver {
         vec![self.vmm_log_path(id)]
     }
 
-    #[generated(model = ClaudeFable, version = "5")]
     #[instrument(skip_all, fields(vm_id = %id, pid))]
     async fn adopt(&self, id: &VmId, pid: u32) -> hypervisor::Result<()> {
         if self.vms.lock().unwrap().contains_key(id) {
@@ -321,7 +319,6 @@ impl Hypervisor for CloudHypervisorDriver {
 /// `ImageType` derives `Deserialize` with no rename, so it reads `"Raw"` and
 /// not `"raw"` — the lowercase form is what `Display` prints into its logs,
 /// and sending it would fail the whole `vm.create` body.
-#[generated(model = ClaudeOpus, version = "5")]
 fn disk_config(disk: &VolumeAttachment) -> Option<serde_json::Value> {
     match disk {
         VolumeAttachment::Path(path) => Some(serde_json::json!({
@@ -347,7 +344,6 @@ fn disk_config(disk: &VolumeAttachment) -> Option<serde_json::Value> {
 /// Read-only, and that is not tidiness: the seed is derived from the spec and
 /// rewritten on every provision, so a guest that wrote to it would be a guest
 /// whose changes vanish at the next re-provision without anybody being told.
-#[generated(model = ClaudeOpus, version = "5")]
 fn disks(spec: &InstanceSpec) -> Vec<serde_json::Value> {
     let mut disks: Vec<serde_json::Value> = spec.volumes.iter().filter_map(disk_config).collect();
     if let Some(seed) = &spec.cloud_init_seed {
@@ -366,7 +362,6 @@ fn disks(spec: &InstanceSpec) -> Vec<serde_json::Value> {
 /// One entry of CH's `fs` array: virtiofsd is already listening on `socket`,
 /// and `tag` is the name the guest mounts (`mount -t virtiofs <tag> /mnt`).
 /// `num_queues` and `queue_size` are CH's own defaults and are left to it.
-#[generated(model = ClaudeOpus, version = "5")]
 fn fs_config(volume: &VolumeAttachment) -> Option<serde_json::Value> {
     match volume {
         VolumeAttachment::FsShare { socket, tag, .. } => {
@@ -519,7 +514,6 @@ impl Pausable for CloudHypervisorDriver {
 /// so a node with a hundred VMs spends roughly 0.2 % of one core here.
 /// Pooling could take back half of that. It is not worth the stale socket.
 // tracing here via ENV: RUST_LOG=cloud_hypervisor_driver=trace
-#[generated(model = ClaudeOpus, version = "4.8")]
 #[instrument(level = "trace", skip(socket, body, ch_timeout), fields(%endpoint))]
 async fn ch_api(
     socket: &Path,
@@ -566,7 +560,6 @@ async fn ch_api(
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use agent_api::NicAttachment;

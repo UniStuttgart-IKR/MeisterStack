@@ -65,7 +65,6 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use agent_api::networking::NetworkError;
-use macros::generated;
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
 
@@ -113,7 +112,6 @@ pub struct BgpConfig {
 /// is FRR's own reload path and it adds what it reads. A renderer that only
 /// ever emitted `network` lines would be a renderer whose announcements never
 /// went away, which is the one thing this feature is for.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn fragment(
     cfg: &BgpConfig,
     announced: &BTreeSet<String>,
@@ -185,7 +183,6 @@ pub struct Frr {
     announced: Mutex<BTreeSet<String>>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Frr {
     /// Check at start-up that FRR is there and answering, exactly as the
     /// lvm-thin driver looks for its pool there.
@@ -323,7 +320,6 @@ impl agent_api::networking::RouteAnnouncer for Frr {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

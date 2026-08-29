@@ -17,7 +17,6 @@ use controller_api::{
     VmSpec, Volume, VolumePhase, apply_spec_update, check_envelope, conflict, invalid,
     resources::{backend_name, new_vm, new_volume},
 };
-use macros::generated;
 use serde_json::json;
 use tracing::info;
 
@@ -72,7 +71,6 @@ pub fn router(store: Arc<EtcdStore>, registry: Arc<crate::session::SessionRegist
 /// over, or — worse — not undone at all, leaving the two tiers describing
 /// different machines. Local operation stays entirely free: this applies only
 /// to objects that carry the mark.
-#[generated(model = ClaudeOpus, version = "5")]
 fn refuse_if_cloud_owned(vm: &Vm) -> Result<(), ApiError> {
     if !vm.metadata.managed_by_cloud() {
         return Ok(());
@@ -92,7 +90,6 @@ async fn healthz() -> &'static str {
 /// document that gets edited afterwards, and it is the edited one that
 /// travels down to the agent: a spec.vm that is not an object gets no further
 /// than build_spec_json, where it fails every pass, silently, forever.
-#[generated(model = ClaudeOpus, version = "5")]
 fn validate_vm_spec(spec: &VmSpec) -> Result<(), ApiError> {
     if !spec.vm.is_object() {
         return Err(invalid("spec.vm must be the agent's NewVmSpec object"));
@@ -105,7 +102,6 @@ fn validate_vm_spec(spec: &VmSpec) -> Result<(), ApiError> {
     Ok(())
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 async fn list_vms(State(st): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
     let items = st.store.list::<Vm>().await?;
     Ok(Json(json!({
@@ -115,7 +111,6 @@ async fn list_vms(State(st): State<ApiState>) -> Result<Json<serde_json::Value>,
     })))
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 /// The edge is where the trace is decided: continue the caller's if it sent a
 /// readable one, start a new one if it did not. The span is built and given
 /// its parent before it starts — see `telemetry::in_trace` — because a parent
@@ -206,7 +201,6 @@ struct LogQuery {
 /// nothing, and one that is not placed yet, both answer with an empty list
 /// and a 200: "nothing to show" is an answer. A node that cannot be reached
 /// is a 503, because that is a different sentence.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn vm_logs(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -238,7 +232,6 @@ async fn vm_logs(
 /// Deserialising it here to serialise it again would be two chances to change
 /// what a console said, in the two tiers between the node and the person
 /// reading it, for no gain at all.
-#[generated(model = ClaudeOpus, version = "5")]
 pub(crate) fn json_passthrough(payload: Vec<u8>) -> axum::response::Response {
     use axum::response::IntoResponse;
     (
@@ -248,7 +241,6 @@ pub(crate) fn json_passthrough(payload: Vec<u8>) -> axum::response::Response {
         .into_response()
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 async fn update_vm(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -274,7 +266,6 @@ async fn update_vm(
     Ok(Json(st.store.update(&body).await?))
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 async fn delete_vm(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -320,7 +311,6 @@ async fn get_storage_pool(
     Ok(Json(st.store.get(&name).await?))
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create_storage_pool(
     State(st): State<ApiState>,
     Json(body): Json<StoragePool>,
@@ -346,7 +336,6 @@ async fn create_storage_pool(
 /// a pool that exists" is worth what the refusal that keeps it true is worth.
 /// `place_volume` reads it back on every pass and would have nowhere to put a
 /// volume whose pool had vanished.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn delete_storage_pool(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -387,7 +376,6 @@ async fn get_volume(
 /// Reserve storage here. Nothing is provisioned: the reconcile pass picks a
 /// node that can reach the pool, and the volume is `Pending` and says why
 /// until one is found.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn create_volume(
     State(st): State<ApiState>,
     Json(body): Json<Volume>,
@@ -438,7 +426,6 @@ async fn create_volume(
 
 /// Mark it for release. Never a hard delete: the finalizer comes off in the
 /// reconcile pass, and only once nothing holds the volume. See `release`.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn delete_volume(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -461,7 +448,6 @@ async fn delete_volume(
 /// user directory (one directory, and it is the cloud's), so a member reading
 /// it is read-only over everything exactly as they are over the VM objects
 /// themselves.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn vm_events(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -477,7 +463,6 @@ async fn vm_events(
 
 /// The whole log of this cluster: its VMs' transitions and its nodes' coming
 /// and going.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn list_events(State(st): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
     let items = controller_api::events::all(&st.store).await;
     Ok(Json(json!({
@@ -489,7 +474,6 @@ async fn list_events(State(st): State<ApiState>) -> Result<Json<serde_json::Valu
 
 /// The inventory is the Node objects, not the live session map: a node that
 /// is down has to stay listed as NotReady, with the capacity it last had.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn list_nodes(State(st): State<ApiState>) -> Result<Json<serde_json::Value>, ApiError> {
     let items = st.store.list::<Node>().await?;
     Ok(Json(json!({
@@ -520,7 +504,6 @@ async fn get_node(
 /// no eviction and no migration happens: those are separate things with
 /// separate questions, and quietly starting to move somebody's VM because a
 /// flag was flipped would be the worst possible answer to both.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn update_node(
     State(st): State<ApiState>,
     Path(name): Path<String>,

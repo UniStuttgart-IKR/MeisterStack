@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-macros = { package = "meister-macros", path = "../macros" }
 common = { package = "meister-common", path = "../common" }
 pki = { package = "meister-pki", path = "../pki" }
 # The metrics registry. The store is one of the three places that writes to

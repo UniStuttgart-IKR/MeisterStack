@@ -19,7 +19,6 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use controller_api::EtcdStore;
-use macros::generated;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -61,7 +60,6 @@ struct Args {
 /// The central cluster setup file — written by the NixOS module in the lab,
 /// hand-edited elsewhere. Every field optional; defaults are the M1 lab
 /// values, flags win over the file.
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -115,7 +113,6 @@ struct FileConfig {
     auth: controller_api::rest::AuthConfig,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 struct Config {
     cluster_name: String,
     listen_api: String,
@@ -150,7 +147,6 @@ struct Config {
     auth: controller_api::rest::AuthConfig,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 fn resolve_config(args: &Args) -> anyhow::Result<Config> {
     let file: FileConfig = match std::fs::read_to_string(&args.config) {
         Ok(raw) => {
@@ -205,7 +201,6 @@ fn resolve_config(args: &Args) -> anyhow::Result<Config> {
 /// a single address, so it wins outright rather than being merged into an
 /// ambiguity — the same rule the agent applies to `controller_addrs`, and the
 /// reason the lab's `cloud_addr` context stays valid as a one-element list.
-#[generated(model = ClaudeOpus, version = "5")]
 fn cloud_endpoints(args: &Args, file: &FileConfig) -> Vec<String> {
     if let Some(flag) = &args.cloud_addrs {
         return flag
@@ -224,7 +219,6 @@ fn cloud_endpoints(args: &Args, file: &FileConfig) -> Vec<String> {
         .collect()
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -362,7 +356,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

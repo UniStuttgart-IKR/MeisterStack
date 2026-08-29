@@ -30,7 +30,6 @@ use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 
 use common::net::{Ipv4Range, Ipv4Ranges};
-use macros::generated;
 use tracing::{debug, error};
 
 use crate::object::Resource;
@@ -51,7 +50,6 @@ const MAX_ROUNDS: usize = 16;
 /// before an operator has configured any addresses at all, and the useful
 /// answer to a member who asks for a floating address on such a cloud is what
 /// the administrator has to do, not `404`.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn pick_pool<'a>(pools: &'a [FloatingPool], named: Option<&str>) -> Result<&'a FloatingPool> {
     if let Some(name) = named.filter(|n| !n.is_empty()) {
         return pools
@@ -103,7 +101,6 @@ fn addresses(ips: &[FloatingIp]) -> BTreeSet<Ipv4Addr> {
 /// applies to its membership check, for the same reason and with more at stake:
 /// there the cost is a tenant deleted too eagerly, here it is two tenants
 /// holding one address.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn all_reservations(store: &EtcdStore) -> Result<Vec<FloatingIp>> {
     let ips = store.list::<FloatingIp>().await?;
     if ips.len() != store.count::<FloatingIp>().await? {
@@ -121,7 +118,6 @@ pub async fn all_reservations(store: &EtcdStore) -> Result<Vec<FloatingIp>> {
 /// Per tenant AND per pool, which is what makes a public pool safe to have
 /// next to a private one: a tenant's four private addresses say nothing about
 /// how many routable ones it may hold.
-#[generated(model = ClaudeOpus, version = "5")]
 fn held_by(ips: &[FloatingIp], tenant: &str, pool: &str) -> u32 {
     ips.iter()
         .filter(|ip| ip.spec.tenant == tenant && ip.spec.pool == pool)
@@ -144,7 +140,6 @@ fn held_by(ips: &[FloatingIp], tenant: &str, pool: &str) -> u32 {
 /// address that can be handed out" and "somebody already has it" are three
 /// different things to the person reading them, and only the last of the three
 /// is worth trying again later.
-#[generated(model = ClaudeOpus, version = "5")]
 fn pick_address(
     ranges: &Ipv4Ranges,
     pool: &FloatingPool,
@@ -207,7 +202,6 @@ fn pick_address(
 /// which a concurrent reader sees an over-quota reservation. Both are the cost
 /// of not holding a lock per tenant, and both are recoverable by asking again
 /// — which the thing they replace, an over-grant no pass takes back, is not.
-#[generated(model = ClaudeOpus, version = "5")]
 fn within_quota(after: &[FloatingIp], tenant: &str, pool: &str, quota: u32) -> bool {
     held_by(after, tenant, pool) <= quota
 }
@@ -225,7 +219,6 @@ fn within_quota(after: &[FloatingIp], tenant: &str, pool: &str, quota: u32) -> b
 /// checked a second time AFTER the write, because the check before it is a
 /// check-then-act that two requests naming two different addresses walk
 /// straight through: `within_quota` has that argument in full.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn allocate(
     store: &EtcdStore,
     pool: &FloatingPool,
@@ -347,7 +340,6 @@ pub async fn allocate(
 /// allowlist by virtue of the subnet, and the pool guard — the rule that says
 /// nobody sources from a pool address without holding it — would have a hole
 /// exactly the size of that subnet.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn occupied(
     pools: &[FloatingPool],
     subnets: &[RoutedSubnet],
@@ -380,7 +372,6 @@ pub fn occupied(
 
 /// Refuse a range that overlaps something that already exists, naming what it
 /// collided with.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn check_free(candidate: &Ipv4Range, occupied: &[(String, Ipv4Range)]) -> Result<()> {
     if let Some((what, range)) = occupied.iter().find(|(_, r)| r.overlaps(candidate)) {
         return Err(StoreError::Conflict(format!(
@@ -396,7 +387,6 @@ pub fn check_free(candidate: &Ipv4Range, occupied: &[(String, Ipv4Range)]) -> Re
 /// Aligned, because a subnet that is not on its own boundary is a subnet no
 /// router will accept as a prefix — and walking blocks rather than addresses
 /// is also what keeps this a handful of comparisons on a /16.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn cut_subnet(
     supers: &Ipv4Ranges,
     prefix_len: u32,
@@ -427,7 +417,6 @@ pub fn cut_subnet(
 /// Every routed subnet, refusing to answer from a partial list — same guard
 /// and same reason as `all_reservations`, with the overlap check at stake
 /// instead of the address.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn all_subnets(store: &EtcdStore) -> Result<Vec<RoutedSubnet>> {
     let subnets = store.list::<RoutedSubnet>().await?;
     if subnets.len() != store.count::<RoutedSubnet>().await? {
@@ -441,7 +430,6 @@ pub async fn all_subnets(store: &EtcdStore) -> Result<Vec<RoutedSubnet>> {
 }
 
 /// Every floating pool, with the same guard.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn all_pools(store: &EtcdStore) -> Result<Vec<FloatingPool>> {
     let pools = store.list::<FloatingPool>().await?;
     if pools.len() != store.count::<FloatingPool>().await? {
@@ -486,7 +474,6 @@ pub async fn all_pools(store: &EtcdStore) -> Result<Vec<FloatingPool>> {
 /// that re-applies one tap's chain from a new list. The chain is already
 /// computed from a list and rebuilt whole on every apply, so the work is the
 /// plumbing and not the rules.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn inject_nic_list(spec: &mut serde_json::Value, field: &str, values: &[String]) -> usize {
     if values.is_empty() {
         return 0;
@@ -518,7 +505,6 @@ pub const NIC_FLOATING_IPS: &str = "floating_ips";
 pub const NIC_ROUTED_SUBNETS: &str = "routed_subnets";
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use crate::resources::{

@@ -26,4 +26,3 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 tokio-rustls = { workspace = true }
 
-macros = { package = "meister-macros", path = "../../shared/macros" }

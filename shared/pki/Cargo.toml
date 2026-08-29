@@ -10,7 +10,6 @@ edition = "2024"
 # have dragged etcd into `meister`.
 
 [dependencies]
-macros = { package = "meister-macros", path = "../macros" }
 
 anyhow = { workspace = true }
 chrono = { workspace = true }

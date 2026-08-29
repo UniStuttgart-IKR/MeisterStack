@@ -23,7 +23,6 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use controller_api::EtcdStore;
-use macros::generated;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -58,7 +57,6 @@ struct Args {
 /// The central cloud setup file — written by the NixOS module in the lab,
 /// hand-edited elsewhere. Every field optional; the defaults are the lab
 /// topology, flags win over the file.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -116,7 +114,6 @@ struct FileConfig {
     auth: controller_api::rest::AuthConfig,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 struct Config {
     listen_api: String,
     listen_session: String,
@@ -152,7 +149,6 @@ struct Config {
 /// than one that does not.
 const DEFAULT_CERT_TTL_DAYS: i64 = 90;
 
-#[generated(model = ClaudeOpus, version = "5")]
 fn resolve_config(args: &Args) -> anyhow::Result<Config> {
     let file: FileConfig = match std::fs::read_to_string(&args.config) {
         Ok(raw) => {
@@ -208,7 +204,6 @@ fn resolve_config(args: &Args) -> anyhow::Result<Config> {
 /// Without it the certificatesigningrequests resource still exists and still
 /// records requests; approving one answers 501. A control plane that accepted
 /// requests it could never fulfil would be worse than one that says so.
-#[generated(model = ClaudeOpus, version = "5")]
 fn signing(cfg: &Config) -> anyhow::Result<Option<Arc<api::Signing>>> {
     let base = cfg.config_dir.as_deref();
     match (&cfg.ca_cert, &cfg.ca_key) {
@@ -242,7 +237,6 @@ fn signing(cfg: &Config) -> anyhow::Result<Option<Arc<api::Signing>>> {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -367,7 +361,6 @@ async fn main() -> anyhow::Result<()> {
     controller_api::rest::serve(listener, router, api_tls).await
 }
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

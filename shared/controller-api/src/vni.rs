@@ -19,8 +19,6 @@
 //! `Conflict` and tries again with what the winner left behind. Nothing new
 //! was built for this; the allocator is one object and a retry.
 
-use macros::generated;
-
 use crate::object::Resource;
 use crate::resources::{Counter, CounterSpec};
 use crate::store::{EtcdStore, Result, StoreError};
@@ -50,7 +48,6 @@ pub const VNI_MAX: u32 = 0x00FF_FFFF;
 /// being a setting that quietly did nothing after the first tenant. Lowering
 /// it does nothing at all, which is the honest behaviour: the numbers below
 /// have already been handed out.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn next_vni(current: Option<u32>, base: u32) -> Result<(u32, u32)> {
     let base = base.max(1);
     let issued = current.unwrap_or(base).max(base);
@@ -69,7 +66,6 @@ pub fn next_vni(current: Option<u32>, base: u32) -> Result<(u32, u32)> {
 /// The bound on retries is a liveness one, not a correctness one: each round
 /// is one lost race, and a caller that has lost sixteen in a row is on an API
 /// server that has bigger problems than this tenant.
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn allocate(store: &EtcdStore, base: u32) -> Result<u32> {
     for _ in 0..16 {
         match store.get::<Counter>(COUNTER_VNI).await {
@@ -121,7 +117,6 @@ pub async fn allocate(store: &EtcdStore, base: u32) -> Result<u32> {
 /// to keep working. It is also the override — an admin who has said exactly
 /// which overlay a NIC belongs on has said something more specific than the
 /// tenant did.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn inject_vxlan_id(spec: &mut serde_json::Value, vni: u32) -> usize {
     let Some(nics) = spec.get_mut("nics").and_then(|n| n.as_array_mut()) else {
         return 0;
@@ -141,7 +136,6 @@ pub fn inject_vxlan_id(spec: &mut serde_json::Value, vni: u32) -> usize {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

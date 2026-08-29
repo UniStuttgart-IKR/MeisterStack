@@ -7,7 +7,6 @@ use agent_api::hypervisor::{BootSource, InstanceSpec};
 use agent_api::networking::NicAttachment;
 use agent_api::{HypervisorError, ResourceLimits, VmId};
 use anyhow::{Context, Result, anyhow, bail};
-use macros::generated;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -34,7 +33,6 @@ const BACKEND_OVERHEAD_MIB: u64 = 512;
 ///
 /// The duration is recorded whether the call succeeded or not: a driver that
 /// fails after thirty seconds is exactly the case this is for.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn timed_driver<F: std::future::Future>(driver: &str, operation: &str, work: F) -> F::Output {
     let clock = telemetry::metrics::Timer::start();
     let out = work.await;
@@ -70,7 +68,6 @@ pub struct Provisioner {
 /// built from. The fallback is the spec default rather than a literal: a
 /// record whose device is not in its own spec should not be routed to
 /// whichever driver happened to be default the day this line was written.
-#[generated(model = ClaudeFable, version = "5")]
 fn device_driver_name(record: &VmRecord, id: &DeviceId) -> String {
     record
         .spec
@@ -85,7 +82,6 @@ fn device_driver_name(record: &VmRecord, id: &DeviceId) -> String {
 /// built from — the mirror of `device_driver_name`, and for the same reason:
 /// teardown has to reach the driver that made the thing, and the record is
 /// the only place that still remembers which one that was.
-#[generated(model = ClaudeOpus, version = "5")]
 fn volume_driver_name(record: &VmRecord, id: &VolumeId) -> String {
     record
         .spec
@@ -113,7 +109,6 @@ fn volume_driver_name(record: &VmRecord, id: &VolumeId) -> String {
 /// `None` is "nothing to do" — a VM whose volumes are all plain paths, which
 /// is most of them, keeps byte for byte the limits it had before this
 /// existed.
-#[generated(model = ClaudeOpus, version = "5")]
 fn widen_for_storage_backends(base: &ResourceLimits, volumes: &[Volume]) -> Option<ResourceLimits> {
     let backends = volumes
         .iter()
@@ -129,7 +124,6 @@ fn widen_for_storage_backends(base: &ResourceLimits, volumes: &[Volume]) -> Opti
     Some(widened)
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl Provisioner {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -167,7 +161,6 @@ impl Provisioner {
     /// A driver the spec names but the node does not have is passed over
     /// here; `run_chain` is where that becomes an error, with the message
     /// that names the configured drivers.
-    #[generated(model = ClaudeOpus, version = "5")]
     fn check_device_admission(&self, id: &VmId, spec: &AgentVmSpec) -> Result<()> {
         if spec.devices.is_empty() {
             return Ok(());
@@ -208,7 +201,6 @@ impl Provisioner {
     /// `managed_by_controller` marks the record as the controller's, which is
     /// what a desired-state snapshot is later allowed to reap. Only the
     /// session path passes true.
-    #[generated(model = ClaudeFable, version = "5")]
     #[instrument(skip(self, spec), fields(vm_id = %id))]
     pub async fn provision(
         &self,
@@ -263,7 +255,6 @@ impl Provisioner {
     /// volumes, then nics, then devices, then the VMM. Instrumented in its
     /// own right because `resume` reaches it too — a re-provision after a
     /// dead VMM is this same chain without a `provision` span above it.
-    #[generated(model = ClaudeFable, version = "5")]
     #[instrument(skip_all, fields(vm_id = %id, volumes = record.spec.volumes.len(),
                                   nics = record.spec.nics.len(),
                                   devices = record.spec.devices.len()))]
@@ -553,7 +544,6 @@ impl Provisioner {
         }
     }
 
-    #[generated(model = ClaudeFable, version = "5")]
     #[instrument(skip(self), fields(vm_id = %id))]
     pub async fn teardown(&self, id: &VmId) -> Result<()> {
         let Some(record) = self.store.get(id)? else {
@@ -661,7 +651,6 @@ impl Provisioner {
         }
     }
 
-    #[generated(model = ClaudeFable, version = "5")]
     #[instrument(skip(self, record), fields(vm_id = %id))]
     pub(crate) async fn stop(&self, id: &VmId, mut record: VmRecord) -> Result<()> {
         let hypervisor = self.drivers.hypervisor()?;
@@ -733,7 +722,6 @@ impl Provisioner {
         Ok(())
     }
 
-    #[generated(model = ClaudeFable, version = "5")]
     #[instrument(skip(self, record), fields(vm_id = %id))]
     pub(crate) async fn resume(&self, id: &VmId, mut record: VmRecord) -> Result<()> {
         record.phase = Phase::Provisioning;
@@ -753,7 +741,6 @@ impl Provisioner {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeFable, version = "5")]
 mod tests {
     use super::*;
     use crate::types::{AgentVmSpec, BootSourceSpec, DeviceWithId};
@@ -941,7 +928,6 @@ mod tests {
     /// VM's own slice, and before the widening it had no allowance at all —
     /// the slice was sized for the VMM and the devices only.
     #[test]
-    #[generated(model = ClaudeOpus, version = "5")]
     fn a_volume_backend_widens_the_slice_and_a_plain_path_does_not() {
         let base = Provisioner::limits_for(&spec(2, 2048, vec![]));
         assert_eq!(base.memory_max, Some((2048 + 112) * 1024 * 1024));
@@ -990,7 +976,6 @@ mod tests {
     /// quietly drop it: it goes back through `create_slice`, which writes the
     /// parent's cpuset from exactly this field.
     #[test]
-    #[generated(model = ClaudeOpus, version = "5")]
     fn widening_keeps_every_limit_it_is_not_about() {
         let mut base = Provisioner::limits_for(&spec(4, 1024, vec![]));
         base.cpuset = Some("0-7".into());

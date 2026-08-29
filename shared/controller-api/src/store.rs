@@ -16,7 +16,6 @@ use etcd_client::{
     Client, Compare, CompareOp, ConnectOptions, EventType, GetOptions, PutOptions, Txn, TxnOp,
     TxnResponse, WatchOptions,
 };
-use macros::generated;
 use tracing::{error, info, warn};
 
 use crate::object::{Resource, StoredObject};
@@ -48,7 +47,6 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl StoreError {
     /// One word for the KIND of failure, for the `result` label on
     /// `meister_etcd_errors_total`.
@@ -146,7 +144,6 @@ pub enum WatchEvent {
     Delete,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl EtcdStore {
     pub async fn connect(endpoints: &[String], prefix: &str) -> Result<Self> {
         let options = ConnectOptions::new().with_connect_timeout(CONNECT_TIMEOUT);
@@ -175,7 +172,6 @@ impl EtcdStore {
     /// atomic increments and gives every caller its own `&mut`, which is what
     /// the queue was standing in for. gRPC multiplexes the requests on the
     /// one connection, as it was always going to.
-    #[generated(model = ClaudeOpus, version = "5")]
     fn handle(&self) -> Client {
         self.client.clone()
     }
@@ -239,7 +235,6 @@ impl EtcdStore {
     /// an object it cannot decode — it says so and drops it — which is right
     /// for a reconcile pass and wrong for any caller whose correctness rests
     /// on the list being complete. Those compare against this.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub async fn count<T: Resource>(&self) -> Result<usize> {
         let dir = self.dir(T::RESOURCE);
         let opts = GetOptions::new().with_prefix().with_count_only();
@@ -254,7 +249,6 @@ impl EtcdStore {
     /// and `list` reads the segment after the last slash — and the relative
     /// path entries would move the key outright. Checked here rather than in
     /// each handler because this is where the key is actually built.
-    #[generated(model = ClaudeOpus, version = "5")]
     fn check_name(name: &str) -> Result<()> {
         if name.is_empty() {
             return Err(StoreError::Invalid(
@@ -290,7 +284,6 @@ impl EtcdStore {
     /// Objects that expire are rare by construction — see `events`, which
     /// writes one only when something CHANGED — so the extra round trip is
     /// paid about as often as something happens.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub async fn create_with_ttl<T: Resource>(&self, obj: &T, ttl_secs: i64) -> Result<T> {
         let lease = timed("lease_grant", self.handle().lease_grant(ttl_secs, None)).await?;
         self.create_inner(obj, Some(lease.id())).await
@@ -341,7 +334,6 @@ impl EtcdStore {
     ///
     /// A response without a header is not something etcd sends. If one ever
     /// does arrive, the read it replaced is still there to fall back on.
-    #[generated(model = ClaudeOpus, version = "5")]
     async fn written<T: Resource>(
         &self,
         name: &str,
@@ -466,8 +458,103 @@ impl EtcdStore {
     }
 }
 
+/// Why a reconcile pass runs: a periodic tick, or something changed.
+///
+/// Level-triggered reconcilers do not act on events — they re-derive
+/// everything from the store every pass — so the watch is only ever a reason
+/// to run one sooner than the tick would. That makes losing it survivable
+/// rather than fatal, and this is where that is arranged: the initial watch is
+/// retried until it takes, a closed stream is re-established on the next wake,
+/// and the tick carries the reconciler in the meantime.
+///
+/// Both tiers ran this loop, identically, thirty-odd lines each. What is
+/// generic about it is `T` — the object type the watch decodes — which is the
+/// same parameter `EtcdStore::watch` already takes, so nothing here is a
+/// contortion to make two things one.
+pub struct PassTrigger<T: Resource> {
+    watch: Option<tokio::sync::mpsc::Receiver<(WatchEvent, String, Option<T>)>>,
+    tick: tokio::time::Interval,
+}
+
+impl<T: Resource> PassTrigger<T> {
+    /// Retries the initial watch until it takes: a controller that starts
+    /// while etcd is still coming up should end up watching, not end up
+    /// ticking forever.
+    pub async fn new(store: &EtcdStore, period: Duration) -> Self {
+        let watch = loop {
+            match store.watch::<T>().await {
+                Ok(w) => break w,
+                Err(e) => {
+                    warn!(
+                        resource = T::RESOURCE,
+                        error = format!("{e:#}"),
+                        "watch failed, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        };
+        let mut tick = tokio::time::interval(period);
+        // Delay, not Burst: a pass that overran its period must not be
+        // followed by a flurry of catch-up passes over the same objects.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self {
+            watch: Some(watch),
+            tick,
+        }
+    }
+
+    /// Wait for the next reason to run a pass. Returns when the tick fires or
+    /// the store says something changed; a watch that closed is re-opened
+    /// here, and until it is, the tick is what keeps the reconciler running.
+    /// This never waits twice: every path here is a reason to run a pass, and
+    /// a reconnect that failed is one too. Looping until the watch came back
+    /// would swallow the tick that woke us and leave the reconciler making no
+    /// passes at all for as long as the store stays unreachable — the opposite
+    /// of what the tick is for, and exactly when a level-triggered pass is
+    /// worth the most. A failed reconnect costs nothing extra either: the next
+    /// call finds `watch: None` and waits for a tick before trying again.
+    pub async fn wait(&mut self, store: &EtcdStore) {
+        let closed = match &mut self.watch {
+            Some(watch) => {
+                tokio::select! {
+                    _ = self.tick.tick() => return,
+                    ev = watch.recv() => ev.is_none(),
+                }
+            }
+            // No watch at the moment: the tick alone drives the passes.
+            None => {
+                self.tick.tick().await;
+                true
+            }
+        };
+        if !closed {
+            return; // a real change
+        }
+        if self.watch.is_some() {
+            warn!(
+                resource = T::RESOURCE,
+                "watch closed, falling back to ticks"
+            );
+            self.watch = None;
+        }
+        match store.watch::<T>().await {
+            Ok(w) => {
+                info!(resource = T::RESOURCE, "watch re-established");
+                self.watch = Some(w);
+            }
+            Err(e) => {
+                warn!(
+                    resource = T::RESOURCE,
+                    error = format!("{e:#}"),
+                    "watch reconnect failed"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 
@@ -573,101 +660,5 @@ mod tests {
             serde_json::to_value(&back).unwrap(),
             serde_json::to_value(&expected).unwrap()
         );
-    }
-}
-
-/// Why a reconcile pass runs: a periodic tick, or something changed.
-///
-/// Level-triggered reconcilers do not act on events — they re-derive
-/// everything from the store every pass — so the watch is only ever a reason
-/// to run one sooner than the tick would. That makes losing it survivable
-/// rather than fatal, and this is where that is arranged: the initial watch is
-/// retried until it takes, a closed stream is re-established on the next wake,
-/// and the tick carries the reconciler in the meantime.
-///
-/// Both tiers ran this loop, identically, thirty-odd lines each. What is
-/// generic about it is `T` — the object type the watch decodes — which is the
-/// same parameter `EtcdStore::watch` already takes, so nothing here is a
-/// contortion to make two things one.
-pub struct PassTrigger<T: Resource> {
-    watch: Option<tokio::sync::mpsc::Receiver<(WatchEvent, String, Option<T>)>>,
-    tick: tokio::time::Interval,
-}
-
-impl<T: Resource> PassTrigger<T> {
-    /// Retries the initial watch until it takes: a controller that starts
-    /// while etcd is still coming up should end up watching, not end up
-    /// ticking forever.
-    pub async fn new(store: &EtcdStore, period: Duration) -> Self {
-        let watch = loop {
-            match store.watch::<T>().await {
-                Ok(w) => break w,
-                Err(e) => {
-                    warn!(
-                        resource = T::RESOURCE,
-                        error = format!("{e:#}"),
-                        "watch failed, retrying"
-                    );
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
-        };
-        let mut tick = tokio::time::interval(period);
-        // Delay, not Burst: a pass that overran its period must not be
-        // followed by a flurry of catch-up passes over the same objects.
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        Self {
-            watch: Some(watch),
-            tick,
-        }
-    }
-
-    /// Wait for the next reason to run a pass. Returns when the tick fires or
-    /// the store says something changed; a watch that closed is re-opened
-    /// here, and until it is, the tick is what keeps the reconciler running.
-    /// This never waits twice: every path here is a reason to run a pass, and
-    /// a reconnect that failed is one too. Looping until the watch came back
-    /// would swallow the tick that woke us and leave the reconciler making no
-    /// passes at all for as long as the store stays unreachable — the opposite
-    /// of what the tick is for, and exactly when a level-triggered pass is
-    /// worth the most. A failed reconnect costs nothing extra either: the next
-    /// call finds `watch: None` and waits for a tick before trying again.
-    pub async fn wait(&mut self, store: &EtcdStore) {
-        let closed = match &mut self.watch {
-            Some(watch) => {
-                tokio::select! {
-                    _ = self.tick.tick() => return,
-                    ev = watch.recv() => ev.is_none(),
-                }
-            }
-            // No watch at the moment: the tick alone drives the passes.
-            None => {
-                self.tick.tick().await;
-                true
-            }
-        };
-        if !closed {
-            return; // a real change
-        }
-        if self.watch.is_some() {
-            warn!(
-                resource = T::RESOURCE,
-                "watch closed, falling back to ticks"
-            );
-            self.watch = None;
-        }
-        match store.watch::<T>().await {
-            Ok(w) => {
-                info!(resource = T::RESOURCE, "watch re-established");
-                self.watch = Some(w);
-            }
-            Err(e) => {
-                warn!(
-                    resource = T::RESOURCE,
-                    error = format!("{e:#}"),
-                    "watch reconnect failed"
-                );
-            }
-        }
     }
 }

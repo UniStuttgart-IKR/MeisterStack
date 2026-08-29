@@ -9,7 +9,6 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use macros::generated;
 use serde::{Deserialize, Serialize};
 
 use crate::object::{Metadata, Object, Resource};
@@ -27,7 +26,6 @@ macro_rules! resources {
     ($( $(#[$about:meta])* $ty:ty => $resource:literal, $kind:literal; )*) => {
         $(
             $(#[$about])*
-            #[generated(model = ClaudeOpus, version = "5")]
             impl Resource for $ty {
                 const RESOURCE: &'static str = $resource;
                 const KIND: &'static str = $kind;
@@ -84,7 +82,6 @@ pub const MANAGED_BY_CLOUD: &str = "cloud";
 pub const LABEL_CLOUD_UID: &str = "meister.io/cloud-uid";
 
 /// The agent's Desired vocabulary, 1:1. Absent happens through DELETE.
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunStrategy {
     #[default]
@@ -105,7 +102,6 @@ impl RunStrategy {
     ];
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VmPhase {
     #[default]
@@ -118,7 +114,6 @@ pub enum VmPhase {
     Quarantined,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl VmPhase {
     /// Every variant, in declaration order — see `RunStrategy::ALL`.
     pub const ALL: [VmPhase; 7] = [
@@ -170,7 +165,6 @@ impl VmPhase {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmSpec {
@@ -227,7 +221,6 @@ pub struct VmSpec {
 /// writes an anti-affinity term and forgets the flag meant to keep two
 /// replicas apart, and a preference that silently was not one is a failure
 /// nobody sees until the machine it was guarding against goes down.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AntiAffinity {
@@ -247,7 +240,6 @@ fn required_default() -> bool {
     true
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VmStatus {
@@ -283,7 +275,6 @@ pub type Vm = Object<VmSpec, VmStatus>;
 /// the way uid and status are: a client that could write them could make its
 /// own VM unremovable, or take the mark off one that really does belong to the
 /// cloud.
-#[generated(model = ClaudeOpus, version = "5")]
 impl Metadata {
     pub fn managed_by_cloud(&self) -> bool {
         self.labels.get(LABEL_MANAGED_BY).map(String::as_str) == Some(MANAGED_BY_CLOUD)
@@ -320,7 +311,6 @@ impl Metadata {
 /// one of them was a place where a resource could be created wearing another
 /// resource's kind. A VM keeps a constructor of its own because it is more
 /// than an envelope — see `new_vm`.
-#[generated(model = ClaudeOpus, version = "5")]
 impl<S, St: Default> Object<S, St>
 where
     Self: Resource,
@@ -342,7 +332,6 @@ pub fn new_vm(name: &str, spec: VmSpec) -> Vm {
 /// A node is an agent the cluster knows about. The object is created on the
 /// first Hello and outlives the session: spec is what an operator decided,
 /// status is what the agent last reported (§2 of the design).
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeSpec {
@@ -367,7 +356,6 @@ impl Default for NodeSpec {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeCapacity {
@@ -388,7 +376,6 @@ pub struct NodeCapacity {
     pub capabilities: Vec<String>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeStatus {
@@ -412,7 +399,6 @@ pub type Node = Object<NodeSpec, NodeStatus>;
 /// a Node one tier down. The object appears on the first Hello and outlives
 /// the session, because a cluster that is down has to stay listed as not
 /// connected, with the capacity it last had.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterSpec {
@@ -437,7 +423,6 @@ impl Default for ClusterSpec {
 /// Deliberately coarse: the cloud places a VM on a *cluster*, and which node
 /// inside it ends up carrying the VM is the cluster's decision — an aggregate
 /// this far away is not something to second-guess a scheduler with.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterCapacity {
@@ -456,7 +441,6 @@ pub struct ClusterCapacity {
     pub capabilities: Vec<String>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterStatus {
@@ -484,7 +468,6 @@ pub type Cluster = Object<ClusterSpec, ClusterStatus>;
 /// already tells raw from qcow2 by itself; carrying it here is for the operator
 /// reading `image ls` and for the storage backends that will need it to decide
 /// between a copy and a clone.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageFormat {
@@ -500,7 +483,6 @@ pub enum ImageFormat {
 /// the bytes already are (a path on shared storage, later a URL); no blob ever
 /// travels through the control plane, and `status.availableOn` stays empty
 /// until the shared-storage track has something true to write there.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageSpec {
@@ -547,7 +529,6 @@ fn is_false(b: &bool) -> bool {
 /// entry over storage somebody else already filled, and this control plane
 /// has never claimed to check it. A URL image starts `Pending` — nobody has
 /// fetched it yet — and moves when a node says what happened.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImagePhase {
     #[default]
@@ -556,7 +537,6 @@ pub enum ImagePhase {
     Failed,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl ImagePhase {
     pub const ALL: [ImagePhase; 3] = [ImagePhase::Pending, ImagePhase::Ready, ImagePhase::Failed];
 
@@ -577,7 +557,6 @@ impl ImagePhase {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageStatus {
@@ -601,7 +580,6 @@ pub type Image = Object<ImageSpec, ImageStatus>;
 /// The distinction earns its place: a dashboard and a person both want "show
 /// me what went wrong" to be one filter rather than a list of reasons somebody
 /// has to keep up to date.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
     #[default]
@@ -638,7 +616,6 @@ impl EventType {
 ///   every call site: the reconcilers are level-triggered and re-derive
 ///   everything every few seconds, so an event per pass would be a store
 ///   filling at one write per VM per tick.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventSpec {
@@ -686,7 +663,6 @@ pub type Event = Object<EventSpec, ()>;
 /// image belong to. It is also the unit a NETWORK belongs to: every tenant
 /// carries a VXLAN network identifier, and that number is what makes the
 /// isolation real rather than a label on an object.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TenantSpec {
@@ -722,7 +698,6 @@ pub struct TenantSpec {
 /// middleware already says it, because `tenants` is not among the resources a
 /// member may write (`auth::TENANT_SCOPED`), so a member raising their own
 /// ceiling never reaches a handler at all.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TenantQuota {
@@ -734,7 +709,6 @@ pub struct TenantQuota {
     pub max_mem_mib: Option<u64>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl TenantQuota {
     /// No ceiling of any kind — the shape every tenant had before this
     /// existed, and the one that is not serialised at all.
@@ -749,7 +723,6 @@ impl TenantQuota {
 /// free capacity is: both halves are objects the server already has, and a
 /// second copy in etcd would be a number that can be wrong — here in the
 /// direction that lets a tenant past its own ceiling.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TenantUsage {
@@ -767,7 +740,6 @@ pub struct TenantUsage {
 /// computable while VMs were not tenant-bound; they are now. Nothing writes
 /// this to the store — a `Tenant` read back out of etcd carries zeros, and
 /// the API is what puts the truth in it.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TenantStatus {
@@ -807,7 +779,6 @@ pub const DEFAULT_QUOTA_PUBLIC: u32 = 0;
 /// a lab's private range is one. Each entry is a CIDR, a single address or an
 /// `a-b` range — `common::net::Ipv4Ranges` is the parser, shared with the node
 /// that has to guard the same addresses.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FloatingPoolSpec {
@@ -834,7 +805,6 @@ pub struct FloatingPoolSpec {
     pub description: String,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl FloatingPoolSpec {
     /// What this tenant may hold here: the named ceiling, or the default the
     /// pool's kind implies.
@@ -850,7 +820,6 @@ impl FloatingPoolSpec {
 /// Empty, and honestly so: how many addresses are left is a question about
 /// the reservations, which are their own objects and are counted when asked.
 /// A number cached here would be a number that is wrong after every create.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FloatingPoolStatus {}
 
@@ -866,7 +835,6 @@ pub type FloatingPool = Object<FloatingPoolSpec, FloatingPoolStatus>;
 /// assign 10.255.0.7 --vm web`), and it is the only name under which two
 /// racing allocators can collide — which turns the store's own create into
 /// the compare-and-swap the allocation needs. See `floating::allocate`.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FloatingIpSpec {
@@ -897,7 +865,6 @@ pub struct FloatingIpSpec {
     pub vm: Option<String>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FloatingIpStatus {}
 
@@ -915,7 +882,6 @@ pub type FloatingIp = Object<FloatingIpSpec, FloatingIpStatus>;
 /// It also completes the anti-spoofing. A tenant whose address space is
 /// UNKNOWN can only be told "not out of the floating pool"; a tenant whose
 /// address space is written down here can be told "these and nothing else".
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutedSubnetSpec {
@@ -941,7 +907,6 @@ pub struct RoutedSubnetSpec {
 /// pool holds 256 tenants' worth of them.
 pub const DEFAULT_ROUTED_PREFIX_LEN: u32 = 24;
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RoutedSubnetStatus {}
 
@@ -972,7 +937,6 @@ pub type RoutedSubnet = Object<RoutedSubnetSpec, RoutedSubnetStatus>;
 /// Empty `nodes` means every node — the compatibility direction, and the one a
 /// single-machine lab wants: a pool nobody restricted is a pool the scheduler
 /// does not use to narrow anything.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoragePoolSpec {
@@ -1012,7 +976,6 @@ pub struct StoragePoolSpec {
 /// and an admin who wants a ticket per volume sets the number to zero.
 pub const DEFAULT_QUOTA_STORAGE_GIB: u64 = 100;
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl StoragePoolSpec {
     /// What this tenant may hold here: the named ceiling, or the default.
     pub fn quota_for(&self, tenant: &str) -> u64 {
@@ -1032,7 +995,6 @@ impl StoragePoolSpec {
 /// Empty, and honestly so: how much room is left is a question about the
 /// volumes, which are their own objects and are counted when asked. A number
 /// cached here would be a number that is wrong after every create.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StoragePoolStatus {}
 
@@ -1048,7 +1010,6 @@ pub type StoragePool = Object<StoragePoolSpec, StoragePoolStatus>;
 /// mounts it by tag. Naming it on the object is what stops "attach this
 /// volume" from being a sentence whose meaning depends on which backend
 /// happened to serve it.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum VolumeMode {
@@ -1060,7 +1021,6 @@ pub enum VolumeMode {
     Filesystem,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl VolumeMode {
     pub const ALL: [VolumeMode; 2] = [VolumeMode::Block, VolumeMode::Filesystem];
 
@@ -1078,7 +1038,6 @@ impl VolumeMode {
 /// needs reference counting at detach — without it the one VM that stops tears
 /// the device out from under the other — and a field with one variant is what
 /// says the second one was considered and refused, rather than forgotten.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AccessMode {
@@ -1090,7 +1049,6 @@ pub enum AccessMode {
 /// Where a volume is in its own life. Its OWN phase, and that is the whole
 /// point of the object: a volume is Ready with no VM anywhere near it, and a
 /// VM being torn down does not move it.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum VolumePhase {
@@ -1108,7 +1066,6 @@ pub enum VolumePhase {
     Failed,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl VolumePhase {
     pub const ALL: [VolumePhase; 5] = [
         VolumePhase::Pending,
@@ -1139,7 +1096,6 @@ impl VolumePhase {
 /// volume entry says is about a disk that is made for one VM and unmade with
 /// it; this says the same things about something that exists on its own, and
 /// the difference is entirely in who deletes it.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeSpec {
@@ -1176,7 +1132,6 @@ fn is_block_mode(mode: &VolumeMode) -> bool {
 }
 
 /// What the control plane observed about a volume.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeStatus {
@@ -1248,7 +1203,6 @@ pub type Volume = Object<VolumeSpec, VolumeStatus>;
 /// certificate says who somebody is, this says what they may do and whose
 /// tenant they are in, and the two are kept apart so that a role change is an
 /// edit rather than a re-issue.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserSpec {
@@ -1266,7 +1220,6 @@ pub struct UserSpec {
 /// credentials are out there for a name and when they die, which is exactly
 /// what a fingerprint answers and exactly what storing the PEM would add
 /// nothing to.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssuedCertificate {
@@ -1282,7 +1235,6 @@ pub struct IssuedCertificate {
     pub request: String,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserStatus {
@@ -1318,7 +1270,6 @@ pub const SIGNER_USER_CLIENT: &str = "meister.io/user-client";
 /// No REST route serves it. It is not something anybody creates, lists or
 /// edits, and a counter an operator could PUT is a counter two tenants can be
 /// given the same value from.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CounterSpec {
@@ -1326,7 +1277,6 @@ pub struct CounterSpec {
     pub next: u32,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CounterStatus {}
 
@@ -1336,7 +1286,6 @@ pub type Counter = Object<CounterSpec, CounterStatus>;
 /// flow: the client keeps its key and sends a CSR, somebody with the right to
 /// approve says yes, and the signer turns the approved request into a
 /// certificate the client then collects.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CsrSpec {
@@ -1354,7 +1303,6 @@ fn default_signer() -> String {
     SIGNER_USER_CLIENT.to_string()
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CsrConditionType {
     Approved,
@@ -1362,7 +1310,6 @@ pub enum CsrConditionType {
     Failed,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CsrCondition {
@@ -1380,7 +1327,6 @@ pub struct CsrCondition {
     pub by: String,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CsrStatus {
@@ -1392,7 +1338,6 @@ pub struct CsrStatus {
     pub certificate: Option<String>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl CsrStatus {
     pub fn has(&self, kind: CsrConditionType) -> bool {
         self.conditions.iter().any(|c| c.kind == kind)
@@ -1441,7 +1386,6 @@ impl CsrStatus {
 pub type CertificateSigningRequest = Object<CsrSpec, CsrStatus>;
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

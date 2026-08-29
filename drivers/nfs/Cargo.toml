@@ -9,7 +9,6 @@ authors.workspace = true
 agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
 backend = { package = "meister-backend", path = "../backend" }
 filesystem-driver = { package = "meister-filesystem-driver", path = "../filesystem" }
-macros = { package = "meister-macros", path = "../../shared/macros" }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

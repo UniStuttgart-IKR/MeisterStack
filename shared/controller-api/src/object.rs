@@ -9,10 +9,8 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use macros::generated;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Metadata {
@@ -39,7 +37,6 @@ pub struct Metadata {
     pub finalizers: Vec<String>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Object<S, St> {
@@ -51,7 +48,6 @@ pub struct Object<S, St> {
     pub status: St,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl<S, St: Default> Object<S, St> {
     pub fn new(api_version: &str, kind: &str, name: &str, spec: S) -> Self {
         Self {

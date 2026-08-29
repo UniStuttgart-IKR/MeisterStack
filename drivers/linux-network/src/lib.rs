@@ -74,7 +74,6 @@ use futures::TryStreamExt;
 use std::net::Ipv4Addr;
 
 use agent_api::networking::{self, BridgeDriver, NetworkError, Nic, NicDriver, NicId, NicSpec};
-use macros::generated;
 use rtnetlink::{LinkBridge, LinkUnspec, LinkVxlan};
 use tracing::{debug, info, instrument};
 
@@ -161,7 +160,6 @@ pub fn overlay_device(vni: u32) -> String {
 /// kernel's and not this driver's, and a node meeting it should say so at the
 /// first VM rather than fail inside a netlink call with `ENAMETOOLONG` and no
 /// hint which name was too long.
-#[generated(model = ClaudeOpus, version = "5")]
 fn check_overlay_name(vni: u32) -> networking::Result<()> {
     let name = overlay_bridge(vni);
     if name.len() >= libc::IFNAMSIZ {
@@ -188,7 +186,6 @@ pub fn multicast_group(vni: u32) -> Ipv4Addr {
     Ipv4Addr::new(239, b1, b2, b3)
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 mod tun {
     use std::os::fd::AsRawFd;
     nix::ioctl_write_ptr_bad!(
@@ -238,7 +235,6 @@ pub struct LinuxNetworkDriver {
     guarded: common::net::Ipv4Ranges,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl LinuxNetworkDriver {
     pub fn new() -> networking::Result<Self> {
         Self::build(
@@ -350,7 +346,6 @@ impl LinuxNetworkDriver {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[async_trait::async_trait]
 impl BridgeDriver for LinuxNetworkDriver {
     #[instrument(skip_all, fields(bridge = %name))]
@@ -428,7 +423,6 @@ impl BridgeDriver for LinuxNetworkDriver {
     /// of being wrong is a VM that boots into a bridge somebody just deleted.
     /// Two idle links per tenant per node is the price; a GC pass driven by
     /// the reconciler is the documented way to stop paying it.
-    #[generated(model = ClaudeOpus, version = "5")]
     #[instrument(skip_all, fields(vni, uplink = tracing::field::Empty))]
     async fn ensure_overlay(&self, vni: u32) -> networking::Result<String> {
         let Some(cfg) = &self.vxlan else {
@@ -534,7 +528,6 @@ impl BridgeDriver for LinuxNetworkDriver {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[async_trait::async_trait]
 impl NicDriver for LinuxNetworkDriver {
     #[instrument(skip_all, fields(nic_id = %id, bridge = tracing::field::Empty,
@@ -638,7 +631,6 @@ impl NicDriver for LinuxNetworkDriver {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use agent_api::types::mac_addr::MacAddr;

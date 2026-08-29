@@ -10,7 +10,6 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
-use macros::generated;
 use tokio::net::UnixStream;
 
 use crate::config::{Credential, Target};
@@ -29,7 +28,6 @@ pub enum Transport {
     },
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn transport_for(endpoint: &str) -> Result<Transport> {
     if let Some(path) = endpoint.strip_prefix("unix://") {
         if path.is_empty() {
@@ -92,7 +90,6 @@ impl Client {
     /// nothing would; and an https endpoint with no CA would fall back to the
     /// system trust store, which a lab CA is not in, turning a config mistake
     /// into an opaque handshake failure.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub fn new(target: &Target) -> Result<Self> {
         let transport = transport_for(&target.endpoint)?;
         let tls_endpoint = matches!(transport, Transport::Https { .. });
@@ -167,7 +164,6 @@ impl Client {
     /// a controller retries on [`is_conflict`]; one that does not, does not.
     /// `subject` names the object the way an operator does, for the error
     /// when it turns out to have no spec at all.
-    #[generated(model = ClaudeOpus, version = "5")]
     pub async fn patch_spec(
         &self,
         path: &str,
@@ -197,7 +193,6 @@ impl Client {
 /// last pair goes — an empty map and no map mean the same thing to the
 /// scheduler, and leaving `"labels": {}` behind makes a diff look like a
 /// change that is not one.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn edit_labels(
     spec: &mut serde_json::Map<String, serde_json::Value>,
     set: &[String],
@@ -227,7 +222,6 @@ pub fn edit_labels(
 }
 
 impl Client {
-    #[generated(model = ClaudeFable, version = "5")]
     pub async fn request(
         &self,
         method: Method,
@@ -377,7 +371,6 @@ pub fn is_conflict(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<Conflict>())
 }
 
-#[generated(model = ClaudeOpus, version = "4.8")]
 fn describe_error(status: StatusCode, body: &Bytes, path: &str) -> String {
     #[derive(serde::Deserialize)]
     struct ErrBody {
@@ -391,7 +384,6 @@ fn describe_error(status: StatusCode, body: &Bytes, path: &str) -> String {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

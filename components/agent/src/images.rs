@@ -49,7 +49,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
-use macros::generated;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, instrument};
@@ -60,7 +59,6 @@ use tracing::{debug, info, instrument};
 /// of this — it is a different thing, one where somebody else chooses what
 /// this node boots — and the create edge refuses it before it can get here.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[generated(model = ClaudeOpus, version = "5")]
 pub struct Source {
     /// The catalogue name: what `base_image` says and what the volume drivers
     /// look up under their own image_dir.
@@ -73,7 +71,6 @@ pub struct Source {
 /// What this node has learned about an image, and what it tells the
 /// controller.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[generated(model = ClaudeOpus, version = "5")]
 pub enum State {
     /// The bytes are here and they hash to what the spec said.
     Ready,
@@ -108,7 +105,6 @@ impl State {
 /// time each image is used again. A `Failed` is forgotten by a restart, which
 /// is right — a checksum that did not match yesterday is worth trying once
 /// more, and if it still does not match it is said again immediately.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Default)]
 pub struct Cache {
     dir: PathBuf,
@@ -119,7 +115,6 @@ pub struct Cache {
 /// the hard link into place stays within one filesystem.
 const CACHE_DIR: &str = ".cache";
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Cache {
     pub fn new(image_dir: PathBuf) -> Self {
         Self {
@@ -295,7 +290,6 @@ impl Cache {
 /// Not tidiness: the digest names the cache entry, so a value with a slash in
 /// it would write outside the cache directory, and one in the wrong case
 /// would never match what was computed and would re-download for ever.
-#[generated(model = ClaudeOpus, version = "5")]
 fn check_digest(sha256: &str) -> Result<()> {
     if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("sha256 {sha256:?} is not 64 hex characters");
@@ -319,7 +313,6 @@ fn check_digest(sha256: &str) -> Result<()> {
 /// is running VMs. `curl` is in the agent's PATH list for the same reason
 /// those four are (nix/agent.nix), and its absence is a named error at the
 /// point of use.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn fetch(url: &str, into: &Path) -> Result<String> {
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
@@ -382,7 +375,6 @@ async fn fetch(url: &str, into: &Path) -> Result<String> {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

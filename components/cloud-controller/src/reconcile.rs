@@ -34,7 +34,6 @@ use controller_api::{
     PendingTally, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhase, heartbeat_expired,
     lifecycle_command,
 };
-use macros::generated;
 use proto::cloud_command;
 use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
@@ -72,7 +71,6 @@ const TICK: Duration = Duration::from_secs(5);
 /// cluster is dialled into no replica at all is reconciled by nobody, a
 /// deleting one included, which waits until the cluster comes back — tearing a
 /// VM down is something only its cluster can do.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn may_reconcile(vm: &Vm, sessions: &HashSet<String>) -> bool {
     match vm.spec.cluster_name.as_deref() {
         Some(cluster) => sessions.contains(cluster),
@@ -80,7 +78,6 @@ pub fn may_reconcile(vm: &Vm, sessions: &HashSet<String>) -> bool {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn run(
     store: Arc<EtcdStore>,
     registry: Arc<SessionRegistry>,
@@ -107,7 +104,6 @@ pub async fn run(
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn pass(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -149,7 +145,6 @@ async fn pass(
 
 /// One event about a VM. The tenant travels with it, so a member sees its
 /// own VMs' history and nobody else's.
-#[generated(model = ClaudeOpus, version = "5")]
 fn about<'a>(vm: &'a Vm, reason: &'a str, message: String, kind: EventType) -> Happening<'a> {
     Happening {
         kind: Vm::KIND,
@@ -172,7 +167,6 @@ fn about<'a>(vm: &'a Vm, reason: &'a str, message: String, kind: EventType) -> H
 /// this prevents is the coarse mistake: handing a cluster more than it has at
 /// all, and then watching every one of those VMs sit Pending down there with
 /// nobody up here able to see why.
-#[generated(model = ClaudeOpus, version = "5")]
 fn free_on(
     cluster: &str,
     capacity: &controller_api::ClusterCapacity,
@@ -195,7 +189,6 @@ fn free_on(
 
 /// The label sets of the VMs already bound to `on` — what anti-affinity is
 /// measured against. Every phase counts, exactly as `free_on` counts them.
-#[generated(model = ClaudeOpus, version = "5")]
 fn hosted_on(
     on: &str,
     vms: &[Vm],
@@ -211,7 +204,6 @@ fn hosted_on(
 /// phase every time, zero included — see the cluster tier's twin: a phase
 /// that stops being written looks exactly like a controller that stopped
 /// reporting.
-#[generated(model = ClaudeOpus, version = "5")]
 fn publish_vm_gauges(vms: &[Vm]) {
     telemetry::metrics::objects().set_count(Vm::KIND, vms.len() as i64);
     for phase in VmPhase::ALL {
@@ -230,7 +222,6 @@ fn publish_vm_gauges(vms: &[Vm]) {
 /// reaching it at once cost one redundant write. `connected` in the candidate
 /// stays strictly local, though: a cluster dialled in *somewhere* is still not
 /// one this replica can send anything to.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn expire_and_collect_clusters(
     store: &EtcdStore,
     sessions: &HashSet<String>,
@@ -303,7 +294,6 @@ async fn expire_and_collect_clusters(
     Ok(out)
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 /// Same shape as one tier down: the trace is on the object, and the span gets
 /// its parent before it starts (`telemetry::in_trace`).
 ///
@@ -517,7 +507,6 @@ async fn reconcile_vm_traced(
 /// Hand the VM to its cluster. Create is idempotent by uid down there, so this
 /// is equally the first handover, the repair after a cluster lost the object,
 /// and the way a changed runStrategy reaches the tier that can act on it.
-#[generated(model = ClaudeOpus, version = "5")]
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_create(
     store: &EtcdStore,
@@ -593,7 +582,6 @@ async fn dispatch_create(
 /// it out. The proof is the VM leaving the cluster's status, and only then may
 /// the cloud object go: an object deleted early is a VM nobody is left to
 /// delete.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn teardown(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -665,7 +653,6 @@ async fn teardown(
 /// watch, and the pass comes round again) or delete the record of a machine
 /// that is very much alive. The floor is the delete request and the last ack,
 /// whichever is later, because those are the two things we did.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn status_is_current(vm: &Vm, reported_at: DateTime<Utc>) -> bool {
     match vm.metadata.deletion_timestamp.max(vm.status.observed_at) {
         // Not-older rather than strictly-younger: a status the mirror already
@@ -689,7 +676,6 @@ pub fn status_is_current(vm: &Vm, reported_at: DateTime<Utc>) -> bool {
 /// and not a failed dispatch: refusing to hand the VM down would leave it
 /// stuck at the cloud with no way back, and the honest degradation is the
 /// same one an old tenant gets.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn tenant_vni(store: &EtcdStore, tenant: Option<&str>) -> anyhow::Result<Option<u32>> {
     let Some(tenant) = tenant.filter(|t| !t.is_empty()) else {
         return Ok(None);
@@ -714,7 +700,6 @@ async fn tenant_vni(store: &EtcdStore, tenant: Option<&str>) -> anyhow::Result<O
 /// entries happens at the cluster, and no tier below this one has to know what
 /// a tenant is. A VM with no tenant holds nothing — a reservation belongs to a
 /// tenant by definition, so an unscoped VM has no way to be given one.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Default)]
 struct Addresses {
     floating_ips: Vec<String>,
@@ -738,13 +723,11 @@ struct Addresses {
 ///
 /// Filled lazily (see `pass`), which is what keeps the common case free: a
 /// pass that dispatches nothing still reads nothing.
-#[generated(model = ClaudeOpus, version = "5")]
 struct AddressBook {
     reservations: Vec<controller_api::FloatingIp>,
     subnets: Vec<controller_api::RoutedSubnet>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl AddressBook {
     /// Through the two readers that refuse to answer from a partial list —
     /// an undecodable object here is an address handed to the wrong VM.
@@ -800,7 +783,6 @@ impl AddressBook {
 /// The tenant DOES travel, and is not a binding: it is what the VM is, the
 /// tier below records it so `cluster vm ls` can say whose a VM is, and the
 /// VNI that comes with it on the same message is what the cluster injects.
-#[generated(model = ClaudeOpus, version = "5")]
 pub(crate) fn build_spec_json(vm: &Vm) -> anyhow::Result<String> {
     if !vm.spec.vm.is_object() {
         bail!("spec.vm must be a JSON object");
@@ -818,7 +800,6 @@ pub(crate) fn build_spec_json(vm: &Vm) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use controller_api::{VmSpec, resources::new_vm};

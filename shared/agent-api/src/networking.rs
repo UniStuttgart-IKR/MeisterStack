@@ -2,8 +2,6 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-use macros::generated;
-
 use crate::types::mac_addr::MacAddr;
 use uuid::Uuid;
 
@@ -133,10 +131,8 @@ pub trait BridgeDriver: Send + Sync {
 /// `Drivers` are upcasts of the same pointer, which is what they always held;
 /// before this they were two `Arc::clone`s of a concrete type, at the one
 /// call site that still knew which type it was.
-#[generated(model = ClaudeOpus, version = "5")]
 pub trait NetworkDriver: NicDriver + BridgeDriver {}
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl<T: NicDriver + BridgeDriver + ?Sized> NetworkDriver for T {}
 
 /// Something that tells the outside world which addresses live on this node.

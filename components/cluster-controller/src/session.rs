@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use chrono::Utc;
-use macros::generated;
 use proto::control_plane_server::{ControlPlane, ControlPlaneServer};
 use proto::{
     AgentMessage, Command, ControllerMessage, DriverInfo, Hello, StatusReport, agent_message,
@@ -55,11 +54,9 @@ type CommandTx = mpsc::Sender<Result<ControllerMessage, Status>>;
 /// would be a number nobody recomputed. Failed wins over Ready where two
 /// nodes disagree — a checksum that did not match is a fact about the bytes,
 /// not about the node that read them.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Default)]
 pub struct ImageView(std::sync::Mutex<HashMap<String, (String, String)>>);
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl ImageView {
     /// Take in one node's opinions.
     pub fn observe(&self, reports: &[proto::ImageStateReport]) {
@@ -107,14 +104,12 @@ pub struct SessionRegistry {
     pub images: ImageView,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl Default for SessionRegistry {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl SessionRegistry {
     pub fn new() -> Self {
         Self {
@@ -135,7 +130,6 @@ impl SessionRegistry {
     /// speaking through the new stream, and commands sent down the old one
     /// would go to a channel nobody reads. The old session's own unwinding
     /// cannot undo this — see `disconnect`.
-    #[generated(model = ClaudeOpus, version = "5")]
     fn register(&self, node_id: &str, tx: &CommandTx) {
         self.nodes
             .lock()
@@ -146,7 +140,6 @@ impl SessionRegistry {
     /// Drop this session's entry — but only if it is still the current one. A
     /// quickly restarting agent registers its new session before the old
     /// stream finishes unwinding, and that newer session must survive.
-    #[generated(model = ClaudeOpus, version = "5")]
     fn disconnect(&self, node_id: &str, tx: &CommandTx) -> bool {
         let mut nodes = self.nodes.lock().unwrap();
         match nodes.get(node_id) {
@@ -210,7 +203,6 @@ impl SessionRegistry {
 /// The spelling itself is `common::capability::entry` — the same function
 /// FirstFit matches against one tier up, so what a node claims and what a
 /// scheduler looks for cannot be worded differently.
-#[generated(model = ClaudeOpus, version = "5")]
 fn capacity_profiles(drivers: &[DriverInfo]) -> Vec<String> {
     drivers
         .iter()
@@ -231,7 +223,6 @@ fn capacity_profiles(drivers: &[DriverInfo]) -> Vec<String> {
 /// Hello: the node exists from now on, with what it just told us about
 /// itself. Creating on first sight is what makes the inventory survive the
 /// agent — a node that is down is NotReady, not absent.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn ingest_hello(store: &EtcdStore, hello: &Hello) -> anyhow::Result<()> {
     let name = hello.node_id.as_str();
     let profiles = capacity_profiles(&hello.drivers);
@@ -270,7 +261,6 @@ async fn ingest_hello(store: &EtcdStore, hello: &Hello) -> anyhow::Result<()> {
 /// object in it would order the teardown of a VM that is merely unreadable
 /// here. Failing to build one costs the reconnect sweep and nothing else;
 /// sending half of one costs somebody's VM.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn desired_snapshot(
     store: &EtcdStore,
     node_id: &str,
@@ -320,14 +310,12 @@ async fn desired_snapshot(
 /// and costs a node that really does run VMs of its own exactly what it cost
 /// before. Everything else a slightly old entry says is corrected by the
 /// write, which is a read-modify-write against the live object.
-#[generated(model = ClaudeOpus, version = "5")]
 #[derive(Default)]
 pub struct VmIndex {
     /// When it was read, and what was read. `None` = never.
     cached: Mutex<Option<(Instant, Arc<Vec<Vm>>)>>,
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 impl VmIndex {
     /// The list, and whether it was read just now. `false` means it came from
     /// the last read and may be behind by up to `VM_INDEX_TTL`.
@@ -367,14 +355,12 @@ impl VmIndex {
 /// Whether every uid in the report is one this list can name. False is the
 /// only thing that makes a reused list worse than a fresh one, so it is the
 /// only thing worth re-reading for.
-#[generated(model = ClaudeOpus, version = "5")]
 fn all_known(vms: &[Vm], reported: &[proto::VmStatusReport]) -> bool {
     let uids: HashSet<&str> = vms.iter().map(|v| v.metadata.uid.as_str()).collect();
     reported.iter().all(|line| uids.contains(line.id.as_str()))
 }
 
 /// A status report is the node's heartbeat and the phase of every VM on it.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn ingest_status(
     store: &EtcdStore,
     index: &VmIndex,
@@ -525,7 +511,6 @@ pub struct ControlPlaneService {
     vms: Arc<VmIndex>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 #[tonic::async_trait]
 impl ControlPlane for ControlPlaneService {
     type SessionStream = ReceiverStream<Result<ControllerMessage, Status>>;
@@ -559,7 +544,6 @@ impl ControlPlane for ControlPlaneService {
 
 /// Everything one agent's session holds for as long as it lasts. `who` is
 /// settled before the first message and never re-read.
-#[generated(model = ClaudeOpus, version = "5")]
 struct Session {
     registry: Arc<SessionRegistry>,
     store: Arc<EtcdStore>,
@@ -572,7 +556,6 @@ struct Session {
 /// what kind of message it is, hand it to the step that answers it. The steps
 /// are below; what stays here is the loop and the one piece of state a
 /// session has — which node it turned out to be.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn pump(session: Session, mut inbound: Streaming<AgentMessage>) {
     let mut node_id: Option<String> = None;
     while let Some(msg) = inbound.next().await {
@@ -632,7 +615,6 @@ async fn pump(session: Session, mut inbound: Streaming<AgentMessage>) {
 /// The node exists, it is who it says it is, it has been told what it is
 /// supposed to be running, and from now on commands reach it. Returns the
 /// node id the rest of the session speaks for, or None to end the session.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn on_hello(session: &Session, hello: Hello) -> Option<String> {
     // The certificate said who dialled; the hello says which node it claims
     // to be. One node's key must not let it be told about another node's VMs.
@@ -687,7 +669,6 @@ async fn on_hello(session: &Session, hello: Hello) -> Option<String> {
 
 /// The reconnect sweep: one message that says everything this node should be
 /// running. False means the stream is gone.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn send_desired_state(store: &EtcdStore, tx: &CommandTx, node_id: &str) -> bool {
     let desired = match desired_snapshot(store, node_id).await {
         Ok(desired) => desired,
@@ -714,7 +695,6 @@ async fn send_desired_state(store: &EtcdStore, tx: &CommandTx, node_id: &str) ->
 
 /// The stream is over. Whether that means the node is down is a question
 /// about the registry, not about this stream.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn on_disconnect(session: &Session, node_id: &str) {
     // A reconnect that already replaced us keeps its own session and its own
     // readiness; only a real disconnect reports down. `same_channel` is what
@@ -738,7 +718,6 @@ async fn on_disconnect(session: &Session, node_id: &str) {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

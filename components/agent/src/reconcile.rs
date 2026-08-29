@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use macros::generated;
 use tokio::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 
@@ -74,7 +73,6 @@ pub enum Action {
     Teardown,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 pub fn plan(record: &VmRecord, obs: &Observed, now: SystemTime) -> Action {
     if record.operation.is_some() {
         return Action::Blocked;
@@ -158,7 +156,6 @@ pub fn plan(record: &VmRecord, obs: &Observed, now: SystemTime) -> Action {
 /// level-triggered and repeats it until the phase moves, and a repeat that
 /// re-armed the grace would push the hard stop out of reach forever. Leaving
 /// Stopped disarms — nothing else is waiting on that deadline.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn next_stop_deadline(
     from: Desired,
     armed: Option<SystemTime>,
@@ -179,7 +176,6 @@ pub fn next_stop_deadline(
 /// straight on the agent's unix socket, which are never in a snapshot and
 /// are not the controller's to reap. Records already on their way out are
 /// left to the pass that is removing them.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn sync_orphans<'a>(
     snapshot: &HashSet<VmId>,
     records: impl IntoIterator<Item = (VmId, &'a VmRecord)>,
@@ -201,7 +197,6 @@ pub fn sync_orphans<'a>(
 /// this walks both lists rather than each being matched on at the one place
 /// that asks. Attachments with no process behind them (passthrough, mdev, a
 /// file, a block device) contribute nothing and are never "dead".
-#[generated(model = ClaudeOpus, version = "5")]
 fn backend_pids(record: &VmRecord) -> impl Iterator<Item = u32> + '_ {
     record
         .devices
@@ -228,7 +223,6 @@ pub const BACKEND_DIED_REASON: &str = "backend process died while the vmm is run
 /// reconciler marks unhealthy and refuses to repair automatically. Shared
 /// between the marking in `reconcile` and the preview in `dry_run`, so
 /// `observe` shows the same decision a real pass would make.
-#[generated(model = ClaudeFable, version = "5")]
 pub fn backend_died_under_vmm(record: &VmRecord, obs: &Observed) -> bool {
     record.phase == Phase::Provisioned
         && matches!(record.desired, Desired::Running | Desired::Paused)
@@ -283,7 +277,6 @@ impl ReportedPhase {
 ///
 /// `Desired::Absent` is not a phase: those records are on their way out and
 /// the caller drops them from the report instead.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn report_status(
     record: &VmRecord,
     obs: &Observed,
@@ -333,7 +326,6 @@ pub fn report_status(
 ///
 /// Only `/32`s, ever. A routed subnet spans hosts and is nobody's to announce
 /// per node; see the module doc in `linux_network_driver::frr`.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn floating_prefixes<'a>(
     running: impl Iterator<Item = &'a VmRecord>,
 ) -> std::collections::BTreeSet<String> {
@@ -394,7 +386,6 @@ pub struct Reconciler {
     failures: Mutex<HashMap<VmId, FailureState>>,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl Reconciler {
     pub fn new(
         store: Arc<Store>,
@@ -665,7 +656,6 @@ impl Reconciler {
     ///
     /// `Ok(None)` means there is no such record — what that is worth is the
     /// caller's business (404 locally, a no-op for a destroy).
-    #[generated(model = ClaudeOpus, version = "5")]
     #[instrument(skip(self), fields(vm_id = %id, ?desired))]
     pub async fn set_desired(
         &self,
@@ -720,7 +710,6 @@ impl Reconciler {
     /// Every tracked VM as the controller should see it. Same observation
     /// and same unhealthy detection a real pass performs, nothing persisted —
     /// `dry_run` for the whole node, without the per-VM plumbing.
-    #[generated(model = ClaudeOpus, version = "5")]
     #[instrument(level = "debug", skip_all)]
     pub async fn report(&self) -> Result<Vec<VmReport>> {
         let mut out = Vec::new();
@@ -894,7 +883,6 @@ impl Reconciler {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeFable, version = "5")]
 mod tests {
     use super::*;
     use crate::types::{AgentVmSpec, BootSourceSpec, VmRecord};

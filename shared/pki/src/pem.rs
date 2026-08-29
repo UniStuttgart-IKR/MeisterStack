@@ -8,13 +8,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use macros::generated;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Every certificate in a PEM file, in file order — leaf first for a chain,
 /// one or more roots for a CA bundle.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
         .with_context(|| format!("reading certificates from {}", path.display()))?
@@ -33,7 +31,6 @@ pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 /// the one function in the crate that opens a secret, and a key the group can
 /// read is a key that has left the machine already. Same rule and same
 /// message as the CLI's credential loader.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     check_permissions(path)?;
     PrivateKeyDer::from_pem_file(path)
@@ -42,7 +39,6 @@ pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 
 /// Write a secret so that only its owner can read it, and never leave a
 /// readable window: created 0600 from the start rather than chmod'ed after.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn write_secret(path: &Path, contents: &str) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -64,7 +60,6 @@ pub fn write_secret(path: &Path, contents: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-#[generated(model = ClaudeOpus, version = "5")]
 fn check_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -90,7 +85,6 @@ fn check_permissions(_path: &Path) -> Result<()> {
 /// to the file that named it — so a controller's config and its `pki/`
 /// directory travel as one unit, exactly as the agent's config and its data
 /// directory do.
-#[generated(model = ClaudeOpus, version = "5")]
 pub fn resolve(base: Option<&Path>, path: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
@@ -102,7 +96,6 @@ pub fn resolve(base: Option<&Path>, path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

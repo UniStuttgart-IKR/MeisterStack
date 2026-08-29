@@ -18,7 +18,6 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use macros::generated;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -62,7 +61,6 @@ struct Condition {
 /// for the API.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-#[generated(model = ClaudeOpus, version = "5")]
 pub async fn run(
     config: &Config,
     target: &Target,
@@ -180,7 +178,6 @@ pub async fn run(
 /// A profile that names nothing yet gets `<config dir>/pki/<profile>.{key,crt}`
 /// and the fragment to paste, which is the same shape `tools/meister-ca`
 /// hands out.
-#[generated(model = ClaudeOpus, version = "5")]
 fn destination(
     config: &Config,
     target: &Target,
@@ -217,7 +214,6 @@ fn destination(
 
 /// The certificate, if this request has one — and an error rather than a wait
 /// if it never will.
-#[generated(model = ClaudeOpus, version = "5")]
 fn certificate(status: &Status) -> Result<Option<String>> {
     if let Some(denied) = status.conditions.iter().find(|c| c.kind == "Denied") {
         bail!(
@@ -242,7 +238,6 @@ fn certificate(status: &Status) -> Result<Option<String>> {
 
 /// Poll until somebody says yes, the request is denied, or the patience runs
 /// out. With the controller's `csr_auto_approve` this is never entered.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn wait_for_approval(client: &Client, name: &str, wait_secs: u64) -> Result<String> {
     if wait_secs == 0 {
         bail!(
@@ -269,7 +264,6 @@ async fn wait_for_approval(client: &Client, name: &str, wait_secs: u64) -> Resul
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
 

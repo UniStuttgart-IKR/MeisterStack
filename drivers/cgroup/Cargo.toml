@@ -7,6 +7,5 @@ authors.workspace = true
 
 [dependencies]
 agent-api = { package = "meister-agent-api", path = "../../shared/agent-api/" }
-macros = { package = "meister-macros", path = "../../shared/macros/" }
 libc = { workspace = true }
 tracing = { workspace = true }

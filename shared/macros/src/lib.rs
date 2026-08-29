@@ -2,10 +2,6 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-// shared/macros/src/lib.rs
-//
-// For the sake of the idea, this macro and the ../common/src/attribution.rs are completly vibe
-// coded. Let's see if this works.
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use syn::{
@@ -14,7 +10,7 @@ use syn::{
     parse_macro_input,
 };
 
-use meister_common::attribution::{AiModel, License};
+use meister_common::attribution::License;
 
 /// Attribution that is present but empty is attribution that says nothing,
 /// and the whole point of these attributes being macros rather than comments
@@ -45,76 +41,6 @@ fn validate_date(date: &LitStr) -> syn::Result<()> {
             "`date` must be in the format \"YYYY-MM\" or \"YYYY-MM-DD\"",
         ))
     }
-}
-
-struct GeneratedArgs {
-    model: Ident,
-    version: LitStr,
-    date: Option<LitStr>,
-}
-
-impl Parse for GeneratedArgs {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let (mut model, mut version, mut date) = (None, None, None);
-
-        while !input.is_empty() {
-            let key: Ident = input.parse()?;
-            input.parse::<Token![=]>()?;
-            match key.to_string().as_str() {
-                "model" => model = Some(input.parse()?),
-                "version" => version = Some(input.parse()?),
-                "date" => date = Some(input.parse()?),
-                other => {
-                    return Err(syn::Error::new(
-                        key.span(),
-                        format!("unkown argument `{other}`, expected: model, version, date"),
-                    ));
-                }
-            }
-            if input.peek(Token![,]) {
-                input.parse::<Token![,]>()?;
-            }
-        }
-
-        Ok(GeneratedArgs {
-            model: model
-                .ok_or_else(|| syn::Error::new(Span::call_site(), "`model` is required"))?,
-            version: version
-                .ok_or_else(|| syn::Error::new(Span::call_site(), "`version` is required"))?,
-            date,
-        })
-    }
-}
-
-#[proc_macro_attribute]
-pub fn generated(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as GeneratedArgs);
-
-    let model_name = args.model.to_string();
-    if AiModel::parse(&model_name).is_none() {
-        let known: Vec<_> = AiModel::names().collect();
-        return syn::Error::new(
-            args.model.span(),
-            format!(
-                "unknown model `{model_name}`. Known models: {}",
-                known.join(", ")
-            ),
-        )
-        .to_compile_error()
-        .into();
-    }
-
-    if let Err(e) = non_empty(&args.version, "version") {
-        return e.to_compile_error().into();
-    }
-
-    if let Some(date) = &args.date
-        && let Err(e) = validate_date(date)
-    {
-        return e.to_compile_error().into();
-    }
-
-    item
 }
 
 struct SourcedArgs {

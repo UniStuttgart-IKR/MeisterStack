@@ -22,7 +22,6 @@ use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tracing::{error, info, instrument, warn};
 
 use agent_api::VmId;
-use macros::generated;
 use proto::{
     AgentMessage, CommandResult, DriverInfo, Hello, NodeStatus, StatusReport, VmStatusReport,
     agent_message, command, command_result, control_plane_client::ControlPlaneClient,
@@ -96,7 +95,6 @@ pub struct Agent {
     node: NodeStatus,
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 impl Agent {
     /// Create is idempotent by id: the controller sends it once for a new VM
     /// and repeats the whole set as a SyncState on every reconnect.
@@ -366,7 +364,6 @@ impl Agent {
     /// other command gives for the same thing, so it is logged at the same
     /// level and repaired by the same SyncState. A vm that has simply printed
     /// nothing answers with an empty list.
-    #[generated(model = ClaudeOpus, version = "5")]
     fn handle_logs(&self, cmd: proto::FetchLogs) -> anyhow::Result<Vec<u8>> {
         let id: VmId = cmd.id.parse().context("invalid vm id")?;
         if self.store.get(&id)?.is_none() {
@@ -446,7 +443,6 @@ impl Agent {
     }
 }
 
-#[generated(model = ClaudeFable, version = "5")]
 pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
     let store = Arc::new(Store::open(&cfg.paths.db_path)?);
     let drivers = Drivers::from_config(&cfg).await?;
@@ -622,7 +618,6 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
     }
 }
 
-#[generated(model = ClaudeOpus, version = "4.8")]
 #[instrument(skip_all, fields(endpoint = %controller_addr))]
 async fn run_session(
     agent: &Arc<Agent>,
@@ -705,7 +700,6 @@ async fn run_session(
 
 /// Heartbeat and phases on the session stream: right after Hello, then every
 /// `STATUS_INTERVAL` and whenever a command was processed.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn status_loop(
     agent: Arc<Agent>,
     tx: mpsc::Sender<AgentMessage>,
@@ -752,7 +746,6 @@ async fn status_loop(
 }
 
 /// What the controller schedules against. Read once at start-up.
-#[generated(model = ClaudeOpus, version = "5")]
 fn node_facts() -> NodeStatus {
     let vcpus = std::thread::available_parallelism()
         .map(|n| n.get() as u32)

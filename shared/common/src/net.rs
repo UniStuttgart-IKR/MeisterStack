@@ -13,11 +13,7 @@
 //! than in either crate, for the same reason `capability` is: the tier that
 //! WRITES the string and the tier that MATCHES against it are different
 //! crates, and this is what they share.
-//!
-//! No `#[generated]` attribution in this file, and it is not an oversight —
-//! it is the reason `hrw` gives: the macro crate depends on this one, so this
-//! one cannot depend on the macro crate. What the model wrote here says so in
-//! a prose comment above itself instead.
+
 //!
 //! IPv4 only, and that is a decision rather than an omission. A floating
 //! address is a scarce thing an operator hands out one at a time, which is
@@ -140,7 +136,6 @@ impl Ipv4Range {
     /// because both are asked: a node's nftables set covers the whole range,
     /// and an allocator that handed out the network or the broadcast address
     /// would give a guest an address its neighbours answer for.
-    // Claude Opus 5, version 5 — in prose, see the module doc.
     pub fn is_allocatable(&self, addr: Ipv4Addr) -> bool {
         if !self.contains(addr) {
             return false;
@@ -315,7 +310,6 @@ impl Ipv4Ranges {
     /// Any, and not all, because the entries are what an operator wrote:
     /// somebody who listed `10.0.0.0` next to `10.0.0.0/24` wrote down that
     /// address on purpose, and the single-address entry means exactly it.
-    // Claude Opus 5, version 5 — in prose, see the module doc.
     pub fn is_allocatable(&self, addr: Ipv4Addr) -> bool {
         self.0.iter().any(|r| r.is_allocatable(addr))
     }

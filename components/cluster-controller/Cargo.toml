@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 controller-api = { package = "meister-controller-api", path = "../../shared/controller-api" }
 proto = { package = "meister-proto", path = "../../shared/proto" }
-macros = { package = "meister-macros", path = "../../shared/macros" }
 common = { package = "meister-common", path = "../../shared/common" }
 pki = { package = "meister-pki", path = "../../shared/pki" }
 telemetry = { package = "meister-telemetry", path = "../../shared/telemetry" }

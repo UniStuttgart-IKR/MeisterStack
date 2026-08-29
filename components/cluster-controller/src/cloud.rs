@@ -24,7 +24,6 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use chrono::Utc;
 use controller_api::{EtcdStore, Node, StoreError, Vm, VmSpec, resources::new_vm};
-use macros::generated;
 use proto::cluster_plane_client::ClusterPlaneClient;
 use proto::{
     ClusterCapacity, ClusterHello, ClusterMessage, ClusterStatus, CommandResult, VmStatusReport,
@@ -85,7 +84,6 @@ enum Ended {
 /// The best-ranked endpoint ahead of us that answers, if any. In order, so a
 /// cluster that drifted two positions comes back to the first one that is
 /// there rather than to the first one it happens to try.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn better_endpoint(
     ahead: &[String],
     tls: &Option<tonic::transport::ClientTlsConfig>,
@@ -100,7 +98,6 @@ async fn better_endpoint(
     None
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 /// `registry` is this cluster's own agent sessions. The cloud can ask for a
 /// VM's console and the only party that has one is the node, so the answer to
 /// a command arriving on THIS session is fetched over one of those.
@@ -151,7 +148,6 @@ pub async fn run(
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 #[instrument(skip_all, fields(endpoint = %cloud_addr, cluster = %cluster_name))]
 #[allow(clippy::too_many_arguments)]
 async fn session(
@@ -267,7 +263,6 @@ async fn session(
 /// This is the whole of the coalescing. It never waits, so it cannot delay a
 /// command that has not arrived yet, and it cannot reorder one — what comes
 /// out is arrival order.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn drain_ready<S>(stream: &mut S, out: &mut Vec<proto::CloudMessage>, cap: usize) -> bool
 where
     S: Stream<Item = Result<proto::CloudMessage, tonic::Status>> + Unpin,
@@ -295,7 +290,6 @@ where
 /// The commands of a batch, in arrival order. Anything else the cloud says
 /// changes nothing about this cluster and therefore owes it no status — which
 /// is why the caller reads "did we act" off this list and not off the batch.
-#[generated(model = ClaudeOpus, version = "5")]
 fn commands(batch: Vec<proto::CloudMessage>) -> Vec<proto::CloudCommand> {
     batch
         .into_iter()
@@ -306,7 +300,6 @@ fn commands(batch: Vec<proto::CloudMessage>) -> Vec<proto::CloudCommand> {
         .collect()
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 /// The cloud's context, if it sent one; its own root if not. Recorded on the
 /// span so the fmt log carries it either way, and attached as the real parent
 /// before the span starts (`telemetry::in_trace`).
@@ -330,7 +323,6 @@ async fn dispatch(
     .await
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn dispatch_traced(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -392,7 +384,6 @@ async fn dispatch_traced(
 /// has it, and an existing one picks it up when it is RECREATED. A live
 /// re-home is a documented nice-to-have and not this milestone's job; see
 /// `controller_api::floating::inject_nic_list`.
-#[generated(model = ClaudeOpus, version = "5")]
 fn bind_nics(c: &proto::CreateVm, vm_spec: &mut serde_json::Value) {
     if let Some(vni) = c.vni {
         let touched = controller_api::vni::inject_vxlan_id(vm_spec, vni);
@@ -430,7 +421,6 @@ fn bind_nics(c: &proto::CreateVm, vm_spec: &mut serde_json::Value) {
 /// somebody else's console. A VM that is not placed yet, or one this cluster
 /// does not have at all, answers with an empty document rather than an error
 /// — there is genuinely nothing to show, and that is not a failure.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn handle_logs(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -452,7 +442,6 @@ async fn handle_logs(
     }
 }
 
-#[generated(model = ClaudeOpus, version = "5")]
 async fn handle_create(
     store: &EtcdStore,
     c: proto::CreateVm,
@@ -533,7 +522,6 @@ async fn handle_create(
 
 /// The cloud's delete becomes this tier's delete: a deletionTimestamp, and the
 /// existing finalizer flow does the rest. Nothing new tears anything down.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn handle_destroy(store: &EtcdStore, d: proto::DestroyVm) -> anyhow::Result<()> {
     let current: Vm = match store.get(&d.name).await {
         Ok(v) => v,
@@ -568,7 +556,6 @@ async fn handle_destroy(store: &EtcdStore, d: proto::DestroyVm) -> anyhow::Resul
 /// everything the cloud does with this message it does on the assumption that
 /// the cluster could read its own store. Missing beats wrong, and a heartbeat
 /// that stops is exactly the signal a cluster in that state should be giving.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn send_status(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -592,7 +579,6 @@ async fn send_status(
 /// holds for it. VMs on their way out are in the list: they exist until they
 /// do not, and it is precisely their disappearance from here that tells the
 /// cloud the teardown finished.
-#[generated(model = ClaudeOpus, version = "5")]
 async fn build_status(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -641,7 +627,6 @@ async fn build_status(
 /// wears the cloud's mark but no uid cannot be named in a language the cloud
 /// understands — and silently leaving it out is exactly the short list this
 /// whole mechanism exists to prevent, so it costs the list its completeness.
-#[generated(model = ClaudeOpus, version = "5")]
 fn report_cloud_vms(vms: &[Vm], complete: &mut bool) -> Vec<VmStatusReport> {
     let mut out = Vec::new();
     for vm in vms.iter().filter(|v| v.metadata.managed_by_cloud()) {
@@ -665,7 +650,6 @@ fn report_cloud_vms(vms: &[Vm], complete: &mut bool) -> Vec<VmStatusReport> {
 }
 
 #[cfg(test)]
-#[generated(model = ClaudeOpus, version = "5")]
 mod tests {
     use super::*;
     use controller_api::{VmPhase, VmSpec};
