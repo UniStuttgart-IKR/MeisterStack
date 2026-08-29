@@ -50,7 +50,21 @@ check_agent() {
     ' || { echo "  SSH FAILED"; rc=1; }
 }
 
-check cloud   "$MEISTER_CLOUD_IP"
-check cluster "$MEISTER_CLUSTER_IP"
+# Lists, like push.sh reads them: both tiers have been HA since M4.6, and a
+# check that looks at one replica of three reports a fleet it has not seen.
+# The singular names are what env files written before that still say, and
+# they keep working -- reading them unguarded under `set -u` is what made this
+# script die on line one of its actual work.
+CLOUD_IPS="${MEISTER_CLOUD_IPS:-${MEISTER_CLOUD_IP:-}}"
+CLUSTER_IPS="${MEISTER_CLUSTER_IPS:-${MEISTER_CLUSTER_IP:-}}"
+
+for ip in $CLOUD_IPS;   do check cloud   "$ip"; done
+for ip in $CLUSTER_IPS; do check cluster "$ip"; done
 for ip in ${MEISTER_AGENT_IPS:-}; do check_agent "$ip"; done
+
+# Say what was reached. A check that silently looked at two of twelve hosts
+# reads exactly like one that looked at all of them.
+n=0
+for ip in $CLOUD_IPS $CLUSTER_IPS ${MEISTER_AGENT_IPS:-}; do n=$((n + 1)); done
+echo "==> checked $n host(s)"
 exit $rc
