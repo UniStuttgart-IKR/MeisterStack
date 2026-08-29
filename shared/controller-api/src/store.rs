@@ -26,6 +26,13 @@ pub enum StoreError {
     NotFound(String),
     #[error("object already exists: {0}")]
     AlreadyExists(String),
+    /// The name is taken by an object that is on its way out: deleted, and
+    /// waiting for a finalizer. Its own variant and not `AlreadyExists`,
+    /// because the two ask different things of the caller — one means "pick
+    /// another name" and this one means "wait a moment". Both are 409, and
+    /// telling them apart is the whole point.
+    #[error("object is being deleted: {0}")]
+    Terminating(String),
     /// Two writers wanted the same thing and one of them lost. The message is
     /// the WHOLE sentence and not a subject the variant decorates: a lost CAS
     /// on a resourceVersion and a floating address somebody already holds are
@@ -59,6 +66,7 @@ impl StoreError {
         match self {
             StoreError::NotFound(_) => "not-found",
             StoreError::AlreadyExists(_) => "already-exists",
+            StoreError::Terminating(_) => "terminating",
             StoreError::Conflict(_) => "conflict",
             StoreError::Invalid(_) => "invalid",
             StoreError::Backend(_) => "backend",
@@ -339,15 +347,50 @@ impl EtcdStore {
             // The put takes the bytes and `written` decodes the result from
             // them, so one of the two gets a copy. One allocation against the
             // read-back round trip it replaces.
-            .and_then(vec![TxnOp::put(key.clone(), value.clone(), options)]);
+            .and_then(vec![TxnOp::put(key.clone(), value.clone(), options)])
+            // Read the squatter, but only on the branch where there is one.
+            // A create that succeeds pays nothing for this, and a create that
+            // fails can then say WHICH kind of taken the name is.
+            .or_else(vec![TxnOp::get(key.clone(), None)]);
         let resp = timed("create", self.handle().txn(txn)).await?;
         if !resp.succeeded() {
-            return Err(StoreError::AlreadyExists(format!(
-                "{resource}/{name}",
-                resource = T::RESOURCE
-            )));
+            let subject = format!("{resource}/{name}", resource = T::RESOURCE);
+            return Err(if Self::is_terminating(resp.op_responses()) {
+                StoreError::Terminating(subject)
+            } else {
+                StoreError::AlreadyExists(subject)
+            });
         }
         self.written(&name, &value, &resp).await
+    }
+
+    /// Does the object that holds this name carry a deletion timestamp?
+    ///
+    /// Read as JSON and not as `T`: this runs on a failure path, and a
+    /// decode that fails there would turn "the name is taken" into "the store
+    /// is broken". Anything unreadable is reported as a plain collision,
+    /// which is the answer that was given before this existed.
+    fn is_terminating(ops: Vec<etcd_client::TxnOpResponse>) -> bool {
+        ops.into_iter().any(|op| match op {
+            etcd_client::TxnOpResponse::Get(r) => {
+                r.kvs().iter().any(|kv| Self::is_deleting(kv.value()))
+            }
+            _ => false,
+        })
+    }
+
+    /// The half of the above that can be tested: the etcd response type
+    /// cannot be built outside a client, and the decision can.
+    fn is_deleting(value: &[u8]) -> bool {
+        serde_json::from_slice::<serde_json::Value>(value)
+            .ok()
+            .and_then(|v| {
+                v.get("metadata")?
+                    .get("deletionTimestamp")?
+                    .as_str()
+                    .map(|s| !s.is_empty())
+            })
+            .unwrap_or(false)
     }
 
     /// The object as the store now holds it, without asking the store again.
@@ -600,6 +643,32 @@ mod tests {
     /// become downstream. A name is an etcd key, a file name and part of an
     /// interface name — three places with three different ideas of what a
     /// byte is.
+    /// The difference between "pick another name" and "wait a moment". A
+    /// create that loses to an object on its way out used to say the name was
+    /// taken, which is not true — the object is gone and its finalizer is
+    /// not done yet.
+    #[test]
+    fn a_name_held_by_a_dying_object_is_told_apart_from_a_name_that_is_taken() {
+        let alive = br#"{"metadata":{"name":"a"}}"#;
+        let dying = br#"{"metadata":{"name":"a","deletionTimestamp":"2026-08-29T13:00:00Z"}}"#;
+        assert!(!EtcdStore::is_deleting(alive));
+        assert!(EtcdStore::is_deleting(dying));
+
+        // An empty stamp is not a stamp, and neither is a null.
+        assert!(!EtcdStore::is_deleting(
+            br#"{"metadata":{"deletionTimestamp":""}}"#
+        ));
+        assert!(!EtcdStore::is_deleting(
+            br#"{"metadata":{"deletionTimestamp":null}}"#
+        ));
+
+        // Unreadable bytes are a plain collision, which is the answer that
+        // was given before this existed — a decode failure here must not
+        // turn "the name is taken" into "the store is broken".
+        assert!(!EtcdStore::is_deleting(b"not json at all"));
+        assert!(!EtcdStore::is_deleting(b""));
+    }
+
     #[test]
     fn a_name_that_is_not_a_dns_label_is_refused() {
         for ok in ["web-1", "a", "vm-0", "chaos-pool-2", &"a".repeat(63)] {

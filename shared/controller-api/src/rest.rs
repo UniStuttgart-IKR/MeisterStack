@@ -196,6 +196,7 @@ impl From<StoreError> for ApiError {
         let (status, reason) = match &e {
             StoreError::NotFound(_) => (StatusCode::NOT_FOUND, "NotFound"),
             StoreError::AlreadyExists(_) => (StatusCode::CONFLICT, "AlreadyExists"),
+            StoreError::Terminating(_) => (StatusCode::CONFLICT, "Terminating"),
             StoreError::Conflict(_) => (StatusCode::CONFLICT, "Conflict"),
             StoreError::Invalid(_) => (StatusCode::UNPROCESSABLE_ENTITY, "Invalid"),
             StoreError::Backend(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal"),
