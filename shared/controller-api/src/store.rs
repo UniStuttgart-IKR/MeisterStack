@@ -243,23 +243,58 @@ impl EtcdStore {
         Ok(resp.count().max(0) as usize)
     }
 
-    /// A name is the last segment of the key, so anything that changes the
-    /// shape of the key is not a name. `/` would silently create an object at
-    /// a path nobody can address back — the REST route matches one segment,
-    /// and `list` reads the segment after the last slash — and the relative
-    /// path entries would move the key outright. Checked here rather than in
-    /// each handler because this is where the key is actually built.
+    /// The longest a name may be. Not arbitrary: a name reaches a node as
+    /// part of a network interface name, and Linux allows fifteen bytes for
+    /// one of those. This is the object name and not the interface name — the
+    /// drivers derive those and keep their own budget — but a name that can
+    /// never fit anywhere downstream is not worth storing.
+    const MAX_NAME: usize = 63;
+
+    /// A name is the last segment of an etcd key, a piece of a file name on a
+    /// node, and part of an interface name. That is three places downstream,
+    /// and the shape below is the intersection of what all three survive: the
+    /// DNS label, which is what Kubernetes settled on for the same reason.
+    ///
+    /// Lowercase alphanumerics and `-`, starting and ending alphanumeric, at
+    /// most [`Self::MAX_NAME`] bytes.
+    ///
+    /// The lab found what the old check let past, and each one is a different
+    /// kind of trouble: a name with a SPACE (a shell word boundary on every
+    /// node that handles it), non-ASCII (`chaos-üml`, which is not one byte
+    /// per character anywhere it is counted), uppercase (two objects that
+    /// differ only in case are one file on a case-insensitive mount), 300
+    /// characters, and an embedded `..` that the old check only caught when
+    /// the whole name was `..`.
     fn check_name(name: &str) -> Result<()> {
+        let invalid = |why: &str| {
+            Err(StoreError::Invalid(format!(
+                "invalid object: metadata.name {name:?} {why}"
+            )))
+        };
         if name.is_empty() {
             return Err(StoreError::Invalid(
                 "invalid object: metadata.name must be set".into(),
             ));
         }
-        if name.contains('/') || name == "." || name == ".." {
-            return Err(StoreError::Invalid(format!(
-                "invalid object: metadata.name {name:?} must be a single path segment \
-                 (no '/', '.' or '..')"
-            )));
+        if name.len() > Self::MAX_NAME {
+            return invalid(&format!(
+                "is {} bytes; at most {} are allowed",
+                name.len(),
+                Self::MAX_NAME
+            ));
+        }
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return invalid(
+                "may hold only lowercase letters, digits and '-' \
+                 (it is a dns label: it becomes an etcd key, a file name and \
+                 part of an interface name)",
+            );
+        }
+        if name.starts_with('-') || name.ends_with('-') {
+            return invalid("must start and end with a letter or a digit");
         }
         Ok(())
     }
@@ -561,6 +596,40 @@ mod tests {
     /// The name is the last segment of the key. A name that is not a segment
     /// produces an object at a path the API cannot address back — reachable
     /// by no GET, no DELETE, and no reconcile decision that needs its name.
+    /// What the lab got past the old check, and what each one would have
+    /// become downstream. A name is an etcd key, a file name and part of an
+    /// interface name — three places with three different ideas of what a
+    /// byte is.
+    #[test]
+    fn a_name_that_is_not_a_dns_label_is_refused() {
+        for ok in ["web-1", "a", "vm-0", "chaos-pool-2", &"a".repeat(63)] {
+            assert!(EtcdStore::check_name(ok).is_ok(), "{ok:?} should be a name");
+        }
+        for (bad, why) in [
+            (
+                "has space",
+                "a shell word boundary on every node that sees it",
+            ),
+            (
+                "chaos-\u{fc}ml",
+                "not one byte per character where it is counted",
+            ),
+            ("Web-1", "two objects differing only in case are one file"),
+            ("-lead", "must start alphanumeric"),
+            ("trail-", "must end alphanumeric"),
+            (
+                "a..b",
+                "the old check caught this only when it was the whole name",
+            ),
+            ("under_score", "not a dns label"),
+        ] {
+            assert!(EtcdStore::check_name(bad).is_err(), "{bad:?}: {why}");
+        }
+        let long = "a".repeat(64);
+        let e = EtcdStore::check_name(&long).unwrap_err().to_string();
+        assert!(e.contains("64 bytes"), "{e}");
+    }
+
     #[test]
     fn a_name_that_is_not_one_path_segment_is_refused() {
         assert!(EtcdStore::check_name("web-1").is_ok());

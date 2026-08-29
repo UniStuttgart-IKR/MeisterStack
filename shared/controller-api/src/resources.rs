@@ -254,6 +254,20 @@ pub struct VmStatus {
     pub cluster_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The CATEGORY behind `message`, when the VM is waiting to be placed —
+    /// one of `PendingReason::as_str()`, a closed set.
+    ///
+    /// Both, because they answer different questions. The sentence counts
+    /// candidates and names capabilities and is what an operator reads; it is
+    /// also unbounded, so a client that wants to branch on WHY has to compare
+    /// prose. This is the same answer in a form a program can hold, and it is
+    /// exactly the word the metric label uses, so a dashboard and a client
+    /// agree by construction.
+    ///
+    /// Cleared wherever `message` is: a placed VM must not carry the reason
+    /// it once could not be placed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<DateTime<Utc>>,
     /// Requeue bookkeeping (see `requeue`): how often the reconciler has
@@ -1049,8 +1063,11 @@ pub enum AccessMode {
 /// Where a volume is in its own life. Its OWN phase, and that is the whole
 /// point of the object: a volume is Ready with no VM anywhere near it, and a
 /// VM being torn down does not move it.
+/// Spelled like `VmPhase` and not camelCase, which is what it was until the
+/// lab pointed out that a client then needs two comparisons for the same
+/// question. Free to change today because no volume object has ever been
+/// stored outside a test; it would not be free tomorrow.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum VolumePhase {
     /// Reserved, not yet placed on a node that can provision it.
     #[default]
@@ -1387,6 +1404,47 @@ pub type CertificateSigningRequest = Object<CsrSpec, CsrStatus>;
 
 #[cfg(test)]
 mod tests {
+    /// Two phases, one spelling. A client that asks "is this thing ready"
+    /// should not need to know which kind of thing it is holding — the lab
+    /// found `Running` beside `provisioning` and had to compare twice.
+    ///
+    /// And the second half, which is what makes it worth a test: the category
+    /// behind a pending VM now reaches the API, in the same words the metric
+    /// label uses, so a dashboard and a client cannot disagree about what
+    /// happened.
+    #[test]
+    fn the_phases_are_spelled_alike_and_the_pending_category_reaches_the_api() {
+        assert_eq!(
+            serde_json::to_value(VmPhase::Provisioning).unwrap(),
+            serde_json::json!("Provisioning")
+        );
+        assert_eq!(
+            serde_json::to_value(VolumePhase::Provisioning).unwrap(),
+            serde_json::json!("Provisioning")
+        );
+        assert_eq!(
+            serde_json::to_value(VolumePhase::Releasing).unwrap(),
+            serde_json::json!("Releasing")
+        );
+
+        // Absent by default and absent from the wire, so every object written
+        // before this field existed reads back as what it was.
+        let s = VmStatus::default();
+        assert!(s.pending_reason.is_none());
+        let wire = serde_json::to_value(&s).unwrap();
+        assert!(wire.get("pendingReason").is_none(), "{wire}");
+
+        // And when it is there it is one of the closed set.
+        let s = VmStatus {
+            pending_reason: Some(crate::PendingReason::NoCapacity.as_str().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&s).unwrap()["pendingReason"],
+            "no-capacity"
+        );
+    }
+
     use super::*;
 
     /// The registration table read back through the trait: no two resources

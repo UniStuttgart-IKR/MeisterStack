@@ -406,6 +406,7 @@ async fn reconcile_vm_traced(
                 // The binding answers whatever a previous pass wrote about
                 // why there was none.
                 bound.status.message = None;
+                bound.status.pending_reason = None;
                 match store.update(&bound).await {
                     Ok(_) => {
                         telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLOUD);
@@ -454,6 +455,7 @@ async fn reconcile_vm_traced(
                     store
                         .mutate::<Vm, _>(&vm.metadata.name, |v| {
                             v.status.message = Some(reason.clone());
+                            v.status.pending_reason = Some(category.as_str().to_string());
                         })
                         .await?;
                     events::record(

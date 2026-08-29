@@ -717,6 +717,7 @@ async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
                 p.store
                     .mutate::<Vm, _>(&vm.metadata.name, |v| {
                         v.status.message = Some(reason.clone());
+                        v.status.pending_reason = Some(category.as_str().to_string());
                     })
                     .await?;
                 events::record(
@@ -737,8 +738,9 @@ async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     bound.spec.node_name = Some(node.clone());
     // The reason a previous pass may have written is answered by the binding
     // itself; leaving it would make a placed VM carry the sentence that said
-    // it could not be placed.
+    // it could not be placed — and the category with it.
     bound.status.message = None;
+    bound.status.pending_reason = None;
     match p.store.update(&bound).await {
         Ok(_) => {
             telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLUSTER);
