@@ -194,10 +194,16 @@ pub fn verify(
         )));
     }
 
+    // Bound once, and every slice below is a slice of THIS string. The
+    // signature is checked over `header.payload` as a range of it, so a
+    // second `trim()` producing a different string would be checking a
+    // signature over bytes nobody signed.
+    let token = token.trim();
+
     // Three parts and no more. A five-part string is a JWE — encrypted, not
     // signed — and there is nothing here that could check it, so it is
     // refused as a shape rather than misread as a signature.
-    let mut parts = token.trim().split('.');
+    let mut parts = token.split('.');
     let (Some(raw_header), Some(raw_payload), Some(raw_sig), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
@@ -247,7 +253,7 @@ pub fn verify(
     // arrived: re-encoding the header would check a signature over bytes the
     // provider never signed.
     let signed_len = raw_header.len() + 1 + raw_payload.len();
-    let signed = &token.trim().as_bytes()[..signed_len];
+    let signed = &token.as_bytes()[..signed_len];
     let sig = b64(raw_sig).context("the signature").map_err(invalid)?;
     key.verify(alg, signed, &sig).map_err(invalid)?;
 

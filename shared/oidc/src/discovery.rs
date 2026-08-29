@@ -11,7 +11,7 @@
 //! must be refused — talks to a trait, and the test hands it a document.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -151,17 +151,25 @@ impl KeySource for HttpKeySource {
 
 /// Keep a cache current: once at start-up, on every nudge, and on a timer.
 ///
-/// Runs until the nudge channel closes, which happens when the last
-/// authenticator holding it is dropped — so a controller shutting down takes
-/// this with it and nothing has to be told twice.
+/// `Weak` and not `Arc`, which is the whole of how this task ends. The nudge
+/// channel's sender lives inside the `KeyCache`, so a task holding the cache
+/// strongly would be holding the sender that tells it to stop — it would
+/// wait for a message only it could still send, forever. With a weak handle
+/// the last authenticator going away drops the cache, drops the sender,
+/// closes the channel and ends this. Nothing has to be told twice, and a
+/// controller shutting down does not leave a task behind.
 pub async fn refresh_forever(
-    cache: Arc<KeyCache>,
+    cache: Weak<KeyCache>,
     source: Arc<dyn KeySource>,
     mut handle: RefreshHandle,
     interval: Duration,
     retry: Duration,
 ) {
     loop {
+        let Some(cache) = cache.upgrade() else {
+            debug!("nothing holds the key cache any more, stopping the refresher");
+            return;
+        };
         match source.fetch().await {
             Ok(set) => {
                 let keys = Keys::parse(&set);
@@ -188,6 +196,9 @@ pub async fn refresh_forever(
         // start-up the provider may simply not be up yet, and an hour is a
         // long time to be answering 401 to everybody.
         let wait = if cache.loaded() { interval } else { retry };
+        // Held only while fetching. Waiting on a strong handle would keep
+        // the cache alive for up to an hour after its last user left.
+        drop(cache);
         tokio::select! {
             got = handle.rx.recv() => {
                 if got.is_none() {
@@ -237,6 +248,155 @@ mod tests {
         check_issuer(&doc("https://idp.example.org"), "https://idp.example.org").unwrap();
         // The trailing slash is the one difference that is not one.
         check_issuer(&doc("https://idp.example.org/"), "https://idp.example.org").unwrap();
+    }
+
+    /// Let the spawned refresher run up to its next wait.
+    ///
+    /// Not `yield_now`: that is one poll, and a fetch has more await points
+    /// than that. Under `start_paused` a sleep costs no wall clock and the
+    /// runtime advances to it only once every task is idle, which is exactly
+    /// the condition being waited for.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    /// A key source that answers from a script instead of an http server.
+    ///
+    /// This is the seam, used the way the brief asks for it: everything above
+    /// `KeySource` — the cache, the rate limit, the refresher, the whole
+    /// authenticator — is exercised here without a provider existing.
+    struct Scripted {
+        answers: Mutex<Vec<Result<String, String>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Scripted {
+        fn new(answers: Vec<Result<String, String>>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: Mutex::new(answers),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KeySource for Scripted {
+        async fn fetch(&self) -> Result<JwkSet> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut answers = self.answers.lock().await;
+            // The last answer repeats, so a test can say "and from then on".
+            let answer = if answers.len() > 1 {
+                answers.remove(0)
+            } else {
+                answers.first().cloned().unwrap_or_else(|| Ok("{}".into()))
+            };
+            match answer {
+                Ok(body) => Ok(serde_json::from_str(&body)?),
+                Err(e) => bail!("{e}"),
+            }
+        }
+
+        fn describe(&self) -> String {
+            "scripted".into()
+        }
+    }
+
+    /// The nudge from the request path reaches the fetcher, and the interval
+    /// is the only thing standing between a flood of invented key ids and a
+    /// flood of requests to somebody else's server.
+    #[tokio::test(start_paused = true)]
+    async fn a_nudge_fetches_and_the_first_fetch_happens_without_one() {
+        let idp = crate::testing::TestIdp::new("k1");
+        let source = Scripted::new(vec![Ok(idp.jwk_set_json().to_string())]);
+        let (cache, handle) = KeyCache::new(Duration::from_secs(60));
+        let cache = Arc::new(cache);
+
+        let task = tokio::spawn(refresh_forever(
+            Arc::downgrade(&cache),
+            source.clone(),
+            handle,
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+        ));
+
+        // Nobody asked, and the keys are there: a controller that starts
+        // while nobody is logging in is ready for the first person who does.
+        settle().await;
+        assert!(cache.loaded());
+        assert_eq!(cache.with_keys(|k| k.len()), 1);
+        assert_eq!(source.calls(), 1);
+
+        // A request meets an unknown key id and asks.
+        assert!(cache.request_refresh());
+        settle().await;
+        assert_eq!(source.calls(), 2);
+
+        // Every further ask inside the interval is refused by the cache
+        // before it ever becomes a request.
+        for _ in 0..100 {
+            assert!(!cache.request_refresh());
+        }
+        settle().await;
+        assert_eq!(source.calls(), 2, "the interval held");
+
+        task.abort();
+    }
+
+    /// A provider that is down does not cost us the keys we have. The
+    /// alternative — installing an empty set on a failed fetch — would turn
+    /// somebody else's outage into ours.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_fetch_keeps_the_keys_we_already_had() {
+        let idp = crate::testing::TestIdp::new("k1");
+        let source = Scripted::new(vec![
+            Ok(idp.jwk_set_json().to_string()),
+            Err("connection refused".into()),
+        ]);
+        let (cache, handle) = KeyCache::new(Duration::from_secs(0));
+        let cache = Arc::new(cache);
+
+        let task = tokio::spawn(refresh_forever(
+            Arc::downgrade(&cache),
+            source.clone(),
+            handle,
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+        ));
+        settle().await;
+        assert_eq!(cache.with_keys(|k| k.len()), 1);
+
+        assert!(cache.request_refresh());
+        settle().await;
+        assert!(source.calls() >= 2, "the failing fetch was attempted");
+        assert_eq!(cache.with_keys(|k| k.len()), 1, "and cost us nothing");
+        assert!(cache.loaded());
+
+        task.abort();
+    }
+
+    /// The refresher is owned by the authenticator it feeds: when the last
+    /// holder of the nudge channel goes, so does it. Nothing has to be told.
+    #[tokio::test(start_paused = true)]
+    async fn the_refresher_stops_when_nothing_holds_the_cache_any_more() {
+        let source = Scripted::new(vec![Ok(r#"{"keys":[]}"#.into())]);
+        let (cache, handle) = KeyCache::new(Duration::from_secs(60));
+        let cache = Arc::new(cache);
+
+        let task = tokio::spawn(refresh_forever(
+            Arc::downgrade(&cache),
+            source,
+            handle,
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+        ));
+        settle().await;
+        drop(cache);
+        settle().await;
+        assert!(task.await.is_ok(), "it returned rather than being killed");
     }
 
     #[test]

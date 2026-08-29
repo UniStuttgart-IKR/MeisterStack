@@ -971,7 +971,9 @@ fn build_oidc(
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_REFRESH_INTERVAL);
     tokio::spawn(meister_oidc::discovery::refresh_forever(
-        cache.clone(),
+        // Weak: the task must not keep the cache — and with it the channel
+        // that tells the task to stop — alive on its own.
+        Arc::downgrade(&cache),
         source,
         handle,
         interval,
@@ -1225,6 +1227,67 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// The default has to do nothing, and "nothing" here has three
+    /// independent reasons — so all three are asserted rather than one
+    /// standing in for the others. Each of them returns before the store is
+    /// ever reached, which is why this can be tested without an etcd.
+    #[tokio::test]
+    async fn first_login_provisioning_does_nothing_unless_everything_asks_for_it() {
+        let oidc_user = Identity::new(
+            "alice",
+            vec![
+                crate::oidc::GROUP_OIDC.to_string(),
+                format!("{}acme", crate::oidc::GROUP_OIDC_TENANT_PREFIX),
+            ],
+        );
+
+        // The switch, off. This is the shipped default and the one that
+        // matters most.
+        let st = AuthState::anonymous();
+        assert!(provision(&st, &oidc_user).await.unwrap().is_none());
+
+        // The switch on, but the identity did not come out of a token. A
+        // certificate for a name the directory does not know stays nobody:
+        // that path has its own bootstrap and does not need a second one.
+        let st = AuthState {
+            provision_oidc_users: true,
+            ..AuthState::anonymous()
+        };
+        let from_a_certificate = Identity::new("alice", vec![crate::auth::GROUP_MEMBERS.into()]);
+        assert!(provision(&st, &from_a_certificate).await.unwrap().is_none());
+
+        // The switch on and a token, but no directory to write into. The
+        // cluster tier, which `build_chain` refuses an oidc link at anyway.
+        assert!(provision(&st, &oidc_user).await.unwrap().is_none());
+    }
+
+    /// The tenant a token claimed, and the fact that it is a group nothing
+    /// else reads. `Role::from_groups` looks only at the two role groups, so
+    /// neither marker can become a permission by accident.
+    #[test]
+    fn the_markers_an_oidc_identity_carries_decide_nothing() {
+        let id = Identity::new(
+            "alice",
+            vec![
+                crate::oidc::GROUP_OIDC.to_string(),
+                format!("{}acme", crate::oidc::GROUP_OIDC_TENANT_PREFIX),
+            ],
+        );
+        assert_eq!(crate::oidc::claimed_tenant(&id), Some("acme"));
+        assert_eq!(id.claimed_role(), None);
+        assert!(!id.is_system());
+        assert!(!permits(
+            &id,
+            None,
+            None,
+            &crate::auth::Attempt {
+                resource: "vms",
+                subresource: None,
+                verb: crate::auth::Verb::Read
+            }
+        ));
     }
 
     /// The check that keeps certificatesigningrequests from being a way up.
