@@ -1,0 +1,44 @@
+[package]
+name = "meister-oidc"
+version = "0.1.0"
+edition = "2024"
+
+# OpenID Connect, in its own crate for the same reason `pki` is in one: both
+# ends need it. The controller verifies the tokens people arrive with, the
+# CLI is what gets them one, and neither of those two crates depends on the
+# other. Putting the verifier in controller-api would have dragged etcd into
+# `meister`; putting the device flow in the CLI would have left the
+# controller re-implementing base64url.
+
+[dependencies]
+# For the one thing a lab provider needs that the public root list cannot
+# give: reading a private CA bundle off disk. The same loader the
+# controllers and the CLI already read their PEM files with.
+pki = { package = "meister-pki", path = "../pki" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+ring = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }
+async-trait = { workspace = true }
+
+[features]
+# The in-process identity provider in `testing`: a real key pair, a real
+# JWKS, real signatures, and the ability to forge a header. Behind a feature
+# so that the controller's tests can sign tokens too; resolver 2 keeps a
+# dev-dependency's features out of a plain `cargo build`.
+testing = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

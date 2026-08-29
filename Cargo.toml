@@ -74,6 +74,19 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 # and whether our CA signed it. "verify" is the signature check.
 x509-parser = { version = "0.18", features = ["verify"] }
 sha2 = "0.10"
+# The JOSE half. `base64` is base64url without padding, which is every field
+# of a JWT and every field of a JWK; `ring` is the signature check itself,
+# and it is deliberately the SAME ring rustls already uses rather than a
+# second crypto stack brought in by a JWT library. Both were already in the
+# tree as transitive dependencies.
+base64 = "0.22"
+ring = "0.17"
+# Mozilla's root list as rustls trust anchors, and nothing else — no code, no
+# crypto, no second provider. An identity provider is on the public internet
+# and its certificate is signed by a CA that no lab bundle contains, which is
+# the one place in this stack where the system's own roots are the right
+# answer. A lab provider with a private CA names it in the config instead.
+webpki-roots = "1"
 # X.509 validity is an OffsetDateTime in rcgen's API and nowhere else in this
 # tree; it is here to say "now + ninety days" to that one function. Already in
 # the tree as rcgen's own dependency, so it costs nothing to build.
