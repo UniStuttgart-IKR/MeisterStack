@@ -69,13 +69,19 @@
 
 pub mod frr;
 pub mod nftables;
+/// 6k Mini-Neutron: the gateway slot. See the module.
+pub mod router;
 
 use futures::TryStreamExt;
 use std::net::Ipv4Addr;
 
-use agent_api::networking::{self, BridgeDriver, NetworkError, Nic, NicDriver, NicId, NicSpec};
+use agent_api::networking::{
+    self, BridgeDriver, NetworkError, Nic, NicDriver, NicId, NicSpec, RouterId, RouterSpec,
+    RouterState,
+};
+use rtnetlink::packet_route::link::LinkAttribute;
 use rtnetlink::{LinkBridge, LinkUnspec, LinkVxlan};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 /// The IANA-assigned VXLAN port (RFC 7348 §5).
 ///
@@ -145,11 +151,41 @@ pub fn overlay_bridge(vni: u32) -> String {
     format!("meister-vx{vni}")
 }
 
+/// The VNI of an overlay bridge this driver named, and `None` for every other
+/// link on the node.
+///
+/// The inverse of [`overlay_bridge`] and the only thing that tells this
+/// driver's overlays from the rest of the machine's links — a tap, an uplink,
+/// somebody's docker0. Kept beside its inverse so the two cannot drift.
+pub fn overlay_vni(name: &str) -> Option<u32> {
+    name.strip_prefix("meister-vx")?.parse().ok()
+}
+
 /// The VXLAN device itself, enslaved to that bridge. Shorter than the bridge
 /// name because both have to fit `IFNAMSIZ` and only one of them can be the
 /// readable one.
 pub fn overlay_device(vni: u32) -> String {
     format!("mvx{vni}")
+}
+
+/// Why this driver will not take down the overlay a record names, if it will
+/// not.
+///
+/// `recorded` is the bridge the VM's record says its overlay actually got,
+/// and `None` — every record written before the name was kept — is a yes:
+/// nobody wrote it down, this driver answers for its own naming as it always
+/// did, and nothing changes for a node that has only ever had one network
+/// driver. A name that is not this driver's is the case the record exists
+/// for: it was built by something that names its links differently, so
+/// removing `meister-vx<vni>` here would take down a link this driver made
+/// for somebody else, or none at all, and say it had cleaned up either way.
+fn not_this_drivers_overlay(vni: u32, recorded: Option<&str>) -> Option<String> {
+    let mine = overlay_bridge(vni);
+    let said = recorded.filter(|name| *name != mine)?;
+    Some(format!(
+        "vxlan {vni} was carried by bridge {said:?} on this node, and this driver names its own \
+         {mine:?}; another network driver built it and it is not this one's to remove"
+    ))
 }
 
 /// Whether this VNI's interfaces can be named at all.
@@ -221,6 +257,15 @@ mod tun {
     }
 }
 
+/// Whether this is an address the kernel gives an interface rather than one
+/// somebody put there.
+fn is_link_local(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.is_unicast_link_local(),
+    }
+}
+
 pub struct LinuxNetworkDriver {
     handle: rtnetlink::Handle,
     /// `None` = this node serves no overlays, which is every node before M5
@@ -233,6 +278,11 @@ pub struct LinuxNetworkDriver {
     /// produces no address rule at all.
     nft: nftables::Nft,
     guarded: common::net::Ipv4Ranges,
+    /// `None` = this node holds no gateway slot, which is every node before
+    /// 6k and every node with no `[network.provider]` section. It gave no
+    /// interface away, so no router can be placed here — see
+    /// `router::GatewayConfig`.
+    gateway: Option<router::GatewayConfig>,
 }
 
 impl LinuxNetworkDriver {
@@ -243,10 +293,15 @@ impl LinuxNetworkDriver {
                 binary: DEFAULT_NFT.to_string(),
                 guarded: common::net::Ipv4Ranges::default(),
             },
+            None,
         )
     }
 
-    pub fn build(vxlan: Option<VxlanConfig>, nft: nftables::NftConfig) -> networking::Result<Self> {
+    pub fn build(
+        vxlan: Option<VxlanConfig>,
+        nft: nftables::NftConfig,
+        gateway: Option<router::GatewayConfig>,
+    ) -> networking::Result<Self> {
         let (connection, handle, _) =
             rtnetlink::new_connection().map_err(|e| NetworkError::Backend(e.into()))?;
         tokio::spawn(connection);
@@ -258,11 +313,24 @@ impl LinuxNetworkDriver {
         // Fails the start-up if this node cannot program nftables. See
         // `nftables::Nft::new` for why that is an error and not a warning.
         let nft = nftables::Nft::new(nft.binary)?;
+        // Said at start-up rather than at the first router, exactly as the
+        // guard above says its own piece: which provider networks a node
+        // gave away is a fact about the node, and an operator wants it in the
+        // log of the boot that made it true.
+        if let Some(g) = &gateway {
+            for (physnet, interface) in &g.physnets {
+                router::check_physnet_name(physnet)?;
+                info!(physnet = %physnet, interface = %interface,
+                      bridge = %router::provider_bridge(physnet),
+                      "this node gives an interface away and can hold routers");
+            }
+        }
         Ok(Self {
             handle,
             vxlan,
             nft,
             guarded,
+            gateway,
         })
     }
 
@@ -283,6 +351,62 @@ impl LinuxNetworkDriver {
             Err(rtnetlink::Error::NetlinkError(err)) if err.raw_code() == -libc::ENODEV => Ok(None),
             Err(e) => Err(NetworkError::Backend(e.into())),
         }
+    }
+
+    /// What one link says its MTU is, or `None` when there is no such link.
+    ///
+    /// Read and not configured, because the number belongs to the operator:
+    /// the interface a node gives away to a provider network carries the
+    /// MTU of that wire, and everything this driver hangs into the same
+    /// bridge has to be told the same number. A Linux bridge takes the MTU
+    /// of its SMALLEST port, so a port that keeps the veth default of 1500
+    /// does not "let the bridge decide" — it decides for the bridge, and
+    /// drags a 9000-byte provider network down to 1500 for everybody on it.
+    pub(crate) async fn link_mtu(&self, name: &str) -> networking::Result<Option<u32>> {
+        let mut links = self
+            .handle
+            .link()
+            .get()
+            .match_name(name.to_string())
+            .execute();
+        match links.try_next().await {
+            Ok(Some(link)) => Ok(link.attributes.iter().find_map(|attr| match attr {
+                rtnetlink::packet_route::link::LinkAttribute::Mtu(mtu) => Some(*mtu),
+                _ => None,
+            })),
+            Ok(None) => Ok(None),
+            Err(rtnetlink::Error::NetlinkError(err)) if err.raw_code() == -libc::ENODEV => Ok(None),
+            Err(e) => Err(NetworkError::Backend(e.into())),
+        }
+    }
+
+    /// Every overlay bridge of this driver's own that is standing on the node
+    /// right now, by VNI, sorted and without repeats.
+    ///
+    /// The bridge and not the VXLAN device: `destroy_overlay` takes both
+    /// down, so either would do, and the bridge is the one whose name an
+    /// operator reads. A half-removed pair — the device gone and the bridge
+    /// left — is still found, which is what makes a sweep after an
+    /// interrupted teardown finish the job.
+    async fn overlays_present(&self) -> networking::Result<Vec<u32>> {
+        let mut links = self.handle.link().get().execute();
+        let mut found = Vec::new();
+        while let Some(link) = links
+            .try_next()
+            .await
+            .map_err(|e| NetworkError::Backend(e.into()))?
+        {
+            for attribute in &link.attributes {
+                if let LinkAttribute::IfName(name) = attribute
+                    && let Some(vni) = overlay_vni(name)
+                {
+                    found.push(vni);
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        Ok(found)
     }
 
     /// The first IPv4 address on a link, which for the uplink is this node's
@@ -309,6 +433,64 @@ impl LinuxNetworkDriver {
         Ok(None)
     }
 
+    /// Put `index` into the bridge `controller` and bring it up, in one
+    /// netlink message.
+    ///
+    /// Pulled out because three callers now do it — a tap joining its bridge,
+    /// a provider interface joining its provider bridge, and each of a
+    /// router's two legs — and because doing it in two messages leaves a
+    /// window in which a link is up and on no bridge.
+    pub(crate) async fn enslave(&self, index: u32, controller: u32) -> networking::Result<()> {
+        self.handle
+            .link()
+            .set(
+                LinkUnspec::new_with_index(index)
+                    .controller(controller)
+                    .up()
+                    .build(),
+            )
+            .execute()
+            .await
+            .map_err(|e| NetworkError::Backend(e.into()))
+    }
+
+    /// Every address on a link that is not link-local, as text.
+    ///
+    /// The question `ensure_physnet` asks: an interface that has been given
+    /// away carries none. Link-local is left out because every interface has
+    /// one the moment it comes up (`fe80::/10`, and IPv4's `169.254/16` when
+    /// nothing answered DHCP) — neither is somebody using the interface, and
+    /// refusing over them would refuse every node.
+    pub(crate) async fn global_addresses(&self, index: u32) -> networking::Result<Vec<String>> {
+        use rtnetlink::packet_route::address::AddressAttribute;
+        let mut addrs = self
+            .handle
+            .address()
+            .get()
+            .set_link_index_filter(index)
+            .execute();
+        let mut out = Vec::new();
+        while let Some(msg) = addrs
+            .try_next()
+            .await
+            .map_err(|e| NetworkError::Backend(e.into()))?
+        {
+            for attr in &msg.attributes {
+                if let AddressAttribute::Address(ip) = attr
+                    && !is_link_local(ip)
+                {
+                    out.push(format!("{ip}/{}", msg.header.prefix_len));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The MTU this node's overlays run at, when it has any.
+    pub(crate) fn vxlan_mtu(&self) -> Option<u32> {
+        self.vxlan.as_ref().map(|v| v.mtu)
+    }
+
     async fn set_up(&self, index: u32) -> networking::Result<()> {
         self.handle
             .link()
@@ -326,10 +508,22 @@ impl LinuxNetworkDriver {
     /// `bridge = "meister_br0", vxlan_id = 10000` is on the overlay, and an
     /// operator reading the record can still see which default it would have
     /// taken without the tenant.
-    fn target_bridge(spec: &NicSpec) -> String {
-        match spec.vxlan_id {
-            Some(vni) => overlay_bridge(vni),
-            None => spec.bridge.clone(),
+    fn target_bridge(spec: &NicSpec) -> networking::Result<String> {
+        match (&spec.physnet, spec.vxlan_id) {
+            // Festlegung 3 and the refusal that guards it: the two say
+            // different things about where this tap belongs, and a precedence
+            // rule would put a tenant's guest on a wire the tenant does not
+            // own -- or the other way round -- without anybody being told.
+            (Some(physnet), Some(vni)) => Err(NetworkError::InvalidSpec(format!(
+                "this nic names the provider network {physnet:?} and the overlay {vni}; a tap \
+                 hangs on one wire, so name one of the two"
+            ))),
+            (Some(physnet), None) => {
+                router::check_physnet_name(physnet)?;
+                Ok(router::provider_bridge(physnet))
+            }
+            (None, Some(vni)) => Ok(overlay_bridge(vni)),
+            (None, None) => Ok(spec.bridge.clone()),
         }
     }
 
@@ -416,13 +610,12 @@ impl BridgeDriver for LinuxNetworkDriver {
     ///
     /// Idempotent by existence, exactly as `ensure` is — the second VM of a
     /// tenant finds both links there and only makes sure they are up. What it
-    /// does NOT do is tear anything down: the bridge and the VXLAN device
-    /// outlive the last VM of a tenant on this node, on purpose. Reaping them
-    /// would mean knowing that no other VM is arriving in the next second,
-    /// which is a question a level-triggered agent cannot answer, and the cost
-    /// of being wrong is a VM that boots into a bridge somebody just deleted.
-    /// Two idle links per tenant per node is the price; a GC pass driven by
-    /// the reconciler is the documented way to stop paying it.
+    /// does NOT do is tear anything down; `destroy_overlay` below does, and
+    /// only when the agent has counted that nothing on this node still uses
+    /// the VNI. The old worry — "is another VM arriving in the next second?"
+    /// — is not a question a timer can answer, and the answer is not a timer:
+    /// it is the agent's own record table, which knows every VM this node was
+    /// told to run.
     #[instrument(skip_all, fields(vni, uplink = tracing::field::Empty))]
     async fn ensure_overlay(&self, vni: u32) -> networking::Result<String> {
         let Some(cfg) = &self.vxlan else {
@@ -526,15 +719,162 @@ impl BridgeDriver for LinuxNetworkDriver {
         debug!(bridge = %bridge, device = %device, "overlay ready");
         Ok(bridge)
     }
+
+    /// Both links of one tenant's overlay, in the order that leaves nothing
+    /// behind if the second half fails.
+    ///
+    /// The encapsulation device FIRST: it is a port of the bridge, and
+    /// deleting a bridge only unenslaves its ports. Taking the bridge first
+    /// and then failing would leave `mvx<vni>` standing with no bridge to
+    /// join and nothing left that names it — which is a worse leak than the
+    /// one this method exists to end, because the next `ensure_overlay` for
+    /// that VNI would find the device there and re-enslave a device built
+    /// against whatever the uplink was then.
+    ///
+    /// A node with no `[network.vxlan]` section never built one, so it has
+    /// none to remove and says so by doing nothing. `destroy` is the
+    /// idempotent half both calls lean on: a link that is not there is not an
+    /// error.
+    ///
+    /// A record naming a bridge this driver would not have built is a refusal
+    /// and not a removal — see [`not_this_drivers_overlay`].
+    #[instrument(skip_all, fields(vni))]
+    async fn destroy_overlay(&self, vni: u32, recorded: Option<&str>) -> networking::Result<()> {
+        if self.vxlan.is_none() {
+            return Ok(());
+        }
+        if let Some(said) = not_this_drivers_overlay(vni, recorded) {
+            return Err(NetworkError::InvalidSpec(said));
+        }
+        let device = overlay_device(vni);
+        let bridge = overlay_bridge(vni);
+        BridgeDriver::destroy(self, &device).await?;
+        BridgeDriver::destroy(self, &bridge).await?;
+        info!(bridge = %bridge, device = %device, "overlay removed, nothing on this node uses it");
+        Ok(())
+    }
+
+    /// The overlays standing on this node that no record names any more.
+    ///
+    /// Nachlese 5: the chaos run left VNI 10003 and 10004 on three nodes. The
+    /// reference count hangs on records, and a VM whose record went while its
+    /// agent was not running takes the last counter of its overlay with it —
+    /// after which nobody counts again and the links stay for the life of the
+    /// machine.
+    ///
+    /// Read off the KERNEL and not off anything remembered, because the
+    /// overlays this is about are precisely the ones nothing remembers. What
+    /// marks one as this driver's is its name (`overlay_bridge`), which is
+    /// also what keeps the sweep off every other link on the node.
+    ///
+    /// Best effort per overlay: one that will not come down is logged and the
+    /// next is tried. A sweep that stopped at the first failure would leave
+    /// the rest for a restart that may not come.
+    #[instrument(skip_all)]
+    async fn sweep_overlays(&self, keep: &[u32]) -> networking::Result<Vec<String>> {
+        if self.vxlan.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut swept = Vec::new();
+        for vni in self.overlays_present().await? {
+            if keep.contains(&vni) {
+                continue;
+            }
+            let bridge = overlay_bridge(vni);
+            let device = overlay_device(vni);
+            match BridgeDriver::destroy(self, &device).await {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!(vni, device = %device, error = %format!("{e:#}"),
+                          "an orphaned overlay device would not come down");
+                    continue;
+                }
+            }
+            match BridgeDriver::destroy(self, &bridge).await {
+                Ok(()) => {
+                    info!(vni, bridge = %bridge, device = %device,
+                          "orphaned overlay removed: no record on this node names it");
+                    swept.push(bridge);
+                }
+                Err(e) => warn!(vni, bridge = %bridge, error = %format!("{e:#}"),
+                                "an orphaned overlay bridge would not come down"),
+            }
+        }
+        Ok(swept)
+    }
+
+    // --- the gateway slot ---------------------------------------------------
+    //
+    // Six one-line forwards to `router.rs`, and the reason they are here is
+    // the seam itself: the agent asks the TRAIT for a router, so a second
+    // backend that answers with a logical router instead of a namespace slots
+    // in without the agent noticing. What each one does is documented at the
+    // implementation.
+
+    async fn ensure_physnet(&self, name: &str, interface: &str) -> networking::Result<String> {
+        self.ensure_physnet_impl(name, interface).await
+    }
+
+    fn physnets(&self) -> Vec<String> {
+        // Off the driver and not off the config file, which is the same
+        // pointer here — but it is the driver that would have refused a name
+        // it cannot build a bridge for, so this is the list that is true.
+        self.gateway
+            .as_ref()
+            .map(|g| g.physnets.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    async fn ensure_router(&self, spec: &RouterSpec) -> networking::Result<RouterState> {
+        self.ensure_router_impl(spec).await
+    }
+
+    async fn destroy_router(&self, id: &RouterId) -> networking::Result<()> {
+        // A node with no gateway slot never built one, so it has none to
+        // remove and says so by doing nothing — the same answer
+        // `destroy_overlay` gives, and for the same reason.
+        match self.gateway.is_some() {
+            true => self.destroy_router_impl(id).await,
+            false => Ok(()),
+        }
+    }
+
+    async fn router_status(&self, id: &RouterId) -> networking::Result<RouterState> {
+        self.router_status_impl(id).await
+    }
+
+    async fn list_routers(&self) -> networking::Result<Vec<RouterState>> {
+        match self.gateway.is_some() {
+            true => self.list_routers_impl().await,
+            false => Ok(Vec::new()),
+        }
+    }
+
+    async fn sweep_routers(&self) -> networking::Result<Vec<String>> {
+        match self.gateway.is_some() {
+            true => self.sweep_routers_impl().await,
+            false => Ok(Vec::new()),
+        }
+    }
+
+    async fn fall_silent(&self) -> networking::Result<Vec<networking::RouterId>> {
+        // A node with no gateway slot holds no router and has nothing to stop
+        // saying — the same answer `sweep_routers` gives one line up.
+        match self.gateway.is_some() {
+            true => self.fall_silent_impl().await,
+            false => Ok(Vec::new()),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl NicDriver for LinuxNetworkDriver {
     #[instrument(skip_all, fields(nic_id = %id, bridge = tracing::field::Empty,
-                                  vxlan_id = spec.vxlan_id))]
+                                  vxlan_id = spec.vxlan_id,
+                                  physnet = spec.physnet.as_deref()))]
     async fn create(&self, id: &NicId, spec: &NicSpec) -> networking::Result<Nic> {
         let tap = Self::tap_name(id);
-        let bridge = Self::target_bridge(spec);
+        let bridge = LinuxNetworkDriver::target_bridge(spec)?;
         tracing::Span::current().record("bridge", bridge.as_str());
 
         let bridge_index = self
@@ -580,10 +920,16 @@ impl NicDriver for LinuxNetworkDriver {
         // Handed back so the hypervisor can pass it to the guest: the tap and
         // the bridge bound what the HOST forwards, and a guest that still
         // believes in 1500 would go on emitting frames the overlay drops.
+        //
+        // The address is handed back for a narrower reason: `guard` above has
+        // just pinned it in this tap's chain, so it is no longer only what
+        // this driver was asked for — it is the one address a frame off this
+        // tap may carry, and the tier above has nowhere else to learn it.
         Ok(Nic {
             id: *id,
             tap_name: tap,
             mtu,
+            mac: Some(spec.mac),
         })
     }
 
@@ -618,12 +964,15 @@ impl NicDriver for LinuxNetworkDriver {
     async fn get(&self, id: &NicId) -> networking::Result<Nic> {
         let tap = Self::tap_name(id);
         match self.link_index(&tap).await? {
-            // Liveness only — `mtu` is what a create SET, and this call is
-            // the reconciler asking whether the tap is still there.
+            // Liveness only — `mtu` and `mac` are what a create SET, and this
+            // call is the reconciler asking whether the tap is still there.
+            // The link's own address is not the answer to either: a tap
+            // carries a random one the guest never uses.
             Some(_) => Ok(Nic {
                 id: *id,
                 tap_name: tap,
                 mtu: None,
+                mac: None,
             }),
             None => Err(NetworkError::NicNotFound(*id)),
         }
@@ -637,12 +986,62 @@ mod tests {
 
     fn nic(bridge: &str, vxlan_id: Option<u32>) -> NicSpec {
         NicSpec {
+            physnet: None,
             bridge: bridge.to_string(),
             mac: "52:54:00:11:22:33".parse::<MacAddr>().unwrap(),
             vxlan_id,
             floating_ips: Vec::new(),
             routed_subnets: Vec::new(),
         }
+    }
+
+    /// The sweep can tell this driver's own overlays from every other link on
+    /// the node, and it can only do that by name.
+    ///
+    /// Nachlese 5: the two VXLAN corpses of the chaos run were `meister-vx`
+    /// links nothing named any more. What the sweep must never touch is
+    /// everything else — a tap, an uplink, somebody's `docker0` — so the
+    /// inverse of `overlay_bridge` is asserted against its own output and
+    /// against the shapes that come close.
+    #[test]
+    fn only_this_drivers_own_overlay_names_yield_a_vni() {
+        for vni in [1, 10_000, 10_003, 99_999] {
+            assert_eq!(overlay_vni(&overlay_bridge(vni)), Some(vni), "vni {vni}");
+        }
+        for other in [
+            "meister_br0",
+            "docker0",
+            "eth0",
+            "mvx10003",
+            "meister-vx",
+            "meister-vxten",
+            "meister-vx10003x",
+            "tap-4f2c",
+        ] {
+            assert_eq!(overlay_vni(other), None, "{other}");
+        }
+    }
+
+    /// The overlay a record names is either this driver's or nobody removes
+    /// it here.
+    ///
+    /// Nachlese 4. `destroy_overlay` used to take the VNI alone and rebuild
+    /// the name from it, which is the right answer exactly while one driver
+    /// builds overlays on a node. The record now carries what the bridge was
+    /// CALLED when it was built, and the three cases are: this driver's own
+    /// name (go ahead), somebody else's (refuse, and say both names), and
+    /// nothing written down at all (go ahead, which is every record from
+    /// before the name was kept).
+    #[test]
+    fn an_overlay_another_driver_named_is_not_this_ones_to_remove() {
+        assert!(not_this_drivers_overlay(10_000, Some("meister-vx10000")).is_none());
+        assert!(not_this_drivers_overlay(10_000, None).is_none());
+
+        let said = not_this_drivers_overlay(10_000, Some("tenant-br-10000"))
+            .expect("a refusal, not a removal");
+        assert!(said.contains("tenant-br-10000"), "{said}");
+        assert!(said.contains("meister-vx10000"), "{said}");
+        assert!(said.contains("10000"), "{said}");
     }
 
     /// One VNI, one group, and no two VNIs sharing one: the three bytes of a
@@ -669,9 +1068,48 @@ mod tests {
     #[test]
     fn a_nic_without_a_vxlan_id_lands_on_the_bridge_it_named() {
         assert_eq!(
-            LinuxNetworkDriver::target_bridge(&nic("meister_br0", None)),
+            LinuxNetworkDriver::target_bridge(&nic("meister_br0", None)).unwrap(),
             "meister_br0"
         );
+    }
+
+    /// Festlegung 3: a NIC that names a provider network hangs on that
+    /// network's bridge and on no overlay. The lab and single-tenant mode,
+    /// which is what exists today and stays.
+    #[test]
+    fn a_nic_with_a_physnet_lands_on_the_provider_bridge() {
+        let mut spec = nic("meister_br0", None);
+        spec.physnet = Some("ext".into());
+        assert_eq!(
+            LinuxNetworkDriver::target_bridge(&spec).unwrap(),
+            "meister-px-ext"
+        );
+        assert_eq!(
+            spec.bridge, "meister_br0",
+            "the spec still says which default it would otherwise have taken"
+        );
+
+        // A name whose bridge would not fit is refused here too, and not only
+        // at start-up: a spec may name a physnet this node never configured.
+        spec.physnet = Some("public".into());
+        let err = LinuxNetworkDriver::target_bridge(&spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("meister-px-public"), "{err}");
+    }
+
+    /// Both at once is a refusal and not a precedence rule. Guessing which
+    /// one an operator meant would put a tenant's guest on a wire the tenant
+    /// does not own, or the other way round, with nothing said.
+    #[test]
+    fn a_nic_that_names_a_physnet_and_an_overlay_is_refused_in_words() {
+        let mut spec = nic("meister_br0", Some(10_000));
+        spec.physnet = Some("ext".into());
+        let err = LinuxNetworkDriver::target_bridge(&spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"ext\"") && err.contains("10000"), "{err}");
+        assert!(err.contains("name one of the two"), "{err}");
     }
 
     /// And one that does goes to the tenant's bridge — while the record goes
@@ -679,7 +1117,10 @@ mod tests {
     #[test]
     fn a_nic_with_a_vxlan_id_lands_on_the_tenant_bridge() {
         let spec = nic("meister_br0", Some(10_000));
-        assert_eq!(LinuxNetworkDriver::target_bridge(&spec), "meister-vx10000");
+        assert_eq!(
+            LinuxNetworkDriver::target_bridge(&spec).unwrap(),
+            "meister-vx10000"
+        );
         assert_eq!(
             spec.bridge, "meister_br0",
             "the spec still says what was asked for"

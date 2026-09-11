@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = ["http-api", "debug-mutations"]
-http-api = ["dep:axum"]
+http-api = ["dep:axum", "dep:hyper", "dep:hyper-util"]
 debug-mutations = ["http-api"]
 
 [[bin]]
@@ -25,6 +25,11 @@ toml = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 axum = { workspace = true, optional = true} 
+# For the console upgrade: axum hands the raw connection over through
+# hyper's OnUpgrade, and TokioIo adapts it back to tokio's traits. Both are
+# already in this workspace and neither is a new supply-chain surface.
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
 nix = { workspace = true }
 # Hashing a fetched base image while it streams past. Already in the tree as
 # the pki crate's dependency, so it costs nothing to build.
@@ -45,5 +50,13 @@ linux-network-driver = { package = "meister-linux-network-driver", path = "../..
 filesystem-driver = { package = "meister-filesystem-driver", path = "../../drivers/filesystem" }
 lvm-thin-driver = { package = "meister-lvm-thin-driver", path = "../../drivers/lvm-thin" }
 nfs-driver = { package = "meister-nfs-driver", path = "../../drivers/nfs" }
+# The `networked` axis: an attacher for namespaces that live elsewhere, and a
+# provider for the ones that already exist.
+nvmeof-driver = { package = "meister-nvmeof-driver", path = "../../drivers/nvmeof" }
+nvmeof-import-driver = { package = "meister-nvmeof-import-driver", path = "../../drivers/nvmeof-import" }
 vfio-driver = { package = "meister-vfio-driver", path = "../../drivers/vfio" }
 nvrm-driver = { package = "meister-nvrm-driver", path = "../../drivers/nvrm" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+prost = { workspace = true }

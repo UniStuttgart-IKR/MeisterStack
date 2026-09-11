@@ -62,7 +62,7 @@ pub fn pick_pool<'a>(pools: &'a [FloatingPool], named: Option<&str>) -> Result<&
         [one] => Ok(one),
         [] if pools.is_empty() => Err(StoreError::Invalid(
             "this cloud has no floating pool; an administrator creates one with \
-             `meister cloud floatingpool create`"
+             `meister floatingpool create`"
                 .into(),
         )),
         [] => Err(StoreError::Invalid(format!(
@@ -219,12 +219,33 @@ fn within_quota(after: &[FloatingIp], tenant: &str, pool: &str, quota: u32) -> b
 /// checked a second time AFTER the write, because the check before it is a
 /// check-then-act that two requests naming two different addresses walk
 /// straight through: `within_quota` has that argument in full.
+/// What a reservation POINTS AT — everything about it that is not the address
+/// itself.
+///
+/// A struct rather than a fourth, fifth and sixth parameter on `allocate`,
+/// and the split is the honest one: the allocator's business is the tenant,
+/// the pool and which address is free, and none of these three change that
+/// answer. They are carried onto the object the allocator writes, because the
+/// alternative is a create followed by a patch and a window in between where
+/// the reservation exists and points nowhere.
+#[derive(Clone, Debug, Default)]
+pub struct Pointing {
+    /// The VM this address is for, by name. `None` = reserved and unassigned.
+    pub vm: Option<String>,
+    /// The router that carries the 1:1 rule, where the address does not live
+    /// in the guest. See `FloatingIpSpec::router`.
+    pub router: String,
+    /// The guest's own address on the overlay — the inside half of that pair.
+    pub internal_address: String,
+}
+
 pub async fn allocate(
     store: &EtcdStore,
     pool: &FloatingPool,
     tenant: &str,
     wanted: Option<Ipv4Addr>,
-    vm: Option<String>,
+    pointing: Pointing,
+    dry: crate::rest::DryRun,
 ) -> Result<FloatingIp> {
     let ranges = Ipv4Ranges::parse(&pool.spec.cidrs).map_err(|e| {
         StoreError::Invalid(format!(
@@ -247,13 +268,13 @@ pub async fn allocate(
             return Err(StoreError::Invalid(if quota == 0 {
                 format!(
                     "tenant {tenant} has no quota in floating pool {name}; an administrator \
-                     grants one with `meister cloud floatingpool quota {name} {tenant} <n>`"
+                     grants one with `meister floatingpool quota {name} {tenant} <n>`"
                 )
             } else {
                 format!(
                     "tenant {tenant} already holds all {quota} of its addresses in floating \
                      pool {name}; an administrator raises it with \
-                     `meister cloud floatingpool quota {name} {tenant} <n>`"
+                     `meister floatingpool quota {name} {tenant} <n>`"
                 )
             }));
         }
@@ -267,9 +288,20 @@ pub async fn allocate(
                 tenant: tenant.to_string(),
                 pool: pool.metadata.name.clone(),
                 address: address.to_string(),
-                vm: vm.clone(),
+                vm: pointing.vm.clone(),
+                router: pointing.router.clone(),
+                internal_address: pointing.internal_address.clone(),
             },
         );
+        // A preview stops here, one line short of the write, and hands back
+        // the address this round picked. That address is not a promise — the
+        // whole loop exists because somebody else may take it between now and
+        // the write — and that is exactly what a preview is worth: the quota
+        // refusal above is answered for real, and the address is the one the
+        // request would get if it went now.
+        if let Some(preview) = dry.preview(&object) {
+            return Ok(preview);
+        }
         match store.create(&object).await {
             // The address is ours. Whether the QUOTA is, is a question the
             // list we read before the write could not answer — see
@@ -285,7 +317,7 @@ pub async fn allocate(
                     // quota and the rollback did not land, so the pool holds
                     // an address that is nobody's business to take back. No
                     // pass repairs it — only a person running
-                    // `meister cloud floatingip release` does.
+                    // `meister floatingip assign --release` does.
                     error!(
                         address = %address,
                         tenant,
@@ -486,6 +518,16 @@ pub fn inject_nic_list(spec: &mut serde_json::Value, field: &str, values: &[Stri
         let Some(nic) = nic.as_object_mut() else {
             continue;
         };
+        // A NIC on a PROVIDER network is not on the tenant's wire at all —
+        // it is on the layer 2 the operator handed over — so neither the
+        // tenant's floating addresses nor its routed subnets say anything
+        // about which addresses are legitimate there. The node stopped
+        // reading them on such a tap (see the driver's `ruleset`); this is
+        // the same statement one tier up, so that the spec a person reads
+        // does not carry a list that means nothing.
+        if nic.get("physnet").is_some_and(|p| !p.is_null()) {
+            continue;
+        }
         let already = nic
             .get(field)
             .and_then(|v| v.as_array())
@@ -599,6 +641,8 @@ mod tests {
         FloatingIp::declare(
             address,
             FloatingIpSpec {
+                internal_address: String::new(),
+                router: String::new(),
                 tenant: tenant.into(),
                 pool: pool.into(),
                 address: address.into(),
@@ -816,6 +860,22 @@ mod tests {
     fn a_vm_with_no_addresses_or_no_nics_is_left_exactly_as_it_was() {
         let mut spec = serde_json::json!({ "vcpus": 2, "nics": [{}] });
         assert_eq!(inject_nic_list(&mut spec, NIC_FLOATING_IPS, &[]), 0);
+
+        // A NIC on a provider network gets neither list: it is not on the
+        // tenant's wire, so what the tenant may source there is not this
+        // tier's statement to make. The node stopped reading them on such a
+        // tap; this keeps the spec a person reads from carrying a list that
+        // means nothing.
+        let mut mixed = serde_json::json!({
+            "nics": [ {}, { "physnet": "ext" } ]
+        });
+        assert_eq!(
+            inject_nic_list(&mut mixed, NIC_ROUTED_SUBNETS, &["10.31.0.0/24".into()]),
+            1,
+            "the overlay nic, and only it"
+        );
+        assert_eq!(mixed["nics"][0][NIC_ROUTED_SUBNETS][0], "10.31.0.0/24");
+        assert!(mixed["nics"][1].get(NIC_ROUTED_SUBNETS).is_none());
         assert_eq!(spec, serde_json::json!({ "vcpus": 2, "nics": [{}] }));
 
         let mut none = serde_json::json!({ "vcpus": 2 });

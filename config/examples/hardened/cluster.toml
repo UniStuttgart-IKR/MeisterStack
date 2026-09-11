@@ -22,7 +22,7 @@ cluster_name = "cluster-1"
 # operator and a debugger. Loopback means reaching it is an SSH session:
 #
 #   ssh -L 3001:127.0.0.1:3001 cluster-1
-#   meister --profile cluster-1 cluster vm ls
+#   meister --profile cluster-1 vm ls
 #
 # The alternative, when a jump host is the wrong shape for the team, is to
 # bind the management address instead — "10.128.1.104:3001". That is still not
@@ -105,6 +105,14 @@ cloud_key = "pki/system-cluster-cluster-1.key"
 
 # Where to send spans — one more outbound permit on a hardened host.
 #otlp_endpoint = "http://127.0.0.1:4317"
+
+# How a line is written: "human" (the default) or "json". The envelope only —
+# no level, no filter and no field changes with it. "json" is for a host whose
+# logs are SHIPPED: the collector reads keys instead of guessing at a regex,
+# and the trace id becomes a key (`span_trace_id` after Loki's `| json`) that
+# joins a log line to its trace. Which also says the quiet part: with a
+# shipper configured, these lines leave this host.
+#log_format = "json"
 
 # --- the authenticator chain -----------------------------------------------
 #

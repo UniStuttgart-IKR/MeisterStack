@@ -17,6 +17,13 @@
 # locked-down variant of this file — TLS, a client CA and a single-link
 # authenticator chain — see hardened/.
 
+# What this cloud is called. The three replicas of one cloud SHARE it — it is
+# the CLOUD's name and not a replica's — and it is the name in their
+# system:cloud:<name> certificate, so it has to be stable across restarts and
+# identical on all three. Default "cloud", which is what a single-replica lab
+# has always been in everything but name.
+#cloud_name = "lab"
+
 # The END API — what a user's CLI and anything outside the lab talks to.
 listen_api = "0.0.0.0:3000"
 # Where the cluster-controllers dial in.
@@ -32,6 +39,18 @@ etcd_prefix = "/cloud"
 # is where a trace begins: `POST /vms` here, and the same trace id comes out
 # in the agent's log three hops down.
 #otlp_endpoint = "http://127.0.0.1:4317"
+
+# How a line is WRITTEN — the envelope, and nothing else. The same events, the
+# same levels, the same fields; "human" (the default) is what `journalctl` on
+# a box reads well, "json" is what a log collector reads without a regex.
+#
+# The reason to turn it on is the join between the two signals: in json the
+# trace id is a KEY rather than a substring. It sits on the span, so a
+# collector that flattens nested objects — Loki's `| json` does, with an
+# underscore — calls it `span_trace_id`, and that is the field a Grafana
+# derived field points at Tempo with. In "human" the same id is in the text,
+# where a person has always found it.
+#log_format = "json"
 
 # --- metrics ---------------------------------------------------------------
 #
@@ -71,7 +90,7 @@ etcd_prefix = "/cloud"
 
 # --- routed subnets: the address space a tenant can be given ----------------
 #
-# The super-pools `meister cloud routedsubnet create` cuts a block out of when
+# The super-pools `meister routedsubnet create` cuts a block out of when
 # an admin does not name a CIDR outright. Absent (the default) means every
 # subnet has to be named with --cidr, which is the honest default: this
 # control plane does not know which prefixes an operator was actually given,
@@ -112,8 +131,8 @@ etcd_prefix = "/cloud"
 #
 # There is no key here for them on purpose. A pool is created with
 #
-#   meister cloud floatingpool create lab --cidr 10.255.0.0/16 --default
-#   meister cloud floatingpool create public --cidr 203.0.113.7 \
+#   meister floatingpool create lab --cidr 10.255.0.0/16 --default
+#   meister floatingpool create public --cidr 203.0.113.7 \
 #       --cidr 203.0.113.16-203.0.113.19 --public
 #
 # — MetalLB's shape, and for MetalLB's reason: a second cloud replica reads
@@ -122,7 +141,7 @@ etcd_prefix = "/cloud"
 # rule lives: four addresses out of a private pool without anybody being
 # asked, ZERO out of a public one, and
 #
-#   meister cloud floatingpool quota public acme 2
+#   meister floatingpool quota public acme 2
 #
 # is the one explicit act that hands out a routable address.
 #
@@ -155,6 +174,38 @@ etcd_prefix = "/cloud"
 # 401 in words, and `meister login` is by definition such a caller.
 #client_ca = "pki/ca.crt"
 
+# This replica's own client identity: CN=system:cloud:<cloud_name>,
+# O=system:clouds, from `tools/meister-ca --cloud <name>`. `push.sh pki` puts
+# it here as identity.crt/.key, the same fixed names a cluster replica and an
+# agent get.
+#
+# What it is FOR is a replica asking its SIBLING. A cluster dials one cloud
+# replica and only that one can ask it anything, so two of every three
+# `vm logs` and console reads have to be forwarded — and the sibling's
+# permission table admits a NAME, which the serving certificate (CN=hostname)
+# is not. Without these two a forward goes in plain http, which is what a lab
+# runs; against a sibling that serves TLS it fails with a sentence naming
+# these keys.
+#identity_cert = "pki/system-cloud-lab.crt"
+#identity_key = "pki/system-cloud-lab.key"
+
+# The key a Secret's values are sealed with: 32 bytes, mode 0600. `push.sh
+# pki` puts it here from the lab PKI directory, and it is the SAME file on
+# both controller tiers -- the cloud seals and the cluster opens, because the
+# cluster is what hands a node its cloud-init. An agent never gets it: a node
+# is handed the plaintext over its already-authenticated session.
+#
+# Absent, the cloud answers 501 to `POST /secrets` and a cluster leaves a vm
+# naming one Pending with a sentence saying so. There is deliberately no
+# degraded mode that stores a value in the clear -- a Secret in plaintext is
+# `spec.vm.cloud_init.user_data` under a new name.
+#
+#   head -c 32 /dev/urandom > secrets.key && chmod 600 secrets.key
+#
+# There is no rotation verb. Changing this file makes every stored value
+# unopenable, which is why it is worth writing down where the key came from.
+#secrets_key = "pki/secrets.key"
+
 # The CA this controller SIGNS certificate requests with. Usually the same
 # file as client_ca, because it is the same CA; named separately because a
 # deployment may verify against a bundle and sign with one of them. Without
@@ -170,7 +221,7 @@ etcd_prefix = "/cloud"
 # lab switch, and exactly as dangerous as it sounds: with it on, the only
 # thing between a caller and a certificate is the authenticator chain — which
 # is why a non-admin can only ever ask for its own name. Off by default;
-# an administrator otherwise runs `meister cloud csr approve <name>`.
+# an administrator otherwise runs `meister csr approve <name>`.
 #csr_auto_approve = true
 
 # The authenticator chain, in order. Order is the security-relevant part and
@@ -213,6 +264,25 @@ etcd_prefix = "/cloud"
 
 [auth]
 #chain = ["mtls", "oidc", "bearer"]
+# A chain WITHOUT "mtls" is refused at start-up, and it is worth knowing why
+# before you write one: the chain is per CONTROLLER and not per port — the
+# same links guard this REST edge and the gRPC session edge — and nothing
+# dials a session port with a bearer token. A cluster shows
+# `system:cluster:<name>`, a node shows `system:node:<name>`, both by
+# certificate and only by certificate. So `chain = ["bearer"]` is a control
+# plane locked out of itself: the sessions fail with "no credentials were
+# presented" and every vm stays Pending while this API answers 200 to
+# everything. Two client authors lost a day to it before it was an error.
+#
+# The lab shape is `["mtls", "bearer"]` with a throwaway CA — mtls carries the
+# peers, bearer carries the person. `tools/meister-ca` makes one in a line:
+#
+#   tools/meister-ca --dir pki --cloud cloud --cluster cluster-1 --admin root
+#
+# and then `client_ca`, `tls_cert` and `tls_key` above point into `pki/`.
+# A REST-only endpoint (no `listen_session`) is the one case where a chain
+# without mtls is merely a warning: it admits no peers, so none are shut out.
+
 
 # The development bearer token: one static string, no expiry, no rotation,
 # read from a file at start-up. It exists because the CSR flow has a
@@ -298,3 +368,45 @@ etcd_prefix = "/cloud"
 # an administrator has built and named.
 #provision_unknown_users = false
 #tenant_claim = "meister_tenant"
+
+# --- the browser ------------------------------------------------------------
+#
+# What a web interface in front of this API is, and what it costs to configure.
+# Written here rather than in a document because the three keys it needs are
+# the three keys above it.
+#
+# A page in a browser calls this API from ANOTHER origin, so without the
+# headers below the browser refuses to hand the page the answer — the request
+# is made, the response is received, and the page is not allowed to read it.
+# A PATCH makes it worse: `Content-Type: application/merge-patch+json` is not
+# one of the three values a browser will send unasked, so every patch is
+# preceded by an OPTIONS preflight that carries no credentials at all.
+#
+# Empty (the default) means no CORS headers anywhere and a browser gets
+# nothing, which is right for an API with no page in front of it. An origin
+# not on the list is answered exactly as one that sent no Origin: the browser
+# blocks the answer, and this server has not lied about who may read it. "*"
+# is allowed and means it — then without a credentials header, as the standard
+# requires.
+#
+#[api]
+#cors_origins = ["https://ui.lab.example"]
+#
+# How the page gets a token. It runs the authorization-code flow with PKCE
+# against the same provider as [auth.oidc], with a client_id OF ITS OWN — a
+# public client with no secret, because a secret in a page is not a secret —
+# and sends the access token as `Authorization: Bearer`. For this API to
+# accept that token, the page's audience has to be in `audience` above; that
+# is the one key a web interface adds to this file.
+#
+# mTLS is not the browser's way and is not described here: a client
+# certificate in a browser is a per-machine ceremony, and the token flow is
+# what a page can do on its own.
+#
+# In the lab this is Dex in the k3s cluster: static users, two clients `cli`
+# and `ui`, with `ui` a `trustedPeer` of `cli` so that one token is valid for
+# both audiences; Grafana hangs off the same Dex. Dex serves no claim of its
+# own, so `provision_unknown_users` stays off and people are entered with
+# `meister user create`. Zitadel is the candidate if self-service and custom
+# claims are ever needed — and a provider swap costs this file exactly three
+# keys: `issuer`, `client_id`, `audience`.

@@ -6,8 +6,18 @@ edition = "2024"
 [dependencies]
 uuid = { workspace = true }
 serde = { workspace = true }
+# `spec`: the shape of a VM document is published under `/schemas`, and the
+# only honest way to publish it is to derive it from the very types serde
+# reads. The controllers ask for it; the agent pays a derive it never calls.
+schemars = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 common = { package = "meister-common", path = "../common" }
+
+[dev-dependencies]
+# One async test, and the trait it exercises is async: the snapshot verbs
+# default to a refusal, and a default that is never awaited is a default
+# nobody has read. `rt` and `macros` only -- this crate spawns nothing.
+tokio = { workspace = true }

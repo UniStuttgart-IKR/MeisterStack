@@ -13,12 +13,12 @@ use std::future::Future;
 use std::time::Duration;
 
 use etcd_client::{
-    Client, Compare, CompareOp, ConnectOptions, EventType, GetOptions, PutOptions, Txn, TxnOp,
-    TxnResponse, WatchOptions,
+    Client, Compare, CompareOp, ConnectOptions, DeleteOptions, Event, EventType, GetOptions,
+    PutOptions, Txn, TxnOp, TxnResponse, WatchOptions,
 };
 use tracing::{error, info, warn};
 
-use crate::object::{Resource, StoredObject};
+use crate::object::{NameShape, Resource, StoredObject};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -206,6 +206,24 @@ impl EtcdStore {
         serde_json::to_vec(&clean).map_err(|e| StoreError::Invalid(format!("invalid object: {e}")))
     }
 
+    /// One read against the store, for a readiness probe.
+    ///
+    /// A key that need not exist, and that is deliberate: what is being asked
+    /// is whether the store ANSWERS, not whether it holds anything in
+    /// particular. A probe that depended on content would go red the first
+    /// time somebody emptied a directory, which is a working control plane
+    /// with nothing in it.
+    ///
+    /// The read goes through `timed` like every other, so it also lands in
+    /// the etcd latency and failure metrics — a replica that is flapping
+    /// ready shows up there before anybody reads its probe log.
+    pub async fn probe(&self) -> Result<()> {
+        let key = format!("{}/readyz", self.prefix);
+        let resp = timed("probe", self.handle().get(key, None)).await?;
+        observe_revision(resp.header());
+        Ok(())
+    }
+
     pub async fn get<T: Resource>(&self, name: &str) -> Result<T> {
         let key = self.key(T::RESOURCE, name);
         let resp = timed("get", self.handle().get(key.clone(), None)).await?;
@@ -260,20 +278,23 @@ impl EtcdStore {
 
     /// A name is the last segment of an etcd key, a piece of a file name on a
     /// node, and part of an interface name. That is three places downstream,
-    /// and the shape below is the intersection of what all three survive: the
-    /// DNS label, which is what Kubernetes settled on for the same reason.
+    /// and the DNS label is the intersection of what all three survive —
+    /// Kubernetes' own answer, for the same reason.
     ///
-    /// Lowercase alphanumerics and `-`, starting and ending alphanumeric, at
-    /// most [`Self::MAX_NAME`] bytes.
+    /// It is not, however, the answer for every resource, because the third
+    /// place does not apply to all of them. `NameShape::Dotted` is the same
+    /// rule with `.` allowed inside it, for the two resources whose name was
+    /// never a word an operator chose: a floating address, and the file name
+    /// an image is looked up as. See [`crate::object::NameShape`].
     ///
-    /// The lab found what the old check let past, and each one is a different
-    /// kind of trouble: a name with a SPACE (a shell word boundary on every
-    /// node that handles it), non-ASCII (`chaos-üml`, which is not one byte
-    /// per character anywhere it is counted), uppercase (two objects that
-    /// differ only in case are one file on a case-insensitive mount), 300
-    /// characters, and an embedded `..` that the old check only caught when
-    /// the whole name was `..`.
-    fn check_name(name: &str) -> Result<()> {
+    /// The lab found what the check before this let past, and each one is a
+    /// different kind of trouble: a name with a SPACE (a shell word boundary
+    /// on every node that handles it), non-ASCII (`chaos-üml`, which is not
+    /// one byte per character anywhere it is counted), uppercase (two objects
+    /// that differ only in case are one file on a case-insensitive mount),
+    /// 300 characters, and an embedded `..` that it only caught when the
+    /// whole name was `..`. None of those is allowed under either shape.
+    fn check_name(name: &str, shape: NameShape) -> Result<()> {
         let invalid = |why: &str| {
             Err(StoreError::Invalid(format!(
                 "invalid object: metadata.name {name:?} {why}"
@@ -291,17 +312,27 @@ impl EtcdStore {
                 Self::MAX_NAME
             ));
         }
-        if !name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        {
-            return invalid(
+        let dotted = shape == NameShape::Dotted;
+        if !name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || (dotted && b == b'.')
+        }) {
+            return invalid(if dotted {
+                "may hold only lowercase letters, digits, '-' and '.' \
+                 (it is one path segment: it becomes an etcd key and a file name)"
+            } else {
                 "may hold only lowercase letters, digits and '-' \
                  (it is a dns label: it becomes an etcd key, a file name and \
-                 part of an interface name)",
-            );
+                 part of an interface name)"
+            });
         }
-        if name.starts_with('-') || name.ends_with('-') {
+        // `..` is the traversal the old check missed, and it stays refused
+        // under the wider shape for exactly that reason.
+        if dotted && name.contains("..") {
+            return invalid("may not hold \"..\"");
+        }
+        if !name.starts_with(|c: char| c.is_ascii_alphanumeric())
+            || !name.ends_with(|c: char| c.is_ascii_alphanumeric())
+        {
             return invalid("must start and end with a letter or a digit");
         }
         Ok(())
@@ -334,7 +365,14 @@ impl EtcdStore {
 
     async fn create_inner<T: Resource>(&self, obj: &T, lease: Option<i64>) -> Result<T> {
         let name = obj.metadata().name.clone();
-        Self::check_name(&name)?;
+        Self::check_name(&name, T::NAME_SHAPE)?;
+        // Every object starts at generation 1, and here rather than in the
+        // handlers because there are a dozen of those and one of these. What
+        // a client sent in the field is not consulted: the count is the
+        // server's, or it is worth nothing. See `Metadata::generation`.
+        let mut obj = obj.clone();
+        obj.metadata_mut().generation = 1;
+        let obj = &obj;
         let key = self.key(T::RESOURCE, &name);
         let value = Self::encode(obj)?;
         let options = lease.map(|id| PutOptions::new().with_lease(id));
@@ -428,7 +466,7 @@ impl EtcdStore {
     /// Compare-and-swap on the object's resource_version.
     pub async fn update<T: Resource>(&self, obj: &T) -> Result<T> {
         let name = obj.metadata().name.clone();
-        Self::check_name(&name)?;
+        Self::check_name(&name, T::NAME_SHAPE)?;
         let rev: i64 = obj.metadata().resource_version.parse().map_err(|_| {
             StoreError::Invalid(
                 "invalid object: metadata.resourceVersion must be set for updates".into(),
@@ -494,6 +532,32 @@ impl EtcdStore {
         Ok(())
     }
 
+    /// Take an object: delete it and hand back what was there, or `None` if
+    /// nothing was.
+    ///
+    /// One round trip, and that is the whole of it. A `get` followed by a
+    /// `delete` is two, and between them a second replica does the same get
+    /// and gets the same answer — so a thing that may be had exactly once is
+    /// had twice. etcd's `with_prev_key` makes the read the delete's own
+    /// return value, and a delete of a key that is already gone deletes
+    /// nothing and returns nothing: exactly one caller can win.
+    ///
+    /// Written for console tickets (Fremdsicht 6) and named for what it is
+    /// rather than for them, because "remove and tell me what it was" is the
+    /// shape every once-only object needs.
+    pub async fn take<T: Resource>(&self, name: &str) -> Result<Option<T>> {
+        let key = self.key(T::RESOURCE, name);
+        let options = DeleteOptions::new().with_prev_key();
+        let resp = timed("take", self.handle().delete(key, Some(options))).await?;
+        match resp.prev_kvs().first() {
+            // The revision the object HAD, which is the one it was deleted
+            // at. Nothing can be compared against it any more; it is carried
+            // so that the value reads like every other object out of here.
+            Some(kv) => Ok(Some(Self::decode::<T>(kv.value(), kv.mod_revision())?)),
+            None => Ok(None),
+        }
+    }
+
     /// Watch a resource prefix. Yields decoded objects; Delete events carry
     /// only the name (the value is gone).
     pub async fn watch<T: Resource>(
@@ -508,23 +572,8 @@ impl EtcdStore {
         tokio::spawn(async move {
             while let Ok(Some(resp)) = stream.message().await {
                 for ev in resp.events() {
-                    let Some(kv) = ev.kv() else { continue };
-                    let name = String::from_utf8_lossy(kv.key())
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or_default()
-                        .to_string();
-                    let item = match ev.event_type() {
-                        EventType::Put => match Self::decode::<T>(kv.value(), kv.mod_revision()) {
-                            Ok(obj) => (WatchEvent::Put, name, Some(obj)),
-                            // Error for the reason `list` logs one: nothing
-                            // heals a key that will not decode.
-                            Err(e) => {
-                                error!(name, error = format!("{e:#}"), "undecodable watch event");
-                                continue;
-                            }
-                        },
-                        EventType::Delete => (WatchEvent::Delete, name, None),
+                    let Some(item) = Self::observed::<T>(ev) else {
+                        continue;
                     };
                     if tx.send(item).await.is_err() {
                         return;
@@ -533,6 +582,33 @@ impl EtcdStore {
             }
         });
         Ok(rx)
+    }
+
+    /// One etcd watch event in this store's own words, or `None` for one
+    /// there is nothing to say about.
+    ///
+    /// An event without a key-value is one etcd told us nothing with. A
+    /// Delete carries only the name, because the value is gone. A Put that
+    /// will not decode is dropped with an error, for the reason `list` logs
+    /// one: nothing heals a key that will not decode, and a watch that
+    /// stopped at one would take the reconciler down with it.
+    fn observed<T: Resource>(ev: &Event) -> Option<(WatchEvent, String, Option<T>)> {
+        let kv = ev.kv()?;
+        let name = String::from_utf8_lossy(kv.key())
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if ev.event_type() == EventType::Delete {
+            return Some((WatchEvent::Delete, name, None));
+        }
+        match Self::decode::<T>(kv.value(), kv.mod_revision()) {
+            Ok(obj) => Some((WatchEvent::Put, name, Some(obj))),
+            Err(e) => {
+                error!(name, error = format!("{e:#}"), "undecodable watch event");
+                None
+            }
+        }
     }
 }
 
@@ -669,10 +745,13 @@ mod tests {
         assert!(!EtcdStore::is_deleting(b""));
     }
 
+    /// The default shape, and every way the lab found to get past the check
+    /// before it.
     #[test]
     fn a_name_that_is_not_a_dns_label_is_refused() {
+        let label = |n: &str| EtcdStore::check_name(n, NameShape::DnsLabel);
         for ok in ["web-1", "a", "vm-0", "chaos-pool-2", &"a".repeat(63)] {
-            assert!(EtcdStore::check_name(ok).is_ok(), "{ok:?} should be a name");
+            assert!(label(ok).is_ok(), "{ok:?} should be a name");
         }
         for (bad, why) in [
             (
@@ -691,21 +770,83 @@ mod tests {
                 "the old check caught this only when it was the whole name",
             ),
             ("under_score", "not a dns label"),
+            ("debian.raw", "a dot is not part of a label"),
         ] {
-            assert!(EtcdStore::check_name(bad).is_err(), "{bad:?}: {why}");
+            assert!(label(bad).is_err(), "{bad:?}: {why}");
         }
         let long = "a".repeat(64);
-        let e = EtcdStore::check_name(&long).unwrap_err().to_string();
+        let e = label(&long).unwrap_err().to_string();
         assert!(e.contains("64 bytes"), "{e}");
+    }
+
+    /// The wider shape, and the two resources it exists for.
+    ///
+    /// Both of them are named after something that was never a word an
+    /// operator chose — an address, and the file a node looks an image up as
+    /// — and while the label was demanded of them, NEITHER could be created
+    /// at all: every floating reservation was a 422, and an image with an
+    /// extension could not be catalogued.
+    #[test]
+    fn a_dotted_name_holds_an_address_and_a_file_name_and_still_no_traversal() {
+        let dotted = |n: &str| EtcdStore::check_name(n, NameShape::Dotted);
+        for ok in [
+            "10.255.0.1",
+            "203.0.113.11",
+            "debian-13.raw",
+            "nixos.qcow2",
+            "web-1",
+        ] {
+            assert!(dotted(ok).is_ok(), "{ok:?} should be a name");
+        }
+        // Everything the label refuses for a reason that still holds, holds.
+        for (bad, why) in [
+            ("has space", "still a shell word boundary"),
+            ("Debian.raw", "still one file on a case-insensitive mount"),
+            ("team/web", "still one path segment"),
+            ("..", "still the traversal"),
+            ("a..b", "and it is refused wherever it sits, not only alone"),
+            (".leading", "still starts alphanumeric"),
+            ("trailing.", "still ends alphanumeric"),
+            ("chaos-\u{fc}ml", "still one byte per character"),
+        ] {
+            assert!(dotted(bad).is_err(), "{bad:?}: {why}");
+        }
+
+        // And the two resources really carry it, which is what makes the
+        // paragraph above true rather than merely available.
+        assert_eq!(
+            <crate::resources::FloatingIp as Resource>::NAME_SHAPE,
+            NameShape::Dotted
+        );
+        assert_eq!(
+            <crate::resources::Image as Resource>::NAME_SHAPE,
+            NameShape::Dotted
+        );
+        // Everything an operator names keeps the label: a vm name becomes
+        // part of an interface name, and that is where the rule is earned.
+        assert_eq!(
+            <crate::resources::Vm as Resource>::NAME_SHAPE,
+            NameShape::DnsLabel
+        );
+        assert_eq!(
+            <crate::resources::Node as Resource>::NAME_SHAPE,
+            NameShape::DnsLabel
+        );
     }
 
     #[test]
     fn a_name_that_is_not_one_path_segment_is_refused() {
-        assert!(EtcdStore::check_name("web-1").is_ok());
-        assert!(EtcdStore::check_name("team/web").is_err());
-        assert!(EtcdStore::check_name("").is_err());
-        assert!(EtcdStore::check_name(".").is_err());
-        assert!(EtcdStore::check_name("..").is_err());
+        assert!(EtcdStore::check_name("web-1", NameShape::DnsLabel).is_ok());
+        for bad in ["team/web", "", ".", ".."] {
+            assert!(
+                EtcdStore::check_name(bad, NameShape::DnsLabel).is_err(),
+                "{bad:?}"
+            );
+            assert!(
+                EtcdStore::check_name(bad, NameShape::Dotted).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     /// A request that never answers becomes an error the caller can act on,
@@ -774,6 +915,8 @@ mod tests {
         let mut obj = FloatingIp::declare(
             "10.255.0.7",
             FloatingIpSpec {
+                internal_address: String::new(),
+                router: String::new(),
                 tenant: "acme".into(),
                 pool: "lab".into(),
                 address: "10.255.0.7".into(),

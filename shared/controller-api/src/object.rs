@@ -9,10 +9,11 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Metadata {
     pub name: String,
     #[serde(default)]
@@ -20,6 +21,31 @@ pub struct Metadata {
     /// etcd mod_revision as a string; empty on objects not yet stored.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub resource_version: String,
+    /// How often a CLIENT has changed this object's spec. `1` when it is
+    /// created, `+1` on every API write that leaves a different spec behind.
+    ///
+    /// Kubernetes' field with Kubernetes' meaning, and it is here to make one
+    /// specific lie impossible: a `PUT` on a running VM used to change
+    /// `spec.vm`, answer 200 and do nothing at all, because a node takes a
+    /// spec once — when it creates the instance. Nothing in the API said so.
+    /// Paired with `observedGeneration` in a status, this is what says it:
+    /// `observedGeneration < generation` means exactly "the spec was changed
+    /// after the controller last acted on it".
+    ///
+    /// Three things deliberately do NOT count. A write that leaves the spec
+    /// as it was — a label, an annotation, a patch that says nothing new —
+    /// is not a change of intent. A controller's own write is not a CLIENT's
+    /// intent: the scheduler's binding puts a `nodeName` in the spec, and a
+    /// generation that counted it would tick on every placement and never
+    /// mean anything again. And `resourceVersion` is not this: that counts
+    /// every write of any kind and is the compare-and-swap; this counts the
+    /// ones a controller has to do something about.
+    ///
+    /// `0` is what an object written before this field existed carries. Its
+    /// `observedGeneration` is `0` too, so the pair reads "in sync", which is
+    /// true — and the first spec change makes it `1`.
+    #[serde(default)]
+    pub generation: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     /// Non-identifying metadata, K8s' own distinction: labels are what a
@@ -37,15 +63,45 @@ pub struct Metadata {
     pub finalizers: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+// `deny_unknown_fields` at the ENVELOPE, and it is the same rule the spec
+// types already carry, one layer out. Without it a key nobody claims falls
+// away silently: `{"metdata": {"name": "web-1"}, …}` used to come back as
+// "metadata.name must be set" — a true sentence about the wrong thing, and
+// the client is left believing the server read a name it never saw. The
+// generic type is the right place for it, because this is one statement about
+// the envelope every resource wears and not a special case for one kind.
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+// `status` is `#[serde(default)]`, so the schema wants to name that default —
+// which needs the bound serde never had to state.
+#[schemars(bound = "S: JsonSchema, St: JsonSchema + Default + Serialize")]
 pub struct Object<S, St> {
     pub api_version: String,
     pub kind: String,
     pub metadata: Metadata,
     pub spec: S,
-    #[serde(default)]
+    /// Left out entirely when it serialises to nothing.
+    ///
+    /// A resource whose status type is `()` — `Secret` is the one today —
+    /// used to answer every GET with `"status": null`. Honest ("this kind has
+    /// no status") and still noise in a JSON API, and noise a client has to
+    /// learn to ignore. The rule is generic on purpose: it is one statement
+    /// about the envelope every resource wears, not a special case for one
+    /// kind, and a status that says something (an all-default struct is still
+    /// `{}`) is still there.
+    #[serde(default, skip_serializing_if = "says_nothing")]
     pub status: St,
+}
+
+/// Does this status serialise to `null`?
+///
+/// Asked of the VALUE rather than of the type, because a `skip_serializing_if`
+/// gets a value and Rust has no stable way to ask "is this `()`". `()` is the
+/// one type in this tree that answers yes; an empty struct serialises to `{}`
+/// and stays in the document, which is right — `{}` is a status that exists
+/// and is empty, `null` is a status that was never a thing.
+fn says_nothing<St: Serialize>(status: &St) -> bool {
+    serde_json::to_value(status).is_ok_and(|v| v.is_null())
 }
 
 impl<S, St: Default> Object<S, St> {
@@ -79,6 +135,29 @@ impl<S, St: Default> Object<S, St> {
 /// years later) is deliberately not part of it. A trace that grew for the
 /// lifetime of a VM would be unreadable and would never end.
 pub const ANNOTATION_TRACEPARENT: &str = "meister.io/traceparent";
+
+/// What a `?dryRun=All` answer wears, so that nobody can mistake it for a
+/// thing that exists.
+///
+/// On the object rather than beside it, because the object is what travels: a
+/// preview handed to a person, pasted into a file and fed back to `apply` has
+/// to be recognisable at every one of those steps, and a field of the HTTP
+/// response would survive none of them. The write path strips it — a client
+/// that sends it back is sending a document it was given, not making a claim.
+pub const ANNOTATION_DRY_RUN: &str = "meister.io/dry-run";
+
+/// The `metadata.generation` of the CLOUD object a mirrored copy stands for.
+///
+/// On the copy rather than derived, because the two objects count different
+/// things: the cluster's own generation counts writes made here, and this is
+/// the version of the thing up there that this copy was made from. It is what
+/// the cluster reports back in `ClusterStatus.secrets`, and therefore what
+/// lets the cloud stop re-sending a secret that has not changed.
+///
+/// An annotation and not a field, by the rule annotations are for: it is
+/// non-identifying, nothing selects on it, and it belongs to the ACT of
+/// mirroring rather than to what a Secret is.
+pub const ANNOTATION_CLOUD_GENERATION: &str = "meister.io/cloud-generation";
 
 impl Metadata {
     /// The trace context this object was created under, if it has one. Not
@@ -123,6 +202,39 @@ pub trait Resource: StoredObject {
     const RESOURCE: &'static str;
     /// The `kind` of the envelope, as a client spells it in a body.
     const KIND: &'static str;
+    /// What a name of this kind may look like. See [`NameShape`]; the DNS
+    /// label is the answer for everything an operator names, and the two
+    /// resources whose name is not a word an operator chose say so in the
+    /// resource table.
+    const NAME_SHAPE: NameShape = NameShape::DnsLabel;
+}
+
+/// What a name may hold.
+///
+/// A name goes to three places downstream and the DNS label is the
+/// intersection of what all three survive — but those three places do not
+/// all apply to every resource, and treating them as if they did made two
+/// resources impossible to create at all:
+///
+/// * a `FloatingIp` is NAMED after its address, and no address has ever been
+///   a DNS label. Every reservation was a 422.
+/// * an `Image` is named after the file a node looks it up as, and a file
+///   with an extension — `debian.raw`, which is every image anybody has —
+///   could not be catalogued.
+///
+/// Neither of those names ever becomes a network interface, which is the one
+/// downstream place that actually demands the label. So the rule stays where
+/// it is earned and is widened by exactly one character where it is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameShape {
+    /// Lowercase alphanumerics and `-`, starting and ending alphanumeric.
+    /// Kubernetes' own answer, and the default here for the same reason: it
+    /// survives an etcd key, a file name and an interface name.
+    DnsLabel,
+    /// The same, plus `.` inside it — a file name with an extension, and an
+    /// IPv4 address. Still one path segment, still no uppercase, no space,
+    /// no non-ASCII, and still no `..` anywhere in it.
+    Dotted,
 }
 
 impl<S, St> StoredObject for Object<S, St>

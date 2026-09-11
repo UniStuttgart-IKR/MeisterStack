@@ -19,9 +19,23 @@
 # every replica of THIS cluster has to use the same one.
 cluster_name = "cluster-1"
 
-# The REST API operators and `meister cluster …` talk to. Cluster #n
+# The REST API operators and `meister …` talk to. Cluster #n
 # conventionally takes 3000+n so several can share a host.
 listen_api = "0.0.0.0:3001"
+
+# Where OTHER replicas of this cluster can reach this one.
+#
+# `listen_api` above is a BIND address, and `0.0.0.0` is not one anybody can
+# dial. A node dials exactly one replica and only that one can ask it for a
+# console, so the holder writes its own address onto the Node object and the
+# other replicas forward a `meister vm logs` to it — once. A replica that
+# cannot name itself writes nothing, and a console read that lands on the
+# wrong one is a 503 naming this key.
+#
+# One replica: leave it. Several behind one address: set it, per replica, to
+# the address the OTHERS can reach this one at. Host and port, as above; the
+# scheme follows tls_cert.
+#advertise_api = "10.128.1.104:3001"
 # Where the agents dial in. Session ports count from 50051 for the same
 # reason.
 listen_session = "0.0.0.0:50051"
@@ -71,6 +85,18 @@ etcd_prefix = "/cluster"
 # trace of a `POST /vms` reaches through this controller into the agent and
 # down to the driver that spawns the backend.
 #otlp_endpoint = "http://127.0.0.1:4317"
+
+# How a line is WRITTEN — the envelope, and nothing else. The same events, the
+# same levels, the same fields; "human" (the default) is what `journalctl` on
+# a box reads well, "json" is what a log collector reads without a regex.
+#
+# The reason to turn it on is the join between the two signals: in json the
+# trace id is a KEY rather than a substring. It sits on the span, so a
+# collector that flattens nested objects — Loki's `| json` does, with an
+# underscore — calls it `span_trace_id`, and that is the field a Grafana
+# derived field points at Tempo with. In "human" the same id is in the text,
+# where a person has always found it.
+#log_format = "json"
 
 # --- metrics ---------------------------------------------------------------
 #
@@ -123,6 +149,23 @@ etcd_prefix = "/cluster"
 #cloud_cert = "pki/system-cluster-cluster-1.crt"
 #cloud_key = "pki/system-cluster-cluster-1.key"
 
+# The key a Secret's values are sealed with: 32 bytes, mode 0600. `push.sh
+# pki` puts it here from the lab PKI directory, and it is the SAME file on
+# both controller tiers -- the cloud seals and the cluster opens, because the
+# cluster is what hands a node its cloud-init. An agent never gets it: a node
+# is handed the plaintext over its already-authenticated session.
+#
+# Absent, the cloud answers 501 to `POST /secrets` and a cluster leaves a vm
+# naming one Pending with a sentence saying so. There is deliberately no
+# degraded mode that stores a value in the clear -- a Secret in plaintext is
+# `spec.vm.cloud_init.user_data` under a new name.
+#
+#   head -c 32 /dev/urandom > secrets.key && chmod 600 secrets.key
+#
+# There is no rotation verb. Changing this file makes every stored value
+# unopenable, which is why it is worth writing down where the key came from.
+#secrets_key = "pki/secrets.key"
+
 # The authenticator chain, in order; see the cloud example for what each link
 # is and why the order matters. An [auth] table that configures nothing is
 # still the anonymous mode.
@@ -165,6 +208,25 @@ etcd_prefix = "/cluster"
 # talks to a cluster controller is machinery, and machinery has certificates.
 [auth]
 #chain = ["mtls", "bearer"]
+# A chain WITHOUT "mtls" is refused at start-up, and it is worth knowing why
+# before you write one: the chain is per CONTROLLER and not per port — the
+# same links guard this REST edge and the gRPC session edge — and nothing
+# dials a session port with a bearer token. A cluster shows
+# `system:cluster:<name>`, a node shows `system:node:<name>`, both by
+# certificate and only by certificate. So `chain = ["bearer"]` is a control
+# plane locked out of itself: the sessions fail with "no credentials were
+# presented" and every vm stays Pending while this API answers 200 to
+# everything. Two client authors lost a day to it before it was an error.
+#
+# The lab shape is `["mtls", "bearer"]` with a throwaway CA — mtls carries the
+# peers, bearer carries the person. `tools/meister-ca` makes one in a line:
+#
+#   tools/meister-ca --dir pki --cloud cloud --cluster cluster-1 --admin root
+#
+# and then `client_ca`, `tls_cert` and `tls_key` above point into `pki/`.
+# A REST-only endpoint (no `listen_session`) is the one case where a chain
+# without mtls is merely a warning: it admits no peers, so none are shut out.
+
 #bearer_token_file = "pki/dev-token"
 #bearer_identity = "dev-admin"
 #bearer_groups = ["system:masters"]

@@ -5,7 +5,7 @@
 //! `meister login` — sugar over the certificatesigningrequests flow.
 //!
 //! Sugar, and nothing more: every step is a call an operator could make by
-//! hand with `cloud csr`. What it saves is the part nobody wants to do by
+//! hand with `meister csr`. What it saves is the part nobody wants to do by
 //! hand, which is generating a key pair and then not sending it.
 //!
 //! The claim this command makes, and the reason it exists at all: **the
@@ -22,7 +22,13 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::client::Client;
-use crate::cloud::CSRS;
+
+/// Where a certificate is asked for. Spelled out here rather than taken from
+/// the discovery document, and that is the one exception in this CLI: login
+/// runs against a profile whose credential does not exist yet, so it is the
+/// one command that may not be able to authenticate a discovery call first.
+const CSRS: &str = "/apis/meister.io/v1/certificatesigningrequests";
+
 use crate::config::{Config, Target};
 use crate::{GlobalArgs, LoginArgs, OutputFormat};
 
@@ -242,7 +248,7 @@ async fn wait_for_approval(client: &Client, name: &str, wait_secs: u64) -> Resul
     if wait_secs == 0 {
         bail!(
             "request {name} is waiting for approval; an administrator runs \
-             `meister cloud csr approve {name}`"
+             `meister csr approve {name}`"
         );
     }
     eprintln!("waiting up to {wait_secs}s for an administrator to approve {name} ...");
@@ -256,7 +262,7 @@ async fn wait_for_approval(client: &Client, name: &str, wait_secs: u64) -> Resul
         if tokio::time::Instant::now() >= deadline {
             bail!(
                 "request {name} is still waiting after {wait_secs}s; it stays where it is - \
-                 `meister cloud csr approve {name}` and run login again"
+                 `meister csr approve {name}` and run login again"
             );
         }
         tokio::time::sleep(POLL_INTERVAL).await;

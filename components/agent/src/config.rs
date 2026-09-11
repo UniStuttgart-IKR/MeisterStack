@@ -6,10 +6,11 @@ use anyhow::{Context, bail};
 use crosvm_gpu_driver::GpuParams;
 use nvrm_driver::NvrmParams;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::read_to_string;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use toml::from_str;
 
 fn default_nvrm_socket_timeout_ms() -> u64 {
@@ -43,10 +44,47 @@ pub struct AgentConfig {
     pub controller_addrs: Vec<String>,
     #[serde(default = "default_stop_grace_secs")]
     pub stop_grace_secs: u64,
+    /// How long this node watches a live migration it is SENDING before it
+    /// stops watching. Default 600.
+    ///
+    /// Deliberately longer than the cluster's own transfer timeout (120 s by
+    /// default), and that relation is the whole reason the number exists: the
+    /// tier that ASKED for the migration is the one that decides it has
+    /// failed, and an agent that gave up first would report a failure for a
+    /// transfer still running. This is only the ceiling that keeps a wait from
+    /// being unbounded.
+    ///
+    /// A key rather than a constant because what it has to be longer than is
+    /// configuration one tier up: an estate that raised
+    /// `migration_transfer_secs` for 32 GiB guests over a congested link has
+    /// to raise this with it, and until now that was a recompile.
+    #[serde(default = "default_migration_ceiling_secs")]
+    pub migrate_out_ceiling_secs: u64,
+    /// How long this node holds a VMM, a set of disks and a set of taps for a
+    /// guest that has not turned up. Default 600.
+    ///
+    /// The same number as `migrate_out_ceiling_secs` and the same argument
+    /// from the other end. It is only ever reached by the one failure nobody
+    /// reports — a source that never dialled — because every transfer that
+    /// STARTED ends with an event in the file, and the pass acts on that the
+    /// moment it appears.
+    ///
+    /// Being wrong downwards is a guest that dies mid-move; being wrong
+    /// upwards is a leak that lasts this long. A fleet that has measured its
+    /// own transfers sets both keys together.
+    #[serde(default = "default_migration_ceiling_secs")]
+    pub receive_ceiling_secs: u64,
     /// OTLP collector for span export, e.g. "http://127.0.0.1:4317". Absent =
     /// the fmt subscriber and nothing else, which is how this has always run.
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
+    /// How a log line is written: `"human"` (the default) or `"json"`.
+    ///
+    /// File-only and deliberately: which format a node logs in is a property
+    /// of the deployment that collects those logs, not of a run. `RUST_LOG`
+    /// is the per-run knob and it is untouched by this.
+    #[serde(default)]
+    pub log_format: telemetry::LogFormat,
     /// Where to serve the Prometheus exposition, e.g. "127.0.0.1:9100".
     /// Absent = nothing listens, which is how every node has run so far.
     ///
@@ -57,6 +95,42 @@ pub struct AgentConfig {
     /// reason there is no single hard default for the whole stack.
     #[serde(default)]
     pub metrics_listen: Option<String>,
+    /// The address other NODES should reach this one at, for a live
+    /// migration stream.
+    ///
+    /// A new key rather than a reuse of anything above, because nothing above
+    /// answers the question: `controller_addrs` is where this agent DIALS,
+    /// `metrics_listen` is where a scraper comes from, and neither is "the
+    /// address a peer on the cluster network can open a TCP connection to me
+    /// on".
+    ///
+    /// Absent = derived, and the derivation is the honest one: the local
+    /// address of the socket this agent used to reach the controller it
+    /// chose. That is by construction an address that carries traffic on the
+    /// cluster network, which is what a migration needs; it is wrong only on
+    /// a node whose route to the controller and whose route to its peers go
+    /// out of different interfaces, and such a node sets this key.
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
+    /// The physical machine this node is on, when somebody outside can see
+    /// what the machine itself cannot.
+    ///
+    /// A nested node — an agent in a VM, which is what a lab is — cannot ask
+    /// its host who it is. The platform's own DMI says `QEMU` and a serial
+    /// that belongs to the guest, and that is the whole of what a guest may
+    /// know. So this is written from outside, by whoever placed the VM.
+    ///
+    /// It exists for exactly one decision, and D-X1 is why: nested KVM state
+    /// does not restore on a different physical host, measured twice on this
+    /// lab's own hardware. Two nested nodes that both name the same host may
+    /// migrate live between each other; two that cannot both name one are
+    /// refused, because "we cannot tell" is not "it is fine" and the lab's
+    /// answer to "we cannot tell" was two nights.
+    ///
+    /// Absent on bare metal, where it is not needed at all: an unnested node
+    /// is never subject to that rule.
+    #[serde(default)]
+    pub physical_host: Option<String>,
 
     // --- the session credential. PEM paths, never PEM. -----------------------
     //
@@ -153,6 +227,14 @@ fn default_stop_grace_secs() -> u64 {
     30
 }
 
+/// 600 s — what `MIGRATE_OUT_CEILING` and `RECEIVE_CEILING` were as
+/// constants. One function for both, because the two numbers are one
+/// argument seen from the two ends of a transfer, and a fleet that changes
+/// one without the other has an asymmetry nobody meant.
+fn default_migration_ceiling_secs() -> u64 {
+    600
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PathsConfig {
@@ -161,6 +243,21 @@ pub struct PathsConfig {
     pub image_dir: PathBuf,
     pub volume_dir: PathBuf,
     pub cgroup_root: PathBuf,
+    /// Who else may talk to the agent's unix socket.
+    ///
+    /// Absent — every config written so far — is `run_dir` 0700 and the socket
+    /// 0600, so the answer is "root and nobody else" and every `meister agent`
+    /// command on the node needs sudo. Named, the socket becomes 0660 and the
+    /// directory 0750, both owned by that group: its members get the node's
+    /// local admin API without becoming root for it.
+    ///
+    /// The group is a *unix* group and not an authorization decision this
+    /// stack makes. There is no authenticator on this socket — it is the
+    /// node's own admin surface, reachable only by somebody already on the
+    /// node — so the group IS the whole access rule, and it should be one
+    /// somebody was deliberately put into.
+    #[serde(default)]
+    pub socket_group: Option<String>,
 }
 
 /// `[hypervisor.cloud-hypervisor]`. Was an enum variant; the two keys under
@@ -172,6 +269,89 @@ pub struct PathsConfig {
 pub struct CloudHypervisorConfig {
     pub binary: PathBuf,
     pub timeout_ms: u64,
+    /// `migration_ports = "49000-49099"` — the range a receiving VMM may
+    /// listen on, inclusive at both ends.
+    ///
+    /// A RANGE and not one port, because a node can be receiving more than
+    /// one guest at a time and each stream is its own listener; a range and
+    /// not "any free port", because the ports have to be open between the
+    /// nodes and an operator has to be able to write that firewall rule down.
+    ///
+    /// Absent = this node does not receive live migrations. It can still SEND
+    /// one, which is not asymmetry for its own sake: sending needs no port of
+    /// one's own, and a node being emptied is exactly the node whose operator
+    /// may not have got round to this key.
+    #[serde(default)]
+    pub migration_ports: Option<String>,
+    /// How long a hot-unplug may take before this driver stops believing in
+    /// it. Default 30.
+    ///
+    /// A key rather than a constant because it is a number about GUESTS and
+    /// not about this stack: virtio unplug is cooperative, and how long a
+    /// kernel takes to let go of a device is a property of the images a fleet
+    /// runs. The deadline is not the guest's response time — it is the point
+    /// at which "the guest is thinking about it" becomes "the guest is never
+    /// going to do it", and being wrong in the fast direction is what D3 was:
+    /// the control plane reported a volume free while the VMM still held the
+    /// fd, and the next VM to use it died on cloud-hypervisor's write lock.
+    ///
+    /// So a fleet whose guests need forty seconds turns this up rather than
+    /// living with a detach that reports a failure over a device that did in
+    /// fact go. Zero is read as the default, the same way `ports()` reads a
+    /// zero: a zero in a config file is almost always a key somebody meant to
+    /// fill in.
+    #[serde(default = "default_unplug_timeout_secs")]
+    pub unplug_timeout_secs: u64,
+}
+
+/// The driver's own default, read from the driver rather than written out a
+/// second time: two literals for one number is how an option table and the
+/// code it describes start disagreeing.
+fn default_unplug_timeout_secs() -> u64 {
+    cloud_hypervisor_driver::DEFAULT_UNPLUG_TIMEOUT.as_secs()
+}
+
+impl CloudHypervisorConfig {
+    /// `unplug_timeout_secs` as a duration, with zero read as the default.
+    pub fn unplug_timeout(&self) -> Duration {
+        match self.unplug_timeout_secs {
+            0 => cloud_hypervisor_driver::DEFAULT_UNPLUG_TIMEOUT,
+            secs => Duration::from_secs(secs),
+        }
+    }
+
+    /// The migration port range as two numbers, or a sentence saying what is
+    /// wrong with what was written.
+    ///
+    /// Parsed at start-up rather than at the first migration, and that is the
+    /// whole reason it is a function: a typo here would otherwise be found by
+    /// an operator who is draining a node at the moment they can least afford
+    /// to read a parse error. `None` = the key was not set, which is a node
+    /// that does not receive migrations and not a mistake.
+    pub fn ports(&self) -> Result<Option<(u16, u16)>, String> {
+        let Some(raw) = self.migration_ports.as_deref() else {
+            return Ok(None);
+        };
+        let raw = raw.trim();
+        let (from, to) = raw.split_once('-').ok_or_else(|| {
+            format!("migration_ports = {raw:?} is not a range; write it as \"49000-49099\"")
+        })?;
+        let parse = |s: &str, which: &str| -> Result<u16, String> {
+            s.trim()
+                .parse::<u16>()
+                .map_err(|e| format!("the {which} of migration_ports = {raw:?} is not a port: {e}"))
+        };
+        let (from, to) = (parse(from, "start")?, parse(to, "end")?);
+        if from == 0 {
+            return Err(format!(
+                "migration_ports = {raw:?} starts at 0, which is not a port"
+            ));
+        }
+        if to < from {
+            return Err(format!("migration_ports = {raw:?} ends before it starts"));
+        }
+        Ok(Some((from, to)))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +374,79 @@ pub struct NetworkConfig {
     /// route or appliance the environment provides.
     #[serde(default)]
     pub bgp: Option<BgpNetworkConfig>,
+    /// `[network.provider]` — this node gives one or more interfaces away to
+    /// provider networks, and is therefore a candidate for a tenant router.
+    /// Absent, which is every config before 6k, means it is not: the node
+    /// still runs VMs and still carries overlays, it just holds no gateway
+    /// slot and claims no `network/gateway:*`.
+    #[serde(default)]
+    pub provider: Option<ProviderNetworkConfig>,
+    /// Take down overlay links no record on this node names, once, at
+    /// start-up.
+    ///
+    /// On by default, and the default answers a leak that was measured: the
+    /// chaos run left VNI 10003 and 10004 standing on three nodes for good.
+    /// The reference count that removes an overlay hangs on records, and a VM
+    /// whose record went while its agent was not running takes its wire's
+    /// last counter with it — after which nobody counts again.
+    ///
+    /// It runs ONCE, before the first reconcile, and only when the whole
+    /// record table could be read. That is what makes it something other than
+    /// the timer this driver's own doc argues against: at that moment no VM
+    /// is being provisioned here, so "is another VM for this tenant arriving
+    /// in the next second?" has an answer.
+    ///
+    /// Off is for a node whose overlay links somebody else administers. Then
+    /// they leak, and that is the operator's trade to make.
+    #[serde(default = "default_sweep_orphans")]
+    pub sweep_orphans: bool,
+}
+
+fn default_sweep_orphans() -> bool {
+    true
+}
+
+/// `[network.provider]`. Config-keyed exactly as `[network.vxlan]` is: the
+/// section is what turns the capability on.
+///
+/// What it turns on is Festlegung 2 — the gateway is a capability out of the
+/// config, not an agent of its own and not a compile feature. A node that
+/// names a physnet builds the provider bridge for it at start-up, claims
+/// `network/gateway:<physnet>` in its Hello, and may be given routers; a node
+/// that names none is no candidate for any.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderNetworkConfig {
+    /// The interfaces this node gives away, by the name of the provider
+    /// network each of them reaches: `physnets = { ext = "eth1" }`.
+    ///
+    /// A map and not a list, because the NAME is the thing the tier above
+    /// schedules on — two nodes saying `ext` mean the same network, and which
+    /// interface each of them uses to reach it is nobody else's business.
+    /// Sorted, because it is a `BTreeMap`: the Hello a node sends must not
+    /// depend on hash order.
+    ///
+    /// The interface must carry NO address. See `ensure_physnet`: an address
+    /// there is somebody still using the interface, and a router placed on it
+    /// would answer for a network the host is also on.
+    pub physnets: BTreeMap<String, String>,
+    /// Where `ip` is. Unset = PATH, the same default `nft` takes.
+    ///
+    /// `iproute2` and not netlink for the namespace half, for the reason this
+    /// stack shells out to `nft`, `vtysh` and `nvme`: `ip netns` pins a
+    /// namespace under `/var/run/netns`, which is what makes
+    /// `ip netns exec meister-rt-<id> ip a` work for an operator standing at
+    /// the node. A netlink implementation would build the same namespace and
+    /// leave nobody a way to look into it.
+    #[serde(default)]
+    pub ip: Option<String>,
+    /// Where `arping` is. Unset = PATH, as `ip` above.
+    ///
+    /// One use: the gratuitous ARP a router sends the moment it becomes the
+    /// active one. A node without it keeps every other property of a failover
+    /// and pays the neighbour's ARP cache — measured at 5,2 s in the lab.
+    #[serde(default)]
+    pub arping: Option<String>,
 }
 
 /// `[network.bgp]`. Config-keyed like every other capability in this file:
@@ -349,6 +602,34 @@ pub struct LvmThinVolumeConfig {
     pub qemu_img: PathBuf,
 }
 
+/// `[volume.nvmeof]`. The attacher alone: this node can connect to a target
+/// and can provision nothing. Nothing to configure but where `nvme` is —
+/// where the target IS comes from the pool, per volume, because one node
+/// attaches namespaces from several.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NvmeofVolumeConfig {
+    /// Where `nvme` is. Unset = PATH.
+    #[serde(default)]
+    pub bin_dir: Option<PathBuf>,
+}
+
+/// `[volume.nvmeof-import]`. The provider half: namespaces that already
+/// exist, handed out one per volume.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NvmeofImportVolumeConfig {
+    /// Where the assignment lives: one claim file per namespace that is
+    /// spoken for. Falls back to a directory beside the agent's own database,
+    /// because it is state of exactly that kind — small, this node's, and
+    /// worthless to anybody else.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+    /// Where `nvme` is. Unset = PATH.
+    #[serde(default)]
+    pub bin_dir: Option<PathBuf>,
+}
+
 /// `[volume.nfs]`. `share_root` is the mounted share everything lives under;
 /// whether the driver is the one mounting it is `manage_mount`.
 #[derive(Debug, Deserialize)]
@@ -416,6 +697,11 @@ pub struct FilesystemVolumeConfig {
     pub image_dir: Option<PathBuf>,
     #[serde(default)]
     pub volume_dir: Option<PathBuf>,
+    /// Where `qemu-img` is, for the one case that needs it: a base image that
+    /// is not raw. Unset = PATH, which is right on a NixOS node — the same
+    /// default `[volume.lvm-thin]` takes for the same tool.
+    #[serde(default = "default_qemu_img")]
+    pub qemu_img: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,6 +746,24 @@ pub struct CrosvmGpuConfig {
 }
 
 impl AgentConfig {
+    /// The two migration ceilings this node was configured with, zero read as
+    /// the default in both — a zero in a config file is almost always a key
+    /// somebody meant to fill in, and a ceiling of zero would end every
+    /// transfer before it began.
+    pub fn migration_ceilings(&self) -> crate::provision::Ceilings {
+        let default = crate::provision::Ceilings::default();
+        crate::provision::Ceilings {
+            migrate_out: match self.migrate_out_ceiling_secs {
+                0 => default.migrate_out,
+                secs => Duration::from_secs(secs),
+            },
+            receive: match self.receive_ceiling_secs {
+                0 => default.receive,
+                secs => Duration::from_secs(secs),
+            },
+        }
+    }
+
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
@@ -482,6 +786,13 @@ impl AgentConfig {
             }
         }
 
+        // Resolved here and not where the socket is bound, because that
+        // happens in a spawned task whose error only reaches the log: a group
+        // that does not exist has to stop the agent, and this is the last
+        // place that still can. The gid itself is looked up again at bind
+        // time; what this call buys is the failure.
+        config.paths.socket_gid()?;
+
         Ok(config)
     }
 
@@ -501,6 +812,30 @@ impl AgentConfig {
                 .clone()
                 .unwrap_or_else(|| linux_network_driver::DEFAULT_NFT.to_string()),
             guarded,
+        })
+    }
+
+    /// `[network.provider]`, resolved against this node's paths — or nothing,
+    /// which is a node that gave no interface away and holds no gateway slot.
+    ///
+    /// The records go under `run_dir`, and that is a decision rather than a
+    /// convenience: a router is a network namespace, a namespace dies with the
+    /// machine, and a record of it that survived a reboot would be a record of
+    /// something that is gone. The two are lost together, which is what makes
+    /// the start-up sweep able to tell a half-built router from a live one.
+    pub fn provider_config(&self) -> Option<linux_network_driver::router::GatewayConfig> {
+        let provider = self.network.as_ref()?.provider.as_ref()?;
+        Some(linux_network_driver::router::GatewayConfig {
+            physnets: provider.physnets.clone(),
+            ip: provider
+                .ip
+                .clone()
+                .unwrap_or_else(|| linux_network_driver::router::DEFAULT_IP.to_string()),
+            arping: provider
+                .arping
+                .clone()
+                .unwrap_or_else(|| linux_network_driver::router::DEFAULT_ARPING.to_string()),
+            state_dir: self.paths.run_dir.join("routers"),
         })
     }
 
@@ -611,6 +946,9 @@ impl AgentConfig {
             mem_mib: self
                 .capacity_mem_mib
                 .map_or(measured.mem_mib, |c| measured.mem_mib.min(c)),
+            // Untouched: a ceiling is about capacity, and no number in a
+            // config makes a fault on this machine go away.
+            conditions: measured.conditions,
         }
     }
 
@@ -626,6 +964,25 @@ impl AgentConfig {
 }
 
 impl PathsConfig {
+    /// `socket_group` as a gid, or `None` when the key is absent.
+    ///
+    /// A name no group answers to is an error rather than a fall back to the
+    /// private mode: the key exists to open the socket, and quietly not
+    /// opening it would be found out by somebody who cannot use the CLI and
+    /// has no reason to suspect the config. Resolved at start-up for the same
+    /// reason a cidr is parsed there.
+    pub fn socket_gid(&self) -> anyhow::Result<Option<u32>> {
+        let Some(name) = &self.socket_group else {
+            return Ok(None);
+        };
+        let group = nix::unistd::Group::from_name(name)
+            .with_context(|| format!("looking up the group {name:?}"))?
+            .with_context(|| {
+                format!("[paths] socket_group names the group {name:?}, which does not exist here")
+            })?;
+        Ok(Some(group.gid.as_raw()))
+    }
+
     fn resolve_against(&mut self, base: &Path) {
         for p in [
             &mut self.db_path,
@@ -643,6 +1000,41 @@ impl PathsConfig {
 
 #[cfg(test)]
 mod tests {
+
+    /// A range an operator has to be able to open in a firewall, and a
+    /// refusal that says what is wrong with what they wrote.
+    #[test]
+    fn the_migration_port_range_is_read_at_startup_or_refused_there() {
+        let cfg = |ports: Option<&str>| CloudHypervisorConfig {
+            binary: "/usr/bin/cloud-hypervisor".into(),
+            timeout_ms: 2000,
+            migration_ports: ports.map(str::to_string),
+            unplug_timeout_secs: default_unplug_timeout_secs(),
+        };
+
+        // Not set is a node that does not receive live migrations, which is
+        // an answer and not a mistake.
+        assert_eq!(cfg(None).ports(), Ok(None));
+        assert_eq!(cfg(Some("49000-49099")).ports(), Ok(Some((49000, 49099))));
+        // One port is a range of one, which is a real thing to want.
+        assert_eq!(cfg(Some("49000-49000")).ports(), Ok(Some((49000, 49000))));
+        assert_eq!(
+            cfg(Some(" 49000 - 49099 ")).ports(),
+            Ok(Some((49000, 49099)))
+        );
+
+        for (written, expected) in [
+            ("49000", "is not a range"),
+            ("49000-", "is not a port"),
+            ("abc-49099", "is not a port"),
+            ("49000-70000", "is not a port"),
+            ("0-49099", "starts at 0"),
+            ("49099-49000", "ends before it starts"),
+        ] {
+            let why = cfg(Some(written)).ports().expect_err(written);
+            assert!(why.contains(expected), "{written}: {why}");
+        }
+    }
     use super::*;
 
     /// `section`, for a section the test knows is there.
@@ -672,6 +1064,45 @@ mod tests {
         assert!(err.contains("[volume.nfs]"), "the section is named: {err}");
     }
 
+    /// The default and every config written before this key existed: root
+    /// talks to the socket, and nobody else.
+    #[test]
+    fn no_socket_group_is_no_group() {
+        let cfg = config_with("");
+        assert!(cfg.paths.socket_group.is_none());
+        assert_eq!(cfg.paths.socket_gid().unwrap(), None);
+    }
+
+    /// A name nothing answers to is refused WITH the name. The alternative is
+    /// a node whose socket is quietly still 0600 while its operator believes
+    /// they opened it, and the person who finds that out is somebody whose
+    /// CLI says "permission denied" for no visible reason.
+    #[test]
+    fn an_unknown_socket_group_is_an_error_that_names_it() {
+        let mut cfg = config_with("");
+        cfg.paths.socket_group = Some("meister-no-such-group".to_string());
+        let err = format!("{:#}", cfg.paths.socket_gid().unwrap_err());
+        assert!(err.contains("meister-no-such-group"), "{err}");
+        assert!(err.contains("socket_group"), "{err}");
+    }
+
+    /// A group that does exist resolves to its gid. The one group every test
+    /// process is certain to be in is its own.
+    #[test]
+    fn a_known_socket_group_resolves_to_its_gid() {
+        let gid = nix::unistd::getgid();
+        let Some(group) = nix::unistd::Group::from_gid(gid).expect("reading the group database")
+        else {
+            // A build environment whose own gid has no /etc/group entry can
+            // say nothing about name lookup. Say so rather than pass quietly.
+            eprintln!("gid {gid} has no name here; nothing to look up");
+            return;
+        };
+        let mut cfg = config_with("");
+        cfg.paths.socket_group = Some(group.name.clone());
+        assert_eq!(cfg.paths.socket_gid().unwrap(), Some(gid.as_raw()));
+    }
+
     /// Enough of a config to parse; the endpoint keys are what is under test.
     fn config_with(endpoints: &str) -> AgentConfig {
         from_str(&format!(
@@ -692,6 +1123,104 @@ mod tests {
             "#
         ))
         .expect("config parses")
+    }
+
+    /// The gateway slot, in the form a node writes it down: the NAME of the
+    /// provider network on the left and this node's interface for it on the
+    /// right. Two nodes reaching one wire by different NICs is the ordinary
+    /// case and the whole reason it is a map.
+    #[test]
+    fn a_node_names_its_provider_networks_and_the_interface_for_each() {
+        let cfg: AgentConfig = from_str(
+            r#"
+            node_id = "n1"
+            [paths]
+            db_path = "/tmp/a.redb"
+            run_dir = "/run/ms"
+            image_dir = "/tmp/img"
+            volume_dir = "/tmp/vol"
+            cgroup_root = "/sys/fs/cgroup/x"
+            [hypervisor.cloud-hypervisor]
+            binary = "/usr/bin/cloud-hypervisor"
+            timeout_ms = 5000
+            [network]
+            default_bridge = "br0"
+            [network.provider]
+            physnets = { ext = "eth1", dmz = "eth2" }
+            "#,
+        )
+        .expect("the provider section parses");
+
+        let gateway = cfg.provider_config().expect("this node holds a slot");
+        assert_eq!(
+            gateway.physnets.keys().collect::<Vec<_>>(),
+            ["dmz", "ext"],
+            "a BTreeMap, so the Hello does not depend on hash order"
+        );
+        assert_eq!(gateway.physnets["ext"], "eth1");
+        assert_eq!(gateway.ip, "ip", "unset = PATH, the same default nft takes");
+        // The records go under run_dir and nowhere else: a namespace dies with
+        // the machine, and a record of it that outlived a reboot would be a
+        // record of something that is gone.
+        assert_eq!(gateway.state_dir, PathBuf::from("/run/ms/routers"));
+
+        // And the ordinary node, which is every node before 6k: no section,
+        // no slot, no claim.
+        assert!(config_with("").provider_config().is_none());
+    }
+
+    /// The three numbers that were constants have keys, and the keys default
+    /// to exactly what the constants were.
+    ///
+    /// That last half is the point of the test. A config key whose default
+    /// differs from the constant it replaced is a silent change of behaviour
+    /// on every fleet that never sets it, and the two migration ceilings are
+    /// the pair where that would be worst: both have to stay longer than the
+    /// cluster's own `migration_transfer_secs`, or a node starts calling a
+    /// transfer failed that the tier above still believes in.
+    #[test]
+    fn the_three_waits_are_keys_and_their_defaults_are_the_old_constants() {
+        let none = config_with("");
+        assert_eq!(none.migrate_out_ceiling_secs, 600);
+        assert_eq!(none.receive_ceiling_secs, 600);
+        let ceilings = none.migration_ceilings();
+        assert_eq!(ceilings.migrate_out, Duration::from_secs(600));
+        assert_eq!(ceilings.receive, Duration::from_secs(600));
+
+        let ch: CloudHypervisorConfig = section(&none.hypervisor, "hypervisor", "cloud-hypervisor")
+            .expect("the section reads")
+            .expect("it is there");
+        assert_eq!(ch.unplug_timeout_secs, 30);
+        assert_eq!(
+            ch.unplug_timeout(),
+            cloud_hypervisor_driver::DEFAULT_UNPLUG_TIMEOUT,
+            "the config's default IS the driver's, not a second copy of 30"
+        );
+
+        // Set, they are what was written.
+        let set = config_with(
+            r#"migrate_out_ceiling_secs = 1800
+               receive_ceiling_secs = 1200"#,
+        );
+        assert_eq!(
+            set.migration_ceilings().migrate_out,
+            Duration::from_secs(1800)
+        );
+        assert_eq!(set.migration_ceilings().receive, Duration::from_secs(1200));
+
+        // And zero is the default rather than "give up at once", the same
+        // rule `ports()` applies to a zero: a zero in a config file is almost
+        // always a key somebody meant to fill in, and a ceiling of zero would
+        // end every transfer before it started.
+        let zero = config_with(
+            r#"migrate_out_ceiling_secs = 0
+               receive_ceiling_secs = 0"#,
+        );
+        assert_eq!(
+            zero.migration_ceilings().migrate_out,
+            Duration::from_secs(600)
+        );
+        assert_eq!(zero.migration_ceilings().receive, Duration::from_secs(600));
     }
 
     #[test]
@@ -745,6 +1274,10 @@ mod tests {
             .join("\n");
         let cfg: AgentConfig = from_str(&uncommented)
             .expect("every commented key and section in the example is a real one");
+        // The envelope key. It is the one line in the example a fleet really
+        // does uncomment, so a rename here has to fail in this test rather
+        // than on twelve nodes at start-up.
+        assert_eq!(cfg.log_format, telemetry::LogFormat::Json);
         // Every section is deserialized into its typed struct HERE, and that
         // is the whole point of this block rather than a `contains_key`:
         // `[volume]` and `[device]` are raw TOML in the config now, so
@@ -958,14 +1491,15 @@ mod tests {
         let measured = proto::NodeStatus {
             vcpus: 32,
             mem_mib: 64_000,
+            conditions: Vec::new(),
         };
-        assert_eq!(config_with("").capped(measured).vcpus, 32);
+        assert_eq!(config_with("").capped(measured.clone()).vcpus, 32);
 
         let pinned = config_with(
             r#"capacity_vcpus   = 16
                capacity_mem_mib = 32000"#,
         );
-        let capped = pinned.capped(measured);
+        let capped = pinned.capped(measured.clone());
         assert_eq!((capped.vcpus, capped.mem_mib), (16, 32_000));
 
         let greedy = config_with(

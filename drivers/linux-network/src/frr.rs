@@ -34,13 +34,22 @@
 //!
 //! ## What is deliberately NOT announced
 //!
-//! **Routed subnets.** A subnet spans hosts by definition — it is the tenant's
-//! address space, and the VMs in it are wherever the scheduler put them — so a
-//! per-host announcement of one would be every node claiming the whole prefix
-//! and the router load-balancing onto hosts that hold none of it. Announcing a
-//! subnet is somebody's job, and that somebody is either a static route in the
-//! environment or the tenant's own appliance speaking for its own space. v1
-//! says so and stops there.
+//! **A routed subnet, from a COMPUTE node.** A subnet spans hosts by
+//! definition — it is the tenant's address space, and the VMs in it are
+//! wherever the scheduler put them — so a per-host announcement of one would
+//! be every node claiming the whole prefix and the router load-balancing onto
+//! hosts that hold none of it. That is still true and still refused: nothing
+//! derived from a VM record is ever anything but a `/32`.
+//!
+//! 6k gives the same prefix a party that MAY announce it, and the difference
+//! is what the announcement means. A router (`router::router_prefixes`) is
+//! the thing traffic for the subnet is supposed to arrive at, so its
+//! announcement is a statement about where the subnet is REACHED and not
+//! about where a VM happens to run. Two active routers of one subnet
+//! announcing it is ECMP, which is the fabric's business and works because
+//! nothing about it is stateful — Festlegung 5. So this renderer takes
+//! whatever prefixes it is handed and the RULE moved to where the set is
+//! built, one tier up in `reconcile::announce_prefixes`.
 //!
 //! **A route to the VM.** `no bgp network import-check` is set precisely
 //! because the `/32` is NOT in this host's routing table: the address lives on
@@ -416,21 +425,30 @@ mod tests {
         assert!(on.contains(" address-family ipv4 unicast\n"), "{on}");
     }
 
-    /// Routed subnets are never in here, and the fragment is where that
-    /// decision shows: a subnet spans hosts, so a per-host announcement of one
-    /// would be every node claiming the whole prefix.
+    /// The renderer takes whatever it is handed, `/32` or prefix, and says
+    /// each of them once.
+    ///
+    /// It used to enforce "host routes only", and 6k moved that rule rather
+    /// than dropped it: a subnet announced per COMPUTE node is still every
+    /// node claiming the whole prefix, and a subnet announced by the ROUTER
+    /// it is reached through is the correct statement. Which set is built is
+    /// `reconcile::announce_prefixes`; this file has never known where a
+    /// prefix came from and now must not.
     #[test]
-    fn only_host_routes_are_ever_announced() {
+    fn whatever_the_pass_hands_over_is_what_this_node_says() {
         let text = fragment(
             &cfg(true),
-            &set(&["10.255.0.7/32", "203.0.113.9/32"]),
+            &set(&["10.255.0.7/32", "203.0.113.9/32", "10.7.2.0/24"]),
             &BTreeSet::new(),
         );
-        for line in text
+        let announced: Vec<&str> = text
             .lines()
-            .filter(|l| l.trim_start().starts_with("network "))
-        {
-            assert!(line.ends_with("/32"), "not a host route: {line}");
-        }
+            .filter_map(|l| l.trim_start().strip_prefix("network "))
+            .collect();
+        assert_eq!(
+            announced,
+            ["10.255.0.7/32", "10.7.2.0/24", "203.0.113.9/32"],
+            "sorted, because the set is: {text}"
+        );
     }
 }

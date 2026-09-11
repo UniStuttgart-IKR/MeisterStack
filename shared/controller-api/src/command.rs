@@ -33,7 +33,7 @@ use tracing::warn;
 #[derive(Debug)]
 pub enum Ack {
     Acked(Vec<u8>),
-    Rejected(String),
+    Rejected(Refusal),
 }
 
 /// Who the command is going to, as the error a person reads names them: an
@@ -52,7 +52,119 @@ pub struct Peer<'a> {
 /// What one waiting caller is handed: the peer's payload, or the peer's own
 /// refusal. Named because the map below is otherwise four nested generics
 /// deep and says nothing at a glance.
-type Answer = Result<Vec<u8>, String>;
+type Answer = Result<Vec<u8>, Refusal>;
+
+/// A peer's "no", with the word that says what kind of no it is.
+///
+/// It used to be a bare `String`, and that is what lost the distinction: the
+/// tier above could not tell "this node has no record of that VM" from "no
+/// replica of this cluster could be reached", so it called both a conflict.
+/// The `reason` is one of the REST edge's own (`Unavailable`, `NotFound`,
+/// `Conflict`, ...), and it is empty from a peer that predates the field —
+/// which is why the caller must have an answer for empty rather than a
+/// `match` that assumes one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub message: String,
+    pub reason: String,
+}
+
+impl Refusal {
+    pub fn new(message: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// A refusal from a peer that does not send reasons, or an internal one
+    /// that has no better word than "it did not work".
+    pub fn plain(message: impl Into<String>) -> Self {
+        Self::new(message, String::new())
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// So that a refusal can travel as an `anyhow` cause instead of being
+/// flattened into a string on its way out of `send_command`.
+///
+/// The reason has to survive that hop: a caller reads it to decide whether to
+/// take a binding back, and a caller reduced to matching on prose would be
+/// one whose behaviour changes when somebody rewords a message.
+impl std::error::Error for Refusal {}
+
+/// A refusal a command HANDLER raises, carrying the word the REST edge would
+/// have used for the same failure.
+///
+/// The one channel by which a handler's meaning reaches the tier above: the
+/// session dispatcher looks for this on its way out and copies the reason
+/// into the `ErrorMsg`. A handler that raises a plain error still works and
+/// still says nothing, which is the old behaviour and the right default.
+#[derive(Debug)]
+pub struct Refused {
+    pub reason: &'static str,
+    pub message: String,
+}
+
+/// The reason word for [`Refused::cannot_serve`]. Defined in `proto`, beside
+/// the field it is a value of, because the agent writes it and the agent
+/// deliberately does not depend on this crate.
+///
+/// Not one of the REST edge's words, and that is deliberate too: those
+/// describe what a CLIENT should be told, and this describes what a control
+/// plane should DO. No caller ever sees it.
+pub use proto::CANNOT_SERVE;
+
+impl Refused {
+    /// "The party that holds the answer is out of reach right now." A caller
+    /// that retries is right, and the tier above should say 503 rather than
+    /// invent a disagreement.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            reason: "Unavailable",
+            message: message.into(),
+        }
+    }
+
+    /// "This node cannot serve this VM at all" — a refusal about the NODE
+    /// and not about the request.
+    ///
+    /// The distinction the reschedule rests on. A create that fails after the
+    /// node has a record is a `Failed` VM with a requeue at the same place: a
+    /// boot that did not work may work next time. A create the node refuses
+    /// STRUCTURALLY — no hypervisor, a driver it does not have, a volume it
+    /// has no record of — leaves no record and will never work here, however
+    /// often it is asked. The tier above answers the second by taking the
+    /// binding back and placing the VM somewhere else, and it can only tell
+    /// the two apart if the node says which one it is.
+    pub fn cannot_serve(message: impl Into<String>) -> Self {
+        Self {
+            reason: CANNOT_SERVE,
+            message: message.into(),
+        }
+    }
+
+    /// The word an `anyhow` error carries, if it is one of these at all.
+    pub fn reason_of(error: &anyhow::Error) -> &'static str {
+        error
+            .downcast_ref::<Refused>()
+            .map(|refused| refused.reason)
+            .unwrap_or("")
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 pub struct Pending {
     waiting: Mutex<HashMap<String, oneshot::Sender<Answer>>>,
@@ -111,7 +223,7 @@ impl Pending {
 
         match tokio::time::timeout(timeout, ack_rx).await {
             Ok(Ok(Ok(payload))) => Ok(Ack::Acked(payload)),
-            Ok(Ok(Err(msg))) => Ok(Ack::Rejected(msg)),
+            Ok(Ok(Err(refusal))) => Ok(Ack::Rejected(refusal)),
             Ok(Err(_)) => bail!("session to {name} dropped before the result"),
             Err(_) => {
                 self.forget(&request_id);
@@ -184,14 +296,16 @@ mod tests {
         let answering = pending.clone();
         tokio::spawn(async move {
             let id = rx.recv().await.unwrap().unwrap();
-            answering.resolve(&id, Err("no such vm".into()));
+            answering.resolve(&id, Err(Refusal::plain("no such vm")));
         });
         let peer = Peer {
             kind: "cluster",
             name: "c1",
         };
         let answer = pending.send(peer, &tx, |id| id).await.unwrap();
-        assert!(matches!(answer, Ack::Rejected(m) if m == "no such vm"));
+        assert!(
+            matches!(answer, Ack::Rejected(r) if r.message == "no such vm" && r.reason.is_empty())
+        );
         assert_eq!(in_flight(&pending), 0);
     }
 

@@ -512,8 +512,8 @@ impl DeviceDriver for NvrmDriver {
             // Not our child: the agent restarted since create, and the
             // record's pid is the only handle left on the backend.
             None => {
-                if let DeviceAttachment::VhostUser { pid, .. } = attachment {
-                    self.process.stop_adopted(*pid);
+                if let DeviceAttachment::VhostUser { socket, pid, .. } = attachment {
+                    self.process.stop_adopted(*pid, socket);
                 }
             }
         }
@@ -528,17 +528,18 @@ impl DeviceDriver for NvrmDriver {
 
     #[instrument(level = "trace", skip_all, fields(device_id = %id))]
     async fn get(&self, id: &DeviceId, attachment: &DeviceAttachment) -> device::Result<Device> {
-        let DeviceAttachment::VhostUser { pid, .. } = attachment else {
+        let DeviceAttachment::VhostUser { socket, pid, .. } = attachment else {
             return Err(DeviceError::NotFound(*id));
         };
-        // Liveness by pid, and by NAME: a bare kill(pid, 0) answers "alive" for
-        // whoever holds that pid now, and after an agent restart the recorded
-        // one may well have been recycled. Reporting a stranger's process as
-        // this device would leave the VM in the inventory with a dead backend —
-        // the exact state the quarantine exists to catch. `is_ours` is the same
-        // /proc/<pid>/comm check the adopted teardown makes, and it subsumes
-        // liveness: a dead pid has no comm to read.
-        if !self.process.is_ours(*pid) {
+        // Liveness by pid, and by IDENTITY: a bare kill(pid, 0) answers
+        // "alive" for whoever holds that pid now, and after an agent restart
+        // the recorded one may well have been recycled. Reporting a
+        // stranger's process as this device would leave the VM in the
+        // inventory with a dead backend — the exact state the quarantine
+        // exists to catch. `is_ours` is the same check the adopted teardown
+        // makes — this kind's `comm` AND this device's socket on the command
+        // line — and it subsumes liveness: a dead pid has neither to read.
+        if !self.process.is_ours(*pid, socket) {
             return Err(DeviceError::NotFound(*id));
         }
         Ok(Device {

@@ -47,6 +47,20 @@ use crate::CgroupHandle;
 
 pub type VolumeId = Uuid;
 
+/// A snapshot's identity, handed down from the `VolumeSnapshot` object's uid.
+///
+/// A type of its own beside `VolumeId` and not an alias for it, because the
+/// two are never interchangeable in a signature: `snapshot(handle, id)` takes
+/// the volume it is OF and the name the snapshot will have, and a driver that
+/// swapped them would name a snapshot after the disk it came from.
+pub type SnapshotId = Uuid;
+
+/// Where a backend's bytes are. Defined in `common::capability` because the
+/// tier that ACTS on the answer — the scheduler, one crate over — must not
+/// depend on this one, and re-exported here because a driver is what states
+/// it. See [`VolumeProvider::locality`].
+pub use common::capability::Locality;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("volume not found: {0}")]
@@ -60,9 +74,31 @@ pub enum StorageError {
     /// separates it: it names a process, and the message carries its log.
     #[error("storage backend process died: {0}")]
     BackendDied(String),
+    /// This backend does not do that at all — not "it failed", but "there is
+    /// no such verb here".
+    ///
+    /// Its own variant because the tier above branches on it: a pool whose
+    /// driver cannot snapshot is a 422 at the API edge, where a person is
+    /// still holding the request, rather than a `Failed` object twenty
+    /// seconds later. Everything else on this enum is a thing that went
+    /// wrong; this is a thing that was never going to happen.
+    #[error("this backend cannot do that: {0}")]
+    Unsupported(String),
     #[error("storage backend failure: {0}")]
     Backend(anyhow::Error),
 }
+
+/// What a backend has to be given for its snapshot to be worth anything.
+///
+/// A property of the BACKEND and not of the request, which is why it is asked
+/// rather than passed: whether a copy has to happen at a standstill is a fact
+/// about how the copy is made, and a caller cannot know it.
+///
+/// Defined in `common::capability` and re-exported here, exactly as
+/// [`Locality`] is and for the same reason: since it travels in the catalogue
+/// (`volume/<backend>/snapshot:atomic`), the tier that ACTS on it is a
+/// controller, and no controller depends on this crate.
+pub use common::capability::SnapshotConsistency;
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
@@ -224,6 +260,37 @@ pub struct VolumeState {
 pub struct Volume {
     pub handle: VolumeHandle,
     pub attachment: VolumeAttachment,
+    /// Whether the connection this `attachment` describes has already been
+    /// given back.
+    ///
+    /// A stopped VM keeps its volumes and loses its backend processes, so a
+    /// record can outlive the attachment written on it — and the record is
+    /// the only place that can say so. Without this the teardown after a stop
+    /// detaches a second time, and a second detach is not a no-op: the
+    /// driver's own map no longer has the entry, so it falls back to the pid
+    /// on this attachment, which by then may belong to somebody else.
+    ///
+    /// `false` in every record ever written, which is the truth for all of
+    /// them: before this existed nothing marked a detach, so nothing had been
+    /// detached and left on record.
+    ///
+    /// Not an `Option<VolumeAttachment>` — the attachment is still what it
+    /// was, and the deprovision path and `lvm-thin`'s device-path recovery
+    /// both still read it. What changed is whether anybody is holding it.
+    #[serde(default)]
+    pub detached: bool,
+}
+
+impl Volume {
+    /// A volume as it comes off a fresh attach: connected, nobody has given
+    /// it back yet.
+    pub fn attached(handle: VolumeHandle, attachment: VolumeAttachment) -> Self {
+        Self {
+            handle,
+            attachment,
+            detached: false,
+        }
+    }
 }
 
 impl Volume {
@@ -242,6 +309,8 @@ enum VolumeRepr {
     Current {
         handle: VolumeHandle,
         attachment: VolumeAttachment,
+        #[serde(default)]
+        detached: bool,
     },
     /// Records from before provisioning and attaching came apart: one
     /// attachment, and whatever the backend had made behind it left unsaid.
@@ -270,6 +339,10 @@ impl From<VolumeRepr> for Volume {
         // A share's backend directory is derived from the id too, so an
         // FsShare record losing its path here costs nothing.
         let migrate = |id, attachment: VolumeAttachment, size_bytes| Volume {
+            // A record from before the flag existed was written by a stop
+            // that did not mark anything, so nothing on it had been given
+            // back: `false` is the migration and also the truth.
+            detached: false,
             handle: VolumeHandle {
                 id,
                 backend: match &attachment {
@@ -284,7 +357,15 @@ impl From<VolumeRepr> for Volume {
             attachment,
         };
         match repr {
-            VolumeRepr::Current { handle, attachment } => Volume { handle, attachment },
+            VolumeRepr::Current {
+                handle,
+                attachment,
+                detached,
+            } => Volume {
+                handle,
+                attachment,
+                detached,
+            },
             VolumeRepr::Attached {
                 id,
                 attachment,
@@ -329,6 +410,142 @@ pub trait VolumeProvider: Send + Sync {
     /// What is there, or `NotFound`. Asked of the DATA — no attachment
     /// needed, so it can be asked of a volume nobody is holding.
     async fn describe(&self, handle: &VolumeHandle) -> Result<VolumeState>;
+
+    /// Where this backend's bytes are, once and for all.
+    ///
+    /// **No default, deliberately.** A default would be a value the author of
+    /// the next backend never had to think about, and the one thing a wrong
+    /// answer here does is place a VM on a node where its disk is not. So the
+    /// compiler asks, every time: an LVM volume group is on one machine
+    /// ([`Locality::NodeLocal`]), an NFS export is the same bytes on every
+    /// node that mounts it ([`Locality::Shared`]), an NVMe-oF namespace is
+    /// somewhere else entirely ([`Locality::Networked`]).
+    ///
+    /// A property of the DRIVER and not of the pool, which is why it is a
+    /// method here and not a field an admin fills in: `StoragePoolSpec` has no
+    /// locality, and an admin who could write one into it could tell the
+    /// scheduler that an lvm-thin pool is shared.
+    ///
+    /// `&self` rather than an associated const because a backend may one day
+    /// answer from its configuration — the same `nfs` driver serves block
+    /// files and shares, and a future driver reading a plugin's topology at
+    /// start-up is exactly the shape this leaves room for.
+    fn locality(&self) -> Locality;
+
+    // --- snapshots ---------------------------------------------------------
+    //
+    // On the PROVIDER and not on the attacher, which is the same cut
+    // `locality` made and for the same reason: a snapshot is a statement
+    // about DATA and needs no consumer. A volume nobody is holding can be
+    // snapshotted, and one being held is snapshotted by the node that made
+    // it — which under a `shared` pool is not the node the VM runs on.
+    //
+    // Defaulted, unlike `locality`. A default there would have been a value
+    // nobody thought about; here it is the honest answer of most backends,
+    // and the compiler asking every driver "can you snapshot?" would only
+    // produce four copies of "no".
+
+    /// Grow the volume to `size_bytes`. Never shrink.
+    ///
+    /// Idempotent: a backend that already has that size is `Ok`, not an
+    /// error. That is what lets the tier above be level-triggered — a resize
+    /// whose answer was lost is simply asked again.
+    ///
+    /// **Always the driver, even for a volume nothing is holding.** The
+    /// hypervisor's `vm.resize-disk` grows a FILE on its own, which would
+    /// make this call redundant for `filesystem` under a running VM — but it
+    /// does nothing at all for a block device (see the VMM half of the resize
+    /// in the cluster's `ResizeAttachment`), and a volume that is not
+    /// attached has no VMM to ask. One place that grows the bytes, and the
+    /// hypervisor's job is only to tell the guest.
+    ///
+    /// Default `Unsupported`, and the same argument as the snapshot verbs:
+    /// the refusal is a variant, so the tier above answers 422 at the edge.
+    async fn resize(&self, handle: &VolumeHandle, size_bytes: u64) -> Result<VolumeHandle> {
+        let _ = (handle, size_bytes);
+        Err(StorageError::Unsupported("resize".into()))
+    }
+
+    /// Whether this backend can snapshot at all, and what it needs if it can.
+    ///
+    /// `None` = it cannot, and that is what puts `volume/<driver>/snapshot`
+    /// in or out of the node's catalogue — the same spelling a GPU profile
+    /// claims, so a pool whose driver cannot do it is refused at the API edge
+    /// instead of failing later.
+    fn snapshot_support(&self) -> Option<SnapshotConsistency> {
+        None
+    }
+
+    /// Freeze what the volume holds right now under `id`.
+    ///
+    /// Idempotent by the same contract `provision` has and for the same
+    /// reason: the handle can be lost between the call and the write. Every
+    /// backend derives the snapshot's name from `id`, so asking twice finds
+    /// the first one rather than making a second.
+    ///
+    /// The returned handle names the SNAPSHOT, not the volume — it is what
+    /// `drop_snapshot` and `provision_from` are given.
+    async fn snapshot(&self, handle: &VolumeHandle, id: &SnapshotId) -> Result<VolumeHandle> {
+        let _ = (handle, id);
+        Err(StorageError::Unsupported("snapshot".into()))
+    }
+
+    /// Destroy a snapshot and its data. Idempotent: one that is already gone
+    /// is `Ok`.
+    async fn drop_snapshot(&self, handle: &VolumeHandle) -> Result<()> {
+        let _ = handle;
+        Err(StorageError::Unsupported("drop_snapshot".into()))
+    }
+
+    /// Make a new, WRITEABLE volume holding what a snapshot holds.
+    ///
+    /// Beside `provision` rather than a flag on it, because the two start
+    /// from different things: `provision` starts from a base image out of
+    /// this node's catalogue, and this starts from a handle. A backend that
+    /// can do it cheaply does (a second thin snapshot of the snapshot); one
+    /// that cannot copies.
+    ///
+    /// `spec.size_bytes` is the size asked for and must be at least the
+    /// snapshot's — growing on the way out is fine, shrinking is not, and a
+    /// backend that cannot tell says so with `InvalidSpec`.
+    async fn provision_from(
+        &self,
+        id: &VolumeId,
+        snapshot: &VolumeHandle,
+        spec: &VolumeSpec,
+    ) -> Result<VolumeHandle> {
+        let _ = (id, snapshot, spec);
+        Err(StorageError::Unsupported("provision_from".into()))
+    }
+
+    /// Let go of whatever THIS NODE holds for the volume, and touch no data.
+    ///
+    /// The verb a live migration needed and no backend had. After a guest
+    /// moves, the source is left with a volume record, possibly a per-node
+    /// claim, and no business with either: the bytes belong to the
+    /// destination now and the object one tier up says so. `deprovision` is
+    /// the wrong call by a mile — for `filesystem` and `lvm-thin` it destroys
+    /// somebody's disk.
+    ///
+    /// So this is the narrow one. Everything a node holds ABOUT the volume
+    /// goes; everything the volume IS stays. For most backends that is
+    /// nothing at all, which is why the default does nothing and answers
+    /// `Ok`: a `filesystem` pool's file IS the data and an `lvm-thin` LV IS
+    /// the data, and neither node-local backend can be the source of a live
+    /// migration in the first place.
+    ///
+    /// The one backend with something to release is `nvmeof-import`, whose
+    /// claim file is a per-node reservation over a namespace somebody else
+    /// owns. Left behind, it is a name spoken for on a machine that has
+    /// nothing to do with it any more, and the next volume assigned that
+    /// namespace there is refused over a conflict with a guest that left.
+    ///
+    /// Idempotent, and `Ok` for a handle this backend has never seen: "let go
+    /// of something you are not holding" is already done.
+    async fn forget(&self, handle: &VolumeHandle) -> Result<()> {
+        let _ = handle;
+        Ok(())
+    }
 }
 
 /// The half that owns the CONNECTION, and everything that lives as long as
@@ -402,6 +619,7 @@ mod tests {
                 params: None,
             },
             attachment,
+            detached: false,
         }
     }
 
@@ -634,5 +852,85 @@ mod tests {
             .backend_pid(),
             Some(11)
         );
+    }
+
+    /// The three snapshot verbs default to a refusal, and `snapshot_support`
+    /// defaults to "cannot".
+    ///
+    /// Unlike `locality`, where the compiler asks every driver because a
+    /// wrong answer puts a VM on a node without its disk. Here a default IS
+    /// the answer of most backends, and making the compiler ask would only
+    /// produce four copies of "no". What makes that safe is that the refusal
+    /// is a VARIANT and not a message: the tier above branches on
+    /// `Unsupported` to answer 422 at the edge instead of `Failed` later.
+    #[tokio::test]
+    async fn a_backend_that_says_nothing_about_snapshots_cannot_take_one() {
+        struct Plain;
+
+        #[async_trait::async_trait]
+        impl VolumeProvider for Plain {
+            fn locality(&self) -> Locality {
+                Locality::NodeLocal
+            }
+            async fn provision(&self, id: &VolumeId, spec: &VolumeSpec) -> Result<VolumeHandle> {
+                Ok(VolumeHandle {
+                    id: *id,
+                    backend: format!("/plain/{id}"),
+                    size_bytes: spec.size_bytes,
+                    params: None,
+                })
+            }
+            async fn deprovision(&self, _: &VolumeHandle) -> Result<()> {
+                Ok(())
+            }
+            async fn describe(&self, h: &VolumeHandle) -> Result<VolumeState> {
+                Ok(VolumeState {
+                    size_bytes: h.size_bytes,
+                })
+            }
+        }
+
+        let plain = Plain;
+        assert!(plain.snapshot_support().is_none());
+
+        let handle = VolumeHandle {
+            id: Uuid::nil(),
+            backend: "/plain/x".into(),
+            size_bytes: 1,
+            params: None,
+        };
+        let spec = VolumeSpec {
+            base_image: None,
+            size_bytes: 1,
+            driver: None,
+            params: None,
+        };
+        for refusal in [
+            plain.snapshot(&handle, &Uuid::nil()).await.err(),
+            plain.drop_snapshot(&handle).await.err(),
+            plain
+                .provision_from(&Uuid::nil(), &handle, &spec)
+                .await
+                .err(),
+        ] {
+            let e = refusal.expect("a backend that cannot, refusing");
+            assert!(
+                matches!(e, StorageError::Unsupported(_)),
+                "the variant is what the tier above branches on: {e:?}"
+            );
+        }
+
+        // And the two consistencies round-trip as the strings the proto and
+        // the catalogue speak, because a second spelling is how a parser
+        // starts guessing.
+        for c in [
+            SnapshotConsistency::Atomic,
+            SnapshotConsistency::NeedsQuiesce,
+        ] {
+            assert_eq!(SnapshotConsistency::parse(c.as_str()), Some(c));
+        }
+        assert_eq!(SnapshotConsistency::Atomic.as_str(), "atomic");
+        assert_eq!(SnapshotConsistency::NeedsQuiesce.as_str(), "needs-quiesce");
+        assert_eq!(SnapshotConsistency::parse("maybe"), None);
     }
 }

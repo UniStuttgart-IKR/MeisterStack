@@ -87,9 +87,9 @@ EOF
  
 # --- Helfer, damit ok/nok keine verschachtelten `bash -c` brauchen ---
 healthz()      { curl -sf --unix-socket "$SOCK" http://localhost/healthz | grep -q ok; }
-create()       { cli agent create --spec "$1"; }
-ls_has()       { cli -o json agent ls | grep -q "$1"; }
-ls_health_ok() { cli agent ls | awk -v id="$1" '$1==id && $4=="ok"' | grep -q .; }
+create()       { cli agent vm create -f "$1"; }
+ls_has()       { cli -o json agent vm ls | grep -q "$1"; }
+ls_health_ok() { cli agent vm ls | awk -v id="$1" '$1==id && $4=="ok"' | grep -q .; }
 # ACHTUNG: der zweite Parameter ist ein FELDNAME aus `Observed`
 # (components/agent/src/reconcile.rs). Ein Name, den es dort nicht gibt,
 # meldet sich als echter FAIL des Lifecycle-Teils und nicht als Tippfehler
@@ -107,8 +107,8 @@ echo "A. Preflight"
 [ -S "$SOCK" ]    || { red "  Kein Agent-Socket: $SOCK  (meister-agent --config config/agent.dev.toml)"; exit 1; }
  
 ok "healthz antwortet" -- healthz
-ok "ls läuft (table)"  -- cli agent ls
-ok "ls läuft (json)"   -- cli -o json agent ls
+ok "ls läuft (table)"  -- cli agent vm ls
+ok "ls läuft (json)"   -- cli -o json agent vm ls
  
 # Selbsttest: der Generator muss gültiges JSON liefern, sonst testen wir nur ihn
 ok "spec-generator liefert gültiges json" -- \
@@ -153,9 +153,9 @@ nok "driver_name-Alias wird gelesen" "is not configured on this node" -- \
   create "$(spec alias '[{"driver_name":"nope","partition":"mediated"}]')"
  
 GHOST="00000000-0000-4000-8000-000000000000"
-nok "inspect unbekannte VM" "404"           -- cli agent inspect "$GHOST"
+nok "inspect unbekannte VM" "404"           -- cli agent vm get "$GHOST"
 nok "observe unbekannte VM" "404"           -- cli agent observe "$GHOST"
-nok "ungültige UUID"        "invalid vm id" -- cli agent inspect "keine-uuid"
+nok "ungültige UUID"        "invalid vm id" -- cli agent vm get "keine-uuid"
  
 # ------------------------------------------------------- C: Lifecycle (opt-in)
 if [ "${SMOKE_FULL:-0}" != "1" ]; then
@@ -166,12 +166,12 @@ else
   echo "C. Lifecycle (bootet echte VMs)"
  
   SPEC="${SMOKE_SPEC:?SMOKE_SPEC muss auf ein bootfähiges Spec-File zeigen}"
-  VM="$(cli -o json agent create --spec "$SPEC" | grep -o '"id"[^,}]*' | cut -d'"' -f4)"
+  VM="$(cli -o json agent vm create -f "$SPEC" | grep -o '"id"[^,}]*' | cut -d'"' -f4)"
   if [ -z "$VM" ]; then
     red "  FAIL create lieferte keine id"; fail=$((fail+1))
   else
     green "  vm: $VM"
-    cleanup() { cli --yes agent destroy "$VM" >/dev/null 2>&1; rm -rf "$TMP"; }
+    cleanup() { cli --yes agent vm rm "$VM" >/dev/null 2>&1; rm -rf "$TMP"; }
  
     ok  "ls listet die VM"          -- ls_has "$VM"
     ok  "health-Spalte = ok"        -- ls_health_ok "$VM"
@@ -188,9 +188,9 @@ else
       nok "pci-Adresse doppelt vergeben" "already assigned to vm" -- create "$SPEC"
     fi
  
-    ok  "destroy" -- cli --yes agent destroy "$VM"
+    ok  "destroy" -- cli --yes agent vm rm "$VM"
     sleep 1
-    nok "nach destroy weg" "404" -- cli agent inspect "$VM"
+    nok "nach destroy weg" "404" -- cli agent vm get "$VM"
     cleanup() { rm -rf "$TMP"; }
   fi
 fi
@@ -209,7 +209,7 @@ else
   echo "D. nvrm (bootet eine vGPU-VM)"
 
   NSPEC="${SMOKE_NVRM_SPEC:?SMOKE_NVRM_SPEC muss auf ein nvrm-Spec-File zeigen}"
-  NVM="$(cli -o json agent create --spec "$NSPEC" | grep -o '"id"[^,}]*' | cut -d'"' -f4)"
+  NVM="$(cli -o json agent vm create -f "$NSPEC" | grep -o '"id"[^,}]*' | cut -d'"' -f4)"
   if [ -z "$NVM" ]; then
     red "  FAIL create lieferte keine id"; fail=$((fail+1))
   else
@@ -226,9 +226,9 @@ else
       nok "zweite Instanz am Limit abgelehnt" "already active" -- create "$NSPEC"
     fi
 
-    ok  "destroy" -- cli --yes agent destroy "$NVM"
+    ok  "destroy" -- cli --yes agent vm rm "$NVM"
     sleep 1
-    nok "nach destroy weg" "404" -- cli agent inspect "$NVM"
+    nok "nach destroy weg" "404" -- cli agent vm get "$NVM"
   fi
 fi
 

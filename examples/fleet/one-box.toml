@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+#
+# The normal case, and the plan this flake reads when the repository root has
+# no fleet.toml of its own: one box that is the whole control plane, and two
+# nodes it runs vms on. Copy it to ./fleet.toml, change the addresses and the
+# disks, `git add` it (a flake does not see untracked files), and every output
+# below is yours.
+#
+#   meister-deploy -f examples/fleet/one-box.toml plan
+#   nix build .#image-box
+
+[fleet]
+name   = "one-box"
+domain = "lab.example"
+# Where meister-ca keeps its directory. NEVER inside the image: `keys push`
+# carries the files, `image` must not.
+ca     = "pki"
+
+[defaults]
+roles    = ["agent"]
+ssh_user = "root"
+
+# The box: all four roles, and therefore its own raft group of one — which is
+# the single-member etcd this stack has always run, said out loud.
+[[node]]
+name    = "box"
+group   = "box"
+roles   = ["cloud", "cluster", "agent", "addons"]
+address = "10.0.0.10"
+disk    = "/dev/vda"
+data    = "/dev/vdb"
+# The hardware of this box, which is not ours to model: kernel modules,
+# NVIDIA, Mellanox, a hardware-configuration.nix. Paths are relative to THIS
+# file, and they are imported into the node's system next to our modules.
+modules = ["hw/box.nix"]
+
+# Two nodes. `group` names the CLUSTER they belong to, which is where their
+# controller_addrs come from — nobody types an address twice.
+[[node]]
+name    = "n1"
+group   = "box"
+address = "10.0.0.11"
+disk    = "/dev/vda"
+labels  = { zone = "rack1" }
+
+[[node]]
+name    = "n2"
+group   = "box"
+address = "10.0.0.12"
+disk    = "/dev/vda"
+labels  = { zone = "rack2" }

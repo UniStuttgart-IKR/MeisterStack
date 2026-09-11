@@ -67,6 +67,10 @@ pub mod reason {
     pub const SCHEDULED: &str = "Scheduled";
     /// And could not be. The message says which of the reasons.
     pub const FAILED_SCHEDULING: &str = "FailedScheduling";
+    /// A binding was taken back — because a client asked for a reschedule, or
+    /// because the node said it cannot serve this VM at all. The message says
+    /// which, and in the second case it is the node's own sentence.
+    pub const UNBOUND: &str = "Unbound";
     /// A create or an update was refused because the tenant is at its
     /// ceiling.
     pub const QUOTA_EXCEEDED: &str = "QuotaExceeded";
@@ -75,6 +79,21 @@ pub mod reason {
     /// A peer's heartbeat stopped, or came back.
     pub const PEER_LOST: &str = "PeerLost";
     pub const PEER_READY: &str = "PeerReady";
+    /// A live migration entered a phase. One event per phase, on the
+    /// migration object itself and not on the VM — a VM's history is what
+    /// happened to the guest, and the phases of a move belong to the record
+    /// of that move. The two that also matter to the guest (it arrived; it
+    /// did not) are written on the VM as `Scheduled` and as this.
+    pub const MIGRATING: &str = "Migrating";
+    /// A router's ACTIVE machine changed — the failover, as an event.
+    ///
+    /// Beside `PHASE_CHANGED` and not folded into it, because they are two
+    /// different facts and only one of them is the one somebody is paged
+    /// about: a router that goes Active→Active on a new machine has not
+    /// changed phase at all, and that is exactly the moment a tenant's
+    /// traffic moved. Without it the failover was in a log line on one
+    /// replica and nowhere an operator reads.
+    pub const ACTIVE_CHANGED: &str = "ActiveChanged";
 }
 
 /// What is being written down. Built by the caller, spent by `record`.
@@ -221,6 +240,69 @@ pub async fn all(store: &EtcdStore) -> Vec<Event> {
     events
 }
 
+/// What a client may ask the event log to narrow to, beside the two filters
+/// every listing has.
+///
+/// The log used to come back whole. The console filtered it in the browser
+/// and said so on screen; a `curl` had nothing. All three of these are
+/// FILTERS and none is a permission — the tenant door was already shut, once,
+/// before this narrows anything.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct EventQuery {
+    /// `involvedName=web-1`, matched against `spec.involvedName`.
+    #[serde(default, rename = "involvedName")]
+    pub involved_name: Option<String>,
+    /// `kind=Vm`, matched against `spec.involvedKind`, case-insensitively —
+    /// a person types `vm` and the API says `Vm`, and refusing that would be
+    /// pedantry about a filter.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// `since=2026-09-09T06:00:00Z`, RFC 3339, matched against
+    /// `spec.lastSeen`.
+    ///
+    /// An absolute instant and not a duration, deliberately: "the last hour"
+    /// is a question about the CLIENT's clock, and a server that answered it
+    /// would be answering with its own. The CLI turns `--since 1h` into an
+    /// instant before it asks.
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+impl EventQuery {
+    /// The floor, parsed once for the whole listing.
+    pub fn since(&self) -> Result<Option<chrono::DateTime<Utc>>, crate::rest::ApiError> {
+        let Some(raw) = self
+            .since
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|t| Some(t.with_timezone(&Utc)))
+            .map_err(|e| {
+                crate::rest::invalid_field(
+                    "since",
+                    format!("since={raw:?} is not an RFC 3339 instant: {e}"),
+                )
+            })
+    }
+
+    /// Does this event survive the narrowing? `since` is passed in rather
+    /// than reparsed, because it is one answer for the whole list.
+    pub fn selects(&self, event: &Event, since: Option<chrono::DateTime<Utc>>) -> bool {
+        self.involved_name
+            .as_deref()
+            .is_none_or(|name| event.spec.involved_name == name)
+            && self
+                .kind
+                .as_deref()
+                .is_none_or(|kind| event.spec.involved_kind.eq_ignore_ascii_case(kind))
+            && since.is_none_or(|floor| event.spec.last_seen >= floor)
+    }
+}
+
 /// The kind an event is about, for the callers that hold a typed object.
 pub fn kind_of<T: Resource>() -> &'static str {
     T::KIND
@@ -229,6 +311,77 @@ pub fn kind_of<T: Resource>() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three narrowings, and the one that is a refusal rather than a
+    /// filter: a `since` that is not an instant is a mistake in the request
+    /// and answering it with an empty list would hide it.
+    #[test]
+    fn the_event_log_narrows_to_one_object_and_one_window() {
+        let at = |minutes: i64| Utc::now() - chrono::Duration::minutes(minutes);
+        let event = |kind: &str, name: &str, minutes: i64| {
+            let mut e = Event::declare(
+                "e",
+                EventSpec {
+                    involved_kind: kind.into(),
+                    involved_name: name.into(),
+                    reason: "Scheduled".into(),
+                    first_seen: at(minutes),
+                    last_seen: at(minutes),
+                    ..Default::default()
+                },
+            );
+            e.metadata.uid = format!("{kind}-{name}");
+            e
+        };
+        // Through serde rather than by hand, so the wire NAMES are covered
+        // too: `involvedName` is what a client sends and the field is
+        // `involved_name`.
+        let query = |doc: serde_json::Value| -> EventQuery {
+            serde_json::from_value(doc).expect("a query")
+        };
+
+        let web = event("Vm", "web-1", 5);
+        let db = event("Vm", "db-1", 5);
+        let old = event("Vm", "web-1", 300);
+        let volume = event("Volume", "web-1", 5);
+
+        let name = query(serde_json::json!({"involvedName": "web-1"}));
+        assert!(name.selects(&web, None));
+        assert!(!name.selects(&db, None));
+        assert!(name.selects(&volume, None), "a name, whatever kind it is");
+
+        // A person types `vm`, the API says `Vm`, and refusing that would be
+        // pedantry about a filter.
+        let kind = query(serde_json::json!({"kind": "vm", "involvedName": "web-1"}));
+        assert!(kind.selects(&web, None));
+        assert!(!kind.selects(&volume, None));
+
+        let window = query(serde_json::json!({"since": "2020-01-01T00:00:00Z"}));
+        let floor = Some(at(60));
+        assert!(window.selects(&web, floor));
+        assert!(!window.selects(&old, floor), "older than the window");
+
+        // What the handler passes in, out of the query it was given.
+        assert_eq!(
+            query(serde_json::json!({"since": "2020-01-01T00:00:00Z"}))
+                .since()
+                .unwrap(),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        assert!(query(serde_json::json!({})).since().unwrap().is_none());
+        let refused = query(serde_json::json!({"since": "yesterday"}))
+            .since()
+            .expect_err("not an instant");
+        assert_eq!(
+            refused.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(refused.field(), Some("since"));
+    }
 
     /// The aggregation key, and the two things it has to separate. Same
     /// object and same reason is one row; a different reason or a different
@@ -289,6 +442,7 @@ mod tests {
         for word in [
             reason::SCHEDULED,
             reason::FAILED_SCHEDULING,
+            reason::UNBOUND,
             reason::QUOTA_EXCEEDED,
             reason::PHASE_CHANGED,
             reason::PEER_LOST,

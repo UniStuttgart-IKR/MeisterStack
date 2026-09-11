@@ -16,6 +16,13 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 axum = { workspace = true }
+# For the console upgrade: axum hands the raw connection over through hyper's
+# OnUpgrade, and TokioIo adapts it back to tokio's traits.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+# The console forward's own hop: a sibling replica that serves TLS is spoken
+# to with this cloud's `system:cloud:<name>` identity.
+tokio-rustls = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,3 +31,11 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 toml = { workspace = true }
+
+[dev-dependencies]
+# The router's own routing table, exercised without a store behind it: a
+# `oneshot` with a method no route registers separates "this path is served"
+# (405) from "this path is not" (404) without any handler running. See the
+# discovery test in src/api.rs.
+tower = { workspace = true }
+http-body-util = { workspace = true }

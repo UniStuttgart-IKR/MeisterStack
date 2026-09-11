@@ -29,7 +29,6 @@ default_profile = "cloud"
 # again is a renewal in place. Against a hardened cloud the FIRST login needs
 # a certificate already — see the bootstrap note in ./README.md.
 [profiles.cloud]
-tier = "cloud"
 endpoint = "https://cloud.example.net:3000"
 ca_cert = "pki/ca.crt"
 credential = { type = "mtls", cert = "pki/alice.crt", key = "pki/alice.key" }
@@ -49,11 +48,10 @@ timeout_secs = 30
 # because `meister-ca` always adds localhost and 127.0.0.1 to a serving
 # certificate's SANs. The tunnel does not weaken the mTLS — it carries it.
 #
-# `tier` is checked against the command, so this profile serves
-# `meister cluster …` and a `meister cloud …` against it is refused rather
-# than sent to a server that would not understand it.
+# There is no `tier` key: what this endpoint is, it says itself. A noun it
+# does not serve -- `meister tenant ls` here -- is a sentence naming the tier
+# that does have it, rather than a 404 to puzzle over.
 [profiles.cluster-1]
-tier = "cluster"
 endpoint = "https://127.0.0.1:3001"
 ca_cert = "pki/ca.crt"
 credential = { type = "mtls", cert = "pki/admin.crt", key = "pki/admin.key" }
@@ -62,7 +60,6 @@ credential = { type = "mtls", cert = "pki/admin.crt", key = "pki/admin.key" }
 # tool: the cluster binds its management address instead of loopback, and the
 # profile names it directly. Same certificate, same CA, no tunnel.
 #[profiles.cluster-1-mgmt]
-#tier = "cluster"
 #endpoint = "https://10.128.1.104:3001"
 #ca_cert = "pki/ca.crt"
 #credential = { type = "mtls", cert = "pki/admin.crt", key = "pki/admin.key" }
@@ -72,10 +69,9 @@ credential = { type = "mtls", cert = "pki/admin.crt", key = "pki/admin.key" }
 # The agent's unix socket. There is no network endpoint to point at and no
 # credential to present: reaching the socket at all IS the authorisation, it
 # is mode 0600, and this profile therefore only works in a session on that
-# node. `meister agent …` against it is the local debugging path — the
+# node. `meister agent vm …` against it is the local debugging path — the
 # control plane drives the same node over its own outbound session.
 [profiles.node-local]
-tier = "agent"
 endpoint = "unix:///run/meisterstack/agent.sock"
 credential = { type = "none" }
 

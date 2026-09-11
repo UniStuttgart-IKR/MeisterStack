@@ -6,7 +6,7 @@
 //! implementation of.
 //!
 //! The nine hand-written cases in `reconcile.rs` say what the interesting
-//! corners mean. This says what ALL of it means: 64.000 cells, each with an
+//! corners mean. This says what ALL of it means: 179.200 cells, each with an
 //! expected action, checked on every `cargo test`. What it buys is the thing
 //! the interesting corners cannot buy — that reordering two `if`s, or adding
 //! a variant to `Desired`, cannot quietly change an answer nobody happened to
@@ -103,6 +103,26 @@ const TABLE: &[Row] = &[
         when: |c| c.record.desired == Desired::Halted,
         then: |_| Action::None,
     },
+    // ---- the two migration phases -----------------------------------------
+    // Below every INTENT above and above every REPAIR below, which is the
+    // whole of the authority a migration has over a record: a destroy, a stop
+    // and a quarantine all still reach it, and the reconciler's own idea of
+    // what to fix does not.
+    Row {
+        why: "the guest arrived: a receiving record becomes an ordinary provisioned vm",
+        when: |c| c.record.phase == Phase::Receiving && c.obs.guest == Some(VmState::Running),
+        then: |_| Action::Arrived,
+    },
+    Row {
+        why: "the guest is not coming: a receiving record gives back what it made for it",
+        when: |c| c.record.phase == Phase::Receiving && c.obs.receive_failed,
+        then: |_| Action::Teardown,
+    },
+    Row {
+        why: "a migration owns this record; the reconciler repairs nothing a migration owns",
+        when: |c| matches!(c.record.phase, Phase::Receiving | Phase::Migrated),
+        then: |_| Action::None,
+    },
     // ---- desired = Running or Paused, healthy ------------------------------
     Row {
         why: "the resource chain has not finished; there is nothing to talk to yet",
@@ -110,6 +130,14 @@ const TABLE: &[Row] = &[
         then: |_| Action::Provision,
     },
     Row {
+        // Provision and NOT Quarantined, and the chaos run is the reason it
+        // is written out here: a killed VMM was expected to quarantine and
+        // recovers instead. It recovers on purpose. A dead VMM takes its
+        // backends with it, so there is nothing left in place to diagnose and
+        // the only two answers are "build it again" or "stay down until a
+        // person looks". The quarantine is for the other shape — a backend
+        // that died under a LIVE vmm — and `reconcile::backend_died_under_vmm`
+        // holds the argument.
         why: "provisioned, but there is no live vmm answering its socket",
         when: |c| !c.obs.vmm_alive || !c.obs.socket_responsive,
         then: |_| Action::Provision,
@@ -221,6 +249,7 @@ fn label(action: Action) -> &'static str {
         Action::Pause => "Pause",
         Action::Resume => "Resume",
         Action::Teardown => "Teardown",
+        Action::Arrived => "Arrived",
     }
 }
 
@@ -243,36 +272,50 @@ fn each_action_owns_the_share_of_the_space_the_guards_give_it() {
     });
     assert_eq!(seen, SPACE_SIZE);
 
+    // Every share below is twice what it was before `receive_failed` joined
+    // the space — the axis is read at exactly one place, so every other guard
+    // simply claims both halves of each cell it claimed before. The two that
+    // are not a doubling are the two the new guard moved, and they are marked.
     let expected: BTreeMap<&'static str, usize> = BTreeMap::from([
         // An operation blocks regardless of everything else: exactly half.
-        ("Blocked", 32_000),
-        // Of the other half, Absent is one desired state in five.
-        ("Teardown", 6_400),
+        ("Blocked", 89_600),
+        // Of the other half, Absent is one desired state in five (17920),
+        // plus the 1024 receiving cells the failed reception gives back —
+        // see the migration gate below for where that number comes from.
+        ("Teardown", 18_944),
         // Quarantine sits below Absent and below the whole Stopped branch, so
-        // it can only claim the three remaining intents: 32000 · 3/5 · 1/2.
-        ("Quarantined", 9_600),
-        // Stopped is 6400 cells. Dead vmm needing the posthumous stop:
-        // 3200 · 1/5 (phase) · 1/2 (pid) = 320. Live vmm with a guest that is
-        // down or paused: 3200 · 3/5 = 1920. Live vmm, guest up or unreadable,
-        // grace gone: 3200 · 2/5 · 3/4 = 960.
-        ("Stop", 3_200),
-        // The same branch, grace left: 3200 · 2/5 · 1/4.
-        ("SignalShutdown", 320),
-        // Phase unfinished 5120, no live socket 960, untracked without a pid
-        // 80 — see the Adopt derivation for the last two factors.
-        ("Provision", 6_160),
+        // it can only claim the three remaining intents: 89600 · 3/5 · 1/2.
+        ("Quarantined", 26_880),
+        // Stopped is 17920 cells. Dead vmm needing the posthumous stop:
+        // 8960 · 1/7 (phase) · 1/2 (pid) = 640 — unchanged by the two
+        // migration phases, because the guard names `Provisioned`. Live vmm
+        // with a guest that is down or paused: 8960 · 3/5 = 5376. Live vmm,
+        // guest up or unreadable, grace gone: 8960 · 2/5 · 3/4 = 2688.
+        ("Stop", 8_704),
+        // The same branch, grace left: 8960 · 2/5 · 1/4.
+        ("SignalShutdown", 896),
+        // The migration gate, and it is BELOW the four above: of the 17920
+        // healthy Running/Paused cells left, 2/7 are in the two migration
+        // phases = 5120, and the receiving half's Running fifth arrives.
+        // 2560 · 1/5 = 512.
+        ("Arrived", 512),
+        // Phase unfinished 10240, no live socket 1920, untracked without a
+        // pid 160 — see the Adopt derivation for the last two factors.
+        ("Provision", 12_320),
         // Healthy, provisioned, live and responsive, untracked, pid present:
-        // 32000 · 2/5 · 1/5 · (1/2)^5.
-        ("Adopt", 80),
-        // The last 160 cells are tracked with a readable guest: 128 of them,
-        // 16 per (desired, guest) pair. Start owns four pairs, Resume and
+        // 64000 · 2/5 · 1/5 · (1/2)^5.
+        ("Adopt", 160),
+        // The last 320 cells are tracked with a readable guest: 256 of them,
+        // 32 per (desired, guest) pair. Start owns four pairs, Resume and
         // Pause one each.
-        ("Start", 64),
-        ("Resume", 16),
-        ("Pause", 16),
-        // Stopped and already down 2880, Halted 3200, guest unreadable 32,
-        // guest already right 32.
-        ("None", 6_144),
+        ("Start", 128),
+        ("Resume", 32),
+        ("Pause", 32),
+        // Stopped and already down 8320, Halted 8960, the migration gate's
+        // 5120 minus the 1024 that now tear down (2560 Migrated plus the 2048
+        // Receiving whose guest is not yet Running, half of which have
+        // `receive_failed`), guest unreadable 64, guest already right 64.
+        ("None", 20_992),
     ]);
     assert_eq!(census, expected, "the shape of the decision space moved");
     assert_eq!(
@@ -336,7 +379,7 @@ fn the_same_cell_always_decides_the_same_way() {
 fn the_space_has_the_dimensions_it_claims() {
     assert_eq!(space::all_operations().len(), 2);
     assert_eq!(space::all_desired().len(), 5);
-    assert_eq!(space::all_phases().len(), 5);
+    assert_eq!(space::all_phases().len(), 7);
     assert_eq!(space::all_deadlines().len(), 4);
     assert_eq!(space::all_unhealthy().len(), 2);
     assert_eq!(space::all_guests().len(), 5);
@@ -350,7 +393,8 @@ fn the_space_has_the_dimensions_it_claims() {
         * 2 // tracked
         * 2 // vmm_alive
         * 2 // socket_responsive
-        * 2; // backends_alive
+        * 2 // backends_alive
+        * 2; // receive_failed
     assert_eq!(product, SPACE_SIZE);
 }
 
@@ -367,6 +411,7 @@ fn a_deadline_is_expired_at_the_instant_it_names() {
         socket_responsive: true,
         backends_alive: true,
         guest: Some(VmState::Running),
+        receive_failed: false,
     };
     record.stop_deadline = Some(now + std::time::Duration::from_secs(1));
     assert_eq!(plan(&record, &obs, now), Action::SignalShutdown);

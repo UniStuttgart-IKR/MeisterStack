@@ -57,6 +57,11 @@ def do_create(w, seed, step):
     if w.tenants and w.rnd.random() < 0.35:
         kw["tenant"] = w.rnd.choice(w.tenants)
         tier = "cloud"          # tenant is a cloud-tier field
+    elif tier == "cloud":
+        # Since runde 4 a cloud create needs one (D-P10), and this walker is
+        # an admin: no tenant to hand it, so the create goes to a cluster,
+        # which carries the field and enforces nothing.
+        tier = "cluster"
     if w.rnd.random() < 0.30:
         grp = f"g{w.rnd.randrange(3)}"
         kw["labels"] = {"grp": grp}
@@ -103,8 +108,11 @@ def do_start(w, seed, step):
 def do_volume(w, seed, step):
     cn = w.rnd.choice(list(CLUSTERS))
     name = w.fresh("vol")
+    # GiB and not bytes: `sizeBytes` is a field this API never had, so every
+    # one of these was a 422 and the walker was exercising the refusal path
+    # rather than the volume one (D-H3). One is the smallest a volume can be.
     c, b = cluster(cn, "POST", "/volumes", obj("Volume", name,
-                   {"sizeBytes": w.rnd.choice([16, 32, 64]) * 1024 * 1024}))
+                   {"sizeGib": w.rnd.choice([1, 2, 4])}))
     if c != 201 and w.rnd.random() < 0.5:
         # delete a random existing one instead
         cc, bb = cluster(cn, "GET", "/volumes")

@@ -39,15 +39,82 @@ check_agent() {
     ssh "${SSH_OPTS[@]}" "$MEISTER_SSH_USER@$ip" '
         echo "  host: $(hostname)  role: $(cat /run/meister-role 2>/dev/null || echo "<none>")"
         printf "  meister-agent: %s\n" "$(systemctl is-active meister-agent 2>/dev/null)"
-        if journalctl -u meister-agent --since "-2 min" --no-pager 2>/dev/null | grep -q "controller session failed"; then
-            echo "  session: FAILING (see journalctl -u meister-agent)"
-        else
-            echo "  session: ok"
-        fi
+        # A session is not "has one ever failed", it is "does one hold NOW" —
+        # and the two were the same question here until 2026-09-10, when a
+        # rollout reported all five agents FAILING while the cluster listed
+        # all five ready. A push restarts the agent, the first dial races the
+        # controller that is restarting too, and those failures sit in any
+        # window wide enough to be useful.
+        #
+        # The agent writes three lifecycle lines — `dialling controller`
+        # before every attempt, `controller session failed` or `controller
+        # session ended` when one is over — and says nothing more while a
+        # session holds (components/agent/src/lib.rs, dial_forever). So the
+        # LAST of the three is the state, and the count in the window is the
+        # context: one failure at boot and a redial loop are the same line
+        # and read very differently to a person.
+        # No window at all, therefore: the AGE of that last line is the
+        # answer. A dial that is going to fail says so within a second or
+        # two, so a `dialling` line that has stood for a quarter of a minute
+        # is a session that holds — while a redial loop leaves a failure as
+        # the last line almost all of the time, and a fresh dial the rest.
+        # Any window ("failures in the last two minutes") counts the past;
+        # this counts the present.
+        sess_line="$(journalctl -u meister-agent -b --no-pager -o short-unix 2>/dev/null \
+            | grep -E "dialling controller|controller session failed|controller session ended" \
+            | tail -1)"
+        sess_at="${sess_line%%.*}"
+        sess_age=$(( $(date +%s) - ${sess_at:-0} ))
+        case "$sess_line" in
+            "") echo "  session: none yet (no dial in this boot)" ;;
+            *"dialling controller"*)
+                if [ "$sess_age" -ge 15 ]; then
+                    echo "  session: ok (haelt seit ${sess_age}s)"
+                else
+                    echo "  session: dialling (seit ${sess_age}s — noch keine Aussage)"
+                fi ;;
+            *"controller session failed"*)
+                echo "  session: FAILING (letzter Fehlschlag vor ${sess_age}s)" ;;
+            *)  echo "  session: FAILING (Sitzung vor ${sess_age}s beendet, keine neue)" ;;
+        esac
         [ -e /dev/kvm ] && echo "  /dev/kvm: present" || echo "  /dev/kvm: MISSING"
         echo "  vm processes: $(ps -C cloud-hypervisor --no-headers 2>/dev/null | wc -l)"
         free -m | awk "/^Mem:/ {print \"  ram: \" \$3 \"/\" \$2 \" MiB used\"}"
-    ' || { echo "  SSH FAILED"; rc=1; }
+        # The conditions the agent reports as Node.status.conditions[], read
+        # here at their source.
+        #
+        # Why here and not from the API: this script has no client, no
+        # profile and no certificate — it ssh-es into hosts. What it CAN do is
+        # ask the same three questions the agent asks about itself, spelled
+        # with the same three words, so that a green check.sh and a green
+        # `node ls` mean the same thing.
+        #
+        # This is the position the mini-chaos run cost three hours: agent-1a
+        # was `active`, its session was `ok`, this script said green, and
+        # every command it was given failed with "Previous I/O error".
+        conditions=""
+        db="$(grep -oP "db_path\s*=\s*\"\K[^\"]+" /etc/meisterstack/agent.toml 2>/dev/null)"
+        state="$(dirname "${db:-/var/lib/meisterstack/agent.redb}")"
+        free_kb="$(df -Pk "$state" 2>/dev/null | awk "NR==2 {print \$4}")"
+        # 256 MiB: a volume is at least 1 GiB and a snapshot copies one, so
+        # this is not "can it work" but "is it already out" — the state that
+        # wedged the store.
+        [ -n "$free_kb" ] && [ "$free_kb" -lt 262144 ] && conditions="$conditions DiskPressure"
+        if journalctl -u meister-agent -b --since "-5 min" --no-pager 2>/dev/null \
+             | grep -q "Previous I/O error"; then
+            conditions="$conditions StoreUnhealthy"
+        fi
+        cg="$(grep -oP "cgroup_root\s*=\s*\"\K[^\"]+" /etc/meisterstack/agent.toml 2>/dev/null)"
+        cg="${cg:-/sys/fs/cgroup}"
+        if [ -d "$cg" ] && [ "$(stat -f -c %T "$cg" 2>/dev/null)" != cgroup2fs ]; then
+            conditions="$conditions CgroupUnusable"
+        fi
+        if [ -n "$conditions" ]; then
+            echo "  conditions:$conditions  <- this node is UP AND UNUSABLE"
+            exit 3
+        fi
+        echo "  conditions: none"
+    ' || { rc_agent=$?; [ "$rc_agent" = 3 ] || echo "  SSH FAILED"; rc=1; }
 }
 
 # Lists, like push.sh reads them: both tiers have been HA since M4.6, and a

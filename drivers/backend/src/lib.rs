@@ -9,7 +9,8 @@
 //! mechanics: spawn it with the right process hygiene, do not come back until
 //! it is listening, keep a log and quote its tail when the thing dies, tear it
 //! down with SIGTERM-then-SIGKILL, and recognise a backend adopted from a
-//! previous agent by its `comm`. That is what lives here.
+//! previous agent by its `comm` and by the socket on its command line. That is
+//! what lives here.
 //!
 //! What a backend IS stays with the driver: which binary, which arguments,
 //! which environment, what it hands back as an attachment, what it admits.
@@ -269,30 +270,61 @@ impl BackendKind {
     /// It is no longer our child, so the pid on the record is the only handle
     /// on it. Ignoring it would leave a backend running for a VM that is gone
     /// — the driver silently failing exactly the promise a teardown makes.
-    /// A pid is reusable, so it is signalled only when `comm` still says the
-    /// process is this backend.
-    pub fn stop_adopted(&self, pid: u32) {
-        if !self.is_ours(pid) {
+    ///
+    /// `socket` is the unix socket THIS consumer's backend was spawned with,
+    /// off the attachment the record holds, and it is what makes the signal
+    /// safe: see `is_ours`.
+    pub fn stop_adopted(&self, pid: u32, socket: &Path) {
+        if !self.is_ours(pid, socket) {
             return;
         }
-        info!(pid, backend = self.label, "stopping adopted backend");
+        info!(pid, backend = self.label, socket = %socket.display(),
+              "stopping adopted backend");
         self.signal(pid, Signal::SIGTERM);
     }
 
-    /// Is `pid` still this backend?
+    /// Is `pid` still the backend we wrote down — this one, and not another
+    /// of the same kind?
     ///
-    /// The question only comes up after an agent restart, when the backend is
-    /// no longer our child and the recorded pid is all we have. A pid is
-    /// reusable, so acting on the record alone would eventually reach somebody
-    /// else's process; `comm` is the cheap check that it is still the process
-    /// we wrote down.
-    pub fn is_ours(&self, pid: u32) -> bool {
+    /// The question comes up after an agent restart, when the backend is no
+    /// longer our child and the recorded pid is all we have. Two checks,
+    /// because one is not enough:
+    ///
+    /// - `comm` says the process is a backend of this kind. That much was
+    ///   here before, and on its own it is exactly the wrong amount of
+    ///   certainty: a node runs one `virtiofsd` per share and one
+    ///   `vhost-user-nvrm` per GPU, so `comm` matching means "some backend of
+    ///   this kind", and a recycled pid on a busy node is most likely to be
+    ///   recycled by the same busy thing. A teardown that trusted `comm`
+    ///   alone would eventually `killpg` a LIVE VM's backend — and killpg,
+    ///   because these get a session of their own, takes the whole group.
+    /// - `/proc/<pid>/cmdline` contains the socket this consumer's backend
+    ///   was spawned with. Every backend here is spawned with its socket path
+    ///   on the command line, the path carries the consumer's uuid, and no
+    ///   two consumers share one. That is identity and not a family
+    ///   resemblance.
+    ///
+    /// A dead pid has no `comm` and no `cmdline` to read, so this subsumes
+    /// liveness, which is what the two `get`/`stat` callers rely on.
+    pub fn is_ours(&self, pid: u32, socket: &Path) -> bool {
         if self.comm.is_empty() {
             return false;
         }
-        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        let comm_matches = std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .map(|comm| comm.trim() == self.comm)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !comm_matches {
+            return false;
+        }
+        // NUL-separated, so the needle is looked for in the raw bytes rather
+        // than in a rendered string: an argument boundary is a NUL and never
+        // a space, and joining with spaces first would let a path with a
+        // space in it match across two arguments.
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        let needle = socket.as_os_str().as_encoded_bytes();
+        !needle.is_empty() && cmdline.windows(needle.len()).any(|w| w == needle)
     }
 
     fn signal(&self, pid: u32, sig: Signal) {
@@ -406,14 +438,25 @@ mod tests {
         );
     }
 
+    /// The first argument of this test binary, which is its own path, and
+    /// therefore a string `/proc/self/cmdline` is guaranteed to contain.
+    /// Stands in for a backend's socket path, which is what the real callers
+    /// pass.
+    fn own_cmdline_argument() -> std::path::PathBuf {
+        let raw = std::fs::read(format!("/proc/{}/cmdline", std::process::id())).expect("linux");
+        let first = raw.split(|b| *b == 0).next().expect("argv[0]");
+        std::path::PathBuf::from(String::from_utf8(first.to_vec()).expect("utf-8 argv[0]"))
+    }
+
     /// A binary path that has no file name at all leaves nothing to compare
     /// against, and matching everything would be worse than matching nothing:
     /// teardown would signal a stranger's process.
     #[test]
     fn a_backend_with_no_expected_name_owns_nothing() {
         let anonymous = BackendKind::child("crosvm", "");
-        assert!(!anonymous.is_ours(std::process::id()));
-        assert!(!anonymous.is_ours(1));
+        let arg = own_cmdline_argument();
+        assert!(!anonymous.is_ours(std::process::id(), &arg));
+        assert!(!anonymous.is_ours(1, &arg));
     }
 
     /// The adoption check against a live process: this test binary is one.
@@ -422,8 +465,36 @@ mod tests {
         let me =
             std::fs::read_to_string(format!("/proc/{}/comm", std::process::id())).expect("linux");
         let kind = BackendKind::child("test", me.trim());
-        assert!(kind.is_ours(std::process::id()));
-        assert!(!BackendKind::child("test", "definitely-not-me").is_ours(std::process::id()));
+        let arg = own_cmdline_argument();
+        assert!(kind.is_ours(std::process::id(), &arg));
+        assert!(!BackendKind::child("test", "definitely-not-me").is_ours(std::process::id(), &arg));
+    }
+
+    /// The half `comm` alone could never see, and the reason this position
+    /// exists: a node runs one `virtiofsd` per share and one crosvm per GPU,
+    /// so "the process at this pid is a backend of this kind" is true of
+    /// every OTHER consumer's backend too. The socket on the command line is
+    /// what tells this one from its siblings — and killpg on a sibling would
+    /// take a live VM's whole backend group down.
+    #[test]
+    fn a_sibling_backend_of_the_same_kind_is_not_this_one() {
+        let me =
+            std::fs::read_to_string(format!("/proc/{}/comm", std::process::id())).expect("linux");
+        let kind = BackendKind::detached("virtiofsd", me.trim(), 1);
+        let pid = std::process::id();
+
+        // Same kind, same pid, right socket: ours.
+        assert!(kind.is_ours(pid, &own_cmdline_argument()));
+
+        // Same kind, same pid, ANOTHER consumer's socket: not ours, and this
+        // is the case that used to come back true.
+        let sibling =
+            std::path::Path::new("/run/meisterstack/nfs/2f3a4b5c-0000-0000-0000-000000000000.sock");
+        assert!(!kind.is_ours(pid, sibling));
+
+        // An empty marker matches everywhere in a byte search, so it is
+        // refused outright rather than allowed to mean "any".
+        assert!(!kind.is_ours(pid, std::path::Path::new("")));
     }
 
     #[test]
@@ -444,7 +515,8 @@ mod tests {
     /// must not put a megabyte into an API error.
     #[test]
     fn the_log_tail_is_the_last_of_it() {
-        let path = std::env::temp_dir().join(format!("meister-tail-{}.log", std::process::id()));
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let path = temp.path().join("backend.log");
         let body: String = std::iter::repeat_n('x', TAIL_CHARS)
             .chain("THE END".chars())
             .collect();
@@ -454,7 +526,5 @@ mod tests {
         assert_eq!(tail.chars().count(), TAIL_CHARS);
         assert!(tail.ends_with("THE END"), "{tail}");
         assert!(!tail.contains("THE BEGINNING"));
-
-        std::fs::remove_file(&path).unwrap();
     }
 }

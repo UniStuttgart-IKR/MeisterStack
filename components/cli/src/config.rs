@@ -13,25 +13,6 @@ pub const ENV_PROFILE: &str = "MEISTER_PROFILE";
 pub const ENV_ENDPOINT: &str = "MEISTER_ENDPOINT";
 pub const ENV_TOKEN: &str = "MEISTER_TOKEN";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Tier {
-    Agent,
-    Cluster,
-    Cloud,
-}
-
-impl std::fmt::Display for Tier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Tier::Agent => "agent",
-            Tier::Cluster => "cluster",
-            Tier::Cloud => "cloud",
-        };
-        f.write_str(s)
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[derive(Default)]
@@ -95,10 +76,21 @@ pub struct OidcSource {
     pub scope: Option<String>,
 }
 
+/// One endpoint under a name: where it is, how to trust it, who we are to it.
+///
+/// There is no `tier` key any more, and its absence is the whole point of
+/// this milestone. A tier was a thing the OPERATOR had to know and keep in
+/// step with the endpoint, and getting it wrong was a refusal from the CLI
+/// about its own config rather than an answer from the server. What is here
+/// now is a server that says what it is (`GET /apis/meister.io/v1`) and a CLI
+/// that asks.
+///
+/// `deny_unknown_fields` therefore turns an old profile into a parse error
+/// naming `tier`, which is wanted: a profile that still carries one was
+/// written against a CLI that checked it, and saying so beats ignoring it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
-    pub tier: Tier,
     pub endpoint: String,
     #[serde(default)]
     pub ca_cert: Option<PathBuf>,
@@ -190,14 +182,11 @@ pub struct Overrides {
 #[derive(Debug)]
 /// A resolved target: what the client needs and nothing else.
 ///
-/// `tier` is deliberately not here — it is checked against the command on the
-/// Profile, before this is built, and carrying the answer past the check only
-/// invites a second one. `ca_cert` was in the same position until this
-/// milestone and was taken out for it; it is back because there is now
-/// something to hand it to. It is the CA an `https://` endpoint is verified
-/// against, and it is required for one — a lab CA is in nobody's system trust
-/// store, so falling back to those would only turn a clear error into an
-/// obscure handshake failure.
+/// `tier` is not here and is not anywhere any more: what an endpoint is, is
+/// something the endpoint says. `ca_cert` is the CA an `https://` endpoint is
+/// verified against, and it is required for one — a lab CA is in nobody's
+/// system trust store, so falling back to those would only turn a clear error
+/// into an obscure handshake failure.
 pub struct Target {
     pub profile_name: String,
     pub endpoint: String,
@@ -242,7 +231,7 @@ impl std::fmt::Debug for Credential {
     }
 }
 
-pub fn resolve(config: &Config, expected_tier: Tier, ov: &Overrides) -> Result<Target> {
+pub fn resolve(config: &Config, ov: &Overrides) -> Result<Target> {
     let profile_name = ov
         .profile
         .clone()
@@ -271,16 +260,6 @@ pub fn resolve(config: &Config, expected_tier: Tier, ov: &Overrides) -> Result<T
         }
         None => ("<flags>".to_string(), None),
     };
-
-    if let Some(p) = profile
-        && p.tier != expected_tier
-    {
-        bail!(
-            "profile {name:?} targets the {} tier, but this command talks to the {} tier",
-            p.tier,
-            expected_tier
-        );
-    }
 
     let endpoint = endpoint_override
         .or_else(|| profile.map(|p| p.endpoint.clone()))
@@ -514,9 +493,6 @@ mod tests {
             toml::from_str(&raw).expect("config/examples/cli.toml parses as written");
         assert_eq!(live.default_profile.as_deref(), Some("lab"));
         assert_eq!(live.profiles.len(), 5);
-        assert_eq!(live.profiles["lab"].tier, Tier::Agent);
-        assert_eq!(live.profiles["cluster-a"].tier, Tier::Cluster);
-        assert_eq!(live.profiles["cloud"].tier, Tier::Cloud);
         // The mTLS profile is the one an operator copies; if its shape ever
         // stops being the shape the client accepts, this is where it shows.
         let mtls = &live.profiles["cloud-mtls"];
@@ -524,7 +500,6 @@ mod tests {
         assert!(mtls.ca_cert.is_some(), "an https profile needs its CA");
         assert!(matches!(mtls.credential, CredentialSource::Mtls { .. }));
         let oidc = &live.profiles["cloud-oidc"];
-        assert_eq!(oidc.tier, Tier::Cloud);
         assert!(matches!(oidc.credential, CredentialSource::Oidc { .. }));
 
         // The credential shapes at the bottom are prose, deliberately: they
@@ -536,7 +511,7 @@ mod tests {
         {
             let value = line.trim_start().trim_start_matches('#').trim();
             let doc = format!(
-                "default_profile = \"p\"\n[profiles.p]\ntier = \"agent\"\n\
+                "default_profile = \"p\"\n[profiles.p]\n\
                  endpoint = \"unix:///x.sock\"\ncredential = {value}"
             );
             toml::from_str::<Config>(&doc)
@@ -556,12 +531,11 @@ mod tests {
             .expect("every commented key in the example is a real one");
     }
 
-    fn config_with(tier: Tier) -> Config {
+    fn config_with() -> Config {
         let mut profiles = BTreeMap::new();
         profiles.insert(
             "p".to_string(),
             Profile {
-                tier,
                 endpoint: "https://example:8443".into(),
                 ca_cert: None,
                 credential: CredentialSource::None,
@@ -575,32 +549,40 @@ mod tests {
         }
     }
 
+    /// A profile written for the CLI before this milestone carries `tier`,
+    /// and `deny_unknown_fields` makes that a parse error that NAMES the key.
+    ///
+    /// Loud on purpose. Ignoring it would leave an operator with a config
+    /// that still says something the CLI no longer reads, and the first time
+    /// that mattered would be the first time they wondered why a profile was
+    /// not being checked against a command any more.
     #[test]
-    fn tier_mismatch_is_rejected() {
-        let cfg = config_with(Tier::Cloud);
-        let err = resolve(&cfg, Tier::Agent, &Overrides::default()).unwrap_err();
-        assert!(err.to_string().contains("tier"), "{err}");
+    fn a_profile_that_still_carries_a_tier_is_a_parse_error_that_says_so() {
+        let doc = "default_profile = \"p\"\n[profiles.p]\ntier = \"cloud\"\n\
+                   endpoint = \"http://x:3000\"";
+        let err = toml::from_str::<Config>(doc).unwrap_err().to_string();
+        assert!(err.contains("tier"), "{err}");
     }
 
     #[test]
     fn unknown_profile_lists_known_ones() {
-        let cfg = config_with(Tier::Agent);
+        let cfg = config_with();
         let ov = Overrides {
             profile: Some("nope".into()),
             ..Default::default()
         };
-        let err = resolve(&cfg, Tier::Agent, &ov).unwrap_err();
+        let err = resolve(&cfg, &ov).unwrap_err();
         assert!(err.to_string().contains("nope"), "{err}");
     }
 
     #[test]
     fn flag_endpoint_beats_profile() {
-        let cfg = config_with(Tier::Agent);
+        let cfg = config_with();
         let ov = Overrides {
             endpoint: Some("unix:///tmp/a.sock".into()),
             ..Default::default()
         };
-        let t = resolve(&cfg, Tier::Agent, &ov).unwrap();
+        let t = resolve(&cfg, &ov).unwrap();
         assert_eq!(t.endpoint, "unix:///tmp/a.sock");
     }
 
@@ -611,7 +593,7 @@ mod tests {
             endpoint: Some("unix:///tmp/a.sock".into()),
             ..Default::default()
         };
-        let t = resolve(&cfg, Tier::Agent, &ov).unwrap();
+        let t = resolve(&cfg, &ov).unwrap();
         assert_eq!(t.profile_name, "<flags>");
         assert!(matches!(t.credential, Credential::None));
         assert!(t.ca_cert.is_none());
@@ -622,18 +604,18 @@ mod tests {
     /// certificate is the problem it looks like.
     #[test]
     fn login_may_resolve_a_profile_whose_certificate_does_not_exist_yet() {
-        let mut cfg = config_with(Tier::Cloud);
+        let mut cfg = config_with();
         cfg.profiles.get_mut("p").unwrap().credential = CredentialSource::Mtls {
             cert: PathBuf::from("/nonexistent/x.crt"),
             key: PathBuf::from("/nonexistent/x.key"),
         };
-        assert!(resolve(&cfg, Tier::Cloud, &Overrides::default()).is_err());
+        assert!(resolve(&cfg, &Overrides::default()).is_err());
 
         let ov = Overrides {
             tolerate_missing_credential: true,
             ..Default::default()
         };
-        let t = resolve(&cfg, Tier::Cloud, &ov).unwrap();
+        let t = resolve(&cfg, &ov).unwrap();
         assert!(matches!(t.credential, Credential::None));
     }
 
@@ -641,10 +623,10 @@ mod tests {
     /// the config file so that a config and its pki/ directory move as one.
     #[test]
     fn the_profiles_ca_reaches_the_client_as_an_absolute_path() {
-        let mut cfg = config_with(Tier::Cloud);
+        let mut cfg = config_with();
         cfg.dir = Some(PathBuf::from("/etc/meisterstack"));
         cfg.profiles.get_mut("p").unwrap().ca_cert = Some(PathBuf::from("pki/ca.crt"));
-        let t = resolve(&cfg, Tier::Cloud, &Overrides::default()).unwrap();
+        let t = resolve(&cfg, &Overrides::default()).unwrap();
         assert_eq!(
             t.ca_cert.as_deref(),
             Some(Path::new("/etc/meisterstack/pki/ca.crt"))
@@ -654,11 +636,11 @@ mod tests {
     #[test]
     fn missing_endpoint_is_an_error() {
         let cfg = Config::default();
-        assert!(resolve(&cfg, Tier::Agent, &Overrides::default()).is_err());
+        assert!(resolve(&cfg, &Overrides::default()).is_err());
     }
 
     fn oidc_config(tokens: Option<&str>) -> Config {
-        let mut cfg = config_with(Tier::Cloud);
+        let mut cfg = config_with();
         cfg.dir = Some(PathBuf::from("/etc/meisterstack"));
         cfg.profiles.get_mut("p").unwrap().credential = CredentialSource::Oidc {
             issuer: "https://idp.example.org".into(),
@@ -679,13 +661,13 @@ mod tests {
             tolerate_missing_credential: true,
             ..Default::default()
         };
-        let t = resolve(&oidc_config(None), Tier::Cloud, &ov).unwrap();
+        let t = resolve(&oidc_config(None), &ov).unwrap();
         let src = t.oidc.expect("the profile names a provider");
         assert_eq!(src.tokens, Path::new("/etc/meisterstack/oidc/p.json"));
         assert_eq!(src.issuer, "https://idp.example.org");
 
         // A named path is still resolved against the config file.
-        let t = resolve(&oidc_config(Some("sessions/x.json")), Tier::Cloud, &ov).unwrap();
+        let t = resolve(&oidc_config(Some("sessions/x.json")), &ov).unwrap();
         assert_eq!(
             t.oidc.unwrap().tokens,
             Path::new("/etc/meisterstack/sessions/x.json")
@@ -703,12 +685,12 @@ mod tests {
             tolerate_missing_credential: true,
             ..Default::default()
         };
-        let err = resolve(&cfg, Tier::Cloud, &ov).unwrap_err();
+        let err = resolve(&cfg, &ov).unwrap_err();
         assert!(err.to_string().contains("plain http"), "{err}");
 
         // https is what the example uses, and it resolves.
         cfg.profiles.get_mut("p").unwrap().endpoint = "https://10.128.1.103:3000".into();
-        assert!(resolve(&cfg, Tier::Cloud, &ov).is_ok());
+        assert!(resolve(&cfg, &ov).is_ok());
     }
 
     /// The state every oidc profile is in before its first login. `meister
@@ -717,14 +699,14 @@ mod tests {
     #[test]
     fn login_may_resolve_an_oidc_profile_that_has_never_logged_in() {
         let cfg = oidc_config(Some("/nonexistent/session.json"));
-        let err = resolve(&cfg, Tier::Cloud, &Overrides::default()).unwrap_err();
+        let err = resolve(&cfg, &Overrides::default()).unwrap_err();
         assert!(err.to_string().contains("login --oidc"), "{err}");
 
         let ov = Overrides {
             tolerate_missing_credential: true,
             ..Default::default()
         };
-        let t = resolve(&cfg, Tier::Cloud, &ov).unwrap();
+        let t = resolve(&cfg, &ov).unwrap();
         assert!(matches!(t.credential, Credential::None));
         // And the source is there anyway -- which is the whole reason it is
         // on the Target: `login --oidc` needs it precisely now.
@@ -736,15 +718,18 @@ mod tests {
     /// can await.
     #[test]
     fn a_session_is_a_token_while_it_lasts_and_a_renewal_afterwards() {
-        let dir = std::env::temp_dir().join(format!("meister-cfg-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("s.json");
+        // A pid is not a unique name: it comes back round, and a crashed run
+        // leaves its directory behind for the process that inherits the
+        // number. `tempfile` is unique and cleans up on a panic too.
+        let dir = tempfile::tempdir().expect("a directory of our own");
+        let path = dir.path().join("s.json");
 
-        let write = |secs: i64| {
+        let write = |secs: i64, id_token: Option<&str>| {
             let s = crate::oidc::Session {
                 issuer: "https://idp.example.org".into(),
                 client_id: "meisterstack".into(),
                 access_token: "at-1".into(),
+                id_token: id_token.map(str::to_string),
                 refresh_token: Some("rt-1".into()),
                 expires_at: chrono::Utc::now() + chrono::TimeDelta::seconds(secs),
                 scope: None,
@@ -753,15 +738,13 @@ mod tests {
         };
 
         let cfg = oidc_config(Some(path.to_str().unwrap()));
-        write(3600);
-        let t = resolve(&cfg, Tier::Cloud, &Overrides::default()).unwrap();
+        write(3600, None);
+        let t = resolve(&cfg, &Overrides::default()).unwrap();
         assert!(matches!(&t.credential, Credential::Bearer(a) if a == "at-1"));
 
-        write(-1);
-        let t = resolve(&cfg, Tier::Cloud, &Overrides::default()).unwrap();
+        write(-1, None);
+        let t = resolve(&cfg, &Overrides::default()).unwrap();
         assert!(matches!(t.credential, Credential::StaleOidc));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

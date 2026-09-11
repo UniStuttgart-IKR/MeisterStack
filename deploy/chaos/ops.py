@@ -16,6 +16,7 @@ import urllib.request
 
 from invariants import (CLOUD, CLUSTER1, CLUSTER2, CLUSTERS, CLOUD_PORT, CLUSTER_PORT,
                         NODE_HOST, NODE_OF_CLUSTER, OUT, SSH, sh, get, items)
+import mtls
 
 V1 = "/apis/meister.io/v1"
 
@@ -34,13 +35,15 @@ def call(ip, port, method, path, body=None, timeout=20):
     head, sep, tail = path.rpartition("/")
     if sep and tail:
         path = head + sep + urllib.parse.quote(tail, safe="")
-    url = f"http://{ip}:{port}{path}"
+    url = f"{mtls.scheme()}://{ip}:{port}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     if data:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        # Not `urllib.request.urlopen`: since Image 58 both tiers want a
+        # client certificate, and the default opener has none.
+        with mtls.urlopen(req, timeout=timeout) as r:
             raw = r.read().decode()
             return r.status, (json.loads(raw) if raw.strip() else {})
     except urllib.error.HTTPError as e:
@@ -207,26 +210,147 @@ def finding(fid, tag, seed, msg):
     print(f"  ** {fid} {tag}: {msg}", flush=True)
 
 
-def cleanup(prefix="chaos-"):
-    """Delete every object this harness could have created, on both tiers."""
+def _mine(o, prefix):
+    """Is this object one of ours?
+
+    By NAME where the harness chose the name, and by the tenant or the pool
+    where it did not -- which is the hole D-H2 was: a floating address is
+    named after the ADDRESS (`198.51.100.1`), so the name filter skipped every
+    one of them, the pool could then not be deleted because addresses were out
+    of it, and the tenant could not be deleted because it held them. Three
+    objects left standing, and `tenant rm` answering `409 ... still has
+    floating addresses` to whoever cleaned up by hand afterwards.
+    """
+    meta, spec = o.get("metadata") or {}, o.get("spec") or {}
+    for value in (meta.get("name"), spec.get("tenant"), spec.get("pool")):
+        if isinstance(value, str) and value.startswith(prefix):
+            return True
+    return False
+
+
+def cleanup(prefix="chaos-", passes=3, settle=15):
+    """Delete every object this harness could have created, on both tiers.
+
+    The ORDER is the rule and it is the reverse of how things are made: what
+    holds something is deleted after the thing it holds. A tenant with a
+    floating address, a pool with an address out of it and a storage pool with
+    a volume in it each refuse to go, correctly -- so the cluster's objects go
+    first, then the cloud's, and the tenants last.
+
+    And then again, twice: a delete refused because a finalizer had not run
+    yet succeeds on the second pass, which is cheaper than teaching this
+    function every wait in the control plane. `passes` exists so a run that
+    cleans nothing stops after one.
+
+    **With time between them, which is what "on the second pass" assumes and
+    which nothing here provided.** Three passes ran back-to-back in under two
+    seconds, and tearing a guest down takes ten to twenty — so a refusal that
+    a later pass was meant to survive met exactly the same estate each time.
+    `settle` makes the sentence above true. It is NOT offered as the
+    explanation of the one leak round 4's e2e saw: that run left
+    `chaos-ten-35` standing, empty and deletable by hand a minute later, and
+    probes at four, six and one vm — cloud tier and cluster tier — deleted
+    their tenant on the first pass every time. What that leak was is written
+    down and not closed.
+
+    Which is why the second half of this exists: **what survives is named.**
+    A cleanup that returns only what it killed reports a clean lab either
+    way, and the leftover above was found by reading `tenant ls` afterwards
+    rather than by anything here.
+    """
     killed = []
-    for res in ("vms", "floatingips", "floatingpools", "images", "tenants", "storagepools"):
-        c, b = cloud("GET", f"/{res}")
-        if c != 200:
-            continue
-        for o in items(b):
-            n = o["metadata"]["name"]
-            if n.startswith(prefix):
-                cloud("DELETE", f"/{res}/{n}")
-                killed.append(f"cloud/{res}/{n}")
-    for cn in CLUSTERS:
-        for res in ("vms", "volumes", "storagepools"):
-            c, b = cluster(cn, "GET", f"/{res}")
+    for attempt in range(passes):
+        if attempt:
+            time.sleep(settle)
+        before = len(killed)
+        # The cluster tier first: a volume holds a storage pool, and a VM
+        # holds a volume.
+        for cn in CLUSTERS:
+            for res in ("vms", "volumesnapshots", "volumes", "storagepools"):
+                c, b = cluster(cn, "GET", f"/{res}")
+                if c != 200:
+                    continue
+                for o in items(b):
+                    if not _mine(o, prefix):
+                        continue
+                    n = o["metadata"]["name"]
+                    rc, _ = cluster(cn, "DELETE", f"/{res}/{n}")
+                    if rc in (200, 202, 204, 404):
+                        killed.append(f"{cn}/{res}/{n}")
+        # Then the cloud's, tenants last: everything else is inside one.
+        # Routers before their provider networks: a network that still
+        # carries one refuses to go, exactly as a pool with reservations does.
+        for res in ("vms", "volumes", "floatingips", "floatingpools",
+                    "routers", "providernetworks",
+                    "routedsubnets", "storagepools", "secrets", "images", "tenants"):
+            c, b = cloud("GET", f"/{res}")
             if c != 200:
                 continue
             for o in items(b):
+                if not _mine(o, prefix):
+                    continue
                 n = o["metadata"]["name"]
-                if n.startswith(prefix):
-                    cluster(cn, "DELETE", f"/{res}/{n}")
-                    killed.append(f"{cn}/{res}/{n}")
-    return killed
+                rc, _ = cloud("DELETE", f"/{res}/{n}")
+                if rc in (200, 202, 204, 404):
+                    killed.append(f"cloud/{res}/{n}")
+        if len(killed) == before:
+            break
+    killed.extend(unlabel_nodes(prefix))
+    for line in survivors(prefix):
+        log(f"cleanup left behind: {line}")
+    # Deduplicated, because a second pass re-lists what the first one asked
+    # to delete: a 202 is "on its way out", not "gone".
+    return sorted(set(killed))
+
+
+def survivors(prefix="chaos-", settle=10):
+    """Everything of this harness's that is still there after a cleanup.
+
+    Asked once, after the passes and after a pause long enough for a `202` to
+    become a `404`: an object on its way out is not a leak, and calling one
+    would make this line noise that nobody reads.
+    """
+    time.sleep(settle)
+    left = []
+    for cn in CLUSTERS:
+        for res in ("vms", "volumesnapshots", "volumes", "storagepools"):
+            c, b = cluster(cn, "GET", f"/{res}")
+            if c == 200:
+                left += [f"{cn}/{res}/{o['metadata']['name']}"
+                         for o in items(b) if _mine(o, prefix)]
+    for res in ("vms", "volumes", "floatingips", "floatingpools", "routers",
+                "providernetworks", "routedsubnets", "storagepools", "secrets",
+                "images", "tenants"):
+        c, b = cloud("GET", f"/{res}")
+        if c == 200:
+            left += [f"cloud/{res}/{o['metadata']['name']}"
+                     for o in items(b) if _mine(o, prefix)]
+    return sorted(left)
+
+
+def unlabel_nodes(prefix="chaos-"):
+    """Take this harness's labels off every node of every cluster.
+
+    The other half of D-H2, and the one nothing was even trying to do:
+    `chaos-l0` and `chaos-l1` were still stuck to all five agents after the
+    run, and it was `meister-deploy check` that found them rather than the
+    harness. A label is not an object, so no delete could ever have reached
+    it -- it is a key in `spec.labels` and comes off with a patch that sets
+    it to null.
+    """
+    taken = []
+    for cn in CLUSTERS:
+        c, b = cluster(cn, "GET", "/nodes")
+        if c != 200:
+            continue
+        for node in items(b):
+            name = node["metadata"]["name"]
+            labels = ((node.get("spec") or {}).get("labels") or {})
+            ours = [k for k in labels if k.startswith(prefix)]
+            if not ours:
+                continue
+            rc, _ = cluster(cn, "PATCH", f"/nodes/{name}",
+                            {"spec": {"labels": {k: None for k in ours}}})
+            if rc in (200, 202):
+                taken.extend(f"{cn}/nodes/{name}/labels/{k}" for k in ours)
+    return taken

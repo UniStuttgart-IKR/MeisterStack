@@ -23,6 +23,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from invariants import (CLOUD, CLUSTER1, CLUSTER2, CLUSTERS, CLOUD_PORT, CLUSTER_PORT,
                         NODE_HOST, NODE_OF_CLUSTER, OUT, State, check, sh, items)
+import mtls
 import ops
 from ops import (cloud, cluster, vm_body, obj, wait_for, wait_phase, wait_gone,
                  cloud_vm, cluster_vm, phase_of, log, finding, ctl, kill_agent,
@@ -47,6 +48,48 @@ def mk(name, **kw):
 
 def rm(name, res="vms"):
     return cloud("DELETE", f"/{res}/{name}")
+
+
+def ensure_tenant(name, description="chaos scenario"):
+    """A tenant to own this scenario's objects, made if it is not there.
+
+    Since runde 4 every tenant-scoped create at the cloud needs a tenant --
+    the rule a volume, a floating address and a secret always had, and which
+    a VM was the exception to (D-P10). The harness runs as an admin, who is
+    confined to no tenant, so it has to say which one.
+    """
+    c, _ = cloud("POST", "/tenants", obj("Tenant", name, {"description": description}))
+    if c not in (200, 201, 409):
+        log(f"tenant {name}: HTTP {c}")
+    return name
+
+
+def ensure_filesystem_pool(cname, name="chaos-pool"):
+    """A pool this scenario can put a plain disk in, made if it needs to be.
+
+    A create with no `pool` lands in the one marked `default`, and whether an
+    estate HAS one is the estate's business: round 4's e2e ran against a lab
+    whose only pool was the nvme-oF import, unmarked and with all three of its
+    namespaces spoken for, so S6's every create came back
+    `422 no storage pool is marked default; name one with spec.pool` and the
+    scenario measured nothing at all. A scenario that only runs on estates
+    shaped like the one it was written on is a scenario that reports on the
+    estate instead of on the software.
+
+    `chaos-` so that `--cleanup` knows it (`_mine`), and `filesystem` because
+    that is the backend every agent in every cluster offers.
+    """
+    c, o = cluster(cname, "GET", "/storagepools")
+    if c == 200:
+        for p in (o.get("items") or []):
+            if (p.get("spec") or {}).get("default"):
+                return None  # the estate has one; use it, and make nothing
+    c, _ = cluster(cname, "POST", "/storagepools",
+                   obj("StoragePool", name, {"driver": "filesystem"}))
+    if c not in (200, 201, 409):
+        log(f"storage pool {name}: HTTP {c}")
+        return None
+    return name
 
 
 def node_put(cname, node, mutate):
@@ -79,7 +122,8 @@ def s1():
         f.append(("S1", "label did not stick on the node object"))
 
     name = "chaos-sel-1"
-    mk(name, node_sel=None, cluster_sel=None)
+    ensure_tenant("chaos-s1")
+    mk(name, node_sel=None, cluster_sel=None, tenant="chaos-s1")
     rm(name)  # keep the namespace clean; the real create goes to the cluster tier
     # nodeSelector is a cluster-tier field: create straight on cluster-1.
     c, b = cluster(cname, "POST", "/vms", vm_body(name, node_sel={"chaos-zone": "z9"}))
@@ -193,9 +237,9 @@ def s3():
 def s4():
     f = []
     name = "chaos-logs-1"
-    c, b = mk(name)
+    c, b = mk(name, tenant=ensure_tenant("chaos-s4"))
     if c != 201:
-        return [("S4", f"create: HTTP {c}")]
+        return [("S4", f"create: HTTP {c} {str(b)[:200]}")]
     o, _ = wait_phase(name, "Running", 120)
     if not o:
         f.append(("S4", "VM never reached Running; log test degraded"))
@@ -247,24 +291,53 @@ def s6():
     f = []
     cname = "cluster-1"
     vol = "chaos-vol-1"
-    c, b = cluster(cname, "POST", "/volumes", obj("Volume", vol,
-                   {"sizeBytes": 33554432, "mode": "filesystem", "accessMode": "single"}))
+    # D-H3: this said `sizeBytes` and `accessMode: "single"`, neither of which
+    # this API has ever had -- so every create was a 422 and the fallback
+    # below it retried the same wrong shape. The scenario measured nothing
+    # from the day the field was named `sizeGib`, and the run still ended
+    # green. A shape the server refuses is a scenario that does not run.
+    spec = {"sizeGib": 1, "mode": "filesystem", "accessMode": "readWriteOnce"}
+    pool = ensure_filesystem_pool(cname)
+    if pool:
+        spec["pool"] = pool
+    c, b = cluster(cname, "POST", "/volumes", obj("Volume", vol, spec))
     if c not in (201, 200):
-        c2, b2 = cluster(cname, "POST", "/volumes", obj("Volume", vol, {"sizeBytes": 33554432}))
-        if c2 not in (201, 200):
-            return [("S6", f"volume create refused both shapes: {c} {str(b)[:200]} / {c2} {str(b2)[:200]}")]
-    o, secs = wait_for(lambda: (lambda x: x if phase_of(x) in ("Bound", "Available", "Ready") else None)(
-        cluster_vm(cname, vol) if False else (cluster(cname, "GET", f"/volumes/{vol}")[1] if
-        cluster(cname, "GET", f"/volumes/{vol}")[0] == 200 else None)), 60)
+        return [("S6", f"volume create refused: HTTP {c} {str(b)[:250]}")]
+
+    def volume():
+        rc, o = cluster(cname, "GET", f"/volumes/{vol}")
+        return o if rc == 200 else None
+
+    o, secs = wait_for(lambda: (lambda x: x if phase_of(x) in ("Bound", "Available", "Ready")
+                                else None)(volume()), 60)
     log(f"S6 volume phase after {secs:.0f}s: {phase_of(o) if o else 'n/a'}")
     name = "chaos-volvm-1"
     c, b = cluster(cname, "POST", "/vms", vm_body(
-        name, volumes=[{"volume_name": vol}]))
+        name, volumes=[{"volume": vol}]))
     if c != 201:
         f.append(("S6", f"VM referencing a volume: HTTP {c} {str(b)[:250]}"))
     else:
-        wait_for(lambda: (lambda x: x if (x or {}).get("spec", {}).get("nodeName") else None)(
-            cluster_vm(cname, name)), 60)
+        # Waited for the HOLD and not for the binding, which is what F11 is
+        # about: `spec.nodeName` is written the moment the scheduler decides,
+        # and the attach happens passes later. Round 4's e2e watched this
+        # delete land 10 ms after the binding, with `status.attachedTo` still
+        # empty -- so the volume was deleted while nobody held it, which is
+        # correct, and the scenario called it "deleted out from under a VM
+        # that holds it". A precondition nobody waited for is not a finding.
+        def held():
+            rc, o = cluster(cname, "GET", f"/volumes/{vol}")
+            if rc != 200:
+                return None
+            return o if (o.get("status") or {}).get("attachedTo") == name else None
+
+        holder, secs = wait_for(held, 90)
+        if holder is None:
+            cluster(cname, "DELETE", f"/vms/{name}")
+            wait_gone(name, 120, where="cluster", cname=cname)
+            cluster(cname, "DELETE", f"/volumes/{vol}")
+            return f + [("S6", f"90s after its vm was bound, volume {vol} was never attached "
+                               f"to it; F11 and I9 below have nothing to measure")]
+        log(f"S6 volume held by {name} after {secs:.0f}s")
         # F11: delete the volume while the VM holds it
         c, b = cluster(cname, "DELETE", f"/volumes/{vol}")
         time.sleep(8)
@@ -559,13 +632,43 @@ def s13():
     if c != 200:
         return [("S13", f"users endpoint: HTTP {c}")]
     log(f"S13 users: {[u['metadata']['name'] for u in items(b)]}")
-    # The lab's REST edge listens on plain http with no auth configured, so
-    # both F17 and F18 are unobservable here — say so rather than guess.
-    c, b = ops.call(CLOUD[0], CLOUD_PORT, "GET", "/apis/meister.io/v1/vms")
-    c2, b2 = ops.call(CLOUD[0], CLOUD_PORT, "DELETE", "/apis/meister.io/v1/tenants/chaos-nonexistent")
-    f.append(("SEC", "the cloud REST edge answers unauthenticated plaintext HTTP: "
-                     f"GET /vms -> {c} and it lists every tenant's VMs; no TLS, no bearer, "
-                     f"no client cert is required. F17/F18 cannot be exercised against this fleet."))
+
+    # D-H1: this line used to be a CONSTANT. It said "the cloud REST edge
+    # answers unauthenticated plaintext HTTP", appended unconditionally,
+    # without ever looking at the code it interpolated -- and it was still
+    # being written in rollout 59, five images after mTLS was turned on. A
+    # security statement that survives the change disproving it is worse
+    # than no statement: somebody reads it and believes the edge is open.
+    #
+    # So it is measured, in three questions, and only an answer that
+    # contradicts the design becomes a finding.
+    path = "/apis/meister.io/v1/vms"
+    if not mtls.available():
+        # A lab that was deliberately started with auth off. That is a
+        # configuration and not a defect, and the harness cannot tell the
+        # difference from here -- it says what it is looking at and stops.
+        log(f"S13 transport: {mtls.describe()}; the edge's auth is not measurable from here")
+        return f
+    plain = mtls.probe(CLOUD[0], CLOUD_PORT, path, scheme_="http")
+    naked = mtls.probe(CLOUD[0], CLOUD_PORT, path, client_cert=False)
+    full = mtls.probe(CLOUD[0], CLOUD_PORT, path, client_cert=True)
+    log(f"S13 edge: http -> {plain}, https without a client cert -> {naked}, with one -> {full}")
+
+    if plain != 0:
+        f.append(("SEC", f"the cloud REST edge answers plaintext http: GET {path} -> {plain}. "
+                         "Every token and every object on that port travels in the clear"))
+    if naked == 200:
+        f.append(("SEC", f"the cloud REST edge served GET {path} to a caller with no client "
+                         "certificate and no bearer; it lists every tenant's VMs"))
+    elif naked not in (401, 403, 0):
+        f.append(("SEC", f"an unauthenticated https request answered {naked}; expected 401"))
+    if full != 200:
+        # Not a finding about the fleet: it is the harness saying its own
+        # credential no longer works, which invalidates every other number
+        # in this run.
+        f.append(("S13", f"the break-glass identity was answered {full} at the cloud edge; "
+                         f"the rest of this run was measured with a credential that is not "
+                         f"getting through ({mtls.describe()})"))
     return f
 
 
@@ -576,14 +679,24 @@ def s14():
     rc, out = sh(node, "cat /run/meisterstack/agent.toml")
     if "[hypervisor" not in out:
         return [("S14", "agent-2b already has no hypervisor section — nothing to prove")]
+    # awk and not python3: **the lab image has no python3** (`command -v
+    # python3` on agent-2b: nothing), so the edit below was a no-op, the agent
+    # restarted with its hypervisor section intact, and the scenario reported
+    # a node that "still advertises hypervisor/cloud-hypervisor" 60s later. It
+    # did, correctly, about a config nobody had changed. Third false finding
+    # this scenario has produced, and the first two were about reading a race
+    # once (D-H5) — this one is about not checking that the setup happened.
     sh(node, "cp /run/meisterstack/agent.toml /run/meisterstack/agent.toml.chaos-bak && "
-             "python3 - <<'EOF'\n"
-             "import re\n"
-             "p='/run/meisterstack/agent.toml'\n"
-             "s=open(p).read()\n"
-             "s=re.sub(r'\\n\\[hypervisor[^\\[]*', '\\n', s)\n"
-             "open(p,'w').write(s)\n"
-             "EOF")
+             "awk '/^\\[hypervisor/{skip=1} /^\\[/&&!/^\\[hypervisor/{skip=0} !skip' "
+             "/run/meisterstack/agent.toml.chaos-bak > /run/meisterstack/agent.toml")
+    # ...and the check that makes the rest of this scenario mean anything. A
+    # setup that did not happen must end the scenario, never feed it.
+    rc, after = sh(node, "cat /run/meisterstack/agent.toml")
+    if "[hypervisor" in after:
+        sh(node, "cp /run/meisterstack/agent.toml.chaos-bak /run/meisterstack/agent.toml; "
+                 "rm -f /run/meisterstack/agent.toml.chaos-bak")
+        return [("S14", "the setup did not take: [hypervisor] is still in agent.toml on "
+                        f"{node}, so nothing below would have measured the agent")]
     sh(node, "systemctl restart meister-agent")
     time.sleep(20)
     rc, out = sh(node, "systemctl is-active meister-agent")
@@ -592,11 +705,33 @@ def s14():
         rc2, j = sh(node, "journalctl -u meister-agent --no-pager -n 12 | tail -8")
         f.append(("S14", f"an agent with no [hypervisor] section does not start: {j.strip()[:300]}"))
     else:
-        c, b = cluster("cluster-2", "GET", f"/nodes/{node}")
-        caps = ((b.get("status") or {}).get("capacity") or {}).get("capabilities", [])
-        log(f"S14 capabilities without hypervisor: {caps}")
-        if any(x.startswith("hypervisor/") for x in caps):
-            f.append(("S14", f"a node with no [hypervisor] config still advertises {caps}"))
+        # D-H5: this read the node object ONCE, twenty seconds after the
+        # restart, and called what it found a defect. The capabilities come
+        # off the agent's Hello, and until that Hello has landed the object
+        # still carries the answer from before the restart -- so the finding
+        # was about a stale read, was withdrawn as one, and was produced
+        # again in rollout 59. A race read once is not a measurement.
+        #
+        # Waited for instead: the list has up to 60s to lose the hypervisor
+        # entries, and only a list that still has them then is a finding.
+        def caps_now():
+            rc, o = cluster("cluster-2", "GET", f"/nodes/{node}")
+            if rc != 200:
+                return None
+            return ((o.get("status") or {}).get("capacity") or {}).get("capabilities", [])
+
+        # `True` and not the list itself: an empty list is falsy, and
+        # `wait_for` polls until something is truthy.
+        gone, secs = wait_for(
+            lambda: (lambda caps: True if caps is not None
+                     and not any(x.startswith("hypervisor/") for x in caps) else None)(caps_now()),
+            60)
+        caps = caps_now()
+        if gone is None:
+            f.append(("S14", f"60s after a restart with no [hypervisor] section, {node} still "
+                             f"advertises {[x for x in (caps or []) if x.startswith('hypervisor/')]}"))
+        else:
+            log(f"S14 hypervisor capabilities gone after {secs:.0f}s; now {caps}")
     sh(node, "mv -f /run/meisterstack/agent.toml.chaos-bak /run/meisterstack/agent.toml && "
              "systemctl restart meister-agent")
     time.sleep(15)
@@ -620,17 +755,32 @@ def f1():
     node = o["spec"]["nodeName"]
     before = running_uids(node)
     kill_agent(node)
-    t0 = time.time()
     time.sleep(4)
     mid = running_uids(node)
     if before - mid:
         f.append(("F1", f"killing the agent on {node} took its VMs down: lost {before-mid}"))
-    nr, secs = wait_for(lambda: (lambda x: True if x and not (x.get("status") or {}).get("ready") else None)(
-        cluster(cname, "GET", f"/nodes/{node}")[1]), 90)
-    if not nr:
-        f.append(("F1", f"{node} never went NotReady 90s after its agent was killed"))
+
+    # D-H4: this used to wait 90s for the node to go NotReady and report a
+    # finding when it did not -- and it never did, because the unit carries
+    # `Restart=always`. systemd puts the agent back in seconds, it dials in
+    # again, and the heartbeat never expires. The line was withdrawn as an
+    # artefact on 2026-08-29 and the scenario went on producing it in
+    # rollout 59: a SUPERVISED agent coming straight back is the system
+    # working, and a harness that calls it a defect trains people to skip
+    # its output.
+    #
+    # So what is measured is what actually has to be true: the agent comes
+    # back on its own. A node that DOES go NotReady in the window is worth a
+    # line -- it means the restart took longer than the heartbeat -- and it
+    # is not a finding either.
+    back, secs = wait_for(lambda: (lambda rc_out: True if rc_out[1].strip() == "active" else None)(
+        sh(node, "systemctl is-active meister-agent")), 90)
+    if not back:
+        f.append(("F1", f"the agent on {node} did not come back 90s after SIGKILL; the unit "
+                        f"carries Restart=always and nothing restarted it"))
     else:
-        log(f"F1 NotReady after {secs:.0f}s")
+        ready = (cluster(cname, "GET", f"/nodes/{node}")[1].get("status") or {}).get("ready")
+        log(f"F1 agent back after {secs:.0f}s; the node read ready={ready} at that moment")
     start_agent(node)
     back, secs = wait_for(lambda: (lambda x: True if (x.get("status") or {}).get("ready") else None)(
         cluster(cname, "GET", f"/nodes/{node}")[1]), 120)

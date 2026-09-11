@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
         default_filter: "info,meister_agent=debug",
         span_close_events: true,
         otlp_endpoint: &config.otlp_endpoint,
+        log_format: config.log_format,
     })?;
 
     // Before the agent comes up, so that a misspelled address fails at

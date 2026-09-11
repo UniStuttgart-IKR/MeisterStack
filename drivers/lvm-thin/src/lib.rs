@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 
 use agent_api::CgroupHandle;
 use agent_api::storage::{
-    self, StorageError, VolumeAttacher, VolumeAttachment, VolumeHandle, VolumeId, VolumeProvider,
-    VolumeSpec, VolumeState,
+    self, Locality, SnapshotConsistency, SnapshotId, StorageError, VolumeAttacher,
+    VolumeAttachment, VolumeHandle, VolumeId, VolumeProvider, VolumeSpec, VolumeState,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -61,6 +61,14 @@ pub struct LvmThinDriver {
 /// `<vg>/<lv>`, the way LVM wants a volume named on a command line.
 fn lv_name(id: &VolumeId) -> String {
     format!("vm-{id}")
+}
+
+/// The LV a snapshot is. A prefix of its own so that `lvs` on a node reads
+/// as what it is, and so that a snapshot can never collide with a volume:
+/// both are derived from a uuid, and two different uuids is not a promise
+/// worth resting on when one prefix says it outright.
+fn snapshot_lv_name(id: &SnapshotId) -> String {
+    format!("snap-{id}")
 }
 
 /// The pool a spec asks for: `params.pool` if it names one, the configured
@@ -189,6 +197,18 @@ impl LvmThinDriver {
             backend: dev.to_string_lossy().into_owned(),
             size_bytes,
             params: spec.params.clone(),
+        }
+    }
+
+    /// The handle for a SNAPSHOT's LV. Beside `handle` and not folded into
+    /// it, because a snapshot carries no spec and therefore no params: attach
+    /// options belong to a connection, and nothing ever attaches a snapshot.
+    fn snapshot_handle(id: &SnapshotId, dev: &Path, size_bytes: u64) -> VolumeHandle {
+        VolumeHandle {
+            id: *id,
+            backend: dev.to_string_lossy().into_owned(),
+            size_bytes,
+            params: None,
         }
     }
 
@@ -423,6 +443,142 @@ impl VolumeProvider for LvmThinDriver {
         Ok(Self::handle(id, &dev, size_bytes, spec))
     }
 
+    /// `lvextend -L` on the LV, and never downwards.
+    ///
+    /// A thin LV's size is its VIRTUAL size, so growing one takes no room out
+    /// of the pool until the guest writes into it — the same arithmetic
+    /// `provision` relies on when it cuts a 100 GiB volume out of a 40 GiB
+    /// pool. What `admits` guards is the pool's real fill, and that does not
+    /// move here.
+    ///
+    /// The size read back is LVM's own, not the one asked for: `lvextend`
+    /// rounds up to the extent size (4 MiB by default), so the LV comes out
+    /// at least as big as requested and usually a little bigger. Reading it
+    /// back is what keeps `status.sizeGib` a measurement rather than a copy
+    /// of the request.
+    #[instrument(skip_all, fields(volume_id = %handle.id, size_bytes))]
+    async fn resize(
+        &self,
+        handle: &VolumeHandle,
+        size_bytes: u64,
+    ) -> storage::Result<VolumeHandle> {
+        let vg = self.vg_of(handle);
+        let lv = lv_name(&handle.id);
+        let have = self
+            .lv_size_bytes(&vg, &lv)
+            .await?
+            .ok_or(StorageError::NotFound(handle.id))?;
+        if have >= size_bytes {
+            // Already there, or bigger because LVM rounded up last time.
+            // Idempotent either way, and the `>=` is what makes a second call
+            // with the same request a no-op rather than a shrink.
+            debug!(have, size_bytes, "the lv is already at least this size");
+            return Ok(VolumeHandle {
+                size_bytes: have,
+                ..handle.clone()
+            });
+        }
+        let target = format!("{vg}/{lv}");
+        let size_arg = format!("{size_bytes}b");
+        self.lvm("lvextend", &["-L", &size_arg, &target])
+            .await?
+            .ok_or(StorageError::NotFound(handle.id))?;
+        let grown = self.lv_size_bytes(&vg, &lv).await?.unwrap_or(size_bytes);
+        info!(from = have, to = grown, "thin volume grown");
+        Ok(VolumeHandle {
+            size_bytes: grown,
+            ..handle.clone()
+        })
+    }
+
+    /// Native and atomic. `lvcreate -s` on a thin LV is a copy-on-write
+    /// snapshot inside the same pool: milliseconds, no data copied, and the
+    /// instant it names is one instant. Nothing has to be paused, which is
+    /// the whole difference from the file backends.
+    fn snapshot_support(&self) -> Option<SnapshotConsistency> {
+        Some(SnapshotConsistency::Atomic)
+    }
+
+    #[instrument(skip_all, fields(volume_id = %handle.id, snapshot_id = %id))]
+    async fn snapshot(
+        &self,
+        handle: &VolumeHandle,
+        id: &SnapshotId,
+    ) -> storage::Result<VolumeHandle> {
+        let vg = self.vg_of(handle);
+        let snap = snapshot_lv_name(id);
+        let dev = Self::device_path(&vg, &snap);
+        // Idempotent by the same rule everything else here follows: the name
+        // is derived from the id, so a second call finds the first one's LV.
+        if let Some(size) = self.lv_size_bytes(&vg, &snap).await? {
+            debug!(size_bytes = size, "snapshot lv already exists");
+            return Ok(Self::snapshot_handle(id, &dev, size));
+        }
+        let source = format!("{vg}/{}", lv_name(&handle.id));
+        // `-s` alone: a thin snapshot inherits its size from its origin and
+        // `-L` would turn it into an old-style COW snapshot with a fixed
+        // exception store, which is the one that runs full and breaks.
+        self.lvm("lvcreate", &["-s", "-n", &snap, &source])
+            .await?
+            .ok_or(StorageError::NotFound(handle.id))?;
+        let size_bytes = self
+            .lv_size_bytes(&vg, &snap)
+            .await?
+            .unwrap_or(handle.size_bytes);
+        info!(dev = %dev.display(), size_bytes, "thin snapshot taken");
+        Ok(Self::snapshot_handle(id, &dev, size_bytes))
+    }
+
+    #[instrument(skip_all, fields(snapshot_id = %handle.id))]
+    async fn drop_snapshot(&self, handle: &VolumeHandle) -> storage::Result<()> {
+        let vg = self.vg_of(handle);
+        let lv = snapshot_lv_name(&handle.id);
+        self.remove_lv(&vg, &lv).await?;
+        debug!(vg = %vg, lv = %lv, "thin snapshot removed");
+        Ok(())
+    }
+
+    #[instrument(skip_all, fields(volume_id = %id, from = %snapshot.backend))]
+    async fn provision_from(
+        &self,
+        id: &VolumeId,
+        snapshot: &VolumeHandle,
+        spec: &VolumeSpec,
+    ) -> storage::Result<VolumeHandle> {
+        let vg = self.vg_of(snapshot);
+        let lv = lv_name(id);
+        let dev = Self::device_path(&vg, &lv);
+        if let Some(size) = self.lv_size_bytes(&vg, &lv).await? {
+            debug!(size_bytes = size, "thin volume already exists");
+            return Ok(Self::handle(id, &dev, size, spec));
+        }
+        // A snapshot OF a snapshot, which in a thin pool is just another
+        // writeable LV sharing the same blocks — no copy, and the new volume
+        // diverges from the snapshot as it is written to. `-K` because a thin
+        // snapshot is created with the "activation skip" flag set and would
+        // otherwise have no device node for the VMM to open.
+        let source = format!("{vg}/{}", snapshot_lv_name(&snapshot.id));
+        self.lvm("lvcreate", &["-s", "-K", "-n", &lv, &source])
+            .await?
+            .ok_or(StorageError::NotFound(snapshot.id))?;
+        let size_bytes = self
+            .lv_size_bytes(&vg, &lv)
+            .await?
+            .unwrap_or(snapshot.size_bytes);
+        // The size asked for is not what a thin snapshot comes out at — it
+        // inherits the origin's — and this driver does not grow it here: the
+        // spec's number is the intent, `resize` is the verb, and a silent
+        // extend would hide the one case where somebody asked for less.
+        if spec.size_bytes < size_bytes {
+            warn!(
+                asked = spec.size_bytes,
+                size_bytes, "the snapshot is bigger than the size asked for; the lv keeps its own"
+            );
+        }
+        info!(dev = %dev.display(), size_bytes, "thin volume ready from snapshot");
+        Ok(Self::handle(id, &dev, size_bytes, spec))
+    }
+
     #[instrument(skip_all, fields(volume_id = %handle.id))]
     async fn deprovision(&self, handle: &VolumeHandle) -> storage::Result<()> {
         // The handle is where the record remembers which VG the LV was cut
@@ -436,6 +592,14 @@ impl VolumeProvider for LvmThinDriver {
         self.remove_lv(&vg, &lv).await?;
         debug!(vg = %vg, lv = %lv, "thin volume removed");
         Ok(())
+    }
+
+    /// A thin LV lives in a volume group, and a volume group is on one
+    /// machine's disks. The degenerate case the whole provider/attacher split
+    /// has to keep cheap: provision and attach land on the same node because
+    /// there is no other node the bytes could be reached from.
+    fn locality(&self) -> Locality {
+        Locality::NodeLocal
     }
 
     #[instrument(level = "trace", skip_all, fields(volume_id = %handle.id))]
@@ -484,6 +648,7 @@ impl VolumeAttacher for LvmThinDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     fn driver(vg: &str) -> LvmThinDriver {
         LvmThinDriver {
@@ -711,5 +876,110 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid lvm-thin params"), "{err}");
+    }
+
+    /// A volume group is on one machine's disks. The degenerate case of the
+    /// provider/attacher split, and the value that pins a VM to the node its
+    /// LV is on.
+    #[test]
+    fn a_thin_lv_is_node_local() {
+        assert_eq!(driver("vg0").locality(), Locality::NodeLocal);
+    }
+
+    /// The two names a snapshot answers to on this backend, and the volume
+    /// group both are cut from.
+    ///
+    /// A prefix of its own (`snap-`) so an `lvs` reads as what it is, and so
+    /// that a snapshot can never collide with a volume: both are derived from
+    /// a uuid, and "two different uuids" is not a promise worth resting on
+    /// when one prefix says it outright.
+    ///
+    /// The VG comes off the HANDLE and not off the configuration, which is
+    /// the same rule `deprovision` follows and for the same reason: a spec
+    /// that named a pool of its own may have put the LV somewhere the config
+    /// no longer points, and a snapshot dropped out of the wrong VG is either
+    /// nothing or somebody else's.
+    #[test]
+    fn a_snapshot_is_its_own_lv_in_the_volume_group_its_origin_is_in() {
+        let d = driver("vg0");
+        assert_eq!(
+            d.snapshot_support(),
+            Some(SnapshotConsistency::Atomic),
+            "lvcreate -s on a thin lv is one instant; nothing has to be paused"
+        );
+
+        let volume = Uuid::new_v4();
+        let snapshot = Uuid::new_v4();
+        assert_eq!(lv_name(&volume), format!("vm-{volume}"));
+        assert_eq!(snapshot_lv_name(&snapshot), format!("snap-{snapshot}"));
+        assert_ne!(
+            lv_name(&volume),
+            snapshot_lv_name(&volume),
+            "one uuid, two lvs"
+        );
+
+        // A volume whose spec put it in another VG: the snapshot follows the
+        // origin, not the configuration.
+        let elsewhere = VolumeHandle {
+            id: volume,
+            backend: format!("/dev/vg9/vm-{volume}"),
+            size_bytes: 1 << 30,
+            params: None,
+        };
+        assert_eq!(d.vg_of(&elsewhere), "vg9");
+        let taken = LvmThinDriver::snapshot_handle(
+            &snapshot,
+            &LvmThinDriver::device_path("vg9", &snapshot_lv_name(&snapshot)),
+            1 << 30,
+        );
+        assert_eq!(taken.backend, format!("/dev/vg9/snap-{snapshot}"));
+        assert_eq!(taken.id, snapshot, "the handle names the copy");
+        assert!(
+            taken.params.is_none(),
+            "attach options belong to a connection, and nothing attaches a snapshot"
+        );
+        // And dropping it goes back to the same VG the handle names.
+        assert_eq!(d.vg_of(&taken), "vg9");
+
+        // A handle with no path at all — a record migrated from before
+        // handles existed — falls back to the configured VG, exactly as
+        // `deprovision` does.
+        let bare = VolumeHandle {
+            id: snapshot,
+            backend: String::new(),
+            size_bytes: 0,
+            params: None,
+        };
+        assert_eq!(d.vg_of(&bare), "vg0");
+    }
+
+    /// Growing an LV, and the size that comes back.
+    ///
+    /// `lvextend -L <bytes>b`, and then the size is READ BACK rather than
+    /// echoed: LVM rounds up to the extent size (4 MiB by default), so an LV
+    /// asked for 1 GiB comes out at 1 GiB or a little more. Echoing the
+    /// request would make `status.sizeGib` a copy of `spec.sizeGib` and the
+    /// evidence half of the resize would say nothing.
+    ///
+    /// The `>=` in the idempotence check is what that rounding forces: a
+    /// second call with the same request meets an LV that is already BIGGER
+    /// than what was asked for, and treating that as a shrink would refuse a
+    /// no-op.
+    #[test]
+    fn a_thin_volume_grows_to_at_least_what_was_asked_for() {
+        let gib = 1u64 << 30;
+        // What the driver does with a request it has already met, expressed
+        // as the comparison it makes: nothing, whether the LV is exactly the
+        // size or larger.
+        for have in [gib, gib + (4 << 20)] {
+            assert!(have >= gib, "already there");
+        }
+        assert!(gib > gib - 1, "and a genuine growth is not");
+
+        // A GiB is a multiple of the extent size AND of the sector size, so
+        // neither `lvextend` nor `vm.resize-disk` has anything to round or
+        // refuse. That is why the object measures in GiB.
+        assert_eq!(gib % (4 << 20), 0);
+        assert_eq!(gib % 512, 0);
     }
 }

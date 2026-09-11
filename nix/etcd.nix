@@ -75,6 +75,29 @@ in
       # own member rather than quietly write through a healthy neighbour.
       listenClientUrls = [ "http://127.0.0.1:2379" ];
       advertiseClientUrls = [ "http://127.0.0.1:2379" ];
+      # Keep an hour of history and no more.
+      #
+      # etcd keeps EVERY revision until somebody compacts, and nothing in
+      # this stack was that somebody. A control plane writes a revision per
+      # heartbeat per node per pass — the lab writes some hundreds a minute
+      # doing nothing at all — so the store grows without bound and stops at
+      # the 2 GiB default quota with `mvcc: database space exceeded`. Then
+      # NOTHING can be written: no vm create, no delete, no phase, and the
+      # only symptom above is that objects stop moving. That is where a day
+      # of chaos runs put this lab on 2026-09-10, and getting out of it was
+      # compact, restart (to drop the failed defrag's temp file, which had
+      # itself filled the disk), defrag, disarm — three times.
+      #
+      # An hour is the same order as the objects it protects: nothing here
+      # reads a revision older than the pass that wrote it, and the one thing
+      # that would — a watch that reconnects with an old revision — falls back
+      # to a fresh list. Periodic and not revision-based, because the number
+      # of revisions per hour is a property of the fleet's size and the
+      # retention should not be.
+      extraConf = {
+        AUTO_COMPACTION_MODE = "periodic";
+        AUTO_COMPACTION_RETENTION = "1h";
+      };
     } // lib.optionalAttrs clustered {
       name = cfg.member;
       listenPeerUrls = [ "http://${selfIp}:2380" ];
@@ -89,7 +112,12 @@ in
     # became sda+vda twice in the lab, and etcd silently lived on the root
     # disk. The label is IN the filesystem (mkfs.ext4 -L etcd-data, or
     # e2label once), so it survives image swaps and bus surprises alike.
-    fileSystems."/var/lib/etcd" = {
+    #
+    # Only in the historical shape. `meisterstack.data.label = "meister-data"`
+    # (nix/data.nix) mounts ONE block for etcd and the addons together and
+    # points etcd at a subdirectory of it instead; two fileSystems entries for
+    # one mount point would be a conflict rather than a choice.
+    fileSystems."/var/lib/etcd" = lib.mkIf (config.meisterstack.data.label == "etcd-data") {
       device = "/dev/disk/by-label/etcd-data";
       fsType = "ext4";
       options = [ "nofail" "x-systemd.device-timeout=5s" ];

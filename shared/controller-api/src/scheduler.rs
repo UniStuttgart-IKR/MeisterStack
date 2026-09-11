@@ -11,12 +11,12 @@
 //! so the candidate is named for what it is to the scheduler, not for which
 //! tier it happens to live on.
 
-use common::capability::{self, offers};
+use common::capability::{self, Locality, offers};
 use tracing::debug;
 
 use std::collections::BTreeMap;
 
-use crate::resources::{AntiAffinity, StoragePool, Vm};
+use crate::resources::{AntiAffinity, NodeSummary, StoragePool, Vm};
 
 /// What a machine has, and what a VM wants of it. Two numbers, because those
 /// are the two a node can run out of.
@@ -178,10 +178,50 @@ pub enum CandidateKind {
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub name: String,
-    /// A session exists AND the candidate's heartbeat has not expired.
+    /// A session exists ON THIS REPLICA and the candidate's heartbeat has not
+    /// expired.
+    ///
+    /// Replica-local on purpose: it is what says whether this process can
+    /// send this machine a command, and a VM belongs to the replica holding
+    /// its node's session (`may_reconcile`). See `alive` for the other
+    /// question, which is not the same one.
     pub connected: bool,
+    /// The machine is up, as the STORE says — `Node.status.ready`, written by
+    /// whichever replica holds its session, read by all of them.
+    ///
+    /// The fleet-wide fact, and it exists because one thing this control
+    /// plane places is deliberately placed on SEVERAL machines at once. A
+    /// router's priority list has to be the same list at every replica, or a
+    /// three-replica cluster whose two gateway nodes hang off two different
+    /// replicas can never plan a router onto both — each replica sees the
+    /// other's machine as "not connected" and plans around it. Seen exactly
+    /// that way in the lab: a router that came up on two nodes lost one of
+    /// them the moment that node's session moved, and never got it back.
+    ///
+    /// The sending half is answered elsewhere and already: a router's
+    /// commands go through `Dispatch`, which forwards to the replica that
+    /// holds the session. So the planner may name a machine this process
+    /// cannot itself reach.
+    ///
+    /// Equal to `connected` at the cloud tier, where there is one view.
+    pub alive: bool,
     /// `spec.schedulable` — an operator draining it without stopping it.
     pub schedulable: bool,
+    /// What the machine itself says is wrong with it — `status.conditions`,
+    /// by type, in the order it reported them. Empty is a healthy machine and
+    /// is what every candidate built before this field carries.
+    ///
+    /// The third half of "usable", beside connected and schedulable, and the
+    /// one neither of those can express: `connected` is a fact about a socket
+    /// and `schedulable` is a fact about an operator, and the machine that
+    /// wedged in the mini-chaos run was both. A node that cannot act on a
+    /// command is not a candidate for one, whatever its heartbeat says.
+    ///
+    /// Read as a VETO and never as a permission: an empty list is also what an
+    /// agent too old to have the field reports, so it can only ever mean
+    /// "said nothing", which is exactly how the scheduler treated every node
+    /// before this existed.
+    pub unhealthy: Vec<String>,
     /// What is still free here: the allowance this candidate's capacity gives
     /// under the configured overcommit, minus everything already bound to it.
     ///
@@ -210,6 +250,23 @@ pub struct Candidate {
     /// on this machine, and the half of a selector that lives on the
     /// inventory.
     pub labels: BTreeMap<String, String>,
+    /// The workload classes this candidate takes, `NodeSpec.accepts`. Empty
+    /// is everything, which is every machine that was never told otherwise —
+    /// see `resources::accepts_class`.
+    ///
+    /// The mirror image of a selector and beside it on purpose: a selector is
+    /// the WORKLOAD choosing machines, this is the MACHINE choosing
+    /// workloads, and a scheduler has to honour both or an operator who said
+    /// "this one is for routers" gets VMs on it anyway.
+    ///
+    /// **Always empty at the cloud tier**, and that is a gap rather than a
+    /// decision: `proto::NodeReport` carries a node's labels, conditions,
+    /// capabilities and drain, and nothing that says what it accepts. So the
+    /// cloud cannot see the refusal and the cluster is what makes it — a VM
+    /// of a class nobody there takes comes back Pending with the cluster's
+    /// own sentence. Filling this in at the cloud needs a field on that
+    /// message.
+    pub accepts: Vec<String>,
     /// The `metadata.labels` of every VM already bound here.
     ///
     /// What anti-affinity is measured against, and derived per pass from the
@@ -218,6 +275,21 @@ pub struct Candidate {
     /// the same reason `free` is not — a second copy in etcd is a number that
     /// can be wrong.
     pub hosted: Vec<BTreeMap<String, String>>,
+    /// What a guest's machine state would be restored INTO here, when this
+    /// candidate is a machine and has said.
+    ///
+    /// **Not a scheduling input.** Nothing in `feasible` reads it and nothing
+    /// should: where to put a NEW guest is a question about room, devices and
+    /// selectors, and a machine profile answers none of them. It is here
+    /// because the one caller that needs it — choosing a live migration's
+    /// DESTINATION — chooses from this very list, and a second list built
+    /// from Node objects beside it would be a second answer to "which
+    /// machines are there".
+    ///
+    /// `None` at the cloud tier, where a candidate is a cluster and not a
+    /// machine, and `None` from a node whose agent predates the field.
+    /// Neither is evidence: see [`crate::live_migration_refusal`].
+    pub machine: Option<crate::MachineProfile>,
 }
 
 /// Does every pair of `selector` appear in `labels`?
@@ -261,6 +333,7 @@ pub fn feasible<'a>(vm: &Vm, candidates: &'a [Candidate]) -> Vec<&'a Candidate> 
     let wanted = DevicePolicy::of(vm);
     let size = Capacity::wanted_by(vm);
     usable(candidates)
+        .filter(|c| crate::resources::accepts_class(&c.accepts, vm.spec.class()))
         .filter(|c| size.fits_in(c.free))
         .filter(|c| selects(selector_for(vm, c.kind), &c.labels))
         .filter(|c| wanted.met_by(&c.catalogue))
@@ -274,17 +347,54 @@ pub fn feasible<'a>(vm: &Vm, candidates: &'a [Candidate]) -> Vec<&'a Candidate> 
         .collect()
 }
 
-/// Up and willing — the two cuts that are about the MACHINE and about nothing
-/// that is being placed on it.
+/// Up, willing and able — the three cuts that are about the MACHINE and about
+/// nothing that is being placed on it.
 ///
 /// Its own function because there is a second thing being placed now. A
 /// volume asks for no vCPUs, carries no anti-affinity and matches no VM
-/// selector, but a node that is down or drained is no more a candidate to
-/// provision on than it is to run on. Sharing the predicate is what keeps
-/// "drained" from meaning two different things depending on what is being
-/// scheduled.
+/// selector, but a node that is down, drained or wedged is no more a
+/// candidate to provision on than it is to run on. Sharing the predicate is
+/// what keeps "unusable" from meaning three different things depending on
+/// what is being scheduled — and the wedged case is exactly the one the
+/// mini-chaos run reached through the volume path, not the VM path.
+pub fn is_usable(c: &Candidate) -> bool {
+    c.connected && c.schedulable && c.unhealthy.is_empty()
+}
+
+/// The same three cuts, asked about the FLEET rather than about this process:
+/// the machine is up, willing and able, whoever happens to be holding its
+/// session.
+///
+/// For what is placed on several machines at once, which is routers and
+/// nothing else. Every replica has to derive the same priority list out of
+/// the same store — that is what makes two replicas planning one router in
+/// the same pass harmless — and `connected` cannot do it, because it is a
+/// fact about THIS process's socket. See `Candidate::alive`.
+pub fn is_alive(c: &Candidate) -> bool {
+    c.alive && c.schedulable && c.unhealthy.is_empty()
+}
+
 fn usable(candidates: &[Candidate]) -> impl Iterator<Item = &Candidate> {
-    candidates.iter().filter(|c| c.connected && c.schedulable)
+    candidates.iter().filter(|c| is_usable(c))
+}
+
+/// The candidates that are up and willing but have said something is wrong
+/// with them — the set the `NodeUnhealthy` sentence is about.
+fn wedged(candidates: &[Candidate]) -> Vec<&Candidate> {
+    candidates
+        .iter()
+        .filter(|c| c.connected && c.schedulable && !c.unhealthy.is_empty())
+        .collect()
+}
+
+/// "agent-1a (StoreUnhealthy), agent-2b (DiskPressure)" — who is wedged and
+/// with what, for the one sentence that has to send an operator to a machine.
+fn wedged_sentence(field: &[Candidate]) -> String {
+    wedged(field)
+        .iter()
+        .map(|c| format!("{} ({})", c.name, c.unhealthy.join(", ")))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What a volume demands of the machine that would PROVISION it.
@@ -403,6 +513,18 @@ pub fn storage_pending_reason(
     }
     let usable: Vec<&Candidate> = usable(candidates).collect();
     if usable.is_empty() {
+        // The specific answer before the general one, exactly as the VM
+        // half's first cut orders them: a wedged node is not a drained one.
+        let wedged = wedged_sentence(candidates);
+        if !wedged.is_empty() {
+            return (
+                PendingReason::NodeUnhealthy,
+                format!(
+                    "every candidate that is up and willing says something is wrong with \
+                     itself: {wedged}"
+                ),
+            );
+        }
         return (
             PendingReason::NoneUsable,
             format!(
@@ -438,7 +560,355 @@ pub fn storage_pending_reason(
     )
 }
 
-/// Narrow a feasible set to those that also honour the PREFERRED terms — or
+/// One volume a VM names, and what it therefore demands of the node.
+///
+/// Assembled by the tier that has the objects — the volume for its node, the
+/// pool for its locality and its wiring — so that this module goes on knowing
+/// nothing about etcd. The same shape `StoragePolicy` has, one question later:
+/// that one asks where a volume may be MADE, this one asks where the VM that
+/// uses it may RUN.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeBinding {
+    /// What the VM's spec called it, for the sentence.
+    pub volume: String,
+    /// `Volume.status.node` — where the bytes were made. `None` while the
+    /// volume has not been placed.
+    pub node: Option<String>,
+    /// `StoragePool.status.locality`. `None` = nobody has said (an agent that
+    /// predates the field, a pool nothing has reported on), and then this
+    /// binding constrains nothing hard — see `required`.
+    pub locality: Option<Locality>,
+    /// `StoragePoolSpec.nodes`. Empty = every node.
+    pub pool_nodes: Vec<String>,
+    /// `StoragePoolSpec.driver` — the backend this volume came out of.
+    ///
+    /// Read for ONE locality: `networked`. A node-local or shared volume is
+    /// pinned to machines by name, and the name is the whole constraint; a
+    /// networked one is pinned to nothing by name, and what a candidate then
+    /// has to have is the DRIVER that can reach the bytes. Without this the
+    /// scheduler would place such a VM anywhere and find out at the attach —
+    /// which works, because that refusal is structural and the VM moves, but
+    /// it is placement by trial and it shows in the events.
+    ///
+    /// `None` on a binding built without one, which reads as "no claim to
+    /// insist on" and is exactly the old behaviour.
+    pub driver: Option<String>,
+}
+
+impl VolumeBinding {
+    /// The nodes that can serve this volume, or `None` for "no hard rule".
+    ///
+    /// The one place the locality axis is actually spent, and each arm is a
+    /// different sentence:
+    ///
+    ///   * `node-local` — the bytes are on ONE machine, so the VM runs there
+    ///     or nowhere. HARD, and it is the reason the axis exists: the same
+    ///     rule as a soft preference would place the VM next to an empty
+    ///     directory and boot it.
+    ///   * `shared` — every node in the pool sees the same bytes, so the pool
+    ///     is the rule and the volume's own node means nothing. Still soft in
+    ///     effect where the pool names no nodes, because then the pool is
+    ///     every node.
+    ///   * `networked` — the bytes are elsewhere and the DRIVER says which
+    ///     nodes can reach them. No driver claims it yet (position 18 of the
+    ///     catalogue brings NVMe-oF); the arm is here so the axis is complete
+    ///     and the day a driver arrives this is the line that changes.
+    ///   * `None` — nobody has said. Falls back to the soft preference this
+    ///     scheduler has always had, which is what keeps a mixed-version
+    ///     cluster placing VMs at all.
+    pub fn required(&self) -> Option<Vec<String>> {
+        match self.locality {
+            Some(Locality::NodeLocal) => self.node.clone().map(|n| vec![n]),
+            Some(Locality::Shared) => {
+                (!self.pool_nodes.is_empty()).then(|| self.pool_nodes.clone())
+            }
+            Some(Locality::Networked) | None => None,
+        }
+    }
+
+    /// The catalogue entry a candidate needs to reach this volume, where
+    /// reaching it is a capability rather than a place.
+    ///
+    /// Only `networked`, and only because that is the one locality whose
+    /// answer to "where are the bytes" is "not here, and it does not matter
+    /// where here is". A `node-local` volume names its machine and a
+    /// `shared` one names its pool's; both are answered by `required` and
+    /// neither needs this. For a networked one the driver IS the constraint:
+    /// a node that cannot speak NVMe-oF cannot reach an NVMe-oF namespace,
+    /// however much room it has.
+    ///
+    /// The day `StoragePool.spec.attacher` exists this returns the ATTACHER's
+    /// claim rather than the provider's — the two are separate roles and the
+    /// catalogue says so. Today they are one driver on one machine, which is
+    /// the shape the lab proves, and this is the line that changes.
+    pub fn claim(&self) -> Option<String> {
+        matches!(self.locality, Some(Locality::Networked))
+            .then(|| self.driver.clone())
+            .flatten()
+            .filter(|d| !d.is_empty())
+    }
+
+    /// Whether this volume is nailed to some machine OTHER than `node`.
+    ///
+    /// `required()` asked of a VM that is already placed, which is a
+    /// different question from the one the scheduler asks: the scheduler is
+    /// choosing and this is checking. It is what refuses an attach of a
+    /// node-local disk to a VM that runs somewhere else — a move is not an
+    /// attach, and the two would be told apart far too late otherwise (the
+    /// node would be handed a path that is not on it).
+    ///
+    /// `false` where nothing is known: an unplaced volume, a pool nobody has
+    /// reported a locality for, a `shared` pool that names no nodes. Same
+    /// direction as `required` — silence never pins.
+    pub fn pins_elsewhere(&self, node: &str) -> bool {
+        self.required()
+            .is_some_and(|allowed| !allowed.iter().any(|n| n == node))
+    }
+}
+
+/// Narrow a candidate set to those every binding REQUIRES — the hard half.
+///
+/// The `feasible` of the volume question, and split from the soft half for
+/// exactly the reason those two are split one function apart: a requirement
+/// and a preference must be applied in that order and never mixed. A
+/// preference applied first can leave the requirement nothing to choose from,
+/// and its fallback would then hand back a node the requirement forbids.
+///
+/// An empty binding list — every VM whose disks are all inline — leaves the
+/// set exactly as it was.
+pub fn feasible_for_volumes<'a>(
+    bindings: &[VolumeBinding],
+    candidates: Vec<&'a Candidate>,
+) -> Vec<&'a Candidate> {
+    let mut allowed = candidates;
+    for binding in bindings {
+        // The claim, for a volume whose bytes are on neither this node nor
+        // any named one. See `VolumeBinding::claim`.
+        if let Some(claim) = binding.claim() {
+            allowed.retain(|c| offers(&c.catalogue, capability::VOLUME, Some(&claim)));
+        }
+        let Some(nodes) = binding.required() else {
+            continue;
+        };
+        allowed.retain(|c| nodes.iter().any(|n| n == &c.name));
+    }
+    allowed
+}
+
+/// Narrow to the candidates that already hold the data — or leave the set
+/// alone, if honouring that would mean placing nothing.
+///
+/// The soft half, over the bindings that have NO hard rule: a `shared` pool
+/// with no node list, and a pool whose locality nobody has reported. Both are
+/// "any node will do, and this one will do best", which is a preference and
+/// must behave like one.
+///
+/// Applied AFTER capacity, which is what makes the fallback real: a node that
+/// holds the data and has no room left has to lose to a node that has room,
+/// or the preference would be a requirement whose author did not know they
+/// were writing one. `prefer_local` is the mechanism; this is the half of the
+/// binding list it may be given.
+pub fn preferred_for_volumes<'a>(
+    bindings: &[VolumeBinding],
+    feasible: Vec<&'a Candidate>,
+) -> Vec<&'a Candidate> {
+    let holders: Vec<String> = bindings
+        .iter()
+        .filter(|b| b.required().is_none())
+        .filter_map(|b| b.node.clone())
+        .collect();
+    prefer_local(feasible, &holders)
+}
+
+/// Why this VM's volumes left it nowhere to go.
+///
+/// Only reached when `feasible` found candidates and `feasible_for_volumes`
+/// left none, so the sentence is always about a volume and never about the
+/// cluster being empty — that case has its own reasons one function up.
+pub fn volume_pending_reason(
+    bindings: &[VolumeBinding],
+    candidates: &[&Candidate],
+) -> (PendingReason, String) {
+    for binding in bindings {
+        let Some(nodes) = binding.required() else {
+            continue;
+        };
+        if candidates
+            .iter()
+            .any(|c| nodes.iter().any(|n| n == &c.name))
+        {
+            continue;
+        }
+        let locality = binding
+            .locality
+            .map(Locality::as_str)
+            .unwrap_or("of unknown locality");
+        return (
+            PendingReason::NoNodeForVolume,
+            format!(
+                "volume {} is {locality} and lives on [{}]; none of them is a candidate that \
+                 can also run this vm",
+                binding.volume,
+                nodes.join(", ")
+            ),
+        );
+    }
+    // Every hard rule is satisfiable on its own and together they are not:
+    // two node-local volumes on two different machines is the shape, and it
+    // is a split request in exactly the sense the existing reason means.
+    (
+        PendingReason::Split,
+        format!(
+            "no single candidate can reach all {} of this vm's volumes at once",
+            bindings.len()
+        ),
+    )
+}
+
+/// Why the machines this VM's volumes pinned it to cannot take it — the
+/// sentence for a narrowing that left nodes standing and a scheduler that
+/// then threw every one of them out.
+///
+/// `volume_pending_reason` above answers the case where the narrowing emptied
+/// the candidate list. This answers the OTHER one, and until it existed that
+/// case fell through to `pending_reason_of` against the FULL node list: a VM
+/// whose `node-local` disks are on a drained `agent-1` was told *"no single
+/// candidate offers all of [hypervisor] at once"* while both nodes offered
+/// `hypervisor` and the truth was that the only node it could use was
+/// drained. An operator read a sentence about hypervisors and went looking at
+/// the wrong end of the cluster.
+///
+/// `None` means the volumes are not the reason and the ordinary sentence is
+/// the true one: nothing was pinned, or a usable node survived the narrowing
+/// and something else defeated it (room, a selector, a device).
+///
+/// Asked AFTER `assign` and not before, which is the whole correction. Before
+/// it, "is this node usable" has not been decided by the party that decides
+/// it.
+pub fn volume_nodes_unusable(
+    bindings: &[VolumeBinding],
+    allowed: &[&Candidate],
+) -> Option<(PendingReason, String)> {
+    // Nothing is nailed down, so nothing here explains anything.
+    if bindings.iter().all(|b| b.required().is_none()) {
+        return None;
+    }
+    // An empty list is the other function's sentence, and a list with a
+    // usable node in it is not a list the volumes defeated.
+    if allowed.is_empty() || allowed.iter().any(|c| is_usable(c)) {
+        return None;
+    }
+    // Not connected before drained before wedged: each is more fundamental
+    // than the next, and an operator who un-drains a node that is also gone
+    // has fixed nothing. The third is what the data disk case needed — the
+    // machine holding the bytes is up and willing and cannot write them.
+    let state = |c: &Candidate| {
+        if !c.connected {
+            "not connected".to_string()
+        } else if !c.schedulable {
+            "drained".to_string()
+        } else {
+            format!("reporting {}", c.unhealthy.join(", "))
+        }
+    };
+    let names: Vec<&str> = allowed.iter().map(|c| c.name.as_str()).collect();
+    let first = state(allowed[0]);
+    let sentence = if allowed.iter().all(|c| state(c) == first) {
+        // One state, so it can be said once — and the singular case is the
+        // common one and reads like a person wrote it.
+        match names.as_slice() {
+            [only] => format!("the node holding this vm's volumes ({only}) is {first}"),
+            _ => format!(
+                "the nodes holding this vm's volumes ({}) are {first}",
+                names.join(", ")
+            ),
+        }
+    } else {
+        format!(
+            "no node holding this vm's volumes can take it: {}",
+            allowed
+                .iter()
+                .map(|c| format!("{} is {}", c.name, state(c)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Some((PendingReason::NoNodeForVolume, sentence))
+}
+
+/// What a VM demands of the NODES inside a cluster.
+///
+/// The question the cloud tier could not ask until `ClusterStatus.nodes`
+/// existed, and the reason two findings were open at once. A cluster's
+/// capacity is a SUM and its catalogue a UNION, so a cluster could look able
+/// to serve a VM that no single node of it can: the `nodeSelector` was
+/// checked one tier down, after the binding, so a VM that no node matched
+/// went Pending on a cluster it should never have been sent to. And a VM
+/// naming a `node-local` volume had the same problem one step worse — the
+/// bytes are on one machine of one cluster, and nothing up here knew it.
+///
+/// Both are the same question and this is it, asked once, before the binding.
+#[derive(Debug)]
+pub struct NodeDemand<'a> {
+    /// `spec.nodeSelector` — matched against each node's own labels, which
+    /// the cluster reports and the cloud mirrors.
+    pub selector: &'a BTreeMap<String, String>,
+    /// The nodes that may serve this VM's volumes, or `None` for "any".
+    ///
+    /// The INTERSECTION of what every referenced volume allows: one
+    /// `node-local` volume allows exactly the node holding it, a `shared` one
+    /// allows its pool's nodes, and an unknown locality allows everything —
+    /// so an empty vector here means the volumes contradict each other and no
+    /// node anywhere can serve them.
+    pub allowed: Option<Vec<String>>,
+}
+
+impl NodeDemand<'_> {
+    /// Whether at least one node of this cluster could actually run the VM.
+    ///
+    /// A node has to be usable — up and not drained — before its labels are
+    /// worth reading: a cluster whose only matching node is being drained is
+    /// a cluster the VM should not be sent to, which is the whole point of
+    /// asking before the binding rather than after it.
+    pub fn met_by_a_node(&self, nodes: &[NodeSummary]) -> bool {
+        nodes.iter().any(|n| {
+            n.ready
+                && n.schedulable
+                // The same veto `is_usable` applies one tier down. A cloud
+                // that binds a VM to a cluster whose only matching machine
+                // has a full disk has sent the VM somewhere it will sit
+                // Pending, which is exactly what asking before the binding
+                // exists to prevent.
+                && n.conditions.is_empty()
+                && selects(self.selector, &n.labels)
+                && self
+                    .allowed
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.iter().any(|a| a == &n.name))
+        })
+    }
+}
+
+/// Narrow the allowed-node set by one more volume.
+///
+/// `None` narrows nothing — an unknown locality, or a `shared` pool that
+/// names no nodes, is "any node will do". Two `Some`s intersect, and an empty
+/// result is the honest answer that no node serves both.
+pub fn narrow_allowed(
+    current: Option<Vec<String>>,
+    next: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    match (current, next) {
+        (None, next) => next,
+        (current, None) => current,
+        (Some(current), Some(next)) => {
+            Some(current.into_iter().filter(|c| next.contains(c)).collect())
+        }
+    }
+}
+
+/// Narrow a feasible set to those that also honour the PREFERRED terms — or/// Narrow a feasible set to those that also honour the PREFERRED terms — or
+/// leave it alone, if honouring them would mean placing nothing./// Narrow a feasible set to those that also honour the PREFERRED terms — or
 /// leave it alone, if honouring them would mean placing nothing.
 ///
 /// That fallback is the whole difference between a preference and a
@@ -560,6 +1030,46 @@ fn resource_requests(vm: &Vm) -> Vec<(String, Option<String>)> {
         ));
     }
 
+    // And the other side of the same field: a NIC that names a provider
+    // network needs a node that really holds an interface for THAT physnet,
+    // which is exactly what a gateway claim says. One request per distinct
+    // physnet, because two of them are two different wires and a node holding
+    // one is not a node holding the other — this is the one place where
+    // asking twice is not noise.
+    let mut physnets: Vec<&str> = array("nics")
+        .iter()
+        .filter_map(|n| crate::vni::physnet_of(n.as_object()?))
+        .collect();
+    physnets.dedup();
+    for physnet in physnets {
+        requests.push((
+            capability::NETWORK.to_string(),
+            Some(capability::gateway_claim(physnet)),
+        ));
+    }
+
+    // Every VM asks for a hypervisor, whatever else it asks for.
+    //
+    // A BARE request — any hypervisor will do, and which one is the node's
+    // business. Matching the name would be sizing knowledge this tier does
+    // not have and should not learn: a VM does not care whether it is served
+    // by cloud-hypervisor or by whatever comes next, only that something
+    // serves it.
+    //
+    // Shipping this was deliberately held back until no node in the fleet ran
+    // an agent that predates the claim: such a node claims no `hypervisor/*`,
+    // and a VM requiring one would go Pending there for ever. Claiming is
+    // additive and safe during a rollout; requiring is not. The condition is
+    // met now — `manacor` was the last node still on a hand-started binary
+    // from before the claim, and the image round replaced it.
+    //
+    // What it buys: a storage-only node has room, is connected, is
+    // schedulable, and carries no hypervisor at all, so without this the
+    // first ordinary VM lands there, the agent refuses correctly, and the VM
+    // ends Failed on a machine that could never have run it. A volume may
+    // still be placed there, which is the whole point of having such a node.
+    requests.push((capability::HYPERVISOR.to_string(), None));
+
     requests
 }
 
@@ -637,10 +1147,31 @@ pub enum PendingReason {
     /// Some are known; none is both connected and schedulable — everything is
     /// down, or everything is drained.
     NoneUsable,
+    /// Everything that is up and willing has said something is wrong with
+    /// itself: a full disk, a store that refuses writes, a cgroup root that
+    /// is not one.
+    ///
+    /// Its own reason and not `NoneUsable`, because the operator fix is a
+    /// different one and lives on a different machine. "Everything is
+    /// drained" sends somebody to `node uncordon`; this sends them to the
+    /// node named in the sentence, which is where the mini-chaos run's three
+    /// wasted hours went.
+    NodeUnhealthy,
     /// Everything is up and willing and none of it has room. The fourth
     /// case, and without it a full cluster looks from the API exactly like a
     /// cluster where nothing is happening.
     NoCapacity,
+    /// Every machine that is up and willing takes only classes this workload
+    /// is not one of — `NodeSpec.accepts` on one side, `spec.class` on the
+    /// other.
+    ///
+    /// Its own reason, and it is asked before room, because the operator fix
+    /// is a different one and "no candidate has room" would send somebody to
+    /// buy memory for a fleet whose machines are all reserved for routers.
+    /// It is also not `SelectorUnmatched`: a selector is what the WORKLOAD
+    /// asked for and is fixed by editing the workload; this is what the
+    /// MACHINES accept and is fixed by editing a node.
+    ClassRefused,
     /// Room enough, and nothing carries the labels the VM selects.
     SelectorUnmatched,
     /// Something the VM asks for is offered by nobody at all.
@@ -651,6 +1182,24 @@ pub enum PendingReason {
     /// Everything that would otherwise do already holds a VM this one is
     /// required to stay away from.
     AntiAffinity,
+    /// A volume this VM names is not `Ready` yet. Its own reason and not
+    /// `Unserved`, because nothing is missing: the disk is being made, and
+    /// the answer is to wait rather than to change anything.
+    VolumeNotReady,
+    /// The volume is Ready, and no candidate can reach it. Where a
+    /// `node-local` volume is IS where the VM has to run, so this is a hard
+    /// wall rather than a preference that was not met — the node holding the
+    /// data is down, drained, or out of room.
+    NoNodeForVolume,
+    /// A `Secret` this VM's cloud-init reads from cannot be opened here yet:
+    /// it has not been mirrored down, it holds no such key, or this tier has
+    /// no `secrets_key`.
+    ///
+    /// Its own word rather than `VolumeNotReady`, which is what it borrowed
+    /// while there was nothing else to say. A reason is a METRIC LABEL —
+    /// `pending_reason{reason="volume-not-ready"}` counting VMs waiting for a
+    /// secret would send whoever is reading the dashboard to the storage.
+    SecretNotReady,
 }
 
 impl PendingReason {
@@ -658,14 +1207,19 @@ impl PendingReason {
     /// pass walks to publish a zero for the reasons nothing is pending for,
     /// so that a reason with no VMs stays a flat line in a dashboard rather
     /// than a series that vanishes.
-    pub const ALL: [PendingReason; 7] = [
+    pub const ALL: [PendingReason; 12] = [
         PendingReason::NoCandidates,
         PendingReason::NoneUsable,
+        PendingReason::NodeUnhealthy,
+        PendingReason::ClassRefused,
         PendingReason::NoCapacity,
         PendingReason::SelectorUnmatched,
         PendingReason::Unserved,
         PendingReason::Split,
         PendingReason::AntiAffinity,
+        PendingReason::VolumeNotReady,
+        PendingReason::NoNodeForVolume,
+        PendingReason::SecretNotReady,
     ];
 
     /// Where this variant sits in `ALL` — the slot a `PendingTally` counts
@@ -685,11 +1239,16 @@ impl PendingReason {
         match self {
             PendingReason::NoCandidates => "no-candidates",
             PendingReason::NoneUsable => "none-usable",
+            PendingReason::NodeUnhealthy => "node-unhealthy",
+            PendingReason::ClassRefused => "class-refused",
             PendingReason::NoCapacity => "no-capacity",
             PendingReason::SelectorUnmatched => "selector-unmatched",
             PendingReason::Unserved => "unserved-request",
             PendingReason::Split => "split-request",
             PendingReason::AntiAffinity => "anti-affinity",
+            PendingReason::VolumeNotReady => "volume-not-ready",
+            PendingReason::SecretNotReady => "secret-not-ready",
+            PendingReason::NoNodeForVolume => "no-node-for-volume",
         }
     }
 }
@@ -728,6 +1287,189 @@ impl PendingTally {
     }
 }
 
+/// One cut the scheduler makes at the field, and what it means that nothing
+/// survived it.
+///
+/// A candidate that is not usable at all is carried past every cut untouched:
+/// the cuts are about the VM's demands, and whether anybody is usable is the
+/// first row's question and nobody else's.
+struct Cut {
+    /// Which candidates get past this cut.
+    keep: fn(&Vm, &Capacity, &DevicePolicy, &Candidate) -> bool,
+    /// What to say when no usable candidate got past. Reads the field as it
+    /// stood BEFORE the cut, which is what these sentences have to name: the
+    /// roomiest machine, the tier the labels are about, the part of the ask
+    /// nobody serves.
+    verdict: fn(&Vm, &Capacity, &DevicePolicy, &[Candidate]) -> (PendingReason, String),
+}
+
+/// The reasons a VM can be Pending, in the order they are asked.
+///
+/// The order IS the answer and that is why it is a table: "nobody is here" and
+/// "nobody is willing" are different operator problems from "nobody can", and
+/// only the last is about the VM's own demands. Room before capability, the
+/// same order FirstFit filters in — a VM that fits nowhere is not a VM whose
+/// device request went unserved, and telling an operator to add a GPU when
+/// what is missing is memory sends them to the wrong machine. Selector before
+/// catalogue, because an unmatched selector is something the operator wrote
+/// down a moment ago and can fix by reading it again; saying "nobody offers
+/// nvrm/4q" to somebody whose typo was `zone=stutgart` sends them to the wrong
+/// problem. Anti-affinity last, because it is the subtlest of the cuts and
+/// blaming it while a GPU is also missing would be true and useless.
+///
+/// A new reason is a new row, and where it goes in the list is the whole of
+/// the decision.
+const CUTS: [Cut; 6] = [
+    // Is anybody here at all, is anybody willing, and is anybody able?
+    Cut {
+        keep: |_, _, _, _| true,
+        verdict: |_, _, _, field| {
+            if field.is_empty() {
+                return (
+                    PendingReason::NoCandidates,
+                    "no candidates are known here yet".to_string(),
+                );
+            }
+            // Before the drained/down sentence, because it is the more
+            // specific answer: a machine that is up, willing and wedged would
+            // otherwise be counted into "none is connected and schedulable",
+            // which is a sentence that sends an operator to look at a cordon
+            // that is not there.
+            let wedged = wedged_sentence(field);
+            if !wedged.is_empty() {
+                return (
+                    PendingReason::NodeUnhealthy,
+                    format!(
+                        "every candidate that is up and willing says something is wrong with \
+                         itself: {wedged}"
+                    ),
+                );
+            }
+            (
+                PendingReason::NoneUsable,
+                format!(
+                    "none of the {} known candidates is both connected and schedulable",
+                    field.len()
+                ),
+            )
+        },
+    },
+    // What the machines accept. Before room, because a fleet whose machines
+    // are all reserved for routers has plenty of room and no place for this
+    // vm, and "no candidate has room" would send somebody to buy memory.
+    Cut {
+        keep: |vm, _, _, c| crate::resources::accepts_class(&c.accepts, vm.spec.class()),
+        verdict: |vm, _, _, field| {
+            let takers: Vec<String> = field
+                .iter()
+                .filter(|c| is_usable(c))
+                .map(|c| format!("{} ({})", c.name, c.accepts.join(", ")))
+                .collect();
+            (
+                PendingReason::ClassRefused,
+                format!(
+                    "no candidate accepts the class {:?}: {}",
+                    vm.spec.class(),
+                    takers.join(", ")
+                ),
+            )
+        },
+    },
+    // Room.
+    Cut {
+        keep: |_, size, _, c| size.fits_in(c.free),
+        verdict: |_, size, _, field| {
+            let biggest = field
+                .iter()
+                .filter(|c| is_usable(c))
+                .map(|c| c.free)
+                .max_by_key(|f| (f.mem_mib, f.vcpus))
+                .unwrap_or_default();
+            (
+                PendingReason::NoCapacity,
+                format!(
+                    "no candidate has room for {} vcpu and {} MiB; the roomiest has {} vcpu and \
+                     {} MiB free",
+                    size.vcpus, size.mem_mib, biggest.vcpus, biggest.mem_mib
+                ),
+            )
+        },
+    },
+    // The labels the VM selects.
+    Cut {
+        keep: |vm, _, _, c| selects(selector_for(vm, c.kind), &c.labels),
+        verdict: |vm, _, _, field| {
+            // The kind is the same for every candidate of one list, so the
+            // first usable one names the tier this sentence is about.
+            let kind = field
+                .iter()
+                .find(|c| is_usable(c))
+                .map(|c| c.kind)
+                .unwrap_or(CandidateKind::Node);
+            let asked = selector_for(vm, kind)
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                PendingReason::SelectorUnmatched,
+                format!("no candidate carries the labels this vm selects [{asked}]"),
+            )
+        },
+    },
+    // The catalogue: every request on ONE candidate.
+    Cut {
+        keep: |_, _, wanted, c| wanted.met_by(&c.catalogue),
+        verdict: |_, _, wanted, field| match wanted.unmet(field) {
+            // Every request IS served somewhere, so the ask is servable in
+            // principle and the split is what defeated it: no single candidate
+            // holds the whole set. Worth its own sentence, because the
+            // operator fix is different (put the capabilities on one machine,
+            // or ask for less on one vm).
+            unmet if unmet.is_empty() => split(wanted),
+            unmet => (
+                PendingReason::Unserved,
+                format!("no connected candidate offers [{}]", unmet.join(", ")),
+            ),
+        },
+    },
+    // Anti-affinity, and by here everything else fits — so if a required term
+    // is what empties the set, it really is the reason.
+    Cut {
+        keep: |vm, _, _, c| {
+            !vm.spec
+                .anti_affinity
+                .iter()
+                .filter(|t| t.required)
+                .any(|t| collides(t, c))
+        },
+        verdict: |_, _, _, _| {
+            (
+                PendingReason::AntiAffinity,
+                "every candidate that would otherwise do already holds a vm this one must stay away from"
+                    .to_string(),
+            )
+        },
+    },
+];
+
+/// Everything is served somewhere and no one candidate serves it all.
+fn split(wanted: &DevicePolicy) -> (PendingReason, String) {
+    (
+        PendingReason::Split,
+        format!(
+            "no single candidate offers all of [{}] at once, though each part is served \
+             somewhere",
+            wanted
+                .requests()
+                .iter()
+                .map(|(d, p)| capability::entry(d, p.as_deref()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+}
+
 /// Why a VM found no placement: the category, and one sentence an operator
 /// can act on.
 ///
@@ -738,139 +1480,25 @@ impl PendingTally {
 /// object and read back with `vm inspect`, and into a category that can be a
 /// metric label.
 ///
-/// The order matters: "nobody is here" and "nobody is willing" are different
-/// operator problems from "nobody can", and only the last is about the VM's
-/// own demands.
+/// One walk down `CUTS`: narrow, and the first cut that leaves nothing usable
+/// is the answer. A field that survives every cut is the `Split` case — every
+/// part of the ask is served, no one machine serves all of it.
 pub fn pending_reason_of(vm: &Vm, candidates: &[Candidate]) -> (PendingReason, String) {
-    if candidates.is_empty() {
-        return (
-            PendingReason::NoCandidates,
-            "no candidates are known here yet".to_string(),
-        );
-    }
-    let usable = candidates
-        .iter()
-        .filter(|c| c.connected && c.schedulable)
-        .count();
-    if usable == 0 {
-        return (
-            PendingReason::NoneUsable,
-            format!(
-                "none of the {} known candidates is both connected and schedulable",
-                candidates.len()
-            ),
-        );
-    }
-    // Room before capability, the same order FirstFit filters in: a VM that
-    // fits nowhere is not a VM whose device request went unserved, and
-    // telling an operator to add a GPU when what is missing is memory sends
-    // them to the wrong machine.
     let size = Capacity::wanted_by(vm);
-    let roomy: Vec<Candidate> = candidates
-        .iter()
-        .filter(|c| !(c.connected && c.schedulable) || size.fits_in(c.free))
-        .cloned()
-        .collect();
-    if !roomy.iter().any(|c| c.connected && c.schedulable) {
-        let biggest = candidates
-            .iter()
-            .filter(|c| c.connected && c.schedulable)
-            .map(|c| c.free)
-            .max_by_key(|f| (f.mem_mib, f.vcpus))
-            .unwrap_or_default();
-        return (
-            PendingReason::NoCapacity,
-            format!(
-                "no candidate has room for {} vcpu and {} MiB; the roomiest has {} vcpu and \
-                 {} MiB free",
-                size.vcpus, size.mem_mib, biggest.vcpus, biggest.mem_mib
-            ),
-        );
-    }
-    // Selector before catalogue: an unmatched selector is something the
-    // operator wrote down a moment ago and can fix by reading it again, and
-    // it is a cruder cut than the device catalogue. Saying "nobody offers
-    // nvrm/4q" to somebody whose typo was `zone=stutgart` sends them to the
-    // wrong problem.
-    let selected: Vec<Candidate> = roomy
-        .iter()
-        .filter(|c| !(c.connected && c.schedulable) || selects(selector_for(vm, c.kind), &c.labels))
-        .cloned()
-        .collect();
-    if !selected.iter().any(|c| c.connected && c.schedulable) {
-        // The kind is the same for every candidate of one list, so the first
-        // usable one names the tier this sentence is about.
-        let kind = roomy
-            .iter()
-            .find(|c| c.connected && c.schedulable)
-            .map(|c| c.kind)
-            .unwrap_or(CandidateKind::Node);
-        let asked = selector_for(vm, kind)
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return (
-            PendingReason::SelectorUnmatched,
-            format!("no candidate carries the labels this vm selects [{asked}]"),
-        );
-    }
-    let roomy = selected;
-    let candidates = &roomy;
     let wanted = DevicePolicy::of(vm);
-    let unmet = wanted.unmet(candidates);
-    if unmet.is_empty() {
-        // Last, and last on purpose: anti-affinity is the subtlest of the
-        // cuts, and blaming it while a GPU is also missing would be true and
-        // useless. By here everything else fits, so if a required term is
-        // what empties the set, it really is the reason.
-        let survivors: Vec<&Candidate> = candidates
+    let mut field: Vec<Candidate> = candidates.to_vec();
+    for cut in CUTS {
+        let next: Vec<Candidate> = field
             .iter()
-            .filter(|c| c.connected && c.schedulable)
-            .filter(|c| wanted.met_by(&c.catalogue))
-            .filter(|c| {
-                !vm.spec
-                    .anti_affinity
-                    .iter()
-                    .filter(|t| t.required)
-                    .any(|t| collides(t, c))
-            })
+            .filter(|c| !is_usable(c) || (cut.keep)(vm, &size, &wanted, c))
+            .cloned()
             .collect();
-        if survivors.is_empty()
-            && vm.spec.anti_affinity.iter().any(|t| t.required)
-            && candidates
-                .iter()
-                .any(|c| c.connected && c.schedulable && wanted.met_by(&c.catalogue))
-        {
-            return (
-                PendingReason::AntiAffinity,
-                "every candidate that would otherwise do already holds a vm this one must stay away from"
-                    .to_string(),
-            );
+        if !next.iter().any(is_usable) {
+            return (cut.verdict)(vm, &size, &wanted, &field);
         }
-        // Every request IS served somewhere, so the ask is servable in
-        // principle and the split is what defeated it: no single candidate
-        // holds the whole set. Worth its own sentence, because the operator
-        // fix is different (put the capabilities on one machine, or ask for
-        // less on one vm).
-        return (
-            PendingReason::Split,
-            format!(
-                "no single candidate offers all of [{}] at once, though each part is served \
-                 somewhere",
-                wanted
-                    .requests()
-                    .iter()
-                    .map(|(d, p)| capability::entry(d, p.as_deref()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        );
+        field = next;
     }
-    (
-        PendingReason::Unserved,
-        format!("no connected candidate offers [{}]", unmet.join(", ")),
-    )
+    split(&wanted)
 }
 
 /// Just the sentence, for the callers that only put it on the object.
@@ -965,29 +1593,45 @@ mod tests {
         mem_mib: 65536,
     };
 
+    /// What every compute node claims, and what every VM now requires. In
+    /// the helpers rather than in each test, because a candidate WITHOUT it
+    /// is a storage-only node — a real and different thing, and the tests
+    /// that mean one say so.
+    const RUNS_VMS: &str = "hypervisor/cloud-hypervisor";
+
     fn candidate(name: &str, connected: bool, schedulable: bool) -> Candidate {
         Candidate {
+            accepts: Vec::new(),
+            machine: None,
             kind: CandidateKind::Node,
             labels: Default::default(),
             hosted: Vec::new(),
             free: ROOMY,
+            unhealthy: Vec::new(),
             name: name.into(),
             connected,
+            alive: connected,
             schedulable,
-            catalogue: Vec::new(),
+            catalogue: vec![RUNS_VMS.to_string()],
         }
     }
 
     fn gpu_candidate(name: &str, profiles: &[&str]) -> Candidate {
         Candidate {
+            accepts: Vec::new(),
+            machine: None,
             kind: CandidateKind::Node,
             labels: Default::default(),
             hosted: Vec::new(),
             free: ROOMY,
+            unhealthy: Vec::new(),
             name: name.into(),
             connected: true,
+            alive: true,
             schedulable: true,
-            catalogue: profiles.iter().map(|p| p.to_string()).collect(),
+            catalogue: std::iter::once(RUNS_VMS.to_string())
+                .chain(profiles.iter().map(|p| p.to_string()))
+                .collect(),
         }
     }
 
@@ -1009,6 +1653,7 @@ mod tests {
     /// labelled `holding`.
     fn labelled(name: &str, on: &[(&str, &str)], holding: &[&[(&str, &str)]]) -> Candidate {
         Candidate {
+            machine: None,
             labels: labels(on),
             hosted: holding.iter().map(|h| labels(h)).collect(),
             ..candidate(name, true, true)
@@ -1032,16 +1677,103 @@ mod tests {
         new_vm(
             "t",
             VmSpec {
+                class: Default::default(),
                 cluster_selector: Default::default(),
                 node_selector: Default::default(),
                 anti_affinity: Vec::new(),
                 node_name: None,
                 cluster_name: None,
                 run_strategy: Default::default(),
+                evacuation: Default::default(),
                 tenant: None,
                 vm: spec,
             },
         )
+    }
+
+    /// The machine's half of the pairing, and the whole point of it: a node
+    /// an operator reserved for routers stops being a candidate for the
+    /// ordinary class, and the sentence names the node and what it takes —
+    /// so somebody reading `vm get` is sent to the machine rather than to
+    /// the shop for more memory.
+    #[test]
+    fn a_node_that_accepts_only_routers_takes_no_ordinary_vm() {
+        let mut gateway = candidate("gw-1", true, true);
+        gateway.accepts = vec![crate::resources::CLASS_ROUTER.to_string()];
+        let plain = candidate("agent-1", true, true);
+
+        assert_eq!(FirstFit.assign(&vm(), &[gateway.clone()]), None);
+        assert_eq!(
+            FirstFit.assign(&vm(), &[gateway.clone(), plain]).as_deref(),
+            Some("agent-1")
+        );
+
+        // ... and a workload OF that class goes exactly there.
+        let mut router_class = vm();
+        router_class.spec.class = crate::resources::CLASS_ROUTER.to_string();
+        assert_eq!(
+            FirstFit
+                .assign(&router_class, &[gateway.clone()])
+                .as_deref(),
+            Some("gw-1")
+        );
+
+        let (reason, sentence) = pending_reason_of(&vm(), &[gateway]);
+        assert_eq!(reason, PendingReason::ClassRefused);
+        assert!(sentence.contains("gw-1 (router)"), "{sentence}");
+        assert!(sentence.contains("\"vm\""), "{sentence}");
+    }
+
+    /// A machine that was never told otherwise takes everything, which is
+    /// every machine in every fleet that predates the field. Read the other
+    /// way round this would empty a cluster on upgrade.
+    #[test]
+    fn a_node_that_accepts_nothing_in_particular_takes_everything() {
+        let plain = candidate("agent-1", true, true);
+        for class in ["", "router", "gpu"] {
+            let mut asking = vm();
+            asking.spec.class = class.to_string();
+            assert_eq!(
+                FirstFit
+                    .assign(&asking, std::slice::from_ref(&plain))
+                    .as_deref(),
+                Some("agent-1"),
+                "class {class:?}"
+            );
+        }
+    }
+
+    /// The other half of 6k's third decision: a NIC that names a provider
+    /// network is a demand for a node that really holds an interface for
+    /// THAT wire, and one physnet is not another. Without it a VM with a
+    /// `physnet` NIC lands wherever there is room and the agent refuses it.
+    #[test]
+    fn a_nic_on_a_provider_network_asks_for_the_node_that_holds_that_wire() {
+        let outside = vm_asking(serde_json::json!({
+            "nics": [{ "physnet": "ext" }],
+        }));
+        let mut holds_ext = candidate("gw-1", true, true);
+        holds_ext.catalogue.push("network/gateway:ext".into());
+        let mut holds_dmz = candidate("gw-2", true, true);
+        holds_dmz.catalogue.push("network/gateway:dmz".into());
+
+        assert_eq!(
+            FirstFit
+                .assign(&outside, &[holds_dmz.clone(), holds_ext.clone()])
+                .as_deref(),
+            Some("gw-1"),
+            "the wrong wire is not a fit"
+        );
+        assert_eq!(FirstFit.assign(&outside, &[holds_dmz]), None);
+        // A plain NIC asks for none of this and still lands anywhere.
+        assert!(
+            FirstFit
+                .assign(
+                    &vm_asking(serde_json::json!({ "nics": [{}] })),
+                    &[holds_ext]
+                )
+                .is_some()
+        );
     }
 
     #[test]
@@ -1144,16 +1876,23 @@ mod tests {
 
     fn volume_candidate(name: &str, backends: &[&str]) -> Candidate {
         Candidate {
+            accepts: Vec::new(),
+            machine: None,
             kind: CandidateKind::Node,
             labels: Default::default(),
             hosted: Vec::new(),
             free: ROOMY,
+            unhealthy: Vec::new(),
             name: name.into(),
             connected: true,
+            alive: true,
             schedulable: true,
-            catalogue: backends
-                .iter()
-                .map(|b| capability::entry(capability::VOLUME, Some(b)))
+            catalogue: std::iter::once(RUNS_VMS.to_string())
+                .chain(
+                    backends
+                        .iter()
+                        .map(|b| capability::entry(capability::VOLUME, Some(b))),
+                )
                 .collect(),
         }
     }
@@ -1240,22 +1979,26 @@ mod tests {
     }
 
     fn overlay_candidate(name: &str, vxlan: bool) -> Candidate {
+        let mut catalogue = vec![RUNS_VMS.to_string()];
+        if vxlan {
+            catalogue.push(capability::entry(
+                capability::NETWORK,
+                Some(capability::VXLAN),
+            ));
+        }
         Candidate {
+            accepts: Vec::new(),
+            machine: None,
             kind: CandidateKind::Node,
             labels: Default::default(),
             hosted: Vec::new(),
             free: ROOMY,
+            unhealthy: Vec::new(),
             name: name.into(),
             connected: true,
+            alive: true,
             schedulable: true,
-            catalogue: if vxlan {
-                vec![capability::entry(
-                    capability::NETWORK,
-                    Some(capability::VXLAN),
-                )]
-            } else {
-                Vec::new()
-            },
+            catalogue,
         }
     }
 
@@ -1393,65 +2136,97 @@ mod tests {
                 ("nvrm".to_string(), Some("4q".to_string())),
                 ("volume".to_string(), Some("lvm-thin".to_string())),
                 ("network".to_string(), Some("vxlan".to_string())),
+                // Last and always: every VM needs a machine that runs VMs.
+                ("hypervisor".to_string(), None),
             ]
         );
         assert!(wanted.met_by(&[
             "nvrm/4q".into(),
             "volume/lvm-thin".into(),
-            "network/vxlan".into()
+            "network/vxlan".into(),
+            RUNS_VMS.into()
         ]));
+        assert!(
+            !wanted.met_by(&[
+                "nvrm/4q".into(),
+                "volume/lvm-thin".into(),
+                "network/vxlan".into()
+            ]),
+            "everything it asked for, on a node that runs no vms"
+        );
         assert!(!wanted.met_by(&["nvrm/4q".into()]));
-        // and a spec that constrains nothing is met by a candidate that
-        // claims nothing
-        assert!(DevicePolicy::of(&vm()).is_empty());
-        assert!(DevicePolicy::of(&vm()).met_by(&[]));
+        // A spec that constrains nothing still asks for the one thing every
+        // VM asks for, so a candidate claiming nothing at all no longer
+        // answers it. See the test below.
+        assert!(!DevicePolicy::of(&vm()).is_empty());
+        assert!(!DevicePolicy::of(&vm()).met_by(&[]));
+        assert!(DevicePolicy::of(&vm()).met_by(&[RUNS_VMS.to_string()]));
     }
 
-    /// The half of the hypervisor capability that is deliberately NOT built,
-    /// pinned so that building it is a deliberate act rather than an
-    /// accident.
+    /// The other half of the sentence, and this test is the one that changed
+    /// when it shipped.
     ///
-    /// A node claims `hypervisor/<name>` from the agent side already, so a
-    /// storage node is distinguishable from a compute one. Making every VM
-    /// REQUEST one is the other half, and it may only ship once no node in
-    /// the cluster runs an agent that predates the claim: such a node claims
-    /// nothing, and a VM requiring `hypervisor/*` would go Pending there and
-    /// stay there. Claiming is additive and safe during a rollout; requiring
-    /// is not, and a rollout is the normal state of a cluster.
-    ///
-    /// When the condition is met, this test is what changes — and the release
-    /// that changes it is the release that ships the requirement.
+    /// A node has claimed `hypervisor/<name>` since the storage split, and
+    /// requiring one was held back for exactly as long as any node ran an
+    /// agent that predates the claim — such a node claims nothing, and a VM
+    /// requiring `hypervisor/*` would go Pending there for ever. Claiming is
+    /// additive and safe during a rollout; requiring is not. The last node on
+    /// an older binary was replaced by the image round, so it ships here.
     #[test]
-    fn no_vm_asks_for_a_hypervisor_yet() {
+    fn every_vm_asks_for_a_hypervisor_and_does_not_care_which() {
         let plain = DevicePolicy::of(&vm());
-        assert!(plain.is_empty(), "a plain vm still constrains nothing");
-        // Even the fully loaded spec asks for the three it always asked for.
+        assert_eq!(
+            plain.requests(),
+            [("hypervisor".to_string(), None)],
+            "a plain vm asks for a hypervisor and nothing else"
+        );
+        // Bare: any hypervisor answers it, because which one is the node's
+        // business and matching the name would be sizing knowledge this tier
+        // does not have.
+        assert!(plain.met_by(&["hypervisor/cloud-hypervisor".to_string()]));
+        assert!(plain.met_by(&["hypervisor/whatever-comes-next".to_string()]));
+        // A storage-only node claims none and is no longer a candidate — the
+        // whole point.
+        assert!(!plain.met_by(&["volume/lvm-thin".to_string()]));
+        assert!(!plain.met_by(&[]));
+        // The loaded spec asks for its three AND for a hypervisor, and all
+        // four have to meet on ONE node — a VM cannot be split across two.
         let loaded = DevicePolicy::of(&vm_asking(serde_json::json!({
             "devices": [{"driver": "nvrm", "profile": "4q"}],
             "volumes": [{"size_bytes": 1, "driver": "lvm-thin"}],
             "nics": [{"vxlan_id": 10000}],
         })));
         assert!(
-            !loaded
+            loaded
                 .requests()
                 .iter()
-                .any(|(driver, _)| driver == capability::HYPERVISOR),
-            "requiring a hypervisor would strand every vm on a node whose agent \
-             predates the claim; see common::capability::HYPERVISOR"
+                .any(|(driver, profile)| driver == capability::HYPERVISOR && profile.is_none())
         );
-        // And the consequence that makes it safe: a node claiming nothing at
-        // all is still a candidate for an ordinary VM.
-        assert!(plain.met_by(&[]));
+
+        // And the other half of the point: a storage-only node is still a
+        // candidate for a VOLUME. The requirement cuts VMs and nothing else,
+        // which is what makes such a node worth having.
+        let pool = storage_pool("lvm-thin", &[]);
+        let storage_only = storage_candidate("shelf-1", &["lvm-thin"]);
+        assert_eq!(
+            feasible_for_storage(&StoragePolicy::of(&pool), &[storage_only]).len(),
+            1,
+            "a node that runs no vms may still hold disks"
+        );
     }
 
     fn storage_candidate(name: &str, drivers: &[&str]) -> Candidate {
         Candidate {
+            accepts: Vec::new(),
+            machine: None,
             kind: CandidateKind::Node,
             labels: Default::default(),
             hosted: Vec::new(),
             free: ROOMY,
+            unhealthy: Vec::new(),
             name: name.into(),
             connected: true,
+            alive: true,
             schedulable: true,
             catalogue: drivers
                 .iter()
@@ -1660,6 +2435,7 @@ mod tests {
 
     fn room(name: &str, vcpus: u32, mem_mib: u64) -> Candidate {
         Candidate {
+            machine: None,
             free: Capacity { vcpus, mem_mib },
             ..candidate(name, true, true)
         }
@@ -2173,11 +2949,16 @@ mod tests {
             [
                 "no-candidates",
                 "none-usable",
+                "node-unhealthy",
+                "class-refused",
                 "no-capacity",
                 "selector-unmatched",
                 "unserved-request",
                 "split-request",
-                "anti-affinity"
+                "anti-affinity",
+                "volume-not-ready",
+                "no-node-for-volume",
+                "secret-not-ready"
             ]
         );
         // and the sentence is still the sentence
@@ -2227,5 +3008,625 @@ mod tests {
             FirstFit.assign(&vm_asking(combo), &both).as_deref(),
             Some("manacor")
         );
+    }
+
+    fn binding(
+        volume: &str,
+        node: Option<&str>,
+        locality: Option<Locality>,
+        pool: &[&str],
+    ) -> VolumeBinding {
+        VolumeBinding {
+            volume: volume.into(),
+            node: node.map(str::to_string),
+            locality,
+            // The claim half is exercised by `served_by` below; every test
+            // that is about the NAME half wants no claim in the way.
+            driver: None,
+            pool_nodes: pool.iter().map(|n| n.to_string()).collect(),
+        }
+    }
+
+    /// A networked binding: the bytes are nowhere in particular and the
+    /// DRIVER is the constraint.
+    fn served_by(volume: &str, driver: &str) -> VolumeBinding {
+        VolumeBinding {
+            volume: volume.into(),
+            node: None,
+            locality: Some(Locality::Networked),
+            driver: Some(driver.into()),
+            pool_nodes: Vec::new(),
+        }
+    }
+
+    /// The `networked` axis, spent. Until this position nothing claimed it:
+    /// `required` answered `None` and every node was a candidate, so a VM
+    /// whose disk is on a fabric could be placed on a machine that cannot
+    /// speak to it — which worked, because the attach refusal is structural
+    /// and the VM moves, but it is placement by trial.
+    #[test]
+    fn a_networked_volume_is_reachable_by_whoever_carries_the_driver() {
+        let initiator = volume_candidate("manacor", &["nvmeof-import"]);
+        let plain = volume_candidate("agent-1", &["filesystem"]);
+        let binding = [served_by("imp-1", "nvmeof-import")];
+
+        assert_eq!(binding[0].claim(), Some("nvmeof-import".to_string()));
+        let allowed = feasible_for_volumes(&binding, vec![&initiator, &plain]);
+        assert_eq!(
+            allowed.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            ["manacor"],
+            "a node without the driver cannot reach the fabric"
+        );
+
+        // It pins nothing by NAME, which is the whole difference from
+        // node-local: any machine with the driver will do, and that is what
+        // makes such a volume survive a node going away.
+        assert_eq!(binding[0].required(), None);
+
+        // Every other locality answers no claim at all: they pin by name and
+        // the name is the constraint.
+        for locality in [Locality::NodeLocal, Locality::Shared] {
+            let mut named = served_by("data-1", "lvm-thin");
+            named.locality = Some(locality);
+            assert_eq!(named.claim(), None, "{locality:?}");
+        }
+        // And a networked binding whose pool has gone missing insists on
+        // nothing rather than on the empty string.
+        let mut poolless = served_by("imp-1", "");
+        assert_eq!(poolless.claim(), None);
+        poolless.driver = None;
+        assert_eq!(poolless.claim(), None);
+    }
+
+    /// The axis spent, in one test. A node-local volume pins the VM to
+    /// exactly the machine that holds it; a shared one opens the pool; a pool
+    /// nobody has reported on constrains nothing hard, which is what keeps a
+    /// mixed-version cluster placing VMs at all.
+    #[test]
+    fn locality_decides_whether_a_volume_pins_a_vm_or_merely_prefers_a_node() {
+        let local = binding("data-1", Some("manacor"), Some(Locality::NodeLocal), &[]);
+        assert_eq!(local.required(), Some(vec!["manacor".to_string()]));
+
+        let shared = binding(
+            "data-2",
+            Some("manacor"),
+            Some(Locality::Shared),
+            &["manacor", "soller"],
+        );
+        assert_eq!(
+            shared.required(),
+            Some(vec!["manacor".to_string(), "soller".to_string()]),
+            "the pool is the rule, and the volume's own node means nothing"
+        );
+
+        // A shared pool that names no nodes is every node, so nothing is cut.
+        assert_eq!(
+            binding("data-3", Some("manacor"), Some(Locality::Shared), &[]).required(),
+            None
+        );
+        // Nobody has said: fall back to the preference this scheduler has
+        // always had.
+        assert_eq!(
+            binding("data-4", Some("manacor"), None, &[]).required(),
+            None
+        );
+        // The arm position 18 will change, and it constrains nothing today.
+        assert_eq!(
+            binding("data-5", Some("manacor"), Some(Locality::Networked), &[]).required(),
+            None
+        );
+    }
+
+    /// A node-local volume leaves exactly one candidate, and it is the one
+    /// that holds the data. This is the whole difference from the soft
+    /// preference: the same rule as a preference would place the VM next to
+    /// an empty directory and boot it.
+    #[test]
+    fn a_node_local_volume_leaves_exactly_the_node_that_holds_it() {
+        let nodes = [gpu_candidate("manacor", &[]), gpu_candidate("soller", &[])];
+        let bindings = [binding(
+            "data-1",
+            Some("soller"),
+            Some(Locality::NodeLocal),
+            &[],
+        )];
+        let left = feasible_for_volumes(&bindings, nodes.iter().collect());
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "soller");
+    }
+
+    /// A shared volume opens the pool, and a node outside it is still not a
+    /// candidate — an export is only the same bytes for the machines that
+    /// mount it.
+    #[test]
+    fn a_shared_volume_opens_the_pool_and_nothing_beyond_it() {
+        let nodes = [
+            gpu_candidate("manacor", &[]),
+            gpu_candidate("soller", &[]),
+            gpu_candidate("inca", &[]),
+        ];
+        let bindings = [binding(
+            "data-1",
+            Some("manacor"),
+            Some(Locality::Shared),
+            &["manacor", "soller"],
+        )];
+        let mut left: Vec<String> = feasible_for_volumes(&bindings, nodes.iter().collect())
+            .into_iter()
+            .map(|c| c.name.clone())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["manacor".to_string(), "soller".into()]);
+    }
+
+    /// Two node-local volumes on two machines is a request no single node can
+    /// serve, and it is a split in exactly the sense the existing reason
+    /// means. The sentence for a single unreachable volume names the volume,
+    /// its locality and the nodes that hold it.
+    #[test]
+    fn a_volume_that_cuts_everything_away_says_which_one_and_why() {
+        let nodes = [gpu_candidate("manacor", &[]), gpu_candidate("soller", &[])];
+        let refs: Vec<&Candidate> = nodes.iter().collect();
+
+        // The node holding it is not a candidate at all.
+        let away = [binding(
+            "data-1",
+            Some("inca"),
+            Some(Locality::NodeLocal),
+            &[],
+        )];
+        assert!(feasible_for_volumes(&away, refs.clone()).is_empty());
+        let (why, sentence) = volume_pending_reason(&away, &refs);
+        assert_eq!(why, PendingReason::NoNodeForVolume);
+        assert!(sentence.contains("data-1"), "{sentence}");
+        assert!(sentence.contains("node-local"), "{sentence}");
+        assert!(sentence.contains("inca"), "{sentence}");
+
+        // Two volumes, each reachable, never together.
+        let split = [
+            binding("data-1", Some("manacor"), Some(Locality::NodeLocal), &[]),
+            binding("data-2", Some("soller"), Some(Locality::NodeLocal), &[]),
+        ];
+        assert!(feasible_for_volumes(&split, refs.clone()).is_empty());
+        let (why, sentence) = volume_pending_reason(&split, &refs);
+        assert_eq!(why, PendingReason::Split);
+        assert!(sentence.contains("all 2"), "{sentence}");
+    }
+
+    /// D8, the controller half: a node that is up, uncordoned and has said
+    /// something is wrong with itself is not a candidate.
+    ///
+    /// The mini-chaos run put a machine in exactly this state — redb wedged
+    /// after one I/O error, `ready` true, session held, `check.sh` green —
+    /// and a reschedule placed a VM onto it, which then failed on the node
+    /// with the store's error. Everything the scheduler had to go on said the
+    /// machine was fine, because everything it had to go on measured the
+    /// heartbeat.
+    #[test]
+    fn a_node_that_says_it_is_wedged_is_not_a_candidate() {
+        let wedged = Candidate {
+            unhealthy: vec![
+                crate::NodeConditionType::StoreUnhealthy
+                    .as_str()
+                    .to_string(),
+            ],
+            ..gpu_candidate("agent-1a", &[])
+        };
+        let fine = gpu_candidate("agent-1b", &[]);
+        let vm = vm();
+
+        assert!(
+            feasible(&vm, std::slice::from_ref(&wedged)).is_empty(),
+            "a wedged machine is not feasible"
+        );
+        // And the healthy one beside it still is, which is the whole point:
+        // the fleet keeps working around the machine that cannot.
+        assert_eq!(
+            FirstFit
+                .assign(&vm, &[wedged.clone(), fine.clone()])
+                .as_deref(),
+            Some("agent-1b")
+        );
+        assert_eq!(FirstFit.assign(&vm, std::slice::from_ref(&wedged)), None);
+    }
+
+    /// And the sentence, which is the half an operator acts on. It has to
+    /// name the machine and the word, because the fix is on that machine.
+    #[test]
+    fn the_wedged_node_is_named_in_the_pending_reason() {
+        let wedged = Candidate {
+            unhealthy: vec![
+                crate::NodeConditionType::StoreUnhealthy
+                    .as_str()
+                    .to_string(),
+            ],
+            ..gpu_candidate("agent-1a", &[])
+        };
+        let vm = vm();
+
+        let (why, sentence) = pending_reason_of(&vm, std::slice::from_ref(&wedged));
+        assert_eq!(why, PendingReason::NodeUnhealthy);
+        assert!(sentence.contains("agent-1a"), "{sentence}");
+        assert!(sentence.contains("StoreUnhealthy"), "{sentence}");
+
+        // NOT the drained sentence. That one sends an operator to look for a
+        // cordon that is not there, which is the wrong machine and the wrong
+        // command.
+        assert!(
+            !sentence.contains("connected and schedulable"),
+            "{sentence}"
+        );
+
+        // A drained machine beside it is still reported as drained: the
+        // wedged sentence is the more specific one and only claims the
+        // machines it is about.
+        let drained = Candidate {
+            schedulable: false,
+            ..gpu_candidate("agent-1b", &[])
+        };
+        let (why, sentence) = pending_reason_of(&vm, &[wedged, drained]);
+        assert_eq!(why, PendingReason::NodeUnhealthy);
+        assert!(sentence.contains("agent-1a"), "{sentence}");
+        assert!(!sentence.contains("agent-1b"), "{sentence}");
+    }
+
+    /// The volume half of the same veto, and it is the half the run actually
+    /// reached: the wedged node's disk was what the next provision was sent
+    /// to.
+    #[test]
+    fn a_wedged_node_provisions_nothing_and_the_sentence_says_why() {
+        let policy = StoragePolicy::of(&storage_pool("filesystem", &[]));
+        let wedged = Candidate {
+            unhealthy: vec![crate::NodeConditionType::DiskPressure.as_str().to_string()],
+            ..storage_candidate("agent-1a", &["filesystem"])
+        };
+        assert!(
+            feasible_for_storage(&policy, std::slice::from_ref(&wedged)).is_empty(),
+            "no volume is provisioned on a machine that says its disk is full"
+        );
+        let (why, sentence) = storage_pending_reason(&policy, "mc-fs", &[wedged]);
+        assert_eq!(why, PendingReason::NodeUnhealthy);
+        assert!(sentence.contains("agent-1a"), "{sentence}");
+        assert!(sentence.contains("DiskPressure"), "{sentence}");
+    }
+
+    /// A word this build has never heard of still takes the machine out of
+    /// the running, and travels into the sentence as it came.
+    ///
+    /// The controller half branches on the LIST and never on the variant,
+    /// exactly so that an agent newer than its controller is believed rather
+    /// than ignored.
+    #[test]
+    fn an_unknown_condition_still_vetoes_the_node() {
+        let odd = Candidate {
+            unhealthy: vec!["FanFailure".to_string()],
+            ..gpu_candidate("agent-1a", &[])
+        };
+        let vm = vm();
+        assert!(feasible(&vm, std::slice::from_ref(&odd)).is_empty());
+        let (why, sentence) = pending_reason_of(&vm, &[odd]);
+        assert_eq!(why, PendingReason::NodeUnhealthy);
+        assert!(sentence.contains("FanFailure"), "{sentence}");
+    }
+
+    /// And the direction that must NOT change: an empty list is what every
+    /// agent from before this field reports, so it can only ever mean "said
+    /// nothing". A veto, never a permission.
+    #[test]
+    fn a_node_that_says_nothing_is_placed_exactly_as_before() {
+        let quiet = gpu_candidate("agent-1a", &[]);
+        assert!(quiet.unhealthy.is_empty());
+        let vm = vm();
+        assert_eq!(
+            FirstFit
+                .assign(&vm, std::slice::from_ref(&quiet))
+                .as_deref(),
+            Some("agent-1a")
+        );
+    }
+
+    /// The other half of the same question, and the one that was answered
+    /// about the wrong machines: the narrowing leaves a node standing, the
+    /// scheduler refuses it anyway, and the sentence has to be about THAT
+    /// node.
+    ///
+    /// Straight out of the drain scenario. `agent-1` holds the disks and is
+    /// drained; `agent-2` is fine and irrelevant, because the VM cannot go
+    /// there. Before this, the fall-through counted both and reported a
+    /// hypervisor split.
+    #[test]
+    fn a_drained_node_holding_the_disks_is_named_as_the_reason() {
+        let drained = Candidate {
+            schedulable: false,
+            ..gpu_candidate("agent-1", &[])
+        };
+        let fine = gpu_candidate("agent-2", &[]);
+        let bindings = [binding(
+            "data-1",
+            Some("agent-1"),
+            Some(Locality::NodeLocal),
+            &[],
+        )];
+
+        // What `place` computes: the volumes narrow the list to the machine
+        // that holds them, and the machine that holds them is drained.
+        let allowed = feasible_for_volumes(&bindings, vec![&drained, &fine]);
+        assert_eq!(
+            allowed.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            ["agent-1"]
+        );
+
+        let (why, sentence) =
+            volume_nodes_unusable(&bindings, &allowed).expect("the volumes are the reason");
+        assert_eq!(why, PendingReason::NoNodeForVolume);
+        assert_eq!(
+            sentence,
+            "the node holding this vm's volumes (agent-1) is drained"
+        );
+
+        // Not connected outranks drained: un-draining a machine that is gone
+        // fixes nothing.
+        let gone = Candidate {
+            connected: false,
+            alive: false,
+            ..drained.clone()
+        };
+        let (_, sentence) = volume_nodes_unusable(&bindings, &[&gone]).expect("still the reason");
+        assert!(sentence.ends_with("is not connected"), "{sentence}");
+
+        // Two machines, two states, and each one is named.
+        let both = [binding(
+            "data-1",
+            Some("agent-1"),
+            Some(Locality::Shared),
+            &["agent-1", "agent-3"],
+        )];
+        let third = Candidate {
+            connected: false,
+            alive: false,
+            ..gpu_candidate("agent-3", &[])
+        };
+        let (_, sentence) =
+            volume_nodes_unusable(&both, &[&drained, &third]).expect("still the reason");
+        assert_eq!(
+            sentence,
+            "no node holding this vm's volumes can take it: agent-1 is drained, \
+             agent-3 is not connected"
+        );
+    }
+
+    /// And the three ways this sentence is NOT the true one. Each would be a
+    /// sharper answer replaced by a vaguer one, which is the same defect in
+    /// the other direction.
+    #[test]
+    fn the_volumes_are_not_blamed_when_they_are_not_the_reason() {
+        let drained = Candidate {
+            schedulable: false,
+            ..gpu_candidate("agent-1", &[])
+        };
+        let fine = gpu_candidate("agent-2", &[]);
+
+        // Nothing pinned: an unknown locality is a preference, and a VM that
+        // could have gone anywhere was not defeated by its disk.
+        let soft = [binding("data-1", Some("agent-1"), None, &[])];
+        assert!(volume_nodes_unusable(&soft, &[&drained]).is_none());
+
+        let hard = [binding(
+            "data-1",
+            Some("agent-1"),
+            Some(Locality::NodeLocal),
+            &[],
+        )];
+        // The narrowing emptied the list: that is `volume_pending_reason`'s
+        // sentence, and it names the volume.
+        assert!(volume_nodes_unusable(&hard, &[]).is_none());
+        // A usable node survived, so something else — room, a label, a device
+        // — is what defeated the placement.
+        assert!(volume_nodes_unusable(&hard, &[&drained, &fine]).is_none());
+    }
+
+    /// The soft half keeps its fallback, which is the whole difference
+    /// between a preference and a requirement.
+    #[test]
+    fn an_unknown_locality_prefers_the_volumes_node_and_gives_way() {
+        let nodes = [gpu_candidate("manacor", &[]), gpu_candidate("soller", &[])];
+        let bindings = [binding("data-1", Some("soller"), None, &[])];
+        let preferred = preferred_for_volumes(&bindings, nodes.iter().collect());
+        assert_eq!(preferred.len(), 1);
+        assert_eq!(preferred[0].name, "soller");
+
+        // ... and where the holder is not among them, everything stands.
+        let elsewhere = [binding("data-1", Some("inca"), None, &[])];
+        assert_eq!(
+            preferred_for_volumes(&elsewhere, nodes.iter().collect()).len(),
+            2,
+            "a preference that can strand a vm is a requirement"
+        );
+    }
+
+    /// A VM whose disks are all inline asks nothing of either half — which is
+    /// every VM written before this milestone.
+    #[test]
+    fn a_vm_with_no_references_is_left_exactly_as_it_was() {
+        let nodes = [gpu_candidate("manacor", &[]), gpu_candidate("soller", &[])];
+        assert_eq!(feasible_for_volumes(&[], nodes.iter().collect()).len(), 2);
+        assert_eq!(preferred_for_volumes(&[], nodes.iter().collect()).len(), 2);
+    }
+
+    fn summary(name: &str, ready: bool, schedulable: bool, labels: &[(&str, &str)]) -> NodeSummary {
+        NodeSummary {
+            name: name.into(),
+            ready,
+            schedulable,
+            drain: false,
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            vcpus: 8,
+            mem_mib: 8192,
+            capabilities: Vec::new(),
+            accepts: Vec::new(),
+            vms: 0,
+            conditions: Vec::new(),
+            draining: None,
+        }
+    }
+
+    /// The same summary with one condition on it — a machine that is up,
+    /// willing, and has just said it cannot act.
+    fn wedged_summary(name: &str, labels: &[(&str, &str)]) -> NodeSummary {
+        let mut n = summary(name, true, true, labels);
+        n.conditions = vec![crate::NodeCondition {
+            type_: crate::NodeConditionType::StoreUnhealthy.as_str().into(),
+            message: "the store refuses writes".into(),
+        }];
+        n
+    }
+
+    /// The finding from the image report, closed: a `nodeSelector` now cuts
+    /// CLUSTERS. Before this it was checked one tier down, after the binding,
+    /// so a VM no node matched went Pending on a cluster it should never have
+    /// been sent to.
+    #[test]
+    fn a_cluster_with_no_matching_node_cannot_serve_the_vm() {
+        let want: BTreeMap<String, String> = [("disk".to_string(), "nvme".to_string())]
+            .into_iter()
+            .collect();
+        let demand = NodeDemand {
+            selector: &want,
+            allowed: None,
+        };
+        assert!(demand.met_by_a_node(&[summary("a", true, true, &[("disk", "nvme")])]));
+        assert!(!demand.met_by_a_node(&[summary("a", true, true, &[("disk", "sata")])]));
+        assert!(!demand.met_by_a_node(&[]));
+
+        // A node that is down or drained does not count, which is the whole
+        // reason to ask before the binding rather than after it.
+        assert!(!demand.met_by_a_node(&[summary("a", false, true, &[("disk", "nvme")])]));
+        assert!(!demand.met_by_a_node(&[summary("a", true, false, &[("disk", "nvme")])]));
+        // And neither does one that is up, uncordoned and has said it cannot
+        // act. That is D8's half at THIS tier: a cloud that binds a VM to a
+        // cluster whose only matching machine is wedged has sent it somewhere
+        // it can only sit Pending.
+        assert!(!demand.met_by_a_node(&[wedged_summary("a", &[("disk", "nvme")])]));
+        // One healthy machine beside it is enough, as it always was.
+        assert!(demand.met_by_a_node(&[
+            wedged_summary("a", &[("disk", "nvme")]),
+            summary("b", true, true, &[("disk", "nvme")]),
+        ]));
+    }
+
+    /// And the volume half: a node-local disk pins the VM to one machine, so
+    /// only the cluster holding that machine is a candidate at all.
+    #[test]
+    fn a_node_local_volume_cuts_every_cluster_but_the_one_holding_it() {
+        let none = BTreeMap::new();
+        let demand = NodeDemand {
+            selector: &none,
+            allowed: Some(vec!["manacor".to_string()]),
+        };
+        assert!(demand.met_by_a_node(&[
+            summary("soller", true, true, &[]),
+            summary("manacor", true, true, &[])
+        ]));
+        assert!(!demand.met_by_a_node(&[summary("soller", true, true, &[])]));
+    }
+
+    /// Both halves at once, which is the case that made them one question:
+    /// the node that holds the disk also has to carry the labels.
+    #[test]
+    fn the_node_holding_the_disk_must_also_match_the_selector() {
+        let want: BTreeMap<String, String> = [("zone".to_string(), "a".to_string())]
+            .into_iter()
+            .collect();
+        let demand = NodeDemand {
+            selector: &want,
+            allowed: Some(vec!["manacor".to_string()]),
+        };
+        assert!(demand.met_by_a_node(&[summary("manacor", true, true, &[("zone", "a")])]));
+        assert!(
+            !demand.met_by_a_node(&[
+                summary("manacor", true, true, &[("zone", "b")]),
+                summary("soller", true, true, &[("zone", "a")])
+            ]),
+            "one node has the labels and the other has the disk: neither can run it"
+        );
+    }
+
+    /// Narrowing: unknown constrains nothing, two sets intersect, and an
+    /// empty intersection is the honest answer that no node serves both.
+    #[test]
+    fn two_volumes_narrow_to_the_nodes_that_serve_both() {
+        let a = || Some(vec!["manacor".to_string(), "soller".into()]);
+        assert_eq!(narrow_allowed(None, None), None);
+        assert_eq!(narrow_allowed(None, a()), a());
+        assert_eq!(narrow_allowed(a(), None), a());
+        assert_eq!(
+            narrow_allowed(a(), Some(vec!["soller".to_string(), "inca".into()])),
+            Some(vec!["soller".to_string()])
+        );
+        assert_eq!(
+            narrow_allowed(a(), Some(vec!["inca".to_string()])),
+            Some(Vec::new()),
+            "two node-local disks on two machines: no node serves both"
+        );
+    }
+
+    /// A VM that refers to nothing and selects nothing demands nothing —
+    /// every VM before this milestone, and the case that must not regress.
+    #[test]
+    fn a_vm_that_asks_for_nothing_is_served_by_any_node_that_is_up() {
+        let none = BTreeMap::new();
+        let demand = NodeDemand {
+            selector: &none,
+            allowed: None,
+        };
+        assert!(demand.met_by_a_node(&[summary("a", true, true, &[])]));
+        assert!(
+            !demand.met_by_a_node(&[]),
+            "but a cluster with no nodes serves nothing"
+        );
+    }
+
+    /// The whole of what position 6 buys, in one place: the same node, the
+    /// two questions, two answers.
+    ///
+    /// A storage-only node has room, is connected and is schedulable. Before
+    /// the requirement it was indistinguishable from a compute node, so the
+    /// first ordinary VM landed there, the agent refused correctly, and the
+    /// VM ended Failed on a machine that could never have run it. Now it is
+    /// not a candidate for a VM — and still is one for a disk, which is the
+    /// reason to have such a node at all.
+    #[test]
+    fn a_storage_only_node_serves_disks_and_no_longer_serves_vms() {
+        let shelf = storage_candidate("shelf-1", &["lvm-thin"]);
+        let compute = gpu_candidate("manacor", &[]);
+
+        // The VM half: only the compute node.
+        let placed = FirstFit.assign(&vm(), &[shelf.clone(), compute.clone()]);
+        assert_eq!(placed.as_deref(), Some("manacor"));
+        assert_eq!(
+            FirstFit.assign(&vm(), std::slice::from_ref(&shelf)),
+            None,
+            "a node that runs no vms is not a candidate for one"
+        );
+
+        // And the sentence an operator reads says what is missing rather
+        // than something about room.
+        let (why, sentence) = pending_reason_of(&vm(), std::slice::from_ref(&shelf));
+        assert_eq!(why, PendingReason::Unserved);
+        assert!(sentence.contains("hypervisor"), "{sentence}");
+
+        // The volume half: the shelf serves the pool it was built for, and
+        // the requirement did not touch that question.
+        let pool = storage_pool("lvm-thin", &[]);
+        let policy = StoragePolicy::of(&pool);
+        let both = [shelf, compute];
+        let served: Vec<&str> = feasible_for_storage(&policy, &both)
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(served, vec!["shelf-1"], "a disk may still go there");
     }
 }

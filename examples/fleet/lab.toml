@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+#
+# The lab as it stands (lab/LAB.md in the journal, Image 58): twelve
+# OpenNebula VMs, three tiers, two clusters. Every one of them is a CONTEXT
+# node — no `disk`, because the disk came from a registered image and the vm
+# lifecycle belongs to OpenNebula — so this plan builds no images. What it
+# does is name the groups, and from the groups fall the twelve context
+# variables that are typed into the .tpl by hand today: the etcd peer sets and
+# their tokens, cluster_name, every controller_addrs and cloud_addrs, and both
+# advertise addresses.
+#
+# Read-only against the real fleet:
+#
+#   . deploy/env
+#   meister-deploy -f examples/fleet/lab.toml plan
+#   meister-deploy -f examples/fleet/lab.toml check \
+#       --cli 'target/release/meister --config /mnt/vmstore/MeisterStack/cli.mtls.toml -p cloud-mtls'
+#
+# and `push`/`keys push` with --dry-run, which prints what they would do.
+
+[fleet]
+name   = "uni-lab"
+# The name the addons box is reached under is `<node>.<domain>`, and it is not
+# decoration: kanidm's issuer is an https url whose certificate has to match
+# it, and its `domain` is an `iname` that refuses anything starting with a
+# digit. A plan with an addons node and no domain is refused for that reason
+# (D-P6), and this line is what makes `MEISTER_HOSTS` fall out of the plan
+# rather than being typed into the twelve .tpl by hand.
+domain = "lab"
+ca     = "/mnt/vmstore/MeisterStack/labpki"
+
+[defaults]
+roles    = ["agent"]
+ssh_user = "root"
+
+# --- the cloud: one raft group of three ------------------------------------
+# The hostnames are not the vm names: they are the node_id, the stem of
+# system-node-<id>, and the `host` label in Loki.
+
+# cloud-a carries the addons as well: kanidm, garage, prometheus, loki, tempo
+# and grafana. One box, and it is this one because it is the only one with a
+# second block big enough (see nix/addons.nix). The whole fleet is then
+# pointed at `meister-cloud.lab`, which this plan derives.
+[[node]]
+name    = "meister-cloud"
+group   = "cloud"
+roles   = ["cloud", "addons"]
+address = "10.128.1.103"
+
+[[node]]
+name    = "meister-cloudb"
+group   = "cloud"
+roles   = ["cloud"]
+address = "10.128.1.112"
+
+[[node]]
+name    = "meister-cloudc"
+group   = "cloud"
+roles   = ["cloud"]
+address = "10.128.1.113"
+
+# --- cluster-1: three replicas across palma, campos and calvia -------------
+
+[[node]]
+name    = "meister-cluster1a"
+group   = "cluster-1"
+roles   = ["cluster"]
+address = "10.128.1.104"
+
+[[node]]
+name    = "meister-cluster1b"
+group   = "cluster-1"
+roles   = ["cluster"]
+address = "10.128.1.110"
+
+[[node]]
+name    = "meister-cluster1c"
+group   = "cluster-1"
+roles   = ["cluster"]
+address = "10.128.1.111"
+
+# --- cluster-2: one replica, which is the single-member case ---------------
+
+[[node]]
+name    = "meister-cluster2"
+group   = "cluster-2"
+roles   = ["cluster"]
+address = "10.128.1.105"
+
+# --- the agents. `group` names the CLUSTER they belong to, and that is where
+# their controller_addrs come from — nobody types an address twice.
+
+[[node]]
+name    = "agent-1a"
+group   = "cluster-1"
+address = "10.128.1.106"
+labels  = { host = "palma" }
+
+[[node]]
+name    = "agent-1b"
+group   = "cluster-1"
+address = "10.128.1.107"
+labels  = { host = "campos" }
+
+[[node]]
+name    = "agent-1c"
+group   = "cluster-1"
+address = "10.128.1.114"
+labels  = { host = "calvia" }
+
+[[node]]
+name    = "agent-2a"
+group   = "cluster-2"
+address = "10.128.1.108"
+labels  = { host = "palma" }
+
+[[node]]
+name    = "agent-2b"
+group   = "cluster-2"
+address = "10.128.1.109"
+labels  = { host = "calvia" }
+
+# Only the two facts a rollout needs; the vm lifecycle is OpenNebula's and
+# stays out of this tool (Tofu, later).
+[opennebula]
+frontend = "10.0.8.21"
+image    = "MeisterStackObs"

@@ -4,6 +4,7 @@ members = [
 	"shared/*",
 	"components/*",
 	"drivers/*",
+	"tools/meister-deploy",
 ]
 
 [workspace.package]
@@ -35,6 +36,10 @@ prost-types = "0.14"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# JSON Schema, derived from the very types serde reads. The API publishes
+# these, so a second client — a web interface, a generator, an agent — can
+# learn the shape of an object instead of being told it in prose.
+schemars = { version = "1", features = ["chrono04"] }
 
 # Error Handling
 anyhow = "1"
@@ -54,6 +59,12 @@ axum = { version = "0.8" }
 # The Service trait and `oneshot`, for handing a hyper connection to an axum
 # Router by hand. Already in the tree under axum.
 tower = { version = "0.5", features = ["util"] }
+
+# Test utilities. A test that writes a file writes it somewhere nobody else
+# is: a fixed path under /tmp turns two concurrent `cargo test` runs — or one
+# run beside a leftover from a crashed one — into a flake nobody can
+# reproduce, and the directory goes away on a panic as well as on a pass.
+tempfile = "3"
 
 # Utils
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
@@ -97,7 +108,11 @@ rtnetlink = "0.21"
 
 # telemetry
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# "json" is the second log format (telemetry::LogFormat). It is a feature
+# rather than a default because it pulls serde_json into every binary that
+# links the subscriber, and this stack wants that trade said out loud: a
+# collector reads json, a human reads the other one.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
@@ -109,5 +124,7 @@ tracing-opentelemetry = "0.33"
 prometheus = { version = "0.14", default-features = false }
 
 # os utils
-nix = { version = "0.31", features = ["fs", "zerocopy", "ioctl", "process", "signal", "resource"] }
+# "user" is getgrnam: the agent turns [paths] socket_group into a gid without
+# shelling out to a tool that may not be on a unit's PATH.
+nix = { version = "0.31", features = ["fs", "zerocopy", "ioctl", "process", "signal", "resource", "term", "user"] }
 libc = "0.2"

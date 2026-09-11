@@ -76,4 +76,25 @@ pub trait ResourceConfiner: Send + Sync {
     // Reconcile requirements
     fn pids_in_slice(&self, name: &str) -> ConfinerResult<Vec<u32>>;
     fn kill_slice(&self, name: &str) -> ConfinerResult<()>;
+
+    /// The directory this confiner puts its slices under, if it uses one.
+    ///
+    /// Asked so that the agent can keep checking that the directory is still
+    /// what it has to be — a cgroup2 mount and not an ordinary directory,
+    /// which is the difference between a node that can tear a VM down and one
+    /// that cannot. The check used to run once at start-up, and a
+    /// `/sys/fs/cgroup` that was unmounted or shadowed while the agent ran was
+    /// then something nobody said anything about until the first delete hung.
+    ///
+    /// It is here rather than passed around beside the driver because the
+    /// driver is the party that KNOWS: it is the one that writes into the
+    /// directory, and a second copy of the path in the reconciler would be a
+    /// second thing to keep in step with the config.
+    ///
+    /// `None` is a confiner with no directory to look at — every fake in this
+    /// tree's tests, and any future confiner that is not cgroupfs. Nothing is
+    /// then checked and nothing is claimed, which is the honest answer.
+    fn root(&self) -> Option<&std::path::Path> {
+        None
+    }
 }

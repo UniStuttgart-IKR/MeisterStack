@@ -25,7 +25,7 @@ use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 
 use crate::object::Resource;
-use crate::resources::{CertificateSigningRequest, FloatingIp, Image, Vm, Volume};
+use crate::resources::{CertificateSigningRequest, FloatingIp, Image, Tenant, User, Vm, Volume};
 
 /// Groups whose name starts with this are the stack's own machinery — nodes,
 /// controllers — rather than people. Kubernetes' convention, and its meaning:
@@ -35,9 +35,19 @@ pub const SYSTEM_PREFIX: &str = "system:";
 pub const GROUP_NODES: &str = "system:nodes";
 /// The same one tier up: CN `system:cluster:<cluster_name>`.
 pub const GROUP_CLUSTERS: &str = "system:clusters";
-/// The two groups a user certificate can carry, one each.
+/// And one tier up again: CN `system:cloud:<cloud_name>`.
+///
+/// The three replicas of one cloud SHARE this name, exactly as the three
+/// replicas of a cluster share theirs. It is the cloud's identity and not a
+/// replica's: what it is for is a replica asking its sibling for a console,
+/// and "which of the three am I talking to" is not a question that has an
+/// answer worth authorizing against — they are interchangeable by design.
+pub const GROUP_CLOUDS: &str = "system:clouds";
+/// The four groups a user certificate can carry, one each.
 pub const GROUP_ADMINS: &str = "meister:admins";
+pub const GROUP_OPERATORS: &str = "meister:operators";
 pub const GROUP_MEMBERS: &str = "meister:members";
+pub const GROUP_VIEWERS: &str = "meister:viewers";
 /// Break glass. Kubernetes' own group, with Kubernetes' own meaning: a
 /// certificate carrying it is above the directory and answers to no `User`
 /// object at all.
@@ -51,31 +61,65 @@ pub const GROUP_MASTERS: &str = "system:masters";
 
 /// What a `User` may do. It is a field on the object in etcd — that is where
 /// the truth is — and the signer stamps the matching group into the
-/// certificate it issues so that a tier without the directory (the cluster)
-/// can still tell an admin from a member.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// certificate it issues so that a person holding one can read what it is
+/// for. Since the permission table below, that group is a LABEL: the cloud
+/// takes the role out of the directory, and the cluster refuses a user
+/// certificate outright.
+///
+/// Four, and the two new ones are the two halves the first two conflated.
+/// `Operator` is somebody who drains a node and declares a pool and has no
+/// business in the user directory; `Viewer` is somebody who may look and not
+/// touch, which is what an on-call rotation and a dashboard both want and
+/// what `Member` was being stretched to mean.
+#[derive(
+    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Admin,
+    Operator,
     #[default]
     Member,
+    Viewer,
 }
 
 impl Role {
-    pub const ALL: [Role; 2] = [Role::Admin, Role::Member];
+    /// Every role, most to least. The order here is what `from_groups` reads
+    /// when a certificate carries two of them; the ORDERING of the type is
+    /// `rank` below, and the test nails both.
+    pub const ALL: [Role; 4] = [Role::Admin, Role::Operator, Role::Member, Role::Viewer];
+
+    /// Least to most. `Viewer < Member < Operator < Admin` is the whole
+    /// policy's backbone: the table says the least role a thing needs, and
+    /// `permits` asks whether the caller is at least that.
+    ///
+    /// Written out rather than derived from the declaration order, because
+    /// deriving it would make reordering the variants a silent policy change.
+    fn rank(self) -> u8 {
+        match self {
+            Role::Viewer => 0,
+            Role::Member => 1,
+            Role::Operator => 2,
+            Role::Admin => 3,
+        }
+    }
 
     /// The group a certificate carries for this role.
     pub fn group(self) -> &'static str {
         match self {
             Role::Admin => GROUP_ADMINS,
+            Role::Operator => GROUP_OPERATORS,
             Role::Member => GROUP_MEMBERS,
+            Role::Viewer => GROUP_VIEWERS,
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Admin => "admin",
+            Role::Operator => "operator",
             Role::Member => "member",
+            Role::Viewer => "viewer",
         }
     }
 
@@ -83,12 +127,25 @@ impl Role {
         Self::ALL.into_iter().find(|r| r.as_str() == s)
     }
 
-    /// The role a set of groups implies, if any. Admin wins: a certificate
-    /// carrying both is not a puzzle worth solving in the negative direction.
+    /// The role a set of groups implies, if any. The highest wins: a
+    /// certificate carrying two is not a puzzle worth solving in the negative
+    /// direction.
     pub fn from_groups(groups: &[String]) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|r| groups.iter().any(|g| g == r.group()))
+    }
+}
+
+impl Ord for Role {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+impl PartialOrd for Role {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -119,9 +176,14 @@ impl Identity {
             || self.groups.iter().any(|g| g.starts_with(SYSTEM_PREFIX))
     }
 
-    /// The role this identity's certificate claims. What the cloud does with
-    /// it depends on whether it has the directory to check it against — see
-    /// `permits`.
+    /// The role this identity's certificate claims.
+    ///
+    /// Nothing in the authorization path reads this any more, and that is the
+    /// permission table's doing: the cloud takes the role out of the
+    /// directory, and a tier without a directory authorizes no person at all.
+    /// What the group in a certificate is now is a LABEL — so that somebody
+    /// holding one can read what it was issued for — and this is how to read
+    /// it. See `rest::grant_of`.
     pub fn claimed_role(&self) -> Option<Role> {
         Role::from_groups(&self.groups)
     }
@@ -199,6 +261,24 @@ pub trait Authenticator: Send + Sync {
     /// `Ok(None)` = not my business, ask the next link. `Ok(Some)` = this is
     /// who it is. `Err` = I checked, and no — which ends the chain.
     fn authenticate(&self, req: &AuthRequest) -> anyhow::Result<Option<Identity>>;
+
+    /// Can this link authenticate anybody right now?
+    ///
+    /// The difference between CONFIGURED and READY, and D11 is what it is
+    /// for: the lab's cloud offered `auth=mtls,oidc` in its discovery
+    /// document for hours while the identity provider was unreachable and no
+    /// signing key had ever been fetched. Every token would have been
+    /// refused. A client that reads the document and believes it gets a
+    /// promise that does not hold, and the failure lands at the far end.
+    ///
+    /// `true` by default, because it is true of every link whose readiness is
+    /// its construction: an mTLS authenticator holds a CA it was given, and a
+    /// bearer link holds a token it was given. Only a link that loads
+    /// something from somewhere else has a second state, and only that link
+    /// overrides this.
+    fn ready(&self) -> bool {
+        true
+    }
 }
 
 /// What the chain concluded.
@@ -225,6 +305,11 @@ impl std::fmt::Display for Rejected {
 #[derive(Default)]
 pub struct AuthChain {
     links: Vec<Box<dyn Authenticator>>,
+    /// What each link is, in order, for the discovery document: "mtls",
+    /// "oidc", "bearer". A name and not the link itself, because what a
+    /// client needs from this is which credentials the endpoint will look at
+    /// — the CA path and the token behind them are nobody else's business.
+    names: Vec<&'static str>,
 }
 
 /// How many links, and nothing about what they are: an authenticator's
@@ -237,8 +322,52 @@ impl std::fmt::Debug for AuthChain {
 }
 
 impl AuthChain {
+    /// A chain that does not say what it is made of. `rest::build_chain` is
+    /// the one place a real one is assembled and it uses `named`; this is for
+    /// tests, where the links are anonymous by construction.
     pub fn new(links: Vec<Box<dyn Authenticator>>) -> Self {
-        Self { links }
+        Self {
+            links,
+            names: Vec::new(),
+        }
+    }
+
+    /// The same, with the config names of the links.
+    pub fn named(links: Vec<Box<dyn Authenticator>>, names: Vec<&'static str>) -> Self {
+        Self { links, names }
+    }
+
+    /// What a discovery document says under `auth`: the links, comma-joined,
+    /// or `none` when nothing is configured.
+    ///
+    /// `none` is not "unknown": it is the anonymous mode this stack has run
+    /// in since M1, and a client that reads it may say so out loud rather
+    /// than waiting for a 401 that will never come.
+    ///
+    /// A link that is configured and cannot authenticate anybody yet is named
+    /// `<name>:degraded` (D11). Named rather than dropped, and that is the
+    /// decision: dropping it would make "this deployment has no identity
+    /// provider" and "the identity provider is unreachable" the same
+    /// sentence, and they need different people. `:degraded` says the door
+    /// exists and is shut, which is what an operator has to know and what a
+    /// client has to stop relying on.
+    ///
+    /// Asked at the moment it is answered and never cached — see
+    /// `rest::discovery`. A snapshot taken when the router was built would
+    /// say `degraded` for ever, because at start-up nothing has loaded yet.
+    pub fn describe(&self) -> String {
+        if self.names.is_empty() {
+            return "none".to_string();
+        }
+        self.names
+            .iter()
+            .zip(self.links.iter())
+            .map(|(name, link)| match link.ready() {
+                true => (*name).to_string(),
+                false => format!("{name}:degraded"),
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     pub fn is_empty(&self) -> bool {
@@ -395,13 +524,34 @@ pub struct Attempt<'a> {
 /// `None` means the path is not an API object route at all — /healthz and
 /// /readyz — and those are never gated: a probe that needs a certificate is a
 /// probe that cannot tell "down" from "not invited".
+///
+/// Two API paths are in that set too, and for one reason: what they answer is
+/// not an object. The discovery document falls out of the prefix (there is no
+/// segment under the group-version at all), and `/schemas` is named here —
+/// the comment over `SCHEMAS_PATH` has always said it should be let past
+/// "exactly as it lets discovery past, the shape of an object is not a
+/// secret", and the code did not do it. A build-time generator needed a
+/// credential for a document with nothing in it but field names.
 pub fn classify<'a>(method: &str, path: &'a str) -> Option<Attempt<'a>> {
     let rest = path.strip_prefix("/apis/meister.io/v1/")?;
     let rest = rest.split('?').next().unwrap_or(rest);
+    // The document, and only the document: anything UNDER it would be a
+    // route this API does not serve, and `statuses` answers those with a 404
+    // rather than this function with a shrug.
+    if rest.trim_end_matches('/') == "schemas" {
+        return None;
+    }
     let mut parts = rest.split('/').filter(|s| !s.is_empty());
     let resource = parts.next()?;
     let _name = parts.next();
     let subresource = parts.next();
+    // A CORS preflight carries no credentials by definition, so classifying
+    // it as a write would answer 401 to the question the browser asks BEFORE
+    // it is willing to send any. Not a permission: the router has no OPTIONS
+    // handler, so an unanswered preflight is a 405 exactly as it was.
+    if method == "OPTIONS" {
+        return None;
+    }
     let verb = match (method, subresource) {
         ("GET" | "HEAD", _) => Verb::Read,
         (_, Some("approval")) => Verb::Approve,
@@ -433,11 +583,32 @@ pub fn classify<'a>(method: &str, path: &'a str) -> Option<Attempt<'a>> {
 /// whose deletion can destroy something irreplaceable, which is a reason to
 /// be careful in the HANDLER (see the release finalizer) and not a reason to
 /// shut this door — a member who cannot make a disk cannot make a VM.
-const TENANT_SCOPED: [&str; 4] = [
+const TENANT_SCOPED: [&str; 8] = [
     Vm::RESOURCE,
     Image::RESOURCE,
     FloatingIp::RESOURCE,
     Volume::RESOURCE,
+    // A snapshot is a copy of a tenant's data and is therefore the tenant's,
+    // by exactly the argument the volume it came from is.
+    crate::resources::VolumeSnapshot::RESOURCE,
+    // A secret is the tenant's own bytes and nothing else is: there is no
+    // administrator's half to it the way a pool is the half of a volume.
+    // Which makes the READ half of this door the interesting one — and it is
+    // shut by the object rather than by the table, because what a read of a
+    // secret answers with is its key NAMES. See `Secret::redacted`.
+    crate::resources::Secret::RESOURCE,
+    // A migration is a record of what happened to a tenant's VM, so it is
+    // filed in that tenant and read by them. It is the one resource here
+    // whose WRITE door is not the tenant's — see `Class::TenantOperated`.
+    crate::resources::VmMigration::RESOURCE,
+    // A router is filed in a tenant for exactly that reason: it is that
+    // tenant's way out and nobody else's, and a member should be able to see
+    // whether theirs is up. It is the SECOND resource whose write door is not
+    // the tenant's, and the same argument makes it so — a router names the
+    // operator's provider network and takes a gateway slot on the operator's
+    // machines, which is running the estate rather than using it. See
+    // `Class::TenantOperated`.
+    crate::resources::Router::RESOURCE,
 ];
 
 /// Whether a resource is one whose objects belong to a tenant.
@@ -445,7 +616,114 @@ pub fn is_tenant_scoped(resource: &str) -> bool {
     TENANT_SCOPED.contains(&resource)
 }
 
+/// What KIND of thing a resource is, for the purposes of the table below.
+///
+/// Four classes and not fourteen resources, because the sentence an operator
+/// has to be able to say out loud is "an operator drains machines and does
+/// not touch the directory" — not a list. A resource that does not fit one of
+/// these is a resource that needs a fifth class and a paragraph, which is the
+/// point of making it an enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// Who exists and what they may do: `tenants`, `users`, and saying yes to
+    /// a certificate request. An admin's, all of it.
+    Directory,
+    /// The estate: clusters, nodes, and the pools and subnets an operator was
+    /// actually given. Everyone with a role may look; an operator may change.
+    Infra,
+    /// What lives inside a tenant: vms, images, volumes, floating addresses.
+    /// The verb door is here, WHOSE object it is is `permits_object`.
+    Tenant,
+    /// Asking for a certificate — the renewal path. Not a privilege: the gate
+    /// is the approval, which is `Directory`. K8s says the same thing.
+    CsrCreate,
+    /// A tenant's object that only an OPERATOR may write: `vmmigrations` and
+    /// `routers`.
+    ///
+    /// The fifth class the comment above asked for, with its paragraph. A
+    /// live migration is filed in a tenant — it is a record of what happened
+    /// to their VM and they should be able to read it — but asking for one is
+    /// running the estate, not using it: it is how an operator gets a machine
+    /// empty, it costs a stream between two hosts, and a member who could
+    /// start them could move their own VMs around somebody else's fleet all
+    /// afternoon.
+    ///
+    /// So `Tenant` for the read half, `Infra` for the write half, which is
+    /// exactly what "a move is an operation" means. Squeezing it into either
+    /// of those two would have got one of the halves wrong.
+    ///
+    /// A `Router` is here by the same argument, one noun over: it is the
+    /// tenant's way out and their business to read, and making one names the
+    /// operator's provider network and takes a gateway slot on the operator's
+    /// machines. A member who could create routers could fill every gateway
+    /// node in the fleet an afternoon.
+    TenantOperated,
+}
+
+/// Which class a resource falls in.
+///
+/// `certificatesigningrequests` is in two of them, and that split IS the
+/// design: creating, reading and deleting your own request is `CsrCreate` and
+/// open to anybody the directory knows, and saying yes to one is `Directory`
+/// and an admin's. `classify` only ever produces `Verb::Approve` for the
+/// `/approval` subresource, so the verb is enough to tell them apart.
+pub fn class_of(resource: &str, verb: Verb) -> Class {
+    match resource {
+        Tenant::RESOURCE | User::RESOURCE => Class::Directory,
+        CertificateSigningRequest::RESOURCE if verb == Verb::Approve => Class::Directory,
+        CertificateSigningRequest::RESOURCE => Class::CsrCreate,
+        // Before the tenant-scoped arm, and it has to be: a migration IS
+        // tenant-scoped, and this is the half of that sentence the general
+        // arm would get wrong. A router is the second of them.
+        crate::resources::VmMigration::RESOURCE | crate::resources::Router::RESOURCE => {
+            Class::TenantOperated
+        }
+        r if is_tenant_scoped(r) => Class::Tenant,
+        // Everything else is the estate: clusters, nodes, storage pools,
+        // floating pools, routed subnets, the provider networks a cluster
+        // gave an interface away for — and the event log, which is a read of
+        // what happened to the estate and is filtered by the handler for a
+        // caller confined to one tenant.
+        _ => Class::Infra,
+    }
+}
+
+/// The least role that may do `verb` to something in `class`.
+///
+/// `None` is "nobody but `system:masters`", and it is what the two
+/// unreachable cells of the table say: there is no approving a VM and no
+/// approving a node.
+///
+/// This function IS the policy. Everything above it decides which cell to
+/// look in and everything below it compares two roles.
+pub fn least_role(class: Class, verb: Verb) -> Option<Role> {
+    match (class, verb) {
+        // Who exists, and who may say yes to a certificate. One answer.
+        (Class::Directory, _) => Some(Role::Admin),
+        // The renewal path: anybody the directory knows at all, which is the
+        // lowest role there is.
+        (Class::CsrCreate, Verb::Read | Verb::Write) => Some(Role::Viewer),
+        (Class::CsrCreate, Verb::Approve) => None,
+        (Class::Infra, Verb::Read) => Some(Role::Viewer),
+        (Class::Infra, Verb::Write) => Some(Role::Operator),
+        (Class::Tenant, Verb::Read) => Some(Role::Viewer),
+        (Class::Tenant, Verb::Write) => Some(Role::Member),
+        // The fifth class: read like a tenant's object, write like the
+        // estate. See `Class::TenantOperated`.
+        (Class::TenantOperated, Verb::Read) => Some(Role::Viewer),
+        (Class::TenantOperated, Verb::Write) => Some(Role::Operator),
+        // Approving is one act on one resource, and it is in `Directory`.
+        (Class::Infra | Class::Tenant | Class::TenantOperated, Verb::Approve) => None,
+    }
+}
+
 /// The verb half of the policy: may this caller do this KIND of thing at all.
+///
+/// A table since the roles became four: `class_of` says which cell,
+/// `least_role` says what it costs, and the comparison is one `<`. The
+/// `match` this replaced grew a branch per role per resource and could not be
+/// read as a policy at all, which is how "system may do anything" survived in
+/// it for four milestones.
 ///
 /// `role` is what the caller could establish: the cloud reads it off the
 /// `User` object, because the directory is the truth and a role change there
@@ -464,35 +742,138 @@ pub fn is_tenant_scoped(resource: &str) -> bool {
 /// the directory, the directory is the cloud's, and a cluster inventing a
 /// second answer to "whose VM is this" is the failure mode the one-directory
 /// rule exists to prevent.
+///
+/// `own_peer` is the one system identity this router lets in besides
+/// `system:masters`: the tier it IS, reading. See the `system:` block below.
+/// A tier with no siblings passes `None`.
 pub fn permits(
     identity: &Identity,
     role: Option<Role>,
     tenant: Option<&str>,
     attempt: &Attempt<'_>,
+    own_peer: Option<OwnPeer<'_>>,
 ) -> bool {
-    // Nodes and controllers run the stack; they are not people and there is
-    // no object in the directory for them.
-    if identity.is_system() {
+    // Break glass is above the directory and above this table.
+    if identity.has_group(GROUP_MASTERS) {
         return true;
     }
-    match (role, attempt.verb) {
-        (Some(Role::Admin), _) => true,
-        (_, Verb::Approve) => false,
-        (Some(Role::Member), Verb::Read) => true,
-        // Asking for a certificate is not a privilege — the gate is the
-        // approval, which is an admin's. K8s says the same thing: anyone
-        // authenticated may create a CSR, approving one is a separate right.
-        // Still only for somebody the directory knows: this is the renewal
-        // path, not a way in.
-        (Some(_), Verb::Write) if attempt.resource == CertificateSigningRequest::RESOURCE => true,
-        // A member with a tenant may write its own VMs and images. WHICH
-        // objects those are is `permits_object`, run by the handler against
-        // the object it is about to touch — this only says the door exists.
-        (Some(Role::Member), Verb::Write) => {
-            tenant.is_some_and(|t| !t.is_empty()) && is_tenant_scoped(attempt.resource)
-        }
-        _ => false,
+    if identity.is_system() {
+        // Every other machine identity has NOTHING at REST, and that is the
+        // change this table makes on purpose. `system:nodes` and
+        // `system:clusters` speak the gRPC session, which is the only place
+        // they need; a node's key used to be a key to every object of every
+        // tenant through this door, for no purpose anybody could name.
+        //
+        // One exception, and it is what `vm logs` needs: a replica of this
+        // same tier may READ here — a replica asking its sibling is the tier
+        // asking itself.
+        //
+        // It takes the KIND as well as the name since the cloud grew the same
+        // need. `system:cluster:cluster-1` at a cloud called `cluster-1`
+        // would otherwise be a cluster reading the cloud's whole estate,
+        // which is the door this table exists to shut.
+        return match (own_peer, attempt.verb) {
+            (Some(peer), Verb::Read) => identity.name == Identity::peer_name(peer.kind, peer.name),
+            // And the write half, which is two named routes wide. See
+            // `OwnPeer::forwarded` for why it is not the whole door.
+            (Some(peer), Verb::Write) => {
+                peer.forwarded
+                    && forwardable_write(attempt)
+                    && identity.name == Identity::peer_name(peer.kind, peer.name)
+            }
+            _ => false,
+        };
     }
+    // A valid certificate for somebody the directory does not know is not a
+    // permission.
+    let Some(role) = role else {
+        return false;
+    };
+    let class = class_of(attempt.resource, attempt.verb);
+    let Some(least) = least_role(class, attempt.verb) else {
+        return false;
+    };
+    if role < least {
+        return false;
+    }
+    // The one thing the table cannot say, because it is about the CALLER and
+    // not about the resource: a tenant-scoped write needs an established
+    // tenant to be scoped to. A tier that keeps no directory establishes
+    // none, so a member there is read-only exactly as it was in M4.5 — see
+    // the paragraph above.
+    if class == Class::Tenant && attempt.verb == Verb::Write && role < Role::Operator {
+        return tenant.is_some_and(|t| !t.is_empty());
+    }
+    true
+}
+
+/// The two routes a sibling may write through, and nothing else.
+///
+/// Named rather than inlined because it is a policy statement, and the two
+/// entries are the same statement one tier apart: what a forwarded write may
+/// reach is something whose write has to travel down a gRPC SESSION, which is
+/// the only kind of write a replica cannot serve on its own. Every other
+/// write at either tier goes into the shared store and any replica can do it,
+/// so no other route needs this and no other route gets it.
+///
+///   * `clusters/<name>/nodes/<node>` — a `node cordon` or `node drain` at
+///     the cloud, which travels down the cluster's session.
+///   * `nodes/<name>/commands` — a live migration's command at the cluster,
+///     which travels down the node's session. The one object this tier
+///     reconciles that is about TWO machines, whose sessions can hang off two
+///     replicas; see the cluster's `dispatch` module. The BODY of that route
+///     is a closed enum of four migration commands, which is where the
+///     narrowness actually lives — this table only says who may knock.
+///   * `vmmigrations` at the CLOUD — `vm migrate` asked one tier up, which
+///     travels down the CLUSTER's session as `CreateVmMigration`. It has the
+///     same shape as the first entry and it was left out: the forward was
+///     built for it and the door was not opened, so the verb worked only if
+///     the caller happened to dial the replica holding that cluster's
+///     session — one in three, and silently. Found in the lab, where it
+///     answered "system:cloud:cloud may not Write vmmigrations".
+fn forwardable_write(attempt: &Attempt<'_>) -> bool {
+    let cluster_node = attempt.resource == crate::resources::Cluster::RESOURCE
+        && attempt.subresource == Some("nodes");
+    let node_command = attempt.resource == crate::resources::Node::RESOURCE
+        && attempt.subresource == Some("commands");
+    let vm_migration = attempt.resource == crate::resources::VmMigration::RESOURCE
+        && attempt.subresource.is_none();
+    cluster_node || node_command || vm_migration
+}
+
+/// The tier a router IS, for the one system identity it lets in besides break
+/// glass: itself, reading.
+///
+/// Kind and name together, and the kind is not decoration. Both tiers issue
+/// their identities through `Identity::peer_name`, so `system:cluster:acme`
+/// and `system:cloud:acme` are two different certificates that differ in one
+/// word — and a comparison that ignored the word would let a cluster read
+/// everything a cloud holds the moment somebody named them alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnPeer<'a> {
+    /// `"cluster"` or `"cloud"` — the middle word of the certificate's CN.
+    pub kind: &'a str,
+    /// This tier's own name: the cluster name, or the cloud name.
+    pub name: &'a str,
+    /// Whether this request carries `x-meister-forwarded` — a sibling passing
+    /// on something a person asked it, once.
+    ///
+    /// It is what opens the WRITE door, and only for a node of a cluster.
+    /// The reason the door is that narrow: a `node drain` at the cloud cannot
+    /// be served by the replica that was asked, because it travels down the
+    /// cluster's gRPC session and only one replica holds it — so two of every
+    /// three `node cordon` calls answered 503 "no active session" and the
+    /// client had to guess which replica to ask. Every other write at this
+    /// tier goes into the shared store and any replica can do it, so no other
+    /// route needs this and no other route gets it.
+    ///
+    /// The header is not a credential and is not treated as one: the caller
+    /// still has to present this tier's own `system:<kind>:<name>`
+    /// certificate, which nothing outside the control plane holds. What the
+    /// header adds is that a sibling cannot be talked into a write by
+    /// somebody who merely stole a look at the CA — a direct call with that
+    /// identity and no header is refused exactly as it was before.
+    pub forwarded: bool,
 }
 
 /// What a tenant-scoped object says about whose it is.
@@ -541,18 +922,34 @@ pub fn permits_object(
     if identity.is_system() || role == Some(Role::Admin) {
         return true;
     }
-    if role != Some(Role::Member) {
+    // Viewer, Member and Operator are all inside the tenancy, and the whole
+    // difference between them is the VERB — which is `permits`' question,
+    // asked before this one. Here the question is only whose the object is,
+    // and it has the same answer for all three.
+    let Some(role) = role else {
         return false;
-    }
+    };
     let Some(mine) = caller_tenant.filter(|t| !t.is_empty()) else {
         return false;
     };
     let own = scope.tenant == Some(mine);
     match verb {
-        // A public image is somebody else's object that everybody may boot
-        // from; it is not somebody else's object that everybody may edit.
-        Verb::Read => own || scope.public,
-        Verb::Write => own,
+        // An operator reads every tenant's objects and a public image is
+        // somebody else's object that everybody may boot from; neither is
+        // somebody else's object that anybody may edit.
+        //
+        // The operator half is the same line `Grant::confined_to` draws one
+        // tier up, said about ONE object rather than about a listing, and the
+        // two have to agree: a listing that hands an operator every VM in the
+        // cloud and a GET that refuses the one they clicked is an API that
+        // contradicts itself in two requests. An estate you can see the names
+        // of and not the objects of is not one you can run — and `logs` and
+        // `events` hang off the same permission, which is the half an
+        // operator actually needs at three in the morning.
+        Verb::Read => role >= Role::Operator || own || scope.public,
+        // Belt and braces with `permits`, which has already refused a viewer
+        // this: a viewer sees its tenant and `public`, and writes nothing.
+        Verb::Write => own && role >= Role::Member,
         Verb::Approve => false,
     }
 }
@@ -564,6 +961,18 @@ mod tests {
 
     fn member(name: &str) -> Identity {
         Identity::new(name, vec![GROUP_MEMBERS.into()])
+    }
+
+    /// `permits` with no sibling to let in, which is every tier but a
+    /// cluster and every one of these cases. The exception has tests of its
+    /// own below.
+    fn allows(
+        identity: &Identity,
+        role: Option<Role>,
+        tenant: Option<&str>,
+        attempt: &Attempt<'_>,
+    ) -> bool {
+        permits(identity, role, tenant, attempt, None)
     }
 
     fn read(resource: &str) -> Attempt<'_> {
@@ -673,6 +1082,9 @@ mod tests {
     #[test]
     fn health_probes_are_not_api_objects_and_are_never_gated() {
         assert!(classify("GET", "/healthz").is_none());
+        // Still ungated now that it does real work: a probe that needed a
+        // certificate could not tell "down" from "not invited", and the whole
+        // value of readiness is that a load balancer can ask it.
         assert!(classify("GET", "/readyz").is_none());
     }
 
@@ -717,10 +1129,10 @@ mod tests {
     fn a_member_writes_inside_its_tenant_and_reads_beyond_it() {
         let m = member("alice");
         let t = Some("acme");
-        assert!(permits(&m, Some(Role::Member), t, &read("vms")));
-        assert!(permits(&m, Some(Role::Member), t, &write("vms")));
-        assert!(permits(&m, Some(Role::Member), t, &write(Image::RESOURCE)));
-        assert!(permits(
+        assert!(allows(&m, Some(Role::Member), t, &read("vms")));
+        assert!(allows(&m, Some(Role::Member), t, &write("vms")));
+        assert!(allows(&m, Some(Role::Member), t, &write(Image::RESOURCE)));
+        assert!(allows(
             &m,
             Some(Role::Member),
             t,
@@ -728,14 +1140,9 @@ mod tests {
         ));
         // Everything else is still an admin's: a member may look at the user
         // directory and at the clusters, and may not write either.
-        assert!(!permits(&m, Some(Role::Member), t, &write(User::RESOURCE)));
-        assert!(!permits(
-            &m,
-            Some(Role::Member),
-            t,
-            &write(Tenant::RESOURCE)
-        ));
-        assert!(!permits(
+        assert!(!allows(&m, Some(Role::Member), t, &write(User::RESOURCE)));
+        assert!(!allows(&m, Some(Role::Member), t, &write(Tenant::RESOURCE)));
+        assert!(!allows(
             &m,
             Some(Role::Member),
             t,
@@ -756,31 +1163,31 @@ mod tests {
     fn a_member_takes_addresses_but_never_makes_pools_or_subnets() {
         let m = member("alice");
         let t = Some("acme");
-        assert!(permits(
+        assert!(allows(
             &m,
             Some(Role::Member),
             t,
             &write(FloatingIp::RESOURCE)
         ));
-        assert!(permits(
+        assert!(allows(
             &m,
             Some(Role::Member),
             t,
             &read(FloatingPool::RESOURCE)
         ));
-        assert!(permits(
+        assert!(allows(
             &m,
             Some(Role::Member),
             t,
             &read(RoutedSubnet::RESOURCE)
         ));
-        assert!(!permits(
+        assert!(!allows(
             &m,
             Some(Role::Member),
             t,
             &write(FloatingPool::RESOURCE)
         ));
-        assert!(!permits(
+        assert!(!allows(
             &m,
             Some(Role::Member),
             t,
@@ -788,13 +1195,13 @@ mod tests {
         ));
 
         let admin = Identity::new("root", vec![GROUP_ADMINS.into()]);
-        assert!(permits(
+        assert!(allows(
             &admin,
             Some(Role::Admin),
             None,
             &write(FloatingPool::RESOURCE)
         ));
-        assert!(permits(
+        assert!(allows(
             &admin,
             Some(Role::Admin),
             None,
@@ -845,11 +1252,11 @@ mod tests {
     #[test]
     fn a_member_without_an_established_tenant_may_still_only_read() {
         let m = member("alice");
-        assert!(permits(&m, Some(Role::Member), None, &read("vms")));
-        assert!(!permits(&m, Some(Role::Member), None, &write("vms")));
-        assert!(!permits(&m, Some(Role::Member), Some(""), &write("vms")));
+        assert!(allows(&m, Some(Role::Member), None, &read("vms")));
+        assert!(!allows(&m, Some(Role::Member), None, &write("vms")));
+        assert!(!allows(&m, Some(Role::Member), Some(""), &write("vms")));
         // The renewal path is not tenant-scoped and stays open.
-        assert!(permits(
+        assert!(allows(
             &m,
             Some(Role::Member),
             None,
@@ -860,8 +1267,8 @@ mod tests {
     #[test]
     fn an_admin_may_do_everything_and_a_stranger_nothing() {
         let admin = Identity::new("root", vec![GROUP_ADMINS.into()]);
-        assert!(permits(&admin, Some(Role::Admin), None, &write("vms")));
-        assert!(permits(
+        assert!(allows(&admin, Some(Role::Admin), None, &write("vms")));
+        assert!(allows(
             &admin,
             Some(Role::Admin),
             None,
@@ -875,8 +1282,8 @@ mod tests {
         // Authenticated but in nobody's directory: a valid certificate is not
         // by itself a permission.
         let stranger = Identity::new("mallory", vec![]);
-        assert!(!permits(&stranger, None, None, &read("vms")));
-        assert!(!permits(
+        assert!(!allows(&stranger, None, None, &read("vms")));
+        assert!(!allows(
             &stranger,
             None,
             None,
@@ -884,12 +1291,462 @@ mod tests {
         ));
     }
 
-    /// Nodes and controllers run the stack and answer to no User object.
+    /// The whole table, one assertion per cell.
+    ///
+    /// Written out rather than derived from `least_role`, which is the point:
+    /// a test that computed the answer the same way the code does would pass
+    /// whatever the policy said. This is the policy, spelled a second time by
+    /// hand, and a change to `least_role` has to be made here too.
     #[test]
-    fn a_system_identity_needs_no_directory_entry() {
+    fn every_cell_of_the_permission_table() {
+        use Role::{Admin, Member, Operator, Viewer};
+        let by_role = |cases: &[(Role, &str, Verb, bool)]| {
+            for (role, resource, verb, expected) in cases {
+                let identity = Identity::new("someone", vec![role.group().to_string()]);
+                let attempt = Attempt {
+                    resource,
+                    subresource: if *verb == Verb::Approve {
+                        Some("approval")
+                    } else {
+                        None
+                    },
+                    verb: *verb,
+                };
+                assert_eq!(
+                    allows(&identity, Some(*role), Some("acme"), &attempt),
+                    *expected,
+                    "{} {verb:?} {resource}",
+                    role.as_str()
+                );
+            }
+        };
+
+        // Directory: who exists and what they may do. An admin's, all of it.
+        by_role(&[
+            (Viewer, "tenants", Verb::Read, false),
+            (Member, "tenants", Verb::Read, false),
+            (Operator, "tenants", Verb::Read, false),
+            (Admin, "tenants", Verb::Read, true),
+            (Operator, "tenants", Verb::Write, false),
+            (Admin, "tenants", Verb::Write, true),
+            (Operator, "users", Verb::Read, false),
+            (Admin, "users", Verb::Write, true),
+            // Approving a certificate request is the one write that hands out
+            // a credential, and it is nobody's but an admin's.
+            (Viewer, "certificatesigningrequests", Verb::Approve, false),
+            (Member, "certificatesigningrequests", Verb::Approve, false),
+            (Operator, "certificatesigningrequests", Verb::Approve, false),
+            (Admin, "certificatesigningrequests", Verb::Approve, true),
+        ]);
+
+        // CsrCreate: the renewal path. Anybody the directory knows at all.
+        by_role(&[
+            (Viewer, "certificatesigningrequests", Verb::Read, true),
+            (Viewer, "certificatesigningrequests", Verb::Write, true),
+            (Member, "certificatesigningrequests", Verb::Write, true),
+            (Operator, "certificatesigningrequests", Verb::Write, true),
+            (Admin, "certificatesigningrequests", Verb::Write, true),
+        ]);
+
+        // Infra: the estate. Everyone looks, an operator changes.
+        for resource in [
+            "clusters",
+            "nodes",
+            "storagepools",
+            "floatingpools",
+            "routedsubnets",
+            "providernetworks",
+            "events",
+        ] {
+            by_role(&[
+                (Viewer, resource, Verb::Read, true),
+                (Member, resource, Verb::Read, true),
+                (Operator, resource, Verb::Read, true),
+                (Admin, resource, Verb::Read, true),
+                (Viewer, resource, Verb::Write, false),
+                (Member, resource, Verb::Write, false),
+                (Operator, resource, Verb::Write, true),
+                (Admin, resource, Verb::Write, true),
+            ]);
+        }
+
+        // Tenant: what lives inside one. Everyone looks, a member changes —
+        // and WHICH objects is `permits_object`, further down.
+        for resource in ["vms", "images", "volumes", "floatingips"] {
+            by_role(&[
+                (Viewer, resource, Verb::Read, true),
+                (Member, resource, Verb::Read, true),
+                (Operator, resource, Verb::Read, true),
+                (Admin, resource, Verb::Read, true),
+                (Viewer, resource, Verb::Write, false),
+                (Member, resource, Verb::Write, true),
+                (Operator, resource, Verb::Write, true),
+                (Admin, resource, Verb::Write, true),
+            ]);
+        }
+
+        // TenantOperated: read like a tenant's object, write like the estate.
+        // The two of them, and the split is the whole class — a member sees
+        // whether their router is up and cannot make one, because a router
+        // takes a gateway slot on the operator's machines.
+        for resource in ["vmmigrations", "routers"] {
+            by_role(&[
+                (Viewer, resource, Verb::Read, true),
+                (Member, resource, Verb::Read, true),
+                (Operator, resource, Verb::Read, true),
+                (Admin, resource, Verb::Read, true),
+                (Viewer, resource, Verb::Write, false),
+                (Member, resource, Verb::Write, false),
+                (Operator, resource, Verb::Write, true),
+                (Admin, resource, Verb::Write, true),
+            ]);
+        }
+
+        // And there is no approving anything but a certificate request.
+        for resource in ["vms", "nodes", "clusters"] {
+            by_role(&[
+                (Admin, resource, Verb::Approve, false),
+                (Operator, resource, Verb::Approve, false),
+            ]);
+        }
+    }
+
+    /// The order the whole table hangs off. Nailed here because reordering
+    /// the variants would otherwise change the policy in silence.
+    #[test]
+    fn the_four_roles_run_viewer_member_operator_admin() {
+        use Role::{Admin, Member, Operator, Viewer};
+        assert!(Viewer < Member);
+        assert!(Member < Operator);
+        assert!(Operator < Admin);
+        let mut sorted = Role::ALL;
+        sorted.sort();
+        assert_eq!(sorted, [Viewer, Member, Operator, Admin]);
+        // ALL itself runs the other way — most to least — because
+        // `from_groups` reads it as a precedence list.
+        assert_eq!(Role::ALL, [Admin, Operator, Member, Viewer]);
+        assert_eq!(
+            Role::from_groups(&[GROUP_VIEWERS.into(), GROUP_OPERATORS.into()]),
+            Some(Operator),
+            "the highest a certificate claims is the one that counts"
+        );
+    }
+
+    /// The two new roles, in the words an operator would use.
+    #[test]
+    fn an_operator_drains_machines_and_a_viewer_only_looks() {
+        let ops = Identity::new("olivia", vec![GROUP_OPERATORS.into()]);
+        assert!(allows(&ops, Some(Role::Operator), None, &write("nodes")));
+        assert!(allows(
+            &ops,
+            Some(Role::Operator),
+            None,
+            &write("storagepools")
+        ));
+        assert!(!allows(&ops, Some(Role::Operator), None, &write("tenants")));
+        assert!(!allows(&ops, Some(Role::Operator), None, &write("users")));
+        assert!(!allows(
+            &ops,
+            Some(Role::Operator),
+            None,
+            &Attempt {
+                resource: CertificateSigningRequest::RESOURCE,
+                subresource: Some("approval"),
+                verb: Verb::Approve
+            }
+        ));
+
+        let view = Identity::new("val", vec![GROUP_VIEWERS.into()]);
+        assert!(allows(
+            &view,
+            Some(Role::Viewer),
+            Some("acme"),
+            &read("vms")
+        ));
+        assert!(allows(
+            &view,
+            Some(Role::Viewer),
+            Some("acme"),
+            &read("nodes")
+        ));
+        assert!(!allows(
+            &view,
+            Some(Role::Viewer),
+            Some("acme"),
+            &write("vms")
+        ));
+        assert!(!allows(
+            &view,
+            Some(Role::Viewer),
+            Some("acme"),
+            &write("nodes")
+        ));
+    }
+
+    /// And at the object level a viewer is scoped exactly as a member is: its
+    /// own tenant and `public`, and nothing at all to write.
+    #[test]
+    fn a_viewer_sees_its_own_tenant_and_public_and_writes_nothing() {
+        let view = Identity::new("val", vec![GROUP_VIEWERS.into()]);
+        let mine = Scope::of(Some("acme"));
+        let theirs = Scope::of(Some("globex"));
+        let shared = Scope::image(Some("ops"), true);
+        let seen =
+            |scope, verb| permits_object(&view, Some(Role::Viewer), Some("acme"), scope, verb);
+
+        assert!(seen(mine, Verb::Read));
+        assert!(seen(shared, Verb::Read));
+        assert!(!seen(theirs, Verb::Read));
+        assert!(!seen(mine, Verb::Write), "not even its own");
+        assert!(!seen(shared, Verb::Write));
+    }
+
+    /// The change this table makes on purpose, and the one existing test it
+    /// breaks: a machine identity has NOTHING at REST.
+    ///
+    /// `system:nodes` and `system:clusters` speak the gRPC session, which is
+    /// the only door they need. Until now a node's key was a key to every
+    /// object of every tenant through this one, for no purpose anybody could
+    /// name.
+    #[test]
+    fn a_machine_identity_has_nothing_at_rest_except_break_glass() {
         let node = Identity::new("system:node:manacor", vec![GROUP_NODES.into()]);
         assert!(node.is_system());
-        assert!(permits(&node, None, None, &write("vms")));
+        for attempt in [read("vms"), write("vms"), read("nodes")] {
+            assert!(!allows(&node, None, None, &attempt), "{attempt:?}");
+            // and a cluster tier that lets a SIBLING in does not let a node in
+            assert!(!permits(
+                &node,
+                None,
+                None,
+                &attempt,
+                Some(OwnPeer {
+                    kind: "cluster",
+                    name: "cluster-1",
+                    forwarded: false,
+                })
+            ));
+        }
+
+        // Break glass is above the directory and above this table.
+        let masters = Identity::new("root", vec![GROUP_MASTERS.into()]);
+        for attempt in [
+            read("vms"),
+            write("tenants"),
+            Attempt {
+                resource: CertificateSigningRequest::RESOURCE,
+                subresource: Some("approval"),
+                verb: Verb::Approve,
+            },
+        ] {
+            assert!(allows(&masters, None, None, &attempt), "{attempt:?}");
+        }
+    }
+
+    /// The one exception: a replica asking its sibling is the tier asking
+    /// itself. Reading only, only its own name — and, since the cloud grew
+    /// the same forward, only its own KIND.
+    #[test]
+    fn a_replica_of_this_tier_may_read_here_and_no_other_peer_may() {
+        let c1 = Identity::new("system:cluster:cluster-1", vec![GROUP_CLUSTERS.into()]);
+        let c2 = Identity::new("system:cluster:cluster-2", vec![GROUP_CLUSTERS.into()]);
+        let here = Some(OwnPeer {
+            kind: "cluster",
+            name: "cluster-1",
+            forwarded: false,
+        });
+
+        assert!(permits(&c1, None, None, &read("vms"), here));
+        assert!(!permits(&c1, None, None, &write("vms"), here), "read only");
+        assert!(
+            !permits(&c2, None, None, &read("vms"), here),
+            "another cluster"
+        );
+        // A tier that passes no sibling at all lets neither in.
+        assert!(!allows(&c1, None, None, &read("vms")));
+
+        // The cloud, one scope up, with the same rule and its own word.
+        let cloud = Identity::new("system:cloud:lab", vec![GROUP_CLOUDS.into()]);
+        let at_the_cloud = Some(OwnPeer {
+            kind: "cloud",
+            name: "lab",
+            forwarded: false,
+        });
+        assert!(permits(&cloud, None, None, &read("vms"), at_the_cloud));
+        assert!(!permits(&cloud, None, None, &write("vms"), at_the_cloud));
+
+        // And the kind is not decoration: a CLUSTER called `lab` is not a
+        // cloud called `lab`, however alike an operator named them.
+        let namesake = Identity::new("system:cluster:lab", vec![GROUP_CLUSTERS.into()]);
+        assert!(
+            !permits(&namesake, None, None, &read("vms"), at_the_cloud),
+            "one word apart is still somebody else"
+        );
+    }
+
+    /// D2's other half: the one WRITE a sibling may pass on, and everything
+    /// it may not.
+    ///
+    /// A node patch at the cloud does not go into the shared store — it
+    /// travels down the cluster's gRPC session, and only one replica holds
+    /// it. So `node cordon` answered 503 on two of three replicas and the
+    /// client had to guess. The door this opens is exactly one route wide,
+    /// and it needs both halves: this tier's own certificate, which nothing
+    /// outside the control plane holds, AND the forward header.
+    #[test]
+    fn a_sibling_may_pass_on_a_node_patch_and_nothing_else() {
+        let cloud = Identity::new("system:cloud:lab", vec![GROUP_CLOUDS.into()]);
+        let node_of_a_cluster = Attempt {
+            resource: crate::resources::Cluster::RESOURCE,
+            subresource: Some("nodes"),
+            verb: Verb::Write,
+        };
+        let forwarded = Some(OwnPeer {
+            kind: "cloud",
+            name: "lab",
+            forwarded: true,
+        });
+        let direct = Some(OwnPeer {
+            kind: "cloud",
+            name: "lab",
+            forwarded: false,
+        });
+
+        assert!(permits(&cloud, None, None, &node_of_a_cluster, forwarded));
+        assert!(
+            !permits(&cloud, None, None, &node_of_a_cluster, direct),
+            "the header is what says a person asked for this, once"
+        );
+
+        // The third route of this table, and the one the lab found missing:
+        // `vm migrate` asked at the cloud travels down the CLUSTER's session
+        // as CreateVmMigration, so it is the node patch's shape exactly. The
+        // forward was built for it and the door was not opened, so the verb
+        // worked on one replica in three and answered
+        // "system:cloud:cloud may not Write vmmigrations" on the other two.
+        let a_migration = Attempt {
+            resource: crate::resources::VmMigration::RESOURCE,
+            subresource: None,
+            verb: Verb::Write,
+        };
+        assert!(permits(&cloud, None, None, &a_migration, forwarded));
+        assert!(
+            !permits(&cloud, None, None, &a_migration, direct),
+            "and the same header rule: a sibling passes on what a person asked, once"
+        );
+
+        // Every other write stays shut, header or no header. The reason the
+        // door is this narrow is that no other write at this tier needs it:
+        // everything else goes into the store, and any replica can do it.
+        for attempt in [
+            write("vms"),
+            write("clusters"),
+            write("tenants"),
+            write("storagepools"),
+            Attempt {
+                resource: crate::resources::Cluster::RESOURCE,
+                subresource: None,
+                verb: Verb::Write,
+            },
+        ] {
+            assert!(
+                !permits(&cloud, None, None, &attempt, forwarded),
+                "{attempt:?} is not the node route"
+            );
+        }
+
+        // And it is still this tier's own certificate or nothing: a cluster,
+        // or a cloud by another name, is refused with the header in hand.
+        let other = Identity::new("system:cloud:other", vec![GROUP_CLOUDS.into()]);
+        assert!(!permits(&other, None, None, &node_of_a_cluster, forwarded));
+        let cluster = Identity::new("system:cluster:lab", vec![GROUP_CLUSTERS.into()]);
+        assert!(!permits(
+            &cluster,
+            None,
+            None,
+            &node_of_a_cluster,
+            forwarded
+        ));
+
+        // A node's key opens nothing here, which is the rule this table was
+        // written to state.
+        let node = Identity::new("system:node:agent-1a", vec![GROUP_NODES.into()]);
+        assert!(!permits(&node, None, None, &node_of_a_cluster, forwarded));
+    }
+
+    /// The second forwarded write, one tier down (D-P2): a live migration is
+    /// the one object at the cluster whose commands have to reach two nodes,
+    /// and their sessions can hang off two replicas.
+    ///
+    /// The same three rules as the node patch above — this tier's own
+    /// certificate, the header, and that one route — because it is the same
+    /// door with a second entry and not a second door.
+    #[test]
+    fn a_sibling_may_pass_on_a_migration_command_and_still_nothing_else() {
+        let cluster = Identity::new("system:cluster:cluster-1", vec![GROUP_CLUSTERS.into()]);
+        let command = Attempt {
+            resource: crate::resources::Node::RESOURCE,
+            subresource: Some("commands"),
+            verb: Verb::Write,
+        };
+        let peer = |forwarded| {
+            Some(OwnPeer {
+                kind: "cluster",
+                name: "cluster-1",
+                forwarded,
+            })
+        };
+
+        assert!(permits(&cluster, None, None, &command, peer(true)));
+        assert!(
+            !permits(&cluster, None, None, &command, peer(false)),
+            "a direct call with that certificate is refused exactly as it was"
+        );
+
+        // A node's own key is the one that would matter if this were open,
+        // and it is not: an agent that reached this route could tell another
+        // agent to destroy a guest.
+        let node = Identity::new("system:node:agent-1a", vec![GROUP_NODES.into()]);
+        assert!(!permits(&node, None, None, &command, peer(true)));
+        // Nor a cloud, nor a cluster by another name.
+        let other = Identity::new("system:cluster:other", vec![GROUP_CLUSTERS.into()]);
+        assert!(!permits(&other, None, None, &command, peer(true)));
+
+        // And the write half of the node route itself stays shut: a node's
+        // SPEC is a store write that any replica can do.
+        let spec = Attempt {
+            resource: crate::resources::Node::RESOURCE,
+            subresource: None,
+            verb: Verb::Write,
+        };
+        assert!(!permits(&cluster, None, None, &spec, peer(true)));
+
+        // The path classifies the way the rule assumes it does.
+        let attempt =
+            classify("POST", "/apis/meister.io/v1/nodes/agent-1a/commands").expect("an api route");
+        assert_eq!(attempt.resource, crate::resources::Node::RESOURCE);
+        assert_eq!(attempt.subresource, Some("commands"));
+        assert_eq!(attempt.verb, Verb::Write);
+    }
+
+    /// And the path really does classify the way the rule assumes. A rule
+    /// written against `resource`/`subresource` that `classify` never
+    /// produces would be a door that is open and unreachable, or shut and
+    /// believed open.
+    #[test]
+    fn a_node_patch_classifies_as_a_write_on_a_cluster_subresource() {
+        let attempt = classify(
+            "PATCH",
+            "/apis/meister.io/v1/clusters/cluster-1/nodes/agent-1a",
+        )
+        .expect("an api route");
+        assert_eq!(attempt.resource, crate::resources::Cluster::RESOURCE);
+        assert_eq!(attempt.subresource, Some("nodes"));
+        assert_eq!(attempt.verb, Verb::Write);
+        // The read of the same path is a read, and needs no header at all.
+        let read =
+            classify("GET", "/apis/meister.io/v1/clusters/cluster-1/nodes").expect("a route");
+        assert_eq!(read.verb, Verb::Read);
     }
 
     // --- the object half: whose object is it -------------------------------
@@ -951,6 +1808,77 @@ mod tests {
             Some("ops"),
             shared,
             Verb::Write
+        ));
+    }
+
+    /// The line an operator's job is drawn at: every object's CONTENTS, and
+    /// only its own tenant's WRITES.
+    ///
+    /// It is `Grant::confined_to`'s line, said about one object. Before this,
+    /// a listing showed an operator every VM in the cloud and the GET on any
+    /// one of them was a 403 — the API contradicting itself in two requests,
+    /// and `logs` and `events` refused along with it. Read is where an
+    /// operator's job lives; write stays where a tenant boundary is worth
+    /// something.
+    #[test]
+    fn an_operator_reads_every_tenants_objects_and_writes_only_its_own() {
+        let olivia = Identity::new("olivia", vec![GROUP_OPERATORS.into()]);
+        let mine = Scope::of(Some("acme"));
+        let theirs = Scope::of(Some("globex"));
+        // An object written before tenancy existed belongs to nobody, and an
+        // operator reads that too: it is inventory, and unreadable inventory
+        // is the thing that cannot be cleaned up.
+        let nobodys = Scope::default();
+
+        for (scope, what) in [
+            (mine, "its own"),
+            (theirs, "another's"),
+            (nobodys, "nobody's"),
+        ] {
+            assert!(
+                permits_object(
+                    &olivia,
+                    Some(Role::Operator),
+                    Some("acme"),
+                    scope,
+                    Verb::Read
+                ),
+                "an operator reads {what} object"
+            );
+        }
+        assert!(permits_object(
+            &olivia,
+            Some(Role::Operator),
+            Some("acme"),
+            mine,
+            Verb::Write
+        ));
+        assert!(
+            !permits_object(
+                &olivia,
+                Some(Role::Operator),
+                Some("acme"),
+                theirs,
+                Verb::Write
+            ),
+            "reading the estate is not editing it"
+        );
+
+        // Unchanged below the line: a member still sees one room.
+        let alice = member("alice");
+        assert!(!permits_object(
+            &alice,
+            Some(Role::Member),
+            Some("acme"),
+            theirs,
+            Verb::Read
+        ));
+        assert!(!permits_object(
+            &alice,
+            Some(Role::Viewer),
+            Some("acme"),
+            theirs,
+            Verb::Read
         ));
     }
 

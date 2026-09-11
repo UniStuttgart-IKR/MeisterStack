@@ -385,6 +385,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dyn-clone"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -992,6 +998,8 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "hyper",
+ "hyper-util",
  "meister-agent-api",
  "meister-cgroup-driver",
  "meister-cloud-hypervisor-driver",
@@ -1001,15 +1009,19 @@ dependencies = [
  "meister-linux-network-driver",
  "meister-lvm-thin-driver",
  "meister-nfs-driver",
+ "meister-nvmeof-driver",
+ "meister-nvmeof-import-driver",
  "meister-nvrm-driver",
  "meister-proto",
  "meister-telemetry",
  "meister-vfio-driver",
  "nix 0.31.3",
+ "prost",
  "redb",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "toml",
@@ -1025,9 +1037,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "meister-common",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "uuid",
 ]
 
@@ -1038,6 +1052,7 @@ dependencies = [
  "anyhow",
  "meister-agent-api",
  "nix 0.31.3",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1066,8 +1081,10 @@ dependencies = [
  "meister-oidc",
  "meister-pki",
  "meister-telemetry",
+ "nix 0.31.3",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "toml",
@@ -1083,6 +1100,9 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "meister-common",
  "meister-controller-api",
  "meister-pki",
@@ -1091,9 +1111,11 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml",
  "tonic",
+ "tower",
  "tracing",
  "uuid",
 ]
@@ -1111,6 +1133,7 @@ dependencies = [
  "meister-agent-api",
  "nix 0.31.3",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -1120,9 +1143,14 @@ name = "meister-cluster-controller"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "meister-common",
  "meister-controller-api",
  "meister-pki",
@@ -1131,9 +1159,11 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml",
  "tonic",
+ "tower",
  "tracing",
  "uuid",
 ]
@@ -1141,27 +1171,40 @@ dependencies = [
 [[package]]
 name = "meister-common"
 version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "meister-controller-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "base64",
+ "bytes",
  "chrono",
  "etcd-client",
+ "http-body-util",
  "hyper",
  "hyper-util",
+ "meister-agent-api",
  "meister-common",
  "meister-oidc",
  "meister-pki",
  "meister-proto",
  "meister-telemetry",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
+ "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -1188,6 +1231,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "meister-deploy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "meister-filesystem-driver"
 version = "0.1.0"
 dependencies = [
@@ -1195,6 +1249,8 @@ dependencies = [
  "async-trait",
  "meister-agent-api",
  "nix 0.31.3",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -1212,7 +1268,9 @@ dependencies = [
  "meister-common",
  "nix 0.31.3",
  "rtnetlink",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -1251,6 +1309,38 @@ dependencies = [
  "meister-filesystem-driver",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "meister-nvmeof-driver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "meister-agent-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "meister-nvmeof-import-driver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "meister-agent-api",
+ "meister-nvmeof-driver",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -1331,7 +1421,10 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prometheus",
+ "serde",
+ "serde_json",
  "tokio",
+ "toml",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -1910,6 +2003,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2071,6 +2184,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "schemars"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
+dependencies = [
+ "chrono",
+ "dyn-clone",
+ "ref-cast",
+ "schemars_derive",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2110,6 +2249,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -2668,6 +2818,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2677,12 +2837,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

@@ -114,6 +114,48 @@ pub fn trim_all(paths: &[(ConsoleStream, std::path::PathBuf)]) {
     }
 }
 
+/// Which of a console's lines a caller wants to see.
+///
+/// Applied HERE, at the ring, and that placement is the whole point: the
+/// truncation to `lines` happens at the same place, and a filter that ran
+/// afterwards could only narrow what was already the last N lines. On a
+/// chatty guest that is nothing at all — ask for the last five lines of a VM
+/// whose init prints a heartbeat every ten seconds and every one of the five
+/// is the heartbeat. Filtering first makes `lines` mean "the last N lines
+/// that matter", which is what somebody asking for it meant.
+///
+/// Plain substring and not a regex, deliberately. It is what a person reaches
+/// for, it cannot be made to backtrack, and a pattern language a NODE runs on
+/// behalf of a remote caller is an attack surface a reading aid has not
+/// earned. A client that wants more can still pipe the answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogFilter {
+    /// Drop a line containing any of these.
+    pub hide: Vec<String>,
+    /// Keep only lines containing at least one of these. Empty keeps
+    /// everything, which is what a caller that named none meant.
+    pub only: Vec<String>,
+}
+
+impl LogFilter {
+    pub fn new(hide: Vec<String>, only: Vec<String>) -> Self {
+        Self { hide, only }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hide.is_empty() && self.only.is_empty()
+    }
+
+    /// `only` narrows first, then `hide` narrows again — so naming both is
+    /// two cuts rather than a contradiction: "only the lines about the disk,
+    /// and not the ones that are just polling it" is one sentence a person
+    /// can mean.
+    pub fn keeps(&self, line: &str) -> bool {
+        let wanted = self.only.is_empty() || self.only.iter().any(|n| line.contains(n));
+        wanted && !self.hide.iter().any(|n| line.contains(n))
+    }
+}
+
 /// The end of one stream, at most `lines` lines of it.
 ///
 /// Reads the last [`RING_BYTES`] and nothing more, whatever the file's
@@ -121,7 +163,7 @@ pub fn trim_all(paths: &[(ConsoleStream, std::path::PathBuf)]) {
 /// alone, and reading further back would be reading a hole. `None` for a file
 /// that is not there — a VM that has never started — which the caller renders
 /// as empty rather than as an error.
-pub fn tail(path: &Path, lines: usize) -> Option<String> {
+pub fn tail(path: &Path, lines: usize, keep: &LogFilter) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let from = len.saturating_sub(RING_BYTES);
@@ -148,6 +190,11 @@ pub fn tail(path: &Path, lines: usize) -> Option<String> {
     if from > 0 && out.len() > 1 {
         out.remove(0);
     }
+    // Before the truncation and after the fragment: what a caller asked to
+    // see decides WHICH lines the last `lines` of them are. See `LogFilter`.
+    if !keep.is_empty() {
+        out.retain(|line| keep.keeps(line));
+    }
     if out.len() > lines {
         out.drain(..out.len() - lines);
     }
@@ -163,10 +210,13 @@ pub fn tail(path: &Path, lines: usize) -> Option<String> {
 pub fn read_all(
     paths: Vec<(ConsoleStream, std::path::PathBuf)>,
     lines: usize,
+    keep: &LogFilter,
+    wanted: &[ConsoleStream],
 ) -> Vec<(ConsoleStream, String)> {
     paths
         .into_iter()
-        .filter_map(|(stream, path)| Some((stream, tail(&path, lines)?)))
+        .filter(|(stream, _)| wanted.contains(stream))
+        .filter_map(|(stream, path)| Some((stream, tail(&path, lines, keep)?)))
         .collect()
 }
 
@@ -180,12 +230,19 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("meister-console-tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
-        let _ = std::fs::remove_file(&path);
-        path
+    /// A file of this test's own, in a directory of its own.
+    ///
+    /// The guard comes back with the path and the caller binds it: the file
+    /// used to live in one directory shared by every test of this module and
+    /// by every run on the machine, which is only safe for as long as no two
+    /// of them ever pick the same name.
+    fn scratch(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::Builder::new()
+            .prefix("meister-console-")
+            .tempdir()
+            .expect("a temp dir");
+        let path = temp.path().join(name);
+        (temp, path)
     }
 
     /// The whole point of the module, with a writer that behaves the way
@@ -196,7 +253,7 @@ mod tests {
     /// END of what it printed, which is the half anybody ever wants.
     #[test]
     fn a_guest_that_outtalks_the_ring_neither_grows_it_nor_loses_its_tail() {
-        let path = scratch("loop.console");
+        let (_temp, path) = scratch("loop.console");
         let mut writer = std::fs::File::create(&path).unwrap();
 
         // Ten rounds of "print a lot, then a pass trims" — a boot loop, in
@@ -229,7 +286,7 @@ mod tests {
         );
 
         // And the end of the output is there, exactly.
-        let text = tail(&path, 5).unwrap();
+        let text = tail(&path, 5, &LogFilter::default()).unwrap();
         let last: Vec<&str> = text.lines().collect();
         assert_eq!(last.len(), 5);
         assert!(last[4].starts_with("round 9 line 1999"), "{}", last[4]);
@@ -237,17 +294,95 @@ mod tests {
         assert!(!text.contains('\0'));
     }
 
+    /// The whole reason the filter lives HERE: it runs before `lines`, so
+    /// `lines` means "the last N that matter".
+    ///
+    /// Filtered afterwards — which is where this started, in the client — the
+    /// same request answers with nothing at all: the last five lines of a
+    /// guest whose init prints a heartbeat every ten seconds are five
+    /// heartbeats, and hiding them leaves an empty screen.
+    #[test]
+    fn the_filter_runs_before_the_truncation_and_not_after() {
+        let (_temp, path) = scratch("chatty.console");
+        let mut text = String::from("something went wrong\n");
+        for t in (0..200).step_by(10) {
+            text.push_str(&format!("nested alive t={t}s\n"));
+        }
+        std::fs::write(&path, &text).unwrap();
+
+        // Unfiltered, the last five lines are five heartbeats — which is the
+        // problem, stated as a test.
+        let raw = tail(&path, 5, &LogFilter::default()).unwrap();
+        assert_eq!(raw.lines().count(), 5);
+        assert!(raw.lines().all(|l| l.contains("alive t=")));
+
+        // Filtered first, the same five-line window finds the one line that
+        // was ever worth reading.
+        let quiet = LogFilter::new(vec!["alive t=".into()], Vec::new());
+        assert_eq!(tail(&path, 5, &quiet).unwrap(), "something went wrong");
+    }
+
+    /// `only` narrows, `hide` narrows again, and naming both is two cuts
+    /// rather than a contradiction.
+    #[test]
+    fn only_and_hide_narrow_in_that_order() {
+        let (_temp, path) = scratch("mixed.console");
+        std::fs::write(
+            &path,
+            "disk: attaching vda\ndisk: polling vda\nnet: link up\nmemory: ok\n",
+        )
+        .unwrap();
+
+        let disk = LogFilter::new(Vec::new(), vec!["disk:".into()]);
+        assert_eq!(
+            tail(&path, 100, &disk).unwrap(),
+            "disk: attaching vda\ndisk: polling vda"
+        );
+
+        let interesting = LogFilter::new(vec!["polling".into()], vec!["disk:".into()]);
+        assert_eq!(
+            tail(&path, 100, &interesting).unwrap(),
+            "disk: attaching vda"
+        );
+
+        // Several needles on the same side: any of them keeps a line.
+        let two = LogFilter::new(Vec::new(), vec!["net:".into(), "memory:".into()]);
+        assert_eq!(tail(&path, 100, &two).unwrap(), "net: link up\nmemory: ok");
+
+        // A filter that matches nothing answers with nothing, and that is an
+        // answer — not an error, and not the unfiltered console.
+        let nothing = LogFilter::new(Vec::new(), vec!["nowhere".into()]);
+        assert_eq!(tail(&path, 100, &nothing).unwrap(), "");
+    }
+
+    /// An empty needle is dropped at the edge rather than sent, because an
+    /// empty `only` matches every line and would make the flag mean its own
+    /// opposite. Here: a filter nobody filled in changes nothing.
+    #[test]
+    fn a_filter_nobody_asked_for_leaves_the_console_exactly_as_it_was() {
+        let (_temp, path) = scratch("untouched.console");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        assert_eq!(
+            tail(&path, 100, &LogFilter::default()).unwrap(),
+            tail(&path, 100, &LogFilter::new(Vec::new(), Vec::new())).unwrap()
+        );
+        assert!(LogFilter::default().is_empty());
+    }
+
     /// A file that fits in the ring is left completely alone: no punching, no
     /// blocks freed, and the first line is still the first line.
     #[test]
     fn a_quiet_guest_is_not_touched_at_all() {
-        let path = scratch("quiet.console");
+        let (_temp, path) = scratch("quiet.console");
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
         trim(&path);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
-        assert_eq!(tail(&path, 100).unwrap(), "one\ntwo\nthree");
+        assert_eq!(
+            tail(&path, 100, &LogFilter::default()).unwrap(),
+            "one\ntwo\nthree"
+        );
         // and asking for fewer lines than there are gives the last of them
-        assert_eq!(tail(&path, 2).unwrap(), "two\nthree");
+        assert_eq!(tail(&path, 2, &LogFilter::default()).unwrap(), "two\nthree");
     }
 
     /// A VM that has printed nothing, and one that has never started: empty
@@ -255,13 +390,13 @@ mod tests {
     /// "nothing to show", which is an answer.
     #[test]
     fn no_output_at_all_is_an_answer_and_not_a_failure() {
-        let empty = scratch("empty.console");
+        let (_temp, empty) = scratch("empty.console");
         std::fs::write(&empty, "").unwrap();
-        assert_eq!(tail(&empty, 10).as_deref(), Some(""));
+        assert_eq!(tail(&empty, 10, &LogFilter::default()).as_deref(), Some(""));
         trim(&empty); // and bounding it does nothing
 
-        let missing = scratch("never-started.console");
-        assert_eq!(tail(&missing, 10), None);
+        let (_temp, missing) = scratch("never-started.console");
+        assert_eq!(tail(&missing, 10, &LogFilter::default()), None);
         trim(&missing); // no file, no warning, no panic
     }
 
@@ -272,22 +407,32 @@ mod tests {
     /// firmware.
     #[test]
     fn a_vm_answers_with_the_streams_it_actually_has() {
-        let console = scratch("both.console");
-        let serial = scratch("both.serial");
+        let (_temp, console) = scratch("both.console");
+        let (_temp, serial) = scratch("both.serial");
         std::fs::write(&console, "kernel says hello\n").unwrap();
         let paths = vec![
             (ConsoleStream::Console, console.clone()),
             (ConsoleStream::Serial, serial.clone()),
         ];
 
-        let only_console = read_all(paths.clone(), 10);
+        let only_console = read_all(
+            paths.clone(),
+            10,
+            &LogFilter::default(),
+            &ConsoleStream::ALL,
+        );
         assert_eq!(only_console.len(), 1);
         assert_eq!(only_console[0].0, ConsoleStream::Console);
         assert_eq!(only_console[0].1, "kernel says hello");
 
         // And with both files there, both come back, console first.
         std::fs::write(&serial, "firmware says hello\n").unwrap();
-        let both = read_all(paths.clone(), 10);
+        let both = read_all(
+            paths.clone(),
+            10,
+            &LogFilter::default(),
+            &ConsoleStream::ALL,
+        );
         assert_eq!(
             both.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
             ConsoleStream::ALL
@@ -295,11 +440,21 @@ mod tests {
 
         // A VM that has never started answers with nothing at all, and that
         // is an answer.
+        let (_console_temp, gone_console) = scratch("gone.console");
+        let (_serial_temp, gone_serial) = scratch("gone.serial");
         let nothing = vec![
-            (ConsoleStream::Console, scratch("gone.console")),
-            (ConsoleStream::Serial, scratch("gone.serial")),
+            (ConsoleStream::Console, gone_console),
+            (ConsoleStream::Serial, gone_serial),
         ];
-        assert!(read_all(nothing.clone(), 10).is_empty());
+        assert!(
+            read_all(
+                nothing.clone(),
+                10,
+                &LogFilter::default(),
+                &ConsoleStream::ALL
+            )
+            .is_empty()
+        );
         trim_all(&nothing); // and bounding it is a no-op, not a panic
     }
 
@@ -308,7 +463,7 @@ mod tests {
     /// runs every few seconds, so this is the normal case and not an edge.
     #[test]
     fn trimming_is_idempotent() {
-        let path = scratch("twice.console");
+        let (_temp, path) = scratch("twice.console");
         let mut writer = std::fs::File::create(&path).unwrap();
         writer
             .write_all(&vec![b'a'; (RING_BYTES * 3) as usize])

@@ -86,7 +86,7 @@ Two prices, both deliberate, both worth knowing before the first outage:
   copied to the operator by hand. That is one manual step, once, in exchange
   for no static credential existing anywhere.
 - **`csr_auto_approve` stays off.** Certificate requests are recorded and a
-  human runs `meister cloud csr approve <name>`. With it on, the only thing
+  human runs `meister csr approve <name>`. With it on, the only thing
   between a caller and a certificate is the authenticator chain.
 
 ## The trap worth naming

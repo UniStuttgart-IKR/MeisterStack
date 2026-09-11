@@ -38,35 +38,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-/// What the guest is configured with. Absent from a spec entirely means the
-/// VM gets no seed and its configuration is byte for byte what it was — which
-/// is the most important property this feature has.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CloudInit {
-    /// The `#cloud-config` document, or a script, or whatever else cloud-init
-    /// accepts. Passed through untouched: what is valid user-data is
-    /// cloud-init's question and not this control plane's, and a stack that
-    /// validated it would be a stack that rejects next year's syntax.
-    pub user_data: String,
-    /// Derived when absent — see `meta_data_for`. Given, it is used verbatim.
-    #[serde(default)]
-    pub meta_data: Option<String>,
-    /// The optional third file. Only written when it is there: an empty
-    /// `network-config` is not the same thing as none, and cloud-init treats
-    /// the two differently.
-    #[serde(default)]
-    pub network_config: Option<String>,
-    /// What the guest should call itself. Filled in by the cluster tier from
-    /// the VM object's name, because that is the only tier that knows it —
-    /// the agent has a uid and nothing else. Absent falls back to the uid,
-    /// which is an ugly hostname and an honest one.
-    #[serde(default)]
-    pub local_hostname: Option<String>,
-}
+// The seed's own shape moved to `agent-api` with the rest of the create
+// document: `spec.vm.cloud_init` is a field both controllers now deserialise
+// at their edge. What stays here is what writes it onto a disk.
+pub use agent_api::spec::CloudInit;
 
 /// The label cloud-init's NoCloud datasource looks for. Exactly this, in
 /// exactly this case: it is a protocol constant and not a name anybody chose.
@@ -525,8 +502,8 @@ mod tests {
     /// as none, and cloud-init treats the two differently.
     #[test]
     fn what_the_spec_says_is_what_is_written() {
-        let dir = std::env::temp_dir().join("meister-cloudinit-tests");
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let dir = temp.path().to_path_buf();
         let id = uuid::Uuid::new_v4();
 
         let path = dir.join("plain.img");

@@ -150,16 +150,73 @@ impl Cache {
     }
 
     fn remember(&self, name: &str, state: State) {
-        self.known
+        let previous = self
+            .known
             .lock()
             .unwrap()
             .insert(name.to_string(), state.clone());
-        // ERROR, not WARN: a base image that cannot be fetched is not a
+        // ERROR, not WARN: a base image that cannot be used is not a
         // degradation that heals — every VM naming it fails, every time, until
-        // somebody fixes the url or the checksum.
-        if let State::Failed(why) = &state {
-            tracing::error!(image = %name, reason = %why, "base image unusable");
+        // somebody fixes the url, the checksum or the file.
+        //
+        // Once per CHANGE and not once per look, the same rule `Conditions`
+        // follows: a path image is re-checked on every reconcile pass, and a
+        // line per pass would bury the pass that first found it.
+        if previous.as_ref() == Some(&state) {
+            return;
         }
+        match &state {
+            State::Failed(why) => {
+                tracing::error!(image = %name, reason = %why, "base image unusable")
+            }
+            // Only interesting as a RECOVERY: the ordinary road to Ready is a
+            // fetch, which has said so itself one line further up.
+            State::Ready if matches!(previous, Some(State::Failed(_))) => {
+                info!(image = %name, "base image usable again")
+            }
+            State::Ready => {}
+        }
+    }
+
+    /// A base image nobody fetches: say whether the bytes are where this node
+    /// would look for them.
+    ///
+    /// The missing first line of a chain that was otherwise complete. A URL
+    /// image is registered here because this node had to GO AND GET it, and
+    /// from there the fact travels — `ImageStateReport` on the status road,
+    /// `ImageView` at the cluster, `Image.status.nodes[]` and then
+    /// `Image.status.phase` at the cloud. A PATH image was fetched by nobody,
+    /// so no node ever said anything about it, so the cloud had no evidence
+    /// and went on saying `Ready` about a catalogue entry pointing at a file
+    /// that is not there. Measured on the fleet, unchanged since 2026-08-29:
+    /// `image with a nonexistent source sits in phase 'Ready', not Failed`.
+    ///
+    /// A `stat`, and deliberately no more. Whether the bytes are the RIGHT
+    /// bytes is a question only a checksum answers, and a path image has none
+    /// by construction — that is what distinguishes it from a URL image. What
+    /// this can say is the half that was missing and is worth everything: the
+    /// file is there, or it is not and here is the path that was looked at.
+    ///
+    /// Level-triggered like everything else this node reports: called on every
+    /// provision that names the image AND once per reconcile pass over the
+    /// records that name it, so an image restored on shared storage goes back
+    /// to `Ready` without anybody creating a VM to prove it.
+    pub async fn verify_path(&self, name: &str) {
+        let path = self.linked(name);
+        let state = match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.is_dir() => State::Failed(format!(
+                "the base image {name} is a directory on this node ({})",
+                path.display()
+            )),
+            Ok(_) => State::Ready,
+            Err(e) => State::Failed(format!(
+                "the base image {name} is not on this node: {} ({e}). \
+                 It has no url, so nothing here fetches it — the bytes have to be put at that \
+                 path, or the image needs a url and a sha256.",
+                path.display()
+            )),
+        };
+        self.remember(name, state);
     }
 
     /// Make sure this image is on the node, fetching it if it is not.
@@ -378,11 +435,18 @@ async fn fetch(url: &str, into: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("meister-image-tests/{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A cache directory of this test's own, and the guard that removes it.
+    ///
+    /// The guard comes back first and the caller binds it: the directory used
+    /// to be named after the test alone, so two runs on one machine shared
+    /// it, and one that crashed left its half-written entries for the next.
+    fn scratch(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::Builder::new()
+            .prefix(&format!("meister-image-{name}-"))
+            .tempdir()
+            .expect("a temp dir");
+        let dir = temp.path().to_path_buf();
+        (temp, dir)
     }
 
     fn digest_of(bytes: &[u8]) -> String {
@@ -415,7 +479,7 @@ mod tests {
     /// stream, the hash, the temp file, the rename and the link.
     #[tokio::test]
     async fn an_image_is_fetched_once_and_then_found() {
-        let dir = scratch("fetch-once");
+        let (_temp, dir) = scratch("fetch-once");
         let payload = b"a stock cloud image, in miniature".repeat(64);
         let origin = dir.join("origin.raw");
         std::fs::write(&origin, &payload).unwrap();
@@ -459,7 +523,7 @@ mod tests {
     /// the catalogue name, not as a partial file.
     #[tokio::test]
     async fn a_wrong_checksum_leaves_nothing_usable() {
-        let dir = scratch("wrong-sum");
+        let (_temp, dir) = scratch("wrong-sum");
         let origin = dir.join("origin.raw");
         std::fs::write(&origin, b"the wrong bytes entirely").unwrap();
 
@@ -503,7 +567,7 @@ mod tests {
     /// half-written survives it.
     #[tokio::test]
     async fn a_url_that_does_not_answer_leaves_nothing_usable() {
-        let dir = scratch("no-answer");
+        let (_temp, dir) = scratch("no-answer");
         let images = dir.join("images");
         std::fs::create_dir_all(&images).unwrap();
         let cache = Cache::new(images.clone());
@@ -523,7 +587,7 @@ mod tests {
     /// digest where nothing points at them any more.
     #[tokio::test]
     async fn the_name_follows_the_newest_bytes() {
-        let dir = scratch("rebuild");
+        let (_temp, dir) = scratch("rebuild");
         let images = dir.join("images");
         std::fs::create_dir_all(&images).unwrap();
         let cache = Cache::new(images.clone());
@@ -554,5 +618,61 @@ mod tests {
         assert_eq!(std::fs::read(images.join("ubuntu.raw")).unwrap(), second);
         assert!(images.join(CACHE_DIR).join(digest_of(&first)).exists());
         assert!(images.join(CACHE_DIR).join(digest_of(&second)).exists());
+    }
+    /// A path image is registered like a fetched one, so the cloud stops
+    /// guessing.
+    ///
+    /// The missing first line of a chain that was otherwise complete. This
+    /// node registered only what it had to FETCH, so a path image — somebody
+    /// else's file on shared storage — was reported by nobody; the cloud had
+    /// no evidence and went on saying `Ready` about a catalogue entry
+    /// pointing at nothing. Unchanged on the fleet since 2026-08-29.
+    ///
+    /// And it is level: the same registry entry follows the file, so an image
+    /// restored on shared storage goes back to `Ready` without anybody
+    /// creating a VM to prove it.
+    #[tokio::test]
+    async fn a_path_image_says_whether_its_bytes_are_here() {
+        let (_temp, images) = scratch("path");
+        let cache = Cache::new(images.clone());
+
+        // Nothing said about an image nobody has looked at. Silence is what
+        // an empty `Image.status.nodes[]` means, and it must stay available.
+        assert!(cache.report().is_empty());
+
+        cache.verify_path("nixos.raw").await;
+        let (name, state) = cache.report().pop().expect("one opinion");
+        assert_eq!(name, "nixos.raw");
+        let State::Failed(why) = state else {
+            panic!("a file that is not there is not Ready");
+        };
+        assert!(
+            why.contains(images.join("nixos.raw").to_str().unwrap()),
+            "the sentence names the path that was looked at: {why}"
+        );
+        assert!(
+            why.contains("no url"),
+            "and says why nothing is going to fetch it: {why}"
+        );
+
+        // Somebody puts the bytes there. The next look says so — no create,
+        // no restart, no second command.
+        std::fs::write(images.join("nixos.raw"), b"an image").expect("the bytes");
+        cache.verify_path("nixos.raw").await;
+        assert_eq!(
+            cache.report(),
+            vec![("nixos.raw".to_string(), State::Ready)],
+            "the registry follows the file"
+        );
+
+        // A directory under the name is not an image, and saying `Ready`
+        // about one would hand the storage driver a path it cannot open.
+        std::fs::remove_file(images.join("nixos.raw")).expect("gone");
+        std::fs::create_dir(images.join("nixos.raw")).expect("a directory instead");
+        cache.verify_path("nixos.raw").await;
+        let State::Failed(why) = cache.report().pop().expect("one").1 else {
+            panic!("a directory is not an image");
+        };
+        assert!(why.contains("is a directory"), "{why}");
     }
 }

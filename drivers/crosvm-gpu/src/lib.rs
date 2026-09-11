@@ -242,8 +242,8 @@ impl DeviceDriver for CrosvmGpuDriver {
             // pid is the only handle on the backend. Ignoring it would leave a
             // crosvm running for a VM that is gone.
             None => {
-                if let DeviceAttachment::VhostUser { pid, .. } = attachment {
-                    self.process.stop_adopted(*pid);
+                if let DeviceAttachment::VhostUser { socket, pid, .. } = attachment {
+                    self.process.stop_adopted(*pid, socket);
                 }
             }
         }
@@ -268,11 +268,13 @@ impl DeviceDriver for CrosvmGpuDriver {
         // this one outlived it. Only the record can tell the two apart, and
         // getting it wrong quarantines a VM whose GPU is working — the whole
         // point of adopting a VM after a restart is that its devices come with
-        // it. Liveness comes from the pid, as it does for nvrm.
-        let DeviceAttachment::VhostUser { pid, .. } = attachment else {
+        // it. Liveness comes from the pid AND the socket recorded with it, as
+        // it does for nvrm: this node runs one crosvm per GPU, so the process
+        // name alone says "a gpu backend" and not "this one".
+        let DeviceAttachment::VhostUser { socket, pid, .. } = attachment else {
             return Err(DeviceError::NotFound(*id));
         };
-        if !self.process.is_ours(*pid) {
+        if !self.process.is_ours(*pid, socket) {
             return Err(DeviceError::NotFound(*id));
         }
         Ok(Device {

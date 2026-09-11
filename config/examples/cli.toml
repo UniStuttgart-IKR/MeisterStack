@@ -1,10 +1,16 @@
 # meister — the CLI's profiles.
 #
 # Looked for at $MEISTER_CONFIG, else ~/.config/meisterstack/config.toml. A
-# profile bundles "which endpoint, which tier, which credential" under a name;
+# profile bundles "which endpoint, which credential" under a name;
 # `--profile` picks one, `--endpoint` bypasses them entirely, and
 # MEISTER_PROFILE / MEISTER_ENDPOINT / MEISTER_TOKEN do the same from the
 # environment.
+#
+# There is no `tier` key. What an endpoint is -- a cloud, a cluster -- is
+# something the endpoint says (`meister api-resources`), not something an
+# operator has to keep in step with it here. A profile that still carries one
+# is a parse error naming the key, which is the point: it was written against
+# a CLI that checked it.
 #
 # For the client side of a locked-down control plane — mTLS everywhere, an
 # SSH tunnel to the cluster tier, and why the bearer shapes at the bottom of
@@ -13,18 +19,16 @@
 # Used when neither --profile nor --endpoint says otherwise.
 default_profile = "lab"
 
-# The agent's own unix socket. `tier` is checked against the command: this
-# profile serves `meister agent …` and a `meister cluster …` against it is
-# refused rather than sent somewhere that would not understand it.
+# The agent's own unix socket. A unix endpoint IS a node's own API, by
+# definition -- so this profile serves `meister agent vm …`, and any other
+# command against it is refused with a sentence saying which tree it is.
 [profiles.lab]
-tier       = "agent"
 endpoint   = "unix:///run/meisterstack/agent.sock"
 credential = { type = "none" }
 
 # A cluster's sub-API. Plain http is the lab-internal shape and still the
 # default one; an https endpoint works too and needs a ca_cert (below).
 [profiles.cluster-a]
-tier       = "cluster"
 endpoint   = "http://10.128.1.104:3001"
 # How long one request may take before the CLI gives up.
 timeout_secs = 30
@@ -34,7 +38,6 @@ credential = { type = "token_file", path = "token" }
 
 # The public tier.
 [profiles.cloud]
-tier       = "cloud"
 endpoint   = "http://10.128.1.103:3000"
 credential = { type = "none" }
 
@@ -50,7 +53,6 @@ credential = { type = "none" }
 # exactly the two paths named here and never edits this file. Running it
 # again is a renewal in place.
 [profiles.cloud-mtls]
-tier       = "cloud"
 endpoint   = "https://10.128.1.103:3000"
 ca_cert    = "pki/ca.crt"
 credential = { type = "mtls", cert = "pki/cloud-mtls.crt", key = "pki/cloud-mtls.key" }
@@ -66,14 +68,13 @@ credential = { type = "mtls", cert = "pki/cloud-mtls.crt", key = "pki/cloud-mtls
 # A token settles WHO you are and nothing else. What you may do is the
 # cloud's user directory's answer: if it does not know the name in the token,
 # every command is a 403 until an administrator runs
-# `meister cloud user create`.
+# `meister user create`.
 #
 # `tokens` defaults to `<config dir>/oidc/<profile>.json` and `scope` to
 # "openid profile email offline_access". Keep `offline_access` in whatever
 # you set: it is what makes a refresh token appear, and without one this
 # profile needs a fresh browser login every few minutes.
 [profiles.cloud-oidc]
-tier       = "cloud"
 endpoint   = "https://10.128.1.103:3000"
 ca_cert    = "pki/ca.crt"
 credential = { type = "oidc", issuer = "https://idp.example.org/realms/lab", client_id = "meisterstack" }

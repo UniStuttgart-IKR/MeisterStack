@@ -21,3 +21,13 @@ tracing = { workspace = true }
 # `nft -j list table` is the one place this driver reads a machine format
 # back; the shape is asserted in the tests rather than assumed.
 serde_json = { workspace = true }
+# One router record per file under the agent's run_dir: the gateway slot's
+# only persistent state, and what the start-up sweep compares namespaces
+# against. See `router`.
+serde = { workspace = true }
+
+[dev-dependencies]
+# The netns test writes one router record per router. `tempfile` and not a
+# name built from the pid: a pid comes back, and a directory left by a panic
+# is what the next run trips over. See the agent's own source rule.
+tempfile = { workspace = true }

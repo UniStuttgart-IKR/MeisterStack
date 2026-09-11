@@ -2,11 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `meister agent …` — drives one node's own REST api, over its unix socket.
+//! `meister agent vm …` — the node itself, over its own socket.
 //!
-//! The bottom tier, and the only one with no api machinery under it: ids are
-//! the node's, listings are bare arrays, and `observe`/`reconcile` exist here
-//! and nowhere above because they are questions about one node's processes.
+//! A different api and not a third tier of the same one: there is no
+//! discovery here, no objects, no names — ids are the node's — listings are
+//! bare arrays, and `observe` and `reconcile` exist here and nowhere above
+//! because they are questions about one machine's processes. So the CLI never
+//! asks a unix endpoint what group-version it serves; a unix endpoint IS a
+//! node, by definition, and pointing anything else at one is a sentence.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -14,7 +17,7 @@ use serde::Deserialize;
 use crate::client::Client;
 use crate::config::Target;
 use crate::output::{self, View, or_dash};
-use crate::{AgentCmd, GlobalArgs, vm};
+use crate::{AgentCmd, AgentVmCmd, AgentVolumeCmd, GlobalArgs};
 
 #[derive(Deserialize)]
 struct VmListEntry {
@@ -63,24 +66,102 @@ struct CreatedResponse {
     id: String,
 }
 
-/// Every verb of this tier that destroys something, and the whole list of it.
-/// See the same function at the two tiers above.
-fn destructive(cmd: &AgentCmd) -> Option<(&'static str, &str)> {
+/// What the NODE thinks it holds, which is a different question from what the
+/// `Volume` objects say — and the one worth asking when the two disagree.
+///
+/// Read-only by construction: there are no write routes at the socket for
+/// volumes, so there are no verbs here for them either. `Gone` rows are shown
+/// rather than filtered: a volume the node has just deprovisioned is exactly
+/// the one somebody is looking for.
+async fn volume(target: &Target, cmd: &AgentVolumeCmd, global: &GlobalArgs) -> Result<()> {
+    let client = Client::new(target)?;
     match cmd {
-        AgentCmd::Destroy { id } => Some(("vm", id)),
-        _ => None,
+        AgentVolumeCmd::Ls => {
+            let body = client.get("/volumes").await?;
+            output::emit(global, &body, |body| {
+                output::table_of_array(
+                    body,
+                    "parsing /volumes response",
+                    &["id", "phase", "driver", "size", "backend", "attached-to"],
+                    "no volumes on this node",
+                    volume_row,
+                )
+            })
+        }
+        // Whole, like `agent vm get`: what is being asked for is the record
+        // itself, and a table would be this CLI deciding which half of it
+        // matters.
+        AgentVolumeCmd::Get { id } => {
+            let _ = global;
+            output::print_json(&client.get(&format!("/volumes/{id}")).await?);
+            Ok(())
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct VolumeEntry {
+    id: String,
+    phase: String,
+    #[serde(default)]
+    backend: String,
+    #[serde(default)]
+    size_bytes: u64,
+    #[serde(default)]
+    driver: String,
+    #[serde(default)]
+    attached_to: Option<String>,
+}
+
+fn volume_row(v: VolumeEntry) -> Vec<String> {
+    vec![
+        v.id,
+        v.phase,
+        v.driver,
+        gib(v.size_bytes),
+        // Empty is the window between "told to make it" and "made it", and a
+        // dash reads as that rather than as a path somebody has to squint at.
+        if v.backend.is_empty() {
+            "-".to_string()
+        } else {
+            v.backend
+        },
+        v.attached_to.unwrap_or_else(|| "-".to_string()),
+    ]
+}
+
+/// Bytes as the unit an operator writes on a whiteboard. Rounded down and
+/// never to zero: a volume smaller than a GiB is a real thing (a share is
+/// reported as zero bytes) and printing `0Gi` for it would be a number.
+fn gib(bytes: u64) -> String {
+    match bytes {
+        0 => "-".to_string(),
+        n if n < 1024 * 1024 * 1024 => format!("{}Mi", n / (1024 * 1024)),
+        n => format!("{}Gi", n / (1024 * 1024 * 1024)),
     }
 }
 
 pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result<()> {
-    if let Some((kind, name)) = destructive(cmd) {
-        output::confirm_destructive(global, target, kind, name)?;
+    let cmd = match cmd {
+        AgentCmd::Vm { cmd } => cmd,
+        AgentCmd::Volume { cmd } => return volume(target, cmd, global).await,
+    };
+    if let AgentVmCmd::Rm { id } = cmd {
+        output::confirm(
+            global,
+            &target.endpoint,
+            &target.profile_name,
+            "delete",
+            "vm",
+            id,
+        )?;
     }
 
     let client = Client::new(target)?;
 
     match cmd {
-        AgentCmd::Ls => {
+        AgentVmCmd::Ls => {
             let body = client.get("/vms").await?;
             output::emit(global, &body, |body| {
                 output::table_of_array(
@@ -96,11 +177,11 @@ pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result
         // No name to create under and none to look one up by at this tier:
         // the node assigns the id, so `create` takes only a spec and prints
         // what it was given.
-        AgentCmd::Create { spec } => {
-            let raw = std::fs::read(spec)
-                .with_context(|| format!("reading spec file {}", spec.display()))?;
+        AgentVmCmd::Create { file } => {
+            let raw = std::fs::read(file)
+                .with_context(|| format!("reading spec file {}", file.display()))?;
             serde_json::from_slice::<serde_json::Value>(&raw)
-                .with_context(|| format!("spec file {} is not valid json", spec.display()))?;
+                .with_context(|| format!("spec file {} is not valid json", file.display()))?;
 
             let body = client.post("/vms", Some(raw)).await?;
             output::emit(global, &body, |body| {
@@ -112,9 +193,24 @@ pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result
 
         // The node's own ring, read straight off it — one hop instead of the
         // two a controller tier takes, and the same document either way.
-        AgentCmd::Logs { id, lines } => vm::logs(&client, global, "/vms", id, *lines).await,
+        AgentVmCmd::Logs {
+            id,
+            lines,
+            hide,
+            only,
+            streams,
+        } => {
+            logs(
+                &client,
+                global,
+                id,
+                *lines,
+                &crate::vm::LogFilter::new(hide, only, streams),
+            )
+            .await
+        }
 
-        AgentCmd::Inspect { id } => {
+        AgentVmCmd::Get { id } => {
             output::print_json(&client.get(&format!("/vms/{id}")).await?);
             Ok(())
         }
@@ -123,7 +219,7 @@ pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result
         // do about the difference. There is no such verb one tier up because
         // there is nothing there to look at: a controller knows what a node
         // reported, not what its processes are doing.
-        AgentCmd::Observe { id } => {
+        AgentVmCmd::Observe { id } => {
             let body = client.get(&format!("/vms/{id}/observe")).await?;
             output::emit(global, &body, |body| {
                 let o: ObserveResponse =
@@ -134,12 +230,12 @@ pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result
 
         // The reconcile loop's one step, asked for by hand. Above this tier
         // the controllers run it themselves, on their own clock.
-        AgentCmd::Reconcile { id } => {
+        AgentVmCmd::Reconcile { id } => {
             let body = client.post(&format!("/vms/{id}/reconcile"), None).await?;
             action(global, &body, "parsing reconcile response")
         }
 
-        AgentCmd::Destroy { id } => {
+        AgentVmCmd::Rm { id } => {
             let body = client.delete(&format!("/vms/{id}")).await?;
             output::emit(global, &body, |body| {
                 // An older node answers a delete with nothing at all, and a
@@ -151,20 +247,42 @@ pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result
             })
         }
 
-        AgentCmd::Start { id } => lifecycle(&client, global, &format!("/vms/{id}/start")).await,
+        AgentVmCmd::Start { id } => lifecycle(&client, global, &format!("/vms/{id}/start")).await,
         // The only tier that takes a grace period, because it is the only one
         // that waits it out: above this, `stop` writes a runStrategy and the
         // node it lands on applies its own.
-        AgentCmd::Stop { id, grace } => {
+        AgentVmCmd::Stop { id, grace } => {
             let path = match grace {
                 Some(g) => format!("/vms/{id}/stop?grace_secs={g}"),
                 None => format!("/vms/{id}/stop"),
             };
             lifecycle(&client, global, &path).await
         }
-        AgentCmd::Pause { id } => lifecycle(&client, global, &format!("/vms/{id}/pause")).await,
-        AgentCmd::Resume { id } => lifecycle(&client, global, &format!("/vms/{id}/resume")).await,
+        AgentVmCmd::Pause { id } => lifecycle(&client, global, &format!("/vms/{id}/pause")).await,
+        AgentVmCmd::Resume { id } => lifecycle(&client, global, &format!("/vms/{id}/resume")).await,
     }
+}
+
+/// What the guest printed, straight off this node's own ring.
+///
+/// The same document the two tiers above serve, one hop instead of two — and
+/// printed as text rather than as a table, because a console is lines and a
+/// table cell with a kernel oops in it is a table nobody can read.
+async fn logs(
+    client: &Client,
+    global: &GlobalArgs,
+    id: &str,
+    lines: Option<u32>,
+    keep: &crate::vm::LogFilter,
+) -> Result<()> {
+    let body = client
+        .get(&format!("/vms/{id}/logs{}", keep.query(lines)))
+        .await?;
+    output::emit(global, &body, |body| {
+        let streams: Vec<crate::vm::LogStream> =
+            serde_json::from_slice(body).context("parsing the console output")?;
+        Ok(View::text(crate::vm::render_logs(&streams)))
+    })
 }
 
 /// The listing row. `note` is last on purpose: see the rule in

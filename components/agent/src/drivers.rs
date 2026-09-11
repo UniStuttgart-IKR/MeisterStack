@@ -15,7 +15,7 @@ use agent_api::{
     Hypervisor, ResourceConfiner,
     device::DeviceDriver,
     networking::{BridgeDriver, NetworkDriver, NicDriver, RouteAnnouncer},
-    storage::VolumeDriver,
+    storage::{Locality, SnapshotConsistency, VolumeDriver},
 };
 use anyhow::bail;
 use crosvm_gpu_driver::CrosvmGpuDriver;
@@ -31,6 +31,11 @@ pub const DRIVER_NVRM: &str = "nvrm";
 pub const DRIVER_VFIO: &str = "vfio";
 pub const DRIVER_LVM_THIN: &str = "lvm-thin";
 pub const DRIVER_NFS: &str = "nfs";
+/// The attacher for namespaces that live somewhere else, and the first
+/// consumer of `Locality::Networked`.
+pub const DRIVER_NVMEOF: &str = "nvmeof";
+/// Its provider half: namespaces that already exist, handed out.
+pub const DRIVER_NVMEOF_IMPORT: &str = "nvmeof-import";
 pub const DRIVER_CLOUD_HYPERVISOR: &str = "cloud-hypervisor";
 /// The one networking driver there is — and the one driver name in this file
 /// that is not also a config key. See `NETWORK_DRIVERS`.
@@ -78,6 +83,16 @@ static VOLUME_DRIVERS: &[DriverEntry<dyn VolumeDriver>] = &[
         name: DRIVER_NFS,
         keys: &[DRIVER_NFS],
         build: build_nfs,
+    },
+    DriverEntry {
+        name: DRIVER_NVMEOF,
+        keys: &[DRIVER_NVMEOF],
+        build: build_nvmeof,
+    },
+    DriverEntry {
+        name: DRIVER_NVMEOF_IMPORT,
+        keys: &[DRIVER_NVMEOF_IMPORT],
+        build: build_nvmeof_import,
     },
 ];
 
@@ -230,6 +245,10 @@ fn build_filesystem(
             .as_ref()
             .and_then(|f| f.volume_dir.clone())
             .unwrap_or_else(|| cfg.paths.volume_dir.clone()),
+        qemu_img: fs
+            .as_ref()
+            .map(|f| f.qemu_img.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from("qemu-img")),
     })?;
     Ok(Some(Arc::new(driver)))
 }
@@ -253,6 +272,48 @@ fn build_lvm_thin(
         qemu_img: l.qemu_img.clone(),
     })?;
     Ok(Some(Arc::new(driver)))
+}
+
+fn build_nvmeof(
+    sections: &Sections,
+    _cfg: &AgentConfig,
+) -> anyhow::Result<Option<Arc<dyn VolumeDriver>>> {
+    let Some(n): Option<crate::config::NvmeofVolumeConfig> =
+        section(sections, "volume", DRIVER_NVMEOF)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(nvmeof_driver::NvmeofAttacher::new(
+        nvmeof_driver::NvmeofAttacherConfig {
+            bin_dir: n.bin_dir.clone(),
+        },
+    ))))
+}
+
+fn build_nvmeof_import(
+    sections: &Sections,
+    cfg: &AgentConfig,
+) -> anyhow::Result<Option<Arc<dyn VolumeDriver>>> {
+    let Some(n): Option<crate::config::NvmeofImportVolumeConfig> =
+        section(sections, "volume", DRIVER_NVMEOF_IMPORT)?
+    else {
+        return Ok(None);
+    };
+    // Beside the agent's own database, because the assignment is state of
+    // exactly that kind: small, this node's, and worthless to anybody else.
+    let state_dir = n.state_dir.clone().unwrap_or_else(|| {
+        cfg.paths
+            .db_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("nvmeof-import")
+    });
+    Ok(Some(Arc::new(
+        nvmeof_import_driver::NvmeofImportDriver::new(nvmeof_import_driver::NvmeofImportConfig {
+            state_dir,
+            bin_dir: n.bin_dir.clone(),
+        }),
+    )))
 }
 
 fn build_nfs(
@@ -339,10 +400,16 @@ fn build_cloud_hypervisor(
     else {
         return Ok(None);
     };
+    // Asked here and not at the first migration: a typo in the range would
+    // otherwise be found by an operator draining a node, at the moment they
+    // can least afford to read a parse error.
+    h.ports()
+        .map_err(|why| anyhow::anyhow!("[hypervisor.cloud-hypervisor]: {why}"))?;
     let driver = cloud_hypervisor_driver::CloudHypervisorDriver::new(
         h.binary.clone(),
         cfg.paths.run_dir.join("vms"),
         Duration::from_millis(h.timeout_ms),
+        h.unplug_timeout(),
     )?;
     Ok(Some(Arc::new(driver)))
 }
@@ -367,6 +434,7 @@ fn build_linux_network(
     Ok(Some(Arc::new(LinuxNetworkDriver::build(
         vxlan,
         cfg.nft_config()?,
+        cfg.provider_config(),
     )?)))
 }
 
@@ -381,6 +449,18 @@ fn build_linux_network(
 #[derive(Clone, Debug, Default)]
 pub struct NetworkCatalog {
     profiles: Vec<String>,
+    /// Whether this node built a NIC driver at all — the plainer half of the
+    /// same question the profiles answer, and the one `validate` needs.
+    ///
+    /// From the registered slot rather than from the config, for the reason
+    /// `HypervisorCatalog::new` gives about its own: what a node claims has
+    /// to be what it actually built. `Drivers::networking` and
+    /// `Drivers::bridge` are `Some` together or `None` together, so one bool
+    /// answers for both.
+    ///
+    /// `false` on a `Default` catalogue, which is what a test that never
+    /// mentions networking means by one.
+    makes_taps: bool,
 }
 
 impl NetworkCatalog {
@@ -389,7 +469,11 @@ impl NetworkCatalog {
     /// are different configurations and the same capability: neither can
     /// carry a tenant overlay, and the catalogue is about what a node can
     /// serve rather than about how it is written down.
-    pub fn new(cfg: Option<&crate::config::NetworkConfig>) -> Self {
+    pub fn new(
+        cfg: Option<&crate::config::NetworkConfig>,
+        makes_taps: bool,
+        physnets: &[String],
+    ) -> Self {
         let mut profiles = Vec::new();
         if let Some(vxlan) = cfg.and_then(|c| c.vxlan.as_ref()) {
             profiles.push(common::capability::VXLAN.to_string());
@@ -397,7 +481,7 @@ impl NetworkCatalog {
             // for an overlay, and a node that dropped `network/vxlan` when it
             // turned evpn on would stop being a candidate for the very VMs it
             // serves best. This one is for the operator reading
-            // `meister cluster nodes` — evpn is a cluster-wide decision (see
+            // `meister node ls` — evpn is a cluster-wide decision (see
             // `VxlanConfig::evpn`), and the only thing that can enforce it is
             // somebody being able to see who is on which side.
             if vxlan.evpn {
@@ -415,7 +499,40 @@ impl NetworkCatalog {
         // does not announce it is still reserved and still enforced — it is
         // reached by a static route instead — so announcing is a property of
         // the environment and not a requirement of the VM.
-        Self { profiles }
+        // Festlegung 2: the gateway is a capability out of the config, not an
+        // agent of its own. One entry per provider network this node gave an
+        // interface away to, named after the network and not after the
+        // interface — two nodes saying `ext` mean the same wire, and which
+        // interface each of them uses to reach it is nobody else's business.
+        //
+        // Off the DRIVER's list and not off the config file, for the reason
+        // `makes_taps` is a bool from the registered slot: what a node claims
+        // has to be what it actually built. A physnet whose bridge name the
+        // driver refused never reaches this list, because the driver refused
+        // to come up at all.
+        profiles.extend(
+            physnets
+                .iter()
+                .map(|physnet| common::capability::gateway_claim(physnet)),
+        );
+        Self {
+            profiles,
+            makes_taps,
+        }
+    }
+
+    /// The provider networks this node claims, by name. What a router's
+    /// physnet is checked against before an `EnsureRouter` reaches the driver.
+    pub fn physnets(&self) -> Vec<&str> {
+        self.profiles
+            .iter()
+            .filter_map(|p| common::capability::parse_gateway_claim(p))
+            .collect()
+    }
+
+    /// Whether a router on `physnet` could be built here at all.
+    pub fn serves_physnet(&self, physnet: &str) -> bool {
+        self.physnets().contains(&physnet)
     }
 
     /// What this node claims about its networking, for the Hello. Empty is a
@@ -430,12 +547,71 @@ impl NetworkCatalog {
         self.profiles.iter().any(|p| p == common::capability::VXLAN)
     }
 
+    /// Whether a router on `physnet` could be built here at all.
+    ///
+    /// Structural in the same sense the four catalogues are: "this node gave
+    /// no interface away to `ext`" will not be different on the next attempt,
+    /// so the refusal carries `CannotServe` and the tier above stops counting
+    /// this node as a candidate. Everything the DRIVER refuses afterwards is
+    /// about the attempt.
+    pub fn validate_router(&self, physnet: &str) -> anyhow::Result<()> {
+        if self.serves_physnet(physnet) {
+            return Ok(());
+        }
+        let mut have = self.physnets();
+        have.sort_unstable();
+        bail!(
+            "this node has no gateway slot on the provider network {physnet:?}; it gave away \
+             [{}]",
+            have.join(", ")
+        )
+    }
+
     /// A spec that asks for an overlay this node cannot join is a 422 on the
     /// REST path and a refused Create on the session — never a VM quietly
     /// placed on the default bridge, where it would reach every other tenant
     /// on this host.
+    ///
+    /// And, since this position, the cruder question first: a NIC at all on a
+    /// node that makes no taps. That refusal existed already — it came out of
+    /// `Drivers::networking()` deep inside `run_chain` — but it came out
+    /// THERE, which is after the point where a refusal can still be called
+    /// structural. Everything the four catalogues refuse carries
+    /// `CannotServe` and gives the binding back; everything `run_chain`
+    /// refuses is a `Failed` VM that stays bound to the node that cannot run
+    /// it. The fact is the same either way — this node has no `[network]`
+    /// section and will not grow one on the next attempt — so it belongs on
+    /// the side that says so.
     pub fn validate(&self, nics: &[crate::types::NicWithId]) -> anyhow::Result<()> {
+        if !nics.is_empty() && !self.makes_taps {
+            bail!(
+                "this node has no [network] section and so makes no taps; a vm with {} nic(s) \
+                 cannot run here",
+                nics.len()
+            );
+        }
         for n in nics {
+            // Festlegung 3: a NIC names one wire. The driver refuses the pair
+            // too, at the tap -- but a refusal there is a Failed VM bound to
+            // this node, and this one is structural and gives the binding
+            // back.
+            if let (Some(physnet), Some(vni)) = (&n.spec.physnet, n.spec.vxlan_id) {
+                bail!(
+                    "nic names the provider network {physnet:?} and the overlay {vni}; a tap \
+                     hangs on one wire, so name one of the two"
+                );
+            }
+            if let Some(physnet) = &n.spec.physnet
+                && !self.serves_physnet(physnet)
+            {
+                let mut have = self.physnets();
+                have.sort_unstable();
+                bail!(
+                    "nic asks for the provider network {physnet:?}, and this node gave away \
+                     [{}]",
+                    have.join(", ")
+                );
+            }
             let Some(vni) = n.spec.vxlan_id else { continue };
             if !self.serves_overlays() {
                 bail!(
@@ -562,7 +738,8 @@ impl Drivers {
     pub fn hypervisor(&self) -> anyhow::Result<&Arc<dyn Hypervisor>> {
         self.hypervisor.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "this node has no [hypervisor.*] section and so runs no vms; it was asked to                  run one anyway"
+                "this node has no [hypervisor.*] section and so runs no vms; it was asked to \
+                 run one anyway"
             )
         })
     }
@@ -571,7 +748,8 @@ impl Drivers {
     pub fn networking(&self) -> anyhow::Result<&Arc<dyn NicDriver>> {
         self.networking.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "this node has no [network] section and so makes no taps; a vm with a nic                  cannot run here"
+                "this node has no [network] section and so makes no taps; a vm with a nic \
+                 cannot run here"
             )
         })
     }
@@ -580,7 +758,8 @@ impl Drivers {
     pub fn bridge(&self) -> anyhow::Result<&Arc<dyn BridgeDriver>> {
         self.bridge.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "this node has no [network] section and so makes no bridges; a vm with a nic                  cannot run here"
+                "this node has no [network] section and so makes no bridges; a vm with a nic \
+                 cannot run here"
             )
         })
     }
@@ -642,14 +821,86 @@ impl HypervisorCatalog {
 /// a VM that gets half-provisioned and then torn down again.
 #[derive(Clone, Debug)]
 pub struct VolumeCatalog {
-    drivers: Vec<String>,
+    /// Backend name and what that backend says about where its bytes are,
+    /// sorted by name so the Hello is byte-identical across restarts.
+    ///
+    /// The locality is asked ONCE, here, and never again: it is a property of
+    /// the driver, so a value read per Hello would be the same value read
+    /// again. Keeping it beside the name is also what makes the two travel
+    /// together — a catalogue entry without its locality is exactly the
+    /// half-statement the pool status would then have to guess at.
+    drivers: Vec<(String, Locality)>,
+    /// The backends that can take a point-in-time copy, and what each needs
+    /// to make one worth having. Asked once for the same reason the locality
+    /// is: it is a property of the driver.
+    snapshots: Vec<(String, SnapshotConsistency)>,
 }
 
 impl VolumeCatalog {
     pub fn new(storage: &HashMap<String, Arc<dyn VolumeDriver>>) -> Self {
-        let mut drivers: Vec<String> = storage.keys().cloned().collect();
-        drivers.sort_unstable();
-        Self { drivers }
+        let mut drivers: Vec<(String, Locality)> = storage
+            .iter()
+            .map(|(name, driver)| (name.clone(), driver.locality()))
+            .collect();
+        drivers.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut snapshots: Vec<(String, SnapshotConsistency)> = storage
+            .iter()
+            .filter_map(|(name, driver)| Some((name.clone(), driver.snapshot_support()?)))
+            .collect();
+        snapshots.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        Self { drivers, snapshots }
+    }
+
+    /// Backend name and locality, in the order the Hello sends them.
+    pub fn localities(&self) -> &[(String, Locality)] {
+        &self.drivers
+    }
+
+    /// The snapshot half of the claim: `<backend>/snapshot` for every backend
+    /// that answered `snapshot_support`, flattening one tier up into
+    /// `volume/<backend>/snapshot`.
+    ///
+    /// The same spelling a GPU profile claims, and that is the whole point:
+    /// the tier above already knows how to ask a catalogue whether a node
+    /// offers `<driver>/<profile>`, so a pool whose driver cannot snapshot is
+    /// refused where a person can still read the refusal rather than becoming
+    /// a `Failed` object twenty seconds later.
+    ///
+    /// The CONSISTENCY travels beside it, as a second profile:
+    /// `<backend>/snapshot:atomic` or `<backend>/snapshot:needs-quiesce`.
+    ///
+    /// It did not, and the reason it has to now is that a backend's answer
+    /// stopped being a property of its NAME. `filesystem` reflinks on XFS and
+    /// btrfs and copies on ext4 — the same driver, two answers, decided by
+    /// the pool's own mount — so the tier that pauses a guest cannot get it
+    /// from `pool.spec.driver` any more. The node is the only party that
+    /// knows, and the claim is how a node says what it knows.
+    ///
+    /// BESIDE and never instead of: the bare `<backend>/snapshot` is what
+    /// every reader built so far matches on, and a node that stopped emitting
+    /// it would have its pools refused by a cluster one release older. Same
+    /// mixed-version trap `capability::HYPERVISOR` describes, same answer —
+    /// claiming is additive and safe, replacing is not.
+    pub fn snapshot_claims(&self) -> Vec<String> {
+        self.snapshots
+            .iter()
+            .flat_map(|(name, consistency)| {
+                [
+                    format!("{name}/{}", common::capability::SNAPSHOT),
+                    common::capability::snapshot_claim(name, *consistency),
+                ]
+            })
+            .collect()
+    }
+
+    /// What this backend needs to make a snapshot worth having, or `None`
+    /// where it cannot make one at all. What the agent asks before it decides
+    /// whether to pause a VM.
+    pub fn snapshot_support(&self, backend: &str) -> Option<SnapshotConsistency> {
+        self.snapshots
+            .iter()
+            .find(|(name, _)| name == backend)
+            .map(|(_, c)| *c)
     }
 
     /// What this node claims about its storage, for the Hello.
@@ -660,24 +911,33 @@ impl VolumeCatalog {
     /// `lvm-thin` in it would collide with a device driver of that name and
     /// answer a device request nobody could serve. The `filesystem` entry is
     /// in there too: every node has it, so it never decides a placement, but
-    /// leaving it out would make `meister cluster nodes` lie about what a
+    /// leaving it out would make `meister node ls` lie about what a
     /// node can do.
     pub fn inventory(&self) -> Vec<String> {
-        self.drivers.clone()
+        self.drivers.iter().map(|(name, _)| name.clone()).collect()
     }
 
     pub fn validate(&self, volumes: &[VolumeWithId]) -> anyhow::Result<()> {
         for v in volumes {
-            // None is the default driver, which is always registered.
-            let Some(driver) = &v.spec.driver else {
-                continue;
-            };
-            if !self.drivers.iter().any(|d| d == driver) {
-                bail!(
-                    "volume driver {driver:?} is not configured on this node; available: [{}]",
-                    self.drivers.join(", ")
-                );
-            }
+            self.validate_driver(v.spec.driver.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// One backend name, or none. The half of `validate` a standalone volume
+    /// needs: it has one spec rather than a list, and refusing it at the edge
+    /// is worth exactly as much — a Provision that names a backend this node
+    /// does not have should be a refused command, not a Failed volume.
+    pub fn validate_driver(&self, driver: Option<&str>) -> anyhow::Result<()> {
+        // None is the default driver, which is always registered.
+        let Some(driver) = driver else {
+            return Ok(());
+        };
+        if !self.drivers.iter().any(|(d, _)| d == driver) {
+            bail!(
+                "volume driver {driver:?} is not configured on this node; available: [{}]",
+                self.inventory().join(", ")
+            );
         }
         Ok(())
     }
@@ -752,14 +1012,23 @@ impl DeviceCatalog {
 mod tests {
     use super::*;
     use crate::types::VolumeWithId;
+    use agent_api::storage::SnapshotConsistency;
     use agent_api::storage::{
         VolumeAttacher, VolumeHandle, VolumeProvider, VolumeSpec, VolumeState,
     };
 
-    struct Stub;
+    struct Stub(Locality, Option<SnapshotConsistency>);
 
     #[async_trait::async_trait]
     impl VolumeProvider for Stub {
+        fn locality(&self) -> Locality {
+            self.0
+        }
+
+        fn snapshot_support(&self) -> Option<SnapshotConsistency> {
+            self.1
+        }
+
         async fn provision(
             &self,
             _: &agent_api::VolumeId,
@@ -794,15 +1063,25 @@ mod tests {
     }
 
     fn catalogue(names: &[&str]) -> VolumeCatalog {
+        localities(
+            &names
+                .iter()
+                .map(|n| (*n, Locality::NodeLocal))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn localities(named: &[(&str, Locality)]) -> VolumeCatalog {
         let mut map: HashMap<String, Arc<dyn VolumeDriver>> = HashMap::new();
-        for n in names {
-            map.insert(n.to_string(), Arc::new(Stub));
+        for (n, l) in named {
+            map.insert(n.to_string(), Arc::new(Stub(*l, None)));
         }
         VolumeCatalog::new(&map)
     }
 
     fn volume(driver: Option<&str>) -> VolumeWithId {
         VolumeWithId {
+            referenced: false,
             id: uuid::Uuid::nil(),
             spec: VolumeSpec {
                 base_image: None,
@@ -811,6 +1090,28 @@ mod tests {
                 params: None,
             },
         }
+    }
+
+    /// Locality is asked of the DRIVER once and travels beside the name, so
+    /// that a Hello can say `volume/nfs` and `shared` in one entry. The
+    /// inventory itself is unchanged by carrying it.
+    #[test]
+    fn the_catalogue_carries_each_backends_locality_beside_its_name() {
+        let cat = localities(&[
+            ("nfs", Locality::Shared),
+            ("filesystem", Locality::NodeLocal),
+            ("lvm-thin", Locality::NodeLocal),
+        ]);
+        assert_eq!(cat.inventory(), vec!["filesystem", "lvm-thin", "nfs"]);
+        assert_eq!(
+            cat.localities(),
+            &[
+                ("filesystem".to_string(), Locality::NodeLocal),
+                ("lvm-thin".to_string(), Locality::NodeLocal),
+                ("nfs".to_string(), Locality::Shared),
+            ],
+            "sorted by name, so a Hello is byte-identical across restarts"
+        );
     }
 
     /// An unknown backend is a rejected spec at the edge — a 422 on the REST
@@ -869,9 +1170,13 @@ mod tests {
         } else {
             r#"default_bridge = "br0""#
         };
-        NetworkCatalog::new(Some(
-            &toml::from_str(raw).expect("the network section parses"),
-        ))
+        // A `[network]` section is what builds the NIC driver, so a catalogue
+        // made from one makes taps.
+        NetworkCatalog::new(
+            Some(&toml::from_str(raw).expect("the network section parses")),
+            true,
+            &[],
+        )
     }
 
     fn tenant_nic(vxlan_id: Option<u32>) -> crate::types::NicWithId {
@@ -881,10 +1186,17 @@ mod tests {
                 bridge: "br0".into(),
                 mac: "52:54:00:00:00:01".parse().unwrap(),
                 vxlan_id,
+                physnet: None,
                 floating_ips: Vec::new(),
                 routed_subnets: Vec::new(),
             },
         }
+    }
+
+    fn provider_nic(physnet: &str) -> crate::types::NicWithId {
+        let mut nic = tenant_nic(None);
+        nic.spec.physnet = Some(physnet.to_string());
+        nic
     }
 
     /// A VM that asks for an overlay this node cannot join must be refused in
@@ -948,7 +1260,7 @@ mod tests {
     /// under test. `image_dir` has to be a directory that exists — the
     /// filesystem backend checks at start-up, which is the point of it — so
     /// everything in [paths] lives under one temp directory.
-    fn config(sections: &str) -> AgentConfig {
+    fn config(sections: &str) -> (tempfile::TempDir, AgentConfig) {
         raw_config(&format!(
             r#"[hypervisor.cloud-hypervisor]
                binary = "/usr/bin/cloud-hypervisor"
@@ -962,11 +1274,13 @@ mod tests {
     /// The same thing without the hypervisor and network sections baked in:
     /// what a node IS is now a question the config answers, so a test about
     /// that question has to be able to leave them out.
-    fn raw_config(sections: &str) -> AgentConfig {
-        let dir = std::env::temp_dir().join("meister-agent-drivers-test");
-        std::fs::create_dir_all(&dir).expect("a temp directory");
-        let dir = dir.display();
-        toml::from_str(&format!(
+    fn raw_config(sections: &str) -> (tempfile::TempDir, AgentConfig) {
+        let temp = tempfile::Builder::new()
+            .prefix("meister-agent-drivers-")
+            .tempdir()
+            .expect("a temp dir");
+        let dir = temp.path().display();
+        let cfg: AgentConfig = toml::from_str(&format!(
             r#"node_id = "n1"
                [paths]
                db_path     = "{dir}/a.redb"
@@ -976,7 +1290,8 @@ mod tests {
                cgroup_root = "/sys/fs/cgroup/x"
                {sections}"#
         ))
-        .expect("the test config parses")
+        .expect("the test config parses");
+        (temp, cfg)
     }
 
     /// `driver: None` in a spec has to keep meaning something on every node,
@@ -986,7 +1301,7 @@ mod tests {
     /// for.
     #[test]
     fn the_default_volume_driver_is_registered_without_a_section() {
-        let cfg = config("");
+        let (_temp, cfg) = config("");
         assert!(cfg.volume.is_empty(), "no [volume] section at all");
 
         let storage = register(VOLUME_DRIVERS, &cfg.volume, &cfg, "volume")
@@ -1005,7 +1320,7 @@ mod tests {
     #[test]
     fn vfio_without_a_managed_inventory_is_not_registered() {
         for sections in ["", "[device]\nmanaged = []"] {
-            let cfg = config(sections);
+            let (_temp, cfg) = config(sections);
             let devices = register(DEVICE_DRIVERS, &cfg.device, &cfg, "device")
                 .expect("nothing configured is not an error");
             assert!(
@@ -1022,12 +1337,12 @@ mod tests {
     /// driver, and the section is now optional.
     #[test]
     fn the_hypervisor_section_still_names_the_driver_it_always_named() {
-        let cfg = config("");
+        let (_temp, cfg) = config("");
         let built = register_one(HYPERVISOR_DRIVERS, &cfg.hypervisor, &cfg, "hypervisor")
             .expect("the example's hypervisor section builds");
         assert!(built.is_some(), "[hypervisor.cloud-hypervisor] builds one");
 
-        let none = raw_config(r#"[volume.filesystem]"#);
+        let (_temp, none) = raw_config(r#"[volume.filesystem]"#);
         assert!(
             register_one(HYPERVISOR_DRIVERS, &none.hypervisor, &none, "hypervisor")
                 .expect("no section is not an error")
@@ -1041,7 +1356,7 @@ mod tests {
     /// enum could say the variant was unknown, but not what this agent has.
     #[test]
     fn an_unknown_hypervisor_section_is_refused_by_name() {
-        let cfg = raw_config(
+        let (_temp, cfg) = raw_config(
             r#"[hypervisor.qemu]
                                 binary = "/usr/bin/qemu-system-x86_64""#,
         );
@@ -1065,15 +1380,15 @@ mod tests {
             DriverEntry {
                 name: "a",
                 keys: &["a"],
-                build: |_, _| Ok(Some(Arc::new(Stub))),
+                build: |_, _| Ok(Some(Arc::new(Stub(Locality::NodeLocal, None)))),
             },
             DriverEntry {
                 name: "b",
                 keys: &["b"],
-                build: |_, _| Ok(Some(Arc::new(Stub))),
+                build: |_, _| Ok(Some(Arc::new(Stub(Locality::NodeLocal, None)))),
             },
         ];
-        let cfg = config("");
+        let (_temp, cfg) = config("");
         let Err(err) = register_one(TWO, &Sections::new(), &cfg, "hypervisor") else {
             panic!("two configured rows in a single slot is not a choice to make");
         };
@@ -1088,7 +1403,7 @@ mod tests {
     /// scheduler's Pending reason in three days.
     #[tokio::test]
     async fn an_agent_that_serves_neither_vms_nor_volumes_refuses_to_start() {
-        let nothing = raw_config("");
+        let (_temp, nothing) = raw_config("");
         assert!(nothing.hypervisor.is_empty() && nothing.volume.is_empty());
 
         let Err(err) = Drivers::from_config(&nothing).await else {
@@ -1108,7 +1423,7 @@ mod tests {
     /// compute node wants its VMMs there.
     #[tokio::test]
     async fn a_storage_node_comes_up_without_a_hypervisor_or_a_network() {
-        let cfg = raw_config("[volume.filesystem]");
+        let (_temp, cfg) = raw_config("[volume.filesystem]");
         let drivers = Drivers::from_config(&cfg)
             .await
             .expect("storage alone is a node");
@@ -1142,7 +1457,7 @@ mod tests {
     async fn a_compute_node_claims_the_hypervisor_a_scheduler_would_match() {
         // No `[network]`: a node that runs VMs without making taps is a legal
         // shape too, and the one this test can build without nftables.
-        let cfg = raw_config(
+        let (_temp, cfg) = raw_config(
             r#"[hypervisor.cloud-hypervisor]
                binary = "/usr/bin/cloud-hypervisor"
                timeout_ms = 5000"#,
@@ -1174,7 +1489,8 @@ mod tests {
     /// one, the same rule the network half follows.
     #[tokio::test]
     async fn a_storage_node_claims_no_hypervisor_and_refuses_a_vm_in_words() {
-        let drivers = Drivers::from_config(&raw_config("[volume.filesystem]"))
+        let (_temp, cfg) = raw_config("[volume.filesystem]");
+        let drivers = Drivers::from_config(&cfg)
             .await
             .expect("storage alone is a node");
         let cat = HypervisorCatalog::new(drivers.hypervisor_name.as_deref());
@@ -1197,14 +1513,122 @@ mod tests {
 
     /// A node with no `[network]` section claims exactly what a node with one
     /// and no overlay claims: nothing. Two configurations, one capability.
+    ///
+    /// The CLAIM is the same and what they can serve is not, which is why the
+    /// catalogue carries `makes_taps` beside the profiles: an empty claim is
+    /// what a scheduler reads, and "can this spec run here at all" is what
+    /// this node reads.
     #[test]
     fn a_node_without_a_network_section_claims_no_overlay() {
-        let cat = NetworkCatalog::new(None);
+        let cat = NetworkCatalog::new(None, false, &[]);
         assert!(cat.inventory().is_empty());
         assert!(!cat.serves_overlays());
-        cat.validate(&[tenant_nic(None)])
-            .expect("a plain nic constrains nothing here either");
         assert_eq!(cat.inventory(), network(false).inventory());
+        // A VM with no NIC at all is still perfectly welcome here.
+        cat.validate(&[]).expect("no nic, no taps needed");
+    }
+
+    /// Festlegung 2: the gateway is a capability out of the config. A node
+    /// that gave an interface away claims one entry per provider network, and
+    /// a node that gave none claims nothing and is a candidate for no router.
+    #[test]
+    fn a_node_that_gave_an_interface_away_claims_it_by_the_networks_name() {
+        let cat = NetworkCatalog::new(
+            Some(&toml::from_str(r#"default_bridge = "br0""#).unwrap()),
+            true,
+            &["ext".to_string(), "dmz".to_string()],
+        );
+        assert_eq!(cat.inventory(), ["gateway:ext", "gateway:dmz"]);
+        assert_eq!(cat.physnets(), ["ext", "dmz"]);
+        assert!(cat.serves_physnet("ext"));
+        assert!(!cat.serves_physnet("wan"));
+        // The overlay claim is a different question and this node answers it
+        // no: a gateway node with no [network.vxlan] can hold no router, and
+        // the router's own build says so at `ensure_overlay`.
+        assert!(!cat.serves_overlays());
+
+        // The ordinary node, which is every node before 6k.
+        assert!(network(true).physnets().is_empty());
+        assert!(!network(true).serves_physnet("ext"));
+    }
+
+    /// A NIC on a provider network this node did not give an interface away
+    /// to is structural: the node will not grow the interface on the next
+    /// attempt, so the refusal carries `CannotServe` and the VM is placed
+    /// somewhere else rather than going Failed here.
+    #[test]
+    fn a_nic_on_a_provider_network_this_node_does_not_have_is_refused() {
+        let gateway = NetworkCatalog::new(
+            Some(&toml::from_str(r#"default_bridge = "br0""#).unwrap()),
+            true,
+            &["ext".to_string()],
+        );
+        gateway
+            .validate(&[provider_nic("ext")])
+            .expect("this node gave eth1 away to ext");
+
+        let err = gateway
+            .validate(&[provider_nic("dmz")])
+            .expect_err("and to nothing else")
+            .to_string();
+        assert!(err.contains("\"dmz\"") && err.contains("[ext]"), "{err}");
+
+        // A node with no slot at all says the same thing with an empty list.
+        let err = network(true)
+            .validate(&[provider_nic("ext")])
+            .expect_err("no slot here")
+            .to_string();
+        assert!(err.contains("[]"), "{err}");
+    }
+
+    /// Both wires named at once, refused where the refusal is still
+    /// structural. The driver refuses it too, at the tap -- but that is a
+    /// Failed VM bound to this node, and this is a VM that moves.
+    #[test]
+    fn a_nic_that_names_both_wires_is_refused_before_a_tap_exists() {
+        let mut nic = provider_nic("ext");
+        nic.spec.vxlan_id = Some(10_000);
+        let err = NetworkCatalog::new(
+            Some(&toml::from_str(r#"default_bridge = "br0""#).unwrap()),
+            true,
+            &["ext".to_string()],
+        )
+        .validate(&[nic])
+        .expect_err("one wire")
+        .to_string();
+        assert!(err.contains("name one of the two"), "{err}");
+    }
+
+    /// The refusal this position moved, and the one behaviour change it
+    /// makes: a plain NIC on a node that makes no taps.
+    ///
+    /// It was always refused. It was refused in `run_chain`, three layers
+    /// down and after the point where `handle_create` marks a refusal
+    /// structural — so the VM stayed bound to a node that will never be able
+    /// to run it and went `Failed` instead of moving. Here it carries
+    /// `CannotServe`, and the tier above takes the binding back.
+    #[test]
+    fn a_nic_on_a_node_that_makes_no_taps_is_refused_where_it_is_structural() {
+        let none = NetworkCatalog::new(None, false, &[]);
+        let err = none
+            .validate(&[tenant_nic(None)])
+            .expect_err("this node makes no taps");
+        let err = err.to_string();
+        assert!(err.contains("[network]"), "it names the section: {err}");
+        assert!(err.contains("makes no taps"), "{err}");
+
+        // And a node that HAS the section takes the same nic, overlay or not
+        // — the second question is the one that was always asked here.
+        network(false)
+            .validate(&[tenant_nic(None)])
+            .expect("a plain nic on a node with taps");
+        network(true)
+            .validate(&[tenant_nic(Some(4242))])
+            .expect("an overlay nic on a node with one");
+        assert!(
+            network(false).validate(&[tenant_nic(Some(4242))]).is_err(),
+            "taps yes, overlay no"
+        );
     }
 
     /// A section no driver owns used to be `deny_unknown_fields` on a config
@@ -1214,7 +1638,7 @@ mod tests {
     /// on the first VM that needed it.
     #[test]
     fn a_section_no_driver_owns_is_refused_by_name() {
-        let cfg = config("[volume.ceph]\npool = \"rbd\"");
+        let (_temp, cfg) = config("[volume.ceph]\npool = \"rbd\"");
         let Err(err) = register(VOLUME_DRIVERS, &cfg.volume, &cfg, "volume") else {
             panic!("ceph is not a storage backend this agent has");
         };
@@ -1228,12 +1652,108 @@ mod tests {
         // The device half goes through the same function, and its list is
         // the table KEYS rather than the driver names — `managed` is what
         // you would have to write, and `vfio` is not.
-        let cfg = config("[device.crosvm-gp]\nbinary = \"/usr/bin/crosvm\"");
+        let (_temp, cfg) = config("[device.crosvm-gp]\nbinary = \"/usr/bin/crosvm\"");
         let Err(err) = register(DEVICE_DRIVERS, &cfg.device, &cfg, "device") else {
             panic!("crosvm-gp is a typo, not a device backend");
         };
         let err = err.to_string();
         assert!(err.contains("[device.crosvm-gp]"), "{err}");
         assert!(err.contains("crosvm-gpu, managed, nvrm"), "{err}");
+    }
+
+    /// The catalogue claim follows `snapshot_support` and nothing else.
+    ///
+    /// The claim is what makes "this pool cannot snapshot" a 422 at the API
+    /// edge rather than a `Failed` object twenty seconds later — the same
+    /// spelling a GPU profile uses, so the tier above asks with the function
+    /// it already has. A backend that answers `None` claims nothing, and one
+    /// that answers anything at all claims `<backend>/snapshot` — plus, since
+    /// a backend's consistency stopped being a property of its name, the
+    /// same entry with the answer on it.
+    #[test]
+    fn a_backend_claims_a_snapshot_entry_exactly_when_it_says_it_can() {
+        let mut map: HashMap<String, Arc<dyn VolumeDriver>> = HashMap::new();
+        map.insert(
+            "filesystem".into(),
+            Arc::new(Stub(
+                Locality::NodeLocal,
+                Some(SnapshotConsistency::NeedsQuiesce),
+            )),
+        );
+        map.insert(
+            "lvm-thin".into(),
+            Arc::new(Stub(Locality::NodeLocal, Some(SnapshotConsistency::Atomic))),
+        );
+        // A backend that cannot. The default of the trait, and the honest
+        // answer of most: unlike `locality`, a default here is a real answer
+        // rather than a value nobody thought about.
+        map.insert("blackhole".into(), Arc::new(Stub(Locality::Shared, None)));
+        let catalogue = VolumeCatalog::new(&map);
+
+        assert_eq!(
+            catalogue.snapshot_claims(),
+            vec![
+                "filesystem/snapshot".to_string(),
+                "filesystem/snapshot:needs-quiesce".into(),
+                "lvm-thin/snapshot".into(),
+                "lvm-thin/snapshot:atomic".into(),
+            ],
+            "sorted, so a Hello is byte-identical across restarts"
+        );
+        // Flattened one tier up, this is what a scheduler and an API edge see.
+        let flat: Vec<String> = catalogue
+            .snapshot_claims()
+            .iter()
+            .map(|p| common::capability::entry(common::capability::VOLUME, Some(p)))
+            .collect();
+        assert!(flat.contains(&"volume/lvm-thin/snapshot".to_string()));
+        assert!(flat.contains(&"volume/lvm-thin/snapshot:atomic".to_string()));
+        assert!(!flat.contains(&"volume/blackhole/snapshot".to_string()));
+
+        // The bare entry is still there and still bare, which is what a
+        // cluster one release older matches on: adding the consistency must
+        // not take a pool away from a controller that has not learned to read
+        // it yet.
+        assert!(
+            common::capability::offers(
+                &flat,
+                common::capability::VOLUME,
+                Some("lvm-thin/snapshot")
+            ),
+            "the old question still gets the old answer"
+        );
+
+        // And the consistency now travels, because it stopped being a
+        // property of the driver's NAME: `filesystem` reflinks on one mount
+        // and copies on the next.
+        for (profile, want) in [
+            ("lvm-thin/snapshot:atomic", SnapshotConsistency::Atomic),
+            (
+                "filesystem/snapshot:needs-quiesce",
+                SnapshotConsistency::NeedsQuiesce,
+            ),
+        ] {
+            let (backend, consistency) =
+                common::capability::parse_snapshot_claim(profile).expect("a claim reads back");
+            assert_eq!(consistency, want);
+            assert!(profile.starts_with(backend));
+        }
+        // The bare entry carries no answer, and a reader that gets none has
+        // to quiesce rather than guess.
+        assert_eq!(
+            common::capability::parse_snapshot_claim("lvm-thin/snapshot"),
+            None
+        );
+
+        assert_eq!(
+            catalogue.snapshot_support("lvm-thin"),
+            Some(SnapshotConsistency::Atomic)
+        );
+        assert_eq!(catalogue.snapshot_support("blackhole"), None);
+        assert_eq!(catalogue.snapshot_support("nothing-here"), None);
+
+        // The locality half is untouched by any of it: the snapshot entry
+        // carries no locality, so it cannot be read as one.
+        assert_eq!(catalogue.localities().len(), 3);
     }
 }

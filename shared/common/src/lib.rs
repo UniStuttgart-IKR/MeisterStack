@@ -7,5 +7,6 @@
 pub mod attribution;
 pub mod capability;
 pub mod hrw;
+pub mod migration;
 pub mod net;
 pub mod redial;

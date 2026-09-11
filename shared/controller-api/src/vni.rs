@@ -66,6 +66,28 @@ pub fn next_vni(current: Option<u32>, base: u32) -> Result<(u32, u32)> {
 /// The bound on retries is a liveness one, not a correctness one: each round
 /// is one lost race, and a caller that has lost sixteen in a row is on an API
 /// server that has bigger problems than this tenant.
+/// The number `allocate` WOULD issue, without issuing it.
+///
+/// For `?dryRun=All`, and it is the reason the parameter needs a second
+/// function rather than a flag: a preview that burned a VNI would leave a
+/// hole in the space every time somebody asked to be shown a tenant, and a
+/// number out of sixteen million is cheap exactly once per tenant and not
+/// once per look.
+///
+/// A racy read, deliberately and harmlessly: two previews in the same instant
+/// name the same number, and neither of them holds it. What a preview
+/// promises is what the request would get if it went now, which is all any
+/// preview of an allocated resource can promise.
+pub async fn peek(store: &EtcdStore, base: u32) -> Result<u32> {
+    let current = match store.get::<Counter>(COUNTER_VNI).await {
+        Ok(counter) => Some(counter.spec.next),
+        Err(StoreError::NotFound(_)) => None,
+        Err(e) => return Err(e),
+    };
+    let (issued, _) = next_vni(current, base)?;
+    Ok(issued)
+}
+
 pub async fn allocate(store: &EtcdStore, base: u32) -> Result<u32> {
     for _ in 0..16 {
         match store.get::<Counter>(COUNTER_VNI).await {
@@ -117,6 +139,22 @@ pub async fn allocate(store: &EtcdStore, base: u32) -> Result<u32> {
 /// to keep working. It is also the override — an admin who has said exactly
 /// which overlay a NIC belongs on has said something more specific than the
 /// tenant did.
+///
+/// **A NIC that names a `physnet` is left alone too, and that is 6k's third
+/// decision.** Such a NIC hangs on the provider bridge instead of the
+/// overlay: it is the appliance road and the single-tenant lab road, and it
+/// is exactly the gap the 6k survey found — "no NIC can go outside, the
+/// cluster writes the tenant VNI into every NIC that has no `vxlan_id` of its
+/// own". Writing one in here would put a VNI on a tap that is not on any
+/// overlay, and the agent refuses a NIC that names both. So the rule is: this
+/// function fills in the tenant's overlay for the NICs that asked for
+/// nothing, and a NIC that asked for something — either something — keeps it.
+///
+/// The field itself belongs to the OTHER crate: `agent_api::spec::NewNic` is
+/// `deny_unknown_fields`, so `POST /vms` refuses a spec naming `physnet`
+/// until the agent side of 6k adds it (N-A2). This half is written first on
+/// purpose — the rule about the VNI is this tier's and it has to be right the
+/// moment the field arrives, not a release later.
 pub fn inject_vxlan_id(spec: &mut serde_json::Value, vni: u32) -> usize {
     let Some(nics) = spec.get_mut("nics").and_then(|n| n.as_array_mut()) else {
         return 0;
@@ -126,13 +164,34 @@ pub fn inject_vxlan_id(spec: &mut serde_json::Value, vni: u32) -> usize {
         let Some(nic) = nic.as_object_mut() else {
             continue;
         };
-        if nic.get("vxlan_id").is_some_and(|v| !v.is_null()) {
+        if nic.get("vxlan_id").is_some_and(|v| !v.is_null()) || on_a_provider_network(nic) {
             continue;
         }
         nic.insert("vxlan_id".to_string(), serde_json::Value::from(vni));
         touched += 1;
     }
     touched
+}
+
+/// Does this NIC name a provider network rather than an overlay?
+///
+/// A non-empty string, so that `"physnet": ""` and `"physnet": null` both read
+/// as "said nothing" — a client that clears the field must not end up with a
+/// NIC on no network at all, which is what an emptiness-blind check would
+/// produce.
+///
+/// Here rather than at the call site because two readers ask it: the
+/// injection above, and `scheduler::resource_requests`, which turns the same
+/// field into the demand for a node that actually holds that interface.
+pub fn on_a_provider_network(nic: &serde_json::Map<String, serde_json::Value>) -> bool {
+    physnet_of(nic).is_some()
+}
+
+/// The provider network this NIC asks for, if it asks for one.
+pub fn physnet_of(nic: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    nic.get("physnet")
+        .and_then(|p| p.as_str())
+        .filter(|p| !p.is_empty())
 }
 
 #[cfg(test)]
@@ -198,6 +257,30 @@ mod tests {
         assert_eq!(inject_vxlan_id(&mut spec, 10_007), 1);
         assert_eq!(spec["nics"][0]["vxlan_id"], 4242);
         assert_eq!(spec["nics"][1]["vxlan_id"], 10_007);
+    }
+
+    /// 6k's third decision, and the gap it closes: a NIC that names a
+    /// provider network hangs on the provider bridge, so the tenant's VNI
+    /// must not be written into it. Before this, every NIC without a
+    /// `vxlan_id` of its own got one, and there was no way to say "outside"
+    /// at all.
+    #[test]
+    fn a_nic_on_a_provider_network_never_gets_the_tenants_vni() {
+        let mut spec = serde_json::json!({
+            "nics": [{ "physnet": "ext" }, {}],
+        });
+        assert_eq!(inject_vxlan_id(&mut spec, 10_007), 1);
+        assert!(
+            spec["nics"][0].get("vxlan_id").is_none(),
+            "a nic on the provider bridge is on no overlay: {spec}"
+        );
+        assert_eq!(spec["nics"][1]["vxlan_id"], 10_007);
+
+        // Empty and null are "said nothing", not "a network called
+        // nothing": a client that cleared the field gets the overlay back
+        // rather than a tap on no network at all.
+        let mut cleared = serde_json::json!({ "nics": [{ "physnet": "" }, { "physnet": null }] });
+        assert_eq!(inject_vxlan_id(&mut cleared, 10_007), 2);
     }
 
     /// A VM with no NICs is a VM with no NICs. Nothing to write, nothing to

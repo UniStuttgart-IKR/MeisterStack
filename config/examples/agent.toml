@@ -18,7 +18,7 @@
 # For the locked-down variant of this file — loopback REST, mTLS sessions,
 # exactly one public edge — see examples/hardened/.
 
-# What this node is called, everywhere: in `meister cluster nodes`, in the
+# What this node is called, everywhere: in `meister node ls`, in the
 # Node object in etcd, and in the hash that picks which controller replica
 # this agent dials. It has to be stable across restarts and unique in the
 # cluster — a second node with this name would take over the first one's
@@ -28,7 +28,7 @@ node_id = "manacor"
 # --- the controller, if there is one ---------------------------------------
 #
 # Neither key: the agent runs standalone. Its unix socket still works and
-# `meister agent …` still drives it; it simply has nobody to report to.
+# `meister agent vm …` still drives it; it simply has nobody to report to.
 #
 # `controller_addrs` is the newer and more complete statement and wins
 # outright when both are set. Order in the list does not matter: each agent
@@ -44,10 +44,63 @@ controller_addrs = ["http://10.128.1.104:50051", "http://10.128.1.110:50051"]
 # the node's business.
 #stop_grace_secs = 30
 
+# How long this node waits on a live migration it cannot see the end of, at
+# either end of one. Both default to 600.
+#
+# Both MUST be longer than the cluster's own `migration_transfer_secs`, and
+# that relation is the whole reason the numbers exist: the tier that ASKED for
+# the migration is the one that decides it has failed, and a node that gave up
+# first would report a failure for a transfer still running. An estate that
+# raised the cluster's patience for 32 GiB guests over a congested link raises
+# these two with it.
+#
+#   migrate_out_ceiling_secs  the SOURCE watching its own VMM. Reached only
+#                             when the VMM neither exits (which is how v53
+#                             says a send took) nor resumes its guest.
+#   receive_ceiling_secs      the DESTINATION holding a VMM, a set of disks
+#                             and a set of taps for a guest that has not
+#                             turned up. Reached only by the one failure
+#                             nobody reports — a source that never dialled.
+#
+# Wrong downwards is a guest that dies mid-move; wrong upwards is a leak that
+# lasts this long. Set them together.
+#migrate_out_ceiling_secs = 600
+#receive_ceiling_secs = 600
+
+# The physical machine this node is on, when somebody outside can see what
+# the machine itself cannot. Unset on bare metal, where it is not needed.
+#
+# A nested node — an agent in a VM, which is what a lab is — cannot ask its
+# host who it is: the platform's DMI says QEMU and a serial belonging to the
+# guest, and that is the whole of what a guest may know.
+#
+# It exists for exactly one decision. Nested KVM state does not restore on a
+# different physical host — measured twice on this lab's own hardware, with
+# two bare cloud-hypervisor processes and no MeisterStack at all (D-X1) — so
+# a live migration between two NESTED nodes is refused unless both name the
+# same host here. "We cannot tell" is not "it is fine", and the lab's answer
+# to "we cannot tell" was two nights.
+#
+# A refusal costs nothing: the guest keeps running, `vm migrate` says which
+# two machines and why, and a drain moves it by reboot instead.
+#physical_host = "palma"
+
 # Where to send spans. Unset = log to stdout and nothing else, which is how
 # this runs unless somebody is looking. Set, and one trace reaches from
 # `POST /vms` at the controller down to the backend spawn on this node.
 #otlp_endpoint = "http://127.0.0.1:4317"
+
+# How a line is WRITTEN — the envelope, and nothing else. The same events, the
+# same levels, the same fields; "human" (the default) is what `journalctl` on
+# a box reads well, "json" is what a log collector reads without a regex.
+#
+# The reason to turn it on is the join between the two signals: in json the
+# trace id is a KEY rather than a substring. It sits on the span, so a
+# collector that flattens nested objects — Loki's `| json` does, with an
+# underscore — calls it `span_trace_id`, and that is the field a Grafana
+# derived field points at Tempo with. In "human" the same id is in the text,
+# where a person has always found it.
+#log_format = "json"
 
 # --- metrics ---------------------------------------------------------------
 #
@@ -119,7 +172,7 @@ controller_addrs = ["http://10.128.1.104:50051", "http://10.128.1.110:50051"]
 # addresses the tap's own VM holds a reservation for, which arrive in the VM
 # spec (`nics[].floating_ips`) and become an accept in front of the ban.
 #
-# This is deliberate duplication of `meister cloud floatingpool ls`, and the
+# This is deliberate duplication of `meister floatingpool ls`, and the
 # honest v1 trade: the rule needs the whole union on the node, and the session
 # carries commands about VMs rather than a catalogue of pools. Keep the two in
 # step; a range missing here is a range nobody guards, and a range here that no
@@ -189,6 +242,20 @@ binary     = "/opt/meisterstack/bin/cloud-hypervisor"
 # How long one call to CH's API socket may take. This is a local unix socket;
 # anything slower than a second or two means the VMM is wedged, not busy.
 timeout_ms = 5000
+# How long a hot-unplug may take before this driver stops believing in it.
+# Default 30.
+#
+# A number about GUESTS and not about this stack: virtio unplug is
+# cooperative, and how long a kernel takes to let go of a device is a property
+# of the images this fleet runs. The deadline is not the guest's response
+# time — it is the point at which "the guest is thinking about it" becomes
+# "the guest is never going to do it".
+#
+# Being wrong in the FAST direction is what D3 was: the control plane reported
+# a volume free while the VMM still held the fd, and the next VM to use that
+# volume died on cloud-hypervisor's write lock, reported to the operator as a
+# scheduling problem. A fleet whose guests need forty seconds turns this up.
+#unplug_timeout_secs = 30
 
 [network]
 # Every NIC that names no bridge of its own lands here. The agent creates it
@@ -202,6 +269,26 @@ default_bridge = "meister_br0"
 # image sets 10.42.0.1/24 here (nix/agent.nix); a VM on a tenant overlay
 # never touches this bridge at all.
 #bridge_addr = "192.168.100.1/24"
+
+# Take down overlay links no record on this node names, once, at start-up.
+# Default: true.
+#
+# The reference count that removes a tenant's overlay when its last VM goes
+# hangs on the agent's records. A VM whose record went while its agent was not
+# running takes that wire's last counter with it, and nobody counts again — the
+# chaos run left VNI 10003 and 10004 standing on three nodes for good, with no
+# failure mode except unbounded growth in links on a machine that runs VMs for
+# a living.
+#
+# The sweep runs ONCE, before the first reconcile, and only when the whole
+# record table could be read: a record this build cannot read might name any
+# VNI, and sweeping on an incomplete list would take a live tenant's wire down.
+# Only this driver's own overlay links (`meister-vx<vni>` and the `mvx<vni>` in
+# them) are ever touched.
+#
+# Set it false on a node whose overlay links somebody else administers. They
+# then leak, which is the trade.
+#sweep_orphans = true
 
 # Tenant overlays. Present = this node can carry them and says so in its
 # Hello (`network/vxlan`), so the scheduler may place a tenant's VM here.
@@ -265,11 +352,50 @@ default_bridge = "meister_br0"
 # other waits for routes nobody sends. Nothing enforces it, because a VM asks
 # for an overlay and not for how the overlay finds its peers; what the stack
 # does instead is SHOW it, as the `network/evpn` entry in
-# `meister cluster nodes`.
+# `meister node ls`.
 #
 # Off is M5's behaviour byte for byte: a derived multicast group, kernel
 # learning, and no daemon anywhere.
 #evpn = false
+
+# --- the gateway slot: an interface this node gives away --------------------
+#
+# Present = this node has given one or more interfaces away to provider
+# networks, says so in its Hello as `network/gateway:<physnet>`, and may be
+# given tenant routers. Absent — every config before 6k — means it holds no
+# gateway slot: it still runs VMs and still carries overlays, it is simply
+# not a candidate for a router.
+#
+# THE INTERFACE MUST CARRY NO ADDRESS. That is the whole of the bargain and
+# the agent refuses to start otherwise: an address there is somebody still
+# using the interface, and a router put on it would answer for a network the
+# host is also on. Management goes wherever the operator wants — another NIC,
+# a VLAN, a bond — just not here.
+#
+# Per provider network the agent makes one bridge (`meister-px-<physnet>`)
+# and puts the interface in it. No tap ever hangs on it directly; what hangs
+# on it is the outside leg of a router, or a NIC that names `physnet` in its
+# spec (the single-tenant and lab mode).
+#
+# Per ROUTER the agent then makes one network namespace
+# (`meister-rt-<uuid>`) with two veth legs: one in the provider bridge with
+# the router's external address, one in the tenant's overlay bridge with its
+# internal address, `ip_forward` between them and the NAT rules in
+# `nft list table ip meister-rt` inside the namespace. Look at one with
+#
+#   ip netns exec meister-rt-<uuid> ip a
+#
+# The name is what the tier above schedules on, not the interface: two nodes
+# saying `ext` mean the same wire, and which NIC each of them reaches it by
+# is nobody else's business. Names are short because
+# `meister-px-` spends 11 of the 15 characters an interface name has.
+#[network.provider]
+#physnets = { ext = "eth1" }
+# Where `ip` is. Unset = PATH, the same default `nft` takes. iproute2 and not
+# netlink for the namespace half, because `ip netns add` PINS the namespace
+# under /var/run/netns — which is what makes the `ip netns exec` line above
+# work for somebody standing at the node.
+#ip = "/run/current-system/sw/bin/ip"
 
 # --- bgp: announcing what lives on this node --------------------------------
 #
@@ -408,7 +534,7 @@ default_bridge = "meister_br0"
 
 # --- images on a share, which is the whole image "distribution" -------------
 #
-# v1 moves no bytes and is not going to: `meister cloud image create` records
+# v1 moves no bytes and is not going to: `meister image create` records
 # where an image ALREADY is, every node looks that name up under its own
 # image_dir, and the catalogue is only worth its 422 if those two namespaces
 # line up. The way to make them line up on more than one node is not a

@@ -198,6 +198,20 @@ impl Authenticator for OidcAuthenticator {
     fn authenticate(&self, req: &AuthRequest) -> Result<Option<Identity>> {
         self.authenticate_at(req, Utc::now())
     }
+
+    /// The one link in this stack whose readiness is not its construction: it
+    /// is built from an issuer URL and can only check a signature once the
+    /// provider's JWKS has been fetched at least once.
+    ///
+    /// `loaded` and not "has usable keys", which would be the stricter
+    /// reading and the wrong one: a provider that answered with an empty key
+    /// set has been REACHED, and that is a different problem from one that
+    /// cannot be reached at all — the refresher already says so with its own
+    /// warning. What this answers is the question the discovery document
+    /// asks: has this link ever been in a position to authenticate anybody.
+    fn ready(&self) -> bool {
+        self.cache.loaded()
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +253,41 @@ mod tests {
             tenant_claim.map(str::to_string),
         );
         (auth, cache)
+    }
+
+    /// D11: this link is configured the moment it is built and ready only
+    /// once the provider's keys have been fetched, and it says which.
+    ///
+    /// The lab ran for hours with `auth: "mtls,oidc"` in the discovery
+    /// document while the issuer was unreachable — the refresher logged
+    /// "keeping the ones we have" over a key set that had never existed, and
+    /// every token would have been refused.
+    #[test]
+    fn the_oidc_link_is_not_ready_until_a_key_set_has_landed() {
+        use crate::auth::Authenticator;
+
+        let (cache, _handle) = KeyCache::new(Duration::from_secs(60));
+        let cache = Arc::new(cache);
+        let auth = OidcAuthenticator::new(
+            Validation::new(ISS, vec![AUD.to_string()]),
+            cache.clone(),
+            None,
+        );
+        assert!(
+            !auth.ready(),
+            "an issuer in a config file is not a provider that has answered"
+        );
+
+        // A provider that answers with an EMPTY key set has still been
+        // reached, and that is a different problem from one that cannot be:
+        // the refresher warns about it in its own words, and this link is not
+        // the place to say it a second time.
+        cache.install(meister_oidc::jwks::Keys::default());
+        assert!(auth.ready());
+
+        let idp = TestIdp::new("k1");
+        cache.install(idp.keys());
+        assert!(auth.ready());
     }
 
     #[test]
@@ -293,7 +342,8 @@ mod tests {
                     resource: "vms",
                     subresource: None,
                     verb,
-                }
+                },
+                None
             ));
         }
         // Once the directory says who they are, the same identity works.
@@ -305,7 +355,8 @@ mod tests {
                 resource: "vms",
                 subresource: None,
                 verb: crate::auth::Verb::Read,
-            }
+            },
+            None
         ));
     }
 

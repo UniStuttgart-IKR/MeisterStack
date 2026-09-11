@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 
 use agent_api::VmState;
 use meister_agent::reconcile::Observed;
-use meister_agent::types::{AgentVmSpec, BootSourceSpec, Desired, Operation, Phase, VmRecord};
+use meister_agent::types::{Desired, Operation, Phase, VmRecord};
 
 /// One point of the space: what `plan` is asked about, and when.
 #[derive(Clone)]
@@ -71,13 +71,17 @@ pub fn all_phases() -> Vec<Phase> {
         Phase::NetworkDone,
         Phase::DevicesDone,
         Phase::Provisioned,
+        Phase::Receiving,
+        Phase::Migrated,
     ];
     all.iter().for_each(|p| match p {
         Phase::Provisioning
         | Phase::VolumesDone
         | Phase::NetworkDone
         | Phase::DevicesDone
-        | Phase::Provisioned => {}
+        | Phase::Provisioned
+        | Phase::Receiving
+        | Phase::Migrated => {}
     });
     all.to_vec()
 }
@@ -127,39 +131,28 @@ pub fn all_unhealthy() -> Vec<Option<String>> {
     vec![None, Some("backend died".to_string())]
 }
 
-/// 2 · 5 · 5 · 4 · 2 · 2 · 2 · 2 · 2 · 2 · 5 — operation, desired, phase,
+/// 2 · 5 · 7 · 4 · 2 · 2 · 2 · 2 · 2 · 2 · 5 · 2 — operation, desired, phase,
 /// stop_deadline, unhealthy, vmm_pid, tracked, vmm_alive, socket_responsive,
-/// backends_alive, guest. Asserted by the walk, so the space cannot shrink
-/// behind a passing test.
-pub const SPACE_SIZE: usize = 64_000;
+/// backends_alive, guest, receive_failed. Asserted by the walk, so the space
+/// cannot shrink behind a passing test.
+///
+/// The phase axis grew from five to seven with live migration, and the two
+/// new values are deliberately IN the space rather than beside it: a phase
+/// that `plan` returns early for is exactly the kind of thing that has to be
+/// enumerated, because the claim being made about it is that nothing below
+/// the early return can reach it.
+///
+/// `receive_failed` doubled it again, and it is carried on every cell rather
+/// than only on the receiving ones for the reason `backends_alive` is: the
+/// claim is that a reception that will not finish decides EXACTLY one thing
+/// and decides it nowhere else, and a dimension enumerated only where it is
+/// expected to matter cannot say that.
+pub const SPACE_SIZE: usize = 179_200;
 
 /// A record with nothing interesting in it; the walk dresses it up per cell,
 /// and the hand-written cases build on it too.
 pub fn blank_record() -> VmRecord {
-    VmRecord {
-        spec: AgentVmSpec {
-            vcpus: 1,
-            memory_mib: 256,
-            boot: BootSourceSpec::Firmware {
-                firmware: "fw".into(),
-            },
-            volumes: vec![],
-            nics: vec![],
-            devices: vec![],
-            images: Vec::new(),
-            cloud_init: None,
-        },
-        desired: Desired::Running,
-        phase: Phase::Provisioned,
-        operation: None,
-        stop_deadline: None,
-        unhealthy: None,
-        managed_by_controller: false,
-        volumes: vec![],
-        nics: vec![],
-        devices: vec![],
-        vmm_pid: None,
-    }
+    VmRecord::blank()
 }
 
 /// Visit every cell exactly once. Returns how many there were, which the
@@ -185,19 +178,22 @@ pub fn walk(mut visit: impl FnMut(&Cell)) -> usize {
                                     for socket_responsive in [false, true] {
                                         for backends_alive in [false, true] {
                                             for guest in all_guests() {
-                                                let cell = Cell {
-                                                    record: record.clone(),
-                                                    obs: Observed {
-                                                        tracked,
-                                                        vmm_alive,
-                                                        socket_responsive,
-                                                        backends_alive,
-                                                        guest,
-                                                    },
-                                                    now,
-                                                };
-                                                visit(&cell);
-                                                seen += 1;
+                                                for receive_failed in [false, true] {
+                                                    let cell = Cell {
+                                                        record: record.clone(),
+                                                        obs: Observed {
+                                                            tracked,
+                                                            vmm_alive,
+                                                            socket_responsive,
+                                                            backends_alive,
+                                                            guest,
+                                                            receive_failed,
+                                                        },
+                                                        now,
+                                                    };
+                                                    visit(&cell);
+                                                    seen += 1;
+                                                }
                                             }
                                         }
                                     }
@@ -226,7 +222,7 @@ pub fn describe(cell: &Cell) -> String {
     };
     format!(
         "operation={} desired={:?} phase={:?} deadline={deadline} unhealthy={} vmm_pid={:?} \
-         | tracked={} vmm_alive={} socket={} backends_alive={} guest={:?}",
+         | tracked={} vmm_alive={} socket={} backends_alive={} guest={:?} receive_failed={}",
         cell.record.operation.is_some(),
         cell.record.desired,
         cell.record.phase,
@@ -237,5 +233,6 @@ pub fn describe(cell: &Cell) -> String {
         cell.obs.socket_responsive,
         cell.obs.backends_alive,
         cell.obs.guest,
+        cell.obs.receive_failed,
     )
 }

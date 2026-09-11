@@ -5,6 +5,12 @@ edition = "2024"
 
 [dependencies]
 common = { package = "meister-common", path = "../common" }
+# The create document, and only that. `spec.vm` is the agent's shape, so the
+# honest way to refuse a malformed one at the REST edge — synchronously, where
+# the client is still listening — is to deserialise into the agent's own type
+# rather than into a second copy of it. `agent-api` is a leaf crate of types
+# and traits: it pulls no node, no driver and no hypervisor behind it.
+agent_api = { package = "meister-agent-api", path = "../agent-api" }
 pki = { package = "meister-pki", path = "../pki" }
 # The token half of `auth`: JWT verification and the provider's key cache.
 # Its own crate because the CLI needs the login half of it and does not
@@ -15,19 +21,31 @@ meister-oidc = { path = "../oidc" }
 telemetry = { package = "meister-telemetry", path = "../telemetry" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+schemars = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
+# `network`: the two plugin traits of 6k are async — a backend sends a command
+# and waits for the node's ack — and a trait object cannot hold an `async fn`
+# without this. The drivers use it for the same reason.
+async-trait = { workspace = true }
 thiserror = { workspace = true }
 etcd-client = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+# `secrets`: AES-256-GCM over the values of a Secret, and base64 for the
+# one string that holds a sealed one.
+ring = { workspace = true }
+base64 = { workspace = true }
 rustls-pki-types = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 axum = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+# `forward`: one replica asking its sibling over plain HTTP.
+http-body-util = { workspace = true }
+bytes = { workspace = true }
 tower = { workspace = true }
 tonic = { workspace = true }
 # For `proto::client_tls`: the session TLS builder is shared with the agent
@@ -36,6 +54,9 @@ proto = { package = "meister-proto", path = "../proto" }
 
 [dev-dependencies]
 toml = { workspace = true }
+# A token file a test writes goes somewhere nobody else is, and goes away on
+# a panic as well as on a pass. See the workspace entry.
+tempfile = { workspace = true }
 # The in-process identity provider: a real key pair, a real JWKS and real
 # signatures, so that every refusal in `oidc` is proved against a token
 # somebody actually signed. Resolver 2 keeps this feature out of a plain

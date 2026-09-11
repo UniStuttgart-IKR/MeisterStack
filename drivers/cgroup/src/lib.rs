@@ -137,4 +137,11 @@ impl ResourceConfiner for CgroupV2 {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// The configured `cgroup_root`. This driver is the one that writes
+    /// `cgroup.subtree_control` and `cgroup.kill` into it, so it is the one
+    /// that can say where "it" is.
+    fn root(&self) -> Option<&std::path::Path> {
+        Some(&self.root)
+    }
 }

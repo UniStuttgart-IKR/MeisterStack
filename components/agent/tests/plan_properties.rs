@@ -6,7 +6,7 @@
 //!
 //! The table next door says what every input decides. These say what the
 //! decisions mean together — the four invariants the agent's safety rests on,
-//! each checked by walking the same 64.000 cells rather than by sampling
+//! each checked by walking the same 179.200 cells rather than by sampling
 //! them. Over a finite space exhaustion is not a weaker proof than a
 //! randomised property runner; it is a stronger one, and it needs no
 //! generator to be trusted.
@@ -77,7 +77,8 @@ fn is_a_real_action(action: Action) -> bool {
         | Action::Stop
         | Action::Pause
         | Action::Resume
-        | Action::Teardown => true,
+        | Action::Teardown
+        | Action::Arrived => true,
     }
 }
 
@@ -204,6 +205,88 @@ fn backend_liveness_reaches_plan_only_through_the_persisted_marker() {
     });
 }
 
+/// The narrowness of the new axis, stated the way `backends_alive`'s is:
+/// a reception that will not finish decides ONE thing, and only where a
+/// reception is what the record is doing. Everywhere else the bit is inert —
+/// which is what lets the destination's give-back sit inside the migration
+/// gate without a single repair path learning about it.
+#[test]
+fn a_failed_reception_decides_nothing_outside_the_receiving_phase() {
+    walk(|cell| {
+        if cell.record.phase == Phase::Receiving {
+            return;
+        }
+        let mut flipped = cell.obs;
+        flipped.receive_failed = !cell.obs.receive_failed;
+        assert_eq!(
+            plan(&cell.record, &cell.obs, cell.now),
+            plan(&cell.record, &flipped, cell.now),
+            "receive_failed changed a decision outside a reception: {}",
+            describe(cell)
+        );
+    });
+}
+
+/// And inside it, the one thing it decides is a give-back — never a repair.
+/// A destination that is holding a VMM for a guest another machine is
+/// running must not be talked into starting it.
+///
+/// The one thing that outranks it is the guest being HERE, and the order is
+/// deliberate rather than incidental. The two cannot both be true of one
+/// reception — v53 writes `migration-receive-finished` or
+/// `migration-receive-failed` and never both — but the space contains the
+/// pair anyway, and the answer to it has to be the safe one: a running guest
+/// on this node is this node's, and tearing down a live VMM on the strength
+/// of a stale line in a file is the one mistake worse than the leak this
+/// whole path exists to end.
+#[test]
+fn a_failed_reception_only_ever_gives_back() {
+    let mut seen = false;
+    walk(|cell| {
+        if cell.record.phase != Phase::Receiving || !cell.obs.receive_failed {
+            return;
+        }
+        // Only where the gate is reached at all. Everything above it is
+        // somebody STATING what should happen to this record — an operation
+        // holding it, a destroy, a stop, a quarantine to be looked at — and
+        // a reception that failed does not outrank any of those, which is
+        // the same placement the arrival has and is argued at the gate.
+        let action = plan(&cell.record, &cell.obs, cell.now);
+        if cell.record.operation.is_some()
+            || cell.record.unhealthy.is_some()
+            || !matches!(cell.record.desired, Desired::Running | Desired::Paused)
+        {
+            let mut waiting = cell.obs;
+            waiting.receive_failed = false;
+            assert_eq!(
+                action,
+                plan(&cell.record, &waiting, cell.now),
+                "the give-back outranked a stated intent: {}",
+                describe(cell)
+            );
+            return;
+        }
+        if cell.obs.guest == Some(VmState::Running) {
+            assert_eq!(
+                action,
+                Action::Arrived,
+                "a guest that is here is here: {}",
+                describe(cell)
+            );
+            return;
+        }
+        assert_eq!(
+            action,
+            Action::Teardown,
+            "a guest that is not coming was {action:?}: {}",
+            describe(cell)
+        );
+        assert!(!is_repair(action));
+        seen = true;
+    });
+    assert!(seen, "no cell ever reached the give-back");
+}
+
 // ---------------------------------------------------------------------------
 // 3. Desired::Absent never provisions
 // ---------------------------------------------------------------------------
@@ -267,6 +350,7 @@ fn every_operation_variant_blocks() {
                 socket_responsive: true,
                 backends_alive: true,
                 guest: Some(VmState::Running),
+                receive_failed: false,
             };
             assert_eq!(
                 plan(&record, &obs, base_now()),
@@ -409,6 +493,7 @@ fn an_ignored_power_button_escalates_when_the_grace_runs_out() {
         socket_responsive: true,
         backends_alive: true,
         guest: Some(VmState::Running),
+        receive_failed: false,
     };
 
     // Inside the grace the answer never changes, however often the pass runs
@@ -453,6 +538,7 @@ fn passes_inside_the_grace_cannot_postpone_it() {
         socket_responsive: true,
         backends_alive: true,
         guest: Some(VmState::Running),
+        receive_failed: false,
     };
     for elapsed in 0..30 {
         assert_eq!(
@@ -483,6 +569,7 @@ fn a_vm_that_never_came_up_is_not_stopped_posthumously() {
             socket_responsive: false,
             backends_alive: true,
             guest: None,
+            receive_failed: false,
         };
         assert_eq!(plan(&record, &obs, base_now()), Action::None, "{phase:?}");
     }

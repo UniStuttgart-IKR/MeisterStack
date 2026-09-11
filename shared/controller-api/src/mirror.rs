@@ -21,7 +21,82 @@ use std::collections::HashMap;
 
 use proto::VmStatusReport;
 
-use crate::resources::{Vm, VmPhase};
+use crate::resources::{Vm, VmAddress, VmAddressKind, VmPhase};
+
+/// Is a peer's report younger than everything this tier has already done?
+/// Only then does it describe the thing as it is now.
+///
+/// The floor is whichever is later of "we asked for it to be deleted" and
+/// "we last recorded an observation", because those are the two things this
+/// tier did. A report built before either describes the world from before it,
+/// and reading it as current would have us repeat a command that already took
+/// — or, worse, accept a "gone" that answered an older question and delete an
+/// object whose bytes were just made.
+///
+/// Loose over the two `Option`s and total, because both are genuinely absent
+/// on a thing nobody has touched yet.
+///
+/// Here rather than beside either caller because both tiers ask it now, of
+/// two different objects: the cloud of a `Vm` and the cluster of a `Volume`.
+/// One rule, one place — the same argument the rest of this module makes.
+pub fn is_current(
+    deletion: Option<chrono::DateTime<chrono::Utc>>,
+    observed: Option<chrono::DateTime<chrono::Utc>>,
+    reported_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    match deletion.max(observed) {
+        // Not-older rather than strictly-younger: a status this tier already
+        // wrote from carries exactly that instant, and it is evidence about
+        // itself. Two different instants never compare equal here in
+        // practice — this only readmits the status that set the floor.
+        Some(floor) => reported_at >= floor,
+        None => true,
+    }
+}
+
+/// A VM's address list with the taps a peer just reported in it.
+///
+/// Here for the reason the rest of this module is: both tiers apply it, and
+/// the two must agree exactly. The agent tells its cluster which taps it made
+/// and the cluster tells the cloud the same thing off the object it wrote —
+/// one rule, one place.
+///
+/// **An empty `reported` is not an answer and clears nothing.** A peer that
+/// names no tap is a peer from before the field, and reading it as "this VM
+/// has no addresses" would blank a working VM's list the moment an old binary
+/// reconnected. A peer that names some replaces the MAC lines wholesale,
+/// which is what makes a tap that has gone away drop out on its own.
+///
+/// Everything that is not a MAC line is kept untouched, because it belongs to
+/// another writer — the cloud's floating addresses are the one there is. And
+/// the MAC lines come FIRST, which is not cosmetic: the floating pass keeps
+/// what it does not own and appends its own after it, so two passes that
+/// agreed on the content and disagreed on the order would each read the
+/// other's document as a change and rewrite it every ten seconds, for ever.
+pub fn addresses_with(current: &[VmAddress], reported: &[proto::NicReport]) -> Vec<VmAddress> {
+    if reported.is_empty() {
+        return current.to_vec();
+    }
+    let mut out: Vec<VmAddress> = reported
+        .iter()
+        .map(|n| VmAddress {
+            kind: VmAddressKind::Mac,
+            nic: n.name.clone(),
+            mac: Some(n.mac.clone()),
+            // Never on a MAC line: the address a guest gave itself is known
+            // to the guest and to nobody here, and there is no agent in there
+            // to ask.
+            address: None,
+        })
+        .collect();
+    out.extend(
+        current
+            .iter()
+            .filter(|a| a.kind != VmAddressKind::Mac)
+            .cloned(),
+    );
+    out
+}
 
 /// What one line of a peer's report means for the VM it names. Everything
 /// here is a case the caller has to answer for its own tier; the case that
@@ -87,12 +162,14 @@ mod tests {
         let mut vm = new_vm(
             name,
             VmSpec {
+                class: Default::default(),
                 cluster_selector: Default::default(),
                 node_selector: Default::default(),
                 anti_affinity: Vec::new(),
                 node_name: node.map(str::to_string),
                 cluster_name: None,
                 run_strategy: Default::default(),
+                evacuation: Default::default(),
                 tenant: None,
                 vm: serde_json::json!({}),
             },
@@ -106,6 +183,11 @@ mod tests {
             id: uid.into(),
             phase: phase.into(),
             message: message.into(),
+            attached_volumes: Vec::new(),
+            node: String::new(),
+            volumes: Vec::new(),
+            pending_reason: String::new(),
+            nics: Vec::new(),
         }
     }
 
@@ -193,5 +275,87 @@ mod tests {
             seen(&known, &[line("uid-a", "Failed", "")], "manacor").as_slice(),
             [Observation::Changed(_, VmPhase::Failed, None)]
         ));
+    }
+
+    fn mac(nic: &str, addr: &str) -> VmAddress {
+        VmAddress {
+            kind: VmAddressKind::Mac,
+            nic: nic.into(),
+            mac: Some(addr.into()),
+            address: None,
+        }
+    }
+
+    fn floating(addr: &str) -> VmAddress {
+        VmAddress {
+            kind: VmAddressKind::FloatingIp,
+            nic: String::new(),
+            mac: None,
+            address: Some(addr.into()),
+        }
+    }
+
+    fn tap(name: &str, addr: &str) -> proto::NicReport {
+        proto::NicReport {
+            name: name.into(),
+            mac: addr.into(),
+        }
+    }
+
+    /// The whole point of the field, and the half that is a rule rather than
+    /// a copy: what a peer reports REPLACES the MAC lines, so a tap that has
+    /// gone away drops out on its own report, and it leaves everything else
+    /// exactly where it was, because the other lines have another writer.
+    #[test]
+    fn the_reported_taps_replace_the_mac_lines_and_leave_the_rest() {
+        let current = [
+            mac("nics[0]", "52:54:00:00:00:01"),
+            mac("nics[1]", "52:54:00:00:00:02"),
+            floating("192.0.2.7"),
+        ];
+        let out = addresses_with(&current, &[tap("nics[0]", "52:54:00:00:00:01")]);
+        assert_eq!(
+            out,
+            vec![mac("nics[0]", "52:54:00:00:00:01"), floating("192.0.2.7")],
+            "the second tap is gone and the floating address is not this writer's to touch"
+        );
+
+        // MAC lines first, because the floating pass keeps what it does not
+        // own and appends its own after it. Two writers that disagreed about
+        // the order would rewrite each other's document every ten seconds.
+        assert_eq!(out[0].kind, VmAddressKind::Mac);
+    }
+
+    /// A peer that names no tap is a peer from before the field — an old
+    /// agent to a cluster, an old cluster to a cloud — and it says NOTHING
+    /// about addresses. Not "none": nothing. Reading it the other way would
+    /// blank a working VM's list the moment an old binary reconnected.
+    #[test]
+    fn a_peer_that_reports_no_tap_leaves_the_addresses_exactly_as_they_were() {
+        let current = [mac("nics[0]", "52:54:00:00:00:01"), floating("192.0.2.7")];
+        assert_eq!(addresses_with(&current, &[]), current.to_vec());
+        // Including on a VM that has none, where the difference does not
+        // show but the rule is the same one.
+        assert!(addresses_with(&[], &[]).is_empty());
+    }
+
+    /// A VM whose taps this peer is the first to report: the list is what it
+    /// said, in the order it said it.
+    #[test]
+    fn the_first_report_of_a_tap_is_the_whole_answer() {
+        let out = addresses_with(
+            &[],
+            &[
+                tap("nics[0]", "52:54:00:11:22:33"),
+                tap("nics[1]", "52:54:00:aa:bb:cc"),
+            ],
+        );
+        assert_eq!(
+            out,
+            vec![
+                mac("nics[0]", "52:54:00:11:22:33"),
+                mac("nics[1]", "52:54:00:aa:bb:cc"),
+            ]
+        );
     }
 }

@@ -2,10 +2,26 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
+//! The cloud hypervisor driver: one VMM process per VM, driven over its own
+//! unix socket.
+//!
+//! This file is the face the agent sees — the struct, and the four traits it
+//! answers to. Every trait method here is one line of substance at most; what
+//! it does lives in one of three files, split the way the driver's own
+//! concerns split:
+//!
+//! * `config` — building the VM document, pure and therefore testable
+//! * `process` — starting, adopting and killing the VMM, and the files
+//!   beside it
+//! * `api` — talking to it over the socket, migration included
+//!
+//! They were one file of 1 660 lines, whose fifteen methods Repowise read as
+//! five groups sharing no state (LCOM4 = 5). These are those groups.
+
 use agent_api::hypervisor;
 use agent_api::{
-    BootSource, CgroupHandle, ConsoleStream, DeviceAttachment, Hypervisor, HypervisorError,
-    InstanceSpec, Pausable, VmId, VmState, VolumeAttachment,
+    AttachedVolume, BootSource, CgroupHandle, ConsoleStream, DeviceAttachment, HotPluggable,
+    Hypervisor, HypervisorError, InstanceSpec, Pausable, VmId, VmState, VolumeAttachment,
 };
 use anyhow::{Context, bail};
 use http_body_util::{BodyExt, Full};
@@ -21,20 +37,46 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tracing::{debug, info, instrument, warn};
 
-enum VmProcess {
-    Owned(Child),
-    Adopted { pid: u32 },
-}
+mod api;
+mod config;
+mod process;
 
-struct RunningVm {
-    process: VmProcess,
-}
+pub(crate) use api::*;
+pub(crate) use config::*;
+pub(crate) use process::*;
+
+/// How long a hot-unplug may take before this driver stops believing in it,
+/// when nobody has said.
+///
+/// Generous on purpose: the deadline is not the guest's response time, it is
+/// the point at which "the guest is thinking about it" becomes "the guest is
+/// never going to do it", and being wrong here in the fast direction is what
+/// D3 was. A detach that takes ten seconds is unusual and fine; a detach that
+/// is reported done while the fd is still open is a VM that will not boot.
+///
+/// A default and no longer the whole answer: it is a number about GUESTS and
+/// not about this stack — how long a kernel takes to let go of a virtio
+/// device is a property of the images a fleet runs — so a fleet whose guests
+/// need forty seconds sets `[hypervisor.cloud-hypervisor] unplug_timeout_secs`
+/// rather than living with a detach that reports a failure over a device that
+/// did in fact go.
+///
+/// **Public because the config's default is this value and must stay this
+/// value.** `AgentConfig`'s serde default reads it from here rather than
+/// spelling `30` a second time: two literals for one number is how a driver
+/// and an option table start disagreeing about what "the default" is.
+pub const DEFAULT_UNPLUG_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct CloudHypervisorDriver {
     binary: PathBuf,
     socket_dir: PathBuf,
     vms: Mutex<HashMap<VmId, RunningVm>>,
     ch_timeout: Duration,
+    /// How long a hot-unplug may take before this driver stops believing in
+    /// it. `[hypervisor.cloud-hypervisor] unplug_timeout_secs`, defaulting to
+    /// [`DEFAULT_UNPLUG_TIMEOUT`] — which is where the number is argued, and
+    /// `remove_disk` is where being wrong about it is paid for.
+    unplug_timeout: Duration,
 }
 
 impl CloudHypervisorDriver {
@@ -42,6 +84,7 @@ impl CloudHypervisorDriver {
         binary: PathBuf,
         socket_dir: PathBuf,
         ch_timeout: Duration,
+        unplug_timeout: Duration,
     ) -> hypervisor::Result<Self> {
         std::fs::create_dir_all(&socket_dir).map_err(|e| {
             HypervisorError::Backend(anyhow::anyhow!(
@@ -54,46 +97,8 @@ impl CloudHypervisorDriver {
             socket_dir,
             vms: Mutex::new(HashMap::new()),
             ch_timeout,
+            unplug_timeout,
         })
-    }
-
-    fn vm_socket_path(&self, id: &VmId) -> PathBuf {
-        self.socket_dir.join(format!("{id}.sock"))
-    }
-
-    /// The guest's own two output files, named once. `create` builds the VM
-    /// config from these and `console_paths` hands them to the agent, so
-    /// there is one spelling of where they are rather than two that can drift.
-    fn console_path(&self, id: &VmId, stream: ConsoleStream) -> PathBuf {
-        self.socket_dir.join(format!("{id}.{}", stream.as_str()))
-    }
-
-    /// Where cloud-hypervisor's OWN stdout and stderr go — the VMM's
-    /// diagnostics, not the guest's. Not part of `console_paths`: it is not
-    /// the guest's output and `vm logs` must not mix the two.
-    fn vmm_log_path(&self, id: &VmId) -> PathBuf {
-        self.socket_dir.join(format!("{id}.log"))
-    }
-
-    fn vm_known(&self, id: &VmId) -> hypervisor::Result<()> {
-        if self.vms.lock().unwrap().contains_key(id) {
-            Ok(())
-        } else {
-            Err(HypervisorError::NotFound(*id))
-        }
-    }
-
-    async fn api(
-        &self,
-        id: &VmId,
-        method: Method,
-        endpoint: &str,
-        body: Option<serde_json::Value>,
-    ) -> hypervisor::Result<Bytes> {
-        let socket = self.vm_socket_path(id);
-        ch_api(&socket, method, endpoint, body, self.ch_timeout)
-            .await
-            .map_err(HypervisorError::Backend)
     }
 }
 
@@ -106,75 +111,7 @@ impl Hypervisor for CloudHypervisorDriver {
         spec: &InstanceSpec,
         cgroup: Option<&CgroupHandle>,
     ) -> hypervisor::Result<u32> {
-        // vm logs into file
-        let log = std::fs::File::create(self.vmm_log_path(id))
-            .map_err(|e| HypervisorError::Backend(e.into()))?;
-        let log2 = log
-            .try_clone()
-            .map_err(|e| HypervisorError::Backend(e.into()))?;
-        let console_path = self.console_path(id, ConsoleStream::Console);
-        let serial_path = self.console_path(id, ConsoleStream::Serial);
-
-        let config = build_vm_config(spec, &console_path, &serial_path)?;
-        let socket = self.vm_socket_path(id);
-        let _ = std::fs::remove_file(&socket);
-
-        // create process without booting VM
-        let mut process = Command::new(&self.binary)
-            .arg("--api-socket")
-            .arg(&socket)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log2))
-            .spawn()
-            .map_err(|e| HypervisorError::Backend(e.into()))?;
-        let pid = process.id().ok_or_else(|| {
-            HypervisorError::Backend(anyhow::anyhow!(
-                "cloud-hypervisor exited before pid could be read"
-            ))
-        })?;
-        debug!(pid, "cloud-hypervisor spawned");
-
-        // put process into cgroup before VM boot
-        if let Some(cg) = cgroup
-            && let Err(e) = cg.attach_pid(pid)
-        {
-            let _ = process.kill().await;
-            return Err(HypervisorError::Backend(e.into()));
-        }
-
-        // wait for API to be ready, if not ready after ch_timeout -> kill process
-        let mut ready = false;
-        for attempt in 0..100 {
-            if self.api(id, Method::GET, "vmm.ping", None).await.is_ok() {
-                debug!(attempt, "vmm api ready");
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        if !ready {
-            warn!("vmm api not reachable, killing process");
-            let _ = process.kill().await;
-            return Err(HypervisorError::Backend(anyhow::anyhow!(
-                "Cloud-Hypervisor API not reachable for socket: {socket:?}"
-            )));
-        }
-
-        // create VM itself
-        if let Err(e) = self.api(id, Method::PUT, "vm.create", Some(config)).await {
-            let _ = process.kill().await;
-            return Err(e);
-        }
-
-        self.vms.lock().unwrap().insert(
-            *id,
-            RunningVm {
-                process: VmProcess::Owned(process),
-            },
-        );
-        debug!("vm created, not booted");
-        Ok(pid)
+        self.create_vm(id, spec, cgroup).await
     }
 
     #[instrument(skip_all, fields(vm_id = %id))]
@@ -200,54 +137,12 @@ impl Hypervisor for CloudHypervisorDriver {
     // telemetry with RUST_LOG=...=trace
     #[instrument(level = "trace", skip_all, fields(vm_id = %id))]
     async fn get_state(&self, id: &VmId) -> hypervisor::Result<VmState> {
-        self.vm_known(id)?;
-        let bytes = self.api(id, Method::GET, "vm.info", None).await?;
-        let info: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|e| HypervisorError::Backend(e.into()))?;
-
-        match info.get("state").and_then(|s| s.as_str()).unwrap_or("") {
-            "Created" => Ok(VmState::Defined),
-            "Running" => Ok(VmState::Running),
-            "Paused" => Ok(VmState::Paused),
-            "Shutdown" => Ok(VmState::Stopped),
-            other => Err(HypervisorError::Backend(anyhow::anyhow!(
-                "unknown Cloud-Hypervisor state: {other}"
-            ))),
-        }
+        self.state(id).await
     }
 
     #[instrument(skip_all, fields(vm_id = %id))]
     async fn destroy(&self, id: &VmId) -> hypervisor::Result<()> {
-        let vm = self.vms.lock().unwrap().remove(id);
-        let vm = vm.ok_or(HypervisorError::NotFound(*id))?;
-
-        if let Err(e) = self.api(id, Method::PUT, "vmm.shutdown", None).await {
-            debug!(error = %format!("{e:#}"), "vmm.shutdown failed, killing process anyway");
-        }
-
-        match vm.process {
-            VmProcess::Owned(mut child) => {
-                let _ = child.kill().await;
-            }
-            VmProcess::Adopted { pid } => {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-        }
-
-        let _ = std::fs::remove_file(self.vm_socket_path(id));
-        // Everything this driver put in the run directory for this VM, and
-        // not only the api socket. Until now the two console files and the
-        // vmm's own log stayed behind for ever, one set per vm id that ever
-        // existed on the node — nothing in the tree read them, nothing
-        // rotated them and nothing removed them.
-        for stream in ConsoleStream::ALL {
-            let _ = std::fs::remove_file(self.console_path(id, stream));
-        }
-        let _ = std::fs::remove_file(self.vmm_log_path(id));
-        Ok(())
+        self.destroy_vm(id).await
     }
 
     fn console_paths(&self, id: &VmId) -> Vec<(ConsoleStream, PathBuf)> {
@@ -257,28 +152,33 @@ impl Hypervisor for CloudHypervisorDriver {
             .collect()
     }
 
+    /// The live log, and every one this driver kept from a VMM of the same id
+    /// that has been torn down — oldest first, so the newest is what a reader
+    /// sees last.
+    ///
+    /// D-P19. `-v` was turned on for the receiving VMM to get one line out of
+    /// it, and the tidy-up removed that log the moment the reception was
+    /// given back: `vm logs --streams vmm` could never show a receiving VMM
+    /// at all, which is the one case the flag was turned on for. Two fixes of
+    /// one round cancelling each other out.
+    ///
+    /// They are `diagnostic_paths` and not `console_paths` for the reason
+    /// that split exists: this is the hypervisor's own noise and never the
+    /// guest's, and `vm logs` mixes the two only when somebody asks for
+    /// `--streams vmm` by name.
     fn diagnostic_paths(&self, id: &VmId) -> Vec<PathBuf> {
-        vec![self.vmm_log_path(id)]
+        let mut paths = self.kept_logs(id);
+        paths.push(self.vmm_log_path(id));
+        paths
+    }
+
+    fn console_socket(&self, id: &VmId) -> Option<PathBuf> {
+        Some(self.serial_socket_path(id))
     }
 
     #[instrument(skip_all, fields(vm_id = %id, pid))]
     async fn adopt(&self, id: &VmId, pid: u32) -> hypervisor::Result<()> {
-        if self.vms.lock().unwrap().contains_key(id) {
-            return Ok(()); // idempotent, and an Owned entry is never overwritten
-        }
-        if !self.probe(id).await {
-            return Err(HypervisorError::Backend(anyhow::anyhow!(
-                "vmm api not responsive, cannot adopt"
-            )));
-        }
-        self.vms.lock().unwrap().insert(
-            *id,
-            RunningVm {
-                process: VmProcess::Adopted { pid },
-            },
-        );
-        info!("adopted running vmm");
-        Ok(())
+        self.adopt_vm(id, pid).await
     }
 
     #[instrument(level = "trace", skip_all, fields(vm_id = %id))]
@@ -290,194 +190,145 @@ impl Hypervisor for CloudHypervisorDriver {
         self.vms.lock().unwrap().contains_key(id)
     }
 
+    async fn strays(&self, known: &[VmId]) -> Vec<VmId> {
+        self.stray_vms(known).await
+    }
+
+    #[instrument(skip_all, fields(vm_id = %id))]
+    async fn end_stray(&self, id: &VmId) -> hypervisor::Result<()> {
+        self.end_stray_vm(id).await
+    }
+
+    /// `<binary> --version`, asked once at start-up.
+    ///
+    /// A subprocess, and the only one this driver runs that is not a VMM —
+    /// which is affordable because it happens once per agent and answers a
+    /// question nothing else can: a v53 and a v54 look identical in every
+    /// other field of a machine profile, and a saved state does not
+    /// necessarily cross between them.
+    ///
+    /// Every failure is `None`: a binary that is not there yet is a node with
+    /// no hypervisor, which the catalogue says at length elsewhere, and an
+    /// agent must not refuse to start over a version string.
+    async fn version(&self) -> Option<String> {
+        let out = Command::new(&self.binary)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .ok()?;
+        let said = String::from_utf8_lossy(&out.stdout);
+        let line = said.lines().next().unwrap_or_default().trim();
+        (!line.is_empty()).then(|| line.to_string())
+    }
+
+    /// v53's `CpuProfile` has one variant. See the trait.
+    fn cpu_profile(&self) -> &'static str {
+        "Host"
+    }
+
     fn as_pausable(&self) -> Option<&dyn Pausable> {
+        Some(self)
+    }
+
+    fn as_migratable(&self) -> Option<&dyn agent_api::Migratable> {
+        Some(self)
+    }
+
+    fn as_hotpluggable(&self) -> Option<&dyn HotPluggable> {
         Some(self)
     }
 }
 
-/// One entry of CH's `disks` array. A path is opened by the VMM itself; a
-/// vhost-user-blk socket is a backend process the VMM connects to instead
-/// (CH's own `vhost_user`/`vhost_socket` disk fields — the same pair the
-/// upstream vhost_user_block daemon is driven with).
-///
-/// None for an attachment that is not a disk at all: a share is a `fs` entry,
-/// and `split_volumes` is what sorts the two apart.
-///
-/// `image_type` is stated and not left to CH, for two reasons that both bite.
-/// Unset is `ImageType::Unknown`, and v53 answers that by auto-detecting, by
-/// logging a DEPRECATION warning saying the auto-detection will be removed —
-/// and, on detecting raw, by turning OFF sector 0 writes. A guest that writes
-/// its own partition table or a bootloader then takes an
-/// `I/O error, dev vda, sector 0 op WRITE` for something it is entitled to do.
-///
-/// `Raw` is right for every path this driver is ever handed, by construction:
-/// `lvm-thin` writes the base image onto the LV with `qemu-img convert -O raw`
-/// and `filesystem` creates `<id>.raw`. A block driver that ever hands over a
-/// qcow2 has to say so here, and this comment is where it will look.
-///
-/// The spelling is the VARIANT name and not the `Display` one: CH's
-/// `ImageType` derives `Deserialize` with no rename, so it reads `"Raw"` and
-/// not `"raw"` — the lowercase form is what `Display` prints into its logs,
-/// and sending it would fail the whole `vm.create` body.
-fn disk_config(disk: &VolumeAttachment) -> Option<serde_json::Value> {
-    match disk {
-        VolumeAttachment::Path(path) => Some(serde_json::json!({
-            "path": path,
-            "image_type": "Raw",
-        })),
-        VolumeAttachment::VhostUserBlk { socket, .. } => Some(serde_json::json!({
-            "vhost_user": true,
-            "vhost_socket": socket,
-        })),
-        VolumeAttachment::FsShare { .. } => None,
-    }
-}
-
-/// The VM's disks, in order, with the cloud-init seed last.
-///
-/// Order is load-bearing: the guest's boot disk is the first block volume of
-/// the spec, and appending rather than prepending the seed is what keeps it
-/// that way. A firmware boot picks the first bootable disk, and a seed that
-/// came first would be a VM that tries to boot off a 1 MiB FAT volume with no
-/// bootloader on it.
-///
-/// Read-only, and that is not tidiness: the seed is derived from the spec and
-/// rewritten on every provision, so a guest that wrote to it would be a guest
-/// whose changes vanish at the next re-provision without anybody being told.
-fn disks(spec: &InstanceSpec) -> Vec<serde_json::Value> {
-    let mut disks: Vec<serde_json::Value> = spec.volumes.iter().filter_map(disk_config).collect();
-    if let Some(seed) = &spec.cloud_init_seed {
-        // Raw for the same reason the volumes are, and stated for the same
-        // reason: a FAT12 image is raw, and an unstated type is a deprecation
-        // warning per boot.
-        disks.push(serde_json::json!({
-            "path": seed,
-            "readonly": true,
-            "image_type": "Raw",
-        }));
-    }
-    disks
-}
-
-/// One entry of CH's `fs` array: virtiofsd is already listening on `socket`,
-/// and `tag` is the name the guest mounts (`mount -t virtiofs <tag> /mnt`).
-/// `num_queues` and `queue_size` are CH's own defaults and are left to it.
-fn fs_config(volume: &VolumeAttachment) -> Option<serde_json::Value> {
-    match volume {
-        VolumeAttachment::FsShare { socket, tag, .. } => {
-            Some(serde_json::json!({ "socket": socket, "tag": tag }))
-        }
-        _ => None,
-    }
-}
-
-fn build_vm_config(
-    spec: &InstanceSpec,
-    console_path: &PathBuf,
-    serial_path: &PathBuf,
-) -> hypervisor::Result<serde_json::Value> {
-    // `memory.shared` is a property of the VM, not of one kind of attachment:
-    // any vhost-user backend maps guest memory, and a vhost-user-blk volume
-    // needs it exactly as much as a gpu device does. Asking both halves of
-    // the spec the same question is what keeps a storage backend from
-    // silently getting a VM whose memory it cannot map.
-    let has_vhost_user = spec
-        .devices
-        .iter()
-        .any(DeviceAttachment::needs_shared_memory)
-        || spec
-            .volumes
-            .iter()
-            .any(VolumeAttachment::needs_shared_memory);
-
-    // handle optional kernel & initramfs for direct-kernel boot, not required for UEFI boot
-    let payload = match &spec.boot {
-        BootSource::DirectKernel {
-            kernel,
-            cmdline,
-            initramfs,
-        } => {
-            let mut p = serde_json::json!({ "kernel": kernel, "cmdline": cmdline });
-            if let Some(i) = initramfs {
-                p["initramfs"] = serde_json::json!(i);
-            }
-            p
-        }
-        BootSource::Firmware { firmware } => serde_json::json!({ "firmware": firmware }),
-    };
-
-    let mut config = serde_json::json!({
-        "cpus":   { "boot_vcpus": spec.vcpus, "max_vcpus": spec.vcpus },
-        "memory": {
-            "size": spec.memory_mib * 1024 * 1024,
-            "shared": has_vhost_user,
-        },
-        "payload": payload,
-        "disks":  disks(spec),
-        "console": { "mode": "File", "file": console_path },
-        "serial": { "mode": "File", "file": serial_path }
-
-    });
-
-    let shares: Vec<_> = spec.volumes.iter().filter_map(fs_config).collect();
-    if !shares.is_empty() {
-        config["fs"] = shares.into();
+#[async_trait::async_trait]
+impl HotPluggable for CloudHypervisorDriver {
+    /// `vm.add-disk` with the same body one entry of `disks` carries at
+    /// create — the id included, which is what makes the disk removable and
+    /// resizable afterwards by a name this stack chose.
+    ///
+    /// A share is refused rather than silently ignored: virtio-fs has its own
+    /// verb (`vm.add-fs`), and a caller who plugged a share and got a
+    /// successful "nothing happened" would have a VM whose record says a
+    /// mount is there and a guest that never sees one.
+    #[instrument(skip_all, fields(vm_id = %id, disk = %volume.disk_id()))]
+    async fn add_disk(&self, id: &VmId, volume: &AttachedVolume) -> hypervisor::Result<()> {
+        self.vm_known(id)?;
+        let config = disk_config(volume).ok_or_else(|| {
+            HypervisorError::InvalidSpec(format!(
+                "volume {} is a filesystem share, not a disk; it cannot be hot-plugged",
+                volume.id
+            ))
+        })?;
+        self.api(id, Method::PUT, "vm.add-disk", Some(config))
+            .await
+            .map(|_| ())
     }
 
-    if !spec.nics.is_empty() {
-        config["net"] = spec
-            .nics
-            .iter()
-            .map(|n| {
-                let mut net = serde_json::json!({ "tap": n.tap_name, "mac": n.mac.to_string() });
-                // virtio-net's own MTU feature (VIRTIO_NET_F_MTU). The tap and
-                // the bridge bound what the host forwards; this is the only way
-                // the GUEST finds out, and without it an overlay VM emits
-                // 1500-byte frames into a 1450-byte path and they vanish. Omitted
-                // where nobody named one, so a plain VM's config is byte-identical
-                // to what it has always been.
-                if let Some(mtu) = n.mtu {
-                    net["mtu"] = serde_json::Value::from(mtu);
-                }
-                net
-            })
-            .collect::<Vec<_>>()
-            .into();
+    /// `vm.resize-disk` by the id the disk was given, with the size the
+    /// BACKEND has already grown to.
+    ///
+    /// The order is not symmetric and not reversible — see the trait. For a
+    /// block device this call is a check rather than a change, and its
+    /// failure message ("Block device size X does not match requested size
+    /// Y") is exactly the sentence an operator needs when the two halves have
+    /// come apart.
+    #[instrument(skip_all, fields(vm_id = %id, disk = %disk_id, size_bytes))]
+    async fn resize_disk(
+        &self,
+        id: &VmId,
+        disk_id: &str,
+        size_bytes: u64,
+    ) -> hypervisor::Result<()> {
+        self.vm_known(id)?;
+        self.api(
+            id,
+            Method::PUT,
+            "vm.resize-disk",
+            Some(serde_json::json!({ "id": disk_id, "desired_size": size_bytes })),
+        )
+        .await
+        .map(|_| ())
     }
 
-    let mut vhost_user_devices = Vec::new();
-    let mut vfio_devices = Vec::new();
-    for dev in &spec.devices {
-        match dev {
-            DeviceAttachment::VhostUser {
-                socket,
-                device_type,
-                queue_sizes,
-                ..
-            } => {
-                vhost_user_devices.push(serde_json::json!({
-                    "socket": socket,
-                    "device_type": device_type,
-                    "queue_sizes": queue_sizes,
-                }));
-            }
-            DeviceAttachment::VfioPci { sysfs_path } => {
-                vfio_devices.push(serde_json::json!({ "path": sysfs_path }));
-            }
-            other => {
-                return Err(HypervisorError::InvalidSpec(format!(
-                    "attachment type not yet supported by CH driver: {other:?}"
-                )));
-            }
-        }
+    /// `vm.remove-device` by the id `add_disk` (or `create`) gave the disk,
+    /// and then the evidence that it is really gone.
+    ///
+    /// Not idempotent at this level and deliberately not made to look it: CH
+    /// answers 404 for a disk it does not have, and a driver that swallowed
+    /// that would turn "the guest still holds it" into "done".
+    ///
+    /// **The 200 is not the answer.** virtio hot-unplug is cooperative: v53
+    /// signals the guest and returns, and a guest that does not acknowledge —
+    /// a kernel without the driver, a device with a mount on it, a guest that
+    /// is simply busy — keeps the device and the VMM keeps the file open. The
+    /// chaos run measured exactly that: the control plane reported the volume
+    /// free within two seconds, the fd was still on `/proc/<vmm>/fd` a minute
+    /// later, and the next VM to use the volume died on cloud hypervisor's own
+    /// write lock with "The file is already locked" — reported to the operator
+    /// as a scheduling problem. So the disk is gone when `vm.info` no longer
+    /// lists it, and not before. The caller detaches the backend after this
+    /// returns, which is the ordering that must not be reversed.
+    #[instrument(skip_all, fields(vm_id = %id, disk = %disk_id))]
+    async fn remove_disk(&self, id: &VmId, disk_id: &str) -> hypervisor::Result<()> {
+        self.vm_known(id)?;
+        self.api(
+            id,
+            Method::PUT,
+            "vm.remove-device",
+            Some(serde_json::json!({ "id": disk_id })),
+        )
+        .await?;
+        until_the_disk_is_gone(
+            disk_id,
+            || async {
+                let bytes = self.api(id, Method::GET, "vm.info", None).await?;
+                serde_json::from_slice(&bytes).map_err(|e| HypervisorError::Backend(e.into()))
+            },
+            self.unplug_timeout,
+            UNPLUG_POLL,
+        )
+        .await
     }
-    if !vhost_user_devices.is_empty() {
-        config["generic_vhost_user"] = vhost_user_devices.into();
-    }
-    if !vfio_devices.is_empty() {
-        config["devices"] = vfio_devices.into();
-    }
-    Ok(config)
 }
 
 #[async_trait::async_trait]
@@ -499,389 +350,179 @@ impl Pausable for CloudHypervisorDriver {
     }
 }
 
-/// One request, one connection: connect, handshake, send, read, drop.
-///
-/// Deliberately not pooled. A pooled connection would outlive the VMM it
-/// points at — `destroy` unlinks the socket and a re-provisioned VM binds a
-/// new one at the same path — and `probe` would then answer "alive" out of a
-/// half-open connection to a process that is gone, which is the one question
-/// it exists to answer. Statelessness is what makes it a liveness check.
-///
-/// The price was measured rather than guessed: 60 us per call in a release
-/// build over a unix socket (the HTTP/1 handshake does no round trip, it only
-/// allocates). A converged VM costs about 20 calls a minute — two probes and
-/// two state reads per 30 s reconcile pass, two more per 10 s status report —
-/// so a node with a hundred VMs spends roughly 0.2 % of one core here.
-/// Pooling could take back half of that. It is not worth the stale socket.
-// tracing here via ENV: RUST_LOG=cloud_hypervisor_driver=trace
-#[instrument(level = "trace", skip(socket, body, ch_timeout), fields(%endpoint))]
-async fn ch_api(
-    socket: &Path,
-    method: Method,
-    endpoint: &str,
-    body: Option<serde_json::Value>,
-    ch_timeout: Duration,
-) -> anyhow::Result<Bytes> {
-    tokio::time::timeout(ch_timeout, async move {
-        // times out after ch_timeout
-        let stream = UnixStream::connect(socket)
-            .await
-            .with_context(|| format!("connect {}", socket.display()))?;
-        let (mut sender, conn) =
-            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
+#[async_trait::async_trait]
+impl agent_api::Migratable for CloudHypervisorDriver {
+    /// Make this machine ready to receive `id`, and return once it is
+    /// listening.
+    ///
+    /// `peer` is where to listen, in cloud hypervisor's own spelling:
+    /// `tcp:<addr>:<port>` — a bare `tcp:` prefix and not `tcp://`, which is
+    /// what v53's `strip_prefix("tcp:")` accepts and nothing else.
+    ///
+    /// **No `vm.create` here, and that is not an oversight.** The brief asked
+    /// for the VM to be made at the destination with the same config; v53
+    /// refuses exactly that — `vm_receive_migration` answers "Can't receive a
+    /// migration when a VM is already created" — and builds the destination's
+    /// VM from a `VmMigrationConfig` that travels in the stream. What the
+    /// destination DOES have to have ready is everything the arriving config
+    /// NAMES: the tap devices, the disk files, the same paths. Those are the
+    /// agent's to make, and it makes them before calling this.
+    ///
+    /// The call blocks the VMM's whole API until the migration is over, so it
+    /// is issued into a task and this returns when the listener is up. Which
+    /// is knowable: `migration-receive-ready` is written to the event file
+    /// just before the accept.
+    ///
+    /// # The guest's two output devices, and why they cannot be pointed
+    ///
+    /// They travel in the config and this side has no say in it. v53's
+    /// `vm_receive_config` does `self.vm_config = Some(received)` — the
+    /// destination's own config, if it had one, is thrown away with a
+    /// warning — and then calls `pre_create_console_devices` on the received
+    /// one straight away. `VmReceiveMigrationData` carries a receiver URL, a
+    /// TLS directory and a memory mode, and nothing else; there is no
+    /// endpoint in the whole of v53's route table that re-points a console or
+    /// a serial line afterwards. So neither half of the question the first
+    /// migration run left open can be answered yes: the destination cannot
+    /// set the paths before, and cannot change them after.
+    ///
+    /// What follows from that is a REQUIREMENT rather than a workaround, and
+    /// it is the same one the disks and the kernel already impose: both nodes
+    /// must have the same `run_dir`, so that the paths in the arriving config
+    /// name this node's own files. On a fleet that is how the agent is
+    /// deployed and nothing has to be done. Two agents on ONE machine
+    /// sharing a run_dir is a different thing and it does not work — see the
+    /// unlink below and the report.
+    ///
+    /// The two devices then behave differently, and only one of them needs
+    /// anything done about it:
+    ///
+    ///   * `console` is `mode: File`, and v53 opens it with `File::create` —
+    ///     which truncates. The destination's own file, on its own node, is
+    ///     empty anyway, so nothing is lost. Output written on the SOURCE
+    ///     stays in the source's file and does not follow the guest, which is
+    ///     honest: it happened there.
+    /// # The guest announcing itself, and why nothing here does it
+    ///
+    /// A guest that has moved is behind a different switch port, and until
+    /// something is sent from its MAC every switch on the segment forwards
+    /// its traffic to the machine it left. Somebody has to make it talk.
+    ///
+    /// **v53 already does, and it is the only component that can.** On every
+    /// restore — a migration included — `Net::new` sets the announcement
+    /// pending (`virtio-devices/src/net.rs:555-565`, "Always mark the
+    /// announcement pending if the device was restored so the device
+    /// announces itself"), and the announcer then does two things:
+    /// `build_rarp_announce` (`net.rs:784`) writes a broadcast RARP frame
+    /// with the guest's MAC as source straight into the tap, and
+    /// `VIRTIO_NET_F_GUEST_ANNOUNCE` asks the guest to announce itself as
+    /// well. Both are retried.
+    ///
+    /// An agent could not do the first half if it wanted to. The frame has to
+    /// enter the bridge as if it came FROM the guest, which means writing to
+    /// the tap's character device — and that file descriptor belongs to the
+    /// VMM. An `AF_PACKET` socket on the tap interface sends the other way,
+    /// towards the guest, and would announce nothing to any switch.
+    ///
+    /// RARP and not a gratuitous ARP, and that is the right choice rather
+    /// than a lesser one: a switch learns a port from the SOURCE MAC of any
+    /// frame, so an announcement needs no IP address — which is as well,
+    /// because the host does not know the guest's. It is what QEMU has always
+    /// sent for the same reason.
+    ///
+    ///   * `serial` is `mode: Socket`, and v53 does a bare `UnixListener::bind`
+    ///     with no unlink first. A path with a file at it fails with
+    ///     `EADDRINUSE`, and that failure happens inside `vm_receive_config`,
+    ///     which aborts the whole migration after the source has already
+    ///     connected. So the leftover is removed here, exactly as `create`
+    ///     removes it for a boot, and for the same reason.
+    #[instrument(skip_all, fields(vm_id = %id, peer = %peer))]
+    async fn migrate_in(&self, id: &VmId, peer: &str) -> hypervisor::Result<u32> {
+        self.receive_migration(id, peer).await
+    }
 
-        let payload = match &body {
-            Some(v) => Bytes::from(serde_json::to_vec(v)?),
-            None => Bytes::new(),
-        };
-        let req = Request::builder()
-            .method(method)
-            .uri(format!("/api/v1/{endpoint}"))
-            .header("Host", "localhost")
-            .header("Content-Type", "application/json")
-            .body(Full::new(payload))?;
+    /// What the event file says about a receive that did not happen.
+    ///
+    /// The event file and not the api socket, and the difference is the whole
+    /// of why this method exists. A failed receive leaves v53 with a VMM that
+    /// answers, a `vm.info` that says `Created`, and no guest — which from
+    /// the outside is the same picture as a VMM that is still waiting for
+    /// one. `migration-receive-failed` is the only place the two are told
+    /// apart, and it is written once and stays written.
+    fn receive_failed(&self, id: &VmId) -> Option<String> {
+        self.receive_failure(id)
+    }
 
-        let res = sender.send_request(req).await?;
-        let status = res.status();
-        let bytes = res.into_body().collect().await?.to_bytes();
-        if !status.is_success() {
-            bail!(
-                "ch {endpoint} -> {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            );
+    /// Whether this VMM is serving its guest again, which after a send has
+    /// been started can only mean the send failed.
+    ///
+    /// **v53 writes no event for a send.** The event monitor carries
+    /// `migration-receive-ready`, `-started`, `-finished` and `-failed` and
+    /// nothing at all for the other end (`vmm/src/lib.rs`), so there is no
+    /// file to read here and the question has to be put to the VMM itself.
+    ///
+    /// What it is asked is `vm.counters`, and the choice is about what the
+    /// answer MEANS rather than about the counters. While a send runs, the
+    /// VMM has handed its VM to the migration worker
+    /// (`VmOwnership::Migration`) and every verb that wants the VM answers
+    /// "VM is currently migrating and can't be modified"; when the worker
+    /// joins, a failure gives the VM back (`VmOwnership::Owned`, the guest
+    /// resumed) and a success shuts the guest down and exits the process. So
+    /// an ANSWER to this question is a guest that is here again — and a
+    /// success is not a race with it, because a VMM that succeeded is not
+    /// answering anything.
+    ///
+    /// `vm.counters` and not `vm.info`, which is the trap next door: v53
+    /// answers `vm.info` during a migration out of a snapshot taken before
+    /// it started, so it says `Running` throughout and says it afterwards
+    /// too. A read-only verb that REFUSES while migrating is the only shape
+    /// that distinguishes the two.
+    ///
+    /// Every other error is `None` and not a failure. An answer this driver
+    /// cannot read must not be able to declare a running transfer dead; the
+    /// cost of being conservative here is that such a node waits out
+    /// the agent's own migrate-out ceiling, which is what it did before this
+    /// existed.
+    async fn send_failed(&self, id: &VmId) -> Option<String> {
+        match self.api(id, Method::GET, "vm.counters", None).await {
+            Ok(_) => Some(
+                "cloud-hypervisor is serving the guest here again, so the transfer ended \
+                 without it leaving"
+                    .to_string(),
+            ),
+            Err(_) => None,
         }
-        Ok(bytes)
-    })
-    .await
-    .with_context(|| format!("ch {endpoint} timeout"))?
+    }
+
+    /// Send this VM to `peer`, which is the address the destination answered
+    /// with — `tcp:<addr>:<port>`, the same spelling.
+    ///
+    /// **204 means "started", not "done".** v53 spawns a worker and answers
+    /// at once; what happens afterwards is not on this connection. On success
+    /// the source VM is shut down and the source VMM process EXITS, so the
+    /// api socket simply stops answering — which is what the agent sees as
+    /// the VM going away. On failure the VM is resumed here and goes on
+    /// running, which is the invariant the tier above is built on: the source
+    /// is never given up before the destination has the guest.
+    ///
+    /// There is **no TLS on this stream** in v1. It is a deliberate limit and
+    /// it is written down in the reference: the migration rides the cluster
+    /// network, the same one the session rode without TLS until the image
+    /// round gave it PKI, and adding `tls_dir` here means a second certificate
+    /// distribution problem with no client for it yet.
+    #[instrument(skip_all, fields(vm_id = %id, peer = %peer))]
+    async fn migrate_out(&self, id: &VmId, peer: &str) -> hypervisor::Result<()> {
+        self.vm_known(id)?;
+        self.api(
+            id,
+            Method::PUT,
+            "vm.send-migration",
+            Some(serde_json::json!({ "destination_url": peer })),
+        )
+        .await
+        .map(|_| ())
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use agent_api::NicAttachment;
-
-    fn spec(volumes: Vec<VolumeAttachment>, devices: Vec<DeviceAttachment>) -> InstanceSpec {
-        InstanceSpec {
-            boot: BootSource::Firmware {
-                firmware: "/fw.fd".into(),
-            },
-            volumes,
-            vcpus: 2,
-            memory_mib: 1024,
-            nics: Vec::<NicAttachment>::new(),
-            devices,
-            cloud_init_seed: None,
-        }
-    }
-
-    fn config(spec: &InstanceSpec) -> serde_json::Value {
-        build_vm_config(spec, &PathBuf::from("/c"), &PathBuf::from("/s")).expect("config builds")
-    }
-
-    /// The seed is an ADDITIONAL disk, it is read-only, and it comes last.
-    ///
-    /// All three matter and the last one most: the guest boots off the first
-    /// bootable disk, so a seed in front of the boot volume would be a VM
-    /// trying to boot a 1 MiB FAT image with no bootloader on it.
-    #[test]
-    fn the_cloud_init_seed_is_an_extra_read_only_disk_after_the_boot_volume() {
-        let boot = VolumeAttachment::Path("/vol/root.raw".into());
-        let mut with_seed = spec(vec![boot.clone()], vec![]);
-        with_seed.cloud_init_seed = Some("/run/vm.cidata.img".into());
-        let disks = config(&with_seed)["disks"].clone();
-
-        assert_eq!(disks.as_array().map(Vec::len), Some(2));
-        assert_eq!(
-            disks[0]["path"], "/vol/root.raw",
-            "the boot disk stays first"
-        );
-        assert!(disks[0].get("readonly").is_none(), "and stays writable");
-        assert_eq!(disks[1]["path"], "/run/vm.cidata.img");
-        assert_eq!(disks[1]["readonly"], true);
-    }
-
-    /// The property this whole feature is judged on: a VM with no cloud-init
-    /// block produces the configuration it always did, byte for byte.
-    #[test]
-    fn a_vm_without_a_seed_gets_exactly_the_config_it_had_before() {
-        let volumes = vec![VolumeAttachment::Path("/vol/root.raw".into())];
-        let without = config(&spec(volumes.clone(), vec![]));
-
-        let mut with_seed = spec(volumes, vec![]);
-        with_seed.cloud_init_seed = Some("/run/vm.cidata.img".into());
-        let with = config(&with_seed);
-
-        // Everything except the disk list is the same document.
-        for key in ["cpus", "memory", "payload", "console", "serial"] {
-            assert_eq!(without[key], with[key], "{key}");
-        }
-        assert_eq!(without["disks"].as_array().map(Vec::len), Some(1));
-        assert_ne!(without["disks"], with["disks"]);
-        // And no key appeared or vanished.
-        assert_eq!(
-            without.as_object().map(|o| o.keys().collect::<Vec<_>>()),
-            with.as_object().map(|o| o.keys().collect::<Vec<_>>())
-        );
-    }
-
-    fn vhost_gpu() -> DeviceAttachment {
-        DeviceAttachment::VhostUser {
-            socket: "/run/gpu.sock".into(),
-            pid: 1,
-            device_type: 16,
-            queue_sizes: vec![256],
-        }
-    }
-
-    fn nic(mtu: Option<u32>) -> NicAttachment {
-        NicAttachment {
-            tap_name: "msk0000".into(),
-            mac: "52:54:00:00:00:01".parse().unwrap(),
-            mtu,
-        }
-    }
-
-    /// The last hop of the overlay MTU. The tap and the bridge bound what the
-    /// HOST forwards; this is the only thing that tells the GUEST, and
-    /// without it an overlay VM emits 1500-byte frames into a 1450-byte path
-    /// and they vanish with nothing in any log.
-    #[test]
-    fn an_overlay_nic_tells_the_guest_its_mtu_and_a_plain_one_says_nothing() {
-        let mut overlay = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
-        overlay.nics = vec![nic(Some(1450))];
-        let cfg = config(&overlay);
-        assert_eq!(cfg["net"][0]["tap"], "msk0000");
-        assert_eq!(cfg["net"][0]["mtu"], 1450);
-
-        // And a NIC on the default bridge produces exactly the config it
-        // always did — no `mtu` key at all, not an mtu of null.
-        let mut plain = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
-        plain.nics = vec![nic(None)];
-        let cfg = config(&plain);
-        assert_eq!(cfg["net"][0]["mac"], "52:54:00:00:00:01");
-        assert!(cfg["net"][0].get("mtu").is_none(), "no key, not a null");
-    }
-
-    /// Unset means `ImageType::Unknown`, and v53 answers that by detecting the
-    /// type, warning that the detection is deprecated, and — on raw — turning
-    /// OFF sector 0 writes. A guest writing its own partition table then takes
-    /// an I/O error for something it is entitled to do.
-    ///
-    /// The capital R is the point of the second half of this test: CH's
-    /// `ImageType` derives `Deserialize` with no rename, so the wire form is
-    /// the VARIANT name. `"raw"` is what its `Display` prints into a log, and
-    /// sending that would fail the whole `vm.create` body — which is a far
-    /// worse failure than the one being fixed.
-    #[test]
-    fn a_file_backed_disk_states_its_image_type_and_states_it_the_way_ch_reads_it() {
-        let cfg = config(&spec(
-            vec![VolumeAttachment::Path("/vol/a.raw".into())],
-            vec![],
-        ));
-        assert_eq!(cfg["disks"][0]["image_type"], "Raw");
-
-        // The seed is a FAT12 file and just as raw, and an unstated type there
-        // is the same deprecation warning once per boot.
-        let mut with_seed = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
-        with_seed.cloud_init_seed = Some("/run/seed.img".into());
-        let cfg = config(&with_seed);
-        assert_eq!(cfg["disks"][1]["image_type"], "Raw");
-
-        // A vhost-user disk is a backend CH connects to, not a file it opens,
-        // so it has no image type to state.
-        let cfg = config(&spec(
-            vec![VolumeAttachment::VhostUserBlk {
-                socket: "/run/blk.sock".into(),
-                pid: 9,
-            }],
-            vec![],
-        ));
-        assert_eq!(cfg["disks"][0].get("image_type"), None);
-    }
-
-    /// The VMM's own log is bounded like the guest's streams and served like
-    /// none of them. Both halves matter: without the first it grows until the
-    /// node's disk is gone, and without the second `vm logs` would answer a
-    /// question about a guest with hypervisor noise.
-    #[test]
-    fn the_vmm_log_is_bounded_but_never_part_of_the_guests_output() {
-        let dir = std::env::temp_dir().join(format!("mstest-ch-{}", std::process::id()));
-        let d = CloudHypervisorDriver::new(
-            "/nonexistent/cloud-hypervisor".into(),
-            dir.clone(),
-            Duration::from_secs(1),
-        )
-        .expect("the driver only needs its socket dir to exist");
-        let id = VmId::new_v4();
-
-        let diagnostics = d.diagnostic_paths(&id);
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0], d.vmm_log_path(&id));
-
-        let served: Vec<_> = d.console_paths(&id).into_iter().map(|(_, p)| p).collect();
-        assert!(
-            !served.contains(&d.vmm_log_path(&id)),
-            "the VMM's log must not reach vm logs"
-        );
-        assert!(
-            !served.is_empty(),
-            "the guest's own streams are still served"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_path_volume_is_a_plain_disk_and_needs_nothing_shared() {
-        let cfg = config(&spec(
-            vec![VolumeAttachment::Path("/vol/a.raw".into())],
-            vec![],
-        ));
-        assert_eq!(cfg["disks"][0]["path"], "/vol/a.raw");
-        assert_eq!(cfg["disks"][0].get("vhost_user"), None);
-        assert_eq!(cfg["memory"]["shared"], false);
-    }
-
-    /// CH's own DiskConfig fields (`vhost_user` / `vhost_socket`) — the same
-    /// pair its upstream vhost_user_block daemon is driven with, so a
-    /// Mayastor-style backend needs nothing new on this side.
-    #[test]
-    fn a_vhost_user_blk_volume_becomes_a_vhost_user_disk() {
-        let cfg = config(&spec(
-            vec![VolumeAttachment::VhostUserBlk {
-                socket: "/run/blk.sock".into(),
-                pid: 9,
-            }],
-            vec![],
-        ));
-        assert_eq!(cfg["disks"][0]["vhost_user"], true);
-        assert_eq!(cfg["disks"][0]["vhost_socket"], "/run/blk.sock");
-        assert_eq!(cfg["disks"][0].get("path"), None);
-    }
-
-    /// The behaviour change this split is for: shared memory is a property of
-    /// the VM, not of the device list. A VM whose only vhost-user backend is
-    /// a disk used to be built with `shared: false` — and the backend would
-    /// have had no guest memory to map.
-    #[test]
-    fn a_vhost_user_volume_alone_turns_shared_memory_on() {
-        let cfg = config(&spec(
-            vec![VolumeAttachment::VhostUserBlk {
-                socket: "/run/blk.sock".into(),
-                pid: 9,
-            }],
-            vec![],
-        ));
-        assert_eq!(cfg["memory"]["shared"], true);
-        assert_eq!(
-            cfg.get("generic_vhost_user"),
-            None,
-            "a disk is not a generic device"
-        );
-    }
-
-    #[test]
-    fn a_vhost_user_device_still_turns_it_on_by_itself() {
-        let cfg = config(&spec(
-            vec![VolumeAttachment::Path("/a.raw".into())],
-            vec![vhost_gpu()],
-        ));
-        assert_eq!(cfg["memory"]["shared"], true);
-        assert_eq!(cfg["generic_vhost_user"][0]["device_type"], 16);
-    }
-
-    /// Disks keep spec order — the first one is the boot disk, and mixing
-    /// attachment kinds must not reorder them.
-    #[test]
-    fn mixed_attachments_keep_their_spec_order() {
-        let cfg = config(&spec(
-            vec![
-                VolumeAttachment::Path("/boot.raw".into()),
-                VolumeAttachment::VhostUserBlk {
-                    socket: "/run/data.sock".into(),
-                    pid: 9,
-                },
-                VolumeAttachment::Path("/seed.raw".into()),
-            ],
-            vec![],
-        ));
-        assert_eq!(cfg["disks"][0]["path"], "/boot.raw");
-        assert_eq!(cfg["disks"][1]["vhost_socket"], "/run/data.sock");
-        assert_eq!(cfg["disks"][2]["path"], "/seed.raw");
-        assert_eq!(cfg["memory"]["shared"], true);
-    }
-
-    fn share() -> VolumeAttachment {
-        VolumeAttachment::FsShare {
-            socket: "/run/fs.sock".into(),
-            tag: "share".into(),
-            pid: 12,
-        }
-    }
-
-    /// A share is a `fs` entry and not a disk. Both halves matter: the guest
-    /// mounts it by tag, and a share that leaked into `disks` would be a
-    /// DiskConfig with neither a path nor a vhost socket — CH refuses the
-    /// whole VM for it, so the boot disk would go down with it.
-    #[test]
-    fn a_share_becomes_an_fs_entry_and_leaves_the_disks_alone() {
-        let cfg = config(&spec(
-            vec![VolumeAttachment::Path("/boot.raw".into()), share()],
-            vec![],
-        ));
-        assert_eq!(cfg["disks"].as_array().unwrap().len(), 1);
-        assert_eq!(cfg["disks"][0]["path"], "/boot.raw");
-        assert_eq!(cfg["fs"][0]["socket"], "/run/fs.sock");
-        assert_eq!(cfg["fs"][0]["tag"], "share");
-        // num_queues/queue_size are CH's defaults, deliberately not ours
-        assert_eq!(cfg["fs"][0].get("num_queues"), None);
-    }
-
-    /// virtiofsd maps guest memory like every other vhost-user backend, so a
-    /// share alone has to turn shared memory on — the same rule the disk case
-    /// already holds, asked of the third form.
-    #[test]
-    fn a_share_alone_turns_shared_memory_on() {
-        let cfg = config(&spec(
-            vec![VolumeAttachment::Path("/a.raw".into()), share()],
-            vec![],
-        ));
-        assert_eq!(cfg["memory"]["shared"], true);
-        assert_eq!(
-            cfg.get("generic_vhost_user"),
-            None,
-            "a share is not a generic device"
-        );
-    }
-
-    /// And a VM with no share has no `fs` key at all, rather than an empty
-    /// array: CH's own field is an Option, and an empty list is not what
-    /// "no shares" means.
-    #[test]
-    fn a_vm_without_shares_has_no_fs_key() {
-        let cfg = config(&spec(vec![VolumeAttachment::Path("/a.raw".into())], vec![]));
-        assert_eq!(cfg.get("fs"), None);
-    }
-
-    /// A vfio device pins memory but maps none of the guest's own into
-    /// another process, so it must NOT flip `shared` — that would change how
-    /// every passthrough VM in the lab is built.
-    #[test]
-    fn passthrough_does_not_ask_for_shared_memory() {
-        let cfg = config(&spec(
-            vec![VolumeAttachment::Path("/a.raw".into())],
-            vec![DeviceAttachment::VfioPci {
-                sysfs_path: "/sys/bus/pci/devices/0000:23:00.0".into(),
-            }],
-        ));
-        assert_eq!(cfg["memory"]["shared"], false);
-        assert_eq!(
-            cfg["devices"][0]["path"],
-            "/sys/bus/pci/devices/0000:23:00.0"
-        );
-    }
-}
+mod tests;

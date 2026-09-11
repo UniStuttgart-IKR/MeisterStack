@@ -23,7 +23,6 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::config::Target;
 use crate::{GlobalArgs, OutputFormat};
 
 /// The K8s-style list every controller endpoint serves. The agent's own REST
@@ -38,7 +37,12 @@ pub struct List<T> {
 pub enum View {
     /// One token on stdout — the id, the name, the state now in force — and
     /// optionally a caveat on stderr. stdout stays pipeable either way.
-    Line(String, Option<&'static str>),
+    ///
+    /// The caveat is an owned `String` rather than a `&'static str` because
+    /// one of them names an object the server told us about: `volume rm` on a
+    /// disk somebody is holding says WHO holds it, and that is the whole
+    /// value of the sentence.
+    Line(String, Option<String>),
     Table(Table),
     /// Lines of somebody else's text — a guest's console, and nothing else so
     /// far. Its own variant rather than a `Line` with newlines in it because
@@ -50,7 +54,10 @@ pub enum View {
 
 /// Columns, rows, and what to say when there are no rows.
 pub struct Table {
-    headers: &'static [&'static str],
+    /// Owned rather than borrowed since a listing's columns stopped being
+    /// fixed: `node ls` grows a `drain` column only where something is being
+    /// drained, and a column nobody can fill is worse than a missing one.
+    headers: Vec<&'static str>,
     rows: Vec<Vec<String>>,
     empty_note: &'static str,
 }
@@ -63,6 +70,12 @@ impl View {
     /// A token plus something the operator has to know and cannot read off
     /// the token. The note is stderr, so stdout is still just the token.
     pub fn note(token: impl Into<String>, note: &'static str) -> Self {
+        Self::Line(token.into(), Some(note.to_string()))
+    }
+
+    /// The same, where the sentence had to be built from what the server
+    /// said rather than written here.
+    pub fn note_owned(token: impl Into<String>, note: String) -> Self {
         Self::Line(token.into(), Some(note))
     }
 
@@ -72,6 +85,16 @@ impl View {
 
     pub fn table(
         headers: &'static [&'static str],
+        rows: Vec<Vec<String>>,
+        empty_note: &'static str,
+    ) -> Self {
+        Self::table_of_columns(headers.to_vec(), rows, empty_note)
+    }
+
+    /// The same table with a column list decided at run time. See
+    /// `Table::headers`.
+    pub fn table_of_columns(
+        headers: Vec<&'static str>,
         rows: Vec<Vec<String>>,
         empty_note: &'static str,
     ) -> Self {
@@ -102,7 +125,7 @@ impl View {
 impl Table {
     /// The rendered lines, header row first. Separate from printing them so
     /// the layout is testable without capturing stdout.
-    fn render(&self) -> Vec<String> {
+    pub(crate) fn render(&self) -> Vec<String> {
         let mut widths: Vec<usize> = self.headers.iter().map(|h| h.len()).collect();
         for row in &self.rows {
             for (i, cell) in row.iter().enumerate() {
@@ -174,6 +197,64 @@ pub fn emit_note(global: &GlobalArgs, body: &Bytes, token: &str, note: &'static 
     emit(global, body, |_| Ok(View::note(token, note)))
 }
 
+/// The same, for a note that was worked out rather than written down: what
+/// this fleet's nodes claim, which is not a sentence anybody could have typed
+/// into the source. `View::note_owned` has taken one since `volume rm`.
+pub fn emit_note_owned(global: &GlobalArgs, body: &Bytes, token: &str, note: String) -> Result<()> {
+    emit(global, body, |_| Ok(View::note_owned(token, note.clone())))
+}
+
+/// A DELETE answered, with the server's own sentence when the object is not
+/// actually gone.
+///
+/// D4: `volume rm` on a disk a running VM holds printed the name and exited
+/// 0 — the same output a successful delete gives — while the object stayed
+/// `Releasing` with its data intact. The behaviour was right and the report
+/// was not, and an operator who cannot tell "deleted" from "queued behind
+/// somebody" will go looking for the disk that is still there.
+///
+/// The API has been answering this all along: a DELETE that did not finish
+/// comes back `202` with `reason: "Deleting"` and a message the handler
+/// wrote — "volume mc-vol-a is attached to vm mc-vm-a; its data stays until
+/// that vm lets go". The CLI threw the whole document away and printed the
+/// name. So the sentence is the server's, not one invented here: the tier
+/// that refused knows why, and a CLI guessing would eventually guess wrong.
+///
+/// stderr, like every other note, so `volume rm x --yes | ...` still pipes
+/// the token alone.
+pub fn emit_removal(global: &GlobalArgs, body: &Bytes, token: &str) -> Result<()> {
+    match removal_note(body) {
+        Some(note) => emit(global, body, |_| Ok(View::note_owned(token, note))),
+        None => emit_line(global, body, token),
+    }
+}
+
+/// The sentence a DELETE that did not finish came back with, or `None`.
+///
+/// `None` for a delete that IS finished (`reason: "Deleted"`), and for a body
+/// of any other shape — an endpoint that answers something else says nothing,
+/// and nothing is what gets printed. Pure, so the reading can be argued
+/// without a server.
+pub fn removal_note(body: &[u8]) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if doc.get("reason")?.as_str()? != "Deleting" {
+        return None;
+    }
+    let said = doc.get("message")?.as_str()?.trim();
+    (!said.is_empty()).then(|| said.to_string())
+}
+
+/// The items of a `{"items": [...]}` listing, without a table around them.
+///
+/// The half `table_of` is written in terms of, exposed because one listing in
+/// this CLI needs the rows before it can build them: `volume ls` counts the
+/// snapshots standing on each disk, and the count comes from a second
+/// request.
+pub fn items<T: DeserializeOwned>(body: &Bytes, parsing: &'static str) -> Result<Vec<T>> {
+    let list: List<T> = serde_json::from_slice(body).context(parsing)?;
+    Ok(list.items)
+}
+
 /// A listing, from the `{"items": [...]}` every controller serves.
 pub fn table_of<T: DeserializeOwned>(
     body: &Bytes,
@@ -182,10 +263,9 @@ pub fn table_of<T: DeserializeOwned>(
     empty_note: &'static str,
     row: impl Fn(T) -> Vec<String>,
 ) -> Result<View> {
-    let list: List<T> = serde_json::from_slice(body).context(parsing)?;
     Ok(View::table(
         headers,
-        list.items.into_iter().map(row).collect(),
+        items::<T>(body, parsing)?.into_iter().map(row).collect(),
         empty_note,
     ))
 }
@@ -219,25 +299,27 @@ pub fn print_json(bytes: &Bytes) {
     }
 }
 
-/// The guard in front of every destructive verb.
+/// The guard in front of the two verbs that can lose something: `rm`, and an
+/// `apply` that replaces an object that is already there.
 ///
 /// One helper and one sentence, because the alternative is what this replaced:
 /// a prompt on `vm destroy` and nothing at all on the seven `rm`s beside it,
 /// one of which cascades. `--yes` is the way to mean it, and a pipe with no
-/// tty is refused rather than answered for.
-pub fn confirm_destructive(
+/// tty is refused rather than answered for. The prompt names the endpoint and
+/// the profile as well as the object, because the mistake this is here to
+/// catch is usually about which of those two an operator is talking to.
+pub fn confirm(
     global: &GlobalArgs,
-    target: &Target,
+    endpoint: &str,
+    profile: &str,
+    verb: &str,
     kind: &str,
     name: &str,
 ) -> Result<()> {
     if global.yes {
         return Ok(());
     }
-    let prompt = format!(
-        "delete {kind} {name} on {} (profile {})?",
-        target.endpoint, target.profile_name
-    );
+    let prompt = format!("{verb} {kind} {name} on {endpoint} (profile {profile})?");
     if !ask(&prompt)? {
         bail!("aborted");
     }
@@ -264,11 +346,52 @@ fn ask(prompt: &str) -> Result<bool> {
 
 /// Drained is worth its own word: the node is up and reporting, the
 /// scheduler just will not place anything new on it.
-pub fn readiness(ready: bool, schedulable: bool) -> &'static str {
-    match (ready, schedulable) {
-        (false, _) => "no",
-        (true, false) => "drained",
-        (true, true) => "yes",
+/// The `ready` column of a machine listing, which now has to say three
+/// things with one word.
+///
+/// `draining` outranks `cordoned`, because it is the one an operator is
+/// waiting on: a drain implies the cordon, so a machine being emptied is
+/// always also unschedulable, and reporting the quieter of the two would
+/// hide the loud one. The old spelling for a cordon was `drained`, and it was
+/// wrong the day the real verb arrived — a cordoned machine has not been
+/// drained of anything.
+/// `conditions` is what the MACHINE said about itself, and it outranks
+/// `yes` for the reason the whole condition exists: a node that is up,
+/// uncordoned and unable to act read `yes` in this column for three hours
+/// during the mini-chaos run while every command it was given failed. It does
+/// NOT outrank `draining` or `cordoned` — those are what an operator decided,
+/// and a decision an operator made is the thing they are looking for in this
+/// column.
+///
+/// The short spellings — `pressure`, `store`, `cgroup` — and a comma between
+/// them, because `node ls` is piped into `awk` and a cell may not carry a raw
+/// space. A word this CLI does not know travels through as it came: an agent
+/// newer than its CLI is still telling the truth.
+pub fn readiness(ready: bool, schedulable: bool, draining: bool, conditions: &[&str]) -> String {
+    match (ready, draining, schedulable) {
+        (false, _, _) => "no".to_string(),
+        (true, true, _) => "draining".to_string(),
+        (true, false, false) => "cordoned".to_string(),
+        (true, false, true) if conditions.is_empty() => "yes".to_string(),
+        (true, false, true) => conditions
+            .iter()
+            .map(|c| short_condition(c))
+            .collect::<Vec<_>>()
+            .join(","),
+    }
+}
+
+/// The one word a READY cell has room for, per condition type.
+///
+/// Unknown words pass through untouched rather than becoming "unknown": the
+/// CLI is the oldest thing in a rollout and an agent that has learned a new
+/// condition should not have it swallowed by the client that prints it.
+fn short_condition(condition: &str) -> String {
+    match condition {
+        "DiskPressure" => "pressure".to_string(),
+        "StoreUnhealthy" => "store".to_string(),
+        "CgroupUnusable" => "cgroup".to_string(),
+        other => other.replace(' ', "-"),
     }
 }
 
@@ -344,7 +467,7 @@ mod tests {
 
     fn table(rows: Vec<Vec<String>>) -> Table {
         Table {
-            headers: &["name", "phase", "note"],
+            headers: vec!["name", "phase", "note"],
             rows,
             empty_note: "nothing here",
         }
@@ -409,11 +532,83 @@ mod tests {
         assert_eq!(age_until(now - chrono::Duration::days(1), now), "expired");
     }
 
+    /// Three states in one word, and the ranking is the point: a drain
+    /// implies the cordon, so a machine being emptied is always also
+    /// unschedulable, and reporting the quieter of the two would hide the one
+    /// the operator is waiting on.
     #[test]
-    fn a_drained_node_is_not_simply_ready() {
-        assert_eq!(readiness(true, true), "yes");
-        assert_eq!(readiness(true, false), "drained");
-        assert_eq!(readiness(false, true), "no");
+    fn a_machine_being_emptied_says_so_and_not_merely_that_it_is_cordoned() {
+        assert_eq!(readiness(true, true, false, &[]), "yes");
+        assert_eq!(readiness(true, false, false, &[]), "cordoned");
+        assert_eq!(readiness(true, false, true, &[]), "draining");
+        // The pair a drain always produces, and the one an operator could
+        // also make by hand — both read as the drain.
+        assert_eq!(readiness(true, true, true, &[]), "draining");
+        // Down beats everything: a machine nobody can reach is not a machine
+        // that is being emptied.
+        assert_eq!(readiness(false, true, false, &[]), "no");
+        assert_eq!(readiness(false, false, true, &[]), "no");
+    }
+
+    /// D8's other half, in the column an operator actually reads: a node that
+    /// is up and uncordoned and has said it cannot act must not read `yes`.
+    /// The mini-chaos run had one reading `yes` for three hours.
+    #[test]
+    fn a_wedged_node_does_not_read_yes() {
+        assert_eq!(readiness(true, true, false, &["StoreUnhealthy"]), "store");
+        assert_eq!(
+            readiness(true, true, false, &["DiskPressure", "StoreUnhealthy"]),
+            "pressure,store"
+        );
+        assert_eq!(readiness(true, true, false, &["CgroupUnusable"]), "cgroup");
+        // A word this CLI has never heard of still takes the node out of
+        // `yes` and reaches the operator unswallowed.
+        assert_eq!(readiness(true, true, false, &["FanFailure"]), "FanFailure");
+        // What an operator decided outranks it: they asked for the drain and
+        // that is what they are looking for here.
+        assert_eq!(
+            readiness(true, false, true, &["StoreUnhealthy"]),
+            "draining"
+        );
+        assert_eq!(
+            readiness(true, false, false, &["StoreUnhealthy"]),
+            "cordoned"
+        );
+        // And a machine nobody can reach is still just down.
+        assert_eq!(readiness(false, true, true, &["StoreUnhealthy"]), "no");
+    }
+
+    /// D4: a delete that only queued the object says so, and one that
+    /// finished says nothing extra.
+    ///
+    /// `volume rm` on a disk a running VM held printed the name and exited 0
+    /// — byte for byte what a successful delete prints — while the volume
+    /// stayed `Releasing` with its data intact. The API had been answering
+    /// with the sentence all along; the CLI threw the document away.
+    #[test]
+    fn a_delete_that_did_not_finish_carries_the_servers_own_sentence() {
+        let deleting = br#"{"kind":"Status","status":"Success","code":202,"reason":"Deleting",
+            "message":"volume mc-vol-a is attached to vm mc-vm-a; its data stays until that vm lets go",
+            "details":{"kind":"Volume","name":"mc-vol-a"}}"#;
+        assert_eq!(
+            removal_note(deleting).as_deref(),
+            Some("volume mc-vol-a is attached to vm mc-vm-a; its data stays until that vm lets go")
+        );
+
+        // A delete that IS finished says nothing extra: the name is the whole
+        // answer, and a note there would be noise on every `rm` in the CLI.
+        let gone = br#"{"kind":"Status","status":"Success","code":200,"reason":"Deleted",
+            "message":"Tenant acme deleted","details":{"kind":"Tenant","name":"acme"}}"#;
+        assert_eq!(removal_note(gone), None);
+
+        // And anything else is silence rather than a guess: a body of another
+        // shape, an empty sentence, no body at all.
+        assert_eq!(removal_note(b"{}"), None);
+        assert_eq!(removal_note(b"not json"), None);
+        assert_eq!(
+            removal_note(br#"{"reason":"Deleting","message":"  "}"#),
+            None
+        );
     }
 
     #[test]
@@ -444,7 +639,9 @@ mod tests {
             mem(2048),
             size(0),
             size(1 << 34),
-            readiness(true, false).to_string(),
+            readiness(true, false, false, &[]),
+            readiness(true, false, true, &[]),
+            readiness(true, true, false, &["DiskPressure", "StoreUnhealthy"]),
             or_dash(None),
             joined(&[]),
             joined(&["a".to_string(), "b".to_string()]),
@@ -494,9 +691,39 @@ mod tests {
         let sources = [
             ("agent.rs", include_str!("agent.rs")),
             ("client.rs", include_str!("client.rs")),
-            ("cloud.rs", include_str!("cloud.rs")),
+            ("nouns/mod.rs", include_str!("nouns/mod.rs")),
+            ("nouns/cluster.rs", include_str!("nouns/cluster.rs")),
+            ("nouns/csr.rs", include_str!("nouns/csr.rs")),
+            ("nouns/floating_ip.rs", include_str!("nouns/floating_ip.rs")),
+            (
+                "nouns/floating_pool.rs",
+                include_str!("nouns/floating_pool.rs"),
+            ),
+            ("nouns/image.rs", include_str!("nouns/image.rs")),
+            ("nouns/network.rs", include_str!("nouns/network.rs")),
+            (
+                "nouns/routed_subnet.rs",
+                include_str!("nouns/routed_subnet.rs"),
+            ),
+            ("nouns/secret.rs", include_str!("nouns/secret.rs")),
+            (
+                "nouns/storage_pool.rs",
+                include_str!("nouns/storage_pool.rs"),
+            ),
+            ("nouns/tenant.rs", include_str!("nouns/tenant.rs")),
+            ("nouns/user.rs", include_str!("nouns/user.rs")),
+            (
+                "nouns/vm_migration.rs",
+                include_str!("nouns/vm_migration.rs"),
+            ),
+            ("nouns/volume.rs", include_str!("nouns/volume.rs")),
+            (
+                "nouns/volume_snapshot.rs",
+                include_str!("nouns/volume_snapshot.rs"),
+            ),
             ("cluster.rs", include_str!("cluster.rs")),
             ("config.rs", include_str!("config.rs")),
+            ("generic.rs", include_str!("generic.rs")),
             ("login.rs", include_str!("login.rs")),
             ("main.rs", include_str!("main.rs")),
             ("output.rs", include_str!("output.rs")),

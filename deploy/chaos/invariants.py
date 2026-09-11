@@ -23,14 +23,39 @@ import urllib.error
 import urllib.request
 from collections import defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mtls
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.environ.get("CHAOS_OUT", os.path.join(HERE, "out"))
 os.makedirs(OUT, exist_ok=True)
 
-CLOUD = ["10.128.1.103", "10.128.1.112", "10.128.1.113"]
-CLUSTER1 = ["10.128.1.104", "10.128.1.110", "10.128.1.111"]
-CLUSTER2 = ["10.128.1.105"]
+def _addrs(name, default):
+    """A comma-separated address list from the environment, or the lab's.
+
+    The topology is the lab's and stays the lab's; what this adds is a way to
+    point the harness somewhere else without editing it. `selftest.sh` needs
+    exactly that — a stack on loopback that proves the harness can still
+    reach a tier at all — and a self-test that had to patch this file would
+    be a self-test nobody runs.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    # SET AND EMPTY is a statement and not a fallback: a stack with one
+    # cluster says `CHAOS_CLUSTER2=` and means it. Reading that as "use the
+    # lab's" would send the self-test at an address nobody is listening on
+    # and call it a finding.
+    return [a.strip() for a in raw.split(",") if a.strip()]
+
+
+CLOUD = _addrs("CHAOS_CLOUD", ["10.128.1.103", "10.128.1.112", "10.128.1.113"])
+CLUSTER1 = _addrs("CHAOS_CLUSTER1", ["10.128.1.104", "10.128.1.110", "10.128.1.111"])
+CLUSTER2 = _addrs("CHAOS_CLUSTER2", ["10.128.1.105"])
 CLUSTERS = {"cluster-1": CLUSTER1, "cluster-2": CLUSTER2}
+# A stack with one cluster is a real shape and the self-test's. Empty means
+# "there is no cluster-2 here", not "cluster-2 is at no address".
+CLUSTERS = {k: v for k, v in CLUSTERS.items() if v}
 # node id -> how to reach a shell on it. manacor is the workstation itself.
 NODE_HOST = {
     "agent-1a": "10.128.1.106",
@@ -44,8 +69,8 @@ NODE_OF_CLUSTER = {
     "cluster-1": ["agent-1a", "agent-1b", "agent-1c", "manacor"],
     "cluster-2": ["agent-2a", "agent-2b"],
 }
-CLOUD_PORT = 3000
-CLUSTER_PORT = 3001
+CLOUD_PORT = int(os.environ.get("CHAOS_CLOUD_PORT", "3000"))
+CLUSTER_PORT = int(os.environ.get("CHAOS_CLUSTER_PORT", "3001"))
 
 SSH = [
     "ssh", "-i", os.path.expanduser("~/.ssh/id_ed25519"),
@@ -54,16 +79,20 @@ SSH = [
 ]
 
 # Objects that were here before the chaos run and are none of its business.
-TABU_VMS = {"cloud-probe", "nested-1"}
+# `ubuntu-probe` joined the list with the first Ubuntu boot from `--from-url`;
+# the `fleet-*` VMs are the placement fleet on manacor. A prefix and not eleven
+# names, because that set grows without this file hearing about it.
+TABU_VMS = {"cloud-probe", "nested-1", "ubuntu-probe"}
+TABU_VM_PREFIXES = ("fleet-",)
 TABU_TENANTS = {"guide-demo"}
 
 
 # --- plumbing ---------------------------------------------------------------
 
 def get(ip, port, path, timeout=8):
-    url = f"http://{ip}:{port}{path}"
+    url = f"{mtls.scheme()}://{ip}:{port}{path}"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with mtls.urlopen(urllib.request.Request(url), timeout=timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e:  # unreachable is itself data, not a crash
         return {"__error__": f"{type(e).__name__}: {e}"}
@@ -131,7 +160,16 @@ class State:
     def probe(self, node):
         cmd = r"""
 echo "###CH"
-ps -eo pid,args --no-headers 2>/dev/null | grep '[c]loud-hypervisor' | sed 's/  */ /g'
+# A VMM is a process whose COMMAND is cloud-hypervisor, and the awk on
+# `$2` is what says so. `grep cloud-hypervisor` over the whole command
+# line matched anything that merely mentioned it -- and on manacor, where
+# `sh()` runs the probe locally instead of over ssh, that includes the
+# shell running this very check. Round 4's e2e got
+# `I3 orphan vmm on manacor for dead vm f60492d8-...` out of it, which is
+# the id of the session that was doing the asking: I3 pulls the first uuid
+# out of the line, and the line was a scratch path. A harness that reports
+# its own toolchain as a leak is worse than one that reports nothing.
+ps -eo pid,args --no-headers 2>/dev/null | awk '$2 ~ /(^|\/)cloud-hypervisor$/' | sed 's/  */ /g'
 echo "###TAP"
 ip -o link 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1
 echo "###VNI"
@@ -206,7 +244,8 @@ def status(o):
 
 
 def ours(o):
-    return name(o) not in TABU_VMS
+    n = name(o)
+    return n not in TABU_VMS and not n.startswith(TABU_VM_PREFIXES)
 
 
 def check(st, base):
@@ -409,7 +448,14 @@ def check(st, base):
         vols = {name(x) for x in st.cl_vols[c]}
         for x in st.cl_vms[c]:
             for vol in (spec(x).get("vm") or {}).get("volumes") or []:
-                claim = vol.get("volume_name") or vol.get("volumeName") or vol.get("claim")
+                # `volume` is the field this API has (agent_api::spec::NewVolume);
+                # the three below it are shapes that were guessed at when this
+                # was written and that the server has never accepted. Kept
+                # beside it rather than instead of it, because an invariant
+                # that reads nothing reports nothing -- which is how I9 passed
+                # on every run while S6 could not create the vm at all.
+                claim = (vol.get("volume") or vol.get("volume_name")
+                         or vol.get("volumeName") or vol.get("claim"))
                 if claim and claim not in vols:
                     v.append(("I9", f"{c}/{name(x)} holds volume {claim} which no longer exists"))
 

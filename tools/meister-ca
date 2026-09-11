@@ -19,8 +19,9 @@
 #   controllers  CN=<name>              O=system:controllers   (serverAuth+clientAuth)
 #   nodes        CN=system:node:<id>    O=system:nodes
 #   clusters     CN=system:cluster:<n>  O=system:clusters
+#   clouds       CN=system:cloud:<n>    O=system:clouds
 #   admin        CN=<name>              O=system:masters       (break glass)
-#   users        CN=<name>              O=meister:admins|meister:members
+#   users        CN=<name>              O=meister:admins|operators|members|viewers
 #
 # `system:masters` is above the user directory and answers to no User object.
 # It exists because the directory has a bootstrap problem — somebody has to
@@ -37,6 +38,7 @@ FORCE=0
 CURVE="prime256v1"
 
 CLOUDS=(); CLUSTERS=(); NODES=(); ADMINS=(); USERS=()
+SERVINGS=(); CLOUD_IDS=(); CLUSTER_IDS=()
 
 usage() {
 	cat <<'USAGE'
@@ -48,12 +50,24 @@ usage: meister-ca [options]
   --force                reissue identities that already exist
   --curve NAME           EC curve (default: prime256v1)
 
-  --cloud   NAME[:SAN,...]   a cloud-controller's serving certificate
+  --cloud   NAME[:SAN,...]   a cloud-controller: serving certificate AND the
+                             system:cloud identity its replicas show each other
   --cluster NAME[:SAN,...]   a cluster-controller: serving certificate AND the
                              system:cluster identity it dials the cloud with
+
+  The two above are the hand-typed form, where one host IS one tier. A fleet
+  with replicas needs the halves apart -- a serving certificate belongs to a
+  HOST and a tier identity to the GROUP of hosts that share it -- so:
+
+  --serving NAME[:SAN,...]   only the serving certificate of one host
+  --cloud-identity NAME      only the system:cloud identity of one cloud
+  --cluster-identity NAME    only the system:cluster identity of one cluster
   --node    NODE_ID          an agent's system:node identity
   --admin   NAME             a break-glass system:masters certificate
-  --user    NAME[:ROLE]      a user certificate (ROLE: admin|member, default member)
+  --user    NAME[:ROLE]      a user certificate (ROLE: admin|operator|member|viewer,
+                             default member). The group is LABELLING, not a
+                             permission: the cloud reads the role off the User
+                             object in its directory on every request.
 
 SANs are the addresses clients will use: bare names become DNS entries,
 anything that parses as an address becomes an IP entry. "localhost" and
@@ -82,6 +96,9 @@ while [ $# -gt 0 ]; do
 		--force)   FORCE=1; shift ;;
 		--cloud)   CLOUDS+=("$2"); shift 2 ;;
 		--cluster) CLUSTERS+=("$2"); shift 2 ;;
+		--serving)          SERVINGS+=("$2"); shift 2 ;;
+		--cloud-identity)   CLOUD_IDS+=("$2"); shift 2 ;;
+		--cluster-identity) CLUSTER_IDS+=("$2"); shift 2 ;;
 		--node)    NODES+=("$2"); shift 2 ;;
 		--admin)   ADMINS+=("$2"); shift 2 ;;
 		--user)    USERS+=("$2"); shift 2 ;;
@@ -198,28 +215,71 @@ nix_block() {
 	bundle "\`/etc/meisterstack/pki/\`, mode 0600 on the key."
 }
 
-# --- controllers -----------------------------------------------------------
+# --- the halves, for a fleet with replicas ---------------------------------
+#
+# `--cloud`/`--cluster` below issue a serving certificate AND a tier identity
+# under one name, which is right when one host is one tier and wrong the
+# moment there are three of them: the serving certificate is what a client
+# checks THIS ADDRESS against, and the tier identity is what the three
+# replicas show as one another. So a plan asks for them separately.
 
-for entry in "${CLOUDS[@]:-}"; do
+for entry in "${SERVINGS[@]:-}"; do
 	[ -n "$entry" ] || continue
 	name="${entry%%:*}"; sans="${entry#"$name"}"; sans="${sans#:}"
 	issue "$name" "/CN=$name/O=system:controllers" \
 		"$SERVER_EXTS
 subjectAltName=$(sans_of "$sans")"
+done
+
+for name in "${CLOUD_IDS[@]:-}"; do
+	[ -n "$name" ] || continue
+	# Shared by the replicas of one cloud on purpose: what it authorizes is a
+	# replica reading from its sibling, and which of them answered is not a
+	# question worth authorizing against.
+	issue "system-cloud-$name" "/CN=system:cloud:$name/O=system:clouds" "$CLIENT_EXTS"
+done
+
+for name in "${CLUSTER_IDS[@]:-}"; do
+	[ -n "$name" ] || continue
+	# This is what the cloud checks the cluster's Hello against, and it names
+	# the CLUSTER rather than the replica that happens to be dialling.
+	issue "system-cluster-$name" "/CN=system:cluster:$name/O=system:clusters" "$CLIENT_EXTS"
+done
+
+# --- controllers -----------------------------------------------------------
+
+for entry in "${CLOUDS[@]:-}"; do
+	[ -n "$entry" ] || continue
+	name="${entry%%:*}"; sans="${entry#"$name"}"; sans="${sans#:}"
+	# Two certificates, for the same reason a cluster gets two. The serving
+	# one is "this host"; the system:cloud one is "this CLOUD" — shared by
+	# the three replicas, because what it authorizes is a replica reading
+	# from its sibling and the three are interchangeable by design.
+	issue "$name" "/CN=$name/O=system:controllers" \
+		"$SERVER_EXTS
+subjectAltName=$(sans_of "$sans")"
+	issue "system-cloud-$name" "/CN=system:cloud:$name/O=system:clouds" "$CLIENT_EXTS"
 	start_bundle "$name"
 	toml_block \
 		'# /etc/meisterstack/cloud.toml' \
+		"cloud_name = \"$name\"" \
 		"tls_cert = \"pki/$name.crt\"" \
 		"tls_key  = \"pki/$name.key\"" \
 		'client_ca = "pki/ca.crt"' \
+		'# asking a sibling replica for a console or a log, as system:cloud:'"$name" \
+		"identity_cert = \"pki/system-cloud-$name.crt\"" \
+		"identity_key  = \"pki/system-cloud-$name.key\"" \
 		'ca_cert   = "pki/ca.crt"' \
 		'ca_key    = "pki/ca.key"' \
 		'#csr_auto_approve = true   # lab only: signs every request that gets past the chain'
 	nix_block \
 		'meisterstack.cloud.settings = {' \
+		"  cloud_name = \"$name\";" \
 		"  tls_cert = \"/etc/meisterstack/pki/$name.crt\";" \
 		"  tls_key = \"/etc/meisterstack/pki/$name.key\";" \
 		'  client_ca = "/etc/meisterstack/pki/ca.crt";' \
+		"  identity_cert = \"/etc/meisterstack/pki/system-cloud-$name.crt\";" \
+		"  identity_key = \"/etc/meisterstack/pki/system-cloud-$name.key\";" \
 		'  ca_cert = "/etc/meisterstack/pki/ca.crt";' \
 		'  ca_key = "/etc/meisterstack/pki/ca.key";' \
 		'};'
@@ -320,16 +380,19 @@ for entry in "${USERS[@]:-}"; do
 	[ -n "$entry" ] || continue
 	name="${entry%%:*}"; role="${entry#"$name"}"; role="${role#:}"; role="${role:-member}"
 	case "$role" in
-		admin)  group="meister:admins" ;;
-		member) group="meister:members" ;;
-		*) die "unknown role $role for user $name (admin|member)" ;;
+		admin)    group="meister:admins" ;;
+		operator) group="meister:operators" ;;
+		member)   group="meister:members" ;;
+		viewer)   group="meister:viewers" ;;
+		*) die "unknown role $role for user $name (admin|operator|member|viewer)" ;;
 	esac
 	issue "$name" "/CN=$name/O=$group" "$CLIENT_EXTS"
 	cli_bundle "$name" \
-		"Role \`$role\` (\`$group\`). The certificate carries the role; the \`User\`
-object at the cloud is what the cloud actually consults, so create it too:
+		"Role \`$role\` (\`$group\`). The group in the certificate is labelling and
+not a permission -- the \`User\` object at the cloud is the only thing anything
+consults -- so create it, or this certificate authorizes nothing:
 
-    meister cloud user create $name --tenant <tenant> --role $role"
+    meister user create $name --tenant <tenant> --role $role"
 done
 
 printf '\n' >&2

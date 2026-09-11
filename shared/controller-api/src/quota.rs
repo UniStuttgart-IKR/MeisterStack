@@ -209,12 +209,14 @@ mod tests {
         new_vm(
             name,
             VmSpec {
+                class: Default::default(),
                 cluster_selector: Default::default(),
                 node_selector: Default::default(),
                 anti_affinity: Vec::new(),
                 node_name: None,
                 cluster_name: None,
                 run_strategy: Default::default(),
+                evacuation: Default::default(),
                 tenant: tenant.map(str::to_string),
                 vm: serde_json::json!({"vcpus": vcpus, "memory_mib": mem_mib}),
             },
@@ -419,6 +421,60 @@ mod tests {
         let shut = pool("fast", &[("newcomer", 0)]);
         let err = check_storage(&shut, "newcomer", StorageUsage::default().plus(1)).unwrap_err();
         assert!(err.contains("quota there is 0 GiB"), "{err}");
+    }
+
+    /// D-P11: the hundred GiB stops being a number only the source knows.
+    ///
+    /// `storagepool ls` showed `QUOTA -` while a create was refused with "its
+    /// quota there is 100 GiB", and there was nowhere to look the number up
+    /// or change it for a tenant nobody had named yet. The `*` row is both:
+    /// what the pool applies, written down, and the thing to patch.
+    #[test]
+    fn the_ceiling_for_everybody_nobody_named_is_a_row_like_any_other() {
+        use crate::resources::StoragePoolSpec;
+
+        // Nothing written: the built-in default, exactly as before.
+        let mut open = pool("fast", &[]);
+        assert_eq!(
+            open.spec.quota_for("newcomer"),
+            crate::resources::DEFAULT_QUOTA_STORAGE_GIB
+        );
+
+        // And this is how a read of the object says so.
+        open.spec.state_default_quota();
+        assert_eq!(
+            open.spec.quota.get(StoragePoolSpec::QUOTA_EVERYONE),
+            Some(&crate::resources::DEFAULT_QUOTA_STORAGE_GIB)
+        );
+
+        // An operator's own number for everybody, and the built-in default
+        // stops applying to anybody.
+        let generous = pool("fast", &[(StoragePoolSpec::QUOTA_EVERYONE, 500)]);
+        assert_eq!(generous.spec.quota_for("newcomer"), 500);
+        assert!(check_storage(&generous, "newcomer", StorageUsage::default().plus(500)).is_ok());
+        let err =
+            check_storage(&generous, "newcomer", StorageUsage::default().plus(501)).unwrap_err();
+        assert!(err.contains("quota there is 500 GiB"), "{err}");
+
+        // A named tenant outranks it, in both directions.
+        let mixed = pool(
+            "fast",
+            &[
+                (StoragePoolSpec::QUOTA_EVERYONE, 500),
+                ("acme", 10),
+                ("globex", 900),
+            ],
+        );
+        assert_eq!(mixed.spec.quota_for("acme"), 10);
+        assert_eq!(mixed.spec.quota_for("globex"), 900);
+        assert_eq!(mixed.spec.quota_for("newcomer"), 500);
+
+        // And filling a gap never overwrites what somebody wrote, including
+        // a deliberate zero -- which is the whole point of the door being
+        // shuttable.
+        let mut shut = pool("fast", &[(StoragePoolSpec::QUOTA_EVERYONE, 0)]);
+        shut.spec.state_default_quota();
+        assert_eq!(shut.spec.quota_for("newcomer"), 0);
     }
 
     /// Growing an existing volume is measured exactly like creating one that

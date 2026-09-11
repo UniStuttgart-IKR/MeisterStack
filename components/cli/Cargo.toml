@@ -29,4 +29,12 @@ hyper-util = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 tokio-rustls = { workspace = true }
+# termios, for `vm connect`: a console needs raw mode or the shell at the far
+# end never sees a key until Enter.
+nix = { workspace = true }
 
+
+[dev-dependencies]
+# A test that writes a file writes it somewhere nobody else is, and cleans up
+# after a panic as well as after a pass. See the workspace entry.
+tempfile = { workspace = true }

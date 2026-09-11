@@ -44,6 +44,20 @@ pub struct Session {
     pub issuer: String,
     pub client_id: String,
     pub access_token: String,
+    /// The token that says WHO, and therefore the one this CLI sends.
+    ///
+    /// D-P13, measured against Kanidm in rollout 59b: an access token there
+    /// carries `sub` as a uuid and nothing else, and `preferred_username` —
+    /// the claim this control plane's directory looks a person up by — is put
+    /// only into the id_token. Sending the access token got
+    /// `401 the token carries no preferred_username claim`; sending the
+    /// id_token got `200` and `identity: alice [meister:oidc]`.
+    ///
+    /// Optional because a provider that was not asked for `openid`, or one
+    /// that answers without an id_token, is still a provider — the access
+    /// token is then what there is, and it is sent exactly as before.
+    #[serde(default)]
+    pub id_token: Option<String>,
     #[serde(default)]
     pub refresh_token: Option<String>,
     pub expires_at: DateTime<Utc>,
@@ -66,9 +80,28 @@ impl Session {
             .with_context(|| format!("writing the oidc session {}", path.display()))
     }
 
-    /// The access token, if it is still worth sending.
+    /// What to send as the bearer: the id_token where there is one, and the
+    /// access token otherwise. See `Session::id_token`.
+    ///
+    /// One function, so that the two roads to a bearer — a session read off
+    /// disk and a session just renewed — cannot answer differently. They did
+    /// not, before this: both sent the access token.
+    pub fn bearer(&self) -> String {
+        self.id_token
+            .clone()
+            .unwrap_or_else(|| self.access_token.clone())
+    }
+
+    /// The bearer, if it is still worth sending.
+    ///
+    /// Measured against the ACCESS token's lifetime even when the id_token is
+    /// what travels, and that is the honest reading of what a provider told
+    /// us: `expires_in` is the only lifetime in a token response, an id_token
+    /// is issued in the same breath, and guessing a longer one for it would
+    /// be inventing a number. A provider that outlives it costs nothing; one
+    /// that does not is caught by the 401 and the refresh.
     pub fn usable_at(&self, now: DateTime<Utc>) -> Option<String> {
-        (now + FRESHNESS_MARGIN < self.expires_at).then(|| self.access_token.clone())
+        (now + FRESHNESS_MARGIN < self.expires_at).then(|| self.bearer())
     }
 
     pub fn usable_now(&self) -> Option<String> {
@@ -86,6 +119,13 @@ impl Session {
         if let Some(fresh) = tokens.refresh_token {
             self.refresh_token = Some(fresh);
         }
+        // The opposite rule to the refresh token's, and deliberately: a
+        // refresh token that was not rotated is still valid, while an
+        // id_token that was not reissued is as old as the one that expired.
+        // Keeping it would mean sending a stale name; dropping it falls back
+        // to the access token, which is what a provider that answers without
+        // an id_token is telling us to use.
+        self.id_token = tokens.id_token;
         self.expires_at = now + chrono::TimeDelta::seconds(tokens.expires_in.unwrap_or(300) as i64);
     }
 }
@@ -134,7 +174,7 @@ pub async fn freshen(target: &mut Target) -> Result<()> {
         expires_at = %session.expires_at,
         "renewed the oidc session"
     );
-    target.credential = Credential::Bearer(session.access_token);
+    target.credential = Credential::Bearer(session.bearer());
     Ok(())
 }
 
@@ -192,11 +232,25 @@ pub async fn login(target: &Target, global: &GlobalArgs) -> Result<()> {
         );
     }
 
+    if tokens.id_token.is_none() {
+        // The other half of "this session will not work", and it is the one
+        // that costs an afternoon: everything succeeds, the file is written,
+        // and every command afterwards is a 401 about a claim. See
+        // `Session::id_token`.
+        eprintln!(
+            "warning: the provider returned no id_token, so the access token is what will be \
+             sent.\n         This control plane looks a person up by \"preferred_username\", \
+             which several providers\n         put only in the id_token. Ask for \"openid\" in \
+             the profile's scope."
+        );
+    }
+
     let now = Utc::now();
     let mut session = Session {
         issuer: src.issuer.clone(),
         client_id: src.client_id.clone(),
         access_token: String::new(),
+        id_token: None,
         refresh_token: None,
         expires_at: now,
         scope: Some(scope.to_string()),
@@ -237,7 +291,7 @@ pub async fn login(target: &Target, global: &GlobalArgs) -> Result<()> {
             eprintln!(
                 "\nthe provider has said WHO you are. What you may do is the cloud's user\n\
                  directory's answer -- if it does not know this name, an administrator runs\n\
-                 `meister cloud user create` before anything else works."
+                 `meister user create` before anything else works."
             );
         }
     }
@@ -253,6 +307,7 @@ mod tests {
             issuer: "https://idp.example.org".into(),
             client_id: "meisterstack".into(),
             access_token: "at-1".into(),
+            id_token: None,
             refresh_token: Some("rt-1".into()),
             expires_at: Utc::now() + chrono::TimeDelta::seconds(expires_in),
             scope: None,
@@ -311,8 +366,9 @@ mod tests {
     /// The file is a credential and is written like one.
     #[test]
     fn a_session_file_is_written_at_0600_and_reads_back() {
-        let dir = std::env::temp_dir().join(format!("meister-oidc-test-{}", std::process::id()));
-        let path = dir.join("p.json");
+        // See the note in `config.rs`: a pid is not a unique name.
+        let dir = tempfile::tempdir().expect("a directory of our own");
+        let path = dir.path().join("p.json");
         let s = session(3600);
         s.save(&path).unwrap();
 
@@ -326,6 +382,71 @@ mod tests {
         let back = Session::load(&path).unwrap();
         assert_eq!(back.access_token, s.access_token);
         assert_eq!(back.refresh_token, s.refresh_token);
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// D-P13, and the shape a fake issuer answers in.
+    ///
+    /// Kanidm puts `preferred_username` -- the claim this control plane looks
+    /// a person up by -- only into the id_token; its access token carries
+    /// `sub` as a uuid. Measured in rollout 59b: the access token got
+    /// `401 the token carries no preferred_username claim` and the id_token
+    /// got `200`. The CLI stored and sent the access token and never read the
+    /// other field, so `meister login --oidc` produced a session that could
+    /// not be used for anything.
+    ///
+    /// The hop that fetches this document is `device::refresh`'s and is
+    /// tested there; what is proved here is what this CLI does with the
+    /// answer -- which is the whole of the defect.
+    #[test]
+    fn the_token_that_carries_the_name_is_the_one_that_is_sent() {
+        let now = Utc::now();
+        let kanidm = r#"{"access_token":"at-2","id_token":"id-2",
+                         "refresh_token":"rt-2","expires_in":900,
+                         "token_type":"bearer","scope":"openid profile"}"#;
+
+        let mut s = session(0);
+        s.apply(serde_json::from_str(kanidm).unwrap(), now);
+        assert_eq!(s.id_token.as_deref(), Some("id-2"));
+        assert_eq!(s.access_token, "at-2", "both are kept");
+        assert_eq!(s.bearer(), "id-2", "and the id_token is what travels");
+        assert_eq!(s.usable_at(now).as_deref(), Some("id-2"));
+
+        // An issuer that answers without one: the access token is what there
+        // is, and it is sent exactly as it was before this fix.
+        let mut s = session(0);
+        s.apply(
+            serde_json::from_str(r#"{"access_token":"at-3","expires_in":900}"#).unwrap(),
+            now,
+        );
+        assert_eq!(s.bearer(), "at-3");
+
+        // A renewal that does not reissue the id_token DROPS it rather than
+        // keeping the old one: an id_token that was not reissued is as old as
+        // the one that expired, and sending it would send a stale name.
+        let mut s = session(0);
+        s.apply(serde_json::from_str(kanidm).unwrap(), now);
+        s.apply(
+            serde_json::from_str(r#"{"access_token":"at-4","expires_in":900}"#).unwrap(),
+            now,
+        );
+        assert_eq!(s.id_token, None);
+        assert_eq!(s.bearer(), "at-4");
+        assert_eq!(
+            s.refresh_token.as_deref(),
+            Some("rt-2"),
+            "and the refresh token keeps its own, opposite rule"
+        );
+    }
+
+    /// A session file written before the field existed still loads, and the
+    /// CLI then behaves exactly as it did: the access token is the bearer.
+    #[test]
+    fn a_session_from_before_the_id_token_still_reads() {
+        let older = r#"{"issuer":"https://idp.example.org","client_id":"x",
+                        "access_token":"at-1","refresh_token":"rt-1",
+                        "expires_at":"2030-01-01T00:00:00Z"}"#;
+        let s: Session = serde_json::from_str(older).expect("an older session");
+        assert_eq!(s.id_token, None);
+        assert_eq!(s.bearer(), "at-1");
     }
 }

@@ -14,16 +14,35 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 axum = { workspace = true }
+# The one HTTP call this process makes as a CLIENT: a replica that was asked
+# for a console it does not hold forwards the question once, to the sibling
+# that does. hyper rather than a second http stack, because this crate
+# already terminates hyper on the way in and the CLI already dials with it on
+# the way out -- one stack in the tree, and this is its third caller.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+tokio-rustls = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+# `RouterSink` on `Dispatch`: the trait is async and lives in controller-api.
+async-trait = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
+# The router's own routing table, exercised without a store behind it: a
+# `oneshot` with a method no route registers separates "this path is served"
+# (405) from "this path is not" (404) without any handler running. See the
+# discovery test in src/api.rs.
+tower = { workspace = true }
+http-body-util = { workspace = true }
+
 # `start_paused` for the VM index's window: it states what a one-second cache
 # does over time without spending the second. Same reason as controller-api.
 tokio = { workspace = true, features = ["test-util"] }

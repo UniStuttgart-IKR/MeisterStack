@@ -85,7 +85,7 @@ cert_ttl_days = 90
 # LEFT OFF, and spelled out rather than omitted so that nobody has to check
 # whether it was forgotten: with it on, the only thing between a caller and a
 # certificate is the authenticator chain. An administrator runs
-# `meister cloud csr approve <name>` instead, which is a person looking at a
+# `meister csr approve <name>` instead, which is a person looking at a
 # name before it becomes an identity.
 #csr_auto_approve = false
 
@@ -105,6 +105,14 @@ cert_ttl_days = 90
 # to, so on a hardened host it is one more outbound permit — worth naming
 # rather than leaving to be discovered when traces do not arrive.
 #otlp_endpoint = "http://127.0.0.1:4317"
+
+# How a line is written: "human" (the default) or "json". The envelope only —
+# no level, no filter and no field changes with it. "json" is for a host whose
+# logs are SHIPPED: the collector reads keys instead of guessing at a regex,
+# and the trace id becomes a key (`span_trace_id` after Loki's `| json`) that
+# joins a log line to its trace. Which also says the quiet part: with a
+# shipper configured, these lines leave this host.
+#log_format = "json"
 
 # --- the authenticator chain -----------------------------------------------
 #

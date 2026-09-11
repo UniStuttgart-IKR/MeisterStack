@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# The one place a spelling both tiers use is DEFINED rather than repeated, so
+# a value that travels on the wire AND stands in a published object needs a
+# derive here. `Locality` is that value; nothing else in this crate is
+# serialised, and nothing else pulls these in.
+serde = { workspace = true }
+schemars = { workspace = true }
+
+[dev-dependencies]
+# Only to prove that serde spells `Locality` the way the wire does.
+serde_json = { workspace = true }

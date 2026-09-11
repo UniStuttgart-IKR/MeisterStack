@@ -82,7 +82,7 @@ controller_key = "pki/system-node-manacor.key"
 # This is the node's half of the tenant-isolation story and the reason it
 # belongs in a hardened example rather than in the optional pile: without it a
 # guest can claim any address in the pool and be believed. Deliberate
-# duplication of `meister cloud floatingpool ls` — keep the two in step, and
+# duplication of `meister floatingpool ls` — keep the two in step, and
 # remember that a range missing here is a range nobody guards.
 #
 # MAC pinning needs no configuration and applies to every VM either way.
@@ -97,9 +97,58 @@ guarded_ranges = ["10.255.0.0/16", "203.0.113.7", "203.0.113.16-203.0.113.19"]
 # killed. The node's business, never the controller's.
 #stop_grace_secs = 30
 
+# How long this node waits on a live migration it cannot see the end of, at
+# either end of one. Both default to 600.
+#
+# Both MUST be longer than the cluster's own `migration_transfer_secs`, and
+# that relation is the whole reason the numbers exist: the tier that ASKED for
+# the migration is the one that decides it has failed, and a node that gave up
+# first would report a failure for a transfer still running. An estate that
+# raised the cluster's patience for 32 GiB guests over a congested link raises
+# these two with it.
+#
+#   migrate_out_ceiling_secs  the SOURCE watching its own VMM. Reached only
+#                             when the VMM neither exits (which is how v53
+#                             says a send took) nor resumes its guest.
+#   receive_ceiling_secs      the DESTINATION holding a VMM, a set of disks
+#                             and a set of taps for a guest that has not
+#                             turned up. Reached only by the one failure
+#                             nobody reports — a source that never dialled.
+#
+# Wrong downwards is a guest that dies mid-move; wrong upwards is a leak that
+# lasts this long. Set them together.
+#migrate_out_ceiling_secs = 600
+#receive_ceiling_secs = 600
+
+# The physical machine this node is on, when somebody outside can see what
+# the machine itself cannot. Unset on bare metal, where it is not needed.
+#
+# A nested node — an agent in a VM, which is what a lab is — cannot ask its
+# host who it is: the platform's DMI says QEMU and a serial belonging to the
+# guest, and that is the whole of what a guest may know.
+#
+# It exists for exactly one decision. Nested KVM state does not restore on a
+# different physical host — measured twice on this lab's own hardware, with
+# two bare cloud-hypervisor processes and no MeisterStack at all (D-X1) — so
+# a live migration between two NESTED nodes is refused unless both name the
+# same host here. "We cannot tell" is not "it is fine", and the lab's answer
+# to "we cannot tell" was two nights.
+#
+# A refusal costs nothing: the guest keeps running, `vm migrate` says which
+# two machines and why, and a drain moves it by reboot instead.
+#physical_host = "palma"
+
 # Where to send spans — one more outbound destination on a hardened host, so
 # worth naming rather than discovering when traces do not arrive.
 #otlp_endpoint = "http://127.0.0.1:4317"
+
+# How a line is written: "human" (the default) or "json". The envelope only —
+# no level, no filter and no field changes with it. "json" is for a host whose
+# logs are SHIPPED: the collector reads keys instead of guessing at a regex,
+# and the trace id becomes a key (`span_trace_id` after Loki's `| json`) that
+# joins a log line to its trace. Which also says the quiet part: with a
+# shipper configured, these lines leave this host.
+#log_format = "json"
 
 [paths]
 # The agent's own record of every VM it holds, and what makes a VM survive a
@@ -121,6 +170,12 @@ binary = "/opt/meisterstack/bin/cloud-hypervisor"
 # A local unix socket to the VMM; anything slower than a second or two means
 # it is wedged, not busy.
 timeout_ms = 5000
+# How long a hot-unplug may take before this driver stops believing in it.
+# Default 30. A number about GUESTS and not about this stack, so it belongs to
+# whoever chose the images. Being wrong in the FAST direction is what D3 was:
+# a volume reported free while the VMM still held the fd, and the next VM to
+# use it dying on cloud-hypervisor's write lock.
+#unplug_timeout_secs = 30
 
 [network]
 default_bridge = "meister_br0"
