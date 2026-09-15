@@ -127,7 +127,7 @@ phases! {
     /// The phase is derived from those words and from nothing else; see
     /// [`settle_image`] for the four rules and `ImageNodeState` for what one
     /// machine's word looks like.
-    ImagePhase / ImagePhaseKind / ImageReason / ImagePhaseWire [3] {
+    ImagePhase / ImagePhaseKind / ImageReason / ImagePhaseWire / ImageReported [3] {
         Pending { reason, message, since } => "Pending",
         Ready { message, since } => "Ready",
         Failed { reason, message, since } => "Failed",

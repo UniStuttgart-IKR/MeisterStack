@@ -90,7 +90,7 @@ phases! {
     /// and `Failed` are both worth keeping — the record of a move that did not
     /// work is the most useful object in this file on the day somebody asks why
     /// a machine is still full.
-    VmMigrationPhase / VmMigrationPhaseKind / VmMigrationReason / VmMigrationPhaseWire [5] {
+    VmMigrationPhase / VmMigrationPhaseKind / VmMigrationReason / VmMigrationPhaseWire / VmMigrationReported [5] {
         /// Accepted, nothing done. No target chosen yet.
         Pending { reason, message, since } => "Pending",
         /// A target has been chosen and is being made ready: the record, the

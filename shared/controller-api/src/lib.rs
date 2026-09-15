@@ -84,8 +84,9 @@ pub use resources::{
     settle_storage_pool, unbind_only, vm_shape_unchanged,
 };
 pub use resources::{
-    ImagePhaseWire, RouterPhaseWire, StoragePoolPhaseWire, UNSTAMPED, VmMigrationPhaseWire,
-    VmPhaseWire, VolumePhaseWire, VolumeSnapshotPhaseWire,
+    ImagePhaseWire, ImageReported, RouterPhaseWire, RouterReported, StoragePoolPhaseWire,
+    StoragePoolReported, UNSTAMPED, VmMigrationPhaseWire, VmMigrationReported, VmPhaseWire,
+    VmReported, VolumePhaseWire, VolumeReported, VolumeSnapshotPhaseWire, VolumeSnapshotReported,
 };
 pub use rest::{
     ApiConfig, ApiError, ApiResource, AuthState, Caller, CallerRole, CallerTenant, DISCOVERY_PATH,

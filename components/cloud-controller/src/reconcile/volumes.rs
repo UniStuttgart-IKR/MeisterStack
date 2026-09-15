@@ -242,20 +242,36 @@ pub(super) async fn dispatch_snapshot(
 }
 
 /// Say what a snapshot is waiting for, and only when it changed.
+///
+/// It used to keep whatever kind the object had and replace the sentence
+/// beside it. That worked while the two were separate fields and cannot
+/// survive the derivation — a word carries its own sentence now — so the
+/// guard below is what takes over the job the kept kind was doing: a copy
+/// some cluster has already described is not waiting for anything. Its bytes
+/// exist down there, and this is only this tier having lost sight of the road
+/// to them. Writing `Pending` over it would be this tier un-observing an
+/// observation, which is D-B2's shape.
 pub(super) async fn note_snapshot_pending(
     store: &EtcdStore,
     snapshot: &controller_api::VolumeSnapshot,
     reason: String,
 ) -> anyhow::Result<()> {
+    if snapshot
+        .status
+        .reported
+        .as_ref()
+        .is_some_and(|r| !r.node.is_empty())
+    {
+        return Ok(());
+    }
     if snapshot.status.phase().message() == Some(reason.as_str()) {
         return Ok(());
     }
     store
         .mutate::<controller_api::VolumeSnapshot, _>(&snapshot.metadata.name, |s| {
-            let kind = s.status.phase().kind();
-            #[allow(deprecated)]
-            s.status.assign(controller_api::VolumeSnapshotPhase::said(
-                kind,
+            s.status.reported = Some(controller_api::VolumeSnapshotReported::here(
+                controller_api::VolumeSnapshotPhaseKind::Pending,
+                controller_api::VolumeSnapshotReason::SourceGone,
                 Some(reason.clone()),
                 chrono::Utc::now(),
             ));

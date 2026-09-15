@@ -418,7 +418,7 @@ reasons! {
 phases! {
     /// How far along a router is — the same vocabulary a VM's phase has, one
     /// object over, and with the same rule: what IS, not what was asked.
-    RouterPhase / RouterPhaseKind / RouterReason / RouterPhaseWire [6] {
+    RouterPhase / RouterPhaseKind / RouterReason / RouterPhaseWire / RouterReported [6] {
         /// Nowhere to put it yet: no cluster has a gateway-capable node for this
         /// provider network, or every candidate is down, drained or refuses the
         /// class. The message says which of those it is.

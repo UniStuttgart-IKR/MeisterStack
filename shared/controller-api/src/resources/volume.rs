@@ -124,7 +124,7 @@ phases! {
     /// the lab pointed out that a client then needs two comparisons for the same
     /// question. Free to change today because no volume object has ever been
     /// stored outside a test; it would not be free tomorrow.
-    VolumePhase / VolumePhaseKind / VolumeReason / VolumePhaseWire [5] {
+    VolumePhase / VolumePhaseKind / VolumeReason / VolumePhaseWire / VolumeReported [5] {
         /// Reserved, not yet placed on a node that can provision it.
         Pending { reason, message, since } => "Pending",
         /// A node was chosen and is making it.
@@ -476,15 +476,21 @@ reasons! {
     /// Why a snapshot is what it is.
     ///
     /// One list out of two vocabularies, the shape `VmReason` explains. This
-    /// tier's four are in the snapshot reconciler: `Dispatched` is the claim
+    /// tier's five are in the snapshot reconciler: `AwaitingNode` is the
+    /// moment between the request and the dispatch, `Dispatched` is the claim
     /// written before `TakeSnapshot` goes out, `Requeued` is the failed-copy
     /// kick, `SourceGone` is a volume or a copy that is not there any more,
     /// and `Undeliverable` is a dispatch that never reached a node. The
     /// node's three are `proto::reasons::SNAPSHOT`.
-    VolumeSnapshotReason [8] {
+    VolumeSnapshotReason [9] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
         Unrecorded => "Unrecorded",
+        /// Written down, and no node has been told yet. The word every
+        /// snapshot wears for the moment between the request and the
+        /// dispatch, and the reason `Pending` no longer has to mean
+        /// "Unrecorded" on a fresh object.
+        AwaitingNode => "AwaitingNode",
         /// A node has been told to take it.
         Dispatched => "Dispatched",
         /// A copy that failed is being tried again.
@@ -518,7 +524,7 @@ reasons! {
 phases! {
     /// How far a snapshot got.
     VolumeSnapshotPhase / VolumeSnapshotPhaseKind / VolumeSnapshotReason
-        / VolumeSnapshotPhaseWire [4] {
+        / VolumeSnapshotPhaseWire / VolumeSnapshotReported [4] {
         /// Written down; the node has not been told yet.
         Pending { reason, message, since } => "Pending",
         /// A node was told and is taking it.
@@ -549,6 +555,20 @@ pub struct VolumeSnapshotStatus {
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
     pub(super) phase: VolumeSnapshotPhase,
+    /// The last word anybody established about this copy — the one fact
+    /// `settle_volume_snapshot` derives from.
+    ///
+    /// A node's word arrives on the status road; this tier's own conclusions
+    /// (the dispatch that went out, the volume that is not there any more,
+    /// the command that could not be delivered, the requeue) are written here
+    /// too, with an empty `node`. That is not a blurring of the two: the
+    /// empty `node` is what stops this tier from writing `Ready`, which only
+    /// a machine holding the bytes may say. See `VolumeSnapshotReported`.
+    ///
+    /// `None` on a copy nobody has said anything about, which is every copy
+    /// for the moment between the request and the dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<VolumeSnapshotReported>,
     /// The node that took it — the volume's provisioning node, which under a
     /// `shared` pool need not be the node the VM runs on. Copied onto the
     /// snapshot at dispatch so that a later `DropSnapshot` goes to the machine
@@ -595,4 +615,191 @@ pub fn new_volume_snapshot(name: &str, spec: VolumeSnapshotSpec) -> VolumeSnapsh
         .finalizers
         .push(VOLUME_RELEASE_FINALIZER.to_string());
     snapshot
+}
+
+/// What a copy IS, out of the last word anybody said about it.
+///
+/// One rule for both tiers, and the thinnest derivation in this file, because
+/// a snapshot really is only ever "what the last party established": nothing
+/// schedules it (it goes to the node its volume is on), nothing else holds it,
+/// and there is no claim on it to fall.
+///
+/// What the one place buys is therefore not an ordering but three guarantees
+/// that were spread over seven writers before:
+///
+/// * **`Ready` demands a machine.** A word with no `node` is this tier's own
+///   conclusion, and this tier may not conclude that bytes exist — see
+///   `VolumeSnapshotReported`. A dispatch that anticipated `Ready` would be
+///   the F16 mistake one object over.
+/// * **No phase without a reason.** A copy nobody has said anything about is
+///   `Pending { AwaitingNode }` and not `Pending { Unrecorded }`, which is
+///   what a fresh object read as before.
+/// * **One `since`.** It moves with the word and not with the report, so
+///   "Creating since" is not "last heard from".
+pub fn settle_volume_snapshot(status: &VolumeSnapshotStatus) -> VolumeSnapshotPhase {
+    match status
+        .reported
+        .as_ref()
+        .and_then(VolumeSnapshotReported::phase)
+    {
+        Some(phase) => phase,
+        None => VolumeSnapshotPhase::new(
+            VolumeSnapshotPhaseKind::Pending,
+            VolumeSnapshotReason::AwaitingNode,
+            Some("no node has been told to take it yet".to_string()),
+            UNSTAMPED,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("an instant")
+    }
+
+    fn snapshot() -> VolumeSnapshot {
+        new_volume_snapshot("nightly-1", VolumeSnapshotSpec::default())
+    }
+
+    /// The table: what was last said about the copy, and what the copy
+    /// therefore IS.
+    #[test]
+    fn a_copy_is_the_last_word_anybody_said_about_it() {
+        let mut fresh = snapshot();
+        fresh.settle(at(0));
+        assert_eq!(
+            fresh.status.phase().kind(),
+            VolumeSnapshotPhaseKind::Pending
+        );
+        assert_eq!(
+            fresh.status.phase().reason(),
+            Some(VolumeSnapshotReason::AwaitingNode),
+            "a fresh copy says what it is waiting for instead of nothing"
+        );
+
+        let cases: &[(
+            VolumeSnapshotReported,
+            VolumeSnapshotPhaseKind,
+            VolumeSnapshotReason,
+        )] = &[
+            (
+                VolumeSnapshotReported::here(
+                    VolumeSnapshotPhaseKind::Creating,
+                    VolumeSnapshotReason::Dispatched,
+                    None,
+                    at(0),
+                ),
+                VolumeSnapshotPhaseKind::Creating,
+                VolumeSnapshotReason::Dispatched,
+            ),
+            (
+                VolumeSnapshotReported::by(
+                    "manacor",
+                    VolumeSnapshotPhaseKind::Failed,
+                    VolumeSnapshotReason::DriverRefused,
+                    Some("no room in the thin pool".into()),
+                    at(0),
+                ),
+                VolumeSnapshotPhaseKind::Failed,
+                VolumeSnapshotReason::DriverRefused,
+            ),
+            (
+                VolumeSnapshotReported::here(
+                    VolumeSnapshotPhaseKind::Failed,
+                    VolumeSnapshotReason::Undeliverable,
+                    Some("no session".into()),
+                    at(0),
+                ),
+                VolumeSnapshotPhaseKind::Failed,
+                VolumeSnapshotReason::Undeliverable,
+            ),
+            (
+                VolumeSnapshotReported::here(
+                    VolumeSnapshotPhaseKind::Pending,
+                    VolumeSnapshotReason::Requeued,
+                    None,
+                    at(0),
+                ),
+                VolumeSnapshotPhaseKind::Pending,
+                VolumeSnapshotReason::Requeued,
+            ),
+        ];
+        for (word, kind, reason) in cases {
+            let mut copy = snapshot();
+            copy.status.reported = Some(word.clone());
+            copy.settle(at(0));
+            assert_eq!(copy.status.phase().kind(), *kind, "{word:?}");
+            assert_eq!(
+                copy.status.phase().reason().unwrap_or_default(),
+                *reason,
+                "{word:?}"
+            );
+        }
+    }
+
+    /// `Ready` demands a machine. F16's rule, one object over and enforced by
+    /// the derivation rather than by every writer remembering it: a word with
+    /// no `node` is this tier's own conclusion, and this tier cannot have
+    /// seen the bytes.
+    #[test]
+    fn this_tier_cannot_conclude_that_a_copy_exists() {
+        let mut invented = snapshot();
+        invented.status.reported = Some(VolumeSnapshotReported::here(
+            VolumeSnapshotPhaseKind::Ready,
+            VolumeSnapshotReason::Unrecorded,
+            None,
+            at(0),
+        ));
+        invented.settle(at(0));
+        assert_eq!(
+            invented.status.phase().kind(),
+            VolumeSnapshotPhaseKind::Pending,
+            "a resting word nobody with the evidence said is not a word"
+        );
+        assert_eq!(
+            invented.status.phase().reason(),
+            Some(VolumeSnapshotReason::AwaitingNode)
+        );
+
+        let mut seen = snapshot();
+        seen.status.reported = Some(VolumeSnapshotReported::by(
+            "manacor",
+            VolumeSnapshotPhaseKind::Ready,
+            VolumeSnapshotReason::Unrecorded,
+            None,
+            at(0),
+        ));
+        seen.settle(at(0));
+        assert_eq!(seen.status.phase().kind(), VolumeSnapshotPhaseKind::Ready);
+    }
+
+    /// Two reports of the same thing are one word: neither the stamp nor the
+    /// instant the word was established moves. A field that advanced per
+    /// report would make every ten-second heartbeat an etcd revision (D-C7).
+    #[test]
+    fn a_report_that_says_the_same_thing_moves_neither_stamp() {
+        let said = |at| {
+            VolumeSnapshotReported::by(
+                "manacor",
+                VolumeSnapshotPhaseKind::Ready,
+                VolumeSnapshotReason::Unrecorded,
+                None,
+                at,
+            )
+        };
+        let mut copy = snapshot();
+        copy.status.reported = Some(said(at(0)));
+        copy.settle(at(0));
+        assert_eq!(copy.status.phase().since(), at(0));
+
+        assert!(
+            said(at(600)).same_word(&said(at(0))),
+            "the instant is not part of the word"
+        );
+        copy.settle(at(600));
+        assert_eq!(copy.status.phase().since(), at(0));
+    }
 }

@@ -95,7 +95,7 @@ macro_rules! phase_reason_of {
 /// ```ignore
 /// phases! {
 ///     /// Where a volume is in its own life.
-///     VolumePhase / VolumePhaseKind / VolumeReason / VolumePhaseWire [5] {
+///     VolumePhase / VolumePhaseKind / VolumeReason / VolumePhaseWire / VolumeReported [5] {
 ///         /// Reserved, not yet placed on a node that can provision it.
 ///         Pending { reason, message, since } => "Pending",
 ///         /// The data exists.
@@ -117,7 +117,7 @@ macro_rules! phase_reason_of {
 macro_rules! phases {
     ($(
         $(#[$about:meta])*
-        $phase:ident / $kind:ident / $reason:ident / $wire:ident [$count:literal] {
+        $phase:ident / $kind:ident / $reason:ident / $wire:ident / $said:ident [$count:literal] {
             $(
                 $(#[$variant_about:meta])*
                 $variant:ident { $($field:ident),* } => $word:literal,
@@ -301,6 +301,100 @@ macro_rules! phases {
                     message: phase.message().map(str::to_string),
                     since: (phase.since() != UNSTAMPED).then(|| phase.since()),
                 }
+            }
+        }
+
+        /// One party's WORD about this object, as a fact on its status.
+        ///
+        /// The input side of a derivation. `settle` may read the spec and the
+        /// status and nothing else — no store, no other object — so
+        /// everything that used to reach a phase from somewhere else has to
+        /// be written down here first, by whichever pass knew it. This is the
+        /// shape that statement takes: what it is, why, when, and **who said
+        /// so**.
+        ///
+        /// `node` is the load-bearing field and the reason this is not just
+        /// the phase over again. An empty `node` means THIS tier concluded
+        /// it — a dispatch that went out, a source that has gone, a command
+        /// that could not be delivered — and a tier may not conclude that
+        /// something is `Ready`. Only a machine that has the bytes may say
+        /// that, and `settle` refuses a resting word that names nobody. That
+        /// is F16's rule (`Ready` demands an observation) enforced by the
+        /// derivation rather than by every writer remembering it.
+        #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct $said {
+            /// The word, as the party that said it spelled it.
+            #[serde(default)]
+            pub phase: $kind,
+            /// And why, in this resource's one closed vocabulary — the
+            /// node's words and this tier's, in one list. See `$reason`.
+            #[serde(default)]
+            pub reason: $reason,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub message: Option<String>,
+            /// When this word was ESTABLISHED — the instant of the report
+            /// that first said it.
+            ///
+            /// It does not move under a report that says the same thing
+            /// again, and that is deliberate for the reason `since` does not:
+            /// a peer reports every ten seconds, and a field that advanced
+            /// per report would make every one of them an etcd revision to
+            /// record that nothing happened (D-C7). `same_word` is what the
+            /// writers compare, and it leaves this out.
+            pub at: DateTime<Utc>,
+            /// The machine or cluster whose word this is, and empty for this
+            /// tier's own conclusion. See the type's own doc.
+            #[serde(default, skip_serializing_if = "String::is_empty")]
+            pub node: String,
+        }
+
+        impl $said {
+            /// A word from a peer: a node at the cluster, a cluster at the
+            /// cloud.
+            pub fn by(
+                node: &str,
+                phase: $kind,
+                reason: $reason,
+                message: Option<String>,
+                at: DateTime<Utc>,
+            ) -> Self {
+                Self { phase, reason, message, at, node: node.to_string() }
+            }
+
+            /// A word this tier established itself — see `node`. It can never
+            /// put an object into a resting state.
+            pub fn here(
+                phase: $kind,
+                reason: $reason,
+                message: Option<String>,
+                at: DateTime<Utc>,
+            ) -> Self {
+                Self { phase, reason, message, at, node: String::new() }
+            }
+
+            /// Do these two say the same thing? Everything but `at`.
+            ///
+            /// The churn guard every ingest uses, and the reason it is here
+            /// rather than at each of them: a peer reports every ten seconds
+            /// and says what it said last time, so what must not count as a
+            /// difference is the INSTANT. See `at`.
+            pub fn same_word(&self, other: &Self) -> bool {
+                self.phase == other.phase
+                    && self.reason == other.reason
+                    && self.message == other.message
+                    && self.node == other.node
+            }
+
+            /// The phase this word amounts to, or `None` when nobody with the
+            /// evidence said it. See the type's own doc for the rule.
+            pub fn phase(&self) -> Option<$phase> {
+                let resting = $phase::new(self.phase, self.reason, None, UNSTAMPED)
+                    .reason()
+                    .is_none();
+                (!resting || !self.node.is_empty()).then(|| {
+                    $phase::new(self.phase, self.reason, self.message.clone(), UNSTAMPED)
+                })
             }
         }
 

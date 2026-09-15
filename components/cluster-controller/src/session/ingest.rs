@@ -925,11 +925,15 @@ pub(super) async fn ingest_snapshots(
                       "the node no longer has this snapshot; it will be taken again");
                 store
                     .mutate::<VolumeSnapshot, _>(&name, |s| {
-                        #[allow(deprecated)]
-                        s.status.assign(controller_api::VolumeSnapshotPhase::new(
+                        // This tier's own conclusion out of a node's silence
+                        // about a copy it used to report, so `here` and not
+                        // `by`: what the node said is that it does not have
+                        // it, and what THIS tier decides is that the copy
+                        // will be taken again.
+                        s.status.reported = Some(controller_api::VolumeSnapshotReported::here(
                             VolumeSnapshotPhaseKind::Pending,
                             controller_api::VolumeSnapshotReason::SourceGone,
-                            None,
+                            Some(format!("{node_id} no longer has this copy")),
                             at,
                         ));
                         s.status.node = None;
@@ -957,15 +961,15 @@ pub(super) async fn ingest_snapshots(
         // came from.
         let size_gib = reported.size_bytes.div_ceil(1024 * 1024 * 1024);
         // Only when something changed: every node reports every ten seconds.
-        // Against the phase the write WOULD leave behind — see
-        // `mirror::observe`.
-        let candidate = controller_api::VolumeSnapshotPhase::new(
-            phase,
-            reason,
-            message.clone(),
-            snapshot.status.phase().since(),
-        );
-        if *snapshot.status.phase() == candidate
+        // The FACT is compared, not the phase — the phase is derived from it,
+        // so a write that does not change the word leaves it where it was.
+        let said =
+            controller_api::VolumeSnapshotReported::by(node_id, phase, reason, message.clone(), at);
+        if snapshot
+            .status
+            .reported
+            .as_ref()
+            .is_some_and(|held| held.same_word(&said))
             && snapshot.status.size_gib == size_gib
             && (backend.is_empty() || snapshot.status.backend == backend)
         {
@@ -973,13 +977,7 @@ pub(super) async fn ingest_snapshots(
         }
         store
             .mutate::<VolumeSnapshot, _>(&name, |s| {
-                #[allow(deprecated)]
-                s.status.assign(controller_api::VolumeSnapshotPhase::new(
-                    phase,
-                    reason,
-                    message.clone(),
-                    at,
-                ));
+                s.status.reported = Some(said.clone());
                 if !backend.is_empty() {
                     s.status.backend = backend.clone();
                 }

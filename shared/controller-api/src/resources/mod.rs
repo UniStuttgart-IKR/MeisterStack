@@ -155,7 +155,14 @@ resources! {
     Volume => "volumes", "Volume";
     /// A point in time of a volume, which outlives the volume. See
     /// `VolumeSnapshotSpec`.
-    VolumeSnapshot => "volumesnapshots", "VolumeSnapshot";
+    VolumeSnapshot => "volumesnapshots", "VolumeSnapshot" {
+        /// The last word anybody said about the copy. See
+        /// [`settle_volume_snapshot`].
+        fn settle(&mut self, now: DateTime<Utc>) {
+            let phase = settle_volume_snapshot(&self.status);
+            self.status.stamp(phase, now);
+        }
+    };
     /// A tenant's own bytes, sealed before they reach etcd. See
     /// `SecretSpec`.
     Secret => "secrets", "Secret";

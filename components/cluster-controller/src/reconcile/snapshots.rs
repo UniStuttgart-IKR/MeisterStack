@@ -132,11 +132,14 @@ pub(super) async fn dispatch_snapshot(
     // the volume has since gone.
     let mut sent = snapshot.clone();
     sent.status.node = Some(node.clone());
-    #[allow(deprecated)]
-    sent.status.assign(controller_api::VolumeSnapshotPhase::new(
+    // The FACT: this tier told a machine. It carries no node in the word
+    // itself — `here` rather than `by` — because nobody has looked at the
+    // copy yet, and that is what keeps the anticipation from ever being
+    // `Ready` (see `VolumeSnapshotReported`).
+    sent.status.reported = Some(controller_api::VolumeSnapshotReported::here(
         VolumeSnapshotPhaseKind::Creating,
         controller_api::VolumeSnapshotReason::Dispatched,
-        None,
+        Some(format!("{node} was told")),
         Utc::now(),
     ));
     match p.store.update(&sent).await {
@@ -393,8 +396,7 @@ pub(super) async fn note_snapshot_failed(
     warn!(snapshot = %snapshot.metadata.name, error = %message, "snapshot failed");
     p.store
         .mutate::<VolumeSnapshot, _>(&snapshot.metadata.name, |s| {
-            #[allow(deprecated)]
-            s.status.assign(controller_api::VolumeSnapshotPhase::new(
+            s.status.reported = Some(controller_api::VolumeSnapshotReported::here(
                 VolumeSnapshotPhaseKind::Failed,
                 reason,
                 Some(message.clone()),
@@ -431,11 +433,16 @@ pub(super) async fn requeue_snapshot(
     let kicked = p
         .store
         .mutate::<VolumeSnapshot, _>(&name, |s| {
-            #[allow(deprecated)]
-            s.status.assign(controller_api::VolumeSnapshotPhase::new(
+            // Back to Pending, which is what makes the next pass dispatch
+            // again — `reconcile_snapshot` branches on the phase, and the
+            // phase is this word.
+            s.status.reported = Some(controller_api::VolumeSnapshotReported::here(
                 VolumeSnapshotPhaseKind::Pending,
                 controller_api::VolumeSnapshotReason::Requeued,
-                None,
+                Some(format!(
+                    "attempt {} after a failure",
+                    s.status.requeue_attempts.saturating_add(1)
+                )),
                 now,
             ));
             s.status.requeue_attempts = s.status.requeue_attempts.saturating_add(1);

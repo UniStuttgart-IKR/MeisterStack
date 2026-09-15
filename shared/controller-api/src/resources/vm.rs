@@ -213,7 +213,7 @@ reasons! {
 
 phases! {
     /// What this control plane says a VM is doing.
-    VmPhase / VmPhaseKind / VmReason / VmPhaseWire [8] {
+    VmPhase / VmPhaseKind / VmReason / VmPhaseWire / VmReported [8] {
         Pending { reason, message, since } => "Pending",
         Provisioning { reason, message, since } => "Provisioning",
         Running { message, since } => "Running",

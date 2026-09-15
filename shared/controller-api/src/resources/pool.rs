@@ -413,7 +413,7 @@ phases! {
     /// Three states and no `Deleting`: a pool owns nothing, so there is no
     /// teardown to be in the middle of — the delete handler simply refuses while
     /// volumes point at it.
-    StoragePoolPhase / StoragePoolPhaseKind / StoragePoolReason / StoragePoolPhaseWire [3] {
+    StoragePoolPhase / StoragePoolPhaseKind / StoragePoolReason / StoragePoolPhaseWire / StoragePoolReported [3] {
         /// Nobody has said anything about it yet. A pool whose nodes are all down,
         /// and every pool for the first few seconds of its life.
         Pending { reason, message, since } => "Pending",

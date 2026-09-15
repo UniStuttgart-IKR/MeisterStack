@@ -432,12 +432,12 @@ pub(super) async fn ingest_snapshots(
                   "unknown snapshot phase from cluster");
             continue;
         };
-        if snapshot_unchanged(snapshot, reported, phase) {
+        if snapshot_unchanged(snapshot, cluster, reported, phase) {
             continue;
         }
         store
             .mutate::<controller_api::VolumeSnapshot, _>(&snapshot.metadata.name, |s| {
-                write_snapshot_status(s, reported, phase, at)
+                write_snapshot_status(s, cluster, reported, phase, at)
             })
             .await?;
         debug!(snapshot = %snapshot.metadata.name, cluster, phase = phase.as_str(),
@@ -712,21 +712,20 @@ fn write_volume_status(
 /// for ever.
 fn snapshot_unchanged(
     snapshot: &controller_api::VolumeSnapshot,
+    cluster: &str,
     reported: &proto::VolumeSnapshotStatusReport,
     phase: controller_api::VolumeSnapshotPhaseKind,
 ) -> bool {
     let observed = snapshot.status.observed_at.is_some();
-    // What the cluster decided about the copy, as the phase the write would
-    // leave behind — see `mirror::observe`.
-    let (reason, message) = reported_snapshot_reason(reported);
-    let settled = controller_api::VolumeSnapshotPhase::new(
-        phase,
-        reason,
-        message,
-        snapshot.status.phase().since(),
-    );
-    let same_verdict =
-        *snapshot.status.phase() == settled && snapshot.status.node == said(&reported.node);
+    // What the cluster decided about the copy, as the FACT the write would
+    // leave behind. The phase is derived from it, so there is one thing to
+    // compare and not four.
+    let same_verdict = snapshot
+        .status
+        .reported
+        .as_ref()
+        .is_some_and(|held| held.same_word(&snapshot_word(cluster, reported, phase)))
+        && snapshot.status.node == said(&reported.node);
     // What a node measured about it.
     let same_size = snapshot.status.size_gib == reported.size_gib;
     // "Only ever arrives", as everywhere else.
@@ -734,25 +733,32 @@ fn snapshot_unchanged(
     observed && same_verdict && same_size && same_backend
 }
 
-/// The same, one object over. See `reported_volume_reason`.
-fn reported_snapshot_reason(
+/// One cluster's word about one copy, as the fact it becomes on the object.
+///
+/// One function because two callers must agree exactly: the churn guard and
+/// the write. A guard that read the word differently from the write would
+/// either write on every report or never write at all.
+fn snapshot_word(
+    cluster: &str,
     reported: &proto::VolumeSnapshotStatusReport,
-) -> (controller_api::VolumeSnapshotReason, Option<String>) {
-    controller_api::VolumeSnapshotReason::read(&reported.reason, said(&reported.message))
+    phase: controller_api::VolumeSnapshotPhaseKind,
+) -> controller_api::VolumeSnapshotReported {
+    let (reason, message) =
+        controller_api::VolumeSnapshotReason::read(&reported.reason, said(&reported.message));
+    controller_api::VolumeSnapshotReported::by(cluster, phase, reason, message, chrono::Utc::now())
 }
 
 /// The reported line, onto the snapshot.
 fn write_snapshot_status(
     s: &mut controller_api::VolumeSnapshot,
+    cluster: &str,
     reported: &proto::VolumeSnapshotStatusReport,
     phase: controller_api::VolumeSnapshotPhaseKind,
     at: DateTime<Utc>,
 ) {
-    let (reason, message) = reported_snapshot_reason(reported);
-    #[allow(deprecated)]
-    s.status.assign(controller_api::VolumeSnapshotPhase::new(
-        phase, reason, message, at,
-    ));
+    let mut word = snapshot_word(cluster, reported, phase);
+    word.at = at;
+    s.status.reported = Some(word);
     s.status.node = said(&reported.node);
     s.status.size_gib = reported.size_gib;
     // "Only ever arrives", as everywhere else: an empty name is silence and
