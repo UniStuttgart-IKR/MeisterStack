@@ -35,7 +35,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::drivers::Drivers;
 use crate::provision::timed_driver;
-use crate::reconcile::VolumeReason;
+use crate::reconcile::{SnapshotReason, VolumeReason};
 use crate::store::Store;
 use crate::types::{SnapshotRecord, SnapshotRecordPhase, VolumeRecord, VolumeRecordPhase};
 
@@ -55,6 +55,16 @@ fn reported_reason(record: &VolumeRecord) -> Option<VolumeReason> {
     match record.phase {
         VolumeRecordPhase::Ready => None,
         _ => record.reason.or(Some(VolumeReason::Unrecorded)),
+    }
+}
+
+/// The word that goes out beside a snapshot's phase. The volume rule
+/// (`reported_reason`), said once more for the other table: `Ready` needs
+/// none, and a record from a build before the field may not go out mute.
+fn reported_snapshot_reason(record: &SnapshotRecord) -> Option<SnapshotReason> {
+    match record.phase {
+        SnapshotRecordPhase::Ready => None,
+        _ => record.reason.or(Some(SnapshotReason::Unrecorded)),
     }
 }
 
@@ -433,6 +443,10 @@ impl Volumes {
                     &id,
                     &SnapshotRecord {
                         phase: SnapshotRecordPhase::Ready,
+                        // Both cleared with the phase they explained, as on a
+                        // volume: a `Ready` copy carrying the reason of its
+                        // last failed attempt contradicts itself.
+                        reason: None,
                         message: None,
                         ..existing
                     },
@@ -464,6 +478,7 @@ impl Volumes {
             handle: None,
             driver: driver_name.clone(),
             phase: SnapshotRecordPhase::Creating,
+            reason: Some(SnapshotReason::Working),
             message: None,
             gone_at: None,
         };
@@ -478,6 +493,7 @@ impl Volumes {
                     &SnapshotRecord {
                         handle: Some(taken),
                         phase: SnapshotRecordPhase::Ready,
+                        reason: None,
                         ..pending
                     },
                 )
@@ -489,6 +505,7 @@ impl Volumes {
                     &id,
                     &SnapshotRecord {
                         phase: SnapshotRecordPhase::Failed,
+                        reason: Some(SnapshotReason::DriverRefused),
                         message: Some(message),
                         ..pending
                     },
@@ -585,6 +602,7 @@ impl Volumes {
                 .map(|r| r.driver)
                 .unwrap_or_else(agent_api::storage::default_volume_driver),
             phase: SnapshotRecordPhase::Gone,
+            reason: Some(SnapshotReason::Dropped),
             message: None,
             gone_at: Some(SystemTime::now()),
         };
@@ -621,6 +639,9 @@ impl Volumes {
                 phase: record.phase.as_str().to_string(),
                 backend: record.backend().to_string(),
                 size_bytes: record.size_bytes(),
+                reason: reported_snapshot_reason(&record)
+                    .map(|reason| reason.as_str().to_string())
+                    .unwrap_or_default(),
                 message: record.message.clone().unwrap_or_default(),
             });
         }
@@ -1073,6 +1094,74 @@ mod tests {
                     spec: spec(4096),
                     handle: None,
                     phase: VolumeRecordPhase::Failed,
+                    reason: None,
+                    message: Some("what an older build wrote".into()),
+                    gone_at: None,
+                },
+            )
+            .expect("a record");
+        assert_eq!(line(&older).reason, "Unrecorded");
+        assert_eq!(line(&older).message, "what an older build wrote");
+    }
+
+    /// A copy says which kind of trouble it is, on the same three roads the
+    /// disk does.
+    ///
+    /// The snapshot half of the reasons round. A copy outlives the volume it
+    /// came from, so its line is the only thing left saying anything about it
+    /// — and `Failed` plus a driver's sentence was all it said.
+    #[tokio::test]
+    async fn a_snapshot_line_says_which_kind_of_trouble_it_is() {
+        let (_temp, volumes, store, dir) = node("snap-reasons");
+        let line = |id: &SnapshotId| {
+            volumes
+                .report_snapshots()
+                .into_iter()
+                .find(|l| l.snapshot_id == id.to_string())
+                .unwrap_or_else(|| panic!("a line for {id}"))
+        };
+
+        let disk = VolumeId::new_v4();
+        volumes.provision(disk, spec(4096)).await.expect("made");
+
+        // A copy that was taken needs no word.
+        let taken = SnapshotId::new_v4();
+        volumes.snapshot(taken, disk).await.expect("copied");
+        assert_eq!(line(&taken).phase, "Ready");
+        assert_eq!(line(&taken).reason, "", "a Ready copy explains itself");
+
+        // And one the backend could not make: the bytes it would have copied
+        // are not there any more.
+        std::fs::remove_file(dir.join(format!("{disk}.raw"))).expect("the source, gone");
+        let refused = SnapshotId::new_v4();
+        volumes
+            .snapshot(refused, disk)
+            .await
+            .expect_err("there is nothing left to copy");
+        assert_eq!(line(&refused).phase, "Failed");
+        assert_eq!(line(&refused).reason, "DriverRefused");
+        assert!(
+            !line(&refused).message.is_empty(),
+            "and it says what it said"
+        );
+
+        // A drop for a copy this node never had: the same outcome, and a
+        // tombstone rather than silence, exactly as a volume's deprovision is.
+        let never = SnapshotId::new_v4();
+        volumes.drop_snapshot(never).await.expect("already gone");
+        assert_eq!(line(&never).phase, "Gone");
+        assert_eq!(line(&never).reason, "Dropped");
+
+        // And a record from a build before the word.
+        let older = SnapshotId::new_v4();
+        store
+            .put_snapshot(
+                &older,
+                &SnapshotRecord {
+                    volume: disk,
+                    handle: None,
+                    driver: "filesystem".into(),
+                    phase: SnapshotRecordPhase::Failed,
                     reason: None,
                     message: Some("what an older build wrote".into()),
                     gone_at: None,

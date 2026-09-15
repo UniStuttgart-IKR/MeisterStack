@@ -338,6 +338,12 @@ message SnapshotStateReport {
   // How big the copy came out, in bytes as the node measured it.
   uint64 size_bytes = 4;
   string message = 5;
+  // Why this copy is in the phase above, in one closed word — the same
+  // vocabulary the volume beside it carries, minus the words a copy cannot
+  // be in. See `VmStatusReport.reason` for why it is a string.
+  //
+  // Empty for `Ready` and from every node that predates the field.
+  string reason = 6;
 }
 
 // One volume, as the node that was told to make it sees it.

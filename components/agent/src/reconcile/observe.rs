@@ -306,6 +306,51 @@ impl VolumeReason {
     }
 }
 
+/// Why a snapshot of this node is in the phase it reports.
+///
+/// The volume's words minus the ones a copy cannot be in, and on the record
+/// for the same reason (`SnapshotRecord::reason`): the pass that asked the
+/// driver is the one that knows. Three and a fallback — a copy has fewer ways
+/// to go wrong than the disk it came from, because nothing ever attaches one:
+/// there is no `NotOnBackend` here, since only `adopt` finds that condition
+/// and it walks volumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SnapshotReason {
+    /// `Creating`: the record is written and the driver has been asked, or is
+    /// being asked right now.
+    Working,
+    /// `Failed`: the backend said no. `message` is what it said.
+    DriverRefused,
+    /// `Gone`: this node was told to drop it and has. The tombstone the tier
+    /// above may forget a `VolumeSnapshot` on — see `SnapshotRecordPhase`.
+    Dropped,
+    /// A record from another build of this agent, which had no reason on it.
+    /// Its `message` is unchanged.
+    Unrecorded,
+}
+
+impl SnapshotReason {
+    pub const ALL: [SnapshotReason; 4] = [
+        SnapshotReason::Working,
+        SnapshotReason::DriverRefused,
+        SnapshotReason::Dropped,
+        SnapshotReason::Unrecorded,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SnapshotReason::Working => "Working",
+            SnapshotReason::DriverRefused => "DriverRefused",
+            SnapshotReason::Dropped => "Dropped",
+            SnapshotReason::Unrecorded => "Unrecorded",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+}
+
 /// Why a base image is not usable on this node.
 ///
 /// No `Unrecorded` here, and the absence is the point: this table is held in
@@ -362,16 +407,19 @@ impl ImageReason {
 /// one nobody can read off in one place. The test below holds it against the
 /// list in the round's report, which is where Silas strikes words.
 ///
-/// Storage pools are deliberately absent: a node reports DRIVERS
-/// (`DriverInfo`, with their locality) and never a pool, so the pool's
-/// `reason` is filled one tier up. Snapshots are absent because
-/// `SnapshotStateReport` carries no `reason` field yet — see the report.
+/// Storage pools are deliberately absent, and they are the only thing that
+/// is: a node reports DRIVERS (`DriverInfo`, with their locality) and never a
+/// pool, so the pool's `reason` is filled one tier up.
 pub fn reason_table() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         ("Vm", VmReason::ALL.iter().map(|r| r.as_str()).collect()),
         (
             "Volume",
             VolumeReason::ALL.iter().map(|r| r.as_str()).collect(),
+        ),
+        (
+            "Snapshot",
+            SnapshotReason::ALL.iter().map(|r| r.as_str()).collect(),
         ),
         (
             "Image",

@@ -339,6 +339,14 @@ pub struct SnapshotRecord {
     /// record may be gone by the time this has to be dropped.
     pub driver: String,
     pub phase: SnapshotRecordPhase,
+    /// Why that phase, in the one word a program may branch on. On the record
+    /// and written by the pass that asked the driver — see
+    /// [`VolumeRecord::reason`], which is here for the same reasons.
+    ///
+    /// `None` on a record from a build before this field (read as
+    /// `SnapshotReason::Unrecorded`) and on `Ready`, which needs no reason.
+    #[serde(default)]
+    pub reason: Option<crate::reconcile::SnapshotReason>,
     #[serde(default)]
     pub message: Option<String>,
     /// When this record became a tombstone, if it did. Same mechanism, same

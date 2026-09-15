@@ -1460,6 +1460,10 @@ fn the_reason_table_is_the_list_in_the_round_report() {
             ],
         ),
         (
+            "Snapshot",
+            vec!["Working", "DriverRefused", "Dropped", "Unrecorded"],
+        ),
+        (
             "Image",
             vec!["NotFound", "NotAFile", "ChecksumMismatch", "FetchFailed"],
         ),
@@ -1475,6 +1479,9 @@ fn the_reason_table_is_the_list_in_the_round_report() {
     }
     for reason in VolumeReason::ALL {
         assert_eq!(VolumeReason::parse(reason.as_str()), Some(reason));
+    }
+    for reason in SnapshotReason::ALL {
+        assert_eq!(SnapshotReason::parse(reason.as_str()), Some(reason));
     }
     for reason in ImageReason::ALL {
         assert_eq!(ImageReason::parse(reason.as_str()), Some(reason));
