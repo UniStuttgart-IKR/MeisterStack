@@ -59,6 +59,81 @@ pub const ROUTER_READY: &str = "Ready";
 /// namespace is gone, or a leg of it is. See [`ROUTER_READY`].
 pub const ROUTER_FAILED: &str = "Failed";
 
+/// Every word a NODE may put in a `reason`, resource by resource.
+///
+/// One list, in the crate both ends already share, and that is the whole
+/// point of it being here. The words are the agent's: they are declared as
+/// enums where the party that writes them lives (`agent::reconcile::observe`
+/// for VMs, volumes, snapshots and images, `agent_api::networking` for the
+/// router, because the network driver is what looks and a driver may not
+/// depend on the agent). The words are the CONTROLLER's too: a phase that
+/// came from a node carries the node's own word on the wire, so
+/// `VmReason::parse("VmmGone")` has to answer.
+///
+/// Two guards run against exactly these lists, which is why they are lists
+/// and not prose in a report: `reason_table_is_the_vocabulary_in_proto` in
+/// the agent holds each enum's `ALL` against its list here, and
+/// `every_word_a_node_can_say_parses_into_the_reason_of_its_resource` in
+/// `controller-api` holds each list against the tier's own enum. A word
+/// added on one side and not the other fails both ends of the build rather
+/// than arriving at a controller as `Unrecorded` in the lab.
+///
+/// Storage pools are deliberately absent and are the only thing that is: a
+/// node reports DRIVERS (`DriverInfo`, with their locality) and never a pool,
+/// so a pool's reason is derived one tier up and `StoragePoolStatusReport`'s
+/// `reason` is filled by the cluster out of its own vocabulary.
+pub mod reasons {
+    /// `VmStatusReport.reason`. Derived fresh on every heartbeat out of what
+    /// `observe` sees, so `Unrecorded` here means a RECORD from another build
+    /// of the agent, not a missing field.
+    pub const VM: &[&str] = &[
+        "Working",
+        "Backoff",
+        "AwaitingGuest",
+        "GuestLeft",
+        "ReceiveFailed",
+        "VmmGone",
+        "BackendGone",
+        "ResumeIneffective",
+        "Unrecorded",
+    ];
+
+    /// `VolumeStateReport.reason`, written onto the node's own volume record
+    /// by the pass that asked the driver.
+    pub const VOLUME: &[&str] = &[
+        "Working",
+        "DriverRefused",
+        "NotOnBackend",
+        "Deprovisioned",
+        "Unrecorded",
+    ];
+
+    /// `SnapshotStateReport.reason`. The volume's words minus the one a copy
+    /// cannot be in: only `adopt` finds `NotOnBackend` and it walks volumes.
+    pub const SNAPSHOT: &[&str] = &["Working", "DriverRefused", "Dropped", "Unrecorded"];
+
+    /// `ImageStateReport.reason`. No `Unrecorded`: the node's image table is
+    /// held in memory and re-derived from the disk, so there is no stored
+    /// opinion from an older build for one to come out of.
+    pub const IMAGE: &[&str] = &["NotFound", "NotAFile", "ChecksumMismatch", "FetchFailed"];
+
+    /// `RouterReport.reason`. Three, and `DriverUnreachable` is the one that
+    /// earns its place: it says this node could not FIND OUT, which is not
+    /// the same as the namespace being gone — and a tier that read it as the
+    /// latter would swing a router away from an `ip` that merely timed out.
+    pub const ROUTER: &[&str] = &["NetnsGone", "LegGone", "DriverUnreachable"];
+
+    /// The five lists with the name of the resource each belongs to, for a
+    /// guard that wants to walk all of them.
+    pub const ALL: [(&str, &[&str]); 5] = [
+        ("Vm", VM),
+        ("Volume", VOLUME),
+        ("Snapshot", SNAPSHOT),
+        ("Image", IMAGE),
+        ("Router", ROUTER),
+    ];
+}
+
 /// How long a session dial may spend getting a connection.
 ///
 /// Both tiers dial down a preference order (HRW) and walk to the next entry

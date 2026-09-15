@@ -1422,53 +1422,24 @@ async fn a_vmm_nobody_has_a_record_of_is_reported_every_pass_and_not_killed_at_o
 
 /// The vocabulary on the wire is the vocabulary in the round's report.
 ///
-/// The list below is copied from `claude/struktur-4-agent-report.md`, which is
-/// where the words were agreed and where one gets struck. Two directions, one
-/// assertion: a word added to an enum without being written down fails here,
-/// and a word struck from the report without being taken out of the enum
-/// fails here too.
+/// The list is `proto::reasons` and no longer a copy in this file, which is
+/// the derivation lane's half of the same guard. Two directions, one
+/// assertion: a word added to an enum here without being added there fails,
+/// and a word taken out there without being taken out here fails too.
 ///
-/// It is the only test in this tree that holds code against a document, and
-/// it earns that because the words are a CONTRACT with a reader who is not in
-/// this repository: the control plane parses them, a dashboard queries them,
-/// and neither finds out about a rename until somebody's panel is empty.
+/// It used to hold code against a DOCUMENT, and it earned that while the
+/// vocabulary existed nowhere else. It does now: the tier above parses these
+/// strings into its own enums, and `controller-api`'s
+/// `every_word_a_node_can_say_parses_into_the_reason_of_its_resource` holds
+/// the very same lists from the other side. A word that only one end knows
+/// is a phase that arrives as `Unrecorded`, which is exactly the silence the
+/// round exists to end — so it fails a build instead.
 #[test]
 fn the_reason_table_is_the_list_in_the_round_report() {
-    let written: Vec<(&str, Vec<&str>)> = vec![
-        (
-            "Vm",
-            vec![
-                "Working",
-                "Backoff",
-                "AwaitingGuest",
-                "GuestLeft",
-                "ReceiveFailed",
-                "VmmGone",
-                "BackendGone",
-                "ResumeIneffective",
-                "Unrecorded",
-            ],
-        ),
-        (
-            "Volume",
-            vec![
-                "Working",
-                "DriverRefused",
-                "NotOnBackend",
-                "Deprovisioned",
-                "Unrecorded",
-            ],
-        ),
-        (
-            "Snapshot",
-            vec!["Working", "DriverRefused", "Dropped", "Unrecorded"],
-        ),
-        (
-            "Image",
-            vec!["NotFound", "NotAFile", "ChecksumMismatch", "FetchFailed"],
-        ),
-        ("Router", vec!["NetnsGone", "LegGone", "DriverUnreachable"]),
-    ];
+    let written: Vec<(&str, Vec<&str>)> = proto::reasons::ALL
+        .iter()
+        .map(|(resource, words)| (*resource, words.to_vec()))
+        .collect();
     assert_eq!(reason_table(), written);
 
     // And every word parses back to the variant it came from: the tier above

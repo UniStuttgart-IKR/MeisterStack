@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use proto::VmStatusReport;
 
-use crate::resources::{Vm, VmAddress, VmAddressKind, VmPhaseKind};
+use crate::resources::{Vm, VmAddress, VmAddressKind, VmPhase, VmPhaseKind, VmReason};
 
 /// Is a peer's report younger than everything this tier has already done?
 /// Only then does it describe the thing as it is now.
@@ -114,9 +114,16 @@ pub enum Observation<'a> {
     /// The peer named a phase this control plane does not have. Rejected
     /// rather than defaulted: a drifting peer should be visible.
     BadPhase(&'a Vm),
-    /// The report says something new about this VM: the phase it observed and
-    /// the message that came with it (absent when the peer sent none).
-    Changed(&'a Vm, VmPhaseKind, Option<String>),
+    /// The report says something new about this VM: the phase the peer
+    /// observed, the WORD it gave for why, and the sentence that came with it
+    /// (absent when the peer sent none).
+    ///
+    /// The reason is the peer's own — `VmmGone`, `Backoff`, `BackendGone` —
+    /// and not a word for the road it came down. It is read through
+    /// `VmReason::read`, so a word this binary does not know arrives as
+    /// `Unrecorded` with the word kept at the front of the sentence rather
+    /// than dropped.
+    Changed(&'a Vm, VmPhaseKind, VmReason, Option<String>),
 }
 
 /// Match a peer's report against the VMs this tier stores, one line at a time.
@@ -146,14 +153,21 @@ pub fn observe<'a>(
             return Some((line, Observation::BadPhase(vm)));
         };
         let message = (!line.message.is_empty()).then(|| line.message.clone());
-        // The sentence lives inside the phase since struktur 4, and the
-        // comparison is the same one it always was: word plus sentence. Not
-        // the reason and not `since` — the reason is derived from these two
-        // one tier along, and `since` moves only with the word.
-        if vm.status.phase().kind() == phase && vm.status.phase().message() == message.as_deref() {
+        let (reason, message) = VmReason::read(&line.reason, message);
+        // Compared against the phase this report WOULD leave behind, not
+        // against its three parts one by one, and that is not a flourish: a
+        // resting word has no slot for a reason, so `Running` + `Working`
+        // stores as `Running` with no reason at all. Held against the parts,
+        // the stored value would differ from the report for ever and every
+        // heartbeat of every running VM would be an etcd revision — D-C7, at
+        // a second field. `since` is taken from the stored phase so that the
+        // comparison is about the word, the reason and the sentence, which
+        // are the three things a report carries.
+        let candidate = VmPhase::new(phase, reason, message.clone(), vm.status.phase().since());
+        if *vm.status.phase() == candidate {
             return None;
         }
-        Some((line, Observation::Changed(vm, phase, message)))
+        Some((line, Observation::Changed(vm, phase, reason, message)))
     })
 }
 
@@ -195,6 +209,13 @@ mod tests {
         }
     }
 
+    fn because(uid: &str, phase: &str, reason: &str, message: &str) -> VmStatusReport {
+        VmStatusReport {
+            reason: reason.into(),
+            ..line(uid, phase, message)
+        }
+    }
+
     /// The binding is the caller's question, so these tests ask it the way
     /// the cluster tier does: a VM speaks for the node its spec names.
     fn bound_to<'a>(node: &'a str) -> impl Fn(&Vm) -> bool + 'a {
@@ -217,7 +238,8 @@ mod tests {
         let reported = [line("uid-a", "Running", "")];
         assert!(matches!(
             seen(&known, &reported, "manacor").as_slice(),
-            [Observation::Changed(vm, VmPhaseKind::Running, None)] if vm.metadata.name == "web-1"
+            [Observation::Changed(vm, VmPhaseKind::Running, VmReason::Unrecorded, None)]
+                if vm.metadata.name == "web-1"
         ));
     }
 
@@ -264,7 +286,8 @@ mod tests {
         assert!(
             matches!(
                 seen(&known, &[line("uid-a", "Running", "host rebooted")], "manacor").as_slice(),
-                [Observation::Changed(_, VmPhaseKind::Running, Some(m))] if m == "host rebooted"
+                [Observation::Changed(_, VmPhaseKind::Running, _, Some(m))]
+                    if m == "host rebooted"
             ),
             "so is a new message under an unchanged phase"
         );
@@ -284,7 +307,12 @@ mod tests {
         let known = [stored];
         assert!(matches!(
             seen(&known, &[line("uid-a", "Failed", "")], "manacor").as_slice(),
-            [Observation::Changed(_, VmPhaseKind::Failed, None)]
+            [Observation::Changed(
+                _,
+                VmPhaseKind::Failed,
+                VmReason::Unrecorded,
+                None
+            )]
         ));
     }
 
@@ -367,6 +395,100 @@ mod tests {
                 mac("nics[0]", "52:54:00:11:22:33"),
                 mac("nics[1]", "52:54:00:aa:bb:cc"),
             ]
+        );
+    }
+
+    /// The node's own word arrives on the object, and a word this tier does
+    /// not know arrives too — at the front of the sentence.
+    ///
+    /// The whole of decision 1 as it reaches a VM: the phase used to come up
+    /// with "Reported" beside it, which said which ROAD it came down and
+    /// never what had happened. `VmmGone` and `BackendGone` are two different
+    /// problems — the requeue curve repairs the first and must not touch the
+    /// second — and they were the same value.
+    #[test]
+    fn the_word_the_peer_gave_is_the_word_on_the_observation() {
+        let known = [vm("web-1", "uid-a", Some("manacor"))];
+
+        let reported = [because(
+            "uid-a",
+            "Quarantined",
+            "BackendGone",
+            "the backend died",
+        )];
+        assert!(matches!(
+            seen(&known, &reported, "manacor").as_slice(),
+            [Observation::Changed(_, VmPhaseKind::Quarantined, VmReason::BackendGone, Some(m))]
+                if m == "the backend died"
+        ));
+
+        // A word from a newer agent than this binary: not dropped, because
+        // "I was told something I do not understand" must not read as
+        // "nobody said anything" (decision 2).
+        let drifted = [because("uid-a", "Failed", "Ascended", "it left")];
+        assert!(matches!(
+            seen(&known, &drifted, "manacor").as_slice(),
+            [Observation::Changed(_, VmPhaseKind::Failed, VmReason::Unrecorded, Some(m))]
+                if m == "Ascended: it left"
+        ));
+    }
+
+    /// The churn guard, held against the case that would break it: a running
+    /// VM whose node sends `Working` on every heartbeat.
+    ///
+    /// A resting word has no slot for a reason, so the stored phase carries
+    /// none — and a guard that compared the report's reason against the
+    /// stored one would find them different for ever. That is an etcd
+    /// revision per VM per ten seconds to record that nothing happened, which
+    /// is the defect this round fixes one field over (D-C7).
+    #[test]
+    fn a_reason_on_a_resting_word_does_not_make_a_report_news() {
+        let mut stored = vm("web-1", "uid-a", Some("manacor"));
+        #[allow(deprecated)]
+        stored.status.assign(VmPhase::new(
+            VmPhaseKind::Running,
+            VmReason::Working,
+            None,
+            chrono::Utc::now(),
+        ));
+        let known = [stored];
+        assert!(
+            seen(
+                &known,
+                &[because("uid-a", "Running", "Working", "")],
+                "manacor"
+            )
+            .is_empty(),
+            "the reason had nowhere to be stored, so it cannot be a difference"
+        );
+
+        // And a reasoned word does compare: the same phase with a new reason
+        // IS news, because the requeue curve reads it.
+        let mut stored = vm("web-2", "uid-b", Some("manacor"));
+        #[allow(deprecated)]
+        stored.status.assign(VmPhase::new(
+            VmPhaseKind::Failed,
+            VmReason::VmmGone,
+            Some("gone".into()),
+            chrono::Utc::now(),
+        ));
+        let known = [stored];
+        assert!(
+            seen(
+                &known,
+                &[because("uid-b", "Failed", "ReceiveFailed", "gone")],
+                "manacor"
+            )
+            .len()
+                == 1
+        );
+        assert!(
+            seen(
+                &known,
+                &[because("uid-b", "Failed", "VmmGone", "gone")],
+                "manacor"
+            )
+            .is_empty()
         );
     }
 }

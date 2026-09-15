@@ -272,9 +272,22 @@ pub(super) async fn ingest_routers(
                 format!("{node_id}: {}", line.message)
             }
         });
-        if router.status.phase().kind() == phase
-            && router.status.phase().message() == message.as_deref()
-        {
+        // The node's own word for what is wrong with the namespace —
+        // `NetnsGone`, `LegGone`, `DriverUnreachable` — rather than a word
+        // for the road it came down. The third of those is why it matters:
+        // "this node could not find out" and "the namespace is gone" used to
+        // be the same value, and swinging a router off a machine whose `ip`
+        // merely timed out takes a working gateway out of service.
+        let (reason, message) = controller_api::RouterReason::read(&line.reason, message);
+        // Against the phase this report WOULD leave behind — see
+        // `mirror::observe` for why the parts cannot be compared one by one.
+        let candidate = controller_api::RouterPhase::new(
+            phase,
+            reason,
+            message.clone(),
+            router.status.phase().since(),
+        );
+        if *router.status.phase() == candidate {
             continue;
         }
         let name = router.metadata.name.clone();
@@ -285,7 +298,7 @@ pub(super) async fn ingest_routers(
                 #[allow(deprecated)]
                 r.status.assign(controller_api::RouterPhase::new(
                     phase,
-                    controller_api::RouterReason::Reported,
+                    reason,
                     message.clone(),
                     chrono::Utc::now(),
                 ));
@@ -556,6 +569,12 @@ pub(super) async fn ingest_volumes(
             continue;
         };
         let message = (!reported.message.is_empty()).then(|| reported.message.clone());
+        // The node's own word off its record: `DriverRefused` when a backend
+        // said no, `NotOnBackend` when a backend has LOST the bytes. Both
+        // used to be `Failed` with the driver's prose beside them, and they
+        // are not the same problem — the first costs a requeue and the second
+        // costs somebody their data.
+        let (reason, message) = controller_api::VolumeReason::read(&reported.reason, message);
         let backend = reported.backend.clone();
         // GiB, rounded UP, because the number has to be comparable to
         // `spec.sizeGib` and lvm rounds an LV up to the extent size — a
@@ -564,9 +583,15 @@ pub(super) async fn ingest_volumes(
         let size_gib = reported.size_bytes.div_ceil(1024 * 1024 * 1024);
         // Only when something CHANGED. Every node reports every ten seconds,
         // and a write per report would churn etcd revisions and wake the
-        // volume watch while nothing about the volume happened.
-        if volume.status.phase().kind() == phase
-            && volume.status.phase().message() == message.as_deref()
+        // volume watch while nothing about the volume happened. Against the
+        // phase the write WOULD leave behind — see `mirror::observe`.
+        let candidate = controller_api::VolumePhase::new(
+            phase,
+            reason,
+            message.clone(),
+            volume.status.phase().since(),
+        );
+        if *volume.status.phase() == candidate
             && volume.status.size_gib == size_gib
             && (backend.is_empty() || volume.status.backend == backend)
         {
@@ -588,7 +613,7 @@ pub(super) async fn ingest_volumes(
                 #[allow(deprecated)]
                 v.status.assign(controller_api::VolumePhase::new(
                     kind,
-                    controller_api::VolumeReason::Reported,
+                    reason,
                     message.clone(),
                     at,
                 ));
@@ -916,6 +941,10 @@ pub(super) async fn ingest_snapshots(
             continue;
         };
         let message = (!reported.message.is_empty()).then(|| reported.message.clone());
+        // The node's own word off its snapshot record — the volume's words
+        // minus the one a copy cannot be in.
+        let (reason, message) =
+            controller_api::VolumeSnapshotReason::read(&reported.reason, message);
         let backend = reported.backend.clone();
         // GiB, rounded UP, because the number an operator reads beside a
         // volume's `sizeGib` has to be comparable to it — and rounding a
@@ -923,8 +952,15 @@ pub(super) async fn ingest_snapshots(
         // came from.
         let size_gib = reported.size_bytes.div_ceil(1024 * 1024 * 1024);
         // Only when something changed: every node reports every ten seconds.
-        if snapshot.status.phase().kind() == phase
-            && snapshot.status.phase().message() == message.as_deref()
+        // Against the phase the write WOULD leave behind — see
+        // `mirror::observe`.
+        let candidate = controller_api::VolumeSnapshotPhase::new(
+            phase,
+            reason,
+            message.clone(),
+            snapshot.status.phase().since(),
+        );
+        if *snapshot.status.phase() == candidate
             && snapshot.status.size_gib == size_gib
             && (backend.is_empty() || snapshot.status.backend == backend)
         {
@@ -935,7 +971,7 @@ pub(super) async fn ingest_snapshots(
                 #[allow(deprecated)]
                 s.status.assign(controller_api::VolumeSnapshotPhase::new(
                     phase,
-                    controller_api::VolumeSnapshotReason::Reported,
+                    reason,
                     message.clone(),
                     at,
                 ));
@@ -1047,7 +1083,7 @@ pub(super) async fn ingest_phases(
     at: DateTime<Utc>,
 ) {
     for (reported, seen) in controller_api::observe(vms, &report.vms, ours) {
-        let Some((vm, phase, message)) = changed(node_id, reported, seen) else {
+        let Some((vm, phase, reason, message)) = changed(node_id, reported, seen) else {
             continue;
         };
         let name = vm.metadata.name.clone();
@@ -1060,7 +1096,7 @@ pub(super) async fn ingest_phases(
                 #[allow(deprecated)]
                 v.status.assign(controller_api::VmPhase::new(
                     phase,
-                    controller_api::VmReason::Reported,
+                    reason,
                     message.clone(),
                     at,
                 ));
@@ -1092,7 +1128,12 @@ pub(super) fn changed<'a>(
     node_id: &str,
     reported: &proto::VmStatusReport,
     seen: Observation<'a>,
-) -> Option<(&'a Vm, VmPhaseKind, Option<String>)> {
+) -> Option<(
+    &'a Vm,
+    VmPhaseKind,
+    controller_api::VmReason,
+    Option<String>,
+)> {
     match seen {
         Observation::Unknown => {
             // A VM created straight on the agent's own API: not ours.
@@ -1107,7 +1148,7 @@ pub(super) fn changed<'a>(
             warn!(vm = %vm.metadata.name, phase = %reported.phase, "unknown phase from agent");
             None
         }
-        Observation::Changed(vm, phase, message) => Some((vm, phase, message)),
+        Observation::Changed(vm, phase, reason, message) => Some((vm, phase, reason, message)),
     }
 }
 

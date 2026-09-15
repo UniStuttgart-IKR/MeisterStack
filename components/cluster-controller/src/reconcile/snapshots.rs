@@ -106,6 +106,7 @@ pub(super) async fn dispatch_snapshot(
             return note_snapshot_failed(
                 p,
                 snapshot,
+                controller_api::VolumeSnapshotReason::SourceGone,
                 format!(
                     "volume {} does not exist here any more",
                     snapshot.spec.volume
@@ -177,7 +178,13 @@ pub(super) async fn dispatch_snapshot(
         // rule a provision that could not be delivered follows, and for the
         // same reason: a node that never accepted the command sends no report
         // about it, so Creating would be forever.
-        return note_snapshot_failed(p, &sent, format!("{e:#}")).await;
+        return note_snapshot_failed(
+            p,
+            &sent,
+            controller_api::VolumeSnapshotReason::Undeliverable,
+            format!("{e:#}"),
+        )
+        .await;
     }
     info!(snapshot = %name, node = %node, "snapshot dispatched");
     Ok(())
@@ -370,9 +377,17 @@ pub(super) async fn holder_of(
 
 /// Say a snapshot failed, and start the requeue clock. Only on a change, like
 /// every other status write in this file.
+///
+/// The reason is the CALLER's, because the two callers know two different
+/// things and the object used to carry the same word for both: a volume that
+/// is not there any more is `SourceGone` and somebody has to make a new
+/// request, and a dispatch that never reached the node is `Undeliverable` and
+/// the next pass will try again. It said "Reported" for both, which was the
+/// name of a road nothing had come down.
 pub(super) async fn note_snapshot_failed(
     p: &Pass<'_>,
     snapshot: &VolumeSnapshot,
+    reason: controller_api::VolumeSnapshotReason,
     message: String,
 ) -> anyhow::Result<()> {
     warn!(snapshot = %snapshot.metadata.name, error = %message, "snapshot failed");
@@ -381,7 +396,7 @@ pub(super) async fn note_snapshot_failed(
             #[allow(deprecated)]
             s.status.assign(controller_api::VolumeSnapshotPhase::new(
                 VolumeSnapshotPhaseKind::Failed,
-                controller_api::VolumeSnapshotReason::Reported,
+                reason,
                 Some(message.clone()),
                 Utc::now(),
             ));

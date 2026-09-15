@@ -92,21 +92,37 @@ reasons! {
     /// Why a VM is what it is — the CATEGORY behind the sentence, in a form a
     /// program can hold and a metric label can carry.
     ///
-    /// Eight, and every one of them is a word this code already said
-    /// somewhere: `Unplaced` and `NotReady` are the twelve `PendingReason`
-    /// categories split where the split changes what an operator DOES (a
-    /// wall, or a wait) — see `PendingReason::category`; `Unbound` is the two
-    /// ingest paths that say "let go; waiting to be placed"; `Dispatched` is
-    /// the anticipation the reconciler writes when a create goes out;
-    /// `Refused` is `CannotServe` and the cloud's refusal of a create;
-    /// `Reported` is a node's or a cluster's own word arriving on the status
-    /// road; `Silent` is `unheard_of` and its counterpart at the cloud.
+    /// **One list, out of two vocabularies.** The first eight are this tier's
+    /// own words, each one a sentence the controllers already wrote:
+    /// `Unplaced` and `NotReady` are the twelve `PendingReason` categories
+    /// split where the split changes what an operator DOES (a wall, or a
+    /// wait) — see `PendingReason::category`; `Unbound` is the two ingest
+    /// paths that say "let go; waiting to be placed"; `Dispatched` is the
+    /// anticipation the reconciler writes when a create goes out; `Refused`
+    /// is `CannotServe` and the cloud's refusal of a create; `Silent` is
+    /// `unheard_of` and its counterpart at the cloud.
+    ///
+    /// The eight after them are the NODE's, verbatim — `proto::reasons::VM`,
+    /// the list the agent writes on the wire. There is no `Reported` here any
+    /// more, and that absence is the decision: a phase that came up from
+    /// below used to arrive as "Reported" with the node's word buried in the
+    /// sentence, so the closed set said only which ROAD the phase came down
+    /// and never what had happened. A guest whose VMM is gone and one whose
+    /// storage backend died under a live VMM were the same word, and they are
+    /// not the same problem — one is repaired by a pass and the other must
+    /// not be. Now the word on the object IS the node's word, and
+    /// `every_word_a_node_can_say_parses_into_the_reason_of_its_resource`
+    /// holds the two lists together.
+    ///
+    /// So the cap of eight from the brief is gone. What replaced it is the
+    /// rule that was behind it: no stock reasons — every word here is written
+    /// by a place in this tree or read off a wire by one.
     ///
     /// The sentence is not replaced by any of this and never will be: it
     /// counts candidates and names capabilities, which is what an operator
     /// reads. This is the closed set behind it, so that "how many VMs are
     /// waiting, and why" is a time series rather than a string.
-    VmReason [8] {
+    VmReason [16] {
         /// Nobody recorded one.
         ///
         /// Not a failure of this enum but the honest value in two cases: a
@@ -126,6 +142,18 @@ reasons! {
         /// `Unplaced` sends somebody to the fleet, this one sends them
         /// nowhere at all.
         NotReady => "NotReady",
+        /// A disk this VM refers to exists and is somebody else's: the claim
+        /// on it names another guest, or a node still reports it open.
+        ///
+        /// Not `NotReady`, and the difference is who has to act. `NotReady`
+        /// is a wait on this control plane — the bytes are being made and
+        /// will arrive. This is a wait on a PERSON: nothing here will ever
+        /// take a disk off the guest holding it. It is also the phase that
+        /// makes D4 safe to read: the claim now falls when the last holder
+        /// has gone AND no node reports the bytes open, so the window in
+        /// between is a VM that says who has its disk instead of one that
+        /// says "not ready" for ever.
+        VolumeHeld => "VolumeHeld",
         /// The tier below let the binding go: the VM is nowhere, and it is
         /// waiting to be placed again. `session::ingest`, both tiers.
         Unbound => "Unbound",
@@ -137,16 +165,49 @@ reasons! {
         /// cluster, a refused create at the cloud. Structural: the same
         /// answer comes back next pass, which is why it is remembered.
         Refused => "Refused",
-        /// The tier below's own word about the guest, verbatim in the
-        /// message. The commonest reason behind `Failed` and the only one
-        /// behind `Quarantined`.
-        Reported => "Reported",
         /// Nobody has heard from the machine holding it for longer than the
         /// heartbeat allows — a node at the cluster, a cluster at the cloud.
         /// ONE word for both, and the sentence says which ("node X last
         /// reported …"). The brief asks for two; there are eight slots and
         /// this is the pair whose difference is already in the sentence.
         Silent => "Silent",
+
+        // ------------------------------------------------------------------
+        // The node's own words from here down: `proto::reasons::VM`, parsed
+        // off `VmStatusReport.reason` and written onto the object unchanged.
+        // A cluster relaying a VM to the cloud passes the word it was given
+        // on, so the same eight arrive at both tiers and mean the same thing.
+        // ------------------------------------------------------------------
+
+        /// `Provisioning`: a pass is building this guest and the last attempt
+        /// did not fail. The ordinary road up to `Running`.
+        Working => "Working",
+        /// `Provisioning`: the last attempt DID fail and the retry schedule
+        /// is waiting. The sentence is that attempt's error — the half of
+        /// this state nobody could see, because a count says a VM is not
+        /// coming up and never says what stopped it.
+        Backoff => "Backoff",
+        /// `Provisioning`: the node is a live migration's destination and the
+        /// guest has not arrived yet.
+        AwaitingGuest => "AwaitingGuest",
+        /// `Provisioning`: the node WAS a live migration's source and the
+        /// guest is on the other machine now.
+        GuestLeft => "GuestLeft",
+        /// `Failed`: a reception did not finish and the node is giving back
+        /// the VMM, the disks and the taps it made. The guest is still
+        /// running where it was, which is the invariant behind the word.
+        ReceiveFailed => "ReceiveFailed",
+        /// `Failed`: the VMM is gone or does not answer its socket, and the
+        /// passes that tried to rebuild it keep failing. The requeue curve is
+        /// what acts on this.
+        VmmGone => "VmmGone",
+        /// `Quarantined`: a storage backend died while the VMM went on
+        /// running. No pass may repair it by itself — a rebuild would be this
+        /// tier deciding what happened to a guest that is still executing.
+        BackendGone => "BackendGone",
+        /// `Quarantined`: the guest did not come back from a pause however
+        /// often it was resumed.
+        ResumeIneffective => "ResumeIneffective",
     }
 }
 

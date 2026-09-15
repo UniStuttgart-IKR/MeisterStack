@@ -404,8 +404,9 @@ impl ImageReason {
 /// that writes them lives — three here, the router's in `agent-api` beside
 /// `RouterPhase`, because the network driver is what looks and the driver
 /// cannot depend on this crate — and a vocabulary spread over two crates is
-/// one nobody can read off in one place. The test below holds it against the
-/// list in the round's report, which is where Silas strikes words.
+/// one nobody can read off in one place. The test below holds it against
+/// `proto::reasons`, which is the same list the CONTROLLER parses these words
+/// with; `proto` is the one crate both ends of that wire share.
 ///
 /// Storage pools are deliberately absent, and they are the only thing that
 /// is: a node reports DRIVERS (`DriverInfo`, with their locality) and never a

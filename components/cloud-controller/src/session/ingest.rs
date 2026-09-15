@@ -101,8 +101,18 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
             continue;
         };
         let message = (!reported.message.is_empty()).then(|| reported.message.clone());
-        if router.status.phase().kind() == phase
-            && router.status.phase().message() == message.as_deref()
+        // The cluster's word, which is a node's driver's word where one came
+        // up that road. Relayed, not re-derived — decision 1.
+        let (reason, message) = controller_api::RouterReason::read(&reported.reason, message);
+        // Against the phase the write WOULD leave behind — see
+        // `mirror::observe`.
+        let candidate = controller_api::RouterPhase::new(
+            phase,
+            reason,
+            message.clone(),
+            router.status.phase().since(),
+        );
+        if *router.status.phase() == candidate
             && router.status.active_node == reported.node
             && router.status.nodes == reported.nodes
         {
@@ -119,7 +129,7 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
                 #[allow(deprecated)]
                 r.status.assign(controller_api::RouterPhase::new(
                     phase,
-                    controller_api::RouterReason::Reported,
+                    reason,
                     message.clone(),
                     now,
                 ));
@@ -554,7 +564,7 @@ pub(super) async fn ingest_phases(
     at: DateTime<Utc>,
 ) {
     for (reported, seen) in controller_api::observe(known, &status.vms, ours) {
-        let Some((vm, phase, message)) = changed(cluster, reported, seen) else {
+        let Some((vm, phase, reason, message)) = changed(cluster, reported, seen) else {
             continue;
         };
         let name = vm.metadata.name.clone();
@@ -567,7 +577,7 @@ pub(super) async fn ingest_phases(
                 #[allow(deprecated)]
                 v.status.assign(controller_api::VmPhase::new(
                     phase,
-                    controller_api::VmReason::Reported,
+                    reason,
                     message.clone(),
                     at,
                 ));
@@ -598,7 +608,12 @@ pub(super) fn changed<'a>(
     cluster: &str,
     reported: &proto::VmStatusReport,
     seen: Observation<'a>,
-) -> Option<(&'a Vm, VmPhaseKind, Option<String>)> {
+) -> Option<(
+    &'a Vm,
+    VmPhaseKind,
+    controller_api::VmReason,
+    Option<String>,
+)> {
     match seen {
         Observation::Unknown => {
             // Not a phase we can file anywhere. It is also not nothing:
@@ -619,7 +634,7 @@ pub(super) fn changed<'a>(
                   "unknown phase from cluster");
             None
         }
-        Observation::Changed(vm, phase, message) => Some((vm, phase, message)),
+        Observation::Changed(vm, phase, reason, message) => Some((vm, phase, reason, message)),
     }
 }
 

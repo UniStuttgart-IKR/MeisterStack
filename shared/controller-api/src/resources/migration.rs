@@ -56,6 +56,14 @@ reasons! {
     /// path's `why`, and the two outcomes a source reports — `StillHere` is
     /// the good outcome of a bad transfer and has always had a field of its
     /// own (`status.sourceReported`).
+    ///
+    /// The one enum in this file that keeps a `Reported`, and the reason is
+    /// that there is nothing for it to be replaced BY: a migration's word
+    /// from below is `MigrationReport.outcome`, a typed enum
+    /// (`DepartureOutcome`) that already travels in a field of its own, and
+    /// `proto::reasons` has no list for migrations because no node writes a
+    /// reason string about one. Here `Reported` names the field to read, and
+    /// that is a different thing from naming the road it came down.
     VmMigrationReason [5] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
@@ -67,7 +75,8 @@ reasons! {
         /// This tier gave up on the transfer and tore the destination down.
         /// The source is still running — that is the invariant.
         Abandoned => "Abandoned",
-        /// A node's own word about the send, verbatim in the message.
+        /// The source's own outcome, which is `status.sourceReported` — see
+        /// this list's own doc for why this one word stays.
         Reported => "Reported",
     }
 }

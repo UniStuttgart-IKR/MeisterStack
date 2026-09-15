@@ -231,6 +231,24 @@ macro_rules! phases {
                 }
             }
 
+            /// The reason as it goes on a WIRE: the word, or the empty
+            /// string for a variant that carries none and for `Unrecorded`.
+            ///
+            /// One function because the rule is one rule and it is applied in
+            /// two dozen places: a relay to the tier above, the flat wire
+            /// form, a metric label. `Unrecorded` travels as ABSENT — an
+            /// object nobody recorded a reason for looks exactly as it did
+            /// before the field existed, and reads back as `Unrecorded`,
+            /// which is the same value. A tier that sent the word instead
+            /// would turn "nobody said" into something a reader could match
+            /// on.
+            pub fn reason_word(&self) -> &'static str {
+                match self.reason() {
+                    Some(reason) if reason != <$reason>::Unrecorded => reason.as_str(),
+                    _ => "",
+                }
+            }
+
             /// The sentence, and `None` rather than `Some("")`: an empty
             /// message is "nobody said anything", which is the rule
             /// `mirror::observe` has always applied and the reason a clearing
@@ -278,10 +296,8 @@ macro_rules! phases {
                     // nobody has recorded a reason for looks on the wire
                     // exactly as it did before this field existed — and reads
                     // back as `Unrecorded`, which is the same value.
-                    reason: phase
-                        .reason()
-                        .filter(|r| *r != <$reason>::Unrecorded)
-                        .map(|r| r.as_str().to_string()),
+                    reason: (!phase.reason_word().is_empty())
+                        .then(|| phase.reason_word().to_string()),
                     message: phase.message().map(str::to_string),
                     since: (phase.since() != UNSTAMPED).then(|| phase.since()),
                 }
@@ -292,18 +308,18 @@ macro_rules! phases {
             /// Reading is TOTAL and that is the whole of decision 6: one
             /// object written before this field existed must not break
             /// `list()`. A missing reason reads as `Unrecorded`, a reason
-            /// this binary does not know reads as `Unrecorded`, a missing
-            /// `since` reads as the moment of the read.
+            /// this binary does not know reads as `Unrecorded` WITH the word
+            /// kept at the front of the sentence (decision 2 of the
+            /// derivation lane), a missing `since` reads as the moment of the
+            /// read.
             fn from(wire: $wire) -> Self {
-                Self::new(
-                    wire.phase,
-                    wire.reason
-                        .as_deref()
-                        .and_then(<$reason>::parse)
-                        .unwrap_or_default(),
-                    wire.message,
-                    wire.since.unwrap_or_else(Utc::now),
-                )
+                // A word this binary does not know is not dropped: it goes to
+                // the front of the sentence. See `read` — the same reader the
+                // status road uses, so a drifting peer looks the same
+                // whichever wire it drifted across.
+                let (reason, message) =
+                    <$reason>::read(wire.reason.as_deref().unwrap_or_default(), wire.message);
+                Self::new(wire.phase, reason, message, wire.since.unwrap_or_else(Utc::now))
             }
         }
 
@@ -375,6 +391,45 @@ macro_rules! reasons {
             /// which the readers turn into `Unrecorded` rather than an error.
             pub fn parse(s: &str) -> Option<Self> {
                 Self::ALL.into_iter().find(|r| r.as_str() == s)
+            }
+
+            /// A word off a wire and the sentence it arrived with, read the
+            /// honest way.
+            ///
+            /// The one reader for both wires a reason crosses: a stored
+            /// object being decoded, and a status report from the tier below.
+            /// Three cases, and only the third does anything:
+            ///
+            /// * an empty word is `Unrecorded` and the sentence is untouched
+            ///   — a peer that predates the field said nothing, which is not
+            ///   the same as saying something wrong.
+            /// * a word this binary knows is itself.
+            /// * a word it does NOT know is `Unrecorded`, and **the word is
+            ///   rescued into the front of the sentence**.
+            ///
+            /// That last line is the whole of decision 2 and it replaces
+            /// dropping the string. A word arrives that this tier cannot
+            /// name in exactly two situations — a newer agent rolled out
+            /// under an older controller, or a rename that only landed on one
+            /// side — and both are a drift somebody has to see. Dropped, it
+            /// showed up as an object with no reason at all, which reads as
+            /// "nobody recorded one": the two states a control plane must
+            /// never confuse are "I have nothing to say" and "I was told
+            /// something I do not understand".
+            pub fn read(word: &str, message: Option<String>) -> (Self, Option<String>) {
+                if word.is_empty() {
+                    return (Self::Unrecorded, message);
+                }
+                match Self::parse(word) {
+                    Some(reason) => (reason, message),
+                    None => (
+                        Self::Unrecorded,
+                        Some(match message {
+                            Some(said) if !said.is_empty() => format!("{word}: {said}"),
+                            _ => word.to_string(),
+                        }),
+                    ),
+                }
             }
         }
     )* };
@@ -514,7 +569,19 @@ mod tests {
             }
             assert_eq!($reason::ALL[0], $reason::Unrecorded, "Unrecorded comes first");
             assert_eq!($reason::default(), $reason::Unrecorded);
-            assert!($reason::ALL.len() <= 8, "at most eight reasons per resource");
+            // The brief capped a list at eight. That cap is gone, and what
+            // took its place is the rule it stood for: ONE list per resource,
+            // out of the controller's words and the node's, with no stock
+            // reasons in it — see `VmReason` and
+            // `every_word_a_node_can_say_parses_into_the_reason_of_its_resource`.
+            // A cap over a union of two vocabularies would have been a reason
+            // to drop a word somebody writes.
+            for reason in $reason::ALL {
+                assert!(!reason.as_str().is_empty(), "every reason has a word");
+                let (read, message) = $reason::read(reason.as_str(), None);
+                assert_eq!(read, reason, "a word this binary knows reads as itself");
+                assert_eq!(message, None, "and leaves the sentence alone");
+            }
         })*};
     }
 
@@ -590,9 +657,17 @@ mod tests {
         assert_eq!(bare.message(), None);
 
         // A word this binary does not have — a drifting peer, or a newer
-        // controller's object read by an older one.
-        let drifted = read(serde_json::json!({ "phase": "Failed", "reason": "Ascended" }));
+        // controller's object read by an older one. Not an error, and not
+        // dropped either: decision 2 of the derivation lane keeps the word at
+        // the front of the sentence, because "I was told something I do not
+        // understand" must not read as "nobody said anything".
+        let drifted = read(
+            serde_json::json!({ "phase": "Failed", "reason": "Ascended", "message": "it left" }),
+        );
         assert_eq!(drifted.reason(), Some(VmReason::Unrecorded));
+        assert_eq!(drifted.message(), Some("Ascended: it left"));
+        let bare_drift = read(serde_json::json!({ "phase": "Failed", "reason": "Ascended" }));
+        assert_eq!(bare_drift.message(), Some("Ascended"));
 
         // No phase either: the field has always been `#[serde(default)]`.
         assert_eq!(read(serde_json::json!({})).kind(), VmPhaseKind::Pending);
@@ -693,5 +768,58 @@ mod tests {
                 _ => assert_eq!(phase.reason(), Some(VmReason::Refused), "{kind:?}"),
             }
         }
+    }
+
+    /// Every word a node can put on the wire is a word this tier can name —
+    /// the other end of the agent's own
+    /// `the_reason_table_is_the_list_in_the_round_report`, against the very
+    /// same lists.
+    ///
+    /// This is the guard behind decision 1 of the derivation lane: there is
+    /// ONE reason list per resource, and a phase that came up from a node
+    /// carries the NODE's word rather than a generic "Reported". That only
+    /// holds while both ends spell the words alike, and the failure mode
+    /// without a test is quiet — the word parses as nothing, the object reads
+    /// `Unrecorded`, and the only place it shows is a lab.
+    ///
+    /// Storage pools and migrations are absent from `proto::reasons` on
+    /// purpose and so are absent here: a node reports drivers and never a
+    /// pool, and a migration's word from below is a typed outcome in a field
+    /// of its own.
+    #[test]
+    fn every_word_a_node_can_say_parses_into_the_reason_of_its_resource() {
+        macro_rules! assert_speaks {
+            ($resource:literal, $words:expr, $reason:ident) => {{
+                for word in $words {
+                    assert!(
+                        $reason::parse(word).is_some(),
+                        "{} says {word:?} and {} cannot read it",
+                        $resource,
+                        stringify!($reason)
+                    );
+                    // And it survives the reader the status road uses, with
+                    // the sentence untouched — an unknown word is the only
+                    // case that rewrites one.
+                    let (reason, message) = $reason::read(word, Some("said".into()));
+                    assert_eq!(reason.as_str(), *word);
+                    assert_eq!(message.as_deref(), Some("said"));
+                }
+            }};
+        }
+        assert_speaks!("Vm", proto::reasons::VM, VmReason);
+        assert_speaks!("Volume", proto::reasons::VOLUME, VolumeReason);
+        assert_speaks!("Snapshot", proto::reasons::SNAPSHOT, VolumeSnapshotReason);
+        assert_speaks!("Image", proto::reasons::IMAGE, ImageReason);
+        assert_speaks!("Router", proto::reasons::ROUTER, RouterReason);
+
+        // The table's own shape, so that a sixth list added over there is a
+        // failure here rather than a list nobody parses.
+        assert_eq!(
+            proto::reasons::ALL
+                .iter()
+                .map(|(resource, _)| *resource)
+                .collect::<Vec<_>>(),
+            ["Vm", "Volume", "Snapshot", "Image", "Router"]
+        );
     }
 }

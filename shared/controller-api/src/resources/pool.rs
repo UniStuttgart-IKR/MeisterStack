@@ -314,13 +314,22 @@ pub struct StoragePoolStatus {
 reasons! {
     /// Why a pool is what it is.
     ///
-    /// Five. `AwaitingNode` and `Disagreement` are the two sentences
-    /// `reconcile_pools` already writes — "nobody has said anything about it
-    /// yet" and "two binaries of different ages on one pool". The two
-    /// cluster words come from D-C11: a pool at the CLOUD is a pointer at one
-    /// a cluster admin already made, and a pointer at nothing stood on
-    /// `Pending` for six minutes without saying which half was missing.
-    StoragePoolReason [6] {
+    /// Four and `Unrecorded`, and this is the one resource with ONE
+    /// vocabulary: a node reports drivers (`DriverInfo`, with their
+    /// locality) and never a pool, so `proto::reasons` has no list for it and
+    /// both tiers derive from these same words. `AwaitingNode` and
+    /// `Disagreement` are the two sentences `reconcile_pools` already writes
+    /// — "nobody has said anything about it yet" and "two binaries of
+    /// different ages on one pool". The two cluster words come from D-C11: a
+    /// pool at the CLOUD is a pointer at one a cluster admin already made,
+    /// and a pointer at nothing stood on `Pending` for six minutes without
+    /// saying which half was missing.
+    ///
+    /// There is no `Reported` any more either, and here the reason is the
+    /// same by a different road: the cluster sends the word it derived from
+    /// this very list, so the cloud parses it back rather than replacing it
+    /// with the name of the road it came down.
+    StoragePoolReason [5] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
         Unrecorded => "Unrecorded",
@@ -329,9 +338,6 @@ reasons! {
         AwaitingNode => "AwaitingNode",
         /// The nodes serving it do not agree about what it is.
         Disagreement => "Disagreement",
-        /// A cluster's own word about the pool, verbatim in the message —
-        /// what the cloud's inventory road relays up.
-        Reported => "Reported",
         /// At the cloud: the cluster this pointer names has not reported.
         ClusterSilent => "ClusterSilent",
         /// At the cloud: the cluster reports, and names no pool by this name.

@@ -1607,9 +1607,11 @@ async fn build_status(
         .map(|pool| proto::StoragePoolStatusReport {
             name: pool.metadata.name,
             phase: pool.status.phase().kind().as_str().to_string(),
-            // struktur 4: D-C11's field. This tier does not derive a word for
-            // it yet -- the derivation lane does.
-            reason: String::new(),
+            // D-C11's field. A pool has ONE vocabulary — no node says a word
+            // about one — so the cloud parses back exactly the word this
+            // tier derived: `AwaitingNode` when nobody serving it has spoken,
+            // `Disagreement` when two binaries of different ages are on it.
+            reason: pool.status.phase().reason_word().to_string(),
             // Empty when nobody has said, which is not the same as
             // `node-local` and must not become it on the way up.
             locality: pool
@@ -1876,13 +1878,14 @@ fn report_cloud_vms(vms: &[Vm], complete: &mut bool) -> Vec<VmStatusReport> {
                 // The category, in the vocabulary the object stores it in
                 // since struktur 4. `Unrecorded` travels as an empty field,
                 // which is what an absent `pendingReason` has always been.
-                reason: vm
-                    .status
-                    .phase()
-                    .reason()
-                    .filter(|r| *r != controller_api::VmReason::Unrecorded)
-                    .map(|r| r.as_str().to_string())
-                    .unwrap_or_default(),
+                //
+                // It is the object's word and therefore sometimes the NODE's,
+                // relayed unchanged: a `VmmGone` that came up from an agent
+                // reaches the cloud as `VmmGone`. That is decision 1 — one
+                // list per resource, so the same word means the same thing at
+                // both altitudes and neither tier has to invent one for the
+                // road it came down.
+                reason: vm.status.phase().reason_word().to_string(),
                 // The MAC half of `status.addresses[]`, relayed. It comes off
                 // the object rather than out of a node's report, because this
                 // tier has already written the nodes' reports onto the object
@@ -1935,9 +1938,11 @@ fn report_cloud_volumes(volumes: &[Volume], complete: &mut bool) -> Vec<proto::V
             Some(uid) => out.push(proto::VolumeStatusReport {
                 uid: uid.to_string(),
                 phase: volume.status.phase().kind().as_str().to_string(),
-                // struktur 4: the field exists on the wire and this tier does not
-                // derive a word for it yet. The derivation lane fills it.
-                reason: String::new(),
+                // The object's word, which is the node's where the node had
+                // one (`DriverRefused`, `NotOnBackend`) and this tier's where
+                // it did not (`Following`, `Undeliverable`, `HeldBy`). One
+                // list, relayed unchanged — decision 1.
+                reason: volume.status.phase().reason_word().to_string(),
                 node: volume.status.node.clone().unwrap_or_default(),
                 attached_to: volume.status.attached_to.clone().unwrap_or_default(),
                 message: volume
@@ -1981,6 +1986,8 @@ fn report_cloud_snapshots(
             Some(uid) => out.push(proto::VolumeSnapshotStatusReport {
                 uid: uid.to_string(),
                 phase: snapshot.status.phase().kind().as_str().to_string(),
+                // The last of the six roads to carry one. Decision 1.
+                reason: snapshot.status.phase().reason_word().to_string(),
                 node: snapshot.status.node.clone().unwrap_or_default(),
                 backend: snapshot.status.backend.clone(),
                 size_gib: snapshot.status.size_gib,
@@ -2015,9 +2022,10 @@ fn report_cloud_routers(routers: &[Router], complete: &mut bool) -> Vec<proto::R
             Some(uid) => out.push(proto::RouterReport {
                 id: uid.to_string(),
                 phase: router.status.phase().kind().as_str().to_string(),
-                // struktur 4: the field exists on the wire and this tier does not
-                // derive a word for it yet. The derivation lane fills it.
-                reason: String::new(),
+                // The object's word, relayed: `NetnsGone` and its two
+                // siblings came off a node's driver, the rest are this tier's
+                // own. Decision 1.
+                reason: router.status.phase().reason_word().to_string(),
                 message: router
                     .status
                     .phase()

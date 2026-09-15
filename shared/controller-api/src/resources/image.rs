@@ -65,12 +65,17 @@ pub struct ImageSpec {
 reasons! {
     /// Why an image is what it is.
     ///
-    /// Four, and one of them is not in today's code: `NotFound` comes from
-    /// the brief (F16 and A3), because today a path image is `Ready` the
-    /// moment it is registered and nothing ever looks at the file. It is
-    /// declared here so the agent lane has a word to report and the
-    /// derivation lane a value to settle on; nothing in THIS lane writes it.
-    ImageReason [4] {
+    /// One list out of two vocabularies, the shape `VmReason` explains. This
+    /// tier has one word of its own — `AwaitingNode`, the wait before anybody
+    /// has looked — and the four after it are the NODE's
+    /// (`proto::reasons::IMAGE`). They are the whole of F16 in a closed set:
+    /// `NotFound` is a catalogue entry pointing at bytes that are not there,
+    /// `NotAFile` is a directory under the name, `ChecksumMismatch` is bytes
+    /// that arrived and hash to something else, `FetchFailed` is bytes that
+    /// did not arrive. All four used to be one word — `Reported` — with the
+    /// node's prose beside it, so "roll-out still running" and "this will
+    /// never work" were the same value.
+    ImageReason [6] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
         Unrecorded => "Unrecorded",
@@ -78,11 +83,28 @@ reasons! {
         /// anybody fetched it, and — from the derivation lane on — a path
         /// image before anybody looked.
         AwaitingNode => "AwaitingNode",
-        /// A node's own word about the bytes, verbatim in the message.
-        Reported => "Reported",
-        /// Every node that looked for the file did not find it. F16's
-        /// answer, and the one reason here that no present writer produces.
+
+        // ------------------------------------------------------------------
+        // The node's own words: `proto::reasons::IMAGE`, off
+        // `ImageStateReport.reason`. No `Unrecorded` among them — the node's
+        // image table is held in memory and re-derived from its disk, so
+        // there is no stored opinion from an older build for one to come out
+        // of.
+        // ------------------------------------------------------------------
+
+        /// The bytes are not at the path the node looks at. F16's word: a
+        /// catalogue entry over shared storage nobody filled used to read
+        /// `Ready` because no node had ever been asked to look.
         NotFound => "NotFound",
+        /// Something IS under the name and it is a directory. `Ready` about
+        /// one would hand a storage driver a path it cannot open.
+        NotAFile => "NotAFile",
+        /// The bytes arrived and hash to something other than `spec.sha256`.
+        /// Its own word because the fix is a different one — the bytes at the
+        /// url changed, or the checksum in the spec is wrong.
+        ChecksumMismatch => "ChecksumMismatch",
+        /// The bytes did not arrive at all, or could not be put in place.
+        FetchFailed => "FetchFailed",
     }
 }
 

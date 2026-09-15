@@ -53,16 +53,24 @@ pub enum AccessMode {
 }
 
 reasons! {
-    /// Why a volume is what it is. Eight, and each one is a sentence this
-    /// file's reconciler already writes: `Unplaced` is
-    /// `storage_pending_reason`, `Following` is "following <vm> to <node>"
-    /// and its cloud twin "moving to <cluster> with its vm", `Dispatched` is
-    /// the claim written before `ProvisionVolume` goes out, `Reported` is the
-    /// node's word arriving, `Undeliverable` is "provision could not be
-    /// delivered", `SourceMissing` is "snapshot <s> does not exist here any
-    /// more", and `HeldBy` is the `Releasing` a DELETE leaves behind while a
-    /// consumer still holds the bytes.
-    VolumeReason [8] {
+    /// Why a volume is what it is.
+    ///
+    /// One list out of two vocabularies, the shape `VmReason` explains. This
+    /// tier's own seven are each a sentence the reconcilers already write:
+    /// `Unplaced` is `storage_pending_reason`, `Following` is "following
+    /// <vm> to <node>" and its cloud twin "moving to <cluster> with its vm",
+    /// `Dispatched` is the claim written before `ProvisionVolume` goes out,
+    /// `Undeliverable` is "provision could not be delivered", `SourceMissing`
+    /// is "snapshot <s> does not exist here any more", `HeldBy` is the
+    /// `Releasing` a DELETE leaves behind while a consumer still holds the
+    /// bytes.
+    ///
+    /// The four after them are the NODE's (`proto::reasons::VOLUME`). The
+    /// pair that earns the change is `DriverRefused` against `NotOnBackend`:
+    /// a refused provision costs a requeue, a volume the backend has LOST
+    /// costs somebody their data, and under the old `Reported` both were one
+    /// word with the driver's prose beside it.
+    VolumeReason [11] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
         Unrecorded => "Unrecorded",
@@ -75,11 +83,9 @@ reasons! {
         Following => "Following",
         /// A node has been asked to make it.
         Dispatched => "Dispatched",
-        /// The node's own word, verbatim in the message.
-        Reported => "Reported",
-        /// The command did not reach the node. Its own reason and not
-        /// `Reported`, because nothing was reported: the sentence is this
-        /// tier's, about a session, and the fix is on the network.
+        /// The command did not reach the node. This tier's own word, about a
+        /// session rather than about bytes: nothing was reported at all, and
+        /// the fix is on the network.
         Undeliverable => "Undeliverable",
         /// What the provision would have copied FROM is not there any more —
         /// the snapshot, or the pool.
@@ -87,6 +93,25 @@ reasons! {
         /// Deleted while a consumer still holds it. The data is still there
         /// and goes when the last one lets go; the sentence names the holder.
         HeldBy => "HeldBy",
+        // ------------------------------------------------------------------
+        // The node's own words from here down: `proto::reasons::VOLUME`, off
+        // `VolumeStateReport.reason`, written onto the object unchanged and
+        // relayed to the cloud as they came.
+        // ------------------------------------------------------------------
+
+        /// `Provisioning`: the node has written its record and the driver has
+        /// been asked, or is being asked right now.
+        Working => "Working",
+        /// `Failed`: the backend said no. The sentence is what it said.
+        DriverRefused => "DriverRefused",
+        /// `Failed`: the backend has no volume of that name any more, and it
+        /// did when the node last wrote its record. Found by the node's
+        /// `adopt` at start-up, and its own word because the operator fix is
+        /// not a retry — this is somebody's data missing.
+        NotOnBackend => "NotOnBackend",
+        /// `Releasing`/gone: the node was told to deprovision and has. The
+        /// tombstone a release is allowed to act on.
+        Deprovisioned => "Deprovisioned",
     }
 }
 
@@ -448,23 +473,45 @@ pub struct VolumeSnapshotSpec {
 }
 
 reasons! {
-    /// Why a snapshot is what it is. Five, and all five are already in the
-    /// snapshot reconciler: `Dispatched` is the claim written before
-    /// `TakeSnapshot` goes out, `Reported` is the node's own sentence on the
-    /// status road, `Requeued` is the failed-copy kick, and `SourceGone` is
-    /// the ingest path that finds the node no longer has the copy at all.
-    VolumeSnapshotReason [5] {
+    /// Why a snapshot is what it is.
+    ///
+    /// One list out of two vocabularies, the shape `VmReason` explains. This
+    /// tier's four are in the snapshot reconciler: `Dispatched` is the claim
+    /// written before `TakeSnapshot` goes out, `Requeued` is the failed-copy
+    /// kick, `SourceGone` is a volume or a copy that is not there any more,
+    /// and `Undeliverable` is a dispatch that never reached a node. The
+    /// node's three are `proto::reasons::SNAPSHOT`.
+    VolumeSnapshotReason [8] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
         Unrecorded => "Unrecorded",
         /// A node has been told to take it.
         Dispatched => "Dispatched",
-        /// The node's own word, verbatim in the message.
-        Reported => "Reported",
         /// A copy that failed is being tried again.
         Requeued => "Requeued",
-        /// The node no longer has the copy, so it will be taken again.
+        /// What the copy would be taken FROM is not there: the volume was
+        /// deleted between the request and the dispatch, or the node no
+        /// longer has the copy it once reported. Somebody has to ask again.
         SourceGone => "SourceGone",
+        /// The dispatch never reached the node. This tier's own word, about a
+        /// session rather than about bytes — `VolumeReason::Undeliverable`
+        /// one field over, and for the same reason: a node that never
+        /// accepted the command sends no report about it, so `Creating` would
+        /// stand for ever.
+        Undeliverable => "Undeliverable",
+
+        // ------------------------------------------------------------------
+        // The node's own words: `proto::reasons::SNAPSHOT`, off
+        // `SnapshotStateReport.reason`.
+        // ------------------------------------------------------------------
+
+        /// `Creating`: the record is written and the driver has been asked.
+        Working => "Working",
+        /// `Failed`: the backend said no. The sentence is what it said.
+        DriverRefused => "DriverRefused",
+        /// Gone: the node was told to drop it and has — including for an id
+        /// it never had, which is the same answer to the tier above.
+        Dropped => "Dropped",
     }
 }
 

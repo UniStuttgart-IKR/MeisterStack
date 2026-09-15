@@ -386,9 +386,13 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
         p.store
             .mutate::<Volume, _>(&name, |v| {
                 #[allow(deprecated)]
+                // Not the node's word: the node never got the command. Two
+                // of the old assignments said "Reported" about a session
+                // failure, and this was one of them — the sentence is this
+                // tier's, about a wire, and the fix is on the network.
                 v.status.assign(controller_api::VolumePhase::new(
                     VolumePhaseKind::Failed,
-                    controller_api::VolumeReason::Reported,
+                    controller_api::VolumeReason::Undeliverable,
                     Some(message.clone()),
                     Utc::now(),
                 ));

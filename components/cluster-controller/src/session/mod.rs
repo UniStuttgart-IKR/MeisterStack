@@ -76,7 +76,21 @@ use ingest::*;
 /// older one, because a node that re-fetched an image is telling the truth
 /// about it now.
 #[derive(Default)]
-pub struct ImageView(std::sync::Mutex<HashMap<(String, String), (String, String)>>);
+pub struct ImageView(std::sync::Mutex<HashMap<(String, String), ImageWord>>);
+
+/// One node's word about one image, as it arrived: the phase, the closed
+/// reason and the sentence.
+///
+/// A struct and not a tuple since the reason joined it, for the reason the
+/// agent's own `report_status` became one: three strings in a row are three
+/// chances to relay the sentence where the word belongs, and the compiler
+/// cannot see the mistake.
+#[derive(Clone)]
+struct ImageWord {
+    phase: String,
+    reason: String,
+    message: String,
+}
 
 impl ImageView {
     /// Take in one node's opinions.
@@ -85,7 +99,11 @@ impl ImageView {
         for report in reports {
             held.insert(
                 (report.name.clone(), node.to_string()),
-                (report.phase.clone(), report.message.clone()),
+                ImageWord {
+                    phase: report.phase.clone(),
+                    reason: report.reason.clone(),
+                    message: report.message.clone(),
+                },
             );
         }
     }
@@ -95,14 +113,17 @@ impl ImageView {
         let held = self.0.lock().unwrap();
         let mut out: Vec<proto::ImageStateReport> = held
             .iter()
-            .map(|((name, node), (phase, message))| proto::ImageStateReport {
+            .map(|((name, node), word)| proto::ImageStateReport {
                 name: name.clone(),
-                phase: phase.clone(),
-                // struktur 4: the nodes send a word now; relaying it is the
-                // derivation lane's, which is where this map grows a third
-                // value.
-                reason: String::new(),
-                message: message.clone(),
+                phase: word.phase.clone(),
+                // Relayed and not re-derived. This tier holds no Image
+                // objects and has no opinion of its own to put here: the word
+                // is the node's — `NotFound` for a catalogue entry over bytes
+                // that are not there, `ChecksumMismatch` for bytes that are
+                // the wrong ones — and a cluster that reworded it would be a
+                // tier able to get it wrong.
+                reason: word.reason.clone(),
+                message: word.message.clone(),
                 node: node.clone(),
             })
             .collect();

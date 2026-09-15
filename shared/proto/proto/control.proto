@@ -1144,6 +1144,16 @@ message VolumeSnapshotStatusReport {
   // How big the copy turned out to be, in GiB. Zero until measured.
   uint64 size_gib = 5;
   string message = 6;
+  // Why, in the tier's own closed word — `Working` and `DriverRefused` off
+  // the node's record, `SourceGone`, `Undeliverable`, `Dispatched` or
+  // `Requeued` from the cluster's own reconciler.
+  //
+  // The last of the six status roads to grow one, and it grew late for a
+  // dull reason: the copy is the one object whose word from below arrives on
+  // a DIFFERENT message (`SnapshotStateReport`, node to cluster), so the
+  // cluster had somewhere to put it before the cloud did. Empty from a
+  // cluster that predates the field, which reads as `Unrecorded`.
+  string reason = 7;
 }
 
 // One storage pool, as the cluster sees it.

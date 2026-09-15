@@ -365,13 +365,20 @@ impl RouterSpec {
 reasons! {
     /// Why a router is where it is.
     ///
-    /// Six, all of them out of the two router reconcilers: the four
-    /// `Pending` sentences the cluster planner returns (no provider network,
-    /// no gateway node, every candidate down or drained, the class refused),
-    /// the dispatch the cloud writes when it has told a cluster, the node's
-    /// own word on the status road, and the silence `verdict` turns into
-    /// `Unknown` when the node holding an active router stops answering.
-    RouterReason [6] {
+    /// One list out of two vocabularies, the shape `VmReason` explains. This
+    /// tier's four are out of the two router reconcilers: the `Pending`
+    /// sentences the cluster planner returns (no provider network, no gateway
+    /// node, every candidate down or drained, the class refused), the
+    /// dispatch the cloud writes when it has told a cluster, the structural
+    /// refusal it remembers in `status.refused`, and the silence `verdict`
+    /// turns into `Unknown` when the node holding an active router stops
+    /// answering.
+    ///
+    /// The three after them are the NODE's (`proto::reasons::ROUTER`), and
+    /// they come from the network driver rather than from the agent —
+    /// `agent_api::networking::RouterReason`, because the driver is what
+    /// looks and a driver may not depend on the agent.
+    RouterReason [8] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
         Unrecorded => "Unrecorded",
@@ -384,12 +391,27 @@ reasons! {
         /// A node refused it — no gateway slot, which is a structural answer
         /// about the MACHINE and is remembered in `status.refused`.
         Refused => "Refused",
-        /// A node's own word about the namespace, verbatim in the message.
-        Reported => "Reported",
         /// Nobody has heard from the node holding it for longer than the
         /// heartbeat allows. Spelled as `VmReason::Silent` is, because it is
         /// the same silence about the same machine.
         Silent => "Silent",
+
+        // ------------------------------------------------------------------
+        // The node's own words: `proto::reasons::ROUTER`, off
+        // `RouterReport.reason`.
+        // ------------------------------------------------------------------
+
+        /// The network namespace this router lives in is gone from the node.
+        NetnsGone => "NetnsGone",
+        /// The namespace is there and a leg of it is not — the uplink, the
+        /// tenant side, or both. The sentence says which.
+        LegGone => "LegGone",
+        /// The node could not FIND OUT: its `ip` call failed. Its own word
+        /// because a tier that read it as "the namespace is gone" would swing
+        /// a router away from a machine whose kernel merely did not answer in
+        /// time — which is a working gateway taken out of service by a
+        /// timeout.
+        DriverUnreachable => "DriverUnreachable",
     }
 }
 

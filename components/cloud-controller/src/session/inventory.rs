@@ -34,7 +34,7 @@ pub(super) async fn ingest_images(
     reports: &[proto::ImageStateReport],
 ) {
     for (name, lines) in by_image(reports) {
-        let Some((phase, message, mine)) = compute_union(cluster, name, &lines) else {
+        let Some((phase, reason, message, mine)) = compute_union(cluster, name, &lines) else {
             continue;
         };
         let current = match store.get::<Image>(name).await {
@@ -49,9 +49,15 @@ pub(super) async fn ingest_images(
             }
         };
         let merged = merged_lines(&current, cluster, mine);
-        if current.status.phase().kind() == phase
-            && current.status.phase().message() == message.as_deref()
-            && same_node_states(&current.status.nodes, &merged)
+        // Against the phase the write WOULD leave behind — see
+        // `mirror::observe` for why the parts cannot be compared one by one.
+        let candidate = controller_api::ImagePhase::new(
+            phase,
+            reason,
+            message.clone(),
+            current.status.phase().since(),
+        );
+        if *current.status.phase() == candidate && same_node_states(&current.status.nodes, &merged)
         {
             continue;
         }
@@ -60,7 +66,7 @@ pub(super) async fn ingest_images(
                 #[allow(deprecated)]
                 i.status.assign(controller_api::ImagePhase::new(
                     phase,
-                    controller_api::ImageReason::Reported,
+                    reason,
                     message.clone(),
                     chrono::Utc::now(),
                 ));
@@ -110,10 +116,11 @@ fn compute_union(
     lines: &[&proto::ImageStateReport],
 ) -> Option<(
     ImagePhaseKind,
+    controller_api::ImageReason,
     Option<String>,
     Vec<controller_api::ImageNodeState>,
 )> {
-    let mut union: Option<(ImagePhaseKind, Option<String>)> = None;
+    let mut union: Option<(ImagePhaseKind, controller_api::ImageReason, Option<String>)> = None;
     let mut nodes: Vec<controller_api::ImageNodeState> = Vec::new();
     for line in lines {
         let Some(phase) = ImagePhaseKind::parse(&line.phase) else {
@@ -124,16 +131,21 @@ fn compute_union(
             continue;
         };
         let message = (!line.message.is_empty()).then(|| line.message.clone());
+        // The node's own word for what is wrong with the bytes, which is the
+        // whole of why the union is worth computing at all: `FetchFailed` on
+        // one node during a roll-out and `ChecksumMismatch` on every node are
+        // both a Failed union, and only the second will never come right.
+        let (reason, message) = controller_api::ImageReason::read(&line.reason, message);
         // Failed wins over Ready where two nodes disagree: a checksum that
         // did not match is a fact about the BYTES, not about the node that
         // read them. The sentence travels with the phase that won, so a
         // Failed union carries the reason one of them gave.
         let beats = match &union {
             None => true,
-            Some((held, _)) => *held != ImagePhaseKind::Failed && phase == ImagePhaseKind::Failed,
+            Some((held, ..)) => *held != ImagePhaseKind::Failed && phase == ImagePhaseKind::Failed,
         };
         if beats {
-            union = Some((phase, message.clone()));
+            union = Some((phase, reason, message.clone()));
         }
         if !line.node.is_empty() {
             nodes.push(controller_api::ImageNodeState {
@@ -144,13 +156,13 @@ fn compute_union(
             });
         }
     }
-    let (phase, message) = union?;
+    let (phase, reason, message) = union?;
     // This cluster's lines replace this cluster's lines and nobody else's.
     // That is what `ImageNodeState::cluster` is for: two clusters may each
     // have a `node-1`, and a list keyed by the bare name would let one
     // overwrite the other's word.
     nodes.sort_by(|a, b| (&a.cluster, &a.name).cmp(&(&b.cluster, &b.name)));
-    Some((phase, message, nodes))
+    Some((phase, reason, message, nodes))
 }
 
 /// The image's node list with this cluster's share of it replaced.
@@ -234,8 +246,15 @@ pub(super) async fn ingest_pools(
             continue;
         };
         let entry = pool_entry(cluster, reported);
-        let (phase, locality, message) = (entry.phase, entry.locality, entry.message.clone());
-        if pool_unchanged(&pool, home, &entry, reported) {
+        let (phase, locality) = (entry.phase, entry.locality);
+        // A pool has ONE vocabulary: no node ever says a word about one, so
+        // what arrives here is a word this very tier's enum spells and it is
+        // parsed back rather than replaced with the name of the road. Empty
+        // from a cluster that predates the field, which reads as
+        // `Unrecorded` — exactly what the object held before.
+        let (reason, message) =
+            controller_api::StoragePoolReason::read(&reported.reason, entry.message.clone());
+        if pool_unchanged(&pool, home, &entry, reported, reason, message.as_deref()) {
             continue;
         }
         store
@@ -246,7 +265,7 @@ pub(super) async fn ingest_pools(
                     #[allow(deprecated)]
                     p.status.assign(controller_api::StoragePoolPhase::new(
                         phase,
-                        controller_api::StoragePoolReason::Reported,
+                        reason,
                         message.clone(),
                         chrono::Utc::now(),
                     ));
@@ -300,13 +319,24 @@ fn pool_unchanged(
     home: bool,
     entry: &controller_api::PoolAtCluster,
     reported: &proto::StoragePoolStatusReport,
+    reason: controller_api::StoragePoolReason,
+    message: Option<&str>,
 ) -> bool {
+    // The phase half is compared against what the write WOULD leave behind
+    // and not field by field — see `mirror::observe`: a resting word has no
+    // slot for a reason, and a guard that held the report's word against a
+    // stored `None` would write on every ten-second report.
+    let settled = controller_api::StoragePoolPhase::new(
+        entry.phase,
+        reason,
+        message.map(str::to_string),
+        pool.status.phase().since(),
+    );
     pool.status.clusters.contains(entry)
         && (!home
-            || (pool.status.phase().kind() == entry.phase
+            || (*pool.status.phase() == settled
                 && pool.status.locality == entry.locality
-                && pool.status.nodes == reported.nodes
-                && pool.status.phase().message() == entry.message.as_deref()))
+                && pool.status.nodes == reported.nodes))
 }
 
 /// The same road as `ingest_volumes`, one object over, with the one hop more
@@ -550,11 +580,13 @@ fn volume_unchanged(
     // Seen at all: a volume nothing has ever been observed about is written
     // even when every field matches the default.
     let observed = volume.status.observed_at.is_some();
-    // What the cluster decided about it.
-    let same_verdict = volume.status.phase().kind() == phase
+    // What the cluster decided about it, as the phase the write would leave
+    // behind — see `mirror::observe`.
+    let (reason, message) = reported_volume_reason(reported);
+    let settled = VolumePhase::new(phase, reason, message, volume.status.phase().since());
+    let same_verdict = *volume.status.phase() == settled
         && volume.status.node == said(&reported.node)
-        && volume.status.attached_to == said(&reported.attached_to)
-        && volume.status.phase().message() == said(&reported.message).as_deref();
+        && volume.status.attached_to == said(&reported.attached_to);
     // What a node measured about it.
     let same_measurements =
         volume.status.size_gib == reported.size_gib && volume.status.open_on == reported.open_on;
@@ -564,6 +596,17 @@ fn volume_unchanged(
     observed && same_verdict && same_measurements && same_backend
 }
 
+/// The word and the sentence a volume line carries, read once.
+///
+/// One function because two callers must agree exactly: the churn guard and
+/// the write. A guard that read the word differently from the write would
+/// either write on every report or never write at all.
+fn reported_volume_reason(
+    reported: &proto::VolumeStatusReport,
+) -> (controller_api::VolumeReason, Option<String>) {
+    controller_api::VolumeReason::read(&reported.reason, said(&reported.message))
+}
+
 /// The reported line, onto the object.
 fn write_volume_status(
     v: &mut Volume,
@@ -571,13 +614,10 @@ fn write_volume_status(
     phase: VolumePhaseKind,
     at: DateTime<Utc>,
 ) {
+    let (reason, message) = reported_volume_reason(reported);
     #[allow(deprecated)]
-    v.status.assign(VolumePhase::new(
-        phase,
-        controller_api::VolumeReason::Reported,
-        said(&reported.message),
-        at,
-    ));
+    v.status
+        .assign(VolumePhase::new(phase, reason, message, at));
     v.status.node = said(&reported.node);
     v.status.attached_to = said(&reported.attached_to);
     // The same rule as one tier down: the name only ever ARRIVES. A cluster
@@ -613,15 +653,29 @@ fn snapshot_unchanged(
     phase: controller_api::VolumeSnapshotPhaseKind,
 ) -> bool {
     let observed = snapshot.status.observed_at.is_some();
-    // What the cluster decided about the copy.
-    let same_verdict = snapshot.status.phase().kind() == phase
-        && snapshot.status.node == said(&reported.node)
-        && snapshot.status.phase().message() == said(&reported.message).as_deref();
+    // What the cluster decided about the copy, as the phase the write would
+    // leave behind — see `mirror::observe`.
+    let (reason, message) = reported_snapshot_reason(reported);
+    let settled = controller_api::VolumeSnapshotPhase::new(
+        phase,
+        reason,
+        message,
+        snapshot.status.phase().since(),
+    );
+    let same_verdict =
+        *snapshot.status.phase() == settled && snapshot.status.node == said(&reported.node);
     // What a node measured about it.
     let same_size = snapshot.status.size_gib == reported.size_gib;
     // "Only ever arrives", as everywhere else.
     let same_backend = reported.backend.is_empty() || snapshot.status.backend == reported.backend;
     observed && same_verdict && same_size && same_backend
+}
+
+/// The same, one object over. See `reported_volume_reason`.
+fn reported_snapshot_reason(
+    reported: &proto::VolumeSnapshotStatusReport,
+) -> (controller_api::VolumeSnapshotReason, Option<String>) {
+    controller_api::VolumeSnapshotReason::read(&reported.reason, said(&reported.message))
 }
 
 /// The reported line, onto the snapshot.
@@ -631,12 +685,10 @@ fn write_snapshot_status(
     phase: controller_api::VolumeSnapshotPhaseKind,
     at: DateTime<Utc>,
 ) {
+    let (reason, message) = reported_snapshot_reason(reported);
     #[allow(deprecated)]
     s.status.assign(controller_api::VolumeSnapshotPhase::new(
-        phase,
-        controller_api::VolumeSnapshotReason::Reported,
-        said(&reported.message),
-        at,
+        phase, reason, message, at,
     ));
     s.status.node = said(&reported.node);
     s.status.size_gib = reported.size_gib;
