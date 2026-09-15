@@ -29,7 +29,7 @@ fn volume_vm(volumes: &[&str]) -> Vm {
             vm: serde_json::json!({ "volumes": entries }),
         },
     );
-    vm.status.phase = VmPhase::Running;
+    vm.status.phase = VmPhaseKind::Running;
     vm
 }
 
@@ -43,7 +43,7 @@ fn released(node: Option<&str>, vm: Option<&str>) -> Volume {
         },
     );
     v.metadata.deletion_timestamp = Some(Utc::now());
-    v.status.phase = VolumePhase::Releasing;
+    v.status.phase = VolumePhaseKind::Releasing;
     v.status.node = node.map(str::to_string);
     v.status.attached_to = vm.map(str::to_string);
     v
@@ -173,11 +173,11 @@ fn silence_leaves_the_pool_without_a_locality_rather_than_with_a_guess() {
 fn a_verdict_becomes_a_phase_and_keeps_what_was_already_known() {
     assert_eq!(
         pool_status("nfs", PoolLocality::Agreed(Locality::Shared), None),
-        (StoragePoolPhase::Ready, Some(Locality::Shared), None)
+        (StoragePoolPhaseKind::Ready, Some(Locality::Shared), None)
     );
     assert_eq!(
         pool_status("nfs", PoolLocality::Unheard, Some(Locality::Shared)),
-        (StoragePoolPhase::Pending, None, None),
+        (StoragePoolPhaseKind::Pending, None, None),
         "nobody said anything this pass, so nothing is known this pass"
     );
 
@@ -191,7 +191,7 @@ fn a_verdict_becomes_a_phase_and_keeps_what_was_already_known() {
         },
         Some(Locality::Shared),
     );
-    assert_eq!(phase, StoragePoolPhase::Failed);
+    assert_eq!(phase, StoragePoolPhaseKind::Failed);
     assert_eq!(
         locality,
         Some(Locality::Shared),
@@ -487,7 +487,7 @@ fn a_drain_does_not_count_what_it_did_not_move() {
 }
 
 /// A VM bound to `agent-1a` in the phase given.
-fn on_agent_1a(phase: VmPhase) -> Vm {
+fn on_agent_1a(phase: VmPhaseKind) -> Vm {
     let mut vm = bound_to(Some("agent-1a"));
     vm.status.phase = phase;
     vm
@@ -503,7 +503,7 @@ fn on_agent_1a(phase: VmPhase) -> Vm {
 #[test]
 fn a_vm_on_a_silent_node_stops_claiming_to_be_running() {
     let timeout = controller_api::HEARTBEAT_TIMEOUT_SECS;
-    let vm = on_agent_1a(VmPhase::Running);
+    let vm = on_agent_1a(VmPhaseKind::Running);
 
     // Inside the watchdog: the node is quiet but not yet late.
     assert!(unheard_of(&vm, Some(at(0)), at(timeout)).is_none());
@@ -536,18 +536,22 @@ fn a_vm_on_a_silent_node_stops_claiming_to_be_running() {
 #[test]
 fn the_watchdog_only_takes_back_a_claim_about_a_guest() {
     let timeout = controller_api::HEARTBEAT_TIMEOUT_SECS + 1;
-    for phase in [VmPhase::Running, VmPhase::Paused, VmPhase::Provisioning] {
+    for phase in [
+        VmPhaseKind::Running,
+        VmPhaseKind::Paused,
+        VmPhaseKind::Provisioning,
+    ] {
         assert!(
             unheard_of(&on_agent_1a(phase), Some(at(0)), at(timeout)).is_some(),
             "{phase:?} claims a guest and has to be given up"
         );
     }
     for phase in [
-        VmPhase::Pending,
-        VmPhase::Stopped,
-        VmPhase::Failed,
-        VmPhase::Quarantined,
-        VmPhase::Unknown,
+        VmPhaseKind::Pending,
+        VmPhaseKind::Stopped,
+        VmPhaseKind::Failed,
+        VmPhaseKind::Quarantined,
+        VmPhaseKind::Unknown,
     ] {
         assert!(
             unheard_of(&on_agent_1a(phase), Some(at(0)), at(timeout)).is_none(),
@@ -558,7 +562,7 @@ fn the_watchdog_only_takes_back_a_claim_about_a_guest() {
     // And a VM that is not on a node at all: there is no machine whose
     // silence could mean anything about it.
     let mut unbound = bound_to(None);
-    unbound.status.phase = VmPhase::Running;
+    unbound.status.phase = VmPhaseKind::Running;
     assert!(unheard_of(&unbound, Some(at(0)), at(timeout)).is_none());
 }
 
@@ -570,16 +574,16 @@ fn the_watchdog_only_takes_back_a_claim_about_a_guest() {
 /// does not exist.
 #[test]
 fn unknown_is_neither_failed_nor_settled() {
-    assert!(!VmPhase::Unknown.is_stable());
-    assert_eq!(VmPhase::Unknown.as_str(), "Unknown");
-    assert_eq!(VmPhase::parse("Unknown"), Some(VmPhase::Unknown));
+    assert!(!VmPhaseKind::Unknown.is_stable());
+    assert_eq!(VmPhaseKind::Unknown.as_str(), "Unknown");
+    assert_eq!(VmPhaseKind::parse("Unknown"), Some(VmPhaseKind::Unknown));
     for strategy in [
         RunStrategy::Running,
         RunStrategy::Stopped,
         RunStrategy::Paused,
     ] {
         assert!(
-            lifecycle_command(strategy, VmPhase::Unknown).is_none(),
+            lifecycle_command(strategy, VmPhaseKind::Unknown).is_none(),
             "{strategy:?} sent a command at a phase nobody has observed"
         );
     }
@@ -634,7 +638,7 @@ fn a_placed_volume_is_only_reconciled_by_the_replica_its_node_talks_to() {
     // exactly as a deleting VM does.
     let mut deleting = volume.clone();
     deleting.metadata.deletion_timestamp = Some(Utc::now());
-    deleting.status.phase = VolumePhase::Releasing;
+    deleting.status.phase = VolumePhaseKind::Releasing;
     assert!(may_reconcile_volume(&deleting, &holder));
     assert!(!may_reconcile_volume(&deleting, &other));
 }
@@ -834,7 +838,7 @@ fn the_requeue_timeline() {
     use controller_api::requeue::{CrashLoopBackoff, NoRequeue};
     let failed = |last: Option<chrono::DateTime<Utc>>, attempts: u32| {
         let mut vm = bound_to(Some("node-a"));
-        vm.status.phase = VmPhase::Failed;
+        vm.status.phase = VmPhaseKind::Failed;
         vm.status.last_requeue = last;
         vm.status.requeue_attempts = attempts;
         vm
@@ -940,7 +944,7 @@ fn policies() -> Vec<(&'static str, Box<dyn RequeuePolicy>)> {
 fn joint_cells() -> Vec<(String, Vm, DateTime<Utc>, usize)> {
     let mut out = Vec::new();
     for (policy_index, (policy_name, _)) in policies().into_iter().enumerate() {
-        for phase in VmPhase::ALL {
+        for phase in VmPhaseKind::ALL {
             for strategy in RunStrategy::ALL {
                 for node in [None, Some("node-a")] {
                     for (elapsed, attempts) in requeue_inputs() {
@@ -965,7 +969,7 @@ fn joint_cells() -> Vec<(String, Vm, DateTime<Utc>, usize)> {
 /// What the requeue side must answer, as an ordered list of guards rather
 /// than as a copy of `requeue_decision`'s control flow.
 fn expected_requeue(vm: &Vm, policy: &dyn RequeuePolicy, now: DateTime<Utc>) -> Requeue {
-    if vm.status.phase != VmPhase::Failed {
+    if vm.status.phase != VmPhaseKind::Failed {
         // Not Failed: nothing to retry, but bookkeeping left over from an
         // earlier Failed has to be cleared or the next failure would
         // inherit somebody else's attempt count.
@@ -1013,7 +1017,7 @@ fn the_joint_cross_product_decides_what_the_guards_say() {
     }
     assert_eq!(
         cells,
-        3 * VmPhase::ALL.len() * 3 * 2 * 16,
+        3 * VmPhaseKind::ALL.len() * 3 * 2 * 16,
         "the joint space is not the size it was"
     );
 }
@@ -1046,7 +1050,7 @@ fn a_requeue_kick_and_a_lifecycle_command_never_fire_in_the_same_pass() {
             );
             assert_eq!(
                 vm.status.phase,
-                VmPhase::Failed,
+                VmPhaseKind::Failed,
                 "a kick outside Failed: {label}"
             );
         }
@@ -1100,7 +1104,7 @@ fn only_reset_may_share_a_pass_with_a_command() {
 fn nothing_automatic_touches_a_quarantined_vm() {
     let policies = policies();
     for (label, vm, now, policy_index) in joint_cells() {
-        if vm.status.phase != VmPhase::Quarantined {
+        if vm.status.phase != VmPhaseKind::Quarantined {
             continue;
         }
         assert_eq!(
@@ -1124,7 +1128,7 @@ fn nothing_automatic_touches_a_quarantined_vm() {
 fn leaving_failed_always_clears_the_bookkeeping() {
     let policies = policies();
     for (label, vm, now, policy_index) in joint_cells() {
-        if vm.status.phase == VmPhase::Failed {
+        if vm.status.phase == VmPhaseKind::Failed {
             continue;
         }
         let has_bookkeeping = vm.status.requeue_attempts > 0 || vm.status.last_requeue.is_some();
@@ -1311,7 +1315,7 @@ fn a_secret_reference_is_replaced_by_its_value_before_the_spec_travels() {
     assert_eq!(doc["cloud_init"]["user_data"], "#cloud-config\nmine\n");
 }
 
-fn volume_at(node: Option<&str>, phase: VolumePhase) -> Volume {
+fn volume_at(node: Option<&str>, phase: VolumePhaseKind) -> Volume {
     let mut v = controller_api::resources::new_volume(
         "data-1",
         controller_api::VolumeSpec {
@@ -1360,8 +1364,8 @@ fn the_release_table_reads_the_same_rule_for_both_ways_of_being_empty() {
 /// standalone volume sat in it for ever.
 #[test]
 fn a_placed_volume_is_still_pending_until_the_command_goes() {
-    let v = volume_at(Some("manacor"), VolumePhase::Pending);
-    assert_eq!(v.status.phase, VolumePhase::Pending);
+    let v = volume_at(Some("manacor"), VolumePhaseKind::Pending);
+    assert_eq!(v.status.phase, VolumePhaseKind::Pending);
     assert!(
         v.status.backend.is_empty(),
         "the backend name arrives with the dispatch"
@@ -1442,7 +1446,7 @@ fn a_report_from_before_the_last_command_changes_nothing() {
 /// satisfied and the second false.
 #[test]
 fn the_drift_is_what_the_node_has_against_what_the_spec_asks_for() {
-    let vm = |wanted: &[&str], held: &[(&str, bool)], phase: VmPhase| {
+    let vm = |wanted: &[&str], held: &[(&str, bool)], phase: VmPhaseKind| {
         let mut v = volume_vm(wanted);
         v.status.phase = phase;
         v.status.volumes = held
@@ -1456,16 +1460,16 @@ fn the_drift_is_what_the_node_has_against_what_the_spec_asks_for() {
     };
 
     // Settled: what it asks for is what it has.
-    assert!(volume_drift(&vm(&["data-1"], &[("data-1", true)], VmPhase::Running)).is_none());
+    assert!(volume_drift(&vm(&["data-1"], &[("data-1", true)], VmPhaseKind::Running)).is_none());
     // A VM with no referenced disks never drifts, which is every VM
     // before this milestone.
-    assert!(volume_drift(&vm(&[], &[], VmPhase::Running)).is_none());
+    assert!(volume_drift(&vm(&[], &[], VmPhaseKind::Running)).is_none());
 
     // The attach: the spec grew an entry the node has not got.
     let drift = volume_drift(&vm(
         &["data-1", "data-2"],
         &[("data-1", true)],
-        VmPhase::Running,
+        VmPhaseKind::Running,
     ))
     .expect("one disk is missing");
     assert_eq!(drift.attach, vec!["data-2".to_string()]);
@@ -1475,7 +1479,7 @@ fn the_drift_is_what_the_node_has_against_what_the_spec_asks_for() {
     let drift = volume_drift(&vm(
         &["data-1"],
         &[("data-1", true), ("data-2", true)],
-        VmPhase::Running,
+        VmPhaseKind::Running,
     ))
     .expect("one disk is spare");
     assert!(drift.attach.is_empty());
@@ -1484,7 +1488,7 @@ fn the_drift_is_what_the_node_has_against_what_the_spec_asks_for() {
     // A disk the node reports as NOT attached is drift as much as one it
     // does not mention: an attach that failed inside the node acked its
     // command, so "told" would say this was finished and it is not.
-    let drift = volume_drift(&vm(&["data-1"], &[("data-1", false)], VmPhase::Running))
+    let drift = volume_drift(&vm(&["data-1"], &[("data-1", false)], VmPhaseKind::Running))
         .expect("asked for, not open");
     assert_eq!(drift.attach, vec!["data-1".to_string()]);
 
@@ -1492,7 +1496,11 @@ fn the_drift_is_what_the_node_has_against_what_the_spec_asks_for() {
     // Pending goes through the create path; Failed is on the requeue
     // curve, which re-sends this very spec with a backoff — plugging a
     // disk into a VM that will not boot would be a command per pass.
-    for phase in [VmPhase::Pending, VmPhase::Failed, VmPhase::Provisioning] {
+    for phase in [
+        VmPhaseKind::Pending,
+        VmPhaseKind::Failed,
+        VmPhaseKind::Provisioning,
+    ] {
         assert!(
             volume_drift(&vm(&["data-1", "data-2"], &[("data-1", true)], phase)).is_none(),
             "{phase:?}"
@@ -1701,7 +1709,7 @@ fn a_resize_is_driven_by_what_the_node_measured() {
                 ..Default::default()
             },
         );
-        v.status.phase = VolumePhase::Ready;
+        v.status.phase = VolumePhaseKind::Ready;
         v.status.node = Some("agent-1".into());
         v.status.size_gib = status_gib;
         v
@@ -1834,11 +1842,11 @@ fn an_unbinding_vm_belongs_to_the_replica_that_can_reach_the_node_it_leaves() {
 /// and what the volume pass then does with it.
 #[test]
 fn a_volume_following_its_vm_is_provisioned_on_the_vms_node_not_placed_again() {
-    let mut v = volume_at(Some("agent-1a"), VolumePhase::Ready);
+    let mut v = volume_at(Some("agent-1a"), VolumePhaseKind::Ready);
     follow_vm(&mut v, "no-nic", "agent-1b");
 
     assert_eq!(v.status.node.as_deref(), Some("agent-1b"));
-    assert_eq!(v.status.phase, VolumePhase::Pending);
+    assert_eq!(v.status.phase, VolumePhaseKind::Pending);
     assert_eq!(
         v.status.message.as_deref(),
         Some("following no-nic to agent-1b")
@@ -1853,7 +1861,7 @@ fn a_volume_following_its_vm_is_provisioned_on_the_vms_node_not_placed_again() {
 /// placed by the pass whose job that is.
 #[test]
 fn a_volume_without_a_node_is_still_the_placers_business() {
-    let v = volume_at(None, VolumePhase::Pending);
+    let v = volume_at(None, VolumePhaseKind::Pending);
     assert_eq!(next_for(&v), Next::Place);
 }
 
@@ -2202,25 +2210,29 @@ fn a_create_the_node_refused_is_written_over_whatever_a_report_left_behind() {
     // The ack half, unchanged: a guess moves only a VM nobody has reported
     // on yet.
     assert_eq!(
-        vms::create_answer(None, VmPhase::Pending),
-        Some((VmPhase::Provisioning, None))
+        vms::create_answer(None, VmPhaseKind::Pending),
+        Some((VmPhaseKind::Provisioning, None))
     );
-    assert_eq!(vms::create_answer(None, VmPhase::Provisioning), None);
-    assert_eq!(vms::create_answer(None, VmPhase::Running), None);
+    assert_eq!(vms::create_answer(None, VmPhaseKind::Provisioning), None);
+    assert_eq!(vms::create_answer(None, VmPhaseKind::Running), None);
 
     // The refusal half: written from Pending, and — the fix — written from
     // the phase a report had already put there.
-    for reported in [VmPhase::Pending, VmPhase::Provisioning, VmPhase::Running] {
+    for reported in [
+        VmPhaseKind::Pending,
+        VmPhaseKind::Provisioning,
+        VmPhaseKind::Running,
+    ] {
         assert_eq!(
             vms::create_answer(said(), reported),
-            Some((VmPhase::Failed, said())),
+            Some((VmPhaseKind::Failed, said())),
             "a refusal from {reported:?} has to land, or nothing ever retries"
         );
     }
 
     // And the one phase it may not overwrite: an operator's word about a VM
     // outranks a machine's.
-    assert_eq!(vms::create_answer(said(), VmPhase::Quarantined), None);
+    assert_eq!(vms::create_answer(said(), VmPhaseKind::Quarantined), None);
 }
 
 /// A router is planned onto the machines the FLEET has, not onto the ones

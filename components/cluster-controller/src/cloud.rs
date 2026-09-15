@@ -2044,7 +2044,7 @@ mod tests {
         );
     }
     use super::*;
-    use controller_api::{VmPhase, VmSpec, VolumePhase};
+    use controller_api::{VmPhaseKind, VmSpec, VolumePhaseKind};
 
     /// What the cloud decided, into this tier's objects — and the two fields
     /// the road one tier down leaves empty, filled on the way back up.
@@ -2097,7 +2097,7 @@ mod tests {
 
         // And back up: `active` is whether a machine is really forwarding,
         // which is not the same question as the phase.
-        router.status.phase = controller_api::RouterPhase::Active;
+        router.status.phase = controller_api::RouterPhaseKind::Active;
         router.status.nodes = vec!["agent-1b".into(), "agent-1c".into()];
         router.status.active_node = "agent-1b".into();
         let mut complete = true;
@@ -2121,7 +2121,7 @@ mod tests {
         assert!(report_cloud_routers(&[mine], &mut complete).is_empty());
     }
 
-    fn vm(name: &str, uid: Option<&str>, phase: VmPhase) -> Vm {
+    fn vm(name: &str, uid: Option<&str>, phase: VmPhaseKind) -> Vm {
         let mut vm = new_vm(
             name,
             VmSpec {
@@ -2423,8 +2423,8 @@ mod tests {
     #[test]
     fn only_the_clouds_vms_are_reported_and_only_by_uid() {
         let vms = [
-            vm("local", None, VmPhase::Running),
-            vm("theirs", Some("uid-1"), VmPhase::Provisioning),
+            vm("local", None, VmPhaseKind::Running),
+            vm("theirs", Some("uid-1"), VmPhaseKind::Provisioning),
         ];
         let mut complete = true;
         let out = report_cloud_vms(&vms, &mut complete);
@@ -2518,7 +2518,7 @@ mod tests {
     /// trade; losing somebody's VM is the expensive one.
     #[test]
     fn a_cloud_vm_that_cannot_be_named_costs_the_list_its_completeness() {
-        let mut vm = vm("orphan", None, VmPhase::Running);
+        let mut vm = vm("orphan", None, VmPhaseKind::Running);
         vm.metadata
             .labels
             .insert("meister.io/managed-by".into(), "cloud".into());
@@ -2528,7 +2528,7 @@ mod tests {
         assert!(!complete);
     }
 
-    fn cloud_volume(name: &str, uid: Option<&str>, phase: VolumePhase) -> Volume {
+    fn cloud_volume(name: &str, uid: Option<&str>, phase: VolumePhaseKind) -> Volume {
         let mut v = new_volume(
             name,
             controller_api::VolumeSpec {
@@ -2552,13 +2552,13 @@ mod tests {
     /// costs the report its completeness rather than being left out quietly.
     #[test]
     fn the_volume_report_speaks_the_uids_the_cloud_handed_out() {
-        let mut held = cloud_volume("data-1", Some("cloud-uid-1"), VolumePhase::Ready);
+        let mut held = cloud_volume("data-1", Some("cloud-uid-1"), VolumePhaseKind::Ready);
         held.status.attached_to = Some("web-1".into());
         let volumes = vec![
             held,
-            cloud_volume("data-2", Some("cloud-uid-2"), VolumePhase::Provisioning),
+            cloud_volume("data-2", Some("cloud-uid-2"), VolumePhaseKind::Provisioning),
             // Cluster-local: not the cloud's, and not in its report.
-            cloud_volume("local-1", None, VolumePhase::Ready),
+            cloud_volume("local-1", None, VolumePhaseKind::Ready),
         ];
         let mut complete = true;
         let report = report_cloud_volumes(&volumes, &mut complete);
@@ -2578,7 +2578,7 @@ mod tests {
         // A cloud-managed object with no cloud uid can never be named up
         // there, so it costs the list its completeness for as long as it
         // exists — the same rule the VM half follows.
-        let mut broken = cloud_volume("data-3", None, VolumePhase::Ready);
+        let mut broken = cloud_volume("data-3", None, VolumePhaseKind::Ready);
         broken.metadata.labels.insert(
             controller_api::LABEL_MANAGED_BY.to_string(),
             controller_api::MANAGED_BY_CLOUD.to_string(),
@@ -2599,7 +2599,7 @@ mod tests {
     /// its volumes without a path at all. So it travels, exactly like `node`.
     #[test]
     fn the_backend_name_travels_up_once_a_node_has_said_it() {
-        let fresh = cloud_volume("data-1", Some("cloud-uid-1"), VolumePhase::Pending);
+        let fresh = cloud_volume("data-1", Some("cloud-uid-1"), VolumePhaseKind::Pending);
         let mut complete = true;
         let report = report_cloud_volumes(std::slice::from_ref(&fresh), &mut complete);
         assert!(
@@ -2609,7 +2609,7 @@ mod tests {
 
         let mut made = fresh;
         made.status.backend = "/tmp/ms-e2e/vols/f8c1592d.raw".into();
-        made.status.phase = VolumePhase::Ready;
+        made.status.phase = VolumePhaseKind::Ready;
         let report = report_cloud_volumes(&[made], &mut complete);
         assert_eq!(report[0].backend, "/tmp/ms-e2e/vols/f8c1592d.raw");
     }
@@ -2624,9 +2624,9 @@ mod tests {
     /// tier decided, and a VM nothing has placed yet honestly has no node.
     #[test]
     fn the_node_a_vm_landed_on_travels_up_with_its_phase() {
-        let mut placed = vm("web-1", Some("cloud-uid-1"), VmPhase::Running);
+        let mut placed = vm("web-1", Some("cloud-uid-1"), VmPhaseKind::Running);
         placed.spec.node_name = Some("manacor".into());
-        let unplaced = vm("web-2", Some("cloud-uid-2"), VmPhase::Pending);
+        let unplaced = vm("web-2", Some("cloud-uid-2"), VmPhaseKind::Pending);
 
         let mut complete = true;
         let report = report_cloud_vms(&[placed, unplaced], &mut complete);
@@ -2649,7 +2649,7 @@ mod tests {
     /// all.
     #[test]
     fn the_disks_a_node_really_has_open_travel_up_with_the_phase() {
-        let mut hot_plugged = vm("mc-vm-c", Some("cloud-uid-1"), VmPhase::Running);
+        let mut hot_plugged = vm("mc-vm-c", Some("cloud-uid-1"), VmPhaseKind::Running);
         hot_plugged.status.volumes = vec![
             controller_api::VolumeAttachmentStatus {
                 name: "mc-vol-b".into(),
@@ -2662,7 +2662,7 @@ mod tests {
                 attached: false,
             },
         ];
-        let mut waiting = vm("mc-vm-d", Some("cloud-uid-2"), VmPhase::Pending);
+        let mut waiting = vm("mc-vm-d", Some("cloud-uid-2"), VmPhaseKind::Pending);
         waiting.status.pending_reason = Some("node-unhealthy".into());
 
         let mut complete = true;
@@ -2694,7 +2694,7 @@ mod tests {
     /// tier answering with an older copy of the asker's own answer.
     #[test]
     fn the_macs_of_a_vms_taps_travel_up_and_the_floating_addresses_do_not() {
-        let mut addressed = vm("mc-vm-e", Some("cloud-uid-3"), VmPhase::Running);
+        let mut addressed = vm("mc-vm-e", Some("cloud-uid-3"), VmPhaseKind::Running);
         addressed.status.addresses = vec![
             controller_api::VmAddress {
                 kind: controller_api::VmAddressKind::Mac,
@@ -2709,7 +2709,7 @@ mod tests {
                 address: Some("192.0.2.7".into()),
             },
         ];
-        let quiet = vm("mc-vm-f", Some("cloud-uid-4"), VmPhase::Running);
+        let quiet = vm("mc-vm-f", Some("cloud-uid-4"), VmPhaseKind::Running);
 
         let mut complete = true;
         let report = report_cloud_vms(&[addressed, quiet], &mut complete);
@@ -2734,13 +2734,13 @@ mod tests {
     /// happened.
     #[test]
     fn the_measured_size_travels_up_beside_the_asked_for_one() {
-        let mut grown = cloud_volume("data-1", Some("cloud-uid-1"), VolumePhase::Ready);
+        let mut grown = cloud_volume("data-1", Some("cloud-uid-1"), VolumePhaseKind::Ready);
         grown.status.size_gib = 6;
         let mut complete = true;
         let report = report_cloud_volumes(std::slice::from_ref(&grown), &mut complete);
         assert_eq!(report[0].size_gib, 6, "what the node measured");
 
-        let fresh = cloud_volume("data-2", Some("cloud-uid-2"), VolumePhase::Pending);
+        let fresh = cloud_volume("data-2", Some("cloud-uid-2"), VolumePhaseKind::Pending);
         let report = report_cloud_volumes(&[fresh], &mut complete);
         assert_eq!(report[0].size_gib, 0, "nobody has measured it yet");
     }
@@ -2767,7 +2767,7 @@ mod tests {
         };
 
         let mut ours = snapshot("nightly-1", Some("cloud-uid-1"));
-        ours.status.phase = controller_api::VolumeSnapshotPhase::Ready;
+        ours.status.phase = controller_api::VolumeSnapshotPhaseKind::Ready;
         ours.status.node = Some("manacor".into());
         ours.status.backend = "/dev/vg0/snap-nightly-1".into();
         ours.status.size_gib = 4;

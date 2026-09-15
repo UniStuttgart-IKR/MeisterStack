@@ -44,7 +44,7 @@
 //! deprovision finishing rather than by the DELETE being accepted — the same
 //! sentence the VM half makes, with more at stake.
 
-use crate::resources::{StoragePool, TenantQuota, TenantUsage, Vm, Volume, VolumePhase};
+use crate::resources::{StoragePool, TenantQuota, TenantUsage, Vm, Volume, VolumePhaseKind};
 use crate::scheduler::Capacity;
 
 /// What a tenant holds, and what it would hold.
@@ -190,13 +190,13 @@ pub fn check_storage(pool: &StoragePool, tenant: &str, after: StorageUsage) -> R
 /// than to filter: a `Failed` volume may have got half-way, a `Releasing` one
 /// is definitely still there, and a `Pending` one is what the tenant asked
 /// for. If a phase ever stops counting, it stops counting here.
-pub fn holds_room(phase: VolumePhase) -> bool {
+pub fn holds_room(phase: VolumePhaseKind) -> bool {
     match phase {
-        VolumePhase::Pending
-        | VolumePhase::Provisioning
-        | VolumePhase::Ready
-        | VolumePhase::Releasing
-        | VolumePhase::Failed => true,
+        VolumePhaseKind::Pending
+        | VolumePhaseKind::Provisioning
+        | VolumePhaseKind::Ready
+        | VolumePhaseKind::Releasing
+        | VolumePhaseKind::Failed => true,
     }
 }
 
@@ -502,11 +502,11 @@ mod tests {
     /// exactly as long as somebody's VM keeps running.
     #[test]
     fn a_volume_on_its_way_out_still_holds_its_room() {
-        for phase in VolumePhase::ALL {
+        for phase in VolumePhaseKind::ALL {
             assert!(holds_room(phase), "{phase:?}");
         }
         let mut vols = disks();
-        vols[1].status.phase = VolumePhase::Releasing;
+        vols[1].status.phase = VolumePhaseKind::Releasing;
         vols[1].metadata.deletion_timestamp = Some(chrono::Utc::now());
         assert_eq!(StorageUsage::of("acme", "fast", &vols, None).gib, 120);
 

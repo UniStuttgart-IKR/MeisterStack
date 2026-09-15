@@ -54,10 +54,10 @@ pub(crate) fn unheard_of(
 
 /// The phases that are a statement about a guest that is supposed to exist
 /// right now, and therefore the only ones a silence can make untrue.
-fn claims_a_guest(phase: VmPhase) -> bool {
+fn claims_a_guest(phase: VmPhaseKind) -> bool {
     matches!(
         phase,
-        VmPhase::Running | VmPhase::Paused | VmPhase::Provisioning
+        VmPhaseKind::Running | VmPhaseKind::Paused | VmPhaseKind::Provisioning
     )
 }
 
@@ -96,7 +96,7 @@ pub(super) async fn expire_vm_reports(
                 // the listing and here, and taking a phase away from a node
                 // that has just spoken is the one way this can do harm.
                 if claims_a_guest(v.status.phase) {
-                    v.status.phase = VmPhase::Unknown;
+                    v.status.phase = VmPhaseKind::Unknown;
                     v.status.message = Some(message.clone());
                 }
             })
@@ -248,7 +248,10 @@ pub(super) async fn reconcile_vm(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
 /// record of where the VM came from, which is worth keeping whether or not
 /// anything is still tracing against it.
 pub(super) fn birth_trace(vm: &Vm) -> Option<telemetry::TraceParent> {
-    if !matches!(vm.status.phase, VmPhase::Pending | VmPhase::Provisioning) {
+    if !matches!(
+        vm.status.phase,
+        VmPhaseKind::Pending | VmPhaseKind::Provisioning
+    ) {
         return None;
     }
     telemetry::TraceParent::parse(vm.metadata.traceparent().unwrap_or_default())
@@ -297,7 +300,7 @@ pub(super) async fn reconcile_vm_traced(
         }
         return place(p, vm).await;
     };
-    if vm.status.phase == VmPhase::Pending {
+    if vm.status.phase == VmPhaseKind::Pending {
         // The claim before the telling, never after. A node that has the disk
         // open while the object says nobody holds it is exactly the window
         // `Release::HeldBy` reads, and it is the window in which a delete
@@ -373,13 +376,13 @@ pub(super) async fn evacuate(
     }
     match controller_api::EvacuationStep::parse(&mark.step) {
         Some(controller_api::EvacuationStep::Stopping) => {
-            if vm.status.phase == VmPhase::Running || vm.status.phase == VmPhase::Paused {
+            if vm.status.phase == VmPhaseKind::Running || vm.status.phase == VmPhaseKind::Paused {
                 // Level-triggered like every other command here: sent again
                 // every pass until the phase moves, and idempotent at the
                 // node because the record's desired state is what changes.
                 return send_lifecycle(p, vm, node, Lifecycle::Stop, outgoing).await;
             }
-            if vm.status.phase != VmPhase::Stopped {
+            if vm.status.phase != VmPhaseKind::Stopped {
                 // Provisioning, Pending, Failed, Quarantined: not something
                 // to stop and not something to move. Waited on rather than
                 // forced — a Failed VM has its own requeue curve and a
@@ -497,7 +500,7 @@ pub(super) async fn unbind_refused(
     p.store
         .mutate::<Vm, _>(&name, |v| {
             v.spec.node_name = None;
-            v.status.phase = VmPhase::Pending;
+            v.status.phase = VmPhaseKind::Pending;
             v.status.message = Some(said.clone());
             v.status.pending_reason = Some(PendingReason::NoneUsable.as_str().to_string());
             v.status.refused_by.retain(|r| r.node != node);
@@ -527,7 +530,7 @@ pub(super) const REFUSAL_TTL: std::time::Duration = std::time::Duration::from_se
 /// then the object really goes away.
 pub(super) async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::Result<()> {
     if let Some(node) = vm.spec.node_name.as_deref()
-        && vm.status.phase != VmPhase::Pending
+        && vm.status.phase != VmPhaseKind::Pending
     {
         p.registry
             .send_command(
@@ -578,7 +581,7 @@ pub(super) fn volume_drift(vm: &Vm) -> Option<Drift> {
     // re-sends the current spec anyway and does it with a backoff — plugging
     // a disk into a VM that will not boot would be a command per pass with
     // nothing to receive it.
-    if !matches!(vm.status.phase, VmPhase::Running | VmPhase::Stopped) {
+    if !matches!(vm.status.phase, VmPhaseKind::Running | VmPhaseKind::Stopped) {
         return None;
     }
     let wanted = vm.spec.referenced_volumes();
@@ -700,7 +703,7 @@ pub(super) async fn hot_plug(
 /// this rule and says the same thing from the volume's side.
 pub(super) fn follow_vm(v: &mut Volume, vm: &str, node: &str) {
     v.status.node = Some(node.to_string());
-    v.status.phase = VolumePhase::Pending;
+    v.status.phase = VolumePhaseKind::Pending;
     v.status.message = Some(format!("following {vm} to {node}"));
 }
 
@@ -792,7 +795,7 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
         // before the provision reached that node. It healed itself on the
         // requeue, which is the worst kind of bug: correct in the end, and a
         // red phase in between that nothing explains.
-        if volume.status.phase != VolumePhase::Ready {
+        if volume.status.phase != VolumePhaseKind::Ready {
             anyhow::bail!(
                 "volume {name} is {} on {node}; the vm waits for it",
                 volume.status.phase.as_str()
@@ -1015,13 +1018,13 @@ pub(super) async fn dispatch_create(
 /// operator's word about a VM and it outranks a machine's.
 pub(crate) fn create_answer(
     refusal: Option<String>,
-    current: VmPhase,
-) -> Option<(VmPhase, Option<String>)> {
+    current: VmPhaseKind,
+) -> Option<(VmPhaseKind, Option<String>)> {
     match refusal {
-        None if current == VmPhase::Pending => Some((VmPhase::Provisioning, None)),
+        None if current == VmPhaseKind::Pending => Some((VmPhaseKind::Provisioning, None)),
         None => None,
-        Some(_) if current == VmPhase::Quarantined => None,
-        Some(said) => Some((VmPhase::Failed, Some(said))),
+        Some(_) if current == VmPhaseKind::Quarantined => None,
+        Some(said) => Some((VmPhaseKind::Failed, Some(said))),
     }
 }
 
@@ -1145,8 +1148,8 @@ pub(super) async fn kick(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> a
                     // A kick re-sends the spec, so it is a dispatch like any
                     // other and says so.
                     v.status.observed_generation = v.status.observed_generation.max(dispatched);
-                    if v.status.phase == VmPhase::Failed {
-                        v.status.phase = VmPhase::Provisioning;
+                    if v.status.phase == VmPhaseKind::Failed {
+                        v.status.phase = VmPhaseKind::Provisioning;
                         v.status.message = None;
                     }
                 })

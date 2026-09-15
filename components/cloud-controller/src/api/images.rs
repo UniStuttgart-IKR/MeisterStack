@@ -146,9 +146,9 @@ pub(super) async fn create_image(
     // a promise where there was none. A URL image is Pending until a node
     // that has fetched it says otherwise, because the node is what fetches.
     image.status.phase = if url.is_some() {
-        controller_api::ImagePhase::Pending
+        controller_api::ImagePhaseKind::Pending
     } else {
-        controller_api::ImagePhase::Ready
+        controller_api::ImagePhaseKind::Ready
     };
     image.status.message = url
         .is_some()

@@ -414,27 +414,27 @@ fn what_a_node_says_about_its_machine_arrives_as_the_object_says_it() {
 /// say.
 #[test]
 fn a_healthy_node_says_ready_and_the_tier_above_knows_which_kind_of_ready() {
-    use controller_api::RouterPhase;
+    use controller_api::RouterPhaseKind;
 
     // The same word, two answers, and which one it is is the CONTROLLER's
     // decision and not the node's.
     assert_eq!(
         super::ingest::observed_phase(proto::ROUTER_READY, true),
-        Some(RouterPhase::Active)
+        Some(RouterPhaseKind::Active)
     );
     assert_eq!(
         super::ingest::observed_phase(proto::ROUTER_READY, false),
-        Some(RouterPhase::Standby)
+        Some(RouterPhaseKind::Standby)
     );
     // Broken is broken on either machine, and it is the one report a standby
     // is listened to for at all.
     assert_eq!(
         super::ingest::observed_phase(proto::ROUTER_FAILED, false),
-        Some(RouterPhase::Failed)
+        Some(RouterPhaseKind::Failed)
     );
     assert_eq!(
         super::ingest::observed_phase(proto::ROUTER_FAILED, true),
-        Some(RouterPhase::Failed)
+        Some(RouterPhaseKind::Failed)
     );
     // And a word from a road nobody has written yet is refused rather than
     // defaulted — the same rule the rest of this session follows.

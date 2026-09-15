@@ -62,37 +62,43 @@ pub struct ImageSpec {
     pub labels: BTreeMap<String, String>,
 }
 
-/// Whether the bytes are there and are the right bytes.
-///
-/// A path image is `Ready` the moment it is registered: it is a catalogue
-/// entry over storage somebody else already filled, and this control plane
-/// has never claimed to check it. A URL image starts `Pending` — nobody has
-/// fetched it yet — and moves when a node says what happened.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum ImagePhase {
-    #[default]
-    Pending,
-    Ready,
-    Failed,
+reasons! {
+    /// Why an image is what it is.
+    ///
+    /// Four, and one of them is not in today's code: `NotFound` comes from
+    /// the brief (F16 and A3), because today a path image is `Ready` the
+    /// moment it is registered and nothing ever looks at the file. It is
+    /// declared here so the agent lane has a word to report and the
+    /// derivation lane a value to settle on; nothing in THIS lane writes it.
+    ImageReason [4] {
+        /// Nobody recorded one — see `VmReason::Unrecorded`.
+        #[default]
+        Unrecorded => "Unrecorded",
+        /// No node has said anything about the bytes yet. A URL image before
+        /// anybody fetched it, and — from the derivation lane on — a path
+        /// image before anybody looked.
+        AwaitingNode => "AwaitingNode",
+        /// A node's own word about the bytes, verbatim in the message.
+        Reported => "Reported",
+        /// Every node that looked for the file did not find it. F16's
+        /// answer, and the one reason here that no present writer produces.
+        NotFound => "NotFound",
+    }
 }
 
-impl ImagePhase {
-    pub const ALL: [ImagePhase; 3] = [ImagePhase::Pending, ImagePhase::Ready, ImagePhase::Failed];
-
-    /// The spelling that goes on the wire (control.proto: ImageStateReport).
-    /// `parse` is its inverse and the tests hold them to it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ImagePhase::Pending => "Pending",
-            ImagePhase::Ready => "Ready",
-            ImagePhase::Failed => "Failed",
-        }
-    }
-
-    /// Unknown input is rejected rather than defaulted — a drifting node
-    /// should be visible, not silently "Pending". The rule VmPhase follows.
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == s)
+phases! {
+    /// Whether the bytes are there and are the right bytes.
+    ///
+    /// A path image is `Ready` the moment it is registered: it is a catalogue
+    /// entry over storage somebody else already filled, and this control plane
+    /// has never claimed to check it. A URL image starts `Pending` — nobody has
+    /// fetched it yet — and moves when a node says what happened. F16 is
+    /// exactly the first half of that sentence being a promise nobody kept;
+    /// the derivation lane is where it stops being made.
+    ImagePhase / ImagePhaseKind / ImageReason / ImagePhaseWire [3] {
+        Pending { reason, message, since } => "Pending",
+        Ready { message, since } => "Ready",
+        Failed { reason, message, since } => "Failed",
     }
 }
 
@@ -117,7 +123,7 @@ pub struct ImageNodeState {
     pub cluster: String,
     /// `Ready` or `Failed`. A node never says `Pending`: an image it has no
     /// opinion about is simply not in its report, and therefore not here.
-    pub phase: ImagePhase,
+    pub phase: ImagePhaseKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -126,7 +132,7 @@ pub struct ImageNodeState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageStatus {
     #[serde(default)]
-    pub phase: ImagePhase,
+    pub phase: ImagePhaseKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// Which nodes have the bytes, and which could not read them.

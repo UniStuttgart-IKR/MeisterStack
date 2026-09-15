@@ -534,7 +534,7 @@ async fn note_unknown_release(st: &ApiState, current: &Vm, next: &Vm) {
 
 /// The sentence a released binding leaves on the object, where it leaves one.
 pub(super) fn release_event(current: &Vm, next: &Vm) -> Option<String> {
-    if current.status.phase != controller_api::VmPhase::Unknown {
+    if current.status.phase != controller_api::VmPhaseKind::Unknown {
         return None;
     }
     let node = releasing(current, next)?;

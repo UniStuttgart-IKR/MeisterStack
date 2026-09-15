@@ -55,7 +55,10 @@ pub(super) async fn reconcile_vm(
 /// record of where the VM came from, which is worth keeping whether or not
 /// anything is still tracing against it.
 pub(super) fn birth_trace(vm: &Vm) -> Option<telemetry::TraceParent> {
-    if !matches!(vm.status.phase, VmPhase::Pending | VmPhase::Provisioning) {
+    if !matches!(
+        vm.status.phase,
+        VmPhaseKind::Pending | VmPhaseKind::Provisioning
+    ) {
         return None;
     }
     telemetry::TraceParent::parse(vm.metadata.traceparent().unwrap_or_default())
@@ -98,7 +101,7 @@ pub(super) async fn reconcile_vm_traced(
         return Ok(());
     };
 
-    if vm.status.phase == VmPhase::Failed {
+    if vm.status.phase == VmPhaseKind::Failed {
         // A cluster that answered "no" answered about this VM. Asking again
         // every five seconds would not change the answer, and renaming the VM
         // to dodge it is the kind of cleverness that loses somebody's disk.
@@ -679,14 +682,14 @@ pub(super) async fn evacuate(
     }
     match controller_api::EvacuationStep::parse(&mark.step) {
         Some(controller_api::EvacuationStep::Stopping) => {
-            if vm.status.phase == VmPhase::Running || vm.status.phase == VmPhase::Paused {
+            if vm.status.phase == VmPhaseKind::Running || vm.status.phase == VmPhaseKind::Paused {
                 // Level-triggered: the same dispatch every pass until the
                 // phase moves, and idempotent at the cluster because what
                 // changes down there is one object's desired state.
                 return dispatch_create(store, registry, cluster, vm, false, book, traceparent)
                     .await;
             }
-            if vm.status.phase != VmPhase::Stopped {
+            if vm.status.phase != VmPhaseKind::Stopped {
                 debug!(vm = %name, phase = vm.status.phase.as_str(),
                        "not stopped yet; the evacuation waits");
                 return Ok(());
@@ -770,8 +773,8 @@ pub(super) async fn dispatch_create(
                     // Anticipation never overwrites observation. Dispatching
                     // is a guess about the future; only a VM nobody has
                     // reported on yet may be moved by one.
-                    if v.status.phase == VmPhase::Pending {
-                        v.status.phase = VmPhase::Provisioning;
+                    if v.status.phase == VmPhaseKind::Pending {
+                        v.status.phase = VmPhaseKind::Provisioning;
                         v.status.message = None;
                     }
                 })
@@ -784,7 +787,7 @@ pub(super) async fn dispatch_create(
             warn!(cluster, error = %msg, "cluster refused the create");
             store
                 .mutate::<Vm, _>(&name, |v| {
-                    v.status.phase = VmPhase::Failed;
+                    v.status.phase = VmPhaseKind::Failed;
                     v.status.message = Some(msg.clone());
                     v.status.cluster_name = v.spec.cluster_name.clone();
                     v.status.observed_at = Some(Utc::now());

@@ -271,7 +271,7 @@ pub(super) async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result
 /// to.
 pub(super) async fn check_base_image(store: &EtcdStore, name: &str) -> Result<(), ApiError> {
     match store.get::<Image>(name).await {
-        Ok(image) if image.status.phase == controller_api::ImagePhase::Failed => {
+        Ok(image) if image.status.phase == controller_api::ImagePhaseKind::Failed => {
             Err(invalid(format!(
                 "base_image {:?} is not usable: {}",
                 image.metadata.name,
@@ -990,7 +990,7 @@ async fn note_unknown_release(st: &ApiState, current: &Vm, next: &Vm) {
 
 /// The sentence a released binding leaves on the object, where it leaves one.
 pub(super) fn release_event(current: &Vm, next: &Vm) -> Option<String> {
-    if current.status.phase != controller_api::VmPhase::Unknown {
+    if current.status.phase != controller_api::VmPhaseKind::Unknown {
         return None;
     }
     let cluster = releasing(current, next)?;
@@ -1997,7 +1997,7 @@ mod tests {
                 vm: json!({ "vcpus": 1 }),
             },
         );
-        vm.status.phase = controller_api::VmPhase::Stopped;
+        vm.status.phase = controller_api::VmPhaseKind::Stopped;
         vm
     }
 
@@ -2023,7 +2023,7 @@ mod tests {
         let at = |secs: i64| chrono::DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap();
         let now = at(1_000);
         let mut vm = stopped_vm();
-        vm.status.phase = controller_api::VmPhase::Unknown;
+        vm.status.phase = controller_api::VmPhaseKind::Unknown;
 
         // Silent: 409, because nothing about the request is malformed — the
         // state of the world refuses it, and that state ends by itself.
@@ -2046,7 +2046,7 @@ mod tests {
 
         // `Failed` is the cluster's own word that the guest is not running.
         let mut failed = vm.clone();
-        failed.status.phase = controller_api::VmPhase::Failed;
+        failed.status.phase = controller_api::VmPhaseKind::Failed;
         holder_refusal(&failed, "cluster-1", None, now).expect("Failed is evidence");
 
         // And what the object is left carrying when the release does land.
@@ -2073,21 +2073,21 @@ mod tests {
         for (strategy, phase) in [
             (
                 controller_api::RunStrategy::Running,
-                controller_api::VmPhase::Running,
+                controller_api::VmPhaseKind::Running,
             ),
             // Told to stop, not stopped yet: the one the second condition is
             // for.
             (
                 controller_api::RunStrategy::Stopped,
-                controller_api::VmPhase::Running,
+                controller_api::VmPhaseKind::Running,
             ),
             (
                 controller_api::RunStrategy::Stopped,
-                controller_api::VmPhase::Provisioning,
+                controller_api::VmPhaseKind::Provisioning,
             ),
             (
                 controller_api::RunStrategy::Paused,
-                controller_api::VmPhase::Paused,
+                controller_api::VmPhaseKind::Paused,
             ),
         ] {
             let mut vm = stopped_vm();
@@ -2108,8 +2108,8 @@ mod tests {
     #[test]
     fn a_failed_or_unknown_vm_may_let_its_cluster_binding_go() {
         for phase in [
-            controller_api::VmPhase::Failed,
-            controller_api::VmPhase::Unknown,
+            controller_api::VmPhaseKind::Failed,
+            controller_api::VmPhaseKind::Unknown,
         ] {
             let mut vm = stopped_vm();
             vm.status.phase = phase;

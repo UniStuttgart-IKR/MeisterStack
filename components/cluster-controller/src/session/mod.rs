@@ -34,9 +34,9 @@ use common::capability::{self, Locality};
 use controller_api::events::{self, Happening};
 use controller_api::{
     Ack, Authenticated, EtcdStore, Node, NodeSpec, Observation, Peer, Pending, StoreError, Vm,
-    Volume, VolumePhase, VolumeSnapshot, VolumeSnapshotPhase,
+    Volume, VolumePhaseKind, VolumeSnapshot, VolumeSnapshotPhaseKind,
 };
-use controller_api::{EventType, Resource, VmPhase};
+use controller_api::{EventType, Resource, VmPhaseKind};
 
 use crate::reconcile::build_spec_json;
 

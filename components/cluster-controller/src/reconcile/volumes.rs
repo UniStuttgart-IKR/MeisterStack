@@ -127,13 +127,13 @@ pub(super) fn pool_status(
     driver: &str,
     verdict: PoolLocality<'_>,
     previous: Option<Locality>,
-) -> (StoragePoolPhase, Option<Locality>, Option<String>) {
+) -> (StoragePoolPhaseKind, Option<Locality>, Option<String>) {
     match verdict {
-        PoolLocality::Agreed(l) => (StoragePoolPhase::Ready, Some(l), None),
+        PoolLocality::Agreed(l) => (StoragePoolPhaseKind::Ready, Some(l), None),
         // NOT Failed: a pool whose nodes are all down, or all older than the
         // field, is a pool nothing is known about, and placement falls back
         // to the soft preference it always had.
-        PoolLocality::Unheard => (StoragePoolPhase::Pending, None, None),
+        PoolLocality::Unheard => (StoragePoolPhaseKind::Pending, None, None),
         // The locality is deliberately KEPT on a disagreement: what was
         // learned before the version mix is still the better guess of the
         // two, and the phase beside it is what says not to trust it. Dropping
@@ -145,7 +145,7 @@ pub(super) fn pool_status(
             other,
             other_says,
         } => (
-            StoragePoolPhase::Failed,
+            StoragePoolPhaseKind::Failed,
             previous,
             Some(format!(
                 "nodes disagree about storage driver {driver}: {other} says {}, {node} says {}; \
@@ -174,7 +174,7 @@ pub(super) async fn write_pool_status(
     {
         return Ok(());
     }
-    if phase == StoragePoolPhase::Failed {
+    if phase == StoragePoolPhaseKind::Failed {
         warn!(pool = %pool.metadata.name,
               reason = %message.clone().unwrap_or_default(),
               "storage pool is inconsistent");
@@ -225,7 +225,7 @@ pub(super) async fn place_volumes(p: &Pass<'_>) -> anyhow::Result<()> {
 
 /// The node's word for "these bytes do not exist any more".
 ///
-/// Not a `VolumePhase`, and it must not become one: an object that reaches it
+/// Not a `VolumePhaseKind`, and it must not become one: an object that reaches it
 /// is deleted rather than parked. It travels as a string on the status road
 /// and is read in exactly two places — the ingest, which maps it onto the
 /// `Releasing` an outgoing volume already carries, and `release`, which reads
@@ -293,9 +293,9 @@ pub(super) fn next_for(volume: &Volume) -> Next<'_> {
         return Next::Place;
     };
     match volume.status.phase {
-        VolumePhase::Pending => Next::Provision(node),
-        VolumePhase::Failed => Next::Requeue(node),
-        VolumePhase::Ready if grew(volume) => Next::Resize(node),
+        VolumePhaseKind::Pending => Next::Provision(node),
+        VolumePhaseKind::Failed => Next::Requeue(node),
+        VolumePhaseKind::Ready if grew(volume) => Next::Resize(node),
         _ => Next::Settled,
     }
 }
@@ -373,7 +373,7 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
         warn!(volume = %name, node, error = %message, "the backend did not grow");
         p.store
             .mutate::<Volume, _>(&name, |v| {
-                v.status.phase = VolumePhase::Failed;
+                v.status.phase = VolumePhaseKind::Failed;
                 v.status.message = Some(message.clone());
             })
             .await?;
@@ -450,7 +450,7 @@ pub(super) async fn provision_volume(
         warn!(volume = %name, %why, "provision cannot start");
         p.store
             .mutate::<Volume, _>(&name, |v| {
-                v.status.phase = VolumePhase::Failed;
+                v.status.phase = VolumePhaseKind::Failed;
                 v.status.message = Some(why.clone());
             })
             .await?;
@@ -464,7 +464,7 @@ pub(super) async fn provision_volume(
     let from_snapshot = match &volume.spec.from_snapshot {
         None => String::new(),
         Some(named) => match p.store.get::<VolumeSnapshot>(named).await {
-            Ok(s) if s.status.phase == VolumeSnapshotPhase::Ready => s.metadata.uid,
+            Ok(s) if s.status.phase == VolumeSnapshotPhaseKind::Ready => s.metadata.uid,
             // Not ready is a WAIT, not a refusal — the copy is being made,
             // and the volume waits as Pending the same way a VM waits for its
             // disk. Gone is a refusal: no later pass can make a volume from a
@@ -479,7 +479,7 @@ pub(super) async fn provision_volume(
                 warn!(volume = %name, %message, "provision cannot start");
                 p.store
                     .mutate::<Volume, _>(&name, |v| {
-                        v.status.phase = VolumePhase::Failed;
+                        v.status.phase = VolumePhaseKind::Failed;
                         v.status.message = Some(message.clone());
                     })
                     .await?;
@@ -489,7 +489,7 @@ pub(super) async fn provision_volume(
         },
     };
     let mut sent = volume.clone();
-    sent.status.phase = VolumePhase::Provisioning;
+    sent.status.phase = VolumePhaseKind::Provisioning;
     sent.status.message = None;
     // The claim before the command, like everywhere else in this file: a CAS
     // that loses means another replica is already sending, and sending twice
@@ -524,8 +524,8 @@ pub(super) async fn provision_volume(
         warn!(volume = %name, node, error = %message, "provision could not be delivered");
         p.store
             .mutate::<Volume, _>(&name, |v| {
-                if v.status.phase == VolumePhase::Provisioning {
-                    v.status.phase = VolumePhase::Failed;
+                if v.status.phase == VolumePhaseKind::Provisioning {
+                    v.status.phase = VolumePhaseKind::Failed;
                     v.status.message = Some(message.clone());
                 }
             })
@@ -576,7 +576,7 @@ pub(super) async fn requeue_volume(
         .mutate::<Volume, _>(&name, |v| {
             v.status.requeue_attempts = v.status.requeue_attempts.saturating_add(1);
             v.status.last_requeue = Some(now);
-            v.status.phase = VolumePhase::Pending;
+            v.status.phase = VolumePhaseKind::Pending;
         })
         .await?;
     info!(volume = %name, attempt = kicked.status.requeue_attempts, "requeueing a failed volume");
@@ -796,14 +796,14 @@ pub(super) async fn note_volume_releasing(
     volume: &Volume,
     reason: String,
 ) -> anyhow::Result<()> {
-    if volume.status.phase == VolumePhase::Releasing
+    if volume.status.phase == VolumePhaseKind::Releasing
         && volume.status.message.as_deref() == Some(reason.as_str())
     {
         return Ok(());
     }
     p.store
         .mutate::<Volume, _>(&volume.metadata.name, |v| {
-            v.status.phase = VolumePhase::Releasing;
+            v.status.phase = VolumePhaseKind::Releasing;
             v.status.message = Some(reason.clone());
         })
         .await?;
@@ -912,7 +912,7 @@ pub(super) async fn place_volume(
     // volume sat in it for ever. The phase moves when the COMMAND goes, one
     // pass later, and `Pending` in between is exactly true: chosen, not yet
     // asked.
-    bound.status.phase = VolumePhase::Pending;
+    bound.status.phase = VolumePhaseKind::Pending;
     bound.status.message = None;
     match p.store.update(&bound).await {
         Ok(_) => info!(volume = %name, node = %node, pool = %bound.spec.pool,
@@ -942,7 +942,7 @@ pub(super) async fn note_pending(
     p.store
         .mutate::<Volume, _>(&volume.metadata.name, |v| {
             v.status.message = Some(reason.clone());
-            v.status.phase = VolumePhase::Pending;
+            v.status.phase = VolumePhaseKind::Pending;
         })
         .await?;
     Ok(())

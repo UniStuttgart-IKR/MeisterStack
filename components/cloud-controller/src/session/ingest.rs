@@ -95,7 +95,7 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
                   "router status from a cluster it is not bound to");
             continue;
         }
-        let Some(phase) = controller_api::RouterPhase::parse(&reported.phase) else {
+        let Some(phase) = controller_api::RouterPhaseKind::parse(&reported.phase) else {
             warn!(router = %router.metadata.name, phase = %reported.phase,
                   "unknown router phase from cluster");
             continue;
@@ -138,7 +138,7 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
                                 None if reported.node.is_empty() => phase.as_str().to_string(),
                                 None => format!("{} on {}", phase.as_str(), reported.node),
                             },
-                            event_type: if phase == controller_api::RouterPhase::Failed {
+                            event_type: if phase == controller_api::RouterPhaseKind::Failed {
                                 EventType::Warning
                             } else {
                                 EventType::Normal
@@ -343,7 +343,7 @@ pub(super) async fn forget_unbound(
                 // Pending and not Stopped, exactly as one tier down: the VM
                 // is nowhere, and the phase an operator reads has to say that
                 // rather than describing a guest that no longer exists.
-                v.status.phase = VmPhase::Pending;
+                v.status.phase = VmPhaseKind::Pending;
                 v.status.message = Some(format!("cluster {cluster} let go; waiting to be placed"));
                 v.status.volumes.clear();
                 v.status.reschedules = v.status.reschedules.saturating_add(1);
@@ -496,7 +496,7 @@ pub(super) fn changed<'a>(
     cluster: &str,
     reported: &proto::VmStatusReport,
     seen: Observation<'a>,
-) -> Option<(&'a Vm, VmPhase, Option<String>)> {
+) -> Option<(&'a Vm, VmPhaseKind, Option<String>)> {
     match seen {
         Observation::Unknown => {
             // Not a phase we can file anywhere. It is also not nothing:
@@ -532,12 +532,12 @@ pub(super) async fn note_phase(
     store: &EtcdStore,
     name: &str,
     uid: &str,
-    phase: VmPhase,
+    phase: VmPhaseKind,
     message: &Option<String>,
     tenant: &Option<String>,
 ) {
     let kind = match phase {
-        VmPhase::Failed | VmPhase::Quarantined => EventType::Warning,
+        VmPhaseKind::Failed | VmPhaseKind::Quarantined => EventType::Warning,
         _ => EventType::Normal,
     };
     events::record(

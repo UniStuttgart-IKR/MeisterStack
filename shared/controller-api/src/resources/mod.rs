@@ -17,6 +17,12 @@ use crate::object::{Metadata, Object, Resource};
 
 pub const API_VERSION: &str = "meister.io/v1";
 
+#[macro_use]
+// The phase machinery every resource below uses, so it has to be textually
+// first: `macro_rules!` is in scope from its definition on, and `#[macro_use]`
+// on a module is what carries it to the sibling modules.
+mod phase;
+
 mod cluster;
 mod counter;
 mod csr;
@@ -43,6 +49,7 @@ pub use image::*;
 pub use migration::*;
 pub use network::*;
 pub use node::*;
+pub use phase::*;
 pub use pool::*;
 pub use secret::*;
 pub use tenant::*;

@@ -348,7 +348,7 @@ pub(super) async fn move_volumes(
                 v.status.cluster = Some(cluster.to_string());
                 v.status.observed_at = None;
                 v.status.observed_generation = 0;
-                v.status.phase = controller_api::VolumePhase::Pending;
+                v.status.phase = controller_api::VolumePhaseKind::Pending;
                 v.status.node = None;
                 v.status.message = Some(format!("moving to {cluster} with its vm"));
             })

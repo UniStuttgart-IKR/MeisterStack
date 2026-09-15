@@ -41,15 +41,21 @@ fn a_volume_is_opened_and_closed_by_name_and_the_list_stays_a_set() {
 #[test]
 fn only_a_migration_under_way_lets_two_nodes_hold_one_volume() {
     assert!(!second_open_is_a_migration(None));
-    assert!(!second_open_is_a_migration(Some(VmMigrationPhase::Pending)));
-    assert!(second_open_is_a_migration(Some(
-        VmMigrationPhase::Preparing
-    )));
-    assert!(second_open_is_a_migration(Some(VmMigrationPhase::Running)));
     assert!(!second_open_is_a_migration(Some(
-        VmMigrationPhase::Succeeded
+        VmMigrationPhaseKind::Pending
     )));
-    assert!(!second_open_is_a_migration(Some(VmMigrationPhase::Failed)));
+    assert!(second_open_is_a_migration(Some(
+        VmMigrationPhaseKind::Preparing
+    )));
+    assert!(second_open_is_a_migration(Some(
+        VmMigrationPhaseKind::Running
+    )));
+    assert!(!second_open_is_a_migration(Some(
+        VmMigrationPhaseKind::Succeeded
+    )));
+    assert!(!second_open_is_a_migration(Some(
+        VmMigrationPhaseKind::Failed
+    )));
 }
 
 /// One pool, two spellings, one answer — and the short form first,
@@ -147,15 +153,15 @@ fn two_clusters_disagree_unless_both_describe_the_same_backend() {
 #[test]
 fn the_phases_are_spelled_alike_and_the_pending_category_reaches_the_api() {
     assert_eq!(
-        serde_json::to_value(VmPhase::Provisioning).unwrap(),
+        serde_json::to_value(VmPhaseKind::Provisioning).unwrap(),
         serde_json::json!("Provisioning")
     );
     assert_eq!(
-        serde_json::to_value(VolumePhase::Provisioning).unwrap(),
+        serde_json::to_value(VolumePhaseKind::Provisioning).unwrap(),
         serde_json::json!("Provisioning")
     );
     assert_eq!(
-        serde_json::to_value(VolumePhase::Releasing).unwrap(),
+        serde_json::to_value(VolumePhaseKind::Releasing).unwrap(),
         serde_json::json!("Releasing")
     );
 
@@ -209,16 +215,16 @@ fn every_resource_has_its_own_directory_and_its_own_kind() {
 /// from the list without the enum changing.
 #[test]
 fn the_variant_lists_name_every_variant() {
-    for phase in VmPhase::ALL {
+    for phase in VmPhaseKind::ALL {
         match phase {
-            VmPhase::Pending
-            | VmPhase::Provisioning
-            | VmPhase::Running
-            | VmPhase::Stopped
-            | VmPhase::Paused
-            | VmPhase::Failed
-            | VmPhase::Quarantined
-            | VmPhase::Unknown => {}
+            VmPhaseKind::Pending
+            | VmPhaseKind::Provisioning
+            | VmPhaseKind::Running
+            | VmPhaseKind::Stopped
+            | VmPhaseKind::Paused
+            | VmPhaseKind::Failed
+            | VmPhaseKind::Quarantined
+            | VmPhaseKind::Unknown => {}
         }
     }
     for strategy in RunStrategy::ALL {
@@ -226,14 +232,14 @@ fn the_variant_lists_name_every_variant() {
             RunStrategy::Running | RunStrategy::Stopped | RunStrategy::Paused => {}
         }
     }
-    for phase in RouterPhase::ALL {
+    for phase in RouterPhaseKind::ALL {
         match phase {
-            RouterPhase::Pending
-            | RouterPhase::Provisioning
-            | RouterPhase::Active
-            | RouterPhase::Standby
-            | RouterPhase::Failed
-            | RouterPhase::Unknown => {}
+            RouterPhaseKind::Pending
+            | RouterPhaseKind::Provisioning
+            | RouterPhaseKind::Active
+            | RouterPhaseKind::Standby
+            | RouterPhaseKind::Failed
+            | RouterPhaseKind::Unknown => {}
         }
     }
     for kind in NatKind::ALL {
@@ -243,13 +249,13 @@ fn the_variant_lists_name_every_variant() {
     }
     // No duplicates hiding a missing one.
     let spellings: std::collections::BTreeSet<_> =
-        VmPhase::ALL.iter().map(|p| p.as_str()).collect();
-    assert_eq!(spellings.len(), VmPhase::ALL.len());
-    assert_eq!(VmPhase::ALL.iter().filter(|p| p.is_stable()).count(), 3);
+        VmPhaseKind::ALL.iter().map(|p| p.as_str()).collect();
+    assert_eq!(spellings.len(), VmPhaseKind::ALL.len());
+    assert_eq!(VmPhaseKind::ALL.iter().filter(|p| p.is_stable()).count(), 3);
 
     let spellings: std::collections::BTreeSet<_> =
-        RouterPhase::ALL.iter().map(|p| p.as_str()).collect();
-    assert_eq!(spellings.len(), RouterPhase::ALL.len());
+        RouterPhaseKind::ALL.iter().map(|p| p.as_str()).collect();
+    assert_eq!(spellings.len(), RouterPhaseKind::ALL.len());
     let spellings: std::collections::BTreeSet<_> =
         NatKind::ALL.iter().map(|k| k.as_str()).collect();
     assert_eq!(spellings.len(), NatKind::ALL.len());
@@ -262,12 +268,16 @@ fn the_variant_lists_name_every_variant() {
 /// rather than defaulted to Pending.
 #[test]
 fn every_router_phase_parses_from_its_own_spelling() {
-    for phase in RouterPhase::ALL {
-        assert_eq!(RouterPhase::parse(phase.as_str()), Some(phase));
+    for phase in RouterPhaseKind::ALL {
+        assert_eq!(RouterPhaseKind::parse(phase.as_str()), Some(phase));
     }
-    assert_eq!(RouterPhase::parse("Ascended"), None);
-    assert_eq!(RouterPhase::parse("active"), None, "the case is part of it");
-    assert_eq!(RouterPhase::default(), RouterPhase::Pending);
+    assert_eq!(RouterPhaseKind::parse("Ascended"), None);
+    assert_eq!(
+        RouterPhaseKind::parse("active"),
+        None,
+        "the case is part of it"
+    );
+    assert_eq!(RouterPhaseKind::default(), RouterPhaseKind::Pending);
 }
 
 /// OVN's spelling, unchanged all the way down: the string in the object,
@@ -410,19 +420,19 @@ fn a_workload_that_names_no_class_is_of_its_own_kinds_class() {
 #[test]
 fn every_phase_parses_from_its_own_spelling() {
     for phase in [
-        VmPhase::Pending,
-        VmPhase::Provisioning,
-        VmPhase::Running,
-        VmPhase::Stopped,
-        VmPhase::Paused,
-        VmPhase::Failed,
-        VmPhase::Quarantined,
+        VmPhaseKind::Pending,
+        VmPhaseKind::Provisioning,
+        VmPhaseKind::Running,
+        VmPhaseKind::Stopped,
+        VmPhaseKind::Paused,
+        VmPhaseKind::Failed,
+        VmPhaseKind::Quarantined,
     ] {
-        assert_eq!(VmPhase::parse(&format!("{phase:?}")), Some(phase));
-        assert_eq!(VmPhase::parse(phase.as_str()), Some(phase));
+        assert_eq!(VmPhaseKind::parse(&format!("{phase:?}")), Some(phase));
+        assert_eq!(VmPhaseKind::parse(phase.as_str()), Some(phase));
     }
-    assert_eq!(VmPhase::parse("running"), None);
-    assert_eq!(VmPhase::parse(""), None);
+    assert_eq!(VmPhaseKind::parse("running"), None);
+    assert_eq!(VmPhaseKind::parse(""), None);
 }
 
 /// The generation pair is spelled the way the rest of this API is.
@@ -600,7 +610,7 @@ fn a_pool_states_its_locality_and_cannot_be_told_one() {
         "the spec has no locality and never gets one: {spec}"
     );
 
-    pool.status.phase = StoragePoolPhase::Ready;
+    pool.status.phase = StoragePoolPhaseKind::Ready;
     pool.status.locality = Some(Locality::NodeLocal);
     let status = serde_json::to_value(&pool.status).unwrap();
     assert_eq!(status["phase"], "Ready");
@@ -609,7 +619,7 @@ fn a_pool_states_its_locality_and_cannot_be_told_one() {
     // A pool nothing is known about carries neither key, which is what
     // every pool written before this field looks like on the way back in.
     let old: StoragePoolStatus = serde_json::from_str("{}").unwrap();
-    assert_eq!(old.phase, StoragePoolPhase::Pending);
+    assert_eq!(old.phase, StoragePoolPhaseKind::Pending);
     assert_eq!(old.locality, None);
 }
 

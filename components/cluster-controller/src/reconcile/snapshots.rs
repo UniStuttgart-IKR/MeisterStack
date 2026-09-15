@@ -50,9 +50,9 @@ pub(super) async fn reconcile_snapshot(
         return drop_snapshot(p, &snapshot).await;
     }
     match snapshot.status.phase {
-        VolumeSnapshotPhase::Pending => dispatch_snapshot(p, &snapshot).await,
-        VolumeSnapshotPhase::Failed => requeue_snapshot(p, &snapshot).await,
-        VolumeSnapshotPhase::Creating | VolumeSnapshotPhase::Ready => Ok(()),
+        VolumeSnapshotPhaseKind::Pending => dispatch_snapshot(p, &snapshot).await,
+        VolumeSnapshotPhaseKind::Failed => requeue_snapshot(p, &snapshot).await,
+        VolumeSnapshotPhaseKind::Creating | VolumeSnapshotPhaseKind::Ready => Ok(()),
     }
 }
 
@@ -117,7 +117,8 @@ pub(super) async fn dispatch_snapshot(
     };
     // Not ready yet is a WAIT and not a refusal, exactly as it is for a VM
     // that names a disk still being made.
-    let (Some(node), VolumePhase::Ready) = (volume.status.node.clone(), volume.status.phase) else {
+    let (Some(node), VolumePhaseKind::Ready) = (volume.status.node.clone(), volume.status.phase)
+    else {
         debug!(snapshot = %name, volume = %volume.metadata.name,
                "the volume is not ready yet; the snapshot waits");
         return Ok(());
@@ -128,7 +129,7 @@ pub(super) async fn dispatch_snapshot(
     // goes on the object HERE, so that a later drop finds the machine even if
     // the volume has since gone.
     let mut sent = snapshot.clone();
-    sent.status.phase = VolumeSnapshotPhase::Creating;
+    sent.status.phase = VolumeSnapshotPhaseKind::Creating;
     sent.status.node = Some(node.clone());
     sent.status.message = None;
     match p.store.update(&sent).await {
@@ -356,7 +357,7 @@ pub(super) async fn holder_of(
     // the node from the BINDING rather than from the status, for the reason
     // the status ingest gives.
     match (vm.status.phase, vm.spec.node_name.clone()) {
-        (VmPhase::Running, Some(node)) => Ok(Some((vm.metadata.uid, node))),
+        (VmPhaseKind::Running, Some(node)) => Ok(Some((vm.metadata.uid, node))),
         _ => Ok(None),
     }
 }
@@ -371,7 +372,7 @@ pub(super) async fn note_snapshot_failed(
     warn!(snapshot = %snapshot.metadata.name, error = %message, "snapshot failed");
     p.store
         .mutate::<VolumeSnapshot, _>(&snapshot.metadata.name, |s| {
-            s.status.phase = VolumeSnapshotPhase::Failed;
+            s.status.phase = VolumeSnapshotPhaseKind::Failed;
             s.status.message = Some(message.clone());
         })
         .await?;
@@ -404,7 +405,7 @@ pub(super) async fn requeue_snapshot(
     let kicked = p
         .store
         .mutate::<VolumeSnapshot, _>(&name, |s| {
-            s.status.phase = VolumeSnapshotPhase::Pending;
+            s.status.phase = VolumeSnapshotPhaseKind::Pending;
             s.status.requeue_attempts = s.status.requeue_attempts.saturating_add(1);
             s.status.last_requeue = Some(now);
         })

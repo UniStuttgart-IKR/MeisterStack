@@ -623,7 +623,7 @@ pub(super) async fn volume_bindings(store: &EtcdStore, vm: &Vm) -> anyhow::Resul
             }
             Err(e) => return Err(e.into()),
         };
-        if volume.status.phase != VolumePhase::Ready {
+        if volume.status.phase != VolumePhaseKind::Ready {
             return Ok(Bindings::NotReady(format!(
                 "volume {name} is {}: {}",
                 volume.status.phase.as_str(),

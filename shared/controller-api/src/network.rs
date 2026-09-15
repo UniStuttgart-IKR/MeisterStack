@@ -26,7 +26,7 @@ use std::net::Ipv4Addr;
 use common::net::Ipv4Ranges;
 
 use crate::resources::{
-    FloatingIp, NatKind, NatRule, ProviderNetwork, Router, RouterPhase, accepts_class,
+    FloatingIp, NatKind, NatRule, ProviderNetwork, Router, RouterPhaseKind, accepts_class,
 };
 use crate::scheduler::{Candidate, is_alive};
 
@@ -298,7 +298,7 @@ pub struct RouterOutcome {
     /// distinction this is — a node that could not be reached is not one that
     /// said no.
     pub refused: Vec<String>,
-    pub phase: RouterPhase,
+    pub phase: RouterPhaseKind,
     pub message: Option<String>,
 }
 
@@ -425,22 +425,22 @@ impl NetworkBackend for MeisterNetwork {
 /// Pending, one every candidate refused is Failed, one that is built and
 /// speaking is Active, one that is built and deliberately silent is Standby,
 /// and one whose machines could not be reached is Unknown — never Failed,
-/// for the reason `VmPhase::Unknown` gives.
-fn verdict(plan: &RouterPlan, out: &RouterOutcome, unreachable: &[String]) -> RouterPhase {
+/// for the reason `VmPhaseKind::Unknown` gives.
+fn verdict(plan: &RouterPlan, out: &RouterOutcome, unreachable: &[String]) -> RouterPhaseKind {
     if plan.nodes.is_empty() {
-        return RouterPhase::Pending;
+        return RouterPhaseKind::Pending;
     }
     if out.built.is_empty() {
         return if unreachable.is_empty() {
-            RouterPhase::Failed
+            RouterPhaseKind::Failed
         } else {
-            RouterPhase::Unknown
+            RouterPhaseKind::Unknown
         };
     }
     if out.active_node.is_empty() {
-        RouterPhase::Standby
+        RouterPhaseKind::Standby
     } else {
-        RouterPhase::Active
+        RouterPhaseKind::Active
     }
 }
 
@@ -862,7 +862,7 @@ mod tests {
             vec![("gw-2".to_string(), false), ("gw-1".to_string(), true)]
         );
         assert_eq!(*sink.destroyed.lock().unwrap(), vec!["gw-old".to_string()]);
-        assert_eq!(out.phase, RouterPhase::Active);
+        assert_eq!(out.phase, RouterPhaseKind::Active);
         assert_eq!(out.active_node, "gw-1");
         assert_eq!(out.built, ["gw-2", "gw-1"]);
     }
@@ -885,7 +885,7 @@ mod tests {
         assert_eq!(out.built, ["gw-2"]);
         assert_eq!(
             out.phase,
-            RouterPhase::Standby,
+            RouterPhaseKind::Standby,
             "built, and nobody speaking"
         );
 
@@ -897,7 +897,7 @@ mod tests {
             .realise(&quiet, &plan_on(&["gw-1"], Some("gw-1"), &[]))
             .await;
         assert!(out.refused.is_empty(), "silence is not a refusal");
-        assert_eq!(out.phase, RouterPhase::Unknown);
+        assert_eq!(out.phase, RouterPhaseKind::Unknown);
 
         // Everything refused, nothing unreachable: that IS a failure.
         let all_refuse = Recorder {
@@ -907,13 +907,13 @@ mod tests {
         let out = MeisterNetwork
             .realise(&all_refuse, &plan_on(&["gw-1"], Some("gw-1"), &[]))
             .await;
-        assert_eq!(out.phase, RouterPhase::Failed);
+        assert_eq!(out.phase, RouterPhaseKind::Failed);
 
         // And a router nobody would carry is Pending, whatever the sink says.
         let out = MeisterNetwork
             .realise(&Recorder::default(), &plan_on(&[], None, &[]))
             .await;
-        assert_eq!(out.phase, RouterPhase::Pending);
+        assert_eq!(out.phase, RouterPhaseKind::Pending);
     }
 
     /// The config seam, the same shape `SchedulerConfig` has: a word chooses

@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use controller_api::{
-    Candidate, EtcdStore, Node, Resource, Scheduler, StoreError, Vm, VmMigration, VmMigrationPhase,
-    VmMigrationStatus, VmPhase, Volume,
+    Candidate, EtcdStore, Node, Resource, Scheduler, StoreError, Vm, VmMigration,
+    VmMigrationPhaseKind, VmMigrationStatus, VmPhaseKind, Volume,
 };
 use proto::StatusReport;
 use tracing::{debug, info, warn};
@@ -105,7 +105,7 @@ pub async fn migration_in_flight(store: &EtcdStore, vm: &Vm) -> anyhow::Result<b
 ///
 /// Separate from `migration_in_flight` because a caller that wants to SAY
 /// which phase allowed a second open needs the phase and not a bool.
-pub fn phase_for(migrations: &[VmMigration], vm: &Vm) -> Option<VmMigrationPhase> {
+pub fn phase_for(migrations: &[VmMigration], vm: &Vm) -> Option<VmMigrationPhaseKind> {
     migrations
         .iter()
         .filter(|m| {
@@ -421,12 +421,12 @@ async fn step(
     };
 
     match migration.status.phase {
-        VmMigrationPhase::Pending => {
+        VmMigrationPhaseKind::Pending => {
             prepare(store, dispatch, scheduler, nodes, &migration, &vm).await
         }
-        VmMigrationPhase::Preparing => send(store, dispatch, timeouts, &migration, &vm).await,
-        VmMigrationPhase::Running => settle(store, dispatch, timeouts, &migration, &vm).await,
-        VmMigrationPhase::Succeeded | VmMigrationPhase::Failed => Ok(()),
+        VmMigrationPhaseKind::Preparing => send(store, dispatch, timeouts, &migration, &vm).await,
+        VmMigrationPhaseKind::Running => settle(store, dispatch, timeouts, &migration, &vm).await,
+        VmMigrationPhaseKind::Succeeded | VmMigrationPhaseKind::Failed => Ok(()),
     }
 }
 
@@ -461,7 +461,7 @@ async fn prepare(
         )
         .await;
     };
-    if vm.status.phase != VmPhase::Running {
+    if vm.status.phase != VmPhaseKind::Running {
         return fail(
             store,
             migration,
@@ -497,7 +497,7 @@ async fn prepare(
     // migration, and two replicas preparing one migration would build two
     // destinations for one guest.
     let mut claimed = migration.clone();
-    claimed.status.phase = VmMigrationPhase::Preparing;
+    claimed.status.phase = VmMigrationPhaseKind::Preparing;
     claimed.status.source_node = Some(source.clone());
     claimed.status.target_node = Some(target.clone());
     claimed.status.started_at = Some(Utc::now());
@@ -782,7 +782,7 @@ async fn send(
     }
 
     let mut claimed = migration.clone();
-    claimed.status.phase = VmMigrationPhase::Running;
+    claimed.status.phase = VmMigrationPhaseKind::Running;
     claimed.status.message = Some(format!("sending to {target} at {peer}"));
     match store.update(&claimed).await {
         Ok(_) => {}
@@ -925,7 +925,8 @@ async fn settle(
         return fail(store, migration, "this migration has no ends".to_string()).await;
     };
 
-    let arrived = migration.status.target_reported.as_deref() == Some(VmPhase::Running.as_str());
+    let arrived =
+        migration.status.target_reported.as_deref() == Some(VmPhaseKind::Running.as_str());
     if !arrived {
         // The one answer that ends a migration before its timeout does, and
         // the one D16 made available: the SOURCE's own word about the send.
@@ -1013,7 +1014,7 @@ async fn settle(
     let finished = Utc::now();
     store
         .mutate::<VmMigration, _>(&name, |m| {
-            m.status.phase = VmMigrationPhase::Succeeded;
+            m.status.phase = VmMigrationPhaseKind::Succeeded;
             m.status.finished_at = Some(finished);
             m.status.message = Some(format!("{} is on {target}", vm.metadata.name));
         })
@@ -1075,7 +1076,7 @@ async fn fail(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow
     warn!(migration = %name, vm = %migration.spec.vm, reason = %why, "migration failed");
     store
         .mutate::<VmMigration, _>(&name, |m| {
-            m.status.phase = VmMigrationPhase::Failed;
+            m.status.phase = VmMigrationPhaseKind::Failed;
             m.status.finished_at = Some(Utc::now());
             m.status.message = Some(why.clone());
         })
@@ -1280,7 +1281,7 @@ mod tests {
         )
     }
 
-    fn migration(vm: &str, phase: VmMigrationPhase) -> VmMigration {
+    fn migration(vm: &str, phase: VmMigrationPhaseKind) -> VmMigration {
         let mut m = VmMigration::declare(
             &format!("{vm}-x"),
             VmMigrationSpec {
@@ -1300,11 +1301,11 @@ mod tests {
     #[test]
     fn only_a_migration_that_is_under_way_permits_a_second_open() {
         for (phase, allowed) in [
-            (VmMigrationPhase::Pending, false),
-            (VmMigrationPhase::Preparing, true),
-            (VmMigrationPhase::Running, true),
-            (VmMigrationPhase::Succeeded, false),
-            (VmMigrationPhase::Failed, false),
+            (VmMigrationPhaseKind::Pending, false),
+            (VmMigrationPhaseKind::Preparing, true),
+            (VmMigrationPhaseKind::Running, true),
+            (VmMigrationPhaseKind::Succeeded, false),
+            (VmMigrationPhaseKind::Failed, false),
         ] {
             let all = vec![migration("web-1", phase)];
             assert_eq!(
@@ -1320,10 +1321,10 @@ mod tests {
     /// another vm's nor the same name in another tenant.
     #[test]
     fn a_migration_of_another_vm_permits_nothing() {
-        let all = vec![migration("web-2", VmMigrationPhase::Running)];
+        let all = vec![migration("web-2", VmMigrationPhaseKind::Running)];
         assert!(phase_for(&all, &vm("web-1")).is_none());
 
-        let mut theirs = migration("web-1", VmMigrationPhase::Running);
+        let mut theirs = migration("web-1", VmMigrationPhaseKind::Running);
         theirs.spec.tenant = "other".into();
         assert!(phase_for(&[theirs], &vm("web-1")).is_none());
     }
@@ -1463,7 +1464,7 @@ mod tests {
     /// started has not run out of time.
     #[test]
     fn a_migration_runs_out_of_time_only_after_it_started() {
-        let mut m = migration("web-1", VmMigrationPhase::Preparing);
+        let mut m = migration("web-1", VmMigrationPhaseKind::Preparing);
         assert!(
             overdue(&m, Duration::from_secs(30)).is_none(),
             "not started"

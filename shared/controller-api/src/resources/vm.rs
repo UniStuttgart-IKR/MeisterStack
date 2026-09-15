@@ -88,50 +88,103 @@ impl Evacuation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum VmPhase {
-    #[default]
-    Pending,
-    Provisioning,
-    Running,
-    Stopped,
-    Paused,
-    Failed,
-    Quarantined,
-    /// Nobody has heard from the machine this VM is on for longer than the
-    /// heartbeat allows, so nothing here knows what the guest is doing.
+reasons! {
+    /// Why a VM is what it is — the CATEGORY behind the sentence, in a form a
+    /// program can hold and a metric label can carry.
     ///
-    /// NOT `Failed`, and the difference is the whole reason this variant
-    /// exists: `Failed` is a claim that something went wrong, and nothing
-    /// went wrong that anybody can point at — the guests on a node whose
-    /// agent was killed keep running, which is exactly what the mini-chaos
-    /// run found on manacor (agent dead 20 h, eleven guests alive). What is
-    /// true is only that the control plane has stopped knowing, and that is
-    /// what this says.
+    /// Eight, and every one of them is a word this code already said
+    /// somewhere: `Unplaced` is the whole of `PendingReason` (twelve
+    /// categories, whose detail stays in the sentence `pending_reason` writes),
+    /// `Unbound` is the two ingest paths that say "let go; waiting to be
+    /// placed", `Dispatched` is the anticipation the reconciler writes when a
+    /// create goes out, `Refused` is `CannotServe` and the cloud's refusal of
+    /// a create, `Reported` is a node's or a cluster's own word arriving on
+    /// the status road, and the two silences are `unheard_of` at the cluster
+    /// and its counterpart at the cloud.
     ///
-    /// It is also not a `Failed` because of what `Failed` COSTS: it is the
-    /// phase the requeue curve acts on, and requeueing a VM whose node simply
-    /// stopped talking would be this tier repairing something it has no
-    /// evidence is broken.
-    ///
-    /// One report from the node replaces it with whatever is true, and that
-    /// is the whole exit — there is no timer that promotes it to anything.
-    Unknown,
+    /// The sentence is not replaced by any of this and never will be: it
+    /// counts candidates and names capabilities, which is what an operator
+    /// reads. This is the closed set behind it, so that "how many VMs are
+    /// waiting, and why" is a time series rather than a string.
+    VmReason [8] {
+        /// Nobody recorded one.
+        ///
+        /// Not a failure of this enum but the honest value in two cases: a
+        /// phase stored before struktur 4, and a writer that genuinely has
+        /// nothing categorical to say. The next pass replaces it — which is
+        /// decision 6 of the brief, and the reason there is no migration
+        /// code anywhere in this change.
+        #[default]
+        Unrecorded => "Unrecorded",
+        /// The scheduler found nowhere to put it. Which of the twelve
+        /// `PendingReason` cases it was stays in the sentence.
+        Unplaced => "Unplaced",
+        /// The tier below let the binding go: the VM is nowhere, and it is
+        /// waiting to be placed again. `session::ingest`, both tiers.
+        Unbound => "Unbound",
+        /// The command has gone out and nobody has reported on it yet. The
+        /// one reason that is a GUESS about the future, and the reconciler
+        /// writes it only over a VM nobody has reported on at all.
+        Dispatched => "Dispatched",
+        /// A machine or a cluster refused to serve it — `CannotServe` at the
+        /// cluster, a refused create at the cloud. Structural: the same
+        /// answer comes back next pass, which is why it is remembered.
+        Refused => "Refused",
+        /// The tier below's own word about the guest, verbatim in the
+        /// message. The commonest reason behind `Failed` and the only one
+        /// behind `Quarantined`.
+        Reported => "Reported",
+        /// Nobody has heard from the NODE holding it for longer than the
+        /// heartbeat allows. `unheard_of`, at the cluster.
+        NodeSilent => "NodeSilent",
+        /// The same one tier up: the CLUSTER holding it has stopped
+        /// reporting. Two words and not one, because they send an operator to
+        /// different machines.
+        ClusterSilent => "ClusterSilent",
+    }
 }
 
-impl VmPhase {
-    /// Every variant, in declaration order — see `RunStrategy::ALL`.
-    pub const ALL: [VmPhase; 8] = [
-        VmPhase::Pending,
-        VmPhase::Provisioning,
-        VmPhase::Running,
-        VmPhase::Stopped,
-        VmPhase::Paused,
-        VmPhase::Failed,
-        VmPhase::Quarantined,
-        VmPhase::Unknown,
-    ];
+phases! {
+    /// What this control plane says a VM is doing.
+    VmPhase / VmPhaseKind / VmReason / VmPhaseWire [8] {
+        Pending { reason, message, since } => "Pending",
+        Provisioning { reason, message, since } => "Provisioning",
+        Running { message, since } => "Running",
+        Stopped { message, since } => "Stopped",
+        Paused { message, since } => "Paused",
+        Failed { reason, message, since } => "Failed",
+        Quarantined { reason, message, since } => "Quarantined",
+        /// Nobody has heard from the machine this VM is on for longer than the
+        /// heartbeat allows, so nothing here knows what the guest is doing.
+        ///
+        /// NOT `Failed`, and the difference is the whole reason this variant
+        /// exists: `Failed` is a claim that something went wrong, and nothing
+        /// went wrong that anybody can point at — the guests on a node whose
+        /// agent was killed keep running, which is exactly what the mini-chaos
+        /// run found on manacor (agent dead 20 h, eleven guests alive). What is
+        /// true is only that the control plane has stopped knowing, and that is
+        /// what this says.
+        ///
+        /// It is also not a `Failed` because of what `Failed` COSTS: it is the
+        /// phase the requeue curve acts on, and requeueing a VM whose node simply
+        /// stopped talking would be this tier repairing something it has no
+        /// evidence is broken.
+        ///
+        /// One report from the node replaces it with whatever is true, and that
+        /// is the whole exit — there is no timer that promotes it to anything.
+        /// `unknown_needs_its_holder`: nothing in this stack turns this into
+        /// `Failed`, however long it stands. What a deadline buys is an event
+        /// and a metric (see `stuck`), not a verdict.
+        ///
+        /// It is PARSED as well as written: an agent that comes back reports a
+        /// real phase, but a CLUSTER relaying its own stored phase to the
+        /// cloud sends this word, and a tier that rejected it would keep
+        /// showing Running for a VM its own cluster has given up on.
+        Unknown { reason, message, since } => "Unknown",
+    }
+}
 
+impl VmPhaseKind {
     /// The three phases that have come to rest. Everything else means a pass
     /// is in flight (Pending, Provisioning), the agent's own backoff is
     /// working (Failed), the VM is deliberately nobody's to touch
@@ -143,43 +196,10 @@ impl VmPhase {
     /// command derived from it would be a Stop or a Start sent at a guest
     /// nobody has looked at, down a session that does not exist.
     pub fn is_stable(self) -> bool {
-        matches!(self, VmPhase::Running | VmPhase::Stopped | VmPhase::Paused)
-    }
-
-    /// The spelling that goes on the wire, in both directions and at both
-    /// tiers. `parse` is its inverse and the tests hold them to it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            VmPhase::Pending => "Pending",
-            VmPhase::Provisioning => "Provisioning",
-            VmPhase::Running => "Running",
-            VmPhase::Stopped => "Stopped",
-            VmPhase::Paused => "Paused",
-            VmPhase::Failed => "Failed",
-            VmPhase::Quarantined => "Quarantined",
-            VmPhase::Unknown => "Unknown",
-        }
-    }
-
-    /// The spelling the agent puts on the wire (control.proto:
-    /// VmStatusReport.phase). Unknown input is rejected rather than defaulted
-    /// — a drifting agent should be visible, not silently "Pending".
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "Pending" => VmPhase::Pending,
-            "Provisioning" => VmPhase::Provisioning,
-            "Running" => VmPhase::Running,
-            "Stopped" => VmPhase::Stopped,
-            "Paused" => VmPhase::Paused,
-            "Failed" => VmPhase::Failed,
-            "Quarantined" => VmPhase::Quarantined,
-            // Parsed as well as written: an agent that comes back reports a
-            // real phase, but a CLUSTER relaying its own stored phase to the
-            // cloud sends this word, and a tier that rejected it would keep
-            // showing Running for a VM its own cluster has given up on.
-            "Unknown" => VmPhase::Unknown,
-            _ => return None,
-        })
+        matches!(
+            self,
+            VmPhaseKind::Running | VmPhaseKind::Stopped | VmPhaseKind::Paused
+        )
     }
 }
 
@@ -578,7 +598,7 @@ pub struct VmAddress {
 #[serde(rename_all = "camelCase")]
 pub struct VmStatus {
     #[serde(default)]
-    pub phase: VmPhase,
+    pub phase: VmPhaseKind,
     /// The last `metadata.generation` this object's controller ACTED on.
     ///
     /// Kubernetes' half of the pair, and the whole of what it says is:

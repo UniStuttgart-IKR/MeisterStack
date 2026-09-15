@@ -52,50 +52,65 @@ pub enum AccessMode {
     ReadWriteOnce,
 }
 
-/// Where a volume is in its own life. Its OWN phase, and that is the whole
-/// point of the object: a volume is Ready with no VM anywhere near it, and a
-/// VM being torn down does not move it.
-/// Spelled like `VmPhase` and not camelCase, which is what it was until the
-/// lab pointed out that a client then needs two comparisons for the same
-/// question. Free to change today because no volume object has ever been
-/// stored outside a test; it would not be free tomorrow.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum VolumePhase {
-    /// Reserved, not yet placed on a node that can provision it.
-    #[default]
-    Pending,
-    /// A node was chosen and is making it.
-    Provisioning,
-    /// The data exists. Attached or not — that is `status.attachedTo`.
-    Ready,
-    /// Deleted while a consumer still held it. The data is still there and
-    /// goes when the last one lets go. See the finalizer on `new_volume`.
-    Releasing,
-    /// The backend refused, and said why in `status.message`.
-    Failed,
+reasons! {
+    /// Why a volume is what it is. Eight, and each one is a sentence this
+    /// file's reconciler already writes: `Unplaced` is
+    /// `storage_pending_reason`, `Following` is "following <vm> to <node>"
+    /// and its cloud twin "moving to <cluster> with its vm", `Dispatched` is
+    /// the claim written before `ProvisionVolume` goes out, `Reported` is the
+    /// node's word arriving, `Undeliverable` is "provision could not be
+    /// delivered", `SourceMissing` is "snapshot <s> does not exist here any
+    /// more", and `HeldBy` is the `Releasing` a DELETE leaves behind while a
+    /// consumer still holds the bytes.
+    VolumeReason [8] {
+        /// Nobody recorded one — see `VmReason::Unrecorded`.
+        #[default]
+        Unrecorded => "Unrecorded",
+        /// No node that could provision it is a candidate: none runs the
+        /// driver, none is up, or none has the room.
+        Unplaced => "Unplaced",
+        /// It is moving because its VM is: the disk follows the guest, and
+        /// the phase says so rather than describing bytes that are being
+        /// made from scratch.
+        Following => "Following",
+        /// A node has been asked to make it.
+        Dispatched => "Dispatched",
+        /// The node's own word, verbatim in the message.
+        Reported => "Reported",
+        /// The command did not reach the node. Its own reason and not
+        /// `Reported`, because nothing was reported: the sentence is this
+        /// tier's, about a session, and the fix is on the network.
+        Undeliverable => "Undeliverable",
+        /// What the provision would have copied FROM is not there any more —
+        /// the snapshot, or the pool.
+        SourceMissing => "SourceMissing",
+        /// Deleted while a consumer still holds it. The data is still there
+        /// and goes when the last one lets go; the sentence names the holder.
+        HeldBy => "HeldBy",
+    }
 }
 
-impl VolumePhase {
-    pub const ALL: [VolumePhase; 5] = [
-        VolumePhase::Pending,
-        VolumePhase::Provisioning,
-        VolumePhase::Ready,
-        VolumePhase::Releasing,
-        VolumePhase::Failed,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            VolumePhase::Pending => "Pending",
-            VolumePhase::Provisioning => "Provisioning",
-            VolumePhase::Ready => "Ready",
-            VolumePhase::Releasing => "Releasing",
-            VolumePhase::Failed => "Failed",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == s)
+phases! {
+    /// Where a volume is in its own life. Its OWN phase, and that is the whole
+    /// point of the object: a volume is Ready with no VM anywhere near it, and a
+    /// VM being torn down does not move it.
+    ///
+    /// Spelled like `VmPhaseKind` and not camelCase, which is what it was until
+    /// the lab pointed out that a client then needs two comparisons for the same
+    /// question. Free to change today because no volume object has ever been
+    /// stored outside a test; it would not be free tomorrow.
+    VolumePhase / VolumePhaseKind / VolumeReason / VolumePhaseWire [5] {
+        /// Reserved, not yet placed on a node that can provision it.
+        Pending { reason, message, since } => "Pending",
+        /// A node was chosen and is making it.
+        Provisioning { reason, message, since } => "Provisioning",
+        /// The data exists. Attached or not — that is `status.attachedTo`.
+        Ready { message, since } => "Ready",
+        /// Deleted while a consumer still held it. The data is still there and
+        /// goes when the last one lets go. See the finalizer on `new_volume`.
+        Releasing { reason, message, since } => "Releasing",
+        /// The backend refused, and said why in the message.
+        Failed { reason, message, since } => "Failed",
     }
 }
 
@@ -171,7 +186,7 @@ fn is_block_mode(mode: &VolumeMode) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct VolumeStatus {
     #[serde(default)]
-    pub phase: VolumePhase,
+    pub phase: VolumePhaseKind,
     /// The name the BACKEND knows this volume by — `/tmp/vols/<uid>.raw`,
     /// `/dev/vg0/vm-<uid>`, an export directory.
     ///
@@ -352,10 +367,10 @@ impl VolumeStatus {
 /// a migration.
 ///
 /// `None` — no migration at all — is the ordinary answer, and it is no.
-pub fn second_open_is_a_migration(phase: Option<VmMigrationPhase>) -> bool {
+pub fn second_open_is_a_migration(phase: Option<VmMigrationPhaseKind>) -> bool {
     matches!(
         phase,
-        Some(VmMigrationPhase::Preparing) | Some(VmMigrationPhase::Running)
+        Some(VmMigrationPhaseKind::Preparing) | Some(VmMigrationPhaseKind::Running)
     )
 }
 
@@ -419,38 +434,39 @@ pub struct VolumeSnapshotSpec {
     pub description: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum VolumeSnapshotPhase {
-    /// Written down; the node has not been told yet.
-    #[default]
-    Pending,
-    /// A node was told and is taking it.
-    Creating,
-    /// The copy exists.
-    Ready,
-    /// The backend refused, and said why in `status.message`.
-    Failed,
+reasons! {
+    /// Why a snapshot is what it is. Five, and all five are already in the
+    /// snapshot reconciler: `Dispatched` is the claim written before
+    /// `TakeSnapshot` goes out, `Reported` is the node's own sentence on the
+    /// status road, `Requeued` is the failed-copy kick, and `SourceGone` is
+    /// the ingest path that finds the node no longer has the copy at all.
+    VolumeSnapshotReason [5] {
+        /// Nobody recorded one — see `VmReason::Unrecorded`.
+        #[default]
+        Unrecorded => "Unrecorded",
+        /// A node has been told to take it.
+        Dispatched => "Dispatched",
+        /// The node's own word, verbatim in the message.
+        Reported => "Reported",
+        /// A copy that failed is being tried again.
+        Requeued => "Requeued",
+        /// The node no longer has the copy, so it will be taken again.
+        SourceGone => "SourceGone",
+    }
 }
 
-impl VolumeSnapshotPhase {
-    pub const ALL: [VolumeSnapshotPhase; 4] = [
-        VolumeSnapshotPhase::Pending,
-        VolumeSnapshotPhase::Creating,
-        VolumeSnapshotPhase::Ready,
-        VolumeSnapshotPhase::Failed,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            VolumeSnapshotPhase::Pending => "Pending",
-            VolumeSnapshotPhase::Creating => "Creating",
-            VolumeSnapshotPhase::Ready => "Ready",
-            VolumeSnapshotPhase::Failed => "Failed",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == s)
+phases! {
+    /// How far a snapshot got.
+    VolumeSnapshotPhase / VolumeSnapshotPhaseKind / VolumeSnapshotReason
+        / VolumeSnapshotPhaseWire [4] {
+        /// Written down; the node has not been told yet.
+        Pending { reason, message, since } => "Pending",
+        /// A node was told and is taking it.
+        Creating { reason, message, since } => "Creating",
+        /// The copy exists.
+        Ready { message, since } => "Ready",
+        /// The backend refused, and said why in the message.
+        Failed { reason, message, since } => "Failed",
     }
 }
 
@@ -459,7 +475,7 @@ impl VolumeSnapshotPhase {
 #[serde(rename_all = "camelCase")]
 pub struct VolumeSnapshotStatus {
     #[serde(default)]
-    pub phase: VolumeSnapshotPhase,
+    pub phase: VolumeSnapshotPhaseKind,
     /// The node that took it — the volume's provisioning node, which under a
     /// `shared` pool need not be the node the VM runs on. Copied onto the
     /// snapshot at dispatch so that a later `DropSnapshot` goes to the machine

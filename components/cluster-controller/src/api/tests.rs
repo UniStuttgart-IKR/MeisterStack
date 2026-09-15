@@ -34,7 +34,7 @@ fn an_inline_disk_is_named_as_the_reason_a_vm_cannot_move_live() {
                 vm: json!({ "volumes": volumes }),
             },
         );
-        vm.status.phase = controller_api::VmPhase::Running;
+        vm.status.phase = controller_api::VmPhaseKind::Running;
         vm
     };
     let somewhere_to_go = MigrationFacts {
@@ -109,7 +109,7 @@ fn running_vm(name: &str) -> Vm {
             vm: serde_json::json!({ "vcpus": 1 }),
         },
     );
-    vm.status.phase = controller_api::VmPhase::Running;
+    vm.status.phase = controller_api::VmPhaseKind::Running;
     vm.status.node_name = Some("agent-1".into());
     vm
 }
@@ -170,9 +170,9 @@ fn a_live_migration_is_refused_with_a_sentence_that_names_the_way_out() {
     // Not running: there is nothing to move, and the cheaper verb is
     // named.
     for phase in [
-        controller_api::VmPhase::Stopped,
-        controller_api::VmPhase::Paused,
-        controller_api::VmPhase::Pending,
+        controller_api::VmPhaseKind::Stopped,
+        controller_api::VmPhaseKind::Paused,
+        controller_api::VmPhaseKind::Pending,
     ] {
         let mut vm = running_vm("web-1");
         vm.status.phase = phase;
@@ -858,7 +858,7 @@ fn an_unknown_binding_is_only_let_go_while_its_node_reports() {
             vm: json!({}),
         },
     );
-    vm.status.phase = controller_api::VmPhase::Unknown;
+    vm.status.phase = controller_api::VmPhaseKind::Unknown;
 
     // Silent: 409, because nothing about the request is malformed — the state
     // of the world refuses it, and that state ends by itself.
@@ -881,7 +881,7 @@ fn an_unknown_binding_is_only_let_go_while_its_node_reports() {
     // `Failed` is the node's own word that the guest is not running, so it is
     // untouched even when the node has since gone quiet.
     let mut failed = vm.clone();
-    failed.status.phase = controller_api::VmPhase::Failed;
+    failed.status.phase = controller_api::VmPhaseKind::Failed;
     holder_refusal(&failed, "agent-1a", None, now).expect("Failed is evidence");
 
     // And what the object is left carrying when the release does land.
@@ -900,7 +900,7 @@ fn an_unknown_binding_is_only_let_go_while_its_node_reports() {
 
 /// A vm bound to a node, in the two states that decide whether the binding
 /// may be let go: what the owner ASKED for and what the node REPORTS.
-fn bound_vm(strategy: controller_api::RunStrategy, phase: controller_api::VmPhase) -> Vm {
+fn bound_vm(strategy: controller_api::RunStrategy, phase: controller_api::VmPhaseKind) -> Vm {
     let mut v = controller_api::resources::new_vm(
         "web-1",
         VmSpec {
@@ -929,28 +929,28 @@ fn let_go(from: &Vm) -> Vm {
 
 #[test]
 fn a_binding_may_only_be_let_go_of_a_vm_that_is_standing_still() {
-    use controller_api::{RunStrategy, VmPhase};
+    use controller_api::{RunStrategy, VmPhaseKind};
 
-    let stopped = bound_vm(RunStrategy::Stopped, VmPhase::Stopped);
+    let stopped = bound_vm(RunStrategy::Stopped, VmPhaseKind::Stopped);
     check_reschedule(&stopped, &let_go(&stopped)).expect("a stopped vm may move");
     // Sending it back unchanged is not a reschedule and is always fine.
     check_reschedule(&stopped, &stopped).expect("a round trip");
 
     for (strategy, phase, why) in [
-        (RunStrategy::Running, VmPhase::Running, "running"),
+        (RunStrategy::Running, VmPhaseKind::Running, "running"),
         (
             RunStrategy::Stopped,
-            VmPhase::Running,
+            VmPhaseKind::Running,
             "asked to stop, still up",
         ),
         (
             RunStrategy::Running,
-            VmPhase::Stopped,
+            VmPhaseKind::Stopped,
             "stopped, but meant to run",
         ),
         (
             RunStrategy::Stopped,
-            VmPhase::Paused,
+            VmPhaseKind::Paused,
             "memory and disks still open",
         ),
     ] {
@@ -969,9 +969,9 @@ fn a_binding_may_only_be_let_go_of_a_vm_that_is_standing_still() {
 /// exit from that state was a pair of hands.
 #[test]
 fn a_vm_whose_node_executes_nothing_is_standing_still_enough() {
-    use controller_api::{RunStrategy, VmPhase};
+    use controller_api::{RunStrategy, VmPhaseKind};
 
-    for phase in [VmPhase::Failed, VmPhase::Unknown] {
+    for phase in [VmPhaseKind::Failed, VmPhaseKind::Unknown] {
         let current = bound_vm(RunStrategy::Stopped, phase);
         check_reschedule(&current, &let_go(&current))
             .unwrap_or_else(|e| panic!("{phase:?} may move: {}", e.message()));
@@ -1045,7 +1045,7 @@ fn a_migration_into_a_machine_that_cannot_hold_the_state_is_refused_at_the_edge(
     // whose disk is node-local, is refused for THAT — the machine comparison
     // never gets a chance to answer a question nobody asked.
     let mut stopped = vm.clone();
-    stopped.status.phase = controller_api::VmPhase::Stopped;
+    stopped.status.phase = controller_api::VmPhaseKind::Stopped;
     let why = migration_refusal(&stopped, &machines(other), None).expect("not running");
     assert!(why.contains("only a running vm"), "{why}");
 }

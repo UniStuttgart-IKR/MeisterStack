@@ -291,7 +291,7 @@ pub(super) async fn delete_volume(
             if v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(Utc::now());
             }
-            v.status.phase = VolumePhase::Releasing;
+            v.status.phase = VolumePhaseKind::Releasing;
         })
         .await?;
     // The sentence as well as the detail, and the same one the tier above
@@ -336,7 +336,7 @@ pub(super) async fn check_snapshot_ready(st: &ApiState, named: &str) -> Result<(
             "snapshot {named} is being deleted; it cannot seed a new volume"
         )));
     }
-    if snapshot.status.phase == controller_api::VolumeSnapshotPhase::Failed {
+    if snapshot.status.phase == controller_api::VolumeSnapshotPhaseKind::Failed {
         return Err(invalid_field(
             "spec.fromSnapshot",
             format!(

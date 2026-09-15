@@ -17,7 +17,7 @@
 use super::*;
 
 use controller_api::network::{self, NetworkBackend, RouterOutcome, RouterPlan, RouterSink};
-use controller_api::{ProviderNetwork, Router, RouterPhase};
+use controller_api::{ProviderNetwork, Router, RouterPhaseKind};
 
 /// Who, of several leaderless replicas, may act on this router: anybody who
 /// can reach ONE of the machines it is on, and everybody while it is on none.
@@ -80,13 +80,13 @@ pub(crate) fn plan_router(
     networks: &[ProviderNetwork],
     load: &std::collections::BTreeMap<String, usize>,
     candidates: &[Candidate],
-) -> Result<RouterPlan, (RouterPhase, String)> {
+) -> Result<RouterPlan, (RouterPhaseKind, String)> {
     let Some(network) = networks
         .iter()
         .find(|n| n.metadata.name == router.spec.provider_network)
     else {
         return Err((
-            RouterPhase::Pending,
+            RouterPhaseKind::Pending,
             format!(
                 "no provider network called {} at this cluster",
                 router.spec.provider_network
@@ -95,7 +95,7 @@ pub(crate) fn plan_router(
     };
     let Some(vni) = router.spec.vni else {
         return Err((
-            RouterPhase::Pending,
+            RouterPhaseKind::Pending,
             "spec.vni is unset, so this router has no overlay to put its inside leg on; \
              the cloud fills it in from the tenant, and a standalone cluster names it"
                 .to_string(),
@@ -103,7 +103,7 @@ pub(crate) fn plan_router(
     };
     if router.spec.internal_addr.is_empty() {
         return Err((
-            RouterPhase::Pending,
+            RouterPhaseKind::Pending,
             "spec.internalAddr is unset, so the guests have no gateway address to point at; \
              this stack allocates no tenant addresses, so somebody has to say which one it is"
                 .to_string(),
@@ -111,7 +111,7 @@ pub(crate) fn plan_router(
     }
     if router.status.external_addr.is_empty() {
         return Err((
-            RouterPhase::Pending,
+            RouterPhaseKind::Pending,
             format!(
                 "no free address left in the allocation of provider network {} ({})",
                 network.metadata.name,
@@ -130,7 +130,7 @@ pub(crate) fn plan_router(
     let nodes = network::plan_nodes(&router.status.nodes, &fit);
     if nodes.is_empty() {
         return Err((
-            RouterPhase::Pending,
+            RouterPhaseKind::Pending,
             gateway_sentence(&network.spec.physnet, router, candidates),
         ));
     }
@@ -385,7 +385,7 @@ async fn ensure_nats(pass: &Pass<'_>, router: Router) -> anyhow::Result<Router> 
 async fn note(
     pass: &Pass<'_>,
     router: &Router,
-    phase: RouterPhase,
+    phase: RouterPhaseKind,
     message: Option<String>,
     placement: Option<Placement<'_>>,
 ) -> anyhow::Result<()> {
@@ -436,7 +436,7 @@ async fn note(
                 uid: &router.metadata.uid,
                 reason: events::reason::PHASE_CHANGED,
                 message: message.unwrap_or_else(|| phase.as_str().to_string()),
-                event_type: if phase == RouterPhase::Failed {
+                event_type: if phase == RouterPhaseKind::Failed {
                     EventType::Warning
                 } else {
                     EventType::Normal

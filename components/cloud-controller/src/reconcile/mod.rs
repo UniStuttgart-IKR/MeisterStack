@@ -31,7 +31,7 @@ use anyhow::bail;
 use chrono::{DateTime, Utc};
 use controller_api::{
     Ack, Candidate, CandidateKind, Capacity, Cluster, EtcdStore, Overcommit, PassTrigger,
-    PendingTally, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhase, heartbeat_expired,
+    PendingTally, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhaseKind, heartbeat_expired,
     lifecycle_command,
 };
 use proto::cloud_command;
@@ -355,7 +355,7 @@ fn about<'a>(vm: &'a Vm, reason: &'a str, message: String, kind: EventType) -> H
 /// reporting.
 fn publish_vm_gauges(vms: &[Vm]) {
     telemetry::metrics::objects().set_count(Vm::KIND, vms.len() as i64);
-    for phase in VmPhase::ALL {
+    for phase in VmPhaseKind::ALL {
         let n = vms.iter().filter(|v| v.status.phase == phase).count();
         telemetry::metrics::objects().set_vms(phase.as_str(), n as i64);
     }

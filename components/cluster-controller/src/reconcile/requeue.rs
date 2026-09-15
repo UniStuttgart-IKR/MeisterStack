@@ -21,7 +21,7 @@ pub enum Requeue {
 }
 
 pub fn requeue_decision(vm: &Vm, policy: &dyn RequeuePolicy, now: DateTime<Utc>) -> Requeue {
-    if vm.status.phase != VmPhase::Failed {
+    if vm.status.phase != VmPhaseKind::Failed {
         return if vm.status.requeue_attempts > 0 || vm.status.last_requeue.is_some() {
             Requeue::Reset
         } else {

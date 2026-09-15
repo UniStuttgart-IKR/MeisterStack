@@ -225,7 +225,7 @@ pub(super) async fn servable_clusters(store: &EtcdStore, vm: &Vm) -> anyhow::Res
             Ok(both) => both,
             Err(sentence) => return Ok(Sentence(sentence)),
         });
-        if volume.status.phase != controller_api::VolumePhase::Ready {
+        if volume.status.phase != controller_api::VolumePhaseKind::Ready {
             return Ok(Sentence(format!(
                 "volume {name} is {}",
                 volume.status.phase.as_str()

@@ -228,7 +228,7 @@ impl StoragePoolSpec {
 pub struct PoolAtCluster {
     pub cluster: String,
     #[serde(default)]
-    pub phase: StoragePoolPhase,
+    pub phase: StoragePoolPhaseKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality: Option<Locality>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -261,7 +261,7 @@ pub struct PoolAtCluster {
 #[serde(rename_all = "camelCase")]
 pub struct StoragePoolStatus {
     #[serde(default)]
-    pub phase: StoragePoolPhase,
+    pub phase: StoragePoolPhaseKind,
     /// Where this pool's bytes are, as the nodes that can reach it agree.
     /// `None` while nobody has said — no node in the pool runs the driver
     /// yet, or every one of them predates the field.
@@ -308,41 +308,47 @@ pub struct StoragePoolStatus {
     pub clusters: Vec<PoolAtCluster>,
 }
 
-/// Whether this pool's own description holds together.
-///
-/// Three states and no `Deleting`: a pool owns nothing, so there is no
-/// teardown to be in the middle of — the delete handler simply refuses while
-/// volumes point at it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum StoragePoolPhase {
-    /// Nobody has said anything about it yet. A pool whose nodes are all down,
-    /// and every pool for the first few seconds of its life.
-    #[default]
-    Pending,
-    /// The nodes that serve it agree about what it is.
-    Ready,
-    /// They do not. See `status.message`, and see `reconcile_pools` for the
-    /// only way this happens: two binaries of different ages on one pool.
-    Failed,
+reasons! {
+    /// Why a pool is what it is.
+    ///
+    /// Five. `AwaitingNode` and `Disagreement` are the two sentences
+    /// `reconcile_pools` already writes — "nobody has said anything about it
+    /// yet" and "two binaries of different ages on one pool". The two
+    /// cluster words come from D-C11: a pool at the CLOUD is a pointer at one
+    /// a cluster admin already made, and a pointer at nothing stood on
+    /// `Pending` for six minutes without saying which half was missing.
+    StoragePoolReason [5] {
+        /// Nobody recorded one — see `VmReason::Unrecorded`.
+        #[default]
+        Unrecorded => "Unrecorded",
+        /// Nobody serving it has said anything yet: every node in it is down,
+        /// or none runs the driver, or the pool is seconds old.
+        AwaitingNode => "AwaitingNode",
+        /// The nodes serving it do not agree about what it is.
+        Disagreement => "Disagreement",
+        /// At the cloud: the cluster this pointer names has not reported.
+        ClusterSilent => "ClusterSilent",
+        /// At the cloud: the cluster reports, and names no pool by this name.
+        /// The whole of D-C11 — the cluster half was never made.
+        ClusterHasNoPool => "ClusterHasNoPool",
+    }
 }
 
-impl StoragePoolPhase {
-    pub const ALL: [StoragePoolPhase; 3] = [
-        StoragePoolPhase::Pending,
-        StoragePoolPhase::Ready,
-        StoragePoolPhase::Failed,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            StoragePoolPhase::Pending => "Pending",
-            StoragePoolPhase::Ready => "Ready",
-            StoragePoolPhase::Failed => "Failed",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == s)
+phases! {
+    /// Whether this pool's own description holds together.
+    ///
+    /// Three states and no `Deleting`: a pool owns nothing, so there is no
+    /// teardown to be in the middle of — the delete handler simply refuses while
+    /// volumes point at it.
+    StoragePoolPhase / StoragePoolPhaseKind / StoragePoolReason / StoragePoolPhaseWire [3] {
+        /// Nobody has said anything about it yet. A pool whose nodes are all down,
+        /// and every pool for the first few seconds of its life.
+        Pending { reason, message, since } => "Pending",
+        /// The nodes that serve it agree about what it is.
+        Ready { message, since } => "Ready",
+        /// They do not. See the message, and see `reconcile_pools` for the
+        /// only way this happens: two binaries of different ages on one pool.
+        Failed { reason, message, since } => "Failed",
     }
 }
 

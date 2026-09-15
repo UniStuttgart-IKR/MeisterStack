@@ -362,66 +362,69 @@ impl RouterSpec {
     }
 }
 
-/// How far along a router is — the same vocabulary a VM's phase has, one
-/// object over, and with the same rule: what IS, not what was asked.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum RouterPhase {
-    /// Nowhere to put it yet: no cluster has a gateway-capable node for this
-    /// provider network, or every candidate is down, drained or refuses the
-    /// class. `status.message` says which of those it is.
-    #[default]
-    Pending,
-    /// Placed, and the nodes have been told. Nobody has reported it active
-    /// yet.
-    Provisioning,
-    /// A node reports it built and active. Packets go.
-    Active,
-    /// A node reports it built and NOT active — every standby says this, and
-    /// so does a router whose whole priority list is standby because the
-    /// active node has gone quiet without letting go.
+reasons! {
+    /// Why a router is where it is.
     ///
-    /// Its own phase rather than `Provisioning`, because the two send an
-    /// operator to different places: `Provisioning` is "wait", this is "the
-    /// thing exists on a machine and is deliberately silent".
-    Standby,
-    /// A node refused it, or reports it broken. The sentence is the node's.
-    Failed,
-    /// Nobody has heard from the node holding it for longer than the
-    /// heartbeat allows. Exactly `VmPhase::Unknown` and for exactly its
-    /// reason: nothing went wrong that anybody can point at, and what is true
-    /// is only that the control plane has stopped knowing.
-    Unknown,
+    /// Six, all of them out of the two router reconcilers: the four
+    /// `Pending` sentences the cluster planner returns (no provider network,
+    /// no gateway node, every candidate down or drained, the class refused),
+    /// the dispatch the cloud writes when it has told a cluster, the node's
+    /// own word on the status road, and the silence `verdict` turns into
+    /// `Unknown` when the node holding an active router stops answering.
+    RouterReason [6] {
+        /// Nobody recorded one — see `VmReason::Unrecorded`.
+        #[default]
+        Unrecorded => "Unrecorded",
+        /// Nowhere to put it: no gateway-capable node for this provider
+        /// network, or every candidate is down, drained or refuses the class.
+        /// The sentence says which.
+        Unplaced => "Unplaced",
+        /// A cluster or a node has been told; nobody has reported it yet.
+        Dispatched => "Dispatched",
+        /// A node refused it — no gateway slot, which is a structural answer
+        /// about the MACHINE and is remembered in `status.refused`.
+        Refused => "Refused",
+        /// A node's own word about the namespace, verbatim in the message.
+        Reported => "Reported",
+        /// Nobody has heard from the node holding it for longer than the
+        /// heartbeat allows.
+        NodeSilent => "NodeSilent",
+    }
 }
 
-impl RouterPhase {
-    /// Every variant, in declaration order — see `RunStrategy::ALL`.
-    pub const ALL: [RouterPhase; 6] = [
-        RouterPhase::Pending,
-        RouterPhase::Provisioning,
-        RouterPhase::Active,
-        RouterPhase::Standby,
-        RouterPhase::Failed,
-        RouterPhase::Unknown,
-    ];
-
-    /// The spelling on the wire (`proto::RouterReport.phase`) and in the
-    /// object. `parse` is its inverse and the tests hold them to it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RouterPhase::Pending => "Pending",
-            RouterPhase::Provisioning => "Provisioning",
-            RouterPhase::Active => "Active",
-            RouterPhase::Standby => "Standby",
-            RouterPhase::Failed => "Failed",
-            RouterPhase::Unknown => "Unknown",
-        }
-    }
-
-    /// Unknown input is rejected rather than defaulted — a drifting agent
-    /// should be visible, not silently `Pending`. The same rule
-    /// `VmPhase::parse` follows.
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == s)
+phases! {
+    /// How far along a router is — the same vocabulary a VM's phase has, one
+    /// object over, and with the same rule: what IS, not what was asked.
+    RouterPhase / RouterPhaseKind / RouterReason / RouterPhaseWire [6] {
+        /// Nowhere to put it yet: no cluster has a gateway-capable node for this
+        /// provider network, or every candidate is down, drained or refuses the
+        /// class. The message says which of those it is.
+        Pending { reason, message, since } => "Pending",
+        /// Placed, and the nodes have been told. Nobody has reported it active
+        /// yet.
+        Provisioning { reason, message, since } => "Provisioning",
+        /// A node reports it built and active. Packets go.
+        Active { message, since } => "Active",
+        /// A node reports it built and NOT active — every standby says this, and
+        /// so does a router whose whole priority list is standby because the
+        /// active node has gone quiet without letting go.
+        ///
+        /// Its own phase rather than `Provisioning`, because the two send an
+        /// operator to different places: `Provisioning` is "wait", this is "the
+        /// thing exists on a machine and is deliberately silent".
+        ///
+        /// No reason slot, and that is the judgement rather than an omission:
+        /// a standby is a RESTING state — the router is built and doing
+        /// exactly what it was asked to do — so there is no category behind
+        /// it. Which node speaks is `status.activeNode`.
+        Standby { message, since } => "Standby",
+        /// A node refused it, or reports it broken. The sentence is the node's.
+        Failed { reason, message, since } => "Failed",
+        /// Nobody has heard from the node holding it for longer than the
+        /// heartbeat allows. Exactly `VmPhaseKind::Unknown` and for exactly its
+        /// reason: nothing went wrong that anybody can point at, and what is true
+        /// is only that the control plane has stopped knowing.
+        Unknown { reason, message, since } => "Unknown",
     }
 }
 
@@ -431,7 +434,7 @@ impl RouterPhase {
 #[serde(rename_all = "camelCase")]
 pub struct RouterStatus {
     #[serde(default)]
-    pub phase: RouterPhase,
+    pub phase: RouterPhaseKind,
     /// What the phase is, in words. The sentence a Pending router carries is
     /// the one that has to send somebody to the right machine — see
     /// `PendingReason`.

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use proto::VmStatusReport;
 
-use crate::resources::{Vm, VmAddress, VmAddressKind, VmPhase};
+use crate::resources::{Vm, VmAddress, VmAddressKind, VmPhaseKind};
 
 /// Is a peer's report younger than everything this tier has already done?
 /// Only then does it describe the thing as it is now.
@@ -116,7 +116,7 @@ pub enum Observation<'a> {
     BadPhase(&'a Vm),
     /// The report says something new about this VM: the phase it observed and
     /// the message that came with it (absent when the peer sent none).
-    Changed(&'a Vm, VmPhase, Option<String>),
+    Changed(&'a Vm, VmPhaseKind, Option<String>),
 }
 
 /// Match a peer's report against the VMs this tier stores, one line at a time.
@@ -142,7 +142,7 @@ pub fn observe<'a>(
         if !speaks_for(vm) {
             return Some((line, Observation::NotBound(vm)));
         }
-        let Some(phase) = VmPhase::parse(&line.phase) else {
+        let Some(phase) = VmPhaseKind::parse(&line.phase) else {
             return Some((line, Observation::BadPhase(vm)));
         };
         let message = (!line.message.is_empty()).then(|| line.message.clone());
@@ -213,7 +213,7 @@ mod tests {
         let reported = [line("uid-a", "Running", "")];
         assert!(matches!(
             seen(&known, &reported, "manacor").as_slice(),
-            [Observation::Changed(vm, VmPhase::Running, None)] if vm.metadata.name == "web-1"
+            [Observation::Changed(vm, VmPhaseKind::Running, None)] if vm.metadata.name == "web-1"
         ));
     }
 
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn a_report_that_says_what_is_already_stored_yields_nothing() {
         let mut stored = vm("web-1", "uid-a", Some("manacor"));
-        stored.status.phase = VmPhase::Running;
+        stored.status.phase = VmPhaseKind::Running;
         let known = [stored];
 
         assert!(seen(&known, &[line("uid-a", "Running", "")], "manacor").is_empty());
@@ -257,7 +257,7 @@ mod tests {
         assert!(
             matches!(
                 seen(&known, &[line("uid-a", "Running", "host rebooted")], "manacor").as_slice(),
-                [Observation::Changed(_, VmPhase::Running, Some(m))] if m == "host rebooted"
+                [Observation::Changed(_, VmPhaseKind::Running, Some(m))] if m == "host rebooted"
             ),
             "so is a new message under an unchanged phase"
         );
@@ -268,12 +268,12 @@ mod tests {
     #[test]
     fn an_empty_message_is_absent_rather_than_empty() {
         let mut stored = vm("web-1", "uid-a", Some("manacor"));
-        stored.status.phase = VmPhase::Failed;
+        stored.status.phase = VmPhaseKind::Failed;
         stored.status.message = Some("out of memory".into());
         let known = [stored];
         assert!(matches!(
             seen(&known, &[line("uid-a", "Failed", "")], "manacor").as_slice(),
-            [Observation::Changed(_, VmPhase::Failed, None)]
+            [Observation::Changed(_, VmPhaseKind::Failed, None)]
         ));
     }
 

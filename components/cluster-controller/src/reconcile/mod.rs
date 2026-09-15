@@ -26,8 +26,8 @@ use chrono::{DateTime, Utc};
 use controller_api::{
     Candidate, CandidateKind, Capacity, EtcdStore, Lifecycle, Locality, Node, Overcommit,
     PassTrigger, PendingReason, PendingTally, RequeuePolicy, Resource, RunStrategy, Scheduler,
-    StoragePool, StoragePoolPhase, StoreError, Vm, VmPhase, Volume, VolumeBinding, VolumePhase,
-    VolumeSnapshot, VolumeSnapshotPhase, heartbeat_expired, lifecycle_command,
+    StoragePool, StoragePoolPhaseKind, StoreError, Vm, VmPhaseKind, Volume, VolumeBinding,
+    VolumePhaseKind, VolumeSnapshot, VolumeSnapshotPhaseKind, heartbeat_expired, lifecycle_command,
     scheduler::{StoragePolicy, feasible_for_storage, storage_pending_reason},
 };
 use proto::command;
@@ -319,7 +319,7 @@ fn warning<'a>(vm: &'a Vm, reason: &'a str, message: String) -> Happening<'a> {
 /// this costs no etcd round trip of its own.
 fn publish_vm_gauges(vms: &[Vm]) {
     telemetry::metrics::objects().set_count(Vm::KIND, vms.len() as i64);
-    for phase in VmPhase::ALL {
+    for phase in VmPhaseKind::ALL {
         let n = vms.iter().filter(|v| v.status.phase == phase).count();
         telemetry::metrics::objects().set_vms(phase.as_str(), n as i64);
     }
