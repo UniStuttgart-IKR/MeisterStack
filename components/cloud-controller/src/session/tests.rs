@@ -33,6 +33,7 @@ fn a_reported_node_reaches_the_cluster_object_unchanged() {
             message: "/var/lib/meisterstack has no room left".into(),
         }],
         draining: None,
+        images_complete: false,
     };
     let kept = node_summary(&reported);
     assert_eq!(kept.name, "manacor");
@@ -474,4 +475,74 @@ fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
     // A report with no capacity block says nothing about capacity, and
     // nothing is what it writes.
     assert!(!cluster_facts_are_news(&status, 2, 2, 3, &nodes, None));
+}
+
+/// F16's second half, at the seam where it is decided: a node that has listed
+/// EVERY file under its image directory and not named this one has said the
+/// file is not there.
+///
+/// It is the only evidence that ever exists for a path image nothing uses.
+/// There is no command that asks a node about an image — `SyncState` carries
+/// VMs — so such an entry got silence, and silence used to read `Ready`.
+///
+/// The asymmetry is the whole of the guard: an INCOMPLETE report contributes
+/// nothing at all, because an agent from before the field, a directory that
+/// could not be read and a heartbeat with no lists are all silence, and
+/// reading any of them as "the file is gone" would fail a working image.
+#[test]
+fn a_complete_inventory_that_does_not_name_an_image_says_the_file_is_not_there() {
+    let complete = |name: &str, images_complete: bool| proto::NodeReport {
+        name: name.into(),
+        images_complete,
+        ..Default::default()
+    };
+    let saw = |node: &str, phase: &str, reason: &str| proto::ImageStateReport {
+        name: "debian.raw".into(),
+        phase: phase.into(),
+        reason: reason.into(),
+        message: String::new(),
+        node: node.into(),
+    };
+
+    // Nobody said anything about the image, and both nodes listed everything
+    // they have: two lines, both NotFound.
+    let nodes = [complete("agent-1a", true), complete("agent-1b", true)];
+    let names: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n.images_complete)
+        .map(|n| n.name.as_str())
+        .collect();
+    let lines = super::inventory::lines_of("cluster-1", "debian.raw", &[], &names);
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.phase == controller_api::ImagePhaseKind::Failed
+                && l.reason == controller_api::ImageReason::NotFound)
+    );
+    assert_eq!(
+        lines[0].message.as_deref(),
+        Some("agent-1a has no file named debian.raw")
+    );
+
+    // One of them has the bytes: its own word wins over its silence, because
+    // it did not stay silent.
+    let said = saw("agent-1a", "Ready", "");
+    let lines = super::inventory::lines_of("cluster-1", "debian.raw", &[&said], &names);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].phase, controller_api::ImagePhaseKind::Ready);
+    assert_eq!(lines[1].reason, controller_api::ImageReason::NotFound);
+
+    // And a node that is not saying whether its list is complete contributes
+    // nothing, however loudly it says nothing.
+    let quiet = [complete("agent-1a", false)];
+    let names: Vec<&str> = quiet
+        .iter()
+        .filter(|n| n.images_complete)
+        .map(|n| n.name.as_str())
+        .collect();
+    assert!(
+        super::inventory::lines_of("cluster-1", "debian.raw", &[], &names).is_empty(),
+        "an incomplete inventory is silence, not absence"
+    );
 }

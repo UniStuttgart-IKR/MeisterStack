@@ -76,7 +76,22 @@ use ingest::*;
 /// older one, because a node that re-fetched an image is telling the truth
 /// about it now.
 #[derive(Default)]
-pub struct ImageView(std::sync::Mutex<HashMap<(String, String), ImageWord>>);
+pub struct ImageView(std::sync::Mutex<ImageWords>);
+
+/// The words, and which nodes said them completely.
+///
+/// Two maps and not one because the two answer different questions: what a
+/// node said about an image, and whether the list it said it in was ALL of
+/// them. The second is a statement about the node and belongs nowhere on a
+/// per-image row — a node whose image directory could not be read has said
+/// nothing complete about any image, including the ones it did name.
+#[derive(Default)]
+struct ImageWords {
+    said: HashMap<(String, String), ImageWord>,
+    /// Nodes whose last report carried `images_complete`. Only for those may
+    /// the tier above read a missing name as a missing file (F16, D6).
+    complete: std::collections::HashSet<String>,
+}
 
 /// One node's word about one image, as it arrived: the phase, the closed
 /// reason and the sentence.
@@ -93,11 +108,22 @@ struct ImageWord {
 }
 
 impl ImageView {
-    /// Take in one node's opinions.
-    pub fn observe(&self, node: &str, reports: &[proto::ImageStateReport]) {
+    /// Take in one node's opinions, and whether they are all of them.
+    ///
+    /// The two arrive together on purpose: a node that says its list is
+    /// complete is saying it about THAT list, and recording the flag from one
+    /// report against the lines of another would be a completeness claim
+    /// about a list nobody made.
+    ///
+    /// A heartbeat that carries no lists at all (`heartbeat_only`) comes
+    /// through here with `complete = false` and no lines, which takes the
+    /// node out of the complete set — correctly: it has not said anything
+    /// this time, and "the inventory is all of them" must never be a claim
+    /// the tier above keeps after the evidence for it has stopped arriving.
+    pub fn observe(&self, node: &str, reports: &[proto::ImageStateReport], complete: bool) {
         let mut held = self.0.lock().unwrap();
         for report in reports {
-            held.insert(
+            held.said.insert(
                 (report.name.clone(), node.to_string()),
                 ImageWord {
                     phase: report.phase.clone(),
@@ -106,12 +132,24 @@ impl ImageView {
                 },
             );
         }
+        if complete {
+            held.complete.insert(node.to_string());
+        } else {
+            held.complete.remove(node);
+        }
+    }
+
+    /// Did this node's last report list every image under its image
+    /// directory? Relayed to the cloud on `NodeReport.images_complete`.
+    pub fn is_complete(&self, node: &str) -> bool {
+        self.0.lock().unwrap().complete.contains(node)
     }
 
     /// What to tell the cloud: one line per image per node.
     pub fn report(&self) -> Vec<proto::ImageStateReport> {
         let held = self.0.lock().unwrap();
         let mut out: Vec<proto::ImageStateReport> = held
+            .said
             .iter()
             .map(|((name, node), word)| proto::ImageStateReport {
                 name: name.clone(),

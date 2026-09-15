@@ -1551,7 +1551,10 @@ async fn build_status(
     // Every node, ready or not: a node that is down is exactly the one an
     // operator is looking for one tier up, and leaving it out of the report
     // would be the cloud saying it does not exist.
-    let reported_nodes: Vec<proto::NodeReport> = nodes.iter().map(node_report).collect();
+    let reported_nodes: Vec<proto::NodeReport> = nodes
+        .iter()
+        .map(|node| node_report(node, registry.images.is_complete(&node.metadata.name)))
+        .collect();
 
     let vms = store.list::<Vm>().await?;
     // Absence from this list is what the cloud accepts as proof that a VM was
@@ -1774,7 +1777,11 @@ fn update_node_patch(u: &proto::UpdateNode) -> Option<serde_json::Value> {
 /// (`spec`) and what the agent reported (`status`), in one message. The cloud
 /// keeps no Node object to merge two halves into, and there is nothing up
 /// there that would ever hold only one of them.
-fn node_report(node: &Node) -> proto::NodeReport {
+///
+/// `images_complete` is the one field that comes from neither half: it is off
+/// the session's own `ImageView`, because the claim is about the last REPORT
+/// and not about the object. See `NodeReport.images_complete`.
+fn node_report(node: &Node, images_complete: bool) -> proto::NodeReport {
     proto::NodeReport {
         name: node.metadata.name.clone(),
         ready: node.status.ready,
@@ -1785,6 +1792,7 @@ fn node_report(node: &Node) -> proto::NodeReport {
         mem_mib: node.status.capacity.mem_mib,
         capabilities: node.status.capacity.capabilities.clone(),
         vms: node.status.vms,
+        images_complete,
         // Relayed and not summarised: what makes a machine unusable is the
         // machine's own sentence, and a tier that reworded it would be a tier
         // that could get it wrong.
@@ -2226,7 +2234,7 @@ mod tests {
     /// not exist.
     #[test]
     fn a_node_report_carries_what_an_operator_decided_and_what_the_agent_said() {
-        let up = node_report(&node("manacor", true, false));
+        let up = node_report(&node("manacor", true, false), false);
         assert_eq!(up.name, "manacor");
         assert!(up.ready, "the agent is talking");
         assert!(!up.schedulable, "and an operator drained it");
@@ -2234,7 +2242,7 @@ mod tests {
         assert_eq!((up.vcpus, up.mem_mib, up.vms), (32, 65_536, 2));
         assert_eq!(up.capabilities, vec!["nvrm/4q".to_string()]);
 
-        let down = node_report(&node("felanitx", false, true));
+        let down = node_report(&node("felanitx", false, true), false);
         assert!(!down.ready);
         assert!(down.schedulable);
         // A healthy machine says nothing, and that is what travels: an empty
@@ -2252,7 +2260,7 @@ mod tests {
     /// drain column reading `0 moved, 0 leaving, 0 staying`.
     #[test]
     fn the_numbers_of_a_drain_travel_up_beside_the_ask() {
-        let quiet = node_report(&node("manacor", true, false));
+        let quiet = node_report(&node("manacor", true, false), false);
         assert!(
             quiet.draining.is_none(),
             "nobody is emptying this one, so there is nothing to say"
@@ -2272,7 +2280,7 @@ mod tests {
                 message: "its owner said evacuation: never".into(),
             }],
         });
-        let up = node_report(&emptying);
+        let up = node_report(&emptying, false);
         assert!(up.drain, "the ask");
         let evidence = up.draining.expect("and the evidence beside it");
         assert_eq!(
@@ -2321,7 +2329,7 @@ mod tests {
                 message: "/var/lib/meisterstack has 0 bytes free".into(),
             },
         ];
-        let up = node_report(&wedged);
+        let up = node_report(&wedged, false);
         assert_eq!(
             up.conditions
                 .iter()

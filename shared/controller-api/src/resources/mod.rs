@@ -65,8 +65,17 @@ pub use volume::*;
 ///
 /// The store reads both off the type (`crate::object::Resource`), which is why
 /// nothing outside this table ever spells a resource name again.
+/// A row may also carry a `{ ... }` block of extra associated items, which is
+/// where `Resource::settle` lives: the derivation is a statement about ONE
+/// resource, so it is written beside that resource's row and reads as part of
+/// it. A row without a block keeps the trait's no-op — the resources with no
+/// phase at all (`Node`, `Secret`, `Ticket`, …) have nothing to derive.
 macro_rules! resources {
-    ($( $(#[$about:meta])* $ty:ty => $resource:literal, $kind:literal $(, $shape:expr)?; )*) => {
+    ($(
+        $(#[$about:meta])*
+        $ty:ty => $resource:literal, $kind:literal $(, $shape:path)?
+        $({ $($item:item)* })? ;
+    )*) => {
         $(
             $(#[$about])*
             impl Resource for $ty {
@@ -75,6 +84,7 @@ macro_rules! resources {
                 // A row that names a shape gets it; every other row keeps the
                 // trait's default, which is the DNS label.
                 $( const NAME_SHAPE: crate::object::NameShape = $shape; )?
+                $( $($item)* )?
             }
         )*
 
@@ -96,7 +106,13 @@ resources! {
     /// dotted name, not a label. `debian-13.raw` is what an image is called;
     /// insisting on a label here meant no image with an extension could be
     /// catalogued at all. See `NameShape`.
-    Image => "images", "Image", crate::object::NameShape::Dotted;
+    Image => "images", "Image", crate::object::NameShape::Dotted {
+        /// What the fleet's words add up to. See [`settle_image`].
+        fn settle(&mut self, now: DateTime<Utc>) {
+            let phase = settle_image(&self.spec, &self.status);
+            self.status.stamp(phase, now);
+        }
+    };
     Tenant => "tenants", "Tenant";
     User => "users", "User";
     CertificateSigningRequest => "certificatesigningrequests", "CertificateSigningRequest";

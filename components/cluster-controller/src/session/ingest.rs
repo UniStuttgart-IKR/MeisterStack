@@ -26,8 +26,13 @@ pub(super) async fn on_status(
     };
     // What the node says about base images goes into the cluster-wide view,
     // whatever the rest of the ingest does: it is a fact about that node's
-    // disk and does not depend on any VM object being readable.
-    session.registry.images.observe(id, &report.images);
+    // disk and does not depend on any VM object being readable. The
+    // completeness flag travels with the lines it is about — see
+    // `ImageView::observe`.
+    session
+        .registry
+        .images
+        .observe(id, &report.images, report.images_complete);
     if let Err(e) = ingest_status(&session.store, &session.vms, id, report).await {
         warn!(node = id, error = format!("{e:#}"), "status ingest failed");
     }

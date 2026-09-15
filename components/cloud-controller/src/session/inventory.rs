@@ -27,59 +27,105 @@ use super::*;
 /// An image the cloud does not know is skipped rather than created: a cluster
 /// naming one is a cluster with a stale spec or a node with a leftover cache
 /// entry, and inventing a catalogue entry for it would be this control plane
-/// making up an image nobody registered.
+/// making up an image nobody registered. The same rule from the other side is
+/// why the walk below is over the CATALOGUE and not over the report: a node's
+/// inventory names every file under its image directory, including an
+/// operator's hand-placed one and, on shared storage, another cluster's.
+///
+/// Walking the catalogue is also what closes F16's second half. The absence
+/// of a name from a COMPLETE inventory is the only evidence there is that a
+/// path image points at nothing — and an absence can only be noticed by
+/// whoever holds the list of names, which is this tier and no other.
 pub(super) async fn ingest_images(
     store: &EtcdStore,
     cluster: &str,
     reports: &[proto::ImageStateReport],
+    nodes: &[proto::NodeReport],
 ) {
-    for (name, lines) in by_image(reports) {
-        let Some((phase, reason, message, mine)) = compute_union(cluster, name, &lines) else {
-            continue;
-        };
-        let current = match store.get::<Image>(name).await {
-            Ok(image) => image,
-            Err(StoreError::NotFound(_)) => {
-                debug!(cluster, image = %name, "status for an image this cloud has not got");
-                continue;
-            }
-            Err(e) => {
-                warn!(image = %name, error = format!("{e:#}"), "reading the image failed");
-                continue;
-            }
-        };
+    let by_image = by_image(reports);
+    // Nodes whose last report listed everything under their image directory.
+    // For those, and only for those, a name that is not in the report is a
+    // file that is not there (decision 4: `images_complete = false` means
+    // "not saying", never "not there").
+    let complete: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n.images_complete)
+        .map(|n| n.name.as_str())
+        .collect();
+    let catalogue = match store.list::<Image>().await {
+        Ok(images) => images,
+        Err(e) => {
+            warn!(
+                cluster,
+                error = format!("{e:#}"),
+                "reading the catalogue failed"
+            );
+            return;
+        }
+    };
+    for current in catalogue {
+        let name = current.metadata.name.clone();
+        let lines: Vec<&proto::ImageStateReport> =
+            by_image.get(name.as_str()).cloned().unwrap_or_default();
+        let mine = lines_of(cluster, &name, &lines, &complete);
         let merged = merged_lines(&current, cluster, mine);
-        // Against the phase the write WOULD leave behind — see
-        // `mirror::observe` for why the parts cannot be compared one by one.
-        let candidate = controller_api::ImagePhase::new(
-            phase,
-            reason,
-            message.clone(),
-            current.status.phase().since(),
-        );
-        if *current.status.phase() == candidate && same_node_states(&current.status.nodes, &merged)
-        {
+        if same_node_states(&current.status.nodes, &merged) {
             continue;
         }
         let result = store
-            .mutate::<Image, _>(name, |i| {
-                #[allow(deprecated)]
-                i.status.assign(controller_api::ImagePhase::new(
-                    phase,
-                    reason,
-                    message.clone(),
-                    chrono::Utc::now(),
-                ));
+            .mutate::<Image, _>(&name, |i| {
+                // The FACT, and nothing else. What the fleet's words add up
+                // to is `settle_image`, which the store runs on the way out —
+                // so there is exactly one rule for "is this image usable" and
+                // it cannot be written down in two places again.
                 i.status.nodes = merged.clone();
             })
             .await;
         match result {
-            Ok(_) => info!(image = %name, ?phase, cluster, nodes = merged.len(),
-                           "image phase observed"),
+            Ok(image) => info!(image = %name, phase = image.status.phase().kind().as_str(),
+                               reason = image.status.phase().reason_word(), cluster,
+                               nodes = merged.len(), "image observed"),
             Err(e) => warn!(image = %name, error = format!("{e:#}"),
                             "writing image status failed"),
         }
     }
+}
+
+/// This cluster's lines about one image: what its nodes said, plus what their
+/// silence says.
+///
+/// The second half is F16. A node that reports a complete inventory and does
+/// not name the image has told this tier that the file is not on its disk —
+/// there is no command that asks a node about an image, so silence was the
+/// only answer a path image nothing used ever got, and a catalogue entry
+/// pointing at nothing read `Ready` for ever.
+///
+/// A node whose report is not complete contributes nothing. That is the
+/// asymmetry the flag exists for: an agent from before the field, a directory
+/// that could not be read and a heartbeat carrying no lists all look like
+/// silence, and reading any of them as "the file is gone" would fail a
+/// working image.
+pub(super) fn lines_of(
+    cluster: &str,
+    name: &str,
+    lines: &[&proto::ImageStateReport],
+    complete: &[&str],
+) -> Vec<controller_api::ImageNodeState> {
+    let mut mine = node_states(cluster, name, lines);
+    for node in complete {
+        if mine.iter().any(|line| line.name == *node) {
+            continue;
+        }
+        mine.push(controller_api::ImageNodeState {
+            name: node.to_string(),
+            cluster: cluster.to_string(),
+            phase: ImagePhaseKind::Failed,
+            reason: controller_api::ImageReason::NotFound,
+            message: Some(format!("{node} has no file named {name}")),
+        });
+    }
+    mine.sort_by(|a, b| (&a.cluster, &a.name).cmp(&(&b.cluster, &b.name)));
+    mine
 }
 
 /// The report's lines, grouped by the image they are about.
@@ -110,17 +156,11 @@ fn by_image(
 ///
 /// `None` when not one line could be read, which is the case in which there
 /// is nothing to write.
-fn compute_union(
+fn node_states(
     cluster: &str,
     name: &str,
     lines: &[&proto::ImageStateReport],
-) -> Option<(
-    ImagePhaseKind,
-    controller_api::ImageReason,
-    Option<String>,
-    Vec<controller_api::ImageNodeState>,
-)> {
-    let mut union: Option<(ImagePhaseKind, controller_api::ImageReason, Option<String>)> = None;
+) -> Vec<controller_api::ImageNodeState> {
     let mut nodes: Vec<controller_api::ImageNodeState> = Vec::new();
     for line in lines {
         let Some(phase) = ImagePhaseKind::parse(&line.phase) else {
@@ -130,39 +170,29 @@ fn compute_union(
                   "unknown image phase from cluster");
             continue;
         };
+        // A cluster older than `ImageStateReport.node` sends the already
+        // merged form with an empty node, and there is nothing to file it
+        // under. It only ever fed the union, and the union is `settle_image`
+        // now — so such a cluster says nothing, which is the honest reading
+        // of a line that names no machine.
+        if line.node.is_empty() {
+            continue;
+        }
         let message = (!line.message.is_empty()).then(|| line.message.clone());
-        // The node's own word for what is wrong with the bytes, which is the
-        // whole of why the union is worth computing at all: `FetchFailed` on
-        // one node during a roll-out and `ChecksumMismatch` on every node are
-        // both a Failed union, and only the second will never come right.
+        // The node's own word for what is wrong with the bytes, which is why
+        // the list is worth keeping per node at all: `FetchFailed` on one
+        // machine during a roll-out and `ChecksumMismatch` everywhere are
+        // both a failure, and only the second will never come right.
         let (reason, message) = controller_api::ImageReason::read(&line.reason, message);
-        // Failed wins over Ready where two nodes disagree: a checksum that
-        // did not match is a fact about the BYTES, not about the node that
-        // read them. The sentence travels with the phase that won, so a
-        // Failed union carries the reason one of them gave.
-        let beats = match &union {
-            None => true,
-            Some((held, ..)) => *held != ImagePhaseKind::Failed && phase == ImagePhaseKind::Failed,
-        };
-        if beats {
-            union = Some((phase, reason, message.clone()));
-        }
-        if !line.node.is_empty() {
-            nodes.push(controller_api::ImageNodeState {
-                name: line.node.clone(),
-                cluster: cluster.to_string(),
-                phase,
-                message,
-            });
-        }
+        nodes.push(controller_api::ImageNodeState {
+            name: line.node.clone(),
+            cluster: cluster.to_string(),
+            phase,
+            reason,
+            message,
+        });
     }
-    let (phase, reason, message) = union?;
-    // This cluster's lines replace this cluster's lines and nobody else's.
-    // That is what `ImageNodeState::cluster` is for: two clusters may each
-    // have a `node-1`, and a list keyed by the bare name would let one
-    // overwrite the other's word.
-    nodes.sort_by(|a, b| (&a.cluster, &a.name).cmp(&(&b.cluster, &b.name)));
-    Some((phase, reason, message, nodes))
+    nodes
 }
 
 /// The image's node list with this cluster's share of it replaced.
@@ -199,6 +229,7 @@ pub(super) fn same_node_states(
             x.name == y.name
                 && x.cluster == y.cluster
                 && x.phase == y.phase
+                && x.reason == y.reason
                 && x.message == y.message
         })
 }

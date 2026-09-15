@@ -131,7 +131,6 @@ pub(super) async fn create_image(
         check_tenant(&st, t).await?;
     }
 
-    let url = body.spec.url.clone();
     let mut image = Image::declare(
         &body.metadata.name,
         ImageSpec {
@@ -140,25 +139,21 @@ pub(super) async fn create_image(
         },
     );
     image.metadata.labels = body.metadata.labels;
-    // A path image is Ready the moment it is registered: it is a catalogue
-    // entry over storage somebody else already filled, and this control plane
-    // has never claimed to check it — saying anything else would be inventing
-    // a promise where there was none. A URL image is Pending until a node
-    // that has fetched it says otherwise, because the node is what fetches.
-    let now = chrono::Utc::now();
-    #[allow(deprecated)]
-    image.status.assign(match url {
-        // The sentence a URL image used to carry beside its phase now travels
-        // inside it, in the same words, with the category the wait has always
-        // had: nobody has fetched the bytes yet.
-        Some(_) => controller_api::ImagePhase::new(
-            controller_api::ImagePhaseKind::Pending,
-            controller_api::ImageReason::AwaitingNode,
-            Some("not fetched by any node yet".to_string()),
-            now,
-        ),
-        None => controller_api::ImagePhase::of(controller_api::ImagePhaseKind::Ready, now),
-    });
+    // Nothing is stamped here any more, and that is F16.
+    //
+    // A path image used to be `Ready` the moment it was registered — the
+    // argument was that a catalogue entry over storage somebody else filled
+    // is not this control plane's to check. But `Ready` is not "we make no
+    // claim", it is a claim, and the chaos run found an entry pointing at
+    // nothing wearing it for as long as anybody looked. A VM booting from it
+    // failed at the node with the storage driver's own words.
+    //
+    // The phase is derived now (`settle_image`), out of `status.nodes[]` and
+    // nothing else, so a fresh image of either kind is
+    // `Pending { AwaitingNode }` until a node has said something about the
+    // bytes. `dry.preview` sees the same value a create would store, because
+    // the derivation runs on the object and not in the store.
+    image.settle(chrono::Utc::now());
     let created = match dry.preview(&image) {
         Some(preview) => preview,
         None => st.store.create(&image).await?,

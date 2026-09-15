@@ -336,7 +336,7 @@ pub(super) async fn ingest_inventory(
     status: &ClusterStatus,
     at: DateTime<Utc>,
 ) {
-    ingest_images(store, cluster, &status.images).await;
+    ingest_images(store, cluster, &status.images, &status.nodes).await;
     if let Err(e) = ingest_pools(store, cluster, status).await {
         warn!(cluster, error = %format!("{e:#}"), "storage pool mirror failed");
     }

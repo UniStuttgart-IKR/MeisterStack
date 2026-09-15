@@ -1312,6 +1312,28 @@ message NodeReport {
   // follows: both tiers read one fact through one predicate, so "will take
   // this workload" cannot come to mean two things one hop apart.
   repeated string accepts = 12;
+  // Whether this node's share of `ClusterStatus.images` is EVERY base image
+  // under its image directory, and not only the ones it has an opinion
+  // about.
+  //
+  // The node's own `StatusReport.images_complete`, relayed per node because
+  // that is the granularity the statement has: one node's image directory
+  // may be unreadable while its neighbour's is fine, and a cluster-wide flag
+  // would have to be the AND of them — which turns one broken node into
+  // "this cluster says nothing about any image".
+  //
+  // What it buys is the cloud half of F16. Only the cloud holds the
+  // catalogue, so only the cloud can ask "is there an `Image` object whose
+  // name this complete inventory does not list" — and a name missing from a
+  // complete inventory is a file that is not there. Without the flag the
+  // absence of a name means nothing at all: an agent from before the field,
+  // a directory that could not be read, a heartbeat that carries no lists.
+  //
+  // False is "not saying" and a reader may never turn it into a statement
+  // about a file. See `StatusReport.images_complete`, which is the same
+  // sentence one tier down.
+  bool images_complete = 13;
+
 }
 
 // The evidence a drain leaves, relayed one tier up. See

@@ -111,12 +111,22 @@ reasons! {
 phases! {
     /// Whether the bytes are there and are the right bytes.
     ///
-    /// A path image is `Ready` the moment it is registered: it is a catalogue
-    /// entry over storage somebody else already filled, and this control plane
-    /// has never claimed to check it. A URL image starts `Pending` — nobody has
-    /// fetched it yet — and moves when a node says what happened. F16 is
-    /// exactly the first half of that sentence being a promise nobody kept;
-    /// the derivation lane is where it stops being made.
+    /// **Every variant of this needs an observation, and that is F16's
+    /// answer.** A path image used to be `Ready` the moment it was
+    /// registered, on the argument that a catalogue entry over storage
+    /// somebody else filled is not this control plane's to check — but
+    /// `Ready` is not "we make no claim", it is a claim, and the chaos-extrem
+    /// run found an entry pointing at nothing wearing it for as long as
+    /// anybody looked. A VM booting from it failed at the node, with the
+    /// storage driver's own words, one tier away from the object that had
+    /// promised the bytes were fine.
+    ///
+    /// So the node is what looks — at a url image it fetched and at a path
+    /// image it merely finds, and it lists its whole image directory so that
+    /// an entry nothing uses is described too (`StatusReport.images_complete`).
+    /// The phase is derived from those words and from nothing else; see
+    /// [`settle_image`] for the four rules and `ImageNodeState` for what one
+    /// machine's word looks like.
     ImagePhase / ImagePhaseKind / ImageReason / ImagePhaseWire [3] {
         Pending { reason, message, since } => "Pending",
         Ready { message, since } => "Ready",
@@ -156,8 +166,21 @@ pub struct ImageNodeState {
     /// `Ready` or `Failed`. A node never says `Pending`: an image it has no
     /// opinion about is simply not in its report, and therefore not here.
     pub phase: ImagePhaseKind,
+    /// WHY, in the node's own closed word — the fact `settle` derives the
+    /// image's phase from.
+    ///
+    /// `Unrecorded` (absent on the wire) for a `Ready` line and for a cluster
+    /// older than the field. It is the difference between a roll-out still
+    /// running and bytes that will never be right: `FetchFailed` on one node
+    /// is a node's problem, `ChecksumMismatch` anywhere is the image's.
+    #[serde(default, skip_serializing_if = "is_unrecorded_image_reason")]
+    pub reason: ImageReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+fn is_unrecorded_image_reason(reason: &ImageReason) -> bool {
+    *reason == ImageReason::Unrecorded
 }
 
 /// `deny_unknown_fields` is off here and on every other spec and status in
@@ -233,3 +256,241 @@ fn refuse_available_on<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::
 /// No finalizer: an image object owns no resource anywhere, so there is
 /// nothing for a teardown to do and DELETE can mean delete.
 pub type Image = Object<ImageSpec, ImageStatus>;
+
+/// What the fleet's words about an image ADD UP TO. The whole of F16's
+/// controller half, and the first derivation of this round.
+///
+/// A pure function of the spec and `status.nodes[]`, which is the only fact
+/// there is about an image: no node has ever been asked a question about one,
+/// they simply say what is on their disks. Four rules, in this order:
+///
+/// 1. **Nobody has said anything → `Pending { AwaitingNode }`.** This is F16.
+///    A path image used to be `Ready` the moment it was registered — a
+///    catalogue entry over shared storage somebody else was supposed to have
+///    filled — and the chaos run found one pointing at nothing, `Ready`, for
+///    as long as anybody looked. `Ready` demands an observation now, and
+///    there is no path that writes it without one.
+/// 2. **A fact about the BYTES beats everything.** `ChecksumMismatch` and
+///    `NotAFile` are true wherever the bytes are: a checksum that did not
+///    match will not start matching, and a directory under the catalogue name
+///    is a path no storage driver can open. One node saying either is the
+///    image's answer.
+/// 3. **Otherwise one `Ready` is enough.** A fact about a NODE — `NotFound`,
+///    `FetchFailed` — is not a fact about the image, and this is the rule
+///    that CHANGED: the union used to let any `Failed` win, so a four-node
+///    fleet mid-roll-out showed a working image as broken. `ImageNodeState`'s
+///    own doc comment has said so since it was written ("a rollout in
+///    progress and a checksum that will never match look the same from up
+///    there, and the first is a wait while the second is a mistake"); the
+///    per-node list is where that detail now lives, and it is complete.
+/// 4. **Every node that looked failed → `Failed`,** with the first line's
+///    word and a sentence naming the machine.
+pub fn settle_image(spec: &ImageSpec, status: &ImageStatus) -> ImagePhase {
+    let said = |line: &ImageNodeState| match &line.message {
+        Some(message) => format!("{}: {message}", line.name),
+        None => format!("{} says {}", line.name, line.reason.as_str()),
+    };
+    // Rule 2, before anything else.
+    if let Some(bytes) = status.nodes.iter().find(|n| {
+        matches!(
+            n.reason,
+            ImageReason::ChecksumMismatch | ImageReason::NotAFile
+        )
+    }) {
+        return ImagePhase::new(
+            ImagePhaseKind::Failed,
+            bytes.reason,
+            Some(said(bytes)),
+            UNSTAMPED,
+        );
+    }
+    // Rule 3. The sentence is the node's if it gave one, which it does not:
+    // a node with the bytes has nothing to add.
+    if let Some(ready) = status
+        .nodes
+        .iter()
+        .find(|n| n.phase == ImagePhaseKind::Ready)
+    {
+        return ImagePhase::said(ImagePhaseKind::Ready, ready.message.clone(), UNSTAMPED);
+    }
+    // Rule 4.
+    if let Some(first) = status.nodes.first() {
+        return ImagePhase::new(
+            ImagePhaseKind::Failed,
+            first.reason,
+            Some(said(first)),
+            UNSTAMPED,
+        );
+    }
+    // Rule 1, and the sentence says what is being waited FOR, which differs:
+    // a url image is waiting for a fetch, a path image for somebody to look
+    // at a file that is supposed to be there already.
+    ImagePhase::new(
+        ImagePhaseKind::Pending,
+        ImageReason::AwaitingNode,
+        Some(match &spec.url {
+            Some(_) => "not fetched by any node yet".to_string(),
+            None => format!("no node has looked for {} yet", spec.source),
+        }),
+        UNSTAMPED,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("an instant")
+    }
+
+    fn line(node: &str, phase: ImagePhaseKind, reason: ImageReason) -> ImageNodeState {
+        ImageNodeState {
+            name: node.to_string(),
+            cluster: "cluster-1".to_string(),
+            phase,
+            reason,
+            message: None,
+        }
+    }
+
+    fn image(url: Option<&str>, nodes: Vec<ImageNodeState>) -> Image {
+        let mut image = Image::declare(
+            "debian.raw",
+            ImageSpec {
+                source: "debian.raw".to_string(),
+                url: url.map(str::to_string),
+                ..Default::default()
+            },
+        );
+        image.status.nodes = nodes;
+        image
+    }
+
+    /// The table: what the fleet said, and what the image therefore IS.
+    ///
+    /// One case per rule of `settle_image`, in the order the rules run, so a
+    /// rule that stops mattering shows up as a row that no longer decides.
+    #[test]
+    fn what_the_fleet_said_about_an_image_is_what_the_image_is() {
+        let cases: &[(&str, Vec<ImageNodeState>, ImagePhaseKind, ImageReason)] = &[
+            (
+                "nobody has looked",
+                vec![],
+                ImagePhaseKind::Pending,
+                ImageReason::AwaitingNode,
+            ),
+            (
+                "one node has the bytes",
+                vec![line("a", ImagePhaseKind::Ready, ImageReason::Unrecorded)],
+                ImagePhaseKind::Ready,
+                ImageReason::Unrecorded,
+            ),
+            (
+                // The rule that changed. A fetch that failed on one machine
+                // is a fact about that machine, and the union used to let it
+                // speak for the image.
+                "one node has them and one could not fetch them",
+                vec![
+                    line("a", ImagePhaseKind::Ready, ImageReason::Unrecorded),
+                    line("b", ImagePhaseKind::Failed, ImageReason::FetchFailed),
+                ],
+                ImagePhaseKind::Ready,
+                ImageReason::Unrecorded,
+            ),
+            (
+                // And the rule that did not. A checksum is a fact about the
+                // BYTES and beats a node that is happy with them.
+                "one node has them and one says they are the wrong bytes",
+                vec![
+                    line("a", ImagePhaseKind::Ready, ImageReason::Unrecorded),
+                    line("b", ImagePhaseKind::Failed, ImageReason::ChecksumMismatch),
+                ],
+                ImagePhaseKind::Failed,
+                ImageReason::ChecksumMismatch,
+            ),
+            (
+                "a directory under the catalogue name",
+                vec![
+                    line("a", ImagePhaseKind::Ready, ImageReason::Unrecorded),
+                    line("b", ImagePhaseKind::Failed, ImageReason::NotAFile),
+                ],
+                ImagePhaseKind::Failed,
+                ImageReason::NotAFile,
+            ),
+            (
+                // F16, all the way through: every node that looked found
+                // nothing, so the catalogue entry points at nothing.
+                "every node that looked found no file",
+                vec![
+                    line("a", ImagePhaseKind::Failed, ImageReason::NotFound),
+                    line("b", ImagePhaseKind::Failed, ImageReason::NotFound),
+                ],
+                ImagePhaseKind::Failed,
+                ImageReason::NotFound,
+            ),
+        ];
+        for (about, nodes, phase, reason) in cases {
+            let settled = settle_image(
+                &image(None, nodes.clone()).spec,
+                &ImageStatus {
+                    nodes: nodes.clone(),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(settled.kind(), *phase, "{about}");
+            assert_eq!(settled.reason().unwrap_or_default(), *reason, "{about}");
+        }
+    }
+
+    /// F16 at the create edge: a path image is not `Ready` because it was
+    /// registered. It used to be, and the chaos run found one over a file
+    /// nobody had ever looked at wearing the word.
+    ///
+    /// The sentence differs by kind because the WAIT differs: a url image is
+    /// waiting for a fetch, a path image for somebody to look at a file that
+    /// is supposed to be there already.
+    #[test]
+    fn a_freshly_registered_image_waits_for_a_node_whichever_kind_it_is() {
+        let mut path = image(None, vec![]);
+        path.settle(at(0));
+        assert_eq!(path.status.phase().kind(), ImagePhaseKind::Pending);
+        assert_eq!(
+            path.status.phase().reason(),
+            Some(ImageReason::AwaitingNode)
+        );
+        assert_eq!(
+            path.status.phase().message(),
+            Some("no node has looked for debian.raw yet")
+        );
+        assert_eq!(path.status.phase().since(), at(0));
+
+        let mut fetched = image(Some("https://example.invalid/debian.raw"), vec![]);
+        fetched.settle(at(0));
+        assert_eq!(fetched.status.phase().kind(), ImagePhaseKind::Pending);
+        assert_eq!(
+            fetched.status.phase().message(),
+            Some("not fetched by any node yet")
+        );
+    }
+
+    /// The stamp belongs to the WORD: a derivation that runs on every write
+    /// must not move it, or "Ready since" becomes "last written".
+    #[test]
+    fn settling_twice_over_the_same_word_does_not_move_the_stamp() {
+        let mut image = image(
+            None,
+            vec![line("a", ImagePhaseKind::Ready, ImageReason::Unrecorded)],
+        );
+        image.settle(at(0));
+        assert_eq!(image.status.phase().since(), at(0));
+        image.settle(at(600));
+        assert_eq!(image.status.phase().since(), at(0));
+
+        // A new word IS the moment of the change.
+        image.status.nodes = vec![line("a", ImagePhaseKind::Failed, ImageReason::NotFound)];
+        image.settle(at(900));
+        assert_eq!(image.status.phase().kind(), ImagePhaseKind::Failed);
+        assert_eq!(image.status.phase().since(), at(900));
+    }
+}

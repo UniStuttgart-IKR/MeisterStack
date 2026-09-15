@@ -395,6 +395,10 @@ mod tests {
             capabilities: vec!["nvrm/4q".into(), "network/vxlan".into()],
             accepts: vec!["router".into()],
             vms: 3,
+            // F16's half of the message: whether this node's share of
+            // `ClusterStatus.images` is EVERY file under its image directory.
+            // Only then may the cloud read a missing name as a missing file.
+            images_complete: true,
             // The node's own word about itself, relayed. On the wire because
             // the tier above places on clusters and has to be able to tell a
             // cluster with a wedged machine from one with a free one.

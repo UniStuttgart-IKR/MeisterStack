@@ -371,9 +371,31 @@ macro_rules! reasons {
         }
     )*) => { $(
         $(#[$about])*
-        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+        ///
+        /// Serialised as its own word, because a reason is also a FACT on a
+        /// status now (`ImageNodeState::reason`, `Vm.status.reported.reason`)
+        /// and not only a field of a phase. Reading is total, like every
+        /// other read in this file: a word this binary does not know is
+        /// `Unrecorded` and never an error, so one object written by a newer
+        /// replica cannot break `list()`.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, JsonSchema)]
         pub enum $name {
             $( $(#[$variant_about])* $variant, )*
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                // The word only. A fact field carries no sentence of its own
+                // to rescue an unknown word into — the ingest that wrote the
+                // fact already applied [`Self::read`] to the wire it came off.
+                Ok(Self::parse(&String::deserialize(d)?).unwrap_or_default())
+            }
         }
 
         impl $name {
@@ -476,11 +498,34 @@ macro_rules! phased {
             /// compiles.
             #[deprecated(note = "struktur 4: wird durch settle() ersetzt")]
             pub fn assign(&mut self, phase: $phase) {
+                let at = phase.since();
+                self.stamp(phase, at);
+            }
+
+            /// The derived phase, onto the object, with the stamp rule
+            /// applied — the ONE place the field moves once `assign` is
+            /// gone.
+            ///
+            /// `pub(super)`, so it is reachable from the `Resource::settle`
+            /// implementations beside the resource table and from nowhere
+            /// else in this workspace. That is what makes a phase a
+            /// derivation rather than an assignment: there is no function a
+            /// reconciler can call to put a word on an object.
+            ///
+            /// `now` is used only when the WORD changes. A derivation runs on
+            /// every write — a status report arrives every ten seconds and
+            /// says what it said last time — and a stamp taken per write
+            /// would make "Running since" mean "last heard from" and turn
+            /// every one of those reports into an etcd revision. The one
+            /// exception is an object nobody has stamped at all
+            /// ([`UNSTAMPED`]): its first derivation IS its first stamp, even
+            /// onto the word it was born with.
+            pub(super) fn stamp(&mut self, phase: $phase, now: DateTime<Utc>) {
                 let since = if phase.kind() == self.phase.kind() && self.phase.since() != UNSTAMPED
                 {
                     self.phase.since()
                 } else {
-                    phase.since()
+                    now
                 };
                 self.phase = $phase::new(
                     phase.kind(),
