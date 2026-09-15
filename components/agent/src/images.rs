@@ -129,6 +129,23 @@ impl State {
 pub struct Cache {
     dir: PathBuf,
     known: Mutex<HashMap<String, Entry>>,
+    /// Everything that IS in the image directory, and when that directory
+    /// last changed. See [`Cache::take_inventory`].
+    inventory: Mutex<Option<Inventory>>,
+}
+
+/// A reading of the image directory, and the mtime it was read at.
+struct Inventory {
+    /// The directory's mtime BEFORE the read. A list taken after this instant
+    /// is never older than it claims to be, which is the direction this has
+    /// to be wrong in.
+    at: std::time::SystemTime,
+    /// The bare file names, sorted. These ARE catalogue names: the cloud
+    /// refuses an image whose `metadata.name` is not the file its source
+    /// points at (`check_image_name`), and the volume drivers resolve
+    /// `base_image` by joining the name onto their own image_dir. So nothing
+    /// is translated here, and nothing has to be.
+    names: Vec<String>,
 }
 
 /// One image's line in this node's opinion, and where the opinion came from.
@@ -193,6 +210,7 @@ impl Cache {
         Self {
             dir: image_dir,
             known: Mutex::default(),
+            inventory: Mutex::default(),
         }
     }
 
@@ -209,13 +227,127 @@ impl Cache {
         self.dir.join(name)
     }
 
+    /// Read the image directory, unless it has not changed since the last
+    /// reading. `true` when the answer can be trusted as complete.
+    ///
+    /// F16's other half, and the whole of what makes it closable from here:
+    /// the node stops waiting to be asked about an image and says what it
+    /// HAS. Nothing tells a node about an `Image` that no record of its own
+    /// names — `SyncState` carries VMs and there is no image command — so the
+    /// only statement that can cover such an image is one about the
+    /// directory. With `images_complete` set, the tier above may read the
+    /// absence of a name as the absence of the file.
+    ///
+    /// A `readdir` and no more: no download, no checksum, and no `stat` per
+    /// entry either — `read_dir` on Linux answers the file type from the
+    /// directory entry itself, so the whole inventory is one syscall's worth
+    /// of work. It is cached on the directory's own mtime, so a fleet's
+    /// steady state costs one `metadata` call per report.
+    ///
+    /// The cache is deliberately distrusted for one second after the mtime it
+    /// holds: mtimes are coarse, and a file that appears in the same second as
+    /// a reading would leave behind exactly the mtime that reading recorded.
+    /// Re-reading for a second afterwards costs a `readdir` on a directory
+    /// somebody is changing anyway.
+    ///
+    /// `false` on any failure, and then this node says nothing: a directory
+    /// that cannot be read must not become "the file is not there", which is
+    /// the one mistake that would make F16 worse rather than better.
+    pub async fn take_inventory(&self) -> bool {
+        let at = match tokio::fs::metadata(&self.dir)
+            .await
+            .and_then(|m| m.modified())
+        {
+            Ok(at) => at,
+            Err(e) => {
+                debug!(dir = %self.dir.display(), error = %e,
+                       "the image directory cannot be read; saying nothing about it");
+                *self.inventory.lock().unwrap() = None;
+                return false;
+            }
+        };
+        let settled = std::time::SystemTime::now()
+            .duration_since(at)
+            .is_ok_and(|age| age > std::time::Duration::from_secs(1));
+        if settled
+            && self
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|held| held.at == at)
+        {
+            return true;
+        }
+
+        let mut entries = match tokio::fs::read_dir(&self.dir).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                debug!(dir = %self.dir.display(), error = %e,
+                       "the image directory cannot be listed; saying nothing about it");
+                *self.inventory.lock().unwrap() = None;
+                return false;
+            }
+        };
+        let mut names = Vec::new();
+        loop {
+            match entries.next_entry().await {
+                Ok(None) => break,
+                Ok(Some(entry)) => {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    // A name that starts with a dot is not a catalogue name:
+                    // the content-addressed cache is `.cache`, and a fetch
+                    // stages its hard link as `.<digest>.linking.<pid>` right
+                    // here. The cloud cannot mint such a name either — it
+                    // refuses `.` and `..` outright and everything with a
+                    // separator in it.
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    // Only regular files. A directory under a catalogue name
+                    // is not an image (`verify_path` says so in a sentence),
+                    // and a `Ready` about one would hand a storage driver a
+                    // path it cannot open.
+                    if entry.file_type().await.is_ok_and(|t| t.is_file()) {
+                        names.push(name);
+                    }
+                }
+                Err(e) => {
+                    debug!(dir = %self.dir.display(), error = %e,
+                           "the image directory could not be walked to the end");
+                    *self.inventory.lock().unwrap() = None;
+                    return false;
+                }
+            }
+        }
+        names.sort();
+        *self.inventory.lock().unwrap() = Some(Inventory { at, names });
+        true
+    }
+
     /// Every image this node has an opinion about, for the status report.
+    ///
+    /// Two sources, and the order between them is the whole of the merge. An
+    /// entry in `known` is a LOOK at one named image — a fetch, or the
+    /// `verify_path` this node runs for every image its records name — and it
+    /// wins, because it can say things the inventory cannot: a checksum that
+    /// did not match, a directory under the name, a path with nothing at it.
+    /// The inventory adds `Ready` for every file nobody asked about, which is
+    /// the half F16 needed.
     pub fn report(&self) -> Vec<(String, State)> {
         let known = self.known.lock().unwrap();
         let mut out: Vec<(String, State)> = known
             .iter()
             .map(|(name, entry)| (name.clone(), entry.state.clone()))
             .collect();
+        if let Some(held) = self.inventory.lock().unwrap().as_ref() {
+            out.extend(
+                held.names
+                    .iter()
+                    .filter(|name| !known.contains_key(*name))
+                    .map(|name| (name.clone(), State::Ready)),
+            );
+        }
         // Sorted so two consecutive reports of the same facts are the same
         // message; the tier above compares them.
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -754,6 +886,92 @@ mod tests {
         assert!(images.join(CACHE_DIR).join(digest_of(&first)).exists());
         assert!(images.join(CACHE_DIR).join(digest_of(&second)).exists());
     }
+    /// The node says what it HAS, not only what it was asked about.
+    ///
+    /// F16's other half. A path image is somebody else's file, and this node
+    /// only ever heard of one through a record that named it — so an `Image`
+    /// object nothing on the fleet used was described by nobody, the cloud had
+    /// no evidence, and a catalogue entry pointing at nothing went on reading
+    /// `Ready`. Nothing can tell a node about such an image: `SyncState`
+    /// carries VMs and there is no image command. So the direction is turned
+    /// around — the node reads its directory and says the list is complete,
+    /// and the tier above may then read a missing name as a missing file.
+    ///
+    /// What must NOT happen is the inventory talking over a look: a checksum
+    /// that did not match and a directory under a catalogue name are things
+    /// only a look can say, and a bare `readdir` would flatten both into
+    /// `Ready`.
+    #[tokio::test]
+    async fn the_inventory_says_what_is_on_the_disk_and_a_look_still_wins() {
+        let (_temp, images) = scratch("inventory");
+        let cache = Cache::new(images.clone());
+
+        std::fs::write(images.join("nixos.raw"), b"an image").expect("the bytes");
+        std::fs::write(images.join("ubuntu.raw"), b"another").expect("the bytes");
+        // Neither of these is a catalogue name, and both are shapes this
+        // directory really holds: the content-addressed cache, and the hard
+        // link a fetch stages before it renames it into place.
+        std::fs::create_dir(images.join(CACHE_DIR)).expect("the cache dir");
+        std::fs::write(images.join(".abc123.linking.4242"), b"half a link").expect("staged");
+        std::fs::create_dir(images.join("not-an-image")).expect("a directory");
+
+        assert!(cache.take_inventory().await, "the directory can be read");
+        let mut said: Vec<(String, State)> = cache.report();
+        said.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            said,
+            vec![
+                ("nixos.raw".to_string(), State::Ready),
+                ("ubuntu.raw".to_string(), State::Ready),
+            ],
+            "two files, and nothing that is not one of them"
+        );
+
+        // A LOOK at one of them, and it disagrees with the file being there:
+        // the same name, re-registered under a url whose bytes did not match.
+        // The look wins, because it is the only one of the two that can say
+        // which of the four things is wrong.
+        cache.remember(
+            "ubuntu.raw",
+            State::Failed {
+                reason: ImageReason::ChecksumMismatch,
+                message: "checksum mismatch for ubuntu.raw".into(),
+            },
+            true,
+        );
+        let mut said: Vec<(String, State)> = cache.report();
+        said.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(said[0].0, "nixos.raw");
+        assert_eq!(said[0].1, State::Ready);
+        assert_eq!(said[1].0, "ubuntu.raw");
+        assert_eq!(said[1].1.reason(), Some(ImageReason::ChecksumMismatch));
+        assert_eq!(said.len(), 2, "one line per name, whatever the sources");
+
+        // A name a record asked about and that is NOT in the directory: the
+        // look says why, and the inventory's completeness is what lets the
+        // tier above believe it about an image nobody named at all.
+        cache.verify_path("chaos-img-bad.raw").await;
+        let said = cache.report();
+        let bad = said
+            .iter()
+            .find(|(name, _)| name == "chaos-img-bad.raw")
+            .expect("a line");
+        assert_eq!(bad.1.reason(), Some(ImageReason::NotFound));
+
+        // A second reading of an unchanged directory is free, and still
+        // answers the same.
+        assert!(cache.take_inventory().await);
+        assert_eq!(cache.report().len(), 3);
+
+        // And a directory that is not there at all: no claim of completeness,
+        // and no `Ready` invented for anything. A directory that cannot be
+        // read must never become "the file is not there" — that would make
+        // F16 worse rather than better.
+        let gone = Cache::new(images.join("nowhere"));
+        assert!(!gone.take_inventory().await);
+        assert!(gone.report().is_empty());
+    }
+
     /// A path image is registered like a fetched one, so the cloud stops
     /// guessing.
     ///

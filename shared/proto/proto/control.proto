@@ -272,6 +272,31 @@ message StatusReport {
   // older than this field, which reads as "did not say" and leaves the
   // cluster's own transfer timeout exactly as it was.
   repeated MigrationReport migrations = 8;
+  // The `images` list above is EVERY base image under this node's image
+  // directory, not only the ones it has an opinion about.
+  //
+  // What it buys is the other half of F16. A path image is somebody else's
+  // file on shared storage, and the node only ever heard of one through a
+  // record that named it — so an `Image` object nothing on this fleet used
+  // was described by nobody, and the cloud went on calling a catalogue entry
+  // that points at nothing `Ready`. There is no way to tell a node about such
+  // an image: `SyncState` carries VMs, and there is no image command.
+  //
+  // So the node stops waiting to be asked and says what it HAS. With this
+  // flag set, the tier above may read the absence of a name as absence of the
+  // file — "the inventory is complete and this image is not in it" — and put
+  // a path image on `Failed { NotFound }` without anybody's record naming it.
+  //
+  // False means "not saying", exactly as an empty list does: an agent from
+  // before this field, a node whose image directory could not be read, and
+  // the heartbeat-only report that carries no lists at all. A reader may
+  // never turn a false into a statement about a file.
+  //
+  // The list is a `readdir` of regular files, cached on the directory's own
+  // mtime; the catalogue name IS the file name (`check_image_name` at the
+  // cloud refuses anything else), so no translation happens on either side.
+  // Nothing is fetched and nothing is hashed for it.
+  bool images_complete = 9;
 }
 
 // What one node has to say about a guest it was told to send away.

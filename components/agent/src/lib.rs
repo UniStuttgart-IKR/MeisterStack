@@ -463,8 +463,13 @@ impl Agent {
             })
             .collect();
         // Before the report is built and not inside it: what the image half
-        // says is a statement about this node's disk right now.
+        // says is a statement about this node's disk right now. Two looks,
+        // and they answer two different questions — `verify_path_images`
+        // looks at the images the records here NAME (and can therefore say
+        // why one is unusable), `take_inventory` reads the directory (and can
+        // therefore say that a name is not in it at all). See F16.
         self.reconciler.verify_path_images().await;
+        let images_complete = self.images.take_inventory().await;
         Ok(StatusReport {
             node: Some(self.node_status()),
             vms,
@@ -509,6 +514,12 @@ impl Agent {
                     node: String::new(),
                 })
                 .collect(),
+            // Whether the list above is EVERY image under this node's image
+            // directory or only the ones it has an opinion about. See
+            // `Cache::take_inventory`: only a `true` lets the tier above read
+            // a missing name as a missing file, which is what closes F16 for
+            // an image no record here names.
+            images_complete,
             // The volumes this node owns on their own. Empty on a node that
             // was never told to make one, which is every node before this
             // milestone — and empty is "knows of none", never "they are gone".
@@ -1346,6 +1357,10 @@ fn heartbeat_only(node: NodeStatus, stopping: bool) -> StatusReport {
         vms: Vec::new(),
         routers: Vec::new(),
         images: Vec::new(),
+        // "Not saying", like the empty list beside it: this beat did not look
+        // at the disk, so the tier above may not read a missing name as a
+        // missing file.
+        images_complete: false,
         volumes: Vec::new(),
         snapshots: Vec::new(),
         stopping,

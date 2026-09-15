@@ -537,6 +537,7 @@ mod tests {
             vms: vec![vm.clone()],
             volumes: vec![volume.clone()],
             images: vec![image.clone()],
+            images_complete: true,
             routers: vec![router.clone()],
             ..Default::default()
         };
@@ -545,6 +546,22 @@ mod tests {
         assert_eq!(back.volumes, vec![volume]);
         assert_eq!(back.images, vec![image]);
         assert_eq!(back.routers, vec![router]);
+        // The flag that lets a reader turn a missing name into a missing
+        // file. A node from before it sends nothing, which decodes `false` —
+        // and `false` is the value nobody may conclude anything from.
+        assert!(back.images_complete);
+        assert!(
+            !StatusReport::decode(
+                StatusReport {
+                    images: status.images.clone(),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+                .as_slice()
+            )
+            .unwrap()
+            .images_complete
+        );
 
         // The pool's road is the cluster's, one tier further up, and the same
         // field travels there.
