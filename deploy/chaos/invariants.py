@@ -65,6 +65,26 @@ NODE_HOST = {
     "agent-1c": "10.128.1.114",
     "manacor": None,
 }
+# The long-term probes. Their survival is an invariant of every run (the
+# chaos-extrem brief makes it a stop condition), and until I17 below nothing
+# checked it: `nested-1` disappeared at some point between 2026-09-10 and
+# 2026-09-15 and every run in between said "all invariants held".
+PROBES = ["cloud-probe", "ubuntu-probe"]
+
+# etcd's NOSPACE quota is checked against the physical backend size. Past this
+# share of it, the tier is on a clock -- and nothing in the product says so.
+ETCD_WARN = 0.80
+
+# What a run did NOT get to look at. An unreachable node used to be a silent
+# `continue`, which turned every injected fault into a free pass for the
+# node-side half of I1, I2 and I3. It is still not a violation -- that is what
+# the fault is for -- but it is no longer invisible.
+SKIPPED = []
+
+# Nodes the caller deliberately broke for this check. Their NotReady is the
+# experiment, not a finding.
+EXPECT_DOWN = set()
+
 NODE_OF_CLUSTER = {
     "cluster-1": ["agent-1a", "agent-1b", "agent-1c", "manacor"],
     "cluster-2": ["agent-2a", "agent-2b"],
@@ -112,6 +132,17 @@ def sh(node, cmd, timeout=25):
     argv = ["bash", "-c", cmd] if host is None else SSH + [f"root@{host}", cmd]
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except subprocess.TimeoutExpired:
+        return 124, ""
+
+
+def sh_ip(ip, cmd, timeout=25):
+    """A shell on a controller by address. `sh()` resolves node NAMES through
+    NODE_HOST, and the controller replicas are not in it."""
+    try:
+        p = subprocess.run(SSH + [f"root@{ip}", cmd],
+                           capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout
     except subprocess.TimeoutExpired:
         return 124, ""
@@ -291,7 +322,10 @@ def check(st, base):
             v.append(("I2", f"{c}/{name(x)} spec node {n} != status node {status(x).get('nodeName')}"))
         p = st.node_probe.get(n)
         if p is None or p["rc"] != 0:
-            continue  # node unreachable is F1/F2 territory, not I2
+            # Not a violation: an unreachable node is the fault, not the bug.
+            # Recorded, so the verdict can say how much of it actually ran.
+            SKIPPED.append(("I2", n, f"{c}/{name(x)}: node not reachable"))
+            continue
         u = uid(x)
         if not any(u in line for line in p.get("CH", [])):
             v.append(("I2", f"{c}/{name(x)} Running on {n} but no vmm process there"))
@@ -494,11 +528,64 @@ def check(st, base):
             if up and up != c:
                 v.append(("I1", f"cloud says {name(x)} is on {up}, but {c} holds a copy"))
 
+    # I15 — etcd stays well under its quota. Rollout Neutron lost two hours to
+    # a full store that looked like a product bug from above, and this run found
+    # cluster-1 at 99 % before it started. One member per tier: the members of a
+    # raft group grow together, and three ssh round-trips is what this can cost.
+    for tier, ip in (("cloud", CLOUD[0]), ("cluster-1", CLUSTERS["cluster-1"][0]),
+                     ("cluster-2", CLUSTERS["cluster-2"][0])):
+        if not ip:
+            SKIPPED.append(("I15", tier, "no replica answered"))
+            continue
+        rc, out = sh_ip(ip, "etcdctl endpoint status -w json 2>/dev/null")
+        m = re.search(r'"dbSize":(\d+)', out or "")
+        q = re.search(r'"dbSizeQuota":(\d+)', out or "")
+        if not (m and q and int(q.group(1))):
+            SKIPPED.append(("I15", tier, "etcdctl gave no status"))
+            continue
+        share = int(m.group(1)) / int(q.group(1))
+        if share > ETCD_WARN:
+            v.append(("I15", f"{tier}: etcd backend at {share*100:.0f}% of quota "
+                             f"({int(m.group(1))//1048576} MiB); writes stop at 100%"))
+
+    # I16 — a cluster still has the nodes it is supposed to have. A node that
+    # vanishes from the roster is a violation; a node that is merely NotReady is
+    # an observation, because that is what half this harness exists to cause.
+    for cname, want in NODE_OF_CLUSTER.items():
+        have = {name(n): (status(n) or {}).get("ready") for n in st.cl_nodes.get(cname, [])}
+        for n in want:
+            if n not in have:
+                v.append(("I16", f"{cname}: node {n} is not in the roster at all"))
+            elif have[n] is not True and n not in EXPECT_DOWN:
+                SKIPPED.append(("I16", n, f"{cname}: NotReady"))
+
+    # I17 — the long-term probes are still there. Compared against the baseline,
+    # so this asks "did THIS run lose one", not "is the lab as it was in August".
+    known = set(base.get("probes") or [])
+    if known:
+        alive = {name(x) for x in st.cloud_vms}
+        for pr in sorted(known):
+            if pr not in alive:
+                v.append(("I17", f"long-term probe {pr} is gone (it was there at baseline)"))
+
+    # I18 — the contradiction that `Unknown` can hide. A guest in Unknown on a
+    # node the cluster calls Ready is not a fault in flight: the node IS
+    # reporting, so it should be reporting this guest too.
+    for cname, xs in st.cl_nodes.items():
+        ready = {name(n) for n in xs if (status(n) or {}).get("ready") is True}
+        for c, x in all_cl_vms:
+            if c != cname or status(x).get("phase") != "Unknown":
+                continue
+            n = spec(x).get("nodeName") or status(x).get("nodeName")
+            if n in ready:
+                v.append(("I18", f"{c}/{name(x)} is Unknown while its node {n} is Ready"))
+
     return v
 
 
 def snapshot_baseline(st):
-    b = {"taps": {}, "files": {}, "lvs": {}, "redb": {}, "vnis": {}}
+    b = {"taps": {}, "files": {}, "lvs": {}, "redb": {}, "vnis": {},
+         "probes": [name(x) for x in st.cloud_vms if name(x) in PROBES]}
     for node, p in st.node_probe.items():
         b["taps"][node] = p.get("TAP", [])
         b["files"][node] = p.get("FILES", [])
@@ -514,7 +601,10 @@ def main():
     ap.add_argument("--seed", default="-")
     ap.add_argument("--tag", default="")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--expect-down", default="",
+                    help="comma-separated nodes this caller broke on purpose")
     a = ap.parse_args()
+    EXPECT_DOWN.update(n for n in a.expect_down.split(",") if n)
 
     bpath = os.path.join(OUT, "baseline.json")
     st = State()
@@ -532,12 +622,26 @@ def main():
         for i, msg in viol:
             fh.write(f"{stamp}\t{i}\t{a.tag}\tseed={a.seed}\t{msg}\n")
 
+    # The verdict says what it looked at. "all invariants held" on its own is
+    # the sentence this checker used to print at a lab with a node four days
+    # gone, two guests in Unknown and a vanished probe.
+    cover = ""
+    if SKIPPED:
+        by = defaultdict(list)
+        for inv, who, why in SKIPPED:
+            by[inv].append(who)
+        cover = "; ".join(f"{i}: not checked on {', '.join(sorted(set(w)))}"
+                          for i, w in sorted(by.items()))
+        with open(os.path.join(OUT, "coverage.txt"), "a") as fh:
+            fh.write(f"{stamp}\t{a.tag}\tseed={a.seed}\t{cover}\n")
+
     if not a.quiet:
         if viol:
             for i, msg in viol:
                 print(f"FAIL {i}  {msg}")
         else:
-            print("all invariants held")
+            print("all invariants held" + (f" — but {cover}" if cover else
+                                           " (everything was reachable)"))
     return 1 if viol else 0
 
 
