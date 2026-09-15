@@ -5,20 +5,25 @@ virtual machines, block-storage and networking resources across multiple machine
 Its goal is to enable small labs and research clusters with a cloud-like experience. It's architecture
 is inspired by Kubernetes, Oakestra and OpenStack.
 
+MeisterStack supports sharing NVIDIA GPUs with its `nvrm` driver that utilizes [Project Leandro](https://github.com/UniStuttgart-IKR/Leandro).
+
 > [!WARNING]
 > The project is at the moment considered in `ALPHA` stage, [most features are proven in the lab]("docs/FEATURES.md") but to reach
-> `BETA`, long-term tests and support for Linstor and Vitastor is planned to support 1st-class NVMe-storage solutions.
+> `BETA`, long-term tests and support for Linstor and Vitastor is planned to support SDS solutions.
 > This project heavily used [AI for implementation and testing]("docs/AI_GUIDELINES.md"), when the project reaches `BETA` stage the generated
 > code will be fully reviewed!
+
+> [!INFO}
+> At the moment MeisterStack is active coursework and in proof-of-concept phase. Feature requests and bug-fixes do not have high priority.
 
 ## Architecture
 
 ![Architecture](docs/diagrams/architecture.svg "Architecture of MeisterStack")
 
-MeisterStacks has a two-tiered controll-plane with a cloud-level, that holds global data like tenants and manages authentication
-and a cluster-level controll-plane that manages one cluster of hypervisors. Each hypervisor runs the MeisterStack agent that 
-controlls the system. As hypervisor Cloud-Hypervisor is used, for NVIDIA GPU-sharing Project Leandro is used. Generic `virtio-gpus`
-are managed by CrosVM. `vfio` is also supported.
+MeisterStack is organized in three tiers. The *Agent* that runs locally on the hypervisor. The *Cluster-Controller* and the *Cloud-Controller*
+that act as two tiered, *etcd* backed control-plane. *Plugins* and *Drivers* allow to utilize traits and abstract capabilities on specific devices
+and adapt to other software stacks at compile time. The three tiers of the system communicate via *gRPC* and use an three-tiered, Kubernetes inspired
+reconcile mechanism to control the cloud.
 
 ## Quick Start
 
@@ -63,7 +68,7 @@ sudo target/debug/meister-agent --config config/agent.dev.toml
 Create  *CLI-profiles*:
 
 CLI-profiles are files that hold an endpoint and the required credentials. This makes it more easy to specify to which layer you want to talk.
-For this example you can jsut use the `config/cli.dev.toml` or specify `--endpoint "http://127.0.0.1:3000" before each command.\
+For this example you can jsut use the `config/cli.dev.toml` or specify `--endpoint "http://127.0.0.1:3000" before each command.
 
 ```bash
 cp config/cli.dev.toml ~/.config/meisterstack/config.toml
@@ -85,4 +90,9 @@ meister vm logs demo
 meister --endpoint http://127.0.0.1:3001 vm ls   # to talk to the cluster-level API
 ```
 
+See [Deployment](docs/DEPLOYMENT.md) for further information. A special deployment tool `meister-deploy` is under active development.
+
+## License
+
+The project is opensource and under MIT License.
 
