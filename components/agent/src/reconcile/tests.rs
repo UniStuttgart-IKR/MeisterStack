@@ -996,6 +996,168 @@ async fn a_pass_says_again_whether_the_path_images_of_its_records_are_here() {
     assert_eq!(images.report()[0].1.phase(), "Ready");
 }
 
+/// A disk stays open until the teardown has really detached it — whatever
+/// the VM's own line says, and whether or not the VM has one at all.
+///
+/// The gap this closes was found by reading the destroy path for struktur 4's
+/// A4 and is the one `openOn` is derived from. `DestroyInstance` writes
+/// `desired = Absent`, and from that instant the VM is gone from the VM half
+/// of the status report (`observe::report` skips it) — while its VMM, its
+/// backends and its disk connections are all still there. In the ordinary
+/// case the teardown runs inside the command and closes them before the
+/// receipt goes out. When something else owns the record — a snapshot, a
+/// migration — `plan` answers `Blocked`, nothing is torn down, and the tier
+/// above was left deriving "nobody here is using this disk" from a VM it
+/// could no longer see. The fd was open for at least another pass.
+///
+/// So the node says it about the DISK: `VolumeStateReport.open`, out of the
+/// VM records rather than the VM reports, and it turns false at the moment
+/// `detach` came back and not before.
+#[tokio::test]
+async fn a_disk_stays_open_until_the_teardown_has_really_detached_it() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let root = temp.path().to_path_buf();
+    let store = Arc::new(Store::open(&root.join("a.redb")).expect("a store"));
+    let image_dir = root.join("images");
+    std::fs::create_dir_all(&image_dir).expect("an image dir");
+
+    let block =
+        filesystem_driver::FilesystemBlockDriver::new(filesystem_driver::FilesystemDriverConfig {
+            image_dir: image_dir.clone(),
+            volume_dir: root.join("volumes"),
+            qemu_img: PathBuf::from("qemu-img"),
+        })
+        .expect("the filesystem driver builds");
+    let mut storage: HashMap<String, Arc<dyn agent_api::storage::VolumeDriver>> = HashMap::new();
+    storage.insert("filesystem".to_string(), Arc::new(block));
+    let drivers = Drivers {
+        confiner: Arc::new(cgroup_driver::CgroupV2::new(root.join("cgroup"))),
+        // No hypervisor on purpose: the teardown below then FAILS and keeps
+        // its record, which is the state this test is about — the disk has to
+        // be closed although the record is still standing.
+        hypervisor: None,
+        hypervisor_name: None,
+        storage,
+        networking: None,
+        bridge: None,
+        announcer: None,
+        devices: HashMap::new(),
+    };
+    let volumes = crate::volumes::Volumes::new(store.clone(), drivers.clone());
+
+    // A volume this node owns, and a VM holding it as a REFERENCED disk: the
+    // shape that outlives its VM, and the one `openOn` is kept for.
+    let disk = agent_api::storage::VolumeId::new_v4();
+    let disk_spec = agent_api::storage::VolumeSpec {
+        base_image: None,
+        size_bytes: 4096,
+        driver: Some("filesystem".into()),
+        params: None,
+    };
+    volumes
+        .provision(disk, disk_spec.clone())
+        .await
+        .expect("the bytes");
+    let handle = volumes
+        .get(&disk)
+        .expect("read")
+        .expect("a record")
+        .handle
+        .expect("a handle");
+
+    let vm = VmId::new_v4();
+    let mut r = record(Desired::Absent, Phase::Provisioned);
+    r.spec.volumes = vec![crate::types::VolumeWithId {
+        id: disk,
+        spec: disk_spec,
+        referenced: true,
+    }];
+    r.volumes = vec![agent_api::storage::Volume::attached(
+        handle.clone(),
+        agent_api::storage::VolumeAttachment::Path(handle.path()),
+    )];
+    // And something else owns the record, so no pass may tear it down.
+    r.operation = Some(crate::types::Operation::Snapshotting {
+        target: "a copy somebody asked for".into(),
+    });
+    store.put(&vm, &r).expect("a record");
+
+    let provisioner = Arc::new(Provisioner::new(
+        store.clone(),
+        drivers.clone(),
+        Arc::new(crate::images::Cache::new(image_dir.clone())),
+        image_dir,
+        root.join("run"),
+        "br0".to_string(),
+        None,
+        None,
+    ));
+    let reconciler = Reconciler::new(
+        store.clone(),
+        drivers,
+        provisioner,
+        Arc::new(tokio::sync::Mutex::new(())),
+    );
+    let line = || {
+        volumes
+            .report()
+            .into_iter()
+            .find(|l| l.id == disk.to_string())
+            .expect("a line for this node's own volume")
+    };
+
+    // The premise: the VM half says nothing about this VM at all.
+    assert!(
+        reconciler.report().await.expect("a report").is_empty(),
+        "a vm on its way out is not in the vm half of the report"
+    );
+    // And the disk is open, because it is.
+    assert!(line().open, "the vmm is still holding it");
+
+    // A pass, and it changes nothing: the operation outranks the teardown.
+    assert_eq!(
+        reconciler
+            .reconcile(vm, Trigger::Periodic)
+            .await
+            .expect("a pass"),
+        Action::Blocked
+    );
+    assert!(
+        line().open,
+        "a blocked teardown is not a closed disk, and this is the window \
+         openOn used to go empty in"
+    );
+
+    // The operation ends. Now the teardown runs — and fails, because there is
+    // no hypervisor to destroy anything with, so the record stays.
+    store
+        .mutate(&vm, |r| r.operation = None)
+        .expect("the marker goes");
+    assert!(
+        reconciler.reconcile(vm, Trigger::Periodic).await.is_err(),
+        "a teardown with no hypervisor cannot finish"
+    );
+    assert!(
+        store.get(&vm).expect("read").is_some(),
+        "so the record is still standing"
+    );
+    // The detach DID run, and that is what the answer follows.
+    assert!(
+        !line().open,
+        "the disk is closed although the vm's record is not gone"
+    );
+    assert!(
+        store
+            .get(&vm)
+            .expect("read")
+            .expect("a record")
+            .volumes
+            .iter()
+            .all(|v| v.detached),
+        "and it is written down, so the next attempt does not detach twice"
+    );
+}
+
 /// The other way this node hears of a path image: a `Volume` object made
 /// from one.
 ///

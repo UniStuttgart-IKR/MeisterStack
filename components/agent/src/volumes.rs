@@ -650,6 +650,37 @@ impl Volumes {
             .ok_or_else(|| anyhow!("volume driver {name:?} is not configured on this node"))
     }
 
+    /// Every volume this node has OPEN right now, by uid.
+    ///
+    /// Asked of the VM records and of nothing else, for the reason `holder`
+    /// below is: the attachment belongs to the consumer, and a VM's record is
+    /// what names the volumes it has open. Two things make this the honest
+    /// answer where the union of the VM REPORTS was not:
+    ///
+    /// * every record counts, whatever its own state. A record with
+    ///   `desired = Absent` is gone from the VM half of the report the moment
+    ///   the intent is written (`observe::report` skips it), and its VMM is
+    ///   still holding the disk until a pass has torn it down — with a
+    ///   snapshot or a migration owning the record, until the pass after that.
+    /// * `detached` is what ends it. A stop, a hot-unplug and a teardown all
+    ///   write it after the driver's `detach` came back, so the moment the fd
+    ///   is really closed is the moment this set shrinks.
+    ///
+    /// A record this build cannot read is not counted and does not stop the
+    /// answer — the same rule the rest of this file follows. It is the
+    /// conservative direction here by luck rather than by design, and the
+    /// alternative (refusing to answer at all) would leave the tier above
+    /// with no statement instead of a nearly complete one.
+    fn open_here(&self) -> anyhow::Result<std::collections::BTreeSet<VolumeId>> {
+        let mut open = std::collections::BTreeSet::new();
+        for (_, record) in self.store.list()? {
+            for volume in record.volumes.iter().filter(|v| !v.detached) {
+                open.insert(volume.id());
+            }
+        }
+        Ok(open)
+    }
+
     /// Which VM on this node is holding this volume, if any.
     ///
     /// Asked of the VM records rather than of the volume record, because the
@@ -679,6 +710,20 @@ impl Volumes {
                 return Vec::new();
             }
         };
+        // One walk of the VM records for the whole report rather than one
+        // per volume: a node with forty VMs and forty disks would otherwise
+        // read the same table forty times every ten seconds.
+        //
+        // A read that fails leaves the set empty, and an empty set says "open
+        // nowhere" about every line below. That is the direction this has to
+        // fail in: the alternative is to claim a disk is open because the
+        // records could not be read, and a claim like that never expires by
+        // itself. The tier above sees a node that stopped saying `open`, and
+        // the store failure is a NodeCondition of its own (`StoreUnhealthy`).
+        let open = self.open_here().unwrap_or_else(|e| {
+            error!(error = %format!("{e:#}"), "reading the vm records for the open set failed");
+            Default::default()
+        });
         let now = SystemTime::now();
         let mut out = Vec::new();
         for (id, record) in records {
@@ -701,6 +746,11 @@ impl Volumes {
                 reason: reported_reason(&record)
                     .map(|reason| reason.as_str().to_string())
                     .unwrap_or_default(),
+                // Whether anything on this node is holding it, from the VM
+                // records. See `open_here`: this is the statement `openOn` is
+                // derived from, so it has to be true while the fd is, and not
+                // while the object it belongs to happens to be reported.
+                open: open.contains(&id),
                 message: record.message.clone().unwrap_or_default(),
                 // What the handle says the volume IS, which after a resize is
                 // not what the spec asked for: lvm rounds up to the extent
@@ -1282,6 +1332,7 @@ mod tests {
                 phase: VolumeRecordPhase::Ready.as_str().to_string(),
                 backend: "/var/lib/meister/volumes/x.raw".into(),
                 reason: String::new(),
+                open: true,
                 message: String::new(),
             }],
             stopping: false,
@@ -1290,6 +1341,11 @@ mod tests {
         let back = proto::StatusReport::decode(report.encode_to_vec().as_slice()).unwrap();
         assert_eq!(back.volumes[0].phase, "Ready");
         assert_eq!(back.volumes[0].backend, "/var/lib/meister/volumes/x.raw");
+        // The word `openOn` is derived from, over the wire: a `true` has to
+        // arrive as one, and a node from before the field sends nothing —
+        // which decodes `false`, the value the tier above may not read as
+        // evidence of anything.
+        assert!(back.volumes[0].open);
 
         // A report from an agent that predates the field carries none, and
         // that is "knows of none" rather than "they are gone".

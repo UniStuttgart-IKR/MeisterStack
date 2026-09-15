@@ -158,6 +158,10 @@ impl Provisioner {
         // harmless no-op it looks like: the driver's own map lost the entry
         // with the first call, so the second falls through to the pid on the
         // record, and a pid is a number the kernel hands out again.
+        // What this pass really closed. Written back below, and the reason it
+        // is collected rather than acted on per volume is that `record` is
+        // borrowed for the length of this loop.
+        let mut closed: Vec<VolumeId> = Vec::new();
         for v in &record.volumes {
             let id = v.id();
             let name = volume_driver_name(&self.store, &record, &id);
@@ -167,10 +171,11 @@ impl Provisioner {
             };
             if v.detached {
                 debug!(volume_id = %id, "already detached by the stop before this");
-            } else if let Err(e) =
-                timed_driver(&name, "detach", driver.detach(&v.handle, &v.attachment)).await
-            {
-                failures.push(format!("volume {id}: detach: {e}"));
+            } else {
+                match timed_driver(&name, "detach", driver.detach(&v.handle, &v.attachment)).await {
+                    Ok(()) => closed.push(id),
+                    Err(e) => failures.push(format!("volume {id}: detach: {e}")),
+                }
             }
             // And here the two shapes part for good. An inline disk was made
             // with this VM and goes with it. A REFERENCED one belongs to a
@@ -208,6 +213,38 @@ impl Provisioner {
             {
                 failures.push(format!("volume {id}: {e}"));
             }
+        }
+
+        // The detaches this pass managed, written down at once — the same
+        // rule every other link of the chain follows, and here it answers two
+        // things at once.
+        //
+        // A teardown that fails keeps its record and is driven again, and
+        // until now the second attempt could not know that the first one had
+        // already given a connection back. The loop above says in full why
+        // that matters: a second detach is not a no-op, it falls through to a
+        // pid the kernel may have handed to somebody else.
+        //
+        // And it is what makes `VolumeStateReport.open` true rather than
+        // approximately true: the tier above derives `openOn` from that field,
+        // so the moment a disk is really closed has to be the moment it stops
+        // being in the set — even though this record will usually be gone
+        // three lines further down, and even though a crash could land in
+        // between.
+        if !closed.is_empty()
+            && let Err(e) = self.store.mutate(id, |r| {
+                for v in r.volumes.iter_mut().filter(|v| closed.contains(&v.id())) {
+                    v.detached = true;
+                }
+            })
+        {
+            // Not a failure of the teardown: the connections ARE closed, and
+            // saying otherwise would keep a record that has nothing left to
+            // give back. It is worth a line, because the next attempt will
+            // detach again on the strength of a record that could not be
+            // updated.
+            warn!(error = %format!("{e:#}"),
+                  "could not write down which volumes this teardown closed");
         }
 
         // The seed goes with the VM. Written from the spec on every

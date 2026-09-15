@@ -352,6 +352,29 @@ message VolumeStateReport {
   //
   // Empty for `Ready`, and empty from every node that predates the field.
   string reason = 6;
+  // This node has the volume OPEN right now.
+  //
+  // Read off the VM RECORDS of this node and not off the volume record above:
+  // a disk is open because something here holds it, and the record that holds
+  // it is the VM's. Every record counts, whatever its own state — one on its
+  // way out whose teardown has not run yet, one whose guest has already left
+  // for another machine — and the answer turns false at exactly one moment,
+  // when `Provisioner::teardown` (or a stop, or a hot-unplug) has actually
+  // run `detach` for this disk.
+  //
+  // It travels because the union of `VmStatusReport.attached_volumes` is not
+  // the same statement and cannot be made into one: a VM with `desired =
+  // Absent` drops out of the report at once (`observe::report`), so between
+  // the receipt of a `DestroyInstance` and the pass that finishes the
+  // teardown, the disk was held by a VMM that nothing upstairs could see any
+  // more. A blocked teardown — a snapshot or a migration owns the record —
+  // stretches that window to the next pass, and `openOn` went empty inside
+  // it while the fd was open.
+  //
+  // False from a node that predates the field, which is why the tier above
+  // may only read a `true` as evidence and has to keep its own rule for a
+  // node that says nothing at all.
+  bool open = 7;
 }
 
 message ImageStateReport {
