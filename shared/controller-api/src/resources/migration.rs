@@ -113,8 +113,13 @@ impl VmMigrationPhaseKind {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct VmMigrationStatus {
-    #[serde(default)]
-    pub phase: VmMigrationPhaseKind,
+    /// The phase, with the reason it is that phase and since when.
+    ///
+    /// Flat on the wire — `phase`, `reason`, `message`, `since` as siblings
+    /// right here — so every client that reads `status.phase` as a string
+    /// goes on reading it as a string. See `resources::phase`.
+    #[serde(flatten)]
+    pub phase: VmMigrationPhase,
     /// The same field, with the same meaning, that every other object here
     /// carries: the last `metadata.generation` the reconciler ACTED on.
     #[serde(default)]
@@ -131,10 +136,6 @@ pub struct VmMigrationStatus {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
-    /// What happened, in the words of whichever tier found out. Set on every
-    /// phase that is worth a sentence and always on `Failed`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
     /// The last phase the DESTINATION reported for this VM, in its own
     /// spelling — and the one piece of evidence the ordinary status ingest
     /// cannot carry.

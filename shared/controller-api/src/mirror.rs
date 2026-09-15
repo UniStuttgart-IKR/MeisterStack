@@ -146,7 +146,11 @@ pub fn observe<'a>(
             return Some((line, Observation::BadPhase(vm)));
         };
         let message = (!line.message.is_empty()).then(|| line.message.clone());
-        if vm.status.phase == phase && vm.status.message == message {
+        // The sentence lives inside the phase since struktur 4, and the
+        // comparison is the same one it always was: word plus sentence. Not
+        // the reason and not `since` — the reason is derived from these two
+        // one tier along, and `since` moves only with the word.
+        if vm.status.phase().kind() == phase && vm.status.phase().message() == message.as_deref() {
             return None;
         }
         Some((line, Observation::Changed(vm, phase, message)))
@@ -156,7 +160,7 @@ pub fn observe<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resources::{VmSpec, new_vm};
+    use crate::resources::{VmPhase, VmSpec, new_vm};
 
     fn vm(name: &str, uid: &str, node: Option<&str>) -> Vm {
         let mut vm = new_vm(
@@ -245,7 +249,9 @@ mod tests {
     #[test]
     fn a_report_that_says_what_is_already_stored_yields_nothing() {
         let mut stored = vm("web-1", "uid-a", Some("manacor"));
-        stored.status.phase = VmPhaseKind::Running;
+        stored
+            .status
+            .assign(VmPhase::of(VmPhaseKind::Running, chrono::Utc::now()));
         let known = [stored];
 
         assert!(seen(&known, &[line("uid-a", "Running", "")], "manacor").is_empty());
@@ -268,8 +274,11 @@ mod tests {
     #[test]
     fn an_empty_message_is_absent_rather_than_empty() {
         let mut stored = vm("web-1", "uid-a", Some("manacor"));
-        stored.status.phase = VmPhaseKind::Failed;
-        stored.status.message = Some("out of memory".into());
+        stored.status.assign(VmPhase::said(
+            VmPhaseKind::Failed,
+            Some("out of memory".into()),
+            chrono::Utc::now(),
+        ));
         let known = [stored];
         assert!(matches!(
             seen(&known, &[line("uid-a", "Failed", "")], "manacor").as_slice(),

@@ -247,12 +247,17 @@ pub(super) async fn note_snapshot_pending(
     snapshot: &controller_api::VolumeSnapshot,
     reason: String,
 ) -> anyhow::Result<()> {
-    if snapshot.status.message.as_deref() == Some(reason.as_str()) {
+    if snapshot.status.phase().message() == Some(reason.as_str()) {
         return Ok(());
     }
     store
         .mutate::<controller_api::VolumeSnapshot, _>(&snapshot.metadata.name, |s| {
-            s.status.message = Some(reason.clone());
+            let kind = s.status.phase().kind();
+            s.status.assign(controller_api::VolumeSnapshotPhase::said(
+                kind,
+                Some(reason.clone()),
+                chrono::Utc::now(),
+            ));
         })
         .await?;
     Ok(())
@@ -264,12 +269,17 @@ pub(super) async fn note_volume_pending(
     volume: &controller_api::Volume,
     reason: String,
 ) -> anyhow::Result<()> {
-    if volume.status.message.as_deref() == Some(reason.as_str()) {
+    if volume.status.phase().message() == Some(reason.as_str()) {
         return Ok(());
     }
     store
         .mutate::<controller_api::Volume, _>(&volume.metadata.name, |v| {
-            v.status.message = Some(reason.clone());
+            let kind = v.status.phase().kind();
+            v.status.assign(controller_api::VolumePhase::said(
+                kind,
+                Some(reason.clone()),
+                chrono::Utc::now(),
+            ));
         })
         .await?;
     Ok(())
@@ -348,9 +358,13 @@ pub(super) async fn move_volumes(
                 v.status.cluster = Some(cluster.to_string());
                 v.status.observed_at = None;
                 v.status.observed_generation = 0;
-                v.status.phase = controller_api::VolumePhaseKind::Pending;
                 v.status.node = None;
-                v.status.message = Some(format!("moving to {cluster} with its vm"));
+                v.status.assign(controller_api::VolumePhase::new(
+                    controller_api::VolumePhaseKind::Pending,
+                    controller_api::VolumeReason::Following,
+                    Some(format!("moving to {cluster} with its vm")),
+                    chrono::Utc::now(),
+                ));
             })
             .await?;
         all_there = false;

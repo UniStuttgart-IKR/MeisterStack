@@ -140,13 +140,21 @@ pub(super) async fn note_pending(
     category: controller_api::PendingReason,
     reason: String,
 ) -> anyhow::Result<()> {
-    if vm.status.message.as_deref() == Some(reason.as_str()) {
+    if vm.status.phase().message() == Some(reason.as_str()) {
         return Ok(());
     }
     store
         .mutate::<Vm, _>(&vm.metadata.name, |v| {
-            v.status.message = Some(reason.clone());
-            v.status.pending_reason = Some(category.as_str().to_string());
+            // The sentence and the category, both inside the phase now, and
+            // the phase itself is whatever it already was: this pass says why
+            // a VM is not placed, it does not decide what the VM is doing.
+            let kind = v.status.phase().kind();
+            v.status.assign(controller_api::VmPhase::new(
+                kind,
+                category.category(),
+                Some(reason.clone()),
+                chrono::Utc::now(),
+            ));
         })
         .await?;
     events::record(
@@ -225,10 +233,10 @@ pub(super) async fn servable_clusters(store: &EtcdStore, vm: &Vm) -> anyhow::Res
             Ok(both) => both,
             Err(sentence) => return Ok(Sentence(sentence)),
         });
-        if volume.status.phase != controller_api::VolumePhaseKind::Ready {
+        if volume.status.phase().kind() != controller_api::VolumePhaseKind::Ready {
             return Ok(Sentence(format!(
                 "volume {name} is {}",
-                volume.status.phase.as_str()
+                volume.status.phase().kind().as_str()
             )));
         }
         allowed = controller_api::narrow_allowed(allowed, reachable_nodes(&volume, &pool));

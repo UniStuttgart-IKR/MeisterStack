@@ -203,7 +203,8 @@ pub fn holds_room(phase: VolumePhaseKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resources::{VmSpec, new_vm};
+    use crate::resources::{VmSpec, VolumePhase, new_vm};
+    use chrono::Utc;
 
     fn vm(name: &str, tenant: Option<&str>, vcpus: u32, mem_mib: u64) -> Vm {
         new_vm(
@@ -506,7 +507,9 @@ mod tests {
             assert!(holds_room(phase), "{phase:?}");
         }
         let mut vols = disks();
-        vols[1].status.phase = VolumePhaseKind::Releasing;
+        vols[1]
+            .status
+            .assign(VolumePhase::of(VolumePhaseKind::Releasing, Utc::now()));
         vols[1].metadata.deletion_timestamp = Some(chrono::Utc::now());
         assert_eq!(StorageUsage::of("acme", "fast", &vols, None).gib, 120);
 

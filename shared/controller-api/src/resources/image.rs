@@ -128,13 +128,31 @@ pub struct ImageNodeState {
     pub message: Option<String>,
 }
 
+/// `deny_unknown_fields` is off here and on every other spec and status in
+/// this file, and the reason is `#[serde(flatten)]` below: serde cannot do
+/// both, because a flattened field is exactly the thing that collects the
+/// keys the outer struct does not know. The looseness is the same looseness
+/// every status now reads with — one object stored before this change must
+/// not break `list()` (decision 6) — and a status is server-written, so
+/// there is no client typo for it to have caught.
+///
+/// The ONE key that was worth refusing is still refused, by name: see
+/// `available_on`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+// The private unit field below is not the `_priv: ()` non-exhaustive trick
+// clippy is looking for — nothing about this struct is sealed, and adding a
+// field to it is what every milestone does. It is a serde refusal; see
+// `available_on`.
+#[allow(clippy::manual_non_exhaustive)]
 pub struct ImageStatus {
-    #[serde(default)]
-    pub phase: ImagePhaseKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    /// The phase, with the reason it is that phase and since when.
+    ///
+    /// Flat on the wire — `phase`, `reason`, `message`, `since` as siblings
+    /// right here — so every client that reads `status.phase` as a string
+    /// goes on reading it as a string. See `resources::phase`.
+    #[serde(flatten)]
+    pub phase: ImagePhase,
     /// Which nodes have the bytes, and which could not read them.
     ///
     /// Sorted by cluster and then by node, so two consecutive reports of the
@@ -143,6 +161,41 @@ pub struct ImageStatus {
     /// older than the field — not "no nodes have it".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<ImageNodeState>,
+    /// `status.availableOn`, which is gone — declared here so that it can go
+    /// on being REFUSED rather than silently dropped.
+    ///
+    /// It meant "not tracked" from v1 on and nothing ever wrote it; since
+    /// `status.nodes[]` exists, the question it pretended to answer has a
+    /// real answer beside it. A client that read the empty list and concluded
+    /// "no cluster has this image" was reading a field, not a fact
+    /// (fremdsicht 4), so an old client that still sends it has to hear about
+    /// it instead of believing the server kept its value.
+    ///
+    /// `deny_unknown_fields` used to carry that and cannot any more — see the
+    /// type's own comment. A named field can, and is better in one way: it
+    /// says WHICH key is refused and why, right here, instead of leaving the
+    /// answer to an attribute somebody would remove without knowing what it
+    /// was holding up.
+    #[serde(
+        default,
+        rename = "availableOn",
+        deserialize_with = "refuse_available_on",
+        skip_serializing
+    )]
+    #[schemars(skip)]
+    // Never read, and that is the whole of it: its only job is to exist under
+    // that name so serde hands the key here and the deserializer refuses it.
+    #[allow(dead_code)]
+    available_on: (),
+}
+
+/// The refusal itself, in serde's own words, so the sentence a client reads
+/// is the one an unknown field has always produced.
+fn refuse_available_on<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::unknown_field(
+        "availableOn",
+        &["phase", "reason", "message", "since", "nodes"],
+    ))
 }
 
 /// No finalizer: an image object owns no resource anywhere, so there is

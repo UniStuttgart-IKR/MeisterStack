@@ -93,14 +93,14 @@ reasons! {
     /// program can hold and a metric label can carry.
     ///
     /// Eight, and every one of them is a word this code already said
-    /// somewhere: `Unplaced` is the whole of `PendingReason` (twelve
-    /// categories, whose detail stays in the sentence `pending_reason` writes),
-    /// `Unbound` is the two ingest paths that say "let go; waiting to be
-    /// placed", `Dispatched` is the anticipation the reconciler writes when a
-    /// create goes out, `Refused` is `CannotServe` and the cloud's refusal of
-    /// a create, `Reported` is a node's or a cluster's own word arriving on
-    /// the status road, and the two silences are `unheard_of` at the cluster
-    /// and its counterpart at the cloud.
+    /// somewhere: `Unplaced` and `NotReady` are the twelve `PendingReason`
+    /// categories split where the split changes what an operator DOES (a
+    /// wall, or a wait) — see `PendingReason::category`; `Unbound` is the two
+    /// ingest paths that say "let go; waiting to be placed"; `Dispatched` is
+    /// the anticipation the reconciler writes when a create goes out;
+    /// `Refused` is `CannotServe` and the cloud's refusal of a create;
+    /// `Reported` is a node's or a cluster's own word arriving on the status
+    /// road; `Silent` is `unheard_of` and its counterpart at the cloud.
     ///
     /// The sentence is not replaced by any of this and never will be: it
     /// counts candidates and names capabilities, which is what an operator
@@ -116,9 +116,16 @@ reasons! {
         /// code anywhere in this change.
         #[default]
         Unrecorded => "Unrecorded",
-        /// The scheduler found nowhere to put it. Which of the twelve
+        /// The scheduler found nowhere to put it: nothing is a candidate,
+        /// nothing has room, or nothing carries what the VM asks for. A WALL
+        /// — somebody has to change a machine or the VM. Which of the ten
         /// `PendingReason` cases it was stays in the sentence.
         Unplaced => "Unplaced",
+        /// Something this VM needs is being made and is not there yet: a
+        /// volume, a secret. A WAIT, and its own word for that reason —
+        /// `Unplaced` sends somebody to the fleet, this one sends them
+        /// nowhere at all.
+        NotReady => "NotReady",
         /// The tier below let the binding go: the VM is nowhere, and it is
         /// waiting to be placed again. `session::ingest`, both tiers.
         Unbound => "Unbound",
@@ -134,13 +141,12 @@ reasons! {
         /// message. The commonest reason behind `Failed` and the only one
         /// behind `Quarantined`.
         Reported => "Reported",
-        /// Nobody has heard from the NODE holding it for longer than the
-        /// heartbeat allows. `unheard_of`, at the cluster.
-        NodeSilent => "NodeSilent",
-        /// The same one tier up: the CLUSTER holding it has stopped
-        /// reporting. Two words and not one, because they send an operator to
-        /// different machines.
-        ClusterSilent => "ClusterSilent",
+        /// Nobody has heard from the machine holding it for longer than the
+        /// heartbeat allows — a node at the cluster, a cluster at the cloud.
+        /// ONE word for both, and the sentence says which ("node X last
+        /// reported …"). The brief asks for two; there are eight slots and
+        /// this is the pair whose difference is already in the sentence.
+        Silent => "Silent",
     }
 }
 
@@ -597,8 +603,13 @@ pub struct VmAddress {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct VmStatus {
-    #[serde(default)]
-    pub phase: VmPhaseKind,
+    /// The phase, with the reason it is that phase and since when.
+    ///
+    /// Flat on the wire — `phase`, `reason`, `message`, `since` as siblings
+    /// right here — so every client that reads `status.phase` as a string
+    /// goes on reading it as a string. See `resources::phase`.
+    #[serde(flatten)]
+    pub phase: VmPhase,
     /// The last `metadata.generation` this object's controller ACTED on.
     ///
     /// Kubernetes' half of the pair, and the whole of what it says is:
@@ -620,22 +631,6 @@ pub struct VmStatus {
     /// VM is: the node underneath it belongs to the cluster's own picture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    /// The CATEGORY behind `message`, when the VM is waiting to be placed —
-    /// one of `PendingReason::as_str()`, a closed set.
-    ///
-    /// Both, because they answer different questions. The sentence counts
-    /// candidates and names capabilities and is what an operator reads; it is
-    /// also unbounded, so a client that wants to branch on WHY has to compare
-    /// prose. This is the same answer in a form a program can hold, and it is
-    /// exactly the word the metric label uses, so a dashboard and a client
-    /// agree by construction.
-    ///
-    /// Cleared wherever `message` is: a placed VM must not carry the reason
-    /// it once could not be placed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_reason: Option<String>,
     /// When the phase above last CHANGED, as this tier saw it.
     ///
     /// The only field in this struct that had no doc comment, and the mistake

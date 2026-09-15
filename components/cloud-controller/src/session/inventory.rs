@@ -49,16 +49,20 @@ pub(super) async fn ingest_images(
             }
         };
         let merged = merged_lines(&current, cluster, mine);
-        if current.status.phase == phase
-            && current.status.message == message
+        if current.status.phase().kind() == phase
+            && current.status.phase().message() == message.as_deref()
             && same_node_states(&current.status.nodes, &merged)
         {
             continue;
         }
         let result = store
             .mutate::<Image, _>(name, |i| {
-                i.status.phase = phase;
-                i.status.message = message.clone();
+                i.status.assign(controller_api::ImagePhase::new(
+                    phase,
+                    controller_api::ImageReason::Reported,
+                    message.clone(),
+                    chrono::Utc::now(),
+                ));
                 i.status.nodes = merged.clone();
             })
             .await;
@@ -236,10 +240,14 @@ pub(super) async fn ingest_pools(
         store
             .mutate::<controller_api::StoragePool, _>(&pool.metadata.name, |p| {
                 if home {
-                    p.status.phase = phase;
                     p.status.locality = locality;
                     p.status.nodes = reported.nodes.clone();
-                    p.status.message = message.clone();
+                    p.status.assign(controller_api::StoragePoolPhase::new(
+                        phase,
+                        controller_api::StoragePoolReason::Reported,
+                        message.clone(),
+                        chrono::Utc::now(),
+                    ));
                 }
                 // Each cluster replaces its own entry and no other's — the
                 // same "evidence, whole" rule the node list one field over
@@ -293,10 +301,10 @@ fn pool_unchanged(
 ) -> bool {
     pool.status.clusters.contains(entry)
         && (!home
-            || (pool.status.phase == entry.phase
+            || (pool.status.phase().kind() == entry.phase
                 && pool.status.locality == entry.locality
                 && pool.status.nodes == reported.nodes
-                && pool.status.message == entry.message))
+                && pool.status.phase().message() == entry.message.as_deref()))
 }
 
 /// The same road as `ingest_volumes`, one object over, with the one hop more
@@ -541,10 +549,10 @@ fn volume_unchanged(
     // even when every field matches the default.
     let observed = volume.status.observed_at.is_some();
     // What the cluster decided about it.
-    let same_verdict = volume.status.phase == phase
+    let same_verdict = volume.status.phase().kind() == phase
         && volume.status.node == said(&reported.node)
         && volume.status.attached_to == said(&reported.attached_to)
-        && volume.status.message == said(&reported.message);
+        && volume.status.phase().message() == said(&reported.message).as_deref();
     // What a node measured about it.
     let same_measurements =
         volume.status.size_gib == reported.size_gib && volume.status.open_on == reported.open_on;
@@ -561,10 +569,14 @@ fn write_volume_status(
     phase: VolumePhaseKind,
     at: DateTime<Utc>,
 ) {
-    v.status.phase = phase;
+    v.status.assign(VolumePhase::new(
+        phase,
+        controller_api::VolumeReason::Reported,
+        said(&reported.message),
+        at,
+    ));
     v.status.node = said(&reported.node);
     v.status.attached_to = said(&reported.attached_to);
-    v.status.message = said(&reported.message);
     // The same rule as one tier down: the name only ever ARRIVES. A cluster
     // that has not been told it yet sends an empty string, and that is
     // silence, not a deletion.
@@ -599,9 +611,9 @@ fn snapshot_unchanged(
 ) -> bool {
     let observed = snapshot.status.observed_at.is_some();
     // What the cluster decided about the copy.
-    let same_verdict = snapshot.status.phase == phase
+    let same_verdict = snapshot.status.phase().kind() == phase
         && snapshot.status.node == said(&reported.node)
-        && snapshot.status.message == said(&reported.message);
+        && snapshot.status.phase().message() == said(&reported.message).as_deref();
     // What a node measured about it.
     let same_size = snapshot.status.size_gib == reported.size_gib;
     // "Only ever arrives", as everywhere else.
@@ -616,9 +628,13 @@ fn write_snapshot_status(
     phase: controller_api::VolumeSnapshotPhaseKind,
     at: DateTime<Utc>,
 ) {
-    s.status.phase = phase;
+    s.status.assign(controller_api::VolumeSnapshotPhase::new(
+        phase,
+        controller_api::VolumeSnapshotReason::Reported,
+        said(&reported.message),
+        at,
+    ));
     s.status.node = said(&reported.node);
-    s.status.message = said(&reported.message);
     s.status.size_gib = reported.size_gib;
     // "Only ever arrives", as everywhere else: an empty name is silence and
     // not a claim that the old one is wrong.

@@ -1606,7 +1606,7 @@ async fn build_status(
         .into_iter()
         .map(|pool| proto::StoragePoolStatusReport {
             name: pool.metadata.name,
-            phase: pool.status.phase.as_str().to_string(),
+            phase: pool.status.phase().kind().as_str().to_string(),
             // Empty when nobody has said, which is not the same as
             // `node-local` and must not become it on the way up.
             locality: pool
@@ -1625,7 +1625,12 @@ async fn build_status(
                 .map(|p| p.to_string())
                 .unwrap_or_default(),
             nodes: pool.spec.nodes,
-            message: pool.status.message.unwrap_or_default(),
+            message: pool
+                .status
+                .phase()
+                .message()
+                .unwrap_or_default()
+                .to_string(),
         })
         .collect();
 
@@ -1831,8 +1836,8 @@ fn report_cloud_vms(vms: &[Vm], complete: &mut bool) -> Vec<VmStatusReport> {
         match vm.metadata.cloud_uid() {
             Some(uid) => out.push(VmStatusReport {
                 id: uid.to_string(),
-                phase: vm.status.phase.as_str().to_string(),
-                message: vm.status.message.clone().unwrap_or_default(),
+                phase: vm.status.phase().kind().as_str().to_string(),
+                message: vm.status.phase().message().unwrap_or_default().to_string(),
                 // Empty on this road, and not for want of the fact. The
                 // cloud already learns who holds a volume from the VOLUME
                 // half of this report (`VolumeStatusReport.attached_to`),
@@ -1865,7 +1870,16 @@ fn report_cloud_vms(vms: &[Vm], complete: &mut bool) -> Vec<VmStatusReport> {
                 // And why it is not placed, which stopped at this tier for
                 // the same reason: a Pending VM at the cloud was a dead end
                 // for anybody holding only that API.
-                pending_reason: vm.status.pending_reason.clone().unwrap_or_default(),
+                // The category, in the vocabulary the object stores it in
+                // since struktur 4. `Unrecorded` travels as an empty field,
+                // which is what an absent `pendingReason` has always been.
+                pending_reason: vm
+                    .status
+                    .phase()
+                    .reason()
+                    .filter(|r| *r != controller_api::VmReason::Unrecorded)
+                    .map(|r| r.as_str().to_string())
+                    .unwrap_or_default(),
                 // The MAC half of `status.addresses[]`, relayed. It comes off
                 // the object rather than out of a node's report, because this
                 // tier has already written the nodes' reports onto the object
@@ -1917,10 +1931,15 @@ fn report_cloud_volumes(volumes: &[Volume], complete: &mut bool) -> Vec<proto::V
         match volume.metadata.cloud_uid() {
             Some(uid) => out.push(proto::VolumeStatusReport {
                 uid: uid.to_string(),
-                phase: volume.status.phase.as_str().to_string(),
+                phase: volume.status.phase().kind().as_str().to_string(),
                 node: volume.status.node.clone().unwrap_or_default(),
                 attached_to: volume.status.attached_to.clone().unwrap_or_default(),
-                message: volume.status.message.clone().unwrap_or_default(),
+                message: volume
+                    .status
+                    .phase()
+                    .message()
+                    .unwrap_or_default()
+                    .to_string(),
                 // Empty until this cluster's node has said it, and passed on
                 // as empty: the cloud applies the same "only ever arrives"
                 // rule the cluster does, so an empty field is silence rather
@@ -1955,11 +1974,16 @@ fn report_cloud_snapshots(
         match snapshot.metadata.cloud_uid() {
             Some(uid) => out.push(proto::VolumeSnapshotStatusReport {
                 uid: uid.to_string(),
-                phase: snapshot.status.phase.as_str().to_string(),
+                phase: snapshot.status.phase().kind().as_str().to_string(),
                 node: snapshot.status.node.clone().unwrap_or_default(),
                 backend: snapshot.status.backend.clone(),
                 size_gib: snapshot.status.size_gib,
-                message: snapshot.status.message.clone().unwrap_or_default(),
+                message: snapshot
+                    .status
+                    .phase()
+                    .message()
+                    .unwrap_or_default()
+                    .to_string(),
             }),
             None => {
                 error!(snapshot = %snapshot.metadata.name,
@@ -1984,8 +2008,13 @@ fn report_cloud_routers(routers: &[Router], complete: &mut bool) -> Vec<proto::R
         match router.metadata.cloud_uid() {
             Some(uid) => out.push(proto::RouterReport {
                 id: uid.to_string(),
-                phase: router.status.phase.as_str().to_string(),
-                message: router.status.message.clone().unwrap_or_default(),
+                phase: router.status.phase().kind().as_str().to_string(),
+                message: router
+                    .status
+                    .phase()
+                    .message()
+                    .unwrap_or_default()
+                    .to_string(),
                 active: !router.status.active_node.is_empty(),
                 node: router.status.active_node.clone(),
                 nodes: router.status.nodes.clone(),
@@ -2097,7 +2126,10 @@ mod tests {
 
         // And back up: `active` is whether a machine is really forwarding,
         // which is not the same question as the phase.
-        router.status.phase = controller_api::RouterPhaseKind::Active;
+        router.status.assign(controller_api::RouterPhase::of(
+            controller_api::RouterPhaseKind::Active,
+            Utc::now(),
+        ));
         router.status.nodes = vec!["agent-1b".into(), "agent-1c".into()];
         router.status.active_node = "agent-1b".into();
         let mut complete = true;
@@ -2140,7 +2172,8 @@ mod tests {
         if let Some(uid) = uid {
             vm.metadata.mark_managed_by_cloud(uid);
         }
-        vm.status.phase = phase;
+        vm.status
+            .assign(controller_api::VmPhase::of(phase, Utc::now()));
         vm
     }
 
@@ -2541,7 +2574,8 @@ mod tests {
         if let Some(uid) = uid {
             v.metadata.mark_managed_by_cloud(uid);
         }
-        v.status.phase = phase;
+        v.status
+            .assign(controller_api::VolumePhase::of(phase, Utc::now()));
         v.status.node = Some("manacor".into());
         v
     }
@@ -2609,7 +2643,10 @@ mod tests {
 
         let mut made = fresh;
         made.status.backend = "/tmp/ms-e2e/vols/f8c1592d.raw".into();
-        made.status.phase = VolumePhaseKind::Ready;
+        made.status.assign(controller_api::VolumePhase::of(
+            VolumePhaseKind::Ready,
+            Utc::now(),
+        ));
         let report = report_cloud_volumes(&[made], &mut complete);
         assert_eq!(report[0].backend, "/tmp/ms-e2e/vols/f8c1592d.raw");
     }
@@ -2663,7 +2700,15 @@ mod tests {
             },
         ];
         let mut waiting = vm("mc-vm-d", Some("cloud-uid-2"), VmPhaseKind::Pending);
-        waiting.status.pending_reason = Some("node-unhealthy".into());
+        // Through the mapping rather than past it: the scheduler's own
+        // category is what a pass writes, and what travels up is the word the
+        // object stores it under.
+        waiting.status.assign(controller_api::VmPhase::new(
+            VmPhaseKind::Pending,
+            controller_api::PendingReason::NodeUnhealthy.category(),
+            None,
+            Utc::now(),
+        ));
 
         let mut complete = true;
         let report = report_cloud_vms(&[hot_plugged, waiting], &mut complete);
@@ -2680,7 +2725,11 @@ mod tests {
             report[0].pending_reason.is_empty(),
             "a placed vm has no pending reason"
         );
-        assert_eq!(report[1].pending_reason, "node-unhealthy");
+        // `Unplaced` and no longer `node-unhealthy`: struktur 4 folded
+        // `pendingReason` into the phase, and the closed set the object
+        // stores is `VmReason`. The twelve scheduler words are unchanged and
+        // still in the sentence and the metric label.
+        assert_eq!(report[1].pending_reason, "Unplaced");
         assert!(report[1].volumes.is_empty());
     }
 
@@ -2767,7 +2816,10 @@ mod tests {
         };
 
         let mut ours = snapshot("nightly-1", Some("cloud-uid-1"));
-        ours.status.phase = controller_api::VolumeSnapshotPhaseKind::Ready;
+        ours.status.assign(controller_api::VolumeSnapshotPhase::of(
+            controller_api::VolumeSnapshotPhaseKind::Ready,
+            Utc::now(),
+        ));
         ours.status.node = Some("manacor".into());
         ours.status.backend = "/dev/vg0/snap-nightly-1".into();
         ours.status.size_gib = 4;

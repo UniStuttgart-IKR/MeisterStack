@@ -39,7 +39,7 @@ use tracing::{debug, error, info, warn};
 use controller_api::events::{self, Happening};
 use controller_api::{
     Ack, Cluster, ClusterSpec, EtcdStore, Observation, Peer, Pending, StoreError, Vm, Volume,
-    VolumePhaseKind,
+    VolumePhase, VolumePhaseKind,
 };
 use controller_api::{EventType, Image, ImagePhaseKind, Resource, VmPhaseKind};
 

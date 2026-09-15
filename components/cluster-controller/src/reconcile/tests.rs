@@ -29,7 +29,10 @@ fn volume_vm(volumes: &[&str]) -> Vm {
             vm: serde_json::json!({ "volumes": entries }),
         },
     );
-    vm.status.phase = VmPhaseKind::Running;
+    vm.status.assign(controller_api::VmPhase::of(
+        VmPhaseKind::Running,
+        Utc::now(),
+    ));
     vm
 }
 
@@ -43,7 +46,10 @@ fn released(node: Option<&str>, vm: Option<&str>) -> Volume {
         },
     );
     v.metadata.deletion_timestamp = Some(Utc::now());
-    v.status.phase = VolumePhaseKind::Releasing;
+    v.status.assign(controller_api::VolumePhase::of(
+        VolumePhaseKind::Releasing,
+        Utc::now(),
+    ));
     v.status.node = node.map(str::to_string);
     v.status.attached_to = vm.map(str::to_string);
     v
@@ -489,7 +495,8 @@ fn a_drain_does_not_count_what_it_did_not_move() {
 /// A VM bound to `agent-1a` in the phase given.
 fn on_agent_1a(phase: VmPhaseKind) -> Vm {
     let mut vm = bound_to(Some("agent-1a"));
-    vm.status.phase = phase;
+    vm.status
+        .assign(controller_api::VmPhase::of(phase, Utc::now()));
     vm
 }
 
@@ -562,7 +569,10 @@ fn the_watchdog_only_takes_back_a_claim_about_a_guest() {
     // And a VM that is not on a node at all: there is no machine whose
     // silence could mean anything about it.
     let mut unbound = bound_to(None);
-    unbound.status.phase = VmPhaseKind::Running;
+    unbound.status.assign(controller_api::VmPhase::of(
+        VmPhaseKind::Running,
+        Utc::now(),
+    ));
     assert!(unheard_of(&unbound, Some(at(0)), at(timeout)).is_none());
 }
 
@@ -638,7 +648,10 @@ fn a_placed_volume_is_only_reconciled_by_the_replica_its_node_talks_to() {
     // exactly as a deleting VM does.
     let mut deleting = volume.clone();
     deleting.metadata.deletion_timestamp = Some(Utc::now());
-    deleting.status.phase = VolumePhaseKind::Releasing;
+    deleting.status.assign(controller_api::VolumePhase::of(
+        VolumePhaseKind::Releasing,
+        Utc::now(),
+    ));
     assert!(may_reconcile_volume(&deleting, &holder));
     assert!(!may_reconcile_volume(&deleting, &other));
 }
@@ -838,7 +851,8 @@ fn the_requeue_timeline() {
     use controller_api::requeue::{CrashLoopBackoff, NoRequeue};
     let failed = |last: Option<chrono::DateTime<Utc>>, attempts: u32| {
         let mut vm = bound_to(Some("node-a"));
-        vm.status.phase = VmPhaseKind::Failed;
+        vm.status
+            .assign(controller_api::VmPhase::of(VmPhaseKind::Failed, Utc::now()));
         vm.status.last_requeue = last;
         vm.status.requeue_attempts = attempts;
         vm
@@ -950,7 +964,8 @@ fn joint_cells() -> Vec<(String, Vm, DateTime<Utc>, usize)> {
                     for (elapsed, attempts) in requeue_inputs() {
                         let mut vm = bound_to(node);
                         vm.spec.run_strategy = strategy;
-                        vm.status.phase = phase;
+                        vm.status
+                            .assign(controller_api::VmPhase::of(phase, Utc::now()));
                         vm.status.requeue_attempts = attempts;
                         vm.status.last_requeue = elapsed.map(|e| at(-e));
                         let label = format!(
@@ -969,7 +984,7 @@ fn joint_cells() -> Vec<(String, Vm, DateTime<Utc>, usize)> {
 /// What the requeue side must answer, as an ordered list of guards rather
 /// than as a copy of `requeue_decision`'s control flow.
 fn expected_requeue(vm: &Vm, policy: &dyn RequeuePolicy, now: DateTime<Utc>) -> Requeue {
-    if vm.status.phase != VmPhaseKind::Failed {
+    if vm.status.phase().kind() != VmPhaseKind::Failed {
         // Not Failed: nothing to retry, but bookkeeping left over from an
         // earlier Failed has to be cleared or the next failure would
         // inherit somebody else's attempt count.
@@ -1041,7 +1056,7 @@ fn a_requeue_kick_and_a_lifecycle_command_never_fire_in_the_same_pass() {
     let mut commands = 0usize;
     for (label, vm, now, policy_index) in joint_cells() {
         let requeue = requeue_decision(&vm, policies[policy_index].1.as_ref(), now);
-        let command = lifecycle_command(vm.spec.run_strategy, vm.status.phase);
+        let command = lifecycle_command(vm.spec.run_strategy, vm.status.phase().kind());
         if requeue == Requeue::Kick {
             kicks += 1;
             assert!(
@@ -1049,7 +1064,7 @@ fn a_requeue_kick_and_a_lifecycle_command_never_fire_in_the_same_pass() {
                 "kick and {command:?} in one pass: {label}"
             );
             assert_eq!(
-                vm.status.phase,
+                vm.status.phase().kind(),
                 VmPhaseKind::Failed,
                 "a kick outside Failed: {label}"
             );
@@ -1080,7 +1095,7 @@ fn only_reset_may_share_a_pass_with_a_command() {
     let mut shared = 0usize;
     for (label, vm, now, policy_index) in joint_cells() {
         let requeue = requeue_decision(&vm, policies[policy_index].1.as_ref(), now);
-        if lifecycle_command(vm.spec.run_strategy, vm.status.phase).is_none() {
+        if lifecycle_command(vm.spec.run_strategy, vm.status.phase().kind()).is_none() {
             continue;
         }
         assert_ne!(requeue, Requeue::Arm, "{label}");
@@ -1104,11 +1119,11 @@ fn only_reset_may_share_a_pass_with_a_command() {
 fn nothing_automatic_touches_a_quarantined_vm() {
     let policies = policies();
     for (label, vm, now, policy_index) in joint_cells() {
-        if vm.status.phase != VmPhaseKind::Quarantined {
+        if vm.status.phase().kind() != VmPhaseKind::Quarantined {
             continue;
         }
         assert_eq!(
-            lifecycle_command(vm.spec.run_strategy, vm.status.phase),
+            lifecycle_command(vm.spec.run_strategy, vm.status.phase().kind()),
             None,
             "{label}"
         );
@@ -1128,7 +1143,7 @@ fn nothing_automatic_touches_a_quarantined_vm() {
 fn leaving_failed_always_clears_the_bookkeeping() {
     let policies = policies();
     for (label, vm, now, policy_index) in joint_cells() {
-        if vm.status.phase == VmPhaseKind::Failed {
+        if vm.status.phase().kind() == VmPhaseKind::Failed {
             continue;
         }
         let has_bookkeeping = vm.status.requeue_attempts > 0 || vm.status.last_requeue.is_some();
@@ -1325,7 +1340,8 @@ fn volume_at(node: Option<&str>, phase: VolumePhaseKind) -> Volume {
         },
     );
     v.status.node = node.map(str::to_string);
-    v.status.phase = phase;
+    v.status
+        .assign(controller_api::VolumePhase::of(phase, Utc::now()));
     v
 }
 
@@ -1365,7 +1381,7 @@ fn the_release_table_reads_the_same_rule_for_both_ways_of_being_empty() {
 #[test]
 fn a_placed_volume_is_still_pending_until_the_command_goes() {
     let v = volume_at(Some("manacor"), VolumePhaseKind::Pending);
-    assert_eq!(v.status.phase, VolumePhaseKind::Pending);
+    assert_eq!(v.status.phase().kind(), VolumePhaseKind::Pending);
     assert!(
         v.status.backend.is_empty(),
         "the backend name arrives with the dispatch"
@@ -1448,7 +1464,8 @@ fn a_report_from_before_the_last_command_changes_nothing() {
 fn the_drift_is_what_the_node_has_against_what_the_spec_asks_for() {
     let vm = |wanted: &[&str], held: &[(&str, bool)], phase: VmPhaseKind| {
         let mut v = volume_vm(wanted);
-        v.status.phase = phase;
+        v.status
+            .assign(controller_api::VmPhase::of(phase, Utc::now()));
         v.status.volumes = held
             .iter()
             .map(|(name, attached)| controller_api::VolumeAttachmentStatus {
@@ -1709,7 +1726,10 @@ fn a_resize_is_driven_by_what_the_node_measured() {
                 ..Default::default()
             },
         );
-        v.status.phase = VolumePhaseKind::Ready;
+        v.status.assign(controller_api::VolumePhase::of(
+            VolumePhaseKind::Ready,
+            Utc::now(),
+        ));
         v.status.node = Some("agent-1".into());
         v.status.size_gib = status_gib;
         v
@@ -1846,10 +1866,15 @@ fn a_volume_following_its_vm_is_provisioned_on_the_vms_node_not_placed_again() {
     follow_vm(&mut v, "no-nic", "agent-1b");
 
     assert_eq!(v.status.node.as_deref(), Some("agent-1b"));
-    assert_eq!(v.status.phase, VolumePhaseKind::Pending);
+    assert_eq!(v.status.phase().kind(), VolumePhaseKind::Pending);
     assert_eq!(
-        v.status.message.as_deref(),
+        v.status.phase().message(),
         Some("following no-nic to agent-1b")
+    );
+    assert_eq!(
+        v.status.phase().reason(),
+        Some(controller_api::VolumeReason::Following),
+        "and the category behind the sentence"
     );
 
     // The half that closes the loop: the next volume pass reaches the node

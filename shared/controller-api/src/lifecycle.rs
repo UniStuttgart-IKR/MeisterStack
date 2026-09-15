@@ -61,7 +61,7 @@ pub fn lifecycle_command(strategy: RunStrategy, phase: VmPhaseKind) -> Option<Li
 /// refused, with the advice to do what had already been done:
 ///
 /// ```text
-/// $ meister vm get mc-r1 -o json | jq -r '.spec.runStrategy, .status.phase'
+/// $ meister vm get mc-r1 -o json | jq -r '.spec.runStrategy, .status.phase().kind()'
 /// Stopped
 /// Failed
 /// $ meister vm reschedule mc-r1

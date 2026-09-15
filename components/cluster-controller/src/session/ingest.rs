@@ -272,7 +272,9 @@ pub(super) async fn ingest_routers(
                 format!("{node_id}: {}", line.message)
             }
         });
-        if router.status.phase == phase && router.status.message == message {
+        if router.status.phase().kind() == phase
+            && router.status.phase().message() == message.as_deref()
+        {
             continue;
         }
         let name = router.metadata.name.clone();
@@ -280,8 +282,12 @@ pub(super) async fn ingest_routers(
         let uid = router.metadata.uid.clone();
         store
             .mutate::<controller_api::Router, _>(&name, |r| {
-                r.status.phase = phase;
-                r.status.message = message.clone();
+                r.status.assign(controller_api::RouterPhase::new(
+                    phase,
+                    controller_api::RouterReason::Reported,
+                    message.clone(),
+                    chrono::Utc::now(),
+                ));
             })
             .await?;
         info!(router = %name, node = node_id, phase = phase.as_str(), "router phase observed");
@@ -476,7 +482,8 @@ pub(super) async fn ingest_volumes(
                     v.status.node = None;
                     v.status.closed_here(node_id);
                     v.status.backend = String::new();
-                    v.status.message = None;
+                    let kind = v.status.phase().kind();
+                    v.status.assign(controller_api::VolumePhase::of(kind, at));
                     v.status.observed_at = Some(at);
                 })
                 .await?;
@@ -497,8 +504,8 @@ pub(super) async fn ingest_volumes(
         // Only when something CHANGED. Every node reports every ten seconds,
         // and a write per report would churn etcd revisions and wake the
         // volume watch while nothing about the volume happened.
-        if volume.status.phase == phase
-            && volume.status.message == message
+        if volume.status.phase().kind() == phase
+            && volume.status.phase().message() == message.as_deref()
             && volume.status.size_gib == size_gib
             && (backend.is_empty() || volume.status.backend == backend)
         {
@@ -509,10 +516,20 @@ pub(super) async fn ingest_volumes(
                 // A volume on its way out keeps `Releasing`: the node is
                 // still reporting the bytes it has, and the phase is about
                 // what the OBJECT is doing.
-                if v.metadata.deletion_timestamp.is_none() {
-                    v.status.phase = phase;
-                }
-                v.status.message = message.clone();
+                // A volume on its way out keeps `Releasing`, so the word it
+                // lands on is not always the word the node said — but the
+                // sentence is the node's either way.
+                let kind = if v.metadata.deletion_timestamp.is_none() {
+                    phase
+                } else {
+                    v.status.phase().kind()
+                };
+                v.status.assign(controller_api::VolumePhase::new(
+                    kind,
+                    controller_api::VolumeReason::Reported,
+                    message.clone(),
+                    at,
+                ));
                 // The backend name only ever ARRIVES; a node that has not made
                 // the volume yet sends an empty string, and that is not a
                 // statement that the name is gone.
@@ -816,7 +833,12 @@ pub(super) async fn ingest_snapshots(
                       "the node no longer has this snapshot; it will be taken again");
                 store
                     .mutate::<VolumeSnapshot, _>(&name, |s| {
-                        s.status.phase = VolumeSnapshotPhaseKind::Pending;
+                        s.status.assign(controller_api::VolumeSnapshotPhase::new(
+                            VolumeSnapshotPhaseKind::Pending,
+                            controller_api::VolumeSnapshotReason::SourceGone,
+                            None,
+                            at,
+                        ));
                         s.status.node = None;
                         s.status.backend = String::new();
                         s.status.observed_at = Some(at);
@@ -838,8 +860,8 @@ pub(super) async fn ingest_snapshots(
         // came from.
         let size_gib = reported.size_bytes.div_ceil(1024 * 1024 * 1024);
         // Only when something changed: every node reports every ten seconds.
-        if snapshot.status.phase == phase
-            && snapshot.status.message == message
+        if snapshot.status.phase().kind() == phase
+            && snapshot.status.phase().message() == message.as_deref()
             && snapshot.status.size_gib == size_gib
             && (backend.is_empty() || snapshot.status.backend == backend)
         {
@@ -847,8 +869,12 @@ pub(super) async fn ingest_snapshots(
         }
         store
             .mutate::<VolumeSnapshot, _>(&name, |s| {
-                s.status.phase = phase;
-                s.status.message = message.clone();
+                s.status.assign(controller_api::VolumeSnapshotPhase::new(
+                    phase,
+                    controller_api::VolumeSnapshotReason::Reported,
+                    message.clone(),
+                    at,
+                ));
                 if !backend.is_empty() {
                     s.status.backend = backend.clone();
                 }
@@ -907,8 +933,12 @@ pub(super) async fn forget_unbound(
                 // Pending and not Stopped: the VM has no node, and the phase
                 // an operator reads has to say that rather than describing a
                 // guest that no longer exists anywhere.
-                v.status.phase = VmPhaseKind::Pending;
-                v.status.message = Some(format!("node {node_id} let go; waiting to be placed"));
+                v.status.assign(controller_api::VmPhase::new(
+                    VmPhaseKind::Pending,
+                    controller_api::VmReason::Unbound,
+                    Some(format!("node {node_id} let go; waiting to be placed")),
+                    at,
+                ));
                 v.status.volumes.clear();
                 v.status.reschedules = v.status.reschedules.saturating_add(1);
                 v.status.observed_at = Some(at);
@@ -962,8 +992,12 @@ pub(super) async fn ingest_phases(
         let vm_tenant = vm.spec.tenant.clone();
         let result = store
             .mutate::<Vm, _>(&name, |v| {
-                v.status.phase = phase;
-                v.status.message = message.clone();
+                v.status.assign(controller_api::VmPhase::new(
+                    phase,
+                    controller_api::VmReason::Reported,
+                    message.clone(),
+                    at,
+                ));
                 // From the binding, never from the reporter — the rule the
                 // cloud tier states one floor up, and it matters more here
                 // because `ours` deliberately accepts a report about a VM

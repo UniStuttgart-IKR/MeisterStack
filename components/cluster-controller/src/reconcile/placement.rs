@@ -540,8 +540,10 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     // The reason a previous pass may have written is answered by the binding
     // itself; leaving it would make a placed VM carry the sentence that said
     // it could not be placed — and the category with it.
-    bound.status.message = None;
-    bound.status.pending_reason = None;
+    // Both of them live inside the phase since struktur 4, so one write
+    // answers the sentence and the category together.
+    let kind = bound.status.phase().kind();
+    bound.status.assign(VmPhase::of(kind, Utc::now()));
     match p.store.update(&bound).await {
         Ok(_) => {
             telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLUSTER);
@@ -623,15 +625,15 @@ pub(super) async fn volume_bindings(store: &EtcdStore, vm: &Vm) -> anyhow::Resul
             }
             Err(e) => return Err(e.into()),
         };
-        if volume.status.phase != VolumePhaseKind::Ready {
+        if volume.status.phase().kind() != VolumePhaseKind::Ready {
             return Ok(Bindings::NotReady(format!(
                 "volume {name} is {}: {}",
-                volume.status.phase.as_str(),
+                volume.status.phase().kind().as_str(),
                 volume
                     .status
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "waiting for it to be made".to_string())
+                    .phase()
+                    .message()
+                    .unwrap_or("waiting for it to be made")
             )));
         }
         // The pool carries the locality. A pool that has gone missing under a
@@ -668,13 +670,21 @@ pub(super) async fn note_vm_pending(
     reason: String,
 ) -> anyhow::Result<()> {
     debug!(reason = %reason, "vm stays pending");
-    if vm.status.message.as_deref() == Some(reason.as_str()) {
+    if vm.status.phase().message() == Some(reason.as_str()) {
         return Ok(());
     }
     p.store
         .mutate::<Vm, _>(&vm.metadata.name, |v| {
-            v.status.message = Some(reason.clone());
-            v.status.pending_reason = Some(category.as_str().to_string());
+            // The sentence and the category, both inside the phase, and the
+            // phase itself left alone: this pass says why a VM is not placed,
+            // it does not decide what the VM is doing.
+            let kind = v.status.phase().kind();
+            v.status.assign(VmPhase::new(
+                kind,
+                category.category(),
+                Some(reason.clone()),
+                Utc::now(),
+            ));
         })
         .await?;
     events::record(

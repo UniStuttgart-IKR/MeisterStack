@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use controller_api::{
     Candidate, CandidateKind, Capacity, EtcdStore, Lifecycle, Locality, Node, Overcommit,
     PassTrigger, PendingReason, PendingTally, RequeuePolicy, Resource, RunStrategy, Scheduler,
-    StoragePool, StoragePoolPhaseKind, StoreError, Vm, VmPhaseKind, Volume, VolumeBinding,
+    StoragePool, StoragePoolPhaseKind, StoreError, Vm, VmPhase, VmPhaseKind, Volume, VolumeBinding,
     VolumePhaseKind, VolumeSnapshot, VolumeSnapshotPhaseKind, heartbeat_expired, lifecycle_command,
     scheduler::{StoragePolicy, feasible_for_storage, storage_pending_reason},
 };
@@ -320,7 +320,10 @@ fn warning<'a>(vm: &'a Vm, reason: &'a str, message: String) -> Happening<'a> {
 fn publish_vm_gauges(vms: &[Vm]) {
     telemetry::metrics::objects().set_count(Vm::KIND, vms.len() as i64);
     for phase in VmPhaseKind::ALL {
-        let n = vms.iter().filter(|v| v.status.phase == phase).count();
+        let n = vms
+            .iter()
+            .filter(|v| v.status.phase().kind() == phase)
+            .count();
         telemetry::metrics::objects().set_vms(phase.as_str(), n as i64);
     }
 }

@@ -387,8 +387,9 @@ reasons! {
         /// A node's own word about the namespace, verbatim in the message.
         Reported => "Reported",
         /// Nobody has heard from the node holding it for longer than the
-        /// heartbeat allows.
-        NodeSilent => "NodeSilent",
+        /// heartbeat allows. Spelled as `VmReason::Silent` is, because it is
+        /// the same silence about the same machine.
+        Silent => "Silent",
     }
 }
 
@@ -433,13 +434,13 @@ phases! {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RouterStatus {
-    #[serde(default)]
-    pub phase: RouterPhaseKind,
-    /// What the phase is, in words. The sentence a Pending router carries is
-    /// the one that has to send somebody to the right machine — see
-    /// `PendingReason`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    /// The phase, with the reason it is that phase and since when.
+    ///
+    /// Flat on the wire — `phase`, `reason`, `message`, `since` as siblings
+    /// right here — so every client that reads `status.phase` as a string
+    /// goes on reading it as a string. See `resources::phase`.
+    #[serde(flatten)]
+    pub phase: RouterPhase,
     /// The address this router answers for on the provider network, CIDR.
     /// Cut from `ProviderNetwork.spec.allocation` when the router is first
     /// placed and kept for its life: it is what the SNAT rules translate to

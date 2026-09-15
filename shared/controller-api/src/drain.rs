@@ -108,8 +108,8 @@ pub fn verdict(vm: &Vm, facts: &DrainFacts) -> Verdict {
     // Standing still is the easy case and does not consult `evacuation` at
     // all: nothing is running, so nothing is being interrupted, and moving a
     // stopped VM is what a client may ask for by hand anyway.
-    let at_rest =
-        vm.spec.run_strategy == RunStrategy::Stopped && vm.status.phase == VmPhaseKind::Stopped;
+    let at_rest = vm.spec.run_strategy == RunStrategy::Stopped
+        && vm.status.phase().kind() == VmPhaseKind::Stopped;
     if at_rest {
         return Verdict::Reschedule;
     }
@@ -170,7 +170,7 @@ pub fn sentence(reason: StayReason, vm: &str, facts: &DrainFacts) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Evacuating, VmSpec, resources::new_vm};
+    use crate::{Evacuating, VmPhase, VmSpec, resources::new_vm};
     use chrono::Utc;
 
     fn vm(strategy: RunStrategy, phase: VmPhaseKind, evacuation: Evacuation) -> Vm {
@@ -189,7 +189,7 @@ mod tests {
                 vm: serde_json::json!({ "vcpus": 1 }),
             },
         );
-        v.status.phase = phase;
+        v.status.assign(VmPhase::of(phase, Utc::now()));
         v
     }
 

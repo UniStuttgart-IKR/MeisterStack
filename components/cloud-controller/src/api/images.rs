@@ -145,14 +145,19 @@ pub(super) async fn create_image(
     // has never claimed to check it — saying anything else would be inventing
     // a promise where there was none. A URL image is Pending until a node
     // that has fetched it says otherwise, because the node is what fetches.
-    image.status.phase = if url.is_some() {
-        controller_api::ImagePhaseKind::Pending
-    } else {
-        controller_api::ImagePhaseKind::Ready
-    };
-    image.status.message = url
-        .is_some()
-        .then(|| "not fetched by any node yet".to_string());
+    let now = chrono::Utc::now();
+    image.status.assign(match url {
+        // The sentence a URL image used to carry beside its phase now travels
+        // inside it, in the same words, with the category the wait has always
+        // had: nobody has fetched the bytes yet.
+        Some(_) => controller_api::ImagePhase::new(
+            controller_api::ImagePhaseKind::Pending,
+            controller_api::ImageReason::AwaitingNode,
+            Some("not fetched by any node yet".to_string()),
+            now,
+        ),
+        None => controller_api::ImagePhase::of(controller_api::ImagePhaseKind::Ready, now),
+    });
     let created = match dry.preview(&image) {
         Some(preview) => preview,
         None => st.store.create(&image).await?,

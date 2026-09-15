@@ -275,7 +275,17 @@ async fn reconcile_router(
             // Nothing is sent and nothing is torn down: a router that cannot
             // be planned right now is a router whose machines should go on
             // forwarding. The sentence is what changes.
-            return note(pass, &router, phase, Some(message), None).await;
+            // The planner said no: nowhere to put it, and the sentence says
+            // which of the four walls it is.
+            return note(
+                pass,
+                &router,
+                phase,
+                controller_api::RouterReason::Unplaced,
+                Some(message),
+                None,
+            )
+            .await;
         }
     };
     let outcome = backend.realise(dispatch, &plan).await;
@@ -386,12 +396,13 @@ async fn note(
     pass: &Pass<'_>,
     router: &Router,
     phase: RouterPhaseKind,
+    reason: controller_api::RouterReason,
     message: Option<String>,
     placement: Option<Placement<'_>>,
 ) -> anyhow::Result<()> {
     let generation = router.metadata.generation;
-    let unchanged = router.status.phase == phase
-        && router.status.message == message
+    let unchanged = router.status.phase().kind() == phase
+        && router.status.phase().message() == message.as_deref()
         && placement.as_ref().is_none_or(|p| {
             router.status.nodes == p.nodes
                 && router.status.active_node == p.active
@@ -402,7 +413,7 @@ async fn note(
     if unchanged {
         return Ok(());
     }
-    let was = router.status.phase;
+    let was = router.status.phase().kind();
     let was_active = router.status.active_node.clone();
     let name = router.metadata.name.clone();
     let placement = placement.map(|p| {
@@ -415,8 +426,12 @@ async fn note(
     });
     pass.store
         .mutate::<Router, _>(&name, |r| {
-            r.status.phase = phase;
-            r.status.message = message.clone();
+            r.status.assign(controller_api::RouterPhase::new(
+                phase,
+                reason,
+                message.clone(),
+                Utc::now(),
+            ));
             r.status.observed_generation = generation;
             if let Some((nodes, active, refused, releasing)) = &placement {
                 r.status.nodes = nodes.clone();
@@ -520,6 +535,7 @@ async fn settle(
         pass,
         router,
         outcome.phase,
+        outcome.reason,
         outcome.message,
         Some(Placement {
             nodes: &built,

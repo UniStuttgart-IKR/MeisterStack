@@ -26,7 +26,7 @@
 use super::*;
 
 use controller_api::network;
-use controller_api::{ProviderNetwork, Router, RouterPhaseKind, Tenant};
+use controller_api::{ProviderNetwork, Router, RouterPhase, RouterPhaseKind, RouterReason, Tenant};
 
 /// One pass over the routers of this cloud.
 pub(super) async fn reconcile_routers(
@@ -228,6 +228,7 @@ async fn reconcile_router(
             store,
             &router,
             RouterPhaseKind::Pending,
+            RouterReason::Unplaced,
             format!(
                 "provider network {} does not exist",
                 router.spec.provider_network
@@ -330,7 +331,17 @@ async fn reconcile_router(
     let cluster = match decision {
         Ok(cluster) => cluster,
         Err(message) => {
-            return note(store, &router, RouterPhaseKind::Pending, message, None).await;
+            // The planner's refusal: nowhere to put it, and the sentence
+            // says which of the four walls it is.
+            return note(
+                store,
+                &router,
+                RouterPhaseKind::Pending,
+                RouterReason::Unplaced,
+                message,
+                None,
+            )
+            .await;
         }
     };
     if !estate.sessions.contains(&cluster) {
@@ -475,11 +486,17 @@ async fn dispatch(
             // Anticipation never overwrites observation: only a router nobody
             // has reported on yet is moved by a dispatch, and the sentence
             // that named the missing message goes with it.
-            if router.status.phase == RouterPhaseKind::Pending && router.status.nodes.is_empty() {
+            if router.status.phase().kind() == RouterPhaseKind::Pending
+                && router.status.nodes.is_empty()
+            {
                 store
                     .mutate::<Router, _>(&name, |r| {
-                        r.status.phase = RouterPhaseKind::Provisioning;
-                        r.status.message = None;
+                        r.status.assign(RouterPhase::new(
+                            RouterPhaseKind::Provisioning,
+                            RouterReason::Dispatched,
+                            None,
+                            Utc::now(),
+                        ));
                     })
                     .await?;
             }
@@ -488,7 +505,15 @@ async fn dispatch(
         Ok(Ack::Rejected(refusal)) => {
             let message = refusal.message;
             warn!(router = %name, cluster, error = %message, "cluster refused the router");
-            note(store, router, RouterPhaseKind::Failed, message, None).await?;
+            note(
+                store,
+                router,
+                RouterPhaseKind::Failed,
+                RouterReason::Refused,
+                message,
+                None,
+            )
+            .await?;
         }
         // A broken session is a fact about the session. Nothing is written,
         // and the next pass derives the same decision from the same state.
@@ -503,18 +528,22 @@ async fn note(
     store: &EtcdStore,
     router: &Router,
     phase: RouterPhaseKind,
+    reason: RouterReason,
     message: String,
     cluster: Option<&str>,
 ) -> anyhow::Result<()> {
-    if router.status.phase == phase && router.status.message.as_deref() == Some(message.as_str()) {
+    if router.status.phase().kind() == phase
+        && router.status.phase().message() == Some(message.as_str())
+    {
         return Ok(());
     }
     let name = router.metadata.name.clone();
     let cluster = cluster.map(str::to_string);
+    let now = Utc::now();
     store
         .mutate::<Router, _>(&name, |r| {
-            r.status.phase = phase;
-            r.status.message = Some(message.clone());
+            r.status
+                .assign(RouterPhase::new(phase, reason, Some(message.clone()), now));
             if let Some(cluster) = &cluster {
                 r.status.cluster = cluster.clone();
             }

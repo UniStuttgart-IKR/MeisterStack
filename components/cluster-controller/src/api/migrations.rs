@@ -133,7 +133,7 @@ pub(super) async fn migration_facts(st: &ApiState, vm: &Vm) -> Result<MigrationF
             }
             Err(e) => return Err(e.into()),
         };
-        if volume.status.phase != controller_api::VolumePhaseKind::Ready {
+        if volume.status.phase().kind() != controller_api::VolumePhaseKind::Ready {
             facts.unready_disk = Some(name);
             break;
         }
@@ -234,12 +234,12 @@ pub(crate) fn migration_refusal(
     facts: &MigrationFacts,
     target: Option<&str>,
 ) -> Option<String> {
-    if vm.status.phase != controller_api::VmPhaseKind::Running {
+    if vm.status.phase().kind() != controller_api::VmPhaseKind::Running {
         return Some(format!(
             "vm {} is {} and only a running vm can migrate live; a stopped one moves with \
              `vm reschedule`",
             vm.metadata.name,
-            vm.status.phase.as_str()
+            vm.status.phase().kind().as_str()
         ));
     }
     let devices = vm

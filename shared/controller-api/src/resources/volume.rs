@@ -185,8 +185,13 @@ fn is_block_mode(mode: &VolumeMode) -> bool {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeStatus {
-    #[serde(default)]
-    pub phase: VolumePhaseKind,
+    /// The phase, with the reason it is that phase and since when.
+    ///
+    /// Flat on the wire — `phase`, `reason`, `message`, `since` as siblings
+    /// right here — so every client that reads `status.phase` as a string
+    /// goes on reading it as a string. See `resources::phase`.
+    #[serde(flatten)]
+    pub phase: VolumePhase,
     /// The name the BACKEND knows this volume by — `/tmp/vols/<uid>.raw`,
     /// `/dev/vg0/vm-<uid>`, an export directory.
     ///
@@ -258,8 +263,6 @@ pub struct VolumeStatus {
     /// neither.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_to: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
     /// How big the volume actually IS, in GiB, as the node measured it.
     ///
     /// The evidence half of `spec.sizeGib`, which is the intent. Two fields
@@ -474,8 +477,13 @@ phases! {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeSnapshotStatus {
-    #[serde(default)]
-    pub phase: VolumeSnapshotPhaseKind,
+    /// The phase, with the reason it is that phase and since when.
+    ///
+    /// Flat on the wire — `phase`, `reason`, `message`, `since` as siblings
+    /// right here — so every client that reads `status.phase` as a string
+    /// goes on reading it as a string. See `resources::phase`.
+    #[serde(flatten)]
+    pub phase: VolumeSnapshotPhase,
     /// The node that took it — the volume's provisioning node, which under a
     /// `shared` pool need not be the node the VM runs on. Copied onto the
     /// snapshot at dispatch so that a later `DropSnapshot` goes to the machine
@@ -490,8 +498,6 @@ pub struct VolumeSnapshotStatus {
     /// has said.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub size_gib: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<DateTime<Utc>>,
     /// The same two fields every other requeueable status keeps, read by the

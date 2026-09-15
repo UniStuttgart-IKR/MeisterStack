@@ -380,6 +380,63 @@ macro_rules! reasons {
     )* };
 }
 
+/// The one read path and the one write path for a stored phase.
+///
+/// Seven status structs, the same two methods, so they are generated here
+/// beside the phase they hand out rather than seven times over. `assign` is
+/// the interesting one: see its doc for the rule about `since`.
+macro_rules! phased {
+    ($( $status:ident / $phase:ident; )*) => { $(
+        impl $status {
+            /// What this tier says this object is doing, with the reason and
+            /// the sentence that go with it.
+            pub fn phase(&self) -> &$phase {
+                &self.phase
+            }
+
+            /// Put a phase on this object — the ONE way the field moves.
+            ///
+            /// It exists to own a rule that every one of the sixty-odd
+            /// assignments it replaced got wrong in the same way: **`since`
+            /// belongs to the WORD, not to the write.** A status report
+            /// arrives every ten seconds and says the same thing it said
+            /// last time; a stamp taken at each of those would make
+            /// "Running since" mean "last heard from", and the object's own
+            /// churn guard would see a change where there was none. So the
+            /// stored instant survives a write that does not change the
+            /// kind.
+            ///
+            /// The exception is an object nobody has stamped at all
+            /// ([`UNSTAMPED`]): its first assignment IS the first stamp,
+            /// even when the word it lands on is the word it was born with.
+            pub fn assign(&mut self, phase: $phase) {
+                let since = if phase.kind() == self.phase.kind() && self.phase.since() != UNSTAMPED
+                {
+                    self.phase.since()
+                } else {
+                    phase.since()
+                };
+                self.phase = $phase::new(
+                    phase.kind(),
+                    phase.reason().unwrap_or_default(),
+                    phase.message().map(str::to_string),
+                    since,
+                );
+            }
+        }
+    )* };
+}
+
+phased! {
+    VmStatus / VmPhase;
+    VolumeStatus / VolumePhase;
+    VolumeSnapshotStatus / VolumeSnapshotPhase;
+    ImageStatus / ImagePhase;
+    StoragePoolStatus / StoragePoolPhase;
+    RouterStatus / RouterPhase;
+    VmMigrationStatus / VmMigrationPhase;
+}
+
 /// The instant a phase nobody has stamped carries.
 ///
 /// A `DateTime<Utc>` has no `Default`, and a phase has to have one — every
@@ -551,6 +608,52 @@ mod tests {
         assert_eq!(fresh.since(), UNSTAMPED);
         let wire = serde_json::to_value(&fresh).expect("serialises");
         assert!(wire.get("since").is_none(), "{wire}");
+    }
+
+    /// `since` belongs to the WORD, and this is the rule that says so.
+    ///
+    /// It is the anti-churn rule, and the cost of getting it wrong is the
+    /// defect this whole round also fixes one field over (D-C7): a status
+    /// report arrives every ten seconds saying what it said last time, and a
+    /// stamp taken per write would turn "Running since" into "last heard
+    /// from" and make every one of those reports an etcd revision.
+    #[test]
+    fn a_write_that_does_not_change_the_word_does_not_move_the_stamp() {
+        let mut status = VmStatus::default();
+        assert_eq!(status.phase().since(), UNSTAMPED);
+
+        // The first assignment is the first stamp, even onto the word the
+        // object was born with.
+        status.assign(VmPhase::of(VmPhaseKind::Pending, at(0)));
+        assert_eq!(status.phase().since(), at(0));
+
+        // The same word again, later: the reason and the sentence move, the
+        // stamp does not.
+        status.assign(VmPhase::new(
+            VmPhaseKind::Pending,
+            VmReason::Unplaced,
+            Some("no candidate has room".into()),
+            at(600),
+        ));
+        assert_eq!(status.phase().since(), at(0), "the word did not change");
+        assert_eq!(status.phase().reason(), Some(VmReason::Unplaced));
+        assert_eq!(status.phase().message(), Some("no candidate has room"));
+
+        // A different word: the stamp is the moment of the change.
+        status.assign(VmPhase::of(VmPhaseKind::Running, at(900)));
+        assert_eq!(status.phase().since(), at(900));
+
+        // And a reason assigned onto a resting word is dropped rather than
+        // kept — so the value is stable under a second identical write,
+        // which is what lets a caller compare against it as a churn guard.
+        status.assign(VmPhase::new(
+            VmPhaseKind::Running,
+            VmReason::Unplaced,
+            None,
+            at(1200),
+        ));
+        assert_eq!(status.phase().reason(), None);
+        assert_eq!(status.phase().since(), at(900));
     }
 
     /// Every reasoned variant really does hold the reason it was given, and

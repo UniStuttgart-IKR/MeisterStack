@@ -26,7 +26,8 @@ use std::net::Ipv4Addr;
 use common::net::Ipv4Ranges;
 
 use crate::resources::{
-    FloatingIp, NatKind, NatRule, ProviderNetwork, Router, RouterPhaseKind, accepts_class,
+    FloatingIp, NatKind, NatRule, ProviderNetwork, Router, RouterPhaseKind, RouterReason,
+    accepts_class,
 };
 use crate::scheduler::{Candidate, is_alive};
 
@@ -299,6 +300,12 @@ pub struct RouterOutcome {
     /// said no.
     pub refused: Vec<String>,
     pub phase: RouterPhaseKind,
+    /// The category behind `phase`, decided by the same function and at the
+    /// same moment. It is here rather than worked out again at the caller
+    /// because `verdict` is the only thing that knows WHY it answered what it
+    /// answered — a second derivation from the phase alone could not tell a
+    /// router nobody would carry from one every candidate refused.
+    pub reason: RouterReason,
     pub message: Option<String>,
 }
 
@@ -413,7 +420,7 @@ impl NetworkBackend for MeisterNetwork {
             }
         }
 
-        out.phase = verdict(plan, &out, &unreachable);
+        (out.phase, out.reason) = verdict(plan, &out, &unreachable);
         out
     }
 }
@@ -426,21 +433,27 @@ impl NetworkBackend for MeisterNetwork {
 /// speaking is Active, one that is built and deliberately silent is Standby,
 /// and one whose machines could not be reached is Unknown — never Failed,
 /// for the reason `VmPhaseKind::Unknown` gives.
-fn verdict(plan: &RouterPlan, out: &RouterOutcome, unreachable: &[String]) -> RouterPhaseKind {
+fn verdict(
+    plan: &RouterPlan,
+    out: &RouterOutcome,
+    unreachable: &[String],
+) -> (RouterPhaseKind, RouterReason) {
     if plan.nodes.is_empty() {
-        return RouterPhaseKind::Pending;
+        return (RouterPhaseKind::Pending, RouterReason::Unplaced);
     }
     if out.built.is_empty() {
         return if unreachable.is_empty() {
-            RouterPhaseKind::Failed
+            (RouterPhaseKind::Failed, RouterReason::Refused)
         } else {
-            RouterPhaseKind::Unknown
+            (RouterPhaseKind::Unknown, RouterReason::Silent)
         };
     }
     if out.active_node.is_empty() {
-        RouterPhaseKind::Standby
+        // A standby carries no reason at all: it is built and doing what it
+        // was asked to do. See `RouterPhase::Standby`.
+        (RouterPhaseKind::Standby, RouterReason::Unrecorded)
     } else {
-        RouterPhaseKind::Active
+        (RouterPhaseKind::Active, RouterReason::Unrecorded)
     }
 }
 

@@ -56,7 +56,7 @@ pub(super) async fn reconcile_vm(
 /// anything is still tracing against it.
 pub(super) fn birth_trace(vm: &Vm) -> Option<telemetry::TraceParent> {
     if !matches!(
-        vm.status.phase,
+        vm.status.phase().kind(),
         VmPhaseKind::Pending | VmPhaseKind::Provisioning
     ) {
         return None;
@@ -101,7 +101,7 @@ pub(super) async fn reconcile_vm_traced(
         return Ok(());
     };
 
-    if vm.status.phase == VmPhaseKind::Failed {
+    if vm.status.phase().kind() == VmPhaseKind::Failed {
         // A cluster that answered "no" answered about this VM. Asking again
         // every five seconds would not change the answer, and renaming the VM
         // to dodge it is the kind of cleverness that loses somebody's disk.
@@ -254,8 +254,10 @@ async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
     bound.spec.cluster_name = Some(pick.clone());
     // The binding answers whatever a previous pass wrote about why there was
     // none.
-    bound.status.message = None;
-    bound.status.pending_reason = None;
+    // Both of them lived inside the phase since struktur 4, so one write
+    // answers what a previous pass said and why it said it.
+    let kind = bound.status.phase().kind();
+    bound.status.assign(VmPhase::of(kind, Utc::now()));
     match store.update(&bound).await {
         Ok(_) => {
             telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLOUD);
@@ -316,7 +318,7 @@ async fn hand_down(
     outgoing: &str,
 ) -> anyhow::Result<()> {
     let missing = !report.uids.contains(&vm.metadata.uid);
-    let drifted = lifecycle_command(vm.spec.run_strategy, vm.status.phase).is_some();
+    let drifted = lifecycle_command(vm.spec.run_strategy, vm.status.phase().kind()).is_some();
     let stale = vm.metadata.generation > vm.status.observed_generation;
     if !(missing || drifted || stale) {
         return Ok(());
@@ -682,15 +684,17 @@ pub(super) async fn evacuate(
     }
     match controller_api::EvacuationStep::parse(&mark.step) {
         Some(controller_api::EvacuationStep::Stopping) => {
-            if vm.status.phase == VmPhaseKind::Running || vm.status.phase == VmPhaseKind::Paused {
+            if vm.status.phase().kind() == VmPhaseKind::Running
+                || vm.status.phase().kind() == VmPhaseKind::Paused
+            {
                 // Level-triggered: the same dispatch every pass until the
                 // phase moves, and idempotent at the cluster because what
                 // changes down there is one object's desired state.
                 return dispatch_create(store, registry, cluster, vm, false, book, traceparent)
                     .await;
             }
-            if vm.status.phase != VmPhaseKind::Stopped {
-                debug!(vm = %name, phase = vm.status.phase.as_str(),
+            if vm.status.phase().kind() != VmPhaseKind::Stopped {
+                debug!(vm = %name, phase = vm.status.phase().kind().as_str(),
                        "not stopped yet; the evacuation waits");
                 return Ok(());
             }
@@ -773,9 +777,13 @@ pub(super) async fn dispatch_create(
                     // Anticipation never overwrites observation. Dispatching
                     // is a guess about the future; only a VM nobody has
                     // reported on yet may be moved by one.
-                    if v.status.phase == VmPhaseKind::Pending {
-                        v.status.phase = VmPhaseKind::Provisioning;
-                        v.status.message = None;
+                    if v.status.phase().kind() == VmPhaseKind::Pending {
+                        v.status.assign(VmPhase::new(
+                            VmPhaseKind::Provisioning,
+                            controller_api::VmReason::Dispatched,
+                            None,
+                            Utc::now(),
+                        ));
                     }
                 })
                 .await?;
@@ -787,8 +795,12 @@ pub(super) async fn dispatch_create(
             warn!(cluster, error = %msg, "cluster refused the create");
             store
                 .mutate::<Vm, _>(&name, |v| {
-                    v.status.phase = VmPhaseKind::Failed;
-                    v.status.message = Some(msg.clone());
+                    v.status.assign(VmPhase::new(
+                        VmPhaseKind::Failed,
+                        controller_api::VmReason::Refused,
+                        Some(msg.clone()),
+                        Utc::now(),
+                    ));
                     v.status.cluster_name = v.spec.cluster_name.clone();
                     v.status.observed_at = Some(Utc::now());
                 })

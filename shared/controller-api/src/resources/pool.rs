@@ -260,8 +260,13 @@ pub struct PoolAtCluster {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StoragePoolStatus {
-    #[serde(default)]
-    pub phase: StoragePoolPhaseKind,
+    /// The phase, with the reason it is that phase and since when.
+    ///
+    /// Flat on the wire — `phase`, `reason`, `message`, `since` as siblings
+    /// right here — so every client that reads `status.phase` as a string
+    /// goes on reading it as a string. See `resources::phase`.
+    #[serde(flatten)]
+    pub phase: StoragePoolPhase,
     /// Where this pool's bytes are, as the nodes that can reach it agree.
     /// `None` while nobody has said — no node in the pool runs the driver
     /// yet, or every one of them predates the field.
@@ -276,8 +281,6 @@ pub struct StoragePoolStatus {
     /// still has to answer "could a VM using this disk run over there".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
     /// Which namespace of this pool belongs to which volume: the NQN as the
     /// pool's params spell it, to the volume's uid.
     ///
@@ -317,7 +320,7 @@ reasons! {
     /// cluster words come from D-C11: a pool at the CLOUD is a pointer at one
     /// a cluster admin already made, and a pointer at nothing stood on
     /// `Pending` for six minutes without saying which half was missing.
-    StoragePoolReason [5] {
+    StoragePoolReason [6] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
         Unrecorded => "Unrecorded",
@@ -326,6 +329,9 @@ reasons! {
         AwaitingNode => "AwaitingNode",
         /// The nodes serving it do not agree about what it is.
         Disagreement => "Disagreement",
+        /// A cluster's own word about the pool, verbatim in the message —
+        /// what the cloud's inventory road relays up.
+        Reported => "Reported",
         /// At the cloud: the cluster this pointer names has not reported.
         ClusterSilent => "ClusterSilent",
         /// At the cloud: the cluster reports, and names no pool by this name.

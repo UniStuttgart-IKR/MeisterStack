@@ -236,7 +236,7 @@ pub async fn fetch(
 /// a dispatch behind it, so it keeps the 409 with the node's own sentence,
 /// and there the word is right: the node had this VM and lost its record.
 fn never_reached_the_node(vm: &Vm) -> bool {
-    match vm.status.phase {
+    match vm.status.phase().kind() {
         VmPhaseKind::Pending => true,
         VmPhaseKind::Failed => vm.status.observed_generation == 0,
         _ => false,
@@ -306,7 +306,8 @@ mod tests {
                 "metadata": {"name": "web-1"}, "spec": {"vm": {}},
             }))
             .expect("a vm");
-            vm.status.phase = phase;
+            vm.status
+                .assign(controller_api::VmPhase::of(phase, chrono::Utc::now()));
             vm.status.observed_generation = observed;
             vm
         };

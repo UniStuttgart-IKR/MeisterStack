@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use controller_api::{
-    Candidate, EtcdStore, Node, Resource, Scheduler, StoreError, Vm, VmMigration,
+    Candidate, EtcdStore, Node, Resource, Scheduler, StoreError, Vm, VmMigration, VmMigrationPhase,
     VmMigrationPhaseKind, VmMigrationStatus, VmPhaseKind, Volume,
 };
 use proto::StatusReport;
@@ -112,7 +112,7 @@ pub fn phase_for(migrations: &[VmMigration], vm: &Vm) -> Option<VmMigrationPhase
             m.spec.vm == vm.metadata.name
                 && controller_api::same_tenancy(&m.spec.tenant, vm.spec.tenant.as_deref())
         })
-        .map(|m| m.status.phase)
+        .map(|m| m.status.phase().kind())
         .find(|p| controller_api::second_open_is_a_migration(Some(*p)))
 }
 
@@ -145,7 +145,7 @@ pub async fn ingest_arrivals(
         Err(e) => return Err(e.into()),
     };
     for migration in migrations {
-        if migration.status.phase.is_final() {
+        if migration.status.phase().kind().is_final() {
             continue;
         }
         if migration.status.target_node.as_deref() != Some(node_id) {
@@ -202,7 +202,7 @@ pub async fn ingest_departures(
         Err(e) => return Err(e.into()),
     };
     for migration in migrations {
-        if migration.status.phase.is_final() {
+        if migration.status.phase().kind().is_final() {
             continue;
         }
         if migration.status.source_node.as_deref() != Some(node_id) {
@@ -264,7 +264,7 @@ pub async fn start_for_drain(store: &EtcdStore, vm: &Vm, node: &str) -> anyhow::
     };
     if existing
         .iter()
-        .any(|m| m.spec.vm == vm.metadata.name && !m.status.phase.is_final())
+        .any(|m| m.spec.vm == vm.metadata.name && !m.status.phase().kind().is_final())
     {
         return Ok(());
     }
@@ -380,7 +380,7 @@ pub async fn reconcile_migrations(
     telemetry::metrics::objects().set_count(VmMigration::KIND, migrations.len() as i64);
     for migration in migrations {
         let name = migration.metadata.name.clone();
-        if migration.status.phase.is_final() {
+        if migration.status.phase().kind().is_final() {
             continue;
         }
         // A record somebody deleted mid-flight is not this pass's to carry
@@ -420,7 +420,7 @@ async fn step(
         Err(e) => return Err(e.into()),
     };
 
-    match migration.status.phase {
+    match migration.status.phase().kind() {
         VmMigrationPhaseKind::Pending => {
             prepare(store, dispatch, scheduler, nodes, &migration, &vm).await
         }
@@ -461,14 +461,14 @@ async fn prepare(
         )
         .await;
     };
-    if vm.status.phase != VmPhaseKind::Running {
+    if vm.status.phase().kind() != VmPhaseKind::Running {
         return fail(
             store,
             migration,
             format!(
                 "vm {} is {} and only a running vm can migrate live",
                 vm.metadata.name,
-                vm.status.phase.as_str()
+                vm.status.phase().kind().as_str()
             ),
         )
         .await;
@@ -497,12 +497,16 @@ async fn prepare(
     // migration, and two replicas preparing one migration would build two
     // destinations for one guest.
     let mut claimed = migration.clone();
-    claimed.status.phase = VmMigrationPhaseKind::Preparing;
     claimed.status.source_node = Some(source.clone());
     claimed.status.target_node = Some(target.clone());
     claimed.status.started_at = Some(Utc::now());
     claimed.status.observed_generation = migration.metadata.generation;
-    claimed.status.message = Some(format!("preparing {target}"));
+    claimed.status.assign(VmMigrationPhase::new(
+        VmMigrationPhaseKind::Preparing,
+        controller_api::VmMigrationReason::Dispatched,
+        Some(format!("preparing {target}")),
+        Utc::now(),
+    ));
     match store.update(&claimed).await {
         Ok(_) => {}
         Err(StoreError::Conflict(_)) => {
@@ -556,7 +560,13 @@ async fn prepare(
 
     store
         .mutate::<VmMigration, _>(&name, |m| {
-            m.status.message = Some(format!("{target} is listening at {peer}"));
+            let kind = m.status.phase().kind();
+            m.status.assign(VmMigrationPhase::new(
+                kind,
+                controller_api::VmMigrationReason::Dispatched,
+                Some(format!("{target} is listening at {peer}")),
+                Utc::now(),
+            ));
         })
         .await?;
     info!(migration = %name, vm = %vm.metadata.name, from = %source, to = %target, %peer,
@@ -756,8 +766,8 @@ async fn send(
     };
     let Some(peer) = migration
         .status
-        .message
-        .as_deref()
+        .phase()
+        .message()
         .and_then(|m| m.rsplit_once(" at ").map(|(_, peer)| peer.to_string()))
     else {
         // The address is written down in the sentence the prepare step left,
@@ -782,8 +792,12 @@ async fn send(
     }
 
     let mut claimed = migration.clone();
-    claimed.status.phase = VmMigrationPhaseKind::Running;
-    claimed.status.message = Some(format!("sending to {target} at {peer}"));
+    claimed.status.assign(VmMigrationPhase::new(
+        VmMigrationPhaseKind::Running,
+        controller_api::VmMigrationReason::Dispatched,
+        Some(format!("sending to {target} at {peer}")),
+        Utc::now(),
+    ));
     match store.update(&claimed).await {
         Ok(_) => {}
         Err(StoreError::Conflict(_)) => {
@@ -842,7 +856,15 @@ async fn send(
         warn!(migration = %name, node = %source, reason = %why,
               "the send is unaccounted for; waiting for the destination to say");
         store
-            .mutate::<VmMigration, _>(&name, |m| m.status.message = Some(why.clone()))
+            .mutate::<VmMigration, _>(&name, |m| {
+                let kind = m.status.phase().kind();
+                m.status.assign(VmMigrationPhase::new(
+                    kind,
+                    controller_api::VmMigrationReason::Reported,
+                    Some(why.clone()),
+                    Utc::now(),
+                ));
+            })
             .await?;
     }
     Ok(())
@@ -1014,9 +1036,12 @@ async fn settle(
     let finished = Utc::now();
     store
         .mutate::<VmMigration, _>(&name, |m| {
-            m.status.phase = VmMigrationPhaseKind::Succeeded;
             m.status.finished_at = Some(finished);
-            m.status.message = Some(format!("{} is on {target}", vm.metadata.name));
+            m.status.assign(VmMigrationPhase::said(
+                VmMigrationPhaseKind::Succeeded,
+                Some(format!("{} is on {target}", vm.metadata.name)),
+                finished,
+            ));
         })
         .await?;
     let took = migration
@@ -1076,9 +1101,14 @@ async fn fail(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow
     warn!(migration = %name, vm = %migration.spec.vm, reason = %why, "migration failed");
     store
         .mutate::<VmMigration, _>(&name, |m| {
-            m.status.phase = VmMigrationPhaseKind::Failed;
-            m.status.finished_at = Some(Utc::now());
-            m.status.message = Some(why.clone());
+            let now = Utc::now();
+            m.status.finished_at = Some(now);
+            m.status.assign(VmMigrationPhase::new(
+                VmMigrationPhaseKind::Failed,
+                controller_api::VmMigrationReason::Abandoned,
+                Some(why.clone()),
+                now,
+            ));
         })
         .await?;
     Ok(())
@@ -1290,7 +1320,7 @@ mod tests {
                 target_node: None,
             },
         );
-        m.status.phase = phase;
+        m.status.assign(VmMigrationPhase::of(phase, Utc::now()));
         m
     }
 
