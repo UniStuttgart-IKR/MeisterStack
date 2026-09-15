@@ -340,6 +340,18 @@ message VolumeStateReport {
   //
   // Zero from a node that predates the field, which reads as "did not say".
   uint64 size_bytes = 5;
+  // Why this volume is in the phase above, in one closed word.
+  //
+  // The node's own vocabulary (`reconcile::observe::VolumeReason`) and not the
+  // control plane's, for the reason `VmStatusReport.reason` gives at length.
+  // It is the half `message` could never be: the message is a driver's
+  // sentence, which is what an operator reads and what no program may branch
+  // on, and the two `Failed` cases behind it are a provision that did not
+  // work and a backend that has LOST a volume it once wrote -- one fix is a
+  // retry, the other is somebody's data.
+  //
+  // Empty for `Ready`, and empty from every node that predates the field.
+  string reason = 6;
 }
 
 message ImageStateReport {
@@ -364,6 +376,19 @@ message ImageStateReport {
   // reads it exactly as it read every report before: an already-merged phase
   // for the image, with nothing to say about nodes.
   string node = 4;
+  // Why, in one closed word: `NotFound` for a path image whose bytes are not
+  // at the path this node looks at, `NotAFile` for a directory under the
+  // catalogue name, `FetchFailed` for a url image that did not arrive or did
+  // not hash to what the spec said.
+  //
+  // `NotFound` is the one F16 is about. A path image is somebody else's file
+  // on shared storage, so a node that had never been asked to fetch anything
+  // said nothing at all about it -- and a catalogue entry nobody had looked
+  // at went on reading `Ready`. The word is what lets the tier above tell
+  // "this node cannot see the bytes" from "this node could not get them".
+  //
+  // Empty for `Ready` and from every node that predates the field.
+  string reason = 5;
 }
 
 message NodeStatus {
@@ -460,13 +485,30 @@ message VmStatusReport {
   // Empty on the AGENT's road, where the uid list above is the answer, and
   // empty from a cluster that predates the field.
   repeated VolumeAttachment volumes = 6;
-  // Why this VM is not placed, in the closed word `PendingReason` spells.
+  // Why this VM is in the phase above, in one closed word.
   //
-  // It travelled no further than the cluster, so a Pending VM at the cloud
-  // was a dead end for anybody holding only that tier's API — which is every
-  // tenant. Empty when the VM is not pending, and from a cluster that
-  // predates the field.
-  string pending_reason = 7;
+  // It was `pending_reason` and carried the scheduler's word only, on the
+  // cluster's road: a Pending VM at the cloud was a dead end for anybody
+  // holding just that tier's API, which is every tenant. Same field number,
+  // same wire type; what widened is WHICH phases may put something in it,
+  // because a phase without a reason is a line an operator cannot act on —
+  // `Pending` that does not say what is missing, `Failed` that does not say
+  // what broke, `Provisioning` that does not say whether a pass is working or
+  // a backoff is waiting.
+  //
+  // A string and not an enum, on BOTH roads, and that is deliberate: the
+  // agent does not depend on `controller-api` (see `CANNOT_SERVE` for the
+  // same argument about `ErrorMsg.reason`), so it cannot name the control
+  // plane's variants and does not try to. It writes the words of its own
+  // table -- one enum per resource, `reconcile::observe::reason_table` -- and
+  // the tier above parses them. A word no reader knows may not be dropped: a
+  // drifting agent has to be visible, so an unparsed reason travels on in the
+  // message.
+  //
+  // Empty is the ordinary answer for `Running`, `Stopped`, `Paused` and
+  // `Ready`, which need no reason, and it is what every reporter from before
+  // this field says.
+  string reason = 7;
   // The hardware addresses of this VM's taps, as the NODE made them.
   //
   // The half of `Vm.status.addresses[]` no tier above can derive. There is no
@@ -660,6 +702,20 @@ message RouterReport {
   // is where a tenant reads it. Evidence: the cloud mirrors it and never
   // writes into it.
   repeated string nodes = 6;
+  // Why this router is not `Ready`, in one closed word: `NetnsGone` (the
+  // namespace this node built is not there any more), `LegGone` (it is, and a
+  // leg of it is not), `DriverUnreachable` (the kernel could not be asked, so
+  // this is what the NODE could not find out rather than what is broken).
+  //
+  // The third is the one worth the field: a `Failed` that means "we could not
+  // look" and a `Failed` that means "it is gone" send an operator to two
+  // different machines, and until now both arrived as a sentence nobody could
+  // branch on. The words are the node's own
+  // (`agent_api::networking::RouterReason`), beside `ROUTER_READY` and for
+  // the same reason.
+  //
+  // Empty for `Ready` and from every reporter that predates the field.
+  string reason = 7;
 }
 
 // Make this node ready to RECEIVE a running guest, and say where to send it.
@@ -1064,6 +1120,20 @@ message StoragePoolStatusReport {
   // cluster's pool is a separate object down there. This is the evidence the
   // comparison is made on.
   string params_json = 6;
+  // Why this pool is in the phase above, in one closed word.
+  //
+  // D-C11 is the line this field is for. A pool at the cloud is a POINTER at
+  // one a cluster admin made, and a pointer whose cluster has no such pool
+  // sat at `Pending` with an empty status for as long as anybody watched:
+  // `"status": { "phase": "Pending" }` was the whole of it, six minutes in,
+  // and nothing anywhere said that the cluster half was missing.
+  //
+  // No agent writes this one -- a node reports DRIVERS (`DriverInfo`, with
+  // the locality), and the pool objects are made one tier up out of them. It
+  // is filled on the cluster's road and read at the cloud.
+  //
+  // Empty for `Ready` and from every cluster that predates the field.
+  string reason = 7;
 }
 
 // One volume, as the cluster sees it. The cloud mirrors these fields onto its
@@ -1111,6 +1181,12 @@ message VolumeStatusReport {
   // Empty from a cluster older than this field, which reads as "did not say"
   // and never as "nobody has it".
   repeated string open_on = 8;
+  // Why this volume is in the phase above, in one closed word — the same
+  // vocabulary `VolumeStateReport.reason` carries one road further down, and
+  // the cloud mirrors it exactly as it mirrors the phase.
+  //
+  // Empty for `Ready` and from every cluster that predates the field.
+  string reason = 9;
 }
 
 // One node, as the cluster sees it. Spec and status flattened into one

@@ -411,8 +411,10 @@ pub(super) async fn ingest_placements(
                 attached: v.attached,
             })
             .collect();
-        let pending_reason =
-            (!reported.pending_reason.is_empty()).then(|| reported.pending_reason.clone());
+        // `VmStatusReport.pending_reason` is `reason` since struktur 4 and
+        // carries the same value on this road; which phases may fill it is the
+        // derivation lane's question.
+        let pending_reason = (!reported.reason.is_empty()).then(|| reported.reason.clone());
         let Some(vm) = known.iter().find(|v| v.metadata.uid == reported.id) else {
             continue;
         };

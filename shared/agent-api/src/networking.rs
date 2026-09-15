@@ -499,6 +499,14 @@ pub struct RouterState {
     /// and for the log line; nothing branches on it.
     pub location: String,
     pub phase: RouterPhase,
+    /// Why, in the one word a program may branch on. `None` for `Ready`.
+    ///
+    /// Beside `message` and not instead of it, the pairing every reason in
+    /// this stack carries (`NodeCondition`, `StayingVm`, `PendingReason`): the
+    /// word is what a program reads, the sentence is what an operator reads,
+    /// and asking a program to match on prose is asking it to break. The
+    /// driver is what fills it, because the driver is what looked.
+    pub reason: Option<RouterReason>,
     pub message: String,
     pub active: bool,
     /// The prefixes to announce while this router is active, already in
@@ -512,6 +520,53 @@ pub enum RouterPhase {
     Ready,
     /// Something the spec asked for is not there. `message` says what.
     Failed,
+}
+
+/// Why a router is not `Ready`, in the node's own vocabulary.
+///
+/// Here rather than in the agent for the reason [`RouterPhase`] is here: the
+/// DRIVER is what finds the condition, the driver depends on this crate and
+/// on nothing above it, and a word the driver cannot name is a word that
+/// would have to be reconstructed from its own sentence one tier up.
+///
+/// Three words, one per way `state_of` can fail to find a router, and no
+/// fourth held in reserve. The one that earns the enum on its own is
+/// [`RouterReason::DriverUnreachable`]: "the namespace is gone" and "the
+/// kernel could not be asked" are the same `Failed` today, they send an
+/// operator to two different machines, and the difference was only ever in a
+/// sentence nobody could branch on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouterReason {
+    /// The network namespace this node built for the router is not there.
+    NetnsGone,
+    /// It is, and one of the two legs in it is not. `message` names which.
+    LegGone,
+    /// The node could not find out: `ip` did not answer, or the state
+    /// directory could not be read. What is NOT said here is that anything is
+    /// broken — this is the reason a reader may not act on.
+    DriverUnreachable,
+}
+
+impl RouterReason {
+    /// Every variant, in declaration order — see `RouterPhase::ALL`.
+    pub const ALL: [RouterReason; 3] = [
+        RouterReason::NetnsGone,
+        RouterReason::LegGone,
+        RouterReason::DriverUnreachable,
+    ];
+
+    /// The wire spelling of `RouterReport.reason`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouterReason::NetnsGone => "NetnsGone",
+            RouterReason::LegGone => "LegGone",
+            RouterReason::DriverUnreachable => "DriverUnreachable",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
 }
 
 impl RouterPhase {

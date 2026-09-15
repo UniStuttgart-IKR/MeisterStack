@@ -1112,3 +1112,71 @@ async fn a_vmm_nobody_has_a_record_of_is_reported_every_pass_and_not_killed_at_o
     );
     assert!(vmm.ended.lock().unwrap().is_empty());
 }
+
+/// The vocabulary on the wire is the vocabulary in the round's report.
+///
+/// The list below is copied from `claude/struktur-4-agent-report.md`, which is
+/// where the words were agreed and where one gets struck. Two directions, one
+/// assertion: a word added to an enum without being written down fails here,
+/// and a word struck from the report without being taken out of the enum
+/// fails here too.
+///
+/// It is the only test in this tree that holds code against a document, and
+/// it earns that because the words are a CONTRACT with a reader who is not in
+/// this repository: the control plane parses them, a dashboard queries them,
+/// and neither finds out about a rename until somebody's panel is empty.
+#[test]
+fn the_reason_table_is_the_list_in_the_round_report() {
+    let written: Vec<(&str, Vec<&str>)> = vec![
+        (
+            "Vm",
+            vec![
+                "Working",
+                "Backoff",
+                "AwaitingGuest",
+                "GuestLeft",
+                "ReceiveFailed",
+                "VmmGone",
+                "BackendGone",
+                "ResumeIneffective",
+                "Unrecorded",
+            ],
+        ),
+        (
+            "Volume",
+            vec![
+                "Working",
+                "DriverRefused",
+                "NotOnBackend",
+                "Deprovisioned",
+                "Unrecorded",
+            ],
+        ),
+        (
+            "Image",
+            vec!["NotFound", "NotAFile", "ChecksumMismatch", "FetchFailed"],
+        ),
+        ("Router", vec!["NetnsGone", "LegGone", "DriverUnreachable"]),
+    ];
+    assert_eq!(reason_table(), written);
+
+    // And every word parses back to the variant it came from: the tier above
+    // reads these off a wire, and a spelling that only goes one way would be
+    // found there rather than here.
+    for reason in VmReason::ALL {
+        assert_eq!(VmReason::parse(reason.as_str()), Some(reason));
+    }
+    for reason in VolumeReason::ALL {
+        assert_eq!(VolumeReason::parse(reason.as_str()), Some(reason));
+    }
+    for reason in ImageReason::ALL {
+        assert_eq!(ImageReason::parse(reason.as_str()), Some(reason));
+    }
+    for reason in agent_api::RouterReason::ALL {
+        assert_eq!(
+            agent_api::RouterReason::parse(reason.as_str()),
+            Some(reason)
+        );
+    }
+    assert_eq!(VmReason::parse("working"), None, "the case is the spelling");
+}

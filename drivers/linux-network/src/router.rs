@@ -571,6 +571,7 @@ impl crate::LinuxNetworkDriver {
             id: spec.id,
             location: netns,
             phase,
+            reason: None,
             message,
             active: spec.active,
             // A router that is not there announces nothing, whatever it was

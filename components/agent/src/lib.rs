@@ -354,6 +354,7 @@ impl Agent {
                 .map(|r| proto::RouterReport {
                     id: r.id.to_string(),
                     phase: r.phase.as_str().to_string(),
+                    reason: String::new(),
                     message: r.message,
                     active: r.active,
                     // Empty on this road, by construction: a node naming
@@ -427,7 +428,7 @@ impl Agent {
                 // tier's answer, by uid, and a node knows nothing about a
                 // placement decision one tier up.
                 volumes: Vec::new(),
-                pending_reason: String::new(),
+                reason: String::new(),
                 // The taps this node made, with the address the network
                 // driver pinned on each. The one half of
                 // `Vm.status.addresses[]` that has to come from down here —
@@ -467,6 +468,7 @@ impl Agent {
                 .map(|(name, state)| proto::ImageStateReport {
                     name,
                     phase: state.phase().to_string(),
+                    reason: String::new(),
                     message: state.message().to_string(),
                     // Empty on this road: the controller addressed this node
                     // and knows which one it is. It fills the field in on the

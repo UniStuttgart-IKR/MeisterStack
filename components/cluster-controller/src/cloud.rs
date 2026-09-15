@@ -1607,6 +1607,9 @@ async fn build_status(
         .map(|pool| proto::StoragePoolStatusReport {
             name: pool.metadata.name,
             phase: pool.status.phase.as_str().to_string(),
+            // struktur 4: D-C11's field. This tier does not derive a word for
+            // it yet -- the derivation lane does.
+            reason: String::new(),
             // Empty when nobody has said, which is not the same as
             // `node-local` and must not become it on the way up.
             locality: pool
@@ -1865,7 +1868,7 @@ fn report_cloud_vms(vms: &[Vm], complete: &mut bool) -> Vec<VmStatusReport> {
                 // And why it is not placed, which stopped at this tier for
                 // the same reason: a Pending VM at the cloud was a dead end
                 // for anybody holding only that API.
-                pending_reason: vm.status.pending_reason.clone().unwrap_or_default(),
+                reason: vm.status.pending_reason.clone().unwrap_or_default(),
                 // The MAC half of `status.addresses[]`, relayed. It comes off
                 // the object rather than out of a node's report, because this
                 // tier has already written the nodes' reports onto the object
@@ -1918,6 +1921,10 @@ fn report_cloud_volumes(volumes: &[Volume], complete: &mut bool) -> Vec<proto::V
             Some(uid) => out.push(proto::VolumeStatusReport {
                 uid: uid.to_string(),
                 phase: volume.status.phase.as_str().to_string(),
+                // struktur 4: the field exists on the wire and this tier does not
+                // derive a word for it yet. The derivation lane fills it.
+                reason: String::new(),
+
                 node: volume.status.node.clone().unwrap_or_default(),
                 attached_to: volume.status.attached_to.clone().unwrap_or_default(),
                 message: volume.status.message.clone().unwrap_or_default(),
@@ -1985,6 +1992,10 @@ fn report_cloud_routers(routers: &[Router], complete: &mut bool) -> Vec<proto::R
             Some(uid) => out.push(proto::RouterReport {
                 id: uid.to_string(),
                 phase: router.status.phase.as_str().to_string(),
+                // struktur 4: the field exists on the wire and this tier does not
+                // derive a word for it yet. The derivation lane fills it.
+                reason: String::new(),
+
                 message: router.status.message.clone().unwrap_or_default(),
                 active: !router.status.active_node.is_empty(),
                 node: router.status.active_node.clone(),
@@ -2677,10 +2688,10 @@ mod tests {
             "names and not uids: the cloud owns neither object and cannot resolve one"
         );
         assert!(
-            report[0].pending_reason.is_empty(),
+            report[0].reason.is_empty(),
             "a placed vm has no pending reason"
         );
-        assert_eq!(report[1].pending_reason, "node-unhealthy");
+        assert_eq!(report[1].reason, "node-unhealthy");
         assert!(report[1].volumes.is_empty());
     }
 

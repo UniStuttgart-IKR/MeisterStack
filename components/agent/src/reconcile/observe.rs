@@ -151,6 +151,242 @@ impl ReportedPhase {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Why, and not only what.
+//
+// A phase this node sends upwards used to be one word and, at best, a
+// sentence beside it. The word is what a program branches on and the sentence
+// is what a person reads, and for four of the six phases below there was no
+// word for WHY at all: `Provisioning` did not say whether a pass was working
+// or a backoff was waiting, `Failed` did not say what had broken, and
+// `Quarantined` carried its reason in prose only.
+//
+// So: one enum per resource this node reports, `Copy`, with `as_str`, `parse`
+// and `ALL`, exactly as `RunStrategy` and `PendingReason` are built. The
+// strings are what goes on the wire (`control.proto`: `reason` on
+// VmStatusReport, VolumeStateReport, ImageStateReport, RouterReport) and they
+// are STRINGS on purpose: this agent does not depend on `controller-api` —
+// see `proto::CANNOT_SERVE` for the same decision about `ErrorMsg.reason` —
+// so it cannot name the control plane's variants, and a shared crate just for
+// these words would be the dependency the split exists to avoid.
+//
+// Every reason here comes from a place in this tree that already writes the
+// same fact into `message`; `reason_table` gathers them and one test holds
+// that table against the list in the round's report, so a word cannot be
+// added, renamed or dropped in silence.
+// ---------------------------------------------------------------------------
+
+/// Why a VM is in the phase this node reports for it.
+///
+/// `None` is correct for `Running`, `Stopped` and `Paused`: those three say
+/// everything there is to say. Every other phase carries one of these, which
+/// is what `no_vm_phase_but_a_settled_one_leaves_this_node_without_a_reason`
+/// keeps true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmReason {
+    /// `Provisioning`: a pass is building this VM and the last attempt did
+    /// not fail. The ordinary road up to `Running`.
+    Working,
+    /// `Provisioning`: the last attempt DID fail and the retry schedule is
+    /// waiting. The message is that attempt's error, which is the half of
+    /// this state nobody could see — the count alone says a VM is not coming
+    /// up and never says what stopped it.
+    Backoff,
+    /// `Provisioning`: this node is a live migration's destination and the
+    /// guest has not arrived. Which machine to look at is the whole content
+    /// of the line; see `report_status`.
+    AwaitingGuest,
+    /// `Provisioning`: this node WAS a live migration's source and the guest
+    /// is on the other machine now.
+    GuestLeft,
+    /// `Failed`: the reception did not finish and this node is giving back
+    /// the VMM, the disks and the taps it made. The guest is still running
+    /// where it was — see [`RECEIVE_FAILED_REASON`].
+    ReceiveFailed,
+    /// `Failed`: the VMM this record names is gone or does not answer its
+    /// socket, and the passes that tried to rebuild it keep failing. The
+    /// first of the three failure classes `plan` distinguishes.
+    VmmGone,
+    /// `Quarantined`: a backend process died while the VMM went on running —
+    /// the second class, and the one no pass may repair by itself. See
+    /// [`BACKEND_DIED_REASON`] and `backend_died_under_vmm`.
+    BackendGone,
+    /// `Quarantined`: the guest did not come back from a pause however often
+    /// it was resumed. See `act::RESUME_INEFFECTIVE_REASON`.
+    ResumeIneffective,
+    /// A marker this build does not recognise — a record written by another
+    /// version of this agent. The sentence it carries travels on unchanged,
+    /// because an agent that has drifted has to be visible rather than
+    /// silent (the same rule the controller reads unknown words by).
+    Unrecorded,
+}
+
+impl VmReason {
+    /// Every variant, in declaration order — see `ReportedPhase::ALL`.
+    pub const ALL: [VmReason; 9] = [
+        VmReason::Working,
+        VmReason::Backoff,
+        VmReason::AwaitingGuest,
+        VmReason::GuestLeft,
+        VmReason::ReceiveFailed,
+        VmReason::VmmGone,
+        VmReason::BackendGone,
+        VmReason::ResumeIneffective,
+        VmReason::Unrecorded,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VmReason::Working => "Working",
+            VmReason::Backoff => "Backoff",
+            VmReason::AwaitingGuest => "AwaitingGuest",
+            VmReason::GuestLeft => "GuestLeft",
+            VmReason::ReceiveFailed => "ReceiveFailed",
+            VmReason::VmmGone => "VmmGone",
+            VmReason::BackendGone => "BackendGone",
+            VmReason::ResumeIneffective => "ResumeIneffective",
+            VmReason::Unrecorded => "Unrecorded",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+}
+
+/// Why a volume of this node is in the phase it reports.
+///
+/// It rides on the RECORD (`types::VolumeRecord::reason`) and not on the
+/// report, and that is the difference between this and the VM half: a VM's
+/// phase is derived on every heartbeat from a fresh observation, and a
+/// volume's is what the pass that asked a driver wrote down. The party that
+/// knows why is that pass, an hour before anybody asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VolumeReason {
+    /// `Provisioning`: the record is written and the driver has been asked,
+    /// or is being asked right now.
+    Working,
+    /// `Failed`: the backend said no. `message` is what it said.
+    DriverRefused,
+    /// `Failed`: the backend has no volume of that name any more, and it did
+    /// when this node last wrote the record. Its own word and not
+    /// [`VolumeReason::DriverRefused`], because the operator fix is not a
+    /// retry: this is somebody's data missing, found by `Volumes::adopt` at
+    /// start-up.
+    NotOnBackend,
+    /// `Gone`: this node was told to deprovision and has. The tombstone the
+    /// tier above may release a volume on — see `VolumeRecordPhase::Gone`.
+    Deprovisioned,
+    /// A record from another build of this agent, which had no reason on it.
+    /// Its `message` is unchanged.
+    Unrecorded,
+}
+
+impl VolumeReason {
+    pub const ALL: [VolumeReason; 5] = [
+        VolumeReason::Working,
+        VolumeReason::DriverRefused,
+        VolumeReason::NotOnBackend,
+        VolumeReason::Deprovisioned,
+        VolumeReason::Unrecorded,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VolumeReason::Working => "Working",
+            VolumeReason::DriverRefused => "DriverRefused",
+            VolumeReason::NotOnBackend => "NotOnBackend",
+            VolumeReason::Deprovisioned => "Deprovisioned",
+            VolumeReason::Unrecorded => "Unrecorded",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+}
+
+/// Why a base image is not usable on this node.
+///
+/// No `Unrecorded` here, and the absence is the point: this table is held in
+/// memory and re-derived from the disk (`images::Cache`), so there is no
+/// stored opinion from an older build for one to come out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageReason {
+    /// `Failed`: a path image whose bytes are not at the path this node
+    /// looks at. The F16 word — a catalogue entry pointing at nothing used to
+    /// read `Ready` because no node had ever said anything about it.
+    NotFound,
+    /// `Failed`: something IS at that path and it is a directory. Saying
+    /// `Ready` about one would hand a storage driver a path it cannot open.
+    NotAFile,
+    /// `Failed`: a url image arrived and hashes to something else than the
+    /// spec said. Its own word because the fix is a different one — the
+    /// bytes at the url changed, or the checksum in the spec is wrong — and
+    /// because a checksum that stopped being checked is how D-H4 happened.
+    ChecksumMismatch,
+    /// `Failed`: the bytes did not arrive at all, or could not be put in
+    /// place. The url did not answer, `curl` is not on the PATH, the cache
+    /// could not be written.
+    FetchFailed,
+}
+
+impl ImageReason {
+    pub const ALL: [ImageReason; 4] = [
+        ImageReason::NotFound,
+        ImageReason::NotAFile,
+        ImageReason::ChecksumMismatch,
+        ImageReason::FetchFailed,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImageReason::NotFound => "NotFound",
+            ImageReason::NotAFile => "NotAFile",
+            ImageReason::ChecksumMismatch => "ChecksumMismatch",
+            ImageReason::FetchFailed => "FetchFailed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+}
+
+/// Every word this node may put in a `reason`, resource by resource.
+///
+/// One list so that there IS one list: the four enums live where the party
+/// that writes them lives — three here, the router's in `agent-api` beside
+/// `RouterPhase`, because the network driver is what looks and the driver
+/// cannot depend on this crate — and a vocabulary spread over two crates is
+/// one nobody can read off in one place. The test below holds it against the
+/// list in the round's report, which is where Silas strikes words.
+///
+/// Storage pools are deliberately absent: a node reports DRIVERS
+/// (`DriverInfo`, with their locality) and never a pool, so the pool's
+/// `reason` is filled one tier up. Snapshots are absent because
+/// `SnapshotStateReport` carries no `reason` field yet — see the report.
+pub fn reason_table() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        ("Vm", VmReason::ALL.iter().map(|r| r.as_str()).collect()),
+        (
+            "Volume",
+            VolumeReason::ALL.iter().map(|r| r.as_str()).collect(),
+        ),
+        (
+            "Image",
+            ImageReason::ALL.iter().map(|r| r.as_str()).collect(),
+        ),
+        (
+            "Router",
+            agent_api::RouterReason::ALL
+                .iter()
+                .map(|r| r.as_str())
+                .collect(),
+        ),
+    ]
+}
+
 /// What the controller should show, from the same record and observation
 /// `plan` decides on — the report is a view of the reconciler's world, not a
 /// second one. `failures` is the consecutive-failure count of the backoff

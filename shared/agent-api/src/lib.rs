@@ -21,7 +21,7 @@ pub use hypervisor::{
 };
 pub use networking::{
     BridgeDriver, NatKind, NatRule, NetworkDriver, NetworkError, Nic, NicAttachment, NicDriver,
-    NicId, NicSpec, RouterId, RouterPhase, RouterSpec, RouterState,
+    NicId, NicSpec, RouterId, RouterPhase, RouterReason, RouterSpec, RouterState,
 };
 pub use pid::{process_carries, process_exists};
 pub use resource_limits::{

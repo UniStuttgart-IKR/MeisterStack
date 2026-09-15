@@ -130,7 +130,7 @@ fn status(complete: bool, uids: &[&str]) -> ClusterStatus {
                 attached_volumes: Vec::new(),
                 node: String::new(),
                 volumes: Vec::new(),
-                pending_reason: String::new(),
+                reason: String::new(),
                 nics: Vec::new(),
             })
             .collect(),

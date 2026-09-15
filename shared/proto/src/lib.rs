@@ -262,7 +262,9 @@ mod tests {
                 name: "data-1".into(),
                 attached: true,
             }],
-            pending_reason: String::new(),
+            // Empty on purpose: this is a `Running` line, and `Running`
+            // needs no reason. The field has a test of its own below.
+            reason: String::new(),
             nics: vec![
                 NicReport {
                     name: "nics[0]".into(),
@@ -457,6 +459,7 @@ mod tests {
         let report = RouterReport {
             id: "u-7".into(),
             phase: "Active".into(),
+            reason: String::new(),
             message: String::new(),
             active: true,
             node: "agent-1b".into(),
@@ -482,5 +485,86 @@ mod tests {
         let back = ClusterStatus::decode(status.encode_to_vec().as_slice()).unwrap();
         assert_eq!(back.routers, vec![report]);
         assert!(back.routers_complete);
+    }
+    /// `reason` on all five reports, both directions, and what a reporter
+    /// from before the field looks like.
+    ///
+    /// The word is a STRING on the wire and not an enum, so the compatibility
+    /// question is not "does it parse" but "does an empty one read as
+    /// silence": every phase that needs no reason sends nothing at all, and so
+    /// does every agent and every cluster built before this round. Both have
+    /// to decode as the empty string and never as an error, because one old
+    /// reporter in a fleet may not break a list.
+    ///
+    /// The five are the five that carry a phase upwards. `reason` sits beside
+    /// `message` on each and replaces nothing: the message is the sentence an
+    /// operator reads, this is the word a program branches on.
+    #[test]
+    fn every_report_carries_its_reason_and_an_empty_one_is_silence() {
+        let vm = VmStatusReport {
+            id: "6f1d5f7c-0000-4000-8000-00000000000a".into(),
+            phase: "Provisioning".into(),
+            reason: "Backoff".into(),
+            message: "the volume driver said no".into(),
+            ..Default::default()
+        };
+        let volume = VolumeStateReport {
+            id: "9d2b1a44-0000-4000-8000-00000000000b".into(),
+            phase: "Failed".into(),
+            reason: "NotOnBackend".into(),
+            ..Default::default()
+        };
+        let image = ImageStateReport {
+            name: "nixos.raw".into(),
+            phase: "Failed".into(),
+            reason: "NotFound".into(),
+            ..Default::default()
+        };
+        let router = RouterReport {
+            id: "u-7".into(),
+            phase: "Failed".into(),
+            reason: "NetnsGone".into(),
+            ..Default::default()
+        };
+        let pool = StoragePoolStatusReport {
+            name: "mc-fs".into(),
+            phase: "Pending".into(),
+            reason: "ClusterHasNoPool".into(),
+            ..Default::default()
+        };
+
+        let status = StatusReport {
+            vms: vec![vm.clone()],
+            volumes: vec![volume.clone()],
+            images: vec![image.clone()],
+            routers: vec![router.clone()],
+            ..Default::default()
+        };
+        let back = StatusReport::decode(status.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(back.vms, vec![vm.clone()]);
+        assert_eq!(back.volumes, vec![volume]);
+        assert_eq!(back.images, vec![image]);
+        assert_eq!(back.routers, vec![router]);
+
+        // The pool's road is the cluster's, one tier further up, and the same
+        // field travels there.
+        let cluster = ClusterStatus {
+            pools: vec![pool.clone()],
+            ..Default::default()
+        };
+        let back = ClusterStatus::decode(cluster.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(back.pools, vec![pool]);
+
+        // And what a reporter that predates the field sends: nothing where
+        // the word would be. It decodes empty, which is what every reader
+        // reads as "did not say".
+        let old = VmStatusReport {
+            reason: String::new(),
+            ..vm
+        };
+        let back = VmStatusReport::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(back.reason.is_empty());
+        assert_eq!(back.phase, "Provisioning");
+        assert_eq!(back.message, "the volume driver said no");
     }
 }

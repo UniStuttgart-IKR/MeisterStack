@@ -98,6 +98,10 @@ impl ImageView {
             .map(|((name, node), (phase, message))| proto::ImageStateReport {
                 name: name.clone(),
                 phase: phase.clone(),
+                // struktur 4: the nodes send a word now; relaying it is the
+                // derivation lane's, which is where this map grows a third
+                // value.
+                reason: String::new(),
                 message: message.clone(),
                 node: node.clone(),
             })

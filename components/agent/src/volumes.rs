@@ -668,6 +668,7 @@ impl Volumes {
                 id: id.to_string(),
                 phase: record.phase.as_str().to_string(),
                 backend: record.backend().to_string(),
+                reason: String::new(),
                 message: record.message.clone().unwrap_or_default(),
                 // What the handle says the volume IS, which after a resize is
                 // not what the spec asked for: lvm rounds up to the extent
@@ -1163,6 +1164,7 @@ mod tests {
                 id: id.to_string(),
                 phase: VolumeRecordPhase::Ready.as_str().to_string(),
                 backend: "/var/lib/meister/volumes/x.raw".into(),
+                reason: String::new(),
                 message: String::new(),
             }],
             stopping: false,
