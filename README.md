@@ -16,17 +16,6 @@ MeisterStack supports sharing NVIDIA GPUs with its `nvrm` driver that utilizes [
 > This project heavily used [AI for implementation and testing]("docs/AI_GUIDELINES.md"), when the project reaches `BETA` stage the generated
 > code will be fully reviewed!
 
-
-
-## Architecture
-
-![Architecture](docs/diagrams/architecture.svg "Architecture of MeisterStack")
-
-MeisterStack is organized in three tiers. The *Agent* that runs locally on the hypervisor. The *Cluster-Controller* and the *Cloud-Controller*
-that act as two tiered, *etcd* backed control-plane. *Plugins* and *Drivers* allow to utilize traits and abstract capabilities on specific devices
-and adapt to other software stacks at compile time. The three tiers of the system communicate via *gRPC* and use an three-tiered, Kubernetes inspired
-reconcile mechanism to control the cloud.
-
 ## Quick Start
 
 Requirements:
@@ -93,6 +82,19 @@ meister --endpoint http://127.0.0.1:3001 vm ls   # to talk to the cluster-level 
 ```
 
 See [Deployment](docs/DEPLOYMENT.md) for further information. A special deployment tool `meister-deploy` is under active development.
+
+## Architecture
+
+![Architecture](docs/diagrams/architecture.svg "Architecture of MeisterStack")
+
+MeisterStack is organized in three tiers. The *Agent* that runs locally on the hypervisor. The *Cluster-Controller* and the *Cloud-Controller*
+that act as two tiered, *etcd* backed control-plane. *Plugins* and *Drivers* allow to utilize traits and abstract capabilities on specific devices
+and adapt to other software stacks at compile time. The three tiers of the system communicate via *gRPC* and use an three-tiered, Kubernetes inspired
+reconcile mechanism to control the cloud.
+The control-plane supports high-availability on both levels, for the future it is planned to make the cluster-controller more modular to adapt more easy
+to already existing solutions for storage and networking like `OVN/OVS` and software defined storage of any kind.
+
+See the [docs](docs/ARCHITECTURE.md) for more detailed information.
 
 ## License
 
