@@ -22,6 +22,67 @@ are managed by CrosVM. `vfio` is also supported.
 
 ## Quick Start
 
-MeisterStack is build for deployment with NixOS. Other distributions are not supported at the moment but it should be possible to
-run the software stack on any Linux machine.
+Requirements:
+
+
+Prerequisites:
+
+```bash
+./get_patched_binaries.sh
+cargo build
+```
+
+Setup local etcd (one for both tiers):
+
+```bash
+etcd --data-dir /tmp/ms-dev/etcd --listen-client-urls http://127.0.0.1:2379 --advertise-client-urls http://127.0.0.1:2379
+```
+
+Setup *cloud-tier*:
+
+```bash
+cp config/examples/cloud.toml /tmp/ms-dev/cloud.toml     # uses port 3000 and 50050
+target/debug/meister-cloud-controller --config /tmp/ms-dev/cloud.toml
+```
+
+Setup *cluster-tier*:
+
+```bash
+cp config/examples/cluster.toml /tmp/ms-dev/cluster.toml    # uses port 3001 and 50051
+target/debug/meister-cluster-controller --config /tmp/ms-dev/cluster.toml
+```
+
+Setup *agent*:
+
+```bash
+sudo target/debug/meister-agent --config config/agent.dev.toml
+```
+*Note that the image `nixos.raw` has to sit in `../images` relative to the config.
+
+
+Create  *CLI-profiles*:
+
+CLI-profiles are files that hold an endpoint and the required credentials. This makes it more easy to specify to which layer you want to talk.
+For this example you can jsut use the `config/cli.dev.toml` or specify `--endpoint "http://127.0.0.1:3000" before each command.\
+
+```bash
+cp config/cli.dev.toml ~/.config/meisterstack/config.toml
+```
+
+Use MeisterStack:
+
+```bash
+meister api-resources
+meister whoami
+
+meister node ls --cluster cluster-1   # the agent must show up here before a VM can land
+meister tenant create lab
+meister image create nixos.raw --source /absolute/path/to/images/nixos.raw
+meister vm create -t lab -f config/json/plain.json demo
+meister vm ls -t lab
+meister vm logs demo
+
+meister --endpoint http://127.0.0.1:3001 vm ls   # to talk to the cluster-level API
+```
+
 
