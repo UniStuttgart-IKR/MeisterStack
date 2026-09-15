@@ -125,14 +125,15 @@ def w5_cluster(link, cond, seconds, cname="cluster-1"):
     ep0, conn0 = voice()
     if not ep0:
         return {"skipped": f"{cname} has no sessionEndpoint to watch"}
-    seen, ends = [ep0], []
+    seen, ends, drops = [ep0], [], False
     t0 = time.time()
     first_change, lost = None, None
     try:
-        ends = ops.shape_link(link, cond, seconds) if cond != "D" else []
         if cond == "D":
-            ops.partition_ip(ops.CLUSTER1[0], ops.CLOUD, port=50050, on=True)
-            ends = ["__partition__"]
+            ends = ops.partition_link("C", on=True)
+            drops = True
+        else:
+            ends = ops.shape_link(link, cond, seconds)
         while time.time() - t0 < 150:
             ep, conn = voice()
             if ep and ep != seen[-1]:
@@ -145,8 +146,8 @@ def w5_cluster(link, cond, seconds, cname="cluster-1"):
                 break            # 45 s of quiet after the move is enough to call it stable
             time.sleep(2)
     finally:
-        if ends == ["__partition__"]:
-            ops.partition_ip(ops.CLUSTER1[0], ops.CLOUD, port=50050, on=False)
+        if drops:
+            ops.unpartition(ends)
         else:
             ops.unshape_all(ends)
     t1 = time.time()
@@ -173,7 +174,12 @@ def w5(link, cond, seconds, cname="cluster-1"):
         return (o.get("status") or {}).get("ready") if isinstance(o, dict) else None
 
     if ready() is not True:
-        return {"skipped": f"{node} was not Ready before the cell started"}
+        # Do not skip on the previous cell's tail: wait for it. The first run
+        # lost A x L200 x w5 because the D cell before it had not given
+        # agent-1a back yet.
+        ops.wait_for(lambda: True if ready() is True else None, 180)
+    if ready() is not True:
+        return {"skipped": f"{node} still not Ready after waiting 180 s"}
 
     ends, t0 = [], time.time()
     try:
@@ -231,8 +237,12 @@ def w2(seed, n=10, pool="fabric", tenant=None):
         t0 = time.time()
         c, _ = ops.cloud("POST", "/volumes", {
             "apiVersion": "meister.io/v1", "kind": "Volume",
-            "metadata": {"name": name, "tenant": tenant},
-            "spec": {"pool": pool, "sizeGib": 1, "accessMode": "readWriteOnce"}})
+            "metadata": {"name": name},
+            # spec.tenant, not metadata.tenant: the API says so, and the first
+            # run put it in metadata and got `unknown field \`tenant\`` twenty
+            # times in 2.1 seconds -- failed=10 that said nothing about storage.
+            "spec": {"pool": pool, "sizeGib": 1, "accessMode": "readWriteOnce",
+                     "tenant": tenant}})
         if c >= 400:
             failed += 1
             continue
@@ -327,12 +337,19 @@ def w4(seed, node="agent-1a", cname="cluster-1"):
     body = ops.vm_body(name, tenant=TENANT)
     body["spec"]["evacuation"] = "restart"
     body["spec"]["nodeName"] = node
-    c, _ = ops.cloud("POST", "/vms", body)
+    # At the CLUSTER, not the cloud. `spec.nodeName` is not a field of a vm at
+    # the cloud -- "the cloud places on clusters, and which machine inside one
+    # runs the vm is the cluster's decision" -- and the first run got a 422 for
+    # it twice and recorded two empty cells. A drain needs the vm pinned to the
+    # machine being drained, so this has to be the cluster's own create.
+    c, o = ops.cluster(cname, "POST", "/vms", body)
     if c >= 400:
-        return {"skipped": f"create refused: {c}"}
-    ok, _ = ops.wait_for(lambda: True if ops.phase_of(ops.cloud_vm(name)) == "Running" else None, 180)
+        return {"skipped": f"create refused: {c} {(o.get('message') if isinstance(o, dict) else '')[:120]}"}
+    ok, _ = ops.wait_for(lambda: True if (ops.cluster(cname, "GET", f"/vms/{name}")[1]
+                                          .get("status", {}).get("phase")) == "Running" else None,
+                         180, step=0.5)
     if not ok:
-        ops.cloud("DELETE", f"/vms/{name}")
+        ops.cluster(cname, "DELETE", f"/vms/{name}")
         return {"skipped": "the VM never ran before the drain"}
     cli = os.path.join(os.path.dirname(os.path.dirname(
         os.path.dirname(os.path.abspath(__file__)))), "target/release/meister")
@@ -347,11 +364,18 @@ def w4(seed, node="agent-1a", cname="cluster-1"):
         n = st.get("nodeName")
         return n if st.get("phase") == "Running" and n and n != node else None
 
-    where, secs = ops.wait_for(elsewhere, 240)
-    subprocess.run([cli, "--config", "/mnt/vmstore/MeisterStack/cli.mtls.toml",
-                    "node", "uncordon", node, "--cluster", cname],
-                   capture_output=True, text=True, timeout=60)
-    ops.cloud("DELETE", f"/vms/{name}")
+    # From t0, not from the wait: `node drain` blocks until the CLI is done,
+    # so a wait that starts afterwards reports 0.0 s for work that took seconds.
+    where, _ = ops.wait_for(elsewhere, 240, step=0.25)
+    secs = time.time() - t0
+    # undrain AND uncordon: `drain` implies the cordon, and `uncordon` alone
+    # leaves spec.drain true -- the node stays `draining`, keeps taking no
+    # placements, and the next cell silently measures a cluster one node short.
+    for verb in ("undrain", "uncordon"):
+        subprocess.run([cli, "--config", "/mnt/vmstore/MeisterStack/cli.mtls.toml",
+                        "node", verb, node, "--cluster", cname],
+                       capture_output=True, text=True, timeout=60)
+    ops.cluster(cname, "DELETE", f"/vms/{name}")
     if not where:
         finding("W4", "drain", seed, f"{name} did not move off {node} within 240 s")
     return {"moved_to": where, "drain_s": round(secs, 1) if where else None,
@@ -371,30 +395,29 @@ def main():
     cell = f"{a.link}x{a.cond}x{a.load}"
     log(f"=== matrix {cell} seed={a.seed} ===")
     before = scheduler_conflicts()
-    res, ends = {}, []
+    res, ends, drops = {}, [], False
     t0 = time.time()
     try:
         if a.load == "w5":
             res = w5(a.link, a.cond, a.seconds)
-        elif a.load in ("w2", "w3", "w4"):
+        else:
+            # A D cell drops the link it names. The first run hardcoded
+            # agent-1a here whatever the link was, so C x D, E1/E2 x D, V x D
+            # and G x D all partitioned an agent instead of their own link --
+            # which is why "etcd majority gone" reported failed=0 and the
+            # cluster's voice never moved. Only A x D was ever valid.
             if a.cond == "D":
-                ops.partition("agent-1a", ops.CLUSTER1, on=True)
-                ends = ["__partition__"]
+                ends = ops.partition_link(a.link, on=True)
+                drops = True
             elif a.cond != "none":
                 ends = ops.shape_link(a.link, a.cond, a.seconds)
-            res = {"w2": lambda: w2(a.seed, a.n),
+            res = {"w1": lambda: w1(a.seed, a.n),
+                   "w2": lambda: w2(a.seed, a.n),
                    "w3": lambda: w3(a.seed),
                    "w4": lambda: w4(a.seed)}[a.load]()
-        else:
-            if a.cond == "D":
-                ops.partition("agent-1a", ops.CLUSTER1, on=True)
-                ends = ["__partition__"]
-            elif a.cond != "none":
-                ends = ops.shape_link(a.link, a.cond, a.seconds)
-            res = w1(a.seed, a.n)
     finally:
-        if ends == ["__partition__"]:
-            ops.partition("agent-1a", ops.CLUSTER1, on=False)
+        if drops:
+            ops.unpartition(ends)
         elif ends:
             ops.unshape_all(ends)
         ops.unshape_all()

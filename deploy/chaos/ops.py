@@ -520,8 +520,9 @@ def link_matches(link):
     a1a, a1b = NODE_HOST["agent-1a"], NODE_HOST["agent-1b"]
     if link == "A":       # one agent's session to its cluster
         return [("agent-1a", [_match("tcp", "dport", 50051, ip) for ip in CLUSTER1])]
-    if link == "C":       # one cluster replica's voice at the cloud
-        return [(CLUSTER1[0], [_match("tcp", "dport", 50050, ip) for ip in CLOUD])]
+    if link == "C":       # the replica that actually holds the voice
+        who = voice_holder("cluster-1") or CLUSTER1[0]
+        return [(who, [_match("tcp", "dport", 50050, ip) for ip in CLOUD])]
     if link == "E1":      # one etcd peer -- minority, raft holds
         peers = [ip for ip in CLUSTER1 if ip != CLUSTER1[0]]
         return [(CLUSTER1[0], [_match("tcp", "dport", 2380, ip) for ip in peers])]
@@ -570,6 +571,99 @@ def unshape_all(ends=None):
         except Exception:
             pass
     return lifted
+
+
+def nft_drop(where, rules, on=True):
+    """DROP the traffic `rules` names, on one end, with nft.
+
+    `rules` are (proto, side, port, peer) like `_match`, so a D cell drops
+    exactly what an L/P cell would have shaped. Never a whole host: ssh rides
+    the same wire, and the never-shape list is honoured here too.
+    """
+    if not on:
+        return _on(where, "nft delete table inet chaos 2>/dev/null; echo lifted")
+    parts = ["nft add table inet chaos",
+             "nft add chain inet chaos out '{ type filter hook output priority 0; }'",
+             "nft add chain inet chaos inb '{ type filter hook input priority 0; }'"]
+    for proto, side, port, peer in rules:
+        if port in NEVER_SHAPE:
+            raise ValueError(f"refusing to drop port {port}: never-shape list")
+        d = "daddr" if side == "dport" else "saddr"
+        peerpart = f"ip {d} {peer} " if peer else ""
+        parts.append(f"nft add rule inet chaos out {peerpart}{proto} {side} {port} drop")
+        back = "sport" if side == "dport" else "dport"
+        d2 = "saddr" if side == "dport" else "daddr"
+        peerpart2 = f"ip {d2} {peer} " if peer else ""
+        parts.append(f"nft add rule inet chaos inb {peerpart2}{proto} {back} {port} drop")
+    parts.append("nft list table inet chaos | grep -c drop")
+    return _on(where, "; ".join(parts))
+
+
+def voice_holder(cname="cluster-1"):
+    """Which cluster replica currently speaks to the cloud.
+
+    `Cluster.status.sessionEndpoint` names the CLOUD end of the speaking
+    session, not the cluster end, so it cannot answer this. Asking each replica
+    whether it holds an ESTABLISHED connection to a cloud on the session port
+    can. Without this a C cell shapes a fixed replica and, four times out of
+    five, shapes one that was not speaking -- which is exactly why the first
+    run's C cells all reported `voice_moves: 0`.
+    """
+    peers = "|".join(CLOUD)
+    for ip in CLUSTERS[cname]:
+        rc, out = ctl(ip, f"ss -tn state established 2>/dev/null | "
+                          f"grep -E ':{50050}' | grep -E '{peers}' | head -1")
+        if out.strip():
+            return ip
+    return None
+
+
+def link_drop_rules(link):
+    """The (where, rules) a D cell has to drop, mirroring link_matches."""
+    a1a, a1b = NODE_HOST["agent-1a"], NODE_HOST["agent-1b"]
+    if link == "A":
+        return [("agent-1a", [("tcp", "dport", 50051, ip) for ip in CLUSTER1])]
+    if link == "C":
+        who = voice_holder("cluster-1") or CLUSTER1[0]
+        return [(who, [("tcp", "dport", 50050, ip) for ip in CLOUD])]
+    if link == "E1":
+        peers = [ip for ip in CLUSTER1 if ip != CLUSTER1[0]]
+        return [(CLUSTER1[0], [("tcp", "dport", 2380, ip) for ip in peers])]
+    if link == "E2":
+        out = []
+        for me in CLUSTER1[:2]:
+            peers = [ip for ip in CLUSTER1 if ip != me]
+            out.append((me, [("tcp", "dport", 2380, ip) for ip in peers]))
+        return out
+    if link == "G":
+        _, r = cloud("GET", "/routers/lab-out?tenant=lab")
+        node = ((r.get("status") or {}).get("activeNode")) if isinstance(r, dict) else None
+        if not node or node not in NODE_HOST:
+            raise ValueError(f"link G: no usable activeNode (got {node!r})")
+        return [(node, [("tcp", "dport", 50051, ip) for ip in CLUSTER1])]
+    if link == "R":
+        return [(CLOUD[0], [("tcp", "sport", 3000, None)])]
+    if link == "V":
+        return [("agent-1a", [("udp", "dport", 4789, a1b)]),
+                ("agent-1b", [("udp", "dport", 4789, a1a)])]
+    raise ValueError(f"unknown link {link}")
+
+
+def partition_link(link, on=True):
+    """A D cell, on the link it names. Returns the ends it touched."""
+    ends = []
+    for where, rules in link_drop_rules(link):
+        nft_drop(where, rules, on=on)
+        ends.append(where)
+    return ends
+
+
+def unpartition(ends):
+    for w in ends:
+        try:
+            nft_drop(w, [], on=False)
+        except Exception:
+            pass
 
 
 def ping_rtt(frm, to, count=10):
