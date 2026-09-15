@@ -13,7 +13,7 @@ MeisterStack supports sharing NVIDIA GPUs with its `nvrm` driver that utilizes [
 > This project heavily used [AI for implementation and testing]("docs/AI_GUIDELINES.md"), when the project reaches `BETA` stage the generated
 > code will be fully reviewed!
 
-> [!INFO}
+> [!INFO]
 > At the moment MeisterStack is active coursework and in proof-of-concept phase. Feature requests and bug-fixes do not have high priority.
 
 ## Architecture
