@@ -102,6 +102,16 @@ phases! {
     }
 }
 
+impl ImagePhaseKind {
+    /// Both ends, and this is the one enum where `Failed` IS one: nothing
+    /// retries an image. A checksum that does not match will not start
+    /// matching, and a file that is not there appears when somebody puts it
+    /// there — which is a new fact from a node and not a timer.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ImagePhaseKind::Ready | ImagePhaseKind::Failed)
+    }
+}
+
 /// One node's word about one image.
 ///
 /// The detail behind `ImageStatus::phase`, which is the UNION and therefore

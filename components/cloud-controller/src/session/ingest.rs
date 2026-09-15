@@ -441,9 +441,11 @@ pub(super) async fn forget_unbound(
 ///     it and the cloud did not, so a tenant, who reads their VM at the
 ///     cloud and nowhere else, could see the intent in `spec.vm.volumes[]`
 ///     and never the observation.
-///   * `status.pendingReason` — the closed word for why a VM is not
-///     placed. It stopped one tier down, and a Pending VM at the cloud was
-///     a dead end for everybody without a cluster credential.
+///   * `status.reason` — the closed word for why a VM is not placed. It
+///     stopped one tier down, and a Pending VM at the cloud was a dead end
+///     for everybody without a cluster credential. Spelled `pendingReason`
+///     until struktur 4 folded it into the phase; the word it carries is a
+///     `VmReason` now and the key sits beside `phase` on the wire.
 ///   * `status.addresses[]` — the MAC lines, which begin at a node's tap and
 ///     stopped at the cluster. This is where a tenant reads their VM, so it
 ///     is the one tier the address has to reach.

@@ -358,6 +358,18 @@ phases! {
     }
 }
 
+impl StoragePoolPhaseKind {
+    /// The nodes agree, and there is nothing in flight to be late.
+    ///
+    /// `Failed` is not an end, and that is deliberate: two binaries of
+    /// different ages on one pool is a state a rollout leaves and a rollout
+    /// clears, so a pool that has been inconsistent for a quarter of an hour
+    /// is a rollout that stopped half way — which is worth a number.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, StoragePoolPhaseKind::Ready)
+    }
+}
+
 /// No finalizer: a pool owns nothing. What keeps it from vanishing under a
 /// volume is the delete handler's refusal, exactly as with a floating pool.
 pub type StoragePool = Object<StoragePoolSpec, StoragePoolStatus>;

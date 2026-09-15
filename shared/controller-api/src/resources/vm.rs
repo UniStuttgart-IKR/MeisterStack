@@ -207,6 +207,20 @@ impl VmPhaseKind {
             VmPhaseKind::Running | VmPhaseKind::Stopped | VmPhaseKind::Paused
         )
     }
+
+    /// Nothing in this stack is going to move this phase on its own, so it
+    /// cannot be late for anything (see `crate::stuck`).
+    ///
+    /// The three resting states, and `Quarantined` beside them: a quarantined
+    /// VM is deliberately nobody's to touch, which is exactly "nothing will
+    /// move it". `Failed` is NOT here — the requeue curve acts on it, so it
+    /// is a wait rather than an end, and it gets no second deadline over the
+    /// top of a backoff. `Unknown` is emphatically not here either, and that
+    /// is the whole of D-C1: a silence that could not be late is a silence
+    /// nobody is ever told about.
+    pub fn is_terminal(self) -> bool {
+        self.is_stable() || matches!(self, VmPhaseKind::Quarantined)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

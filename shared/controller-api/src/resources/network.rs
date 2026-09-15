@@ -429,6 +429,21 @@ phases! {
     }
 }
 
+impl RouterPhaseKind {
+    /// The two resting states: a router that is forwarding, and one that is
+    /// built and deliberately silent. Both are doing what they were asked to
+    /// do.
+    ///
+    /// `Failed` and `Unknown` are not ends here for the reason they are not
+    /// ends on a VM — a node that refused a gateway slot may have it
+    /// repaired, and a node that has gone quiet may come back — and a router
+    /// that has been either for a quarter of an hour is a tenant with no way
+    /// out.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, RouterPhaseKind::Active | RouterPhaseKind::Standby)
+    }
+}
+
 /// Where the router ended up and what it is doing — all of it evidence, none
 /// of it a request.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]

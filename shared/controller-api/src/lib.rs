@@ -27,6 +27,7 @@ pub mod rest;
 pub mod scheduler;
 pub mod secrets;
 pub mod store;
+pub mod stuck;
 pub mod tickets;
 pub mod vm_spec;
 pub mod vni;
@@ -101,3 +102,6 @@ pub use scheduler::{
     volume_pending_reason,
 };
 pub use store::{EtcdStore, PassTrigger, StoreError};
+pub use stuck::{
+    STUCK_AFTER_PENDING, STUCK_AFTER_PROVISIONING, STUCK_AFTER_UNKNOWN, stuck, stuck_after,
+};

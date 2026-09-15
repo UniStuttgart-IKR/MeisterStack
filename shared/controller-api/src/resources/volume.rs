@@ -114,6 +114,16 @@ phases! {
     }
 }
 
+impl VolumePhaseKind {
+    /// The one end a volume has: its data exists. `Failed` rides the requeue
+    /// curve and `Releasing` is waiting for a consumer to let go, so neither
+    /// is an end — a `Releasing` that stands for a quarter of an hour is
+    /// exactly the case D4 is about, and it has to be able to say so.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, VolumePhaseKind::Ready)
+    }
+}
+
 /// A volume a tenant holds: a size, a pool, a kind, and a life of its own.
 ///
 /// The object the whole brief is about. Everything a `VmSpec`'s embedded
@@ -470,6 +480,14 @@ phases! {
         Ready { message, since } => "Ready",
         /// The backend refused, and said why in the message.
         Failed { reason, message, since } => "Failed",
+    }
+}
+
+impl VolumeSnapshotPhaseKind {
+    /// The copy exists, and nothing takes that back. `Failed` is a wait: the
+    /// same requeue curve every other backend refusal here rides.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, VolumeSnapshotPhaseKind::Ready)
     }
 }
 

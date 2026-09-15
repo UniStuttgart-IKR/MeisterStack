@@ -108,6 +108,18 @@ impl VmMigrationPhaseKind {
             VmMigrationPhaseKind::Succeeded | VmMigrationPhaseKind::Failed
         )
     }
+
+    /// The same question, under the name `crate::stuck` asks it by — and the
+    /// only enum here where `Failed` is an end: a migration that failed was
+    /// an operation somebody ASKED for, and asking again is somebody's
+    /// decision rather than a curve's.
+    ///
+    /// Two names for one answer, and the older one stays because the
+    /// migration reconciler reads it on every pass and "is this record
+    /// finished" is the sentence that belongs there.
+    pub fn is_terminal(self) -> bool {
+        self.is_final()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
