@@ -32,9 +32,17 @@ def call(ip, port, method, path, body=None, timeout=20):
     # Names travel in the path and the lab accepts names a path cannot hold
     # verbatim; quote the last segment so the CLIENT is never the thing that
     # fails when the server took something odd.
+    # Quote the NAME, not the query (D-H7). The name is the last path segment
+    # and the lab accepts names a path cannot hold verbatim, so it has to be
+    # quoted -- but the split used to take everything after the last slash,
+    # query string included, and turned `/routers/lab-out?tenant=lab` into
+    # `/routers/lab-out%3Ftenant%3Dlab`. That is a 404 with no hint, and every
+    # tenant-scoped GET in this harness was quietly getting one.
+    path, qsep, query = path.partition("?")
     head, sep, tail = path.rpartition("/")
     if sep and tail:
         path = head + sep + urllib.parse.quote(tail, safe="")
+    path = path + qsep + query
     url = f"{mtls.scheme()}://{ip}:{port}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -216,6 +224,22 @@ def partition(node, peer_ips, on=True, port=50051):
     else:
         cmd = "nft delete table inet chaos 2>/dev/null; echo lifted"
     return sh(node, cmd)
+
+
+def partition_ip(ip, peer_ips, on=True, port=50050):
+    """`partition` by address instead of node name: the controller replicas are
+    not in NODE_HOST, and link C drops a cluster replica's session to the cloud."""
+    ips = ", ".join(peer_ips)
+    if on:
+        cmd = ("nft add table inet chaos; "
+               "nft add chain inet chaos out '{ type filter hook output priority 0; }'; "
+               "nft add chain inet chaos inb '{ type filter hook input priority 0; }'; "
+               f"nft add rule inet chaos out ip daddr {{ {ips} }} tcp dport {port} drop; "
+               f"nft add rule inet chaos inb ip saddr {{ {ips} }} tcp sport {port} drop; "
+               "nft list table inet chaos | grep -c drop")
+    else:
+        cmd = "nft delete table inet chaos 2>/dev/null; echo lifted"
+    return ctl(ip, cmd)
 
 
 def log(msg, f="run.log"):
@@ -511,10 +535,18 @@ def link_matches(link):
         # Shaped at the CLOUD end on sport 3000, never on manacor: the brief
         # forbids changing manacor's interfaces, and a qdisc is a change.
         return [(CLOUD[0], [_match("tcp", "sport", 3000)])]
+    if link == "G":       # whichever node actually holds the gateway right now
+        # Not a fixed node: the active gateway moves, and a W3 cell that shapes
+        # agent-1a while the router sits on agent-1c measures nothing at all.
+        _, r = cloud("GET", "/routers/lab-out?tenant=lab")
+        node = ((r.get("status") or {}).get("activeNode")) if isinstance(r, dict) else None
+        if not node or node not in NODE_HOST:
+            raise ValueError(f"link G: no usable activeNode on lab-out (got {node!r})")
+        return [(node, [_match("tcp", "dport", 50051, ip) for ip in CLUSTER1])]
     if link == "V":       # the tenant overlay, agent to agent
         return [("agent-1a", [_match("udp", "dport", 4789, a1b)]),
                 ("agent-1b", [_match("udp", "dport", 4789, a1a)])]
-    raise ValueError(f"unknown link {link}; have A C E1 E2 R V")
+    raise ValueError(f"unknown link {link}; have A C E1 E2 G R V")
 
 
 def shape_link(link, cond, seconds):

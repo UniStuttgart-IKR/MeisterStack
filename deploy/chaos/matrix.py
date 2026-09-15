@@ -97,8 +97,66 @@ def w1(seed, n, cname="cluster-1"):
             "samples": creates}
 
 
+def w5_cluster(link, cond, seconds, cname="cluster-1"):
+    """Link C's half of W5: how fast does the CLOUD notice that a cluster
+    replica went quiet, and does the voice move exactly once?
+
+    `Cluster.status.sessionEndpoint` is published by the replica whose session
+    currently speaks for the cluster (cloud-controller `session::speaker`), so
+    a change in it IS the voice moving. `MUTE_AFTER_SECS` is 30 in
+    `components/cloud-controller/src/session/mod.rs:54`, which is the number
+    this cell is measured against.
+
+    Two changes instead of one is the finding worth having: a voice that flaps
+    costs every command of that cluster a retry, and nothing above would say so.
+    """
+    def voice():
+        _, o = ops.cloud("GET", f"/clusters/{cname}")
+        st = o.get("status") or {}
+        return st.get("sessionEndpoint"), st.get("connected")
+
+    ep0, conn0 = voice()
+    if not ep0:
+        return {"skipped": f"{cname} has no sessionEndpoint to watch"}
+    seen, ends = [ep0], []
+    t0 = time.time()
+    first_change, lost = None, None
+    try:
+        ends = ops.shape_link(link, cond, seconds) if cond != "D" else []
+        if cond == "D":
+            ops.partition_ip(ops.CLUSTER1[0], ops.CLOUD, port=50050, on=True)
+            ends = ["__partition__"]
+        while time.time() - t0 < 150:
+            ep, conn = voice()
+            if ep and ep != seen[-1]:
+                seen.append(ep)
+                if first_change is None:
+                    first_change = round(time.time() - t0, 1)
+            if conn is False and lost is None:
+                lost = round(time.time() - t0, 1)
+            if first_change and time.time() - t0 > first_change + 45:
+                break            # 45 s of quiet after the move is enough to call it stable
+            time.sleep(2)
+    finally:
+        if ends == ["__partition__"]:
+            ops.partition_ip(ops.CLUSTER1[0], ops.CLOUD, port=50050, on=False)
+        else:
+            ops.unshape_all(ends)
+    t1 = time.time()
+    back, t_back = ops.wait_for(lambda: True if voice()[1] is True else None, 180)
+    if len(seen) > 2:
+        finding("W5C", f"{link}x{cond}", "-",
+                f"the voice of {cname} moved {len(seen)-1} times, not once: {seen}")
+    return {"detect_s": first_change, "connected_false_s": lost,
+            "voice_moves": len(seen) - 1, "voice_path": seen,
+            "return_s": round(t_back, 1) if back else None,
+            "mute_after_secs": 30}
+
+
 def w5(link, cond, seconds, cname="cluster-1"):
     """Detection: how fast does the cluster notice, and how fast is it back."""
+    if link == "C":
+        return w5_cluster(link, cond, seconds, cname)
     node = "agent-1a" if link in ("A", "V") else None
     if node is None:
         return {"skipped": f"w5 is a node-detection load; link {link} has no single node"}
@@ -276,7 +334,7 @@ def w4(seed, node="agent-1a", cname="cluster-1"):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--link", required=True, choices=["A", "C", "E1", "E2", "R", "V"])
+    ap.add_argument("--link", required=True, choices=["A", "C", "E1", "E2", "G", "R", "V"])
     ap.add_argument("--cond", required=True)
     ap.add_argument("--load", required=True, choices=["w1", "w2", "w3", "w4", "w5"])
     ap.add_argument("--seed", type=int, required=True)
