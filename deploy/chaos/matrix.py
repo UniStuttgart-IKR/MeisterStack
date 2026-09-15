@@ -22,7 +22,8 @@ self-lift timer inside `shape()` is the second belt.
 import argparse
 import json
 import os
-import statistics
+import re
+import subprocess
 import time
 
 import ops
@@ -132,11 +133,152 @@ def w5(link, cond, seconds, cname="cluster-1"):
             "came_back": bool(back), "node": node}
 
 
+def _ping_log(target, seconds, path):
+    """Start a timestamped ping and return the Popen. Started BEFORE the fault,
+    read after it: the gap between two successive replies is what the tenant
+    actually felt, and you cannot measure it by asking afterwards."""
+    fh = open(path, "w")
+    return subprocess.Popen(["ping", "-D", "-i", "0.2", "-w", str(int(seconds)), target],
+                            stdout=fh, stderr=subprocess.DEVNULL), fh
+
+
+def _ping_gap(path):
+    """(largest gap in seconds, replies seen). A ping that never came back at
+    all is a gap of None, which is a different fact from a gap of zero."""
+    ts = []
+    with open(path) as fh:
+        for line in fh:
+            m = re.match(r"\[(\d+\.\d+)\].*icmp_seq=", line)
+            if m:
+                ts.append(float(m.group(1)))
+    if len(ts) < 2:
+        return None, len(ts)
+    return round(max(b - a for a, b in zip(ts, ts[1:])), 2), len(ts)
+
+
+def w2(seed, n=10, pool="fabric", tenant=None):
+    """Provision -> Ready for volumes, and how many never get there."""
+    tenant = tenant or TENANT
+    ensure_tenant()
+    ready, failed = [], 0
+    for i in range(n):
+        name = f"chaos-mv{seed}-{i:02d}"
+        t0 = time.time()
+        c, _ = ops.cloud("POST", "/volumes", {
+            "apiVersion": "meister.io/v1", "kind": "Volume",
+            "metadata": {"name": name, "tenant": tenant},
+            "spec": {"pool": pool, "sizeGib": 1, "accessMode": "readWriteOnce"}})
+        if c >= 400:
+            failed += 1
+            continue
+        ok, _ = ops.wait_for(lambda: True if (ops.cloud("GET", f"/volumes/{name}")[1]
+                                              .get("status", {}).get("phase")) == "Ready" else None, 180)
+        if ok:
+            ready.append(round(time.time() - t0, 3))
+        else:
+            failed += 1
+        ops.cloud("DELETE", f"/volumes/{name}")
+        ops.wait_for(lambda: True if ops.cloud("GET", f"/volumes/{name}")[0] == 404 else None, 120)
+    return {"n": len(ready), "failed": failed, "pool": pool,
+            "ready_p50": pct(ready, .50), "ready_p99": pct(ready, .99),
+            "ready_max": max(ready) if ready else None, "samples": ready}
+
+
+def w3(seed, rounds=3, tenant="lab", router="lab-out", fip="10.128.1.217"):
+    """Router failover, both halves: the control plane's new activeNode, and
+    the gap a packet from outside actually saw.
+
+    The reference numbers this is measured against: 52.8 s on a hard poweroff
+    (rollout-neutron), 4.4 s / 5.2 s on bare metal (blech-manacor).
+    """
+    control, data, notes = [], [], []
+    for i in range(rounds):
+        c, r = ops.cloud("GET", f"/routers/{router}?tenant={tenant}")
+        if c >= 400:
+            return {"skipped": f"router {router} not readable: {c}"}
+        was = (r.get("status") or {}).get("activeNode")
+        if not was:
+            return {"skipped": "router has no activeNode"}
+        plog = os.path.join(OUT, f"w3-ping-{seed}-{i}.log")
+        proc, fh = _ping_log(fip, 120, plog)
+        time.sleep(3)
+        t0 = time.time()
+        ops.stop_agent(was)
+        log(f"  w3 round {i}: stopped the agent on {was}")
+
+        def moved():
+            _, o = ops.cloud("GET", f"/routers/{router}?tenant={tenant}")
+            now = (o.get("status") or {}).get("activeNode")
+            return now if now and now != was else None
+
+        new, secs = ops.wait_for(moved, 150)
+        if new:
+            control.append(round(secs, 1))
+            notes.append(f"{was} -> {new} in {secs:.1f}s")
+        else:
+            notes.append(f"{was} never handed over within 150 s")
+            finding("W3", "failover", seed, f"{router} stayed on {was} 150 s after it stopped")
+        time.sleep(8)
+        proc.terminate()
+        proc.wait(timeout=10)
+        fh.close()
+        gap, seen = _ping_gap(plog)
+        data.append(gap)
+        log(f"  w3 round {i}: control {control[-1] if new else '-'}s, "
+            f"data gap {gap}s over {seen} replies")
+        ops.start_agent(was)
+        ops.wait_for(lambda: True if (ops.cluster("cluster-1", "GET", f"/nodes/{was}")[1]
+                                      .get("status", {}).get("ready")) else None, 180)
+    good = [d for d in data if d is not None]
+    return {"n": len(control), "control_s": control, "data_gap_s": data,
+            "control_p50": pct(control, .50), "control_max": max(control) if control else None,
+            "data_p50": pct(good, .50), "data_max": max(good) if good else None,
+            "notes": notes}
+
+
+def w4(seed, node="agent-1a", cname="cluster-1"):
+    """A VM with evacuation = restart, moved by `node drain`."""
+    ensure_tenant()
+    name = f"chaos-m4-{seed}"
+    body = ops.vm_body(name, tenant=TENANT)
+    body["spec"]["evacuation"] = "restart"
+    body["spec"]["nodeName"] = node
+    c, _ = ops.cloud("POST", "/vms", body)
+    if c >= 400:
+        return {"skipped": f"create refused: {c}"}
+    ok, _ = ops.wait_for(lambda: True if ops.phase_of(ops.cloud_vm(name)) == "Running" else None, 180)
+    if not ok:
+        ops.cloud("DELETE", f"/vms/{name}")
+        return {"skipped": "the VM never ran before the drain"}
+    cli = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))), "target/release/meister")
+    t0 = time.time()
+    subprocess.run([cli, "--config", "/mnt/vmstore/MeisterStack/cli.mtls.toml",
+                    "node", "drain", node, "--cluster", cname],
+                   capture_output=True, text=True, timeout=120)
+
+    def elsewhere():
+        _, o = ops.cluster(cname, "GET", f"/vms/{name}")
+        st = o.get("status") or {}
+        n = st.get("nodeName")
+        return n if st.get("phase") == "Running" and n and n != node else None
+
+    where, secs = ops.wait_for(elsewhere, 240)
+    subprocess.run([cli, "--config", "/mnt/vmstore/MeisterStack/cli.mtls.toml",
+                    "node", "uncordon", node, "--cluster", cname],
+                   capture_output=True, text=True, timeout=60)
+    ops.cloud("DELETE", f"/vms/{name}")
+    if not where:
+        finding("W4", "drain", seed, f"{name} did not move off {node} within 240 s")
+    return {"moved_to": where, "drain_s": round(secs, 1) if where else None,
+            "from": node}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--link", required=True, choices=["A", "C", "E1", "E2", "R", "V"])
     ap.add_argument("--cond", required=True)
-    ap.add_argument("--load", required=True, choices=["w1", "w5"])
+    ap.add_argument("--load", required=True, choices=["w1", "w2", "w3", "w4", "w5"])
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--seconds", type=int, default=900)
@@ -150,6 +292,15 @@ def main():
     try:
         if a.load == "w5":
             res = w5(a.link, a.cond, a.seconds)
+        elif a.load in ("w2", "w3", "w4"):
+            if a.cond == "D":
+                ops.partition("agent-1a", ops.CLUSTER1, on=True)
+                ends = ["__partition__"]
+            elif a.cond != "none":
+                ends = ops.shape_link(a.link, a.cond, a.seconds)
+            res = {"w2": lambda: w2(a.seed, a.n),
+                   "w3": lambda: w3(a.seed),
+                   "w4": lambda: w4(a.seed)}[a.load]()
         else:
             if a.cond == "D":
                 ops.partition("agent-1a", ops.CLUSTER1, on=True)
