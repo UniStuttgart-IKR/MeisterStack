@@ -23,7 +23,7 @@ mod space;
 use std::time::{Duration, SystemTime};
 
 use agent_api::VmState;
-use meister_agent::reconcile::{Action, Observed, plan};
+use meister_agent::reconcile::{Action, Observed, ReportedPhase, plan, report_status};
 use meister_agent::types::{Desired, Operation, Phase, VmRecord};
 
 use space::{Cell, SPACE_SIZE, base_now, describe, walk};
@@ -602,5 +602,83 @@ fn a_stopped_intent_only_ever_names_stop_signal_or_nothing() {
         seen,
         ["None", "SignalShutdown", "Stop"],
         "all three must actually occur"
+    );
+}
+// ---------------------------------------------------------------------------
+// 5. No phase leaves this node mute
+// ---------------------------------------------------------------------------
+
+/// Every phase this node reports carries a reason, except the three that
+/// explain themselves.
+///
+/// The invariant of the reasons round, on the whole space rather than on the
+/// handful of cases somebody thought of: `Running`, `Stopped` and `Paused` are
+/// states nobody has to act on, and every other phase is a state somebody
+/// does — a `Provisioning` that does not say whether a pass is working or a
+/// backoff is waiting, a `Failed` that does not say what broke and a
+/// `Quarantined` that carries its reason in prose only were the three lines
+/// an operator could read and still not know what to do.
+///
+/// The two backoff dimensions are swept with the space: `failures` decides
+/// between `Working` and `Backoff` and `last_error` decides whether the
+/// sentence can be written, and a report may not fall mute on either.
+#[test]
+fn no_reported_phase_but_a_settled_one_leaves_this_node_without_a_reason() {
+    let mut settled = 0usize;
+    let mut explained = 0usize;
+    let mut words: Vec<&'static str> = Vec::new();
+    let seen = walk(|cell: &Cell| {
+        for failures in [0u32, 1, 7] {
+            for last_error in [None, Some("the volume driver said no")] {
+                let reported = report_status(&cell.record, &cell.obs, failures, last_error);
+                match reported.phase {
+                    ReportedPhase::Running | ReportedPhase::Stopped | ReportedPhase::Paused => {
+                        assert!(
+                            reported.reason.is_none(),
+                            "{:?} needs no reason and carries {:?}: {}",
+                            reported.phase,
+                            reported.reason,
+                            describe(cell)
+                        );
+                        settled += 1;
+                    }
+                    phase => {
+                        let reason = reported.reason.unwrap_or_else(|| {
+                            panic!("{phase:?} without a reason: {}", describe(cell))
+                        });
+                        if !words.contains(&reason.as_str()) {
+                            words.push(reason.as_str());
+                        }
+                        explained += 1;
+                    }
+                }
+            }
+        }
+    });
+    assert_eq!(seen, SPACE_SIZE);
+    assert!(settled > 0 && explained > 0, "{settled} / {explained}");
+    // And the words that actually occur over the whole space. A reason that
+    // no input can produce is a reason nobody has to read, so the list is
+    // written down rather than counted.
+    //
+    // Two of `VmReason`'s nine are missing here and both for the same
+    // reason: the space carries ONE quarantine marker (`space::all_unhealthy`)
+    // and it is not either of the two constants, so every quarantine in here
+    // is `Unrecorded` — which is itself worth having asserted, because it is
+    // what a record from another build of this agent looks like.
+    // `BackendGone` and `ResumeIneffective` are covered where the constants
+    // are, in `reconcile::tests`. Any OTHER absence here is a word to strike.
+    words.sort_unstable();
+    assert_eq!(
+        words,
+        [
+            "AwaitingGuest",
+            "Backoff",
+            "GuestLeft",
+            "ReceiveFailed",
+            "Unrecorded",
+            "VmmGone",
+            "Working",
+        ]
     );
 }

@@ -296,6 +296,7 @@ fn migratable_spec(store: &crate::store::Store) -> AgentVmSpec {
                     params: None,
                 }),
                 phase: crate::types::VolumeRecordPhase::Ready,
+                reason: None,
                 message: None,
                 gone_at: None,
             },
@@ -784,7 +785,7 @@ fn the_route_announcement_follows_the_guest_and_never_leads_it() {
         let mut record = spec_record();
         record.desired = Desired::Running;
         record.phase = phase;
-        crate::reconcile::report_status(&record, &obs, 0).0
+        crate::reconcile::report_status(&record, &obs, 0, None).phase
     };
     // Listening for a guest that is not here: nothing to announce, and
     // the sentence says which of the two machines to look at. The guest
@@ -799,7 +800,7 @@ fn the_route_announcement_follows_the_guest_and_never_leads_it() {
     record.desired = Desired::Running;
     record.phase = Phase::Receiving;
     assert_eq!(
-        crate::reconcile::report_status(&record, &waiting, 0).0,
+        crate::reconcile::report_status(&record, &waiting, 0, None).phase,
         crate::reconcile::ReportedPhase::Provisioning
     );
     assert_eq!(
@@ -823,15 +824,15 @@ fn the_route_announcement_follows_the_guest_and_never_leads_it() {
     // without one is the state an operator cannot act on.
     record.phase = Phase::Receiving;
     assert!(
-        crate::reconcile::report_status(&record, &waiting, 0)
-            .1
+        crate::reconcile::report_status(&record, &waiting, 0, None)
+            .message
             .is_some(),
         "a receiving vm with no guest yet says nothing"
     );
     record.phase = Phase::Migrated;
     assert!(
-        crate::reconcile::report_status(&record, &obs, 0)
-            .1
+        crate::reconcile::report_status(&record, &obs, 0, None)
+            .message
             .is_some(),
         "a migrated vm says nothing"
     );
@@ -897,10 +898,16 @@ async fn a_reception_that_fails_gives_everything_back_and_the_next_one_works() {
     assert!(broken.observed.receive_failed, "the node can see it now");
     assert_eq!(broken.action, crate::reconcile::Action::Teardown);
     // And the report says it, rather than "in flight" forever.
-    let (phase, message) = crate::reconcile::report_status(&standing, &broken.observed, 0);
-    assert_eq!(phase, crate::reconcile::ReportedPhase::Failed);
+    let reported = crate::reconcile::report_status(&standing, &broken.observed, 0, None);
+    assert_eq!(reported.phase, crate::reconcile::ReportedPhase::Failed);
+    assert_eq!(
+        reported.reason,
+        Some(crate::reconcile::VmReason::ReceiveFailed),
+        "and names the class of failure, not just that there was one"
+    );
     assert!(
-        message
+        reported
+            .message
             .expect("a sentence")
             .contains("still running where it was"),
         "the report names the machine to look at"

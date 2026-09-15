@@ -164,6 +164,7 @@ fn arriving_vm(store: &Store, root: &std::path::Path) -> AgentVmSpec {
                     params: None,
                 }),
                 phase: meister_agent::types::VolumeRecordPhase::Ready,
+                reason: None,
                 message: None,
                 gone_at: None,
             },

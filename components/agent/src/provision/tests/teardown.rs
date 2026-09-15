@@ -143,6 +143,7 @@ fn a_referenced_volume_is_torn_down_by_the_driver_that_made_it() {
                 },
                 handle: None,
                 phase: crate::types::VolumeRecordPhase::Ready,
+                reason: None,
                 message: None,
                 gone_at: None,
             },

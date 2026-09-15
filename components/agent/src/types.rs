@@ -287,6 +287,21 @@ pub struct VolumeRecord {
     #[serde(default)]
     pub handle: Option<agent_api::storage::VolumeHandle>,
     pub phase: VolumeRecordPhase,
+    /// Why that phase, in the one word a program may branch on.
+    ///
+    /// On the RECORD and not derived at report time, and that is the whole of
+    /// why it is here: the two `Failed` cases are a provision the backend
+    /// refused and a volume the backend has LOST, the fix for the first is a
+    /// retry and the fix for the second is somebody's backup, and by the time
+    /// anybody reads the report the only thing that told them apart was the
+    /// driver's own prose. The pass that asked the driver is what knows, so
+    /// the pass writes it down.
+    ///
+    /// `None` on a record from a build before this field — read as
+    /// `VolumeReason::Unrecorded`, whose `message` is untouched — and on
+    /// `Ready`, which needs no reason.
+    #[serde(default)]
+    pub reason: Option<crate::reconcile::VolumeReason>,
     #[serde(default)]
     pub message: Option<String>,
     /// When this record became a tombstone, if it did. See

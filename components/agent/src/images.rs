@@ -50,6 +50,8 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+
+use crate::reconcile::ImageReason;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, instrument};
 
@@ -74,9 +76,18 @@ pub struct Source {
 pub enum State {
     /// The bytes are here and they hash to what the spec said.
     Ready,
-    /// They are not, and this is why. A checksum that did not match is in
-    /// here, and so is a URL that did not answer.
-    Failed(String),
+    /// They are not, and this is why — in the word a program reads and the
+    /// sentence a person reads. A checksum that did not match is in here, and
+    /// so is a url that did not answer and a path with nothing at it.
+    ///
+    /// The word arrived with the reasons round: the four ways an image is
+    /// unusable want four different things done about them — put the bytes on
+    /// the share, fix the path, fix the checksum, fix the url — and until now
+    /// all four reached the catalogue as `Failed` plus prose.
+    Failed {
+        reason: ImageReason,
+        message: String,
+    },
 }
 
 impl State {
@@ -85,14 +96,23 @@ impl State {
     pub fn phase(&self) -> &'static str {
         match self {
             State::Ready => "Ready",
-            State::Failed(_) => "Failed",
+            State::Failed { .. } => "Failed",
+        }
+    }
+
+    /// The word for `ImageStateReport.reason`. `None` for `Ready`, which
+    /// needs none.
+    pub fn reason(&self) -> Option<ImageReason> {
+        match self {
+            State::Ready => None,
+            State::Failed { reason, .. } => Some(*reason),
         }
     }
 
     pub fn message(&self) -> &str {
         match self {
             State::Ready => "",
-            State::Failed(why) => why,
+            State::Failed { message, .. } => message,
         }
     }
 }
@@ -114,6 +134,42 @@ pub struct Cache {
 /// Where the content-addressed copies live, under the image directory so that
 /// the hard link into place stays within one filesystem.
 const CACHE_DIR: &str = ".cache";
+
+/// Why a fetch did not end with the right bytes in place, in the two classes
+/// the catalogue has to tell apart.
+///
+/// A type and not a look at the sentence, for the reason every reason in this
+/// stack is a word: prose is for a person, and a program that matched on it
+/// would break the first time somebody improved the wording. `From` makes
+/// every `?` in `ensure_inner` the second class, so the ONE place that is the
+/// first class is the one place that has to say so.
+enum FetchFailure {
+    /// The bytes arrived and are not the bytes the spec named. A different
+    /// thing to fix from everything below — the url's content changed, or the
+    /// checksum in the spec is wrong — and the class D-H4 was about.
+    Mismatch(anyhow::Error),
+    /// Everything else: the url did not answer, `curl` is not on the PATH,
+    /// the cache could not be written, the link could not be made.
+    Broken(anyhow::Error),
+}
+
+impl From<anyhow::Error> for FetchFailure {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Broken(e)
+    }
+}
+
+impl FetchFailure {
+    /// The word for the catalogue and the error for the caller. Both, because
+    /// a failed fetch is two statements: `Image.status` learns why, and the
+    /// provision that asked for it still has to fail.
+    fn split(self) -> (ImageReason, anyhow::Error) {
+        match self {
+            FetchFailure::Mismatch(e) => (ImageReason::ChecksumMismatch, e),
+            FetchFailure::Broken(e) => (ImageReason::FetchFailed, e),
+        }
+    }
+}
 
 impl Cache {
     pub fn new(image_dir: PathBuf) -> Self {
@@ -166,12 +222,13 @@ impl Cache {
             return;
         }
         match &state {
-            State::Failed(why) => {
-                tracing::error!(image = %name, reason = %why, "base image unusable")
+            State::Failed { reason, message } => {
+                tracing::error!(image = %name, reason = %reason.as_str(), why = %message,
+                                "base image unusable")
             }
             // Only interesting as a RECOVERY: the ordinary road to Ready is a
             // fetch, which has said so itself one line further up.
-            State::Ready if matches!(previous, Some(State::Failed(_))) => {
+            State::Ready if matches!(previous, Some(State::Failed { .. })) => {
                 info!(image = %name, "base image usable again")
             }
             State::Ready => {}
@@ -204,17 +261,23 @@ impl Cache {
     pub async fn verify_path(&self, name: &str) {
         let path = self.linked(name);
         let state = match tokio::fs::metadata(&path).await {
-            Ok(meta) if meta.is_dir() => State::Failed(format!(
-                "the base image {name} is a directory on this node ({})",
-                path.display()
-            )),
+            Ok(meta) if meta.is_dir() => State::Failed {
+                reason: ImageReason::NotAFile,
+                message: format!(
+                    "the base image {name} is a directory on this node ({})",
+                    path.display()
+                ),
+            },
             Ok(_) => State::Ready,
-            Err(e) => State::Failed(format!(
-                "the base image {name} is not on this node: {} ({e}). \
-                 It has no url, so nothing here fetches it — the bytes have to be put at that \
-                 path, or the image needs a url and a sha256.",
-                path.display()
-            )),
+            Err(e) => State::Failed {
+                reason: ImageReason::NotFound,
+                message: format!(
+                    "the base image {name} is not on this node: {} ({e}). \
+                     It has no url, so nothing here fetches it — the bytes have to be put at \
+                     that path, or the image needs a url and a sha256.",
+                    path.display()
+                ),
+            },
         };
         self.remember(name, state);
     }
@@ -231,15 +294,21 @@ impl Cache {
                 self.remember(&source.name, State::Ready);
                 Ok(())
             }
-            Err(e) => {
-                let why = format!("{e:#}");
-                self.remember(&source.name, State::Failed(why.clone()));
+            Err(failure) => {
+                let (reason, e) = failure.split();
+                self.remember(
+                    &source.name,
+                    State::Failed {
+                        reason,
+                        message: format!("{e:#}"),
+                    },
+                );
                 Err(e)
             }
         }
     }
 
-    async fn ensure_inner(&self, source: &Source) -> Result<()> {
+    async fn ensure_inner(&self, source: &Source) -> std::result::Result<(), FetchFailure> {
         check_digest(&source.sha256)?;
         let cached = self.cached(&source.sha256);
         if tokio::fs::metadata(&cached).await.is_ok() {
@@ -247,7 +316,7 @@ impl Cache {
             // the right bytes are here: nothing writes into the cache except
             // through the verify-then-rename below.
             debug!("already cached");
-            return self.link(source, &cached).await;
+            return Ok(self.link(source, &cached).await?);
         }
         tokio::fs::create_dir_all(self.cache_dir())
             .await
@@ -268,17 +337,19 @@ impl Cache {
             Ok(digest) => digest,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&partial).await;
-                return Err(e);
+                return Err(e.into());
             }
         };
         if digest != source.sha256 {
             let _ = tokio::fs::remove_file(&partial).await;
-            bail!(
+            // The one place that is `Mismatch`, so the word does not have to
+            // be read back out of this sentence.
+            return Err(FetchFailure::Mismatch(anyhow::anyhow!(
                 "checksum mismatch for {}: the spec says {} and the bytes at {} hash to {digest}",
                 source.name,
                 source.sha256,
                 source.url
-            );
+            )));
         }
         // Atomic within one directory, and the only way anything gets into
         // the cache. A second agent that finished the same download first has
@@ -292,7 +363,7 @@ impl Cache {
         // suspension point, and the whole future stops being Send.
         let bytes = tokio::fs::metadata(&cached).await.map(|m| m.len()).ok();
         info!(?bytes, "base image fetched");
-        self.link(source, &cached).await
+        Ok(self.link(source, &cached).await?)
     }
 
     /// Put the catalogue name next to the cached bytes.
@@ -555,9 +626,12 @@ mod tests {
 
         // And the node says so, with the reason, for the status report.
         match &cache.report()[..] {
-            [(name, State::Failed(why))] => {
+            [(name, State::Failed { reason, message })] => {
                 assert_eq!(name, "ubuntu.raw");
-                assert!(why.contains("checksum mismatch"), "{why}");
+                assert!(message.contains("checksum mismatch"), "{message}");
+                // And in the word, so the catalogue can tell this apart from
+                // a url that did not answer: the fix is a different one.
+                assert_eq!(*reason, ImageReason::ChecksumMismatch);
             }
             other => panic!("{other:?}"),
         }
@@ -579,7 +653,13 @@ mod tests {
 
         assert!(cache.ensure(&source).await.is_err());
         assert!(!images.join("ubuntu.raw").exists());
-        assert!(matches!(cache.report()[0].1, State::Failed(_)));
+        assert!(matches!(
+            cache.report()[0].1,
+            State::Failed {
+                reason: ImageReason::FetchFailed,
+                ..
+            }
+        ));
     }
 
     /// An image re-registered under the same name with new content: the name
@@ -643,9 +723,14 @@ mod tests {
         cache.verify_path("nixos.raw").await;
         let (name, state) = cache.report().pop().expect("one opinion");
         assert_eq!(name, "nixos.raw");
-        let State::Failed(why) = state else {
+        let State::Failed {
+            reason,
+            message: why,
+        } = state
+        else {
             panic!("a file that is not there is not Ready");
         };
+        assert_eq!(reason, ImageReason::NotFound);
         assert!(
             why.contains(images.join("nixos.raw").to_str().unwrap()),
             "the sentence names the path that was looked at: {why}"
@@ -670,9 +755,14 @@ mod tests {
         std::fs::remove_file(images.join("nixos.raw")).expect("gone");
         std::fs::create_dir(images.join("nixos.raw")).expect("a directory instead");
         cache.verify_path("nixos.raw").await;
-        let State::Failed(why) = cache.report().pop().expect("one").1 else {
+        let State::Failed {
+            reason,
+            message: why,
+        } = cache.report().pop().expect("one").1
+        else {
             panic!("a directory is not an image");
         };
         assert!(why.contains("is a directory"), "{why}");
+        assert_eq!(reason, ImageReason::NotAFile);
     }
 }

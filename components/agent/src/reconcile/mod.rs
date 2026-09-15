@@ -95,6 +95,18 @@ impl ReconcileSummary {
 struct FailureState {
     failures: u32,
     next_attempt: Instant,
+    /// What the last failed attempt said.
+    ///
+    /// Kept beside the count because the count alone is not a diagnosis: a VM
+    /// that has been `Provisioning` for ten minutes used to report how often
+    /// a pass had failed and nothing about what stopped it, and the sentence
+    /// was in this node's log — the one place the person reading the API
+    /// cannot see. It goes out with the phase now (`VmReason::Backoff`).
+    ///
+    /// In memory like the schedule it belongs to, and gone with it: a restart
+    /// forgets both, and the first pass after one either works or says why
+    /// again.
+    last_error: String,
 }
 
 const BACKOFF_BASE: Duration = Duration::from_secs(30);
@@ -534,8 +546,9 @@ impl Reconciler {
                 .execute(&id, (record.phase, record.desired), action)
                 .await
             {
-                let retry_in = self.register_failure(&id);
-                warn!(error = %format!("{e:#}"), ?retry_in, "reconcile failed");
+                let said = format!("{e:#}");
+                let retry_in = self.register_failure(&id, &said);
+                warn!(error = %said, ?retry_in, "reconcile failed");
                 return Err(e);
             }
 
@@ -621,14 +634,6 @@ impl Reconciler {
         }))
     }
 
-    fn failure_count(&self, id: &VmId) -> u32 {
-        self.failures
-            .lock()
-            .unwrap()
-            .get(id)
-            .map_or(0, |st| st.failures)
-    }
-
     fn in_backoff(&self, id: &VmId) -> bool {
         self.failures
             .lock()
@@ -637,13 +642,30 @@ impl Reconciler {
             .is_some_and(|st| Instant::now() < st.next_attempt)
     }
 
-    fn register_failure(&self, id: &VmId) -> Duration {
+    /// The retry schedule as the status report reads it: how many passes in
+    /// a row have failed, and what the last one said.
+    fn backoff_state(&self, id: &VmId) -> (u32, Option<String>) {
+        self.failures
+            .lock()
+            .unwrap()
+            .get(id)
+            .map_or((0, None), |st| {
+                (
+                    st.failures,
+                    Some(st.last_error.clone()).filter(|s| !s.is_empty()),
+                )
+            })
+    }
+
+    fn register_failure(&self, id: &VmId, said: &str) -> Duration {
         let mut map = self.failures.lock().unwrap();
         let st = map.entry(*id).or_insert(FailureState {
             failures: 0,
             next_attempt: Instant::now(),
+            last_error: String::new(),
         });
         st.failures += 1;
+        st.last_error = said.to_string();
         let delay = BACKOFF_BASE
             .saturating_mul(2u32.saturating_pow(st.failures.min(5)))
             .min(BACKOFF_MAX);

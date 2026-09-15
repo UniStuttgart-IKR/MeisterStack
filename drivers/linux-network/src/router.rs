@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use agent_api::networking::{
-    self, NatKind, NetworkError, RouterId, RouterPhase, RouterSpec, RouterState,
+    self, NatKind, NetworkError, RouterId, RouterPhase, RouterReason, RouterSpec, RouterState,
 };
 use tracing::{debug, info, instrument, warn};
 
@@ -539,39 +539,19 @@ impl crate::LinuxNetworkDriver {
     async fn state_of(&self, spec: &RouterSpec, live: &[String]) -> RouterState {
         let netns = router_netns(&spec.id);
         let announce = router_prefixes(spec);
-        let (phase, message) = if !live.contains(&netns) {
-            (
-                RouterPhase::Failed,
-                format!("the network namespace {netns} is gone"),
-            )
-        } else {
-            match self.ip(&["-n", &netns, "-o", "link", "show"]).await {
-                Err(e) => (RouterPhase::Failed, format!("{e:#}")),
-                Ok(links) => {
-                    let missing: Vec<&str> = [LEG_EXTERNAL, LEG_INTERNAL]
-                        .into_iter()
-                        // `ip -o link show` prints `2: ext@if7: <...>`, so the
-                        // name is followed by `@` or `:` and never bare.
-                        .filter(|leg| {
-                            !links.contains(&format!(" {leg}@"))
-                                && !links.contains(&format!(" {leg}:"))
-                        })
-                        .collect();
-                    match missing.is_empty() {
-                        true => (RouterPhase::Ready, String::new()),
-                        false => (
-                            RouterPhase::Failed,
-                            format!("the leg(s) {} are gone from {netns}", missing.join(", ")),
-                        ),
-                    }
-                }
-            }
+        let links = match live.contains(&netns) {
+            // Not asked at all when the namespace is gone: `ip -n` on a
+            // namespace that is not there would answer with an error, and
+            // "we could not look" is a different statement from "it is gone".
+            false => None,
+            true => Some(self.ip(&["-n", &netns, "-o", "link", "show"]).await),
         };
+        let (phase, reason, message) = classify(&netns, links);
         RouterState {
             id: spec.id,
             location: netns,
             phase,
-            reason: None,
+            reason,
             message,
             active: spec.active,
             // A router that is not there announces nothing, whatever it was
@@ -1007,6 +987,57 @@ impl crate::LinuxNetworkDriver {
     }
 }
 
+/// What a router IS, from the two facts there are about it: whether its
+/// namespace is still there, and what the links inside it are.
+///
+/// A pure function and not three arms inside `state_of`, for the reason
+/// `reconcile::plan` is one in the agent: this is the whole of what the tier
+/// above acts on, and the three answers it can give are worth asserting
+/// without a kernel, a namespace and root. `None` for `links` means the
+/// namespace was not there and nothing was asked.
+///
+/// Each answer carries the word the reader branches on.
+/// [`RouterReason::DriverUnreachable`] is the arm worth the type: it does not
+/// say that anything is broken, only that this node could not find out, and a
+/// reader that took it for "the router is gone" would fail a router over on
+/// the strength of an `ip` that did not answer.
+fn classify(
+    netns: &str,
+    links: Option<networking::Result<String>>,
+) -> (RouterPhase, Option<RouterReason>, String) {
+    let Some(links) = links else {
+        return (
+            RouterPhase::Failed,
+            Some(RouterReason::NetnsGone),
+            format!("the network namespace {netns} is gone"),
+        );
+    };
+    let links = match links {
+        Ok(links) => links,
+        Err(e) => {
+            return (
+                RouterPhase::Failed,
+                Some(RouterReason::DriverUnreachable),
+                format!("{e:#}"),
+            );
+        }
+    };
+    let missing: Vec<&str> = [LEG_EXTERNAL, LEG_INTERNAL]
+        .into_iter()
+        // `ip -o link show` prints `2: ext@if7: <...>`, so the name is
+        // followed by `@` or `:` and never bare.
+        .filter(|leg| !links.contains(&format!(" {leg}@")) && !links.contains(&format!(" {leg}:")))
+        .collect();
+    match missing.is_empty() {
+        true => (RouterPhase::Ready, None, String::new()),
+        false => (
+            RouterPhase::Failed,
+            Some(RouterReason::LegGone),
+            format!("the leg(s) {} are gone from {netns}", missing.join(", ")),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,5 +1211,51 @@ mod tests {
     fn a_standby_answers_no_arp_and_an_active_router_answers_normally() {
         assert_eq!(arp_ignore(true), "0");
         assert_eq!(arp_ignore(false), "8");
+    }
+    /// The three answers about a router, and the word each one carries.
+    ///
+    /// Two `Failed`s that mean different things is the whole point: "the
+    /// namespace is gone" sends an operator to this node, "the kernel could
+    /// not be asked" sends them to whatever is wrong with `ip` on it, and the
+    /// tier above may fail a router over on the first and must not on the
+    /// second. Until the word existed both arrived as the same phase with a
+    /// different sentence.
+    #[test]
+    fn a_router_says_which_of_the_three_things_is_wrong_with_it() {
+        let netns = "meister-rt-1a2b3c4d-5e6f-0000-0000-000000000000";
+
+        // Nothing was asked, because there was nothing to ask about.
+        let (phase, reason, message) = classify(netns, None);
+        assert_eq!(phase, RouterPhase::Failed);
+        assert_eq!(reason, Some(RouterReason::NetnsGone));
+        assert!(message.contains(netns), "{message}");
+
+        // Both legs there: `ip -o link show` prints them with the `@peer`
+        // suffix a veth carries.
+        let links = format!(
+            "1: lo: <LOOPBACK>\n2: {LEG_EXTERNAL}@if7: <UP>\n3: {LEG_INTERNAL}@if8: <UP>\n"
+        );
+        let (phase, reason, message) = classify(netns, Some(Ok(links.clone())));
+        assert_eq!(phase, RouterPhase::Ready);
+        assert_eq!(reason, None, "a Ready router explains itself");
+        assert!(message.is_empty());
+
+        // One leg gone: the namespace is there and the router is not usable.
+        let half = links.replace(&format!("3: {LEG_INTERNAL}@if8: <UP>\n"), "");
+        let (phase, reason, message) = classify(netns, Some(Ok(half)));
+        assert_eq!(phase, RouterPhase::Failed);
+        assert_eq!(reason, Some(RouterReason::LegGone));
+        assert!(message.contains(LEG_INTERNAL), "{message}");
+
+        // And the one that is not a statement about the router at all.
+        let (phase, reason, message) = classify(
+            netns,
+            Some(Err(NetworkError::Backend(anyhow::anyhow!(
+                "ip: command not found"
+            )))),
+        );
+        assert_eq!(phase, RouterPhase::Failed);
+        assert_eq!(reason, Some(RouterReason::DriverUnreachable));
+        assert!(message.contains("command not found"), "{message}");
     }
 }

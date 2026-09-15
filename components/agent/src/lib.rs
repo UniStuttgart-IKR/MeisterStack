@@ -354,7 +354,14 @@ impl Agent {
                 .map(|r| proto::RouterReport {
                     id: r.id.to_string(),
                     phase: r.phase.as_str().to_string(),
-                    reason: String::new(),
+                    // Straight out of the driver, like the phase beside it:
+                    // whether a router is gone, half gone or unaskable is the
+                    // answer of whoever looked, and this agent does not
+                    // recompute it.
+                    reason: r
+                        .reason
+                        .map(|reason| reason.as_str().to_string())
+                        .unwrap_or_default(),
                     message: r.message,
                     active: r.active,
                     // Empty on this road, by construction: a node naming
@@ -428,7 +435,14 @@ impl Agent {
                 // tier's answer, by uid, and a node knows nothing about a
                 // placement decision one tier up.
                 volumes: Vec::new(),
-                reason: String::new(),
+                // The word that says why the phase is what it is, empty for
+                // the three phases that need none. A string because this side
+                // does not know the control plane's enum; see
+                // `reconcile::observe::reason_table`.
+                reason: r
+                    .reason
+                    .map(|reason| reason.as_str().to_string())
+                    .unwrap_or_default(),
                 // The taps this node made, with the address the network
                 // driver pinned on each. The one half of
                 // `Vm.status.addresses[]` that has to come from down here —
@@ -468,7 +482,14 @@ impl Agent {
                 .map(|(name, state)| proto::ImageStateReport {
                     name,
                     phase: state.phase().to_string(),
-                    reason: String::new(),
+                    // Which of the four ways an image is unusable this is —
+                    // the bytes are not there, the name is a directory, the
+                    // checksum did not match, the fetch did not work. Empty
+                    // for `Ready`.
+                    reason: state
+                        .reason()
+                        .map(|reason| reason.as_str().to_string())
+                        .unwrap_or_default(),
                     message: state.message().to_string(),
                     // Empty on this road: the controller addressed this node
                     // and knows which one it is. It fills the field in on the

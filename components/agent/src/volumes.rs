@@ -35,8 +35,28 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::drivers::Drivers;
 use crate::provision::timed_driver;
+use crate::reconcile::VolumeReason;
 use crate::store::Store;
 use crate::types::{SnapshotRecord, SnapshotRecordPhase, VolumeRecord, VolumeRecordPhase};
+
+/// The word that goes out beside a volume's phase.
+///
+/// Almost always what the pass that wrote the record put there. Two arms
+/// besides:
+///
+/// * `Ready` needs no reason, and an old record that has one — written before
+///   the reason was cleared with the phase — must not send it.
+/// * a record from a build before the field has none, and a phase that needs
+///   one may not go out mute. It goes out as `Unrecorded` with its own
+///   message untouched, which is what makes a fleet mid-upgrade readable
+///   rather than half-silent (round decision 6: no migration code, the next
+///   pass overwrites it).
+fn reported_reason(record: &VolumeRecord) -> Option<VolumeReason> {
+    match record.phase {
+        VolumeRecordPhase::Ready => None,
+        _ => record.reason.or(Some(VolumeReason::Unrecorded)),
+    }
+}
 
 /// How long a `Gone` tombstone is kept.
 ///
@@ -130,6 +150,7 @@ impl Volumes {
                 spec: spec.clone(),
                 handle: None,
                 phase: VolumeRecordPhase::Provisioning,
+                reason: Some(VolumeReason::Working),
                 message: None,
                 gone_at: None,
             },
@@ -151,6 +172,7 @@ impl Volumes {
                         spec,
                         handle: Some(handle),
                         phase: VolumeRecordPhase::Ready,
+                        reason: None,
                         message: None,
                         gone_at: None,
                     },
@@ -165,6 +187,7 @@ impl Volumes {
                         spec,
                         handle: None,
                         phase: VolumeRecordPhase::Failed,
+                        reason: Some(VolumeReason::DriverRefused),
                         message: Some(message),
                         gone_at: None,
                     },
@@ -195,6 +218,10 @@ impl Volumes {
                     id,
                     VolumeRecord {
                         phase: VolumeRecordPhase::Ready,
+                        // Both cleared with the phase they explained: a
+                        // `Ready` volume carrying the reason its last failed
+                        // attempt had would be a line that contradicts itself.
+                        reason: None,
                         message: None,
                         ..existing
                     },
@@ -222,6 +249,7 @@ impl Volumes {
                 spec: spec.clone(),
                 handle: None,
                 phase: VolumeRecordPhase::Provisioning,
+                reason: Some(VolumeReason::Working),
                 message: None,
                 gone_at: None,
             },
@@ -238,6 +266,7 @@ impl Volumes {
                         spec,
                         handle: Some(handle),
                         phase: VolumeRecordPhase::Ready,
+                        reason: None,
                         message: None,
                         gone_at: None,
                     },
@@ -256,6 +285,7 @@ impl Volumes {
                         spec,
                         handle: None,
                         phase: VolumeRecordPhase::Failed,
+                        reason: Some(VolumeReason::DriverRefused),
                         message: Some(message),
                         gone_at: None,
                     },
@@ -668,7 +698,9 @@ impl Volumes {
                 id: id.to_string(),
                 phase: record.phase.as_str().to_string(),
                 backend: record.backend().to_string(),
-                reason: String::new(),
+                reason: reported_reason(&record)
+                    .map(|reason| reason.as_str().to_string())
+                    .unwrap_or_default(),
                 message: record.message.clone().unwrap_or_default(),
                 // What the handle says the volume IS, which after a resize is
                 // not what the spec asked for: lvm rounds up to the extent
@@ -737,6 +769,12 @@ impl Volumes {
                         VolumeRecord {
                             handle: None,
                             phase: VolumeRecordPhase::Failed,
+                            // Not `DriverRefused`: nothing refused anything.
+                            // The bytes this node wrote a record about are
+                            // not on the backend any more, and the tier above
+                            // has to be able to tell that from a provision
+                            // that did not work.
+                            reason: Some(VolumeReason::NotOnBackend),
                             message: Some(message),
                             ..record
                         },
@@ -773,6 +811,7 @@ impl Volumes {
                 spec,
                 handle: None,
                 phase: VolumeRecordPhase::Gone,
+                reason: Some(VolumeReason::Deprovisioned),
                 message,
                 gone_at: Some(SystemTime::now()),
             },
@@ -915,6 +954,83 @@ mod tests {
         assert_eq!(report[0].phase, "Ready");
         assert!(report[0].backend.ends_with(".raw"), "{:?}", report[0]);
         assert!(report[0].message.is_empty());
+    }
+
+    /// Every volume line but a `Ready` one says WHICH kind of trouble it is.
+    ///
+    /// Four words over four paths, and the pair that earns the field is
+    /// `DriverRefused` against `NotOnBackend`: a provision the backend said no
+    /// to is retried by the tier above and costs nothing, and a volume the
+    /// backend has LOST is somebody's data gone. Both were `Failed` plus a
+    /// driver's sentence, and a program cannot branch on a sentence.
+    #[tokio::test]
+    async fn a_volume_line_says_which_kind_of_trouble_it_is() {
+        let (_temp, volumes, store, dir) = node("reasons");
+        let line = |id: &VolumeId| {
+            volumes
+                .report()
+                .into_iter()
+                .find(|l| l.id == id.to_string())
+                .unwrap_or_else(|| panic!("a line for {id}"))
+        };
+
+        // The backend refuses: the base image this spec names is on no disk
+        // here. A retry after somebody puts it there is the whole fix.
+        let refused = VolumeId::new_v4();
+        let mut asks_for_an_image = spec(4096);
+        asks_for_an_image.base_image = Some("not-on-this-node.raw".into());
+        volumes
+            .provision(refused, asks_for_an_image)
+            .await
+            .expect_err("there is nothing to copy from");
+        assert_eq!(line(&refused).phase, "Failed");
+        assert_eq!(line(&refused).reason, "DriverRefused");
+        assert!(
+            !line(&refused).message.is_empty(),
+            "and it says what it said"
+        );
+
+        // A volume that was made, and whose bytes are then not there any
+        // more. `adopt` is what finds it, at start-up, and what it found is
+        // not a refusal.
+        let lost = VolumeId::new_v4();
+        volumes.provision(lost, spec(4096)).await.expect("made");
+        assert_eq!(
+            line(&lost).reason,
+            "",
+            "a Ready volume needs no word and must not send one"
+        );
+        std::fs::remove_file(dir.join(format!("{lost}.raw"))).expect("the bytes, gone");
+        volumes.adopt().await;
+        assert_eq!(line(&lost).phase, "Failed");
+        assert_eq!(line(&lost).reason, "NotOnBackend");
+
+        // The tombstone the tier above may release a volume on.
+        let gone = VolumeId::new_v4();
+        volumes.provision(gone, spec(4096)).await.expect("made");
+        volumes.deprovision(gone).await.expect("deprovisioned");
+        assert_eq!(line(&gone).phase, "Gone");
+        assert_eq!(line(&gone).reason, "Deprovisioned");
+
+        // And a record from a build before the word. Its sentence travels on
+        // and the word says that nothing wrote one — the line is never mute,
+        // which is what keeps a fleet mid-upgrade readable.
+        let older = VolumeId::new_v4();
+        store
+            .put_volume(
+                &older,
+                &VolumeRecord {
+                    spec: spec(4096),
+                    handle: None,
+                    phase: VolumeRecordPhase::Failed,
+                    reason: None,
+                    message: Some("what an older build wrote".into()),
+                    gone_at: None,
+                },
+            )
+            .expect("a record");
+        assert_eq!(line(&older).reason, "Unrecorded");
+        assert_eq!(line(&older).message, "what an older build wrote");
     }
 
     /// The node is the last defence. The controller clears `attachedTo`
@@ -1105,6 +1221,7 @@ mod tests {
                 params: None,
             }),
             phase: VolumeRecordPhase::Ready,
+            reason: None,
             message: None,
             gone_at: None,
         };

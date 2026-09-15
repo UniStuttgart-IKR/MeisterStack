@@ -155,7 +155,7 @@ fn a_killed_vmm_recovers_and_a_backend_that_dies_under_a_live_one_does_not() {
         "the vm is rebuilt rather than left for a person"
     );
     assert_eq!(
-        report_status(&r, &killed, 0).0,
+        report_status(&r, &killed, 0, None).phase,
         ReportedPhase::Provisioning,
         "and it says so: Provisioning on the way back, never Quarantined"
     );
@@ -172,6 +172,13 @@ fn a_killed_vmm_recovers_and_a_backend_that_dies_under_a_live_one_does_not() {
         plan(&r, &orphaned, now()),
         Action::Quarantined,
         "no automatic repair of a live vm with half its hardware gone"
+    );
+    // And the tier above is told WHICH quarantine this is, out of the marker
+    // rather than out of the sentence: the two quarantines this agent has
+    // want different things done about them.
+    assert_eq!(
+        report_status(&r, &orphaned, 0, None).reason,
+        Some(VmReason::BackendGone)
     );
 
     // And a VM without the marker in the same world is not quarantined by
@@ -296,7 +303,7 @@ fn untracked_vmm_with_pid_is_adopted() {
 }
 
 fn phase_of(r: &VmRecord, o: &Observed, failures: u32) -> &'static str {
-    report_status(r, o, failures).0.as_str()
+    report_status(r, o, failures, None).phase.as_str()
 }
 
 #[test]
@@ -344,18 +351,26 @@ fn reported_phase_is_provisioning_while_resources_are_built() {
 #[test]
 fn repeated_reconcile_failures_report_failed_with_a_count() {
     let r = record(Desired::Running, Phase::Provisioned);
-    let (phase, message) = report_status(&r, &obs(false, false, false, None), 3);
-    assert_eq!(phase.as_str(), "Failed");
-    assert!(message.unwrap().contains('3'));
+    let reported = report_status(&r, &obs(false, false, false, None), 3, None);
+    assert_eq!(reported.phase.as_str(), "Failed");
+    assert!(reported.message.unwrap().contains('3'));
+    // The word beside the count: what a person is told is that the vmm this
+    // record names is not there, which is the class of failure `plan` acts
+    // on. The count is the schedule and was never the diagnosis.
+    assert_eq!(reported.reason, Some(VmReason::VmmGone));
 }
 
 #[test]
 fn unhealthy_reports_quarantined_with_its_reason() {
     let mut r = record(Desired::Running, Phase::Provisioned);
     r.unhealthy = Some("backend died".into());
-    let (phase, message) = report_status(&r, &obs(true, true, false, Some(VmState::Running)), 0);
-    assert_eq!(phase.as_str(), "Quarantined");
-    assert_eq!(message.as_deref(), Some("backend died"));
+    let reported = report_status(&r, &obs(true, true, false, Some(VmState::Running)), 0, None);
+    assert_eq!(reported.phase.as_str(), "Quarantined");
+    assert_eq!(reported.message.as_deref(), Some("backend died"));
+    // A marker no build of this agent writes: the sentence travels on and the
+    // word says that nothing here recognised it, rather than the line being
+    // dropped or a wrong class being guessed.
+    assert_eq!(reported.reason, Some(VmReason::Unrecorded));
 }
 
 #[test]
@@ -657,9 +672,15 @@ async fn a_resume_that_does_not_take_is_not_repeated_in_silence() {
     );
     // What the tier above reads: the phase and the sentence that becomes
     // the event.
-    let (phase, message) = report_status(&marked, &obs(true, true, true, Some(VmState::Paused)), 0);
-    assert_eq!(phase, ReportedPhase::Quarantined);
-    assert_eq!(message.as_deref(), Some(RESUME_INEFFECTIVE_REASON));
+    let reported = report_status(
+        &marked,
+        &obs(true, true, true, Some(VmState::Paused)),
+        0,
+        None,
+    );
+    assert_eq!(reported.phase, ReportedPhase::Quarantined);
+    assert_eq!(reported.message.as_deref(), Some(RESUME_INEFFECTIVE_REASON));
+    assert_eq!(reported.reason, Some(VmReason::ResumeIneffective));
 
     // A resume that DOES take is silent and clears the count.
     *vmm.guest.lock().unwrap() = VmState::Running;

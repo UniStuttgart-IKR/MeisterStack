@@ -387,11 +387,74 @@ pub fn reason_table() -> Vec<(&'static str, Vec<&'static str>)> {
     ]
 }
 
+/// What this node says about one VM: the phase, the word that says WHY it is
+/// in that phase, and the sentence an operator reads.
+///
+/// A struct and not the triple, and the reason is the diff this round is
+/// about: `message` used to be the second slot. Putting the reason in the
+/// middle of a tuple would have left every existing `.1` compiling and
+/// silently reading the other field — a phase that lies about itself is
+/// exactly the shape of failure this round exists to remove, and reproducing
+/// it in the fix would be a poor start.
+pub struct Reported {
+    pub phase: ReportedPhase,
+    /// `None` for `Running`, `Stopped` and `Paused`, and for nothing else.
+    /// Those three say everything there is to say; every other phase this
+    /// node reports is a state somebody has to act on, and one that does not
+    /// say what it is waiting for or what broke cannot be acted on.
+    pub reason: Option<VmReason>,
+    pub message: Option<String>,
+}
+
+impl Reported {
+    /// A phase that explains itself.
+    fn settled(phase: ReportedPhase) -> Self {
+        Self {
+            phase,
+            reason: None,
+            message: None,
+        }
+    }
+
+    /// Every other phase. There is no constructor without a reason, which is
+    /// how "no phase but a settled one leaves this node mute" is kept by the
+    /// type rather than by everybody remembering.
+    fn because(phase: ReportedPhase, reason: VmReason, message: Option<String>) -> Self {
+        Self {
+            phase,
+            reason: Some(reason),
+            message,
+        }
+    }
+}
+
+/// Which quarantine this is, from the marker the reconciler left.
+///
+/// The marker is a sentence and the sentences are constants, so this is a
+/// comparison against the two that exist rather than a reading of prose.
+/// Anything else is a record written by another build of this agent: its
+/// sentence travels on unchanged under [`VmReason::Unrecorded`], because an
+/// agent that has drifted has to be visible and dropping the line would hide
+/// exactly the VM a person has to look at.
+fn quarantine_reason(marker: &str) -> VmReason {
+    match marker {
+        BACKEND_DIED_REASON => VmReason::BackendGone,
+        RESUME_INEFFECTIVE_REASON => VmReason::ResumeIneffective,
+        _ => VmReason::Unrecorded,
+    }
+}
+
 /// What the controller should show, from the same record and observation
 /// `plan` decides on — the report is a view of the reconciler's world, not a
 /// second one. `failures` is the consecutive-failure count of the backoff
 /// (0 = the last pass was fine), which is what separates "the agent is
-/// working on it" from "the agent keeps failing at it".
+/// working on it" from "the agent keeps failing at it", and `last_error` is
+/// what that last failed pass said.
+///
+/// `last_error` travels because a count is not a diagnosis. A VM stuck in
+/// `Provisioning` for ten minutes used to report the number of attempts and
+/// nothing about what stopped them; the sentence was in the node's log, which
+/// is the one place the person reading the API cannot see.
 ///
 /// `Desired::Absent` is not a phase: those records are on their way out and
 /// the caller drops them from the report instead.
@@ -464,14 +527,19 @@ pub fn report_status(
     record: &VmRecord,
     obs: &Observed,
     failures: u32,
-) -> (ReportedPhase, Option<String>) {
-    if let Some(reason) = &record.unhealthy {
-        return (ReportedPhase::Quarantined, Some(reason.clone()));
+    last_error: Option<&str>,
+) -> Reported {
+    if let Some(marker) = &record.unhealthy {
+        return Reported::because(
+            ReportedPhase::Quarantined,
+            quarantine_reason(marker),
+            Some(marker.clone()),
+        );
     }
     // Stop leaves the phase at Provisioned (volumes and taps stay), so the
     // desired state is what tells a stopped VM from an unprovisioned one.
     if record.desired == Desired::Stopped && !obs.vmm_alive {
-        return (ReportedPhase::Stopped, None);
+        return Reported::settled(ReportedPhase::Stopped);
     }
     // The two migration phases report `Provisioning` with a sentence, and
     // both choices are deliberate.
@@ -497,7 +565,7 @@ pub fn report_status(
             // which a migration's transfer timeout fires, and the tier above
             // decides what may be torn down by reading this line.
             return match obs.guest {
-                Some(VmState::Running) => (ReportedPhase::Running, None),
+                Some(VmState::Running) => Reported::settled(ReportedPhase::Running),
                 // And the third answer, which used to be the second one's
                 // silence: the guest is not coming and this node is giving
                 // back what it built for it. `Failed` and not `Provisioning`,
@@ -506,48 +574,87 @@ pub fn report_status(
                 // own arrival check — so the only reader of this line is a
                 // person asking why a move did not happen, and "in flight"
                 // would be the wrong thing to tell them.
-                _ if obs.receive_failed => (
+                _ if obs.receive_failed => Reported::because(
                     ReportedPhase::Failed,
+                    VmReason::ReceiveFailed,
                     Some(RECEIVE_FAILED_REASON.to_string()),
                 ),
-                _ => (
+                _ => Reported::because(
                     ReportedPhase::Provisioning,
+                    VmReason::AwaitingGuest,
                     Some("waiting for the guest to arrive from another node".to_string()),
                 ),
             };
         }
         Phase::Migrated => {
-            return (
+            return Reported::because(
                 ReportedPhase::Provisioning,
+                VmReason::GuestLeft,
                 Some("the guest has left this node; the destination has it".to_string()),
             );
         }
         _ => {}
     }
     if record.phase != Phase::Provisioned {
-        return (ReportedPhase::Provisioning, None);
+        return building(failures, last_error);
     }
     if !obs.vmm_alive || !obs.socket_responsive {
         // The next pass re-provisions; only a run of failed attempts turns
-        // that from "in flight" into something a human has to look at.
+        // that from "in flight" into something a human has to look at. When
+        // it has, the word is the failure class and not the schedule: what a
+        // person is being told is that the VMM this record names is not
+        // there, which is the first of the three classes `plan` separates
+        // (the other two are a backend that died under a live VMM —
+        // `backend_died_under_vmm`, quarantined — and a driver that refuses a
+        // create outright, which leaves no record and therefore no line).
         return if failures > 0 {
-            (
+            Reported::because(
                 ReportedPhase::Failed,
-                Some(format!(
-                    "{failures} failed reconcile attempt(s), retrying with backoff"
-                )),
+                VmReason::VmmGone,
+                Some(match last_error {
+                    Some(said) => format!(
+                        "{failures} failed reconcile attempt(s), retrying with backoff: {said}"
+                    ),
+                    None => {
+                        format!("{failures} failed reconcile attempt(s), retrying with backoff")
+                    }
+                }),
             )
         } else {
-            (ReportedPhase::Provisioning, None)
+            Reported::because(ReportedPhase::Provisioning, VmReason::Working, None)
         };
     }
     match obs.guest {
-        Some(VmState::Running) => (ReportedPhase::Running, None),
-        Some(VmState::Paused) => (ReportedPhase::Paused, None),
-        Some(VmState::Defined) | Some(VmState::Stopped) => (ReportedPhase::Stopped, None),
+        Some(VmState::Running) => Reported::settled(ReportedPhase::Running),
+        Some(VmState::Paused) => Reported::settled(ReportedPhase::Paused),
+        Some(VmState::Defined) | Some(VmState::Stopped) => {
+            Reported::settled(ReportedPhase::Stopped)
+        }
         // VMM alive but its state is unreadable: the pass will re-provision.
-        None => (ReportedPhase::Provisioning, None),
+        None => building(failures, last_error),
     }
+}
+
+/// A VM on its way up, and which of the two that is.
+///
+/// One function for the two places that reach it — a record short of
+/// `Provisioned`, and a VMM whose state cannot be read — because the question
+/// they ask is the same one: is a pass working on this, or is the retry
+/// schedule waiting? The distinction is the whole value of the word.
+/// `Working` is the ordinary road and says "come back in a moment"; `Backoff`
+/// says the last attempt failed, and carries its sentence, which is the half
+/// that never used to leave the node at all.
+fn building(failures: u32, last_error: Option<&str>) -> Reported {
+    if failures == 0 {
+        return Reported::because(ReportedPhase::Provisioning, VmReason::Working, None);
+    }
+    Reported::because(
+        ReportedPhase::Provisioning,
+        VmReason::Backoff,
+        last_error.map(|said| {
+            format!("{failures} failed reconcile attempt(s), retrying with backoff: {said}")
+        }),
+    )
 }
 
 /// The host routes a set of records asks the world to send it.
@@ -579,6 +686,8 @@ pub fn floating_prefixes<'a>(
 pub struct VmReport {
     pub id: VmId,
     pub phase: ReportedPhase,
+    /// Why that phase, in the one word the wire carries. See [`Reported`].
+    pub reason: Option<VmReason>,
     pub message: Option<String>,
     /// The referenced volumes this node has ATTACHED to the VM right now,
     /// read off the record rather than off the spec.
@@ -690,13 +799,15 @@ impl Reconciler {
             if record.unhealthy.is_none() && backend_died_under_vmm(&record, &observed) {
                 record.unhealthy = Some(BACKEND_DIED_REASON.to_string());
             }
-            let (phase, message) = report_status(&record, &observed, self.failure_count(&id));
+            let (failures, last_error) = self.backoff_state(&id);
+            let reported = report_status(&record, &observed, failures, last_error.as_deref());
             let volumes = attached_volumes(&record);
             let nics = reported_nics(&record);
             out.push(VmReport {
                 id,
-                phase,
-                message,
+                phase: reported.phase,
+                reason: reported.reason,
+                message: reported.message,
                 volumes,
                 nics,
                 departure: departure(&record),
