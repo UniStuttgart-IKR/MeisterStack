@@ -9,7 +9,7 @@ the IKR (Institute of Communication Networks and Computer Engineering).
 The following LLMs/AI-Tools were used during documentation and development:
  - Claude and Claude Code with the models (Sonnet, Opus and Fable)
  - DeepL Write to improve text
- - Google Gemini Flash/Pro
+
 *For more information on the usage of LLMs and AI please refer to the [AI-Guidelines](AI_GUIDELINES.md)*
 
 During the research of this thesis [Project Leandro](https://github.com/UniStuttgart-IKR/Leandro) was created
