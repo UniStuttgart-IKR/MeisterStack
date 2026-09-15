@@ -9,20 +9,21 @@
 
   <!-- ===== Cloud-Ebene ===== -->
   <rect x="40" y="30" width="920" height="140" rx="6" fill="#FFF8E7" stroke="#D6B656"/>
-  <text x="54" y="52" font-size="14" font-weight="bold" fill="#7A5C00">Cloud-Ebene</text>
+  <text x="54" y="52" font-size="14" font-weight="bold" fill="#7A5C00">Cloud tier</text>
 
   <rect x="80" y="85" width="140" height="50" rx="8" fill="#E1D5E7" stroke="#9673A6"/>
   <text x="150" y="115" font-size="14" font-weight="bold" text-anchor="middle">CLI</text>
 
   <rect x="380" y="75" width="200" height="70" rx="8" fill="#DAE8FC" stroke="#6C8EBF"/>
-  <text x="480" y="115" font-size="15" font-weight="bold" text-anchor="middle">Cloud-Controller</text>
+  <text x="480" y="115" font-size="15" font-weight="bold" text-anchor="middle">Cloud controller</text>
 
   <path d="M680,88 a50,8 0 0,1 100,0 v44 a50,8 0 0,1 -100,0 z" fill="#F5F5F5" stroke="#666666"/>
   <path d="M680,88 a50,8 0 0,0 100,0" fill="none" stroke="#666666"/>
   <text x="730" y="120" font-size="13" font-weight="bold" text-anchor="middle">etcd</text>
 
-  <rect x="810" y="85" width="120" height="50" rx="8" fill="#FFFFFF" stroke="#999999"/>
-  <text x="870" y="115" font-size="13" font-weight="bold" text-anchor="middle">Auth Service</text>
+  <rect x="810" y="85" width="120" height="50" rx="8" fill="#FFFFFF" stroke="#999999" stroke-dasharray="5 4"/>
+  <text x="870" y="110" font-size="13" font-weight="bold" text-anchor="middle">OIDC provider</text>
+  <text x="870" y="126" font-size="10" fill="#555555" text-anchor="middle">optional</text>
 
   <!-- Kanten Cloud-Ebene -->
   <line x1="220" y1="110" x2="378" y2="110" stroke="#555555" stroke-width="1.5" marker-end="url(#arrow)"/>
@@ -41,24 +42,14 @@
   <text x="140" y="330" font-size="13" font-weight="bold" text-anchor="middle">etcd</text>
 
   <rect x="300" y="280" width="220" height="80" rx="8" fill="#DAE8FC" stroke="#6C8EBF"/>
-  <text x="410" y="316" font-size="15" font-weight="bold" text-anchor="middle">Cluster-Controller</text>
-  <text x="410" y="338" font-size="11" fill="#555555" text-anchor="middle">Plugin-Traits</text>
+  <text x="410" y="316" font-size="15" font-weight="bold" text-anchor="middle">Cluster controller</text>
+  <text x="410" y="338" font-size="11" fill="#555555" text-anchor="middle">Scheduling, placement</text>
 
-  <rect x="640" y="265" width="290" height="110" rx="6" fill="none" stroke="#D6B656" stroke-dasharray="6 4"/>
-  <text x="652" y="283" font-size="12" font-weight="bold" fill="#7A5C00">Backends</text>
-  <rect x="655" y="300" width="125" height="55" rx="8" fill="#FFF2CC" stroke="#D6B656"/>
-  <text x="717" y="332" font-size="13" font-weight="bold" text-anchor="middle">Storage</text>
-  <rect x="790" y="300" width="125" height="55" rx="8" fill="#FFF2CC" stroke="#D6B656"/>
-  <text x="852" y="332" font-size="13" font-weight="bold" text-anchor="middle">Networking</text>
-
-  <!-- Kanten Cluster -->
-  <line x1="480" y1="145" x2="442" y2="278" stroke="#555555" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <rect x="486" y="190" width="72" height="16" fill="#FFFFFF"/>
-  <text x="490" y="202" font-size="12" font-weight="bold" fill="#333333">gRPC · 1:n</text>
+  <!-- Kanten Cluster: the cluster dials the cloud -->
+  <line x1="442" y1="278" x2="480" y2="147" stroke="#555555" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="486" y="190" width="110" height="16" fill="#FFFFFF"/>
+  <text x="490" y="202" font-size="12" font-weight="bold" fill="#333333">gRPC · dials up · n:1</text>
   <line x1="190" y1="320" x2="300" y2="320" stroke="#888888" stroke-dasharray="5 4"/>
-  <line x1="522" y1="320" x2="638" y2="320" stroke="#555555" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
-  <rect x="556" y="302" width="50" height="14" fill="#F4F7FC"/>
-  <text x="581" y="313" font-size="12" text-anchor="middle" fill="#333333">Plugins</text>
 
   <!-- ===== Node (gestapelt) ===== -->
   <rect x="252" y="452" width="300" height="170" rx="8" fill="#FFFFFF" stroke="#82B366" stroke-dasharray="6 4"/>
@@ -71,23 +62,23 @@
 
   <rect x="370" y="490" width="150" height="75" rx="8" fill="#D5E8D4" stroke="#82B366"/>
   <text x="445" y="524" font-size="15" font-weight="bold" text-anchor="middle">Agent</text>
-  <text x="445" y="545" font-size="11" fill="#555555" text-anchor="middle">Driver-Traits</text>
+  <text x="445" y="545" font-size="11" fill="#555555" text-anchor="middle">Driver traits</text>
 
   <rect x="640" y="440" width="290" height="175" rx="6" fill="none" stroke="#D6B656" stroke-dasharray="6 4"/>
   <text x="652" y="458" font-size="12" font-weight="bold" fill="#7A5C00">Drivers</text>
   <rect x="655" y="475" width="125" height="55" rx="8" fill="#FFF2CC" stroke="#D6B656"/>
   <text x="717" y="507" font-size="13" font-weight="bold" text-anchor="middle">Hypervisor</text>
   <rect x="790" y="475" width="125" height="55" rx="8" fill="#FFF2CC" stroke="#D6B656"/>
-  <text x="852" y="507" font-size="13" font-weight="bold" text-anchor="middle">Networking</text>
+  <text x="852" y="507" font-size="13" font-weight="bold" text-anchor="middle">Network</text>
   <rect x="655" y="545" width="125" height="55" rx="8" fill="#FFF2CC" stroke="#D6B656"/>
   <text x="717" y="577" font-size="13" font-weight="bold" text-anchor="middle">Storage</text>
   <rect x="790" y="545" width="125" height="55" rx="8" fill="#FFF2CC" stroke="#D6B656"/>
   <text x="852" y="577" font-size="13" font-weight="bold" text-anchor="middle">Devices</text>
 
   <!-- Kanten Node -->
-  <line x1="410" y1="360" x2="444" y2="488" stroke="#555555" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <rect x="436" y="400" width="72" height="16" fill="#F4F7FC"/>
-  <text x="440" y="412" font-size="12" font-weight="bold" fill="#333333">gRPC · 1:n</text>
+  <line x1="444" y1="488" x2="410" y2="362" stroke="#555555" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="436" y="400" width="110" height="16" fill="#F4F7FC"/>
+  <text x="440" y="412" font-size="12" font-weight="bold" fill="#333333">gRPC · dials up · n:1</text>
   <line x1="340" y1="527" x2="370" y2="527" stroke="#888888" stroke-dasharray="5 4"/>
   <line x1="522" y1="527" x2="638" y2="527" stroke="#555555" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
   <rect x="558" y="509" width="46" height="14" fill="#F4F7FC"/>
