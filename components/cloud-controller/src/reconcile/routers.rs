@@ -26,7 +26,7 @@
 use super::*;
 
 use controller_api::network;
-use controller_api::{ProviderNetwork, Router, RouterPhase, RouterPhaseKind, RouterReason, Tenant};
+use controller_api::{ProviderNetwork, Router, RouterPhaseKind, RouterReason, Tenant};
 
 /// One pass over the routers of this cloud.
 pub(super) async fn reconcile_routers(
@@ -491,11 +491,13 @@ async fn dispatch(
             {
                 store
                     .mutate::<Router, _>(&name, |r| {
-                        #[allow(deprecated)]
-                        r.status.assign(RouterPhase::new(
+                        // This tier's own anticipation, so it names nobody —
+                        // which is also what stops it ever being read as a
+                        // router that is up.
+                        r.status.reported = Some(controller_api::RouterReported::here(
                             RouterPhaseKind::Provisioning,
                             RouterReason::Dispatched,
-                            None,
+                            Some(format!("{cluster} was told")),
                             Utc::now(),
                         ));
                     })
@@ -543,9 +545,12 @@ async fn note(
     let now = Utc::now();
     store
         .mutate::<Router, _>(&name, |r| {
-            #[allow(deprecated)]
-            r.status
-                .assign(RouterPhase::new(phase, reason, Some(message.clone()), now));
+            r.status.reported = Some(controller_api::RouterReported::here(
+                phase,
+                reason,
+                Some(message.clone()),
+                now,
+            ));
             if let Some(cluster) = &cluster {
                 r.status.cluster = cluster.clone();
             }

@@ -141,6 +141,20 @@ pub struct VmMigrationStatus {
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
     pub(super) phase: VmMigrationPhase,
+    /// The last word anybody established about the move — the one fact
+    /// `settle_vm_migration` derives from.
+    ///
+    /// Nearly all of them are this tier's own, because a migration is an
+    /// operation this tier RUNS: it chose the target, it made the
+    /// destination ready, it told the source to send. Those words carry no
+    /// node, which is what keeps any of them from being `Succeeded` —
+    /// the one resting word here, and the only one that needs a machine's
+    /// say-so. See `VmMigrationReported`.
+    ///
+    /// `None` on a record nothing has been decided about, which is every
+    /// record for the moment between the request and the first pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<VmMigrationReported>,
     /// The same field, with the same meaning, that every other object here
     /// carries: the last `metadata.generation` the reconciler ACTED on.
     #[serde(default)]
@@ -222,3 +236,148 @@ pub const SEND_STILL_HERE: &str = "StillHere";
 /// not the VM — the source is still running, which is the invariant — and the
 /// reconciler's next pass finds no object to carry on with.
 pub type VmMigration = Object<VmMigrationSpec, VmMigrationStatus>;
+
+/// How far the move got, out of the last word anybody established about it.
+///
+/// The thinnest of the three "last word" derivations and the one where that
+/// is least surprising: a migration is not a thing whose state somebody
+/// observes, it is an OPERATION this tier runs, and its phase is the step it
+/// has reached. Which is why nearly every word here carries no node.
+///
+/// What the one place is for:
+///
+/// * **`Succeeded` demands a machine.** It is the one resting word, and what
+///   it claims is that a guest is executing somewhere else — so it has to
+///   name the destination that reported `Running`. A step this tier took
+///   cannot be the evidence for that; see `VmMigrationReported`.
+/// * **No phase without a reason.** A record nobody has acted on is
+///   `Pending { AwaitingTarget }`, which is the sentence
+///   `VmMigrationPhase::Pending` has carried in its own doc comment since it
+///   was written and that nothing ever put on an object.
+/// * **One `since`,** so "Running since" is when the send started.
+pub fn settle_vm_migration(status: &VmMigrationStatus) -> VmMigrationPhase {
+    match status
+        .reported
+        .as_ref()
+        .and_then(VmMigrationReported::phase)
+    {
+        Some(phase) => phase,
+        None => VmMigrationPhase::new(
+            VmMigrationPhaseKind::Pending,
+            VmMigrationReason::AwaitingTarget,
+            Some("no target chosen yet".to_string()),
+            UNSTAMPED,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("an instant")
+    }
+
+    fn migration() -> VmMigration {
+        VmMigration::declare(
+            "web-1-x",
+            VmMigrationSpec {
+                tenant: "acme".to_string(),
+                vm: "web-1".to_string(),
+                target_node: None,
+            },
+        )
+    }
+
+    /// The table: the step this tier has reached, and the one word from below
+    /// that ends it.
+    #[test]
+    fn a_move_is_the_step_it_has_reached() {
+        let mut fresh = migration();
+        fresh.settle(at(0));
+        assert_eq!(fresh.status.phase().kind(), VmMigrationPhaseKind::Pending);
+        assert_eq!(
+            fresh.status.phase().reason(),
+            Some(VmMigrationReason::AwaitingTarget),
+            "the sentence Pending's own doc comment has carried since it was written"
+        );
+
+        let cases: &[(VmMigrationReported, VmMigrationPhaseKind, VmMigrationReason)] = &[
+            (
+                VmMigrationReported::here(
+                    VmMigrationPhaseKind::Preparing,
+                    VmMigrationReason::Dispatched,
+                    Some("preparing soller".into()),
+                    at(0),
+                ),
+                VmMigrationPhaseKind::Preparing,
+                VmMigrationReason::Dispatched,
+            ),
+            (
+                VmMigrationReported::here(
+                    VmMigrationPhaseKind::Running,
+                    VmMigrationReason::Dispatched,
+                    Some("sending to soller at 10.0.0.2:18000".into()),
+                    at(0),
+                ),
+                VmMigrationPhaseKind::Running,
+                VmMigrationReason::Dispatched,
+            ),
+            (
+                VmMigrationReported::here(
+                    VmMigrationPhaseKind::Failed,
+                    VmMigrationReason::Abandoned,
+                    Some("the destination was not ready after 120s".into()),
+                    at(0),
+                ),
+                VmMigrationPhaseKind::Failed,
+                VmMigrationReason::Abandoned,
+            ),
+        ];
+        for (word, kind, reason) in cases {
+            let mut m = migration();
+            m.status.reported = Some(word.clone());
+            m.settle(at(0));
+            assert_eq!(m.status.phase().kind(), *kind, "{word:?}");
+            assert_eq!(
+                m.status.phase().reason().unwrap_or_default(),
+                *reason,
+                "{word:?}"
+            );
+        }
+    }
+
+    /// `Succeeded` demands a machine, and it is the only word here that does.
+    /// What it claims is that a guest is executing somewhere else, and a step
+    /// this tier took cannot be the evidence for that — the destination's own
+    /// `Running` is.
+    #[test]
+    fn nothing_has_succeeded_unless_the_destination_said_so() {
+        let mut invented = migration();
+        invented.status.reported = Some(VmMigrationReported::here(
+            VmMigrationPhaseKind::Succeeded,
+            VmMigrationReason::Unrecorded,
+            Some("web-1 is on soller".into()),
+            at(0),
+        ));
+        invented.settle(at(0));
+        assert_eq!(
+            invented.status.phase().kind(),
+            VmMigrationPhaseKind::Pending,
+            "this tier cannot declare a guest arrived"
+        );
+
+        let mut real = migration();
+        real.status.reported = Some(VmMigrationReported::by(
+            "soller",
+            VmMigrationPhaseKind::Succeeded,
+            VmMigrationReason::Unrecorded,
+            Some("web-1 is on soller".into()),
+            at(0),
+        ));
+        real.settle(at(0));
+        assert_eq!(real.status.phase().kind(), VmMigrationPhaseKind::Succeeded);
+        assert!(real.status.phase().kind().is_final());
+    }
+}

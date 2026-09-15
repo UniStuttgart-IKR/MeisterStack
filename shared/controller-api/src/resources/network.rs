@@ -378,10 +378,19 @@ reasons! {
     /// they come from the network driver rather than from the agent —
     /// `agent_api::networking::RouterReason`, because the driver is what
     /// looks and a driver may not depend on the agent.
-    RouterReason [8] {
+    RouterReason [9] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
         Unrecorded => "Unrecorded",
+        /// No pass has looked at it yet — the moment between the create and
+        /// the first reconcile, and the reason a fresh router no longer reads
+        /// `Pending` with nothing beside it. Written by
+        /// [`settle_router`] and by nobody else, which is where the state
+        /// exists.
+        ///
+        /// Spelled as the image's, the pool's and the copy's are, so that
+        /// "nobody has said anything yet" is one word across this crate.
+        AwaitingNode => "AwaitingNode",
         /// Nowhere to put it: no gateway-capable node for this provider
         /// network, or every candidate is down, drained or refuses the class.
         /// The sentence says which.
@@ -478,6 +487,20 @@ pub struct RouterStatus {
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
     pub(super) phase: RouterPhase,
+    /// The last word anybody established about this router — the one fact
+    /// `settle_router` derives from.
+    ///
+    /// At the cluster it is the verdict of a pass (`network::realise`'s
+    /// outcome, which is built out of what the nodes answered); at the cloud
+    /// it is what the cluster relayed. This tier's own conclusions — the
+    /// planner finding nowhere to put it, a cluster refusing it, a dispatch
+    /// that went out — are written here too, with an empty `node`, and that
+    /// is what stops either of them from ever being `Active`. See
+    /// `RouterReported`.
+    ///
+    /// `None` between the create and the first pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<RouterReported>,
     /// The address this router answers for on the provider network, CIDR.
     /// Cut from `ProviderNetwork.spec.allocation` when the router is first
     /// placed and kept for its life: it is what the SNAT rules translate to
@@ -583,3 +606,150 @@ pub struct RouterStatus {
 }
 
 pub type Router = Object<RouterSpec, RouterStatus>;
+
+/// What a router IS, out of the last word anybody established about it.
+///
+/// One rule for both tiers. Like a copy's (`settle_volume_snapshot`) this is
+/// a thin derivation, and for the same honest reason: a router's phase really
+/// is "what the pass that looked last found", because the looking is the
+/// interesting part and it happens in `network::realise` against the nodes'
+/// own answers. What the one place buys is the three things seven writers
+/// used to each have to remember:
+///
+/// * **`Active` and `Standby` demand a machine.** They are resting words — a
+///   router that is forwarding, and one that is built and deliberately silent
+///   — and a tier may not conclude either. The word has to name the node it
+///   is about, which it can: the active one, or the first that built it.
+/// * **No phase without a reason.** A router nobody has planned yet is
+///   `Pending { AwaitingNode }` rather than `Pending` with nothing beside it.
+/// * **One `since`,** moving with the word and not with the pass.
+pub fn settle_router(status: &RouterStatus) -> RouterPhase {
+    match status.reported.as_ref().and_then(RouterReported::phase) {
+        Some(phase) => phase,
+        None => RouterPhase::new(
+            RouterPhaseKind::Pending,
+            RouterReason::AwaitingNode,
+            Some("no pass has placed it yet".to_string()),
+            UNSTAMPED,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("an instant")
+    }
+
+    fn router() -> Router {
+        Router::declare("acme-out", RouterSpec::default())
+    }
+
+    /// The table: what the pass that looked last found, and what the router
+    /// therefore IS.
+    #[test]
+    fn a_router_is_the_last_word_anybody_established_about_it() {
+        let mut fresh = router();
+        fresh.settle(at(0));
+        assert_eq!(fresh.status.phase().kind(), RouterPhaseKind::Pending);
+        assert_eq!(
+            fresh.status.phase().reason(),
+            Some(RouterReason::AwaitingNode),
+            "a router nobody has planned says so instead of nothing"
+        );
+
+        let cases: &[(RouterReported, RouterPhaseKind, RouterReason)] = &[
+            (
+                RouterReported::here(
+                    RouterPhaseKind::Pending,
+                    RouterReason::Unplaced,
+                    Some("no gateway-capable node for physnet0".into()),
+                    at(0),
+                ),
+                RouterPhaseKind::Pending,
+                RouterReason::Unplaced,
+            ),
+            (
+                RouterReported::here(
+                    RouterPhaseKind::Provisioning,
+                    RouterReason::Dispatched,
+                    Some("cluster-1 was told".into()),
+                    at(0),
+                ),
+                RouterPhaseKind::Provisioning,
+                RouterReason::Dispatched,
+            ),
+            (
+                // The node's own driver word, the one `DriverUnreachable`
+                // earns its place for: this says the machine could not find
+                // out, not that the namespace is gone.
+                RouterReported::by(
+                    "agent-1b",
+                    RouterPhaseKind::Failed,
+                    RouterReason::DriverUnreachable,
+                    Some("ip did not answer".into()),
+                    at(0),
+                ),
+                RouterPhaseKind::Failed,
+                RouterReason::DriverUnreachable,
+            ),
+            (
+                RouterReported::here(
+                    RouterPhaseKind::Unknown,
+                    RouterReason::Silent,
+                    Some("agent-1b last reported 2026-09-15T16:42:25Z".into()),
+                    at(0),
+                ),
+                RouterPhaseKind::Unknown,
+                RouterReason::Silent,
+            ),
+        ];
+        for (word, kind, reason) in cases {
+            let mut r = router();
+            r.status.reported = Some(word.clone());
+            r.settle(at(0));
+            assert_eq!(r.status.phase().kind(), *kind, "{word:?}");
+            assert_eq!(
+                r.status.phase().reason().unwrap_or_default(),
+                *reason,
+                "{word:?}"
+            );
+        }
+    }
+
+    /// `Active` and `Standby` demand a machine. Both claim that a namespace
+    /// exists somewhere and is either forwarding or deliberately silent, and
+    /// no tier may claim that on its own behalf — so a word with no speaker
+    /// is not one, and the router falls back to the wait.
+    #[test]
+    fn nothing_is_active_unless_a_machine_is_named() {
+        for resting in [RouterPhaseKind::Active, RouterPhaseKind::Standby] {
+            let mut invented = router();
+            invented.status.reported = Some(RouterReported::here(
+                resting,
+                RouterReason::Unrecorded,
+                None,
+                at(0),
+            ));
+            invented.settle(at(0));
+            assert_eq!(
+                invented.status.phase().kind(),
+                RouterPhaseKind::Pending,
+                "{resting:?} with nobody behind it"
+            );
+
+            let mut real = router();
+            real.status.reported = Some(RouterReported::by(
+                "agent-1a",
+                resting,
+                RouterReason::Unrecorded,
+                None,
+                at(0),
+            ));
+            real.settle(at(0));
+            assert_eq!(real.status.phase().kind(), resting);
+        }
+    }
+}

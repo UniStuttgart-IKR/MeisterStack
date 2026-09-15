@@ -284,15 +284,21 @@ pub(super) async fn ingest_routers(
         // be the same value, and swinging a router off a machine whose `ip`
         // merely timed out takes a working gateway out of service.
         let (reason, message) = controller_api::RouterReason::read(&line.reason, message);
-        // Against the phase this report WOULD leave behind — see
-        // `mirror::observe` for why the parts cannot be compared one by one.
-        let candidate = controller_api::RouterPhase::new(
+        // The NODE is the speaker, which is what lets `Active` stand here:
+        // the machine with the namespace is the party that looked.
+        let said = controller_api::RouterReported::by(
+            node_id,
             phase,
             reason,
             message.clone(),
-            router.status.phase().since(),
+            chrono::Utc::now(),
         );
-        if *router.status.phase() == candidate {
+        if router
+            .status
+            .reported
+            .as_ref()
+            .is_some_and(|held| held.same_word(&said))
+        {
             continue;
         }
         let name = router.metadata.name.clone();
@@ -300,13 +306,7 @@ pub(super) async fn ingest_routers(
         let uid = router.metadata.uid.clone();
         store
             .mutate::<controller_api::Router, _>(&name, |r| {
-                #[allow(deprecated)]
-                r.status.assign(controller_api::RouterPhase::new(
-                    phase,
-                    reason,
-                    message.clone(),
-                    chrono::Utc::now(),
-                ));
+                r.status.reported = Some(said.clone());
             })
             .await?;
         info!(router = %name, node = node_id, phase = phase.as_str(), "router phase observed");

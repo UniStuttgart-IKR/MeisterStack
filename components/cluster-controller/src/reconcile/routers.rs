@@ -401,8 +401,29 @@ async fn note(
     placement: Option<Placement<'_>>,
 ) -> anyhow::Result<()> {
     let generation = router.metadata.generation;
-    let unchanged = router.status.phase().kind() == phase
-        && router.status.phase().message() == message.as_deref()
+    // Who the word is ABOUT. A resting word — `Active`, `Standby` — claims
+    // that a namespace exists on a machine and is forwarding or deliberately
+    // silent, and no tier may claim that on its own behalf: the word has to
+    // name the node. The active one, or the first that built it. Everything
+    // else is this pass's own conclusion and names nobody, which is exactly
+    // what keeps a planner from writing `Active`.
+    let speaker = placement
+        .as_ref()
+        .map(|p| {
+            if p.active.is_empty() {
+                p.nodes.first().map(String::as_str).unwrap_or_default()
+            } else {
+                p.active
+            }
+        })
+        .unwrap_or_default();
+    let said =
+        controller_api::RouterReported::by(speaker, phase, reason, message.clone(), Utc::now());
+    let unchanged = router
+        .status
+        .reported
+        .as_ref()
+        .is_some_and(|held| held.same_word(&said))
         && placement.as_ref().is_none_or(|p| {
             router.status.nodes == p.nodes
                 && router.status.active_node == p.active
@@ -426,13 +447,7 @@ async fn note(
     });
     pass.store
         .mutate::<Router, _>(&name, |r| {
-            #[allow(deprecated)]
-            r.status.assign(controller_api::RouterPhase::new(
-                phase,
-                reason,
-                message.clone(),
-                Utc::now(),
-            ));
+            r.status.reported = Some(said.clone());
             r.status.observed_generation = generation;
             if let Some((nodes, active, refused, releasing)) = &placement {
                 r.status.nodes = nodes.clone();

@@ -138,7 +138,13 @@ resources! {
     ProviderNetwork => "providernetworks", "ProviderNetwork";
     /// A tenant's way out over one of those — the tenant's half. See
     /// `RouterSpec`.
-    Router => "routers", "Router";
+    Router => "routers", "Router" {
+        /// The last word anybody established about it. See [`settle_router`].
+        fn settle(&mut self, now: DateTime<Utc>) {
+            let phase = settle_router(&self.status);
+            self.status.stamp(phase, now);
+        }
+    };
     /// The storage side of the same shape the network side has: what EXISTS
     /// is an administrator's decision, and taking room out of it is
     /// self-service inside a quota. See `StoragePoolSpec`.
@@ -168,7 +174,13 @@ resources! {
     Secret => "secrets", "Secret";
     /// One live migration of one VM: the intent, and how far it got. See
     /// `VmMigrationSpec`.
-    VmMigration => "vmmigrations", "VmMigration";
+    VmMigration => "vmmigrations", "VmMigration" {
+        /// How far the move got. See [`settle_vm_migration`].
+        fn settle(&mut self, now: DateTime<Utc>) {
+            let phase = settle_vm_migration(&self.status);
+            self.status.stamp(phase, now);
+        }
+    };
     /// One credential, for one URL, for thirty seconds — and the second
     /// resource that expires by itself. Served by nobody: a client that could
     /// list these could read every other client's outstanding credential. See

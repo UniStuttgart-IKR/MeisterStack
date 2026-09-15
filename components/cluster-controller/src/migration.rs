@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use controller_api::{
-    Candidate, EtcdStore, Node, Resource, Scheduler, StoreError, Vm, VmMigration, VmMigrationPhase,
+    Candidate, EtcdStore, Node, Resource, Scheduler, StoreError, Vm, VmMigration,
     VmMigrationPhaseKind, VmMigrationStatus, VmPhaseKind, Volume,
 };
 use proto::StatusReport;
@@ -501,8 +501,8 @@ async fn prepare(
     claimed.status.target_node = Some(target.clone());
     claimed.status.started_at = Some(Utc::now());
     claimed.status.observed_generation = migration.metadata.generation;
-    #[allow(deprecated)]
-    claimed.status.assign(VmMigrationPhase::new(
+    // This tier's own step, so it names nobody — see `VmMigrationReported`.
+    claimed.status.reported = Some(controller_api::VmMigrationReported::here(
         VmMigrationPhaseKind::Preparing,
         controller_api::VmMigrationReason::Dispatched,
         Some(format!("preparing {target}")),
@@ -561,10 +561,9 @@ async fn prepare(
 
     store
         .mutate::<VmMigration, _>(&name, |m| {
-            let kind = m.status.phase().kind();
-            #[allow(deprecated)]
-            m.status.assign(VmMigrationPhase::new(
-                kind,
+            let phase = m.status.phase().kind();
+            m.status.reported = Some(controller_api::VmMigrationReported::here(
+                phase,
                 controller_api::VmMigrationReason::Dispatched,
                 Some(format!("{target} is listening at {peer}")),
                 Utc::now(),
@@ -794,8 +793,7 @@ async fn send(
     }
 
     let mut claimed = migration.clone();
-    #[allow(deprecated)]
-    claimed.status.assign(VmMigrationPhase::new(
+    claimed.status.reported = Some(controller_api::VmMigrationReported::here(
         VmMigrationPhaseKind::Running,
         controller_api::VmMigrationReason::Dispatched,
         Some(format!("sending to {target} at {peer}")),
@@ -860,10 +858,9 @@ async fn send(
               "the send is unaccounted for; waiting for the destination to say");
         store
             .mutate::<VmMigration, _>(&name, |m| {
-                let kind = m.status.phase().kind();
-                #[allow(deprecated)]
-                m.status.assign(VmMigrationPhase::new(
-                    kind,
+                let phase = m.status.phase().kind();
+                m.status.reported = Some(controller_api::VmMigrationReported::here(
+                    phase,
                     controller_api::VmMigrationReason::Reported,
                     Some(why.clone()),
                     Utc::now(),
@@ -1041,9 +1038,14 @@ async fn settle(
     store
         .mutate::<VmMigration, _>(&name, |m| {
             m.status.finished_at = Some(finished);
-            #[allow(deprecated)]
-            m.status.assign(VmMigrationPhase::said(
+            // The one resting word here, and the only one that names a
+            // machine: what it claims is that a guest is executing on the
+            // destination, and the evidence for that is the destination's own
+            // `Running` — see `VmMigrationReported` and `settle_vm_migration`.
+            m.status.reported = Some(controller_api::VmMigrationReported::by(
+                &target,
                 VmMigrationPhaseKind::Succeeded,
+                controller_api::VmMigrationReason::Unrecorded,
                 Some(format!("{} is on {target}", vm.metadata.name)),
                 finished,
             ));
@@ -1108,8 +1110,7 @@ async fn fail(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow
         .mutate::<VmMigration, _>(&name, |m| {
             let now = Utc::now();
             m.status.finished_at = Some(now);
-            #[allow(deprecated)]
-            m.status.assign(VmMigrationPhase::new(
+            m.status.reported = Some(controller_api::VmMigrationReported::here(
                 VmMigrationPhaseKind::Failed,
                 controller_api::VmMigrationReason::Abandoned,
                 Some(why.clone()),
@@ -1326,8 +1327,14 @@ mod tests {
                 target_node: None,
             },
         );
-        #[allow(deprecated)]
-        m.status.assign(VmMigrationPhase::of(phase, Utc::now()));
+        m.status.reported = Some(controller_api::VmMigrationReported::by(
+            "target",
+            phase,
+            controller_api::VmMigrationReason::Dispatched,
+            None,
+            Utc::now(),
+        ));
+        m.settle(Utc::now());
         m
     }
 

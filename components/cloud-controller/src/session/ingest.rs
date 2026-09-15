@@ -102,37 +102,35 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
         };
         let message = (!reported.message.is_empty()).then(|| reported.message.clone());
         // The cluster's word, which is a node's driver's word where one came
-        // up that road. Relayed, not re-derived — decision 1.
+        // up that road. Relayed, not re-derived — decision 1. The CLUSTER is
+        // the speaker at this tier, which is what lets `Active` stand: it is
+        // the party that looked.
         let (reason, message) = controller_api::RouterReason::read(&reported.reason, message);
-        // Against the phase the write WOULD leave behind — see
-        // `mirror::observe`.
-        let candidate = controller_api::RouterPhase::new(
+        let said = controller_api::RouterReported::by(
+            cluster,
             phase,
             reason,
             message.clone(),
-            router.status.phase().since(),
+            chrono::Utc::now(),
         );
-        if *router.status.phase() == candidate
+        if router
+            .status
+            .reported
+            .as_ref()
+            .is_some_and(|held| held.same_word(&said))
             && router.status.active_node == reported.node
             && router.status.nodes == reported.nodes
         {
             continue;
         }
         let name = router.metadata.name.clone();
-        let now = chrono::Utc::now();
         let was = router.status.phase().kind();
         let active_was = router.status.active_node.clone();
         let tenant = router.spec.tenant.clone();
         let uid = router.metadata.uid.clone();
         let result = store
             .mutate::<controller_api::Router, _>(&name, |r| {
-                #[allow(deprecated)]
-                r.status.assign(controller_api::RouterPhase::new(
-                    phase,
-                    reason,
-                    message.clone(),
-                    now,
-                ));
+                r.status.reported = Some(said.clone());
                 r.status.active_node = reported.node.clone();
                 r.status.nodes = reported.nodes.clone();
             })
