@@ -14,7 +14,7 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 OUT=out
-FROM=1; ONLY=""
+FROM=0; ONLY=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --from) FROM=$2; shift 2 ;;

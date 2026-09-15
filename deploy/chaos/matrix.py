@@ -78,8 +78,14 @@ def w1(seed, n, cname="cluster-1"):
         except Exception:
             errors += 1
             continue
+        # step=0.25, not the default 2: at a 2 s poll every sample lands on the
+        # same multiple and the first cell came out p50=8.06 / p99=8.07 / max=8.07
+        # -- twenty numbers inside ten milliseconds. That is the poll interval
+        # talking, not the control plane, and a p99 quantised to 2 s cannot show
+        # the tail the brief is asking for.
         ok, secs = ops.wait_for(
-            lambda: True if ops.phase_of(ops.cloud_vm(name)) == "Running" else None, 180)
+            lambda: True if ops.phase_of(ops.cloud_vm(name)) == "Running" else None,
+            180, step=0.25)
         if ok:
             creates.append(round(time.time() - t0, 3))
         else:
@@ -94,6 +100,7 @@ def w1(seed, n, cname="cluster-1"):
             "create_p50": pct(creates, .50), "create_p99": pct(creates, .99),
             "create_max": max(creates) if creates else None,
             "delete_p50": pct(deletes, .50),
+            "poll_step_s": 0.25,
             "samples": creates}
 
 
@@ -250,6 +257,22 @@ def w3(seed, rounds=3, tenant="lab", router="lab-out", fip="10.128.1.217"):
     (rollout-neutron), 4.4 s / 5.2 s on bare metal (blech-manacor).
     """
     control, data, notes = [], [], []
+    stopped = []          # every agent this cell put down, for the finally
+    try:
+        return _w3_rounds(seed, rounds, tenant, router, fip, control, data, notes, stopped)
+    finally:
+        # A killed cell must not leave an agent down. The first w3 run was
+        # orphaned mid-round and left agent-1c stopped: cluster-1 ran 2/4 until
+        # somebody noticed. `systemctl start` is idempotent, so starting one
+        # that is already up costs nothing.
+        for node in stopped:
+            try:
+                ops.start_agent(node)
+            except Exception:
+                pass
+
+
+def _w3_rounds(seed, rounds, tenant, router, fip, control, data, notes, stopped):
     for i in range(rounds):
         c, r = ops.cloud("GET", f"/routers/{router}?tenant={tenant}")
         if c >= 400:
@@ -262,6 +285,7 @@ def w3(seed, rounds=3, tenant="lab", router="lab-out", fip="10.128.1.217"):
         time.sleep(3)
         t0 = time.time()
         ops.stop_agent(was)
+        stopped.append(was)
         log(f"  w3 round {i}: stopped the agent on {was}")
 
         def moved():
@@ -285,6 +309,8 @@ def w3(seed, rounds=3, tenant="lab", router="lab-out", fip="10.128.1.217"):
         log(f"  w3 round {i}: control {control[-1] if new else '-'}s, "
             f"data gap {gap}s over {seen} replies")
         ops.start_agent(was)
+        if was in stopped:
+            stopped.remove(was)
         ops.wait_for(lambda: True if (ops.cluster("cluster-1", "GET", f"/nodes/{was}")[1]
                                       .get("status", {}).get("ready")) else None, 180)
     good = [d for d in data if d is not None]
