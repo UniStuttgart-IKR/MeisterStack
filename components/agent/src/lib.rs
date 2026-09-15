@@ -462,6 +462,9 @@ impl Agent {
                     .collect(),
             })
             .collect();
+        // Before the report is built and not inside it: what the image half
+        // says is a statement about this node's disk right now.
+        self.reconciler.verify_path_images().await;
         Ok(StatusReport {
             node: Some(self.node_status()),
             vms,
@@ -472,9 +475,18 @@ impl Agent {
             // this node's VMs that still has to go out, and the next one is
             // three seconds away.
             routers: self.routers().await,
-            // What this node has learned about the base images it was asked
-            // to fetch. Empty on a node that has only ever seen path-based
-            // images, which is every node before this milestone.
+            // What this node has learned about the base images its records
+            // name — the ones it fetched, and the ones that are somebody
+            // else's file on shared storage.
+            //
+            // F16: a path image was looked at once per reconcile pass and
+            // reported on every beat in between out of that one look, so an
+            // image that had gone missing kept being reported `Ready` for as
+            // long as three reports. The look happens here now, once per
+            // image per report, and `Cache::report` below is a read of what
+            // it found. `verify_path_images` is what bounds the cost: the
+            // names are a set, so forty VMs off three images is three
+            // `stat`s, and nothing is fetched or hashed on this path.
             images: self
                 .images
                 .report()

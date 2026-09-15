@@ -128,7 +128,24 @@ impl State {
 #[derive(Default)]
 pub struct Cache {
     dir: PathBuf,
-    known: Mutex<HashMap<String, State>>,
+    known: Mutex<HashMap<String, Entry>>,
+}
+
+/// One image's line in this node's opinion, and where the opinion came from.
+struct Entry {
+    state: State,
+    /// This node FETCHED these bytes rather than looked for somebody else's
+    /// file: the entry came from [`Cache::ensure`] and not from
+    /// [`Cache::verify_path`].
+    ///
+    /// It is remembered because a volume record names its base image by
+    /// catalogue name and nothing else — the url half only ever travels in a
+    /// VM spec — so the pass that looks at path images cannot tell the two
+    /// apart from the records alone. Re-stating a fetched image as a path one
+    /// would replace "the checksum did not match" with "it has no url, so
+    /// nothing here fetches it", which is the one sentence that is certainly
+    /// wrong about it.
+    fetched: bool,
 }
 
 /// Where the content-addressed copies live, under the image directory so that
@@ -197,7 +214,7 @@ impl Cache {
         let known = self.known.lock().unwrap();
         let mut out: Vec<(String, State)> = known
             .iter()
-            .map(|(name, state)| (name.clone(), state.clone()))
+            .map(|(name, entry)| (name.clone(), entry.state.clone()))
             .collect();
         // Sorted so two consecutive reports of the same facts are the same
         // message; the tier above compares them.
@@ -205,12 +222,29 @@ impl Cache {
         out
     }
 
-    fn remember(&self, name: &str, state: State) {
+    /// Whether this node's opinion about an image came from a fetch. See
+    /// [`Entry::fetched`].
+    fn was_fetched(&self, name: &str) -> bool {
+        self.known
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_some_and(|entry| entry.fetched)
+    }
+
+    fn remember(&self, name: &str, state: State, fetched: bool) {
         let previous = self
             .known
             .lock()
             .unwrap()
-            .insert(name.to_string(), state.clone());
+            .insert(
+                name.to_string(),
+                Entry {
+                    state: state.clone(),
+                    fetched,
+                },
+            )
+            .map(|entry| entry.state);
         // ERROR, not WARN: a base image that cannot be used is not a
         // degradation that heals — every VM naming it fails, every time, until
         // somebody fixes the url, the checksum or the file.
@@ -259,6 +293,12 @@ impl Cache {
     /// records that name it, so an image restored on shared storage goes back
     /// to `Ready` without anybody creating a VM to prove it.
     pub async fn verify_path(&self, name: &str) {
+        // An image this node FETCHED is not a path image, whatever a record
+        // calls it. See `Entry::fetched`: the digest is what verified those
+        // bytes, and a `stat` here could only make the answer vaguer.
+        if self.was_fetched(name) {
+            return;
+        }
         let path = self.linked(name);
         let state = match tokio::fs::metadata(&path).await {
             Ok(meta) if meta.is_dir() => State::Failed {
@@ -279,7 +319,7 @@ impl Cache {
                 ),
             },
         };
-        self.remember(name, state);
+        self.remember(name, state, false);
     }
 
     /// Make sure this image is on the node, fetching it if it is not.
@@ -291,7 +331,7 @@ impl Cache {
     pub async fn ensure(&self, source: &Source) -> Result<()> {
         match self.ensure_inner(source).await {
             Ok(()) => {
-                self.remember(&source.name, State::Ready);
+                self.remember(&source.name, State::Ready, true);
                 Ok(())
             }
             Err(failure) => {
@@ -302,6 +342,7 @@ impl Cache {
                         reason,
                         message: format!("{e:#}"),
                     },
+                    true,
                 );
                 Err(e)
             }
@@ -653,6 +694,20 @@ mod tests {
 
         assert!(cache.ensure(&source).await.is_err());
         assert!(!images.join("ubuntu.raw").exists());
+        assert!(matches!(
+            cache.report()[0].1,
+            State::Failed {
+                reason: ImageReason::FetchFailed,
+                ..
+            }
+        ));
+
+        // And the pass that looks at PATH images does not overwrite it. A
+        // volume record names its base image by catalogue name and carries no
+        // url, so that pass reaches this name too — and "it has no url, so
+        // nothing here fetches it" is the one sentence that is certainly
+        // wrong about an image this node tried to fetch. See `Entry::fetched`.
+        cache.verify_path("ubuntu.raw").await;
         assert!(matches!(
             cache.report()[0].1,
             State::Failed {

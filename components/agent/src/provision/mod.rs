@@ -189,24 +189,54 @@ impl Provisioner {
     /// that keeps both honest, on the same schedule and with the same
     /// argument as everything else in the reconciler.
     ///
-    /// Records and not objects: a node knows the images its own VMs name and
-    /// nothing else. An `Image` no VM on this node uses is one this node has
-    /// no evidence about, which is exactly what an empty entry in
-    /// `Image.status.nodes[]` means.
+    /// Run by the reconcile pass AND by every status report, which is F16's
+    /// node half: the report is what carries the answer upwards, and one that
+    /// went out between two passes used to carry the previous pass's opinion
+    /// of the disk. One `stat` per image per report, because the names are
+    /// gathered into a set first — a node with forty VMs off three base
+    /// images looks three times.
+    ///
+    /// Records and not objects: a node knows the images its own records name
+    /// and nothing else. An `Image` nothing on this node uses is one this
+    /// node has no evidence about, which is exactly what an empty entry in
+    /// `Image.status.nodes[]` means — and it is also the half of F16 that
+    /// cannot be closed from here, because nothing tells a node about an
+    /// image no record of its own names.
+    ///
+    /// BOTH kinds of record name one. A VM spec names a base image per disk,
+    /// and a `Volume` object provisioned from a catalogue entry names one
+    /// too — that is the road a standalone disk takes, it carries no url by
+    /// construction (`ProvisionVolume` has no source half), and until now
+    /// nobody looked at it: a node whose only use of an image was a volume
+    /// said nothing about that image at all.
     ///
     /// A record this build cannot read contributes nothing and stops nothing
     /// — unlike the overlay sweep, which declines altogether over one. The
     /// difference is what is at stake: there it is somebody's live wire, here
     /// it is one line of evidence about one image.
     pub(crate) async fn verify_path_images(&self) {
-        let Ok(records) = self.store.list() else {
-            return;
-        };
         let mut seen: Vec<String> = Vec::new();
-        for (_, record) in &records {
-            for name in path_images(&record.spec) {
-                if !seen.contains(&name) {
-                    seen.push(name);
+        let mut note = |name: String| {
+            if !seen.contains(&name) {
+                seen.push(name);
+            }
+        };
+        if let Ok(records) = self.store.list() {
+            for (_, record) in &records {
+                for name in path_images(&record.spec) {
+                    note(name);
+                }
+            }
+        }
+        if let Ok(volumes) = self.store.list_volumes() {
+            for (_, record) in &volumes {
+                // A tombstone names bytes that are gone on purpose; nothing
+                // about its base image is evidence about anything any more.
+                if record.phase == crate::types::VolumeRecordPhase::Gone {
+                    continue;
+                }
+                if let Some(name) = record.spec.base_image.clone() {
+                    note(name);
                 }
             }
         }

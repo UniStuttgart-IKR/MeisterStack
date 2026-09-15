@@ -996,6 +996,130 @@ async fn a_pass_says_again_whether_the_path_images_of_its_records_are_here() {
     assert_eq!(images.report()[0].1.phase(), "Ready");
 }
 
+/// The other way this node hears of a path image: a `Volume` object made
+/// from one.
+///
+/// F16's second half. A standalone volume's spec names a base image by
+/// catalogue name and carries no url — `ProvisionVolume` has no source half,
+/// by construction — so a node whose only use of an image was a volume said
+/// nothing at all about that image, and the cloud went on calling a
+/// catalogue entry pointing at nothing `Ready`. The look is the same one the
+/// VM half gets, and it is the whole of what the agent can do: an image no
+/// record here names is one this node has no evidence about.
+///
+/// A directory with the file NOT in it, which is the case the fleet was in.
+#[tokio::test]
+async fn a_volume_record_is_the_other_way_this_node_hears_of_a_path_image() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let root = temp.path().to_path_buf();
+    let store = Arc::new(Store::open(&root.join("a.redb")).expect("a store"));
+    let image_dir = root.join("images");
+    std::fs::create_dir_all(&image_dir).expect("an image dir, and nothing in it");
+
+    // A volume this node was told to make from a catalogue entry. No VM
+    // names it and no VM has to: the object is a disk of its own.
+    let volume = agent_api::storage::VolumeId::new_v4();
+    store
+        .put_volume(
+            &volume,
+            &crate::types::VolumeRecord {
+                spec: agent_api::storage::VolumeSpec {
+                    base_image: Some("chaos-img-bad.raw".into()),
+                    size_bytes: 1024,
+                    driver: Some("filesystem".into()),
+                    params: None,
+                },
+                handle: None,
+                phase: crate::types::VolumeRecordPhase::Provisioning,
+                reason: Some(VolumeReason::Working),
+                message: None,
+                gone_at: None,
+            },
+        )
+        .expect("a volume record");
+
+    let images = Arc::new(crate::images::Cache::new(image_dir.clone()));
+    let provisioner = Provisioner::new(
+        store.clone(),
+        Drivers {
+            confiner: Arc::new(cgroup_driver::CgroupV2::new(root.join("cgroup"))),
+            hypervisor: None,
+            hypervisor_name: None,
+            storage: HashMap::new(),
+            networking: None,
+            bridge: None,
+            announcer: None,
+            devices: HashMap::new(),
+        },
+        images.clone(),
+        image_dir.clone(),
+        root.join("run"),
+        "br0".to_string(),
+        None,
+        None,
+    );
+
+    // Nothing said before anybody looked, which is what an empty
+    // `Image.status.nodes[]` means and has to keep meaning.
+    assert!(images.report().is_empty());
+
+    provisioner.verify_path_images().await;
+    let (name, state) = images.report().pop().expect("an opinion");
+    assert_eq!(name, "chaos-img-bad.raw");
+    assert_eq!(state.phase(), "Failed", "the file is not in that directory");
+    assert_eq!(
+        state.reason(),
+        Some(crate::reconcile::ImageReason::NotFound),
+        "and in the word, so the tier above can tell it from a failed fetch"
+    );
+    assert!(
+        state.message().contains(
+            image_dir
+                .join("chaos-img-bad.raw")
+                .to_str()
+                .expect("a path")
+        ),
+        "the sentence names the path that was looked at: {}",
+        state.message()
+    );
+
+    // Somebody puts the bytes on the share. The next look says so — no
+    // create, no restart, and no fetch: this node never had a url for it.
+    std::fs::write(image_dir.join("chaos-img-bad.raw"), b"an image").expect("the bytes");
+    provisioner.verify_path_images().await;
+    assert_eq!(images.report()[0].1.phase(), "Ready");
+
+    // And a tombstone names bytes that are gone on purpose: nothing about
+    // its base image is evidence about anything any more, so the look drops
+    // it rather than carrying a dead volume's image for the tombstone's TTL.
+    store
+        .put_volume(
+            &volume,
+            &crate::types::VolumeRecord {
+                spec: agent_api::storage::VolumeSpec {
+                    base_image: Some("only-the-tombstone-names-it.raw".into()),
+                    size_bytes: 1024,
+                    driver: Some("filesystem".into()),
+                    params: None,
+                },
+                handle: None,
+                phase: crate::types::VolumeRecordPhase::Gone,
+                reason: Some(VolumeReason::Deprovisioned),
+                message: None,
+                gone_at: Some(SystemTime::now()),
+            },
+        )
+        .expect("a tombstone");
+    provisioner.verify_path_images().await;
+    assert!(
+        !images
+            .report()
+            .iter()
+            .any(|(name, _)| name == "only-the-tombstone-names-it.raw"),
+        "a tombstone's base image is nobody's evidence"
+    );
+}
+
 /// A VMM this node has no record of is said out loud, every pass, until it is
 /// not one any more.
 ///

@@ -613,6 +613,19 @@ impl Reconciler {
         self.reconcile(id, Trigger::Manual).await.map(Some)
     }
 
+    /// Look again at every path image the records here name. See
+    /// [`Provisioner::verify_path_images`].
+    ///
+    /// On the reconciler because the status report reaches the provisioner
+    /// through it and through nothing else, exactly as it reaches `report`
+    /// and `drivers` that way. The report calls this before it reads the
+    /// image table: a report is the only thing that carries the answer
+    /// upwards, so a report that went out between two passes was carrying the
+    /// previous pass's look at the disk.
+    pub async fn verify_path_images(&self) {
+        self.provisioner.verify_path_images().await;
+    }
+
     #[instrument(level = "debug", skip_all, fields(vm_id = %id))]
     pub async fn dry_run(&self, id: &VmId) -> Result<Option<DryRun>> {
         let Some(mut record) = self.store.get(id)? else {
