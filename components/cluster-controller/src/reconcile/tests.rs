@@ -176,21 +176,28 @@ fn silence_leaves_the_pool_without_a_locality_rather_than_with_a_guess() {
 
 /// What a verdict becomes on the object. The one that matters is the
 /// third: a version mix does not erase what was already known, and the
-/// sentence names both machines so an operator knows which two to look at.
+/// disagreement names both machines so an operator knows which two to look
+/// at.
+///
+/// It asserts on FACTS now and not on a phase, because that is what the pass
+/// writes: the phase is `controller_api::settle_storage_pool`, one place for
+/// both tiers, and the sentence about a version mix is written there. What
+/// this test used to check about the sentence it checks here about the four
+/// names the sentence is built from — which is the stronger assertion of the
+/// two, and the whole reason a disagreement is data.
 #[test]
 fn a_verdict_becomes_a_phase_and_keeps_what_was_already_known() {
     assert_eq!(
-        pool_status("nfs", PoolLocality::Agreed(Locality::Shared), None),
-        (StoragePoolPhaseKind::Ready, Some(Locality::Shared), None)
+        pool_facts(PoolLocality::Agreed(Locality::Shared), None),
+        (Some(Locality::Shared), None)
     );
     assert_eq!(
-        pool_status("nfs", PoolLocality::Unheard, Some(Locality::Shared)),
-        (StoragePoolPhaseKind::Pending, None, None),
+        pool_facts(PoolLocality::Unheard, Some(Locality::Shared)),
+        (None, None),
         "nobody said anything this pass, so nothing is known this pass"
     );
 
-    let (phase, locality, message) = pool_status(
-        "nfs",
+    let (locality, disagreement) = pool_facts(
         PoolLocality::Split {
             other: "manacor",
             other_says: Locality::Shared,
@@ -199,13 +206,36 @@ fn a_verdict_becomes_a_phase_and_keeps_what_was_already_known() {
         },
         Some(Locality::Shared),
     );
-    assert_eq!(phase, StoragePoolPhaseKind::Failed);
     assert_eq!(
         locality,
         Some(Locality::Shared),
         "the better of the two guesses survives; the phase says not to trust it"
     );
-    let message = message.expect("a sentence");
+    assert_eq!(
+        disagreement,
+        Some(controller_api::PoolDisagreement {
+            node: "soller".into(),
+            says: Locality::NodeLocal,
+            other: "manacor".into(),
+            other_says: Locality::Shared,
+        })
+    );
+
+    // And the phase those facts add up to, through the one function that
+    // decides it.
+    let mut pool = pool("bulk", "nfs", &[]);
+    pool.status.locality = locality;
+    pool.status.disagreement = disagreement;
+    pool.settle(Utc::now());
+    assert_eq!(
+        pool.status.phase().kind(),
+        controller_api::StoragePoolPhaseKind::Failed
+    );
+    assert_eq!(
+        pool.status.phase().reason(),
+        Some(controller_api::StoragePoolReason::Disagreement)
+    );
+    let message = pool.status.phase().message().expect("a sentence");
     assert!(
         message.contains("manacor") && message.contains("soller"),
         "{message}"
@@ -213,11 +243,6 @@ fn a_verdict_becomes_a_phase_and_keeps_what_was_already_known() {
     assert!(
         message.contains("shared") && message.contains("node-local"),
         "{message}"
-    );
-    assert!(message.contains("version mix"), "{message}");
-    assert!(
-        message.contains("nfs"),
-        "the driver they disagree about: {message}"
     );
 }
 

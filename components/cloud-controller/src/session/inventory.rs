@@ -269,50 +269,77 @@ pub(super) async fn ingest_pools(
         // makes "do these two describe the same backend" a question with an
         // answer.
         let home = pool.spec.home() == Some(cluster);
-        let Some(reported) = status.pools.iter().find(|p| p.name == pool.metadata.name) else {
+        let reported = status.pools.iter().find(|p| p.name == pool.metadata.name);
+        // D-C11. That the home cluster SPOKE is a fact of its own, and it is
+        // the one nothing recorded: a pointer at a pool nobody made and a
+        // pointer at a cluster that never connected both left the object at
+        // its birth phase with no reason on it, and the chaos run watched one
+        // do that for six minutes. Written before the `continue` below —
+        // which is exactly the path that used to leave no trace at all.
+        let spoke = home
+            && pool
+                .status
+                .pointer_target
+                .as_ref()
+                .map(|p| p.cluster.as_str())
+                != Some(cluster);
+        let Some(reported) = reported else {
             // The cluster does not have a pool of that name. Not an error and
             // not a reason to blank the status: a cloud pool may be written
-            // before the cluster's own is, and the volumes in it stay Pending
-            // with a sentence that says so.
+            // before the cluster's own is. What is new is that the object now
+            // SAYS so — `settle_storage_pool` turns the pointer fact plus the
+            // missing entry into `Pending { ClusterHasNoPool }`.
+            if spoke || pool.status.clusters.iter().any(|e| e.cluster == cluster) {
+                store
+                    .mutate::<controller_api::StoragePool, _>(&pool.metadata.name, |p| {
+                        note_pointer(p, cluster, home);
+                        p.status.clusters.retain(|e| e.cluster != cluster);
+                    })
+                    .await?;
+            }
             continue;
         };
         let entry = pool_entry(cluster, reported);
-        let (phase, locality) = (entry.phase, entry.locality);
-        // A pool has ONE vocabulary: no node ever says a word about one, so
-        // what arrives here is a word this very tier's enum spells and it is
-        // parsed back rather than replaced with the name of the road. Empty
-        // from a cluster that predates the field, which reads as
-        // `Unrecorded` — exactly what the object held before.
-        let (reason, message) =
-            controller_api::StoragePoolReason::read(&reported.reason, entry.message.clone());
-        if pool_unchanged(&pool, home, &entry, reported, reason, message.as_deref()) {
+        let (locality, nodes) = (entry.locality, reported.nodes.clone());
+        if !spoke && pool_unchanged(&pool, home, &entry, reported) {
             continue;
         }
         store
             .mutate::<controller_api::StoragePool, _>(&pool.metadata.name, |p| {
+                note_pointer(p, cluster, home);
                 if home {
                     p.status.locality = locality;
-                    p.status.nodes = reported.nodes.clone();
-                    #[allow(deprecated)]
-                    p.status.assign(controller_api::StoragePoolPhase::new(
-                        phase,
-                        reason,
-                        message.clone(),
-                        chrono::Utc::now(),
-                    ));
+                    p.status.nodes = nodes.clone();
                 }
                 // Each cluster replaces its own entry and no other's — the
                 // same "evidence, whole" rule the node list one field over
-                // follows, applied per reporter.
+                // follows, applied per reporter. The FACT, and nothing else:
+                // what the pointer therefore IS is `settle_storage_pool`.
                 p.status.clusters.retain(|e| e.cluster != cluster);
                 p.status.clusters.push(entry.clone());
                 p.status.clusters.sort_by(|a, b| a.cluster.cmp(&b.cluster));
             })
             .await?;
-        debug!(pool = %pool.metadata.name, cluster, phase = phase.as_str(),
+        debug!(pool = %pool.metadata.name, cluster, phase = entry.phase.as_str(),
                "storage pool observed");
     }
     Ok(())
+}
+
+/// Record that the cluster this pointer names has spoken. See
+/// `StoragePoolStatus::pointer_target`.
+///
+/// Only for the HOME cluster, because that is the one `spec.cluster` points
+/// at and the one `settle_storage_pool` asks about. A second serving cluster
+/// contributes an entry and nothing about the pointer.
+fn note_pointer(pool: &mut controller_api::StoragePool, cluster: &str, home: bool) {
+    if !home {
+        return;
+    }
+    pool.status.pointer_target = Some(controller_api::PoolPointer {
+        cluster: cluster.to_string(),
+        reported_at: chrono::Utc::now(),
+    });
 }
 
 /// What one cluster says about one pool, as the cloud keeps it.
@@ -336,10 +363,24 @@ fn pool_entry(
     controller_api::PoolAtCluster {
         cluster: cluster.to_string(),
         phase: controller_api::StoragePoolPhaseKind::parse(&reported.phase).unwrap_or_default(),
+        // A pool has ONE vocabulary: no node ever says a word about one, so
+        // what arrives here is a word this tier's own enum spells and it is
+        // parsed back rather than replaced with the name of the road it came
+        // down. Empty from a cluster older than the field reads as
+        // `Unrecorded`, which is what the object held before.
+        reason: controller_api::StoragePoolReason::read(
+            &reported.reason,
+            (!reported.message.is_empty()).then(|| reported.message.clone()),
+        )
+        .0,
         locality,
         nodes: reported.nodes.clone(),
         params,
-        message: (!reported.message.is_empty()).then(|| reported.message.clone()),
+        message: controller_api::StoragePoolReason::read(
+            &reported.reason,
+            (!reported.message.is_empty()).then(|| reported.message.clone()),
+        )
+        .1,
     }
 }
 
@@ -350,24 +391,15 @@ fn pool_unchanged(
     home: bool,
     entry: &controller_api::PoolAtCluster,
     reported: &proto::StoragePoolStatusReport,
-    reason: controller_api::StoragePoolReason,
-    message: Option<&str>,
 ) -> bool {
-    // The phase half is compared against what the write WOULD leave behind
-    // and not field by field — see `mirror::observe`: a resting word has no
-    // slot for a reason, and a guard that held the report's word against a
-    // stored `None` would write on every ten-second report.
-    let settled = controller_api::StoragePoolPhase::new(
-        entry.phase,
-        reason,
-        message.map(str::to_string),
-        pool.status.phase().since(),
-    );
+    // Only the FACTS are compared now, and the phase is not among them: it is
+    // derived from exactly these fields, so a write they do not change leaves
+    // it where it was. One thing fewer to keep in step, and the trap it
+    // removes is real — a guard that held a report's reason against a resting
+    // phase's empty slot would write on every ten-second report (D-C7).
     pool.status.clusters.contains(entry)
         && (!home
-            || (*pool.status.phase() == settled
-                && pool.status.locality == entry.locality
-                && pool.status.nodes == reported.nodes))
+            || (pool.status.locality == entry.locality && pool.status.nodes == reported.nodes))
 }
 
 /// The same road as `ingest_volumes`, one object over, with the one hop more

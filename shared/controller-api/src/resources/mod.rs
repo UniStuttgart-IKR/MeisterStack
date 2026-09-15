@@ -142,7 +142,14 @@ resources! {
     /// The storage side of the same shape the network side has: what EXISTS
     /// is an administrator's decision, and taking room out of it is
     /// self-service inside a quota. See `StoragePoolSpec`.
-    StoragePool => "storagepools", "StoragePool";
+    StoragePool => "storagepools", "StoragePool" {
+        /// What the nodes — or the cluster this pointer names — have said.
+        /// See [`settle_storage_pool`].
+        fn settle(&mut self, now: DateTime<Utc>) {
+            let phase = settle_storage_pool(&self.metadata.name, &self.spec, &self.status);
+            self.status.stamp(phase, now);
+        }
+    };
     /// A volume with a life of its own — the object that lets a disk outlive
     /// the VM that was using it. See `VolumeSpec`.
     Volume => "volumes", "Volume";

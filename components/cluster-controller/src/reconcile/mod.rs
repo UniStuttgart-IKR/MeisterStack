@@ -26,8 +26,8 @@ use chrono::{DateTime, Utc};
 use controller_api::{
     Candidate, CandidateKind, Capacity, EtcdStore, Lifecycle, Locality, Node, Overcommit,
     PassTrigger, PendingReason, PendingTally, RequeuePolicy, Resource, RunStrategy, Scheduler,
-    StoragePool, StoragePoolPhaseKind, StoreError, Vm, VmPhase, VmPhaseKind, Volume, VolumeBinding,
-    VolumePhaseKind, VolumeSnapshot, VolumeSnapshotPhaseKind, heartbeat_expired, lifecycle_command,
+    StoragePool, StoreError, Vm, VmPhase, VmPhaseKind, Volume, VolumeBinding, VolumePhaseKind,
+    VolumeSnapshot, VolumeSnapshotPhaseKind, heartbeat_expired, lifecycle_command,
     scheduler::{StoragePolicy, feasible_for_storage, storage_pending_reason},
 };
 use proto::command;

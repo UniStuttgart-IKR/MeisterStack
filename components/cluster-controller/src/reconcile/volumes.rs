@@ -119,40 +119,45 @@ pub(super) fn pool_locality<'a>(
     }
 }
 
-/// The verdict as the three status fields, given what the pool already said.
+/// The verdict as the FACTS it puts on the pool. What phase those facts add
+/// up to is `controller_api::settle_storage_pool`, one place for both tiers.
 ///
-/// Where the sentence is written, once, so that the rule above stays a rule
-/// and its tests assert on values.
-pub(super) fn pool_status(
-    driver: &str,
+/// It used to return the phase and the sentence as well. It returns neither
+/// now, and that is the whole shape of this round: a pass writes down what it
+/// found out, the derivation says what the object therefore IS. Two things
+/// followed from it here — the sentence about a version mix is written once,
+/// in the crate both tiers share, and a disagreement is DATA (`node`,
+/// `says`, `other`, `other_says`) rather than prose, so the test asserts on
+/// four names instead of on a string.
+pub(super) fn pool_facts(
     verdict: PoolLocality<'_>,
     previous: Option<Locality>,
-) -> (StoragePoolPhaseKind, Option<Locality>, Option<String>) {
+) -> (Option<Locality>, Option<controller_api::PoolDisagreement>) {
     match verdict {
-        PoolLocality::Agreed(l) => (StoragePoolPhaseKind::Ready, Some(l), None),
-        // NOT Failed: a pool whose nodes are all down, or all older than the
-        // field, is a pool nothing is known about, and placement falls back
-        // to the soft preference it always had.
-        PoolLocality::Unheard => (StoragePoolPhaseKind::Pending, None, None),
+        PoolLocality::Agreed(l) => (Some(l), None),
+        // Nobody said anything, and that is not a disagreement: a pool whose
+        // nodes are all down, or all older than the field, is a pool nothing
+        // is known about, and placement falls back to the soft preference it
+        // always had.
+        PoolLocality::Unheard => (None, None),
         // The locality is deliberately KEPT on a disagreement: what was
         // learned before the version mix is still the better guess of the
-        // two, and the phase beside it is what says not to trust it. Dropping
-        // it would turn one bad agent into "this pool's shape is unknown",
-        // which is a worse statement than the one it replaces.
+        // two, and the phase derived beside it is what says not to trust it.
+        // Dropping it would turn one bad agent into "this pool's shape is
+        // unknown", which is a worse statement than the one it replaces.
         PoolLocality::Split {
             node,
             says,
             other,
             other_says,
         } => (
-            StoragePoolPhaseKind::Failed,
             previous,
-            Some(format!(
-                "nodes disagree about storage driver {driver}: {other} says {}, {node} says {}; \
-                 that is a version mix, not a setting",
-                other_says.as_str(),
-                says.as_str()
-            )),
+            Some(controller_api::PoolDisagreement {
+                node: node.to_string(),
+                says,
+                other: other.to_string(),
+                other_says,
+            }),
         ),
     }
 }
@@ -167,39 +172,23 @@ pub(super) async fn write_pool_status(
     pool: &StoragePool,
     verdict: PoolLocality<'_>,
 ) -> anyhow::Result<()> {
-    let (phase, locality, message) = pool_status(&pool.spec.driver, verdict, pool.status.locality);
-    if pool.status.phase().kind() == phase
-        && pool.status.locality == locality
-        && pool.status.phase().message() == message.as_deref()
-    {
+    let (locality, disagreement) = pool_facts(verdict, pool.status.locality);
+    if pool.status.locality == locality && pool.status.disagreement == disagreement {
         return Ok(());
     }
-    if phase == StoragePoolPhaseKind::Failed {
-        warn!(pool = %pool.metadata.name,
-              reason = %message.clone().unwrap_or_default(),
-              "storage pool is inconsistent");
-    } else {
-        info!(pool = %pool.metadata.name, phase = phase.as_str(),
-              locality = locality.map(|l| l.as_str()).unwrap_or("unknown"),
-              "storage pool status");
+    match &disagreement {
+        Some(split) => warn!(pool = %pool.metadata.name, node = %split.node,
+                             says = split.says.as_str(), other = %split.other,
+                             other_says = split.other_says.as_str(),
+                             "storage pool is inconsistent"),
+        None => info!(pool = %pool.metadata.name,
+                      locality = locality.map(|l| l.as_str()).unwrap_or("unknown"),
+                      "storage pool locality"),
     }
     store
         .mutate::<StoragePool, _>(&pool.metadata.name, |p| {
             p.status.locality = locality;
-            // `Failed` here is one thing only — see `reconcile_pools`: two
-            // binaries of different ages on one pool. `Pending` is nobody
-            // having said anything yet.
-            let reason = match phase {
-                StoragePoolPhaseKind::Failed => controller_api::StoragePoolReason::Disagreement,
-                _ => controller_api::StoragePoolReason::AwaitingNode,
-            };
-            #[allow(deprecated)]
-            p.status.assign(controller_api::StoragePoolPhase::new(
-                phase,
-                reason,
-                message.clone(),
-                Utc::now(),
-            ));
+            p.status.disagreement = disagreement.clone();
         })
         .await?;
     Ok(())

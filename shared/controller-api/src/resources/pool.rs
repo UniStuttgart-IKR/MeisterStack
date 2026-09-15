@@ -229,6 +229,14 @@ pub struct PoolAtCluster {
     pub cluster: String,
     #[serde(default)]
     pub phase: StoragePoolPhaseKind,
+    /// And WHY, in the same closed word the cluster derived it with — a pool
+    /// has one vocabulary because no node ever says anything about one, so
+    /// this travels up and back into the same enum unchanged.
+    ///
+    /// `Unrecorded` from a cluster older than the field, which is what a
+    /// `Ready` also carries: a pool that holds together has nothing to add.
+    #[serde(default, skip_serializing_if = "is_unrecorded_pool_reason")]
+    pub reason: StoragePoolReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locality: Option<Locality>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -309,6 +317,59 @@ pub struct StoragePoolStatus {
     /// what, and whether the two are describing the same bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clusters: Vec<PoolAtCluster>,
+    /// Two nodes of this pool that say different things about its driver —
+    /// the CLUSTER tier's one way to be `Failed`.
+    ///
+    /// Data and not a sentence, because it is a fact and the sentence is a
+    /// derivation: `settle_storage_pool` writes the prose, so there is one
+    /// wording of it and a test can assert on the four names rather than on a
+    /// string. Locality is compiled into a driver, so this cannot be a
+    /// setting — it is two binaries of different ages on one pool.
+    ///
+    /// `None` on every healthy pool and on every pool at the cloud, which has
+    /// no nodes of its own to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disagreement: Option<PoolDisagreement>,
+    /// Whether the cluster this pointer names has said anything AT ALL — the
+    /// cloud tier's own fact, and the whole of D-C11.
+    ///
+    /// A pool at the cloud is a pointer at a pool an admin made down there,
+    /// and a pointer can be wrong in two ways that look identical from the
+    /// object: the cluster has never connected, or it has and has no pool of
+    /// that name. Both left the object at its birth phase — `Pending`, no
+    /// reason — and the chaos run watched one stand there for six minutes
+    /// without saying which half was missing. `status.clusters` answers the
+    /// second question (an entry exists, or it does not); this answers the
+    /// first.
+    ///
+    /// `None` means no report from the named cluster has ever been ingested.
+    /// It is deliberately NOT cleared when a cluster goes quiet again: a
+    /// mirrored object keeps the last word it was told, like every other
+    /// mirror in this tree, and how long it has stood is what the stuck
+    /// deadline reports (see `stuck`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer_target: Option<PoolPointer>,
+}
+
+/// Two nodes of one pool that do not agree about its driver.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PoolDisagreement {
+    pub node: String,
+    pub says: Locality,
+    pub other: String,
+    pub other_says: Locality,
+}
+
+/// That the cluster a cloud pool points at has spoken.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PoolPointer {
+    /// Which cluster — compared against `spec.home()`, so that repointing a
+    /// pool at another cluster does not read as evidence about the new one.
+    pub cluster: String,
+    /// When it last reported, whether or not it named this pool.
+    pub reported_at: DateTime<Utc>,
 }
 
 reasons! {
@@ -379,3 +440,263 @@ impl StoragePoolPhaseKind {
 /// No finalizer: a pool owns nothing. What keeps it from vanishing under a
 /// volume is the delete handler's refusal, exactly as with a floating pool.
 pub type StoragePool = Object<StoragePoolSpec, StoragePoolStatus>;
+
+fn is_unrecorded_pool_reason(reason: &StoragePoolReason) -> bool {
+    *reason == StoragePoolReason::Unrecorded
+}
+
+/// What a pool's own facts add up to — **one function for both tiers**,
+/// because the type is the same type and a second copy is where the two would
+/// start disagreeing about what `Ready` means.
+///
+/// The tiers are told apart by the spec and not by a flag: `spec.cluster` is
+/// empty at a cluster, always (a cluster IS the process, it has no reference
+/// to itself to write down), and a cloud pool without one is a 422 at the
+/// create edge. So a pool that names a cluster is a POINTER, and one that
+/// does not is the real thing.
+///
+/// **The real thing** is decided by the nodes that can reach it:
+///
+/// * two of them disagree about the driver's locality → `Failed`. It cannot
+///   be a setting — locality is compiled in — so it is two binaries of
+///   different ages, and both machines are named because which two is the
+///   whole of what an operator needs.
+/// * somebody said → `Ready`.
+/// * nobody said → `Pending { AwaitingNode }`. Not `Failed`: a pool whose
+///   nodes are all down is a pool nothing is KNOWN about, and placement falls
+///   back to the soft preference it always had.
+///
+/// **The pointer** is decided by what the cluster it names has said, and this
+/// is D-C11:
+///
+/// * the cluster reported a pool of this name → its own word, relayed.
+/// * it reported and named no such pool → `Pending { ClusterHasNoPool }`.
+/// * it has never reported → `Pending { ClusterSilent }`.
+///
+/// The last two both used to be the object standing at its birth phase with
+/// no reason on it, and the chaos run watched one do that for six minutes.
+/// They are two different mistakes: the first is a name somebody typed
+/// wrongly or a pool nobody made down there, the second is a cluster that is
+/// not talking to this cloud at all.
+pub fn settle_storage_pool(
+    name: &str,
+    spec: &StoragePoolSpec,
+    status: &StoragePoolStatus,
+) -> StoragePoolPhase {
+    if let Some(home) = spec.home() {
+        // A pointer. `status.clusters` is evidence-whole per reporter, so the
+        // home cluster's entry is there exactly while that cluster is saying
+        // it has such a pool.
+        if let Some(entry) = status.clusters.iter().find(|e| e.cluster == home) {
+            return StoragePoolPhase::new(
+                entry.phase,
+                entry.reason,
+                entry.message.clone(),
+                UNSTAMPED,
+            );
+        }
+        let spoken = status
+            .pointer_target
+            .as_ref()
+            .is_some_and(|p| p.cluster == home);
+        return StoragePoolPhase::new(
+            StoragePoolPhaseKind::Pending,
+            if spoken {
+                StoragePoolReason::ClusterHasNoPool
+            } else {
+                StoragePoolReason::ClusterSilent
+            },
+            Some(if spoken {
+                format!("{home} reports no pool named {name}")
+            } else {
+                format!("{home} has not reported")
+            }),
+            UNSTAMPED,
+        );
+    }
+    if let Some(split) = &status.disagreement {
+        return StoragePoolPhase::new(
+            StoragePoolPhaseKind::Failed,
+            StoragePoolReason::Disagreement,
+            Some(format!(
+                "nodes disagree about storage driver {}: {} says {}, {} says {}; \
+                 that is a version mix, not a setting",
+                spec.driver,
+                split.other,
+                split.other_says.as_str(),
+                split.node,
+                split.says.as_str()
+            )),
+            UNSTAMPED,
+        );
+    }
+    match status.locality {
+        Some(_) => StoragePoolPhase::said(StoragePoolPhaseKind::Ready, None, UNSTAMPED),
+        None => StoragePoolPhase::new(
+            StoragePoolPhaseKind::Pending,
+            StoragePoolReason::AwaitingNode,
+            Some(format!(
+                "no node serving {name} has said anything about driver {} yet",
+                spec.driver
+            )),
+            UNSTAMPED,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("an instant")
+    }
+
+    fn pool(cluster: Option<&str>) -> StoragePool {
+        StoragePool::declare(
+            "mc-fs",
+            StoragePoolSpec {
+                driver: "nfs".to_string(),
+                cluster: cluster.unwrap_or_default().to_string(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// D-C11, both halves. A pool at the cloud is a POINTER, and a pointer
+    /// can be wrong in two ways that looked identical from the object:
+    /// `Pending`, no reason, for six minutes.
+    ///
+    /// They are two different mistakes. `ClusterHasNoPool` is a name somebody
+    /// typed wrongly or a pool nobody made down there, and the fix is at the
+    /// cluster. `ClusterSilent` is a cluster that is not talking to this
+    /// cloud at all, and the fix is a session.
+    #[test]
+    fn a_pointer_at_nothing_says_which_half_is_missing() {
+        // Nothing has ever reported.
+        let mut silent = pool(Some("cluster-1"));
+        silent.settle(at(0));
+        assert_eq!(silent.status.phase().kind(), StoragePoolPhaseKind::Pending);
+        assert_eq!(
+            silent.status.phase().reason(),
+            Some(StoragePoolReason::ClusterSilent)
+        );
+        assert_eq!(
+            silent.status.phase().message(),
+            Some("cluster-1 has not reported")
+        );
+
+        // The cluster reported, and has no pool of that name. That is the
+        // half nothing recorded: the ingest used to `continue` and leave the
+        // object exactly as it was.
+        let mut spoke = pool(Some("cluster-1"));
+        spoke.status.pointer_target = Some(PoolPointer {
+            cluster: "cluster-1".to_string(),
+            reported_at: at(0),
+        });
+        spoke.settle(at(10));
+        assert_eq!(
+            spoke.status.phase().reason(),
+            Some(StoragePoolReason::ClusterHasNoPool)
+        );
+        assert_eq!(
+            spoke.status.phase().message(),
+            Some("cluster-1 reports no pool named mc-fs")
+        );
+
+        // And a pointer repointed at another cluster does not read the old
+        // cluster's report as evidence about the new one.
+        let mut moved = pool(Some("cluster-2"));
+        moved.status.pointer_target = Some(PoolPointer {
+            cluster: "cluster-1".to_string(),
+            reported_at: at(0),
+        });
+        moved.settle(at(10));
+        assert_eq!(
+            moved.status.phase().reason(),
+            Some(StoragePoolReason::ClusterSilent)
+        );
+    }
+
+    /// The cluster has such a pool: its own word, relayed and not reworded.
+    /// One vocabulary, so the cloud parses back exactly what the cluster
+    /// derived.
+    #[test]
+    fn a_pointer_at_a_real_pool_carries_the_clusters_own_word() {
+        let mut pointer = pool(Some("cluster-1"));
+        pointer.status.pointer_target = Some(PoolPointer {
+            cluster: "cluster-1".to_string(),
+            reported_at: at(0),
+        });
+        pointer.status.clusters = vec![PoolAtCluster {
+            cluster: "cluster-1".to_string(),
+            phase: StoragePoolPhaseKind::Ready,
+            reason: StoragePoolReason::Unrecorded,
+            locality: Some(Locality::Shared),
+            nodes: vec!["agent-1a".to_string()],
+            params: None,
+            message: None,
+        }];
+        pointer.settle(at(0));
+        assert_eq!(pointer.status.phase().kind(), StoragePoolPhaseKind::Ready);
+
+        // A second serving cluster's entry does not speak for the pointer:
+        // the flat fields are the HOME cluster's answer, and that has not
+        // changed.
+        pointer.status.clusters.push(PoolAtCluster {
+            cluster: "cluster-2".to_string(),
+            phase: StoragePoolPhaseKind::Failed,
+            reason: StoragePoolReason::Disagreement,
+            locality: None,
+            nodes: Vec::new(),
+            params: None,
+            message: Some("two ages".to_string()),
+        });
+        pointer.settle(at(60));
+        assert_eq!(pointer.status.phase().kind(), StoragePoolPhaseKind::Ready);
+        assert_eq!(
+            pointer.status.phase().since(),
+            at(0),
+            "the word did not move"
+        );
+    }
+
+    /// The cluster tier, which has nodes instead of a pointer. Three rows,
+    /// and the order matters: a disagreement is read BEFORE the locality,
+    /// because the locality is deliberately kept through one.
+    #[test]
+    fn a_real_pool_is_what_the_nodes_that_reach_it_say() {
+        let mut unheard = pool(None);
+        unheard.settle(at(0));
+        assert_eq!(unheard.status.phase().kind(), StoragePoolPhaseKind::Pending);
+        assert_eq!(
+            unheard.status.phase().reason(),
+            Some(StoragePoolReason::AwaitingNode)
+        );
+
+        let mut agreed = pool(None);
+        agreed.status.locality = Some(Locality::Shared);
+        agreed.settle(at(0));
+        assert_eq!(agreed.status.phase().kind(), StoragePoolPhaseKind::Ready);
+        assert_eq!(agreed.status.phase().reason(), None, "a resting word");
+
+        let mut split = pool(None);
+        split.status.locality = Some(Locality::Shared);
+        split.status.disagreement = Some(PoolDisagreement {
+            node: "soller".to_string(),
+            says: Locality::NodeLocal,
+            other: "manacor".to_string(),
+            other_says: Locality::Shared,
+        });
+        split.settle(at(0));
+        assert_eq!(
+            split.status.phase().kind(),
+            StoragePoolPhaseKind::Failed,
+            "the disagreement is read before the locality it kept"
+        );
+        assert_eq!(
+            split.status.phase().reason(),
+            Some(StoragePoolReason::Disagreement)
+        );
+    }
+}
