@@ -90,10 +90,14 @@ pub(crate) async fn candidates_for_preview(
 ) -> anyhow::Result<Vec<Candidate>> {
     let now = Utc::now();
     let vms = store.list::<Vm>().await?;
+    // One read for the whole fleet's liveness: the heartbeat lives in its own
+    // key since D-C7, and a LIST of ten nodes must not become eleven round
+    // trips.
+    let beats = store.beats::<Node>().await?;
     let mut out = Vec::new();
     for node in store.list::<Node>().await? {
         let name = node.metadata.name;
-        let ready = node.status.ready && !heartbeat_expired(node.status.last_heartbeat, now);
+        let ready = node.status.ready && !heartbeat_expired(beats.get(&name).copied(), now);
         out.push(Candidate {
             connected: ready,
             // No session map in this listing at all, so the two questions
@@ -142,9 +146,12 @@ pub(super) async fn expire_and_collect_nodes(
     // keep the last one for ever — frozen, and indistinguishable from a node
     // whose heartbeat merely stopped.
     telemetry::metrics::sessions().reset_heartbeats();
+    // The fleet's heartbeats in one read — see `candidates_for_preview`.
+    let beats = store.beats::<Node>().await?;
     for node in store.list::<Node>().await? {
         let name = node.metadata.name;
-        if let Some(last) = node.status.last_heartbeat {
+        let heard = beats.get(&name).copied();
+        if let Some(last) = heard {
             telemetry::metrics::sessions().set_heartbeat_age(
                 telemetry::metrics::PEER_NODE,
                 &name,
@@ -152,12 +159,10 @@ pub(super) async fn expire_and_collect_nodes(
             );
         }
         let mut ready = node.status.ready;
-        if ready && heartbeat_expired(node.status.last_heartbeat, now) {
+        if ready && heartbeat_expired(heard, now) {
             // ISO-8601 UTC rather than the Debug of an Option: the instant
             // is what an operator lines up against everything else in the log.
-            let last = node
-                .status
-                .last_heartbeat
+            let last = heard
                 .map(|t| t.to_rfc3339())
                 .unwrap_or_else(|| "never".to_string());
             warn!(node = %name, last_heartbeat = %last, "heartbeat expired, node not ready");
@@ -199,7 +204,7 @@ pub(super) async fn expire_and_collect_nodes(
         // already down before this existed is answered too, which is the case
         // the lab was actually in.
         if !ready {
-            expire_vm_reports(store, vms, &name, node.status.last_heartbeat, now).await;
+            expire_vm_reports(store, vms, &name, heard, now).await;
         }
         // Read off the object rather than off the Candidate, because a
         // Candidate is what a SCHEDULER sees and a locality is not a
@@ -540,8 +545,11 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     // The reason a previous pass may have written is answered by the binding
     // itself; leaving it would make a placed VM carry the sentence that said
     // it could not be placed — and the category with it.
-    bound.status.message = None;
-    bound.status.pending_reason = None;
+    // Both of them live inside the phase since struktur 4, so one write
+    // answers the sentence and the category together.
+    let kind = bound.status.phase().kind();
+    #[allow(deprecated)]
+    bound.status.assign(VmPhase::of(kind, Utc::now()));
     match p.store.update(&bound).await {
         Ok(_) => {
             telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLUSTER);
@@ -623,15 +631,15 @@ pub(super) async fn volume_bindings(store: &EtcdStore, vm: &Vm) -> anyhow::Resul
             }
             Err(e) => return Err(e.into()),
         };
-        if volume.status.phase != VolumePhase::Ready {
+        if volume.status.phase().kind() != VolumePhaseKind::Ready {
             return Ok(Bindings::NotReady(format!(
                 "volume {name} is {}: {}",
-                volume.status.phase.as_str(),
+                volume.status.phase().kind().as_str(),
                 volume
                     .status
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "waiting for it to be made".to_string())
+                    .phase()
+                    .message()
+                    .unwrap_or("waiting for it to be made")
             )));
         }
         // The pool carries the locality. A pool that has gone missing under a
@@ -668,13 +676,22 @@ pub(super) async fn note_vm_pending(
     reason: String,
 ) -> anyhow::Result<()> {
     debug!(reason = %reason, "vm stays pending");
-    if vm.status.message.as_deref() == Some(reason.as_str()) {
+    if vm.status.phase().message() == Some(reason.as_str()) {
         return Ok(());
     }
     p.store
         .mutate::<Vm, _>(&vm.metadata.name, |v| {
-            v.status.message = Some(reason.clone());
-            v.status.pending_reason = Some(category.as_str().to_string());
+            // The sentence and the category, both inside the phase, and the
+            // phase itself left alone: this pass says why a VM is not placed,
+            // it does not decide what the VM is doing.
+            let kind = v.status.phase().kind();
+            #[allow(deprecated)]
+            v.status.assign(VmPhase::new(
+                kind,
+                category.category(),
+                Some(reason.clone()),
+                Utc::now(),
+            ));
         })
         .await?;
     events::record(

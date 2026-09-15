@@ -148,9 +148,9 @@ def s1():
             f.append(("S1", f"unsatisfiable nodeSelector still placed on {o['spec']['nodeName']}"))
         pr = ((o or {}).get("status") or {}).get("message")
         if not pr:
-            f.append(("S1", f"unsatisfiable nodeSelector: no pendingReason, status={((o or {}).get('status'))}"))
+            f.append(("S1", f"unsatisfiable nodeSelector: no reason, status={((o or {}).get('status'))}"))
         else:
-            log(f"S1 pendingReason={pr}")
+            log(f"S1 reason={pr}")
     # --rm the label again
     node_put(cname, node, lambda o: o["spec"].get("labels", {}).pop("chaos-zone", None))
     c, o = cluster(cname, "GET", f"/nodes/{node}")
@@ -559,9 +559,9 @@ def s11():
     if placed:
         f.append(("F13", f"a VM was placed on {placed} while EVERY node was cordoned"))
     elif not reason:
-        f.append(("F13", f"cordoned-everywhere VM has no pendingReason; status={((o or {}).get('status'))}"))
+        f.append(("F13", f"cordoned-everywhere VM has no reason; status={((o or {}).get('status'))}"))
     else:
-        log(f"F13 pendingReason={reason}")
+        log(f"F13 reason={reason}")
     live_after = {n: running_uids(n) for n in nodes}
     for n in nodes:
         if live_before[n] - live_after[n]:

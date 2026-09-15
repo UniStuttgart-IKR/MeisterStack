@@ -26,7 +26,7 @@
 //! 503 rather than passing it on again.
 
 use anyhow::bail;
-use controller_api::{EtcdStore, Node, StoreError, Vm, VmPhase};
+use controller_api::{EtcdStore, Node, StoreError, Vm, VmPhaseKind};
 use proto::command;
 use tracing::{debug, info};
 
@@ -236,9 +236,9 @@ pub async fn fetch(
 /// a dispatch behind it, so it keeps the 409 with the node's own sentence,
 /// and there the word is right: the node had this VM and lost its record.
 fn never_reached_the_node(vm: &Vm) -> bool {
-    match vm.status.phase {
-        VmPhase::Pending => true,
-        VmPhase::Failed => vm.status.observed_generation == 0,
+    match vm.status.phase().kind() {
+        VmPhaseKind::Pending => true,
+        VmPhaseKind::Failed => vm.status.observed_generation == 0,
         _ => false,
     }
 }
@@ -300,31 +300,33 @@ mod tests {
     /// is not the same as failing to reach somebody.
     #[test]
     fn a_vm_that_was_never_dispatched_has_no_console_rather_than_a_conflict() {
-        let vm = |phase: VmPhase, observed: u64| {
+        let vm = |phase: VmPhaseKind, observed: u64| {
             let mut vm: Vm = serde_json::from_value(serde_json::json!({
                 "apiVersion": "meister.io/v1", "kind": "Vm",
                 "metadata": {"name": "web-1"}, "spec": {"vm": {}},
             }))
             .expect("a vm");
-            vm.status.phase = phase;
+            #[allow(deprecated)]
+            vm.status
+                .assign(controller_api::VmPhase::of(phase, chrono::Utc::now()));
             vm.status.observed_generation = observed;
             vm
         };
 
         // Never dispatched: the phase says so on its own.
-        assert!(never_reached_the_node(&vm(VmPhase::Pending, 0)));
+        assert!(never_reached_the_node(&vm(VmPhaseKind::Pending, 0)));
         // Failed before the create ever left this process.
-        assert!(never_reached_the_node(&vm(VmPhase::Failed, 0)));
+        assert!(never_reached_the_node(&vm(VmPhaseKind::Failed, 0)));
 
         // Failed AFTER a dispatch: the node had it. If it has lost the record
         // now, two truths really do disagree and 409 is the right word.
-        assert!(!never_reached_the_node(&vm(VmPhase::Failed, 1)));
+        assert!(!never_reached_the_node(&vm(VmPhaseKind::Failed, 1)));
         for phase in [
-            VmPhase::Provisioning,
-            VmPhase::Running,
-            VmPhase::Stopped,
-            VmPhase::Paused,
-            VmPhase::Quarantined,
+            VmPhaseKind::Provisioning,
+            VmPhaseKind::Running,
+            VmPhaseKind::Stopped,
+            VmPhaseKind::Paused,
+            VmPhaseKind::Quarantined,
         ] {
             assert!(
                 !never_reached_the_node(&vm(phase, 0)),

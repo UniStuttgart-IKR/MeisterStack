@@ -292,7 +292,7 @@ pub(super) async fn drain_facts(
         // on somewhere to go, which is the same question `migration_refusal`
         // asks at the api edge, answered here against the same fleet the
         // placement is measured against.
-        live_possible: vm.status.phase == VmPhase::Running && live_target,
+        live_possible: vm.status.phase().kind() == VmPhaseKind::Running && live_target,
         live_refusal,
     }))
 }

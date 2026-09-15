@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn the_label_names_are_the_ones_that_are_bounded() {
         // tier: three components. kind: the resource table, or the two peer
-        // kinds. phase: VmPhase::ALL. reason: the pending categories.
+        // kinds. phase: VmPhaseKind::ALL. reason: the pending categories.
         // operation: the store's verbs, or a driver's. driver: what the node
         // has configured. peer: a node or cluster name. result: the store's
         // error variants.

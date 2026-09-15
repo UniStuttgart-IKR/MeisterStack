@@ -39,9 +39,9 @@ use tracing::{debug, error, info, warn};
 use controller_api::events::{self, Happening};
 use controller_api::{
     Ack, Cluster, ClusterSpec, EtcdStore, Observation, Peer, Pending, StoreError, Vm, Volume,
-    VolumePhase,
+    VolumePhase, VolumePhaseKind,
 };
-use controller_api::{EventType, Image, ImagePhase, Resource, VmPhase};
+use controller_api::{EventType, Image, ImagePhaseKind, Resource, VmPhaseKind};
 
 /// Shorter than the agent tier's, and deliberately: a cluster answers a command
 /// with a single store write, so a minute of patience would only mean a minute

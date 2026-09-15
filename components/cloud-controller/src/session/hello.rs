@@ -36,10 +36,13 @@ pub(super) async fn ingest_hello(
         }
     }
     let version = hello.version.clone();
+    // A Hello is a beat: it is the first thing a cluster says on a new
+    // session, and a lease that waited for the first status report would read
+    // as expired for up to ten seconds after connecting (D-C7).
+    store.beat::<Cluster>(name, Utc::now()).await?;
     store
         .mutate::<Cluster, _>(name, |c| {
             c.status.connected = true;
-            c.status.last_heartbeat = Some(Utc::now());
             c.status.version = Some(version.clone());
             // This cluster dialled THIS replica, so this replica is the only
             // one that can ask it anything. Writing where it can be reached

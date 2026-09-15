@@ -27,6 +27,7 @@ pub mod rest;
 pub mod scheduler;
 pub mod secrets;
 pub mod store;
+pub mod stuck;
 pub mod tickets;
 pub mod vm_spec;
 pub mod vni;
@@ -63,20 +64,27 @@ pub use resources::{
     DEFAULT_QUOTA_STORAGE_GIB, DEFAULT_ROUTED_PREFIX_LEN, Draining, Evacuating, Evacuation,
     EvacuationStep, Event, EventSpec, EventType, FloatingIp, FloatingIpSpec, FloatingIpStatus,
     FloatingPool, FloatingPoolSpec, FloatingPoolStatus, Image, ImageFormat, ImageNodeState,
-    ImagePhase, ImageSpec, ImageStatus, IssuedCertificate, LABEL_CLOUD_UID, LABEL_MANAGED_BY,
-    Locality, MANAGED_BY_CLOUD, MachineProfile, NatKind, NatRule, Node, NodeCapacity,
-    NodeCondition, NodeConditionType, NodeSpec, NodeStatus, NodeSummary, PoolAtCluster,
-    ProviderNetwork, ProviderNetworkSpec, ProviderNetworkStatus, Refusal as VmRefusal,
-    RoutedSubnet, RoutedSubnetSpec, RoutedSubnetStatus, Router, RouterPhase, RouterSpec,
-    RouterStatus, RunStrategy, SIGNER_USER_CLIENT, Secret, SecretSpec, StayReason, StayingVm,
-    StoragePool, StoragePoolPhase, StoragePoolSpec, StoragePoolStatus, Tenant, TenantQuota,
-    TenantSpec, TenantStatus, TenantUsage, Ticket, TicketBearer, TicketSpec, User, UserSpec,
-    UserStatus, VOLUME_RELEASE_FINALIZER, Vm, VmAddress, VmAddressKind, VmMigration,
-    VmMigrationPhase, VmMigrationSpec, VmMigrationStatus, VmPhase, VmSpec, VmStatus, Volume,
-    VolumeAttachmentStatus, VolumeMode, VolumePhase, VolumeSnapshot, VolumeSnapshotPhase,
-    VolumeSnapshotSpec, VolumeSnapshotStatus, VolumeSpec, VolumeStatus, accepts_class,
-    cluster_accepts, frozen_vm_shape, grows_only, live_migration_refusal, new_volume,
-    new_volume_snapshot, same_tenancy, second_open_is_a_migration, unbind_only, vm_shape_unchanged,
+    ImagePhase, ImagePhaseKind, ImageReason, ImageSpec, ImageStatus, IssuedCertificate,
+    LABEL_CLOUD_UID, LABEL_MANAGED_BY, Locality, MANAGED_BY_CLOUD, MachineProfile, NatKind,
+    NatRule, Node, NodeCapacity, NodeCondition, NodeConditionType, NodeSpec, NodeStatus,
+    NodeSummary, PoolAtCluster, ProviderNetwork, ProviderNetworkSpec, ProviderNetworkStatus,
+    Refusal as VmRefusal, RoutedSubnet, RoutedSubnetSpec, RoutedSubnetStatus, Router, RouterPhase,
+    RouterPhaseKind, RouterReason, RouterSpec, RouterStatus, RunStrategy, SIGNER_USER_CLIENT,
+    Secret, SecretSpec, StayReason, StayingVm, StoragePool, StoragePoolPhase, StoragePoolPhaseKind,
+    StoragePoolReason, StoragePoolSpec, StoragePoolStatus, Tenant, TenantQuota, TenantSpec,
+    TenantStatus, TenantUsage, Ticket, TicketBearer, TicketSpec, User, UserSpec, UserStatus,
+    VOLUME_RELEASE_FINALIZER, Vm, VmAddress, VmAddressKind, VmMigration, VmMigrationPhase,
+    VmMigrationPhaseKind, VmMigrationReason, VmMigrationSpec, VmMigrationStatus, VmPhase,
+    VmPhaseKind, VmReason, VmSpec, VmStatus, Volume, VolumeAttachmentStatus, VolumeMode,
+    VolumePhase, VolumePhaseKind, VolumeReason, VolumeSnapshot, VolumeSnapshotPhase,
+    VolumeSnapshotPhaseKind, VolumeSnapshotReason, VolumeSnapshotSpec, VolumeSnapshotStatus,
+    VolumeSpec, VolumeStatus, accepts_class, cluster_accepts, frozen_vm_shape, grows_only,
+    live_migration_refusal, new_volume, new_volume_snapshot, same_tenancy,
+    second_open_is_a_migration, unbind_only, vm_shape_unchanged,
+};
+pub use resources::{
+    ImagePhaseWire, RouterPhaseWire, StoragePoolPhaseWire, UNSTAMPED, VmMigrationPhaseWire,
+    VmPhaseWire, VolumePhaseWire, VolumeSnapshotPhaseWire,
 };
 pub use rest::{
     ApiConfig, ApiError, ApiResource, AuthState, Caller, CallerRole, CallerTenant, DISCOVERY_PATH,
@@ -94,3 +102,6 @@ pub use scheduler::{
     volume_pending_reason,
 };
 pub use store::{EtcdStore, PassTrigger, StoreError};
+pub use stuck::{
+    STUCK_AFTER_PENDING, STUCK_AFTER_PROVISIONING, STUCK_AFTER_UNKNOWN, stuck, stuck_after,
+};

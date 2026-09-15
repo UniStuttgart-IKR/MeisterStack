@@ -414,27 +414,27 @@ fn what_a_node_says_about_its_machine_arrives_as_the_object_says_it() {
 /// say.
 #[test]
 fn a_healthy_node_says_ready_and_the_tier_above_knows_which_kind_of_ready() {
-    use controller_api::RouterPhase;
+    use controller_api::RouterPhaseKind;
 
     // The same word, two answers, and which one it is is the CONTROLLER's
     // decision and not the node's.
     assert_eq!(
         super::ingest::observed_phase(proto::ROUTER_READY, true),
-        Some(RouterPhase::Active)
+        Some(RouterPhaseKind::Active)
     );
     assert_eq!(
         super::ingest::observed_phase(proto::ROUTER_READY, false),
-        Some(RouterPhase::Standby)
+        Some(RouterPhaseKind::Standby)
     );
     // Broken is broken on either machine, and it is the one report a standby
     // is listened to for at all.
     assert_eq!(
         super::ingest::observed_phase(proto::ROUTER_FAILED, false),
-        Some(RouterPhase::Failed)
+        Some(RouterPhaseKind::Failed)
     );
     assert_eq!(
         super::ingest::observed_phase(proto::ROUTER_FAILED, true),
-        Some(RouterPhase::Failed)
+        Some(RouterPhaseKind::Failed)
     );
     // And a word from a road nobody has written yet is refused rather than
     // defaulted — the same rule the rest of this session follows.
@@ -501,4 +501,90 @@ async fn a_router_the_list_does_not_name_this_second_is_not_an_orphan() {
     // them when it passes the report on.
     assert!(mine.routers[0].node.is_empty());
     assert!(mine.routers[0].nodes.is_empty());
+}
+
+/// D-C7: two heartbeats that say the same thing are ONE write, and it is the
+/// lease.
+///
+/// The number that made this a defect: twelve PUTs in a twenty-second watch
+/// on a lab where nobody was doing anything, every one of them a whole `Node`
+/// object — `machine.cpuFlags` and all, about 1.5 kB — rewritten because
+/// `lastHeartbeat` had moved 108 ms. 1.13 etcd revisions a second at idle,
+/// 8.3 MB an hour, and a fleet that fills its own quota in six days.
+///
+/// So this is the rule in one assertion: what decides whether the OBJECT is
+/// written is `ready`, `capacity`, `vms` and `conditions` — and never the
+/// beat. The beat is a key of its own (`store.beat`), written every time,
+/// about sixty bytes.
+#[test]
+fn a_second_heartbeat_that_says_the_same_thing_writes_no_node_revision() {
+    use super::ingest::{NodeFacts, node_facts_are_news};
+
+    let facts = |vcpus: u32, mem_mib: u64, vms: u32, conditions: &[&str]| NodeFacts {
+        vcpus,
+        mem_mib,
+        vms,
+        conditions: Some(
+            conditions
+                .iter()
+                .map(|t| controller_api::NodeCondition {
+                    type_: (*t).to_string(),
+                    message: String::new(),
+                })
+                .collect(),
+        ),
+    };
+
+    // A node nobody has heard from: the first report is news, because `ready`
+    // is what it changes.
+    let mut node = Node::declare("agent-1c", controller_api::NodeSpec::default());
+    assert!(
+        node_facts_are_news(&node.status, &facts(8, 16384, 3, &[])),
+        "the first report of a node makes it ready"
+    );
+
+    // What that report left behind.
+    node.status.ready = true;
+    node.status.vms = 3;
+    node.status.capacity.vcpus = 8;
+    node.status.capacity.mem_mib = 16384;
+
+    // And the second, identical one: nothing. This is the whole of D-C7 —
+    // ten seconds later, the same machine, the same guests, no revision.
+    assert!(
+        !node_facts_are_news(&node.status, &facts(8, 16384, 3, &[])),
+        "the same report twice is one write"
+    );
+
+    // Each of the four facts on its own is still news, because each of them
+    // is something an operator or a scheduler acts on.
+    assert!(node_facts_are_news(&node.status, &facts(8, 16384, 4, &[])));
+    assert!(node_facts_are_news(&node.status, &facts(16, 16384, 3, &[])));
+    assert!(node_facts_are_news(&node.status, &facts(8, 32768, 3, &[])));
+    assert!(
+        node_facts_are_news(&node.status, &facts(8, 16384, 3, &["DiskPressure"])),
+        "a node saying its disk is full is news whatever else stayed the same"
+    );
+
+    // A report with no `node` block says nothing about health, and a `None`
+    // must not be read as "nothing is wrong": that shape is the
+    // heartbeat-only report an agent sends when it could not read its own
+    // state, and a write here would clear a veto on the strength of a
+    // failure.
+    node.status.conditions = vec![controller_api::NodeCondition {
+        type_: "DiskPressure".into(),
+        message: "no room in /var".into(),
+    }];
+    assert!(
+        !node_facts_are_news(
+            &node.status,
+            &NodeFacts {
+                vcpus: 8,
+                mem_mib: 16384,
+                vms: 3,
+                conditions: None,
+            }
+        ),
+        "silence about health leaves the list alone and writes nothing"
+    );
 }

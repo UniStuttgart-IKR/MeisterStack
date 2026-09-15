@@ -12,7 +12,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::resources::{RunStrategy, VmPhase};
+use crate::resources::{RunStrategy, VmPhaseKind};
 
 /// A runtime transition the node has to be told about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,17 +33,17 @@ pub enum Lifecycle {
 /// agent's own backoff doing its job; Quarantined exists precisely so that
 /// nothing automatic touches the VM. All four converge to a stable phase or
 /// to a human, and the drift is decided then.
-pub fn lifecycle_command(strategy: RunStrategy, phase: VmPhase) -> Option<Lifecycle> {
+pub fn lifecycle_command(strategy: RunStrategy, phase: VmPhaseKind) -> Option<Lifecycle> {
     Some(match (strategy, phase) {
-        (RunStrategy::Running, VmPhase::Stopped) => Lifecycle::Start,
-        (RunStrategy::Running, VmPhase::Paused) => Lifecycle::Resume,
-        (RunStrategy::Stopped, VmPhase::Running) => Lifecycle::Stop,
-        (RunStrategy::Stopped, VmPhase::Paused) => Lifecycle::Stop,
-        (RunStrategy::Paused, VmPhase::Running) => Lifecycle::Pause,
+        (RunStrategy::Running, VmPhaseKind::Stopped) => Lifecycle::Start,
+        (RunStrategy::Running, VmPhaseKind::Paused) => Lifecycle::Resume,
+        (RunStrategy::Stopped, VmPhaseKind::Running) => Lifecycle::Stop,
+        (RunStrategy::Stopped, VmPhaseKind::Paused) => Lifecycle::Stop,
+        (RunStrategy::Paused, VmPhaseKind::Running) => Lifecycle::Pause,
         // Not Start: the command names the intent, and the agent's own plan
         // goes from stopped to paused in one pass (start, then pause).
         // Sending Start would leave the node believing Running.
-        (RunStrategy::Paused, VmPhase::Stopped) => Lifecycle::Pause,
+        (RunStrategy::Paused, VmPhaseKind::Stopped) => Lifecycle::Pause,
         _ => return None,
     })
 }
@@ -61,7 +61,7 @@ pub fn lifecycle_command(strategy: RunStrategy, phase: VmPhase) -> Option<Lifecy
 /// refused, with the advice to do what had already been done:
 ///
 /// ```text
-/// $ meister vm get mc-r1 -o json | jq -r '.spec.runStrategy, .status.phase'
+/// $ meister vm get mc-r1 -o json | jq -r '.spec.runStrategy, .status.phase().kind()'
 /// Stopped
 /// Failed
 /// $ meister vm reschedule mc-r1
@@ -83,9 +83,12 @@ pub fn lifecycle_command(strategy: RunStrategy, phase: VmPhase) -> Option<Lifecy
 /// would be two VMMs on one disk the moment the old one is resumed.
 /// `Pending` and `Provisioning` are a pass in flight, and `Quarantined` is
 /// deliberately nobody's to touch.
-pub fn stopped_enough(strategy: RunStrategy, phase: VmPhase) -> bool {
+pub fn stopped_enough(strategy: RunStrategy, phase: VmPhaseKind) -> bool {
     strategy == RunStrategy::Stopped
-        && matches!(phase, VmPhase::Stopped | VmPhase::Failed | VmPhase::Unknown)
+        && matches!(
+            phase,
+            VmPhaseKind::Stopped | VmPhaseKind::Failed | VmPhaseKind::Unknown
+        )
 }
 
 /// Why not, in the words the two halves need to be told apart.
@@ -95,7 +98,7 @@ pub fn stopped_enough(strategy: RunStrategy, phase: VmPhase) -> bool {
 /// `RUN Stopped` while the phase is still `Running`, and being told to do
 /// what you have done is how an operator concludes the API is broken. The two
 /// cases are different waits: one is on a person, the other is on a guest.
-pub fn not_stopped_enough(strategy: RunStrategy, phase: VmPhase) -> String {
+pub fn not_stopped_enough(strategy: RunStrategy, phase: VmPhaseKind) -> String {
     match strategy {
         RunStrategy::Stopped => format!(
             "this vm has been told to stop and is still {}; wait for it to come to rest, then \
@@ -150,13 +153,13 @@ impl Holder {
 /// holder's OWN word that the guest is not running, which is evidence. Only
 /// `Unknown` is an absence of evidence.
 pub fn unknown_needs_its_holder(
-    phase: VmPhase,
+    phase: VmPhaseKind,
     holder: Holder,
     name: &str,
     last_heartbeat: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Option<String> {
-    if phase != VmPhase::Unknown {
+    if phase != VmPhaseKind::Unknown {
         return None;
     }
     if !crate::heartbeat_expired(last_heartbeat, now) {
@@ -195,24 +198,28 @@ mod tests {
     fn a_reschedule_takes_every_phase_that_is_not_a_promise_about_a_guest() {
         use RunStrategy::*;
         // Stopped enough: nothing is claiming this guest runs.
-        for phase in [VmPhase::Stopped, VmPhase::Failed, VmPhase::Unknown] {
+        for phase in [
+            VmPhaseKind::Stopped,
+            VmPhaseKind::Failed,
+            VmPhaseKind::Unknown,
+        ] {
             assert!(stopped_enough(Stopped, phase), "{phase:?}");
         }
         // And not: a paused guest holds its memory and its disks, a pass is
         // in flight, or the VM is deliberately nobody's.
         for phase in [
-            VmPhase::Running,
-            VmPhase::Paused,
-            VmPhase::Pending,
-            VmPhase::Provisioning,
-            VmPhase::Quarantined,
+            VmPhaseKind::Running,
+            VmPhaseKind::Paused,
+            VmPhaseKind::Pending,
+            VmPhaseKind::Provisioning,
+            VmPhaseKind::Quarantined,
         ] {
             assert!(!stopped_enough(Stopped, phase), "{phase:?}");
         }
         // The intent half is unchanged and unconditional: nobody moves a VM
         // somebody still wants running, whatever it is doing.
         for strategy in [Running, Paused] {
-            for phase in VmPhase::ALL {
+            for phase in VmPhaseKind::ALL {
                 assert!(!stopped_enough(strategy, phase), "{strategy:?} {phase:?}");
             }
         }
@@ -233,24 +240,30 @@ mod tests {
         // Silent: refused, and the sentence carries the four things a person
         // needs — who is silent, since when, what may still be running, and
         // the two ways out.
-        let why =
-            unknown_needs_its_holder(VmPhase::Unknown, Holder::Node, "agent-1a", Some(at(0)), now)
-                .expect("a silent node refuses");
+        let why = unknown_needs_its_holder(
+            VmPhaseKind::Unknown,
+            Holder::Node,
+            "agent-1a",
+            Some(at(0)),
+            now,
+        )
+        .expect("a silent node refuses");
         assert!(why.contains("node agent-1a"), "{why}");
         assert!(why.contains(&at(0).to_rfc3339()), "{why}");
         assert!(why.contains("may still be running"), "{why}");
         assert!(why.contains("drain the node"), "{why}");
 
         // Never heard from at all is the same refusal, said honestly.
-        let never = unknown_needs_its_holder(VmPhase::Unknown, Holder::Node, "agent-1a", None, now)
-            .expect("a node that never reported refuses");
+        let never =
+            unknown_needs_its_holder(VmPhaseKind::Unknown, Holder::Node, "agent-1a", None, now)
+                .expect("a node that never reported refuses");
         assert!(never.contains("has never reported"), "{never}");
 
         // Talking: allowed. The holder can be asked to stop the guest, which
         // is the whole difference.
         assert_eq!(
             unknown_needs_its_holder(
-                VmPhase::Unknown,
+                VmPhaseKind::Unknown,
                 Holder::Node,
                 "agent-1a",
                 Some(at(1_000)),
@@ -261,8 +274,8 @@ mod tests {
 
         // Every other phase is untouched, `Failed` above all: that is the
         // holder's OWN word that the guest is not running, which is evidence.
-        for phase in VmPhase::ALL {
-            if phase == VmPhase::Unknown {
+        for phase in VmPhaseKind::ALL {
+            if phase == VmPhaseKind::Unknown {
                 continue;
             }
             assert_eq!(
@@ -274,9 +287,14 @@ mod tests {
 
         // One rule, two tiers: the cloud asks it about a cluster and gets the
         // same shape with the other noun.
-        let up =
-            unknown_needs_its_holder(VmPhase::Unknown, Holder::Cluster, "cluster-1", None, now)
-                .expect("a silent cluster refuses too");
+        let up = unknown_needs_its_holder(
+            VmPhaseKind::Unknown,
+            Holder::Cluster,
+            "cluster-1",
+            None,
+            now,
+        )
+        .expect("a silent cluster refuses too");
         assert!(up.contains("cluster cluster-1"), "{up}");
         assert!(up.contains("drain the cluster"), "{up}");
     }
@@ -295,11 +313,11 @@ mod tests {
     fn the_refusal_says_which_of_the_two_waits_this_is() {
         // Told to stop, still stopping: the wait is on the guest, and telling
         // an operator to stop it again is telling them to do what they did.
-        let waiting = not_stopped_enough(RunStrategy::Stopped, VmPhase::Running);
+        let waiting = not_stopped_enough(RunStrategy::Stopped, VmPhaseKind::Running);
         assert!(waiting.contains("has been told to stop"), "{waiting}");
         assert!(!waiting.contains("stop it first"), "{waiting}");
         // Nobody has asked for it to stop at all: the wait is on a person.
-        let unasked = not_stopped_enough(RunStrategy::Running, VmPhase::Running);
+        let unasked = not_stopped_enough(RunStrategy::Running, VmPhaseKind::Running);
         assert!(unasked.contains("runStrategy to Stopped"), "{unasked}");
     }
 
@@ -308,17 +326,17 @@ mod tests {
         use Lifecycle::*;
         use RunStrategy::*;
         let cases = [
-            (Running, VmPhase::Running, None),
-            (Running, VmPhase::Stopped, Some(Start)),
-            (Running, VmPhase::Paused, Some(Resume)),
-            (Stopped, VmPhase::Stopped, None),
-            (Stopped, VmPhase::Running, Some(Stop)),
-            (Stopped, VmPhase::Paused, Some(Stop)),
-            (Paused, VmPhase::Paused, None),
-            (Paused, VmPhase::Running, Some(Pause)),
+            (Running, VmPhaseKind::Running, None),
+            (Running, VmPhaseKind::Stopped, Some(Start)),
+            (Running, VmPhaseKind::Paused, Some(Resume)),
+            (Stopped, VmPhaseKind::Stopped, None),
+            (Stopped, VmPhaseKind::Running, Some(Stop)),
+            (Stopped, VmPhaseKind::Paused, Some(Stop)),
+            (Paused, VmPhaseKind::Paused, None),
+            (Paused, VmPhaseKind::Running, Some(Pause)),
             // Pause, not Start: the agent's plan starts it and pauses it in
             // the same pass, and Start would name the wrong intent.
-            (Paused, VmPhase::Stopped, Some(Pause)),
+            (Paused, VmPhaseKind::Stopped, Some(Pause)),
         ];
         for (strategy, phase, expected) in cases {
             assert_eq!(
@@ -338,7 +356,7 @@ mod tests {
         let mut cells = 0usize;
         let mut commanded = 0usize;
         for strategy in RunStrategy::ALL {
-            for phase in VmPhase::ALL {
+            for phase in VmPhaseKind::ALL {
                 cells += 1;
                 if lifecycle_command(strategy, phase).is_some() {
                     commanded += 1;
@@ -347,7 +365,7 @@ mod tests {
         }
         assert_eq!(
             cells,
-            RunStrategy::ALL.len() * VmPhase::ALL.len(),
+            RunStrategy::ALL.len() * VmPhaseKind::ALL.len(),
             "the cross product is not the size it was"
         );
         // Six drifted pairs get a command: the 3 x 3 stable block minus the
@@ -365,7 +383,7 @@ mod tests {
     #[test]
     fn a_command_is_never_a_race_and_never_a_no_op() {
         for strategy in RunStrategy::ALL {
-            for phase in VmPhase::ALL {
+            for phase in VmPhaseKind::ALL {
                 let Some(action) = lifecycle_command(strategy, phase) else {
                     continue;
                 };
@@ -375,9 +393,9 @@ mod tests {
                 );
                 let already_there = matches!(
                     (strategy, phase),
-                    (RunStrategy::Running, VmPhase::Running)
-                        | (RunStrategy::Stopped, VmPhase::Stopped)
-                        | (RunStrategy::Paused, VmPhase::Paused)
+                    (RunStrategy::Running, VmPhaseKind::Running)
+                        | (RunStrategy::Stopped, VmPhaseKind::Stopped)
+                        | (RunStrategy::Paused, VmPhaseKind::Paused)
                 );
                 assert!(
                     !already_there,
@@ -393,12 +411,16 @@ mod tests {
     #[test]
     fn every_stable_disagreement_gets_one() {
         for strategy in RunStrategy::ALL {
-            for phase in [VmPhase::Running, VmPhase::Stopped, VmPhase::Paused] {
+            for phase in [
+                VmPhaseKind::Running,
+                VmPhaseKind::Stopped,
+                VmPhaseKind::Paused,
+            ] {
                 let agrees = matches!(
                     (strategy, phase),
-                    (RunStrategy::Running, VmPhase::Running)
-                        | (RunStrategy::Stopped, VmPhase::Stopped)
-                        | (RunStrategy::Paused, VmPhase::Paused)
+                    (RunStrategy::Running, VmPhaseKind::Running)
+                        | (RunStrategy::Stopped, VmPhaseKind::Stopped)
+                        | (RunStrategy::Paused, VmPhaseKind::Paused)
                 );
                 assert_eq!(
                     lifecycle_command(strategy, phase).is_some(),
@@ -415,10 +437,10 @@ mod tests {
         // backoff is retrying. Quarantined: the state that exists so nothing
         // automatic touches the VM.
         for phase in [
-            VmPhase::Pending,
-            VmPhase::Provisioning,
-            VmPhase::Failed,
-            VmPhase::Quarantined,
+            VmPhaseKind::Pending,
+            VmPhaseKind::Provisioning,
+            VmPhaseKind::Failed,
+            VmPhaseKind::Quarantined,
         ] {
             for strategy in [
                 RunStrategy::Running,

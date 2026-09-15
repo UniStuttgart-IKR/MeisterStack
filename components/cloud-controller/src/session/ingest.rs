@@ -95,28 +95,34 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
                   "router status from a cluster it is not bound to");
             continue;
         }
-        let Some(phase) = controller_api::RouterPhase::parse(&reported.phase) else {
+        let Some(phase) = controller_api::RouterPhaseKind::parse(&reported.phase) else {
             warn!(router = %router.metadata.name, phase = %reported.phase,
                   "unknown router phase from cluster");
             continue;
         };
         let message = (!reported.message.is_empty()).then(|| reported.message.clone());
-        if router.status.phase == phase
-            && router.status.message == message
+        if router.status.phase().kind() == phase
+            && router.status.phase().message() == message.as_deref()
             && router.status.active_node == reported.node
             && router.status.nodes == reported.nodes
         {
             continue;
         }
         let name = router.metadata.name.clone();
-        let was = router.status.phase;
+        let now = chrono::Utc::now();
+        let was = router.status.phase().kind();
         let active_was = router.status.active_node.clone();
         let tenant = router.spec.tenant.clone();
         let uid = router.metadata.uid.clone();
         let result = store
             .mutate::<controller_api::Router, _>(&name, |r| {
-                r.status.phase = phase;
-                r.status.message = message.clone();
+                #[allow(deprecated)]
+                r.status.assign(controller_api::RouterPhase::new(
+                    phase,
+                    controller_api::RouterReason::Reported,
+                    message.clone(),
+                    now,
+                ));
                 r.status.active_node = reported.node.clone();
                 r.status.nodes = reported.nodes.clone();
             })
@@ -138,7 +144,7 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
                                 None if reported.node.is_empty() => phase.as_str().to_string(),
                                 None => format!("{} on {}", phase.as_str(), reported.node),
                             },
-                            event_type: if phase == controller_api::RouterPhase::Failed {
+                            event_type: if phase == controller_api::RouterPhaseKind::Failed {
                                 EventType::Warning
                             } else {
                                 EventType::Normal
@@ -158,18 +164,56 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
 
 /// The heartbeat on its own: this session is up, and that is all a
 /// non-speaking replica's copy of the report is allowed to say.
+///
+/// Two writes and not one since D-C7: the beat goes into a key of its own and
+/// the OBJECT is touched only when `connected` really changes — which for a
+/// cluster that is up is never, and was one full `Cluster` rewrite every ten
+/// seconds before this.
 pub(super) async fn beat(
     store: &EtcdStore,
     cluster: &str,
     at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
+    store.beat::<Cluster>(cluster, at).await?;
+    // The read `mutate` used to make, made here so the write can be skipped.
+    // A cluster with no object errors exactly as it did before.
+    if store.get::<Cluster>(cluster).await?.status.connected {
+        // Already up, and there is nothing else on this road to say: the beat
+        // is recorded and the object stays exactly as it is.
+        return Ok(());
+    }
     store
-        .mutate::<Cluster, _>(cluster, |c| {
-            c.status.connected = true;
-            c.status.last_heartbeat = Some(at);
-        })
+        .mutate::<Cluster, _>(cluster, |c| c.status.connected = true)
         .await?;
     Ok(())
+}
+
+/// Does this report say anything the Cluster object does not already say?
+///
+/// The same four questions the node half asks, one tier up, and the same
+/// omission: NOT the heartbeat. Pulled out so the decision can be made in a
+/// test without an etcd.
+pub(super) fn cluster_facts_are_news(
+    status: &controller_api::ClusterStatus,
+    ready: u32,
+    total: u32,
+    vms: u32,
+    nodes: &[controller_api::NodeSummary],
+    capacity: Option<&proto::ClusterCapacity>,
+) -> bool {
+    if !status.connected
+        || status.nodes_ready != ready
+        || status.nodes_total != total
+        || status.vms != vms
+        || status.nodes != nodes
+    {
+        return true;
+    }
+    capacity.is_some_and(|cap| {
+        status.capacity.vcpus != cap.vcpus
+            || status.capacity.mem_mib != cap.mem_mib
+            || status.capacity.capabilities != cap.capabilities
+    })
 }
 
 /// What the cluster says about ITSELF: how many nodes it has, how many are
@@ -192,10 +236,23 @@ pub(super) async fn ingest_cluster_facts(
     // for ever — the same rule the VM phases below follow and the same rule
     // the tier below follows about what an agent reported.
     let nodes: Vec<controller_api::NodeSummary> = status.nodes.iter().map(node_summary).collect();
+    // The beat in its own key (D-C7), and the object only when the cluster's
+    // own facts moved.
+    store.beat::<Cluster>(cluster, at).await?;
+    let current = store.get::<Cluster>(cluster).await?;
+    if !cluster_facts_are_news(
+        &current.status,
+        ready,
+        total,
+        vms,
+        &nodes,
+        capacity.as_ref(),
+    ) {
+        return Ok(());
+    }
     store
         .mutate::<Cluster, _>(cluster, |c| {
             c.status.connected = true;
-            c.status.last_heartbeat = Some(at);
             c.status.nodes_ready = ready;
             c.status.nodes_total = total;
             c.status.vms = vms;
@@ -343,8 +400,13 @@ pub(super) async fn forget_unbound(
                 // Pending and not Stopped, exactly as one tier down: the VM
                 // is nowhere, and the phase an operator reads has to say that
                 // rather than describing a guest that no longer exists.
-                v.status.phase = VmPhase::Pending;
-                v.status.message = Some(format!("cluster {cluster} let go; waiting to be placed"));
+                #[allow(deprecated)]
+                v.status.assign(controller_api::VmPhase::new(
+                    VmPhaseKind::Pending,
+                    controller_api::VmReason::Unbound,
+                    Some(format!("cluster {cluster} let go; waiting to be placed")),
+                    at,
+                ));
                 v.status.volumes.clear();
                 v.status.reschedules = v.status.reschedules.saturating_add(1);
                 v.status.observed_at = Some(at);
@@ -379,9 +441,11 @@ pub(super) async fn forget_unbound(
 ///     it and the cloud did not, so a tenant, who reads their VM at the
 ///     cloud and nowhere else, could see the intent in `spec.vm.volumes[]`
 ///     and never the observation.
-///   * `status.pendingReason` — the closed word for why a VM is not
-///     placed. It stopped one tier down, and a Pending VM at the cloud was
-///     a dead end for everybody without a cluster credential.
+///   * `status.reason` — the closed word for why a VM is not placed. It
+///     stopped one tier down, and a Pending VM at the cloud was a dead end
+///     for everybody without a cluster credential. Spelled `pendingReason`
+///     until struktur 4 folded it into the phase; the word it carries is a
+///     `VmReason` now and the key sits beside `phase` on the wire.
 ///   * `status.addresses[]` — the MAC lines, which begin at a node's tap and
 ///     stopped at the cluster. This is where a tenant reads their VM, so it
 ///     is the one tier the address has to reach.
@@ -394,6 +458,22 @@ pub(super) async fn forget_unbound(
 /// from before the field, and it changes nothing here — which is also what an
 /// old AGENT looks like one tier further down, deliberately: neither of them
 /// is saying "this VM has no addresses".
+/// One reason, onto the phase an object already has.
+///
+/// `since` comes off the stored phase, so the value is exactly what `assign`
+/// would leave — which is what lets the caller use it as its own churn guard.
+fn relayed_onto(
+    stored: &controller_api::VmPhase,
+    reason: controller_api::VmReason,
+) -> controller_api::VmPhase {
+    controller_api::VmPhase::new(
+        stored.kind(),
+        reason,
+        stored.message().map(str::to_string),
+        stored.since(),
+    )
+}
+
 pub(super) async fn ingest_placements(
     store: &EtcdStore,
     cluster: &str,
@@ -411,10 +491,12 @@ pub(super) async fn ingest_placements(
                 attached: v.attached,
             })
             .collect();
-        // `VmStatusReport.pending_reason` is `reason` since struktur 4 and
-        // carries the same value on this road; which phases may fill it is the
-        // derivation lane's question.
-        let pending_reason = (!reported.reason.is_empty()).then(|| reported.reason.clone());
+        // The cluster's word for WHY a VM is not placed, in the vocabulary
+        // this tier stores it in. An empty field is "said nothing", which
+        // reads as `Unrecorded` — and so does a word this binary does not
+        // know, which is what a newer cluster talking to an older cloud
+        // sends.
+        let relayed = controller_api::VmReason::parse(&reported.reason).unwrap_or_default();
         let Some(vm) = known.iter().find(|v| v.metadata.uid == reported.id) else {
             continue;
         };
@@ -424,9 +506,16 @@ pub(super) async fn ingest_placements(
         // has no pending reason any more. What an EMPTY list may not do is
         // clear a list that a cluster too old to send one never filled — and
         // it cannot, because such a cluster's VMs never had one either.
+        // The phase this road WOULD leave, compared against the one that is
+        // stored. Not "is the reason the relayed word", which is the same
+        // question only for a phase that has a slot for a reason: a resting
+        // phase drops one, so that comparison would differ for ever and this
+        // pass would write a Running VM every ten seconds — which is D-C7 in
+        // a second place.
+        let relayed_phase = relayed_onto(vm.status.phase(), relayed);
         let unchanged = vm.status.node_name == node
             && vm.status.volumes == volumes
-            && vm.status.pending_reason == pending_reason
+            && *vm.status.phase() == relayed_phase
             && vm.status.addresses == addresses;
         if !ours(vm) || unchanged {
             continue;
@@ -436,7 +525,13 @@ pub(super) async fn ingest_placements(
             .mutate::<Vm, _>(&name, |v| {
                 v.status.node_name = node.clone();
                 v.status.volumes = volumes.clone();
-                v.status.pending_reason = pending_reason.clone();
+                // The category the cluster relayed, onto the phase the VM
+                // already has: this road carries evidence about a placement,
+                // not a phase. A cluster that says nothing clears it, exactly
+                // as an absent `pendingReason` did.
+                let onto = relayed_onto(v.status.phase(), relayed);
+                #[allow(deprecated)]
+                v.status.assign(onto);
                 v.status.addresses = addresses.clone();
             })
             .await
@@ -469,8 +564,13 @@ pub(super) async fn ingest_phases(
         let vm_tenant = vm.spec.tenant.clone();
         let result = store
             .mutate::<Vm, _>(&name, |v| {
-                v.status.phase = phase;
-                v.status.message = message.clone();
+                #[allow(deprecated)]
+                v.status.assign(controller_api::VmPhase::new(
+                    phase,
+                    controller_api::VmReason::Reported,
+                    message.clone(),
+                    at,
+                ));
                 // From the binding, never from the reporter: the only cluster
                 // whose word counts for a VM is the one it was placed on.
                 v.status.cluster_name = v.spec.cluster_name.clone();
@@ -498,7 +598,7 @@ pub(super) fn changed<'a>(
     cluster: &str,
     reported: &proto::VmStatusReport,
     seen: Observation<'a>,
-) -> Option<(&'a Vm, VmPhase, Option<String>)> {
+) -> Option<(&'a Vm, VmPhaseKind, Option<String>)> {
     match seen {
         Observation::Unknown => {
             // Not a phase we can file anywhere. It is also not nothing:
@@ -534,12 +634,12 @@ pub(super) async fn note_phase(
     store: &EtcdStore,
     name: &str,
     uid: &str,
-    phase: VmPhase,
+    phase: VmPhaseKind,
     message: &Option<String>,
     tenant: &Option<String>,
 ) {
     let kind = match phase {
-        VmPhase::Failed | VmPhase::Quarantined => EventType::Warning,
+        VmPhaseKind::Failed | VmPhaseKind::Quarantined => EventType::Warning,
         _ => EventType::Normal,
     };
     events::record(

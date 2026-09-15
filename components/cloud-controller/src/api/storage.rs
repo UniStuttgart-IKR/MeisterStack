@@ -518,7 +518,7 @@ pub(super) fn check_owned_volume_status(volume: &Volume) -> Result<(), ApiError>
         ("status.attachedTo", volume.status.attached_to.is_some()),
         (
             "status.phase",
-            volume.status.phase != VolumePhase::default(),
+            volume.status.phase().kind() != VolumePhaseKind::default(),
         ),
     ];
     if let Some((field, _)) = owned.into_iter().find(|(_, set)| *set) {
@@ -646,7 +646,11 @@ pub(super) async fn delete_volume(
             if v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(chrono::Utc::now());
             }
-            v.status.phase = VolumePhase::Releasing;
+            #[allow(deprecated)]
+            v.status.assign(VolumePhase::of(
+                VolumePhaseKind::Releasing,
+                chrono::Utc::now(),
+            ));
         })
         .await?;
 
@@ -820,15 +824,15 @@ async fn check_snapshot_seeds(st: &ApiState, who: &Grant, named: &str) -> Result
             "snapshot {named} is being deleted; it cannot seed a new volume"
         )));
     }
-    if snapshot.status.phase == controller_api::VolumeSnapshotPhase::Failed {
+    if snapshot.status.phase().kind() == controller_api::VolumeSnapshotPhaseKind::Failed {
         return Err(controller_api::invalid_field(
             "spec.fromSnapshot",
             format!(
                 "snapshot {named} failed: {}",
                 snapshot
                     .status
-                    .message
-                    .as_deref()
+                    .phase()
+                    .message()
                     .unwrap_or("no reason recorded")
             ),
         ));
@@ -956,7 +960,11 @@ mod tests {
             ("status.attachedTo", |v| {
                 v.status.attached_to = Some("web".into())
             }),
-            ("status.phase", |v| v.status.phase = VolumePhase::Ready),
+            ("status.phase", |v| {
+                #[allow(deprecated)]
+                v.status
+                    .assign(VolumePhase::of(VolumePhaseKind::Ready, chrono::Utc::now()))
+            }),
         ];
         for (field, set) in owned {
             let mut volume = Volume::declare("data", controller_api::VolumeSpec::default());
@@ -1091,7 +1099,7 @@ mod tests {
             fresh.status.backend
         );
         assert!(fresh.status.node.is_none());
-        assert_eq!(fresh.status.phase, VolumePhase::Pending);
+        assert_eq!(fresh.status.phase().kind(), VolumePhaseKind::Pending);
 
         // And the same string, arriving as evidence, is a client's 422 — the
         // field is the control plane's answer about where the data is.
@@ -1113,7 +1121,7 @@ mod tests {
             "{:?}",
             v.metadata.finalizers
         );
-        assert_eq!(v.status.phase, VolumePhase::Pending);
+        assert_eq!(v.status.phase().kind(), VolumePhaseKind::Pending);
         assert!(v.status.attached_to.is_none());
     }
 }

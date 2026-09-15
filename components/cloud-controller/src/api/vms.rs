@@ -271,11 +271,11 @@ pub(super) async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result
 /// to.
 pub(super) async fn check_base_image(store: &EtcdStore, name: &str) -> Result<(), ApiError> {
     match store.get::<Image>(name).await {
-        Ok(image) if image.status.phase == controller_api::ImagePhase::Failed => {
+        Ok(image) if image.status.phase().kind() == controller_api::ImagePhaseKind::Failed => {
             Err(invalid(format!(
                 "base_image {:?} is not usable: {}",
                 image.metadata.name,
-                image.status.message.as_deref().unwrap_or("unknown reason")
+                image.status.phase().message().unwrap_or("unknown reason")
             )))
         }
         Ok(_) => Ok(()),
@@ -598,7 +598,7 @@ pub(super) async fn create_vm_traced(
     // cluster rather than a node. The same reason it is worth having — a
     // suggestion is only worth showing if it says where the thing would land.
     if dry.requested() {
-        vm.status.message = Some(
+        let said =
             crate::reconcile::would_place(&st.store, st.scheduler.as_ref(), st.overcommit, &vm)
                 .await
                 .map_err(|e| {
@@ -607,8 +607,16 @@ pub(super) async fn create_vm_traced(
                         "Internal",
                         format!("{e:#}"),
                     )
-                })?,
-        );
+                })?;
+        // On the phase the VM already has, because a preview is not a phase
+        // change: it is a sentence about a VM that has not been created.
+        let phase = vm.status.phase().kind();
+        #[allow(deprecated)]
+        vm.status.assign(controller_api::VmPhase::said(
+            phase,
+            Some(said),
+            chrono::Utc::now(),
+        ));
     }
     let created = match dry.preview(&vm) {
         Some(preview) => preview,
@@ -819,10 +827,10 @@ pub(super) fn reschedule_refusal(current: &Vm, disks: &[DiskFacts]) -> Option<St
     // see `controller_api::stopped_enough`. `Failed` and `Unknown` are
     // stopped enough, which is the whole of D12: the phases a wedged VM is
     // actually in were the phases the call that would rescue it refused.
-    if !controller_api::stopped_enough(current.spec.run_strategy, current.status.phase) {
+    if !controller_api::stopped_enough(current.spec.run_strategy, current.status.phase().kind()) {
         return Some(controller_api::not_stopped_enough(
             current.spec.run_strategy,
-            current.status.phase,
+            current.status.phase().kind(),
         ));
     }
     for disk in disks {
@@ -929,13 +937,13 @@ async fn check_holder_is_talking(
     current: &Vm,
     cluster: &str,
 ) -> Result<(), ApiError> {
-    let heard = match st.store.get::<controller_api::Cluster>(cluster).await {
-        Ok(c) => c.status.last_heartbeat,
-        // A cluster object that is not there any more has certainly not
-        // reported; the refusal is the same one and says so.
-        Err(StoreError::NotFound(_)) => None,
-        Err(e) => return Err(e.into()),
-    };
+    // The lease and not the object: the heartbeat moved into a key of its own
+    // (D-C7), and an absent lease is the same answer an absent object gave —
+    // this cluster has not reported.
+    let heard = st
+        .store
+        .last_beat::<controller_api::Cluster>(cluster)
+        .await?;
     holder_refusal(current, cluster, heard, Utc::now())
 }
 
@@ -952,7 +960,7 @@ pub(super) fn holder_refusal(
     now: chrono::DateTime<Utc>,
 ) -> Result<(), ApiError> {
     match controller_api::unknown_needs_its_holder(
-        current.status.phase,
+        current.status.phase().kind(),
         controller_api::Holder::Cluster,
         cluster,
         heard,
@@ -990,7 +998,7 @@ async fn note_unknown_release(st: &ApiState, current: &Vm, next: &Vm) {
 
 /// The sentence a released binding leaves on the object, where it leaves one.
 pub(super) fn release_event(current: &Vm, next: &Vm) -> Option<String> {
-    if current.status.phase != controller_api::VmPhase::Unknown {
+    if current.status.phase().kind() != controller_api::VmPhaseKind::Unknown {
         return None;
     }
     let cluster = releasing(current, next)?;
@@ -1997,7 +2005,11 @@ mod tests {
                 vm: json!({ "vcpus": 1 }),
             },
         );
-        vm.status.phase = controller_api::VmPhase::Stopped;
+        #[allow(deprecated)]
+        vm.status.assign(controller_api::VmPhase::of(
+            controller_api::VmPhaseKind::Stopped,
+            chrono::Utc::now(),
+        ));
         vm
     }
 
@@ -2023,7 +2035,11 @@ mod tests {
         let at = |secs: i64| chrono::DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap();
         let now = at(1_000);
         let mut vm = stopped_vm();
-        vm.status.phase = controller_api::VmPhase::Unknown;
+        #[allow(deprecated)]
+        vm.status.assign(controller_api::VmPhase::of(
+            controller_api::VmPhaseKind::Unknown,
+            now,
+        ));
 
         // Silent: 409, because nothing about the request is malformed — the
         // state of the world refuses it, and that state ends by itself.
@@ -2046,7 +2062,11 @@ mod tests {
 
         // `Failed` is the cluster's own word that the guest is not running.
         let mut failed = vm.clone();
-        failed.status.phase = controller_api::VmPhase::Failed;
+        #[allow(deprecated)]
+        failed.status.assign(controller_api::VmPhase::of(
+            controller_api::VmPhaseKind::Failed,
+            now,
+        ));
         holder_refusal(&failed, "cluster-1", None, now).expect("Failed is evidence");
 
         // And what the object is left carrying when the release does land.
@@ -2073,26 +2093,28 @@ mod tests {
         for (strategy, phase) in [
             (
                 controller_api::RunStrategy::Running,
-                controller_api::VmPhase::Running,
+                controller_api::VmPhaseKind::Running,
             ),
             // Told to stop, not stopped yet: the one the second condition is
             // for.
             (
                 controller_api::RunStrategy::Stopped,
-                controller_api::VmPhase::Running,
+                controller_api::VmPhaseKind::Running,
             ),
             (
                 controller_api::RunStrategy::Stopped,
-                controller_api::VmPhase::Provisioning,
+                controller_api::VmPhaseKind::Provisioning,
             ),
             (
                 controller_api::RunStrategy::Paused,
-                controller_api::VmPhase::Paused,
+                controller_api::VmPhaseKind::Paused,
             ),
         ] {
             let mut vm = stopped_vm();
             vm.spec.run_strategy = strategy;
-            vm.status.phase = phase;
+            #[allow(deprecated)]
+            vm.status
+                .assign(controller_api::VmPhase::of(phase, chrono::Utc::now()));
             let why = reschedule_refusal(&vm, &[]).expect("a moving vm does not move");
             assert!(why.contains(phase.as_str()), "and names the phase: {why}");
         }
@@ -2108,11 +2130,13 @@ mod tests {
     #[test]
     fn a_failed_or_unknown_vm_may_let_its_cluster_binding_go() {
         for phase in [
-            controller_api::VmPhase::Failed,
-            controller_api::VmPhase::Unknown,
+            controller_api::VmPhaseKind::Failed,
+            controller_api::VmPhaseKind::Unknown,
         ] {
             let mut vm = stopped_vm();
-            vm.status.phase = phase;
+            #[allow(deprecated)]
+            vm.status
+                .assign(controller_api::VmPhase::of(phase, chrono::Utc::now()));
             assert_eq!(
                 reschedule_refusal(&vm, &[]),
                 None,

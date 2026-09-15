@@ -34,7 +34,7 @@ use std::time::Duration;
 use chrono::Utc;
 use controller_api::{
     Candidate, EtcdStore, Node, Resource, Scheduler, StoreError, Vm, VmMigration, VmMigrationPhase,
-    VmMigrationStatus, VmPhase, Volume,
+    VmMigrationPhaseKind, VmMigrationStatus, VmPhaseKind, Volume,
 };
 use proto::StatusReport;
 use tracing::{debug, info, warn};
@@ -105,14 +105,14 @@ pub async fn migration_in_flight(store: &EtcdStore, vm: &Vm) -> anyhow::Result<b
 ///
 /// Separate from `migration_in_flight` because a caller that wants to SAY
 /// which phase allowed a second open needs the phase and not a bool.
-pub fn phase_for(migrations: &[VmMigration], vm: &Vm) -> Option<VmMigrationPhase> {
+pub fn phase_for(migrations: &[VmMigration], vm: &Vm) -> Option<VmMigrationPhaseKind> {
     migrations
         .iter()
         .filter(|m| {
             m.spec.vm == vm.metadata.name
                 && controller_api::same_tenancy(&m.spec.tenant, vm.spec.tenant.as_deref())
         })
-        .map(|m| m.status.phase)
+        .map(|m| m.status.phase().kind())
         .find(|p| controller_api::second_open_is_a_migration(Some(*p)))
 }
 
@@ -145,7 +145,7 @@ pub async fn ingest_arrivals(
         Err(e) => return Err(e.into()),
     };
     for migration in migrations {
-        if migration.status.phase.is_final() {
+        if migration.status.phase().kind().is_final() {
             continue;
         }
         if migration.status.target_node.as_deref() != Some(node_id) {
@@ -202,7 +202,7 @@ pub async fn ingest_departures(
         Err(e) => return Err(e.into()),
     };
     for migration in migrations {
-        if migration.status.phase.is_final() {
+        if migration.status.phase().kind().is_final() {
             continue;
         }
         if migration.status.source_node.as_deref() != Some(node_id) {
@@ -264,7 +264,7 @@ pub async fn start_for_drain(store: &EtcdStore, vm: &Vm, node: &str) -> anyhow::
     };
     if existing
         .iter()
-        .any(|m| m.spec.vm == vm.metadata.name && !m.status.phase.is_final())
+        .any(|m| m.spec.vm == vm.metadata.name && !m.status.phase().kind().is_final())
     {
         return Ok(());
     }
@@ -380,7 +380,7 @@ pub async fn reconcile_migrations(
     telemetry::metrics::objects().set_count(VmMigration::KIND, migrations.len() as i64);
     for migration in migrations {
         let name = migration.metadata.name.clone();
-        if migration.status.phase.is_final() {
+        if migration.status.phase().kind().is_final() {
             continue;
         }
         // A record somebody deleted mid-flight is not this pass's to carry
@@ -420,13 +420,13 @@ async fn step(
         Err(e) => return Err(e.into()),
     };
 
-    match migration.status.phase {
-        VmMigrationPhase::Pending => {
+    match migration.status.phase().kind() {
+        VmMigrationPhaseKind::Pending => {
             prepare(store, dispatch, scheduler, nodes, &migration, &vm).await
         }
-        VmMigrationPhase::Preparing => send(store, dispatch, timeouts, &migration, &vm).await,
-        VmMigrationPhase::Running => settle(store, dispatch, timeouts, &migration, &vm).await,
-        VmMigrationPhase::Succeeded | VmMigrationPhase::Failed => Ok(()),
+        VmMigrationPhaseKind::Preparing => send(store, dispatch, timeouts, &migration, &vm).await,
+        VmMigrationPhaseKind::Running => settle(store, dispatch, timeouts, &migration, &vm).await,
+        VmMigrationPhaseKind::Succeeded | VmMigrationPhaseKind::Failed => Ok(()),
     }
 }
 
@@ -461,14 +461,14 @@ async fn prepare(
         )
         .await;
     };
-    if vm.status.phase != VmPhase::Running {
+    if vm.status.phase().kind() != VmPhaseKind::Running {
         return fail(
             store,
             migration,
             format!(
                 "vm {} is {} and only a running vm can migrate live",
                 vm.metadata.name,
-                vm.status.phase.as_str()
+                vm.status.phase().kind().as_str()
             ),
         )
         .await;
@@ -497,12 +497,17 @@ async fn prepare(
     // migration, and two replicas preparing one migration would build two
     // destinations for one guest.
     let mut claimed = migration.clone();
-    claimed.status.phase = VmMigrationPhase::Preparing;
     claimed.status.source_node = Some(source.clone());
     claimed.status.target_node = Some(target.clone());
     claimed.status.started_at = Some(Utc::now());
     claimed.status.observed_generation = migration.metadata.generation;
-    claimed.status.message = Some(format!("preparing {target}"));
+    #[allow(deprecated)]
+    claimed.status.assign(VmMigrationPhase::new(
+        VmMigrationPhaseKind::Preparing,
+        controller_api::VmMigrationReason::Dispatched,
+        Some(format!("preparing {target}")),
+        Utc::now(),
+    ));
     match store.update(&claimed).await {
         Ok(_) => {}
         Err(StoreError::Conflict(_)) => {
@@ -556,7 +561,14 @@ async fn prepare(
 
     store
         .mutate::<VmMigration, _>(&name, |m| {
-            m.status.message = Some(format!("{target} is listening at {peer}"));
+            let kind = m.status.phase().kind();
+            #[allow(deprecated)]
+            m.status.assign(VmMigrationPhase::new(
+                kind,
+                controller_api::VmMigrationReason::Dispatched,
+                Some(format!("{target} is listening at {peer}")),
+                Utc::now(),
+            ));
         })
         .await?;
     info!(migration = %name, vm = %vm.metadata.name, from = %source, to = %target, %peer,
@@ -756,8 +768,8 @@ async fn send(
     };
     let Some(peer) = migration
         .status
-        .message
-        .as_deref()
+        .phase()
+        .message()
         .and_then(|m| m.rsplit_once(" at ").map(|(_, peer)| peer.to_string()))
     else {
         // The address is written down in the sentence the prepare step left,
@@ -782,8 +794,13 @@ async fn send(
     }
 
     let mut claimed = migration.clone();
-    claimed.status.phase = VmMigrationPhase::Running;
-    claimed.status.message = Some(format!("sending to {target} at {peer}"));
+    #[allow(deprecated)]
+    claimed.status.assign(VmMigrationPhase::new(
+        VmMigrationPhaseKind::Running,
+        controller_api::VmMigrationReason::Dispatched,
+        Some(format!("sending to {target} at {peer}")),
+        Utc::now(),
+    ));
     match store.update(&claimed).await {
         Ok(_) => {}
         Err(StoreError::Conflict(_)) => {
@@ -842,7 +859,16 @@ async fn send(
         warn!(migration = %name, node = %source, reason = %why,
               "the send is unaccounted for; waiting for the destination to say");
         store
-            .mutate::<VmMigration, _>(&name, |m| m.status.message = Some(why.clone()))
+            .mutate::<VmMigration, _>(&name, |m| {
+                let kind = m.status.phase().kind();
+                #[allow(deprecated)]
+                m.status.assign(VmMigrationPhase::new(
+                    kind,
+                    controller_api::VmMigrationReason::Reported,
+                    Some(why.clone()),
+                    Utc::now(),
+                ));
+            })
             .await?;
     }
     Ok(())
@@ -925,7 +951,8 @@ async fn settle(
         return fail(store, migration, "this migration has no ends".to_string()).await;
     };
 
-    let arrived = migration.status.target_reported.as_deref() == Some(VmPhase::Running.as_str());
+    let arrived =
+        migration.status.target_reported.as_deref() == Some(VmPhaseKind::Running.as_str());
     if !arrived {
         // The one answer that ends a migration before its timeout does, and
         // the one D16 made available: the SOURCE's own word about the send.
@@ -1013,9 +1040,13 @@ async fn settle(
     let finished = Utc::now();
     store
         .mutate::<VmMigration, _>(&name, |m| {
-            m.status.phase = VmMigrationPhase::Succeeded;
             m.status.finished_at = Some(finished);
-            m.status.message = Some(format!("{} is on {target}", vm.metadata.name));
+            #[allow(deprecated)]
+            m.status.assign(VmMigrationPhase::said(
+                VmMigrationPhaseKind::Succeeded,
+                Some(format!("{} is on {target}", vm.metadata.name)),
+                finished,
+            ));
         })
         .await?;
     let took = migration
@@ -1075,9 +1106,15 @@ async fn fail(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow
     warn!(migration = %name, vm = %migration.spec.vm, reason = %why, "migration failed");
     store
         .mutate::<VmMigration, _>(&name, |m| {
-            m.status.phase = VmMigrationPhase::Failed;
-            m.status.finished_at = Some(Utc::now());
-            m.status.message = Some(why.clone());
+            let now = Utc::now();
+            m.status.finished_at = Some(now);
+            #[allow(deprecated)]
+            m.status.assign(VmMigrationPhase::new(
+                VmMigrationPhaseKind::Failed,
+                controller_api::VmMigrationReason::Abandoned,
+                Some(why.clone()),
+                now,
+            ));
         })
         .await?;
     Ok(())
@@ -1280,7 +1317,7 @@ mod tests {
         )
     }
 
-    fn migration(vm: &str, phase: VmMigrationPhase) -> VmMigration {
+    fn migration(vm: &str, phase: VmMigrationPhaseKind) -> VmMigration {
         let mut m = VmMigration::declare(
             &format!("{vm}-x"),
             VmMigrationSpec {
@@ -1289,7 +1326,8 @@ mod tests {
                 target_node: None,
             },
         );
-        m.status.phase = phase;
+        #[allow(deprecated)]
+        m.status.assign(VmMigrationPhase::of(phase, Utc::now()));
         m
     }
 
@@ -1300,11 +1338,11 @@ mod tests {
     #[test]
     fn only_a_migration_that_is_under_way_permits_a_second_open() {
         for (phase, allowed) in [
-            (VmMigrationPhase::Pending, false),
-            (VmMigrationPhase::Preparing, true),
-            (VmMigrationPhase::Running, true),
-            (VmMigrationPhase::Succeeded, false),
-            (VmMigrationPhase::Failed, false),
+            (VmMigrationPhaseKind::Pending, false),
+            (VmMigrationPhaseKind::Preparing, true),
+            (VmMigrationPhaseKind::Running, true),
+            (VmMigrationPhaseKind::Succeeded, false),
+            (VmMigrationPhaseKind::Failed, false),
         ] {
             let all = vec![migration("web-1", phase)];
             assert_eq!(
@@ -1320,10 +1358,10 @@ mod tests {
     /// another vm's nor the same name in another tenant.
     #[test]
     fn a_migration_of_another_vm_permits_nothing() {
-        let all = vec![migration("web-2", VmMigrationPhase::Running)];
+        let all = vec![migration("web-2", VmMigrationPhaseKind::Running)];
         assert!(phase_for(&all, &vm("web-1")).is_none());
 
-        let mut theirs = migration("web-1", VmMigrationPhase::Running);
+        let mut theirs = migration("web-1", VmMigrationPhaseKind::Running);
         theirs.spec.tenant = "other".into();
         assert!(phase_for(&[theirs], &vm("web-1")).is_none());
     }
@@ -1463,7 +1501,7 @@ mod tests {
     /// started has not run out of time.
     #[test]
     fn a_migration_runs_out_of_time_only_after_it_started() {
-        let mut m = migration("web-1", VmMigrationPhase::Preparing);
+        let mut m = migration("web-1", VmMigrationPhaseKind::Preparing);
         assert!(
             overdue(&m, Duration::from_secs(30)).is_none(),
             "not started"
@@ -1510,11 +1548,15 @@ mod tests {
     /// guest may be torn down, and one that might hold the only copy may not.
     #[test]
     fn a_source_that_still_has_the_guest_ends_the_migration_without_a_timeout() {
-        let status = |reported: Option<&str>, target_said: Option<&str>| VmMigrationStatus {
-            source_reported: reported.map(str::to_string),
-            source_message: Some("cloud-hypervisor is serving the guest here again".into()),
-            target_reported: target_said.map(str::to_string),
-            ..Default::default()
+        // Field by field and not a struct literal: `status.phase` is private
+        // since struktur 4, and a literal that leaves a private field out is
+        // refused even with `..Default::default()`.
+        let status = |reported: Option<&str>, target_said: Option<&str>| {
+            let mut status = VmMigrationStatus::default();
+            status.source_reported = reported.map(str::to_string);
+            status.source_message = Some("cloud-hypervisor is serving the guest here again".into());
+            status.target_reported = target_said.map(str::to_string);
+            status
         };
 
         // Nothing said, and the two words that are not a failure: this

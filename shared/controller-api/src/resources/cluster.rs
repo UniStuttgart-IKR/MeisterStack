@@ -81,6 +81,9 @@ pub struct ClusterStatus {
     /// publish an address pointing at the asker's own loopback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_endpoint: Option<String>,
+    /// When this cluster last reported, as the API answers it. The same
+    /// field one tier up, moved for the same reason and joined in the same
+    /// way — see `NodeStatus::last_heartbeat` and `EtcdStore::beat`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_heartbeat: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1251,6 +1251,33 @@ impl PendingReason {
             PendingReason::NoNodeForVolume => "no-node-for-volume",
         }
     }
+
+    /// Which of the VM's own reasons this category is, for the phase the
+    /// object now carries (`VmStatus::phase`).
+    ///
+    /// Twelve into two, and the line is drawn where it changes what somebody
+    /// DOES about it. Ten of these are a wall: a machine has to be added,
+    /// uncordoned, repaired or relabelled, or the VM has to ask for
+    /// something else. Two are a wait: a disk or a secret is being made and
+    /// the answer is to leave it alone. The twelve words themselves do not go
+    /// anywhere — they are still what `as_str` says, still the metric label,
+    /// and still in the sentence on the object.
+    pub fn category(self) -> crate::resources::VmReason {
+        use crate::resources::VmReason;
+        match self {
+            PendingReason::VolumeNotReady | PendingReason::SecretNotReady => VmReason::NotReady,
+            PendingReason::NoCandidates
+            | PendingReason::NoneUsable
+            | PendingReason::NodeUnhealthy
+            | PendingReason::ClassRefused
+            | PendingReason::NoCapacity
+            | PendingReason::SelectorUnmatched
+            | PendingReason::Unserved
+            | PendingReason::Split
+            | PendingReason::AntiAffinity
+            | PendingReason::NoNodeForVolume => VmReason::Unplaced,
+        }
+    }
 }
 
 /// How many VMs are pending for each reason, over one reconcile pass.

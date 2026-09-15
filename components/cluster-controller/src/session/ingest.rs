@@ -200,14 +200,14 @@ pub(super) fn held_here<'a>(
 /// announcing.
 ///
 /// Parsing the node's word as this tier's own was the bug: `Ready` is not a
-/// `RouterPhase`, so every report from every healthy gateway node was dropped
+/// `RouterPhaseKind`, so every report from every healthy gateway node was dropped
 /// with a warning, ten seconds apart, and the only thing a node could ever
 /// tell this tier was that something had broken.
-pub(super) fn observed_phase(said: &str, speaks: bool) -> Option<controller_api::RouterPhase> {
+pub(super) fn observed_phase(said: &str, speaks: bool) -> Option<controller_api::RouterPhaseKind> {
     match said {
-        proto::ROUTER_FAILED => Some(controller_api::RouterPhase::Failed),
-        proto::ROUTER_READY if speaks => Some(controller_api::RouterPhase::Active),
-        proto::ROUTER_READY => Some(controller_api::RouterPhase::Standby),
+        proto::ROUTER_FAILED => Some(controller_api::RouterPhaseKind::Failed),
+        proto::ROUTER_READY if speaks => Some(controller_api::RouterPhaseKind::Active),
+        proto::ROUTER_READY => Some(controller_api::RouterPhaseKind::Standby),
         _ => None,
     }
 }
@@ -262,7 +262,7 @@ pub(super) async fn ingest_routers(
                   "unknown router phase from agent");
             continue;
         };
-        if !speaks && phase != controller_api::RouterPhase::Failed {
+        if !speaks && phase != controller_api::RouterPhaseKind::Failed {
             continue;
         }
         let message = (!line.message.is_empty()).then(|| {
@@ -272,7 +272,9 @@ pub(super) async fn ingest_routers(
                 format!("{node_id}: {}", line.message)
             }
         });
-        if router.status.phase == phase && router.status.message == message {
+        if router.status.phase().kind() == phase
+            && router.status.phase().message() == message.as_deref()
+        {
             continue;
         }
         let name = router.metadata.name.clone();
@@ -280,8 +282,13 @@ pub(super) async fn ingest_routers(
         let uid = router.metadata.uid.clone();
         store
             .mutate::<controller_api::Router, _>(&name, |r| {
-                r.status.phase = phase;
-                r.status.message = message.clone();
+                #[allow(deprecated)]
+                r.status.assign(controller_api::RouterPhase::new(
+                    phase,
+                    controller_api::RouterReason::Reported,
+                    message.clone(),
+                    chrono::Utc::now(),
+                ));
             })
             .await?;
         info!(router = %name, node = node_id, phase = phase.as_str(), "router phase observed");
@@ -296,7 +303,7 @@ pub(super) async fn ingest_routers(
                     Some(said) => format!("{} ({said})", phase.as_str()),
                     None => phase.as_str().to_string(),
                 },
-                event_type: if phase == controller_api::RouterPhase::Failed {
+                event_type: if phase == controller_api::RouterPhaseKind::Failed {
                     EventType::Warning
                 } else {
                     EventType::Normal
@@ -309,8 +316,43 @@ pub(super) async fn ingest_routers(
     Ok(orphans)
 }
 
+/// What a status report says about the MACHINE, beside the beat itself.
+///
+/// Pulled out of `beat_node` so that "is this report news" is a value
+/// comparison a test can make without an etcd — which is the whole of D-C7's
+/// second half.
+pub(super) struct NodeFacts {
+    pub vcpus: u32,
+    pub mem_mib: u64,
+    pub vms: u32,
+    /// `None` is "the report said nothing about health", which is not the
+    /// same as "nothing is wrong" — see the comment in `node_facts`.
+    pub conditions: Option<Vec<controller_api::NodeCondition>>,
+}
+
+/// Does this report say anything the object does not already say?
+///
+/// The four facts the brief names and no others: ready, capacity, vms,
+/// conditions. NOT the heartbeat — that is the whole point, and a comparison
+/// that included it would be the defect back again.
+pub(super) fn node_facts_are_news(status: &controller_api::NodeStatus, facts: &NodeFacts) -> bool {
+    !status.ready
+        || status.vms != facts.vms
+        || status.capacity.vcpus != facts.vcpus
+        || status.capacity.mem_mib != facts.mem_mib
+        || facts
+            .conditions
+            .as_ref()
+            .is_some_and(|c| *c != status.conditions)
+}
+
 /// The heartbeat and the node's own facts: that it is up, how many VMs it
 /// carries, how much room it has, and what it says is wrong with it.
+///
+/// Two writes and not one, and the split is D-C7. The BEAT goes into a key of
+/// its own, every ten seconds, about sixty bytes. The OBJECT is written only
+/// when something about the machine changed — which on an idle fleet is
+/// never, and was 1.13 etcd revisions a second before this.
 pub(super) async fn beat_node(
     store: &EtcdStore,
     node_id: &str,
@@ -339,16 +381,40 @@ pub(super) async fn beat_node(
             })
             .collect()
     });
+    // The beat first and on its own. It is also what makes the read below
+    // safe to skip a write on: whatever the object says, the fleet's liveness
+    // answer has already been recorded.
+    store.beat::<Node>(node_id, Utc::now()).await?;
+    // The read `mutate` used to make, made here so the write can be skipped.
+    // A node with no object errors exactly as it did before — `ingest_hello`
+    // creates it, and a beat that arrives first is worth the warning the
+    // caller logs.
+    let current = store.get::<Node>(node_id).await?;
+    // A report with no `node` block says nothing about capacity, so what it
+    // compares against is what the node already has rather than zero: that
+    // shape is the heartbeat-only report an agent sends when it could not read
+    // its own state, and reading it as "no vcpus" would rewrite the object
+    // twice per outage.
+    let news = NodeFacts {
+        vcpus: facts
+            .map(|f| f.vcpus)
+            .unwrap_or(current.status.capacity.vcpus),
+        mem_mib: facts
+            .map(|f| f.mem_mib)
+            .unwrap_or(current.status.capacity.mem_mib),
+        vms: count,
+        conditions,
+    };
+    if !node_facts_are_news(&current.status, &news) {
+        return Ok(());
+    }
     store
         .mutate::<Node, _>(node_id, |n| {
             n.status.ready = true;
-            n.status.last_heartbeat = Some(Utc::now());
-            n.status.vms = count;
-            if let Some(f) = facts {
-                n.status.capacity.vcpus = f.vcpus;
-                n.status.capacity.mem_mib = f.mem_mib;
-            }
-            if let Some(conditions) = &conditions {
+            n.status.vms = news.vms;
+            n.status.capacity.vcpus = news.vcpus;
+            n.status.capacity.mem_mib = news.mem_mib;
+            if let Some(conditions) = &news.conditions {
                 n.status.conditions = conditions.clone();
             }
         })
@@ -476,14 +542,16 @@ pub(super) async fn ingest_volumes(
                     v.status.node = None;
                     v.status.closed_here(node_id);
                     v.status.backend = String::new();
-                    v.status.message = None;
+                    let kind = v.status.phase().kind();
+                    #[allow(deprecated)]
+                    v.status.assign(controller_api::VolumePhase::of(kind, at));
                     v.status.observed_at = Some(at);
                 })
                 .await?;
             continue;
         }
 
-        let Some(phase) = VolumePhase::parse(&reported.phase) else {
+        let Some(phase) = VolumePhaseKind::parse(&reported.phase) else {
             warn!(volume = %name, phase = %reported.phase, "unknown volume phase from agent");
             continue;
         };
@@ -497,8 +565,8 @@ pub(super) async fn ingest_volumes(
         // Only when something CHANGED. Every node reports every ten seconds,
         // and a write per report would churn etcd revisions and wake the
         // volume watch while nothing about the volume happened.
-        if volume.status.phase == phase
-            && volume.status.message == message
+        if volume.status.phase().kind() == phase
+            && volume.status.phase().message() == message.as_deref()
             && volume.status.size_gib == size_gib
             && (backend.is_empty() || volume.status.backend == backend)
         {
@@ -509,10 +577,21 @@ pub(super) async fn ingest_volumes(
                 // A volume on its way out keeps `Releasing`: the node is
                 // still reporting the bytes it has, and the phase is about
                 // what the OBJECT is doing.
-                if v.metadata.deletion_timestamp.is_none() {
-                    v.status.phase = phase;
-                }
-                v.status.message = message.clone();
+                // A volume on its way out keeps `Releasing`, so the word it
+                // lands on is not always the word the node said — but the
+                // sentence is the node's either way.
+                let kind = if v.metadata.deletion_timestamp.is_none() {
+                    phase
+                } else {
+                    v.status.phase().kind()
+                };
+                #[allow(deprecated)]
+                v.status.assign(controller_api::VolumePhase::new(
+                    kind,
+                    controller_api::VolumeReason::Reported,
+                    message.clone(),
+                    at,
+                ));
                 // The backend name only ever ARRIVES; a node that has not made
                 // the volume yet sends an empty string, and that is not a
                 // statement that the name is gone.
@@ -816,7 +895,13 @@ pub(super) async fn ingest_snapshots(
                       "the node no longer has this snapshot; it will be taken again");
                 store
                     .mutate::<VolumeSnapshot, _>(&name, |s| {
-                        s.status.phase = VolumeSnapshotPhase::Pending;
+                        #[allow(deprecated)]
+                        s.status.assign(controller_api::VolumeSnapshotPhase::new(
+                            VolumeSnapshotPhaseKind::Pending,
+                            controller_api::VolumeSnapshotReason::SourceGone,
+                            None,
+                            at,
+                        ));
                         s.status.node = None;
                         s.status.backend = String::new();
                         s.status.observed_at = Some(at);
@@ -826,7 +911,7 @@ pub(super) async fn ingest_snapshots(
             continue;
         }
 
-        let Some(phase) = VolumeSnapshotPhase::parse(&reported.phase) else {
+        let Some(phase) = VolumeSnapshotPhaseKind::parse(&reported.phase) else {
             warn!(snapshot = %name, phase = %reported.phase, "unknown snapshot phase from agent");
             continue;
         };
@@ -838,8 +923,8 @@ pub(super) async fn ingest_snapshots(
         // came from.
         let size_gib = reported.size_bytes.div_ceil(1024 * 1024 * 1024);
         // Only when something changed: every node reports every ten seconds.
-        if snapshot.status.phase == phase
-            && snapshot.status.message == message
+        if snapshot.status.phase().kind() == phase
+            && snapshot.status.phase().message() == message.as_deref()
             && snapshot.status.size_gib == size_gib
             && (backend.is_empty() || snapshot.status.backend == backend)
         {
@@ -847,8 +932,13 @@ pub(super) async fn ingest_snapshots(
         }
         store
             .mutate::<VolumeSnapshot, _>(&name, |s| {
-                s.status.phase = phase;
-                s.status.message = message.clone();
+                #[allow(deprecated)]
+                s.status.assign(controller_api::VolumeSnapshotPhase::new(
+                    phase,
+                    controller_api::VolumeSnapshotReason::Reported,
+                    message.clone(),
+                    at,
+                ));
                 if !backend.is_empty() {
                     s.status.backend = backend.clone();
                 }
@@ -907,8 +997,13 @@ pub(super) async fn forget_unbound(
                 // Pending and not Stopped: the VM has no node, and the phase
                 // an operator reads has to say that rather than describing a
                 // guest that no longer exists anywhere.
-                v.status.phase = VmPhase::Pending;
-                v.status.message = Some(format!("node {node_id} let go; waiting to be placed"));
+                #[allow(deprecated)]
+                v.status.assign(controller_api::VmPhase::new(
+                    VmPhaseKind::Pending,
+                    controller_api::VmReason::Unbound,
+                    Some(format!("node {node_id} let go; waiting to be placed")),
+                    at,
+                ));
                 v.status.volumes.clear();
                 v.status.reschedules = v.status.reschedules.saturating_add(1);
                 v.status.observed_at = Some(at);
@@ -962,8 +1057,13 @@ pub(super) async fn ingest_phases(
         let vm_tenant = vm.spec.tenant.clone();
         let result = store
             .mutate::<Vm, _>(&name, |v| {
-                v.status.phase = phase;
-                v.status.message = message.clone();
+                #[allow(deprecated)]
+                v.status.assign(controller_api::VmPhase::new(
+                    phase,
+                    controller_api::VmReason::Reported,
+                    message.clone(),
+                    at,
+                ));
                 // From the binding, never from the reporter — the rule the
                 // cloud tier states one floor up, and it matters more here
                 // because `ours` deliberately accepts a report about a VM
@@ -992,7 +1092,7 @@ pub(super) fn changed<'a>(
     node_id: &str,
     reported: &proto::VmStatusReport,
     seen: Observation<'a>,
-) -> Option<(&'a Vm, VmPhase, Option<String>)> {
+) -> Option<(&'a Vm, VmPhaseKind, Option<String>)> {
     match seen {
         Observation::Unknown => {
             // A VM created straight on the agent's own API: not ours.
@@ -1022,12 +1122,12 @@ pub(super) async fn note_phase(
     store: &EtcdStore,
     name: &str,
     uid: &str,
-    phase: VmPhase,
+    phase: VmPhaseKind,
     message: &Option<String>,
     tenant: &Option<String>,
 ) {
     let kind = match phase {
-        VmPhase::Failed | VmPhase::Quarantined => EventType::Warning,
+        VmPhaseKind::Failed | VmPhaseKind::Quarantined => EventType::Warning,
         _ => EventType::Normal,
     };
     events::record(

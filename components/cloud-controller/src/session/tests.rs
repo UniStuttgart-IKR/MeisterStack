@@ -385,3 +385,93 @@ fn a_cluster_nobody_reported_on_is_unknown_not_empty() {
         "a fresh session has told us nothing yet"
     );
 }
+
+/// D-C7 one tier up: two reports that say the same thing are one write, and
+/// it is the lease.
+///
+/// The same rule the cluster applies to a node, applied by the cloud to a
+/// cluster, and it is worth its own test because the objects are different
+/// sizes and the same mistake: a `Cluster` carries its whole node list, so a
+/// beat that rewrote it rewrote every `NodeSummary` with it.
+#[test]
+fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
+    use super::ingest::cluster_facts_are_news;
+
+    let summary = |name: &str, ready: bool| controller_api::NodeSummary {
+        name: name.to_string(),
+        ready,
+        ..Default::default()
+    };
+    let nodes = vec![summary("agent-1a", true), summary("agent-1b", true)];
+    let capacity = proto::ClusterCapacity {
+        vcpus: 16,
+        mem_mib: 32768,
+        capabilities: vec!["network/vxlan".to_string()],
+    };
+
+    // A cluster nobody has heard from: the first report is news, because
+    // `connected` is what it changes.
+    let mut status = controller_api::ClusterStatus::default();
+    assert!(cluster_facts_are_news(
+        &status,
+        2,
+        2,
+        3,
+        &nodes,
+        Some(&capacity)
+    ));
+
+    // What that report left behind.
+    status.connected = true;
+    status.nodes_ready = 2;
+    status.nodes_total = 2;
+    status.vms = 3;
+    status.nodes = nodes.clone();
+    status.capacity.vcpus = 16;
+    status.capacity.mem_mib = 32768;
+    status.capacity.capabilities = vec!["network/vxlan".to_string()];
+
+    // The second, identical one: nothing.
+    assert!(
+        !cluster_facts_are_news(&status, 2, 2, 3, &nodes, Some(&capacity)),
+        "the same report twice is one write"
+    );
+
+    // And each fact on its own is still news.
+    assert!(cluster_facts_are_news(
+        &status,
+        1,
+        2,
+        3,
+        &nodes,
+        Some(&capacity)
+    ));
+    assert!(cluster_facts_are_news(
+        &status,
+        2,
+        2,
+        4,
+        &nodes,
+        Some(&capacity)
+    ));
+    let one_down = vec![summary("agent-1a", true), summary("agent-1b", false)];
+    assert!(
+        cluster_facts_are_news(&status, 2, 2, 3, &one_down, Some(&capacity)),
+        "a node that went not-ready is news even while the counts agree"
+    );
+    assert!(cluster_facts_are_news(
+        &status,
+        2,
+        2,
+        3,
+        &nodes,
+        Some(&proto::ClusterCapacity {
+            vcpus: 32,
+            ..capacity.clone()
+        })
+    ));
+
+    // A report with no capacity block says nothing about capacity, and
+    // nothing is what it writes.
+    assert!(!cluster_facts_are_news(&status, 2, 2, 3, &nodes, None));
+}

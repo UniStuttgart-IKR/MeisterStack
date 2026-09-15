@@ -9,16 +9,45 @@
 //! /cluster, real separation is a different endpoint. No controller ever
 //! reads a foreign prefix (the Oakestra rule).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use etcd_client::{
     Client, Compare, CompareOp, ConnectOptions, DeleteOptions, Event, EventType, GetOptions,
     PutOptions, Txn, TxnOp, TxnResponse, WatchOptions,
 };
+use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::object::{NameShape, Resource, StoredObject};
+
+/// What a lease key holds: one instant, and nothing else.
+///
+/// An object rather than a bare timestamp, because it is a document in etcd
+/// and a document that may need a second field one day should not have to
+/// change shape to get one. Sixty bytes either way.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct Lease {
+    at: DateTime<Utc>,
+}
+
+/// `<prefix>/leases/<resource>/<name>` — spelled once, and beside the
+/// registry rather than inside it so that a `list` of a resource cannot walk
+/// over its own leases.
+///
+/// Free functions and not methods, so the shape of the key can be asserted
+/// without an etcd client. The shape IS the interface: `etcdctl get --prefix
+/// /cluster/leases/nodes/` is what an operator reads when they want to know
+/// which machine went quiet, and it is what proved D-C7 in the first place.
+fn lease_key(prefix: &str, resource: &str, name: &str) -> String {
+    format!("{prefix}/leases/{resource}/{name}")
+}
+
+fn lease_dir(prefix: &str, resource: &str) -> String {
+    format!("{prefix}/leases/{resource}/")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -199,10 +228,23 @@ impl EtcdStore {
         Ok(obj)
     }
 
-    fn encode<T: StoredObject>(obj: &T) -> Result<Vec<u8>> {
+    /// The bytes that go into etcd, and the one place [`Resource::settle`] is
+    /// called from.
+    ///
+    /// Here rather than in `update` and `create` separately, because "before
+    /// the bytes are made" is exactly what the hook has to mean: every write
+    /// in this file passes through here, `mutate` included (it writes through
+    /// `update`), so there is no path that stores an object the derivation
+    /// never saw. A caller that wants the settled object back reads the
+    /// return value of the write, which is decoded from these very bytes.
+    ///
+    /// It costs no clone that was not already being made: the copy exists
+    /// anyway, to keep `resourceVersion` out of the store.
+    fn encode<T: Resource>(obj: &T, now: chrono::DateTime<chrono::Utc>) -> Result<Vec<u8>> {
         // resource_version is derived state; never persist it.
         let mut clean = obj.clone();
         clean.metadata_mut().resource_version = String::new();
+        clean.settle(now);
         serde_json::to_vec(&clean).map_err(|e| StoreError::Invalid(format!("invalid object: {e}")))
     }
 
@@ -255,6 +297,94 @@ impl EtcdStore {
             }
         }
         Ok(out)
+    }
+
+    /// Record that this peer has just spoken, in a key of its own.
+    ///
+    /// D-C7, and the number behind it is the whole argument: a 20-second
+    /// watch on an idle lab showed twelve PUTs, every one of them a whole
+    /// `Node` object rewritten because `lastHeartbeat` had moved 108 ms. Two
+    /// megabytes of live data in a 2029-megabyte database, 1.13 revisions a
+    /// second with nobody doing anything, and a `cpuFlags` string of about
+    /// 300 bytes persisted with each of them. Liveness is the most volatile
+    /// thing this control plane knows and it was living in the same object as
+    /// the spec and the inventory, which are the least.
+    ///
+    /// So it lives here: `<prefix>/leases/<resource>/<name>`, about sixty
+    /// bytes, and the object itself is written only when something about the
+    /// MACHINE changed. Kubernetes left `Node.status` for `Lease` in
+    /// `kube-node-lease` for exactly this reason.
+    ///
+    /// **No etcd TTL.** The deadline stays [`crate::heartbeat::expired`] — 30
+    /// seconds, one constant, read at both tiers — because a key that
+    /// vanished on its own would make "has not reported in 40 s" and "has
+    /// never reported" the same answer, and those are the two cases the
+    /// timeout function exists to keep apart. A lease that stops moving is
+    /// evidence; a lease that is gone is silence about a peer that may never
+    /// have existed.
+    pub async fn beat<T: Resource>(&self, name: &str, at: DateTime<Utc>) -> Result<()> {
+        let key = lease_key(&self.prefix, T::RESOURCE, name);
+        let value = serde_json::to_vec(&Lease { at })
+            .map_err(|e| StoreError::Invalid(format!("invalid lease: {e}")))?;
+        let resp = timed("lease_put", self.handle().put(key, value, None)).await?;
+        observe_revision(resp.header());
+        Ok(())
+    }
+
+    /// When this peer last spoke, or `None` if this store has never heard it.
+    ///
+    /// `None` and not an error for a key that is not there: a peer whose
+    /// object exists because somebody said Hello once has no lease, and that
+    /// is exactly what `expired(None, now)` is written to answer.
+    pub async fn last_beat<T: Resource>(&self, name: &str) -> Result<Option<DateTime<Utc>>> {
+        let key = lease_key(&self.prefix, T::RESOURCE, name);
+        let resp = timed("lease_get", self.handle().get(key, None)).await?;
+        observe_revision(resp.header());
+        Ok(resp
+            .kvs()
+            .first()
+            .and_then(|kv| Self::read_lease(kv.value())))
+    }
+
+    /// Every peer's lease, by name, in ONE read.
+    ///
+    /// The batched half, and the reason it exists rather than a loop of
+    /// `last_beat`: a reconcile pass asks this of every node it has, and a
+    /// LIST of ten nodes must not become eleven round trips.
+    pub async fn beats<T: Resource>(&self) -> Result<HashMap<String, DateTime<Utc>>> {
+        let dir = lease_dir(&self.prefix, T::RESOURCE);
+        let resp = timed(
+            "lease_list",
+            self.handle()
+                .get(dir.clone(), Some(GetOptions::new().with_prefix())),
+        )
+        .await?;
+        observe_revision(resp.header());
+        let mut out = HashMap::with_capacity(resp.kvs().len());
+        for kv in resp.kvs() {
+            let key = String::from_utf8_lossy(kv.key()).to_string();
+            let Some(name) = key.strip_prefix(dir.as_str()) else {
+                continue;
+            };
+            if let Some(at) = Self::read_lease(kv.value()) {
+                out.insert(name.to_string(), at);
+            }
+        }
+        Ok(out)
+    }
+
+    /// A lease this store cannot read is a peer that has not reported, and
+    /// not an error anybody can act on: the next beat replaces the key.
+    /// Warned about once per read rather than propagated, because the caller
+    /// of a liveness question has no repair to make.
+    fn read_lease(bytes: &[u8]) -> Option<DateTime<Utc>> {
+        match serde_json::from_slice::<Lease>(bytes) {
+            Ok(lease) => Some(lease.at),
+            Err(e) => {
+                warn!(error = %e, "skipping an undecodable lease");
+                None
+            }
+        }
     }
 
     /// How many keys the resource prefix actually holds. `list` degrades on
@@ -374,7 +504,7 @@ impl EtcdStore {
         obj.metadata_mut().generation = 1;
         let obj = &obj;
         let key = self.key(T::RESOURCE, &name);
-        let value = Self::encode(obj)?;
+        let value = Self::encode(obj, chrono::Utc::now())?;
         let options = lease.map(|id| PutOptions::new().with_lease(id));
         let txn = Txn::new()
             .when(vec![Compare::create_revision(
@@ -473,7 +603,7 @@ impl EtcdStore {
             )
         })?;
         let key = self.key(T::RESOURCE, &name);
-        let value = Self::encode(obj)?;
+        let value = Self::encode(obj, chrono::Utc::now())?;
         let txn = Txn::new()
             .when(vec![Compare::mod_revision(
                 key.clone(),
@@ -928,7 +1058,7 @@ mod tests {
         // it must not be what comes back out.
         obj.metadata.resource_version = "41".into();
 
-        let bytes = EtcdStore::encode(&obj).expect("encodes");
+        let bytes = EtcdStore::encode(&obj, chrono::Utc::now()).expect("encodes");
         let back: FloatingIp = EtcdStore::decode(&bytes, 42).expect("decodes");
 
         assert_eq!(back.metadata.resource_version, "42", "the write's revision");
@@ -941,5 +1071,115 @@ mod tests {
             serde_json::to_value(&back).unwrap(),
             serde_json::to_value(&expected).unwrap()
         );
+    }
+
+    /// The heartbeat's own key, and what is in it.
+    ///
+    /// D-C7's fix in two assertions. The KEY is beside the registry and not
+    /// inside it, so `list::<Node>()` cannot walk over a lease and a lease
+    /// cannot be mistaken for an object. The VALUE is one instant — sixty
+    /// bytes against the 1.5 kB `Node` object a beat used to rewrite, which
+    /// is the factor of 25 the report asked for.
+    #[test]
+    fn a_heartbeat_has_a_key_of_its_own_beside_the_registry() {
+        use crate::resources::{Cluster, Node};
+
+        assert_eq!(
+            lease_key("/cluster", <Node as Resource>::RESOURCE, "agent-1c"),
+            "/cluster/leases/nodes/agent-1c"
+        );
+        assert_eq!(
+            lease_key("/cloud", <Cluster as Resource>::RESOURCE, "cluster-1"),
+            "/cloud/leases/clusters/cluster-1"
+        );
+        // The directory a batched read walks, and the prefix `beats` strips
+        // the name off.
+        let dir = lease_dir("/cluster", <Node as Resource>::RESOURCE);
+        assert_eq!(dir, "/cluster/leases/nodes/");
+        assert_eq!(
+            lease_key("/cluster", <Node as Resource>::RESOURCE, "agent-1c")
+                .strip_prefix(dir.as_str()),
+            Some("agent-1c")
+        );
+        // And not under the registry, which is what keeps a lease out of
+        // every `list` and every watch in this file.
+        assert!(!dir.starts_with("/cluster/registry"));
+
+        let at = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("an instant");
+        let bytes = serde_json::to_vec(&Lease { at }).expect("a lease serialises");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).expect("utf8"),
+            r#"{"at":"2027-01-15T08:00:00Z"}"#
+        );
+        assert!(bytes.len() < 64, "{} bytes", bytes.len());
+        assert_eq!(EtcdStore::read_lease(&bytes), Some(at));
+        // A lease nobody can read is a peer that has not reported, not an
+        // error: the next beat replaces the key.
+        assert_eq!(EtcdStore::read_lease(b"{}"), None);
+        assert_eq!(EtcdStore::read_lease(b"not json"), None);
+    }
+
+    /// The store runs [`Resource::settle`] on the way out, and this is where
+    /// that is nailed down without an etcd.
+    ///
+    /// Two halves. The default is a NO-OP, which is what makes struktur 4's
+    /// type half behaviour-neutral: every resource in the tree writes exactly
+    /// the bytes it wrote before. And a resource that does implement it is
+    /// really called, with the instant the store chose — which is the
+    /// contract the derivation lane is going to build on.
+    #[test]
+    fn the_store_settles_an_object_before_it_makes_the_bytes() {
+        use crate::object::Object;
+        use crate::resources::{FloatingIp, FloatingIpSpec};
+
+        // The default: nothing in the tree implements `settle` yet, so the
+        // document that goes in is the document that comes out — which is
+        // the whole claim "the type half changes no behaviour".
+        let plain = FloatingIp::declare(
+            "10.255.0.9",
+            FloatingIpSpec {
+                internal_address: String::new(),
+                router: String::new(),
+                tenant: "acme".into(),
+                pool: "lab".into(),
+                address: "10.255.0.9".into(),
+                vm: None,
+            },
+        );
+        let bytes = EtcdStore::encode(&plain, chrono::Utc::now()).expect("encodes");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("json"),
+            serde_json::to_value(&plain).expect("json"),
+            "a resource without a settle is written verbatim"
+        );
+
+        // And one that has one: its phase is a function of its spec, which is
+        // the shape every real `settle` will have.
+        #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+        struct Wanted {
+            ready: bool,
+        }
+        #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+        struct Derived {
+            phase: String,
+            at: String,
+        }
+        type Thing = Object<Wanted, Derived>;
+        impl Resource for Thing {
+            const RESOURCE: &'static str = "things";
+            const KIND: &'static str = "Thing";
+            fn settle(&mut self, now: chrono::DateTime<chrono::Utc>) {
+                self.status.phase = if self.spec.ready { "Ready" } else { "Pending" }.to_string();
+                self.status.at = now.to_rfc3339();
+            }
+        }
+
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("an instant");
+        let thing = Thing::new("meister.io/v1", "Thing", "t", Wanted { ready: true });
+        assert_eq!(thing.status.phase, "", "nobody has assigned anything");
+        let bytes = EtcdStore::encode(&thing, now).expect("encodes");
+        let back: Thing = EtcdStore::decode(&bytes, 1).expect("decodes");
+        assert_eq!(back.status.phase, "Ready", "derived on the way out");
+        assert_eq!(back.status.at, now.to_rfc3339(), "at the store's instant");
     }
 }

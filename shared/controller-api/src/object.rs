@@ -207,6 +207,34 @@ pub trait Resource: StoredObject {
     /// resources whose name is not a word an operator chose say so in the
     /// resource table.
     const NAME_SHAPE: NameShape = NameShape::DnsLabel;
+
+    /// Work out what this object's own status SAYS, out of its spec and the
+    /// facts already written on it, and write that down. Called by the store
+    /// on every write, after whatever the caller did and before the bytes are
+    /// made.
+    ///
+    /// The hook a phase stops being an assignment through. Until struktur 4 a
+    /// phase was whatever the last writer to come past the object happened to
+    /// know — 80 assignments in 23 files, none of which could see what any of
+    /// the others knew, which is how a `StoragePool` pointer stood on
+    /// `Pending` for six minutes without saying why (D-C11) and an `Image`
+    /// stood on `Ready` over a file nobody had looked at (F16). A derivation
+    /// needs exactly one place per resource and a moment at which it is
+    /// certain to run; this is the moment.
+    ///
+    /// **Nothing implements it in this lane.** The default is a no-op, so
+    /// every object goes on being written exactly as it was written before,
+    /// and the derivation lane fills it in one resource at a time — each with
+    /// its own table test, and each a behaviour change that is named in a
+    /// report rather than discovered in a lab.
+    ///
+    /// Total and silent by contract: it reads the object and nothing else (no
+    /// store, no other object, no clock but the one it is handed) and it
+    /// cannot fail. A derivation that needed another object would be a
+    /// derivation the store cannot run inside a compare-and-swap — which is
+    /// why the facts it needs are written ONTO the object by whichever pass
+    /// knows them.
+    fn settle(&mut self, _now: DateTime<Utc>) {}
 }
 
 /// What a name may hold.

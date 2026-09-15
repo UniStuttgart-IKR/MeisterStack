@@ -18,6 +18,14 @@ pub(super) async fn list_clusters(
     let selector = controller_api::Selector::parse(q.label_selector.as_deref())?;
     let mut items = st.store.list::<Cluster>().await?;
     items.retain(|c| selector.selects(&c.metadata.labels));
+    // `status.lastHeartbeat`, joined back on: the field lives in a key of its
+    // own since D-C7 (`EtcdStore::beat`), and this is what keeps the API's
+    // answer the answer it always was — `meister cluster ls` shows the column
+    // it always showed. One batched read per LIST.
+    let beats = st.store.beats::<Cluster>().await?;
+    for cluster in items.iter_mut() {
+        cluster.status.last_heartbeat = beats.get(&cluster.metadata.name).copied();
+    }
     Ok(Json(
         json!({ "apiVersion": API_VERSION, "kind": "ClusterList", "items": items }),
     ))
@@ -27,7 +35,9 @@ pub(super) async fn get_cluster(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<Cluster>, ApiError> {
-    Ok(Json(st.store.get(&name).await?))
+    let mut cluster: Cluster = st.store.get(&name).await?;
+    cluster.status.last_heartbeat = st.store.last_beat::<Cluster>(&name).await?;
+    Ok(Json(cluster))
 }
 
 /// The Node route one tier up, over the object one tier up, with the same
@@ -47,10 +57,14 @@ pub(super) async fn update_cluster(
     let was = current.spec.schedulable;
     let next = apply_spec_update(body, &name, current)?;
     let now = next.spec.schedulable;
-    let updated = match dry.preview(&next) {
+    let mut updated = match dry.preview(&next) {
         Some(preview) => preview,
         None => st.store.update(&next).await?,
     };
+    // The same join GET and LIST make: a response that showed the instant
+    // left in etcd before the field moved would be the only lie this route
+    // could still tell.
+    updated.status.last_heartbeat = st.store.last_beat::<Cluster>(&name).await?;
     if was != now {
         info!(cluster = %name, schedulable = now, "cluster schedulability changed");
     }

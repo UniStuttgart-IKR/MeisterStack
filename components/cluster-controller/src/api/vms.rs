@@ -125,7 +125,7 @@ pub(super) async fn create_vm_traced(
     // "is this a legal VM"; this answers "and where would it go", which is
     // the question somebody looking at a suggestion actually has.
     if dry.requested() {
-        vm.status.message = Some(
+        let said =
             crate::reconcile::would_place(&st.store, st.scheduler.as_ref(), st.overcommit, &vm)
                 .await
                 .map_err(|e| {
@@ -134,8 +134,16 @@ pub(super) async fn create_vm_traced(
                         "Internal",
                         format!("{e:#}"),
                     )
-                })?,
-        );
+                })?;
+        // On the phase the VM already has: a preview is a sentence about a VM
+        // that has not been created, not a phase change.
+        let phase = vm.status.phase().kind();
+        #[allow(deprecated)]
+        vm.status.assign(controller_api::VmPhase::said(
+            phase,
+            Some(said),
+            chrono::Utc::now(),
+        ));
     }
     let created = match dry.preview(&vm) {
         Some(preview) => preview,
@@ -473,13 +481,10 @@ async fn check_holder_is_talking(st: &ApiState, current: &Vm, next: &Vm) -> Resu
     let Some(node) = releasing(current, next) else {
         return Ok(());
     };
-    let heard = match st.store.get::<Node>(node).await {
-        Ok(n) => n.status.last_heartbeat,
-        // A node object that is not there any more has certainly not
-        // reported; the refusal is the same one and says so.
-        Err(StoreError::NotFound(_)) => None,
-        Err(e) => return Err(e.into()),
-    };
+    // The lease and not the object: the heartbeat moved into a key of its own
+    // (D-C7), and an absent lease is the same answer an absent object gave —
+    // this machine has not reported.
+    let heard = st.store.last_beat::<Node>(node).await?;
     holder_refusal(current, node, heard, Utc::now())
 }
 
@@ -496,7 +501,7 @@ pub(super) fn holder_refusal(
     now: chrono::DateTime<Utc>,
 ) -> Result<(), ApiError> {
     match controller_api::unknown_needs_its_holder(
-        current.status.phase,
+        current.status.phase().kind(),
         controller_api::Holder::Node,
         node,
         heard,
@@ -534,7 +539,7 @@ async fn note_unknown_release(st: &ApiState, current: &Vm, next: &Vm) {
 
 /// The sentence a released binding leaves on the object, where it leaves one.
 pub(super) fn release_event(current: &Vm, next: &Vm) -> Option<String> {
-    if current.status.phase != controller_api::VmPhase::Unknown {
+    if current.status.phase().kind() != controller_api::VmPhaseKind::Unknown {
         return None;
     }
     let node = releasing(current, next)?;
@@ -568,12 +573,15 @@ pub(super) fn check_reschedule(current: &Vm, next: &Vm) -> Result<(), ApiError> 
     // that holds both. Two copies of this drifted once already — the cloud
     // grew disk conditions the cluster does not have — and the phase half is
     // exactly the half that must not.
-    if controller_api::stopped_enough(current.spec.run_strategy, current.status.phase) {
+    if controller_api::stopped_enough(current.spec.run_strategy, current.status.phase().kind()) {
         return Ok(());
     }
     Err(invalid_field(
         "spec.nodeName",
-        controller_api::not_stopped_enough(current.spec.run_strategy, current.status.phase),
+        controller_api::not_stopped_enough(
+            current.spec.run_strategy,
+            current.status.phase().kind(),
+        ),
     ))
 }
 

@@ -41,15 +41,21 @@ fn a_volume_is_opened_and_closed_by_name_and_the_list_stays_a_set() {
 #[test]
 fn only_a_migration_under_way_lets_two_nodes_hold_one_volume() {
     assert!(!second_open_is_a_migration(None));
-    assert!(!second_open_is_a_migration(Some(VmMigrationPhase::Pending)));
-    assert!(second_open_is_a_migration(Some(
-        VmMigrationPhase::Preparing
-    )));
-    assert!(second_open_is_a_migration(Some(VmMigrationPhase::Running)));
     assert!(!second_open_is_a_migration(Some(
-        VmMigrationPhase::Succeeded
+        VmMigrationPhaseKind::Pending
     )));
-    assert!(!second_open_is_a_migration(Some(VmMigrationPhase::Failed)));
+    assert!(second_open_is_a_migration(Some(
+        VmMigrationPhaseKind::Preparing
+    )));
+    assert!(second_open_is_a_migration(Some(
+        VmMigrationPhaseKind::Running
+    )));
+    assert!(!second_open_is_a_migration(Some(
+        VmMigrationPhaseKind::Succeeded
+    )));
+    assert!(!second_open_is_a_migration(Some(
+        VmMigrationPhaseKind::Failed
+    )));
 }
 
 /// One pool, two spellings, one answer — and the short form first,
@@ -147,34 +153,41 @@ fn two_clusters_disagree_unless_both_describe_the_same_backend() {
 #[test]
 fn the_phases_are_spelled_alike_and_the_pending_category_reaches_the_api() {
     assert_eq!(
-        serde_json::to_value(VmPhase::Provisioning).unwrap(),
+        serde_json::to_value(VmPhaseKind::Provisioning).unwrap(),
         serde_json::json!("Provisioning")
     );
     assert_eq!(
-        serde_json::to_value(VolumePhase::Provisioning).unwrap(),
+        serde_json::to_value(VolumePhaseKind::Provisioning).unwrap(),
         serde_json::json!("Provisioning")
     );
     assert_eq!(
-        serde_json::to_value(VolumePhase::Releasing).unwrap(),
+        serde_json::to_value(VolumePhaseKind::Releasing).unwrap(),
         serde_json::json!("Releasing")
     );
 
     // Absent by default and absent from the wire, so every object written
-    // before this field existed reads back as what it was.
+    // before this field existed reads back as what it was. `reason` is what
+    // `pendingReason` became in struktur 4: the same closed word in the same
+    // place, one key shorter.
     let s = VmStatus::default();
-    assert!(s.pending_reason.is_none());
+    assert_eq!(s.phase().reason(), Some(VmReason::Unrecorded));
     let wire = serde_json::to_value(&s).unwrap();
+    assert!(wire.get("reason").is_none(), "{wire}");
     assert!(wire.get("pendingReason").is_none(), "{wire}");
 
     // And when it is there it is one of the closed set.
-    let s = VmStatus {
-        pending_reason: Some(crate::PendingReason::NoCapacity.as_str().to_string()),
-        ..Default::default()
-    };
-    assert_eq!(
-        serde_json::to_value(&s).unwrap()["pendingReason"],
-        "no-capacity"
-    );
+    let mut s = VmStatus::default();
+    #[allow(deprecated)]
+    s.assign(VmPhase::new(
+        VmPhaseKind::Pending,
+        VmReason::Unplaced,
+        Some("no candidate has room".into()),
+        Utc::now(),
+    ));
+    let wire = serde_json::to_value(&s).unwrap();
+    assert_eq!(wire["reason"], "Unplaced");
+    assert_eq!(wire["message"], "no candidate has room");
+    assert_eq!(wire["phase"], "Pending", "still a sibling, still a string");
 }
 
 /// The registration table read back through the trait: no two resources
@@ -209,16 +222,16 @@ fn every_resource_has_its_own_directory_and_its_own_kind() {
 /// from the list without the enum changing.
 #[test]
 fn the_variant_lists_name_every_variant() {
-    for phase in VmPhase::ALL {
+    for phase in VmPhaseKind::ALL {
         match phase {
-            VmPhase::Pending
-            | VmPhase::Provisioning
-            | VmPhase::Running
-            | VmPhase::Stopped
-            | VmPhase::Paused
-            | VmPhase::Failed
-            | VmPhase::Quarantined
-            | VmPhase::Unknown => {}
+            VmPhaseKind::Pending
+            | VmPhaseKind::Provisioning
+            | VmPhaseKind::Running
+            | VmPhaseKind::Stopped
+            | VmPhaseKind::Paused
+            | VmPhaseKind::Failed
+            | VmPhaseKind::Quarantined
+            | VmPhaseKind::Unknown => {}
         }
     }
     for strategy in RunStrategy::ALL {
@@ -226,14 +239,14 @@ fn the_variant_lists_name_every_variant() {
             RunStrategy::Running | RunStrategy::Stopped | RunStrategy::Paused => {}
         }
     }
-    for phase in RouterPhase::ALL {
+    for phase in RouterPhaseKind::ALL {
         match phase {
-            RouterPhase::Pending
-            | RouterPhase::Provisioning
-            | RouterPhase::Active
-            | RouterPhase::Standby
-            | RouterPhase::Failed
-            | RouterPhase::Unknown => {}
+            RouterPhaseKind::Pending
+            | RouterPhaseKind::Provisioning
+            | RouterPhaseKind::Active
+            | RouterPhaseKind::Standby
+            | RouterPhaseKind::Failed
+            | RouterPhaseKind::Unknown => {}
         }
     }
     for kind in NatKind::ALL {
@@ -243,13 +256,13 @@ fn the_variant_lists_name_every_variant() {
     }
     // No duplicates hiding a missing one.
     let spellings: std::collections::BTreeSet<_> =
-        VmPhase::ALL.iter().map(|p| p.as_str()).collect();
-    assert_eq!(spellings.len(), VmPhase::ALL.len());
-    assert_eq!(VmPhase::ALL.iter().filter(|p| p.is_stable()).count(), 3);
+        VmPhaseKind::ALL.iter().map(|p| p.as_str()).collect();
+    assert_eq!(spellings.len(), VmPhaseKind::ALL.len());
+    assert_eq!(VmPhaseKind::ALL.iter().filter(|p| p.is_stable()).count(), 3);
 
     let spellings: std::collections::BTreeSet<_> =
-        RouterPhase::ALL.iter().map(|p| p.as_str()).collect();
-    assert_eq!(spellings.len(), RouterPhase::ALL.len());
+        RouterPhaseKind::ALL.iter().map(|p| p.as_str()).collect();
+    assert_eq!(spellings.len(), RouterPhaseKind::ALL.len());
     let spellings: std::collections::BTreeSet<_> =
         NatKind::ALL.iter().map(|k| k.as_str()).collect();
     assert_eq!(spellings.len(), NatKind::ALL.len());
@@ -262,12 +275,16 @@ fn the_variant_lists_name_every_variant() {
 /// rather than defaulted to Pending.
 #[test]
 fn every_router_phase_parses_from_its_own_spelling() {
-    for phase in RouterPhase::ALL {
-        assert_eq!(RouterPhase::parse(phase.as_str()), Some(phase));
+    for phase in RouterPhaseKind::ALL {
+        assert_eq!(RouterPhaseKind::parse(phase.as_str()), Some(phase));
     }
-    assert_eq!(RouterPhase::parse("Ascended"), None);
-    assert_eq!(RouterPhase::parse("active"), None, "the case is part of it");
-    assert_eq!(RouterPhase::default(), RouterPhase::Pending);
+    assert_eq!(RouterPhaseKind::parse("Ascended"), None);
+    assert_eq!(
+        RouterPhaseKind::parse("active"),
+        None,
+        "the case is part of it"
+    );
+    assert_eq!(RouterPhaseKind::default(), RouterPhaseKind::Pending);
 }
 
 /// OVN's spelling, unchanged all the way down: the string in the object,
@@ -410,19 +427,19 @@ fn a_workload_that_names_no_class_is_of_its_own_kinds_class() {
 #[test]
 fn every_phase_parses_from_its_own_spelling() {
     for phase in [
-        VmPhase::Pending,
-        VmPhase::Provisioning,
-        VmPhase::Running,
-        VmPhase::Stopped,
-        VmPhase::Paused,
-        VmPhase::Failed,
-        VmPhase::Quarantined,
+        VmPhaseKind::Pending,
+        VmPhaseKind::Provisioning,
+        VmPhaseKind::Running,
+        VmPhaseKind::Stopped,
+        VmPhaseKind::Paused,
+        VmPhaseKind::Failed,
+        VmPhaseKind::Quarantined,
     ] {
-        assert_eq!(VmPhase::parse(&format!("{phase:?}")), Some(phase));
-        assert_eq!(VmPhase::parse(phase.as_str()), Some(phase));
+        assert_eq!(VmPhaseKind::parse(&format!("{phase:?}")), Some(phase));
+        assert_eq!(VmPhaseKind::parse(phase.as_str()), Some(phase));
     }
-    assert_eq!(VmPhase::parse("running"), None);
-    assert_eq!(VmPhase::parse(""), None);
+    assert_eq!(VmPhaseKind::parse("running"), None);
+    assert_eq!(VmPhaseKind::parse(""), None);
 }
 
 /// The generation pair is spelled the way the rest of this API is.
@@ -600,7 +617,11 @@ fn a_pool_states_its_locality_and_cannot_be_told_one() {
         "the spec has no locality and never gets one: {spec}"
     );
 
-    pool.status.phase = StoragePoolPhase::Ready;
+    #[allow(deprecated)]
+    pool.status.assign(StoragePoolPhase::of(
+        StoragePoolPhaseKind::Ready,
+        Utc::now(),
+    ));
     pool.status.locality = Some(Locality::NodeLocal);
     let status = serde_json::to_value(&pool.status).unwrap();
     assert_eq!(status["phase"], "Ready");
@@ -609,7 +630,7 @@ fn a_pool_states_its_locality_and_cannot_be_told_one() {
     // A pool nothing is known about carries neither key, which is what
     // every pool written before this field looks like on the way back in.
     let old: StoragePoolStatus = serde_json::from_str("{}").unwrap();
-    assert_eq!(old.phase, StoragePoolPhase::Pending);
+    assert_eq!(old.phase().kind(), StoragePoolPhaseKind::Pending);
     assert_eq!(old.locality, None);
 }
 
@@ -1358,4 +1379,132 @@ fn a_machine_state_is_only_moved_where_it_can_be_restored() {
         ..metal()
     };
     assert_eq!(refusal(&metal(), &newer), None);
+}
+
+/// The flat wire form of all seven phases, in one place.
+///
+/// The whole of decision 1 of struktur 4, and the reason it is one test
+/// rather than seven: what a client reads is `status.phase` as a STRING with
+/// `reason`, `message` and `since` beside it, and the seven resources must
+/// not drift apart about that. The CLI, Tofu, the UI and the chaos harness
+/// all read it this way; a tagged enum would have made every one of them read
+/// `status.phase.Pending.reason` instead.
+#[test]
+fn every_status_wears_its_phase_flat() {
+    let at = DateTime::from_timestamp(1_800_000_000, 0).expect("an instant");
+    let said = |m: &str| Some(m.to_string());
+
+    let mut vm = VmStatus::default();
+    #[allow(deprecated)]
+    vm.assign(VmPhase::new(
+        VmPhaseKind::Pending,
+        VmReason::Unplaced,
+        said("no candidate has room (3 looked at)"),
+        at,
+    ));
+    let mut volume = VolumeStatus::default();
+    #[allow(deprecated)]
+    volume.assign(VolumePhase::new(
+        VolumePhaseKind::Releasing,
+        VolumeReason::HeldBy,
+        said("held by vm web-1"),
+        at,
+    ));
+    let mut snapshot = VolumeSnapshotStatus::default();
+    #[allow(deprecated)]
+    snapshot.assign(VolumeSnapshotPhase::new(
+        VolumeSnapshotPhaseKind::Creating,
+        VolumeSnapshotReason::Dispatched,
+        said("agent-1a was told"),
+        at,
+    ));
+    let mut image = ImageStatus::default();
+    #[allow(deprecated)]
+    image.assign(ImagePhase::new(
+        ImagePhaseKind::Pending,
+        ImageReason::AwaitingNode,
+        said("not fetched by any node yet"),
+        at,
+    ));
+    let mut pool = StoragePoolStatus::default();
+    #[allow(deprecated)]
+    pool.assign(StoragePoolPhase::new(
+        StoragePoolPhaseKind::Pending,
+        StoragePoolReason::ClusterHasNoPool,
+        said("cluster-1 reports no pool named mc-fs"),
+        at,
+    ));
+    let mut router = RouterStatus::default();
+    #[allow(deprecated)]
+    router.assign(RouterPhase::new(
+        RouterPhaseKind::Unknown,
+        RouterReason::Silent,
+        said("node agent-1b last reported 2026-09-15T16:42:25Z"),
+        at,
+    ));
+    let mut migration = VmMigrationStatus::default();
+    #[allow(deprecated)]
+    migration.assign(VmMigrationPhase::new(
+        VmMigrationPhaseKind::Failed,
+        VmMigrationReason::Abandoned,
+        said("the destination was not ready after 120s"),
+        at,
+    ));
+
+    let four = |status: serde_json::Value, phase: &str, reason: &str, message: &str| {
+        assert_eq!(status["phase"], phase, "{status}");
+        assert_eq!(status["reason"], reason, "{status}");
+        assert_eq!(status["message"], message, "{status}");
+        assert_eq!(status["since"], "2027-01-15T08:00:00Z", "{status}");
+    };
+    let wire = |s: &dyn StatusWire| s.wire();
+
+    four(
+        wire(&vm),
+        "Pending",
+        "Unplaced",
+        "no candidate has room (3 looked at)",
+    );
+    four(wire(&volume), "Releasing", "HeldBy", "held by vm web-1");
+    four(
+        wire(&snapshot),
+        "Creating",
+        "Dispatched",
+        "agent-1a was told",
+    );
+    four(
+        wire(&image),
+        "Pending",
+        "AwaitingNode",
+        "not fetched by any node yet",
+    );
+    four(
+        wire(&pool),
+        "Pending",
+        "ClusterHasNoPool",
+        "cluster-1 reports no pool named mc-fs",
+    );
+    four(
+        wire(&router),
+        "Unknown",
+        "Silent",
+        "node agent-1b last reported 2026-09-15T16:42:25Z",
+    );
+    four(
+        wire(&migration),
+        "Failed",
+        "Abandoned",
+        "the destination was not ready after 120s",
+    );
+}
+
+/// One trait so the assertion above can be written once for seven types.
+/// Nothing outside this test file has any use for it.
+trait StatusWire {
+    fn wire(&self) -> serde_json::Value;
+}
+impl<T: Serialize> StatusWire for T {
+    fn wire(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("a status serialises")
+    }
 }

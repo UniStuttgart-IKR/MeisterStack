@@ -14,7 +14,7 @@
 //! that could only be exercised through an etcd and two agents is a rule
 //! nobody checks.
 
-use crate::{Evacuation, RunStrategy, StayReason, Vm, VmPhase};
+use crate::{Evacuation, RunStrategy, StayReason, Vm, VmPhaseKind};
 
 /// What a drain should do about one VM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,8 +108,8 @@ pub fn verdict(vm: &Vm, facts: &DrainFacts) -> Verdict {
     // Standing still is the easy case and does not consult `evacuation` at
     // all: nothing is running, so nothing is being interrupted, and moving a
     // stopped VM is what a client may ask for by hand anyway.
-    let at_rest =
-        vm.spec.run_strategy == RunStrategy::Stopped && vm.status.phase == VmPhase::Stopped;
+    let at_rest = vm.spec.run_strategy == RunStrategy::Stopped
+        && vm.status.phase().kind() == VmPhaseKind::Stopped;
     if at_rest {
         return Verdict::Reschedule;
     }
@@ -170,10 +170,10 @@ pub fn sentence(reason: StayReason, vm: &str, facts: &DrainFacts) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Evacuating, VmSpec, resources::new_vm};
+    use crate::{Evacuating, VmPhase, VmSpec, resources::new_vm};
     use chrono::Utc;
 
-    fn vm(strategy: RunStrategy, phase: VmPhase, evacuation: Evacuation) -> Vm {
+    fn vm(strategy: RunStrategy, phase: VmPhaseKind, evacuation: Evacuation) -> Vm {
         let mut v = new_vm(
             "web-1",
             VmSpec {
@@ -189,7 +189,8 @@ mod tests {
                 vm: serde_json::json!({ "vcpus": 1 }),
             },
         );
-        v.status.phase = phase;
+        #[allow(deprecated)]
+        v.status.assign(VmPhase::of(phase, Utc::now()));
         v
     }
 
@@ -210,7 +211,11 @@ mod tests {
         // Stopped: moves, and nobody had to allow it.
         assert_eq!(
             verdict(
-                &vm(RunStrategy::Stopped, VmPhase::Stopped, Evacuation::Never),
+                &vm(
+                    RunStrategy::Stopped,
+                    VmPhaseKind::Stopped,
+                    Evacuation::Never
+                ),
                 &plain()
             ),
             Verdict::Reschedule,
@@ -220,7 +225,11 @@ mod tests {
         // Running, restart: one operation the guest sees as a reboot.
         assert_eq!(
             verdict(
-                &vm(RunStrategy::Running, VmPhase::Running, Evacuation::Restart),
+                &vm(
+                    RunStrategy::Running,
+                    VmPhaseKind::Running,
+                    Evacuation::Restart
+                ),
                 &plain()
             ),
             Verdict::Restart
@@ -229,7 +238,11 @@ mod tests {
         // Running, never: stays, and is listed.
         assert_eq!(
             verdict(
-                &vm(RunStrategy::Running, VmPhase::Running, Evacuation::Never),
+                &vm(
+                    RunStrategy::Running,
+                    VmPhaseKind::Running,
+                    Evacuation::Never
+                ),
                 &plain()
             ),
             Verdict::Stays(StayReason::EvacuationNever)
@@ -239,7 +252,11 @@ mod tests {
         // observation are two facts, and only both make a vm standing still.
         assert_eq!(
             verdict(
-                &vm(RunStrategy::Stopped, VmPhase::Running, Evacuation::Never),
+                &vm(
+                    RunStrategy::Stopped,
+                    VmPhaseKind::Running,
+                    Evacuation::Never
+                ),
                 &plain()
             ),
             Verdict::Stays(StayReason::EvacuationNever)
@@ -250,7 +267,11 @@ mod tests {
     /// rules it out however capable the tier is.
     #[test]
     fn live_is_offered_only_where_it_exists_and_never_with_a_device() {
-        let running = vm(RunStrategy::Running, VmPhase::Running, Evacuation::Never);
+        let running = vm(
+            RunStrategy::Running,
+            VmPhaseKind::Running,
+            Evacuation::Never,
+        );
         let live = DrainFacts {
             live_possible: true,
             ..plain()
@@ -272,7 +293,11 @@ mod tests {
         assert!(said.contains("spec.evacuation = restart"), "{said}");
 
         // And with `restart` it goes by reboot, which is the GPU case whole.
-        let gpu = vm(RunStrategy::Running, VmPhase::Running, Evacuation::Restart);
+        let gpu = vm(
+            RunStrategy::Running,
+            VmPhaseKind::Running,
+            Evacuation::Restart,
+        );
         assert_eq!(verdict(&gpu, &with_device), Verdict::Restart);
 
         // Where live is not built, the same vm is treated as `never` — the
@@ -293,9 +318,21 @@ mod tests {
             ..plain()
         };
         for (strategy, phase, evacuation) in [
-            (RunStrategy::Running, VmPhase::Running, Evacuation::Restart),
-            (RunStrategy::Running, VmPhase::Running, Evacuation::Never),
-            (RunStrategy::Stopped, VmPhase::Stopped, Evacuation::Restart),
+            (
+                RunStrategy::Running,
+                VmPhaseKind::Running,
+                Evacuation::Restart,
+            ),
+            (
+                RunStrategy::Running,
+                VmPhaseKind::Running,
+                Evacuation::Never,
+            ),
+            (
+                RunStrategy::Stopped,
+                VmPhaseKind::Stopped,
+                Evacuation::Restart,
+            ),
         ] {
             assert_eq!(
                 verdict(&vm(strategy, phase, evacuation), &pinned),
@@ -313,7 +350,11 @@ mod tests {
     /// and `since` would never age.
     #[test]
     fn a_vm_already_moving_is_left_alone() {
-        let mut moving = vm(RunStrategy::Running, VmPhase::Running, Evacuation::Restart);
+        let mut moving = vm(
+            RunStrategy::Running,
+            VmPhaseKind::Running,
+            Evacuation::Restart,
+        );
         moving.status.evacuating = Some(Evacuating {
             from: "agent-1".into(),
             step: crate::EvacuationStep::Stopping.as_str().to_string(),

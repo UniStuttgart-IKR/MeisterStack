@@ -17,7 +17,7 @@
 use super::*;
 
 use controller_api::network::{self, NetworkBackend, RouterOutcome, RouterPlan, RouterSink};
-use controller_api::{ProviderNetwork, Router, RouterPhase};
+use controller_api::{ProviderNetwork, Router, RouterPhaseKind};
 
 /// Who, of several leaderless replicas, may act on this router: anybody who
 /// can reach ONE of the machines it is on, and everybody while it is on none.
@@ -80,13 +80,13 @@ pub(crate) fn plan_router(
     networks: &[ProviderNetwork],
     load: &std::collections::BTreeMap<String, usize>,
     candidates: &[Candidate],
-) -> Result<RouterPlan, (RouterPhase, String)> {
+) -> Result<RouterPlan, (RouterPhaseKind, String)> {
     let Some(network) = networks
         .iter()
         .find(|n| n.metadata.name == router.spec.provider_network)
     else {
         return Err((
-            RouterPhase::Pending,
+            RouterPhaseKind::Pending,
             format!(
                 "no provider network called {} at this cluster",
                 router.spec.provider_network
@@ -95,7 +95,7 @@ pub(crate) fn plan_router(
     };
     let Some(vni) = router.spec.vni else {
         return Err((
-            RouterPhase::Pending,
+            RouterPhaseKind::Pending,
             "spec.vni is unset, so this router has no overlay to put its inside leg on; \
              the cloud fills it in from the tenant, and a standalone cluster names it"
                 .to_string(),
@@ -103,7 +103,7 @@ pub(crate) fn plan_router(
     };
     if router.spec.internal_addr.is_empty() {
         return Err((
-            RouterPhase::Pending,
+            RouterPhaseKind::Pending,
             "spec.internalAddr is unset, so the guests have no gateway address to point at; \
              this stack allocates no tenant addresses, so somebody has to say which one it is"
                 .to_string(),
@@ -111,7 +111,7 @@ pub(crate) fn plan_router(
     }
     if router.status.external_addr.is_empty() {
         return Err((
-            RouterPhase::Pending,
+            RouterPhaseKind::Pending,
             format!(
                 "no free address left in the allocation of provider network {} ({})",
                 network.metadata.name,
@@ -130,7 +130,7 @@ pub(crate) fn plan_router(
     let nodes = network::plan_nodes(&router.status.nodes, &fit);
     if nodes.is_empty() {
         return Err((
-            RouterPhase::Pending,
+            RouterPhaseKind::Pending,
             gateway_sentence(&network.spec.physnet, router, candidates),
         ));
     }
@@ -275,7 +275,17 @@ async fn reconcile_router(
             // Nothing is sent and nothing is torn down: a router that cannot
             // be planned right now is a router whose machines should go on
             // forwarding. The sentence is what changes.
-            return note(pass, &router, phase, Some(message), None).await;
+            // The planner said no: nowhere to put it, and the sentence says
+            // which of the four walls it is.
+            return note(
+                pass,
+                &router,
+                phase,
+                controller_api::RouterReason::Unplaced,
+                Some(message),
+                None,
+            )
+            .await;
         }
     };
     let outcome = backend.realise(dispatch, &plan).await;
@@ -385,13 +395,14 @@ async fn ensure_nats(pass: &Pass<'_>, router: Router) -> anyhow::Result<Router> 
 async fn note(
     pass: &Pass<'_>,
     router: &Router,
-    phase: RouterPhase,
+    phase: RouterPhaseKind,
+    reason: controller_api::RouterReason,
     message: Option<String>,
     placement: Option<Placement<'_>>,
 ) -> anyhow::Result<()> {
     let generation = router.metadata.generation;
-    let unchanged = router.status.phase == phase
-        && router.status.message == message
+    let unchanged = router.status.phase().kind() == phase
+        && router.status.phase().message() == message.as_deref()
         && placement.as_ref().is_none_or(|p| {
             router.status.nodes == p.nodes
                 && router.status.active_node == p.active
@@ -402,7 +413,7 @@ async fn note(
     if unchanged {
         return Ok(());
     }
-    let was = router.status.phase;
+    let was = router.status.phase().kind();
     let was_active = router.status.active_node.clone();
     let name = router.metadata.name.clone();
     let placement = placement.map(|p| {
@@ -415,8 +426,13 @@ async fn note(
     });
     pass.store
         .mutate::<Router, _>(&name, |r| {
-            r.status.phase = phase;
-            r.status.message = message.clone();
+            #[allow(deprecated)]
+            r.status.assign(controller_api::RouterPhase::new(
+                phase,
+                reason,
+                message.clone(),
+                Utc::now(),
+            ));
             r.status.observed_generation = generation;
             if let Some((nodes, active, refused, releasing)) = &placement {
                 r.status.nodes = nodes.clone();
@@ -436,7 +452,7 @@ async fn note(
                 uid: &router.metadata.uid,
                 reason: events::reason::PHASE_CHANGED,
                 message: message.unwrap_or_else(|| phase.as_str().to_string()),
-                event_type: if phase == RouterPhase::Failed {
+                event_type: if phase == RouterPhaseKind::Failed {
                     EventType::Warning
                 } else {
                     EventType::Normal
@@ -520,6 +536,7 @@ async fn settle(
         pass,
         router,
         outcome.phase,
+        outcome.reason,
         outcome.message,
         Some(Placement {
             nodes: &built,

@@ -31,8 +31,8 @@ use anyhow::bail;
 use chrono::{DateTime, Utc};
 use controller_api::{
     Ack, Candidate, CandidateKind, Capacity, Cluster, EtcdStore, Overcommit, PassTrigger,
-    PendingTally, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhase, heartbeat_expired,
-    lifecycle_command,
+    PendingTally, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhase, VmPhaseKind,
+    heartbeat_expired, lifecycle_command,
 };
 use proto::cloud_command;
 use tokio::sync::OnceCell;
@@ -355,8 +355,11 @@ fn about<'a>(vm: &'a Vm, reason: &'a str, message: String, kind: EventType) -> H
 /// reporting.
 fn publish_vm_gauges(vms: &[Vm]) {
     telemetry::metrics::objects().set_count(Vm::KIND, vms.len() as i64);
-    for phase in VmPhase::ALL {
-        let n = vms.iter().filter(|v| v.status.phase == phase).count();
+    for phase in VmPhaseKind::ALL {
+        let n = vms
+            .iter()
+            .filter(|v| v.status.phase().kind() == phase)
+            .count();
         telemetry::metrics::objects().set_vms(phase.as_str(), n as i64);
     }
 }
@@ -382,10 +385,14 @@ async fn expire_and_collect_clusters(
     // Rebuilt from this listing every pass: a cluster taken out of the
     // inventory must LOSE its age rather than keep the last one for ever.
     telemetry::metrics::sessions().reset_heartbeats();
+    // One read for every cluster's liveness: the heartbeat lives in its own
+    // key since D-C7.
+    let beats = store.beats::<Cluster>().await?;
     for cluster in store.list::<Cluster>().await? {
         let name = cluster.metadata.name;
-        publish_heartbeat_age(&name, cluster.status.last_heartbeat, now);
-        let connected = still_connected(store, &name, &cluster.status, now).await;
+        let heard = beats.get(&name).copied();
+        publish_heartbeat_age(&name, heard, now);
+        let connected = still_connected(store, &name, &cluster.status, heard, now).await;
         out.push(Candidate {
             connected: connected && sessions.contains(&name),
             // One view at this tier: a cloud has one session per cluster
@@ -438,15 +445,15 @@ async fn still_connected(
     store: &EtcdStore,
     name: &str,
     status: &controller_api::ClusterStatus,
+    heard: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> bool {
-    if !status.connected || !heartbeat_expired(status.last_heartbeat, now) {
+    if !status.connected || !heartbeat_expired(heard, now) {
         return status.connected;
     }
     // ISO-8601 UTC rather than the Debug of an Option: the instant is what an
     // operator lines up against everything else in the log.
-    let last = status
-        .last_heartbeat
+    let last = heard
         .map(|t| t.to_rfc3339())
         .unwrap_or_else(|| "never".to_string());
     warn!(cluster = %name, last_heartbeat = %last,

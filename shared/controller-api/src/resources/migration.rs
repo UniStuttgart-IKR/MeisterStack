@@ -48,68 +48,90 @@ pub struct VmMigrationSpec {
     pub target_node: Option<String>,
 }
 
-/// How far a migration got.
-///
-/// Five phases and the two ends are terminal: nothing retries a `Failed`
-/// migration by itself, because the thing that failed was an operation
-/// somebody asked for and asking again is somebody's decision. `Succeeded`
-/// and `Failed` are both worth keeping — the record of a move that did not
-/// work is the most useful object in this file on the day somebody asks why
-/// a machine is still full.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum VmMigrationPhase {
-    /// Accepted, nothing done. No target chosen yet.
-    #[default]
-    Pending,
-    /// A target has been chosen and is being made ready: the record, the
-    /// taps, the volumes attached THERE, and a VMM listening for the stream.
-    Preparing,
-    /// The source has been told to send. The guest is still the source's
-    /// until it is not.
-    Running,
-    /// The target reports the VM Running and the source has stopped naming
-    /// it. `Vm.spec.nodeName` is the target.
-    Succeeded,
-    /// It did not happen, and `status.message` says what stopped it. **The
-    /// source VM is still running** — that is the invariant the whole
-    /// reconciler is built around, and it is why this phase is safe to reach.
-    Failed,
+reasons! {
+    /// Why a migration is where it is.
+    ///
+    /// Five, all of them sentences the migration reconciler already writes:
+    /// "preparing <target>", "sending to <target> at <peer>", the abandon
+    /// path's `why`, and the two outcomes a source reports — `StillHere` is
+    /// the good outcome of a bad transfer and has always had a field of its
+    /// own (`status.sourceReported`).
+    VmMigrationReason [5] {
+        /// Nobody recorded one — see `VmReason::Unrecorded`.
+        #[default]
+        Unrecorded => "Unrecorded",
+        /// Waiting for a target to be chosen.
+        AwaitingTarget => "AwaitingTarget",
+        /// The destination is being built, or the stream is in the air.
+        Dispatched => "Dispatched",
+        /// This tier gave up on the transfer and tore the destination down.
+        /// The source is still running — that is the invariant.
+        Abandoned => "Abandoned",
+        /// A node's own word about the send, verbatim in the message.
+        Reported => "Reported",
+    }
 }
 
-impl VmMigrationPhase {
-    pub const ALL: [VmMigrationPhase; 5] = [
-        VmMigrationPhase::Pending,
-        VmMigrationPhase::Preparing,
-        VmMigrationPhase::Running,
-        VmMigrationPhase::Succeeded,
-        VmMigrationPhase::Failed,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            VmMigrationPhase::Pending => "Pending",
-            VmMigrationPhase::Preparing => "Preparing",
-            VmMigrationPhase::Running => "Running",
-            VmMigrationPhase::Succeeded => "Succeeded",
-            VmMigrationPhase::Failed => "Failed",
-        }
+phases! {
+    /// How far a migration got.
+    ///
+    /// Five phases and the two ends are terminal: nothing retries a `Failed`
+    /// migration by itself, because the thing that failed was an operation
+    /// somebody asked for and asking again is somebody's decision. `Succeeded`
+    /// and `Failed` are both worth keeping — the record of a move that did not
+    /// work is the most useful object in this file on the day somebody asks why
+    /// a machine is still full.
+    VmMigrationPhase / VmMigrationPhaseKind / VmMigrationReason / VmMigrationPhaseWire [5] {
+        /// Accepted, nothing done. No target chosen yet.
+        Pending { reason, message, since } => "Pending",
+        /// A target has been chosen and is being made ready: the record, the
+        /// taps, the volumes attached THERE, and a VMM listening for the stream.
+        Preparing { reason, message, since } => "Preparing",
+        /// The source has been told to send. The guest is still the source's
+        /// until it is not.
+        Running { reason, message, since } => "Running",
+        /// The target reports the VM Running and the source has stopped naming
+        /// it. `Vm.spec.nodeName` is the target.
+        Succeeded { message, since } => "Succeeded",
+        /// It did not happen, and the message says what stopped it. **The
+        /// source VM is still running** — that is the invariant the whole
+        /// reconciler is built around, and it is why this phase is safe to reach.
+        Failed { reason, message, since } => "Failed",
     }
+}
 
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == s)
-    }
-
+impl VmMigrationPhaseKind {
     /// Nothing will move this one again.
     pub fn is_final(self) -> bool {
-        matches!(self, VmMigrationPhase::Succeeded | VmMigrationPhase::Failed)
+        matches!(
+            self,
+            VmMigrationPhaseKind::Succeeded | VmMigrationPhaseKind::Failed
+        )
+    }
+
+    /// The same question, under the name `crate::stuck` asks it by — and the
+    /// only enum here where `Failed` is an end: a migration that failed was
+    /// an operation somebody ASKED for, and asking again is somebody's
+    /// decision rather than a curve's.
+    ///
+    /// Two names for one answer, and the older one stays because the
+    /// migration reconciler reads it on every pass and "is this record
+    /// finished" is the sentence that belongs there.
+    pub fn is_terminal(self) -> bool {
+        self.is_final()
     }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct VmMigrationStatus {
-    #[serde(default)]
-    pub phase: VmMigrationPhase,
+    /// The phase, with the reason it is that phase and since when.
+    ///
+    /// Flat on the wire — `phase`, `reason`, `message`, `since` as siblings
+    /// right here — so every client that reads `status.phase` as a string
+    /// goes on reading it as a string. See `resources::phase`.
+    #[serde(flatten)]
+    pub(super) phase: VmMigrationPhase,
     /// The same field, with the same meaning, that every other object here
     /// carries: the last `metadata.generation` the reconciler ACTED on.
     #[serde(default)]
@@ -126,10 +148,6 @@ pub struct VmMigrationStatus {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
-    /// What happened, in the words of whichever tier found out. Set on every
-    /// phase that is worth a sentence and always on `Failed`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
     /// The last phase the DESTINATION reported for this VM, in its own
     /// spelling — and the one piece of evidence the ordinary status ingest
     /// cannot carry.

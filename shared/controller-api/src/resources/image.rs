@@ -62,37 +62,53 @@ pub struct ImageSpec {
     pub labels: BTreeMap<String, String>,
 }
 
-/// Whether the bytes are there and are the right bytes.
-///
-/// A path image is `Ready` the moment it is registered: it is a catalogue
-/// entry over storage somebody else already filled, and this control plane
-/// has never claimed to check it. A URL image starts `Pending` — nobody has
-/// fetched it yet — and moves when a node says what happened.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum ImagePhase {
-    #[default]
-    Pending,
-    Ready,
-    Failed,
+reasons! {
+    /// Why an image is what it is.
+    ///
+    /// Four, and one of them is not in today's code: `NotFound` comes from
+    /// the brief (F16 and A3), because today a path image is `Ready` the
+    /// moment it is registered and nothing ever looks at the file. It is
+    /// declared here so the agent lane has a word to report and the
+    /// derivation lane a value to settle on; nothing in THIS lane writes it.
+    ImageReason [4] {
+        /// Nobody recorded one — see `VmReason::Unrecorded`.
+        #[default]
+        Unrecorded => "Unrecorded",
+        /// No node has said anything about the bytes yet. A URL image before
+        /// anybody fetched it, and — from the derivation lane on — a path
+        /// image before anybody looked.
+        AwaitingNode => "AwaitingNode",
+        /// A node's own word about the bytes, verbatim in the message.
+        Reported => "Reported",
+        /// Every node that looked for the file did not find it. F16's
+        /// answer, and the one reason here that no present writer produces.
+        NotFound => "NotFound",
+    }
 }
 
-impl ImagePhase {
-    pub const ALL: [ImagePhase; 3] = [ImagePhase::Pending, ImagePhase::Ready, ImagePhase::Failed];
-
-    /// The spelling that goes on the wire (control.proto: ImageStateReport).
-    /// `parse` is its inverse and the tests hold them to it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ImagePhase::Pending => "Pending",
-            ImagePhase::Ready => "Ready",
-            ImagePhase::Failed => "Failed",
-        }
+phases! {
+    /// Whether the bytes are there and are the right bytes.
+    ///
+    /// A path image is `Ready` the moment it is registered: it is a catalogue
+    /// entry over storage somebody else already filled, and this control plane
+    /// has never claimed to check it. A URL image starts `Pending` — nobody has
+    /// fetched it yet — and moves when a node says what happened. F16 is
+    /// exactly the first half of that sentence being a promise nobody kept;
+    /// the derivation lane is where it stops being made.
+    ImagePhase / ImagePhaseKind / ImageReason / ImagePhaseWire [3] {
+        Pending { reason, message, since } => "Pending",
+        Ready { message, since } => "Ready",
+        Failed { reason, message, since } => "Failed",
     }
+}
 
-    /// Unknown input is rejected rather than defaulted — a drifting node
-    /// should be visible, not silently "Pending". The rule VmPhase follows.
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == s)
+impl ImagePhaseKind {
+    /// Both ends, and this is the one enum where `Failed` IS one: nothing
+    /// retries an image. A checksum that does not match will not start
+    /// matching, and a file that is not there appears when somebody puts it
+    /// there — which is a new fact from a node and not a timer.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ImagePhaseKind::Ready | ImagePhaseKind::Failed)
     }
 }
 
@@ -117,18 +133,36 @@ pub struct ImageNodeState {
     pub cluster: String,
     /// `Ready` or `Failed`. A node never says `Pending`: an image it has no
     /// opinion about is simply not in its report, and therefore not here.
-    pub phase: ImagePhase,
+    pub phase: ImagePhaseKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
 
+/// `deny_unknown_fields` is off here and on every other spec and status in
+/// this file, and the reason is `#[serde(flatten)]` below: serde cannot do
+/// both, because a flattened field is exactly the thing that collects the
+/// keys the outer struct does not know. The looseness is the same looseness
+/// every status now reads with — one object stored before this change must
+/// not break `list()` (decision 6) — and a status is server-written, so
+/// there is no client typo for it to have caught.
+///
+/// The ONE key that was worth refusing is still refused, by name: see
+/// `available_on`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+// The private unit field below is not the `_priv: ()` non-exhaustive trick
+// clippy is looking for — nothing about this struct is sealed, and adding a
+// field to it is what every milestone does. It is a serde refusal; see
+// `available_on`.
+#[allow(clippy::manual_non_exhaustive)]
 pub struct ImageStatus {
-    #[serde(default)]
-    pub phase: ImagePhase,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    /// The phase, with the reason it is that phase and since when.
+    ///
+    /// Flat on the wire — `phase`, `reason`, `message`, `since` as siblings
+    /// right here — so every client that reads `status.phase` as a string
+    /// goes on reading it as a string. See `resources::phase`.
+    #[serde(flatten)]
+    pub(super) phase: ImagePhase,
     /// Which nodes have the bytes, and which could not read them.
     ///
     /// Sorted by cluster and then by node, so two consecutive reports of the
@@ -137,6 +171,41 @@ pub struct ImageStatus {
     /// older than the field — not "no nodes have it".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<ImageNodeState>,
+    /// `status.availableOn`, which is gone — declared here so that it can go
+    /// on being REFUSED rather than silently dropped.
+    ///
+    /// It meant "not tracked" from v1 on and nothing ever wrote it; since
+    /// `status.nodes[]` exists, the question it pretended to answer has a
+    /// real answer beside it. A client that read the empty list and concluded
+    /// "no cluster has this image" was reading a field, not a fact
+    /// (fremdsicht 4), so an old client that still sends it has to hear about
+    /// it instead of believing the server kept its value.
+    ///
+    /// `deny_unknown_fields` used to carry that and cannot any more — see the
+    /// type's own comment. A named field can, and is better in one way: it
+    /// says WHICH key is refused and why, right here, instead of leaving the
+    /// answer to an attribute somebody would remove without knowing what it
+    /// was holding up.
+    #[serde(
+        default,
+        rename = "availableOn",
+        deserialize_with = "refuse_available_on",
+        skip_serializing
+    )]
+    #[schemars(skip)]
+    // Never read, and that is the whole of it: its only job is to exist under
+    // that name so serde hands the key here and the deserializer refuses it.
+    #[allow(dead_code)]
+    available_on: (),
+}
+
+/// The refusal itself, in serde's own words, so the sentence a client reads
+/// is the one an unknown field has always produced.
+fn refuse_available_on<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::unknown_field(
+        "availableOn",
+        &["phase", "reason", "message", "since", "nodes"],
+    ))
 }
 
 /// No finalizer: an image object owns no resource anywhere, so there is
