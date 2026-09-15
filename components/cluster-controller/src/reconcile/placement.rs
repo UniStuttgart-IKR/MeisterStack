@@ -543,6 +543,7 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     // Both of them live inside the phase since struktur 4, so one write
     // answers the sentence and the category together.
     let kind = bound.status.phase().kind();
+    #[allow(deprecated)]
     bound.status.assign(VmPhase::of(kind, Utc::now()));
     match p.store.update(&bound).await {
         Ok(_) => {
@@ -679,6 +680,7 @@ pub(super) async fn note_vm_pending(
             // phase itself left alone: this pass says why a VM is not placed,
             // it does not decide what the VM is doing.
             let kind = v.status.phase().kind();
+            #[allow(deprecated)]
             v.status.assign(VmPhase::new(
                 kind,
                 category.category(),

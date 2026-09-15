@@ -29,6 +29,7 @@ fn volume_vm(volumes: &[&str]) -> Vm {
             vm: serde_json::json!({ "volumes": entries }),
         },
     );
+    #[allow(deprecated)]
     vm.status.assign(controller_api::VmPhase::of(
         VmPhaseKind::Running,
         Utc::now(),
@@ -46,6 +47,7 @@ fn released(node: Option<&str>, vm: Option<&str>) -> Volume {
         },
     );
     v.metadata.deletion_timestamp = Some(Utc::now());
+    #[allow(deprecated)]
     v.status.assign(controller_api::VolumePhase::of(
         VolumePhaseKind::Releasing,
         Utc::now(),
@@ -495,6 +497,7 @@ fn a_drain_does_not_count_what_it_did_not_move() {
 /// A VM bound to `agent-1a` in the phase given.
 fn on_agent_1a(phase: VmPhaseKind) -> Vm {
     let mut vm = bound_to(Some("agent-1a"));
+    #[allow(deprecated)]
     vm.status
         .assign(controller_api::VmPhase::of(phase, Utc::now()));
     vm
@@ -569,6 +572,7 @@ fn the_watchdog_only_takes_back_a_claim_about_a_guest() {
     // And a VM that is not on a node at all: there is no machine whose
     // silence could mean anything about it.
     let mut unbound = bound_to(None);
+    #[allow(deprecated)]
     unbound.status.assign(controller_api::VmPhase::of(
         VmPhaseKind::Running,
         Utc::now(),
@@ -648,6 +652,7 @@ fn a_placed_volume_is_only_reconciled_by_the_replica_its_node_talks_to() {
     // exactly as a deleting VM does.
     let mut deleting = volume.clone();
     deleting.metadata.deletion_timestamp = Some(Utc::now());
+    #[allow(deprecated)]
     deleting.status.assign(controller_api::VolumePhase::of(
         VolumePhaseKind::Releasing,
         Utc::now(),
@@ -851,6 +856,7 @@ fn the_requeue_timeline() {
     use controller_api::requeue::{CrashLoopBackoff, NoRequeue};
     let failed = |last: Option<chrono::DateTime<Utc>>, attempts: u32| {
         let mut vm = bound_to(Some("node-a"));
+        #[allow(deprecated)]
         vm.status
             .assign(controller_api::VmPhase::of(VmPhaseKind::Failed, Utc::now()));
         vm.status.last_requeue = last;
@@ -964,6 +970,7 @@ fn joint_cells() -> Vec<(String, Vm, DateTime<Utc>, usize)> {
                     for (elapsed, attempts) in requeue_inputs() {
                         let mut vm = bound_to(node);
                         vm.spec.run_strategy = strategy;
+                        #[allow(deprecated)]
                         vm.status
                             .assign(controller_api::VmPhase::of(phase, Utc::now()));
                         vm.status.requeue_attempts = attempts;
@@ -1340,6 +1347,7 @@ fn volume_at(node: Option<&str>, phase: VolumePhaseKind) -> Volume {
         },
     );
     v.status.node = node.map(str::to_string);
+    #[allow(deprecated)]
     v.status
         .assign(controller_api::VolumePhase::of(phase, Utc::now()));
     v
@@ -1464,6 +1472,7 @@ fn a_report_from_before_the_last_command_changes_nothing() {
 fn the_drift_is_what_the_node_has_against_what_the_spec_asks_for() {
     let vm = |wanted: &[&str], held: &[(&str, bool)], phase: VmPhaseKind| {
         let mut v = volume_vm(wanted);
+        #[allow(deprecated)]
         v.status
             .assign(controller_api::VmPhase::of(phase, Utc::now()));
         v.status.volumes = held
@@ -1726,6 +1735,7 @@ fn a_resize_is_driven_by_what_the_node_measured() {
                 ..Default::default()
             },
         );
+        #[allow(deprecated)]
         v.status.assign(controller_api::VolumePhase::of(
             VolumePhaseKind::Ready,
             Utc::now(),

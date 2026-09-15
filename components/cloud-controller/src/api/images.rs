@@ -146,6 +146,7 @@ pub(super) async fn create_image(
     // a promise where there was none. A URL image is Pending until a node
     // that has fetched it says otherwise, because the node is what fetches.
     let now = chrono::Utc::now();
+    #[allow(deprecated)]
     image.status.assign(match url {
         // The sentence a URL image used to carry beside its phase now travels
         // inside it, in the same words, with the category the wait has always

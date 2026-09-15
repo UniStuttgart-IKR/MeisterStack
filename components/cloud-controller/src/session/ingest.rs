@@ -116,6 +116,7 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
         let uid = router.metadata.uid.clone();
         let result = store
             .mutate::<controller_api::Router, _>(&name, |r| {
+                #[allow(deprecated)]
                 r.status.assign(controller_api::RouterPhase::new(
                     phase,
                     controller_api::RouterReason::Reported,
@@ -348,6 +349,7 @@ pub(super) async fn forget_unbound(
                 // Pending and not Stopped, exactly as one tier down: the VM
                 // is nowhere, and the phase an operator reads has to say that
                 // rather than describing a guest that no longer exists.
+                #[allow(deprecated)]
                 v.status.assign(controller_api::VmPhase::new(
                     VmPhaseKind::Pending,
                     controller_api::VmReason::Unbound,
@@ -475,6 +477,7 @@ pub(super) async fn ingest_placements(
                 // not a phase. A cluster that says nothing clears it, exactly
                 // as an absent `pendingReason` did.
                 let onto = relayed_onto(v.status.phase(), relayed);
+                #[allow(deprecated)]
                 v.status.assign(onto);
                 v.status.addresses = addresses.clone();
             })
@@ -508,6 +511,7 @@ pub(super) async fn ingest_phases(
         let vm_tenant = vm.spec.tenant.clone();
         let result = store
             .mutate::<Vm, _>(&name, |v| {
+                #[allow(deprecated)]
                 v.status.assign(controller_api::VmPhase::new(
                     phase,
                     controller_api::VmReason::Reported,

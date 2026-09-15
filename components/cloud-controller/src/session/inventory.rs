@@ -57,6 +57,7 @@ pub(super) async fn ingest_images(
         }
         let result = store
             .mutate::<Image, _>(name, |i| {
+                #[allow(deprecated)]
                 i.status.assign(controller_api::ImagePhase::new(
                     phase,
                     controller_api::ImageReason::Reported,
@@ -242,6 +243,7 @@ pub(super) async fn ingest_pools(
                 if home {
                     p.status.locality = locality;
                     p.status.nodes = reported.nodes.clone();
+                    #[allow(deprecated)]
                     p.status.assign(controller_api::StoragePoolPhase::new(
                         phase,
                         controller_api::StoragePoolReason::Reported,
@@ -569,6 +571,7 @@ fn write_volume_status(
     phase: VolumePhaseKind,
     at: DateTime<Utc>,
 ) {
+    #[allow(deprecated)]
     v.status.assign(VolumePhase::new(
         phase,
         controller_api::VolumeReason::Reported,
@@ -628,6 +631,7 @@ fn write_snapshot_status(
     phase: controller_api::VolumeSnapshotPhaseKind,
     at: DateTime<Utc>,
 ) {
+    #[allow(deprecated)]
     s.status.assign(controller_api::VolumeSnapshotPhase::new(
         phase,
         controller_api::VolumeSnapshotReason::Reported,

@@ -253,6 +253,7 @@ pub(super) async fn note_snapshot_pending(
     store
         .mutate::<controller_api::VolumeSnapshot, _>(&snapshot.metadata.name, |s| {
             let kind = s.status.phase().kind();
+            #[allow(deprecated)]
             s.status.assign(controller_api::VolumeSnapshotPhase::said(
                 kind,
                 Some(reason.clone()),
@@ -275,6 +276,7 @@ pub(super) async fn note_volume_pending(
     store
         .mutate::<controller_api::Volume, _>(&volume.metadata.name, |v| {
             let kind = v.status.phase().kind();
+            #[allow(deprecated)]
             v.status.assign(controller_api::VolumePhase::said(
                 kind,
                 Some(reason.clone()),
@@ -359,6 +361,7 @@ pub(super) async fn move_volumes(
                 v.status.observed_at = None;
                 v.status.observed_generation = 0;
                 v.status.node = None;
+                #[allow(deprecated)]
                 v.status.assign(controller_api::VolumePhase::new(
                     controller_api::VolumePhaseKind::Pending,
                     controller_api::VolumeReason::Following,

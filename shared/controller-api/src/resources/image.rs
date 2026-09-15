@@ -152,7 +152,7 @@ pub struct ImageStatus {
     /// right here — so every client that reads `status.phase` as a string
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
-    pub phase: ImagePhase,
+    pub(super) phase: ImagePhase,
     /// Which nodes have the bytes, and which could not read them.
     ///
     /// Sorted by cluster and then by node, so two consecutive reports of the

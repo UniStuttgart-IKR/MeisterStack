@@ -440,7 +440,7 @@ pub struct RouterStatus {
     /// right here — so every client that reads `status.phase` as a string
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
-    pub phase: RouterPhase,
+    pub(super) phase: RouterPhase,
     /// The address this router answers for on the provider network, CIDR.
     /// Cut from `ProviderNetwork.spec.allocation` when the router is first
     /// placed and kept for its life: it is what the SNAT rules translate to

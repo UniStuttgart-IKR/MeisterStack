@@ -193,6 +193,7 @@ pub(super) async fn write_pool_status(
                 StoragePoolPhaseKind::Failed => controller_api::StoragePoolReason::Disagreement,
                 _ => controller_api::StoragePoolReason::AwaitingNode,
             };
+            #[allow(deprecated)]
             p.status.assign(controller_api::StoragePoolPhase::new(
                 phase,
                 reason,
@@ -384,6 +385,7 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
         warn!(volume = %name, node, error = %message, "the backend did not grow");
         p.store
             .mutate::<Volume, _>(&name, |v| {
+                #[allow(deprecated)]
                 v.status.assign(controller_api::VolumePhase::new(
                     VolumePhaseKind::Failed,
                     controller_api::VolumeReason::Reported,
@@ -422,6 +424,7 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
         p.store
             .mutate::<Volume, _>(&name, |v| {
                 let kind = v.status.phase().kind();
+                #[allow(deprecated)]
                 v.status.assign(controller_api::VolumePhase::said(
                     kind,
                     Some(message.clone()),
@@ -438,6 +441,7 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
         p.store
             .mutate::<Volume, _>(&name, |v| {
                 let kind = v.status.phase().kind();
+                #[allow(deprecated)]
                 v.status
                     .assign(controller_api::VolumePhase::of(kind, Utc::now()));
             })
@@ -474,6 +478,7 @@ pub(super) async fn provision_volume(
         warn!(volume = %name, %why, "provision cannot start");
         p.store
             .mutate::<Volume, _>(&name, |v| {
+                #[allow(deprecated)]
                 v.status.assign(controller_api::VolumePhase::new(
                     VolumePhaseKind::Failed,
                     controller_api::VolumeReason::SourceMissing,
@@ -507,6 +512,7 @@ pub(super) async fn provision_volume(
                 warn!(volume = %name, %message, "provision cannot start");
                 p.store
                     .mutate::<Volume, _>(&name, |v| {
+                        #[allow(deprecated)]
                         v.status.assign(controller_api::VolumePhase::new(
                             VolumePhaseKind::Failed,
                             controller_api::VolumeReason::SourceMissing,
@@ -521,6 +527,7 @@ pub(super) async fn provision_volume(
         },
     };
     let mut sent = volume.clone();
+    #[allow(deprecated)]
     sent.status.assign(controller_api::VolumePhase::new(
         VolumePhaseKind::Provisioning,
         controller_api::VolumeReason::Dispatched,
@@ -561,6 +568,7 @@ pub(super) async fn provision_volume(
         p.store
             .mutate::<Volume, _>(&name, |v| {
                 if v.status.phase().kind() == VolumePhaseKind::Provisioning {
+                    #[allow(deprecated)]
                     v.status.assign(controller_api::VolumePhase::new(
                         VolumePhaseKind::Failed,
                         controller_api::VolumeReason::Undeliverable,
@@ -616,6 +624,7 @@ pub(super) async fn requeue_volume(
         .mutate::<Volume, _>(&name, |v| {
             v.status.requeue_attempts = v.status.requeue_attempts.saturating_add(1);
             v.status.last_requeue = Some(now);
+            #[allow(deprecated)]
             v.status.assign(controller_api::VolumePhase::of(
                 VolumePhaseKind::Pending,
                 now,
@@ -848,6 +857,7 @@ pub(super) async fn note_volume_releasing(
         .mutate::<Volume, _>(&volume.metadata.name, |v| {
             // The one place that knows WHO is holding it — the sentence names
             // the vm or the snapshot — so the one place that writes `HeldBy`.
+            #[allow(deprecated)]
             v.status.assign(controller_api::VolumePhase::new(
                 VolumePhaseKind::Releasing,
                 controller_api::VolumeReason::HeldBy,
@@ -961,6 +971,7 @@ pub(super) async fn place_volume(
     // volume sat in it for ever. The phase moves when the COMMAND goes, one
     // pass later, and `Pending` in between is exactly true: chosen, not yet
     // asked.
+    #[allow(deprecated)]
     bound.status.assign(controller_api::VolumePhase::of(
         VolumePhaseKind::Pending,
         Utc::now(),
@@ -992,6 +1003,7 @@ pub(super) async fn note_pending(
     }
     p.store
         .mutate::<Volume, _>(&volume.metadata.name, |v| {
+            #[allow(deprecated)]
             v.status.assign(controller_api::VolumePhase::new(
                 VolumePhaseKind::Pending,
                 controller_api::VolumeReason::Unplaced,

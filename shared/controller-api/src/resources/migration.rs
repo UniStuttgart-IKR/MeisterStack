@@ -119,7 +119,7 @@ pub struct VmMigrationStatus {
     /// right here — so every client that reads `status.phase` as a string
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
-    pub phase: VmMigrationPhase,
+    pub(super) phase: VmMigrationPhase,
     /// The same field, with the same meaning, that every other object here
     /// carries: the last `metadata.generation` the reconciler ACTED on.
     #[serde(default)]

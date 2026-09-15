@@ -177,6 +177,7 @@ fn the_phases_are_spelled_alike_and_the_pending_category_reaches_the_api() {
 
     // And when it is there it is one of the closed set.
     let mut s = VmStatus::default();
+    #[allow(deprecated)]
     s.assign(VmPhase::new(
         VmPhaseKind::Pending,
         VmReason::Unplaced,
@@ -616,6 +617,7 @@ fn a_pool_states_its_locality_and_cannot_be_told_one() {
         "the spec has no locality and never gets one: {spec}"
     );
 
+    #[allow(deprecated)]
     pool.status.assign(StoragePoolPhase::of(
         StoragePoolPhaseKind::Ready,
         Utc::now(),
@@ -1393,6 +1395,7 @@ fn every_status_wears_its_phase_flat() {
     let said = |m: &str| Some(m.to_string());
 
     let mut vm = VmStatus::default();
+    #[allow(deprecated)]
     vm.assign(VmPhase::new(
         VmPhaseKind::Pending,
         VmReason::Unplaced,
@@ -1400,6 +1403,7 @@ fn every_status_wears_its_phase_flat() {
         at,
     ));
     let mut volume = VolumeStatus::default();
+    #[allow(deprecated)]
     volume.assign(VolumePhase::new(
         VolumePhaseKind::Releasing,
         VolumeReason::HeldBy,
@@ -1407,6 +1411,7 @@ fn every_status_wears_its_phase_flat() {
         at,
     ));
     let mut snapshot = VolumeSnapshotStatus::default();
+    #[allow(deprecated)]
     snapshot.assign(VolumeSnapshotPhase::new(
         VolumeSnapshotPhaseKind::Creating,
         VolumeSnapshotReason::Dispatched,
@@ -1414,6 +1419,7 @@ fn every_status_wears_its_phase_flat() {
         at,
     ));
     let mut image = ImageStatus::default();
+    #[allow(deprecated)]
     image.assign(ImagePhase::new(
         ImagePhaseKind::Pending,
         ImageReason::AwaitingNode,
@@ -1421,6 +1427,7 @@ fn every_status_wears_its_phase_flat() {
         at,
     ));
     let mut pool = StoragePoolStatus::default();
+    #[allow(deprecated)]
     pool.assign(StoragePoolPhase::new(
         StoragePoolPhaseKind::Pending,
         StoragePoolReason::ClusterHasNoPool,
@@ -1428,6 +1435,7 @@ fn every_status_wears_its_phase_flat() {
         at,
     ));
     let mut router = RouterStatus::default();
+    #[allow(deprecated)]
     router.assign(RouterPhase::new(
         RouterPhaseKind::Unknown,
         RouterReason::Silent,
@@ -1435,6 +1443,7 @@ fn every_status_wears_its_phase_flat() {
         at,
     ));
     let mut migration = VmMigrationStatus::default();
+    #[allow(deprecated)]
     migration.assign(VmMigrationPhase::new(
         VmMigrationPhaseKind::Failed,
         VmMigrationReason::Abandoned,

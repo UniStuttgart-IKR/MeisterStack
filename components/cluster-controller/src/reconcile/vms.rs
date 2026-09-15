@@ -96,6 +96,7 @@ pub(super) async fn expire_vm_reports(
                 // the listing and here, and taking a phase away from a node
                 // that has just spoken is the one way this can do harm.
                 if claims_a_guest(v.status.phase().kind()) {
+                    #[allow(deprecated)]
                     v.status.assign(VmPhase::new(
                         VmPhaseKind::Unknown,
                         controller_api::VmReason::Silent,
@@ -509,6 +510,7 @@ pub(super) async fn unbind_refused(
             // The node refused to serve it at all, which is a statement about
             // the MACHINE — it is remembered in `refusedBy` for exactly that
             // reason, and the phase now says the same thing in one word.
+            #[allow(deprecated)]
             v.status.assign(VmPhase::new(
                 VmPhaseKind::Pending,
                 controller_api::VmReason::Refused,
@@ -718,6 +720,7 @@ pub(super) async fn hot_plug(
 /// this rule and says the same thing from the volume's side.
 pub(super) fn follow_vm(v: &mut Volume, vm: &str, node: &str) {
     v.status.node = Some(node.to_string());
+    #[allow(deprecated)]
     v.status.assign(controller_api::VolumePhase::new(
         VolumePhaseKind::Pending,
         controller_api::VolumeReason::Following,
@@ -1007,6 +1010,7 @@ pub(super) async fn dispatch_create(
                     VmPhaseKind::Failed => controller_api::VmReason::Refused,
                     _ => controller_api::VmReason::Dispatched,
                 };
+                #[allow(deprecated)]
                 v.status
                     .assign(VmPhase::new(phase, reason, message, Utc::now()));
                 v.status.node_name = v.spec.node_name.clone();
@@ -1175,6 +1179,7 @@ pub(super) async fn kick(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> a
                     // other and says so.
                     v.status.observed_generation = v.status.observed_generation.max(dispatched);
                     if v.status.phase().kind() == VmPhaseKind::Failed {
+                        #[allow(deprecated)]
                         v.status.assign(VmPhase::new(
                             VmPhaseKind::Provisioning,
                             controller_api::VmReason::Dispatched,

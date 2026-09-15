@@ -426,6 +426,7 @@ async fn note(
     });
     pass.store
         .mutate::<Router, _>(&name, |r| {
+            #[allow(deprecated)]
             r.status.assign(controller_api::RouterPhase::new(
                 phase,
                 reason,

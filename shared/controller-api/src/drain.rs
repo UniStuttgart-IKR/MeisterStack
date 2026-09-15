@@ -189,6 +189,7 @@ mod tests {
                 vm: serde_json::json!({ "vcpus": 1 }),
             },
         );
+        #[allow(deprecated)]
         v.status.assign(VmPhase::of(phase, Utc::now()));
         v
     }

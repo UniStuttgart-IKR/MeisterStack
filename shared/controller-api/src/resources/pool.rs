@@ -266,7 +266,7 @@ pub struct StoragePoolStatus {
     /// right here — so every client that reads `status.phase` as a string
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
-    pub phase: StoragePoolPhase,
+    pub(super) phase: StoragePoolPhase,
     /// Where this pool's bytes are, as the nodes that can reach it agree.
     /// `None` while nobody has said — no node in the pool runs the driver
     /// yet, or every one of them predates the field.

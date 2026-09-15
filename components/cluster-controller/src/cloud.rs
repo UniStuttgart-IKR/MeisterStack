@@ -2126,6 +2126,7 @@ mod tests {
 
         // And back up: `active` is whether a machine is really forwarding,
         // which is not the same question as the phase.
+        #[allow(deprecated)]
         router.status.assign(controller_api::RouterPhase::of(
             controller_api::RouterPhaseKind::Active,
             Utc::now(),
@@ -2172,6 +2173,7 @@ mod tests {
         if let Some(uid) = uid {
             vm.metadata.mark_managed_by_cloud(uid);
         }
+        #[allow(deprecated)]
         vm.status
             .assign(controller_api::VmPhase::of(phase, Utc::now()));
         vm
@@ -2574,6 +2576,7 @@ mod tests {
         if let Some(uid) = uid {
             v.metadata.mark_managed_by_cloud(uid);
         }
+        #[allow(deprecated)]
         v.status
             .assign(controller_api::VolumePhase::of(phase, Utc::now()));
         v.status.node = Some("manacor".into());
@@ -2643,6 +2646,7 @@ mod tests {
 
         let mut made = fresh;
         made.status.backend = "/tmp/ms-e2e/vols/f8c1592d.raw".into();
+        #[allow(deprecated)]
         made.status.assign(controller_api::VolumePhase::of(
             VolumePhaseKind::Ready,
             Utc::now(),
@@ -2703,6 +2707,7 @@ mod tests {
         // Through the mapping rather than past it: the scheduler's own
         // category is what a pass writes, and what travels up is the word the
         // object stores it under.
+        #[allow(deprecated)]
         waiting.status.assign(controller_api::VmPhase::new(
             VmPhaseKind::Pending,
             controller_api::PendingReason::NodeUnhealthy.category(),
@@ -2816,6 +2821,7 @@ mod tests {
         };
 
         let mut ours = snapshot("nightly-1", Some("cloud-uid-1"));
+        #[allow(deprecated)]
         ours.status.assign(controller_api::VolumeSnapshotPhase::of(
             controller_api::VolumeSnapshotPhaseKind::Ready,
             Utc::now(),

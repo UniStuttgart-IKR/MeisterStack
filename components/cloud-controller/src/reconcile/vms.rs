@@ -257,6 +257,7 @@ async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
     // Both of them lived inside the phase since struktur 4, so one write
     // answers what a previous pass said and why it said it.
     let kind = bound.status.phase().kind();
+    #[allow(deprecated)]
     bound.status.assign(VmPhase::of(kind, Utc::now()));
     match store.update(&bound).await {
         Ok(_) => {
@@ -778,6 +779,7 @@ pub(super) async fn dispatch_create(
                     // is a guess about the future; only a VM nobody has
                     // reported on yet may be moved by one.
                     if v.status.phase().kind() == VmPhaseKind::Pending {
+                        #[allow(deprecated)]
                         v.status.assign(VmPhase::new(
                             VmPhaseKind::Provisioning,
                             controller_api::VmReason::Dispatched,
@@ -795,6 +797,7 @@ pub(super) async fn dispatch_create(
             warn!(cluster, error = %msg, "cluster refused the create");
             store
                 .mutate::<Vm, _>(&name, |v| {
+                    #[allow(deprecated)]
                     v.status.assign(VmPhase::new(
                         VmPhaseKind::Failed,
                         controller_api::VmReason::Refused,

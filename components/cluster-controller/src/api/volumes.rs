@@ -291,6 +291,7 @@ pub(super) async fn delete_volume(
             if v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(Utc::now());
             }
+            #[allow(deprecated)]
             v.status.assign(controller_api::VolumePhase::of(
                 VolumePhaseKind::Releasing,
                 Utc::now(),

@@ -501,6 +501,7 @@ async fn prepare(
     claimed.status.target_node = Some(target.clone());
     claimed.status.started_at = Some(Utc::now());
     claimed.status.observed_generation = migration.metadata.generation;
+    #[allow(deprecated)]
     claimed.status.assign(VmMigrationPhase::new(
         VmMigrationPhaseKind::Preparing,
         controller_api::VmMigrationReason::Dispatched,
@@ -561,6 +562,7 @@ async fn prepare(
     store
         .mutate::<VmMigration, _>(&name, |m| {
             let kind = m.status.phase().kind();
+            #[allow(deprecated)]
             m.status.assign(VmMigrationPhase::new(
                 kind,
                 controller_api::VmMigrationReason::Dispatched,
@@ -792,6 +794,7 @@ async fn send(
     }
 
     let mut claimed = migration.clone();
+    #[allow(deprecated)]
     claimed.status.assign(VmMigrationPhase::new(
         VmMigrationPhaseKind::Running,
         controller_api::VmMigrationReason::Dispatched,
@@ -858,6 +861,7 @@ async fn send(
         store
             .mutate::<VmMigration, _>(&name, |m| {
                 let kind = m.status.phase().kind();
+                #[allow(deprecated)]
                 m.status.assign(VmMigrationPhase::new(
                     kind,
                     controller_api::VmMigrationReason::Reported,
@@ -1037,6 +1041,7 @@ async fn settle(
     store
         .mutate::<VmMigration, _>(&name, |m| {
             m.status.finished_at = Some(finished);
+            #[allow(deprecated)]
             m.status.assign(VmMigrationPhase::said(
                 VmMigrationPhaseKind::Succeeded,
                 Some(format!("{} is on {target}", vm.metadata.name)),
@@ -1103,6 +1108,7 @@ async fn fail(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow
         .mutate::<VmMigration, _>(&name, |m| {
             let now = Utc::now();
             m.status.finished_at = Some(now);
+            #[allow(deprecated)]
             m.status.assign(VmMigrationPhase::new(
                 VmMigrationPhaseKind::Failed,
                 controller_api::VmMigrationReason::Abandoned,
@@ -1320,6 +1326,7 @@ mod tests {
                 target_node: None,
             },
         );
+        #[allow(deprecated)]
         m.status.assign(VmMigrationPhase::of(phase, Utc::now()));
         m
     }
@@ -1541,11 +1548,15 @@ mod tests {
     /// guest may be torn down, and one that might hold the only copy may not.
     #[test]
     fn a_source_that_still_has_the_guest_ends_the_migration_without_a_timeout() {
-        let status = |reported: Option<&str>, target_said: Option<&str>| VmMigrationStatus {
-            source_reported: reported.map(str::to_string),
-            source_message: Some("cloud-hypervisor is serving the guest here again".into()),
-            target_reported: target_said.map(str::to_string),
-            ..Default::default()
+        // Field by field and not a struct literal: `status.phase` is private
+        // since struktur 4, and a literal that leaves a private field out is
+        // refused even with `..Default::default()`.
+        let status = |reported: Option<&str>, target_said: Option<&str>| {
+            let mut status = VmMigrationStatus::default();
+            status.source_reported = reported.map(str::to_string);
+            status.source_message = Some("cloud-hypervisor is serving the guest here again".into());
+            status.target_reported = target_said.map(str::to_string);
+            status
         };
 
         // Nothing said, and the two words that are not a failure: this

@@ -646,6 +646,7 @@ pub(super) async fn delete_volume(
             if v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(chrono::Utc::now());
             }
+            #[allow(deprecated)]
             v.status.assign(VolumePhase::of(
                 VolumePhaseKind::Releasing,
                 chrono::Utc::now(),
@@ -960,6 +961,7 @@ mod tests {
                 v.status.attached_to = Some("web".into())
             }),
             ("status.phase", |v| {
+                #[allow(deprecated)]
                 v.status
                     .assign(VolumePhase::of(VolumePhaseKind::Ready, chrono::Utc::now()))
             }),

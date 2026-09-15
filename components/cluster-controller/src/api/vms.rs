@@ -138,6 +138,7 @@ pub(super) async fn create_vm_traced(
         // On the phase the VM already has: a preview is a sentence about a VM
         // that has not been created, not a phase change.
         let phase = vm.status.phase().kind();
+        #[allow(deprecated)]
         vm.status.assign(controller_api::VmPhase::said(
             phase,
             Some(said),

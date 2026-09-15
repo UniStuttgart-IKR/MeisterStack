@@ -282,6 +282,7 @@ pub(super) async fn ingest_routers(
         let uid = router.metadata.uid.clone();
         store
             .mutate::<controller_api::Router, _>(&name, |r| {
+                #[allow(deprecated)]
                 r.status.assign(controller_api::RouterPhase::new(
                     phase,
                     controller_api::RouterReason::Reported,
@@ -483,6 +484,7 @@ pub(super) async fn ingest_volumes(
                     v.status.closed_here(node_id);
                     v.status.backend = String::new();
                     let kind = v.status.phase().kind();
+                    #[allow(deprecated)]
                     v.status.assign(controller_api::VolumePhase::of(kind, at));
                     v.status.observed_at = Some(at);
                 })
@@ -524,6 +526,7 @@ pub(super) async fn ingest_volumes(
                 } else {
                     v.status.phase().kind()
                 };
+                #[allow(deprecated)]
                 v.status.assign(controller_api::VolumePhase::new(
                     kind,
                     controller_api::VolumeReason::Reported,
@@ -833,6 +836,7 @@ pub(super) async fn ingest_snapshots(
                       "the node no longer has this snapshot; it will be taken again");
                 store
                     .mutate::<VolumeSnapshot, _>(&name, |s| {
+                        #[allow(deprecated)]
                         s.status.assign(controller_api::VolumeSnapshotPhase::new(
                             VolumeSnapshotPhaseKind::Pending,
                             controller_api::VolumeSnapshotReason::SourceGone,
@@ -869,6 +873,7 @@ pub(super) async fn ingest_snapshots(
         }
         store
             .mutate::<VolumeSnapshot, _>(&name, |s| {
+                #[allow(deprecated)]
                 s.status.assign(controller_api::VolumeSnapshotPhase::new(
                     phase,
                     controller_api::VolumeSnapshotReason::Reported,
@@ -933,6 +938,7 @@ pub(super) async fn forget_unbound(
                 // Pending and not Stopped: the VM has no node, and the phase
                 // an operator reads has to say that rather than describing a
                 // guest that no longer exists anywhere.
+                #[allow(deprecated)]
                 v.status.assign(controller_api::VmPhase::new(
                     VmPhaseKind::Pending,
                     controller_api::VmReason::Unbound,
@@ -992,6 +998,7 @@ pub(super) async fn ingest_phases(
         let vm_tenant = vm.spec.tenant.clone();
         let result = store
             .mutate::<Vm, _>(&name, |v| {
+                #[allow(deprecated)]
                 v.status.assign(controller_api::VmPhase::new(
                     phase,
                     controller_api::VmReason::Reported,

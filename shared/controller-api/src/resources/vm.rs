@@ -609,7 +609,7 @@ pub struct VmStatus {
     /// right here — so every client that reads `status.phase` as a string
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
-    pub phase: VmPhase,
+    pub(super) phase: VmPhase,
     /// The last `metadata.generation` this object's controller ACTED on.
     ///
     /// Kubernetes' half of the pair, and the whole of what it says is:

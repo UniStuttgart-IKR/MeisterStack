@@ -131,6 +131,7 @@ pub(super) async fn dispatch_snapshot(
     // the volume has since gone.
     let mut sent = snapshot.clone();
     sent.status.node = Some(node.clone());
+    #[allow(deprecated)]
     sent.status.assign(controller_api::VolumeSnapshotPhase::new(
         VolumeSnapshotPhaseKind::Creating,
         controller_api::VolumeSnapshotReason::Dispatched,
@@ -377,6 +378,7 @@ pub(super) async fn note_snapshot_failed(
     warn!(snapshot = %snapshot.metadata.name, error = %message, "snapshot failed");
     p.store
         .mutate::<VolumeSnapshot, _>(&snapshot.metadata.name, |s| {
+            #[allow(deprecated)]
             s.status.assign(controller_api::VolumeSnapshotPhase::new(
                 VolumeSnapshotPhaseKind::Failed,
                 controller_api::VolumeSnapshotReason::Reported,
@@ -414,6 +416,7 @@ pub(super) async fn requeue_snapshot(
     let kicked = p
         .store
         .mutate::<VolumeSnapshot, _>(&name, |s| {
+            #[allow(deprecated)]
             s.status.assign(controller_api::VolumeSnapshotPhase::new(
                 VolumeSnapshotPhaseKind::Pending,
                 controller_api::VolumeSnapshotReason::Requeued,

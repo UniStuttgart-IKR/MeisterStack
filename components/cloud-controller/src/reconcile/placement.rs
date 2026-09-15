@@ -149,6 +149,7 @@ pub(super) async fn note_pending(
             // the phase itself is whatever it already was: this pass says why
             // a VM is not placed, it does not decide what the VM is doing.
             let kind = v.status.phase().kind();
+            #[allow(deprecated)]
             v.status.assign(controller_api::VmPhase::new(
                 kind,
                 category.category(),

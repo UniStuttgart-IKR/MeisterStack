@@ -507,6 +507,7 @@ mod tests {
             assert!(holds_room(phase), "{phase:?}");
         }
         let mut vols = disks();
+        #[allow(deprecated)]
         vols[1]
             .status
             .assign(VolumePhase::of(VolumePhaseKind::Releasing, Utc::now()));

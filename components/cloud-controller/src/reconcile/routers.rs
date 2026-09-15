@@ -491,6 +491,7 @@ async fn dispatch(
             {
                 store
                     .mutate::<Router, _>(&name, |r| {
+                        #[allow(deprecated)]
                         r.status.assign(RouterPhase::new(
                             RouterPhaseKind::Provisioning,
                             RouterReason::Dispatched,
@@ -542,6 +543,7 @@ async fn note(
     let now = Utc::now();
     store
         .mutate::<Router, _>(&name, |r| {
+            #[allow(deprecated)]
             r.status
                 .assign(RouterPhase::new(phase, reason, Some(message.clone()), now));
             if let Some(cluster) = &cluster {

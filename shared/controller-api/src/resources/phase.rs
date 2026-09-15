@@ -409,6 +409,17 @@ macro_rules! phased {
             /// The exception is an object nobody has stamped at all
             /// ([`UNSTAMPED`]): its first assignment IS the first stamp,
             /// even when the word it lands on is the word it was born with.
+            ///
+            /// Deprecated from the day it was written, and that is the point.
+            /// A phase is going to be DERIVED — `settle(now)` out of the spec
+            /// and the facts in the status, at one place per resource — and
+            /// until that exists every writer that still stamps a phase out
+            /// of what its own code path happens to know carries
+            /// `#[allow(deprecated)]`. So the list of them is a `grep`, the
+            /// compiler keeps it honest, and the proof the round is finished
+            /// is that this function can be deleted and everything still
+            /// compiles.
+            #[deprecated(note = "struktur 4: wird durch settle() ersetzt")]
             pub fn assign(&mut self, phase: $phase) {
                 let since = if phase.kind() == self.phase.kind() && self.phase.since() != UNSTAMPED
                 {
@@ -624,11 +635,13 @@ mod tests {
 
         // The first assignment is the first stamp, even onto the word the
         // object was born with.
+        #[allow(deprecated)]
         status.assign(VmPhase::of(VmPhaseKind::Pending, at(0)));
         assert_eq!(status.phase().since(), at(0));
 
         // The same word again, later: the reason and the sentence move, the
         // stamp does not.
+        #[allow(deprecated)]
         status.assign(VmPhase::new(
             VmPhaseKind::Pending,
             VmReason::Unplaced,
@@ -640,12 +653,14 @@ mod tests {
         assert_eq!(status.phase().message(), Some("no candidate has room"));
 
         // A different word: the stamp is the moment of the change.
+        #[allow(deprecated)]
         status.assign(VmPhase::of(VmPhaseKind::Running, at(900)));
         assert_eq!(status.phase().since(), at(900));
 
         // And a reason assigned onto a resting word is dropped rather than
         // kept — so the value is stable under a second identical write,
         // which is what lets a caller compare against it as a churn guard.
+        #[allow(deprecated)]
         status.assign(VmPhase::new(
             VmPhaseKind::Running,
             VmReason::Unplaced,

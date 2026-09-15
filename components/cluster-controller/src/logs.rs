@@ -306,6 +306,7 @@ mod tests {
                 "metadata": {"name": "web-1"}, "spec": {"vm": {}},
             }))
             .expect("a vm");
+            #[allow(deprecated)]
             vm.status
                 .assign(controller_api::VmPhase::of(phase, chrono::Utc::now()));
             vm.status.observed_generation = observed;

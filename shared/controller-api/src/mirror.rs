@@ -249,6 +249,7 @@ mod tests {
     #[test]
     fn a_report_that_says_what_is_already_stored_yields_nothing() {
         let mut stored = vm("web-1", "uid-a", Some("manacor"));
+        #[allow(deprecated)]
         stored
             .status
             .assign(VmPhase::of(VmPhaseKind::Running, chrono::Utc::now()));
@@ -274,6 +275,7 @@ mod tests {
     #[test]
     fn an_empty_message_is_absent_rather_than_empty() {
         let mut stored = vm("web-1", "uid-a", Some("manacor"));
+        #[allow(deprecated)]
         stored.status.assign(VmPhase::said(
             VmPhaseKind::Failed,
             Some("out of memory".into()),

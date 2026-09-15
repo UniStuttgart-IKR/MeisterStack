@@ -191,7 +191,7 @@ pub struct VolumeStatus {
     /// right here — so every client that reads `status.phase` as a string
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
-    pub phase: VolumePhase,
+    pub(super) phase: VolumePhase,
     /// The name the BACKEND knows this volume by — `/tmp/vols/<uid>.raw`,
     /// `/dev/vg0/vm-<uid>`, an export directory.
     ///
@@ -483,7 +483,7 @@ pub struct VolumeSnapshotStatus {
     /// right here — so every client that reads `status.phase` as a string
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
-    pub phase: VolumeSnapshotPhase,
+    pub(super) phase: VolumeSnapshotPhase,
     /// The node that took it — the volume's provisioning node, which under a
     /// `shared` pool need not be the node the VM runs on. Copied onto the
     /// snapshot at dispatch so that a later `DropSnapshot` goes to the machine
