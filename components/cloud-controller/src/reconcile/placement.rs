@@ -78,11 +78,14 @@ pub(crate) async fn would_place(
     };
     let now = Utc::now();
     let vms = store.list::<Vm>().await?;
+    // One read for every cluster's liveness — the heartbeat has its own key
+    // since D-C7.
+    let beats = store.beats::<Cluster>().await?;
     let mut clusters = Vec::new();
     for cluster in store.list::<Cluster>().await? {
         let name = cluster.metadata.name;
         let connected = cluster.status.connected
-            && !controller_api::heartbeat_expired(cluster.status.last_heartbeat, now);
+            && !controller_api::heartbeat_expired(beats.get(&name).copied(), now);
         clusters.push(Candidate {
             connected,
             // One view at this tier: a cloud has one session per cluster

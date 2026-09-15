@@ -164,18 +164,56 @@ pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &Cl
 
 /// The heartbeat on its own: this session is up, and that is all a
 /// non-speaking replica's copy of the report is allowed to say.
+///
+/// Two writes and not one since D-C7: the beat goes into a key of its own and
+/// the OBJECT is touched only when `connected` really changes — which for a
+/// cluster that is up is never, and was one full `Cluster` rewrite every ten
+/// seconds before this.
 pub(super) async fn beat(
     store: &EtcdStore,
     cluster: &str,
     at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
+    store.beat::<Cluster>(cluster, at).await?;
+    // The read `mutate` used to make, made here so the write can be skipped.
+    // A cluster with no object errors exactly as it did before.
+    if store.get::<Cluster>(cluster).await?.status.connected {
+        // Already up, and there is nothing else on this road to say: the beat
+        // is recorded and the object stays exactly as it is.
+        return Ok(());
+    }
     store
-        .mutate::<Cluster, _>(cluster, |c| {
-            c.status.connected = true;
-            c.status.last_heartbeat = Some(at);
-        })
+        .mutate::<Cluster, _>(cluster, |c| c.status.connected = true)
         .await?;
     Ok(())
+}
+
+/// Does this report say anything the Cluster object does not already say?
+///
+/// The same four questions the node half asks, one tier up, and the same
+/// omission: NOT the heartbeat. Pulled out so the decision can be made in a
+/// test without an etcd.
+pub(super) fn cluster_facts_are_news(
+    status: &controller_api::ClusterStatus,
+    ready: u32,
+    total: u32,
+    vms: u32,
+    nodes: &[controller_api::NodeSummary],
+    capacity: Option<&proto::ClusterCapacity>,
+) -> bool {
+    if !status.connected
+        || status.nodes_ready != ready
+        || status.nodes_total != total
+        || status.vms != vms
+        || status.nodes != nodes
+    {
+        return true;
+    }
+    capacity.is_some_and(|cap| {
+        status.capacity.vcpus != cap.vcpus
+            || status.capacity.mem_mib != cap.mem_mib
+            || status.capacity.capabilities != cap.capabilities
+    })
 }
 
 /// What the cluster says about ITSELF: how many nodes it has, how many are
@@ -198,10 +236,23 @@ pub(super) async fn ingest_cluster_facts(
     // for ever — the same rule the VM phases below follow and the same rule
     // the tier below follows about what an agent reported.
     let nodes: Vec<controller_api::NodeSummary> = status.nodes.iter().map(node_summary).collect();
+    // The beat in its own key (D-C7), and the object only when the cluster's
+    // own facts moved.
+    store.beat::<Cluster>(cluster, at).await?;
+    let current = store.get::<Cluster>(cluster).await?;
+    if !cluster_facts_are_news(
+        &current.status,
+        ready,
+        total,
+        vms,
+        &nodes,
+        capacity.as_ref(),
+    ) {
+        return Ok(());
+    }
     store
         .mutate::<Cluster, _>(cluster, |c| {
             c.status.connected = true;
-            c.status.last_heartbeat = Some(at);
             c.status.nodes_ready = ready;
             c.status.nodes_total = total;
             c.status.vms = vms;

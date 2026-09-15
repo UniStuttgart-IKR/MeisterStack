@@ -937,13 +937,13 @@ async fn check_holder_is_talking(
     current: &Vm,
     cluster: &str,
 ) -> Result<(), ApiError> {
-    let heard = match st.store.get::<controller_api::Cluster>(cluster).await {
-        Ok(c) => c.status.last_heartbeat,
-        // A cluster object that is not there any more has certainly not
-        // reported; the refusal is the same one and says so.
-        Err(StoreError::NotFound(_)) => None,
-        Err(e) => return Err(e.into()),
-    };
+    // The lease and not the object: the heartbeat moved into a key of its own
+    // (D-C7), and an absent lease is the same answer an absent object gave —
+    // this cluster has not reported.
+    let heard = st
+        .store
+        .last_beat::<controller_api::Cluster>(cluster)
+        .await?;
     holder_refusal(current, cluster, heard, Utc::now())
 }
 

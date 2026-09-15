@@ -316,8 +316,43 @@ pub(super) async fn ingest_routers(
     Ok(orphans)
 }
 
+/// What a status report says about the MACHINE, beside the beat itself.
+///
+/// Pulled out of `beat_node` so that "is this report news" is a value
+/// comparison a test can make without an etcd — which is the whole of D-C7's
+/// second half.
+pub(super) struct NodeFacts {
+    pub vcpus: u32,
+    pub mem_mib: u64,
+    pub vms: u32,
+    /// `None` is "the report said nothing about health", which is not the
+    /// same as "nothing is wrong" — see the comment in `node_facts`.
+    pub conditions: Option<Vec<controller_api::NodeCondition>>,
+}
+
+/// Does this report say anything the object does not already say?
+///
+/// The four facts the brief names and no others: ready, capacity, vms,
+/// conditions. NOT the heartbeat — that is the whole point, and a comparison
+/// that included it would be the defect back again.
+pub(super) fn node_facts_are_news(status: &controller_api::NodeStatus, facts: &NodeFacts) -> bool {
+    !status.ready
+        || status.vms != facts.vms
+        || status.capacity.vcpus != facts.vcpus
+        || status.capacity.mem_mib != facts.mem_mib
+        || facts
+            .conditions
+            .as_ref()
+            .is_some_and(|c| *c != status.conditions)
+}
+
 /// The heartbeat and the node's own facts: that it is up, how many VMs it
 /// carries, how much room it has, and what it says is wrong with it.
+///
+/// Two writes and not one, and the split is D-C7. The BEAT goes into a key of
+/// its own, every ten seconds, about sixty bytes. The OBJECT is written only
+/// when something about the machine changed — which on an idle fleet is
+/// never, and was 1.13 etcd revisions a second before this.
 pub(super) async fn beat_node(
     store: &EtcdStore,
     node_id: &str,
@@ -346,16 +381,40 @@ pub(super) async fn beat_node(
             })
             .collect()
     });
+    // The beat first and on its own. It is also what makes the read below
+    // safe to skip a write on: whatever the object says, the fleet's liveness
+    // answer has already been recorded.
+    store.beat::<Node>(node_id, Utc::now()).await?;
+    // The read `mutate` used to make, made here so the write can be skipped.
+    // A node with no object errors exactly as it did before — `ingest_hello`
+    // creates it, and a beat that arrives first is worth the warning the
+    // caller logs.
+    let current = store.get::<Node>(node_id).await?;
+    // A report with no `node` block says nothing about capacity, so what it
+    // compares against is what the node already has rather than zero: that
+    // shape is the heartbeat-only report an agent sends when it could not read
+    // its own state, and reading it as "no vcpus" would rewrite the object
+    // twice per outage.
+    let news = NodeFacts {
+        vcpus: facts
+            .map(|f| f.vcpus)
+            .unwrap_or(current.status.capacity.vcpus),
+        mem_mib: facts
+            .map(|f| f.mem_mib)
+            .unwrap_or(current.status.capacity.mem_mib),
+        vms: count,
+        conditions,
+    };
+    if !node_facts_are_news(&current.status, &news) {
+        return Ok(());
+    }
     store
         .mutate::<Node, _>(node_id, |n| {
             n.status.ready = true;
-            n.status.last_heartbeat = Some(Utc::now());
-            n.status.vms = count;
-            if let Some(f) = facts {
-                n.status.capacity.vcpus = f.vcpus;
-                n.status.capacity.mem_mib = f.mem_mib;
-            }
-            if let Some(conditions) = &conditions {
+            n.status.vms = news.vms;
+            n.status.capacity.vcpus = news.vcpus;
+            n.status.capacity.mem_mib = news.mem_mib;
+            if let Some(conditions) = &news.conditions {
                 n.status.conditions = conditions.clone();
             }
         })

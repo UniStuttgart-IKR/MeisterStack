@@ -14,6 +14,31 @@ use super::*;
 /// `CLUSTER_OWNED` for why this is declared rather than left out.
 pub(super) const NODE_OWNED: &[Owned] = &[];
 
+/// `status.lastHeartbeat`, joined back onto the objects the API answers with.
+///
+/// The field moved into a key of its own (D-C7, `EtcdStore::beat`) and this is
+/// what keeps the API's answer the answer it always was: `meister node ls`
+/// shows the column it always showed, and Tofu and the UI read the key they
+/// always read. One batched read per LIST, one per GET.
+///
+/// A node with no lease gets no key at all rather than a null — which is what
+/// a node nobody has heard from has always looked like here.
+async fn join_heartbeats(store: &EtcdStore, nodes: &mut [Node]) -> Result<(), ApiError> {
+    let beats = store.beats::<Node>().await?;
+    for node in nodes.iter_mut() {
+        node.status.last_heartbeat = beats.get(&node.metadata.name).copied();
+    }
+    Ok(())
+}
+
+/// The same join for the one object a write answers with. A response that
+/// showed the instant left in etcd before the field moved would be a lie
+/// about a machine, and the only one this route could still tell.
+async fn join_one(store: &EtcdStore, node: &mut Node) -> Result<(), ApiError> {
+    node.status.last_heartbeat = store.last_beat::<Node>(&node.metadata.name).await?;
+    Ok(())
+}
+
 pub(super) async fn list_nodes(
     State(st): State<ApiState>,
     axum::extract::Query(q): axum::extract::Query<controller_api::ListQuery>,
@@ -24,6 +49,7 @@ pub(super) async fn list_nodes(
     // Node is a field nothing here has ever filled in.
     let mut items = st.store.list::<Node>().await?;
     items.retain(|n| selector.selects(&n.spec.labels));
+    join_heartbeats(&st.store, &mut items).await?;
     Ok(Json(json!({
         "apiVersion": API_VERSION,
         "kind": "NodeList",
@@ -35,7 +61,9 @@ pub(super) async fn get_node(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<Node>, ApiError> {
-    Ok(Json(st.store.get(&name).await?))
+    let mut node: Node = st.store.get(&name).await?;
+    join_one(&st.store, &mut node).await?;
+    Ok(Json(node))
 }
 
 /// The only write on a Node, and the reason this route exists: `spec` is what
@@ -59,9 +87,9 @@ pub(super) async fn update_node(
     Json(body): Json<SpecUpdate<NodeSpec>>,
 ) -> Result<Json<Node>, ApiError> {
     let current: Node = st.store.get(&name).await?;
-    Ok(Json(
-        write_node_spec(&st.store, &name, body, current, dry).await?,
-    ))
+    let mut node = write_node_spec(&st.store, &name, body, current, dry).await?;
+    join_one(&st.store, &mut node).await?;
+    Ok(Json(node))
 }
 
 pub(super) async fn patch_node(
@@ -70,7 +98,9 @@ pub(super) async fn patch_node(
     dry: controller_api::DryRun,
     Json(patch): Json<serde_json::Value>,
 ) -> Result<Json<Node>, ApiError> {
-    Ok(Json(patch_node_spec(&st.store, &name, &patch, dry).await?))
+    let mut node = patch_node_spec(&st.store, &name, &patch, dry).await?;
+    join_one(&st.store, &mut node).await?;
+    Ok(Json(node))
 }
 
 /// A merge patch onto one node's spec, from wherever it came: this tier's own

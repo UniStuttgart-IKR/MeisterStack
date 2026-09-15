@@ -481,13 +481,10 @@ async fn check_holder_is_talking(st: &ApiState, current: &Vm, next: &Vm) -> Resu
     let Some(node) = releasing(current, next) else {
         return Ok(());
     };
-    let heard = match st.store.get::<Node>(node).await {
-        Ok(n) => n.status.last_heartbeat,
-        // A node object that is not there any more has certainly not
-        // reported; the refusal is the same one and says so.
-        Err(StoreError::NotFound(_)) => None,
-        Err(e) => return Err(e.into()),
-    };
+    // The lease and not the object: the heartbeat moved into a key of its own
+    // (D-C7), and an absent lease is the same answer an absent object gave —
+    // this machine has not reported.
+    let heard = st.store.last_beat::<Node>(node).await?;
     holder_refusal(current, node, heard, Utc::now())
 }
 

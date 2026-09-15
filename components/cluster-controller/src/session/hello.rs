@@ -103,7 +103,6 @@ pub(super) async fn ingest_hello(
     let machine = hello.machine.as_ref().map(machine_profile);
     let apply = |n: &mut Node| {
         n.status.ready = true;
-        n.status.last_heartbeat = Some(Utc::now());
         n.status.agent_version = Some(hello.agent_version.clone());
         n.status.capacity.capabilities = profiles.clone();
         n.status.capacity.volume_localities = localities.clone();
@@ -129,6 +128,11 @@ pub(super) async fn ingest_hello(
         }
     }
     store.mutate::<Node, _>(name, apply).await?;
+    // The beat goes in its own key, here as in every other place a node
+    // speaks (D-C7). A Hello IS a beat: it is the first thing the agent says
+    // on a new session, and a node whose lease waited for the first status
+    // report would read as expired for up to ten seconds after connecting.
+    store.beat::<Node>(name, Utc::now()).await?;
     forget_router_refusals(store, name).await;
     Ok(())
 }

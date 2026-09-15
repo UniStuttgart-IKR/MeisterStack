@@ -385,10 +385,14 @@ async fn expire_and_collect_clusters(
     // Rebuilt from this listing every pass: a cluster taken out of the
     // inventory must LOSE its age rather than keep the last one for ever.
     telemetry::metrics::sessions().reset_heartbeats();
+    // One read for every cluster's liveness: the heartbeat lives in its own
+    // key since D-C7.
+    let beats = store.beats::<Cluster>().await?;
     for cluster in store.list::<Cluster>().await? {
         let name = cluster.metadata.name;
-        publish_heartbeat_age(&name, cluster.status.last_heartbeat, now);
-        let connected = still_connected(store, &name, &cluster.status, now).await;
+        let heard = beats.get(&name).copied();
+        publish_heartbeat_age(&name, heard, now);
+        let connected = still_connected(store, &name, &cluster.status, heard, now).await;
         out.push(Candidate {
             connected: connected && sessions.contains(&name),
             // One view at this tier: a cloud has one session per cluster
@@ -441,15 +445,15 @@ async fn still_connected(
     store: &EtcdStore,
     name: &str,
     status: &controller_api::ClusterStatus,
+    heard: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> bool {
-    if !status.connected || !heartbeat_expired(status.last_heartbeat, now) {
+    if !status.connected || !heartbeat_expired(heard, now) {
         return status.connected;
     }
     // ISO-8601 UTC rather than the Debug of an Option: the instant is what an
     // operator lines up against everything else in the log.
-    let last = status
-        .last_heartbeat
+    let last = heard
         .map(|t| t.to_rfc3339())
         .unwrap_or_else(|| "never".to_string());
     warn!(cluster = %name, last_heartbeat = %last,

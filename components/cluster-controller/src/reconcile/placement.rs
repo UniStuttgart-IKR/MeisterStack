@@ -90,10 +90,14 @@ pub(crate) async fn candidates_for_preview(
 ) -> anyhow::Result<Vec<Candidate>> {
     let now = Utc::now();
     let vms = store.list::<Vm>().await?;
+    // One read for the whole fleet's liveness: the heartbeat lives in its own
+    // key since D-C7, and a LIST of ten nodes must not become eleven round
+    // trips.
+    let beats = store.beats::<Node>().await?;
     let mut out = Vec::new();
     for node in store.list::<Node>().await? {
         let name = node.metadata.name;
-        let ready = node.status.ready && !heartbeat_expired(node.status.last_heartbeat, now);
+        let ready = node.status.ready && !heartbeat_expired(beats.get(&name).copied(), now);
         out.push(Candidate {
             connected: ready,
             // No session map in this listing at all, so the two questions
@@ -142,9 +146,12 @@ pub(super) async fn expire_and_collect_nodes(
     // keep the last one for ever — frozen, and indistinguishable from a node
     // whose heartbeat merely stopped.
     telemetry::metrics::sessions().reset_heartbeats();
+    // The fleet's heartbeats in one read — see `candidates_for_preview`.
+    let beats = store.beats::<Node>().await?;
     for node in store.list::<Node>().await? {
         let name = node.metadata.name;
-        if let Some(last) = node.status.last_heartbeat {
+        let heard = beats.get(&name).copied();
+        if let Some(last) = heard {
             telemetry::metrics::sessions().set_heartbeat_age(
                 telemetry::metrics::PEER_NODE,
                 &name,
@@ -152,12 +159,10 @@ pub(super) async fn expire_and_collect_nodes(
             );
         }
         let mut ready = node.status.ready;
-        if ready && heartbeat_expired(node.status.last_heartbeat, now) {
+        if ready && heartbeat_expired(heard, now) {
             // ISO-8601 UTC rather than the Debug of an Option: the instant
             // is what an operator lines up against everything else in the log.
-            let last = node
-                .status
-                .last_heartbeat
+            let last = heard
                 .map(|t| t.to_rfc3339())
                 .unwrap_or_else(|| "never".to_string());
             warn!(node = %name, last_heartbeat = %last, "heartbeat expired, node not ready");
@@ -199,7 +204,7 @@ pub(super) async fn expire_and_collect_nodes(
         // already down before this existed is answered too, which is the case
         // the lab was actually in.
         if !ready {
-            expire_vm_reports(store, vms, &name, node.status.last_heartbeat, now).await;
+            expire_vm_reports(store, vms, &name, heard, now).await;
         }
         // Read off the object rather than off the Candidate, because a
         // Candidate is what a SCHEDULER sees and a locality is not a

@@ -110,6 +110,22 @@ pub struct NodeStatus {
     /// The agent has a session AND its heartbeat has not expired.
     #[serde(default)]
     pub ready: bool,
+    /// When this node last reported, as the API answers it.
+    ///
+    /// **Not stored on this object any more.** It lives in a key of its own
+    /// (`<prefix>/leases/nodes/<name>`, see `EtcdStore::beat`) and the REST
+    /// layer joins it in on GET and LIST, which is why the field is still
+    /// here and still spelled the same: `meister node ls` shows the column it
+    /// always showed, and Tofu and the UI read the key they always read.
+    ///
+    /// D-C7 is what moved it. Every beat rewrote this whole object —
+    /// `machine.cpuFlags` and all, about 1.5 kB — to move one instant by
+    /// 108 ms, at 1.13 etcd revisions a second on an idle lab. A field that
+    /// changes every ten seconds cannot share an object with a spec and an
+    /// inventory that change once a week.
+    ///
+    /// `None` on a node this store has never heard from, which is exactly
+    /// what [`crate::heartbeat::expired`] reads as gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_heartbeat: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
