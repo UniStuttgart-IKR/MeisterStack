@@ -1,0 +1,6 @@
+[submodule "bin/dependencies/cloud-hypervisor"]
+	path = bin/dependencies/cloud-hypervisor
+	url = https://github.com/cloud-hypervisor/cloud-hypervisor.git
+[submodule "bin/dependencies/crosvm"]
+	path = bin/dependencies/crosvm
+	url = https://chromium.googlesource.com/crosvm/crosvm

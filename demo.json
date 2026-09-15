@@ -1,0 +1,15 @@
+{
+  "apiVersion": "meister.io/v1", "kind": "Vm",
+  "metadata": { "name": "demo-small" },
+  "spec": {
+    "clusterSelector": { "tier": "small" },
+    "runStrategy": "Running",
+    "vm": {
+      "vcpus": 1, "memory_mib": 512,
+      "boot": { "kind": "direct_kernel", "kernel": "vmlinux.elf",
+                "initramfs": "tiny-initrd", "cmdline": "console=ttyS0 rdinit=/init" },
+      "volumes": [ { "base_image": "tiny-volume.raw", "size_bytes": 67108864 } ],
+      "nics": [], "devices": []
+    }
+  }
+}
