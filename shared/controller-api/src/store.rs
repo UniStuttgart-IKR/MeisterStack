@@ -199,10 +199,23 @@ impl EtcdStore {
         Ok(obj)
     }
 
-    fn encode<T: StoredObject>(obj: &T) -> Result<Vec<u8>> {
+    /// The bytes that go into etcd, and the one place [`Resource::settle`] is
+    /// called from.
+    ///
+    /// Here rather than in `update` and `create` separately, because "before
+    /// the bytes are made" is exactly what the hook has to mean: every write
+    /// in this file passes through here, `mutate` included (it writes through
+    /// `update`), so there is no path that stores an object the derivation
+    /// never saw. A caller that wants the settled object back reads the
+    /// return value of the write, which is decoded from these very bytes.
+    ///
+    /// It costs no clone that was not already being made: the copy exists
+    /// anyway, to keep `resourceVersion` out of the store.
+    fn encode<T: Resource>(obj: &T, now: chrono::DateTime<chrono::Utc>) -> Result<Vec<u8>> {
         // resource_version is derived state; never persist it.
         let mut clean = obj.clone();
         clean.metadata_mut().resource_version = String::new();
+        clean.settle(now);
         serde_json::to_vec(&clean).map_err(|e| StoreError::Invalid(format!("invalid object: {e}")))
     }
 
@@ -374,7 +387,7 @@ impl EtcdStore {
         obj.metadata_mut().generation = 1;
         let obj = &obj;
         let key = self.key(T::RESOURCE, &name);
-        let value = Self::encode(obj)?;
+        let value = Self::encode(obj, chrono::Utc::now())?;
         let options = lease.map(|id| PutOptions::new().with_lease(id));
         let txn = Txn::new()
             .when(vec![Compare::create_revision(
@@ -473,7 +486,7 @@ impl EtcdStore {
             )
         })?;
         let key = self.key(T::RESOURCE, &name);
-        let value = Self::encode(obj)?;
+        let value = Self::encode(obj, chrono::Utc::now())?;
         let txn = Txn::new()
             .when(vec![Compare::mod_revision(
                 key.clone(),
@@ -928,7 +941,7 @@ mod tests {
         // it must not be what comes back out.
         obj.metadata.resource_version = "41".into();
 
-        let bytes = EtcdStore::encode(&obj).expect("encodes");
+        let bytes = EtcdStore::encode(&obj, chrono::Utc::now()).expect("encodes");
         let back: FloatingIp = EtcdStore::decode(&bytes, 42).expect("decodes");
 
         assert_eq!(back.metadata.resource_version, "42", "the write's revision");
@@ -941,5 +954,69 @@ mod tests {
             serde_json::to_value(&back).unwrap(),
             serde_json::to_value(&expected).unwrap()
         );
+    }
+
+    /// The store runs [`Resource::settle`] on the way out, and this is where
+    /// that is nailed down without an etcd.
+    ///
+    /// Two halves. The default is a NO-OP, which is what makes struktur 4's
+    /// type half behaviour-neutral: every resource in the tree writes exactly
+    /// the bytes it wrote before. And a resource that does implement it is
+    /// really called, with the instant the store chose — which is the
+    /// contract the derivation lane is going to build on.
+    #[test]
+    fn the_store_settles_an_object_before_it_makes_the_bytes() {
+        use crate::object::Object;
+        use crate::resources::{FloatingIp, FloatingIpSpec};
+
+        // The default: nothing in the tree implements `settle` yet, so the
+        // document that goes in is the document that comes out — which is
+        // the whole claim "the type half changes no behaviour".
+        let plain = FloatingIp::declare(
+            "10.255.0.9",
+            FloatingIpSpec {
+                internal_address: String::new(),
+                router: String::new(),
+                tenant: "acme".into(),
+                pool: "lab".into(),
+                address: "10.255.0.9".into(),
+                vm: None,
+            },
+        );
+        let bytes = EtcdStore::encode(&plain, chrono::Utc::now()).expect("encodes");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("json"),
+            serde_json::to_value(&plain).expect("json"),
+            "a resource without a settle is written verbatim"
+        );
+
+        // And one that has one: its phase is a function of its spec, which is
+        // the shape every real `settle` will have.
+        #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+        struct Wanted {
+            ready: bool,
+        }
+        #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+        struct Derived {
+            phase: String,
+            at: String,
+        }
+        type Thing = Object<Wanted, Derived>;
+        impl Resource for Thing {
+            const RESOURCE: &'static str = "things";
+            const KIND: &'static str = "Thing";
+            fn settle(&mut self, now: chrono::DateTime<chrono::Utc>) {
+                self.status.phase = if self.spec.ready { "Ready" } else { "Pending" }.to_string();
+                self.status.at = now.to_rfc3339();
+            }
+        }
+
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("an instant");
+        let thing = Thing::new("meister.io/v1", "Thing", "t", Wanted { ready: true });
+        assert_eq!(thing.status.phase, "", "nobody has assigned anything");
+        let bytes = EtcdStore::encode(&thing, now).expect("encodes");
+        let back: Thing = EtcdStore::decode(&bytes, 1).expect("decodes");
+        assert_eq!(back.status.phase, "Ready", "derived on the way out");
+        assert_eq!(back.status.at, now.to_rfc3339(), "at the store's instant");
     }
 }
