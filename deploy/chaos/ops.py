@@ -54,11 +54,22 @@ def call(ip, port, method, path, body=None, timeout=20):
         # took M4, M5 and M6 with it. `str(o)` still reads fine on a dict, which
         # is how every existing caller formats an error body.
         text = e.read().decode()
+        msg = text
         try:
             parsed = json.loads(text)
-            return e.code, parsed if isinstance(parsed, dict) else {"error": parsed}
+            if isinstance(parsed, dict):
+                msg = parsed.get("message") or parsed.get("error") or text
         except Exception:
-            return e.code, {"error": text}
+            pass
+        # Deliberately NOT the raw error envelope. The API answers errors with
+        # `kind: Status`, and that envelope carries a top-level `status` field
+        # whose value is the STRING "Failure" -- the same key a resource uses
+        # for its status OBJECT. Handing it back verbatim makes every
+        # `o.get("status").get("phase")` in this harness blow up one level
+        # deeper than before, which is exactly what happened to mini.py's
+        # wait_vm the first time this was fixed. `__error__` is the shape
+        # invariants.py already uses for "this is not a resource".
+        return e.code, {"__error__": text, "message": msg, "code": e.code}
     except Exception as e:
         raise ApiError(0, f"{type(e).__name__}: {e}")
 
