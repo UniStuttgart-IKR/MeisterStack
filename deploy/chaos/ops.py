@@ -354,3 +354,177 @@ def unlabel_nodes(prefix="chaos-"):
             if rc in (200, 202):
                 taken.extend(f"{cn}/nodes/{name}/labels/{k}" for k in ours)
     return taken
+
+
+# --- the shaper: Weg B, one NIC, the ports told apart on eth0 ----------------
+#
+# Position 0 of the chaos-extrem run measured the lab and found Weg A closed:
+# only agent-1b and agent-1c carry an `eth1`, and it holds no IPv4 -- it is the
+# router's provider NIC, not a MeisterStack path. Every controller has exactly
+# `eth0`. So all of it -- sessions, etcd, REST, VXLAN and the ssh this harness
+# rides on -- shares one wire, and the qdisc has to tell them apart by port.
+#
+# The shape is a `prio` root with every packet defaulting to band 2 (untouched)
+# and a `u32` filter lifting only the named ports into band 3, which carries the
+# netem. Port 22 can never be named; the guard below refuses it, because the
+# harness would shape away its own hands. The NVMe-oF ports are refused for the
+# same kind of reason: the brief puts that path out of bounds.
+
+WIRE = "eth0"
+NEVER_SHAPE = {22, 4421, 4422}          # ssh, and the storage path the brief protects
+SHAPE_TOKEN = "/run/chaos-shape.token"
+
+CONDS = {
+    "L50":   ("netem", "delay 50ms 10ms"),
+    "L200":  ("netem", "delay 200ms 10ms"),
+    "L1000": ("netem", "delay 1000ms 10ms"),
+    "P1":    ("netem", "loss 1%"),
+    "P5":    ("netem", "loss 5%"),
+    "P20":   ("netem", "loss 20%"),
+    "J":     ("netem", "delay 200ms 150ms distribution normal"),
+    "B10":   ("tbf",   "rate 10mbit burst 32kbit latency 400ms"),
+}
+
+
+def _on(where, cmd, timeout=40):
+    """Run a shell command on a node name or on a bare IP."""
+    if where in NODE_HOST:
+        return sh(where, cmd, timeout=timeout)
+    return ctl(where, cmd, timeout=timeout)
+
+
+def _match(proto, side, port, peer=None):
+    """One u32 clause. `side` is dport or sport -- the direction this end sees."""
+    if port in NEVER_SHAPE:
+        raise ValueError(f"refusing to shape port {port}: it is on the never-shape list")
+    num = {"tcp": 6, "udp": 17}[proto]
+    m = f"match ip protocol {num} 0xff match ip {side} {port} 0xffff"
+    if peer:
+        m += f" match ip dst {peer}/32"
+    return m
+
+
+def shape(where, cond, seconds, matches, wire=WIRE):
+    """Put `cond` on the traffic `matches` names, and nothing else.
+
+    The self-lift is a transient systemd timer, not a backgrounded shell: the
+    first version built that timer as a nested `nohup setsid sh -c "..."` string
+    and the escaping collapsed on the way through ssh, so the `tc qdisc del`
+    inside it ran immediately instead of in three minutes. The qdisc was gone
+    before the first packet, `tc qdisc show` still said `mq`, and the shaping
+    silently did nothing. Position 1's ping proof is what caught it -- which is
+    exactly why the brief asks for two numbers before the first cell.
+
+    Raises if the qdisc or the filters are not actually on the wire afterwards.
+    A shaper that reports success it did not achieve is worse than none.
+    """
+    if cond not in CONDS:
+        raise ValueError(f"unknown condition {cond}; have {sorted(CONDS)}")
+    kind, args = CONDS[cond]
+    unit = f"chaos-unshape-{wire}"
+    deadline = int(seconds) + 60
+    parts = [
+        f"systemctl stop {unit}.timer 2>/dev/null",
+        f"systemctl reset-failed {unit}.timer {unit}.service 2>/dev/null",
+        f"tc qdisc del dev {wire} root 2>/dev/null",
+        f"tc qdisc add dev {wire} root handle 1: prio bands 3 "
+        f"priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+        f"tc qdisc add dev {wire} parent 1:3 handle 30: {kind} {args}",
+    ]
+    for i, m in enumerate(matches, start=1):
+        parts.append(f"tc filter add dev {wire} protocol ip parent 1: prio {i} u32 {m} flowid 1:3")
+    parts += [
+        f"systemd-run --collect --on-active={deadline} --unit={unit} "
+        f"tc qdisc del dev {wire} root >/dev/null 2>&1",
+        f"echo FILTERS=$(tc filter show dev {wire} | grep -c flowid)",
+        f"echo ROOT=$(tc qdisc show dev {wire} | head -1 | awk '{{print $2}}')",
+        f"echo LEAF=$(tc qdisc show dev {wire} | sed -n 2p | awk '{{print $2}}')",
+    ]
+    rc, out = _on(where, "; ".join(parts))
+    got = dict(l.split("=", 1) for l in out.split() if "=" in l and l.split("=")[0].isupper())
+    n_want, n_got = len(matches), int(got.get("FILTERS", -1))
+    if got.get("ROOT") != "prio" or got.get("LEAF") != kind or n_got != n_want:
+        unshape(where, wire)
+        raise RuntimeError(
+            f"shape did not take on {where}: root={got.get('ROOT')} (want prio), "
+            f"leaf={got.get('LEAF')} (want {kind}), filters={n_got} (want {n_want}). "
+            f"raw: {out.strip()[:300]}")
+    log(f"shape {where} {cond} [{kind} {args}] on {n_got} match(es), self-lift in {deadline}s")
+    return rc, out
+
+
+def unshape(where, wire=WIRE):
+    """Idempotent. Safe on a node that was never shaped."""
+    unit = f"chaos-unshape-{wire}"
+    return _on(where, f"systemctl stop {unit}.timer 2>/dev/null; "
+                      f"systemctl reset-failed {unit}.timer {unit}.service 2>/dev/null; "
+                      f"tc qdisc del dev {wire} root 2>/dev/null; echo lifted")
+
+
+def shaped(where, wire=WIRE):
+    """What is actually on the wire right now -- for the report, not for trust."""
+    return _on(where, f"tc qdisc show dev {wire}; tc filter show dev {wire} | grep -c flowid")
+
+
+# The six links of the matrix, as the ends that have to be shaped. A link is a
+# list of (where, [match, ...]) -- more than one end when the condition has to
+# bite in both directions.
+
+def link_matches(link):
+    a1a, a1b = NODE_HOST["agent-1a"], NODE_HOST["agent-1b"]
+    if link == "A":       # one agent's session to its cluster
+        return [("agent-1a", [_match("tcp", "dport", 50051, ip) for ip in CLUSTER1])]
+    if link == "C":       # one cluster replica's voice at the cloud
+        return [(CLUSTER1[0], [_match("tcp", "dport", 50050, ip) for ip in CLOUD])]
+    if link == "E1":      # one etcd peer -- minority, raft holds
+        peers = [ip for ip in CLUSTER1 if ip != CLUSTER1[0]]
+        return [(CLUSTER1[0], [_match("tcp", "dport", 2380, ip) for ip in peers])]
+    if link == "E2":      # two etcd peers -- majority gone, writes stall
+        out = []
+        for me in CLUSTER1[:2]:
+            peers = [ip for ip in CLUSTER1 if ip != me]
+            out.append((me, [_match("tcp", "dport", 2380, ip) for ip in peers]))
+        return out
+    if link == "R":       # the API as a client sees it.
+        # Shaped at the CLOUD end on sport 3000, never on manacor: the brief
+        # forbids changing manacor's interfaces, and a qdisc is a change.
+        return [(CLOUD[0], [_match("tcp", "sport", 3000)])]
+    if link == "V":       # the tenant overlay, agent to agent
+        return [("agent-1a", [_match("udp", "dport", 4789, a1b)]),
+                ("agent-1b", [_match("udp", "dport", 4789, a1a)])]
+    raise ValueError(f"unknown link {link}; have A C E1 E2 R V")
+
+
+def shape_link(link, cond, seconds):
+    """Shape every end of a link. Returns the list of ends, for unshaping."""
+    ends = []
+    for where, matches in link_matches(link):
+        shape(where, cond, seconds, matches)
+        ends.append(where)
+    return ends
+
+
+def unshape_all(ends=None):
+    """Lift everything, everywhere. Called in every `finally` and at cleanup."""
+    targets = ends if ends is not None else (
+        list(NODE_HOST) + list(CLOUD) + list(CLUSTER1) + list(CLUSTER2))
+    lifted = []
+    for w in targets:
+        try:
+            unshape(w)
+            lifted.append(w)
+        except Exception:
+            pass
+    return lifted
+
+
+def ping_rtt(frm, to, count=10):
+    """Median RTT in ms as one node sees another, or None when nothing came back."""
+    rc, out = _on(frm, f"ping -c {count} -i 0.3 -W 3 {to} 2>/dev/null | tail -2")
+    for line in out.splitlines():
+        if "min/avg/max" in line or "rtt" in line:
+            try:
+                return float(line.split("=")[1].strip().split("/")[1])
+            except Exception:
+                pass
+    return None
