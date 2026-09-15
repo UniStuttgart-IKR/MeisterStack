@@ -70,10 +70,18 @@ reasons! {
     /// a refused provision costs a requeue, a volume the backend has LOST
     /// costs somebody their data, and under the old `Reported` both were one
     /// word with the driver's prose beside it.
-    VolumeReason [11] {
+    VolumeReason [12] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
         Unrecorded => "Unrecorded",
+        /// Nobody has been asked yet: the volume is written down, and either
+        /// no pass has placed it or the placed node has not been told.
+        ///
+        /// Not `Unplaced`, which is the planner having LOOKED and found
+        /// nowhere. Spelled as the image's, the pool's, the copy's and the
+        /// router's are, so that "nobody has said anything yet" is one word
+        /// across this crate.
+        AwaitingNode => "AwaitingNode",
         /// No node that could provision it is a candidate: none runs the
         /// driver, none is up, or none has the room.
         Unplaced => "Unplaced",
@@ -81,7 +89,9 @@ reasons! {
         /// the phase says so rather than describing bytes that are being
         /// made from scratch.
         Following => "Following",
-        /// A node has been asked to make it.
+        /// A node has been ASKED — to make the bytes, or to unmake them. The
+        /// second half is the release in flight: the `DeprovisionVolume` has
+        /// gone out and the node has not answered `Gone` yet.
         Dispatched => "Dispatched",
         /// The command did not reach the node. This tier's own word, about a
         /// session rather than about bytes: nothing was reported at all, and
@@ -147,6 +157,70 @@ impl VolumePhaseKind {
     pub fn is_terminal(self) -> bool {
         matches!(self, VolumePhaseKind::Ready)
     }
+}
+
+/// What a volume IS, out of the facts on it.
+///
+/// One rule for both tiers, and the first derivation in this file with a real
+/// ORDER to it — three of them, and each one exists because two writers used
+/// to reach different answers about the same volume:
+///
+/// 1. **A volume being released is `Releasing`, whatever anybody says about
+///    the bytes.** The `deletionTimestamp` is the decision and the phase
+///    follows it. Before this, three edges each stamped `Releasing` when they
+///    set the timestamp (two REST handlers and the quota pass) and the node
+///    report path carried a special case to avoid undoing them — an object
+///    whose own status could contradict its own metadata if any one of the
+///    four was missed.
+/// 2. **Otherwise the last word, and `Ready` demands a machine.** A word with
+///    no `node` is this tier's own conclusion: a dispatch, a missing source,
+///    a command that did not arrive. None of those is evidence that bytes
+///    exist. See `VolumeReported`.
+/// 3. **Otherwise it is waiting for a node,** and the sentence says which
+///    kind of waiting: nothing has placed it, or the node it was placed on
+///    has not been told yet. That second state used to be `Pending` with
+///    nothing beside it.
+pub fn settle_volume(deleting: bool, status: &VolumeStatus) -> VolumePhase {
+    let said = status.reported.as_ref();
+    if deleting {
+        // Who is holding it, if anybody. The pass that lists snapshots wrote
+        // the sentence down (`status.holder`), because the derivation cannot
+        // read another object.
+        if let Some(holder) = &status.holder {
+            return VolumePhase::new(
+                VolumePhaseKind::Releasing,
+                VolumeReason::HeldBy,
+                Some(holder.clone()),
+                UNSTAMPED,
+            );
+        }
+        // The node answering `Gone` is the tombstone a release acts on, and
+        // it is the one word from below that belongs on a `Releasing` phase.
+        let gone = said.is_some_and(|r| r.reason == VolumeReason::Deprovisioned);
+        return VolumePhase::new(
+            VolumePhaseKind::Releasing,
+            if gone {
+                VolumeReason::Deprovisioned
+            } else {
+                VolumeReason::Dispatched
+            },
+            said.and_then(|r| r.message.clone())
+                .or_else(|| Some("waiting for the node to say the bytes are gone".to_string())),
+            UNSTAMPED,
+        );
+    }
+    if let Some(phase) = said.and_then(VolumeReported::phase) {
+        return phase;
+    }
+    VolumePhase::new(
+        VolumePhaseKind::Pending,
+        VolumeReason::AwaitingNode,
+        Some(match &status.node {
+            Some(node) => format!("{node} was chosen; the provision has not gone out yet"),
+            None => "not placed yet".to_string(),
+        }),
+        UNSTAMPED,
+    )
 }
 
 /// A volume a tenant holds: a size, a pool, a kind, and a life of its own.
@@ -227,6 +301,31 @@ pub struct VolumeStatus {
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
     pub(super) phase: VolumePhase,
+    /// The last word anybody established about the bytes — a node's on the
+    /// status road, a cluster's one tier up, or this tier's own (a dispatch
+    /// that went out, a source that is missing, a command that could not be
+    /// delivered).
+    ///
+    /// The first of the facts `settle_volume` reads. An empty `node` on it is
+    /// this tier's own conclusion and cannot make the volume `Ready`: only a
+    /// machine that made the bytes may say they exist. See `VolumeReported`.
+    ///
+    /// `None` on a volume nobody has said anything about — a fresh one, and
+    /// one whose node has just reported the bytes gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<VolumeReported>,
+    /// What still holds the bytes of a volume that is being released, as a
+    /// sentence naming it.
+    ///
+    /// Written by the release pass, which is the only party that can know:
+    /// the holder may be a VM (`attachedTo`, on this object) or a
+    /// `VolumeSnapshot` (another object entirely, listed once per pass). The
+    /// derivation may not read that second one — `settle` sees this object
+    /// and nothing else — so the pass that lists them writes down the answer.
+    ///
+    /// `None` on every volume nothing holds, which is nearly all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
     /// The name the BACKEND knows this volume by — `/tmp/vols/<uid>.raw`,
     /// `/dev/vg0/vm-<uid>`, an export directory.
     ///
@@ -801,5 +900,164 @@ mod snapshot_tests {
         );
         copy.settle(at(600));
         assert_eq!(copy.status.phase().since(), at(0));
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("an instant")
+    }
+
+    fn volume() -> Volume {
+        new_volume(
+            "data-1",
+            VolumeSpec {
+                pool: "fast".to_string(),
+                size_gib: 10,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The table: the facts on a volume, and the phase they add up to.
+    ///
+    /// One row per rule of `settle_volume`, in the order the rules run, and
+    /// the order is what the table is FOR: a volume being released is
+    /// `Releasing` whatever the bytes are doing, and that used to be four
+    /// writers agreeing.
+    #[test]
+    fn what_is_known_about_a_volume_is_what_the_volume_is() {
+        // Nothing at all.
+        let mut fresh = volume();
+        fresh.settle(at(0));
+        assert_eq!(fresh.status.phase().kind(), VolumePhaseKind::Pending);
+        assert_eq!(
+            fresh.status.phase().reason(),
+            Some(VolumeReason::AwaitingNode)
+        );
+        assert_eq!(fresh.status.phase().message(), Some("not placed yet"));
+
+        // Placed, not asked. This state used to be `Pending` with nothing
+        // beside it, which is what an operator saw for as long as a pool had
+        // no node to serve it.
+        let mut placed = volume();
+        placed.status.node = Some("agent-1a".to_string());
+        placed.settle(at(0));
+        assert_eq!(
+            placed.status.phase().message(),
+            Some("agent-1a was chosen; the provision has not gone out yet")
+        );
+
+        // A node's word.
+        let mut made = volume();
+        made.status.reported = Some(VolumeReported::by(
+            "agent-1a",
+            VolumePhaseKind::Ready,
+            VolumeReason::Unrecorded,
+            None,
+            at(0),
+        ));
+        made.settle(at(0));
+        assert_eq!(made.status.phase().kind(), VolumePhaseKind::Ready);
+
+        // The backend lost the bytes — its own word, and the pair that
+        // earns the reason field: a refused provision costs a requeue, this
+        // costs somebody their data.
+        let mut lost = volume();
+        lost.status.reported = Some(VolumeReported::by(
+            "agent-1a",
+            VolumePhaseKind::Failed,
+            VolumeReason::NotOnBackend,
+            Some("the backend has no volume data-1".into()),
+            at(0),
+        ));
+        lost.settle(at(0));
+        assert_eq!(lost.status.phase().kind(), VolumePhaseKind::Failed);
+        assert_eq!(
+            lost.status.phase().reason(),
+            Some(VolumeReason::NotOnBackend)
+        );
+    }
+
+    /// A volume being released is `Releasing`, whatever a node says about the
+    /// bytes.
+    ///
+    /// The rule that used to live in four places: two REST delete handlers
+    /// and the quota pass each stamped the word when they set the timestamp,
+    /// and the node-report path carried a special case so as not to undo
+    /// them. Any one of the four missed left an object whose own status
+    /// contradicted its own metadata.
+    #[test]
+    fn a_volume_being_released_says_so_whatever_the_bytes_are_doing() {
+        let mut deleting = volume();
+        deleting.status.reported = Some(VolumeReported::by(
+            "agent-1a",
+            VolumePhaseKind::Ready,
+            VolumeReason::Unrecorded,
+            None,
+            at(0),
+        ));
+        deleting.settle(at(0));
+        assert_eq!(deleting.status.phase().kind(), VolumePhaseKind::Ready);
+
+        // The timestamp is the whole of the decision.
+        deleting.metadata.deletion_timestamp = Some(at(10));
+        deleting.settle(at(10));
+        assert_eq!(deleting.status.phase().kind(), VolumePhaseKind::Releasing);
+        assert_eq!(
+            deleting.status.phase().reason(),
+            Some(VolumeReason::Dispatched),
+            "the deprovision is in flight"
+        );
+
+        // Somebody is holding it: the sentence the release pass wrote down,
+        // because it is the only party that can list the snapshots.
+        deleting.status.holder = Some("held by vm web-1".to_string());
+        deleting.settle(at(20));
+        assert_eq!(deleting.status.phase().reason(), Some(VolumeReason::HeldBy));
+        assert_eq!(deleting.status.phase().message(), Some("held by vm web-1"));
+
+        // The node answered `Gone`: the tombstone a release acts on.
+        deleting.status.holder = None;
+        deleting.status.reported = Some(VolumeReported::by(
+            "agent-1a",
+            VolumePhaseKind::Pending,
+            VolumeReason::Deprovisioned,
+            Some("agent-1a no longer has the bytes".into()),
+            at(30),
+        ));
+        deleting.settle(at(30));
+        assert_eq!(
+            deleting.status.phase().reason(),
+            Some(VolumeReason::Deprovisioned)
+        );
+        assert_eq!(
+            deleting.status.phase().since(),
+            at(10),
+            "still Releasing, so the stamp has not moved since it became so"
+        );
+    }
+
+    /// `Ready` demands a machine. A dispatch, a missing source and a command
+    /// that never arrived are all this tier's own conclusions, and none of
+    /// them is evidence that bytes exist.
+    #[test]
+    fn this_tier_cannot_conclude_that_the_bytes_exist() {
+        let mut invented = volume();
+        invented.status.reported = Some(VolumeReported::here(
+            VolumePhaseKind::Ready,
+            VolumeReason::Unrecorded,
+            None,
+            at(0),
+        ));
+        invented.settle(at(0));
+        assert_eq!(invented.status.phase().kind(), VolumePhaseKind::Pending);
+        assert_eq!(
+            invented.status.phase().reason(),
+            Some(VolumeReason::AwaitingNode)
+        );
     }
 }

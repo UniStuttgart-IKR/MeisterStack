@@ -17,9 +17,8 @@ use chrono::Utc;
 use controller_api::rest::Json;
 use controller_api::{
     API_VERSION, ApiError, ApiResource, EtcdStore, Event, Node, NodeSpec, Owned, ProviderNetwork,
-    Resource, SpecUpdate, StoragePool, StoreError, Vm, VmSpec, Volume, VolumePhaseKind,
-    VolumeSnapshot, apply_spec_update, check_envelope, check_owned, conflict, invalid,
-    invalid_field,
+    Resource, SpecUpdate, StoragePool, StoreError, Vm, VmSpec, Volume, VolumeSnapshot,
+    apply_spec_update, check_envelope, check_owned, conflict, invalid, invalid_field,
     resources::{new_vm, new_volume},
 };
 use serde_json::json;

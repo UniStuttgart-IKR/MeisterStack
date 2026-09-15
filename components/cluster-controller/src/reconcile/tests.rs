@@ -47,13 +47,11 @@ fn released(node: Option<&str>, vm: Option<&str>) -> Volume {
         },
     );
     v.metadata.deletion_timestamp = Some(Utc::now());
-    #[allow(deprecated)]
-    v.status.assign(controller_api::VolumePhase::of(
-        VolumePhaseKind::Releasing,
-        Utc::now(),
-    ));
     v.status.node = node.map(str::to_string);
     v.status.attached_to = vm.map(str::to_string);
+    // `Releasing` follows from the timestamp — see `settle_volume` — so the
+    // test sets the fact and lets the derivation say the word.
+    v.settle(Utc::now());
     v
 }
 
@@ -677,11 +675,7 @@ fn a_placed_volume_is_only_reconciled_by_the_replica_its_node_talks_to() {
     // exactly as a deleting VM does.
     let mut deleting = volume.clone();
     deleting.metadata.deletion_timestamp = Some(Utc::now());
-    #[allow(deprecated)]
-    deleting.status.assign(controller_api::VolumePhase::of(
-        VolumePhaseKind::Releasing,
-        Utc::now(),
-    ));
+    deleting.settle(Utc::now());
     assert!(may_reconcile_volume(&deleting, &holder));
     assert!(!may_reconcile_volume(&deleting, &other));
 }
@@ -1372,9 +1366,14 @@ fn volume_at(node: Option<&str>, phase: VolumePhaseKind) -> Volume {
         },
     );
     v.status.node = node.map(str::to_string);
-    #[allow(deprecated)]
-    v.status
-        .assign(controller_api::VolumePhase::of(phase, Utc::now()));
+    v.status.reported = Some(controller_api::VolumeReported::by(
+        node.unwrap_or("agent-1"),
+        phase,
+        controller_api::VolumeReason::Unrecorded,
+        None,
+        Utc::now(),
+    ));
+    v.settle(Utc::now());
     v
 }
 
@@ -1760,13 +1759,16 @@ fn a_resize_is_driven_by_what_the_node_measured() {
                 ..Default::default()
             },
         );
-        #[allow(deprecated)]
-        v.status.assign(controller_api::VolumePhase::of(
-            VolumePhaseKind::Ready,
-            Utc::now(),
-        ));
         v.status.node = Some("agent-1".into());
         v.status.size_gib = status_gib;
+        v.status.reported = Some(controller_api::VolumeReported::by(
+            "agent-1",
+            VolumePhaseKind::Ready,
+            controller_api::VolumeReason::Unrecorded,
+            None,
+            Utc::now(),
+        ));
+        v.settle(Utc::now());
         v
     };
     assert!(grew(&volume(2, 1)), "asked for more than the node has");
@@ -1899,6 +1901,11 @@ fn an_unbinding_vm_belongs_to_the_replica_that_can_reach_the_node_it_leaves() {
 fn a_volume_following_its_vm_is_provisioned_on_the_vms_node_not_placed_again() {
     let mut v = volume_at(Some("agent-1a"), VolumePhaseKind::Ready);
     follow_vm(&mut v, "no-nic", "agent-1b");
+    // `follow_vm` writes the FACT and nothing else since struktur 4; the
+    // phase follows from it in the store, on the way out. Here the test has
+    // to do what the store does — and that it has to is the point of the
+    // round: there is no longer a way for a pass to put a word on an object.
+    v.settle(Utc::now());
 
     assert_eq!(v.status.node.as_deref(), Some("agent-1b"));
     assert_eq!(v.status.phase().kind(), VolumePhaseKind::Pending);

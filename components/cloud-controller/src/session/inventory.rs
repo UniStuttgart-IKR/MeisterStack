@@ -483,12 +483,12 @@ pub(super) async fn ingest_volumes(
                   "unknown volume phase from cluster");
             continue;
         };
-        if volume_unchanged(volume, reported, phase) {
+        if volume_unchanged(volume, cluster, reported, phase) {
             continue;
         }
         store
             .mutate::<Volume, _>(&volume.metadata.name, |v| {
-                write_volume_status(v, reported, phase, at)
+                write_volume_status(v, cluster, reported, phase, at)
             })
             .await?;
         debug!(volume = %volume.metadata.name, cluster, phase = phase.as_str(),
@@ -637,17 +637,20 @@ fn said(s: &str) -> Option<String> {
 /// observed, and had its create re-sent every five seconds.
 fn volume_unchanged(
     volume: &Volume,
+    cluster: &str,
     reported: &proto::VolumeStatusReport,
     phase: VolumePhaseKind,
 ) -> bool {
     // Seen at all: a volume nothing has ever been observed about is written
     // even when every field matches the default.
     let observed = volume.status.observed_at.is_some();
-    // What the cluster decided about it, as the phase the write would leave
-    // behind — see `mirror::observe`.
-    let (reason, message) = reported_volume_reason(reported);
-    let settled = VolumePhase::new(phase, reason, message, volume.status.phase().since());
-    let same_verdict = *volume.status.phase() == settled
+    // What the cluster decided about it, as the FACT the write would leave
+    // behind. The phase is derived from it, so there is one thing to compare.
+    let same_verdict = volume
+        .status
+        .reported
+        .as_ref()
+        .is_some_and(|held| held.same_word(&volume_word(cluster, reported, phase)))
         && volume.status.node == said(&reported.node)
         && volume.status.attached_to == said(&reported.attached_to);
     // What a node measured about it.
@@ -659,28 +662,32 @@ fn volume_unchanged(
     observed && same_verdict && same_measurements && same_backend
 }
 
-/// The word and the sentence a volume line carries, read once.
+/// One cluster's word about one volume, as the fact it becomes on the object.
 ///
 /// One function because two callers must agree exactly: the churn guard and
 /// the write. A guard that read the word differently from the write would
 /// either write on every report or never write at all.
-fn reported_volume_reason(
+fn volume_word(
+    cluster: &str,
     reported: &proto::VolumeStatusReport,
-) -> (controller_api::VolumeReason, Option<String>) {
-    controller_api::VolumeReason::read(&reported.reason, said(&reported.message))
+    phase: VolumePhaseKind,
+) -> controller_api::VolumeReported {
+    let (reason, message) =
+        controller_api::VolumeReason::read(&reported.reason, said(&reported.message));
+    controller_api::VolumeReported::by(cluster, phase, reason, message, chrono::Utc::now())
 }
 
 /// The reported line, onto the object.
 fn write_volume_status(
     v: &mut Volume,
+    cluster: &str,
     reported: &proto::VolumeStatusReport,
     phase: VolumePhaseKind,
     at: DateTime<Utc>,
 ) {
-    let (reason, message) = reported_volume_reason(reported);
-    #[allow(deprecated)]
-    v.status
-        .assign(VolumePhase::new(phase, reason, message, at));
+    let mut word = volume_word(cluster, reported, phase);
+    word.at = at;
+    v.status.reported = Some(word);
     v.status.node = said(&reported.node);
     v.status.attached_to = said(&reported.attached_to);
     // The same rule as one tier down: the name only ever ARRIVES. A cluster

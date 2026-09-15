@@ -560,9 +560,21 @@ pub(super) async fn ingest_volumes(
                     v.status.node = None;
                     v.status.closed_here(node_id);
                     v.status.backend = String::new();
-                    let kind = v.status.phase().kind();
-                    #[allow(deprecated)]
-                    v.status.assign(controller_api::VolumePhase::of(kind, at));
+                    // The tombstone, as the node's own word. For a volume on
+                    // its way out this IS the answer a release acts on; for
+                    // one nobody deleted it says the bytes have to be made
+                    // again, which is what `place_volumes` does next pass.
+                    //
+                    // The phase used to be KEPT here, so a volume whose node
+                    // had just said the bytes were gone went on reading
+                    // `Ready`. It reads `Pending { Deprovisioned }` now.
+                    v.status.reported = Some(controller_api::VolumeReported::by(
+                        node_id,
+                        VolumePhaseKind::Pending,
+                        controller_api::VolumeReason::Deprovisioned,
+                        Some(format!("{node_id} no longer has the bytes")),
+                        at,
+                    ));
                     v.status.observed_at = Some(at);
                 })
                 .await?;
@@ -588,15 +600,14 @@ pub(super) async fn ingest_volumes(
         let size_gib = reported.size_bytes.div_ceil(1024 * 1024 * 1024);
         // Only when something CHANGED. Every node reports every ten seconds,
         // and a write per report would churn etcd revisions and wake the
-        // volume watch while nothing about the volume happened. Against the
-        // phase the write WOULD leave behind — see `mirror::observe`.
-        let candidate = controller_api::VolumePhase::new(
-            phase,
-            reason,
-            message.clone(),
-            volume.status.phase().since(),
-        );
-        if *volume.status.phase() == candidate
+        // volume watch while nothing about the volume happened. The FACT is
+        // compared, because the phase is derived from it.
+        let said = controller_api::VolumeReported::by(node_id, phase, reason, message.clone(), at);
+        if volume
+            .status
+            .reported
+            .as_ref()
+            .is_some_and(|held| held.same_word(&said))
             && volume.status.size_gib == size_gib
             && (backend.is_empty() || volume.status.backend == backend)
         {
@@ -604,24 +615,12 @@ pub(super) async fn ingest_volumes(
         }
         store
             .mutate::<Volume, _>(&name, |v| {
-                // A volume on its way out keeps `Releasing`: the node is
-                // still reporting the bytes it has, and the phase is about
-                // what the OBJECT is doing.
-                // A volume on its way out keeps `Releasing`, so the word it
-                // lands on is not always the word the node said — but the
-                // sentence is the node's either way.
-                let kind = if v.metadata.deletion_timestamp.is_none() {
-                    phase
-                } else {
-                    v.status.phase().kind()
-                };
-                #[allow(deprecated)]
-                v.status.assign(controller_api::VolumePhase::new(
-                    kind,
-                    reason,
-                    message.clone(),
-                    at,
-                ));
+                // The node's word, whole, and no special case for a volume on
+                // its way out: `settle_volume` reads the `deletionTimestamp`
+                // and keeps such a volume `Releasing` whatever the bytes are
+                // doing. This function used to carry that rule as well, which
+                // is one of the two places that had to agree.
+                v.status.reported = Some(said.clone());
                 // The backend name only ever ARRIVES; a node that has not made
                 // the volume yet sends an empty string, and that is not a
                 // statement that the name is gone.

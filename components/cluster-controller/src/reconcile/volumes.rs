@@ -374,12 +374,12 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
         warn!(volume = %name, node, error = %message, "the backend did not grow");
         p.store
             .mutate::<Volume, _>(&name, |v| {
-                #[allow(deprecated)]
-                // Not the node's word: the node never got the command. Two
-                // of the old assignments said "Reported" about a session
+                // Not the node's word: the node never got the command. Two of
+                // the old assignments said "Reported" about a session
                 // failure, and this was one of them — the sentence is this
-                // tier's, about a wire, and the fix is on the network.
-                v.status.assign(controller_api::VolumePhase::new(
+                // tier's, about a wire, and the fix is on the network. Which
+                // is also why it names nobody.
+                v.status.reported = Some(controller_api::VolumeReported::here(
                     VolumePhaseKind::Failed,
                     controller_api::VolumeReason::Undeliverable,
                     Some(message.clone()),
@@ -416,13 +416,11 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
         warn!(volume = %name, node = %vm_node, "{message}");
         p.store
             .mutate::<Volume, _>(&name, |v| {
-                let kind = v.status.phase().kind();
-                #[allow(deprecated)]
-                v.status.assign(controller_api::VolumePhase::said(
-                    kind,
-                    Some(message.clone()),
-                    Utc::now(),
-                ));
+                // The sentence, onto the word that is already there. The
+                // bytes ARE what the node last said they are — the resize
+                // grew them — and what is missing is one notification, so the
+                // word must not move. Only the sentence does.
+                note_on_volume(v, Some(message.clone()));
             })
             .await?;
         return Ok(());
@@ -432,12 +430,7 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
     // previous half-resize may have left, because it is answered now.
     if volume.status.phase().message().is_some() {
         p.store
-            .mutate::<Volume, _>(&name, |v| {
-                let kind = v.status.phase().kind();
-                #[allow(deprecated)]
-                v.status
-                    .assign(controller_api::VolumePhase::of(kind, Utc::now()));
-            })
+            .mutate::<Volume, _>(&name, |v| note_on_volume(v, None))
             .await?;
     }
     info!(volume = %name, "the guest was told");
@@ -471,8 +464,7 @@ pub(super) async fn provision_volume(
         warn!(volume = %name, %why, "provision cannot start");
         p.store
             .mutate::<Volume, _>(&name, |v| {
-                #[allow(deprecated)]
-                v.status.assign(controller_api::VolumePhase::new(
+                v.status.reported = Some(controller_api::VolumeReported::here(
                     VolumePhaseKind::Failed,
                     controller_api::VolumeReason::SourceMissing,
                     Some(why.clone()),
@@ -505,8 +497,7 @@ pub(super) async fn provision_volume(
                 warn!(volume = %name, %message, "provision cannot start");
                 p.store
                     .mutate::<Volume, _>(&name, |v| {
-                        #[allow(deprecated)]
-                        v.status.assign(controller_api::VolumePhase::new(
+                        v.status.reported = Some(controller_api::VolumeReported::here(
                             VolumePhaseKind::Failed,
                             controller_api::VolumeReason::SourceMissing,
                             Some(message.clone()),
@@ -520,11 +511,10 @@ pub(super) async fn provision_volume(
         },
     };
     let mut sent = volume.clone();
-    #[allow(deprecated)]
-    sent.status.assign(controller_api::VolumePhase::new(
+    sent.status.reported = Some(controller_api::VolumeReported::here(
         VolumePhaseKind::Provisioning,
         controller_api::VolumeReason::Dispatched,
-        None,
+        Some(format!("{node} was told to make the bytes")),
         Utc::now(),
     ));
     // The claim before the command, like everywhere else in this file: a CAS
@@ -561,8 +551,7 @@ pub(super) async fn provision_volume(
         p.store
             .mutate::<Volume, _>(&name, |v| {
                 if v.status.phase().kind() == VolumePhaseKind::Provisioning {
-                    #[allow(deprecated)]
-                    v.status.assign(controller_api::VolumePhase::new(
+                    v.status.reported = Some(controller_api::VolumeReported::here(
                         VolumePhaseKind::Failed,
                         controller_api::VolumeReason::Undeliverable,
                         Some(message.clone()),
@@ -617,9 +606,17 @@ pub(super) async fn requeue_volume(
         .mutate::<Volume, _>(&name, |v| {
             v.status.requeue_attempts = v.status.requeue_attempts.saturating_add(1);
             v.status.last_requeue = Some(now);
-            #[allow(deprecated)]
-            v.status.assign(controller_api::VolumePhase::of(
+            // Back to a wait, and the failure that got it here is forgotten:
+            // a requeue IS "try again as if nothing had been said". Without
+            // clearing the word the derivation would go on reading the old
+            // `Failed` and the volume would never be asked for again.
+            v.status.reported = Some(controller_api::VolumeReported::here(
                 VolumePhaseKind::Pending,
+                controller_api::VolumeReason::AwaitingNode,
+                Some(format!(
+                    "attempt {} after a failure",
+                    v.status.requeue_attempts
+                )),
                 now,
             ));
         })
@@ -841,22 +838,16 @@ pub(super) async fn note_volume_releasing(
     volume: &Volume,
     reason: String,
 ) -> anyhow::Result<()> {
-    if volume.status.phase().kind() == VolumePhaseKind::Releasing
-        && volume.status.phase().message() == Some(reason.as_str())
-    {
+    if volume.status.holder.as_deref() == Some(reason.as_str()) {
         return Ok(());
     }
     p.store
         .mutate::<Volume, _>(&volume.metadata.name, |v| {
             // The one place that knows WHO is holding it — the sentence names
-            // the vm or the snapshot — so the one place that writes `HeldBy`.
-            #[allow(deprecated)]
-            v.status.assign(controller_api::VolumePhase::new(
-                VolumePhaseKind::Releasing,
-                controller_api::VolumeReason::HeldBy,
-                Some(reason.clone()),
-                Utc::now(),
-            ));
+            // the vm or the snapshot, and the snapshot is an object the
+            // derivation may not read — so the one place that writes the
+            // fact. `Releasing { HeldBy }` follows from it.
+            v.status.holder = Some(reason.clone());
         })
         .await?;
     Ok(())
@@ -964,11 +955,11 @@ pub(super) async fn place_volume(
     // volume sat in it for ever. The phase moves when the COMMAND goes, one
     // pass later, and `Pending` in between is exactly true: chosen, not yet
     // asked.
-    #[allow(deprecated)]
-    bound.status.assign(controller_api::VolumePhase::of(
-        VolumePhaseKind::Pending,
-        Utc::now(),
-    ));
+    // Nothing said about the bytes any more: whatever a previous pass
+    // concluded — unplaceable, a failed provision, a record following a vm —
+    // is answered by this placement. `Pending { AwaitingNode }` follows, with
+    // the sentence naming the machine that was chosen.
+    bound.status.reported = None;
     match p.store.update(&bound).await {
         Ok(_) => info!(volume = %name, node = %node, pool = %bound.spec.pool,
                        "volume placed"),
@@ -978,6 +969,24 @@ pub(super) async fn place_volume(
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// A sentence about a volume, onto the word that is already there.
+///
+/// The one thing a writer may do to somebody else's word, and it is worth a
+/// function because it is the case that used to be a phase assignment with
+/// the kind read back out of the object: a half-finished resize has grown the
+/// bytes and failed to tell the guest, so what the volume IS has not changed
+/// and only the sentence has. Writing the kind back would have been a second
+/// party deciding the word.
+///
+/// Nothing at all on a volume nobody has said anything about: there is no
+/// word to put a sentence on, and inventing one here would be this tier
+/// claiming an observation.
+fn note_on_volume(v: &mut Volume, message: Option<String>) {
+    if let Some(said) = &mut v.status.reported {
+        said.message = message;
+    }
 }
 
 /// Say WHY on the object, and only when it changed.
@@ -996,8 +1005,7 @@ pub(super) async fn note_pending(
     }
     p.store
         .mutate::<Volume, _>(&volume.metadata.name, |v| {
-            #[allow(deprecated)]
-            v.status.assign(controller_api::VolumePhase::new(
+            v.status.reported = Some(controller_api::VolumeReported::here(
                 VolumePhaseKind::Pending,
                 controller_api::VolumeReason::Unplaced,
                 Some(reason.clone()),

@@ -22,7 +22,7 @@ use controller_api::{
     API_VERSION, ApiError, ApiResource, Caller, CallerRole, CallerTenant, Capacity,
     CertificateSigningRequest, Cluster, ClusterSpec, EtcdStore, Event, FloatingIp, FloatingPool,
     Image, ImageSpec, Owned, ProviderNetwork, Resource, Role, RoutedSubnet, Scope, SpecUpdate,
-    StoragePool, StoreError, Tenant, User, Verb, Vm, VmSpec, Volume, VolumePhase, VolumePhaseKind,
+    StoragePool, StoreError, Tenant, User, Verb, Vm, VmSpec, Volume, VolumePhaseKind,
     VolumeSnapshot, apply_spec_update, check_envelope, check_owned, conflict, floating, forbidden,
     invalid, invalid_field, permits_object, quota,
     resources::{

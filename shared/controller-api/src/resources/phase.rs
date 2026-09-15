@@ -847,40 +847,37 @@ mod tests {
         let mut status = VmStatus::default();
         assert_eq!(status.phase().since(), UNSTAMPED);
 
-        // The first assignment is the first stamp, even onto the word the
+        // The first derivation is the first stamp, even onto the word the
         // object was born with.
-        #[allow(deprecated)]
-        status.assign(VmPhase::of(VmPhaseKind::Pending, at(0)));
+        status.stamp(VmPhase::of(VmPhaseKind::Pending, UNSTAMPED), at(0));
         assert_eq!(status.phase().since(), at(0));
 
         // The same word again, later: the reason and the sentence move, the
         // stamp does not.
-        #[allow(deprecated)]
-        status.assign(VmPhase::new(
-            VmPhaseKind::Pending,
-            VmReason::Unplaced,
-            Some("no candidate has room".into()),
+        status.stamp(
+            VmPhase::new(
+                VmPhaseKind::Pending,
+                VmReason::Unplaced,
+                Some("no candidate has room".into()),
+                UNSTAMPED,
+            ),
             at(600),
-        ));
+        );
         assert_eq!(status.phase().since(), at(0), "the word did not change");
         assert_eq!(status.phase().reason(), Some(VmReason::Unplaced));
         assert_eq!(status.phase().message(), Some("no candidate has room"));
 
         // A different word: the stamp is the moment of the change.
-        #[allow(deprecated)]
-        status.assign(VmPhase::of(VmPhaseKind::Running, at(900)));
+        status.stamp(VmPhase::of(VmPhaseKind::Running, UNSTAMPED), at(900));
         assert_eq!(status.phase().since(), at(900));
 
-        // And a reason assigned onto a resting word is dropped rather than
+        // And a reason derived onto a resting word is dropped rather than
         // kept — so the value is stable under a second identical write,
         // which is what lets a caller compare against it as a churn guard.
-        #[allow(deprecated)]
-        status.assign(VmPhase::new(
-            VmPhaseKind::Running,
-            VmReason::Unplaced,
-            None,
+        status.stamp(
+            VmPhase::new(VmPhaseKind::Running, VmReason::Unplaced, None, UNSTAMPED),
             at(1200),
-        ));
+        );
         assert_eq!(status.phase().reason(), None);
         assert_eq!(status.phase().since(), at(900));
     }

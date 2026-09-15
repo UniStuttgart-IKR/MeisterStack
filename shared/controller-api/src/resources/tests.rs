@@ -177,13 +177,16 @@ fn the_phases_are_spelled_alike_and_the_pending_category_reaches_the_api() {
 
     // And when it is there it is one of the closed set.
     let mut s = VmStatus::default();
-    #[allow(deprecated)]
-    s.assign(VmPhase::new(
-        VmPhaseKind::Pending,
-        VmReason::Unplaced,
-        Some("no candidate has room".into()),
-        Utc::now(),
-    ));
+    let now = Utc::now();
+    s.stamp(
+        VmPhase::new(
+            VmPhaseKind::Pending,
+            VmReason::Unplaced,
+            Some("no candidate has room".into()),
+            now,
+        ),
+        now,
+    );
     let wire = serde_json::to_value(&s).unwrap();
     assert_eq!(wire["reason"], "Unplaced");
     assert_eq!(wire["message"], "no candidate has room");
@@ -617,12 +620,10 @@ fn a_pool_states_its_locality_and_cannot_be_told_one() {
         "the spec has no locality and never gets one: {spec}"
     );
 
-    #[allow(deprecated)]
-    pool.status.assign(StoragePoolPhase::of(
-        StoragePoolPhaseKind::Ready,
-        Utc::now(),
-    ));
+    // Through the derivation, which is the only way in: a pool whose nodes
+    // agree about the locality IS `Ready` — see `settle_storage_pool`.
     pool.status.locality = Some(Locality::NodeLocal);
+    pool.settle(Utc::now());
     let status = serde_json::to_value(&pool.status).unwrap();
     assert_eq!(status["phase"], "Ready");
     assert_eq!(status["locality"], "node-local");
@@ -1395,61 +1396,75 @@ fn every_status_wears_its_phase_flat() {
     let said = |m: &str| Some(m.to_string());
 
     let mut vm = VmStatus::default();
-    #[allow(deprecated)]
-    vm.assign(VmPhase::new(
-        VmPhaseKind::Pending,
-        VmReason::Unplaced,
-        said("no candidate has room (3 looked at)"),
+    vm.stamp(
+        VmPhase::new(
+            VmPhaseKind::Pending,
+            VmReason::Unplaced,
+            said("no candidate has room (3 looked at)"),
+            at,
+        ),
         at,
-    ));
+    );
     let mut volume = VolumeStatus::default();
-    #[allow(deprecated)]
-    volume.assign(VolumePhase::new(
-        VolumePhaseKind::Releasing,
-        VolumeReason::HeldBy,
-        said("held by vm web-1"),
+    volume.stamp(
+        VolumePhase::new(
+            VolumePhaseKind::Releasing,
+            VolumeReason::HeldBy,
+            said("held by vm web-1"),
+            at,
+        ),
         at,
-    ));
+    );
     let mut snapshot = VolumeSnapshotStatus::default();
-    #[allow(deprecated)]
-    snapshot.assign(VolumeSnapshotPhase::new(
-        VolumeSnapshotPhaseKind::Creating,
-        VolumeSnapshotReason::Dispatched,
-        said("agent-1a was told"),
+    snapshot.stamp(
+        VolumeSnapshotPhase::new(
+            VolumeSnapshotPhaseKind::Creating,
+            VolumeSnapshotReason::Dispatched,
+            said("agent-1a was told"),
+            at,
+        ),
         at,
-    ));
+    );
     let mut image = ImageStatus::default();
-    #[allow(deprecated)]
-    image.assign(ImagePhase::new(
-        ImagePhaseKind::Pending,
-        ImageReason::AwaitingNode,
-        said("not fetched by any node yet"),
+    image.stamp(
+        ImagePhase::new(
+            ImagePhaseKind::Pending,
+            ImageReason::AwaitingNode,
+            said("not fetched by any node yet"),
+            at,
+        ),
         at,
-    ));
+    );
     let mut pool = StoragePoolStatus::default();
-    #[allow(deprecated)]
-    pool.assign(StoragePoolPhase::new(
-        StoragePoolPhaseKind::Pending,
-        StoragePoolReason::ClusterHasNoPool,
-        said("cluster-1 reports no pool named mc-fs"),
+    pool.stamp(
+        StoragePoolPhase::new(
+            StoragePoolPhaseKind::Pending,
+            StoragePoolReason::ClusterHasNoPool,
+            said("cluster-1 reports no pool named mc-fs"),
+            at,
+        ),
         at,
-    ));
+    );
     let mut router = RouterStatus::default();
-    #[allow(deprecated)]
-    router.assign(RouterPhase::new(
-        RouterPhaseKind::Unknown,
-        RouterReason::Silent,
-        said("node agent-1b last reported 2026-09-15T16:42:25Z"),
+    router.stamp(
+        RouterPhase::new(
+            RouterPhaseKind::Unknown,
+            RouterReason::Silent,
+            said("node agent-1b last reported 2026-09-15T16:42:25Z"),
+            at,
+        ),
         at,
-    ));
+    );
     let mut migration = VmMigrationStatus::default();
-    #[allow(deprecated)]
-    migration.assign(VmMigrationPhase::new(
-        VmMigrationPhaseKind::Failed,
-        VmMigrationReason::Abandoned,
-        said("the destination was not ready after 120s"),
+    migration.stamp(
+        VmMigrationPhase::new(
+            VmMigrationPhaseKind::Failed,
+            VmMigrationReason::Abandoned,
+            said("the destination was not ready after 120s"),
+            at,
+        ),
         at,
-    ));
+    );
 
     let four = |status: serde_json::Value, phase: &str, reason: &str, message: &str| {
         assert_eq!(status["phase"], phase, "{status}");

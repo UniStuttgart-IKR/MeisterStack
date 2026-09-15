@@ -158,7 +158,13 @@ resources! {
     };
     /// A volume with a life of its own — the object that lets a disk outlive
     /// the VM that was using it. See `VolumeSpec`.
-    Volume => "volumes", "Volume";
+    Volume => "volumes", "Volume" {
+        /// What the facts on this volume add up to. See [`settle_volume`].
+        fn settle(&mut self, now: DateTime<Utc>) {
+            let phase = settle_volume(self.metadata.deletion_timestamp.is_some(), &self.status);
+            self.status.stamp(phase, now);
+        }
+    };
     /// A point in time of a volume, which outlives the volume. See
     /// `VolumeSnapshotSpec`.
     VolumeSnapshot => "volumesnapshots", "VolumeSnapshot" {

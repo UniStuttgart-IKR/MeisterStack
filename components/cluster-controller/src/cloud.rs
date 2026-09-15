@@ -2098,6 +2098,7 @@ mod tests {
         );
     }
     use super::*;
+    use controller_api::object::Resource as _;
     use controller_api::{VmPhaseKind, VmSpec, VolumePhaseKind};
 
     /// What the cloud decided, into this tier's objects — and the two fields
@@ -2601,10 +2602,15 @@ mod tests {
         if let Some(uid) = uid {
             v.metadata.mark_managed_by_cloud(uid);
         }
-        #[allow(deprecated)]
-        v.status
-            .assign(controller_api::VolumePhase::of(phase, Utc::now()));
         v.status.node = Some("manacor".into());
+        v.status.reported = Some(controller_api::VolumeReported::by(
+            "manacor",
+            phase,
+            controller_api::VolumeReason::Unrecorded,
+            None,
+            Utc::now(),
+        ));
+        v.settle(Utc::now());
         v
     }
 
@@ -2671,11 +2677,14 @@ mod tests {
 
         let mut made = fresh;
         made.status.backend = "/tmp/ms-e2e/vols/f8c1592d.raw".into();
-        #[allow(deprecated)]
-        made.status.assign(controller_api::VolumePhase::of(
+        made.status.reported = Some(controller_api::VolumeReported::by(
+            "manacor",
             VolumePhaseKind::Ready,
+            controller_api::VolumeReason::Unrecorded,
+            None,
             Utc::now(),
         ));
+        made.settle(Utc::now());
         let report = report_cloud_volumes(&[made], &mut complete);
         assert_eq!(report[0].backend, "/tmp/ms-e2e/vols/f8c1592d.raw");
     }

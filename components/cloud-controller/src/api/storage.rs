@@ -643,14 +643,11 @@ pub(super) async fn delete_volume(
     let released = st
         .store
         .mutate::<Volume, _>(&name, |v| {
+            // The timestamp is the decision; `Releasing` is derived from it.
+            // See the cluster's own delete edge and `settle_volume`.
             if v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(chrono::Utc::now());
             }
-            #[allow(deprecated)]
-            v.status.assign(VolumePhase::of(
-                VolumePhaseKind::Releasing,
-                chrono::Utc::now(),
-            ));
         })
         .await?;
 
@@ -961,9 +958,19 @@ mod tests {
                 v.status.attached_to = Some("web".into())
             }),
             ("status.phase", |v| {
-                #[allow(deprecated)]
-                v.status
-                    .assign(VolumePhase::of(VolumePhaseKind::Ready, chrono::Utc::now()))
+                // Through the derivation, because there is no other way in
+                // and that is the point: a client's word about the bytes is
+                // exactly what must not reach this field. A node's `Ready`
+                // put on the object by hand is the shape a forged body would
+                // take.
+                v.status.reported = Some(controller_api::VolumeReported::by(
+                    "manacor",
+                    VolumePhaseKind::Ready,
+                    controller_api::VolumeReason::Unrecorded,
+                    None,
+                    chrono::Utc::now(),
+                ));
+                v.settle(chrono::Utc::now());
             }),
         ];
         for (field, set) in owned {

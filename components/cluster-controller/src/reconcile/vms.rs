@@ -720,8 +720,7 @@ pub(super) async fn hot_plug(
 /// this rule and says the same thing from the volume's side.
 pub(super) fn follow_vm(v: &mut Volume, vm: &str, node: &str) {
     v.status.node = Some(node.to_string());
-    #[allow(deprecated)]
-    v.status.assign(controller_api::VolumePhase::new(
+    v.status.reported = Some(controller_api::VolumeReported::here(
         VolumePhaseKind::Pending,
         controller_api::VolumeReason::Following,
         Some(format!("following {vm} to {node}")),

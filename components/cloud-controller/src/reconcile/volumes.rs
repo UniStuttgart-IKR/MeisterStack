@@ -281,20 +281,34 @@ pub(super) async fn note_snapshot_pending(
 }
 
 /// Say what a volume is waiting for, and only when it changed.
+///
+/// The same shape `note_snapshot_pending` took one object over, and the same
+/// guard for the same reason: this used to keep whatever kind the object had
+/// and replace the sentence beside it, which a derived phase cannot do. A
+/// volume some cluster has already described is not waiting — its bytes are
+/// down there, and this is only this tier having lost sight of the road to
+/// them.
 pub(super) async fn note_volume_pending(
     store: &EtcdStore,
     volume: &controller_api::Volume,
     reason: String,
 ) -> anyhow::Result<()> {
+    if volume
+        .status
+        .reported
+        .as_ref()
+        .is_some_and(|r| !r.node.is_empty())
+    {
+        return Ok(());
+    }
     if volume.status.phase().message() == Some(reason.as_str()) {
         return Ok(());
     }
     store
         .mutate::<controller_api::Volume, _>(&volume.metadata.name, |v| {
-            let kind = v.status.phase().kind();
-            #[allow(deprecated)]
-            v.status.assign(controller_api::VolumePhase::said(
-                kind,
+            v.status.reported = Some(controller_api::VolumeReported::here(
+                controller_api::VolumePhaseKind::Pending,
+                controller_api::VolumeReason::Unplaced,
                 Some(reason.clone()),
                 chrono::Utc::now(),
             ));
@@ -377,8 +391,7 @@ pub(super) async fn move_volumes(
                 v.status.observed_at = None;
                 v.status.observed_generation = 0;
                 v.status.node = None;
-                #[allow(deprecated)]
-                v.status.assign(controller_api::VolumePhase::new(
+                v.status.reported = Some(controller_api::VolumeReported::here(
                     controller_api::VolumePhaseKind::Pending,
                     controller_api::VolumeReason::Following,
                     Some(format!("moving to {cluster} with its vm")),

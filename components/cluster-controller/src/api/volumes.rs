@@ -288,14 +288,14 @@ pub(super) async fn delete_volume(
     let volume = st
         .store
         .mutate::<Volume, _>(&name, |v| {
+            // The timestamp is the whole of the decision. `Releasing` follows
+            // from it — `settle_volume` reads the metadata — so this edge no
+            // longer stamps a phase, and neither do the two other places that
+            // set the same timestamp. That is three writers of one word
+            // reduced to one reader of one fact.
             if v.metadata.deletion_timestamp.is_none() {
                 v.metadata.deletion_timestamp = Some(Utc::now());
             }
-            #[allow(deprecated)]
-            v.status.assign(controller_api::VolumePhase::of(
-                VolumePhaseKind::Releasing,
-                Utc::now(),
-            ));
         })
         .await?;
     // The sentence as well as the detail, and the same one the tier above

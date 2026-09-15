@@ -203,7 +203,8 @@ pub fn holds_room(phase: VolumePhaseKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resources::{VmSpec, VolumePhase, new_vm};
+    use crate::object::Resource;
+    use crate::resources::{VmSpec, new_vm};
     use chrono::Utc;
 
     fn vm(name: &str, tenant: Option<&str>, vcpus: u32, mem_mib: u64) -> Vm {
@@ -507,11 +508,16 @@ mod tests {
             assert!(holds_room(phase), "{phase:?}");
         }
         let mut vols = disks();
-        #[allow(deprecated)]
-        vols[1]
-            .status
-            .assign(VolumePhase::of(VolumePhaseKind::Releasing, Utc::now()));
         vols[1].metadata.deletion_timestamp = Some(chrono::Utc::now());
+        // The timestamp is the decision and `Releasing` is derived from it —
+        // see `settle_volume`. This test used to say both, which was the
+        // shape of the defect: four writers of one word.
+        vols[1].settle(Utc::now());
+        assert_eq!(
+            vols[1].status.phase().kind(),
+            VolumePhaseKind::Releasing,
+            "a volume being released says so without anybody stamping it"
+        );
         assert_eq!(StorageUsage::of("acme", "fast", &vols, None).gib, 120);
 
         // ... and it is the object going away that gives the room back.
