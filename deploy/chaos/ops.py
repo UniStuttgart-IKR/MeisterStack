@@ -47,7 +47,18 @@ def call(ip, port, method, path, body=None, timeout=20):
             raw = r.read().decode()
             return r.status, (json.loads(raw) if raw.strip() else {})
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode()
+        # Always a dict, never a bare string (D-H6). The success path returns a
+        # parsed object and this one used to return text, so every caller that
+        # forgot to check the code got `TypeError: string indices must be
+        # integers` instead of a finding -- mini.py M3 died on exactly that and
+        # took M4, M5 and M6 with it. `str(o)` still reads fine on a dict, which
+        # is how every existing caller formats an error body.
+        text = e.read().decode()
+        try:
+            parsed = json.loads(text)
+            return e.code, parsed if isinstance(parsed, dict) else {"error": parsed}
+        except Exception:
+            return e.code, {"error": text}
     except Exception as e:
         raise ApiError(0, f"{type(e).__name__}: {e}")
 
