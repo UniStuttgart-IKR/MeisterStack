@@ -7,6 +7,7 @@ MeisterStack is a lightweight Infrastructure-as-a-Service (IaaS) tool that enabl
 virtual machines, block-storage and networking resources across multiple machines in multiple clusters.
 Its goal is to enable small labs and research clusters with a cloud-like experience. It's architecture
 is inspired by Kubernetes, Oakestra and OpenStack.
+For a list of already supported and planned features read the [docs](docs/FEATURES.md).
 
 MeisterStack supports sharing NVIDIA GPUs with its `nvrm` driver that utilizes [Project Leandro](https://github.com/UniStuttgart-IKR/Leandro).
 
