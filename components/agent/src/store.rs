@@ -183,6 +183,18 @@ impl Store {
     fn open_database(path: &Path) -> anyhow::Result<Database> {
         let db = Database::create(path)
             .with_context(|| format!("opening agent db {}", path.display()))?;
+        // Owner only. redb makes the file with the process umask, which on
+        // every host here is 0644 — and since stage 3 the VMM and its backends
+        // run as another user that shares nothing with the agent but a
+        // group. The socket is closed to them (proven, stufe-3-report.md S4);
+        // the store held every VM's spec, seed and volume paths open to
+        // anybody in the group. A record is the agent's to read, nobody
+        // else's.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("closing agent db {} to the owner", path.display()))?;
+        }
 
         // Create DB if not already existing
         let tx = db.begin_write().context("initializing tables")?;
@@ -769,6 +781,22 @@ mod tests {
             .expect("a temp dir");
         let path = temp.path().join("agent.redb");
         (temp, path)
+    }
+
+    /// Stage 3 shares the run directory's group with the VMM's user; the
+    /// store must not come along. redb creates with the umask, this closes
+    /// it, and this test is the only thing that keeps it closed.
+    #[test]
+    fn the_store_file_belongs_to_the_owner_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, path) = tmp("mode");
+        let _store = Store::open(&path).expect("a store");
+        let mode = std::fs::metadata(&path)
+            .expect("the file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "agent.redb is {mode:o}, not owner-only");
     }
 
     /// One I/O error is not the end of the agent.
