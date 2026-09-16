@@ -199,7 +199,7 @@ class State:
             self.cl_events[name] = items(get(ip, CLUSTER_PORT, "/apis/meister.io/v1/events")) if ip else []
             self.cl_phased[name] = {"vms": self.cl_vms[name], "volumes": self.cl_vols[name],
                                     "storagepools": self.cl_pools[name]}
-            for kind in ("volumesnapshots", "routers", "images"):
+            for kind in ("volumesnapshots", "routers", "images", "vmmigrations"):
                 self.cl_phased[name][kind] = items(
                     get(ip, CLUSTER_PORT, f"/apis/meister.io/v1/{kind}")) if ip else []
 
@@ -609,7 +609,7 @@ def check(st, base):
     # phase with nothing to say is the state the whole round removed.
     for kind, xs in st.cloud_phased.items():
         for x in xs:
-            flag = phase_hole(x)
+            flag = phase_hole(x, kind)
             if flag:
                 pst = status(x)
                 v.append(("I19", f"cloud/{kind}/{name(x)}: {flag} "
@@ -618,7 +618,7 @@ def check(st, base):
     for cname, kinds in st.cl_phased.items():
         for kind, xs in kinds.items():
             for x in xs:
-                flag = phase_hole(x)
+                flag = phase_hole(x, kind)
                 if flag:
                     pst = status(x)
                     v.append(("I19", f"{cname}/{kind}/{name(x)}: {flag} "

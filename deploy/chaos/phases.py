@@ -17,11 +17,25 @@ import json
 import sys
 
 KINDS_CLOUD = ["vms", "volumes", "volumesnapshots", "images", "storagepools", "routers"]
-KINDS_CLUSTER = ["vms", "volumes", "volumesnapshots", "storagepools", "routers", "images"]
+# Struktur 4 gave SEVEN resources a phase with a reason, and this list held
+# six: `vmmigrations` was the one nobody looked at, and the lab had sixteen
+# records in it. A checker that does not name a kind cannot find anything in
+# it -- D-H1, one more time.
+KINDS_CLUSTER = ["vms", "volumes", "volumesnapshots", "storagepools", "routers",
+                 "images", "vmmigrations"]
 RESTING = {"Ready", "Running", "Stopped", "Paused", "Active", "Migrated", "Done", "Succeeded"}
+# `Failed` is at rest for exactly one kind. A VmMigration has five phases and
+# "the two ends are terminal: nothing retries a `Failed` migration by itself,
+# because the thing that failed was an operation somebody asked for and asking
+# again is somebody's decision"
+# (shared/controller-api/src/resources/migration.rs:87-92). For a Vm or an
+# Image, `Failed` is a stop the reconciler can leave again -- an image goes
+# back to Ready the moment a node has the bytes -- so there it owes a reason
+# like every other phase in flight.
+RESTING_BY_KIND = {"vmmigrations": RESTING | {"Failed"}}
 
 
-def hole(obj):
+def hole(obj, kind=""):
     """The flag this object earns, or "" if it explains itself.
 
     One rule, one place: the CLI below and I19 in `invariants.py` cannot drift
@@ -29,12 +43,17 @@ def hole(obj):
     """
     st = obj.get("status") or {}
     phase, reason, since = st.get("phase"), st.get("reason"), st.get("since")
+    message = st.get("message")
     if phase is None:
         return "NO-PHASE"
     if reason == "Unrecorded":
         return "UNRECORDED"
-    if phase not in RESTING and not reason:
+    if phase not in RESTING_BY_KIND.get(kind, RESTING) and not reason:
         return "NO-REASON"
+    # A terminal failure still has to say what stopped it -- that is what the
+    # phase is FOR, and `Failed` resting is not `Failed` silent.
+    if phase == "Failed" and not (reason or message):
+        return "NO-WHY"
     if not since:
         return "NO-SINCE"
     return ""
@@ -65,7 +84,7 @@ def main():
         name = obj["metadata"]["name"]
         phase, reason, since, msg = st.get("phase"), st.get("reason"), st.get("since"), st.get("message")
         n += 1
-        flag = hole(obj)
+        flag = hole(obj, kind)
         if flag:
             holes.append((tier, kind, name, flag))
         print(f"{tier:10} {kind:16} {name:26} {phase or '-':12} {reason or '':18} {since or '':27} {(msg or '')[:70]}{'  <-- ' + flag if flag else ''}")
