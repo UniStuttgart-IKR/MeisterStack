@@ -599,7 +599,14 @@ def m6(reps=6):
 # --- cleanup -----------------------------------------------------------------
 
 def cleanup():
-    """Every mc-* object on both tiers, and the tenant."""
+    """Every mc-* VM, volume and snapshot on both tiers.
+
+    NOT the storage pools: `mc-fs` and `mc-fs2` are the lab's fixtures for M1
+    and M2 (D-L9), made once and kept, and they happen to carry the harness
+    prefix. The night this took them with it, they had to be restored byte
+    for byte from a snapshot (lab-refresh-report.md). A run makes VMs,
+    volumes and snapshots; it never makes a pool, so it never removes one.
+    """
     gone = []
     for res in ("vms", "volumes", "volumesnapshots"):
         c, o = cloud("GET", f"/{res}")
@@ -609,7 +616,7 @@ def cleanup():
                 cloud("DELETE", f"/{res}/{n}")
                 gone.append(f"cloud/{res}/{n}")
     for cname in CLUSTERS:
-        for res in ("vms", "volumes", "volumesnapshots", "storagepools"):
+        for res in ("vms", "volumes", "volumesnapshots"):
             c, o = cluster(cname, "GET", f"/{res}")
             if not isinstance(o, dict):
                 continue
@@ -618,12 +625,6 @@ def cleanup():
                 if n.startswith(PREFIX):
                     cluster(cname, "DELETE", f"/{res}/{n}")
                     gone.append(f"{cname}/{res}/{n}")
-    c, o = cloud("GET", "/storagepools")
-    for i in (o.get("items") or []):
-        n = i["metadata"]["name"]
-        if n.startswith(PREFIX):
-            cloud("DELETE", f"/storagepools/{n}")
-            gone.append(f"cloud/storagepools/{n}")
     return gone
 
 

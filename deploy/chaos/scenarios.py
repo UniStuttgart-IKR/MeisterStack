@@ -359,30 +359,76 @@ def s6():
 
 @scenario("S7", "image create with a right and a wrong checksum")
 def s7():
+    """The checksum half of this scenario tested nothing for a whole schema
+    generation (D-H4). It sent `spec.checksum`, the field is `spec.sha256`, and
+    the API answered
+
+        400: spec.checksum: unknown field `checksum`, expected one of
+             `source`, `url`, `sha256`, `format`, `sizeBytes`, `tenant`, …
+
+    which the scenario neither reported nor noticed, because the `c == 201`
+    guard silently skipped the check behind it. So: the field is the right one
+    now, and every create says whether the code it got is the code it wanted.
+    A rejection that was expected is a pass; a rejection that was not is the
+    finding.
+    """
     f = []
-    for nm, spec in (
+    # want: the http code this body is supposed to get. Anything else is a
+    # finding, in BOTH directions -- that is the whole of D-H4.
+    cases = (
         # v1 demands metadata.name == basename(spec.source).
-        ("chaos-img-ok.raw", {"format": "raw", "source": "/opt/meisterstack/images/chaos-img-ok.raw"}),
-        ("chaos-img-bad.raw", {"format": "raw", "source": "/opt/meisterstack/images/chaos-img-bad.raw"}),
-        ("chaos-img-url.raw", {"format": "raw", "source": "http://127.0.0.1:1/chaos-img-url.raw",
-                               "checksum": "sha256:" + "0" * 64}),
-    ):
+        ("chaos-img-ok.raw", 201,
+         {"format": "raw", "source": "/opt/meisterstack/images/chaos-img-ok.raw"}),
+        ("chaos-img-bad.raw", 201,
+         {"format": "raw", "source": "/opt/meisterstack/images/chaos-img-bad.raw"}),
+        # the right checksum: 64 hex, and `url` beside it, which is the only
+        # thing an sha256 means anything with.
+        ("chaos-img-url.raw", 201,
+         {"format": "raw", "source": "chaos-img-url.raw",
+          "url": "http://127.0.0.1:1/chaos-img-url.raw", "sha256": "0" * 64}),
+        # the wrong checksum, twice, and both refusals are the point of the
+        # scenario's name: not hex, and missing altogether next to a url.
+        ("chaos-img-hex.raw", 422,
+         {"format": "raw", "source": "chaos-img-hex.raw",
+          "url": "http://127.0.0.1:1/chaos-img-hex.raw", "sha256": "nothex"}),
+        ("chaos-img-nosum.raw", 422,
+         {"format": "raw", "source": "chaos-img-nosum.raw",
+          "url": "http://127.0.0.1:1/chaos-img-nosum.raw"}),
+    )
+    for nm, want, spec in cases:
         cloud("DELETE", f"/images/{nm}")
         c, b = cloud("POST", "/images", obj("Image", nm, spec))
-        log(f"S7 {nm}: HTTP {c} {str(b)[:160]}")
-        if nm == "chaos-img-bad.raw" and c == 201:
-            time.sleep(6)
-            cc, o = cloud("GET", f"/images/{nm}")
-            ph = phase_of(o)
-            if ph not in ("Failed",):
-                f.append(("F16", f"image with a nonexistent source sits in phase {ph!r}, "
-                                 f"not Failed with a message"))
-        if nm == "chaos-img-url.raw" and c == 201:
-            time.sleep(8)
-            cc, o = cloud("GET", f"/images/{nm}")
-            if phase_of(o) not in ("Failed",):
-                f.append(("F16", f"image from an unreachable URL sits in phase {phase_of(o)!r}, "
-                                 f"not Failed"))
+        log(f"S7 {nm}: HTTP {c} (wanted {want}) {str(b)[:200]}")
+        if c != want:
+            f.append(("D-H4", f"image create {nm} answered HTTP {c}, not {want}: "
+                              f"{str(b)[:220]}"))
+            cloud("DELETE", f"/images/{nm}")
+            continue
+        if want != 201:
+            # A refusal has to say what is wrong, not just that something is.
+            if "sha256" not in str(b):
+                f.append(("S7", f"{nm} was refused without naming spec.sha256: {str(b)[:200]}"))
+            continue
+        if nm in ("chaos-img-bad.raw", "chaos-img-url.raw"):
+            # F16: bytes nobody has are not `Ready`. Since struktur 4 the
+            # honest path is Pending{AwaitingNode} until a node has looked and
+            # Failed once one has, so wait for a verdict instead of sleeping a
+            # constant and judging whatever was there.
+            def verdict():
+                _, o = cloud("GET", f"/images/{nm}")
+                return o if phase_of(o) in ("Failed", "Ready") else None
+            o, _secs = ops.wait_for(verdict, 60)
+            st = (o or {}).get("status") or {}
+            if not o:
+                _, o = cloud("GET", f"/images/{nm}")
+                st = o.get("status") or {}
+                f.append(("F16", f"{nm} never reached a verdict in 60 s: "
+                                 f"phase={st.get('phase')!r} reason={st.get('reason')!r}"))
+            elif st.get("phase") != "Failed":
+                f.append(("F16", f"image with no bytes behind it sits in phase "
+                                 f"{st.get('phase')!r}/{st.get('reason')!r}, not Failed"))
+            elif not st.get("reason") or not st.get("message"):
+                f.append(("F16", f"{nm} is Failed without a reason or a sentence: {st}"))
         cloud("DELETE", f"/images/{nm}")
     return f
 

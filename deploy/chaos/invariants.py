@@ -30,6 +30,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.environ.get("CHAOS_OUT", os.path.join(HERE, "out"))
 os.makedirs(OUT, exist_ok=True)
 
+# The phase rule lives in phases.py and is imported, not copied: I19 and
+# `phases.py` on the command line have to agree, and two copies of a rule is
+# how D-H4 happened. phases.py keeps its module level free of `ops` and of
+# this file precisely so this import cannot close a cycle.
+from phases import hole as phase_hole
+
+
 def _addrs(name, default):
     """A comma-separated address list from the environment, or the lab's.
 
@@ -167,12 +174,20 @@ class State:
         self.fpools = items(first_alive(CLOUD, CLOUD_PORT, "/apis/meister.io/v1/floatingpools")[1])
         self.images = items(first_alive(CLOUD, CLOUD_PORT, "/apis/meister.io/v1/images")[1])
         self.clusters = items(first_alive(CLOUD, CLOUD_PORT, "/apis/meister.io/v1/clusters")[1])
+        # The rest of what carries a phase at the cloud. I19 judges every
+        # object of both tiers, and an invariant that reads only the kinds
+        # some older check happened to need is the D-H1 shape again.
+        self.cloud_phased = {"vms": self.cloud_vms, "images": self.images}
+        for kind in ("volumes", "volumesnapshots", "storagepools", "routers"):
+            self.cloud_phased[kind] = items(
+                first_alive(CLOUD, CLOUD_PORT, f"/apis/meister.io/v1/{kind}")[1])
 
         self.cl_vms = {}      # cluster -> [vm]
         self.cl_nodes = {}    # cluster -> [node]
         self.cl_vols = {}     # cluster -> [volume]
         self.cl_pools = {}
         self.cl_events = {}
+        self.cl_phased = {}   # cluster -> kind -> [object], for I19
         self.cl_ip = {}
         for name, ips in CLUSTERS.items():
             ip, d = first_alive(ips, CLUSTER_PORT, "/apis/meister.io/v1/vms")
@@ -182,6 +197,11 @@ class State:
             self.cl_vols[name] = items(get(ip, CLUSTER_PORT, "/apis/meister.io/v1/volumes")) if ip else []
             self.cl_pools[name] = items(get(ip, CLUSTER_PORT, "/apis/meister.io/v1/storagepools")) if ip else []
             self.cl_events[name] = items(get(ip, CLUSTER_PORT, "/apis/meister.io/v1/events")) if ip else []
+            self.cl_phased[name] = {"vms": self.cl_vms[name], "volumes": self.cl_vols[name],
+                                    "storagepools": self.cl_pools[name]}
+            for kind in ("volumesnapshots", "routers", "images", "vmmigrations"):
+                self.cl_phased[name][kind] = items(
+                    get(ip, CLUSTER_PORT, f"/apis/meister.io/v1/{kind}")) if ip else []
 
         # one shell round-trip per node, everything the node-side checks need
         self.node_probe = {}
@@ -579,6 +599,31 @@ def check(st, base):
             n = spec(x).get("nodeName") or status(x).get("nodeName")
             if n in ready:
                 v.append(("I18", f"{c}/{name(x)} is Unknown while its node {n} is Ready"))
+
+    # I19 — every object explains itself. Struktur 4 made a phase a derived
+    # value with `reason`, `message` and `since`, and `deploy/chaos/phases.py`
+    # was written to check that after the roll-out. Silas asked for it to be
+    # part of the verdict rather than a thing somebody remembers to run, so
+    # the rule is imported from there and applied to every phased object of
+    # both tiers. A hole is a violation: an object standing in a non-terminal
+    # phase with nothing to say is the state the whole round removed.
+    for kind, xs in st.cloud_phased.items():
+        for x in xs:
+            flag = phase_hole(x, kind)
+            if flag:
+                pst = status(x)
+                v.append(("I19", f"cloud/{kind}/{name(x)}: {flag} "
+                                 f"(phase={pst.get('phase')!r} reason={pst.get('reason')!r} "
+                                 f"since={pst.get('since')!r})"))
+    for cname, kinds in st.cl_phased.items():
+        for kind, xs in kinds.items():
+            for x in xs:
+                flag = phase_hole(x, kind)
+                if flag:
+                    pst = status(x)
+                    v.append(("I19", f"{cname}/{kind}/{name(x)}: {flag} "
+                                     f"(phase={pst.get('phase')!r} reason={pst.get('reason')!r} "
+                                     f"since={pst.get('since')!r})"))
 
     return v
 
