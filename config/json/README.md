@@ -20,6 +20,7 @@ without knowing any names.
 | `example-vm.json` | The same, with the bridge named explicitly. |
 | `gpu.json` | A mediated GPU through the `crosvm-gpu` driver, profile `venus`. |
 | `nvrm.json` | A mediated NVIDIA vGPU through the `nvrm` driver, profile `4q`. |
+| `input.json` | A keyboard through the `input` driver, profile `fifo`. The node makes a named pipe for the device (`<run_dir>/input/<device-id>.fifo`), and `printf '1 30 1\n0 0 0\n' > …` presses KEY_A in the guest — which is how a test presses a key with no human. Profile `evdev` instead forwards one host `/dev/input/eventN`, and that one has to be named: `"params": { "evdev": "/dev/input/event0" }`. |
 | `passthrough.json` | A whole PCI device through the `vfio` driver. Note the spelling: the driver is `vfio`, while the agent config section that whitelists the address is `[[device.managed]]`. |
 
 The device drivers named here have to be configured on the node the VM lands
