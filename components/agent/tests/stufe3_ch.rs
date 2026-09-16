@@ -403,3 +403,421 @@ fn uuid_from(path: &Path) -> uuid::Uuid {
     }
     uuid::Uuid::from_bytes(bytes)
 }
+/// What `ps` says about a pid, in one field.
+fn ps(pid: u32, field: &str) -> String {
+    let out = std::process::Command::new("ps")
+        .args(["-o", field, "-p", &pid.to_string(), "--no-headers"])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Whether this process holds an open descriptor on `target`.
+///
+/// The proof that a tap arrived as a descriptor rather than by name: the
+/// entry is in the VMM's fd table and the VMM is a process that could not
+/// have opened it — unprivileged, and Landlocked without a rule for
+/// `/dev/net/tun`.
+fn holds(pid: u32, target: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        std::fs::read_link(e.path())
+            .map(|link| link.to_string_lossy() == target)
+            .unwrap_or(false)
+    })
+}
+
+/// S4: the whole of Stufe 3 on one machine, in one test.
+///
+/// Every assertion here is a sentence from the brief, and together they are
+/// the claim: a guest running on this node is one process away from nothing,
+/// not one process away from root.
+///
+/// * `ps -o user` says the VMM is `MEISTER_VMM_USER` — or says it is the
+///   user running the test, when the run was given no switch to make, and
+///   then this test states that rather than pretending.
+/// * the VMM holds a `/dev/net/tun` descriptor it could not have opened.
+/// * `CapEff` is empty: not "fewer capabilities", none.
+/// * the guest boots and reaches the host.
+/// * the teardown leaves no process and no file.
+/// * and the agent's own socket is closed to the VMM user, shown by trying
+///   it from a process that IS that user.
+#[tokio::test]
+#[ignore = "needs a real cloud-hypervisor, kernel, initramfs, a prepared tap and (for the switch) root; see the module note"]
+async fn the_vmm_runs_as_somebody_else_and_cannot_reach_the_agent() {
+    let dir = rig("proof");
+    let user = vmm_user();
+    let ch = driver(dir.path());
+    let id = VmId::new_v4();
+
+    ch.create(&id, &spec(Some(1450)), None)
+        .await
+        .expect("vm.create + add-net");
+    let (console, tail) = serial_transcript(&ch, &id, dir.path()).await;
+    ch.start(&id).await.expect("vm.boot");
+    let said = guest_said(&console, "MS-S0-DONE", Duration::from_secs(60)).await;
+    let lines = ours(&said);
+    println!("guest: {lines:#?}");
+
+    let pid = vmm_pid(dir.path(), &id);
+    let who = ps(pid, "user");
+    let expected = match &user {
+        Some(user) => user.name.clone(),
+        None => whoami(),
+    };
+    println!("vmm pid {pid} runs as {who:?} (expected {expected:?})");
+    assert!(
+        who == expected || expected.starts_with(&who),
+        "the vmm runs as {who:?} and not as {expected:?}"
+    );
+    if user.is_none() {
+        println!(
+            "NOTE: MEISTER_VMM_USER was not set, so no user change was attempted. \
+             Everything below still holds; the switch itself is unproved in this run."
+        );
+    }
+
+    // The tap. It is in the VMM's fd table, and the VMM is Landlocked with
+    // no rule for /dev/net/tun and (with a switch) has no capability at all
+    // — so it did not open this itself.
+    assert!(
+        holds(pid, "/dev/net/tun"),
+        "the vmm holds no tap descriptor, so the tap did not arrive as one"
+    );
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("status");
+    let field = |name: &str| {
+        status
+            .lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let cap_eff = field("CapEff:");
+    let groups = field("Groups:");
+    println!("vmm {cap_eff} | {groups}");
+    if user.is_some() {
+        assert!(
+            cap_eff.ends_with("0000000000000000"),
+            "a vmm that changed user should hold no capabilities: {cap_eff}"
+        );
+        // The supplementary groups, and this is not a detail. `setgid` alone
+        // would leave the agent's inherited list in place — including group
+        // 0 for a root agent — and a VMM carrying group 0 reaches every
+        // `0660 root:root` file on the node, the agent's own socket first
+        // among them. `Command::uid` drops the list; this is where that is
+        // checked rather than assumed.
+        assert_eq!(
+            groups.trim(),
+            "Groups:",
+            "the vmm inherited supplementary groups from the agent: {groups}"
+        );
+    }
+
+    assert!(
+        lines.iter().any(|l| l == "MS-S0-PING-OK"),
+        "the guest could not reach {}: {lines:#?}",
+        host_ip()
+    );
+
+    // The three files the VMM made for itself. Owned by it, and closed to
+    // the world: the api socket is a control channel — CH's own threat model
+    // calls its API "trusted" and says Landlock does not protect it, "it does
+    // not prevent access to AF_UNIX sockets" — so the permissions on it are
+    // this stack's job and not the VMM's. The console is what the guest
+    // printed.
+    if let Some(user) = &user {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        for path in [
+            dir.path().join("vms").join(format!("{id}.sock")),
+            ch.console_socket(&id).expect("a serial socket"),
+            dir.path().join("vms").join(format!("{id}.console")),
+        ] {
+            let meta = std::fs::metadata(&path).expect("the vmm made this");
+            let mode = meta.permissions().mode() & 0o777;
+            println!(
+                "{} is {mode:o} uid={} gid={}",
+                path.display(),
+                meta.uid(),
+                meta.gid()
+            );
+            // Nothing for the world, and the group put back: CH's own
+            // `umask(0o077)` leaves these `0700`/`0600`, which an agent that
+            // is not root could not read. See `relax_to_the_group`.
+            assert_eq!(mode & 0o007, 0, "{} is open to the world", path.display());
+            assert_eq!(
+                mode & 0o060,
+                0o060,
+                "{} is closed to its group",
+                path.display()
+            );
+            assert_eq!(meta.uid(), user.uid, "{}", path.display());
+            assert_eq!(meta.gid(), user.gid, "{}", path.display());
+        }
+    }
+
+    // The agent's socket, in the shape `api.rs` gives it: 0660, owned by
+    // whoever runs the agent. Tried from a process that IS the VMM user.
+    if let Some(user) = &user {
+        let sock = dir.path().join("agent.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("a socket");
+        std::fs::set_permissions(&sock, {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::Permissions::from_mode(0o660)
+        })
+        .expect("0660");
+        let errno = connect_as(user, &sock);
+        println!("connecting to the agent socket as {user}: errno {errno}");
+        assert_ne!(
+            errno, COULD_NOT_SWITCH,
+            "the probe could not become {user}, so it proves nothing"
+        );
+        assert_eq!(
+            errno,
+            nix::libc::EACCES,
+            "the vmm user could open the agent's socket, which is the whole \
+             thing Stufe 3 is for"
+        );
+    }
+
+    ch.destroy(&id).await.expect("teardown");
+    tail.abort();
+    assert!(!ch.probe(&id).await, "the vmm still answers");
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the vmm process is still there"
+    );
+    // Nothing of this VM is left in the run directory but the log the driver
+    // keeps on purpose.
+    let left: Vec<String> = std::fs::read_dir(dir.path().join("vms"))
+        .expect("the run dir")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(&id.to_string()))
+        .collect();
+    assert!(
+        left.iter().all(|n| n.contains(".log.gone-")),
+        "the teardown left {left:?}"
+    );
+}
+
+fn whoami() -> String {
+    let uid = nix::unistd::Uid::effective();
+    nix::unistd::User::from_uid(uid)
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+        .unwrap_or_else(|| uid.to_string())
+}
+
+/// The VMM's pid, off the one place this test can read it without the
+/// driver's private map: `fuser`-style, by who holds the api socket.
+///
+/// The driver knows, but does not publish it — and it should not: a pid is
+/// not an identity, and the driver says so at length. For a test on one
+/// machine the process holding the socket IS the VMM.
+fn vmm_pid(dir: &Path, id: &VmId) -> u32 {
+    let socket = dir.join("vms").join(format!("{id}.sock"));
+    let target = socket.to_string_lossy().to_string();
+    for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if cmdline
+            .windows(target.len())
+            .any(|w| w == target.as_bytes())
+        {
+            return pid;
+        }
+    }
+    panic!("no process names {target}");
+}
+
+/// A `connect_as` child that could not become the user it was asked to.
+/// Its own code, so that a failed switch can never be read as a successful
+/// connect — which it was, for one run, and the test passed nothing.
+const COULD_NOT_SWITCH: i32 = 111;
+
+/// Try to connect to `socket` as `user`, and answer with the errno.
+///
+/// A forked child rather than a spawned helper, because the question is
+/// about a uid and not about a program: no interpreter has to be on this
+/// machine for the answer to be true. The child does the two things the
+/// kernel cares about — group before user, which is the order that cannot be
+/// undone — and exits with the errno as its status.
+///
+/// The credential change goes through the raw syscalls and not through
+/// `nix`, and that is the difference between this test working and not.
+/// glibc's `setuid` is `__nptl_setxid`: it broadcasts to every thread of the
+/// process and waits for them. This child is the fork of a tokio runtime, so
+/// glibc's idea of the thread list is stale, the broadcast fails, and the
+/// call comes back as an error — after which a connect as the ORIGINAL user
+/// succeeds and looks like a hole in the permissions. The syscall changes
+/// the calling thread only, which in a forked child is the whole process.
+fn connect_as(user: &agent_api::VmmUser, socket: &Path) -> i32 {
+    use nix::unistd::{ForkResult, fork};
+    // SAFETY: the child calls only socket syscalls before `_exit` and never
+    // returns into the test harness.
+    match unsafe { fork() }.expect("fork") {
+        ForkResult::Child => {
+            let code = (|| -> i32 {
+                // SAFETY: FFI calls with scalar arguments.
+                unsafe {
+                    // The supplementary groups FIRST, and this is the line
+                    // that cost a run. `setgid` replaces the primary group
+                    // and leaves the inherited list alone — so a child of a
+                    // root process keeps group 0 in it, and a socket that is
+                    // `0660 root:root` is then reachable through its GROUP
+                    // bits by a process whose uid is 907. Measured exactly
+                    // that way: `0660` let the probe in and `0600` did not.
+                    //
+                    // `std::process::Command::uid` does this for us in the
+                    // real spawn — it documents "a call to `setgroups(0,
+                    // NULL)` in the child process if no groups have been
+                    // specified" — so the probe has to, or it is not asking
+                    // the same question the VMM answers.
+                    if nix::libc::syscall(nix::libc::SYS_setgroups, 0, std::ptr::null::<u32>()) != 0
+                    {
+                        return COULD_NOT_SWITCH;
+                    }
+                    if nix::libc::syscall(nix::libc::SYS_setgid, user.gid) != 0 {
+                        return COULD_NOT_SWITCH;
+                    }
+                    if nix::libc::syscall(nix::libc::SYS_setuid, user.uid) != 0 {
+                        return COULD_NOT_SWITCH;
+                    }
+                    if nix::libc::geteuid() != user.uid {
+                        return COULD_NOT_SWITCH;
+                    }
+                }
+                match std::os::unix::net::UnixStream::connect(socket) {
+                    Ok(_) => 0,
+                    Err(e) => e.raw_os_error().unwrap_or(0),
+                }
+            })();
+            // `_exit` and not `std::process::exit`: running atexit handlers
+            // in the fork of a tokio runtime would run the runtime's.
+            // SAFETY: FFI call that does not return.
+            unsafe { nix::libc::_exit(code) }
+        }
+        ForkResult::Parent { child } => {
+            match nix::sys::wait::waitpid(child, None).expect("waitpid") {
+                nix::sys::wait::WaitStatus::Exited(_, code) => code,
+                other => panic!("the child did not exit: {other:?}"),
+            }
+        }
+    }
+}
+
+/// S4, the other half: the vhost-user backend is the same unprivileged user,
+/// and the socket it makes is not readable by the node.
+///
+/// This is the half that decides whether Stufe 3 buys anything for a display
+/// VM, and the argument is not ours. QEMU: "There is not considered to be
+/// security boundary between QEMU and the vhost-user & vfio-user backends."
+/// Cloud Hypervisor: "Cloud Hypervisor gives vhost-user devices complete
+/// control over the guest." A root backend beside an unprivileged VMM is a
+/// root VMM with extra steps.
+///
+/// `input` and not `nvrm`, and that is a property of this machine rather than
+/// a choice: the card here is a GeForce RTX 2070 with no vGPU, so there is no
+/// mdev device for `nvrm` to serve. The seam is the same one either way —
+/// `drivers/backend` spawns all three — and Leandro's nvrm backend is built
+/// to run unprivileged already: its own `settle_admin_privilege` DROPS
+/// `CAP_SYS_ADMIN` unless `LEA_ADMIN_PRIV=1` asks for it.
+#[tokio::test]
+#[ignore = "needs Leandro's vhost-user-input in MEISTER_INPUT_BACKEND and (for the switch) root; see the module note"]
+async fn a_vhost_user_backend_runs_as_the_same_user_as_the_vmm() {
+    let backend = std::env::var("MEISTER_INPUT_BACKEND").unwrap_or_default();
+    if backend.is_empty() {
+        eprintln!("MEISTER_INPUT_BACKEND names no backend binary; nothing to spawn");
+        return;
+    }
+    let dir = rig("backend");
+    let user = vmm_user();
+    let driver = input_driver::InputDriver::new(input_driver::InputDriverConfig {
+        binary: PathBuf::from(&backend),
+        run_dir: dir.path().join("input"),
+        socket_timeout: Duration::from_secs(10),
+        vmm_user: user.clone(),
+    })
+    .expect("a driver over Leandro's backend");
+
+    // The `fifo` profile, because it needs no host device: what is under test
+    // is the process and the file it makes, not where its events come from.
+    let id = agent_api::DeviceId::new_v4();
+    let device = agent_api::device::DeviceDriver::create(
+        &driver,
+        &id,
+        &agent_api::DeviceSpec {
+            driver: "input".into(),
+            partition: agent_api::PartitionSpec::Mediated,
+            profile: Some("fifo".into()),
+            params: None,
+        },
+        None,
+    )
+    .await
+    .expect("the backend starts");
+
+    let agent_api::DeviceAttachment::VhostUser { socket, pid, .. } = device.attachment.clone()
+    else {
+        panic!("the input driver did not hand back a vhost-user attachment");
+    };
+    let who = ps(pid, "user");
+    let expected = match &user {
+        Some(user) => user.name.clone(),
+        None => whoami(),
+    };
+    println!("backend pid {pid} runs as {who:?} (expected {expected:?})");
+    assert!(
+        who == expected || expected.starts_with(&who),
+        "the backend runs as {who:?} and not as {expected:?}"
+    );
+
+    // And the socket the VMM will connect to is the backend's own, with
+    // nothing for the world: the VMM is the same user, so nothing wider is
+    // needed, and what a guest sends through its input device is nobody
+    // else's business.
+    //
+    // `0770` and not `0660`, which is worth knowing rather than asserting
+    // loosely: a socket's base mode is `0777` where a regular file's is
+    // `0666`, so the same `umask 007` produces different numbers for the
+    // console FILE and for the sockets beside it. The execute bit means
+    // nothing on a socket; the bits that matter are the last three.
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(&socket).expect("the backend's socket");
+        println!(
+            "backend socket {} is {:o} uid={} gid={}",
+            socket.display(),
+            meta.permissions().mode() & 0o777,
+            meta.uid(),
+            meta.gid()
+        );
+        if let Some(user) = &user {
+            assert_eq!(
+                meta.permissions().mode() & 0o007,
+                0,
+                "world bits on the backend's socket"
+            );
+            assert_eq!(meta.permissions().mode() & 0o770, 0o770);
+            assert_eq!(meta.uid(), user.uid);
+            assert_eq!(meta.gid(), user.gid);
+        }
+    }
+
+    agent_api::device::DeviceDriver::destroy(&driver, &id, &device.attachment)
+        .await
+        .expect("teardown");
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the backend is still there"
+    );
+}

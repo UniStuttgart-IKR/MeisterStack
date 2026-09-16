@@ -207,6 +207,50 @@ impl CloudHypervisorDriver {
         }
     }
 
+    /// Let the VMM user's GROUP at the three files the VMM made for itself.
+    ///
+    /// Not a widening for its own sake. cloud-hypervisor sets
+    /// `umask(0o077)` in its own `main` — "Ensure all created files (.e.g
+    /// sockets) are only accessible by this user" — so its api socket and
+    /// serial socket come out `0700` and its console file `0600`, owned by
+    /// the VMM user (measured: exactly those numbers). That is stricter than
+    /// this driver would have asked for, and it is stricter than the AGENT
+    /// can live with: the agent drives the VM over that api socket, and reads
+    /// the console for `vm logs`.
+    ///
+    /// A root agent reaches them anyway. An agent that is NOT root — the
+    /// no-root lane's node — reaches them only through the group, so the
+    /// group bits are put back here. That is the smallest widening that
+    /// works: the group is the VMM user's own, whose only other member is
+    /// whoever the deployment puts there, and it is the reason the direction
+    /// of that membership is "the agent joins the VMM's group" and never the
+    /// reverse (see `agent_api::VmmUser`).
+    ///
+    /// Needs `CAP_FOWNER` — a file owned by somebody else cannot be chmodded
+    /// by its group — so an agent that is not root cannot do this for itself.
+    /// It is not fatal: a root agent does it, and a non-root agent that
+    /// cannot gets a warning and a VM it can still start, because the failure
+    /// only bites the calls that come afterwards.
+    fn relax_to_the_group(&self, id: &VmId) {
+        let Some(user) = &self.vmm_user else {
+            return;
+        };
+        for (path, mode) in [
+            (self.vm_socket_path(id), 0o770),
+            (self.serial_socket_path(id), 0o770),
+            (self.console_path(id, ConsoleStream::Console), 0o660),
+        ] {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
+                warn!(
+                    path = %path.display(), user = %user.name, error = %e,
+                    "the vmm's own file could not be opened to its group; an agent that is not \
+                     root will not be able to read it"
+                );
+            }
+        }
+    }
+
     /// Give the run directory to the VMM user, once, so that the VMM can bind
     /// its own socket in it.
     ///
@@ -389,20 +433,6 @@ impl CloudHypervisorDriver {
             // needs and cannot open for itself has to be ready before it
             // stops being able to.
             command.uid(user.uid).gid(user.gid);
-            // And a umask, so that the three files the VMM makes for itself
-            // in here — its api socket, its serial socket, its console file —
-            // come out `0660` with its own group rather than world-readable.
-            // The guest's console is what a guest printed; nobody else on the
-            // node is entitled to it.
-            //
-            // SAFETY: `umask` is async-signal-safe and touches nothing but
-            // the child's own process state.
-            unsafe {
-                command.pre_exec(|| {
-                    libc::umask(0o007);
-                    Ok(())
-                });
-            }
         }
         let mut process = command
             .stdin(Stdio::null())
@@ -497,6 +527,11 @@ impl CloudHypervisorDriver {
                 }
             }
         }
+
+        // After `vm.create`, because that is when the console file and the
+        // serial socket exist: v53 makes them in `pre_create_console_devices`
+        // and not at start-up. The api socket has been there since the spawn.
+        self.relax_to_the_group(id);
 
         self.vms.lock().unwrap().insert(
             *id,

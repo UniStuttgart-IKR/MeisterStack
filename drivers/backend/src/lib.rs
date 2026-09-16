@@ -211,10 +211,11 @@ impl BackendKind {
         }
 
         // The backend's socket is what the VMM connects to, so it has to be
-        // openable by the VMM — which is the same user, so `0660` with the
-        // backend's own group is exactly right and world-readable is not. The
-        // socket is made by the BACKEND, so the umask is the only way to say
-        // it from here.
+        // openable by the VMM — which is the same user, so the backend's own
+        // group is exactly right and world-reachable is not. The socket is
+        // made by the BACKEND, so a umask is the only way to say that from
+        // here; it comes out `0770`, because a socket's base mode is `0777`
+        // and not a file's `0666`.
         let umask = self.vmm_user.is_some();
         if let Some(user) = &self.vmm_user {
             cmd.uid(user.uid).gid(user.gid);
