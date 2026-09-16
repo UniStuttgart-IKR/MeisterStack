@@ -630,6 +630,18 @@ default_bridge = "meister_br0"
 #[device.nvrm.profiles.8q]
 #vgpu_type = "RTX2070-8Q"
 
+# The second vhost-user backend of the display rig: virtio-input, which
+# cloud-hypervisor does not have of its own. Two keys and no profile table —
+# the profiles are the backend's two SOURCES rather than settings, so a node
+# with this section advertises `input/fifo` and `input/evdev` and a spec picks
+# one. `fifo` gets a named pipe next to the socket and takes `type code value`
+# lines (`printf '1 30 1\n0 0 0\n' > <run_dir>/input/<id>.fifo` presses KEY_A);
+# `evdev` forwards one host `/dev/input/eventN`, named per device in
+# `params.evdev`, and hands the guest the keyboard of whoever is at the machine.
+#[device.input]
+#binary = "/opt/meisterstack/bin/vhost-user-input"
+#socket_timeout_ms = 5000
+
 # PCI devices this node may hand to a guest whole. Nothing else is passthrough-
 # able: a spec naming an address that is not in this list is refused, and the
 # list is what keeps a VM from being given the NIC the lab runs on.

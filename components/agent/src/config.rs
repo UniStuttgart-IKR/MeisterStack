@@ -16,6 +16,9 @@ use toml::from_str;
 fn default_nvrm_socket_timeout_ms() -> u64 {
     nvrm_driver::DEFAULT_SOCKET_TIMEOUT_MS
 }
+fn default_input_socket_timeout_ms() -> u64 {
+    input_driver::DEFAULT_SOCKET_TIMEOUT_MS
+}
 fn default_nfs_socket_timeout_ms() -> u64 {
     nfs_driver::DEFAULT_SOCKET_TIMEOUT_MS
 }
@@ -719,6 +722,22 @@ pub struct NvrmConfig {
     pub profiles: HashMap<String, NvrmParams>,
 }
 
+/// Two keys, because a node configures nothing else about this backend: the
+/// profiles `fifo` and `evdev` are the backend's own sources, not settings,
+/// and the per-device knobs (which host node to forward, what the guest reads
+/// back as the name) belong to one device and travel in its spec.
+///
+/// Leandro's package is NOT vendored into this repo — the path is
+/// configuration, and a node that does not name one does not serve virtio-input.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputConfig {
+    pub binary: PathBuf,
+    /// The driver's own number, not the config's: see input_driver::DEFAULT_SOCKET_TIMEOUT_MS.
+    #[serde(default = "default_input_socket_timeout_ms")]
+    pub socket_timeout_ms: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ManagedDevice {
@@ -1287,6 +1306,8 @@ mod tests {
         let gpu: CrosvmGpuConfig = one(&cfg.device, "device", "crosvm-gpu");
         assert!(gpu.profiles.contains_key("venus"));
         let _: NvrmConfig = one(&cfg.device, "device", "nvrm");
+        let input: InputConfig = one(&cfg.device, "device", "input");
+        assert_eq!(input.socket_timeout_ms, 5000);
         let _: FilesystemVolumeConfig = one(&cfg.volume, "volume", "filesystem");
         let lvm: LvmThinVolumeConfig = one(&cfg.volume, "volume", "lvm-thin");
         assert_eq!(lvm.vg, "meister");

@@ -1006,6 +1006,7 @@ dependencies = [
  "meister-common",
  "meister-crosvm-gpu-driver",
  "meister-filesystem-driver",
+ "meister-input-driver",
  "meister-linux-network-driver",
  "meister-lvm-thin-driver",
  "meister-nfs-driver",

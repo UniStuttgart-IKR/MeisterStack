@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{
-    AgentConfig, CloudHypervisorConfig, CrosvmGpuConfig, FilesystemVolumeConfig,
+    AgentConfig, CloudHypervisorConfig, CrosvmGpuConfig, FilesystemVolumeConfig, InputConfig,
     LvmThinVolumeConfig, ManagedDevice, NfsVolumeConfig, NvrmConfig, Sections, section,
 };
 use crate::types::{DeviceWithId, VolumeWithId};
@@ -20,6 +20,7 @@ use agent_api::{
 use anyhow::bail;
 use crosvm_gpu_driver::CrosvmGpuDriver;
 use filesystem_driver::FilesystemBlockDriver;
+use input_driver::InputDriver;
 use linux_network_driver::LinuxNetworkDriver;
 use lvm_thin_driver::LvmThinDriver;
 use nfs_driver::NfsDriver;
@@ -28,6 +29,9 @@ use vfio_driver::VfioPciDriver;
 
 pub const DRIVER_CROSVM_GPU: &str = "crosvm-gpu";
 pub const DRIVER_NVRM: &str = "nvrm";
+/// The second vhost-user backend of the display rig: virtio-input, which
+/// cloud-hypervisor does not have of its own.
+pub const DRIVER_INPUT: &str = "input";
 pub const DRIVER_VFIO: &str = "vfio";
 pub const DRIVER_LVM_THIN: &str = "lvm-thin";
 pub const DRIVER_NFS: &str = "nfs";
@@ -107,6 +111,11 @@ static DEVICE_DRIVERS: &[DriverEntry<dyn DeviceDriver>] = &[
         name: DRIVER_NVRM,
         keys: &[DRIVER_NVRM],
         build: build_nvrm,
+    },
+    DriverEntry {
+        name: DRIVER_INPUT,
+        keys: &[DRIVER_INPUT],
+        build: build_input,
     },
     DriverEntry {
         name: DRIVER_VFIO,
@@ -371,6 +380,24 @@ fn build_nvrm(
         vram_budget_mib: n.vram_budget_mib,
         defaults: n.defaults.clone(),
         profiles: n.profiles.clone(),
+    })?;
+    Ok(Some(Arc::new(driver)))
+}
+
+/// The sibling of `build_nvrm` with nothing to resolve: the two profiles are
+/// the backend's own sources and not a node's configuration, so the section
+/// is the binary and the patience to wait for it.
+fn build_input(
+    sections: &Sections,
+    cfg: &AgentConfig,
+) -> anyhow::Result<Option<Arc<dyn DeviceDriver>>> {
+    let Some(i): Option<InputConfig> = section(sections, "device", DRIVER_INPUT)? else {
+        return Ok(None);
+    };
+    let driver = InputDriver::new(input_driver::InputDriverConfig {
+        binary: i.binary.clone(),
+        run_dir: cfg.paths.run_dir.join(DRIVER_INPUT),
+        socket_timeout: Duration::from_millis(i.socket_timeout_ms),
     })?;
     Ok(Some(Arc::new(driver)))
 }
@@ -1331,6 +1358,82 @@ mod tests {
         }
     }
 
+    /// What a node with `[device.input]` reports, and the round trip a
+    /// scheduler makes against it.
+    ///
+    /// The claim is nobody's to spell out: the driver answers `profiles()`
+    /// with its two sources, the catalogue flattens them, and `input/fifo`
+    /// and `input/evdev` are in the node's report because of that and not
+    /// because a config file listed them. The test is here because that is
+    /// exactly what could silently stop being true — a driver row that
+    /// registers and claims nothing looks configured and schedules nowhere.
+    #[test]
+    fn a_node_with_the_input_section_claims_both_its_sources() {
+        // Any binary that really exists: the driver refuses to build
+        // without one, and what is under test is the claim, not the backend.
+        let binary = std::env::current_exe().expect("this test binary");
+        let (_temp, cfg) = config(&format!("[device.input]\nbinary = {binary:?}"));
+
+        let devices = register(DEVICE_DRIVERS, &cfg.device, &cfg, "device")
+            .expect("[device.input] builds the driver");
+        let cat = DeviceCatalog::new(&devices);
+        assert_eq!(
+            cat.inventory(),
+            vec![(
+                DRIVER_INPUT.to_string(),
+                vec!["evdev".to_string(), "fifo".to_string()]
+            )],
+            "one driver, both sources, sorted for a stable Hello"
+        );
+
+        // The same flattening the cluster session does on its way into a
+        // NodeCapacity, and the questions FirstFit then asks of it.
+        let catalogue: Vec<String> = cat
+            .inventory()
+            .into_iter()
+            .flat_map(|(name, profiles)| {
+                profiles
+                    .into_iter()
+                    .map(move |p| common::capability::entry(&name, Some(&p)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(catalogue, vec!["input/evdev", "input/fifo"]);
+        for profile in ["fifo", "evdev"] {
+            assert!(
+                common::capability::offers(&catalogue, DRIVER_INPUT, Some(profile)),
+                "a vm asking for input/{profile} fits this node"
+            );
+        }
+        // A request with no profile fits too, and the node picks — which is
+        // the rule `InputDriver::source` follows when it takes the fifo.
+        assert!(common::capability::offers(&catalogue, DRIVER_INPUT, None));
+        assert!(!common::capability::offers(
+            &catalogue,
+            DRIVER_INPUT,
+            Some("touchscreen")
+        ));
+
+        // And the admission side of the same claim: what the node accepts
+        // in a spec is what it told the scheduler it serves.
+        let device = |profile: &str| DeviceWithId {
+            id: agent_api::device::DeviceId::new_v4(),
+            spec: agent_api::device::DeviceSpec {
+                driver: DRIVER_INPUT.to_string(),
+                partition: agent_api::device::PartitionSpec::Mediated,
+                profile: Some(profile.to_string()),
+                params: None,
+            },
+        };
+        cat.validate(&[device("fifo"), device("evdev")])
+            .expect("both sources are servable here");
+        let err = cat
+            .validate(&[device("touchscreen")])
+            .expect_err("and nothing else is")
+            .to_string();
+        assert!(err.contains("fifo, evdev"), "{err}");
+    }
+
     /// The hypervisor came out of a `match` on a config enum and is now a
     /// row, and this is the round trip that says the file on disk did not
     /// move: the same two keys under the same section name build the same
@@ -1658,7 +1761,7 @@ mod tests {
         };
         let err = err.to_string();
         assert!(err.contains("[device.crosvm-gp]"), "{err}");
-        assert!(err.contains("crosvm-gpu, managed, nvrm"), "{err}");
+        assert!(err.contains("crosvm-gpu, input, managed, nvrm"), "{err}");
     }
 
     /// The catalogue claim follows `snapshot_support` and nothing else.

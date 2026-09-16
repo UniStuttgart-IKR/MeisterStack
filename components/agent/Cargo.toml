@@ -56,6 +56,7 @@ nvmeof-driver = { package = "meister-nvmeof-driver", path = "../../drivers/nvmeo
 nvmeof-import-driver = { package = "meister-nvmeof-import-driver", path = "../../drivers/nvmeof-import" }
 vfio-driver = { package = "meister-vfio-driver", path = "../../drivers/vfio" }
 nvrm-driver = { package = "meister-nvrm-driver", path = "../../drivers/nvrm" }
+input-driver = { package = "meister-input-driver", path = "../../drivers/input" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
