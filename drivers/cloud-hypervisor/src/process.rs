@@ -207,6 +207,34 @@ impl CloudHypervisorDriver {
         }
     }
 
+    /// Give the run directory to the VMM user, once, so that the VMM can bind
+    /// its own socket in it.
+    ///
+    /// One directory for every VM on the node and not one per VM, and that is
+    /// a decision with a date on it: a per-VM directory would buy isolation
+    /// only if there were a uid per VM, and there is one `vmm_user` for the
+    /// whole node — a second VMM is the SAME user and could open the first
+    /// one's files whatever the directory layout says. What it would buy
+    /// today is a narrower Landlock rule, which is worth having when per-VM
+    /// uids arrive and is not worth restructuring every path in this file
+    /// for before then. See the report.
+    ///
+    /// `0770`: the VMM writes here, and so does the agent. An agent that is
+    /// not root has to be in the VMM's group for the second half of that —
+    /// the direction is deliberate, because the reverse (the VMM in the
+    /// agent's group) would hand it the agent's socket.
+    fn hand_over_run_dir(&self) -> hypervisor::Result<()> {
+        let Some(user) = &self.vmm_user else {
+            return Ok(());
+        };
+        user.take(&self.socket_dir).map_err(|e| {
+            HypervisorError::Backend(anyhow::anyhow!(
+                "giving {} to {user}: {e}",
+                self.socket_dir.display()
+            ))
+        })
+    }
+
     /// Where the serial line listens for the one client that may type into
     /// it. Beside the file it is recorded into, one suffix apart, so the two
     /// names cannot drift — the agent derives one from the other.
@@ -330,8 +358,19 @@ impl CloudHypervisorDriver {
         id: &VmId,
         events: Option<&Path>,
     ) -> hypervisor::Result<Child> {
+        // Everything the VMM will need to write in changes hands first, while
+        // the agent still has the rights to give it away. The directory,
+        // because the VMM binds its own api socket and creates its own
+        // console file in it; the log, because the agent opens it and passes
+        // the descriptor, but `vm logs` and a later spawn both come back to
+        // the path.
+        self.hand_over_run_dir()?;
         let log = std::fs::File::create(self.vmm_log_path(id))
             .map_err(|e| HypervisorError::Backend(e.into()))?;
+        if let Some(user) = &self.vmm_user {
+            user.take(&self.vmm_log_path(id))
+                .map_err(|e| HypervisorError::Backend(anyhow::anyhow!("the vmm's log: {e}")))?;
+        }
         let log2 = log
             .try_clone()
             .map_err(|e| HypervisorError::Backend(e.into()))?;
@@ -343,12 +382,40 @@ impl CloudHypervisorDriver {
         }
         let mut command = Command::new(&self.binary);
         command.args(vmm_args(&socket, events));
+        if let Some(user) = &self.vmm_user {
+            // The uid change happens in the child, between fork and exec —
+            // the same moment libvirt picked ("immediately before executing
+            // the QEMU binary") and for the same reason: everything the VMM
+            // needs and cannot open for itself has to be ready before it
+            // stops being able to.
+            command.uid(user.uid).gid(user.gid);
+            // And a umask, so that the three files the VMM makes for itself
+            // in here — its api socket, its serial socket, its console file —
+            // come out `0660` with its own group rather than world-readable.
+            // The guest's console is what a guest printed; nobody else on the
+            // node is entitled to it.
+            //
+            // SAFETY: `umask` is async-signal-safe and touches nothing but
+            // the child's own process state.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o007);
+                    Ok(())
+                });
+            }
+        }
         let mut process = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log2))
             .spawn()
-            .map_err(|e| HypervisorError::Backend(e.into()))?;
+            .map_err(|e| match &self.vmm_user {
+                Some(user) => HypervisorError::Backend(anyhow::anyhow!(
+                    "the hypervisor could not be started: {}",
+                    user.cannot_switch(&e)
+                )),
+                None => HypervisorError::Backend(e.into()),
+            })?;
         let pid = process.id().ok_or_else(|| {
             HypervisorError::Backend(anyhow::anyhow!(
                 "cloud-hypervisor exited before pid could be read"
@@ -388,6 +455,9 @@ impl CloudHypervisorDriver {
         let _ = std::fs::remove_file(&serial_socket);
 
         let config = build_vm_config(spec, &console_path, &serial_socket, self.net_form())?;
+        // Before the VMM exists, because it opens its disks while it builds
+        // the VM. See `hand_over_files`.
+        self.hand_over_files(spec)?;
         // No event monitor: this VM answers every question over its API
         // socket. See `event_path`.
         let mut process = self.spawn_vmm(id, None).await?;
@@ -445,6 +515,9 @@ impl CloudHypervisorDriver {
     pub(crate) async fn destroy_vm(&self, id: &VmId) -> hypervisor::Result<()> {
         let vm = self.vms.lock().unwrap().remove(id);
         let vm = vm.ok_or(HypervisorError::NotFound(*id))?;
+
+        // While it can still be asked what it holds. See `take_files_back`.
+        self.take_files_back(id).await;
 
         if let Err(e) = self.api(id, Method::PUT, "vmm.shutdown", None).await {
             debug!(error = %format!("{e:#}"), "vmm.shutdown failed, killing process anyway");

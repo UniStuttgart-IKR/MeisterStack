@@ -361,6 +361,7 @@ fn build_crosvm_gpu(
         defaults: g.defaults.clone(),
         profiles: g.profiles.clone(),
         socket_timeout: Duration::from_millis(g.socket_timeout_ms),
+        vmm_user: vmm_user(cfg)?,
     })?;
     Ok(Some(Arc::new(driver)))
 }
@@ -380,6 +381,9 @@ fn build_nvrm(
         vram_budget_mib: n.vram_budget_mib,
         defaults: n.defaults.clone(),
         profiles: n.profiles.clone(),
+        // A vhost-user backend maps the guest's memory, so it drops with the
+        // vmm and not after it. See `agent_api::VmmUser`.
+        vmm_user: vmm_user(cfg)?,
     })?;
     Ok(Some(Arc::new(driver)))
 }
@@ -398,6 +402,7 @@ fn build_input(
         binary: i.binary.clone(),
         run_dir: cfg.paths.run_dir.join(DRIVER_INPUT),
         socket_timeout: Duration::from_millis(i.socket_timeout_ms),
+        vmm_user: vmm_user(cfg)?,
     })?;
     Ok(Some(Arc::new(driver)))
 }
@@ -418,6 +423,18 @@ fn build_vfio(
     Ok(Some(Arc::new(VfioPciDriver::new(inventory)?)))
 }
 
+/// The resolved `vmm_user`, or `None` where nobody named one.
+///
+/// Resolved here rather than in each driver so that a node with a `vmm_user`
+/// that does not exist fails once, at start-up, with the name in the message
+/// — and not five times at the first VM. See `agent_api::VmmUser`.
+fn vmm_user(cfg: &AgentConfig) -> anyhow::Result<Option<agent_api::VmmUser>> {
+    cfg.vmm_user
+        .as_deref()
+        .map(agent_api::VmmUser::resolve)
+        .transpose()
+}
+
 fn build_cloud_hypervisor(
     sections: &Sections,
     cfg: &AgentConfig,
@@ -432,12 +449,19 @@ fn build_cloud_hypervisor(
     // can least afford to read a parse error.
     h.ports()
         .map_err(|why| anyhow::anyhow!("[hypervisor.cloud-hypervisor]: {why}"))?;
+    // Stufe 3, and the two halves go together: the descriptor form for taps
+    // exists so that an unprivileged VMM is possible at all, and a VMM that
+    // runs as the agent would only pay its price (no live migration for a vm
+    // with nics). `None` is every node today and changes nothing.
+    let vmm_user = vmm_user(cfg)?;
     let driver = cloud_hypervisor_driver::CloudHypervisorDriver::new(
         h.binary.clone(),
         cfg.paths.run_dir.join("vms"),
         Duration::from_millis(h.timeout_ms),
         h.unplug_timeout(),
-    )?;
+    )?
+    .with_tap_fds(vmm_user.is_some())
+    .with_vmm_user(vmm_user);
     Ok(Some(Arc::new(driver)))
 }
 

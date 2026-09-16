@@ -60,6 +60,9 @@ pub struct CrosvmGpuDriverConfig {
     pub defaults: GpuParams,
     pub profiles: HashMap<String, serde_json::Value>,
     pub socket_timeout: Duration,
+    /// Who the backend runs as. `None` is the agent, which is every node that
+    /// has ever run this. See `InputDriverConfig::vmm_user`.
+    pub vmm_user: Option<agent_api::VmmUser>,
 }
 
 pub struct CrosvmGpuDriver {
@@ -92,7 +95,7 @@ impl CrosvmGpuDriver {
             .to_string();
 
         Ok(Self {
-            process: BackendKind::child("crosvm", &comm),
+            process: BackendKind::child("crosvm", &comm).as_user(config.vmm_user.clone()),
             config,
             children: Mutex::new(HashMap::new()),
         })

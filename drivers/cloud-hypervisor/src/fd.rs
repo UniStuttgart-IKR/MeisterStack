@@ -250,6 +250,95 @@ impl CloudHypervisorDriver {
     }
 }
 
+/// Every file this VM's VMM will open for writing, out of its own spec.
+///
+/// The disks and the cloud-init seed, and deliberately not the kernel, the
+/// initramfs or the firmware: those are shared, read-only and live in the
+/// image directory, so handing one to the VMM user would change a file
+/// several VMs read. Read access to them is an ordinary `0644` and a Landlock
+/// rule, not an ownership question.
+///
+/// A vhost-user disk is a socket and not a file, and the socket belongs to
+/// the backend — which already runs as the same user. A share is virtiofsd's
+/// and virtiofsd stays the agent. So both are absent, and `disk_config` is
+/// where the same split is made for the VMM's config document.
+pub(crate) fn writable_files(spec: &InstanceSpec) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = spec
+        .volumes
+        .iter()
+        .filter_map(|v| match &v.attachment {
+            VolumeAttachment::Path(path) => Some(path.clone()),
+            VolumeAttachment::VhostUserBlk { .. } | VolumeAttachment::FsShare { .. } => None,
+        })
+        .collect();
+    if let Some(seed) = &spec.cloud_init_seed {
+        files.push(seed.clone());
+    }
+    files
+}
+
+impl CloudHypervisorDriver {
+    /// Hand this VM's writable files to the VMM user, libvirt's
+    /// `dynamic_ownership` in one call.
+    ///
+    /// Before `vm.create` and not after: the VMM opens its disks while it is
+    /// building the VM, and a disk it cannot open is a create that fails with
+    /// CH's own errno rather than with a sentence about ownership.
+    ///
+    /// An error here is fatal on purpose. The alternative — carry on and let
+    /// the VMM fail — turns one clear message into two unclear ones.
+    pub(crate) fn hand_over_files(&self, spec: &InstanceSpec) -> hypervisor::Result<()> {
+        let Some(user) = &self.vmm_user else {
+            return Ok(());
+        };
+        for path in writable_files(spec) {
+            user.take(&path).map_err(|e| {
+                HypervisorError::Backend(anyhow::anyhow!(
+                    "giving {} to {user} so the vmm can open it: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Take the files back, which is the other half of the same idea.
+    ///
+    /// The paths come off `vm.info` rather than off a record, and that is
+    /// what makes this work for a VMM this agent did not start: an adopted
+    /// VM has no spec here, and the VMM lists what it holds. Asked BEFORE the
+    /// shutdown, because a VMM that has exited answers nothing.
+    ///
+    /// Best effort, unlike the handover. A teardown that failed over a chown
+    /// would leave the VM in the records for ever; a volume left owned by the
+    /// VMM user is untidy and is corrected the next time it is attached.
+    pub(crate) async fn take_files_back(&self, id: &VmId) {
+        if self.vmm_user.is_none() {
+            return;
+        }
+        let Ok(bytes) = self.api(id, Method::GET, "vm.info", None).await else {
+            return;
+        };
+        let Ok(info) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return;
+        };
+        let disks = info
+            .get("config")
+            .and_then(|c| c.get("disks"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for path in disks
+            .iter()
+            .filter_map(|d| d.get("path").and_then(serde_json::Value::as_str))
+        {
+            if let Err(e) = agent_api::VmmUser::give_back(Path::new(path)) {
+                debug!(path, error = %e, "a volume could not be handed back");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

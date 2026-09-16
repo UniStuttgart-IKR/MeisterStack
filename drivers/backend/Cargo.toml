@@ -9,6 +9,7 @@ authors.workspace = true
 agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
 anyhow = { workspace = true }
 nix = { workspace = true }
+libc = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

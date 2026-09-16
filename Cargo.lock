@@ -1038,9 +1038,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "meister-common",
+ "nix 0.31.3",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "uuid",
@@ -1051,6 +1053,7 @@ name = "meister-backend"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "meister-agent-api",
  "nix 0.31.3",
  "tempfile",

@@ -82,6 +82,7 @@ fn a_receive_says_nothing_until_it_has_finished_or_failed() {
         .expect_err("failed");
     assert!(said.contains("migration-receive-failed"), "{said}");
 }
+use super::fd::writable_files;
 use super::*;
 use agent_api::NicAttachment;
 
@@ -866,4 +867,66 @@ async fn what_a_torn_down_vmm_said_outlives_the_teardown() {
         "both attempts are on disk: {:?}",
         d.kept_logs(&id)
     );
+}
+
+/// What changes hands when the VMM is somebody else, and what does not.
+///
+/// The disks and the seed do: the VMM opens them for writing and cannot be
+/// given the right to, so it is given the files. The kernel, the initramfs
+/// and the firmware do NOT, and that is the half worth pinning down — they
+/// live in the shared image directory, several VMs read the same bytes, and
+/// chowning one to the VMM user would change a file that is not this VM's.
+/// A vhost-user disk is a socket its backend owns, and a share is
+/// virtiofsd's, which stays the agent.
+#[test]
+fn only_the_files_this_vm_writes_change_hands() {
+    let mut s = spec(
+        vec![
+            VolumeAttachment::Path("/vol/a.raw".into()),
+            VolumeAttachment::VhostUserBlk {
+                socket: "/run/blk.sock".into(),
+                pid: 7,
+            },
+            VolumeAttachment::FsShare {
+                socket: "/run/fs.sock".into(),
+                tag: "share".into(),
+                pid: 8,
+            },
+        ],
+        vec![],
+    );
+    s.boot = BootSource::DirectKernel {
+        kernel: "/images/vmlinux".into(),
+        cmdline: "console=hvc0".into(),
+        initramfs: Some("/images/initrd".into()),
+    };
+    s.cloud_init_seed = Some("/run/seed.raw".into());
+
+    let files = writable_files(&s);
+    assert_eq!(
+        files,
+        vec![PathBuf::from("/vol/a.raw"), PathBuf::from("/run/seed.raw")]
+    );
+}
+
+/// A driver nobody gave a user to hands nothing over and asks nothing of
+/// anybody — which is the rule this whole lane is held to.
+#[test]
+fn without_a_vmm_user_nothing_changes_hands() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = CloudHypervisorDriver::new(
+        PathBuf::from("/nonexistent/cloud-hypervisor"),
+        dir.path().join("vms"),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    let mut s = spec(
+        vec![VolumeAttachment::Path("/nonexistent/a.raw".into())],
+        vec![],
+    );
+    s.nics = vec![nic(None)];
+    // A path that does not exist would be an error if it were touched.
+    ch.hand_over_files(&s).expect("nothing to do");
+    assert_eq!(ch.net_form(), NetForm::TapName);
 }

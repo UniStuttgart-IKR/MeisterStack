@@ -134,6 +134,22 @@ pub struct AgentConfig {
     /// is never subject to that rule.
     #[serde(default)]
     pub physical_host: Option<String>,
+    /// The system user the hypervisor and its vhost-user backends run as.
+    ///
+    /// Absent — the default, and the whole fleet today — means they run as the
+    /// agent, exactly as they always have. Set, it is Stufe 3 of
+    /// `design/privilege-separation.md`: the agent stays the privileged side
+    /// and prepares what needs rights (taps, cgroups, device nodes, file
+    /// ownership), and the processes that run guest code get descriptors
+    /// instead. `nvrm`, `input` and `crosvm-gpu` change with the VMM and not
+    /// after it, because vhost-user is not a boundary between them.
+    ///
+    /// The user has to exist before the agent starts; the deployment makes
+    /// it, and it must NOT be in the agent's `socket_group`.
+    ///
+    /// no-root-Lane: Start-Check prueft CAP_SETUID/SETGID dafuer.
+    #[serde(default)]
+    pub vmm_user: Option<String>,
 
     // --- the session credential. PEM paths, never PEM. -----------------------
     //

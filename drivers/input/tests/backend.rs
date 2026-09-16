@@ -79,6 +79,7 @@ impl Rig {
             binary: self.temp.path().join("vhost-user-input"),
             run_dir: self.temp.path().join("run").join("input"),
             socket_timeout: timeout,
+            vmm_user: None,
         })
         .expect("a driver over the stand-in")
     }

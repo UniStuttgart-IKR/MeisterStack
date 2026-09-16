@@ -95,6 +95,9 @@ pub struct CloudHypervisorDriver {
     /// therefore cannot do the last — see `NetForm` for the measurement
     /// behind that sentence.
     tap_fds: bool,
+    /// Who the VMM runs as, when that is not the agent. `None` is every node
+    /// that has ever run this.
+    vmm_user: Option<agent_api::VmmUser>,
 }
 
 impl CloudHypervisorDriver {
@@ -118,6 +121,7 @@ impl CloudHypervisorDriver {
             unplug_timeout,
             unplugging: Mutex::new(HashMap::new()),
             tap_fds: false,
+            vmm_user: None,
         })
     }
 
@@ -130,6 +134,19 @@ impl CloudHypervisorDriver {
     /// the agent has no use for it and would only pay its price.
     pub fn with_tap_fds(mut self, tap_fds: bool) -> Self {
         self.tap_fds = tap_fds;
+        self
+    }
+
+    /// Run this driver's VMMs as somebody else.
+    ///
+    /// A builder step beside `with_tap_fds`, and the two are turned on
+    /// together by the same config key — the descriptor form exists so that
+    /// this one is possible. Kept separate anyway, because they fail
+    /// separately: a node with no `CAP_SETUID` can hand over descriptors and
+    /// cannot change user, and the error for that has to name the right
+    /// thing.
+    pub fn with_vmm_user(mut self, user: Option<agent_api::VmmUser>) -> Self {
+        self.vmm_user = user;
         self
     }
 
@@ -299,6 +316,18 @@ impl HotPluggable for CloudHypervisorDriver {
                 volume.id
             ))
         })?;
+        // The same handover `create` does, for the same reason and in the
+        // same order: the VMM opens the file while it answers this call.
+        if let Some(user) = &self.vmm_user
+            && let VolumeAttachment::Path(path) = &volume.attachment
+        {
+            user.take(path).map_err(|e| {
+                HypervisorError::Backend(anyhow::anyhow!(
+                    "giving {} to {user} so the vmm can open it: {e}",
+                    path.display()
+                ))
+            })?;
+        }
         self.api(id, Method::PUT, "vm.add-disk", Some(config))
             .await
             .map(|_| ())
@@ -421,6 +450,15 @@ impl HotPluggable for CloudHypervisorDriver {
             UNPLUG_POLL,
         )
         .await?;
+        // After the fd table has said the VMM let go, and not before: a file
+        // handed back while the VMM still had it open would be a running
+        // guest whose disk it can no longer reopen after a reboot.
+        if self.vmm_user.is_some()
+            && let Some(path) = &path
+            && let Err(e) = agent_api::VmmUser::give_back(path)
+        {
+            debug!(path = %path.display(), error = %e, "the volume could not be handed back");
+        }
         self.unplugging.lock().unwrap().remove(&key);
         Ok(())
     }

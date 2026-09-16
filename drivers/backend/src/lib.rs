@@ -99,6 +99,15 @@ pub struct BackendKind {
     nofile_limit: Option<u64>,
     /// `/dev/null` on stdin, so a detached daemon cannot read the agent's.
     stdin_null: bool,
+    /// Who this backend runs as, when that is not the agent.
+    ///
+    /// Beside the VMM and not behind it, because vhost-user is not a
+    /// boundary: the backend maps the guest's memory and CH says so
+    /// ("Cloud Hypervisor gives vhost-user devices complete control over the
+    /// guest"). A root backend beside an unprivileged VMM leaves the guest
+    /// exactly one process away from root, which is what Stufe 3 is for.
+    /// `None` is every node that has ever run this.
+    vmm_user: Option<agent_api::VmmUser>,
 }
 
 impl BackendKind {
@@ -118,6 +127,7 @@ impl BackendKind {
             own_session: true,
             nofile_limit: Some(nofile_limit),
             stdin_null: true,
+            vmm_user: None,
         }
     }
 
@@ -135,7 +145,24 @@ impl BackendKind {
             own_session: false,
             nofile_limit: None,
             stdin_null: false,
+            vmm_user: None,
         }
+    }
+
+    /// Run this backend as somebody else.
+    ///
+    /// One builder for all four backends, which is the whole reason this
+    /// crate exists: `nvrm`, `input`, `crosvm-gpu` and `virtiofsd` had four
+    /// copies of the same spawn and now have one, so "the backends run as the
+    /// VMM user" is a single seam rather than four.
+    ///
+    /// Which of them actually gets one is the driver's decision and not this
+    /// crate's. `virtiofsd` is the exception in the tree today: it changes
+    /// file ownership inside the share on the guest's behalf, so it stays the
+    /// agent and is sandboxed differently (`--sandbox=namespace`).
+    pub fn as_user(mut self, user: Option<agent_api::VmmUser>) -> Self {
+        self.vmm_user = user;
+        self
     }
 
     /// Start `cmd` and do not come back until the backend is listening.
@@ -162,6 +189,19 @@ impl BackendKind {
         let _ = tokio::fs::remove_file(socket).await;
 
         let log_file = std::fs::File::create(log).map_err(|e| BackendError::Failed(e.into()))?;
+        // The directory the backend will bind its socket in, and its own log,
+        // change hands while the agent still can give them away. The log is
+        // handed over as well as passed as a descriptor, because a driver
+        // that quotes the tail of a dead backend's log comes back to the
+        // PATH — see `tail_log`.
+        if let Some(user) = &self.vmm_user {
+            if let Some(dir) = socket.parent() {
+                user.take(dir)
+                    .map_err(|e| BackendError::Failed(anyhow::anyhow!("{}: {e}", dir.display())))?;
+            }
+            user.take(log)
+                .map_err(|e| BackendError::Failed(anyhow::anyhow!("{}: {e}", log.display())))?;
+        }
         let log_dup = log_file
             .try_clone()
             .map_err(|e| BackendError::Failed(e.into()))?;
@@ -170,8 +210,18 @@ impl BackendKind {
             cmd.stdin(std::process::Stdio::null());
         }
 
+        // The backend's socket is what the VMM connects to, so it has to be
+        // openable by the VMM — which is the same user, so `0660` with the
+        // backend's own group is exactly right and world-readable is not. The
+        // socket is made by the BACKEND, so the umask is the only way to say
+        // it from here.
+        let umask = self.vmm_user.is_some();
+        if let Some(user) = &self.vmm_user {
+            cmd.uid(user.uid).gid(user.gid);
+        }
+
         let (own_session, nofile_limit) = (self.own_session, self.nofile_limit);
-        if own_session || nofile_limit.is_some() {
+        if own_session || nofile_limit.is_some() || umask {
             unsafe {
                 cmd.pre_exec(move || {
                     if own_session {
@@ -184,12 +234,20 @@ impl BackendKind {
                             limit,
                         );
                     }
+                    if umask {
+                        // async-signal-safe, and it touches nothing but the
+                        // child's own process state.
+                        libc::umask(0o007);
+                    }
                     Ok(())
                 });
             }
         }
 
-        let mut child = cmd.spawn().map_err(|e| BackendError::Failed(e.into()))?;
+        let mut child = cmd.spawn().map_err(|e| match &self.vmm_user {
+            Some(user) => BackendError::Died(format!("{} {}", self.label, user.cannot_switch(&e))),
+            None => BackendError::Failed(e.into()),
+        })?;
         let pid = child.id().ok_or_else(|| {
             BackendError::Died(format!("{} exited before pid could be read", self.label))
         })?;
