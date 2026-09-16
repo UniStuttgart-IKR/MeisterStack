@@ -32,8 +32,23 @@ use super::*;
 /// that reads `Utc::now()` is a rule that can only be exercised by waiting.
 pub(crate) fn silent(vm: &Vm, last_heartbeat: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     vm.spec.node_name.is_some()
-        && claims_a_guest(vm.status.phase().kind())
+        && (claims_a_guest(vm.status.phase().kind()) || unexplained_unknown(&vm.status))
         && heartbeat_expired(last_heartbeat, now)
+}
+
+/// An `Unknown` with nothing behind it: the word is on the object and no
+/// silence FACT says why.
+///
+/// A binary from before struktur 4 wrote the word directly, and the lab had
+/// fourteen of them the night the derivation shipped — every guest of
+/// manacor, `Unknown` since the tenth. `Unknown` is this watchdog's own
+/// verdict and nobody else's (no node ever reports it), so an unexplained one
+/// is its to explain: without this, such an object is never written again,
+/// `settle` never runs on it, and the stuck deadline that D-C1 was about
+/// never sees it. Once the fact is on it the watchdog is done with it, which
+/// is what keeps the level-triggered pass from writing every tick.
+fn unexplained_unknown(status: &controller_api::VmStatus) -> bool {
+    status.phase().kind() == VmPhaseKind::Unknown && status.silence.is_none()
 }
 
 /// The phases that are a statement about a guest that is supposed to exist
@@ -51,8 +66,8 @@ fn claims_a_guest(phase: VmPhaseKind) -> bool {
 /// forces: the node had been down for twenty hours before this code existed,
 /// so `ready` was already false and there was no transition left to fire on.
 /// Every pass asks the same question of every node, and the write only
-/// happens where the phase is not already `Unknown` — so the event fires once
-/// and the store sees nothing after that.
+/// happens where the phase still claims a guest or is an `Unknown` nobody has
+/// explained — so the event fires once and the store sees nothing after that.
 ///
 /// Every replica's business, exactly as the heartbeat expiry beside it is:
 /// the verdict is idempotent under CAS, and a VM whose node talks to nobody
@@ -84,7 +99,7 @@ pub(super) async fn expire_vm_reports(
                 // The FACT, and `settle` makes `Unknown { Silent }` out of it
                 // — including the sentence, so that both tiers word a silence
                 // the same way. See `VmSilence`.
-                if claims_a_guest(v.status.phase().kind()) {
+                if claims_a_guest(v.status.phase().kind()) || unexplained_unknown(&v.status) {
                     v.status.silence = Some(controller_api::VmSilence {
                         holder: format!("node {node}"),
                         last_heard: last_heartbeat,

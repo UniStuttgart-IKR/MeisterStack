@@ -622,19 +622,82 @@ fn the_watchdog_only_takes_back_a_claim_about_a_guest() {
         VmPhaseKind::Stopped,
         VmPhaseKind::Failed,
         VmPhaseKind::Quarantined,
-        VmPhaseKind::Unknown,
     ] {
         assert!(
             !silent(&on_agent_1a(phase), Some(at(0)), at(timeout)),
             "{phase:?} is not a claim a silence can make untrue"
         );
     }
+    // An `Unknown` the watchdog itself explained is done with: the fact is on
+    // it, and writing it again every tick would be the churn D-C7 was about.
+    // (An `Unknown` WITHOUT the fact is the legacy case below, and that one
+    // it does take.)
+    let mut explained = on_agent_1a(VmPhaseKind::Running);
+    explained.status.silence = Some(controller_api::VmSilence {
+        holder: "node agent-1a".to_string(),
+        last_heard: Some(at(0)),
+        since: at(timeout),
+    });
+    explained.settle(at(timeout));
+    assert_eq!(explained.status.phase().kind(), VmPhaseKind::Unknown);
+    assert!(!silent(&explained, Some(at(0)), at(timeout)));
 
     // And a VM that is not on a node at all: there is no machine whose
     // silence could mean anything about it.
     let mut unbound = bound_to(None);
     reported_as(&mut unbound, "agent-1a", VmPhaseKind::Running);
     assert!(!silent(&unbound, Some(at(0)), at(timeout)));
+}
+
+/// D-C1, the half the derivation alone did not close: an `Unknown` written
+/// by a binary from before struktur 4.
+///
+/// Such an object has the word and nothing behind it — no reason, no fact,
+/// and a `since` that is only the moment somebody read it. The watchdog used
+/// to walk past it, because `Unknown` does not claim a guest; so nothing ever
+/// wrote it again, `settle` never ran on it, and the stuck deadline never saw
+/// the one object it was made for. The lab had fourteen of these the night
+/// this shipped, every one of them manacor's.
+#[test]
+fn an_unknown_nobody_explained_is_the_watchdogs_to_explain() {
+    let timeout = controller_api::HEARTBEAT_TIMEOUT_SECS + 1;
+    // The object exactly as the older binary left it in the store: the word,
+    // the sentence, the node — and none of the fields that exist now.
+    let mut legacy = serde_json::to_value(bound_to(Some("manacor"))).expect("a vm serialises");
+    legacy["status"] = serde_json::json!({
+        "phase": "Unknown",
+        "message": "node manacor last reported 2026-09-10T20:57:16Z",
+        "nodeName": "manacor",
+    });
+    let legacy: Vm = serde_json::from_value(legacy).expect("an older object still reads");
+    assert_eq!(legacy.status.phase().kind(), VmPhaseKind::Unknown);
+    assert_eq!(
+        legacy.status.phase().reason(),
+        Some(controller_api::VmReason::Unrecorded)
+    );
+    assert!(legacy.status.silence.is_none());
+
+    // Unexplained, so the watchdog takes it — and the node in question has
+    // never written a lease, which is the manacor case exactly.
+    assert!(silent(&legacy, None, at(timeout)));
+
+    // Through the fact it becomes an explained `Unknown { Silent }` with the
+    // sentence that names the machine, and from then on the watchdog leaves
+    // it alone.
+    let said = spoke_last(&legacy, "manacor", None);
+    assert!(said.contains("manacor"), "{said}");
+    let mut explained = legacy.clone();
+    explained.status.silence = Some(controller_api::VmSilence {
+        holder: "node manacor".to_string(),
+        last_heard: None,
+        since: at(timeout),
+    });
+    explained.settle(at(timeout));
+    assert_eq!(
+        explained.status.phase().reason(),
+        Some(controller_api::VmReason::Silent)
+    );
+    assert!(!silent(&explained, None, at(timeout)));
 }
 
 /// `Unknown` is not `Failed`, and this is the difference that costs
