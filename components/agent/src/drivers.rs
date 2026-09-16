@@ -713,7 +713,39 @@ impl Drivers {
             );
         }
 
-        let confiner = Arc::new(cgroup_driver::CgroupV2::new(cfg.paths.cgroup_root.clone()));
+        // The confiner, and the one thing it has to do to ITSELF before it can
+        // confine anything else.
+        //
+        // systemd's rule "no processes in inner nodes": while this process
+        // sits in `cgroup_root`, a write of `+cpu +memory` to that directory's
+        // own `cgroup.subtree_control` is EBUSY, and a VM slice under it gets
+        // no `memory.max` file to write at all. That is only true when
+        // `cgroup_root` IS this agent's cgroup — an unprivileged agent under
+        // `Delegate=` — and then the move is what makes the delegation usable.
+        // An agent as root with `cgroup_root = /sys/fs/cgroup/meisterstack`
+        // lives elsewhere and does nothing here. `DelegateSubgroup=supervisor`
+        // (systemd 254+) arrives already moved, and this is a no-op for it.
+        //
+        // A warning and not a refusal: the same node still starts, still runs
+        // guests, and says on every heartbeat that it cannot limit them
+        // (`check_cgroup_root`). Refusing here would turn a lost limit into an
+        // outage, which is the argument `CgroupUnusable` already makes.
+        let mut cgroups = cgroup_driver::CgroupV2::new(cfg.paths.cgroup_root.clone());
+        match cgroups.join_supervisor_subgroup() {
+            Ok(Some(supervisor)) => tracing::info!(
+                supervisor = %supervisor.display(),
+                "this agent hung itself below its delegated cgroup root, so the root can hand \
+                 cpu and memory to vm slices"
+            ),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                cgroup_root = %cfg.paths.cgroup_root.display(),
+                error = %format!("{e:#}"),
+                "could not move this process into <cgroup_root>/supervisor; vm slices under a \
+                 root that still holds this process cannot be given limits"
+            ),
+        }
+        let confiner = Arc::new(cgroups);
 
         // All four slots come out of tables now, and the two that used to be
         // hard-wired are the reason: a node used to be assumed to run VMs and

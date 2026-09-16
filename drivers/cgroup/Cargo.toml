@@ -9,3 +9,6 @@ authors.workspace = true
 agent-api = { package = "meister-agent-api", path = "../../shared/agent-api/" }
 libc = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
