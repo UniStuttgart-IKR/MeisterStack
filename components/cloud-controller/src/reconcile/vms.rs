@@ -253,12 +253,9 @@ async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
     let mut bound = vm;
     bound.spec.cluster_name = Some(pick.clone());
     // The binding answers whatever a previous pass wrote about why there was
-    // none.
-    // Both of them lived inside the phase since struktur 4, so one write
-    // answers what a previous pass said and why it said it.
-    let kind = bound.status.phase().kind();
-    #[allow(deprecated)]
-    bound.status.assign(VmPhase::of(kind, Utc::now()));
+    // none: clearing the FACT is all there is to do, because `settle_vm`
+    // reads it only while the VM is waiting.
+    bound.status.placement = None;
     match store.update(&bound).await {
         Ok(_) => {
             telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLOUD);
@@ -779,11 +776,13 @@ pub(super) async fn dispatch_create(
                     // is a guess about the future; only a VM nobody has
                     // reported on yet may be moved by one.
                     if v.status.phase().kind() == VmPhaseKind::Pending {
-                        #[allow(deprecated)]
-                        v.status.assign(VmPhase::new(
+                        // This tier's own guess, so it names nobody — which
+                        // is also what stops a dispatch from ever reading as
+                        // a guest that is up.
+                        v.status.reported = Some(controller_api::VmReported::here(
                             VmPhaseKind::Provisioning,
                             controller_api::VmReason::Dispatched,
-                            None,
+                            Some(format!("{cluster} was told")),
                             Utc::now(),
                         ));
                     }
@@ -797,8 +796,7 @@ pub(super) async fn dispatch_create(
             warn!(cluster, error = %msg, "cluster refused the create");
             store
                 .mutate::<Vm, _>(&name, |v| {
-                    #[allow(deprecated)]
-                    v.status.assign(VmPhase::new(
+                    v.status.reported = Some(controller_api::VmReported::here(
                         VmPhaseKind::Failed,
                         controller_api::VmReason::Refused,
                         Some(msg.clone()),

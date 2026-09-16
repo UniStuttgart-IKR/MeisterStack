@@ -29,11 +29,7 @@ fn volume_vm(volumes: &[&str]) -> Vm {
             vm: serde_json::json!({ "volumes": entries }),
         },
     );
-    #[allow(deprecated)]
-    vm.status.assign(controller_api::VmPhase::of(
-        VmPhaseKind::Running,
-        Utc::now(),
-    ));
+    reported_as(&mut vm, "agent-1", VmPhaseKind::Running);
     vm
 }
 
@@ -520,10 +516,26 @@ fn a_drain_does_not_count_what_it_did_not_move() {
 /// A VM bound to `agent-1a` in the phase given.
 fn on_agent_1a(phase: VmPhaseKind) -> Vm {
     let mut vm = bound_to(Some("agent-1a"));
-    #[allow(deprecated)]
-    vm.status
-        .assign(controller_api::VmPhase::of(phase, Utc::now()));
+    reported_as(&mut vm, "agent-1a", phase);
     vm
+}
+
+/// A VM whose node has said it is in this phase, through the derivation.
+///
+/// There is no other way in since struktur 4, and that is the whole point of
+/// the round: what a test used to set with one assignment it now has to state
+/// as a FACT — a machine said this — and let `settle_vm` say the word. A
+/// resting phase is refused unless a machine is named, so the node goes in
+/// the word (see `VmReported`).
+fn reported_as(vm: &mut Vm, node: &str, phase: VmPhaseKind) {
+    vm.status.reported = Some(controller_api::VmReported::by(
+        node,
+        phase,
+        controller_api::VmReason::Unrecorded,
+        None,
+        Utc::now(),
+    ));
+    vm.settle(Utc::now());
 }
 
 /// D10: a VM on a node nobody has heard from stops claiming to be Running.
@@ -539,12 +551,15 @@ fn a_vm_on_a_silent_node_stops_claiming_to_be_running() {
     let vm = on_agent_1a(VmPhaseKind::Running);
 
     // Inside the watchdog: the node is quiet but not yet late.
-    assert!(unheard_of(&vm, Some(at(0)), at(timeout)).is_none());
+    assert!(!silent(&vm, Some(at(0)), at(timeout)));
 
     // One second past it, and the phase is no longer a claim anybody can
     // make. The sentence names the node and when it was last heard, because
-    // that is what sends an operator to the right machine.
-    let said = unheard_of(&vm, Some(at(0)), at(timeout + 1)).expect("past the watchdog");
+    // that is what sends an operator to the right machine — and it is written
+    // by the derivation now, out of the fact the pass records, so both tiers
+    // word a silence alike (see `VmSilence`).
+    assert!(silent(&vm, Some(at(0)), at(timeout + 1)));
+    let said = spoke_last(&vm, "agent-1a", Some(at(0)));
     assert!(said.contains("agent-1a"), "{said}");
     assert!(said.contains(&at(0).to_rfc3339()), "{said}");
     assert!(said.contains("not known here"), "{said}");
@@ -552,11 +567,34 @@ fn a_vm_on_a_silent_node_stops_claiming_to_be_running() {
     // A node that has never reported at all — every node after a controller
     // restart, and the one the object exists for because somebody said Hello
     // once.
+    assert!(silent(&vm, None, at(0)));
     assert!(
-        unheard_of(&vm, None, at(0))
-            .expect("never reported")
-            .contains("has never reported")
+        spoke_last(&vm, "agent-1a", None).contains("has never reported"),
+        "{}",
+        spoke_last(&vm, "agent-1a", None)
     );
+}
+
+/// The sentence a recorded silence becomes, through the derivation.
+fn spoke_last(vm: &Vm, node: &str, last_heard: Option<DateTime<Utc>>) -> String {
+    let mut silent = vm.clone();
+    silent.status.silence = Some(controller_api::VmSilence {
+        holder: format!("node {node}"),
+        last_heard,
+        since: Utc::now(),
+    });
+    silent.settle(Utc::now());
+    assert_eq!(silent.status.phase().kind(), VmPhaseKind::Unknown);
+    assert_eq!(
+        silent.status.phase().reason(),
+        Some(controller_api::VmReason::Silent)
+    );
+    silent
+        .status
+        .phase()
+        .message()
+        .expect("a silence says which machine")
+        .to_string()
 }
 
 /// Which phases the silence can make untrue, and which it may not touch.
@@ -575,7 +613,7 @@ fn the_watchdog_only_takes_back_a_claim_about_a_guest() {
         VmPhaseKind::Provisioning,
     ] {
         assert!(
-            unheard_of(&on_agent_1a(phase), Some(at(0)), at(timeout)).is_some(),
+            silent(&on_agent_1a(phase), Some(at(0)), at(timeout)),
             "{phase:?} claims a guest and has to be given up"
         );
     }
@@ -587,7 +625,7 @@ fn the_watchdog_only_takes_back_a_claim_about_a_guest() {
         VmPhaseKind::Unknown,
     ] {
         assert!(
-            unheard_of(&on_agent_1a(phase), Some(at(0)), at(timeout)).is_none(),
+            !silent(&on_agent_1a(phase), Some(at(0)), at(timeout)),
             "{phase:?} is not a claim a silence can make untrue"
         );
     }
@@ -595,12 +633,8 @@ fn the_watchdog_only_takes_back_a_claim_about_a_guest() {
     // And a VM that is not on a node at all: there is no machine whose
     // silence could mean anything about it.
     let mut unbound = bound_to(None);
-    #[allow(deprecated)]
-    unbound.status.assign(controller_api::VmPhase::of(
-        VmPhaseKind::Running,
-        Utc::now(),
-    ));
-    assert!(unheard_of(&unbound, Some(at(0)), at(timeout)).is_none());
+    reported_as(&mut unbound, "agent-1a", VmPhaseKind::Running);
+    assert!(!silent(&unbound, Some(at(0)), at(timeout)));
 }
 
 /// `Unknown` is not `Failed`, and this is the difference that costs
@@ -875,9 +909,7 @@ fn the_requeue_timeline() {
     use controller_api::requeue::{CrashLoopBackoff, NoRequeue};
     let failed = |last: Option<chrono::DateTime<Utc>>, attempts: u32| {
         let mut vm = bound_to(Some("node-a"));
-        #[allow(deprecated)]
-        vm.status
-            .assign(controller_api::VmPhase::of(VmPhaseKind::Failed, Utc::now()));
+        reported_as(&mut vm, "node-a", VmPhaseKind::Failed);
         vm.status.last_requeue = last;
         vm.status.requeue_attempts = attempts;
         vm
@@ -989,9 +1021,13 @@ fn joint_cells() -> Vec<(String, Vm, DateTime<Utc>, usize)> {
                     for (elapsed, attempts) in requeue_inputs() {
                         let mut vm = bound_to(node);
                         vm.spec.run_strategy = strategy;
-                        #[allow(deprecated)]
-                        vm.status
-                            .assign(controller_api::VmPhase::of(phase, Utc::now()));
+                        // A word from the machine the VM is bound to, or from
+                        // one that used to hold it when there is no binding.
+                        // The derivation then says what the VM IS — and for
+                        // an unbound VM that is `Pending` whatever the word
+                        // was, which is the rule `expected_requeue` reads
+                        // back off the object rather than out of this loop.
+                        reported_as(&mut vm, node.unwrap_or("node-a"), phase);
                         vm.status.requeue_attempts = attempts;
                         vm.status.last_requeue = elapsed.map(|e| at(-e));
                         let label = format!(
@@ -1496,9 +1532,7 @@ fn a_report_from_before_the_last_command_changes_nothing() {
 fn the_drift_is_what_the_node_has_against_what_the_spec_asks_for() {
     let vm = |wanted: &[&str], held: &[(&str, bool)], phase: VmPhaseKind| {
         let mut v = volume_vm(wanted);
-        #[allow(deprecated)]
-        v.status
-            .assign(controller_api::VmPhase::of(phase, Utc::now()));
+        reported_as(&mut v, "agent-1", phase);
         v.status.volumes = held
             .iter()
             .map(|(name, attached)| controller_api::VolumeAttachmentStatus {

@@ -99,7 +99,13 @@ macro_rules! resources {
 }
 
 resources! {
-    Vm => "vms", "Vm";
+    Vm => "vms", "Vm" {
+        /// What the facts on this VM add up to. See [`settle_vm`].
+        fn settle(&mut self, now: DateTime<Utc>) {
+            let phase = settle_vm(&self.spec, &self.status);
+            self.status.stamp(phase, now);
+        }
+    };
     Node => "nodes", "Node";
     Cluster => "clusters", "Cluster";
     /// Named after the FILE a node looks it up as, extension and all — so a

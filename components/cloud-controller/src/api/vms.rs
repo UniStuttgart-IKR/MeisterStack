@@ -608,15 +608,15 @@ pub(super) async fn create_vm_traced(
                         format!("{e:#}"),
                     )
                 })?;
-        // On the phase the VM already has, because a preview is not a phase
-        // change: it is a sentence about a VM that has not been created.
-        let phase = vm.status.phase().kind();
-        #[allow(deprecated)]
-        vm.status.assign(controller_api::VmPhase::said(
-            phase,
-            Some(said),
-            chrono::Utc::now(),
-        ));
+        // As the scheduler's own fact, exactly as one tier down: a preview is
+        // a sentence about a VM that has not been created, and this object is
+        // never stored.
+        vm.status.placement = Some(controller_api::VmPlacement {
+            reason: controller_api::VmReason::Unplaced,
+            message: said,
+            at: chrono::Utc::now(),
+        });
+        vm.settle(chrono::Utc::now());
     }
     let created = match dry.preview(&vm) {
         Some(preview) => preview,
@@ -2005,12 +2005,28 @@ mod tests {
                 vm: json!({ "vcpus": 1 }),
             },
         );
-        #[allow(deprecated)]
-        vm.status.assign(controller_api::VmPhase::of(
-            controller_api::VmPhaseKind::Stopped,
+        said_to_be(&mut vm, controller_api::VmPhaseKind::Stopped);
+        vm
+    }
+
+    /// A VM whose cluster has said it is in this phase, through the
+    /// derivation — the only way in since struktur 4, and a resting word is
+    /// refused unless a holder is named (see `VmReported`).
+    fn said_to_be(vm: &mut Vm, phase: controller_api::VmPhaseKind) {
+        let holder = vm
+            .status
+            .cluster_name
+            .clone()
+            .or_else(|| vm.spec.cluster_name.clone())
+            .unwrap_or_else(|| "a-cluster".to_string());
+        vm.status.reported = Some(controller_api::VmReported::by(
+            &holder,
+            phase,
+            controller_api::VmReason::Unrecorded,
+            None,
             chrono::Utc::now(),
         ));
-        vm
+        vm.settle(chrono::Utc::now());
     }
 
     fn disk(locality: Option<controller_api::Locality>, serving: usize) -> DiskFacts {
@@ -2035,11 +2051,7 @@ mod tests {
         let at = |secs: i64| chrono::DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap();
         let now = at(1_000);
         let mut vm = stopped_vm();
-        #[allow(deprecated)]
-        vm.status.assign(controller_api::VmPhase::of(
-            controller_api::VmPhaseKind::Unknown,
-            now,
-        ));
+        said_to_be(&mut vm, controller_api::VmPhaseKind::Unknown);
 
         // Silent: 409, because nothing about the request is malformed — the
         // state of the world refuses it, and that state ends by itself.
@@ -2062,11 +2074,7 @@ mod tests {
 
         // `Failed` is the cluster's own word that the guest is not running.
         let mut failed = vm.clone();
-        #[allow(deprecated)]
-        failed.status.assign(controller_api::VmPhase::of(
-            controller_api::VmPhaseKind::Failed,
-            now,
-        ));
+        said_to_be(&mut failed, controller_api::VmPhaseKind::Failed);
         holder_refusal(&failed, "cluster-1", None, now).expect("Failed is evidence");
 
         // And what the object is left carrying when the release does land.
@@ -2112,9 +2120,7 @@ mod tests {
         ] {
             let mut vm = stopped_vm();
             vm.spec.run_strategy = strategy;
-            #[allow(deprecated)]
-            vm.status
-                .assign(controller_api::VmPhase::of(phase, chrono::Utc::now()));
+            said_to_be(&mut vm, phase);
             let why = reschedule_refusal(&vm, &[]).expect("a moving vm does not move");
             assert!(why.contains(phase.as_str()), "and names the phase: {why}");
         }
@@ -2134,9 +2140,7 @@ mod tests {
             controller_api::VmPhaseKind::Unknown,
         ] {
             let mut vm = stopped_vm();
-            #[allow(deprecated)]
-            vm.status
-                .assign(controller_api::VmPhase::of(phase, chrono::Utc::now()));
+            said_to_be(&mut vm, phase);
             assert_eq!(
                 reschedule_refusal(&vm, &[]),
                 None,

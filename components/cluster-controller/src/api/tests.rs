@@ -34,11 +34,7 @@ fn an_inline_disk_is_named_as_the_reason_a_vm_cannot_move_live() {
                 vm: json!({ "volumes": volumes }),
             },
         );
-        #[allow(deprecated)]
-        vm.status.assign(controller_api::VmPhase::of(
-            controller_api::VmPhaseKind::Running,
-            Utc::now(),
-        ));
+        said_to_be(&mut vm, controller_api::VmPhaseKind::Running);
         vm
     };
     let somewhere_to_go = MigrationFacts {
@@ -113,12 +109,8 @@ fn running_vm(name: &str) -> Vm {
             vm: serde_json::json!({ "vcpus": 1 }),
         },
     );
-    #[allow(deprecated)]
-    vm.status.assign(controller_api::VmPhase::of(
-        controller_api::VmPhaseKind::Running,
-        Utc::now(),
-    ));
     vm.status.node_name = Some("agent-1".into());
+    said_to_be(&mut vm, controller_api::VmPhaseKind::Running);
     vm
 }
 
@@ -183,9 +175,7 @@ fn a_live_migration_is_refused_with_a_sentence_that_names_the_way_out() {
         controller_api::VmPhaseKind::Pending,
     ] {
         let mut vm = running_vm("web-1");
-        #[allow(deprecated)]
-        vm.status
-            .assign(controller_api::VmPhase::of(phase, Utc::now()));
+        said_to_be(&mut vm, phase);
         let why = migration_refusal(&vm, &somewhere_to_go(), None).expect("not running");
         assert!(why.contains(phase.as_str()), "{why}");
         assert!(why.contains("vm reschedule"), "and the way out: {why}");
@@ -868,11 +858,7 @@ fn an_unknown_binding_is_only_let_go_while_its_node_reports() {
             vm: json!({}),
         },
     );
-    #[allow(deprecated)]
-    vm.status.assign(controller_api::VmPhase::of(
-        controller_api::VmPhaseKind::Unknown,
-        Utc::now(),
-    ));
+    said_to_be(&mut vm, controller_api::VmPhaseKind::Unknown);
 
     // Silent: 409, because nothing about the request is malformed — the state
     // of the world refuses it, and that state ends by itself.
@@ -895,11 +881,7 @@ fn an_unknown_binding_is_only_let_go_while_its_node_reports() {
     // `Failed` is the node's own word that the guest is not running, so it is
     // untouched even when the node has since gone quiet.
     let mut failed = vm.clone();
-    #[allow(deprecated)]
-    failed.status.assign(controller_api::VmPhase::of(
-        controller_api::VmPhaseKind::Failed,
-        Utc::now(),
-    ));
+    said_to_be(&mut failed, controller_api::VmPhaseKind::Failed);
     holder_refusal(&failed, "agent-1a", None, now).expect("Failed is evidence");
 
     // And what the object is left carrying when the release does land.
@@ -934,9 +916,7 @@ fn bound_vm(strategy: controller_api::RunStrategy, phase: controller_api::VmPhas
             vm: json!({}),
         },
     );
-    #[allow(deprecated)]
-    v.status
-        .assign(controller_api::VmPhase::of(phase, Utc::now()));
+    said_to_be(&mut v, phase);
     v
 }
 
@@ -1065,11 +1045,33 @@ fn a_migration_into_a_machine_that_cannot_hold_the_state_is_refused_at_the_edge(
     // whose disk is node-local, is refused for THAT — the machine comparison
     // never gets a chance to answer a question nobody asked.
     let mut stopped = vm.clone();
-    #[allow(deprecated)]
-    stopped.status.assign(controller_api::VmPhase::of(
-        controller_api::VmPhaseKind::Stopped,
-        Utc::now(),
-    ));
+    said_to_be(&mut stopped, controller_api::VmPhaseKind::Stopped);
     let why = migration_refusal(&stopped, &machines(other), None).expect("not running");
     assert!(why.contains("only a running vm"), "{why}");
+}
+
+/// A VM whose holder has said it is in this phase, through the derivation.
+///
+/// The only way in since struktur 4, and that is the point of the round: what
+/// a test used to set with one assignment it states as a FACT — a machine
+/// said this — and lets `settle_vm` say the word. A resting phase is refused
+/// unless a machine is named (see `VmReported`), so the word carries the
+/// holder the object already names.
+fn said_to_be(vm: &mut Vm, phase: controller_api::VmPhaseKind) {
+    let holder = vm
+        .status
+        .node_name
+        .clone()
+        .or_else(|| vm.spec.node_name.clone())
+        .or_else(|| vm.status.cluster_name.clone())
+        .or_else(|| vm.spec.cluster_name.clone())
+        .unwrap_or_else(|| "a-holder".to_string());
+    vm.status.reported = Some(controller_api::VmReported::by(
+        &holder,
+        phase,
+        controller_api::VmReason::Unrecorded,
+        None,
+        chrono::Utc::now(),
+    ));
+    vm.settle(chrono::Utc::now());
 }

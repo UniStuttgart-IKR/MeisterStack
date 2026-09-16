@@ -554,8 +554,15 @@ macro_rules! reasons {
 /// The one read path and the one write path for a stored phase.
 ///
 /// Seven status structs, the same two methods, so they are generated here
-/// beside the phase they hand out rather than seven times over. `assign` is
-/// the interesting one: see its doc for the rule about `since`.
+/// beside the phase they hand out rather than seven times over.
+///
+/// `assign` used to be the third, and its deletion is the proof the round
+/// asked for: it was `#[deprecated]` from the day it was written, every one
+/// of the eighty places that stamped a phase out of what its own code path
+/// happened to know carried an `#[allow(deprecated)]`, and the compiler kept
+/// that list honest. There are none left, and nothing outside this module can
+/// put a word on an object any more — `stamp` is `pub(super)` and only the
+/// `Resource::settle` implementations beside the resource table call it.
 macro_rules! phased {
     ($( $status:ident / $phase:ident; )*) => { $(
         impl $status {
@@ -563,37 +570,6 @@ macro_rules! phased {
             /// the sentence that go with it.
             pub fn phase(&self) -> &$phase {
                 &self.phase
-            }
-
-            /// Put a phase on this object — the ONE way the field moves.
-            ///
-            /// It exists to own a rule that every one of the sixty-odd
-            /// assignments it replaced got wrong in the same way: **`since`
-            /// belongs to the WORD, not to the write.** A status report
-            /// arrives every ten seconds and says the same thing it said
-            /// last time; a stamp taken at each of those would make
-            /// "Running since" mean "last heard from", and the object's own
-            /// churn guard would see a change where there was none. So the
-            /// stored instant survives a write that does not change the
-            /// kind.
-            ///
-            /// The exception is an object nobody has stamped at all
-            /// ([`UNSTAMPED`]): its first assignment IS the first stamp,
-            /// even when the word it lands on is the word it was born with.
-            ///
-            /// Deprecated from the day it was written, and that is the point.
-            /// A phase is going to be DERIVED — `settle(now)` out of the spec
-            /// and the facts in the status, at one place per resource — and
-            /// until that exists every writer that still stamps a phase out
-            /// of what its own code path happens to know carries
-            /// `#[allow(deprecated)]`. So the list of them is a `grep`, the
-            /// compiler keeps it honest, and the proof the round is finished
-            /// is that this function can be deleted and everything still
-            /// compiles.
-            #[deprecated(note = "struktur 4: wird durch settle() ersetzt")]
-            pub fn assign(&mut self, phase: $phase) {
-                let at = phase.since();
-                self.stamp(phase, at);
             }
 
             /// The derived phase, onto the object, with the stamp rule

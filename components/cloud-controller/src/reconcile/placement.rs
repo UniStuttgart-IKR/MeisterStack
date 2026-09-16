@@ -148,17 +148,15 @@ pub(super) async fn note_pending(
     }
     store
         .mutate::<Vm, _>(&vm.metadata.name, |v| {
-            // The sentence and the category, both inside the phase now, and
-            // the phase itself is whatever it already was: this pass says why
-            // a VM is not placed, it does not decide what the VM is doing.
-            let kind = v.status.phase().kind();
-            #[allow(deprecated)]
-            v.status.assign(controller_api::VmPhase::new(
-                kind,
-                category.category(),
-                Some(reason.clone()),
-                chrono::Utc::now(),
-            ));
+            // Its own fact, exactly as one tier down: this pass says why a VM
+            // is WAITING and does not decide what the VM is doing. See
+            // `settle_vm`, which reads it only where a wait is what the VM is
+            // in.
+            v.status.placement = Some(controller_api::VmPlacement {
+                reason: category.category(),
+                message: reason.clone(),
+                at: chrono::Utc::now(),
+            });
         })
         .await?;
     events::record(

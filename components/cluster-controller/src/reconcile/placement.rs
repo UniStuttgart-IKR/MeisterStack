@@ -542,14 +542,11 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     // placed. One write, one winner, and the loser is told.
     let mut bound = vm;
     bound.spec.node_name = Some(node.clone());
-    // The reason a previous pass may have written is answered by the binding
+    // What the scheduler said about the last pass is answered by the binding
     // itself; leaving it would make a placed VM carry the sentence that said
-    // it could not be placed — and the category with it.
-    // Both of them live inside the phase since struktur 4, so one write
-    // answers the sentence and the category together.
-    let kind = bound.status.phase().kind();
-    #[allow(deprecated)]
-    bound.status.assign(VmPhase::of(kind, Utc::now()));
+    // it could not be placed — and the category with it. Clearing the FACT is
+    // all there is to do: `settle_vm` reads it only while the VM is waiting.
+    bound.status.placement = None;
     match p.store.update(&bound).await {
         Ok(_) => {
             telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLUSTER);
@@ -681,17 +678,16 @@ pub(super) async fn note_vm_pending(
     }
     p.store
         .mutate::<Vm, _>(&vm.metadata.name, |v| {
-            // The sentence and the category, both inside the phase, and the
-            // phase itself left alone: this pass says why a VM is not placed,
-            // it does not decide what the VM is doing.
-            let kind = v.status.phase().kind();
-            #[allow(deprecated)]
-            v.status.assign(VmPhase::new(
-                kind,
-                category.category(),
-                Some(reason.clone()),
-                Utc::now(),
-            ));
+            // Its own fact, and that is what keeps the old sentence true:
+            // this pass says why a VM is WAITING, it does not decide what the
+            // VM is doing. `settle_vm` reads it only where a wait is what the
+            // VM is in — a running guest whose newly added disk is not ready
+            // is still running.
+            v.status.placement = Some(controller_api::VmPlacement {
+                reason: category.category(),
+                message: reason.clone(),
+                at: Utc::now(),
+            });
         })
         .await?;
     events::record(

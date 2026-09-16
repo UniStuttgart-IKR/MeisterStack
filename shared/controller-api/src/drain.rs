@@ -170,7 +170,8 @@ pub fn sentence(reason: StayReason, vm: &str, facts: &DrainFacts) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Evacuating, VmPhase, VmSpec, resources::new_vm};
+    use crate::object::Resource as _;
+    use crate::{Evacuating, VmSpec, resources::new_vm};
     use chrono::Utc;
 
     fn vm(strategy: RunStrategy, phase: VmPhaseKind, evacuation: Evacuation) -> Vm {
@@ -189,8 +190,17 @@ mod tests {
                 vm: serde_json::json!({ "vcpus": 1 }),
             },
         );
-        #[allow(deprecated)]
-        v.status.assign(VmPhase::of(phase, Utc::now()));
+        // Through the derivation, which is the only way in: the node the
+        // spec names is what said it, because a resting word with no machine
+        // behind it is refused (see `VmReported`).
+        v.status.reported = Some(crate::VmReported::by(
+            "agent-1",
+            phase,
+            crate::VmReason::Unrecorded,
+            None,
+            Utc::now(),
+        ));
+        v.settle(Utc::now());
         v
     }
 

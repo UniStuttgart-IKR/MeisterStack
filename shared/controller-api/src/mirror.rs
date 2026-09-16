@@ -174,7 +174,7 @@ pub fn observe<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resources::{VmPhase, VmSpec, new_vm};
+    use crate::resources::{VmSpec, new_vm};
 
     fn vm(name: &str, uid: &str, node: Option<&str>) -> Vm {
         let mut vm = new_vm(
@@ -193,6 +193,20 @@ mod tests {
             },
         );
         vm.metadata.uid = uid.to_string();
+        vm
+    }
+
+    /// A VM its node has already said something about, through the
+    /// derivation — the only way in since struktur 4.
+    fn said_to_be(mut vm: Vm, phase: VmPhaseKind, reason: VmReason, message: Option<String>) -> Vm {
+        vm.status.reported = Some(crate::VmReported::by(
+            "manacor",
+            phase,
+            reason,
+            message,
+            chrono::Utc::now(),
+        ));
+        crate::object::Resource::settle(&mut vm, chrono::Utc::now());
         vm
     }
 
@@ -270,12 +284,12 @@ mod tests {
     /// stayed while its reason changed is news.
     #[test]
     fn a_report_that_says_what_is_already_stored_yields_nothing() {
-        let mut stored = vm("web-1", "uid-a", Some("manacor"));
-        #[allow(deprecated)]
-        stored
-            .status
-            .assign(VmPhase::of(VmPhaseKind::Running, chrono::Utc::now()));
-        let known = [stored];
+        let known = [said_to_be(
+            vm("web-1", "uid-a", Some("manacor")),
+            VmPhaseKind::Running,
+            VmReason::Unrecorded,
+            None,
+        )];
 
         assert!(seen(&known, &[line("uid-a", "Running", "")], "manacor").is_empty());
         assert_eq!(
@@ -297,14 +311,12 @@ mod tests {
     /// empty string" — otherwise every clearing report would be a write.
     #[test]
     fn an_empty_message_is_absent_rather_than_empty() {
-        let mut stored = vm("web-1", "uid-a", Some("manacor"));
-        #[allow(deprecated)]
-        stored.status.assign(VmPhase::said(
+        let known = [said_to_be(
+            vm("web-1", "uid-a", Some("manacor")),
             VmPhaseKind::Failed,
+            VmReason::Unrecorded,
             Some("out of memory".into()),
-            chrono::Utc::now(),
-        ));
-        let known = [stored];
+        )];
         assert!(matches!(
             seen(&known, &[line("uid-a", "Failed", "")], "manacor").as_slice(),
             [Observation::Changed(
@@ -443,15 +455,12 @@ mod tests {
     /// is the defect this round fixes one field over (D-C7).
     #[test]
     fn a_reason_on_a_resting_word_does_not_make_a_report_news() {
-        let mut stored = vm("web-1", "uid-a", Some("manacor"));
-        #[allow(deprecated)]
-        stored.status.assign(VmPhase::new(
+        let known = [said_to_be(
+            vm("web-1", "uid-a", Some("manacor")),
             VmPhaseKind::Running,
             VmReason::Working,
             None,
-            chrono::Utc::now(),
-        ));
-        let known = [stored];
+        )];
         assert!(
             seen(
                 &known,
@@ -464,15 +473,12 @@ mod tests {
 
         // And a reasoned word does compare: the same phase with a new reason
         // IS news, because the requeue curve reads it.
-        let mut stored = vm("web-2", "uid-b", Some("manacor"));
-        #[allow(deprecated)]
-        stored.status.assign(VmPhase::new(
+        let known = [said_to_be(
+            vm("web-2", "uid-b", Some("manacor")),
             VmPhaseKind::Failed,
             VmReason::VmmGone,
             Some("gone".into()),
-            chrono::Utc::now(),
-        ));
-        let known = [stored];
+        )];
         assert!(
             seen(
                 &known,

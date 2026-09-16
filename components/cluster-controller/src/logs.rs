@@ -246,6 +246,7 @@ fn never_reached_the_node(vm: &Vm) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use controller_api::object::Resource as _;
 
     /// This tier carries the needles and never reads them — but it does have
     /// to put them on the wire correctly for the one hop that is HTTP.
@@ -306,9 +307,19 @@ mod tests {
                 "metadata": {"name": "web-1"}, "spec": {"vm": {}},
             }))
             .expect("a vm");
-            #[allow(deprecated)]
-            vm.status
-                .assign(controller_api::VmPhase::of(phase, chrono::Utc::now()));
+            // The holder has to be named for the derivation to keep a word at
+            // all — a VM nobody claims is `Pending` whatever anybody said
+            // about it (see `settle_vm`), and a VM whose console is being
+            // read is on a machine.
+            vm.status.node_name = Some("agent-1".into());
+            vm.status.reported = Some(controller_api::VmReported::by(
+                "agent-1",
+                phase,
+                controller_api::VmReason::Unrecorded,
+                None,
+                chrono::Utc::now(),
+            ));
+            vm.settle(chrono::Utc::now());
             vm.status.observed_generation = observed;
             vm
         };

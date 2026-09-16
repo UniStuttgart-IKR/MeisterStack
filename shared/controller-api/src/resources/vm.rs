@@ -122,7 +122,7 @@ reasons! {
     /// counts candidates and names capabilities, which is what an operator
     /// reads. This is the closed set behind it, so that "how many VMs are
     /// waiting, and why" is a time series rather than a string.
-    VmReason [16] {
+    VmReason [17] {
         /// Nobody recorded one.
         ///
         /// Not a failure of this enum but the honest value in two cases: a
@@ -132,6 +132,15 @@ reasons! {
         /// code anywhere in this change.
         #[default]
         Unrecorded => "Unrecorded",
+        /// Nobody has looked yet, or nobody has been told yet: the moment
+        /// between the create and the first scheduler pass, and the moment
+        /// between the binding and the create going out.
+        ///
+        /// Not `Unplaced`, which is the scheduler having LOOKED and found
+        /// nowhere. Spelled as the image's, the pool's, the copy's, the
+        /// volume's and the router's are, so that "nobody has said anything
+        /// yet" is one word across this crate.
+        AwaitingNode => "AwaitingNode",
         /// The scheduler found nowhere to put it: nothing is a candidate,
         /// nothing has room, or nothing carries what the VM asks for. A WALL
         /// — somebody has to change a machine or the VM. Which of the ten
@@ -685,6 +694,46 @@ pub struct VmStatus {
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
     pub(super) phase: VmPhase,
+    /// The last word the tier below said about the guest — a node's at the
+    /// cluster, a cluster's at the cloud — and this tier's own conclusions
+    /// beside it (a create that went out, a machine that refused, a holder
+    /// that let go).
+    ///
+    /// **The same type and the same derivation at both altitudes**, which is
+    /// what keeps `Running` from meaning two things one hop apart. An empty
+    /// `node` on it is this tier's own word and can never make the VM
+    /// `Running`, `Stopped` or `Paused`: only a machine that has the guest
+    /// may say what it is doing. See `VmReported`.
+    ///
+    /// `None` on a VM nobody has said anything about — a fresh one, and one
+    /// whose binding has just been let go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<VmReported>,
+    /// That the machine or cluster holding this VM has stopped answering, as
+    /// a reconcile pass saw it.
+    ///
+    /// The fact behind `Unknown`, and the one D-C1 is about: a node fell out
+    /// of the lab and nothing anywhere said so. The pass that reads the lease
+    /// is the only party that knows, so it writes this down; `settle` turns
+    /// it into `Unknown { Silent }` and NOTHING turns that into anything else
+    /// (`unknown_needs_its_holder`). One report from the holder clears it.
+    ///
+    /// It is also what the stuck deadline measures: `Unknown` since four and
+    /// a half days is a number in Prometheus because this field says when.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silence: Option<VmSilence>,
+    /// What the scheduler last said about a VM it could not place.
+    ///
+    /// Its own fact and not part of `reported`, because it answers a
+    /// different question and must not answer the first one: this pass says
+    /// WHY a VM is waiting, it does not decide what the VM is doing. A
+    /// running guest whose newly added disk is not ready yet is still
+    /// running.
+    ///
+    /// Cleared by the binding: a VM that has been placed must not go on
+    /// carrying the sentence that said it could not be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<VmPlacement>,
     /// The last `metadata.generation` this object's controller ACTED on.
     ///
     /// Kubernetes' half of the pair, and the whole of what it says is:
@@ -900,6 +949,129 @@ fn u32_is_zero(n: &u32) -> bool {
     *n == 0
 }
 
+/// Nobody has heard from the machine or cluster holding a VM.
+///
+/// Data and not the finished sentence, so that both tiers word it the same
+/// way and a test can assert on the instant rather than on prose.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VmSilence {
+    /// What stopped answering, with its kind — `node agent-1a`,
+    /// `cluster cluster-1`. The whole phrase, because the two tiers hold
+    /// different kinds of holder and neither should reword the other's.
+    pub holder: String,
+    /// When it last reported, out of its lease. `None` = it never has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heard: Option<DateTime<Utc>>,
+    /// When this tier first noticed. What the stuck deadline measures.
+    pub since: DateTime<Utc>,
+}
+
+/// What the scheduler said about a VM it could not place.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VmPlacement {
+    /// The category, out of `PendingReason::category` — a WALL (`Unplaced`)
+    /// or a WAIT (`NotReady`). The twelve scheduler words themselves stay in
+    /// the sentence and in `PendingTally`'s metric label, which is counted
+    /// per pass and not read off this field.
+    pub reason: VmReason,
+    /// The sentence, which counts candidates and names capabilities. This is
+    /// what an operator reads, and no closed word replaces it.
+    pub message: String,
+    pub at: DateTime<Utc>,
+}
+
+/// What a VM IS, out of the facts on it — **one rule for both tiers**,
+/// because the type is the same type and `Running` must not come to mean two
+/// things one hop apart.
+///
+/// Four rules in one order, and the order is the whole content:
+///
+/// 1. **Silence beats every word.** A holder that has stopped answering
+///    makes its last word no longer KNOWN to be true, which is exactly what
+///    `Unknown` says and the only thing that is honest. Nothing promotes it
+///    — not a timer, not a requeue — and the reason is in
+///    `VmPhaseKind::Unknown`'s own doc: the guests on a node whose agent was
+///    killed keep running.
+/// 2. **A VM nobody claims is `Pending`.** Not bound, and no holder named on
+///    the status either: it is nowhere, so a phase describing a guest would
+///    be describing one that does not exist. The scheduler's word says why.
+///    The second half of that test is what keeps a guest that is still
+///    RUNNING on a node this tier has unbound from reading as nowhere — the
+///    old node is still named on the status until it lets go.
+/// 3. **Otherwise the last word, and a resting word demands a machine.**
+///    `Running`, `Stopped` and `Paused` are claims about a guest, and this
+///    tier has not seen one. A dispatch that anticipated `Running` would be
+///    F16's mistake on the object that matters most.
+/// 4. **Otherwise it is waiting,** and the sentence says for what: the
+///    scheduler's, if it has spoken, or the machine that has not reported
+///    yet.
+pub fn settle_vm(spec: &VmSpec, status: &VmStatus) -> VmPhase {
+    // Rule 1.
+    if let Some(silence) = &status.silence {
+        return VmPhase::new(
+            VmPhaseKind::Unknown,
+            VmReason::Silent,
+            Some(match silence.last_heard {
+                Some(last) => format!(
+                    "{} last reported {}, more than {}s ago; what the guest is doing is not \
+                     known here",
+                    silence.holder,
+                    last.to_rfc3339(),
+                    crate::heartbeat::HEARTBEAT_TIMEOUT_SECS
+                ),
+                None => format!(
+                    "{} has never reported, more than {}s ago; what the guest is doing is not \
+                     known here",
+                    silence.holder,
+                    crate::heartbeat::HEARTBEAT_TIMEOUT_SECS
+                ),
+            }),
+            UNSTAMPED,
+        );
+    }
+    let said = status.reported.as_ref();
+    let waiting = |reason: VmReason, message: Option<String>| {
+        VmPhase::new(VmPhaseKind::Pending, reason, message, UNSTAMPED)
+    };
+    let scheduler = status
+        .placement
+        .as_ref()
+        .map(|p| (p.reason, Some(p.message.clone())));
+    // Rule 2. A binding at either tier, and a holder named on the status at
+    // either tier: the cluster writes `nodeName`, the cloud writes both.
+    let claimed = spec.node_name.is_some()
+        || spec.cluster_name.is_some()
+        || status.node_name.is_some()
+        || status.cluster_name.is_some();
+    if !claimed {
+        let (reason, message) = scheduler
+            .or_else(|| said.map(|r| (r.reason, r.message.clone())))
+            .unwrap_or((VmReason::AwaitingNode, Some("not placed yet".to_string())));
+        return waiting(reason, message);
+    }
+    // Rule 3.
+    if let Some(phase) = said.and_then(VmReported::phase) {
+        return phase;
+    }
+    // Rule 4.
+    let (reason, message) = scheduler.unwrap_or_else(|| {
+        let holder = status
+            .node_name
+            .as_deref()
+            .or(status.cluster_name.as_deref())
+            .or(spec.node_name.as_deref())
+            .or(spec.cluster_name.as_deref())
+            .unwrap_or("nobody");
+        (
+            VmReason::AwaitingNode,
+            Some(format!("{holder} has not reported yet")),
+        )
+    });
+    waiting(reason, message)
+}
+
 pub type Vm = Object<VmSpec, VmStatus>;
 
 /// A VM, with the finalizer that makes teardown the one path out.
@@ -909,4 +1081,229 @@ pub fn new_vm(name: &str, spec: VmSpec) -> Vm {
         .finalizers
         .push("meister.io/teardown".to_string());
     vm
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::Resource;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("an instant")
+    }
+
+    fn vm(node: Option<&str>) -> Vm {
+        new_vm(
+            "web-1",
+            VmSpec {
+                class: Default::default(),
+                cluster_selector: Default::default(),
+                node_selector: Default::default(),
+                anti_affinity: Vec::new(),
+                node_name: node.map(str::to_string),
+                cluster_name: None,
+                run_strategy: RunStrategy::Running,
+                evacuation: Default::default(),
+                tenant: None,
+                vm: serde_json::json!({ "vcpus": 1 }),
+            },
+        )
+    }
+
+    /// The table, in the order the four rules run — and the order is the
+    /// whole content of the derivation.
+    #[test]
+    fn what_is_known_about_a_vm_is_what_the_vm_is() {
+        // Rule 4, and the state nothing used to have a word for: created,
+        // bound, and the create has not gone out.
+        let mut fresh = vm(Some("agent-1a"));
+        fresh.settle(at(0));
+        assert_eq!(fresh.status.phase().kind(), VmPhaseKind::Pending);
+        assert_eq!(
+            fresh.status.phase().reason(),
+            Some(VmReason::AwaitingNode),
+            "a VM nobody has reported on says what it is waiting for"
+        );
+        assert_eq!(
+            fresh.status.phase().message(),
+            Some("agent-1a has not reported yet")
+        );
+
+        // Rule 2: nothing claims it. The scheduler says why.
+        let mut nowhere = vm(None);
+        nowhere.settle(at(0));
+        assert_eq!(nowhere.status.phase().message(), Some("not placed yet"));
+        nowhere.status.placement = Some(VmPlacement {
+            reason: VmReason::Unplaced,
+            message: "no candidate has room (3 looked at)".to_string(),
+            at: at(0),
+        });
+        nowhere.settle(at(0));
+        assert_eq!(nowhere.status.phase().kind(), VmPhaseKind::Pending);
+        assert_eq!(nowhere.status.phase().reason(), Some(VmReason::Unplaced));
+        assert_eq!(
+            nowhere.status.phase().message(),
+            Some("no candidate has room (3 looked at)")
+        );
+
+        // Rule 3: the node's own word, and its own reason — `VmmGone` and
+        // `BackendGone` are two different problems and used to be one word.
+        let mut broken = vm(Some("agent-1a"));
+        broken.status.reported = Some(VmReported::by(
+            "agent-1a",
+            VmPhaseKind::Quarantined,
+            VmReason::BackendGone,
+            Some("the vhost-user backend died under a live vmm".into()),
+            at(0),
+        ));
+        broken.settle(at(0));
+        assert_eq!(broken.status.phase().kind(), VmPhaseKind::Quarantined);
+        assert_eq!(broken.status.phase().reason(), Some(VmReason::BackendGone));
+
+        // Rule 1: the machine has stopped answering, so the last word is no
+        // longer known to be true. D-C1.
+        let mut lost = vm(Some("agent-1a"));
+        lost.status.reported = Some(VmReported::by(
+            "agent-1a",
+            VmPhaseKind::Running,
+            VmReason::Unrecorded,
+            None,
+            at(0),
+        ));
+        lost.settle(at(0));
+        assert_eq!(lost.status.phase().kind(), VmPhaseKind::Running);
+        lost.status.silence = Some(VmSilence {
+            holder: "node agent-1a".to_string(),
+            last_heard: Some(at(0)),
+            since: at(60),
+        });
+        lost.settle(at(60));
+        assert_eq!(lost.status.phase().kind(), VmPhaseKind::Unknown);
+        assert_eq!(lost.status.phase().reason(), Some(VmReason::Silent));
+        let said = lost.status.phase().message().expect("a sentence");
+        assert!(said.contains("node agent-1a"), "{said}");
+        assert!(said.contains("not known here"), "{said}");
+    }
+
+    /// A guest that is still RUNNING on a node this tier has unbound does not
+    /// read as nowhere.
+    ///
+    /// The second half of rule 2, and the reason it is two conditions rather
+    /// than one: `unbind` clears `spec.nodeName` while the old machine still
+    /// has the VM, and it is `status.nodeName` that says so. A VM is nowhere
+    /// only when nobody claims it at all.
+    #[test]
+    fn a_guest_a_node_still_holds_is_not_nowhere() {
+        let mut leaving = vm(None);
+        leaving.status.node_name = Some("agent-1a".to_string());
+        leaving.status.reported = Some(VmReported::by(
+            "agent-1a",
+            VmPhaseKind::Running,
+            VmReason::Unrecorded,
+            None,
+            at(0),
+        ));
+        leaving.settle(at(0));
+        assert_eq!(
+            leaving.status.phase().kind(),
+            VmPhaseKind::Running,
+            "the old node still has the guest"
+        );
+
+        // And when it lets go, the VM is waiting to be placed.
+        leaving.status.node_name = None;
+        leaving.status.reported = Some(VmReported::here(
+            VmPhaseKind::Pending,
+            VmReason::Unbound,
+            Some("node agent-1a let go; waiting to be placed".into()),
+            at(60),
+        ));
+        leaving.settle(at(60));
+        assert_eq!(leaving.status.phase().kind(), VmPhaseKind::Pending);
+        assert_eq!(leaving.status.phase().reason(), Some(VmReason::Unbound));
+    }
+
+    /// A resting word demands a machine. `Running`, `Stopped` and `Paused`
+    /// are claims about a guest, and a dispatch is not one — F16's rule on
+    /// the object it matters most on.
+    #[test]
+    fn this_tier_cannot_conclude_that_a_guest_is_running() {
+        for resting in [
+            VmPhaseKind::Running,
+            VmPhaseKind::Stopped,
+            VmPhaseKind::Paused,
+        ] {
+            let mut invented = vm(Some("agent-1a"));
+            invented.status.reported =
+                Some(VmReported::here(resting, VmReason::Dispatched, None, at(0)));
+            invented.settle(at(0));
+            assert_eq!(
+                invented.status.phase().kind(),
+                VmPhaseKind::Pending,
+                "{resting:?} with nobody behind it"
+            );
+        }
+    }
+
+    /// The scheduler explains a wait; it does not create one.
+    ///
+    /// A running guest whose newly added disk is not ready yet is still
+    /// running, and that is why `placement` is its own fact rather than part
+    /// of the word: `hot_plug` writes it about a VM that is up.
+    #[test]
+    fn the_scheduler_explains_a_wait_and_does_not_make_one() {
+        let mut running = vm(Some("agent-1a"));
+        running.status.reported = Some(VmReported::by(
+            "agent-1a",
+            VmPhaseKind::Running,
+            VmReason::Unrecorded,
+            None,
+            at(0),
+        ));
+        running.settle(at(0));
+        running.status.placement = Some(VmPlacement {
+            reason: VmReason::NotReady,
+            message: "volume data-2 is Provisioning on agent-1a".to_string(),
+            at: at(10),
+        });
+        running.settle(at(10));
+        assert_eq!(running.status.phase().kind(), VmPhaseKind::Running);
+        assert_eq!(running.status.phase().since(), at(0));
+    }
+
+    /// `Unknown` is never promoted, however long it stands
+    /// (`unknown_needs_its_holder`). The only exit is the holder speaking.
+    #[test]
+    fn nothing_turns_an_unknown_into_a_verdict() {
+        let mut lost = vm(Some("agent-1a"));
+        lost.status.silence = Some(VmSilence {
+            holder: "node agent-1a".to_string(),
+            last_heard: Some(at(0)),
+            since: at(60),
+        });
+        // A failure reported before the silence, a requeue count, four days:
+        // none of it is evidence about a guest nobody has looked at.
+        lost.status.reported = Some(VmReported::by(
+            "agent-1a",
+            VmPhaseKind::Failed,
+            VmReason::VmmGone,
+            None,
+            at(0),
+        ));
+        lost.status.requeue_attempts = 9;
+        lost.settle(at(60));
+        assert_eq!(lost.status.phase().kind(), VmPhaseKind::Unknown);
+        lost.settle(at(60 + 4 * 24 * 3600));
+        assert_eq!(lost.status.phase().kind(), VmPhaseKind::Unknown);
+        assert_eq!(
+            lost.status.phase().since(),
+            at(60),
+            "and it has been Unknown since the silence, which is what the deadline measures"
+        );
+
+        // The holder speaks: whatever it says replaces the absence.
+        lost.status.silence = None;
+        lost.settle(at(60 + 4 * 24 * 3600));
+        assert_eq!(lost.status.phase().kind(), VmPhaseKind::Failed);
+    }
 }

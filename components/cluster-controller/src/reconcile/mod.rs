@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use controller_api::{
     Candidate, CandidateKind, Capacity, EtcdStore, Lifecycle, Locality, Node, Overcommit,
     PassTrigger, PendingReason, PendingTally, RequeuePolicy, Resource, RunStrategy, Scheduler,
-    StoragePool, StoreError, Vm, VmPhase, VmPhaseKind, Volume, VolumeBinding, VolumePhaseKind,
+    StoragePool, StoreError, Vm, VmPhaseKind, Volume, VolumeBinding, VolumePhaseKind,
     VolumeSnapshot, VolumeSnapshotPhaseKind, heartbeat_expired, lifecycle_command,
     scheduler::{StoragePolicy, feasible_for_storage, storage_pending_reason},
 };

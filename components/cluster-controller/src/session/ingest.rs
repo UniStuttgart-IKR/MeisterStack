@@ -1034,14 +1034,17 @@ pub(super) async fn forget_unbound(
                 v.status.node_name = None;
                 // Pending and not Stopped: the VM has no node, and the phase
                 // an operator reads has to say that rather than describing a
-                // guest that no longer exists anywhere.
-                #[allow(deprecated)]
-                v.status.assign(controller_api::VmPhase::new(
+                // guest that no longer exists anywhere. `settle_vm` makes
+                // that from the two facts together — no binding, no holder —
+                // and this word is the sentence that goes with it.
+                v.status.reported = Some(controller_api::VmReported::here(
                     VmPhaseKind::Pending,
                     controller_api::VmReason::Unbound,
                     Some(format!("node {node_id} let go; waiting to be placed")),
                     at,
                 ));
+                // Nobody holds it, so nobody's silence is about it.
+                v.status.silence = None;
                 v.status.volumes.clear();
                 v.status.reschedules = v.status.reschedules.saturating_add(1);
                 v.status.observed_at = Some(at);
@@ -1095,13 +1098,17 @@ pub(super) async fn ingest_phases(
         let vm_tenant = vm.spec.tenant.clone();
         let result = store
             .mutate::<Vm, _>(&name, |v| {
-                #[allow(deprecated)]
-                v.status.assign(controller_api::VmPhase::new(
+                v.status.reported = Some(controller_api::VmReported::by(
+                    node_id,
                     phase,
                     reason,
                     message.clone(),
                     at,
                 ));
+                // The node has spoken, so whatever a watchdog pass concluded
+                // from its silence is answered. Cleared here and nowhere
+                // else: this is the one road a holder's word comes down.
+                v.status.silence = None;
                 // From the binding, never from the reporter — the rule the
                 // cloud tier states one floor up, and it matters more here
                 // because `ours` deliberately accepts a report about a VM

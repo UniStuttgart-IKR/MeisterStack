@@ -2152,11 +2152,14 @@ mod tests {
 
         // And back up: `active` is whether a machine is really forwarding,
         // which is not the same question as the phase.
-        #[allow(deprecated)]
-        router.status.assign(controller_api::RouterPhase::of(
+        router.status.reported = Some(controller_api::RouterReported::by(
+            "agent-1b",
             controller_api::RouterPhaseKind::Active,
+            controller_api::RouterReason::Unrecorded,
+            None,
             Utc::now(),
         ));
+        router.settle(Utc::now());
         router.status.nodes = vec!["agent-1b".into(), "agent-1c".into()];
         router.status.active_node = "agent-1b".into();
         let mut complete = true;
@@ -2199,9 +2202,18 @@ mod tests {
         if let Some(uid) = uid {
             vm.metadata.mark_managed_by_cloud(uid);
         }
-        #[allow(deprecated)]
-        vm.status
-            .assign(controller_api::VmPhase::of(phase, Utc::now()));
+        // Through the derivation, which is the only way in. The holder has
+        // to be named for a resting word to stand at all (see `VmReported`),
+        // and a VM this cluster reports upward is on one of its machines.
+        vm.status.node_name = Some("manacor".into());
+        vm.status.reported = Some(controller_api::VmReported::by(
+            "manacor",
+            phase,
+            controller_api::VmReason::Unrecorded,
+            None,
+            Utc::now(),
+        ));
+        vm.settle(Utc::now());
         vm
     }
 
@@ -2740,14 +2752,15 @@ mod tests {
         let mut waiting = vm("mc-vm-d", Some("cloud-uid-2"), VmPhaseKind::Pending);
         // Through the mapping rather than past it: the scheduler's own
         // category is what a pass writes, and what travels up is the word the
-        // object stores it under.
-        #[allow(deprecated)]
-        waiting.status.assign(controller_api::VmPhase::new(
-            VmPhaseKind::Pending,
-            controller_api::PendingReason::NodeUnhealthy.category(),
-            None,
-            Utc::now(),
-        ));
+        // object stores it under. As the FACT the pass writes, which is
+        // `status.placement` — the phase follows from it.
+        waiting.status.reported = None;
+        waiting.status.placement = Some(controller_api::VmPlacement {
+            reason: controller_api::PendingReason::NodeUnhealthy.category(),
+            message: "every candidate has said something is wrong with itself".into(),
+            at: Utc::now(),
+        });
+        waiting.settle(Utc::now());
 
         let mut complete = true;
         let report = report_cloud_vms(&[hot_plugged, waiting], &mut complete);
@@ -2855,11 +2868,14 @@ mod tests {
         };
 
         let mut ours = snapshot("nightly-1", Some("cloud-uid-1"));
-        #[allow(deprecated)]
-        ours.status.assign(controller_api::VolumeSnapshotPhase::of(
+        ours.status.reported = Some(controller_api::VolumeSnapshotReported::by(
+            "manacor",
             controller_api::VolumeSnapshotPhaseKind::Ready,
+            controller_api::VolumeSnapshotReason::Unrecorded,
+            None,
             Utc::now(),
         ));
+        ours.settle(Utc::now());
         ours.status.node = Some("manacor".into());
         ours.status.backend = "/dev/vg0/snap-nightly-1".into();
         ours.status.size_gib = 4;

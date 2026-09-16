@@ -408,13 +408,15 @@ pub(super) async fn forget_unbound(
                 // Pending and not Stopped, exactly as one tier down: the VM
                 // is nowhere, and the phase an operator reads has to say that
                 // rather than describing a guest that no longer exists.
-                #[allow(deprecated)]
-                v.status.assign(controller_api::VmPhase::new(
+                // `settle_vm` makes it out of the two facts together — no
+                // binding, no holder — and this word is the sentence.
+                v.status.reported = Some(controller_api::VmReported::here(
                     VmPhaseKind::Pending,
                     controller_api::VmReason::Unbound,
                     Some(format!("cluster {cluster} let go; waiting to be placed")),
                     at,
                 ));
+                v.status.silence = None;
                 v.status.volumes.clear();
                 v.status.reschedules = v.status.reschedules.saturating_add(1);
                 v.status.observed_at = Some(at);
@@ -466,22 +468,6 @@ pub(super) async fn forget_unbound(
 /// from before the field, and it changes nothing here — which is also what an
 /// old AGENT looks like one tier further down, deliberately: neither of them
 /// is saying "this VM has no addresses".
-/// One reason, onto the phase an object already has.
-///
-/// `since` comes off the stored phase, so the value is exactly what `assign`
-/// would leave — which is what lets the caller use it as its own churn guard.
-fn relayed_onto(
-    stored: &controller_api::VmPhase,
-    reason: controller_api::VmReason,
-) -> controller_api::VmPhase {
-    controller_api::VmPhase::new(
-        stored.kind(),
-        reason,
-        stored.message().map(str::to_string),
-        stored.since(),
-    )
-}
-
 pub(super) async fn ingest_placements(
     store: &EtcdStore,
     cluster: &str,
@@ -499,31 +485,22 @@ pub(super) async fn ingest_placements(
                 attached: v.attached,
             })
             .collect();
-        // The cluster's word for WHY a VM is not placed, in the vocabulary
-        // this tier stores it in. An empty field is "said nothing", which
-        // reads as `Unrecorded` — and so does a word this binary does not
-        // know, which is what a newer cluster talking to an older cloud
-        // sends.
-        let relayed = controller_api::VmReason::parse(&reported.reason).unwrap_or_default();
         let Some(vm) = known.iter().find(|v| v.metadata.uid == reported.id) else {
             continue;
         };
         let addresses = controller_api::addresses_with(&vm.status.addresses, &reported.nics);
-        // All three clear, and that is deliberate for each: a placement can
-        // be given up, a disk can be detached, and a VM that has been placed
-        // has no pending reason any more. What an EMPTY list may not do is
-        // clear a list that a cluster too old to send one never filled — and
-        // it cannot, because such a cluster's VMs never had one either.
-        // The phase this road WOULD leave, compared against the one that is
-        // stored. Not "is the reason the relayed word", which is the same
-        // question only for a phase that has a slot for a reason: a resting
-        // phase drops one, so that comparison would differ for ever and this
-        // pass would write a Running VM every ten seconds — which is D-C7 in
-        // a second place.
-        let relayed_phase = relayed_onto(vm.status.phase(), relayed);
+        // Both clear, and that is deliberate for each: a placement can be
+        // given up and a disk can be detached. What an EMPTY list may not do
+        // is clear a list that a cluster too old to send one never filled —
+        // and it cannot, because such a cluster's VMs never had one either.
+        //
+        // The WORD is not relayed here any more, and that is one duplicate
+        // writer fewer: the cluster's reason arrives on the same report and
+        // travels through `ingest_phases`, which is where a word about a VM
+        // belongs. Two roads writing one field is the shape D-B2 came out of,
+        // and this was the second of them.
         let unchanged = vm.status.node_name == node
             && vm.status.volumes == volumes
-            && *vm.status.phase() == relayed_phase
             && vm.status.addresses == addresses;
         if !ours(vm) || unchanged {
             continue;
@@ -533,13 +510,6 @@ pub(super) async fn ingest_placements(
             .mutate::<Vm, _>(&name, |v| {
                 v.status.node_name = node.clone();
                 v.status.volumes = volumes.clone();
-                // The category the cluster relayed, onto the phase the VM
-                // already has: this road carries evidence about a placement,
-                // not a phase. A cluster that says nothing clears it, exactly
-                // as an absent `pendingReason` did.
-                let onto = relayed_onto(v.status.phase(), relayed);
-                #[allow(deprecated)]
-                v.status.assign(onto);
                 v.status.addresses = addresses.clone();
             })
             .await
@@ -572,13 +542,16 @@ pub(super) async fn ingest_phases(
         let vm_tenant = vm.spec.tenant.clone();
         let result = store
             .mutate::<Vm, _>(&name, |v| {
-                #[allow(deprecated)]
-                v.status.assign(controller_api::VmPhase::new(
+                v.status.reported = Some(controller_api::VmReported::by(
+                    cluster,
                     phase,
                     reason,
                     message.clone(),
                     at,
                 ));
+                // The cluster has spoken, so a silence concluded from its
+                // absence is answered.
+                v.status.silence = None;
                 // From the binding, never from the reporter: the only cluster
                 // whose word counts for a VM is the one it was placed on.
                 v.status.cluster_name = v.spec.cluster_name.clone();

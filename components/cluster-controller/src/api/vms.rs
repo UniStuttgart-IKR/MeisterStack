@@ -135,15 +135,16 @@ pub(super) async fn create_vm_traced(
                         format!("{e:#}"),
                     )
                 })?;
-        // On the phase the VM already has: a preview is a sentence about a VM
-        // that has not been created, not a phase change.
-        let phase = vm.status.phase().kind();
-        #[allow(deprecated)]
-        vm.status.assign(controller_api::VmPhase::said(
-            phase,
-            Some(said),
-            chrono::Utc::now(),
-        ));
+        // As the scheduler's own fact, which is what it IS: a preview is a
+        // sentence about a VM that has not been created, and the object it is
+        // written on is never stored. `settle_vm` shows it as the wait the VM
+        // would be in.
+        vm.status.placement = Some(controller_api::VmPlacement {
+            reason: controller_api::VmReason::Unplaced,
+            message: said,
+            at: chrono::Utc::now(),
+        });
+        vm.settle(chrono::Utc::now());
     }
     let created = match dry.preview(&vm) {
         Some(preview) => preview,

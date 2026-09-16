@@ -30,26 +30,10 @@ use super::*;
 ///
 /// Pure, and the clock comes in as an argument: this is the rule, and a rule
 /// that reads `Utc::now()` is a rule that can only be exercised by waiting.
-pub(crate) fn unheard_of(
-    vm: &Vm,
-    last_heartbeat: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> Option<String> {
-    let node = vm.spec.node_name.as_deref()?;
-    if !claims_a_guest(vm.status.phase().kind()) {
-        return None;
-    }
-    if !heartbeat_expired(last_heartbeat, now) {
-        return None;
-    }
-    let since = match last_heartbeat {
-        Some(last) => format!("last reported {}", last.to_rfc3339()),
-        None => "has never reported".to_string(),
-    };
-    Some(format!(
-        "node {node} {since}, more than {}s ago; what the guest is doing is not known here",
-        controller_api::HEARTBEAT_TIMEOUT_SECS
-    ))
+pub(crate) fn silent(vm: &Vm, last_heartbeat: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    vm.spec.node_name.is_some()
+        && claims_a_guest(vm.status.phase().kind())
+        && heartbeat_expired(last_heartbeat, now)
 }
 
 /// The phases that are a statement about a guest that is supposed to exist
@@ -85,24 +69,27 @@ pub(super) async fn expire_vm_reports(
         .iter()
         .filter(|v| v.spec.node_name.as_deref() == Some(node))
     {
-        let Some(message) = unheard_of(vm, last_heartbeat, now) else {
+        if !silent(vm, last_heartbeat, now) {
             continue;
-        };
+        }
         let name = vm.metadata.name.clone();
         let was = vm.status.phase().kind();
+        let message = format!("{node} stopped answering");
         match store
             .mutate::<Vm, _>(&name, |v| {
                 // Re-read inside the mutate: a report may have landed between
                 // the listing and here, and taking a phase away from a node
                 // that has just spoken is the one way this can do harm.
+                //
+                // The FACT, and `settle` makes `Unknown { Silent }` out of it
+                // — including the sentence, so that both tiers word a silence
+                // the same way. See `VmSilence`.
                 if claims_a_guest(v.status.phase().kind()) {
-                    #[allow(deprecated)]
-                    v.status.assign(VmPhase::new(
-                        VmPhaseKind::Unknown,
-                        controller_api::VmReason::Silent,
-                        Some(message.clone()),
-                        Utc::now(),
-                    ));
+                    v.status.silence = Some(controller_api::VmSilence {
+                        holder: format!("node {node}"),
+                        last_heard: last_heartbeat,
+                        since: v.status.silence.as_ref().map(|s| s.since).unwrap_or(now),
+                    });
                 }
             })
             .await
@@ -509,14 +496,18 @@ pub(super) async fn unbind_refused(
             v.spec.node_name = None;
             // The node refused to serve it at all, which is a statement about
             // the MACHINE — it is remembered in `refusedBy` for exactly that
-            // reason, and the phase now says the same thing in one word.
-            #[allow(deprecated)]
-            v.status.assign(VmPhase::new(
+            // reason, and the word says the same thing. This tier's own
+            // conclusion out of a refusal, so it names nobody: what the node
+            // said is that it cannot, not what the guest is doing.
+            v.status.reported = Some(controller_api::VmReported::here(
                 VmPhaseKind::Pending,
                 controller_api::VmReason::Refused,
                 Some(said.clone()),
                 Utc::now(),
             ));
+            // The binding is gone, so what the scheduler said about the last
+            // one is answered.
+            v.status.placement = None;
             v.status.refused_by.retain(|r| r.node != node);
             v.status.refused_by.push(refusal.clone());
         })
@@ -1005,13 +996,19 @@ pub(super) async fn dispatch_create(
                 // A refusal is the node's own word; a dispatch is this tier's
                 // guess. `create_answer` has already decided which of the two
                 // this is, and the reason follows from the phase it chose.
+                // Either way it is written HERE — as this tier's conclusion —
+                // because neither is a machine saying what a guest is doing,
+                // and that is what keeps a dispatch from ever being `Running`.
                 let reason = match phase {
                     VmPhaseKind::Failed => controller_api::VmReason::Refused,
                     _ => controller_api::VmReason::Dispatched,
                 };
-                #[allow(deprecated)]
-                v.status
-                    .assign(VmPhase::new(phase, reason, message, Utc::now()));
+                v.status.reported = Some(controller_api::VmReported::here(
+                    phase,
+                    reason,
+                    message,
+                    Utc::now(),
+                ));
                 v.status.node_name = v.spec.node_name.clone();
                 v.status.observed_at = Some(Utc::now());
             }
@@ -1178,11 +1175,10 @@ pub(super) async fn kick(p: &Pass<'_>, vm: &Vm, node: &str, outgoing: &str) -> a
                     // other and says so.
                     v.status.observed_generation = v.status.observed_generation.max(dispatched);
                     if v.status.phase().kind() == VmPhaseKind::Failed {
-                        #[allow(deprecated)]
-                        v.status.assign(VmPhase::new(
+                        v.status.reported = Some(controller_api::VmReported::here(
                             VmPhaseKind::Provisioning,
                             controller_api::VmReason::Dispatched,
-                            None,
+                            Some(format!("{node} was told again")),
                             Utc::now(),
                         ));
                     }

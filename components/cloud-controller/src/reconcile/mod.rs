@@ -31,8 +31,8 @@ use anyhow::bail;
 use chrono::{DateTime, Utc};
 use controller_api::{
     Ack, Candidate, CandidateKind, Capacity, Cluster, EtcdStore, Overcommit, PassTrigger,
-    PendingTally, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhase, VmPhaseKind,
-    heartbeat_expired, lifecycle_command,
+    PendingTally, Resource, RunStrategy, Scheduler, StoreError, Vm, VmPhaseKind, heartbeat_expired,
+    lifecycle_command,
 };
 use proto::cloud_command;
 use tokio::sync::OnceCell;
