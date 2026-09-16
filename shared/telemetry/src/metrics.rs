@@ -547,6 +547,7 @@ fn build() -> Metrics {
         Box::new(reconcile.last_success.clone()),
         Box::new(objects.count.clone()),
         Box::new(objects.vms.clone()),
+        Box::new(objects.stuck.clone()),
         Box::new(scheduling.placements.clone()),
         Box::new(scheduling.conflicts.clone()),
         Box::new(scheduling.pending.clone()),
@@ -588,6 +589,7 @@ mod tests {
         m.reconcile.pass(TIER_CLOUD, "Vm", 0.01, false);
         m.objects.set_count("Node", 3);
         m.objects.set_vms("Running", 2);
+        m.objects.set_stuck("Vm", "Unknown", "Silent", 1);
         m.scheduling.placed(TIER_CLUSTER);
         m.scheduling.conflict(TIER_CLUSTER);
         m.scheduling.set_pending(TIER_CLUSTER, "no-capacity", 1);
@@ -680,6 +682,15 @@ mod tests {
             body.contains(
                 r#"meister_scheduler_pending_vms{reason="no-capacity",tier="cluster"} 1"#
             ),
+            "{body}"
+        );
+        // D7's gauge, and it is here rather than in a test of its own for
+        // the reason it is here at all: it was BUILT, given labels and set by
+        // a pass, and simply never added to the collector list — so it went
+        // through the whole of one lane's tests and one local stack invisible.
+        // A series that is not in the exposition is a series nobody has.
+        assert!(
+            body.contains(r#"meister_phase_stuck{kind="Vm",phase="Unknown",reason="Silent"} 1"#),
             "{body}"
         );
         // and the histogram's own three families, which is what makes a
