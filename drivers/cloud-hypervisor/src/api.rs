@@ -170,15 +170,17 @@ pub(crate) fn disk_gone(info: &serde_json::Value, disk_id: &str) -> Option<bool>
 /// without a VMM: what is worth pinning down is that a disk which disappears
 /// late still counts as removed, and that one which never disappears is an
 /// error with a sentence instead of a success.
-pub(crate) async fn until_the_disk_is_gone<F, Fut>(
+pub(crate) async fn until_the_disk_is_gone<F, Fut, H>(
     disk_id: &str,
     mut info: F,
+    mut held: H,
     timeout: Duration,
     poll: Duration,
 ) -> hypervisor::Result<()>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = hypervisor::Result<serde_json::Value>>,
+    H: FnMut() -> hypervisor::Result<Option<bool>>,
 {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut asked = 0u32;
@@ -186,10 +188,17 @@ where
         asked += 1;
         let seen = info().await?;
         match disk_gone(&seen, disk_id) {
-            Some(true) => {
-                debug!(asked, "the vmm has let the disk go");
-                return Ok(());
-            }
+            // The config has dropped it — which the VMM does the moment it
+            // accepts the request. Only the fd table knows whether the guest
+            // has followed; `None` is a disk nobody can ask that about, and
+            // then the config is all there is.
+            Some(true) => match held()? {
+                Some(true) => {}
+                _ => {
+                    debug!(asked, "the vmm has let the disk go");
+                    return Ok(());
+                }
+            },
             Some(false) => {}
             None => {
                 return Err(HypervisorError::Backend(anyhow::anyhow!(
@@ -206,6 +215,69 @@ where
             )));
         }
         tokio::time::sleep(poll).await;
+    }
+}
+
+/// Whether the process still has this file open: the one honest witness of
+/// a hot-unplug, read off `/proc/<pid>/fd`.
+///
+/// Compared by the file's real path, because that is what the kernel writes
+/// into the link — a config that named a symlink would otherwise never match.
+/// A process that is gone holds nothing, and says so as `false` rather than
+/// as an error: the VMM exiting under a detach is a different problem, and
+/// not one that should keep a volume attached for ever.
+pub(crate) fn vmm_holds(pid: u32, path: &Path) -> hypervisor::Result<bool> {
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let table = PathBuf::from(format!("/proc/{pid}/fd"));
+    let entries = match std::fs::read_dir(&table) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(HypervisorError::Backend(anyhow::anyhow!(
+                "reading {}: {e}",
+                table.display()
+            )));
+        }
+    };
+    for entry in entries.flatten() {
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        let target = target.strip_suffix(" (deleted)").unwrap_or(&target);
+        if Path::new(target) == real {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+impl CloudHypervisorDriver {
+    /// The backend path of a disk, as the VMM's config names it right now.
+    ///
+    /// `None` for a disk the config does not list — already asked to go, or
+    /// never there — and for one that is not a file (vhost-user names a
+    /// socket, and a socket is not what the fd table would show).
+    pub(crate) async fn disk_path(
+        &self,
+        id: &VmId,
+        disk_id: &str,
+    ) -> hypervisor::Result<Option<PathBuf>> {
+        let bytes = self.api(id, Method::GET, "vm.info", None).await?;
+        let info: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| HypervisorError::Backend(e.into()))?;
+        Ok(info
+            .get("config")
+            .and_then(|c| c.get("disks"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|disks| {
+                disks
+                    .iter()
+                    .find(|d| d.get("id").and_then(serde_json::Value::as_str) == Some(disk_id))
+            })
+            .and_then(|d| d.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from))
     }
 }
 

@@ -77,6 +77,15 @@ pub struct CloudHypervisorDriver {
     /// [`DEFAULT_UNPLUG_TIMEOUT`] — which is where the number is argued, and
     /// `remove_disk` is where being wrong about it is paid for.
     unplug_timeout: Duration,
+    /// The backend path of every disk a `remove_disk` has asked the guest to
+    /// let go of and not yet seen closed, by vm and disk id.
+    ///
+    /// Kept because the path is only readable off `vm.info` BEFORE the
+    /// request: cloud hypervisor drops the disk from `config.disks` the
+    /// moment it accepts `vm.remove-device`, which is what made the config a
+    /// false witness (see `remove_disk`). A retry after a guest that took too
+    /// long has nothing left to read the path from but this.
+    unplugging: Mutex<HashMap<(VmId, String), PathBuf>>,
 }
 
 impl CloudHypervisorDriver {
@@ -98,6 +107,7 @@ impl CloudHypervisorDriver {
             vms: Mutex::new(HashMap::new()),
             ch_timeout,
             unplug_timeout,
+            unplugging: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -297,37 +307,92 @@ impl HotPluggable for CloudHypervisorDriver {
     /// answers 404 for a disk it does not have, and a driver that swallowed
     /// that would turn "the guest still holds it" into "done".
     ///
-    /// **The 200 is not the answer.** virtio hot-unplug is cooperative: v53
-    /// signals the guest and returns, and a guest that does not acknowledge —
-    /// a kernel without the driver, a device with a mount on it, a guest that
-    /// is simply busy — keeps the device and the VMM keeps the file open. The
-    /// chaos run measured exactly that: the control plane reported the volume
-    /// free within two seconds, the fd was still on `/proc/<vmm>/fd` a minute
-    /// later, and the next VM to use the volume died on cloud hypervisor's own
-    /// write lock with "The file is already locked" — reported to the operator
-    /// as a scheduling problem. So the disk is gone when `vm.info` no longer
-    /// lists it, and not before. The caller detaches the backend after this
-    /// returns, which is the ordering that must not be reversed.
+    /// **The 200 is not the answer, and neither is `vm.info`.** virtio
+    /// hot-unplug is cooperative: v53 signals the guest and returns, and a
+    /// guest that does not acknowledge — a kernel without the driver, a
+    /// device with a mount on it, a guest that is simply busy — keeps the
+    /// device and the VMM keeps the file open. The chaos run measured exactly
+    /// that: the control plane reported the volume free within two seconds,
+    /// the fd was still on `/proc/<vmm>/fd` a minute later, and the next VM
+    /// to use the volume died on cloud hypervisor's own write lock with "The
+    /// file is already locked" — reported to the operator as a scheduling
+    /// problem.
+    ///
+    /// The first repair asked `vm.info` until the disk left `config.disks`,
+    /// and the lab showed that to be no witness at all: the config is what
+    /// the VMM INTENDS, and it drops the disk the moment it accepts the
+    /// request — 774 µs after the call, with the fd still open sixty seconds
+    /// later (struktur 4, M2). What the guest has actually done shows in one
+    /// place only, the VMM's own fd table, so that is what is asked, by the
+    /// disk's path, until it no longer names the file. The config is still
+    /// read, because a VMM that still LISTS the disk has not even been asked
+    /// yet. The caller detaches the backend after this returns, which is the
+    /// ordering that must not be reversed.
+    ///
+    /// A disk without a path to ask about — a vhost-user disk holds a socket,
+    /// not the file — falls back to the config, which is the weaker witness
+    /// and says so in the log.
     #[instrument(skip_all, fields(vm_id = %id, disk = %disk_id))]
     async fn remove_disk(&self, id: &VmId, disk_id: &str) -> hypervisor::Result<()> {
         self.vm_known(id)?;
-        self.api(
-            id,
-            Method::PUT,
-            "vm.remove-device",
-            Some(serde_json::json!({ "id": disk_id })),
-        )
-        .await?;
+        // The path first, while the config still names it (see `unplugging`).
+        let key = (*id, disk_id.to_string());
+        let path = match self.disk_path(id, disk_id).await? {
+            Some(path) => {
+                self.unplugging
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), path.clone());
+                Some(path)
+            }
+            None => self.unplugging.lock().unwrap().get(&key).cloned(),
+        };
+        match self
+            .api(
+                id,
+                Method::PUT,
+                "vm.remove-device",
+                Some(serde_json::json!({ "id": disk_id })),
+            )
+            .await
+        {
+            Ok(_) => {}
+            // 404 is CH saying the disk is not in its config any more — which
+            // is exactly what an earlier pass's request leaves behind while
+            // the guest is still thinking. With a path to ask about, the fd
+            // table decides whether that is "done" or "still held"; without
+            // one it stays the error it always was, because a driver that
+            // swallowed it would turn "the guest still holds it" into "done".
+            Err(e) if path.is_some() && is_not_found(&e) => {
+                debug!("the vmm has already been asked; waiting on the fd");
+            }
+            Err(e) => return Err(e),
+        }
+        let pid = self.pid_of(id);
+        let witness = path.as_deref().zip(pid);
+        if witness.is_none() {
+            warn!(
+                path = path.is_some(),
+                pid = pid.is_some(),
+                "no fd witness for this disk; trusting the vmm's config, which is weaker"
+            );
+        }
         until_the_disk_is_gone(
             disk_id,
             || async {
                 let bytes = self.api(id, Method::GET, "vm.info", None).await?;
                 serde_json::from_slice(&bytes).map_err(|e| HypervisorError::Backend(e.into()))
             },
+            || match witness {
+                Some((path, pid)) => vmm_holds(pid, path).map(Some),
+                None => Ok(None),
+            },
             self.unplug_timeout,
             UNPLUG_POLL,
         )
-        .await
+        .await?;
+        self.unplugging.lock().unwrap().remove(&key);
+        Ok(())
     }
 }
 
@@ -522,6 +587,12 @@ impl agent_api::Migratable for CloudHypervisorDriver {
         .await
         .map(|_| ())
     }
+}
+
+/// Whether a `ch_api` error was cloud hypervisor answering 404 — the shape
+/// `api()` gives it is "ch <endpoint> -> 404 Not Found: ...".
+fn is_not_found(e: &HypervisorError) -> bool {
+    format!("{e}").contains("-> 404")
 }
 
 #[cfg(test)]

@@ -537,6 +537,7 @@ async fn a_disk_that_disappears_late_still_counts_as_unplugged() {
             };
             async move { Ok(answer) }
         },
+        || Ok(None),
         std::time::Duration::from_secs(5),
         std::time::Duration::from_millis(1),
     )
@@ -551,6 +552,7 @@ async fn a_disk_that_disappears_late_still_counts_as_unplugged() {
     let refused = super::until_the_disk_is_gone(
         "disk-5f8f99ec",
         || async { Ok(info(&["disk-5f8f99ec"])) },
+        || Ok(None),
         std::time::Duration::from_millis(5),
         std::time::Duration::from_millis(1),
     )
@@ -560,6 +562,70 @@ async fn a_disk_that_disappears_late_still_counts_as_unplugged() {
     assert!(
         said.contains("disk-5f8f99ec") && said.contains("still has it open"),
         "the failure names the disk and what is true: {said}"
+    );
+}
+
+/// The lab's M2, the second time: the config had dropped the disk within a
+/// millisecond of the request and the fd was still open a minute later. The
+/// config is what the VMM intends; the fd table is what the guest has done,
+/// and only the second one may end the wait.
+#[tokio::test]
+async fn a_disk_the_config_has_dropped_is_not_gone_while_the_vmm_holds_it() {
+    use std::cell::Cell;
+
+    let gone =
+        || async { Ok(serde_json::json!({ "state": "Running", "config": { "disks": [] } })) };
+    let looked = Cell::new(0);
+    super::until_the_disk_is_gone(
+        "disk-5f8f99ec",
+        gone,
+        || {
+            looked.set(looked.get() + 1);
+            Ok(Some(looked.get() < 3))
+        },
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(1),
+    )
+    .await
+    .expect("the fd closed on the third look");
+    assert_eq!(looked.get(), 3, "and the fd table was asked until it did");
+
+    let refused = super::until_the_disk_is_gone(
+        "disk-5f8f99ec",
+        gone,
+        || Ok(Some(true)),
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(1),
+    )
+    .await
+    .expect_err("a config that says gone is not the fd being closed");
+    assert!(
+        format!("{refused}").contains("still has it open"),
+        "{refused}"
+    );
+}
+
+/// The witness itself, against this very process: a file this test holds
+/// open is in its fd table, and is not once it is closed. A pid that does
+/// not exist holds nothing.
+#[test]
+fn the_fd_table_says_whether_a_file_is_still_held() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("disk.raw");
+    let file = std::fs::File::create(&path).expect("a file");
+    let me = std::process::id();
+    assert!(
+        super::vmm_holds(me, &path).expect("readable"),
+        "open, so held"
+    );
+    drop(file);
+    assert!(
+        !super::vmm_holds(me, &path).expect("readable"),
+        "closed, so not held"
+    );
+    assert!(
+        !super::vmm_holds(u32::MAX - 1, &path).expect("a missing process is not an error"),
+        "a process that is gone holds nothing"
     );
 }
 

@@ -215,6 +215,14 @@ impl CloudHypervisorDriver {
             .join(format!("{id}.{}.sock", ConsoleStream::Serial.as_str()))
     }
 
+    /// The VMM's pid, whichever way this driver came to know it.
+    pub(crate) fn pid_of(&self, id: &VmId) -> Option<u32> {
+        match &self.vms.lock().unwrap().get(id)?.process {
+            VmProcess::Owned(child) => child.id(),
+            VmProcess::Adopted { pid } => Some(*pid),
+        }
+    }
+
     pub(crate) fn vm_known(&self, id: &VmId) -> hypervisor::Result<()> {
         if self.vms.lock().unwrap().contains_key(id) {
             Ok(())
