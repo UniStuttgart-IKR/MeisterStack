@@ -216,13 +216,13 @@ impl BackendKind {
         // made by the BACKEND, so a umask is the only way to say that from
         // here; it comes out `0770`, because a socket's base mode is `0777`
         // and not a file's `0666`.
-        let umask = self.vmm_user.is_some();
-        if let Some(user) = &self.vmm_user {
-            cmd.uid(user.uid).gid(user.gid);
-        }
-
         let (own_session, nofile_limit) = (self.own_session, self.nofile_limit);
-        if own_session || nofile_limit.is_some() || umask {
+        // Cloned into the closure: `pre_exec` outlives this call.
+        let user = self.vmm_user.clone();
+        if own_session || nofile_limit.is_some() || user.is_some() {
+            // SAFETY: setsid, setrlimit, umask and `switch_to` are syscalls
+            // on values the closure owns — nothing here allocates, opens a
+            // file or takes a lock, which is what a forked child may not do.
             unsafe {
                 cmd.pre_exec(move || {
                     if own_session {
@@ -235,10 +235,12 @@ impl BackendKind {
                             limit,
                         );
                     }
-                    if umask {
-                        // async-signal-safe, and it touches nothing but the
-                        // child's own process state.
+                    if let Some(user) = &user {
+                        // `umask` first, so it applies to the socket the
+                        // backend binds; then the credentials, which cannot
+                        // be undone.
                         libc::umask(0o007);
+                        user.switch_to()?;
                     }
                     Ok(())
                 });

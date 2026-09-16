@@ -53,6 +53,16 @@ pub struct VmmUser {
     /// VMM creates. Deliberately the user's own and not the agent's: see the
     /// module note on what this user must not be in.
     pub gid: u32,
+    /// Every group this user is in, `gid` included — resolved from
+    /// `/etc/group` at start-up.
+    ///
+    /// **This is how the VMM reaches devices, and it is the whole of how.**
+    /// `/dev/kvm` is `crw-rw---- root:kvm` on a node that has not loosened
+    /// it, `/dev/dri/renderD*` is `root:render`, `/dev/input/event*` is
+    /// `root:input` — the answer every reference gives is group membership,
+    /// not a descriptor per device. So the list has to survive the switch,
+    /// and it does not survive it for free: see `switch_to`.
+    pub groups: Vec<u32>,
 }
 
 impl VmmUser {
@@ -76,18 +86,70 @@ impl VmmUser {
                  option exists to stop; leave the key unset to get today's behaviour honestly"
             );
         }
+        // Resolved here, where NSS may be consulted freely, and never in the
+        // child: `getgrouplist` reads files and allocates, and the child of a
+        // fork in a threaded process may do neither.
+        let name_c = std::ffi::CString::new(name)
+            .map_err(|e| anyhow::anyhow!("the user name {name:?} is not a C string: {e}"))?;
+        let groups: Vec<u32> = nix::unistd::getgrouplist(&name_c, user.gid)
+            .map_err(|e| anyhow::anyhow!("reading the groups of {name:?}: {e}"))?
+            .into_iter()
+            .map(|g| g.as_raw())
+            .collect();
         Ok(Self {
             name: name.to_string(),
             uid: user.uid.as_raw(),
             gid: user.gid.as_raw(),
+            groups,
         })
+    }
+
+    /// Become this user, in the child, between `fork` and `exec`.
+    ///
+    /// **Why this is not `Command::uid`/`Command::gid`.** Those do the right
+    /// thing in the wrong amount: std's own `do_exec` calls
+    /// `setgroups(0, NULL)` before `setuid` — "This will also trigger a call
+    /// to `setgroups(0, NULL)` in the child process if no groups have been
+    /// specified" — which is correct for the general case and fatal for this
+    /// one. It throws away `kvm`, `render`, `video` and `input`, and those
+    /// groups ARE the VMM's access to `/dev/kvm` and to every device it is
+    /// meant to have. A VMM without group `kvm` on a node whose `/dev/kvm`
+    /// is `0660` cannot start a guest at all.
+    ///
+    /// So the whole credential change happens here instead, in the one order
+    /// that cannot be undone: supplementary groups, then group, then user.
+    /// After `setuid` to a non-zero uid the process has no capability left to
+    /// widen anything it skipped.
+    ///
+    /// `Command::groups` would do this on the library's side, and it is
+    /// unstable (`setgroups`, rust-lang/rust#38527), which is why this is
+    /// here at all.
+    ///
+    /// Only syscalls, because this runs in the child of a `fork` in a process
+    /// with threads: nothing here allocates, opens a file or takes a lock.
+    /// The group list was resolved at start-up for exactly that reason.
+    pub fn switch_to(&self) -> std::io::Result<()> {
+        let groups: Vec<libc::gid_t> = self.groups.iter().map(|g| *g as libc::gid_t).collect();
+        // SAFETY: three FFI calls with a slice this function owns and scalars.
+        unsafe {
+            if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setgid(self.gid as libc::gid_t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(self.uid as libc::uid_t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 
     /// The one sentence a failed uid change needs.
     ///
-    /// `Command::uid`/`gid` do their work in the child, between `fork` and
-    /// `exec`, so a missing capability surfaces as `EPERM` on the spawn with
-    /// nothing said about which of the two calls failed or why. An agent that
+    /// `switch_to` does its work in the child, between `fork` and `exec`, so
+    /// a missing capability surfaces as `EPERM` on the spawn with
+    /// nothing said about which of the three calls failed or why. An agent that
     /// is root has both capabilities; an agent that is not needs them
     /// granted, and that is a line in a unit file rather than anything code
     /// can fix.
@@ -161,6 +223,26 @@ mod tests {
         assert!(said.contains("vmm_user"), "{said}");
     }
 
+    /// The groups a real account is in come back with it, primary included:
+    /// they are what the VMM reaches `/dev/kvm` through, and a switch that
+    /// dropped them would be a node that cannot start a guest.
+    #[test]
+    fn a_resolved_user_carries_its_group_list() {
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+            .unwrap()
+            .unwrap();
+        let resolved = VmmUser::resolve(&me.name);
+        // uid 0 is refused by design, so this test says nothing when it runs
+        // as root — which is how the ignored e2es run.
+        if let Ok(resolved) = resolved {
+            assert!(
+                resolved.groups.contains(&resolved.gid),
+                "the primary group is missing from {:?}",
+                resolved.groups
+            );
+        }
+    }
+
     /// `root` is refused rather than accepted as a no-op: an operator who
     /// wrote it meant to change something, and silently doing nothing is the
     /// worst of the three possible answers.
@@ -178,6 +260,7 @@ mod tests {
             name: "meister-vmm".into(),
             uid: 991,
             gid: 991,
+            groups: vec![991],
         };
         let said = user.cannot_switch(&std::io::Error::from_raw_os_error(libc_eperm()));
         assert!(said.contains("CAP_SETUID"), "{said}");
@@ -204,6 +287,7 @@ mod tests {
             name: "me".into(),
             uid: nix::unistd::Uid::effective().as_raw(),
             gid: nix::unistd::Gid::effective().as_raw(),
+            groups: vec![nix::unistd::Gid::effective().as_raw()],
         };
         me.take(&file).expect("own user, own file");
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;

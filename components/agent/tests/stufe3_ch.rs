@@ -497,21 +497,44 @@ async fn the_vmm_runs_as_somebody_else_and_cannot_reach_the_agent() {
     let cap_eff = field("CapEff:");
     let groups = field("Groups:");
     println!("vmm {cap_eff} | {groups}");
-    if user.is_some() {
+    if let Some(user) = &user {
         assert!(
             cap_eff.ends_with("0000000000000000"),
             "a vmm that changed user should hold no capabilities: {cap_eff}"
         );
-        // The supplementary groups, and this is not a detail. `setgid` alone
-        // would leave the agent's inherited list in place — including group
-        // 0 for a root agent — and a VMM carrying group 0 reaches every
-        // `0660 root:root` file on the node, the agent's own socket first
-        // among them. `Command::uid` drops the list; this is where that is
-        // checked rather than assumed.
+        // The supplementary groups, and this is the sharpest field in
+        // `/proc/<pid>/status` for this lane — for two opposite reasons at
+        // once.
+        //
+        // Too many is a hole: `setgid` alone leaves the agent's inherited
+        // list in place, including group 0 for a root agent, and a VMM
+        // carrying group 0 reaches every `0660 root:root` file on the node —
+        // the agent's own socket first among them. Measured exactly that way
+        // while building this test.
+        //
+        // Too few is a node that cannot boot a guest: `/dev/kvm` is
+        // `root:kvm` on anything that has not loosened it, and `render`,
+        // `video` and `input` are how the other devices arrive. So what is
+        // asserted is neither "empty" nor "anything": it is EXACTLY the
+        // user's own list, which is what `VmmUser::switch_to` sets and what
+        // `Command::uid` would have thrown away.
+        let mut seen: Vec<u32> = groups
+            .trim_start_matches("Groups:")
+            .split_whitespace()
+            .filter_map(|g| g.parse().ok())
+            .collect();
+        seen.sort_unstable();
+        let mut wanted = user.groups.clone();
+        wanted.sort_unstable();
+        wanted.dedup();
         assert_eq!(
-            groups.trim(),
-            "Groups:",
-            "the vmm inherited supplementary groups from the agent: {groups}"
+            seen, wanted,
+            "the vmm's groups are {seen:?} and {}'s are {wanted:?}",
+            user.name
+        );
+        assert!(
+            !seen.contains(&0),
+            "the vmm carries group 0, which is every 0660 root file on the node"
         );
     }
 

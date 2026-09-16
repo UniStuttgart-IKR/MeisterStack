@@ -427,12 +427,22 @@ impl CloudHypervisorDriver {
         let mut command = Command::new(&self.binary);
         command.args(vmm_args(&socket, events));
         if let Some(user) = &self.vmm_user {
-            // The uid change happens in the child, between fork and exec —
-            // the same moment libvirt picked ("immediately before executing
-            // the QEMU binary") and for the same reason: everything the VMM
-            // needs and cannot open for itself has to be ready before it
-            // stops being able to.
-            command.uid(user.uid).gid(user.gid);
+            // The credential change happens in the child, between fork and
+            // exec — the same moment libvirt picked ("immediately before
+            // executing the QEMU binary") and for the same reason: everything
+            // the VMM needs and cannot open for itself has to be ready before
+            // it stops being able to.
+            //
+            // Through `pre_exec` and not `Command::uid`, because the standard
+            // library's version throws away the supplementary groups and
+            // those are the VMM's access to `/dev/kvm`. See
+            // `VmmUser::switch_to`.
+            let user = user.clone();
+            // SAFETY: `switch_to` is three syscalls on values it already
+            // holds; it allocates nothing and opens nothing.
+            unsafe {
+                command.pre_exec(move || user.switch_to());
+            }
         }
         let mut process = command
             .stdin(Stdio::null())

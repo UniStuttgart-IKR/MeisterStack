@@ -962,6 +962,7 @@ fn a_sandboxed_vmm_gets_a_rule_for_everything_a_hotplug_could_name() {
         name: "meister-vmm".into(),
         uid: 991,
         gid: 991,
+        groups: vec![991],
     }))
     .with_landlock_paths(vec![
         PathBuf::from("/images"),
