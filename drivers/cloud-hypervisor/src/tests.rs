@@ -109,9 +109,13 @@ fn the_vmm_that_receives_a_guest_is_the_one_that_is_asked_to_explain_itself() {
         booting,
         vec![
             "--api-socket".to_string(),
-            "/run/meisterstack/agent/vms/a.sock".to_string()
+            "/run/meisterstack/agent/vms/a.sock".to_string(),
+            // v53's own default, stated rather than relied on — see
+            // `every_vmm_is_started_with_its_seccomp_filter_stated`.
+            "--seccomp".to_string(),
+            "true".to_string(),
         ],
-        "a boot is what it always was"
+        "a boot says nothing about itself beyond its socket and its filter"
     );
 
     let events = Path::new("/run/meisterstack/agent/vms/a.events");
@@ -164,7 +168,10 @@ fn config(spec: &InstanceSpec) -> serde_json::Value {
         spec,
         &PathBuf::from("/c"),
         &PathBuf::from("/s"),
-        NetForm::TapName,
+        &VmForm {
+            net: NetForm::TapName,
+            landlock: None,
+        },
     )
     .expect("config builds")
 }
@@ -175,7 +182,10 @@ fn config_with_tap_fds(spec: &InstanceSpec) -> serde_json::Value {
         spec,
         &PathBuf::from("/c"),
         &PathBuf::from("/s"),
-        NetForm::TapFd,
+        &VmForm {
+            net: NetForm::TapFd,
+            landlock: None,
+        },
     )
     .expect("config builds")
 }
@@ -929,4 +939,84 @@ fn without_a_vmm_user_nothing_changes_hands() {
     // A path that does not exist would be an error if it were touched.
     ch.hand_over_files(&s).expect("nothing to do");
     assert_eq!(ch.net_form(), NetForm::TapName);
+}
+
+/// Landlock turns on with `vmm_user` and its rules cover what cloud
+/// hypervisor cannot know about: what will be attached after `vm.create`.
+///
+/// The three sources are asserted by shape rather than by count, because
+/// each one is a hot-plug that would otherwise come back as Permission
+/// Denied — CH's own documentation says so in as many words.
+#[test]
+fn a_sandboxed_vmm_gets_a_rule_for_everything_a_hotplug_could_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path().join("run");
+    let ch = CloudHypervisorDriver::new(
+        PathBuf::from("/nonexistent/cloud-hypervisor"),
+        run.join("vms"),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    )
+    .unwrap()
+    .with_vmm_user(Some(agent_api::VmmUser {
+        name: "meister-vmm".into(),
+        uid: 991,
+        gid: 991,
+    }))
+    .with_landlock_paths(vec![
+        PathBuf::from("/images"),
+        PathBuf::from("/var/volumes"),
+    ]);
+
+    let mut s = spec(
+        vec![VolumeAttachment::Path("/dev/mapper/meister-vm0".into())],
+        vec![],
+    );
+    s.nics = vec![nic(None)];
+    let form = ch.vm_form(&s);
+    let rules = form.landlock.clone().expect("a vmm_user turns landlock on");
+    let paths: Vec<&str> = rules.iter().map(|r| r.path.to_str().unwrap()).collect();
+
+    // The run directory, one level ABOVE this driver's own corner: the
+    // backends' sockets are siblings of `vms/`, not children.
+    assert!(paths.contains(&run.to_str().unwrap()), "{paths:?}");
+    assert!(paths.contains(&"/images"), "{paths:?}");
+    assert!(paths.contains(&"/var/volumes"), "{paths:?}");
+    // And the directory an existing volume came out of, which is how a
+    // storage driver that does not put its volumes under `volume_dir` gets
+    // covered at all.
+    assert!(paths.contains(&"/dev/mapper"), "{paths:?}");
+    assert!(rules.iter().all(|r| r.access == "rw"), "{rules:?}");
+
+    let cfg = build_vm_config(&s, &PathBuf::from("/c"), &PathBuf::from("/s"), &form)
+        .expect("config builds");
+    assert_eq!(cfg["landlock_enable"], true);
+    assert_eq!(
+        cfg["landlock_rules"][0]["path"],
+        run.to_str().unwrap().to_string()
+    );
+    assert_eq!(cfg["landlock_rules"][0]["access"], "rw");
+}
+
+/// And a node that has not asked for Stufe 3 gets no `landlock_enable` key
+/// at all — not `false`, which would be a different document.
+#[test]
+fn without_a_vmm_user_the_document_says_nothing_about_landlock() {
+    let s = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
+    let cfg = config(&s);
+    assert!(cfg.get("landlock_enable").is_none());
+    assert!(cfg.get("landlock_rules").is_none());
+}
+
+/// The VMM's own seccomp filter, said out loud on the command line.
+///
+/// v53's default is `true`, and a default is exactly the thing that changes
+/// upstream without anybody here noticing. This also fixes the shape of the
+/// one thing `--landlock` could NOT be: an argument passed without a VM on
+/// the command line.
+#[test]
+fn every_vmm_is_started_with_its_seccomp_filter_stated() {
+    let args = vmm_args(Path::new("/run/vms/x.sock"), None);
+    let at = args.iter().position(|a| a == "--seccomp").expect("stated");
+    assert_eq!(args[at + 1], "true");
 }

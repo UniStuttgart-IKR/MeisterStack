@@ -454,7 +454,7 @@ impl CloudHypervisorDriver {
         // agent's and is cleaned up with the rest in `destroy`.
         let _ = std::fs::remove_file(&serial_socket);
 
-        let config = build_vm_config(spec, &console_path, &serial_socket, self.net_form())?;
+        let config = build_vm_config(spec, &console_path, &serial_socket, &self.vm_form(spec))?;
         // Before the VMM exists, because it opens its disks while it builds
         // the VM. See `hand_over_files`.
         self.hand_over_files(spec)?;
@@ -700,7 +700,18 @@ impl CloudHypervisorDriver {
 /// `spawn_vmm` on why a receiving VMM speaks and a booting one does not —
 /// can be asserted without a process to spawn.
 pub(crate) fn vmm_args(socket: &Path, events: Option<&Path>) -> Vec<String> {
-    let mut args = vec!["--api-socket".to_string(), socket.display().to_string()];
+    let mut args = vec![
+        "--api-socket".to_string(),
+        socket.display().to_string(),
+        // v53's own default, said out loud. `--seccomp` takes `true`, `log`
+        // or `false`, and a VMM whose filter is off is a VMM whose sandbox
+        // silently is not there — this is the one line that makes that
+        // visible in `ps` and impossible to lose to a default changing
+        // upstream. Measured to be accepted without a VM on the command
+        // line, which `--landlock` is not (see `build_vm_config`).
+        "--seccomp".to_string(),
+        "true".to_string(),
+    ];
     if let Some(path) = events {
         args.push("-v".to_string());
         args.push("--event-monitor".to_string());

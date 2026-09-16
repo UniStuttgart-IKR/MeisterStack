@@ -182,7 +182,19 @@ fn ours(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The user the VMM and its backends should run as, when the run was given
+/// one. `None` means "as whoever is running this test", which is what a
+/// machine with no `meister-vmm` and no way to make one gets.
+fn vmm_user() -> Option<agent_api::VmmUser> {
+    let name = std::env::var("MEISTER_VMM_USER").unwrap_or_default();
+    if name.is_empty() {
+        return None;
+    }
+    Some(agent_api::VmmUser::resolve(&name).expect("MEISTER_VMM_USER must name a real user"))
+}
+
 fn driver(dir: &Path) -> CloudHypervisorDriver {
+    let user = vmm_user();
     CloudHypervisorDriver::new(
         from_env("MEISTER_CH"),
         dir.join("vms"),
@@ -191,6 +203,11 @@ fn driver(dir: &Path) -> CloudHypervisorDriver {
     )
     .expect("the driver builds")
     .with_tap_fds(true)
+    .with_vmm_user(user)
+    // The rig's own directory stands in for the node's image and volume
+    // directories: the kernel and initramfs come from outside it, and CH
+    // covers those itself because they are in the create document.
+    .with_landlock_paths(vec![dir.to_path_buf()])
 }
 
 /// S1: the tap crosses as a descriptor and the guest gets a working NIC.
@@ -307,4 +324,82 @@ async fn a_nic_plugged_into_a_running_guest_goes_the_same_way() {
 
     ch.destroy(&id).await.expect("teardown");
     tail.abort();
+}
+
+/// S3: the sandbox is on, and it bites the one thing it is documented to
+/// bite.
+///
+/// Landlock is applied at `vm_create`, so the ruleset is closed before the
+/// guest exists and cannot be widened afterwards — "the process cannot access
+/// any resources outside of the ruleset during its lifetime, even if it were
+/// compromised", which is the point and also the cost. CH's own note is
+/// explicit: "Hotplugging any new file-backed resources to above guest will
+/// result in Permission Denied error."
+///
+/// So this asserts both halves. A disk hot-plugged out of a directory the
+/// rules name goes in; one out of a directory nothing names is refused, by
+/// the kernel, not by this stack. A test that only showed the refusal would
+/// pass just as well against a ruleset that denied everything.
+#[tokio::test]
+#[ignore = "needs a real cloud-hypervisor, kernel, initramfs and a prepared tap; see the module note"]
+async fn landlock_lets_a_hotplug_from_a_named_directory_in_and_keeps_the_rest_out() {
+    let dir = rig("landlock");
+    let ch = driver(dir.path());
+    let id = VmId::new_v4();
+
+    // Inside the rules: the rig is a `landlock_paths` entry.
+    let allowed = dir.path().join("extra.raw");
+    std::fs::write(&allowed, vec![0u8; 8 * 1024 * 1024]).expect("a disk");
+    // Outside: a second directory nothing has a rule for.
+    let elsewhere = rig("elsewhere");
+    let denied = elsewhere.path().join("extra.raw");
+    std::fs::write(&denied, vec![0u8; 8 * 1024 * 1024]).expect("a disk");
+    if let Some(user) = vmm_user() {
+        // Ownership is NOT what this test is about, so both files are handed
+        // over up front: a refusal that turned out to be `EACCES` from the
+        // mode would prove nothing about Landlock.
+        user.take(&allowed).expect("chown");
+        user.take(&denied).expect("chown");
+    }
+
+    ch.create(&id, &spec(Some(1450)), None)
+        .await
+        .expect("vm.create + add-net");
+    let (console, tail) = serial_transcript(&ch, &id, dir.path()).await;
+    ch.start(&id).await.expect("vm.boot");
+    guest_said(&console, "MS-S0-DONE", Duration::from_secs(60)).await;
+
+    let hot = ch.as_hotpluggable().expect("this driver hot-plugs");
+    let volume = |path: &Path| agent_api::AttachedVolume {
+        id: uuid_from(path),
+        attachment: agent_api::VolumeAttachment::Path(path.to_path_buf()),
+    };
+
+    hot.add_disk(&id, &volume(&allowed))
+        .await
+        .expect("a disk from a directory the ruleset names");
+
+    let refused = hot
+        .add_disk(&id, &volume(&denied))
+        .await
+        .expect_err("a disk from outside the ruleset must be refused");
+    let said = format!("{refused:#}");
+    println!("refused: {said}");
+    assert!(
+        said.to_lowercase().contains("permission denied") || said.contains("EACCES"),
+        "the refusal should be the kernel's and name it: {said}"
+    );
+
+    ch.destroy(&id).await.expect("teardown");
+    tail.abort();
+}
+
+/// A volume id derived from a path, so the two `add_disk` calls above get
+/// different disk names without a fixture holding them.
+fn uuid_from(path: &Path) -> uuid::Uuid {
+    let mut bytes = [0u8; 16];
+    for (i, b) in path.to_string_lossy().bytes().enumerate() {
+        bytes[i % 16] ^= b;
+    }
+    uuid::Uuid::from_bytes(bytes)
 }

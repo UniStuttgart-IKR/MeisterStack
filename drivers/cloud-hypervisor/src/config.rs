@@ -128,12 +128,41 @@ pub(crate) enum NetForm {
     TapFd,
 }
 
+/// One `landlock_rules` entry: a path the VMM may reach, and how.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct LandlockRule {
+    pub(crate) path: PathBuf,
+    /// `"r"` or `"rw"`, which is CH's own spelling
+    /// (`--landlock-rules "path=…,access=[rw]"`).
+    pub(crate) access: &'static str,
+}
+
+/// What shape of VM document this driver is building: how the NICs arrive,
+/// and whether the VMM sandboxes itself.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct VmForm {
+    pub(crate) net: NetForm,
+    /// `Some` turns `landlock_enable` on and adds these rules BESIDE the ones
+    /// cloud hypervisor derives from the config itself — it already covers
+    /// every disk, the payload, the console file and the serial socket
+    /// (`vmm/src/vm_config.rs`, the `ApplyLandlock` impls). What it cannot
+    /// know is what will be attached LATER, and its own documentation is
+    /// blunt about the consequence: "Hotplugging any new file-backed
+    /// resources to above guest will result in Permission Denied error". So
+    /// these are the directories a hot-plug will come out of.
+    ///
+    /// `None` is no Landlock at all, which is every node that has not asked
+    /// for Stufe 3.
+    pub(crate) landlock: Option<Vec<LandlockRule>>,
+}
+
 pub(crate) fn build_vm_config(
     spec: &InstanceSpec,
     console_path: &PathBuf,
     serial_socket: &PathBuf,
-    net_form: NetForm,
+    form: &VmForm,
 ) -> hypervisor::Result<serde_json::Value> {
+    let net_form = form.net;
     // `memory.shared` is a property of the VM, not of one kind of attachment:
     // any vhost-user backend maps guest memory, and a vhost-user-blk volume
     // needs it exactly as much as a gpu device does. Asking both halves of
@@ -249,6 +278,25 @@ pub(crate) fn build_vm_config(
     }
     if !vfio_devices.is_empty() {
         config["devices"] = vfio_devices.into();
+    }
+
+    // Landlock through the API and not through `--landlock`, and that is not
+    // a preference: the flag sits in the same clap group as a VM built on the
+    // command line, so `cloud-hypervisor --api-socket … --landlock` refuses
+    // to start at all — "the following required arguments were not provided:
+    // <--firmware <firmware>|--kernel <kernel>>". Measured. The config field
+    // is the documented way for an API-driven VMM and it is applied at
+    // `vm_create`, after the console devices are made and before the boot,
+    // which is exactly where this document arrives.
+    if let Some(rules) = &form.landlock {
+        config["landlock_enable"] = true.into();
+        if !rules.is_empty() {
+            config["landlock_rules"] = rules
+                .iter()
+                .map(|r| serde_json::json!({ "path": r.path, "access": r.access }))
+                .collect::<Vec<_>>()
+                .into();
+        }
     }
     Ok(config)
 }

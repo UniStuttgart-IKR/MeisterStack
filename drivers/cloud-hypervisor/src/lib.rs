@@ -98,6 +98,11 @@ pub struct CloudHypervisorDriver {
     /// Who the VMM runs as, when that is not the agent. `None` is every node
     /// that has ever run this.
     vmm_user: Option<agent_api::VmmUser>,
+    /// Directories a hot-plug may later come out of, for the Landlock
+    /// ruleset. The node's image and volume directories: everything the
+    /// CURRENT config names is covered by cloud hypervisor's own rules, and
+    /// what is missing is only ever what arrives afterwards.
+    landlock_paths: Vec<PathBuf>,
 }
 
 impl CloudHypervisorDriver {
@@ -122,6 +127,7 @@ impl CloudHypervisorDriver {
             unplugging: Mutex::new(HashMap::new()),
             tap_fds: false,
             vmm_user: None,
+            landlock_paths: Vec::new(),
         })
     }
 
@@ -150,12 +156,85 @@ impl CloudHypervisorDriver {
         self
     }
 
+    /// Directories a later hot-plug may name, for the Landlock ruleset.
+    ///
+    /// The node's image and volume directories. Only what arrives AFTER
+    /// `vm.create` needs this — CH derives a rule for every path in the
+    /// create document itself — and a file-backed hot-plug into a sandboxed
+    /// VMM is the one thing CH's own Landlock documentation warns about by
+    /// name.
+    pub fn with_landlock_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.landlock_paths = paths;
+        self
+    }
+
     /// Which of the two shapes a NIC reaches the VMM in. See `NetForm`.
     pub(crate) fn net_form(&self) -> NetForm {
         match self.tap_fds {
             true => NetForm::TapFd,
             false => NetForm::TapName,
         }
+    }
+
+    /// The document shape for one VM: how its NICs arrive, and what its
+    /// sandbox lets it reach.
+    ///
+    /// Landlock follows `vmm_user` and is not a knob of its own. It would
+    /// work for a VMM that is still the agent — CH says so, "Landlock is a
+    /// lightweight mechanism to allow unprivileged applications to sandbox
+    /// themselves", and it costs nothing there — but turning it on for the
+    /// fleet's current configuration would change the behaviour of every
+    /// node that has not asked for anything, and the rule for this lane is
+    /// that nothing changes without the key.
+    pub(crate) fn vm_form(&self, spec: &InstanceSpec) -> VmForm {
+        VmForm {
+            net: self.net_form(),
+            landlock: self.vmm_user.as_ref().map(|_| self.landlock_rules(spec)),
+        }
+    }
+
+    /// The rules beside the ones cloud hypervisor derives for itself.
+    ///
+    /// Three sources, and each is a hot-plug that would otherwise be denied:
+    ///
+    /// * the run directory, `rw` — every vhost-user socket a device hot-plug
+    ///   would name, the input driver's FIFO, and this driver's own files.
+    ///   One rule covers all of them because they all live under it.
+    /// * the node's image and volume directories, from the config.
+    /// * the directory of every volume this VM already has. That is what
+    ///   covers a storage driver whose paths are NOT under `volume_dir` — an
+    ///   LVM volume is `/dev/mapper/…`, an NVMe-oF one is `/dev/nvme…` — for
+    ///   a VM that has one of those already. A VM that hot-plugs its FIRST
+    ///   volume from such a driver is the known gap, and it is a gap in
+    ///   Landlock's own model: a ruleset cannot be widened after
+    ///   `restrict_self`.
+    fn landlock_rules(&self, spec: &InstanceSpec) -> Vec<LandlockRule> {
+        let mut rules: Vec<LandlockRule> = Vec::new();
+        let mut add = |path: PathBuf, access: &'static str| {
+            if !rules.iter().any(|r| r.path == path) {
+                rules.push(LandlockRule { path, access });
+            }
+        };
+        // The run directory and not only this driver's own corner of it: the
+        // backends' sockets are siblings, one level up.
+        add(
+            self.socket_dir
+                .parent()
+                .unwrap_or(&self.socket_dir)
+                .to_path_buf(),
+            "rw",
+        );
+        for path in &self.landlock_paths {
+            add(path.clone(), "rw");
+        }
+        for volume in &spec.volumes {
+            if let VolumeAttachment::Path(path) = &volume.attachment
+                && let Some(dir) = path.parent()
+            {
+                add(dir.to_path_buf(), "rw");
+            }
+        }
+        rules
     }
 }
 

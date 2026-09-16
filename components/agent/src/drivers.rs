@@ -461,7 +461,14 @@ fn build_cloud_hypervisor(
         h.unplug_timeout(),
     )?
     .with_tap_fds(vmm_user.is_some())
-    .with_vmm_user(vmm_user);
+    .with_vmm_user(vmm_user)
+    // What a sandboxed VMM must still be able to reach when something is
+    // attached AFTER it has boxed itself in. Only these two: everything the
+    // create document names, cloud hypervisor covers itself.
+    .with_landlock_paths(vec![
+        cfg.paths.image_dir.clone(),
+        cfg.paths.volume_dir.clone(),
+    ]);
     Ok(Some(Arc::new(driver)))
 }
 
