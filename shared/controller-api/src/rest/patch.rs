@@ -73,10 +73,23 @@ where
         return Err(invalid("metadata.name does not match the path"));
     }
     if let Some(sent) = &body.status {
-        let held = serde_json::to_value(&current.status).map_err(|e| {
+        let mut held = serde_json::to_value(&current.status).map_err(|e| {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal", e.to_string())
         })?;
-        if sent != &held {
+        let mut sent = sent.clone();
+        // `lastHeartbeat` is served, not stored (D-C7): a GET joins it in from
+        // the lease, and what etcd still holds under that key is the instant
+        // left there before the field moved out. So what a client read and
+        // what the store has never agree, and neither is the client's to
+        // send. Left in the comparison, every `node label` and every cordon
+        // was a 422 — the regression S1 and S11 found the night the lease
+        // shipped.
+        for status in [&mut held, &mut sent] {
+            if let Some(fields) = status.as_object_mut() {
+                fields.remove("lastHeartbeat");
+            }
+        }
+        if sent != held {
             return Err(invalid(format!(
                 "status belongs to the controller; send this {expected} back with the status it \
                  was read with, or leave status out"

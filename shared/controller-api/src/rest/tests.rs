@@ -1522,6 +1522,15 @@ fn a_spec_only_put_takes_the_spec_and_refuses_a_written_status() {
     let echoed = serde_json::to_value(&current.status).unwrap();
     assert!(apply_spec_update(put(Some(echoed), "41"), "manacor", current.clone()).is_ok());
 
+    // Echoed back with the heartbeat a GET joins in from the lease, which is
+    // never the instant etcd still holds under that key: still a round trip.
+    // The night D-C7's lease shipped, this was a 422 on every `node label`
+    // and every cordon (S1, S11), because the join moved a field the store
+    // does not.
+    let mut moved = serde_json::to_value(&current.status).unwrap();
+    moved["lastHeartbeat"] = serde_json::json!("2027-01-15T08:00:00Z");
+    assert!(apply_spec_update(put(Some(moved), "41"), "manacor", current.clone()).is_ok());
+
     // Status changed: refused, and the sentence says whose it is.
     let forged = serde_json::json!({"ready": true, "vms": 999});
     let err = apply_spec_update(put(Some(forged), "41"), "manacor", current.clone())
