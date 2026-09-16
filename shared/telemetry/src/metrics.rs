@@ -111,11 +111,38 @@ impl Reconcile {
 pub struct Objects {
     count: IntGaugeVec,
     vms: IntGaugeVec,
+    stuck: IntGaugeVec,
 }
 
 impl Objects {
     pub fn set_count(&self, kind: &str, n: i64) {
         self.count.with_label_values(&[kind]).set(n);
+    }
+
+    /// How many objects are past the deadline for the phase they are in.
+    ///
+    /// D-C1 as a number. A node fell out of the lab and the VMs on it stood
+    /// at `Unknown { Silent }` for four and a half days with nothing anywhere
+    /// distinguishing them from a VM that went `Unknown` nine seconds ago —
+    /// see `controller_api::stuck`, which owns the budgets. **Nothing is
+    /// promoted by it**: this gauge and one event are all a deadline buys.
+    ///
+    /// Every label is a closed set — the kind from the resource table, the
+    /// phase from an `XPhaseKind`, the reason from an `XReason` — so the
+    /// series count is bounded by the code and not by the fleet.
+    pub fn set_stuck(&self, kind: &str, phase: &str, reason: &str, n: i64) {
+        self.stuck.with_label_values(&[kind, phase, reason]).set(n);
+    }
+
+    /// Forget every stuck series before a pass sets the ones it found.
+    ///
+    /// Rebuilt per pass rather than decremented, for the reason
+    /// `Sessions::reset_heartbeats` is: an object that has come unstuck — or
+    /// been deleted — has to LOSE its series rather than keep the last value
+    /// for ever, and a pass cannot know which cells it is about to stop
+    /// filling.
+    pub fn reset_stuck(&self) {
+        self.stuck.reset();
     }
 
     /// One phase's count. Callers set EVERY phase each pass, zero included,
@@ -436,6 +463,13 @@ fn build() -> Metrics {
             &["kind"],
         ),
         vms: gauge("vms", "Vm objects by phase.", &["phase"]),
+        stuck: gauge(
+            "phase_stuck",
+            "Objects whose phase has stood longer than that phase's budget, by kind, phase \
+             and the reason behind it. Nothing is promoted on account of it; see the deadlines \
+             in controller_api::stuck.",
+            &["kind", "phase", "reason"],
+        ),
     };
 
     let scheduling = Scheduling {

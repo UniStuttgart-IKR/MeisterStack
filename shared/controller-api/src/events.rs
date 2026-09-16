@@ -76,6 +76,10 @@ pub mod reason {
     pub const QUOTA_EXCEEDED: &str = "QuotaExceeded";
     /// The phase the tier below reports is not the one that was stored.
     pub const PHASE_CHANGED: &str = "PhaseChanged";
+    /// A non-terminal phase that has stood longer than its budget — see
+    /// `crate::stuck`. Recorded ONCE, when the deadline is crossed, and
+    /// never a promotion: the object keeps the phase it had.
+    pub const PHASE_STUCK: &str = "PhaseStuck";
     /// A peer's heartbeat stopped, or came back.
     pub const PEER_LOST: &str = "PeerLost";
     pub const PEER_READY: &str = "PeerReady";

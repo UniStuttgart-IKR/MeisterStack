@@ -106,8 +106,20 @@ pub async fn run(
     overcommit: Overcommit,
 ) {
     let mut trigger = PassTrigger::<Vm>::new(&store, TICK).await;
+    // The same cadence as one tier down and for the same reason: a
+    // five-minute budget does not need a five-second resolution, and six
+    // listings per tick would be a monitoring feature that changes the thing
+    // it monitors.
+    const DEADLINE_EVERY: u32 = 12;
+    let mut ticks: u32 = 0;
     loop {
         trigger.wait(&store).await;
+        ticks = ticks.wrapping_add(1);
+        if ticks % DEADLINE_EVERY == 0
+            && let Err(e) = deadlines(&store, TICK * DEADLINE_EVERY).await
+        {
+            warn!(error = format!("{e:#}"), "deadline pass failed");
+        }
         let clock = telemetry::metrics::Timer::start();
         let outcome = pass(&store, &registry, scheduler.as_ref(), overcommit).await;
         // Around the whole pass, and a failed pass still took the time it
@@ -123,6 +135,88 @@ pub async fn run(
             warn!(error = format!("{e:#}"), "reconcile pass failed");
         }
     }
+}
+
+/// No non-terminal state without a deadline — the cloud's half of D7.
+///
+/// The same pass one tier down runs, over the kinds this tier holds: an
+/// `Image` instead of a `VmMigration`, because a migration is a cluster's
+/// operation and a catalogue is only ever the cloud's. It writes nothing onto
+/// the objects; see the cluster's own `deadlines` for why that is the whole
+/// design.
+async fn deadlines(store: &EtcdStore, tick: Duration) -> anyhow::Result<()> {
+    let now = Utc::now();
+    use controller_api::stuck::{About, Late};
+    let mut late = Late::default();
+    for vm in store.list::<Vm>().await? {
+        late.look(
+            About::of::<Vm>(&vm.metadata, vm.spec.tenant.as_deref()),
+            vm.status.standing(),
+            now,
+            tick,
+        );
+    }
+    for volume in store.list::<controller_api::Volume>().await? {
+        late.look(
+            About::of::<controller_api::Volume>(
+                &volume.metadata,
+                Some(volume.spec.tenant.as_str()),
+            ),
+            volume.status.standing(),
+            now,
+            tick,
+        );
+    }
+    for snapshot in store.list::<controller_api::VolumeSnapshot>().await? {
+        late.look(
+            About::of::<controller_api::VolumeSnapshot>(
+                &snapshot.metadata,
+                Some(snapshot.spec.tenant.as_str()),
+            ),
+            snapshot.status.standing(),
+            now,
+            tick,
+        );
+    }
+    for pool in store.list::<controller_api::StoragePool>().await? {
+        late.look(
+            About::of::<controller_api::StoragePool>(&pool.metadata, None),
+            pool.status.standing(),
+            now,
+            tick,
+        );
+    }
+    for router in store.list::<controller_api::Router>().await? {
+        late.look(
+            About::of::<controller_api::Router>(
+                &router.metadata,
+                Some(router.spec.tenant.as_str()),
+            ),
+            router.status.standing(),
+            now,
+            tick,
+        );
+    }
+    // The catalogue, which is F16's other end: a path image that no node can
+    // see now says `Failed { NotFound }` at once, and one that nobody has
+    // looked at yet sits at `Pending { AwaitingNode }` — and if it sits there
+    // for five minutes, something is not fetching it.
+    for image in store.list::<controller_api::Image>().await? {
+        late.look(
+            About::of::<controller_api::Image>(&image.metadata, image.spec.tenant.as_deref()),
+            image.status.standing(),
+            now,
+            tick,
+        );
+    }
+    late.publish();
+    late.report(store).await;
+    for crossed in late.crossed() {
+        warn!(kind = crossed.kind, name = %crossed.name, phase = crossed.word,
+              reason = crossed.reason, over_secs = crossed.over.as_secs(),
+              "a phase has stood past its budget");
+    }
+    Ok(())
 }
 
 async fn pass(

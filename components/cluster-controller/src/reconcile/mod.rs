@@ -158,8 +158,22 @@ pub async fn run(
     network: Arc<dyn NetworkBackend>,
 ) {
     let mut trigger = PassTrigger::<Vm>::new(&store, TICK).await;
+    // How many ticks between two deadline passes. A five-minute budget does
+    // not need a five-second resolution, and six listings per tick would be a
+    // monitoring feature that changes the thing it monitors — the same
+    // argument `telemetry::metrics::Objects` makes about its own gauges. One
+    // minute leaves the overshoot a deadline reports accurate to a minute,
+    // which is what a four-and-a-half-day silence needed (D-C1).
+    const DEADLINE_EVERY: u32 = 12;
+    let mut ticks: u32 = 0;
     loop {
         trigger.wait(&store).await;
+        ticks = ticks.wrapping_add(1);
+        if ticks % DEADLINE_EVERY == 0
+            && let Err(e) = deadlines(&store, TICK * DEADLINE_EVERY).await
+        {
+            warn!(error = format!("{e:#}"), "deadline pass failed");
+        }
         let clock = telemetry::metrics::Timer::start();
         let outcome = pass(
             &store,
@@ -186,6 +200,93 @@ pub async fn run(
             warn!(error = format!("{e:#}"), "reconcile pass failed");
         }
     }
+}
+
+/// No non-terminal state without a deadline: one pass over every kind this
+/// tier holds, once a minute.
+///
+/// It writes NOTHING onto the objects. That is decision 7 and it is the whole
+/// design: a deadline buys a number (`meister_phase_stuck`) and a sentence
+/// (one `PhaseStuck` event on crossing), and never a promotion — `Unknown`
+/// does not become `Failed` however long it stands, because `Failed` is what
+/// the requeue curve acts on and a timer that promoted a silence would be
+/// this tier re-creating a guest on the strength of no evidence at all.
+///
+/// Its own pass with its own listings rather than a rider on the reconcile
+/// sub-passes, and that is worth the reads: the question is asked of EVERY
+/// object of every kind, including the ones a reconcile pass skips because
+/// another replica owns them — and a machine that fell out is exactly the
+/// case where no replica owns anything. D-C1 stood for four and a half days
+/// behind an ownership check of that shape.
+async fn deadlines(store: &EtcdStore, tick: Duration) -> anyhow::Result<()> {
+    let now = Utc::now();
+    use controller_api::stuck::{About, Late};
+    let mut late = Late::default();
+    for vm in store.list::<Vm>().await? {
+        late.look(
+            About::of::<Vm>(&vm.metadata, vm.spec.tenant.as_deref()),
+            vm.status.standing(),
+            now,
+            tick,
+        );
+    }
+    for volume in store.list::<Volume>().await? {
+        late.look(
+            About::of::<Volume>(&volume.metadata, Some(volume.spec.tenant.as_str())),
+            volume.status.standing(),
+            now,
+            tick,
+        );
+    }
+    for snapshot in store.list::<controller_api::VolumeSnapshot>().await? {
+        late.look(
+            About::of::<controller_api::VolumeSnapshot>(
+                &snapshot.metadata,
+                Some(snapshot.spec.tenant.as_str()),
+            ),
+            snapshot.status.standing(),
+            now,
+            tick,
+        );
+    }
+    for pool in store.list::<StoragePool>().await? {
+        late.look(
+            About::of::<StoragePool>(&pool.metadata, None),
+            pool.status.standing(),
+            now,
+            tick,
+        );
+    }
+    for router in store.list::<controller_api::Router>().await? {
+        late.look(
+            About::of::<controller_api::Router>(
+                &router.metadata,
+                Some(router.spec.tenant.as_str()),
+            ),
+            router.status.standing(),
+            now,
+            tick,
+        );
+    }
+    for migration in store.list::<controller_api::VmMigration>().await? {
+        late.look(
+            About::of::<controller_api::VmMigration>(
+                &migration.metadata,
+                Some(migration.spec.tenant.as_str()),
+            ),
+            migration.status.standing(),
+            now,
+            tick,
+        );
+    }
+    late.publish();
+    late.report(store).await;
+    for crossed in late.crossed() {
+        warn!(kind = crossed.kind, name = %crossed.name, phase = crossed.word,
+              reason = crossed.reason, over_secs = crossed.over.as_secs(),
+              "a phase has stood past its budget");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

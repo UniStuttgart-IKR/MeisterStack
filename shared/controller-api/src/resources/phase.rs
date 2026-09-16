@@ -572,6 +572,24 @@ macro_rules! phased {
                 &self.phase
             }
 
+            /// The four things a deadline needs to know about this object,
+            /// out of the phase and nothing else.
+            ///
+            /// Generated here so that one pass can ask the same question of
+            /// seven kinds without knowing which it is holding — see
+            /// `crate::stuck::Late`. `terminal` is the judgement each
+            /// `XPhaseKind` makes for itself, because `Failed` is an end for
+            /// an `Image` and a backoff for a `Vm` out of the same five
+            /// letters.
+            pub fn standing(&self) -> crate::stuck::Standing {
+                crate::stuck::Standing {
+                    word: self.phase.kind().as_str(),
+                    terminal: self.phase.kind().is_terminal(),
+                    reason: self.phase.reason_word(),
+                    since: self.phase.since(),
+                }
+            }
+
             /// The derived phase, onto the object, with the stamp rule
             /// applied — the ONE place the field moves once `assign` is
             /// gone.

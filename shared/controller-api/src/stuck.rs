@@ -20,13 +20,18 @@
 //! mini-chaos run found alive on manacor, twenty hours after their agent
 //! died, are the reason.
 //!
-//! This file is the rule and its tests. The pass that reads it — one event on
-//! crossing, one gauge `meister_phase_stuck{kind,phase,reason}` — is the
-//! derivation lane's (D7).
+//! This file is the rule, the pass that applies it, and their tests: one
+//! event when a deadline is crossed, one gauge
+//! `meister_phase_stuck{kind,phase,reason}`, and nothing else.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+
+use crate::events::{self, Happening};
+use crate::resources::EventType;
+use crate::store::EtcdStore;
 
 /// A phase that means "nobody has placed this yet".
 ///
@@ -117,6 +122,191 @@ pub fn stuck(
     age.checked_sub(budget).filter(|over| !over.is_zero())
 }
 
+/// What a deadline needs to know about one object, out of its phase.
+///
+/// Four `&'static str`s and an instant, so that one pass can ask the same
+/// question of seven kinds without knowing which it is holding.
+/// `XStatus::standing()` builds it; see `resources::phase`.
+#[derive(Clone, Copy, Debug)]
+pub struct Standing {
+    /// `XPhaseKind::as_str`.
+    pub word: &'static str,
+    /// `XPhaseKind::is_terminal` — the judgement each enum makes for itself.
+    pub terminal: bool,
+    /// `XPhase::reason_word`: the closed word, or empty where the phase has
+    /// no slot for one and where nobody recorded one.
+    pub reason: &'static str,
+    /// When the WORD last changed. Not when the object was last written —
+    /// that is the difference this round's `stamp` rule exists to keep, and
+    /// it is what makes "Unknown for four days" a number at all.
+    pub since: DateTime<Utc>,
+}
+
+/// One object that has just crossed its deadline.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Crossed {
+    pub kind: &'static str,
+    pub name: String,
+    pub uid: String,
+    pub tenant: Option<String>,
+    pub word: &'static str,
+    pub reason: &'static str,
+    /// How far past the budget, at the pass that noticed.
+    pub over: Duration,
+}
+
+impl Crossed {
+    /// The sentence an operator reads. It names the overshoot rather than the
+    /// age, because "5m over its 5m budget" says something "10m" does not.
+    pub fn sentence(&self) -> String {
+        let since = match self.reason {
+            "" => String::new(),
+            reason => format!(" ({reason})"),
+        };
+        format!(
+            "{} has been {}{} for {}s longer than the {}s this phase is given; nothing here \
+             will change it on account of that",
+            self.name,
+            self.word,
+            since,
+            self.over.as_secs(),
+            stuck_after(self.word)
+                .map(|b| b.as_secs())
+                .unwrap_or_default()
+        )
+    }
+}
+
+/// What one pass found late: a count per (kind, phase, reason) for the gauge,
+/// and the objects that crossed in THIS pass for the events.
+///
+/// Two answers out of one walk, because they are two different statements. The
+/// gauge is a LEVEL — how many are late right now — and has to be rebuilt
+/// from scratch every pass, or an object that came unstuck would keep its
+/// series for ever. The events are EDGES, and an edge that fired every tick
+/// would be a store filling at one write per stuck object per pass, which is
+/// the churn this whole round is against.
+#[derive(Default, Debug)]
+pub struct Late {
+    counted: BTreeMap<(&'static str, &'static str, &'static str), i64>,
+    crossed: Vec<Crossed>,
+}
+
+/// Which object a deadline is about.
+///
+/// A struct rather than four parameters, and it earns that twice over: the
+/// six call sites per tier all read the same three fields off a `Metadata`,
+/// and the one that differs — the tenant, which lives on the spec and is
+/// spelled `Option<String>` on some kinds and `String` on others — is then
+/// the only thing a call site has to think about.
+pub struct About<'a> {
+    pub kind: &'static str,
+    pub name: &'a str,
+    pub uid: &'a str,
+    /// Whose object it is, which is who gets to read the event. `None` =
+    /// unscoped, and then only an admin sees it.
+    pub tenant: Option<&'a str>,
+}
+
+impl<'a> About<'a> {
+    /// The identity out of the envelope, with the tenant off the spec.
+    pub fn of<T: crate::object::Resource>(
+        metadata: &'a crate::object::Metadata,
+        tenant: Option<&'a str>,
+    ) -> Self {
+        Self {
+            kind: T::KIND,
+            name: &metadata.name,
+            uid: &metadata.uid,
+            tenant,
+        }
+    }
+}
+
+impl Late {
+    /// Ask one object whether it is late, and remember the answer.
+    ///
+    /// `tick` is how often this pass runs, and it is what turns a level into
+    /// an edge: an object whose overshoot is smaller than one interval has
+    /// crossed its deadline SINCE the last pass, and every later pass sees a
+    /// bigger overshoot and says nothing. No mark on the object is needed for
+    /// that, which is the point — a "we told you" flag would be a field
+    /// nothing else reads and one more thing to get wrong on a restart.
+    ///
+    /// A missed pass costs at most a missed event, not a wrong one, and the
+    /// gauge is unaffected: it is a level and does not care when the crossing
+    /// happened.
+    pub fn look(
+        &mut self,
+        about: About<'_>,
+        standing: Standing,
+        now: DateTime<Utc>,
+        tick: Duration,
+    ) {
+        let Some(over) = stuck(standing.terminal, standing.word, standing.since, now) else {
+            return;
+        };
+        *self
+            .counted
+            .entry((about.kind, standing.word, standing.reason))
+            .or_default() += 1;
+        if over < tick {
+            self.crossed.push(Crossed {
+                kind: about.kind,
+                name: about.name.to_string(),
+                uid: about.uid.to_string(),
+                tenant: about.tenant.map(str::to_string),
+                word: standing.word,
+                reason: standing.reason,
+                over,
+            });
+        }
+    }
+
+    /// The level, onto the gauge. Every pass, whether or not anything is
+    /// late: `reset` first, so a cell nothing fills this time disappears.
+    pub fn publish(&self) {
+        let objects = telemetry::metrics::objects();
+        objects.reset_stuck();
+        for ((kind, word, reason), n) in &self.counted {
+            objects.set_stuck(kind, word, reason, *n);
+        }
+    }
+
+    /// The edges, as events. Warning, because a deadline crossed is something
+    /// somebody has to look at — and the one thing it is NOT is a verdict
+    /// about the object.
+    pub async fn report(&self, store: &EtcdStore) {
+        for crossed in &self.crossed {
+            events::record(
+                store,
+                Happening {
+                    kind: crossed.kind,
+                    name: &crossed.name,
+                    uid: &crossed.uid,
+                    reason: events::reason::PHASE_STUCK,
+                    message: crossed.sentence(),
+                    event_type: EventType::Warning,
+                    tenant: crossed.tenant.as_deref(),
+                },
+            )
+            .await;
+        }
+    }
+
+    /// What crossed, for a caller that wants to log it. Empty on nearly every
+    /// pass, which is the state this whole file exists to tell apart from
+    /// "nobody is looking".
+    pub fn crossed(&self) -> &[Crossed] {
+        &self.crossed
+    }
+
+    /// How many objects are late, over all kinds — one number for a log line.
+    pub fn total(&self) -> i64 {
+        self.counted.values().sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +314,15 @@ mod tests {
         ImagePhaseKind, RouterPhaseKind, StoragePoolPhaseKind, VmMigrationPhaseKind, VmPhaseKind,
         VolumePhaseKind, VolumeSnapshotPhaseKind,
     };
+
+    fn about<'a>(kind: &'static str, name: &'a str) -> About<'a> {
+        About {
+            kind,
+            name,
+            uid: name,
+            tenant: None,
+        }
+    }
 
     fn at(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("an instant")
@@ -283,5 +482,101 @@ mod tests {
                 .iter()
                 .any(|(t, w)| stuck(*t, w, at(0), at(86_400)).is_some())
         );
+    }
+
+    /// The pass: a level and an edge out of one walk.
+    ///
+    /// D-C1 as the two things a deadline buys. The gauge counts what is late
+    /// NOW, by kind, phase and reason; the event fires on the pass that
+    /// notices the crossing and on no later one — an edge derived from the
+    /// overshoot, so there is no "we told you" mark on the object to get
+    /// wrong on a restart.
+    #[test]
+    fn a_deadline_is_a_level_and_an_edge_and_never_a_verdict() {
+        let tick = Duration::from_secs(60);
+        let silent = |since| Standing {
+            word: VmPhaseKind::Unknown.as_str(),
+            terminal: VmPhaseKind::Unknown.is_terminal(),
+            reason: "Silent",
+            since,
+        };
+        let budget = STUCK_AFTER_UNKNOWN.as_secs() as i64;
+
+        // Inside the budget: nothing at all.
+        let mut early = Late::default();
+        early.look(about("Vm", "web-1"), silent(at(0)), at(budget), tick);
+        assert_eq!(early.total(), 0);
+        assert!(early.crossed().is_empty());
+
+        // The pass that notices: counted AND reported.
+        let mut crossing = Late::default();
+        crossing.look(
+            About {
+                tenant: Some("acme"),
+                ..about("Vm", "web-1")
+            },
+            silent(at(0)),
+            at(budget + 30),
+            tick,
+        );
+        assert_eq!(crossing.total(), 1);
+        let [one] = crossing.crossed() else {
+            panic!("exactly one crossing, got {:?}", crossing.crossed())
+        };
+        assert_eq!(one.word, "Unknown");
+        assert_eq!(one.reason, "Silent");
+        assert_eq!(one.over, Duration::from_secs(30));
+        let said = one.sentence();
+        assert!(said.contains("web-1") && said.contains("Unknown"), "{said}");
+        assert!(said.contains("Silent"), "{said}");
+        assert!(
+            said.contains("nothing here will change it"),
+            "the sentence says it is not a verdict: {said}"
+        );
+
+        // Every later pass: still counted, never reported again.
+        for over in [tick.as_secs() as i64, 4 * 24 * 3600] {
+            let mut later = Late::default();
+            later.look(about("Vm", "web-1"), silent(at(0)), at(budget + over), tick);
+            assert_eq!(later.total(), 1, "the level stands");
+            assert!(
+                later.crossed().is_empty(),
+                "and the edge fired once, {over}s ago"
+            );
+        }
+    }
+
+    /// The gauge's labels are counts per (kind, phase, reason), so two VMs
+    /// silent for the same reason are one series with a two in it — and a
+    /// third late for another reason is its own.
+    #[test]
+    fn the_late_are_counted_by_kind_phase_and_reason() {
+        let tick = Duration::from_secs(60);
+        let standing = |word: &'static str, reason: &'static str| Standing {
+            word,
+            terminal: false,
+            reason,
+            since: at(0),
+        };
+        let mut late = Late::default();
+        let now = at(STUCK_AFTER_UNKNOWN.as_secs() as i64 + 7 * 24 * 3600);
+        for name in ["web-1", "web-2"] {
+            late.look(about("Vm", name), standing("Unknown", "Silent"), now, tick);
+        }
+        late.look(
+            about("Vm", "db-1"),
+            standing("Pending", "Unplaced"),
+            now,
+            tick,
+        );
+        late.look(
+            about("Volume", "data-1"),
+            standing("Releasing", "HeldBy"),
+            now,
+            tick,
+        );
+        assert_eq!(late.total(), 4);
+        // Nothing crossed in this pass: all four are days past their budget.
+        assert!(late.crossed().is_empty());
     }
 }
