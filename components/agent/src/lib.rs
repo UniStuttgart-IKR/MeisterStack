@@ -14,6 +14,7 @@ pub mod drivers;
 pub mod images;
 pub mod machine;
 pub mod migration;
+pub mod privileges;
 pub mod provision;
 pub mod reconcile;
 pub mod store;
@@ -211,6 +212,10 @@ pub struct Agent {
     /// What is wrong with this node right now — the half of the heartbeat
     /// that does change. See `crate::conditions`.
     conditions: Arc<crate::conditions::Conditions>,
+    /// The rights this node holds against the drivers it configured, asked
+    /// again on every report. See `crate::privileges::Watch` for why it is
+    /// level-triggered and not read once.
+    unprivileged: Arc<crate::privileges::Watch>,
     /// Whether this agent is going away on purpose. See `Shutdown`.
     shutdown: Arc<Shutdown>,
     /// Wakes the status loop of whichever session is current. On the agent
@@ -387,6 +392,11 @@ impl Agent {
     /// one the scheduler has to stop placing on, and until this field existed
     /// there was nothing on the heartbeat that said so.
     fn node_status(&self) -> NodeStatus {
+        // Measured again, here, because this is the sentence that carries it:
+        // a group that was added to the unit, a module that loaded, a udev
+        // rule that arrived late all change what this node can do without
+        // changing anything about the process.
+        self.unprivileged.refresh(&self.conditions);
         node_status(&self.node, &self.conditions)
     }
 
@@ -717,6 +727,20 @@ async fn give_the_interfaces_away(
 pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
     let (conditions, store) = store_and_conditions(&cfg)?;
     let drivers = Drivers::from_config(&cfg).await?;
+    // The start-check again, for the half of it that is not a build decision:
+    // what the heartbeat has to keep saying. `screen` is pure — same config,
+    // same rights, same answer — so asking it twice is a second measurement
+    // and not a second authority, and `from_config` keeps owning which
+    // drivers get built. It has already said each sentence once, at WARN.
+    let unprivileged = Arc::new(crate::privileges::Watch::new(
+        Arc::new(crate::privileges::Host),
+        crate::drivers::screen(&cfg, &crate::privileges::Host).watch,
+    ));
+    // Raised here and not only on the first heartbeat, for the reason
+    // `store_and_conditions` gives about the cgroup root: the answer belongs
+    // in the log of the boot that made it true, and a node with no
+    // controller configured never sends a heartbeat at all.
+    unprivileged.refresh(&conditions);
     let networking_driver = drivers.networking.clone();
     let bridge_driver = drivers.bridge.clone();
     // Cloned before the reconciler takes ownership of `drivers`, and for one
@@ -854,6 +878,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
         node: cfg.capped(node_facts()),
         machine: machine_profile(&cfg, hypervisor_driver.as_ref()).await,
         conditions,
+        unprivileged,
         shutdown: Arc::new(Shutdown::default()),
         report_now: Arc::new(tokio::sync::Notify::new()),
         migration: migration_endpoint,

@@ -37,6 +37,22 @@ pub const STORE_UNHEALTHY: &str = "StoreUnhealthy";
 /// killed or torn down through its slice. See [`check_cgroup_root`].
 pub const CGROUP_UNUSABLE: &str = "CgroupUnusable";
 
+/// This node configured a driver it has no right to build, and left it out.
+/// The message is one sentence per such driver — see [`crate::privileges`].
+///
+/// The counterpart of `CgroupUnusable` for everything that is not a cgroup:
+/// the node comes up, runs what it can and says what it cannot, because the
+/// tier above is the party that can act on it. The scheduler is already kept
+/// away by the catalogues, which follow the drivers that were actually BUILT;
+/// this condition is for the operator who has to find out why a node stopped
+/// taking LVM volumes.
+///
+/// Level-triggered and re-measured on every report, like every other
+/// condition here. The rights of a running process barely change, but the
+/// things they are measured against do: a udev rule that arrives late, a
+/// `/dev/nvme-fabrics` that appears when its module loads.
+pub const UNPRIVILEGED: &str = "Unprivileged";
+
 /// A VMM is running here that no record of this agent names.
 ///
 /// D18. "The agent adopts what it has a record of" was only half a rule, and

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use crate::config::{
     AgentConfig, CloudHypervisorConfig, CrosvmGpuConfig, FilesystemVolumeConfig, InputConfig,
     LvmThinVolumeConfig, ManagedDevice, NfsVolumeConfig, NvrmConfig, Sections, section,
 };
+use crate::privileges;
 use crate::types::{DeviceWithId, VolumeWithId};
 use agent_api::{
     Hypervisor, ResourceConfiner,
@@ -66,6 +67,14 @@ pub struct DriverEntry<T: ?Sized + 'static> {
     /// configuration is an inventory of host devices and not a setting of
     /// itself.
     pub keys: &'static [&'static str],
+    /// What the host has to give this driver before building it is worth
+    /// trying — measured, one row per driver, in `crate::privileges`.
+    ///
+    /// Here and not on the driver itself, for the reason this table exists:
+    /// a need that lived inside the driver could only be asked by BUILDING
+    /// the driver, and building is exactly what fails. `privileges::NOTHING`
+    /// for the ones that need nothing, which is a claim and not a blank.
+    pub needs: &'static crate::privileges::Needs,
     /// Ok(None) = not configured on this node.
     pub build: fn(&Sections, &AgentConfig) -> anyhow::Result<Option<Arc<T>>>,
 }
@@ -76,26 +85,31 @@ static VOLUME_DRIVERS: &[DriverEntry<dyn VolumeDriver>] = &[
     DriverEntry {
         name: DRIVER_FILESYSTEM,
         keys: &[DRIVER_FILESYSTEM],
+        needs: &privileges::NOTHING,
         build: build_filesystem,
     },
     DriverEntry {
         name: DRIVER_LVM_THIN,
         keys: &[DRIVER_LVM_THIN],
+        needs: &privileges::DEVICE_MAPPER,
         build: build_lvm_thin,
     },
     DriverEntry {
         name: DRIVER_NFS,
         keys: &[DRIVER_NFS],
+        needs: &privileges::MOUNT,
         build: build_nfs,
     },
     DriverEntry {
         name: DRIVER_NVMEOF,
         keys: &[DRIVER_NVMEOF],
+        needs: &privileges::NVME_FABRICS,
         build: build_nvmeof,
     },
     DriverEntry {
         name: DRIVER_NVMEOF_IMPORT,
         keys: &[DRIVER_NVMEOF_IMPORT],
+        needs: &privileges::NOTHING,
         build: build_nvmeof_import,
     },
 ];
@@ -105,21 +119,25 @@ static DEVICE_DRIVERS: &[DriverEntry<dyn DeviceDriver>] = &[
     DriverEntry {
         name: DRIVER_CROSVM_GPU,
         keys: &[DRIVER_CROSVM_GPU],
+        needs: &privileges::RENDER_NODE,
         build: build_crosvm_gpu,
     },
     DriverEntry {
         name: DRIVER_NVRM,
         keys: &[DRIVER_NVRM],
+        needs: &privileges::NVIDIA,
         build: build_nvrm,
     },
     DriverEntry {
         name: DRIVER_INPUT,
         keys: &[DRIVER_INPUT],
+        needs: &privileges::NOTHING,
         build: build_input,
     },
     DriverEntry {
         name: DRIVER_VFIO,
         keys: &[KEY_MANAGED],
+        needs: &privileges::VFIO_BIND,
         build: build_vfio,
     },
 ];
@@ -137,6 +155,7 @@ static DEVICE_DRIVERS: &[DriverEntry<dyn DeviceDriver>] = &[
 static HYPERVISOR_DRIVERS: &[DriverEntry<dyn Hypervisor>] = &[DriverEntry {
     name: DRIVER_CLOUD_HYPERVISOR,
     keys: &[DRIVER_CLOUD_HYPERVISOR],
+    needs: &privileges::KVM,
     build: build_cloud_hypervisor,
 }];
 
@@ -157,6 +176,7 @@ static HYPERVISOR_DRIVERS: &[DriverEntry<dyn Hypervisor>] = &[DriverEntry {
 static NETWORK_DRIVERS: &[DriverEntry<dyn NetworkDriver>] = &[DriverEntry {
     name: DRIVER_LINUX_NETWORK,
     keys: &[],
+    needs: &privileges::TAPS,
     build: build_linux_network,
 }];
 
@@ -171,6 +191,7 @@ fn register<T: ?Sized>(
     sections: &Sections,
     cfg: &AgentConfig,
     what: &str,
+    skip: &HashSet<&'static str>,
 ) -> anyhow::Result<HashMap<String, Arc<T>>> {
     // A section no driver owns is a typo, and a typo that is ignored is a
     // node that comes up without the backend somebody configured — the
@@ -198,6 +219,15 @@ fn register<T: ?Sized>(
 
     let mut built: HashMap<String, Arc<T>> = HashMap::new();
     for entry in entries {
+        // A driver the start-check left out is not built and not claimed —
+        // and this is NOT the `bail!` above. A section nobody owns is a typo
+        // somebody can fix by editing the file; a section whose driver this
+        // process has no right to build is a fact about the machine, and a
+        // node that refused to start over it would be a node that cannot be
+        // run unprivileged at all. `screen` has already said which and why.
+        if skip.contains(entry.name) {
+            continue;
+        }
         if let Some(driver) = (entry.build)(sections, cfg)? {
             built.insert(entry.name.to_string(), driver);
         }
@@ -222,8 +252,9 @@ fn register_one<T: ?Sized>(
     sections: &Sections,
     cfg: &AgentConfig,
     what: &str,
+    skip: &HashSet<&'static str>,
 ) -> anyhow::Result<Option<(String, Arc<T>)>> {
-    let built = register(entries, sections, cfg, what)?;
+    let built = register(entries, sections, cfg, what, skip)?;
     if built.len() > 1 {
         let mut names: Vec<&str> = built.keys().map(String::as_str).collect();
         names.sort_unstable();
@@ -234,6 +265,120 @@ fn register_one<T: ?Sized>(
         );
     }
     Ok(built.into_iter().next())
+}
+
+/// What this node may actually build, measured against what it configured.
+///
+/// The start-check, in the shape Incus' `Info()` has: one sentence per
+/// driver, in plain words, decided at RUN time. See `crate::privileges` for
+/// the needs and for how each of them was measured.
+#[derive(Default)]
+pub struct Screen {
+    /// Driver names `register` leaves out.
+    pub skip: HashSet<&'static str>,
+    /// One sentence per configured driver that stays out — and one for the
+    /// router, which is not a driver of its own but is a capability this node
+    /// claims in its Hello.
+    pub gaps: Vec<String>,
+    /// The one deficiency that is not survivable: a node that configured a
+    /// hypervisor and cannot open `/dev/kvm`. Everything else is a node that
+    /// can do less; this is a node that cannot do the thing it exists for,
+    /// and it would spend its life failing every create it is given.
+    pub fatal: Option<String>,
+    /// Every configured driver and what it needs, so that the heartbeat can
+    /// ask the same question again. See `privileges::Watch`.
+    pub watch: Vec<crate::privileges::Watched>,
+}
+
+impl Screen {
+    fn look<T: ?Sized>(
+        &mut self,
+        entries: &[DriverEntry<T>],
+        sections: &Sections,
+        rights: &dyn privileges::Probe,
+        fatal: bool,
+    ) {
+        for entry in entries {
+            // Configured = a section this row owns is in the file. A driver
+            // nobody asked for has nothing it could be missing, and saying
+            // "this node cannot do LVM" about a node that never mentioned
+            // LVM would bury the sentences that matter.
+            if !entry.keys.iter().any(|key| sections.contains_key(*key)) {
+                continue;
+            }
+            self.watch.push(privileges::Watched {
+                driver: entry.name,
+                needs: entry.needs,
+            });
+            let Some(gap) = entry.needs.missing(entry.name, rights) else {
+                continue;
+            };
+            if fatal {
+                self.fatal = Some(gap);
+            } else {
+                self.skip.insert(entry.name);
+                self.gaps.push(gap);
+            }
+        }
+    }
+}
+
+/// Ask the host, once, before anything is built.
+///
+/// Pure: the same config and the same rights give the same answer, which is
+/// why `from_config` and `run_agent` can both ask without passing a verdict
+/// between them — and why the heartbeat can ask a third time, thirty seconds
+/// later, and get an answer about then rather than about start-up.
+pub fn screen(cfg: &AgentConfig, rights: &dyn privileges::Probe) -> Screen {
+    let mut screen = Screen::default();
+    screen.look(VOLUME_DRIVERS, &cfg.volume, rights, false);
+    screen.look(DEVICE_DRIVERS, &cfg.device, rights, false);
+    screen.look(HYPERVISOR_DRIVERS, &cfg.hypervisor, rights, true);
+
+    // `[network]` is a single section and not a table of them, so the row
+    // owns no key and the rule above cannot see it (see `NETWORK_DRIVERS`).
+    // The same question, asked here.
+    if cfg.network.is_some() {
+        let row = &NETWORK_DRIVERS[0];
+        screen.watch.push(privileges::Watched {
+            driver: row.name,
+            needs: row.needs,
+        });
+        match row.needs.missing(row.name, rights) {
+            Some(gap) => {
+                screen.skip.insert(row.name);
+                screen.gaps.push(gap);
+            }
+            // The router is the half of this driver that needs MORE than the
+            // taps do — measured: `unshare(CLONE_NEWNET)` wants
+            // CAP_SYS_ADMIN, where a tap wants CAP_NET_ADMIN. It cannot be
+            // skipped, because it is not a driver: it is a thing this node
+            // claims in its Hello and would fail at the first router placed
+            // here. So it is said, and only said.
+            //
+            // Asked only when the taps are there at all: a node without
+            // CAP_NET_ADMIN has already been told it makes no taps, and a
+            // second sentence about the routers it also cannot hold would be
+            // noise.
+            None => {
+                let claims_gateway = cfg
+                    .network
+                    .as_ref()
+                    .and_then(|network| network.provider.as_ref())
+                    .is_some_and(|provider| !provider.physnets.is_empty());
+                if claims_gateway {
+                    screen.watch.push(privileges::Watched {
+                        driver: "router",
+                        needs: &privileges::ROUTER,
+                    });
+                    if let Some(gap) = privileges::ROUTER.missing("router", rights) {
+                        screen.gaps.push(gap);
+                    }
+                }
+            }
+        }
+    }
+    screen
 }
 
 /// The default backend, and the one builder that never returns `None`: a
@@ -747,19 +892,52 @@ impl Drivers {
         }
         let confiner = Arc::new(cgroups);
 
+        // The start-check, before a single driver is built.
+        //
+        // The order matters and is the whole of the design: ASK first, build
+        // second. A driver whose need is missing is left out rather than
+        // built and failed — `lvm-thin` checks its pool in `new`, `nft` writes
+        // a table in `new`, and both of those are start-up refusals for an
+        // agent that simply has no right to do them. What a node does not
+        // build it does not claim (the four catalogues follow the registered
+        // drivers), so the scheduler stops placing that work here by itself.
+        let rights = privileges::Host;
+        let screen = screen(cfg, &rights);
+        // Podman's half: the primitives, once, so that the sentences below
+        // can be checked rather than believed.
+        tracing::info!(
+            rights = %privileges::Probe::primitives(&rights, &cfg.paths.cgroup_root),
+            "the rights this agent came up with"
+        );
+        for gap in &screen.gaps {
+            // Incus' half: one sentence per driver, at WARN, naming the
+            // driver, the need and the fact. The same list goes onto the
+            // heartbeat as the `Unprivileged` condition (`run_agent`).
+            tracing::warn!(detail = %gap, "a configured driver is not registered on this node");
+        }
+        // And the one that is not survivable. A node whose whole purpose is
+        // running guests and which cannot open `/dev/kvm` would answer every
+        // create with the same error for as long as it was left up; Incus
+        // says the same thing in the same place ("KVM support is missing (no
+        // /dev/kvm)").
+        if let Some(fatal) = screen.fatal {
+            bail!("{fatal}");
+        }
+
         // All four slots come out of tables now, and the two that used to be
         // hard-wired are the reason: a node used to be assumed to run VMs and
         // to make taps, and that assumption is what kept a volume tied to the
         // VM it was made for. A storage node has neither.
+        let skip = &screen.skip;
         let (hypervisor_name, hypervisor) =
-            register_one(HYPERVISOR_DRIVERS, &cfg.hypervisor, cfg, "hypervisor")?.unzip();
-        let storage = register(VOLUME_DRIVERS, &cfg.volume, cfg, "volume")?;
-        let devices = register(DEVICE_DRIVERS, &cfg.device, cfg, "device")?;
+            register_one(HYPERVISOR_DRIVERS, &cfg.hypervisor, cfg, "hypervisor", skip)?.unzip();
+        let storage = register(VOLUME_DRIVERS, &cfg.volume, cfg, "volume", skip)?;
+        let devices = register(DEVICE_DRIVERS, &cfg.device, cfg, "device", skip)?;
         // `[network]` is not a table of sections, so there is none to check
         // against; the row's own builder reads `cfg.network`. See
         // `NETWORK_DRIVERS`.
         let net: Option<Arc<dyn NetworkDriver>> =
-            register_one(NETWORK_DRIVERS, &Sections::new(), cfg, "network")?.map(|(_, n)| n);
+            register_one(NETWORK_DRIVERS, &Sections::new(), cfg, "network", skip)?.map(|(_, n)| n);
         // One pointer, two views of it. Upcasts rather than two registrations:
         // a tap and the bridge it joins are made by the same driver on the
         // same node, and two independently configured halves would be a state
@@ -1330,6 +1508,14 @@ mod tests {
         ))
     }
 
+    /// Every driver built, which is what a test about the TABLES wants: the
+    /// start-check is a separate question with its own tests below, and a
+    /// test of `register` should not also depend on what this machine's
+    /// `/dev` happens to hold.
+    fn nothing_skipped() -> HashSet<&'static str> {
+        HashSet::new()
+    }
+
     /// The same thing without the hypervisor and network sections baked in:
     /// what a node IS is now a question the config answers, so a test about
     /// that question has to be able to leave them out.
@@ -1363,8 +1549,14 @@ mod tests {
         let (_temp, cfg) = config("");
         assert!(cfg.volume.is_empty(), "no [volume] section at all");
 
-        let storage = register(VOLUME_DRIVERS, &cfg.volume, &cfg, "volume")
-            .expect("a config with no [volume] section still has storage");
+        let storage = register(
+            VOLUME_DRIVERS,
+            &cfg.volume,
+            &cfg,
+            "volume",
+            &nothing_skipped(),
+        )
+        .expect("a config with no [volume] section still has storage");
         assert_eq!(
             storage.keys().collect::<Vec<_>>(),
             vec![&agent_api::default_volume_driver()],
@@ -1380,8 +1572,14 @@ mod tests {
     fn vfio_without_a_managed_inventory_is_not_registered() {
         for sections in ["", "[device]\nmanaged = []"] {
             let (_temp, cfg) = config(sections);
-            let devices = register(DEVICE_DRIVERS, &cfg.device, &cfg, "device")
-                .expect("nothing configured is not an error");
+            let devices = register(
+                DEVICE_DRIVERS,
+                &cfg.device,
+                &cfg,
+                "device",
+                &nothing_skipped(),
+            )
+            .expect("nothing configured is not an error");
             assert!(
                 devices.is_empty(),
                 "{sections:?} registers no device driver, got {:?}",
@@ -1406,8 +1604,14 @@ mod tests {
         let binary = std::env::current_exe().expect("this test binary");
         let (_temp, cfg) = config(&format!("[device.input]\nbinary = {binary:?}"));
 
-        let devices = register(DEVICE_DRIVERS, &cfg.device, &cfg, "device")
-            .expect("[device.input] builds the driver");
+        let devices = register(
+            DEVICE_DRIVERS,
+            &cfg.device,
+            &cfg,
+            "device",
+            &nothing_skipped(),
+        )
+        .expect("[device.input] builds the driver");
         let cat = DeviceCatalog::new(&devices);
         assert_eq!(
             cat.inventory(),
@@ -1473,15 +1677,27 @@ mod tests {
     #[test]
     fn the_hypervisor_section_still_names_the_driver_it_always_named() {
         let (_temp, cfg) = config("");
-        let built = register_one(HYPERVISOR_DRIVERS, &cfg.hypervisor, &cfg, "hypervisor")
-            .expect("the example's hypervisor section builds");
+        let built = register_one(
+            HYPERVISOR_DRIVERS,
+            &cfg.hypervisor,
+            &cfg,
+            "hypervisor",
+            &nothing_skipped(),
+        )
+        .expect("the example's hypervisor section builds");
         assert!(built.is_some(), "[hypervisor.cloud-hypervisor] builds one");
 
         let (_temp, none) = raw_config(r#"[volume.filesystem]"#);
         assert!(
-            register_one(HYPERVISOR_DRIVERS, &none.hypervisor, &none, "hypervisor")
-                .expect("no section is not an error")
-                .is_none(),
+            register_one(
+                HYPERVISOR_DRIVERS,
+                &none.hypervisor,
+                &none,
+                "hypervisor",
+                &nothing_skipped()
+            )
+            .expect("no section is not an error")
+            .is_none(),
             "a node with no [hypervisor.*] section runs no vms"
         );
     }
@@ -1495,7 +1711,13 @@ mod tests {
             r#"[hypervisor.qemu]
                                 binary = "/usr/bin/qemu-system-x86_64""#,
         );
-        let Err(err) = register_one(HYPERVISOR_DRIVERS, &cfg.hypervisor, &cfg, "hypervisor") else {
+        let Err(err) = register_one(
+            HYPERVISOR_DRIVERS,
+            &cfg.hypervisor,
+            &cfg,
+            "hypervisor",
+            &nothing_skipped(),
+        ) else {
             panic!("qemu is a typo, not a hypervisor this agent has");
         };
         let err = err.to_string();
@@ -1515,16 +1737,24 @@ mod tests {
             DriverEntry {
                 name: "a",
                 keys: &["a"],
+                needs: &privileges::NOTHING,
                 build: |_, _| Ok(Some(Arc::new(Stub(Locality::NodeLocal, None)))),
             },
             DriverEntry {
                 name: "b",
                 keys: &["b"],
+                needs: &privileges::NOTHING,
                 build: |_, _| Ok(Some(Arc::new(Stub(Locality::NodeLocal, None)))),
             },
         ];
         let (_temp, cfg) = config("");
-        let Err(err) = register_one(TWO, &Sections::new(), &cfg, "hypervisor") else {
+        let Err(err) = register_one(
+            TWO,
+            &Sections::new(),
+            &cfg,
+            "hypervisor",
+            &nothing_skipped(),
+        ) else {
             panic!("two configured rows in a single slot is not a choice to make");
         };
         let err = err.to_string();
@@ -1774,7 +2004,13 @@ mod tests {
     #[test]
     fn a_section_no_driver_owns_is_refused_by_name() {
         let (_temp, cfg) = config("[volume.ceph]\npool = \"rbd\"");
-        let Err(err) = register(VOLUME_DRIVERS, &cfg.volume, &cfg, "volume") else {
+        let Err(err) = register(
+            VOLUME_DRIVERS,
+            &cfg.volume,
+            &cfg,
+            "volume",
+            &nothing_skipped(),
+        ) else {
             panic!("ceph is not a storage backend this agent has");
         };
         let err = err.to_string();
@@ -1788,7 +2024,13 @@ mod tests {
         // the table KEYS rather than the driver names — `managed` is what
         // you would have to write, and `vfio` is not.
         let (_temp, cfg) = config("[device.crosvm-gp]\nbinary = \"/usr/bin/crosvm\"");
-        let Err(err) = register(DEVICE_DRIVERS, &cfg.device, &cfg, "device") else {
+        let Err(err) = register(
+            DEVICE_DRIVERS,
+            &cfg.device,
+            &cfg,
+            "device",
+            &nothing_skipped(),
+        ) else {
             panic!("crosvm-gp is a typo, not a device backend");
         };
         let err = err.to_string();
@@ -1890,5 +2132,160 @@ mod tests {
         // The locality half is untouched by any of it: the snapshot entry
         // carries no locality, so it cannot be read as one.
         assert_eq!(catalogue.localities().len(), 3);
+    }
+
+    // ---- the start-check, with faked rights ------------------------------
+    //
+    // Every one of these is a rights combination this machine cannot be put
+    // into for the length of a test: an agent with CAP_NET_ADMIN and no
+    // CAP_SYS_ADMIN, a `/dev/kvm` that is there and refuses to open. The
+    // probe is a trait so that they can be asked anyway.
+
+    use crate::privileges::{Capability, Denial, fake::Fake};
+
+    /// A node with three storage backends and a network, run by somebody
+    /// with no rights at all: what it cannot build it leaves out, and says
+    /// one sentence about each.
+    #[test]
+    fn an_unprivileged_node_leaves_out_what_it_may_not_build() {
+        let (_temp, cfg) = config(
+            r#"[volume.lvm-thin]
+               vg = "vg0"
+               thin_pool = "pool"
+               [volume.nfs]
+               share_root = "/srv/nfs"
+               [volume.filesystem]"#,
+        );
+        let screen = screen(&cfg, &Fake::unprivileged());
+
+        assert!(screen.skip.contains(DRIVER_LVM_THIN));
+        assert!(screen.skip.contains(DRIVER_NFS));
+        assert!(screen.skip.contains(DRIVER_LINUX_NETWORK));
+        assert!(
+            !screen.skip.contains(DRIVER_FILESYSTEM),
+            "the default backend needs nothing and stays"
+        );
+        assert!(
+            screen.fatal.is_none(),
+            "a node that can do less is not a node that must not start: {:?}",
+            screen.fatal
+        );
+        assert_eq!(screen.gaps.len(), 3, "{:?}", screen.gaps);
+        let said = screen.gaps.join(" | ");
+        assert!(
+            said.contains("CAP_SYS_ADMIN and CAP_DAC_OVERRIDE"),
+            "{said}"
+        );
+        assert!(
+            said.contains("tap guard off: guests on this node are not filtered"),
+            "the security statement is said out loud: {said}"
+        );
+
+        // And the drivers really do not get registered — which is what makes
+        // the node's catalogue honest, because the catalogues follow what was
+        // built.
+        let storage = register(VOLUME_DRIVERS, &cfg.volume, &cfg, "volume", &screen.skip)
+            .expect("a node with no rights still comes up");
+        assert!(storage.contains_key(DRIVER_FILESYSTEM));
+        assert!(!storage.contains_key(DRIVER_LVM_THIN));
+        assert!(!storage.contains_key(DRIVER_NFS));
+    }
+
+    /// The one capability the unit actually grants: with it the network
+    /// driver is exactly what it is today, and the storage backends are
+    /// still out.
+    #[test]
+    fn with_cap_net_admin_the_taps_stay_and_the_storage_does_not() {
+        let (_temp, cfg) = config(
+            r#"[volume.lvm-thin]
+               vg = "vg0"
+               thin_pool = "pool""#,
+        );
+        let screen = screen(&cfg, &Fake::unprivileged().with(Capability::NetAdmin));
+
+        assert!(
+            !screen.skip.contains(DRIVER_LINUX_NETWORK),
+            "CAP_NET_ADMIN is the whole of what a tap, a bridge and the guard need"
+        );
+        assert!(screen.skip.contains(DRIVER_LVM_THIN));
+    }
+
+    /// The router needs more than the taps do — measured — and a node that
+    /// claims a gateway says so rather than finding out at the first router.
+    /// It is NOT a skipped driver: it is the same driver, doing less.
+    #[test]
+    fn a_node_that_claims_a_gateway_without_cap_sys_admin_says_so() {
+        let (_temp, cfg) = config(
+            r#"[network.provider]
+               physnets = { ext = "eth1" }"#,
+        );
+        let screen = screen(&cfg, &Fake::unprivileged().with(Capability::NetAdmin));
+
+        assert!(!screen.skip.contains(DRIVER_LINUX_NETWORK));
+        let said = screen.gaps.join(" | ");
+        assert!(said.contains("router: needs CAP_SYS_ADMIN"), "{said}");
+        assert!(said.contains("network/gateway"), "{said}");
+
+        // With it, nothing is said at all.
+        let screen = super::screen(
+            &cfg,
+            &Fake::unprivileged()
+                .with(Capability::NetAdmin)
+                .with(Capability::SysAdmin),
+        );
+        assert!(screen.gaps.is_empty(), "{:?}", screen.gaps);
+    }
+
+    /// The one deficiency that is not survivable. Incus says the same thing
+    /// in the same place: "KVM support is missing (no /dev/kvm)".
+    #[test]
+    fn a_node_that_cannot_open_dev_kvm_does_not_start() {
+        let (_temp, cfg) = config("");
+        let screen = screen(
+            &cfg,
+            &Fake::root().without_device("/dev/kvm", Denial::Refused("Permission denied".into())),
+        );
+        let fatal = screen
+            .fatal
+            .expect("a node that runs no vm must not come up");
+        assert!(fatal.contains("cloud-hypervisor"), "{fatal}");
+        assert!(fatal.contains("/dev/kvm"), "{fatal}");
+    }
+
+    /// And the rule the whole lane is measured against: as root, nothing
+    /// changes.
+    #[test]
+    fn as_root_the_start_check_changes_nothing() {
+        let (_temp, cfg) = config(
+            r#"[volume.lvm-thin]
+               vg = "vg0"
+               thin_pool = "pool"
+               [volume.nfs]
+               share_root = "/srv/nfs"
+               [device.nvrm]
+               binary = "/opt/meisterstack/bin/vhost-user-nvrm"
+               vgpuprofile = "/opt/meisterstack/bin/vgpuprofile""#,
+        );
+        let screen = screen(&cfg, &Fake::root());
+        assert!(screen.skip.is_empty(), "{:?}", screen.skip);
+        assert!(screen.gaps.is_empty(), "{:?}", screen.gaps);
+        assert!(screen.fatal.is_none());
+        // Four configured drivers plus the network row, all watched: the
+        // condition has to be able to go away again, so what is FINE is
+        // measured on every report too.
+        assert!(screen.watch.len() >= 5, "{}", screen.watch.len());
+    }
+
+    /// A driver nobody configured is not a deficiency. A node that never
+    /// mentioned LVM should not be told it cannot do LVM — the sentences are
+    /// only worth anything while there are few of them.
+    #[test]
+    fn a_driver_nobody_configured_says_nothing() {
+        let (_temp, cfg) = config("");
+        let screen = screen(&cfg, &Fake::unprivileged());
+        let said = screen.gaps.join(" | ");
+        assert!(!said.contains(DRIVER_LVM_THIN), "{said}");
+        assert!(!said.contains(DRIVER_NVMEOF), "{said}");
+        assert!(!said.contains(DRIVER_VFIO), "{said}");
     }
 }
