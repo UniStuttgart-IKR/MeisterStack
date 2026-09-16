@@ -39,6 +39,7 @@ use tracing::{debug, info, instrument, warn};
 
 mod api;
 mod config;
+mod fd;
 mod process;
 
 pub(crate) use api::*;
@@ -86,6 +87,22 @@ pub struct CloudHypervisorDriver {
     /// false witness (see `remove_disk`). A retry after a guest that took too
     /// long has nothing left to read the path from but this.
     unplugging: Mutex<HashMap<(VmId, String), PathBuf>>,
+    /// Hand the VMM its taps as open descriptors instead of by name.
+    ///
+    /// `false` is every node that has ever run this: the VMM is the agent's
+    /// own child with the agent's own rights, opens `/dev/net/tun` itself and
+    /// can live-migrate. `true` is Stufe 3, where it cannot do the first and
+    /// therefore cannot do the last — see `NetForm` for the measurement
+    /// behind that sentence.
+    tap_fds: bool,
+    /// Who the VMM runs as, when that is not the agent. `None` is every node
+    /// that has ever run this.
+    vmm_user: Option<agent_api::VmmUser>,
+    /// Directories a hot-plug may later come out of, for the Landlock
+    /// ruleset. The node's image and volume directories: everything the
+    /// CURRENT config names is covered by cloud hypervisor's own rules, and
+    /// what is missing is only ever what arrives afterwards.
+    landlock_paths: Vec<PathBuf>,
 }
 
 impl CloudHypervisorDriver {
@@ -108,7 +125,116 @@ impl CloudHypervisorDriver {
             ch_timeout,
             unplug_timeout,
             unplugging: Mutex::new(HashMap::new()),
+            tap_fds: false,
+            vmm_user: None,
+            landlock_paths: Vec::new(),
         })
+    }
+
+    /// Hand this driver's VMMs their taps as descriptors.
+    ///
+    /// A builder step and not an argument to `new`, so that a node which has
+    /// not asked for Stufe 3 is constructed by exactly the call it always
+    /// was. What turns it on is `vmm_user`: the descriptor form exists
+    /// because an unprivileged VMM cannot open a tap, and a VMM that runs as
+    /// the agent has no use for it and would only pay its price.
+    pub fn with_tap_fds(mut self, tap_fds: bool) -> Self {
+        self.tap_fds = tap_fds;
+        self
+    }
+
+    /// Run this driver's VMMs as somebody else.
+    ///
+    /// A builder step beside `with_tap_fds`, and the two are turned on
+    /// together by the same config key — the descriptor form exists so that
+    /// this one is possible. Kept separate anyway, because they fail
+    /// separately: a node with no `CAP_SETUID` can hand over descriptors and
+    /// cannot change user, and the error for that has to name the right
+    /// thing.
+    pub fn with_vmm_user(mut self, user: Option<agent_api::VmmUser>) -> Self {
+        self.vmm_user = user;
+        self
+    }
+
+    /// Directories a later hot-plug may name, for the Landlock ruleset.
+    ///
+    /// The node's image and volume directories. Only what arrives AFTER
+    /// `vm.create` needs this — CH derives a rule for every path in the
+    /// create document itself — and a file-backed hot-plug into a sandboxed
+    /// VMM is the one thing CH's own Landlock documentation warns about by
+    /// name.
+    pub fn with_landlock_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.landlock_paths = paths;
+        self
+    }
+
+    /// Which of the two shapes a NIC reaches the VMM in. See `NetForm`.
+    pub(crate) fn net_form(&self) -> NetForm {
+        match self.tap_fds {
+            true => NetForm::TapFd,
+            false => NetForm::TapName,
+        }
+    }
+
+    /// The document shape for one VM: how its NICs arrive, and what its
+    /// sandbox lets it reach.
+    ///
+    /// Landlock follows `vmm_user` and is not a knob of its own. It would
+    /// work for a VMM that is still the agent — CH says so, "Landlock is a
+    /// lightweight mechanism to allow unprivileged applications to sandbox
+    /// themselves", and it costs nothing there — but turning it on for the
+    /// fleet's current configuration would change the behaviour of every
+    /// node that has not asked for anything, and the rule for this lane is
+    /// that nothing changes without the key.
+    pub(crate) fn vm_form(&self, spec: &InstanceSpec) -> VmForm {
+        VmForm {
+            net: self.net_form(),
+            landlock: self.vmm_user.as_ref().map(|_| self.landlock_rules(spec)),
+        }
+    }
+
+    /// The rules beside the ones cloud hypervisor derives for itself.
+    ///
+    /// Three sources, and each is a hot-plug that would otherwise be denied:
+    ///
+    /// * the run directory, `rw` — every vhost-user socket a device hot-plug
+    ///   would name, the input driver's FIFO, and this driver's own files.
+    ///   One rule covers all of them because they all live under it.
+    /// * the node's image and volume directories, from the config.
+    /// * the directory of every volume this VM already has. That is what
+    ///   covers a storage driver whose paths are NOT under `volume_dir` — an
+    ///   LVM volume is `/dev/mapper/…`, an NVMe-oF one is `/dev/nvme…` — for
+    ///   a VM that has one of those already. A VM that hot-plugs its FIRST
+    ///   volume from such a driver is the known gap, and it is a gap in
+    ///   Landlock's own model: a ruleset cannot be widened after
+    ///   `restrict_self`.
+    fn landlock_rules(&self, spec: &InstanceSpec) -> Vec<LandlockRule> {
+        let mut rules: Vec<LandlockRule> = Vec::new();
+        let mut add = |path: PathBuf, access: &'static str| {
+            if !rules.iter().any(|r| r.path == path) {
+                rules.push(LandlockRule { path, access });
+            }
+        };
+        // The run directory and not only this driver's own corner of it: the
+        // backends' sockets are siblings, one level up.
+        add(
+            self.socket_dir
+                .parent()
+                .unwrap_or(&self.socket_dir)
+                .to_path_buf(),
+            "rw",
+        );
+        for path in &self.landlock_paths {
+            add(path.clone(), "rw");
+        }
+        for volume in &spec.volumes {
+            if let VolumeAttachment::Path(path) = &volume.attachment
+                && let Some(dir) = path.parent()
+            {
+                add(dir.to_path_buf(), "rw");
+            }
+        }
+        rules
     }
 }
 
@@ -269,6 +395,18 @@ impl HotPluggable for CloudHypervisorDriver {
                 volume.id
             ))
         })?;
+        // The same handover `create` does, for the same reason and in the
+        // same order: the VMM opens the file while it answers this call.
+        if let Some(user) = &self.vmm_user
+            && let VolumeAttachment::Path(path) = &volume.attachment
+        {
+            user.take(path).map_err(|e| {
+                HypervisorError::Backend(anyhow::anyhow!(
+                    "giving {} to {user} so the vmm can open it: {e}",
+                    path.display()
+                ))
+            })?;
+        }
         self.api(id, Method::PUT, "vm.add-disk", Some(config))
             .await
             .map(|_| ())
@@ -391,8 +529,43 @@ impl HotPluggable for CloudHypervisorDriver {
             UNPLUG_POLL,
         )
         .await?;
+        // After the fd table has said the VMM let go, and not before: a file
+        // handed back while the VMM still had it open would be a running
+        // guest whose disk it can no longer reopen after a reboot.
+        if self.vmm_user.is_some()
+            && let Some(path) = &path
+            && let Err(e) = agent_api::VmmUser::give_back(path)
+        {
+            debug!(path = %path.display(), error = %e, "the volume could not be handed back");
+        }
         self.unplugging.lock().unwrap().remove(&key);
         Ok(())
+    }
+
+    /// `vm.add-net`, the same call `create` makes before the boot.
+    ///
+    /// One path for both, because v53 has one: `vm_add_net` branches on
+    /// whether it owns a VM yet and either adds to the config it will boot
+    /// from or builds the device and answers with its PCI address. So a
+    /// hot-plug needs no second mechanism here, and the descriptor goes over
+    /// the same `SCM_RIGHTS` send — which is what makes Landlock harmless to
+    /// it: a NIC is the one hot-plug that opens no file, and the file-backed
+    /// ones are what CH's own documentation warns about.
+    ///
+    /// On the name form this is refused rather than quietly done the old way.
+    /// A node that has not asked for Stufe 3 has never had NIC hot-plug, and
+    /// inventing it here would mean a second, untested shape of the same verb
+    /// on the only configuration the fleet actually runs.
+    #[instrument(skip_all, fields(vm_id = %id, tap = %nic.tap_name))]
+    async fn add_nic(&self, id: &VmId, nic: &agent_api::NicAttachment) -> hypervisor::Result<()> {
+        self.vm_known(id)?;
+        if self.net_form() != NetForm::TapFd {
+            return Err(HypervisorError::Backend(anyhow::anyhow!(
+                "adding a nic to a running vm needs the descriptor form, which this node has not \
+                 asked for: set `vmm_user` or recreate the vm with the nic in its spec"
+            )));
+        }
+        self.add_net_with_fd(id, nic).await
     }
 }
 
@@ -575,9 +748,40 @@ impl agent_api::Migratable for CloudHypervisorDriver {
     /// network, the same one the session rode without TLS until the image
     /// round gave it PKI, and adding `tls_dir` here means a second certificate
     /// distribution problem with no client for it yet.
+    ///
+    /// # A NIC that came as a descriptor cannot travel
+    ///
+    /// And this is where that is said, because it is the last moment at which
+    /// saying it costs nothing. The VMM's config is what crosses the wire, as
+    /// JSON, and v53 deliberately throws the descriptor numbers away on the
+    /// way in — `deserialize_netconfig_fds` turns them into `-1` with the
+    /// comment "they are most likely invalid now" — while
+    /// `vm.receive-migration` has no way to be handed replacements: `net_fds`
+    /// is a field of `vm.restore` and of nothing else. The destination
+    /// therefore aborts, and it aborts with v53's one unexplained sentence
+    /// ("Failed to receive migratable component snapshot"), which is the
+    /// worst way for an operator to learn this.
+    ///
+    /// Measured on this machine, both directions: a guest with an fd-backed
+    /// NIC fails on arrival with exactly that line; the same rig moves a
+    /// guest with no NIC at all without complaint.
+    ///
+    /// So it is refused here, before the guest is touched. The source keeps
+    /// serving it — which is the invariant of this whole path — and the
+    /// answer names the node's own configuration, because that is the thing
+    /// an operator can actually change.
     #[instrument(skip_all, fields(vm_id = %id, peer = %peer))]
     async fn migrate_out(&self, id: &VmId, peer: &str) -> hypervisor::Result<()> {
         self.vm_known(id)?;
+        if self.tap_fds && self.has_fd_nic(id).await? {
+            return Err(HypervisorError::Backend(anyhow::anyhow!(
+                "this vm's nics were handed to the vmm as file descriptors, and cloud hypervisor \
+                 v53 cannot carry those across a live migration: the arriving config's fds are \
+                 deserialised as -1 and vm.receive-migration has no way to be given new ones. A \
+                 node that must migrate vms with nics runs its vmm as the agent, which means \
+                 leaving `vmm_user` unset"
+            )));
+        }
         self.api(
             id,
             Method::PUT,

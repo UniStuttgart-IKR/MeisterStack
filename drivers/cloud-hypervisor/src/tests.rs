@@ -82,6 +82,7 @@ fn a_receive_says_nothing_until_it_has_finished_or_failed() {
         .expect_err("failed");
     assert!(said.contains("migration-receive-failed"), "{said}");
 }
+use super::fd::writable_files;
 use super::*;
 use agent_api::NicAttachment;
 
@@ -108,9 +109,13 @@ fn the_vmm_that_receives_a_guest_is_the_one_that_is_asked_to_explain_itself() {
         booting,
         vec![
             "--api-socket".to_string(),
-            "/run/meisterstack/agent/vms/a.sock".to_string()
+            "/run/meisterstack/agent/vms/a.sock".to_string(),
+            // v53's own default, stated rather than relied on — see
+            // `every_vmm_is_started_with_its_seccomp_filter_stated`.
+            "--seccomp".to_string(),
+            "true".to_string(),
         ],
-        "a boot is what it always was"
+        "a boot says nothing about itself beyond its socket and its filter"
     );
 
     let events = Path::new("/run/meisterstack/agent/vms/a.events");
@@ -159,7 +164,30 @@ fn spec(volumes: Vec<VolumeAttachment>, devices: Vec<DeviceAttachment>) -> Insta
 }
 
 fn config(spec: &InstanceSpec) -> serde_json::Value {
-    build_vm_config(spec, &PathBuf::from("/c"), &PathBuf::from("/s")).expect("config builds")
+    build_vm_config(
+        spec,
+        &PathBuf::from("/c"),
+        &PathBuf::from("/s"),
+        &VmForm {
+            net: NetForm::TapName,
+            landlock: None,
+        },
+    )
+    .expect("config builds")
+}
+
+/// The same document a VMM that gets its taps as descriptors is handed.
+fn config_with_tap_fds(spec: &InstanceSpec) -> serde_json::Value {
+    build_vm_config(
+        spec,
+        &PathBuf::from("/c"),
+        &PathBuf::from("/s"),
+        &VmForm {
+            net: NetForm::TapFd,
+            landlock: None,
+        },
+    )
+    .expect("config builds")
 }
 
 /// Every disk states an id, and the id is the volume's rather than the
@@ -282,6 +310,66 @@ fn an_overlay_nic_tells_the_guest_its_mtu_and_a_plain_one_says_nothing() {
     let cfg = config(&plain);
     assert_eq!(cfg["net"][0]["mac"], "52:54:00:00:00:01");
     assert!(cfg["net"][0].get("mtu").is_none(), "no key, not a null");
+}
+
+/// On the descriptor form the NIC is not in the create document at all, and
+/// the `vm.add-net` body that replaces it names neither the tap, nor an fd,
+/// nor an MTU.
+///
+/// Every one of those absences is a measured failure avoided, and they are
+/// asserted here because the document is the whole of what this driver is
+/// judged on: `tap` would make the VMM open `/dev/net/tun` itself, `fds`
+/// would buy a warning per NIC per boot (v53 ignores body fds), and `mtu`
+/// would make an unprivileged VMM die at boot in `SIOCSIFMTU` — which is
+/// exactly what it did on this machine before the field came out. The guest
+/// still learns the MTU, from the tap, which is why the field can go.
+#[test]
+fn the_descriptor_form_names_no_tap_no_fd_and_no_mtu() {
+    let mut overlay = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
+    overlay.nics = vec![nic(Some(1450))];
+    let cfg = config_with_tap_fds(&overlay);
+    assert!(
+        cfg.get("net").is_none(),
+        "vm.create must carry no net at all: v53 nulls every fd in it"
+    );
+
+    let body = net_config(&nic(Some(1450)));
+    assert_eq!(body["id"], "msk0000");
+    assert_eq!(body["mac"], "52:54:00:00:00:01");
+    // Exactly two: v53 refuses anything but `2 * fds.len()`.
+    assert_eq!(body["num_queues"], 2);
+    assert!(
+        body.get("tap").is_none(),
+        "the descriptor replaces the name"
+    );
+    assert!(body.get("fds").is_none(), "only SCM_RIGHTS fds count");
+    assert!(
+        body.get("mtu").is_none(),
+        "set_mtu is SIOCSIFMTU and an unprivileged vmm may not; the tap already carries it"
+    );
+}
+
+/// And the two forms disagree about nothing else. A node that has not asked
+/// for Stufe 3 gets the document it always got — that is the rule the whole
+/// lane is held to — so the only difference between the two is `net`.
+#[test]
+fn the_two_net_forms_differ_in_net_and_in_nothing_else() {
+    let mut s = spec(
+        vec![
+            VolumeAttachment::Path("/vol/a.raw".into()),
+            VolumeAttachment::VhostUserBlk {
+                socket: "/run/blk.sock".into(),
+                pid: 7,
+            },
+        ],
+        vec![vhost_gpu()],
+    );
+    s.nics = vec![nic(Some(1450))];
+    let mut named = config(&s);
+    let with_fds = config_with_tap_fds(&s);
+    assert!(named.get("net").is_some());
+    named.as_object_mut().unwrap().remove("net");
+    assert_eq!(named, with_fds);
 }
 
 /// Unset means `ImageType::Unknown`, and v53 answers that by detecting the
@@ -789,4 +877,147 @@ async fn what_a_torn_down_vmm_said_outlives_the_teardown() {
         "both attempts are on disk: {:?}",
         d.kept_logs(&id)
     );
+}
+
+/// What changes hands when the VMM is somebody else, and what does not.
+///
+/// The disks and the seed do: the VMM opens them for writing and cannot be
+/// given the right to, so it is given the files. The kernel, the initramfs
+/// and the firmware do NOT, and that is the half worth pinning down — they
+/// live in the shared image directory, several VMs read the same bytes, and
+/// chowning one to the VMM user would change a file that is not this VM's.
+/// A vhost-user disk is a socket its backend owns, and a share is
+/// virtiofsd's, which stays the agent.
+#[test]
+fn only_the_files_this_vm_writes_change_hands() {
+    let mut s = spec(
+        vec![
+            VolumeAttachment::Path("/vol/a.raw".into()),
+            VolumeAttachment::VhostUserBlk {
+                socket: "/run/blk.sock".into(),
+                pid: 7,
+            },
+            VolumeAttachment::FsShare {
+                socket: "/run/fs.sock".into(),
+                tag: "share".into(),
+                pid: 8,
+            },
+        ],
+        vec![],
+    );
+    s.boot = BootSource::DirectKernel {
+        kernel: "/images/vmlinux".into(),
+        cmdline: "console=hvc0".into(),
+        initramfs: Some("/images/initrd".into()),
+    };
+    s.cloud_init_seed = Some("/run/seed.raw".into());
+
+    let files = writable_files(&s);
+    assert_eq!(
+        files,
+        vec![PathBuf::from("/vol/a.raw"), PathBuf::from("/run/seed.raw")]
+    );
+}
+
+/// A driver nobody gave a user to hands nothing over and asks nothing of
+/// anybody — which is the rule this whole lane is held to.
+#[test]
+fn without_a_vmm_user_nothing_changes_hands() {
+    let dir = tempfile::tempdir().unwrap();
+    let ch = CloudHypervisorDriver::new(
+        PathBuf::from("/nonexistent/cloud-hypervisor"),
+        dir.path().join("vms"),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    let mut s = spec(
+        vec![VolumeAttachment::Path("/nonexistent/a.raw".into())],
+        vec![],
+    );
+    s.nics = vec![nic(None)];
+    // A path that does not exist would be an error if it were touched.
+    ch.hand_over_files(&s).expect("nothing to do");
+    assert_eq!(ch.net_form(), NetForm::TapName);
+}
+
+/// Landlock turns on with `vmm_user` and its rules cover what cloud
+/// hypervisor cannot know about: what will be attached after `vm.create`.
+///
+/// The three sources are asserted by shape rather than by count, because
+/// each one is a hot-plug that would otherwise come back as Permission
+/// Denied — CH's own documentation says so in as many words.
+#[test]
+fn a_sandboxed_vmm_gets_a_rule_for_everything_a_hotplug_could_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path().join("run");
+    let ch = CloudHypervisorDriver::new(
+        PathBuf::from("/nonexistent/cloud-hypervisor"),
+        run.join("vms"),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    )
+    .unwrap()
+    .with_vmm_user(Some(agent_api::VmmUser {
+        name: "meister-vmm".into(),
+        uid: 991,
+        gid: 991,
+        groups: vec![991],
+    }))
+    .with_landlock_paths(vec![
+        PathBuf::from("/images"),
+        PathBuf::from("/var/volumes"),
+    ]);
+
+    let mut s = spec(
+        vec![VolumeAttachment::Path("/dev/mapper/meister-vm0".into())],
+        vec![],
+    );
+    s.nics = vec![nic(None)];
+    let form = ch.vm_form(&s);
+    let rules = form.landlock.clone().expect("a vmm_user turns landlock on");
+    let paths: Vec<&str> = rules.iter().map(|r| r.path.to_str().unwrap()).collect();
+
+    // The run directory, one level ABOVE this driver's own corner: the
+    // backends' sockets are siblings of `vms/`, not children.
+    assert!(paths.contains(&run.to_str().unwrap()), "{paths:?}");
+    assert!(paths.contains(&"/images"), "{paths:?}");
+    assert!(paths.contains(&"/var/volumes"), "{paths:?}");
+    // And the directory an existing volume came out of, which is how a
+    // storage driver that does not put its volumes under `volume_dir` gets
+    // covered at all.
+    assert!(paths.contains(&"/dev/mapper"), "{paths:?}");
+    assert!(rules.iter().all(|r| r.access == "rw"), "{rules:?}");
+
+    let cfg = build_vm_config(&s, &PathBuf::from("/c"), &PathBuf::from("/s"), &form)
+        .expect("config builds");
+    assert_eq!(cfg["landlock_enable"], true);
+    assert_eq!(
+        cfg["landlock_rules"][0]["path"],
+        run.to_str().unwrap().to_string()
+    );
+    assert_eq!(cfg["landlock_rules"][0]["access"], "rw");
+}
+
+/// And a node that has not asked for Stufe 3 gets no `landlock_enable` key
+/// at all — not `false`, which would be a different document.
+#[test]
+fn without_a_vmm_user_the_document_says_nothing_about_landlock() {
+    let s = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
+    let cfg = config(&s);
+    assert!(cfg.get("landlock_enable").is_none());
+    assert!(cfg.get("landlock_rules").is_none());
+}
+
+/// The VMM's own seccomp filter, said out loud on the command line.
+///
+/// v53's default is `true`, and a default is exactly the thing that changes
+/// upstream without anybody here noticing. This also fixes the shape of the
+/// one thing `--landlock` could NOT be: an argument passed without a VM on
+/// the command line.
+#[test]
+fn every_vmm_is_started_with_its_seccomp_filter_stated() {
+    let args = vmm_args(Path::new("/run/vms/x.sock"), None);
+    let at = args.iter().position(|a| a == "--seccomp").expect("stated");
+    assert_eq!(args[at + 1], "true");
 }

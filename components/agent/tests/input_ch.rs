@@ -122,6 +122,10 @@ fn node(
             // The same place `drivers::build_input` puts it.
             run_dir: root.join("run").join("input"),
             socket_timeout: Duration::from_millis(input_driver::DEFAULT_SOCKET_TIMEOUT_MS),
+            // This test is about the device a guest finds and not about who
+            // owns the process; `stufe3_ch.rs` is where the user switch is
+            // proved.
+            vmm_user: None,
         })
         .expect("a driver over Leandro's backend"),
     );

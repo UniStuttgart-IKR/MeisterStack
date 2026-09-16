@@ -15,9 +15,16 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 common = { package = "meister-common", path = "../common" }
+# getpwnam and chown, for `vmm_user`: who the hypervisor runs as is resolved
+# from a name once at start-up, and the files it must open are handed over by
+# the agent. Shelling out to `id`/`chown` would make a privilege decision
+# depend on a unit's PATH.
+nix = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 # One async test, and the trait it exercises is async: the snapshot verbs
 # default to a refusal, and a default that is never awaited is a default
 # nobody has read. `rt` and `macros` only -- this crate spawns nothing.
 tokio = { workspace = true }
+tempfile = { workspace = true }

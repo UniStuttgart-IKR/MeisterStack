@@ -97,11 +97,72 @@ pub(crate) fn fs_config(volume: &VolumeAttachment) -> Option<serde_json::Value> 
     }
 }
 
+/// How a NIC reaches the VMM: by the tap's NAME, which the VMM then opens
+/// itself, or as an open DESCRIPTOR the agent hands over.
+///
+/// Two forms and not one, and the reason is measured rather than tidy. The
+/// descriptor form is what makes an unprivileged VMM possible — it is the
+/// only way a process without `CAP_NET_ADMIN` gets a tap — but it costs live
+/// migration: the VMM's config travels to the destination as JSON, v53
+/// deserialises `fds` to `-1` on purpose (`vm_config.rs`,
+/// `deserialize_netconfig_fds`: "FDs in 'NetConfig' won't be deserialized as
+/// they are most likely invalid now"), and `vm.receive-migration` has no
+/// channel to supply new ones — `net_fds` exists on `vm.restore` alone. A
+/// guest with an fd-backed NIC therefore dies on arrival, which was measured
+/// on this machine: the destination logs exactly that debug line and then
+/// `migration-receive-failed`, while the same rig migrates a VM with no NIC
+/// at all without complaint.
+///
+/// So the form follows the privilege. A node that runs its VMM as itself
+/// keeps the name form and keeps live migration, byte for byte as before; a
+/// node that sets `vmm_user` takes the descriptor form and gives migration
+/// up for the VMs that have NICs — and `migrate_out` says so in words rather
+/// than letting the guest fail at the far end.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NetForm {
+    /// `"net": [{"tap": "msk…"}]` in `vm.create`. The VMM opens
+    /// `/dev/net/tun` itself and needs the right to.
+    TapName,
+    /// `vm.create` without `net`, then one `vm.add-net` per NIC carrying the
+    /// open tap as `SCM_RIGHTS`. See `fd.rs`.
+    TapFd,
+}
+
+/// One `landlock_rules` entry: a path the VMM may reach, and how.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct LandlockRule {
+    pub(crate) path: PathBuf,
+    /// `"r"` or `"rw"`, which is CH's own spelling
+    /// (`--landlock-rules "path=…,access=[rw]"`).
+    pub(crate) access: &'static str,
+}
+
+/// What shape of VM document this driver is building: how the NICs arrive,
+/// and whether the VMM sandboxes itself.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct VmForm {
+    pub(crate) net: NetForm,
+    /// `Some` turns `landlock_enable` on and adds these rules BESIDE the ones
+    /// cloud hypervisor derives from the config itself — it already covers
+    /// every disk, the payload, the console file and the serial socket
+    /// (`vmm/src/vm_config.rs`, the `ApplyLandlock` impls). What it cannot
+    /// know is what will be attached LATER, and its own documentation is
+    /// blunt about the consequence: "Hotplugging any new file-backed
+    /// resources to above guest will result in Permission Denied error". So
+    /// these are the directories a hot-plug will come out of.
+    ///
+    /// `None` is no Landlock at all, which is every node that has not asked
+    /// for Stufe 3.
+    pub(crate) landlock: Option<Vec<LandlockRule>>,
+}
+
 pub(crate) fn build_vm_config(
     spec: &InstanceSpec,
     console_path: &PathBuf,
     serial_socket: &PathBuf,
+    form: &VmForm,
 ) -> hypervisor::Result<serde_json::Value> {
+    let net_form = form.net;
     // `memory.shared` is a property of the VM, not of one kind of attachment:
     // any vhost-user backend maps guest memory, and a vhost-user-blk volume
     // needs it exactly as much as a gpu device does. Asking both halves of
@@ -162,7 +223,10 @@ pub(crate) fn build_vm_config(
         config["fs"] = shares.into();
     }
 
-    if !spec.nics.is_empty() {
+    // The name form, unchanged, for a VMM that runs as the agent. On the
+    // descriptor form this stays absent and `create_vm` sends one
+    // `vm.add-net` per NIC instead — see `NetForm`.
+    if net_form == NetForm::TapName && !spec.nics.is_empty() {
         config["net"] = spec
             .nics
             .iter()
@@ -215,5 +279,76 @@ pub(crate) fn build_vm_config(
     if !vfio_devices.is_empty() {
         config["devices"] = vfio_devices.into();
     }
+
+    // Landlock through the API and not through `--landlock`, and that is not
+    // a preference: the flag sits in the same clap group as a VM built on the
+    // command line, so `cloud-hypervisor --api-socket … --landlock` refuses
+    // to start at all — "the following required arguments were not provided:
+    // <--firmware <firmware>|--kernel <kernel>>". Measured. The config field
+    // is the documented way for an API-driven VMM and it is applied at
+    // `vm_create`, after the console devices are made and before the boot,
+    // which is exactly where this document arrives.
+    if let Some(rules) = &form.landlock {
+        config["landlock_enable"] = true.into();
+        if !rules.is_empty() {
+            config["landlock_rules"] = rules
+                .iter()
+                .map(|r| serde_json::json!({ "path": r.path, "access": r.access }))
+                .collect::<Vec<_>>()
+                .into();
+        }
+    }
     Ok(config)
+}
+
+/// The `vm.add-net` body for one NIC, for the descriptor that travels beside
+/// it.
+///
+/// Every field that is NOT here is the point of the function, so each absence
+/// is argued:
+///
+/// * **no `tap`**, because naming the device is what would make the VMM open
+///   `/dev/net/tun` itself and need `CAP_NET_ADMIN` to do it. The descriptor
+///   replaces the name; that is Stufe 3 in one line.
+/// * **no `fds`**, because v53 throws away any fd number found in the HTTP
+///   body and logs a warning about it per device
+///   (`http_endpoint.rs`, `attach_fds_to_cfg_inner`: "FD numbers were present
+///   in HTTP request body for device … but will be ignored"). Only the
+///   `SCM_RIGHTS` copies count. Naming them would buy one warning per NIC per
+///   boot and nothing else — measured.
+/// * **no `mtu`**, and this one was paid for in the lab. `Net::from_tap_fds`
+///   calls `taps[0].set_mtu()` unconditionally, which is `SIOCSIFMTU`, which
+///   an unprivileged VMM may not do: the boot dies with
+///   `Using existing tap: Ioctl failed (35106): Operation not permitted`.
+///   And it is not needed, because `Net::new_with_tap` READS the MTU back off
+///   the tap and advertises `VIRTIO_NET_F_MTU` from that
+///   (`virtio-devices/src/net.rs`, "Skip advertising VIRTIO_NET_F_MTU and let
+///   the guest fall back to the Ethernet default if querying failed"). The
+///   agent sets the MTU on the tap before it opens it — `linux-network`'s
+///   `create` does, in the same netlink call that brings the device up — so
+///   the guest is told the right number by a VMM that never asked for one.
+///   A guest on a 1450-byte overlay was measured getting 1450 this way.
+///
+/// `num_queues` is 2 and must be: v53 validates `num_queues == 2 * fds.len()`
+/// and refuses anything else with "Number of queues (N) to virtio_net does not
+/// match the number of FDs (M)". One queue pair per NIC is what the tap
+/// carries — `linux-network` creates it without `IFF_MULTI_QUEUE` — so one
+/// descriptor, two queues.
+///
+/// `mac` still travels in the body, because it is the one thing the
+/// descriptor cannot carry: `from_tap_fds` takes `guest_mac` and puts it in
+/// the virtio config, and never touches the tap's own hardware address
+/// (`set_mac_addr` is not on this path at all — which is deliberate on CH's
+/// side, its own comment says the ioctl is avoided "in the case where the VMM
+/// is running without the privilege to do that").
+///
+/// The `id` is the tap's name, so that `vm.info` and `ip link` name the same
+/// thing. It is unique per NIC by construction and cannot collide; v53's only
+/// rule for an identifier is that it must not start with `__`.
+pub(crate) fn net_config(nic: &agent_api::NicAttachment) -> serde_json::Value {
+    serde_json::json!({
+        "id": nic.tap_name,
+        "mac": nic.mac.to_string(),
+        "num_queues": 2,
+    })
 }

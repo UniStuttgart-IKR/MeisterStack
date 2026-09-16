@@ -60,6 +60,7 @@ fn a_host_input_node_another_vm_holds_is_refused_before_anything_is_built() {
                 binary: std::env::current_exe().expect("this test binary"),
                 run_dir: root.join("run").join("input"),
                 socket_timeout: std::time::Duration::from_millis(1),
+                vmm_user: None,
             })
             .expect("a driver over a binary that exists"),
         ),

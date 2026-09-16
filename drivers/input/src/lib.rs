@@ -88,6 +88,11 @@ pub struct InputDriverConfig {
     pub binary: PathBuf,
     pub run_dir: PathBuf,
     pub socket_timeout: Duration,
+    /// Who the backend runs as. `None` is the agent, which is every node that
+    /// has ever run this; `Some` is Stufe 3, where the backend is
+    /// unprivileged alongside the VMM because vhost-user is not a boundary
+    /// between them.
+    pub vmm_user: Option<agent_api::VmmUser>,
 }
 
 /// Where one backend's events come from — the resolved profile.
@@ -129,11 +134,12 @@ impl InputDriver {
             )));
         }
         Ok(Self {
-            config,
             // The name is the backend's own and not the configured binary's:
             // `comm` is what the process calls itself, whatever a node has
             // called the file it lives in.
-            process: BackendKind::detached("vhost-user-input", "vhost-user-input", NOFILE_LIMIT),
+            process: BackendKind::detached("vhost-user-input", "vhost-user-input", NOFILE_LIMIT)
+                .as_user(config.vmm_user.clone()),
+            config,
             active: Mutex::new(HashMap::new()),
         })
     }
@@ -255,12 +261,26 @@ impl InputDriver {
 /// driver owns the file either way, because teardown has to take it away: a
 /// named pipe whose reader is gone is worse than no pipe at all, a writer
 /// blocks on it forever instead of failing.
-fn make_fifo(path: &Path) -> device::Result<()> {
+/// `user` is who will READ it. The two ends of this pipe are not the same
+/// process and stopped being the same user in Stufe 3: the backend reads it,
+/// the agent (or whoever writes through the agent) writes it. So it is the
+/// backend's file, `0660`, and the writing side reaches it by being root or
+/// by being in the backend's group.
+fn make_fifo(path: &Path, user: Option<&agent_api::VmmUser>) -> device::Result<()> {
     // A leftover from a killed run may be anything by now — a regular file
     // somebody's stray redirect made, a pipe with no reader. Replace it.
     let _ = std::fs::remove_file(path);
-    nix::unistd::mkfifo(path, nix::sys::stat::Mode::from_bits_truncate(0o600))
+    let mode = match user {
+        Some(_) => 0o660,
+        None => 0o600,
+    };
+    nix::unistd::mkfifo(path, nix::sys::stat::Mode::from_bits_truncate(mode))
         .map_err(|e| DeviceError::Backend(anyhow::anyhow!("mkfifo {}: {e}", path.display())))?;
+    if let Some(user) = user {
+        user.take(path).map_err(|e| {
+            DeviceError::Backend(anyhow::anyhow!("giving {} to {user}: {e}", path.display()))
+        })?;
+    }
     Ok(())
 }
 
@@ -298,7 +318,7 @@ impl DeviceDriver for InputDriver {
 
         let (source, params) = self.plan(id, spec)?;
         if let Source::Fifo(path) = &source {
-            make_fifo(path)?;
+            make_fifo(path, self.config.vmm_user.as_ref())?;
         }
 
         let (flag, path) = source.arg();
@@ -468,6 +488,7 @@ mod tests {
                 binary: PathBuf::from("/nonexistent/vhost-user-input"),
                 run_dir: run_dir.to_path_buf(),
                 socket_timeout: Duration::from_millis(1),
+                vmm_user: None,
             },
             process: BackendKind::detached("vhost-user-input", "vhost-user-input", NOFILE_LIMIT),
             active: Mutex::new(HashMap::new()),
@@ -743,7 +764,7 @@ mod tests {
     fn a_fifo_is_made_and_is_really_a_pipe() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("in.fifo");
-        make_fifo(&path).unwrap();
+        make_fifo(&path, None).unwrap();
         let meta = std::fs::metadata(&path).unwrap();
         assert!(
             std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()),
@@ -754,7 +775,7 @@ mod tests {
         // backend would open it and read nothing forever.
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"not a pipe").unwrap();
-        make_fifo(&path).unwrap();
+        make_fifo(&path, None).unwrap();
         let meta = std::fs::metadata(&path).unwrap();
         assert!(std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()));
     }
@@ -776,6 +797,7 @@ mod tests {
             binary: dir.path().join("vhost-user-input"),
             run_dir: dir.path().join("input"),
             socket_timeout: Duration::from_millis(1),
+            vmm_user: None,
         }) else {
             panic!("a driver was built without its binary");
         };

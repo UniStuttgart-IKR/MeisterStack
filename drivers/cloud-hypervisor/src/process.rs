@@ -207,6 +207,78 @@ impl CloudHypervisorDriver {
         }
     }
 
+    /// Let the VMM user's GROUP at the three files the VMM made for itself.
+    ///
+    /// Not a widening for its own sake. cloud-hypervisor sets
+    /// `umask(0o077)` in its own `main` — "Ensure all created files (.e.g
+    /// sockets) are only accessible by this user" — so its api socket and
+    /// serial socket come out `0700` and its console file `0600`, owned by
+    /// the VMM user (measured: exactly those numbers). That is stricter than
+    /// this driver would have asked for, and it is stricter than the AGENT
+    /// can live with: the agent drives the VM over that api socket, and reads
+    /// the console for `vm logs`.
+    ///
+    /// A root agent reaches them anyway. An agent that is NOT root — the
+    /// no-root lane's node — reaches them only through the group, so the
+    /// group bits are put back here. That is the smallest widening that
+    /// works: the group is the VMM user's own, whose only other member is
+    /// whoever the deployment puts there, and it is the reason the direction
+    /// of that membership is "the agent joins the VMM's group" and never the
+    /// reverse (see `agent_api::VmmUser`).
+    ///
+    /// Needs `CAP_FOWNER` — a file owned by somebody else cannot be chmodded
+    /// by its group — so an agent that is not root cannot do this for itself.
+    /// It is not fatal: a root agent does it, and a non-root agent that
+    /// cannot gets a warning and a VM it can still start, because the failure
+    /// only bites the calls that come afterwards.
+    fn relax_to_the_group(&self, id: &VmId) {
+        let Some(user) = &self.vmm_user else {
+            return;
+        };
+        for (path, mode) in [
+            (self.vm_socket_path(id), 0o770),
+            (self.serial_socket_path(id), 0o770),
+            (self.console_path(id, ConsoleStream::Console), 0o660),
+        ] {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
+                warn!(
+                    path = %path.display(), user = %user.name, error = %e,
+                    "the vmm's own file could not be opened to its group; an agent that is not \
+                     root will not be able to read it"
+                );
+            }
+        }
+    }
+
+    /// Give the run directory to the VMM user, once, so that the VMM can bind
+    /// its own socket in it.
+    ///
+    /// One directory for every VM on the node and not one per VM, and that is
+    /// a decision with a date on it: a per-VM directory would buy isolation
+    /// only if there were a uid per VM, and there is one `vmm_user` for the
+    /// whole node — a second VMM is the SAME user and could open the first
+    /// one's files whatever the directory layout says. What it would buy
+    /// today is a narrower Landlock rule, which is worth having when per-VM
+    /// uids arrive and is not worth restructuring every path in this file
+    /// for before then. See the report.
+    ///
+    /// `0770`: the VMM writes here, and so does the agent. An agent that is
+    /// not root has to be in the VMM's group for the second half of that —
+    /// the direction is deliberate, because the reverse (the VMM in the
+    /// agent's group) would hand it the agent's socket.
+    fn hand_over_run_dir(&self) -> hypervisor::Result<()> {
+        let Some(user) = &self.vmm_user else {
+            return Ok(());
+        };
+        user.take(&self.socket_dir).map_err(|e| {
+            HypervisorError::Backend(anyhow::anyhow!(
+                "giving {} to {user}: {e}",
+                self.socket_dir.display()
+            ))
+        })
+    }
+
     /// Where the serial line listens for the one client that may type into
     /// it. Beside the file it is recorded into, one suffix apart, so the two
     /// names cannot drift — the agent derives one from the other.
@@ -330,8 +402,19 @@ impl CloudHypervisorDriver {
         id: &VmId,
         events: Option<&Path>,
     ) -> hypervisor::Result<Child> {
+        // Everything the VMM will need to write in changes hands first, while
+        // the agent still has the rights to give it away. The directory,
+        // because the VMM binds its own api socket and creates its own
+        // console file in it; the log, because the agent opens it and passes
+        // the descriptor, but `vm logs` and a later spawn both come back to
+        // the path.
+        self.hand_over_run_dir()?;
         let log = std::fs::File::create(self.vmm_log_path(id))
             .map_err(|e| HypervisorError::Backend(e.into()))?;
+        if let Some(user) = &self.vmm_user {
+            user.take(&self.vmm_log_path(id))
+                .map_err(|e| HypervisorError::Backend(anyhow::anyhow!("the vmm's log: {e}")))?;
+        }
         let log2 = log
             .try_clone()
             .map_err(|e| HypervisorError::Backend(e.into()))?;
@@ -343,12 +426,36 @@ impl CloudHypervisorDriver {
         }
         let mut command = Command::new(&self.binary);
         command.args(vmm_args(&socket, events));
+        if let Some(user) = &self.vmm_user {
+            // The credential change happens in the child, between fork and
+            // exec — the same moment libvirt picked ("immediately before
+            // executing the QEMU binary") and for the same reason: everything
+            // the VMM needs and cannot open for itself has to be ready before
+            // it stops being able to.
+            //
+            // Through `pre_exec` and not `Command::uid`, because the standard
+            // library's version throws away the supplementary groups and
+            // those are the VMM's access to `/dev/kvm`. See
+            // `VmmUser::switch_to`.
+            let user = user.clone();
+            // SAFETY: `switch_to` is three syscalls on values it already
+            // holds; it allocates nothing and opens nothing.
+            unsafe {
+                command.pre_exec(move || user.switch_to());
+            }
+        }
         let mut process = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log2))
             .spawn()
-            .map_err(|e| HypervisorError::Backend(e.into()))?;
+            .map_err(|e| match &self.vmm_user {
+                Some(user) => HypervisorError::Backend(anyhow::anyhow!(
+                    "the hypervisor could not be started: {}",
+                    user.cannot_switch(&e)
+                )),
+                None => HypervisorError::Backend(e.into()),
+            })?;
         let pid = process.id().ok_or_else(|| {
             HypervisorError::Backend(anyhow::anyhow!(
                 "cloud-hypervisor exited before pid could be read"
@@ -387,7 +494,10 @@ impl CloudHypervisorDriver {
         // agent's and is cleaned up with the rest in `destroy`.
         let _ = std::fs::remove_file(&serial_socket);
 
-        let config = build_vm_config(spec, &console_path, &serial_socket)?;
+        let config = build_vm_config(spec, &console_path, &serial_socket, &self.vm_form(spec))?;
+        // Before the VMM exists, because it opens its disks while it builds
+        // the VM. See `hand_over_files`.
+        self.hand_over_files(spec)?;
         // No event monitor: this VM answers every question over its API
         // socket. See `event_path`.
         let mut process = self.spawn_vmm(id, None).await?;
@@ -409,6 +519,30 @@ impl CloudHypervisorDriver {
             return Err(e);
         }
 
+        // The NICs, one `vm.add-net` each, with the tap as a descriptor —
+        // because `vm.create` is the one verb v53 refuses descriptors on
+        // (`http_endpoint.rs`: "For the VmCreate call, we do not accept FDs
+        // from the socket currently."). Between the create and the boot is
+        // exactly where they belong: `vm_add_net` with no VM yet only adds to
+        // the config the boot will read, and it VALIDATES it there, so a
+        // wrong `num_queues` is an error now rather than a dead guest later.
+        //
+        // On the name form this loop does nothing: the NICs are already in
+        // the document above.
+        if self.net_form() == NetForm::TapFd {
+            for nic in &spec.nics {
+                if let Err(e) = self.add_net_with_fd(id, nic).await {
+                    let _ = process.kill().await;
+                    return Err(e);
+                }
+            }
+        }
+
+        // After `vm.create`, because that is when the console file and the
+        // serial socket exist: v53 makes them in `pre_create_console_devices`
+        // and not at start-up. The api socket has been there since the spawn.
+        self.relax_to_the_group(id);
+
         self.vms.lock().unwrap().insert(
             *id,
             RunningVm {
@@ -426,6 +560,9 @@ impl CloudHypervisorDriver {
     pub(crate) async fn destroy_vm(&self, id: &VmId) -> hypervisor::Result<()> {
         let vm = self.vms.lock().unwrap().remove(id);
         let vm = vm.ok_or(HypervisorError::NotFound(*id))?;
+
+        // While it can still be asked what it holds. See `take_files_back`.
+        self.take_files_back(id).await;
 
         if let Err(e) = self.api(id, Method::PUT, "vmm.shutdown", None).await {
             debug!(error = %format!("{e:#}"), "vmm.shutdown failed, killing process anyway");
@@ -608,7 +745,18 @@ impl CloudHypervisorDriver {
 /// `spawn_vmm` on why a receiving VMM speaks and a booting one does not —
 /// can be asserted without a process to spawn.
 pub(crate) fn vmm_args(socket: &Path, events: Option<&Path>) -> Vec<String> {
-    let mut args = vec!["--api-socket".to_string(), socket.display().to_string()];
+    let mut args = vec![
+        "--api-socket".to_string(),
+        socket.display().to_string(),
+        // v53's own default, said out loud. `--seccomp` takes `true`, `log`
+        // or `false`, and a VMM whose filter is off is a VMM whose sandbox
+        // silently is not there — this is the one line that makes that
+        // visible in `ps` and impossible to lose to a default changing
+        // upstream. Measured to be accepted without a VM on the command
+        // line, which `--landlock` is not (see `build_vm_config`).
+        "--seccomp".to_string(),
+        "true".to_string(),
+    ];
     if let Some(path) = events {
         args.push("-v".to_string());
         args.push("--event-monitor".to_string());

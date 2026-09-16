@@ -259,6 +259,25 @@ pub trait HotPluggable: Send + Sync {
     /// stack's, exactly as it is with EBS — the one disk a guest can never be
     /// asked about is the boot disk, and that entry is immutable.
     async fn remove_disk(&self, id: &VmId, disk_id: &str) -> Result<()>;
+
+    /// Plug a NIC into a running VM, on a tap that already exists.
+    ///
+    /// The tap is the network driver's half and happened before this call —
+    /// it is in its bridge, it is UP, it carries its MTU and its guard chain
+    /// is in place — exactly as a volume is attached before `add_disk` tells
+    /// the VMM. What this does is tell the VMM.
+    ///
+    /// A default, and the default is a refusal in words, for the reason
+    /// `NicDriver`'s overlay methods have one: a hypervisor that cannot plug
+    /// a NIC into a live guest must SAY so, because the alternative — a
+    /// successful call that does nothing — is a record claiming a NIC and a
+    /// guest that never sees one.
+    async fn add_nic(&self, id: &VmId, nic: &NicAttachment) -> Result<()> {
+        let _ = nic;
+        Err(HypervisorError::Backend(anyhow::anyhow!(
+            "this hypervisor cannot add a nic to vm {id} while it runs"
+        )))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

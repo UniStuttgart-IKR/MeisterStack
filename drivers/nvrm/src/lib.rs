@@ -110,6 +110,24 @@ pub struct NvrmDriverConfig {
     pub vram_budget_mib: Option<u64>,
     pub defaults: NvrmParams,
     pub profiles: HashMap<String, NvrmParams>,
+    /// Who the backend runs as. `None` is the agent, which is every node that
+    /// has ever run this. See `InputDriverConfig::vmm_user`.
+    ///
+    /// Leandro's backend does not need root, and it is worth saying why
+    /// rather than assuming: `settle_admin_privilege` in its `main.rs` DROPS
+    /// `CAP_SYS_ADMIN` unless `LEA_ADMIN_PRIV=1` asks for it, with a measured
+    /// argument that the capability made the display outcome worse. So it is
+    /// already built to run without privilege; what it needs is access to the
+    /// device nodes — `/dev/nvidiactl`, `/dev/nvidia<N>`, `/dev/nvidia-uvm`
+    /// and `/dev/nvidia-uvm-tools` — and that is a group or a mode on the
+    /// node, not anything this driver can grant.
+    ///
+    /// Its pinning ceiling is `LEA_MAX_PIN_MIB` (default 256 MiB per arena,
+    /// an environment variable and not a flag), and the pages are pinned by
+    /// the NVIDIA RM through `RmAllocOsDescriptor` rather than by `mlock`, so
+    /// `RLIMIT_MEMLOCK` is not what bounds it. Read off Leandro's source and
+    /// not measured — this tree has no vGPU-capable card.
+    pub vmm_user: Option<agent_api::VmmUser>,
 }
 
 struct ActiveBackend {
@@ -171,11 +189,12 @@ impl NvrmDriver {
         }
 
         Ok(Self {
-            config,
             // The name is the backend's own and not the configured binary's:
             // `--nvrm` is Leandro's binary whatever a node has called the file
             // it lives in, and `comm` is what the process calls itself.
-            process: BackendKind::detached("vhost-user-nvrm", "vhost-user-nvrm", NOFILE_LIMIT),
+            process: BackendKind::detached("vhost-user-nvrm", "vhost-user-nvrm", NOFILE_LIMIT)
+                .as_user(config.vmm_user.clone()),
+            config,
             vgpu_cache: Mutex::new(cache),
             active: Mutex::new(HashMap::new()),
         })

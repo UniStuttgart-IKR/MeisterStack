@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 nix = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

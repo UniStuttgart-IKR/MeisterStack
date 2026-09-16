@@ -11,6 +11,7 @@ pub mod resource_limits;
 pub mod spec;
 pub mod storage;
 pub mod types;
+pub mod vmm_user;
 
 pub use device::{
     Device, DeviceAttachment, DeviceDriver, DeviceError, DeviceId, DeviceSpec, PartitionSpec,
@@ -33,3 +34,4 @@ pub use storage::{
     VolumeDriver, VolumeHandle, VolumeId, VolumeProvider, VolumeSpec, VolumeState,
     default_volume_driver,
 };
+pub use vmm_user::VmmUser;
