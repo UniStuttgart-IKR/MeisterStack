@@ -156,6 +156,102 @@ RDMA-NIC. Ein Mensch uebernimmt daraus, was stimmt. Die Wahrheit bleibt der
 Plan — ein Werkzeug, das sich seine Konfiguration von der Maschine holt,
 kann nie sagen, dass die Maschine falsch ist.
 
+## Stufe 3: der VMM laeuft nicht als der Agent
+
+Ein Schluessel, `vmm_user` in `meisterstack.agent.settings`:
+
+```toml
+vmm_user = "meister-vmm"
+```
+
+**Fehlt er, aendert sich nichts.** Jeder Knoten, der heute laeuft, laeuft
+danach genauso: cloud-hypervisor und die vhost-user-Backends sind Kinder des
+Agenten mit den Rechten des Agenten, und die Live-Migration geht wie bisher.
+
+Ist er gesetzt, gilt:
+
+| Wer | laeuft als | hat |
+|---|---|---|
+| Agent | root (bzw. `meister` + `CAP_NET_ADMIN`) | Taps, Bridges, VXLAN, `nft`, cgroups, LVM/NFS/NVMe-oF, vfio-Bindung |
+| cloud-hypervisor | `meister-vmm` | `/dev/kvm` (Gruppe `kvm`), Landlock, seccomp, **keine** Capability — gemessen: `CapEff: 0000000000000000` |
+| `vhost-user-nvrm`, `vhost-user-input`, `crosvm` (gpu) | `meister-vmm` | dasselbe |
+| `virtiofsd` | der Agent | es setzt Eigentuemer im Share; es bleibt privilegiert und wird per `--sandbox=namespace` eingehegt |
+
+Der Nutzer muss vor dem Agentenstart existieren, und er darf **nicht** in der
+Gruppe am Agent-Socket (`[paths] socket_group`) sein. Ein Knoten mit einem
+`vmm_user`, den es nicht gibt, startet nicht und sagt den Namen.
+
+### Was der Rollout dafuer bereitstellen muss
+
+* Den Nutzer, ohne Shell, in der Gruppe `kvm` — und je Knoten `video`,
+  `render` (fuer `crosvm-gpu`) bzw. `input` (fuer das `evdev`-Profil).
+  Geraete kommen ueber **Gruppen**, nicht ueber Dateideskriptoren: das ist
+  die Antwort der Referenzstudie und die von Kata.
+* **Alles, was der VMM oeffnet, muss fuer ihn erreichbar sein — samt
+  Ausfuehrungsbit auf jedem Elternverzeichnis.** Der uid-Wechsel passiert vor
+  dem `exec`, also braucht schon das Binary selbst ein `x` fuer ihn. Der
+  erste Messlauf starb genau daran: `EACCES` beim `exec` eines
+  cloud-hypervisor unter einem `0700`-Heimatverzeichnis. Auf einem Knoten
+  sind das `/opt/meisterstack/bin`, das Image-Verzeichnis und das
+  Volume-Verzeichnis.
+* `CAP_SETUID` und `CAP_SETGID` fuer den Agenten, wenn er nicht root ist. Ein
+  Agent ohne sie bekommt beim ersten VM-Start einen Satz, der genau das sagt.
+* Ein Agent, der nicht root ist, muss zusaetzlich **in der Gruppe des
+  VMM-Nutzers** sein: die Dateien der VM gehoeren danach dem VMM. Die
+  Richtung ist Absicht und nur diese: der Agent tritt der Gruppe des VMM bei,
+  nie umgekehrt.
+
+### Die drei Saetze, die die Rechnung bestimmen
+
+**1. Die Gruppe am Agent-Socket ist root-aequivalent, solange der VMM root
+ist.** Wer am Socket eine VM anlegen darf, waehlt Image-Pfade, virtiofs-Shares
+und Geraete auf einem Knoten, dessen Agent root ist. Drei Stacks sagen
+denselben Satz ueber ihre eigene Gruppe: Docker — "The `docker` group grants
+root-level privileges to the user."; libvirt — "A connection to this socket
+gives the client privileges that are equivalent to having a root shell.";
+Incus — "Anyone added to this group will have full control over Incus." Erst
+`vmm_user` macht diese Gruppe zu weniger als root.
+
+**2. vhost-user ist keine Isolationsgrenze.** QEMU: "There is not considered
+to be security boundary between QEMU and the vhost-user & vfio-user
+backends." Cloud Hypervisor: "Cloud Hypervisor gives vhost-user devices
+complete control over the guest." Deshalb wechseln `nvrm`, `input` und
+`crosvm-gpu` **mit** dem VMM den Nutzer und nicht nach ihm — ein
+unprivilegierter VMM neben einem root-Backend ist ein root-VMM mit
+Zwischenschritt.
+
+**3. Der API-Socket des VMM ist eine Vertrauensgrenze, und Landlock schuetzt
+ihn nicht.** Cloud Hypervisors Threat Model: "These interfaces are considered
+trusted. For instance, Cloud Hypervisor does not prevent an API client from
+telling Cloud Hypervisor to access /proc/self/mem and thus overwrite its own
+memory." Und: "The sandbox only prevents access to resources subject to
+Landlock access controls. For instance, it does not prevent access to AF_UNIX
+sockets." Die Rechte auf `<run_dir>/vms/<vm>.sock` sind also Arbeit dieses
+Stacks. Sie sind `0770`, Eigentuemer und Gruppe der VMM-Nutzer —
+cloud-hypervisor macht die Datei selbst mit `umask(0o077)`, und der Agent
+oeffnet sie danach genau der einen Gruppe, weil er sonst seine eigene VM
+nicht mehr faehrt.
+
+### Was Stufe 3 kostet
+
+**Keine Live-Migration fuer VMs mit NICs.** Der Tap kommt als
+Dateideskriptor, und cloud-hypervisor v53 kann Deskriptoren nicht ueber eine
+Migration tragen: die Config reist als JSON, `fds` wird beim Empfaenger
+absichtlich zu `-1` ("FDs in 'NetConfig' won't be deserialized as they are
+most likely invalid now"), und `vm.receive-migration` hat keinen Kanal fuer
+neue — `net_fds` gibt es nur an `vm.restore`. Gemessen: der Empfaenger bricht
+ab, derselbe Aufbau ohne NIC wandert fehlerfrei. Der Agent verweigert so eine
+Migration darum mit einem Satz, statt den Gast draussen sterben zu lassen.
+Ein Knoten, der live migrieren muss, laesst `vmm_user` weg.
+
+**Kein Hot-Plug eines Datei-Volumes aus einem Verzeichnis, das die
+Landlock-Regeln nicht nennen.** Genannt sind das Run-, das Image- und das
+Volume-Verzeichnis plus das Verzeichnis jedes Volumes, das die VM beim
+Anlegen schon hatte. Eine VM, die ihr erstes `lvm-thin`- oder
+`nvmeof`-Volume (`/dev/mapper/...`, `/dev/nvme...`) heiss anhaengt, bekommt
+`Permission denied`. Das ist Landlocks Modell und kein Versehen: ein Ruleset
+laesst sich nach `restrict_self` nicht erweitern.
+
 ## Die Optionen des Moduls
 
 Erzeugt aus den Modulen selbst (`nix build .#module-options`,
