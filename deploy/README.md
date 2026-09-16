@@ -147,6 +147,85 @@ wird und die Maschinen sich unterscheiden:
 | `MEISTER_BGP_ASN` / `MEISTER_BGP_ROUTER_ID` | `65001`, `10.128.1.10` | `[network.bgp]` — dieser Knoten spricht BGP und kuendigt an, was er traegt (`/32` je Floating IP eines Gastes hier, und die Praefixe seiner Router). Beide oder keiner: ein halber Abschnitt ist ein Startfehler. Die `router_id` wird gesetzt und nicht FRR ueberlassen, das sonst die hoechste Adresse der Kiste nimmt — auf einem Knoten voller Bruecken und Taps die des zuletzt gebauten Gastes. |
 | `MEISTER_BGP_NEIGHBORS` | `10.128.0.1=65000` oder `"10.128.0.1=65000, 10.128.0.2=65000"` | Die Peers, `<adresse>=<asn>`. Leer ist erlaubt: der Abschnitt steht, `frr` laeuft, angekuendigt wird an niemanden. Ohne `MEISTER_BGP_ASN` wirkungslos. |
 
+## Ohne root
+
+Der Agent laeuft als root, und das bleibt der Default. Fuer einen reinen
+Rechenknoten — ein PoC- oder Benchmark-Knoten — gibt es daneben ein Profil:
+
+```nix
+meisterstack.agent.unprivileged = true;          # User=meister
+meisterstack.agent.capabilities = [ "CAP_NET_ADMIN" ];   # der Default
+```
+
+Die Unit wird damit zu `User=meister`, `Group=meister`, mit den
+Geraetegruppen `kvm video render input`, `Delegate=cpu cpuset io memory pids`
+und `DelegateSubgroup=supervisor`, `AmbientCapabilities=` aus der Option und
+`DeviceAllow=` statt `PrivateDevices=`. `cgroup_root` ist dann die cgroup der
+Unit, nicht `/sys/fs/cgroup/meisterstack`. Es bleibt eine **System-Unit**:
+nur `system.slice` fuehrt `cpuset`, eine User-Session nie — ein Agent unter
+`user@.service` koennte `cgroup_cpuset` also nicht durchsetzen.
+
+**Ein PoC-Knoten kann kein LVM, kein NFS, kein NVMe-oF und kein vfio; der
+Agent sagt beim Start, was fehlt.** Ein Treiber, dessen Bedarf fehlt, wird
+nicht registriert — und was ein Knoten nicht gebaut hat, behauptet er nicht
+in seinem Hello, also platziert der Scheduler solche Arbeit nie dort. Dazu
+eine WARN-Zeile je Treiber und die NodeCondition `Unprivileged` auf jedem
+Herzschlag.
+
+Der Bedarf, gemessen (2026-09-16, Kernel 7.2.4; je Zeile die Operation, an
+der es haengt):
+
+| Treiber | braucht | woran es haengt |
+|---|---|---|
+| `cloud-hypervisor` | `/dev/kvm` | Gruppe `kvm` (udev-Regel `0660 root:kvm`) — **keine** Capability |
+| `filesystem` | nichts | Dateien und `qemu-img` |
+| `input` (`fifo`) | nichts | eine Named Pipe, die der Treiber selbst anlegt |
+| `input` (`evdev`) | Gruppe `input` | `open("/dev/input/eventN")` |
+| `crosvm-gpu` | Gruppen `render`/`video` | `open("/dev/dri/renderD*")` |
+| `linux` (Taps, Bridges, VXLAN, nft-Tap-Guard) | `CAP_NET_ADMIN` | `TUNSETIFF`, rtnetlink `RTM_NEWLINK`, `nft -f -` |
+| Tenant-**Router** | `CAP_SYS_ADMIN` | `unshare(CLONE_NEWNET)` + Bind-Mount unter `/run/netns` — `CAP_NET_ADMIN` genuegt dafuer **nicht** |
+| `nfs` | `CAP_SYS_ADMIN` | `mount(2)` (ueber `mount.nfs`) |
+| `lvm-thin` | `CAP_SYS_ADMIN` **und** `CAP_DAC_OVERRIDE` | `/dev/mapper/control` ist `0600 root:root`, `/run/lock/lvm` root-only |
+| `nvmeof` | `CAP_SYS_ADMIN` **und** `CAP_DAC_OVERRIDE` | `nvme connect` nach `/dev/nvme-fabrics` (`0600 root:root`) |
+| `vfio` | `CAP_SYS_ADMIN` **und** `CAP_DAC_OVERRIDE` | die Bindung an `vfio-pci` per sysfs; `/dev/vfio/vfio` selbst ist `0666` |
+| `nvrm` | Gruppen `video`/`render` | die NVIDIA-Geraeteknoten; die mdev-Seite schreibt sysfs und braucht dann dasselbe wie `vfio` |
+
+`CAP_SYS_ADMIN` in `capabilities` ist kein Mittelweg: capabilities(7) sagt
+ueber sie "It can plausibly be called 'the new root'". Ein Knoten, der LVM,
+NFS, NVMe-oF oder vfio braucht, laeuft als root und sagt das.
+
+Drei Saetze, die unabhaengig von diesem Profil gelten und die man kennen
+muss, bevor man es fuer eine Haertung haelt:
+
+1. **Die Gruppe `meister` am Agent-Socket ist root-aequivalent.** Wer am
+   Socket eine VM anlegen darf, waehlt Image-Pfade, virtiofs-Shares und
+   Geraete; auf einem Knoten, dessen Agent root ist, ist das root. Jeder
+   Referenzstack sagt dasselbe ueber seine Gruppe — Docker: "The `docker`
+   group grants root-level privileges to the user."; libvirt ueber
+   `libvirt-sock`: "A connection to this socket gives the client privileges
+   that are equivalent to having a root shell."; Incus: "Anyone added to
+   this group will have full control over Incus." Erst wenn auch der VMM
+   unprivilegiert ist (Stufe 3), ist die Socket-Gruppe weniger als root.
+2. **vhost-user ist keine Isolationsgrenze.** QEMU: "There is not considered
+   to be security boundary between QEMU and the vhost-user & vfio-user
+   backends."; cloud-hypervisor: "Cloud Hypervisor gives vhost-user devices
+   complete control over the guest." `nvrm`, `input` und `crosvm-gpu` muessen
+   also **mit** dem VMM unprivilegiert werden, sonst kauft ein
+   unprivilegierter VMM fuer eine Display-VM nichts.
+3. **Der cloud-hypervisor-API-Socket ist eine Vertrauensgrenze, und Landlock
+   schuetzt ihn nicht.** CHs Threat Model: "These interfaces are considered
+   trusted. For instance, Cloud Hypervisor does not prevent an API client
+   from telling Cloud Hypervisor to access /proc/self/mem and thus overwrite
+   its own memory." und "it does not prevent access to AF_UNIX sockets". Die
+   Rechte auf `<run_dir>/vms/<vm>.sock` sind also unsere Arbeit.
+
+Zwei Dinge, die ein solcher Knoten sonst noch anders macht: die Sektion
+`[volume.nvmeof]` steht im Rollen-Template dieser Flotte und wird auf einem
+`unprivileged`-Knoten **nicht** registriert (der Knoten sagt es beim Start und
+auf jedem Herzschlag; wer die Meldung nicht will, nimmt die Sektion per
+`meisterstack.agent.settings` heraus), und `[network.provider]` ist dort kein
+sinnvoller Schluessel, weil ein Router `CAP_SYS_ADMIN` braucht.
+
 ## Spaeter: `meister-deploy discover <host>`
 
 Ein Verb, das es noch nicht gibt. Es wuerde per SSH **nur lesen** (`lspci`,
@@ -169,9 +248,11 @@ von Hand aendert, aendert sie am naechsten Lauf wieder zurueck.
 | `meisterstack.addons.fqdn` | string | `"nixos"` | The name this box is reached under. It is the Kanidm origin, the issuer, the name in the serving certificate and the host in every oauth2 redirect url at once — so it is a NAME and not an address, it has to resolve on every machine that logs in, and `meister-deploy keys init` has to have signed it. |
 | `meisterstack.addons.retention` | string | `"7d"` | How long Prometheus keeps series. A lab box, not an archive. |
 | `meisterstack.addons.scrapeTargets` | list of string | `[ ]` | The `meister` scrape job, one entry per node AND role: a box with two roles has two metrics listeners (9100 cloud, 9101 cluster, 9102 agent). nix/fleet.nix derives this from the plan; the lab's twelve vms are twelve targets, not thirty-six. |
+| `meisterstack.agent.capabilities` | list of string | `[ "CAP_NET_ADMIN" ]` | The capabilities an unprivileged agent holds — both its ambient set (so that `nft`, `ip` and the VMM it spawns inherit them) and its bounding set (so that the list is the whole truth and not a floor). Only read when `meisterstack.agent.unprivileged` is true. The default is the one capability that buys something a node cannot work around: `CAP_NET_ADMIN`, which is exactly enough for taps, bridges, VXLAN and the tap guard, and exactly not enough for anything else (measured). An empty list is a node with no networking at all — legal, and then a VM with a NIC cannot run there. `CAP_SYS_ADMIN` in this list is not a middle ground: capabilities(7) says of it "It can plausibly be called 'the new root'". A node that needs LVM, NFS, NVMe-oF or vfio should run the agent as root and say so, rather than pretend. The list exists because the next lane needs two more: the VMM-as- `meister-vmm` step (`design/privilege-separation.md`, stage 3) adds `CAP_SETUID CAP_SETGID`, since dropping to another user is itself a privilege. |
 | `meisterstack.agent.inputBackend` | null or string | `null` | Where `vhost-user-input` is on this node, or null (the default) for a node that does not serve virtio-input. cloud-hypervisor has no virtio-input device of its own, so the keyboard and the mouse of a guest come from a backend beside the VMM — Leandro's `vhost-user-input`, the second one of the display rig. The PACKAGE is not in this repo and is not built by this flake: it is a path, pushed to the node like the patched cloud-hypervisor beside it, and naming it here is what makes the agent register the driver and claim `input/fifo` and `input/evdev` in its Hello. A path and not a bool, for the reason the hypervisor binary is one: an image that carried the backend would make every node claim a device it may not have, and a node that has it in another place has to be able to say so. The two profiles come with the backend and need no configuration: `fifo` takes `type code value` lines from a named pipe the driver makes beside the socket, which is how a test presses a key with no human; `evdev` forwards one host `/dev/input/eventN`, named per device in `params.evdev`. A node that wants a longer patience than the driver's 5000 ms sets `settings.device.input.socket_timeout_ms` beside this. |
 | `meisterstack.agent.physnets` | attribute set of string | `{ }` | The interfaces this node gives away to provider networks, by the name of the network each of them reaches. Empty (the default) is a node that gives none away: it still runs VMs and still carries tenant overlays, it is simply no candidate for a tenant router. A non-empty attrset renders `[network.provider] physnets` into the config template, and the agent then makes one bridge per provider network (`meister-px-<name>`, so a name has four characters), puts the interface in it, and claims `network/gateway:<name>` in its Hello. The tier above places routers only where that claim is. The interface must carry NO address: an address there is somebody still using the interface, and the agent refuses to start rather than put a router on a network the host is also on. This is per NODE and not per role, which is why it is its own option rather than a line in `settings` — a fleet plan says it per machine, and a machine that has no spare NIC says nothing. |
 | `meisterstack.agent.settings` | TOML value | `{ }` | Agent config template overrides, merged over the role defaults above. Free-form TOML: nothing here validates a key, the agent does that at start-up with deny_unknown_fields. config/examples/agent.toml is the reference for what may go in it, and config/examples/hardened/agent.toml for a node that is not on a lab switch. node_id and controller_addr are NOT settable here — one-context writes them into /run/meisterstack/agent.toml at boot from the hostname and the OpenNebula context, and a key in both places would be a duplicate TOML key and a parse error. |
+| `meisterstack.agent.unprivileged` | boolean | `false` | Run the agent as the user `meister` with exactly the capabilities in `meisterstack.agent.capabilities`, instead of as root. The default is false and stays false: root is what every node in this fleet has been, and the agent's behaviour as root does not change. What such a node can still do, all of it measured on 2026-09-16: boot guests (`/dev/kvm` through the group `kvm`), `filesystem` volumes, `input` with the `fifo` profile, and — with the default `CAP_NET_ADMIN` — every tap, bridge, VXLAN and nftables tap guard it makes today. What it cannot do, and says so at start-up, one sentence per driver: `lvm-thin` and `vfio` (CAP_SYS_ADMIN *and* CAP_DAC_OVERRIDE), `nfs` (CAP_SYS_ADMIN for mount(2)), `nvmeof` (the same, plus a root-owned /dev/nvme-fabrics), and a tenant router (CAP_SYS_ADMIN for `unshare(CLONE_NEWNET)` — a tap needs CAP_NET_ADMIN, a router does not stop at it). A driver whose need is missing is not registered, so this node claims none of that in its Hello and the scheduler places none of it here. This is a PROFILE for a compute-only node, not a hardening pass for the fleet: `deploy/README.md`, section "Ohne root", says what falls away, and in particular that the group `meister` on the agent socket is root-equivalent either way. |
 | `meisterstack.cloud.settings` | TOML value | `{ }` | cloud-controller config, same shape and same rules; see config/examples/cloud.toml. This is the one tier with a public port, so config/examples/hardened/cloud.toml is worth reading before any deployment that is reachable from outside the lab. NOT `auth`: this tier's whole [auth] table is appended by one-context at boot (see cloudAuthMtls/cloudAuthOidc above and the reason it has to be one owner). A key here would be a duplicate [auth] table and a parse error on the VM. The values live in cloudAuthOidc; the issuer comes from MEISTER_OIDC_ISSUER. |
 | `meisterstack.cluster.settings` | TOML value | `{ }` | cluster-controller config, merged OVER the role defaults above (so a deployment that sets one key keeps the rest). Free-form TOML: nothing here validates a key, the binary does that at start-up with deny_unknown_fields. config/examples/cluster.toml is the reference for every key it takes, and config/examples/hardened/cluster.toml for a control plane that is not on a lab switch. Empty (the default) = the role defaults above and, for everything they do not name, the binary's own — which are the lab topology. cluster_name, cloud_addr and cloud_addrs are normally left out here and written by one-context from the OpenNebula context instead — a key in both places would be a duplicate TOML key. |
 | `meisterstack.context.defaults` | attribute set of string | `{ }` | MEISTER_* variables baked as defaults for one-context. Anything the OpenNebula context can say, a configuration can say here instead — and the context, being the thing that knows where this machine was actually booted, wins over it. Secrets do not belong here: this file is in the nix store and the store is world-readable. Certificates and keys travel with `meister-deploy keys push`, as they always have. |
