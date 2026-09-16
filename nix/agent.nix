@@ -14,6 +14,7 @@ let
   toml = pkgs.formats.toml { };
 
   physnets = config.meisterstack.agent.physnets;
+  inputBackend = config.meisterstack.agent.inputBackend;
 
   # The role's config template. The reference for what every key means is
   # config/examples/agent.toml; what is here is only "which value, and why not
@@ -159,6 +160,11 @@ let
     # an empty table says "no device backends configured" out loud in the
     # rendered file instead of leaving a reader to wonder. Optional either
     # way — the agent registers no device driver without a section.
+    #
+    # One of them has an option of its own: `inputBackend` renders
+    # `[device.input]` when a node has Leandro's vhost-user-input, because a
+    # keyboard for a guest is a path somebody pushed and not a GPU somebody
+    # owns. Everything else goes through `settings`.
     device = { };
   };
 in
@@ -185,6 +191,36 @@ in
       role, which is why it is its own option rather than a line in `settings`
       — a fleet plan says it per machine, and a machine that has no spare NIC
       says nothing.
+    '';
+  };
+
+  options.meisterstack.agent.inputBackend = lib.mkOption {
+    type = lib.types.nullOr lib.types.str;
+    default = null;
+    example = "/opt/meisterstack/bin/vhost-user-input";
+    description = ''
+      Where `vhost-user-input` is on this node, or null (the default) for a
+      node that does not serve virtio-input.
+
+      cloud-hypervisor has no virtio-input device of its own, so the keyboard
+      and the mouse of a guest come from a backend beside the VMM — Leandro's
+      `vhost-user-input`, the second one of the display rig. The PACKAGE is
+      not in this repo and is not built by this flake: it is a path, pushed to
+      the node like the patched cloud-hypervisor beside it, and naming it here
+      is what makes the agent register the driver and claim `input/fifo` and
+      `input/evdev` in its Hello.
+
+      A path and not a bool, for the reason the hypervisor binary is one: an
+      image that carried the backend would make every node claim a device it
+      may not have, and a node that has it in another place has to be able to
+      say so.
+
+      The two profiles come with the backend and need no configuration: `fifo`
+      takes `type code value` lines from a named pipe the driver makes beside
+      the socket, which is how a test presses a key with no human; `evdev`
+      forwards one host `/dev/input/eventN`, named per device in
+      `params.evdev`. A node that wants a longer patience than the driver's
+      5000 ms sets `settings.device.input.socket_timeout_ms` beside this.
     '';
   };
 
@@ -263,7 +299,16 @@ in
             # start-up error and not "no gateway slot" — the agent tells the
             # two apart by the SECTION being there.
             (lib.optionalAttrs (physnets != { }) { network.provider = { inherit physnets; }; }))
-          config.meisterstack.agent.settings);
+          # The device half of the same rule: a section that is THERE is what
+          # makes the agent build the driver, so the absent option has to
+          # render no `[device.input]` at all rather than one with an empty
+          # binary — which would be a start-up error on every node in the
+          # fleet instead of "this node serves no virtio-input".
+          (lib.recursiveUpdate
+            (lib.optionalAttrs (inputBackend != null) {
+              device.input.binary = inputBackend;
+            })
+            config.meisterstack.agent.settings));
 
     systemd.tmpfiles.rules = [
       "d /opt/meisterstack/images 0755 root root -"
