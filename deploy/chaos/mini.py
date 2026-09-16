@@ -411,6 +411,11 @@ def m3(reps=1):
     for n in (stay, move):
         cc, oo = cluster(cname, "GET", f"/vms/{n}")
         where_before[n] = (oo.get("status") or {}).get("nodeName")
+    # Everything on the machine, not just ours: `nested-1` lives there with
+    # evacuation never, and a drain's `staying` counts it too.
+    cc, oo = cluster(cname, "GET", "/vms")
+    on_node_before = sum(1 for v in oo.get("items", [])
+                         if (v.get("status") or {}).get("nodeName") == node)
 
     o["spec"]["drain"] = True
     cluster(cname, "PUT", f"/nodes/{node}", o)
@@ -428,17 +433,22 @@ def m3(reps=1):
         cc, oo = cluster(cname, "GET", f"/vms/{n}")
         where_after[n] = (oo.get("status") or {}).get("nodeName")
 
-    really_moved = sum(1 for n in (stay, move)
-                       if where_before[n] != where_after[n] and where_after[n])
+    # "moved" is `movedTotal` since the proto addendum: cumulative, and what
+    # this scenario was written to get. A VM that has LEFT the node counts,
+    # whether or not it has landed anywhere yet.
+    really_left = sum(1 for n in (stay, move)
+                      if where_before[n] == node and where_after[n] != node)
     rows.append({"scenario": "drain", "seconds": round(time.time() - t0, 1),
-                 "report.moved": (drained or {}).get("moved"),
-                 "report.staying": (drained or {}).get("staying"),
-                 "really_moved": really_moved,
+                 "report": drained,
+                 "really_left": really_left, "on_node_before": on_node_before,
                  "where": {k: (where_before[k], where_after[k]) for k in where_before}})
-    if drained and drained.get("moved") == 0 and really_moved > 0:
-        f.append(("M3", f"drain of {node} completed reporting moved=0 while {really_moved} "
-                        f"vm(s) actually changed node; `complete` is defined as `moved == 0`, "
-                        f"so the field can never report a finished drain's work"))
+    if drained and drained.get("movedTotal", 0) != really_left:
+        f.append(("M3", f"drain of {node} completed reporting movedTotal="
+                        f"{drained.get('movedTotal', 0)} while {really_left} vm(s) actually "
+                        f"left the node: {drained}"))
+    if drained and drained.get("staying") != on_node_before - really_left:
+        f.append(("M3", f"drain of {node} reports staying={drained.get('staying')} with "
+                        f"{on_node_before - really_left} vm(s) still on it: {drained}"))
 
     # put the node back the way it was found
     c, o = cluster(cname, "GET", f"/nodes/{node}")
