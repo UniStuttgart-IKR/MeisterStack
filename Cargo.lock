@@ -1257,6 +1257,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "meister-input-driver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "meister-agent-api",
+ "meister-backend",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "meister-linux-network-driver"
 version = "0.1.0"
 dependencies = [
