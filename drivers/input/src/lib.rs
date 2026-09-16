@@ -19,7 +19,8 @@
 //!   involved.
 //! * `evdev` forwards a host input node (`/dev/input/eventN`) verbatim. The
 //!   VM then eats the events of whoever is sitting at the machine, which is
-//!   why the node has to be named explicitly and is never a default.
+//!   why the node has to be named explicitly and is never a default — and why
+//!   one node is admitted to one guest at a time (`admit`).
 //!
 //! One backend serves exactly one VM and is never reused. Unlike
 //! `vhost-user-nvrm` this one does NOT end itself when the VMM hangs up
@@ -216,6 +217,26 @@ impl InputDriver {
         }
     }
 
+    /// The host node this spec CLAIMS, or None for a spec that claims none.
+    ///
+    /// Only the `evdev` profile claims anything: a `fifo` device's source is
+    /// a file this driver makes under its own run directory, named after the
+    /// device's own uuid, so two of them cannot be the same file.
+    ///
+    /// Deliberately not validating: a spec that is malformed, or that names
+    /// no node at all, cannot be in conflict over one, and `create` is where
+    /// its sentence lives (`source`). Admission that also validated would
+    /// answer a broken spec with the wrong complaint — and it is asked about
+    /// OTHER VMs' specs too, where a refusal would be about somebody else's
+    /// mistake.
+    fn claimed_node(spec: &DeviceSpec) -> Option<PathBuf> {
+        if spec.profile.as_deref().unwrap_or(PROFILE_FIFO) != PROFILE_EVDEV {
+            return None;
+        }
+        let params: InputParams = serde_json::from_value(spec.params.clone()?).ok()?;
+        params.evdev
+    }
+
     fn attachment(socket: PathBuf, pid: u32) -> DeviceAttachment {
         DeviceAttachment::VhostUser {
             socket,
@@ -380,6 +401,61 @@ impl DeviceDriver for InputDriver {
     fn profiles(&self) -> Vec<String> {
         vec![PROFILE_FIFO.to_string(), PROFILE_EVDEV.to_string()]
     }
+
+    /// A host input node belongs to ONE guest at a time.
+    ///
+    /// Two backends on one `/dev/input/eventN` both open it and both read
+    /// from it, and evdev hands each event to whichever reader takes it — so
+    /// a keypress goes to one of the two guests and nobody can say which.
+    /// That is not sharing, it is a coin toss, and neither guest's operator
+    /// asked for one. The `fifo` profile has no such question: its source is
+    /// this driver's own file, named after the device's uuid.
+    ///
+    /// Over what is DECLARED and not over what is running, which is what the
+    /// trait asks of this method and what makes it survive an agent restart:
+    /// the specs come from the caller's store, so a VM that was torn down has
+    /// no record, holds no claim, and the node is free again — without this
+    /// driver having to remember anything across its own lifetime.
+    fn admit(
+        &self,
+        requested: &[(DeviceId, DeviceSpec)],
+        claimed: &[(agent_api::VmId, DeviceSpec)],
+    ) -> device::Result<()> {
+        for (index, (id, spec)) in requested.iter().enumerate() {
+            let Some(node) = Self::claimed_node(spec) else {
+                continue;
+            };
+
+            // Somebody else's guest first: that is the case the operator
+            // cannot see from their own spec, so the message has to name the
+            // vm that holds it.
+            if let Some((holder, _)) = claimed
+                .iter()
+                .find(|(_, held)| Self::claimed_node(held).as_deref() == Some(node.as_path()))
+            {
+                return Err(DeviceError::InvalidSpec(format!(
+                    "host input device {} is already claimed by vm {holder} on this node; \
+                     one evdev node belongs to one guest at a time (device {id})",
+                    node.display()
+                )));
+            }
+
+            // And the same spec asking for it twice, which is the same
+            // conflict with both halves in one hand. Only the devices BEFORE
+            // this one are compared, so the pair is reported once.
+            if let Some((twin, _)) = requested[..index]
+                .iter()
+                .find(|(_, other)| Self::claimed_node(other).as_deref() == Some(node.as_path()))
+            {
+                return Err(DeviceError::InvalidSpec(format!(
+                    "host input device {} is named twice by this vm, by device {twin} and \
+                     by device {id}; one evdev node belongs to one guest at a time",
+                    node.display()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -405,6 +481,118 @@ mod tests {
             profile: profile.map(str::to_string),
             params,
         }
+    }
+
+    fn evdev_spec(node: &str) -> DeviceSpec {
+        spec(
+            Some(PROFILE_EVDEV),
+            Some(serde_json::json!({ "evdev": node })),
+        )
+    }
+
+    /// The claim a spec makes, which is the whole input to admission. A fifo
+    /// device claims nothing at all — its source is this driver's own file.
+    #[test]
+    fn only_an_evdev_spec_claims_a_host_node() {
+        assert_eq!(
+            InputDriver::claimed_node(&evdev_spec("/dev/input/event0")),
+            Some(PathBuf::from("/dev/input/event0"))
+        );
+        assert_eq!(
+            InputDriver::claimed_node(&spec(Some(PROFILE_FIFO), None)),
+            None
+        );
+        assert_eq!(InputDriver::claimed_node(&spec(None, None)), None);
+        // An evdev spec that names nothing claims nothing: it cannot be in
+        // conflict over a node, and `create` is where its sentence lives.
+        assert_eq!(
+            InputDriver::claimed_node(&spec(Some(PROFILE_EVDEV), None)),
+            None
+        );
+    }
+
+    /// Two guests on one `/dev/input/eventN` is a coin toss over every
+    /// keypress, so the second one is refused — and the message has to name
+    /// both the node and the vm that holds it, because the operator of the
+    /// second guest can see neither from their own spec.
+    #[test]
+    fn a_host_node_already_held_by_another_vm_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = driver(dir.path());
+        let holder = agent_api::VmId::new_v4();
+        let wanted = DeviceId::new_v4();
+
+        let err = d
+            .admit(
+                &[(wanted, evdev_spec("/dev/input/event0"))],
+                &[(holder, evdev_spec("/dev/input/event0"))],
+            )
+            .expect_err("the node is taken");
+        let msg = err.to_string();
+        assert!(msg.contains("/dev/input/event0"), "{msg}");
+        assert!(msg.contains(&holder.to_string()), "{msg}");
+        assert!(msg.contains(&wanted.to_string()), "{msg}");
+
+        // Another node on the same node is not a conflict, and neither is
+        // another vm's fifo device.
+        d.admit(
+            &[(wanted, evdev_spec("/dev/input/event1"))],
+            &[(holder, evdev_spec("/dev/input/event0"))],
+        )
+        .expect("two different host devices are two different claims");
+        d.admit(
+            &[(wanted, evdev_spec("/dev/input/event0"))],
+            &[(holder, spec(Some(PROFILE_FIFO), None))],
+        )
+        .expect("a fifo device holds no host node");
+    }
+
+    /// The claim travels with the RECORD, which is what makes a teardown give
+    /// the node back: the caller reads the store, a vm that is gone is not in
+    /// it, and this driver has to remember nothing across its own lifetime.
+    #[test]
+    fn a_node_nobody_holds_any_more_is_free_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = driver(dir.path());
+        let wanted = DeviceId::new_v4();
+        d.admit(&[(wanted, evdev_spec("/dev/input/event0"))], &[])
+            .expect("nothing holds it");
+    }
+
+    /// The same conflict with both halves in one hand.
+    #[test]
+    fn one_vm_naming_a_host_node_twice_is_the_same_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = driver(dir.path());
+        let first = DeviceId::new_v4();
+        let second = DeviceId::new_v4();
+
+        let err = d
+            .admit(
+                &[
+                    (first, evdev_spec("/dev/input/event0")),
+                    (second, evdev_spec("/dev/input/event0")),
+                ],
+                &[],
+            )
+            .expect_err("one node, two devices of one vm");
+        let msg = err.to_string();
+        assert!(msg.contains("named twice"), "{msg}");
+        assert!(
+            msg.contains(&first.to_string()) && msg.contains(&second.to_string()),
+            "{msg}"
+        );
+
+        // Two fifo devices in one vm are fine and always were: each gets its
+        // own pipe, named after its own uuid.
+        d.admit(
+            &[
+                (first, spec(Some(PROFILE_FIFO), None)),
+                (second, spec(Some(PROFILE_FIFO), None)),
+            ],
+            &[],
+        )
+        .expect("two pipes are two files");
     }
 
     #[test]

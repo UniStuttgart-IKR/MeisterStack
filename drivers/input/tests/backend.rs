@@ -243,6 +243,72 @@ async fn an_evdev_device_forwards_a_node_and_leaves_it_where_it_is() {
     );
 }
 
+/// One host node, two guests: the second is refused, and the node is free
+/// again once the first is gone.
+///
+/// The claim list is the CALLER's store, the way
+/// `provision::check_device_admission` reads it — every other VM's device
+/// specs — so this test plays that store: a VM with a record holds its claim,
+/// and a VM that was torn down has no record and holds nothing. That is what
+/// makes a teardown give the node back without this driver remembering
+/// anything across its own lifetime.
+#[tokio::test]
+async fn a_host_node_belongs_to_one_guest_at_a_time() {
+    let rig = Rig::new(LISTENS);
+    let node = rig.temp.path().join("event0");
+    std::fs::write(&node, b"").expect("a stand-in for a host input node");
+    let driver = rig.driver(Duration::from_secs(5));
+
+    let first_vm = agent_api::VmId::new_v4();
+    let first = DeviceId::new_v4();
+    let second = DeviceId::new_v4();
+    let claim = spec(PROFILE_EVDEV, Some(serde_json::json!({ "evdev": node })));
+
+    // Nothing holds it, so the first guest is admitted and gets it.
+    driver
+        .admit(&[(first, claim.clone())], &[])
+        .expect("nothing holds the node yet");
+    let device = driver
+        .create(&first, &claim, None)
+        .await
+        .expect("the first guest's backend");
+
+    // The second, while the first VM's record is in the store: refused
+    // before anything is built, and the message names both halves.
+    let Err(err) = driver.admit(&[(second, claim.clone())], &[(first_vm, claim.clone())]) else {
+        panic!("two guests were given one host input device");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains(&node.display().to_string()), "{msg}");
+    assert!(msg.contains(&first_vm.to_string()), "{msg}");
+
+    // And the teardown gives it back.
+    driver
+        .destroy(&first, &device.attachment)
+        .await
+        .expect("teardown");
+    wait_gone(pid_of(&device)).await;
+    driver
+        .admit(&[(second, claim.clone())], &[])
+        .expect("the node is free again");
+    let again = driver
+        .create(&second, &claim, None)
+        .await
+        .expect("the second guest gets it now");
+    assert_ne!(
+        pid_of(&device),
+        pid_of(&again),
+        "a backend of its own, never the dead one"
+    );
+    assert!(node.exists(), "and the host's node survived both guests");
+
+    driver
+        .destroy(&second, &again.attachment)
+        .await
+        .expect("teardown");
+    wait_gone(pid_of(&again)).await;
+}
+
 /// A backend that never serves must fail the create with the reason in hand,
 /// and it must not be left behind: nothing would ever collect it.
 #[tokio::test]
