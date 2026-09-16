@@ -2533,3 +2533,72 @@ fn the_machine_a_router_forwards_on_is_news_of_its_own() {
         "losing the last one is a phase change, and says so with its own sentence"
     );
 }
+
+/// D4, end to end as a rule: the quittance of a `DestroyInstance` does not
+/// let go of a disk, and the claim that is still standing is why a second
+/// guest waits instead of taking it.
+///
+/// The three steps are the three facts, in the order a teardown produces
+/// them. What used to happen between the first and the third is the defect:
+/// `release_volumes` cleared `attachedTo` as the command went out, so for one
+/// command's round trip the object said nobody held a disk a VMM still had
+/// open — and `release_action` reads exactly that field to decide a
+/// deprovision may go.
+#[test]
+fn a_destroy_that_has_been_quittanced_has_not_let_go_of_the_disk() {
+    let none: [String; 0] = [];
+    let mut volume = volume_at(Some("agent-1a"), VolumePhaseKind::Ready);
+    volume.status.attached_to = Some("web-1".into());
+    volume.status.open_on = vec!["agent-1a".into()];
+    volume.settle(Utc::now());
+
+    // 1. The destroy is accepted. `release_named_volumes` writes the fact it
+    //    knows — the claimant is going — and nothing else.
+    volume.status.claimant_gone = true;
+    volume.settle(Utc::now());
+    assert_eq!(
+        volume.status.attached_to.as_deref(),
+        Some("web-1"),
+        "the node still reports the bytes open"
+    );
+    assert_eq!(
+        release_action(&volume, &none),
+        Release::HeldBy(HeldBy::Vm("web-1")),
+        "so a delete of the volume keeps the data"
+    );
+
+    // 2. A second guest that names the same disk waits, and says who has it.
+    //    `VolumeHeld` and not `NotReady`: nothing here will take a disk off
+    //    its holder, so this is a wait on a person.
+    let waiting = controller_api::VmPlacement {
+        reason: controller_api::VmReason::VolumeHeld,
+        message: format!("volume {} is still held by web-1", volume.metadata.name),
+        at: Utc::now(),
+    };
+    let mut second = bound_to(Some("agent-1b"));
+    second.status.placement = Some(waiting);
+    second.settle(Utc::now());
+    assert_eq!(second.status.phase().kind(), VmPhaseKind::Pending);
+    assert_eq!(
+        second.status.phase().reason(),
+        Some(controller_api::VmReason::VolumeHeld)
+    );
+    assert!(
+        second
+            .status
+            .phase()
+            .message()
+            .is_some_and(|m| m.contains("web-1")),
+        "and names the guest that has it"
+    );
+
+    // 3. The node reports the disk closed — the `detach` has run. Now the
+    //    claim falls, and the second guest's next pass takes it.
+    volume.status.open_on.clear();
+    volume.settle(Utc::now());
+    assert_eq!(volume.status.attached_to, None);
+    assert_eq!(
+        release_action(&volume, &none),
+        Release::WaitingForNode("agent-1a")
+    );
+}

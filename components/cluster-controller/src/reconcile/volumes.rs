@@ -207,12 +207,27 @@ pub(super) async fn place_volumes(p: &Pass<'_>) -> anyhow::Result<()> {
         return Ok(());
     }
     let pools = p.store.list::<StoragePool>().await?;
+    // D4: whether the claim on each volume still has an object behind it.
+    // One listing per pass, shared, for the reason the pools are — and the
+    // VMs have to be read here at all because `attachedTo` is a NAME and the
+    // derivation may not look up another object.
+    let claimants = p.store.list::<Vm>().await?;
     telemetry::metrics::objects().set_count(Volume::KIND, volumes.len() as i64);
     for volume in volumes {
-        // Whose volume this is, before anything is decided about it. Without
-        // this the two replicas that do not hold the node's session used to
-        // reconcile it too, fail to deliver, and publish `Failed` with a
-        // sentence that was false — see `may_reconcile_volume`.
+        // Before the ownership gate, and deliberately: this is a fact about
+        // `Vm` OBJECTS, which every replica reads out of the same store, and
+        // it is idempotent under CAS. Gating it would leave unanswered
+        // exactly the case it exists for — a holder that went away with its
+        // machine, whose volume no replica holds a session for. The same
+        // argument `expire_vm_reports` makes one object over.
+        if let Err(e) = note_claimant(p, &volume, &claimants).await {
+            warn!(volume = %volume.metadata.name, error = format!("{e:#}"),
+                  "recording the claimant failed");
+        }
+        // Whose volume this is, before anything else is decided about it.
+        // Without this the two replicas that do not hold the node's session
+        // used to reconcile it too, fail to deliver, and publish `Failed`
+        // with a sentence that was false — see `may_reconcile_volume`.
         if !may_reconcile_volume(&volume, p.sessions) {
             continue;
         }
@@ -220,6 +235,49 @@ pub(super) async fn place_volumes(p: &Pass<'_>) -> anyhow::Result<()> {
         if let Err(e) = reconcile_volume(p, &pools, volume).await {
             warn!(volume = %name, error = format!("{e:#}"), "volume reconcile failed");
         }
+    }
+    Ok(())
+}
+
+/// Whether any `Vm` object still carries this volume's claim, written onto
+/// the volume so that `settle` can read it.
+///
+/// D4's other half. `attachedTo` is a name, and whether an object of that
+/// name still refers to this volume is a question about a SECOND object —
+/// which the derivation may not ask, because a derivation that needed another
+/// object could not run inside a compare-and-swap. So the pass that lists the
+/// VMs answers it, every pass, and `volume_claim_holds` reads it beside
+/// `openOn`.
+///
+/// A VM with a `deletionTimestamp` counts as gone, and that is what makes the
+/// claim fall at the right moment rather than at the right object: the guest
+/// is on its way out, so what is left to wait for is the `detach`, and
+/// `openOn` is what says when that has happened.
+///
+/// A reschedule of the same VM keeps the claim for free — the name is the
+/// same name, the object is found, and this writes `false` again.
+async fn note_claimant(p: &Pass<'_>, volume: &Volume, vms: &[Vm]) -> anyhow::Result<()> {
+    let Some(holder) = volume.status.attached_to.as_deref() else {
+        return Ok(());
+    };
+    let gone = !vms.iter().any(|vm| {
+        vm.metadata.name == holder
+            && vm.metadata.deletion_timestamp.is_none()
+            && vm
+                .spec
+                .referenced_volumes()
+                .iter()
+                .any(|named| named == &volume.metadata.name)
+    });
+    if volume.status.claimant_gone == gone {
+        return Ok(());
+    }
+    p.store
+        .mutate::<Volume, _>(&volume.metadata.name, |v| v.status.claimant_gone = gone)
+        .await?;
+    if gone {
+        info!(volume = %volume.metadata.name, holder,
+              "the claimant is gone; the claim falls when no node reports the bytes open");
     }
     Ok(())
 }

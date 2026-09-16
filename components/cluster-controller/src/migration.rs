@@ -1030,7 +1030,7 @@ async fn settle(
         warn!(migration = %name, node = %source, error = %format!("{e:#}"),
               "the source could not be told to let go; the guest is at the destination either way");
     }
-    close_volumes_at(store, vm, &source).await;
+    close_volumes_at(vm, &source);
     move_volume_home(store, vm, &source, &target).await;
     forget_volumes_at(store, dispatch, vm, &source).await;
 
@@ -1096,7 +1096,7 @@ async fn abandon(
         warn!(migration = %migration.metadata.name, node = target,
               error = %format!("{e:#}"), "the destination could not be torn down");
     }
-    close_volumes_at(store, vm, target).await;
+    close_volumes_at(vm, target);
     fail(store, migration, why).await
 }
 
@@ -1156,12 +1156,12 @@ async fn open_volumes_at(
             )
             .await
             .map_err(|e| anyhow::anyhow!("volume {name} on {node}: {e:#}"))?;
-        store
-            .mutate::<Volume, _>(&name, |v| {
-                v.status.open_here(node);
-            })
-            .await?;
-        debug!(volume = %name, node, "the destination has the disk open");
+        // `openOn` is not written here since D4. The destination says it
+        // itself on its next report, out of the record this command has just
+        // given it (`VolumeStateReport.open`) — and that is the honest half
+        // second: this pass knows the command was ACCEPTED, not that the disk
+        // is open. One writer of that set, and it is the machine.
+        debug!(volume = %name, node, "the destination was told to open the disk");
     }
     Ok(())
 }
@@ -1214,21 +1214,18 @@ async fn forget_volumes_at(store: &EtcdStore, dispatch: &Dispatch, vm: &Vm, node
 
 /// The mirror: `node` has let go of this VM's disks.
 ///
-/// Best effort and never fatal. A volume whose object could not be written is
-/// re-stated by that node's own next report — `openOn` is evidence as much as
-/// it is bookkeeping, and a node that no longer has the disk drops out of the
-/// list by itself.
-async fn close_volumes_at(store: &EtcdStore, vm: &Vm, node: &str) {
+/// It writes nothing any more — see the body. It stays as a named step
+/// because the ORDER of a migration's ending is what this file is about, and
+/// a step that has become "the machine will say so" is worth reading in
+/// place rather than inferring from an absence.
+fn close_volumes_at(vm: &Vm, node: &str) {
+    // Nothing to write since D4: the source says it itself, and it says it
+    // when the `detach` has really run rather than when this tier decided the
+    // migration was over. That is the difference A5 measured — a record on
+    // its way out still has the disk open — and it is the whole reason this
+    // tier stopped keeping its own copy of the answer.
     for name in vm.spec.referenced_volumes() {
-        if let Err(e) = store
-            .mutate::<Volume, _>(&name, |v| {
-                v.status.closed_here(node);
-            })
-            .await
-        {
-            debug!(volume = %name, node, error = %format!("{e:#}"),
-                   "taking the node off the volume did nothing");
-        }
+        debug!(volume = %name, node, "the source will report the disk closed");
     }
 }
 

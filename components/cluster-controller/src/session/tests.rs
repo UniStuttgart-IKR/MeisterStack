@@ -314,46 +314,39 @@ fn a_hot_plug_closes_when_the_node_reports_the_disks_and_not_when_it_is_told() {
 ///
 /// The books said `openOn: ["agent-1a","agent-1b"]` while agent-1b held no
 /// vmm, no record and no `nvme list-subsys` entry — the teardown was right
-/// and nothing ever told the volume object about it, because the pass that
-/// maintains `openOn` reads the VMs a node REPORTS and agent-1b reported the
-/// vm no longer.
+/// and nothing ever told the volume object about it.
 ///
-/// The rule is two statements from one report, and both have to be there:
-/// "I still have this disk" and "nothing here is using it".
+/// The answer used to be two statements read out of one report: "I still have
+/// this disk" and "nothing here is using it", the second derived from the
+/// union of every VM's `attached_volumes`. **D4 took that pass out.** The
+/// union is wrong in a window nothing could see — a VM with `desired =
+/// Absent` drops out of a node's report the instant the record is written, so
+/// the set went empty while the VMM still had the disk, and a DELETE in that
+/// window takes somebody's data. The node answers it directly now
+/// (`VolumeStateReport.open`, true until the `detach` has really run), and
+/// this test holds the one writer that reads it.
 #[test]
 fn a_node_that_still_has_the_disk_and_no_guest_on_it_has_let_go() {
-    let disk = "ce298d89-02f0-41fc-9a83-5db4663b23bd";
-    let other = "cb469ada-6782-4a80-a6f9-857a2219bb3f";
+    let mut volume =
+        controller_api::resources::new_volume("data-1", controller_api::VolumeSpec::default());
+    volume.status.node = Some("agent-1a".into());
+    volume.status.open_on = vec!["agent-1a".into(), "agent-1b".into()];
 
-    // The destination after the teardown: it knows the volume, no vm holds it.
-    let after = proto::StatusReport {
-        vms: Vec::new(),
-        volumes: vec![proto::VolumeStateReport {
-            id: disk.into(),
-            phase: "Ready".into(),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    assert!(ingest::let_go_of(&after, disk));
+    // The destination after the teardown says so itself, in one field.
+    ingest::note_open(&mut volume, "agent-1b", false);
+    assert_eq!(volume.status.open_on, vec!["agent-1a"]);
 
-    // The same node while the guest is actually on it: it has not let go.
-    let mut during = after.clone();
-    during.vms = vec![proto::VmStatusReport {
-        id: "6da35260-9ef6-4b05-bf0b-2d744a2db285".into(),
-        attached_volumes: vec![disk.into()],
-        ..Default::default()
-    }];
-    assert!(!ingest::let_go_of(&during, disk));
+    // Idempotent in both directions: a node reports every ten seconds and
+    // says the same thing every time.
+    ingest::note_open(&mut volume, "agent-1b", false);
+    assert_eq!(volume.status.open_on, vec!["agent-1a"]);
+    ingest::note_open(&mut volume, "agent-1b", true);
+    ingest::note_open(&mut volume, "agent-1b", true);
+    assert_eq!(volume.status.open_on, vec!["agent-1a", "agent-1b"]);
 
-    // A disk this node has never been told about is not this node's word.
-    // `hold_volumes` writes a node into `openOn` the moment the create goes
-    // out, before any report, and clearing it on that silence would undo the
-    // dispatch's own work one beat later.
-    assert!(!ingest::let_go_of(&after, other));
-
-    // A heartbeat-only report says "not saying" about both lists at once.
-    assert!(!ingest::let_go_of(&proto::StatusReport::default(), disk));
+    // A heartbeat-only report carries no volume list at all, so nothing is
+    // said about anybody: `ingest_volumes` returns before this is reached.
+    assert!(proto::StatusReport::default().volumes.is_empty());
 }
 /// The machine profile makes the trip from the node's own `/proc` to the
 /// object the destination choice reads.

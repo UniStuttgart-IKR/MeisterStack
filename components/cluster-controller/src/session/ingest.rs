@@ -9,8 +9,6 @@
 //! `ingest_status` is the order they are read in. Verbatim out of
 //! `session.rs`; the module path of every caller is unchanged.
 
-use std::collections::BTreeSet;
-
 use super::*;
 
 /// What a node says about itself: its images into the cluster-wide view, the
@@ -127,13 +125,8 @@ pub(super) async fn ingest_status(
     // Its own pass because the two change independently: a disk arrives while
     // the VM stays Running, and `observe` — which is what the phase loop
     // below is driven by — would call that report unchanged and drop it.
-    if let Err(e) = ingest_attachments(store, &vms, node_id, report, ours, at).await {
+    if let Err(e) = ingest_attachments(store, &vms, report, ours, at).await {
         warn!(node = node_id, error = %format!("{e:#}"), "volume attachment ingest failed");
-    }
-
-    // ...and the half of it that no VM can carry, because the VM is gone.
-    if let Err(e) = ingest_released(store, node_id, report).await {
-        warn!(node = node_id, error = %format!("{e:#}"), "volume release ingest failed");
     }
 
     // The address half, next to it and for the same reason: a tap says the
@@ -549,7 +542,7 @@ pub(super) async fn ingest_volumes(
                 info!(volume = %name, node = node_id, "a holder let the volume go");
                 store
                     .mutate::<Volume, _>(&name, |v| {
-                        v.status.closed_here(node_id);
+                        note_open(v, node_id, reported.open);
                     })
                     .await?;
                 continue;
@@ -558,7 +551,7 @@ pub(super) async fn ingest_volumes(
             store
                 .mutate::<Volume, _>(&name, |v| {
                     v.status.node = None;
-                    v.status.closed_here(node_id);
+                    note_open(v, node_id, reported.open);
                     v.status.backend = String::new();
                     // The tombstone, as the node's own word. For a volume on
                     // its way out this IS the answer a release acts on; for
@@ -603,12 +596,16 @@ pub(super) async fn ingest_volumes(
         // volume watch while nothing about the volume happened. The FACT is
         // compared, because the phase is derived from it.
         let said = controller_api::VolumeReported::by(node_id, phase, reason, message.clone(), at);
+        // `openOn` is this node's own answer about its own disk, and the one
+        // road it comes down since D4 — see `VolumeStatus::open_here`.
+        let listed = volume.status.open_on.iter().any(|n| n == node_id);
         if volume
             .status
             .reported
             .as_ref()
             .is_some_and(|held| held.same_word(&said))
             && volume.status.size_gib == size_gib
+            && listed == reported.open
             && (backend.is_empty() || volume.status.backend == backend)
         {
             continue;
@@ -621,6 +618,7 @@ pub(super) async fn ingest_volumes(
                 // doing. This function used to carry that rule as well, which
                 // is one of the two places that had to agree.
                 v.status.reported = Some(said.clone());
+                note_open(v, node_id, reported.open);
                 // The backend name only ever ARRIVES; a node that has not made
                 // the volume yet sends an empty string, and that is not a
                 // statement that the name is gone.
@@ -646,69 +644,29 @@ pub(super) async fn ingest_volumes(
 ///
 /// # The defect this answers
 ///
-/// `ingest_attachments` maintains `openOn` out of the VMs a node REPORTS, and
-/// the comment there promises the list is self-healing: "a machine that has
-/// let go — or that restarted without the disk — drops out on its next
-/// report". It does not, in the one case that matters. A node whose VM is
-/// gone does not report that VM at all, so the loop never reaches the disk
-/// again and the node stays on the list for ever.
+/// Whether `node` has this volume open, as the node itself says.
 ///
-/// Round 4's e2e measured it. Three live migrations of `fabric-probe` onto
-/// agent-1b failed in cloud-hypervisor; the destination tore everything down
-/// correctly — no vmm, no record, no `nvme list-subsys` entry, which is
-/// exactly what D-P5 asked for — and the volume object went on saying
-/// `openOn: ["agent-1a","agent-1b"]`. The machine was right and the books
-/// were wrong.
+/// The one writer of `openOn` since D4, and a function because both roads
+/// through this file — the ordinary report and the `Gone` tombstone — have to
+/// say it the same way. `VolumeStateReport.open` is the node's own answer out
+/// of its VM records, and it stays true until the `detach` has really run, so
+/// the set now means exactly "some machine has the bytes open". That is the
+/// whole of what a delete has to wait for.
 ///
-/// # Why these two conditions and no heuristic
-///
-/// A node's word about what it has ATTACHED is the union of
-/// `attached_volumes` over the VMs it reports. Silence there is only evidence
-/// if the node is speaking at all about that volume, so the second condition
-/// is that the node reports the volume's own RECORD. Together they say: "I
-/// still have this disk, and nothing here is using it."
-///
-/// That pair is also what keeps this off the dispatch's toes. `hold_volumes`
-/// writes the node into `openOn` the moment a create goes out, before any
-/// report — and a node that has not been told about the volume yet does not
-/// report its record, so this pass says nothing about it. A heartbeat-only
-/// report carries neither list and reaches nothing here at all, which is what
-/// "not saying" has to mean.
-pub(super) fn let_go_of(report: &StatusReport, uid: &str) -> bool {
-    let attached: BTreeSet<&str> = report
-        .vms
-        .iter()
-        .flat_map(|r| r.attached_volumes.iter().map(String::as_str))
-        .collect();
-    let known: BTreeSet<&str> = report.volumes.iter().map(|v| v.id.as_str()).collect();
-    known.contains(uid) && !attached.contains(uid)
-}
-
-pub(super) async fn ingest_released(
-    store: &EtcdStore,
-    node_id: &str,
-    report: &StatusReport,
-) -> anyhow::Result<()> {
-    if report.volumes.is_empty() {
-        return Ok(());
+/// What it replaced was FIVE writers of one set: a pass that derived it from
+/// the union of every VM's `attached_volumes` (`ingest_released`, gone with
+/// this), the dispatch half in `hold_volumes`, the release, and both ends of
+/// a live migration. Each was right about its own half and none could see
+/// what the others knew — and the union one was wrong in a way nothing could
+/// notice: a VM with `desired = Absent` drops out of a node's report the
+/// instant the record is written, so the set went empty while the VMM still
+/// had the disk. A DELETE in that window takes somebody's data.
+pub(super) fn note_open(volume: &mut Volume, node: &str, open: bool) {
+    if open {
+        volume.status.open_here(node);
+    } else {
+        volume.status.closed_here(node);
     }
-    for volume in store.list::<Volume>().await? {
-        if !volume.status.open_on.iter().any(|n| n == node_id) {
-            continue;
-        }
-        if !let_go_of(report, &volume.metadata.uid) {
-            continue;
-        }
-        let name = volume.metadata.name.clone();
-        store
-            .mutate::<Volume, _>(&name, |v| {
-                v.status.closed_here(node_id);
-            })
-            .await?;
-        info!(volume = %name, node = node_id,
-              "the node still has the disk and no guest on it; it comes off the open set");
-    }
-    Ok(())
 }
 
 /// Write what a node said about the disks it has OPEN onto the VM objects.
@@ -726,7 +684,6 @@ pub(super) async fn ingest_released(
 pub(super) async fn ingest_attachments(
     store: &EtcdStore,
     vms: &[Vm],
-    node_id: &str,
     report: &StatusReport,
     ours: impl Fn(&Vm) -> bool,
     at: DateTime<Utc>,
@@ -758,37 +715,17 @@ pub(super) async fn ingest_attachments(
             .iter()
             .filter_map(|uid| by_uid.get(uid).map(String::as_str))
             .collect();
-        // `openOn` from the node's own word, and only ever about ITSELF.
-        // Every other node's entry stays as that node's own report left it,
-        // which is what makes the list self-healing: a machine that has let
-        // go — or that restarted without the disk — drops out on its next
-        // report, and nobody has to remember to take it out. The dispatch
-        // half in `hold_volumes` puts the node in as soon as the create goes
-        // out, so the reconciler never waits a heartbeat to see its own work;
-        // this half is the evidence that keeps it honest.
-        for volume in &volumes {
-            let Some(name) = by_uid.get(&volume.metadata.uid) else {
-                continue;
-            };
-            if !vm.spec.referenced_volumes().iter().any(|v| v == name) {
-                continue;
-            }
-            let open_here = held.contains(&name.as_str());
-            let listed = volume.status.open_on.iter().any(|n| n == node_id);
-            if open_here == listed {
-                continue;
-            }
-            store
-                .mutate::<Volume, _>(name, |v| {
-                    if open_here {
-                        v.status.open_here(node_id);
-                    } else {
-                        v.status.closed_here(node_id);
-                    }
-                })
-                .await?;
-            debug!(volume = %name, node = node_id, open = open_here, "volume open-set observed");
-        }
+        // `openOn` is NOT written here any more, and that is D4. This list
+        // is the union of what every VM on this node reports as attached, and
+        // a VM with `desired = Absent` drops out of that report the instant
+        // the record is written — so the set went empty while the VMM still
+        // had the disk open. Deriving one set from two sources is the shape
+        // D-B2 came out of; the node says it directly now
+        // (`VolumeStateReport.open`, see `note_open`).
+        //
+        // What this pass still answers is the question it was made for: which
+        // of the SPEC's disks this VM has. That is a statement about the VM
+        // and not about the machine, and it is the evidence half of hot-plug.
         let observed = observed_attachments(vm, &held);
         if vm.status.volumes == observed {
             continue;

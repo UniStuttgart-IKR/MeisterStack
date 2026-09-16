@@ -159,6 +159,35 @@ impl VolumePhaseKind {
     }
 }
 
+/// Does the claim on this volume still hold?
+///
+/// **The whole of D4.** `attachedTo` is the CLAIM and `openOn` is the
+/// OBSERVATION, and the claim falls only when both halves say it may: no `Vm`
+/// object carries it any more (`claimantGone`, written by the pass that lists
+/// the VMs) and no machine reports the bytes open.
+///
+/// It used to fall on the way OUT of a teardown — `release_volumes` cleared
+/// it as the `DestroyInstance` was dispatched — and that is one command's
+/// round trip too early. Between the dispatch and the node's `detach` there
+/// was an object saying nobody held the disk while a VMM still had it open,
+/// and that is exactly the window in which a DELETE takes somebody's data:
+/// `Release::HeldBy` reads this field, finds nothing, and lets the
+/// deprovision go.
+///
+/// A reschedule of the SAME VM keeps the claim, and it keeps it for free:
+/// the name is the same name, so the pass that lists the VMs finds the object
+/// and `claimantGone` stays false. That is the case a timeout-based answer
+/// would have got wrong.
+pub fn volume_claim_holds(status: &VolumeStatus) -> bool {
+    match status.attached_to {
+        // Nothing to drop, so nothing to decide. `true` rather than `false`
+        // because the question is "may the claim stay", and a volume with no
+        // claim is not one whose claim has fallen.
+        None => true,
+        Some(_) => !status.claimant_gone || !status.open_on.is_empty(),
+    }
+}
+
 /// What a volume IS, out of the facts on it.
 ///
 /// One rule for both tiers, and the first derivation in this file with a real
@@ -326,6 +355,19 @@ pub struct VolumeStatus {
     /// `None` on every volume nothing holds, which is nearly all of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder: Option<String>,
+    /// That no `Vm` object names this volume any more — the VM was deleted,
+    /// or its spec stopped referring to it.
+    ///
+    /// The half of D4 that the derivation cannot see: `attachedTo` is a NAME,
+    /// and whether an object of that name still exists is a question about
+    /// another object. So the pass that lists the VMs writes the answer down,
+    /// every pass, and `volume_claim_holds` reads it beside `openOn`.
+    ///
+    /// False on a volume nothing ever claimed, which is also the honest
+    /// default: a claim is only ever dropped on evidence, and "nobody has
+    /// looked" is not evidence.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub claimant_gone: bool,
     /// The name the BACKEND knows this volume by — `/tmp/vols/<uid>.raw`,
     /// `/dev/vg0/vm-<uid>`, an export directory.
     ///
@@ -454,8 +496,21 @@ impl VolumeStatus {
     /// Record that `node` has the volume open. Idempotent, and it keeps the
     /// list sorted so that "the same two nodes" is one value and not two.
     ///
-    /// Returns whether anything changed, because every writer of this field
-    /// is inside a store mutation that must not churn a revision per report.
+    /// Returns whether anything changed, because the writer of this field is
+    /// inside a store mutation that must not churn a revision per report.
+    ///
+    /// **One writer, since D4:** the volume half of a node's status report
+    /// (`VolumeStateReport.open`). There used to be five — the dispatch in
+    /// `hold_volumes`, the release, both ends of a live migration, and a pass
+    /// that derived the set from the union of every VM's
+    /// `attached_volumes` — and the last of them is where D-B2's shape came
+    /// from: five writers of one set, each right about its own half and none
+    /// of them able to see what the others knew.
+    ///
+    /// What replaced them is the node saying it directly, and saying it until
+    /// the `detach` has actually run: `openOn` is now true exactly while some
+    /// machine has the bytes open, which is the whole of what a delete has to
+    /// wait for.
     pub fn open_here(&mut self, node: &str) -> bool {
         match self.open_on.binary_search_by(|n| n.as_str().cmp(node)) {
             Ok(_) => false,
@@ -466,7 +521,8 @@ impl VolumeStatus {
         }
     }
 
-    /// Record that `node` has let go. Idempotent for the same reason.
+    /// Record that `node` has let go. Idempotent for the same reason, and
+    /// with the same one writer — see [`Self::open_here`].
     pub fn closed_here(&mut self, node: &str) -> bool {
         match self.open_on.binary_search_by(|n| n.as_str().cmp(node)) {
             Ok(at) => {
@@ -1059,5 +1115,111 @@ mod volume_tests {
             invented.status.phase().reason(),
             Some(VolumeReason::AwaitingNode)
         );
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("an instant")
+    }
+
+    fn attached() -> Volume {
+        let mut v = new_volume(
+            "data-1",
+            VolumeSpec {
+                pool: "fast".to_string(),
+                size_gib: 10,
+                ..Default::default()
+            },
+        );
+        v.status.node = Some("agent-1a".to_string());
+        v.status.attached_to = Some("web-1".to_string());
+        v.status.open_on = vec!["agent-1a".to_string()];
+        v.status.reported = Some(VolumeReported::by(
+            "agent-1a",
+            VolumePhaseKind::Ready,
+            VolumeReason::Unrecorded,
+            None,
+            at(0),
+        ));
+        v
+    }
+
+    /// **D4.** The claim falls when the last holder has gone AND no machine
+    /// reports the bytes open — not when a `DestroyInstance` is dispatched.
+    ///
+    /// The window between those two is one command's round trip, and in it
+    /// the object said nobody held a disk a VMM still had open. That is
+    /// exactly where a DELETE takes somebody's data: `Release::HeldBy` reads
+    /// `attachedTo`, finds nothing, and lets the deprovision go.
+    #[test]
+    fn a_claim_falls_only_when_the_bytes_are_nobodys() {
+        // The ordinary state: a guest has it.
+        let mut held = attached();
+        held.settle(at(0));
+        assert_eq!(held.status.attached_to.as_deref(), Some("web-1"));
+
+        // The destroy is quittanced and the VM object is going. The node
+        // still reports the disk open, because the `detach` has not run.
+        held.status.claimant_gone = true;
+        held.settle(at(10));
+        assert_eq!(
+            held.status.attached_to.as_deref(),
+            Some("web-1"),
+            "the VMM still has it open; the claim is what stops a delete taking the data"
+        );
+        assert!(!volume_claim_holds(&VolumeStatus {
+            claimant_gone: true,
+            open_on: Vec::new(),
+            ..held.status.clone()
+        }));
+
+        // The node reports the disk closed: now it is nobody's.
+        held.status.open_on.clear();
+        held.settle(at(20));
+        assert_eq!(held.status.attached_to, None, "and now the claim falls");
+        assert!(
+            !held.status.claimant_gone,
+            "the fact goes with the claim it was about"
+        );
+    }
+
+    /// A reschedule of the SAME VM keeps the claim, and keeps it for free:
+    /// the name is the same name, so the pass that lists the VMs finds the
+    /// object and writes `claimantGone = false` again.
+    ///
+    /// This is the case a timeout would have got wrong — the disk is
+    /// re-opened on another machine of the same pool, and a claim that had
+    /// expired in between would have let a second guest take it.
+    #[test]
+    fn a_reschedule_of_the_same_vm_keeps_its_disk() {
+        let mut moving = attached();
+        // The old node lets go and the object is still there.
+        moving.status.open_on.clear();
+        moving.status.claimant_gone = false;
+        moving.settle(at(10));
+        assert_eq!(moving.status.attached_to.as_deref(), Some("web-1"));
+
+        // And the new node opens it.
+        moving.status.open_on = vec!["agent-1b".to_string()];
+        moving.settle(at(20));
+        assert_eq!(moving.status.attached_to.as_deref(), Some("web-1"));
+    }
+
+    /// A volume nobody ever claimed is not a volume whose claim has fallen.
+    #[test]
+    fn nothing_is_dropped_from_a_volume_with_no_claim() {
+        let mut free = attached();
+        free.status.attached_to = None;
+        free.status.open_on.clear();
+        assert!(
+            volume_claim_holds(&free.status),
+            "there is nothing to drop, so there is nothing to decide"
+        );
+        free.settle(at(0));
+        assert_eq!(free.status.attached_to, None);
     }
 }

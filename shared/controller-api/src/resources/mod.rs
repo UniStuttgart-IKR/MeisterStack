@@ -165,8 +165,19 @@ resources! {
     /// A volume with a life of its own — the object that lets a disk outlive
     /// the VM that was using it. See `VolumeSpec`.
     Volume => "volumes", "Volume" {
-        /// What the facts on this volume add up to. See [`settle_volume`].
+        /// The claim, and then the phase. See [`volume_claim_holds`] and
+        /// [`settle_volume`].
+        ///
+        /// The one derivation that changes a field other than the phase, and
+        /// it earns that: `attachedTo` is a claim on somebody's DATA, so the
+        /// moment it may be given up is a rule with as much at stake as the
+        /// phase itself — and a rule nothing else may write is a rule nothing
+        /// else can get wrong. See D4.
         fn settle(&mut self, now: DateTime<Utc>) {
+            if !volume_claim_holds(&self.status) {
+                self.status.attached_to = None;
+                self.status.claimant_gone = false;
+            }
             let phase = settle_volume(self.metadata.deletion_timestamp.is_some(), &self.status);
             self.status.stamp(phase, now);
         }

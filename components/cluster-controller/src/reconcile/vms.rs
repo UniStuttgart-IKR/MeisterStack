@@ -815,17 +815,22 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
         }
         match volume.status.attached_to.as_deref() {
             Some(holder) if holder == vm.metadata.name => {
-                // Held by us already, but the node may still be missing from
-                // `openOn` — a volume attached before the field existed, or a
-                // vm that has just been rebound. One idempotent write, and
-                // `open_here` returns false on every pass after the first.
-                let mut here = volume;
-                if here.status.open_here(node) {
-                    let _ = p.store.update(&here).await;
-                }
+                // Held by us already, and nothing to write: `openOn` is the
+                // node's own answer since D4 and arrives with its next report
+                // (`VolumeStateReport.open`). This pass used to put the node
+                // in as the create went out, which was a second writer of the
+                // set and an anticipation besides — the disk is open when the
+                // machine has opened it.
                 continue;
             }
             Some(holder) => {
+                // The claim is somebody else's, and since D4 it may still be
+                // standing after that somebody has gone: it falls when no Vm
+                // object carries it AND no machine reports the bytes open
+                // (`volume_claim_holds`). So the wait gets a word of its own
+                // — nothing here will ever take a disk off its holder, and an
+                // operator has to be able to see who has it.
+                note_vm_held(p, vm, &name, holder).await?;
                 anyhow::bail!("volume {name} is held by {holder}");
             }
             None => {}
@@ -848,7 +853,9 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
         }
         let mut held = volume;
         held.status.attached_to = Some(vm.metadata.name.clone());
-        held.status.open_here(node);
+        // A fresh claim: whatever a previous holder's absence established is
+        // about that holder and not this one.
+        held.status.claimant_gone = false;
         match p.store.update(&held).await {
             Ok(_) => info!(volume = %name, "volume attached"),
             // Somebody wrote the volume between the read and the write. Not
@@ -860,6 +867,39 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
             Err(e) => return Err(e.into()),
         }
     }
+    Ok(())
+}
+
+/// Say that this VM is waiting for a disk somebody else holds.
+///
+/// Its own word (`VolumeHeld`) and not `NotReady`, because the two send
+/// different people to different places: `NotReady` is a wait on this control
+/// plane — the bytes are being made and will arrive — and this is a wait on a
+/// PERSON. Nothing here will ever take a disk off the guest holding it.
+///
+/// It is also what makes D4 safe to read. The claim now falls only when the
+/// last holder has gone AND no machine reports the bytes open, so the window
+/// in between is a VM that says who has its disk instead of one that says
+/// "not ready" for as long as anybody watches.
+async fn note_vm_held(p: &Pass<'_>, vm: &Vm, volume: &str, holder: &str) -> anyhow::Result<()> {
+    let said = format!("volume {volume} is still held by {holder}");
+    if vm
+        .status
+        .placement
+        .as_ref()
+        .is_some_and(|pl| pl.message == said)
+    {
+        return Ok(());
+    }
+    p.store
+        .mutate::<Vm, _>(&vm.metadata.name, |v| {
+            v.status.placement = Some(controller_api::VmPlacement {
+                reason: controller_api::VmReason::VolumeHeld,
+                message: said.clone(),
+                at: Utc::now(),
+            });
+        })
+        .await?;
     Ok(())
 }
 
@@ -880,32 +920,35 @@ pub(super) async fn release_volumes(p: &Pass<'_>, vm: &Vm) {
 /// handing it the same loop is what keeps the two from growing two answers to
 /// "may I clear this claim".
 pub(super) async fn release_named_volumes(p: &Pass<'_>, vm: &Vm, names: &[String]) {
-    // WHERE it was open, so that letting go clears both halves of the claim.
-    // `status.nodeName` is the evidence half and `spec.nodeName` the intent,
-    // and a vm being torn down may have lost either — whichever is left names
-    // the machine that had the disk open.
-    let node = vm
-        .status
-        .node_name
-        .clone()
-        .or_else(|| vm.spec.node_name.clone());
     for name in names {
         let held = p
             .store
             .mutate::<Volume, _>(name, |v| {
                 if v.status.attached_to.as_deref() == Some(vm.metadata.name.as_str()) {
-                    v.status.attached_to = None;
-                    // Only THIS vm's node comes off. A migration in flight has
-                    // the other end in the list too, and that end is not this
-                    // release's to clear.
-                    if let Some(node) = &node {
-                        v.status.closed_here(node);
-                    }
+                    // **The claim is not cleared here any anymore, and that is
+                    // D4.** It used to fall as the `DestroyInstance` was
+                    // dispatched, which is one command's round trip too
+                    // early: between the dispatch and the node's `detach`
+                    // there was an object saying nobody held the disk while a
+                    // VMM still had it open, and that is exactly the window
+                    // in which a DELETE takes somebody's data —
+                    // `Release::HeldBy` reads this field, finds nothing, and
+                    // lets the deprovision go.
+                    //
+                    // What is written instead is the FACT this pass knows:
+                    // the VM that held it is on its way out. The claim falls
+                    // in `settle` when that fact and an empty `openOn` agree
+                    // (`volume_claim_holds`), which is when the bytes really
+                    // are nobody's. A reschedule of the same VM keeps it: the
+                    // name is the same name, so the volume pass finds the
+                    // object again and clears this.
+                    v.status.claimant_gone = true;
                 }
             })
             .await;
         match held {
-            Ok(_) => debug!(volume = %name, "volume released"),
+            Ok(_) => debug!(volume = %name, "the claimant is going; the claim falls when the \
+                                             bytes are nobody's"),
             // A volume that is already gone needs no release, and a store
             // that could not be written is retried by the next pass. Neither
             // is worth failing a teardown over — the object is the record and
