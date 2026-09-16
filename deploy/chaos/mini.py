@@ -284,53 +284,77 @@ def m0(reps=1):
 @scenario("M2", "hot-unplug: the control plane frees a disk the VMM still has open")
 def m2(reps=1):
     """`vm detach` reports the volume free while cloud-hypervisor keeps the fd.
-
     The agent calls `vm.remove-device` and the CH API acknowledges the
     REQUEST; virtio unplug is guest-cooperative and a guest that never
     acknowledges leaves the device -- and the open file -- in place. Nothing
     verifies. The volume goes to `Ready / attachedTo: none`, and the next VM
     that uses it dies on cloud-hypervisor's own write lock, which is the only
     thing standing between this and two VMMs on one disk.
-
     Judged on the node, because the control plane is exactly the thing that
     is wrong here: `/proc/<vmm>/fd` is the only honest witness.
+
+    Two volumes, and the DATA disk is the one that goes: the first entry is
+    the boot disk and the cloud refuses to take it off a vm (422, "a vm needs
+    at least one volume as boot disk"). The first version of this scenario
+    detached the only volume, never checked the PUT's status, and measured a
+    detach that had never been asked for.
     """
     ensure_tenant()
     f, rows = [], []
-    vol, vm = f"{PREFIX}m2-vol", f"{PREFIX}m2-vm"
-    c, o = cloud("POST", "/volumes", vol_body(vol, "mc-fs2"))
-    if c not in (200, 201):
-        return [("M2", f"volume create refused HTTP {c}")], []
-    ph, _, _ = wait_volume(vol)
-    if ph != "Ready":
-        drop_volume(vol)
-        return [("M2", f"volume never became Ready (stopped at {ph})")], []
-    c, o = cloud("GET", f"/volumes/{vol}")
+    boot, data, vm = f"{PREFIX}m2-boot", f"{PREFIX}m2-vol", f"{PREFIX}m2-vm"
+    for v in (boot, data):
+        c, o = cloud("POST", "/volumes", vol_body(v, "mc-fs2"))
+        if c not in (200, 201):
+            return [("M2", f"volume create {v} refused HTTP {c}")], []
+        ph, _, _ = wait_volume(v)
+        if ph != "Ready":
+            drop_volume(v)
+            return [("M2", f"volume {v} never became Ready (stopped at {ph})")], []
+    c, o = cloud("GET", f"/volumes/{data}")
     uid = o["metadata"]["uid"]
     node = (o.get("status") or {}).get("node")
-
-    cloud("POST", "/vms", vm_body(vm, tenant=TENANT, volumes=[{"volume": vol}]))
+    cloud("POST", "/vms", vm_body(vm, tenant=TENANT, volumes=[{"volume": boot}, {"volume": data}]))
     wait_vm(vm)
+    # the data disk has to be open before a detach can prove anything
+    for _ in range(30):
+        c, o = cloud("GET", f"/volumes/{data}")
+        if (o.get("status") or {}).get("openOn"):
+            break
+        time.sleep(2)
     _, out = sh(node, f"for p in $(pgrep -f '[c]loud-hypervisor'); do ls -l /proc/$p/fd 2>/dev/null; done | grep -c {uid}")
     open_before = out.strip()
 
     # detach through the cloud, then ask the node, not the API
     c, o = cloud("GET", f"/vms/{vm}")
-    o["spec"]["vm"]["volumes"] = []
-    cloud("PUT", f"/vms/{vm}", o)
-    time.sleep(15)
-    c, o = cloud("GET", f"/volumes/{vol}")
-    attached = (o.get("status") or {}).get("attachedTo")
+    o["spec"]["vm"]["volumes"] = [{"volume": boot}]
+    c, r = cloud("PUT", f"/vms/{vm}", o)
+    if c != 200:
+        f.append(("M2", f"detach PUT refused HTTP {c}: {str(r)[:160]}"))
+    # give the control plane a minute to say the disk is closed, then look
+    freed_at = None
+    t0 = time.time()
+    while time.time() - t0 < 60:
+        c, o = cloud("GET", f"/volumes/{data}")
+        st = o.get("status") or {}
+        if not st.get("openOn") and not st.get("attachedTo"):
+            freed_at = round(time.time() - t0, 1)
+            break
+        time.sleep(3)
+    c, o = cloud("GET", f"/volumes/{data}")
+    st = o.get("status") or {}
     _, out = sh(node, f"for p in $(pgrep -f '[c]loud-hypervisor'); do ls -l /proc/$p/fd 2>/dev/null; done | grep -c {uid}")
     open_after = out.strip()
     rows.append({"scenario": "detach", "node": node, "fd_before": open_before,
-                 "fd_after": open_after, "status.attachedTo": attached})
-    if open_after != "0":
-        f.append(("M2", f"detach reported done (attachedTo={attached!r}) but the vmm on "
+                 "fd_after": open_after, "status.attachedTo": st.get("attachedTo"),
+                 "status.openOn": st.get("openOn"), "control_plane_freed_after_s": freed_at})
+    if freed_at is not None and open_after != "0":
+        f.append(("M2", f"the control plane freed the disk after {freed_at}s (attachedTo="
+                        f"{st.get('attachedTo')!r}, openOn={st.get('openOn')!r}) but the vmm on "
                         f"{node} still holds {open_after} fd on {uid}; the next vm on this "
                         f"volume will die on ch's write lock"))
     drop_vm(vm)
-    drop_volume(vol)
+    drop_volume(data)
+    drop_volume(boot)
     return f, rows
 
 
@@ -356,17 +380,31 @@ def m3(reps=1):
     f, rows = [], []
     cname, node = "cluster-2", "agent-2a"
     stay, move = f"{PREFIX}m3-stay", f"{PREFIX}m3-move"
+    # Pinned: this scenario drains agent-2a, so a VM the scheduler put
+    # somewhere else would make the drain a no-op and the measurement a lie
+    # about a machine it never touched. Pinned by a label and a nodeSelector
+    # at the CLUSTER, because `spec.nodeName` is not a client's field at the
+    # cloud (422 since the F20 fix) and nodeSelector is a cluster-tier field.
+    c, o = cluster(cname, "GET", f"/nodes/{node}")
+    o["spec"].setdefault("labels", {})["mc-m3"] = "here"
+    c, o = cluster(cname, "PUT", f"/nodes/{node}", o)
+    if c not in (200, 201):
+        return [("M3", f"labelling {node} failed: HTTP {c}")], []
     for n in (stay, move):
-        # Pinned: this scenario drains agent-2a, so a VM the scheduler put
-        # somewhere else would make the drain a no-op and the measurement a
-        # lie about a machine it never touched.
-        body = vm_body(n, tenant=TENANT, cluster_name=cname)
-        body["spec"]["nodeName"] = node
-        cloud("POST", "/vms", body)
-        wait_vm(n)
-    c, o = cloud("GET", f"/vms/{move}")
+        c, o = cluster(cname, "POST", "/vms", vm_body(n, node_sel={"mc-m3": "here"}))
+        if c != 201:
+            return [("M3", f"create {n} at {cname}: HTTP {c} {str(o)[:160]}")], []
+        t0 = time.time()
+        while time.time() - t0 < 180:
+            c, o = cluster(cname, "GET", f"/vms/{n}")
+            if (o.get("status") or {}).get("phase") == "Running":
+                break
+            time.sleep(2)
+    c, o = cluster(cname, "GET", f"/vms/{move}")
     o["spec"]["evacuation"] = "restart"
-    cloud("PUT", f"/vms/{move}", o)
+    c, r = cluster(cname, "PUT", f"/vms/{move}", o)
+    if c != 200:
+        f.append(("M3", f"setting evacuation=restart on {move}: HTTP {c} {str(r)[:160]}"))
 
     c, o = cluster(cname, "GET", f"/nodes/{node}")
     where_before = {}
@@ -406,9 +444,15 @@ def m3(reps=1):
     c, o = cluster(cname, "GET", f"/nodes/{node}")
     o["spec"]["drain"] = False
     o["spec"]["schedulable"] = True
+    (o["spec"].get("labels") or {}).pop("mc-m3", None)
     cluster(cname, "PUT", f"/nodes/{node}", o)
     for n in (stay, move):
-        drop_vm(n)
+        cluster(cname, "DELETE", f"/vms/{n}")
+    t0 = time.time()
+    while time.time() - t0 < 120:
+        if all(cluster(cname, "GET", f"/vms/{n}")[0] == 404 for n in (stay, move)):
+            break
+        time.sleep(2)
     return f, rows
 
 
