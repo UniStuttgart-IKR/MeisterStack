@@ -373,3 +373,36 @@ async fn ch_api(
     .await
     .with_context(|| format!("ch {endpoint} timeout"))?
 }
+
+impl CloudHypervisorDriver {
+    /// Whether this VMM holds a NIC it was handed as a descriptor.
+    ///
+    /// Asked of the VMM and not of the record, because the VMM is the party
+    /// that knows: `vm.info` reports `fds` for exactly the network devices
+    /// that were built from descriptors, whatever the agent believes it sent.
+    /// That matters for an ADOPTED VM — one whose VMM outlived the agent that
+    /// configured it, possibly under a different configuration.
+    ///
+    /// A VM with no NICs answers `false`, and so does a VM whose `vm.info`
+    /// this driver cannot read as a document — the caller uses this to REFUSE
+    /// something, and refusing on an unreadable answer would be a node that
+    /// cannot drain.
+    pub(crate) async fn has_fd_nic(&self, id: &VmId) -> hypervisor::Result<bool> {
+        let bytes = self.api(id, Method::GET, "vm.info", None).await?;
+        let info: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(info) => info,
+            Err(e) => {
+                warn!(error = %e, "vm.info is not a document this driver can read");
+                return Ok(false);
+            }
+        };
+        Ok(info
+            .get("config")
+            .and_then(|c| c.get("net"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|nets| {
+                nets.iter()
+                    .any(|n| n.get("fds").is_some_and(|f| !f.is_null()))
+            }))
+    }
+}

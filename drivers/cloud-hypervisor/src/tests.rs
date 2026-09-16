@@ -159,7 +159,24 @@ fn spec(volumes: Vec<VolumeAttachment>, devices: Vec<DeviceAttachment>) -> Insta
 }
 
 fn config(spec: &InstanceSpec) -> serde_json::Value {
-    build_vm_config(spec, &PathBuf::from("/c"), &PathBuf::from("/s")).expect("config builds")
+    build_vm_config(
+        spec,
+        &PathBuf::from("/c"),
+        &PathBuf::from("/s"),
+        NetForm::TapName,
+    )
+    .expect("config builds")
+}
+
+/// The same document a VMM that gets its taps as descriptors is handed.
+fn config_with_tap_fds(spec: &InstanceSpec) -> serde_json::Value {
+    build_vm_config(
+        spec,
+        &PathBuf::from("/c"),
+        &PathBuf::from("/s"),
+        NetForm::TapFd,
+    )
+    .expect("config builds")
 }
 
 /// Every disk states an id, and the id is the volume's rather than the
@@ -282,6 +299,66 @@ fn an_overlay_nic_tells_the_guest_its_mtu_and_a_plain_one_says_nothing() {
     let cfg = config(&plain);
     assert_eq!(cfg["net"][0]["mac"], "52:54:00:00:00:01");
     assert!(cfg["net"][0].get("mtu").is_none(), "no key, not a null");
+}
+
+/// On the descriptor form the NIC is not in the create document at all, and
+/// the `vm.add-net` body that replaces it names neither the tap, nor an fd,
+/// nor an MTU.
+///
+/// Every one of those absences is a measured failure avoided, and they are
+/// asserted here because the document is the whole of what this driver is
+/// judged on: `tap` would make the VMM open `/dev/net/tun` itself, `fds`
+/// would buy a warning per NIC per boot (v53 ignores body fds), and `mtu`
+/// would make an unprivileged VMM die at boot in `SIOCSIFMTU` — which is
+/// exactly what it did on this machine before the field came out. The guest
+/// still learns the MTU, from the tap, which is why the field can go.
+#[test]
+fn the_descriptor_form_names_no_tap_no_fd_and_no_mtu() {
+    let mut overlay = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
+    overlay.nics = vec![nic(Some(1450))];
+    let cfg = config_with_tap_fds(&overlay);
+    assert!(
+        cfg.get("net").is_none(),
+        "vm.create must carry no net at all: v53 nulls every fd in it"
+    );
+
+    let body = net_config(&nic(Some(1450)));
+    assert_eq!(body["id"], "msk0000");
+    assert_eq!(body["mac"], "52:54:00:00:00:01");
+    // Exactly two: v53 refuses anything but `2 * fds.len()`.
+    assert_eq!(body["num_queues"], 2);
+    assert!(
+        body.get("tap").is_none(),
+        "the descriptor replaces the name"
+    );
+    assert!(body.get("fds").is_none(), "only SCM_RIGHTS fds count");
+    assert!(
+        body.get("mtu").is_none(),
+        "set_mtu is SIOCSIFMTU and an unprivileged vmm may not; the tap already carries it"
+    );
+}
+
+/// And the two forms disagree about nothing else. A node that has not asked
+/// for Stufe 3 gets the document it always got — that is the rule the whole
+/// lane is held to — so the only difference between the two is `net`.
+#[test]
+fn the_two_net_forms_differ_in_net_and_in_nothing_else() {
+    let mut s = spec(
+        vec![
+            VolumeAttachment::Path("/vol/a.raw".into()),
+            VolumeAttachment::VhostUserBlk {
+                socket: "/run/blk.sock".into(),
+                pid: 7,
+            },
+        ],
+        vec![vhost_gpu()],
+    );
+    s.nics = vec![nic(Some(1450))];
+    let mut named = config(&s);
+    let with_fds = config_with_tap_fds(&s);
+    assert!(named.get("net").is_some());
+    named.as_object_mut().unwrap().remove("net");
+    assert_eq!(named, with_fds);
 }
 
 /// Unset means `ImageType::Unknown`, and v53 answers that by detecting the

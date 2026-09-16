@@ -387,7 +387,7 @@ impl CloudHypervisorDriver {
         // agent's and is cleaned up with the rest in `destroy`.
         let _ = std::fs::remove_file(&serial_socket);
 
-        let config = build_vm_config(spec, &console_path, &serial_socket)?;
+        let config = build_vm_config(spec, &console_path, &serial_socket, self.net_form())?;
         // No event monitor: this VM answers every question over its API
         // socket. See `event_path`.
         let mut process = self.spawn_vmm(id, None).await?;
@@ -407,6 +407,25 @@ impl CloudHypervisorDriver {
         if let Err(e) = self.api(id, Method::PUT, "vm.create", Some(config)).await {
             let _ = process.kill().await;
             return Err(e);
+        }
+
+        // The NICs, one `vm.add-net` each, with the tap as a descriptor —
+        // because `vm.create` is the one verb v53 refuses descriptors on
+        // (`http_endpoint.rs`: "For the VmCreate call, we do not accept FDs
+        // from the socket currently."). Between the create and the boot is
+        // exactly where they belong: `vm_add_net` with no VM yet only adds to
+        // the config the boot will read, and it VALIDATES it there, so a
+        // wrong `num_queues` is an error now rather than a dead guest later.
+        //
+        // On the name form this loop does nothing: the NICs are already in
+        // the document above.
+        if self.net_form() == NetForm::TapFd {
+            for nic in &spec.nics {
+                if let Err(e) = self.add_net_with_fd(id, nic).await {
+                    let _ = process.kill().await;
+                    return Err(e);
+                }
+            }
         }
 
         self.vms.lock().unwrap().insert(

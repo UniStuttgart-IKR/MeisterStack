@@ -126,5 +126,7 @@ prometheus = { version = "0.14", default-features = false }
 # os utils
 # "user" is getgrnam: the agent turns [paths] socket_group into a gid without
 # shelling out to a tool that may not be on a unit's PATH.
-nix = { version = "0.31", features = ["fs", "zerocopy", "ioctl", "process", "signal", "resource", "term", "user"] }
+# "socket" is sendmsg with SCM_RIGHTS: the agent hands the VMM an open tap
+# instead of the right to make one (drivers/cloud-hypervisor/src/fd.rs).
+nix = { version = "0.31", features = ["fs", "zerocopy", "ioctl", "process", "signal", "resource", "socket", "term", "user"] }
 libc = "0.2"
