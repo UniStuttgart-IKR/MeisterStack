@@ -16,6 +16,22 @@ let
   physnets = config.meisterstack.agent.physnets;
   inputBackend = config.meisterstack.agent.inputBackend;
 
+  unprivileged = config.meisterstack.agent.unprivileged;
+  capabilities = config.meisterstack.agent.capabilities;
+
+  # The cgroup of THIS unit, which is what `cgroup_root` becomes when the
+  # agent is not root: a system unit's cgroup is
+  # /sys/fs/cgroup/<slice>/<unit>, and `Delegate=` below is what hands the
+  # subtree over. Written out rather than discovered at run time because it
+  # goes into a config file the agent reads before it does anything.
+  #
+  # A SYSTEM unit and not a user unit, and that is measured, not a taste:
+  # `system.slice/cgroup.subtree_control` offers `cpuset cpu io memory pids`,
+  # `user@1000.service` offers `cpu memory pids`. A user unit can never have
+  # `cgroup_cpuset`, so the two-agents-per-NUMA-node recipe would silently
+  # stop enforcing.
+  unitCgroup = "/sys/fs/cgroup/system.slice/meister-agent.service";
+
   # The role's config template. The reference for what every key means is
   # config/examples/agent.toml; what is here is only "which value, and why not
   # the example's".
@@ -83,7 +99,11 @@ let
       run_dir = "/run/meisterstack/agent";
       image_dir = "/opt/meisterstack/images";
       volume_dir = "/var/lib/meisterstack/volumes";
-      cgroup_root = "/sys/fs/cgroup/meisterstack";
+      # Root's agent makes its own directory under the mount root and asks
+      # systemd for nothing. An unprivileged one cannot: `/sys/fs/cgroup` is
+      # not writable for anybody else, so its root has to BE the subtree
+      # systemd delegated to it. See `unitCgroup` and `Delegate=` below.
+      cgroup_root = if unprivileged then unitCgroup else "/sys/fs/cgroup/meisterstack";
       # Who may talk to this node's admin socket besides root. The agent
       # itself stays root — it writes nftables rules, makes taps, opens
       # /dev/kvm — but its socket does not have to be root-only for that:
@@ -224,6 +244,67 @@ in
     '';
   };
 
+  options.meisterstack.agent.unprivileged = lib.mkOption {
+    type = lib.types.bool;
+    default = false;
+    description = ''
+      Run the agent as the user `meister` with exactly the capabilities in
+      `meisterstack.agent.capabilities`, instead of as root.
+
+      The default is false and stays false: root is what every node in this
+      fleet has been, and the agent's behaviour as root does not change.
+
+      What such a node can still do, all of it measured on 2026-09-16: boot
+      guests (`/dev/kvm` through the group `kvm`), `filesystem` volumes,
+      `input` with the `fifo` profile, and — with the default
+      `CAP_NET_ADMIN` — every tap, bridge, VXLAN and nftables tap guard it
+      makes today.
+
+      What it cannot do, and says so at start-up, one sentence per driver:
+      `lvm-thin` and `vfio` (CAP_SYS_ADMIN *and* CAP_DAC_OVERRIDE), `nfs`
+      (CAP_SYS_ADMIN for mount(2)), `nvmeof` (the same, plus a root-owned
+      /dev/nvme-fabrics), and a tenant router (CAP_SYS_ADMIN for
+      `unshare(CLONE_NEWNET)` — a tap needs CAP_NET_ADMIN, a router does
+      not stop at it). A driver whose need is missing is not registered, so
+      this node claims none of that in its Hello and the scheduler places
+      none of it here.
+
+      This is a PROFILE for a compute-only node, not a hardening pass for
+      the fleet: `deploy/README.md`, section "Ohne root", says what falls
+      away, and in particular that the group `meister` on the agent socket
+      is root-equivalent either way.
+    '';
+  };
+
+  options.meisterstack.agent.capabilities = lib.mkOption {
+    type = lib.types.listOf lib.types.str;
+    default = [ "CAP_NET_ADMIN" ];
+    example = [ "CAP_NET_ADMIN" "CAP_SETUID" "CAP_SETGID" ];
+    description = ''
+      The capabilities an unprivileged agent holds — both its ambient set
+      (so that `nft`, `ip` and the VMM it spawns inherit them) and its
+      bounding set (so that the list is the whole truth and not a floor).
+
+      Only read when `meisterstack.agent.unprivileged` is true.
+
+      The default is the one capability that buys something a node cannot
+      work around: `CAP_NET_ADMIN`, which is exactly enough for taps,
+      bridges, VXLAN and the tap guard, and exactly not enough for anything
+      else (measured). An empty list is a node with no networking at all —
+      legal, and then a VM with a NIC cannot run there.
+
+      `CAP_SYS_ADMIN` in this list is not a middle ground: capabilities(7)
+      says of it "It can plausibly be called 'the new root'". A node that
+      needs LVM, NFS, NVMe-oF or vfio should run the agent as root and say
+      so, rather than pretend.
+
+      The list exists because the next lane needs two more: the VMM-as-
+      `meister-vmm` step (`design/privilege-separation.md`, stage 3) adds
+      `CAP_SETUID CAP_SETGID`, since dropping to another user is itself a
+      privilege.
+    '';
+  };
+
   options.meisterstack.agent.settings = lib.mkOption {
     type = toml.type;
     default = { };
@@ -313,7 +394,67 @@ in
     systemd.tmpfiles.rules = [
       "d /opt/meisterstack/images 0755 root root -"
       "d /var/lib/meisterstack 0755 root root -"
+    ] ++ lib.optionals unprivileged [
+      # The three directories [paths] names, given to the user that now has
+      # to write them. tmpfiles and not `StateDirectory=`/`RuntimeDirectory=`,
+      # because these paths are absolute in a config template one-context
+      # renders — systemd's own directory options would put them under
+      # /var/lib/<name> and /run/<name> and the agent would be told about a
+      # different place than the one that was created.
+      #
+      # `/run/meisterstack` stays root-owned: one-context renders agent.toml
+      # and etcd.env into it, and the agent only reads those.
+      "d /run/meisterstack/agent 0750 meister meister -"
+      "d /var/lib/meisterstack/volumes 0750 meister meister -"
+      # The session credential, which the agent opens at start-up. push.sh
+      # leaves the key 0600 root, so without this line an unprivileged agent
+      # refuses to start on a line about a file it cannot read. The
+      # certificate and the CA are public by construction (nix/base.nix says
+      # why); only the key needs the group.
+      "z /opt/meisterstack/pki/identity.key 0640 root meister -"
     ];
+
+    # The device half of the same rule. On this fleet's own hosts /dev/kvm is
+    # 0666 root:kvm, and then the group buys nothing — but that is a property
+    # of one distribution's udev defaults (systemd ships
+    # `KERNEL=="kvm", GROUP="kvm", MODE="{{DEV_KVM_MODE}}"`, and the
+    # substitution is the packager's). Written down here so that an agent
+    # which is not root has a documented way in on any node of this role,
+    # rather than depending on which mode the image happened to be built
+    # with. 0660 and not 0666 is the tighter of the two, and the group is the
+    # access rule.
+    services.udev.extraRules = lib.mkIf unprivileged ''
+      KERNEL=="kvm", GROUP="kvm", MODE="0660"
+    '';
+
+    # The VMM's own user, created and not yet used.
+    #
+    # Stage 3 of `design/privilege-separation.md`: cloud-hypervisor and the
+    # vhost-user backends beside it get their own account, so that a guest
+    # breaking out of the VMM lands in a process that owns nothing. That is
+    # the other lane's work (`Command::uid/gid` at the spawn, plus the file
+    # ownership that has to follow it); the account is here because a user
+    # that appears in the same release as the code which drops to it is a
+    # rollout with two ways to fail.
+    #
+    # The groups are the VMM's reason to exist: `kvm` for the vcpu ioctls,
+    # `video`/`render` for a GPU node's nodes, `input` for an evdev backend.
+    # No shell, no home, no password.
+    users.groups.meister-vmm = { };
+    users.users.meister-vmm = {
+      isSystemUser = true;
+      group = "meister-vmm";
+      extraGroups = [ "kvm" "video" "render" "input" ];
+      description = "MeisterStack VMM (unprivileged, stage 3)";
+      shell = "${pkgs.shadow}/bin/nologin";
+    };
+
+    # The agent's own device groups are NOT set here. `meister` is
+    # nix/base.nix' account and the CONTROLLERS run as it too — a membership
+    # in the system database would hand /dev/kvm to two services that have no
+    # business with it. It belongs to this unit instead, as
+    # `SupplementaryGroups=` below, which systemd documents as extending
+    # rather than replacing what the database says.
 
     # The volume block, by the same rule etcd's follows (nix/etcd.nix): a
     # labelled disk or the root disk, and which one is a sentence somebody
@@ -476,6 +617,68 @@ in
         # things to use has to do. It does not widen what the process may
         # touch; it says that what it mounts is not private to it.
         MountFlags = "shared";
+      } // lib.optionalAttrs unprivileged {
+        # --- the agent as `meister`, with exactly its capabilities ---------
+        #
+        # Model C of the reference study, and it is only honest for a
+        # compute-only node: the moment CAP_SYS_ADMIN is in the list below,
+        # this is root with extra steps (capabilities(7): "the new root").
+        # The full node keeps running as root, which is the default.
+        User = "meister";
+        Group = "meister";
+
+        # The device nodes this agent opens, by group rather than by
+        # capability — which is how every reference does it (Kata: "crw-rw----
+        # root:kvm" plus a supplemental group; QEMU: "configure UNIX groups
+        # for access to /dev/kvm, /dev/net/tun"). `kvm` for the guest,
+        # `video`/`render` for a GPU node, `input` for an evdev backend.
+        SupplementaryGroups = [ "kvm" "video" "render" "input" ];
+
+        # Exactly what the option says, in both sets. Ambient, because the
+        # drivers work by execing `nft` and `ip` and those need the
+        # capability themselves; bounding, so the list is a ceiling and not
+        # just a starting point.
+        AmbientCapabilities = capabilities;
+        CapabilityBoundingSet = capabilities;
+
+        # Written out, not `Delegate=yes`: the list IS the claim, and
+        # docker.service (measured on this machine) writes it out for the
+        # same reason. `cpuset` is in it because `cgroup_cpuset` in the agent
+        # config is worthless without it — and because a system unit is the
+        # only kind of unit that can have it (see `unitCgroup`).
+        #
+        # Delegation does not enable anything by itself: systemd's own
+        # documentation says "you have to do that manually by writing to
+        # cgroup.subtree_control", which is what drivers/cgroup does.
+        Delegate = "cpu cpuset io memory pids";
+        # cgroup v2 forbids processes in an inner node, so the agent cannot
+        # sit in the directory it also wants to put VM slices under. systemd
+        # 254+ does the move itself with this; the agent does it too, at
+        # start-up, and finds nothing left to do. Both, because the two are
+        # the same directory and either one alone is a node that limits
+        # nothing.
+        DelegateSubgroup = "supervisor";
+
+        # `DeviceAllow=` and NOT `PrivateDevices=yes` — the trap the study
+        # names, and systemd's own man page says it: "When access to some but
+        # not all devices must be possible, the DeviceAllow= setting might be
+        # used instead". PrivateDevices would give this unit a /dev with no
+        # /dev/kvm in it, which is a node that cannot boot a guest.
+        #
+        # `closed` leaves the harmless pseudo-devices (null, zero, random,
+        # tty) and nothing else. char-drm and char-input are whole device
+        # groups because their numbers are the host's to choose; a GPU node
+        # with an NVIDIA card needs its own line beside these, which is a
+        # fact about that node and belongs in its own configuration.
+        DevicePolicy = "closed";
+        DeviceAllow = [
+          "/dev/kvm rw"
+          "/dev/net/tun rw"
+          "/dev/vhost-net rw"
+          "/dev/vhost-vsock rw"
+          "char-drm rw"
+          "char-input r"
+        ];
       };
     };
   };
