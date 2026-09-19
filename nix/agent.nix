@@ -182,7 +182,7 @@ let
     # way — the agent registers no device driver without a section.
     #
     # One of them has an option of its own: `inputBackend` renders
-    # `[device.input]` when a node has Leandro's vhost-user-input, because a
+    # `[device.input]` when a node has Leandro's vhost-device-input, because a
     # keyboard for a guest is a path somebody pushed and not a GPU somebody
     # owns. Everything else goes through `settings`.
     device = { };
@@ -217,30 +217,13 @@ in
   options.meisterstack.agent.inputBackend = lib.mkOption {
     type = lib.types.nullOr lib.types.str;
     default = null;
-    example = "/opt/meisterstack/bin/vhost-user-input";
+    example = "/opt/meisterstack/bin/vhost-device-input";
     description = ''
-      Where `vhost-user-input` is on this node, or null (the default) for a
-      node that does not serve virtio-input.
-
-      cloud-hypervisor has no virtio-input device of its own, so the keyboard
-      and the mouse of a guest come from a backend beside the VMM — Leandro's
-      `vhost-user-input`, the second one of the display rig. The PACKAGE is
-      not in this repo and is not built by this flake: it is a path, pushed to
-      the node like the patched cloud-hypervisor beside it, and naming it here
-      is what makes the agent register the driver and claim `input/fifo` and
-      `input/evdev` in its Hello.
-
-      A path and not a bool, for the reason the hypervisor binary is one: an
-      image that carried the backend would make every node claim a device it
-      may not have, and a node that has it in another place has to be able to
-      say so.
-
-      The two profiles come with the backend and need no configuration: `fifo`
-      takes `type code value` lines from a named pipe the driver makes beside
-      the socket, which is how a test presses a key with no human; `evdev`
-      forwards one host `/dev/input/eventN`, named per device in
-      `params.evdev`. A node that wants a longer patience than the driver's
-      5000 ms sets `settings.device.input.socket_timeout_ms` beside this.
+      Path to upstream vhost-device-input; null disables the input driver.
+      Each device uses profile "evdev" and params.evdev to select a host
+      /dev/input/eventN node. The backend user needs read access to that node.
+      Set settings.device.input.socket_timeout_ms to override the 5000 ms
+      startup timeout. The package is supplied separately.
     '';
   };
 
@@ -256,7 +239,7 @@ in
 
       What such a node can still do, all of it measured on 2026-09-16: boot
       guests (`/dev/kvm` through the group `kvm`), `filesystem` volumes,
-      `input` with the `fifo` profile, and — with the default
+      and — with the default
       `CAP_NET_ADMIN` — every tap, bridge, VXLAN and nftables tap guard it
       makes today.
 

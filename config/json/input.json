@@ -12,6 +12,6 @@
   ],
   "nics": [ {} ],
   "devices": [
-    { "driver": "input", "partition": "mediated", "profile": "fifo" }
+    { "driver": "input", "partition": "mediated", "profile": "evdev", "params": { "evdev": "/dev/input/event0" } }
   ]
 }

@@ -754,7 +754,7 @@ fn connect_as(user: &agent_api::VmmUser, socket: &Path) -> i32 {
 /// to run unprivileged already: its own `settle_admin_privilege` DROPS
 /// `CAP_SYS_ADMIN` unless `LEA_ADMIN_PRIV=1` asks for it.
 #[tokio::test]
-#[ignore = "needs Leandro's vhost-user-input in MEISTER_INPUT_BACKEND and (for the switch) root; see the module note"]
+#[ignore = "needs MEISTER_INPUT_BACKEND, MEISTER_INPUT_DEVICE readable by the VMM user, and root"]
 async fn a_vhost_user_backend_runs_as_the_same_user_as_the_vmm() {
     let backend = std::env::var("MEISTER_INPUT_BACKEND").unwrap_or_default();
     if backend.is_empty() {
@@ -769,10 +769,9 @@ async fn a_vhost_user_backend_runs_as_the_same_user_as_the_vmm() {
         socket_timeout: Duration::from_secs(10),
         vmm_user: user.clone(),
     })
-    .expect("a driver over Leandro's backend");
+    .expect("a driver over the upstream backend");
 
-    // The `fifo` profile, because it needs no host device: what is under test
-    // is the process and the file it makes, not where its events come from.
+    // The fixture must be readable by the backend user.
     let id = agent_api::DeviceId::new_v4();
     let device = agent_api::device::DeviceDriver::create(
         &driver,
@@ -780,8 +779,8 @@ async fn a_vhost_user_backend_runs_as_the_same_user_as_the_vmm() {
         &agent_api::DeviceSpec {
             driver: "input".into(),
             partition: agent_api::PartitionSpec::Mediated,
-            profile: Some("fifo".into()),
-            params: None,
+            profile: Some("evdev".into()),
+            params: Some(serde_json::json!({"evdev": std::env::var("MEISTER_INPUT_DEVICE").expect("input fixture path")})),
         },
         None,
     )

@@ -1271,7 +1271,6 @@ dependencies = [
  "async-trait",
  "meister-agent-api",
  "meister-backend",
- "nix 0.31.3",
  "serde",
  "serde_json",
  "tempfile",

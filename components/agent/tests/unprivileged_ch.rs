@@ -15,7 +15,7 @@
 //!       MEISTER_CH=$PWD/bin/cloud-hypervisor \
 //!       MEISTER_KERNEL=$PWD/images/vmlinux.elf \
 //!       MEISTER_INITRD=$PWD/images/initrd \
-//!       MEISTER_INPUT_BACKEND=~/git/Leandro/target/release/vhost-user-input \
+//!       MEISTER_INPUT_BACKEND=/path/to/vhost-device-input \
 //!   cargo test -p meister-agent --test unprivileged_ch -- --ignored --nocapture
 //! ```
 //!

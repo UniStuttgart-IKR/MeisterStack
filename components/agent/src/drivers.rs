@@ -1619,19 +1619,8 @@ mod tests {
         }
     }
 
-    /// What a node with `[device.input]` reports, and the round trip a
-    /// scheduler makes against it.
-    ///
-    /// The claim is nobody's to spell out: the driver answers `profiles()`
-    /// with its two sources, the catalogue flattens them, and `input/fifo`
-    /// and `input/evdev` are in the node's report because of that and not
-    /// because a config file listed them. The test is here because that is
-    /// exactly what could silently stop being true — a driver row that
-    /// registers and claims nothing looks configured and schedules nowhere.
     #[test]
-    fn a_node_with_the_input_section_claims_both_its_sources() {
-        // Any binary that really exists: the driver refuses to build
-        // without one, and what is under test is the claim, not the backend.
+    fn a_node_with_the_input_section_claims_evdev() {
         let binary = std::env::current_exe().expect("this test binary");
         let (_temp, cfg) = config(&format!("[device.input]\nbinary = {binary:?}"));
 
@@ -1646,15 +1635,10 @@ mod tests {
         let cat = DeviceCatalog::new(&devices);
         assert_eq!(
             cat.inventory(),
-            vec![(
-                DRIVER_INPUT.to_string(),
-                vec!["evdev".to_string(), "fifo".to_string()]
-            )],
-            "one driver, both sources, sorted for a stable Hello"
+            vec![(DRIVER_INPUT.to_string(), vec!["evdev".to_string()])],
+            "one evdev profile"
         );
 
-        // The same flattening the cluster session does on its way into a
-        // NodeCapacity, and the questions FirstFit then asks of it.
         let catalogue: Vec<String> = cat
             .inventory()
             .into_iter()
@@ -1665,15 +1649,13 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert_eq!(catalogue, vec!["input/evdev", "input/fifo"]);
-        for profile in ["fifo", "evdev"] {
+        assert_eq!(catalogue, vec!["input/evdev"]);
+        for profile in ["evdev"] {
             assert!(
                 common::capability::offers(&catalogue, DRIVER_INPUT, Some(profile)),
                 "a vm asking for input/{profile} fits this node"
             );
         }
-        // A request with no profile fits too, and the node picks — which is
-        // the rule `InputDriver::source` follows when it takes the fifo.
         assert!(common::capability::offers(&catalogue, DRIVER_INPUT, None));
         assert!(!common::capability::offers(
             &catalogue,
@@ -1681,8 +1663,6 @@ mod tests {
             Some("touchscreen")
         ));
 
-        // And the admission side of the same claim: what the node accepts
-        // in a spec is what it told the scheduler it serves.
         let device = |profile: &str| DeviceWithId {
             id: agent_api::device::DeviceId::new_v4(),
             spec: agent_api::device::DeviceSpec {
@@ -1692,13 +1672,14 @@ mod tests {
                 params: None,
             },
         };
-        cat.validate(&[device("fifo"), device("evdev")])
-            .expect("both sources are servable here");
+        cat.validate(&[device("evdev")])
+            .expect("evdev is available");
+        assert!(cat.validate(&[device("fifo")]).is_err());
         let err = cat
             .validate(&[device("touchscreen")])
             .expect_err("and nothing else is")
             .to_string();
-        assert!(err.contains("fifo, evdev"), "{err}");
+        assert!(err.contains("evdev"), "{err}");
     }
 
     /// The hypervisor came out of a `match` on a config enum and is now a

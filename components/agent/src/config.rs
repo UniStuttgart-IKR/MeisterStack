@@ -738,13 +738,7 @@ pub struct NvrmConfig {
     pub profiles: HashMap<String, NvrmParams>,
 }
 
-/// Two keys, because a node configures nothing else about this backend: the
-/// profiles `fifo` and `evdev` are the backend's own sources, not settings,
-/// and the per-device knobs (which host node to forward, what the guest reads
-/// back as the name) belong to one device and travel in its spec.
-///
-/// Leandro's package is NOT vendored into this repo — the path is
-/// configuration, and a node that does not name one does not serve virtio-input.
+/// Upstream vhost-device-input executable and startup timeout.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputConfig {

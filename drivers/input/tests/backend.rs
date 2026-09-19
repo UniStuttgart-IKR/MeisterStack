@@ -2,415 +2,228 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The driver against a process, without Leandro's binary.
-//!
-//! What the lib's own tests cannot say: they reason about a spec and never
-//! fork anything, so the half that matters on a node — a backend is started,
-//! it is waited for, it is recognised again after a restart, and teardown
-//! really ends it — needs a process. The real backend needs a VMM to talk to
-//! and a guest to talk about; here a stand-in takes the same arguments, makes
-//! the socket the driver waits for and stays until it is signalled. The real
-//! one is exercised in `components/agent/tests/input_ch.rs`.
-//!
-//! The stand-in is a shell script, and its FILE NAME is load-bearing: an
-//! adopted backend is recognised by `/proc/<pid>/comm`
-//! (`BackendKind::is_ours`), and for an interpreted file the kernel takes
-//! `comm` from the script rather than from the interpreter. So the script is
-//! called `vhost-user-input`, the process calls itself `vhost-user-inpu` —
-//! cut where the kernel cuts it — and the identity check has something real
-//! to answer.
+//! Process lifecycle and upstream CLI contract. Character devices stand in for evdev.
 
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-use agent_api::device::{
-    Device, DeviceAttachment, DeviceDriver, DeviceError, DeviceId, DeviceSpec, PartitionSpec,
+use agent_api::device::{DeviceAttachment, DeviceDriver, DeviceId, DeviceSpec, PartitionSpec};
+use meister_input_driver::{InputDriver, InputDriverConfig};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
 };
-use meister_input_driver::{InputDriver, InputDriverConfig, PROFILE_EVDEV, PROFILE_FIFO};
 
-/// A backend that comes up: it makes the socket and waits to be signalled.
 const LISTENS: &str = r#"
-socket=; src=
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --socket) socket=$2; shift 2 ;;
-    --fifo|--evdev) src=$2; shift 2 ;;
-    --name) shift 2 ;;
-    *) echo "unexpected argument: $1" >&2; exit 2 ;;
-  esac
-done
-[ -n "$socket" ] || { echo "no --socket" >&2; exit 2; }
-[ -n "$src" ] || { echo "no --fifo and no --evdev" >&2; exit 2; }
-[ -e "$src" ] || { echo "source $src does not exist" >&2; exit 2; }
-echo "fake vhost-user-input: $socket <- $src"
+[ "$1" = --socket-path ] && [ "$3" = --event-list ] || exit 2
+socket=${2}0
+[ -c "$4" ] || exit 3
 trap 'rm -f "$socket"; exit 0' TERM
 : > "$socket"
-while : ; do sleep 0.05; done
+while :; do sleep 0.05; done
 "#;
 
-/// A backend that starts and never serves — the shape of every real failure
-/// that is not a crash: a card that is busy, a permission that is missing.
-const NEVER_LISTENS: &str = r#"
-echo "fake vhost-user-input: not listening today" >&2
-while : ; do sleep 0.05; done
-"#;
-
-struct Rig {
-    temp: tempfile::TempDir,
+fn driver(root: &Path, binary: PathBuf, timeout: Duration) -> InputDriver {
+    InputDriver::new(InputDriverConfig {
+        binary,
+        run_dir: root.join("run"),
+        socket_timeout: timeout,
+        vmm_user: None,
+    })
+    .unwrap()
 }
 
-impl Rig {
-    fn new(body: &str) -> Self {
-        let temp = tempfile::Builder::new()
-            .prefix("ms-input-driver-")
-            .tempdir()
-            .expect("a directory");
-        // Named after the backend, because that name becomes the process's
-        // `comm` and `comm` is half of the identity check.
-        let script = temp.path().join("vhost-user-input");
-        std::fs::write(&script, format!("#!/bin/sh\n{body}")).expect("a script");
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("an executable script");
-        Self { temp }
-    }
-
-    fn driver(&self, timeout: Duration) -> InputDriver {
-        InputDriver::new(InputDriverConfig {
-            binary: self.temp.path().join("vhost-user-input"),
-            run_dir: self.temp.path().join("run").join("input"),
-            socket_timeout: timeout,
-            vmm_user: None,
-        })
-        .expect("a driver over the stand-in")
-    }
-
-    fn run_dir(&self) -> PathBuf {
-        self.temp.path().join("run").join("input")
-    }
+fn fake(root: &Path, body: &str) -> InputDriver {
+    use std::os::unix::fs::PermissionsExt;
+    let binary = root.join("vhost-device-input");
+    std::fs::write(&binary, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    driver(root, binary, Duration::from_millis(500))
 }
 
-fn spec(profile: &str, params: Option<serde_json::Value>) -> DeviceSpec {
+fn spec(path: &Path) -> DeviceSpec {
     DeviceSpec {
         driver: "input".into(),
         partition: PartitionSpec::Mediated,
-        profile: Some(profile.to_string()),
-        params,
+        profile: Some("evdev".into()),
+        params: Some(serde_json::json!({"evdev": path})),
     }
 }
 
-fn alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
-fn pid_of(device: &Device) -> u32 {
-    let DeviceAttachment::VhostUser { pid, .. } = &device.attachment else {
-        panic!("a vhost-user attachment");
+fn pid(attachment: &DeviceAttachment) -> u32 {
+    let DeviceAttachment::VhostUser { pid, .. } = attachment else {
+        panic!("not vhost-user")
     };
     *pid
 }
 
-/// Wait for a process to really be gone. SIGTERM is asynchronous and the
-/// alternative is a sleep somebody has to tune.
-async fn wait_gone(pid: u32) {
+async fn gone(pid: u32) {
     for _ in 0..200 {
-        if !alive(pid) {
+        // try_wait reaps an owned child; adopted children may remain zombies until reaped.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        if stat.is_err() || stat.unwrap().split(") ").nth(1).unwrap().starts_with('Z') {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("the backend at pid {pid} is still running");
+    panic!("backend {pid} still running");
 }
 
-/// One device end to end: the process, the two files it needs, and what the
-/// VMM is handed about it.
 #[tokio::test]
-async fn a_fifo_device_is_a_process_a_socket_and_a_pipe() {
-    let rig = Rig::new(LISTENS);
-    let driver = rig.driver(Duration::from_secs(5));
+async fn lifecycle_and_restart_use_the_socket_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let before = fake(temp.path(), LISTENS);
     let id = DeviceId::new_v4();
-
-    let device = driver
-        .create(&id, &spec(PROFILE_FIFO, None), None)
-        .await
-        .expect("the stand-in comes up");
-
+    let spec = spec(Path::new("/dev/null"));
+    let device = before.create(&id, &spec, None).await.unwrap();
     let DeviceAttachment::VhostUser {
         socket,
-        pid,
         device_type,
         queue_sizes,
+        ..
     } = &device.attachment
     else {
-        panic!("a vhost-user attachment");
+        unreachable!()
     };
-    assert_eq!(*device_type, 18, "virtio-input");
-    assert_eq!(queue_sizes, &vec![256, 256]);
-    assert!(alive(*pid), "the backend is running");
-    assert_eq!(socket, &rig.run_dir().join(format!("{id}.sock")));
-    assert!(socket.exists(), "the driver waited for the socket");
-
-    // The pipe a gate writes into, made by the driver and not by the
-    // backend — so it is there the moment `create` returns.
-    let fifo = rig.run_dir().join(format!("{id}.fifo"));
-    let meta = std::fs::metadata(&fifo).expect("the pipe is there");
+    assert_eq!(socket, &temp.path().join(format!("run/{id}.sock0")));
+    assert!(socket.exists());
+    assert_eq!(*device_type, 18);
+    assert_eq!(queue_sizes, &[256, 256]);
+    assert_eq!(
+        pid(&before.create(&id, &spec, None).await.unwrap().attachment),
+        pid(&device.attachment)
+    );
+    before.get(&id, &device.attachment).await.unwrap();
     assert!(
-        std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()),
-        "and it is a pipe"
-    );
-
-    // The backend was given both paths, in the two arguments Leandro's
-    // binary takes. This is read off /proc rather than mocked: what the
-    // driver puts on a command line is the whole of its contract with the
-    // backend.
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).expect("linux");
-    let args: Vec<String> = cmdline
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect();
-    assert!(args.contains(&"--socket".to_string()), "{args:?}");
-    assert!(args.contains(&"--fifo".to_string()), "{args:?}");
-    assert!(args.contains(&fifo.display().to_string()), "{args:?}");
-    assert!(!args.contains(&"--evdev".to_string()), "{args:?}");
-
-    // And the liveness probe agrees with all of it.
-    driver
-        .get(&id, &device.attachment)
-        .await
-        .expect("the device this driver just made is its own");
-
-    driver
-        .destroy(&id, &device.attachment)
-        .await
-        .expect("teardown");
-    wait_gone(*pid).await;
-    assert!(!socket.exists(), "the socket went with the backend");
-    assert!(
-        !fifo.exists(),
-        "and the pipe too: a writer on a readerless pipe blocks for ever"
-    );
-    assert!(
-        driver.get(&id, &device.attachment).await.is_err(),
-        "a torn-down device is not found"
-    );
-}
-
-/// The evdev profile forwards a node this driver did not make, so it makes no
-/// pipe and it must not take the node away.
-#[tokio::test]
-async fn an_evdev_device_forwards_a_node_and_leaves_it_where_it_is() {
-    let rig = Rig::new(LISTENS);
-    let node = rig.temp.path().join("event0");
-    std::fs::write(&node, b"").expect("a stand-in for a host input node");
-    let driver = rig.driver(Duration::from_secs(5));
-    let id = DeviceId::new_v4();
-
-    let device = driver
-        .create(
-            &id,
-            &spec(
-                PROFILE_EVDEV,
-                Some(serde_json::json!({ "evdev": node, "name": "a named device" })),
-            ),
-            None,
-        )
-        .await
-        .expect("the stand-in comes up");
-    let pid = pid_of(&device);
-
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).expect("linux");
-    let raw = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-    assert!(raw.contains("--evdev"), "{raw}");
-    assert!(raw.contains(&node.display().to_string()), "{raw}");
-    assert!(
-        raw.contains("--name"),
-        "the name reaches the backend: {raw}"
-    );
-    assert!(raw.contains("a named device"), "{raw}");
-    assert!(!raw.contains("--fifo"), "{raw}");
-    assert!(
-        !rig.run_dir().join(format!("{id}.fifo")).exists(),
-        "no pipe for a device that forwards a host node"
-    );
-
-    driver
-        .destroy(&id, &device.attachment)
-        .await
-        .expect("teardown");
-    wait_gone(pid).await;
-    assert!(
-        node.exists(),
-        "the host's input node is not this driver's to remove"
-    );
-}
-
-/// One host node, two guests: the second is refused, and the node is free
-/// again once the first is gone.
-///
-/// The claim list is the CALLER's store, the way
-/// `provision::check_device_admission` reads it — every other VM's device
-/// specs — so this test plays that store: a VM with a record holds its claim,
-/// and a VM that was torn down has no record and holds nothing. That is what
-/// makes a teardown give the node back without this driver remembering
-/// anything across its own lifetime.
-#[tokio::test]
-async fn a_host_node_belongs_to_one_guest_at_a_time() {
-    let rig = Rig::new(LISTENS);
-    let node = rig.temp.path().join("event0");
-    std::fs::write(&node, b"").expect("a stand-in for a host input node");
-    let driver = rig.driver(Duration::from_secs(5));
-
-    let first_vm = agent_api::VmId::new_v4();
-    let first = DeviceId::new_v4();
-    let second = DeviceId::new_v4();
-    let claim = spec(PROFILE_EVDEV, Some(serde_json::json!({ "evdev": node })));
-
-    // Nothing holds it, so the first guest is admitted and gets it.
-    driver
-        .admit(&[(first, claim.clone())], &[])
-        .expect("nothing holds the node yet");
-    let device = driver
-        .create(&first, &claim, None)
-        .await
-        .expect("the first guest's backend");
-
-    // The second, while the first VM's record is in the store: refused
-    // before anything is built, and the message names both halves.
-    let Err(err) = driver.admit(&[(second, claim.clone())], &[(first_vm, claim.clone())]) else {
-        panic!("two guests were given one host input device");
-    };
-    let msg = err.to_string();
-    assert!(msg.contains(&node.display().to_string()), "{msg}");
-    assert!(msg.contains(&first_vm.to_string()), "{msg}");
-
-    // And the teardown gives it back.
-    driver
-        .destroy(&first, &device.attachment)
-        .await
-        .expect("teardown");
-    wait_gone(pid_of(&device)).await;
-    driver
-        .admit(&[(second, claim.clone())], &[])
-        .expect("the node is free again");
-    let again = driver
-        .create(&second, &claim, None)
-        .await
-        .expect("the second guest gets it now");
-    assert_ne!(
-        pid_of(&device),
-        pid_of(&again),
-        "a backend of its own, never the dead one"
-    );
-    assert!(node.exists(), "and the host's node survived both guests");
-
-    driver
-        .destroy(&second, &again.attachment)
-        .await
-        .expect("teardown");
-    wait_gone(pid_of(&again)).await;
-}
-
-/// A backend that never serves must fail the create with the reason in hand,
-/// and it must not be left behind: nothing would ever collect it.
-#[tokio::test]
-async fn a_backend_that_never_listens_fails_the_create_and_says_why() {
-    let rig = Rig::new(NEVER_LISTENS);
-    let driver = rig.driver(Duration::from_millis(300));
-    let id = DeviceId::new_v4();
-
-    let Err(err) = driver.create(&id, &spec(PROFILE_FIFO, None), None).await else {
-        panic!("a device was reported for a backend that is not listening");
-    };
-    assert!(
-        matches!(err, DeviceError::BackendDied(_)),
-        "the shape of it matters: {err:?}"
-    );
-    let msg = err.to_string();
-    assert!(msg.contains("socket did not appear"), "{msg}");
-    // The log tail rides on the message, because the file's name is the one
-    // thing an operator does not have.
-    assert!(msg.contains("not listening today"), "{msg}");
-}
-
-/// The same device asked for twice gets the backend that is already serving
-/// it, and not a second one on the same socket. Leandro's rig measured what
-/// the other answer costs: seven orphaned backends, the oldest four hours
-/// old (`scripts/lib/rig.sh`, `_lea_stop_stale`).
-#[tokio::test]
-async fn a_second_create_for_one_device_is_the_backend_that_is_already_there() {
-    let rig = Rig::new(LISTENS);
-    let driver = rig.driver(Duration::from_secs(5));
-    let id = DeviceId::new_v4();
-
-    let first = driver
-        .create(&id, &spec(PROFILE_FIFO, None), None)
-        .await
-        .expect("a backend");
-    let again = driver
-        .create(&id, &spec(PROFILE_FIFO, None), None)
-        .await
-        .expect("the same backend");
-    assert_eq!(pid_of(&first), pid_of(&again), "one backend, not two");
-
-    driver
-        .destroy(&id, &first.attachment)
-        .await
-        .expect("teardown");
-    wait_gone(pid_of(&first)).await;
-}
-
-/// Teardown after an agent restart, which is the case the identity check
-/// exists for: the backend is no longer anybody's child, and the pid on the
-/// record is the only handle left on it. A driver that shrugged here would
-/// leave a backend serving a VM that is gone — and this backend does not end
-/// itself when it has nothing to serve.
-#[tokio::test]
-async fn a_backend_adopted_from_a_previous_agent_is_still_stopped() {
-    let rig = Rig::new(LISTENS);
-    let id = DeviceId::new_v4();
-
-    let device = {
-        let before = rig.driver(Duration::from_secs(5));
         before
-            .create(&id, &spec(PROFILE_FIFO, None), None)
+            .get(&DeviceId::new_v4(), &device.attachment)
             .await
-            .expect("a backend")
-        // `before` is dropped here: the process survives, the handle does
-        // not. That is exactly what an agent restart leaves behind.
-    };
-    let pid = pid_of(&device);
-    assert!(alive(pid), "the backend outlived the driver that made it");
-
-    let after = rig.driver(Duration::from_secs(5));
-    after
-        .destroy(&id, &device.attachment)
-        .await
-        .expect("teardown of an adopted backend");
-    wait_gone(pid).await;
-    assert!(
-        !rig.run_dir().join(format!("{id}.fifo")).exists(),
-        "the files went too"
+            .is_err()
     );
+    drop(before);
+    let after = fake(temp.path(), LISTENS);
+    after.get(&id, &device.attachment).await.unwrap();
+    after.destroy(&id, &device.attachment).await.unwrap();
+    gone(pid(&device.attachment)).await;
+    after.destroy(&id, &device.attachment).await.unwrap();
+    assert!(!socket.exists());
+    assert!(Path::new("/dev/null").exists());
 }
 
-/// Teardown is idempotent, and it has to be: a reconciler that retries one
-/// must be able to finish.
 #[tokio::test]
-async fn destroying_the_same_device_twice_is_done_twice() {
-    let rig = Rig::new(LISTENS);
-    let driver = rig.driver(Duration::from_secs(5));
+async fn owned_teardown_and_concurrent_create() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = fake(temp.path(), LISTENS);
     let id = DeviceId::new_v4();
+    let spec = spec(Path::new("/dev/null"));
+    let (a, b) = tokio::join!(
+        driver.create(&id, &spec, None),
+        driver.create(&id, &spec, None)
+    );
+    let a = a.unwrap();
+    assert_eq!(pid(&a.attachment), pid(&b.unwrap().attachment));
+    driver.destroy(&id, &a.attachment).await.unwrap();
+    gone(pid(&a.attachment)).await;
+    assert!(driver.get(&id, &a.attachment).await.is_err());
+}
 
-    let device = driver
-        .create(&id, &spec(PROFILE_FIFO, None), None)
+#[tokio::test]
+async fn failure_includes_backend_log() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = fake(temp.path(), "echo test-failure >&2; exit 1");
+    let error = driver
+        .create(&DeviceId::new_v4(), &spec(Path::new("/dev/null")), None)
         .await
-        .expect("a backend");
-    driver
-        .destroy(&id, &device.attachment)
+        .unwrap_err();
+    assert!(error.to_string().contains("test-failure"), "{error}");
+}
+
+#[tokio::test]
+async fn timeout_stops_the_backend() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = fake(
+        temp.path(),
+        "echo $$ > \"$2.pid\"; echo waiting >&2; while :; do sleep 0.05; done",
+    );
+    let id = DeviceId::new_v4();
+    let error = driver
+        .create(&id, &spec(Path::new("/dev/null")), None)
         .await
-        .expect("the first teardown");
-    driver
-        .destroy(&id, &device.attachment)
-        .await
-        .expect("and the second, which has nothing left to do");
+        .unwrap_err();
+    assert!(error.to_string().contains("waiting"), "{error}");
+    let pid = std::fs::read_to_string(temp.path().join(format!("run/{id}.sock.pid"))).unwrap();
+    gone(pid.trim().parse().unwrap()).await;
+}
+
+#[tokio::test]
+async fn rejects_legacy_and_invalid_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = fake(temp.path(), LISTENS);
+    let id = DeviceId::new_v4();
+    let mut s = spec(Path::new("/dev/null"));
+    s.profile = Some("fifo".into());
+    assert!(driver.create(&id, &s, None).await.is_err());
+    s.profile = None;
+    s.params = None;
+    assert!(driver.create(&id, &s, None).await.is_err());
+    s.params = Some(serde_json::json!({"evdev": "/dev/null", "name": "old"}));
+    assert!(driver.create(&id, &s, None).await.is_err());
+    for path in [temp.path(), Path::new("/does-not-exist")] {
+        assert!(driver.create(&id, &spec(path), None).await.is_err());
+    }
+    s = spec(Path::new("/dev/null"));
+    s.partition = PartitionSpec::Exclusive;
+    assert!(driver.create(&id, &s, None).await.is_err());
+}
+
+#[test]
+fn admission_excludes_aliases_and_duplicates() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = fake(temp.path(), LISTENS);
+    let alias = temp.path().join("event");
+    std::os::unix::fs::symlink("/dev/null", &alias).unwrap();
+    let a = (DeviceId::new_v4(), spec(Path::new("/dev/null")));
+    let b = (DeviceId::new_v4(), spec(&alias));
+    assert!(
+        driver
+            .admit(
+                std::slice::from_ref(&b),
+                &[(agent_api::VmId::new_v4(), a.1.clone())]
+            )
+            .is_err()
+    );
+    assert!(driver.admit(&[a, b], &[]).is_err());
+    assert!(
+        driver
+            .admit(
+                &[(DeviceId::new_v4(), spec(Path::new("/dev/zero")))],
+                &[(agent_api::VmId::new_v4(), spec(Path::new("/dev/null")))]
+            )
+            .is_ok()
+    );
+    assert_eq!(driver.profiles(), ["evdev"]);
+}
+
+/// The verifier receives the socket path and must check guest event delivery.
+#[tokio::test]
+#[ignore = "requires MEISTER_INPUT_BACKEND, MEISTER_INPUT_DEVICE and MEISTER_INPUT_VERIFY"]
+async fn upstream_guest_delivery() {
+    let temp = tempfile::tempdir().unwrap();
+    let driver = driver(
+        temp.path(),
+        std::env::var_os("MEISTER_INPUT_BACKEND").unwrap().into(),
+        Duration::from_secs(5),
+    );
+    let id = DeviceId::new_v4();
+    let source = PathBuf::from(std::env::var_os("MEISTER_INPUT_DEVICE").unwrap());
+    let device = driver.create(&id, &spec(&source), None).await.unwrap();
+    driver.get(&id, &device.attachment).await.unwrap();
+    let DeviceAttachment::VhostUser { socket, .. } = &device.attachment else {
+        unreachable!()
+    };
+    let result = tokio::process::Command::new(std::env::var_os("MEISTER_INPUT_VERIFY").unwrap())
+        .arg(socket)
+        .status()
+        .await;
+    driver.destroy(&id, &device.attachment).await.unwrap();
+    gone(pid(&device.attachment)).await;
+    assert!(!socket.exists());
+    assert!(result.unwrap().success(), "guest verification failed");
 }
