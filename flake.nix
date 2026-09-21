@@ -489,6 +489,16 @@
             grep -qx 'MEISTER_ROLE=agent,cluster,cloud,addons' \
               ${cfg.environment.etc."meisterstack/context.env".source}
             grep -q metrics_listen ${cfg.environment.etc."meisterstack/cloud.toml".source}
+
+            # And the two the host decides and we must not. The example sets
+            # 24.11 and a firewall ON; ours would be 25.11 and a firewall off
+            # (nix/appliance.nix). If either of these lines ever reads like
+            # our answer, a module of ours has started deciding something
+            # that belongs to somebody else's machine.
+            test '${cfg.system.stateVersion}' = '24.11' \
+              || { echo "the foreign host's stateVersion is ${cfg.system.stateVersion}, not its own 24.11"; exit 1; }
+            ${lib.optionalString (!cfg.networking.firewall.enable)
+              "echo 'the foreign host asked for a firewall and did not get one'; exit 1"}
             touch $out
           '';
       };

@@ -29,15 +29,41 @@
       system = "x86_64-linux";
       modules = [
         meisterstack.nixosModules.default
+        # And the renderer, because this host has no image and no provider:
+        # `default` is the SERVICES, which know what a cloud is and nothing
+        # about where this machine was booted. nix/context.nix is what turns
+        # the variables in box.nix into the files the units read. The other
+        # answer is `nixosModules.managed`, which renders them at build time
+        # — this file is the smaller of the two roads on purpose.
+        meisterstack.nixosModules.context
         # What this host IS, in this fleet: written by
         # `meister-deploy render box -o box.nix` and nothing else. Roles, the
         # derived addresses, the issuer, the scrape list — a pure function of
         # fleet.toml, byte-identical on every render, and carrying nothing
         # about this machine's hardware.
         ./box.nix
-        {
+        ({ config, ... }: {
           networking.hostName = "foreign";
-          system.stateVersion = "25.11";
+
+          # NOT our value, deliberately. `stateVersion` is the host's own
+          # answer to "which NixOS did this machine's state start on", and a
+          # module that sets it cannot be imported into a host that already
+          # has one. 24.11 here and 25.11 in nix/appliance.nix, so that the
+          # check in the flake above fails the moment our modules start
+          # deciding this again.
+          system.stateVersion = "24.11";
+
+          # Same test, the other way round: this host runs a firewall, and
+          # our modules must not turn it off — they open no port and close
+          # none. What they do is SAY which ports they listen on
+          # (`meisterstack.ports`), and the host's own rule names them.
+          networking.firewall.enable = true;
+          networking.firewall.allowedTCPPorts = with config.meisterstack.ports; [
+            cloud.api
+            cloud.grpc
+            cluster.api
+            cluster.grpc
+          ];
 
           # And anything the binaries take, straight through. Nothing here
           # validates a key — the binaries do that at start-up. This is the
@@ -50,7 +76,7 @@
           # keeps all of it and is still a node of this fleet.
           fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
           boot.loader.grub.device = "/dev/vda";
-        }
+        })
       ];
     };
   };
