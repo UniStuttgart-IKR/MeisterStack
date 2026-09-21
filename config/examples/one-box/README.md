@@ -18,14 +18,18 @@ cp examples/fleet/one-box.toml fleet.toml   # 1. Plan schreiben: Adressen,
 $EDITOR fleet.toml                          #    Platten, Domain anpassen
 git add fleet.toml                          #    (ein Flake sieht nur, was in git ist)
 nix flake check                             # 2. Plan pruefen
-meister-deploy keys init                    # 3. CA, Zertifikate, drei Geheimnisse
-meister-deploy image all --copy /var/tmp    # 4. je Knoten ein raw-efi-Image
+meister-deploy legacy keys init             # 3. CA, Zertifikate, drei Geheimnisse
+meister-deploy legacy image all --copy /var/tmp   # 4. je Knoten ein raw-efi-Image
 sudo dd if=/var/tmp/meisterstack-one-box-box-*.img of=/dev/nvme0n1 bs=4M status=progress
                                             # 5. auf die Platte, je Kiste einmal
 #    booten, dann von hier aus:
-meister-deploy keys push                    # 6. Zertifikate auf die Kisten
-meister-deploy check                        # 7. Units, Sessions, /dev/kvm, etcd
+meister-deploy legacy keys push             # 6. Zertifikate auf die Kisten
+meister-deploy legacy check                 # 7. Units, Sessions, /dev/kvm, etcd
 ```
+
+Das `legacy` gehoert seit meister-deploy v1 dazu: diese sieben Verben
+lesen `fleet.toml` in der alten Form weiter, und `plan` meint jetzt eine
+Datei auf der Platte statt der Tabelle auf dem Terminal.
 
 Das war es. Was danach noch von Hand kommt, steht unten.
 
@@ -100,5 +104,5 @@ meister user create silas --tenant ops --role admin
 
 - `deploy/README.md` — die vier Formen des Deployments und die
   Optionstabelle des Moduls
-- `meister-deploy plan` — was die Flotte gerade wirklich ist
-- `meister-deploy push` — der naechste Stand, Gruppe fuer Gruppe
+- `meister-deploy legacy plan` — was die Flotte gerade wirklich ist
+- `meister-deploy legacy push` — der naechste Stand, Gruppe fuer Gruppe
