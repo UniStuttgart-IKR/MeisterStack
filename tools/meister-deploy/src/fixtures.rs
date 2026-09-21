@@ -20,6 +20,10 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 
 use crate::manifest::{NixManifest, ResolvedFleet, Source, Tool};
+use crate::observation::{
+    BootedKernel, EtcdMember, EtcdView, HostObservation, Identity, Mount, Observations,
+};
+use crate::plan::{PlanKind, PlanPolicy, WorkloadControl};
 use crate::release::{
     BootArtifacts, BuildEnv, ConfigArtifact, HostArtifacts, ReleaseManifest, Reproducibility,
     StoreArtifact, bind,
@@ -136,4 +140,170 @@ pub fn release_of(resolved: ResolvedFleet) -> ReleaseManifest {
         at("2026-09-21T11:00:00Z"),
     )
     .expect("the fixture binds")
+}
+
+/// The same fleet with every host enrolled.
+///
+/// `n2` has no host key in the file on purpose — it is the fixture's
+/// unenrolled host — and most tests about a rollout are not about that, so
+/// they start from here. The manifest id is recomputed, because a fleet
+/// whose content was edited and whose id was not is a fleet
+/// `validate` refuses.
+pub fn onebox_enrolled() -> ResolvedFleet {
+    let mut fleet = onebox();
+    for (id, host) in fleet.hosts.iter_mut() {
+        if host.ssh.host_key_fingerprint.is_none() {
+            host.ssh.host_key_fingerprint = Some(format!("SHA256:enrolled-{id}"));
+        }
+    }
+    fleet.manifest_id =
+        crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
+    fleet
+}
+
+/// A release in which the named hosts got a new system — which is what a
+/// changed profile or a changed input actually looks like: a new evaluation,
+/// a new manifest, a new set of store paths.
+pub fn with_new_systems(
+    mut fleet: ResolvedFleet,
+    hosts: &[&str],
+    new_kernel: bool,
+) -> ReleaseManifest {
+    for id in hosts {
+        let host = fleet
+            .hosts
+            .get_mut(*id)
+            .unwrap_or_else(|| panic!("{id} is in the fixture"));
+        host.build.toplevel_drv = format!("/nix/store/next{id}-nixos-system-{id}-25.11.drv");
+        host.build.toplevel_out = format!("/nix/store/next{id}-nixos-system-{id}-25.11");
+        if new_kernel {
+            host.build.boot.kernel_out = "/nix/store/next-linux-6.12.48/bzImage".to_string();
+            host.build.boot.initrd_out = "/nix/store/next-initrd-linux-6.12.48/initrd".to_string();
+            host.build.boot.kernel_params_sha256 = "3b8fnnnnnnnn".to_string();
+            host.build.boot.kernel_version = "6.12.48".to_string();
+        }
+    }
+    fleet.manifest_id =
+        crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
+    release_of(fleet)
+}
+
+/// Every host of this release, running exactly what it says, with nothing in
+/// the way. The starting point every test about a rollout departs from.
+pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observations {
+    let fleet = &release.resolved_fleet;
+    let mut hosts = BTreeMap::new();
+    for (id, host) in &fleet.hosts {
+        let artifacts = &release.artifacts[id];
+        let system = artifacts.toplevel.store_path.clone();
+        let mut units = BTreeMap::new();
+        for role in &host.roles {
+            let unit = match role.as_str() {
+                "agent" => "meister-agent.service",
+                "cluster" => "meister-cluster-controller.service",
+                "cloud" => "meister-cloud-controller.service",
+                _ => continue,
+            };
+            units.insert(unit.to_string(), "active".to_string());
+        }
+        hosts.insert(
+            id.clone(),
+            HostObservation {
+                reachable: true,
+                identity: Identity {
+                    hostname: Some(host.name.clone()),
+                    machine_id: Some(format!("machine-id-of-{id}")),
+                    host_key_fingerprint: host
+                        .ssh
+                        .host_key_fingerprint
+                        .clone()
+                        .or_else(|| Some(format!("SHA256:seen-{id}"))),
+                },
+                current_system: Some(system.clone()),
+                booted_system: Some(system.clone()),
+                next_boot_system: Some(system),
+                generation: Some(42),
+                kernel_running: Some(host.build.boot.kernel_version.clone()),
+                kernel_booted: Some(BootedKernel {
+                    kernel_store_path: artifacts.boot.kernel_store_path.clone(),
+                    initrd_store_path: artifacts.boot.initrd_store_path.clone(),
+                    kernel_params_sha256: artifacts.boot.kernel_params_sha256.clone(),
+                }),
+                units,
+                mounts: host
+                    .persistence
+                    .iter()
+                    .map(|p| Mount {
+                        path: p.path.clone(),
+                        device: p.device_ref.replace("label:", "/dev/disk/by-label/"),
+                        fstype: "ext4".to_string(),
+                    })
+                    .collect(),
+                credentials: host
+                    .secret_refs
+                    .iter()
+                    .map(|s| (s.id.clone(), Some(format!("fingerprint-of-{}", s.id))))
+                    .collect(),
+                etcd: etcd_view(fleet, id),
+                vms_running: host.roles.iter().any(|r| r == "agent").then_some(0),
+                open_txns: Vec::new(),
+                lock: None,
+                capabilities: host.hardware.capabilities.clone(),
+                enrolled: true,
+                unknown_reason: None,
+            },
+        );
+    }
+    Observations {
+        schema: crate::observation::OBSERVATION_SCHEMA.to_string(),
+        taken_at,
+        provisional: false,
+        hosts,
+    }
+}
+
+/// What etcd would report on a host that is a member of a raft group: the
+/// membership the fleet itself declares in `initial_cluster`.
+fn etcd_view(fleet: &ResolvedFleet, id: &str) -> Option<EtcdView> {
+    let host = fleet.hosts.get(id)?;
+    let in_raft = host.groups.iter().any(|g| {
+        fleet
+            .groups
+            .get(g)
+            .map(|group| group.kind == crate::manifest::GroupKind::Raft)
+            .unwrap_or(false)
+    });
+    if !in_raft {
+        return None;
+    }
+    let declared = host
+        .effective_settings
+        .etcd
+        .as_ref()?
+        .get("initial_cluster")?
+        .as_str()?
+        .to_string();
+    let members = declared
+        .split(',')
+        .filter_map(|entry| entry.trim().split_once('='))
+        .map(|(name, url)| EtcdMember {
+            id: format!("{name}-member-id"),
+            name: name.to_string(),
+            peer_urls: vec![url.to_string()],
+            healthy: true,
+        })
+        .collect::<Vec<_>>();
+    Some(EtcdView {
+        member_id: Some(format!("{id}-member-id")),
+        healthy: true,
+        members,
+    })
+}
+
+/// An operator who has the cli the drain needs.
+pub fn plan_policy(kind: PlanKind) -> PlanPolicy {
+    PlanPolicy::new(kind).with_workload_control(Some(WorkloadControl {
+        cli_config: "cli.toml".to_string(),
+        cli_profile: Some("cloud-mtls".to_string()),
+    }))
 }
