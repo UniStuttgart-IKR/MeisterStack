@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 
-use crate::fleet::{Node, Role};
-use crate::run::{Cmd, Runner};
+use crate::legacy::fleet::{Node, Role};
+use crate::legacy::run::{Cmd, Runner};
 
 #[derive(Debug, Clone)]
 pub struct Ssh {
@@ -344,8 +344,8 @@ impl Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::Plan;
-    use crate::run::Fake;
+    use crate::legacy::fleet::Plan;
+    use crate::legacy::run::Fake;
 
     const PLAN: &str = r#"
 [fleet]

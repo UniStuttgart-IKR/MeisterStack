@@ -169,9 +169,14 @@ impl Runner for Real {
     }
 }
 
-/// The one the tests use. It records every command line and answers from a
-/// queue of canned replies, so a test reads the ORDER and the ARGUMENTS of a
-/// rollout without a lab, a network or a key.
+/// The one the legacy tests use. It records every command line and answers
+/// from a queue of canned replies, so a test reads the ORDER and the
+/// ARGUMENTS of a rollout without a lab, a network or a key.
+///
+/// No new test may use this; `crate::run::StrictFake` is the contract. This
+/// one answers an unexpected command with a default success and never says a
+/// word about an expectation nobody used, so a test written against it can
+/// pass while the code under it calls something nobody planned for.
 #[derive(Default)]
 pub struct Fake {
     pub calls: RefCell<Vec<String>>,

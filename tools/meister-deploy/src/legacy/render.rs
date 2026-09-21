@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::fleet::{Node, Plan, Role};
+use crate::legacy::fleet::{Node, Plan, Role};
 
 /// The MeisterStack options for one node, as a Nix module.
 pub fn module(plan: &Plan, node: &Node) -> String {

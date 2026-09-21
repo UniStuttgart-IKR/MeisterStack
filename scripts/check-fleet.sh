@@ -52,7 +52,7 @@ DEPLOY="$ROOT/target/release/meister-deploy"
 
 # Welche Knoten der Plan als Blech kennt — nur die haben eine
 # nixosConfiguration, gegen die sich vergleichen laesst.
-mapfile -t NODES < <("$DEPLOY" -f "$PLAN" plan --offline \
+mapfile -t NODES < <("$DEPLOY" legacy -f "$PLAN" plan --offline \
     | awk 'NR > 1 && $5 == "metal" {print $1}')
 
 if [ ${#NODES[@]} -eq 0 ]; then
@@ -65,7 +65,7 @@ echo
 echo "B. mkNode und render setzen dieselben Optionen"
 
 for node in "${NODES[@]}"; do
-    "$DEPLOY" -f "$PLAN" render "$node" -o "$T/$node.nix" > /dev/null || {
+    "$DEPLOY" legacy -f "$PLAN" render "$node" -o "$T/$node.nix" > /dev/null || {
         bad "$node: render"; continue
     }
 
@@ -126,13 +126,13 @@ echo "C. die eingecheckte gerenderte Datei ist aktuell"
 COMMITTED="examples/fleet/foreign-flake/box.nix"
 if [ ! -f "$COMMITTED" ]; then
     bad "$COMMITTED fehlt"
-elif "$DEPLOY" -f examples/fleet/one-box.toml render box > "$T/box.fresh" 2>/dev/null \
+elif "$DEPLOY" legacy -f examples/fleet/one-box.toml render box > "$T/box.fresh" 2>/dev/null \
      && diff -q "$T/box.fresh" "$COMMITTED" > /dev/null; then
     ok "$COMMITTED ist byteidentisch mit einem frischen Render"
 else
     bad "$COMMITTED ist nicht mehr, was ein Render schreibt" \
         "$(diff "$COMMITTED" "$T/box.fresh" | head -20)" \
-        "-> meister-deploy -f examples/fleet/one-box.toml render box -o $COMMITTED"
+        "-> meister-deploy legacy -f examples/fleet/one-box.toml render box -o $COMMITTED"
 fi
 
 echo
@@ -166,7 +166,7 @@ address = "10.0.0.10"
 disk    = "/dev/vda"
 TOML
 
-if out="$("$DEPLOY" -f "$T/no-domain.toml" plan --offline 2>&1)"; then
+if out="$("$DEPLOY" legacy -f "$T/no-domain.toml" plan --offline 2>&1)"; then
     bad "meister-deploy nimmt einen Addons-Knoten ohne [fleet] domain an" "$out"
 elif printf '%s' "$out" | grep -q '\[fleet\] domain'; then
     ok "meister-deploy: Planfehler mit dem Satz, der den Schluessel nennt"

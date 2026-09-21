@@ -2,31 +2,43 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `meister-deploy` — the plan, the order, and the table.
+//! `meister-deploy` — the plan, the order, and the evidence.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
-use meister_deploy::fleet::Plan;
-use meister_deploy::ops::{self, Ctx};
-use meister_deploy::remote::Ssh;
-use meister_deploy::run::Real;
+use meister_deploy::legacy::fleet::Plan;
+use meister_deploy::legacy::ops::{self, Ctx};
+use meister_deploy::legacy::remote::Ssh;
+use meister_deploy::legacy::run::Real;
 
 #[derive(Parser)]
 #[command(
     name = "meister-deploy",
     about = "The fleet plan, the order a rollout happens in, and what the fleet looks like now",
-    long_about = "Reads fleet.toml and calls nix, ssh, rsync, nixos-rebuild and \
-                  tools/meister-ca. It evaluates no Nix of its own and speaks no ssh of its \
-                  own: the shell tools are the ones an operator can also run by hand.\n\n\
-                  The ssh settings come from the same variables deploy/env holds \
-                  (MEISTER_SSH_KEY, MEISTER_SSH_PORT, MEISTER_SSH_STRICT), so `. deploy/env` \
-                  in front of this binary means what it means in front of the scripts."
+    long_about = "Reads a fleet inventory and calls nix, ssh and tools/meister-ca. It \
+                  evaluates no Nix of its own and speaks no ssh of its own: the shell tools \
+                  are the ones an operator can also run by hand."
 )]
 struct Cli {
+    #[command(subcommand)]
+    cmd: Verb,
+}
+
+#[derive(Subcommand)]
+enum Verb {
+    /// The tool as it was before v1: the `fleet.toml` of schema 1, the rsync
+    /// push to the context fleet, `nixos-rebuild --target-host` for metal.
+    /// Kept whole, with the same flags, because twelve VMs are served by it
+    /// today and `plan` means something else from v1 on.
+    Legacy(LegacyCli),
+}
+
+#[derive(Args)]
+struct LegacyCli {
     /// The plan
     #[arg(short = 'f', long, default_value = "fleet.toml", global = true)]
     fleet: PathBuf,
@@ -49,11 +61,11 @@ struct Cli {
     dry_run: bool,
 
     #[command(subcommand)]
-    cmd: Verb,
+    cmd: LegacyVerb,
 }
 
 #[derive(Subcommand)]
-enum Verb {
+enum LegacyVerb {
     /// The table: what each node is, what it is running, and whether that is
     /// what the plan says. Read-only.
     Plan {
@@ -134,6 +146,12 @@ fn main() -> ExitCode {
 
 fn run() -> Result<bool> {
     let cli = Cli::parse();
+    match &cli.cmd {
+        Verb::Legacy(legacy) => run_legacy(legacy),
+    }
+}
+
+fn run_legacy(cli: &LegacyCli) -> Result<bool> {
     let plan = Plan::load(&cli.fleet)?;
     let runner = Real {
         dry_run: cli.dry_run,
@@ -143,8 +161,8 @@ fn run() -> Result<bool> {
 
     // `render` is a pure function of the plan — no ssh, no nix, no host — so
     // it is answered before anything that could need a network.
-    if let Verb::Render { node, out } = &cli.cmd {
-        let text = meister_deploy::render::module(&plan, plan.node(node)?);
+    if let LegacyVerb::Render { node, out } = &cli.cmd {
+        let text = meister_deploy::legacy::render::module(&plan, plan.node(node)?);
         match out {
             Some(path) => {
                 std::fs::write(path, &text)?;
@@ -162,21 +180,23 @@ fn run() -> Result<bool> {
         flake: cli.flake.clone(),
         ca: cli.ca.clone().unwrap_or_else(|| plan.fleet.ca.clone()),
         wait: match &cli.cmd {
-            Verb::Push { wait, .. } => *wait,
+            LegacyVerb::Push { wait, .. } => *wait,
             _ => 0,
         },
-        offline: matches!(cli.cmd, Verb::Plan { offline: true }),
+        offline: matches!(cli.cmd, LegacyVerb::Plan { offline: true }),
     };
 
     match &cli.cmd {
-        Verb::Plan { .. } => ops::plan(&ctx).map(|()| true),
-        Verb::Image { target, copy } => ops::image(&ctx, target, copy.as_deref()).map(|()| true),
-        Verb::Push { only, .. } => ops::push(&ctx, Some(only)).map(|()| true),
-        Verb::Keys { cmd } => match cmd {
+        LegacyVerb::Plan { .. } => ops::plan(&ctx).map(|()| true),
+        LegacyVerb::Image { target, copy } => {
+            ops::image(&ctx, target, copy.as_deref()).map(|()| true)
+        }
+        LegacyVerb::Push { only, .. } => ops::push(&ctx, Some(only)).map(|()| true),
+        LegacyVerb::Keys { cmd } => match cmd {
             KeysVerb::Init => ops::keys_init(&ctx).map(|()| true),
             KeysVerb::Push { only } => ops::keys_push(&ctx, Some(only)).map(|()| true),
         },
-        Verb::Check { cli: cli_argv } => {
+        LegacyVerb::Check { cli: cli_argv } => {
             // A whole command line in one argument, split on spaces: the cli
             // takes a config path and a profile, and asking for four flags to
             // pass three of its own would be worse than one string.
@@ -185,6 +205,6 @@ fn run() -> Result<bool> {
                 .map(|s| s.split_whitespace().map(str::to_string).collect());
             ops::check(&ctx, argv.as_deref())
         }
-        Verb::Render { .. } => unreachable!("answered above"),
+        LegacyVerb::Render { .. } => unreachable!("answered above"),
     }
 }
