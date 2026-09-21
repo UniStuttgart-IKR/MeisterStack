@@ -538,6 +538,19 @@ impl Runner for Real {
             std::thread::sleep(POLL);
         };
 
+        // The child is gone. Anything still in its process group is something
+        // it left behind — and that something inherited the write end of our
+        // stdout and stderr pipes, so `read_to_end` below would wait for IT
+        // rather than for the command. `sh -c 'sleep 1000 & echo hi'` exits
+        // immediately and would hang this call for a quarter of an hour: the
+        // deadline would be a promise about the child alone, which is not what
+        // the caller asked for. So the group is swept BEFORE the readers are
+        // joined, and the joins are bounded by that rather than by patience.
+        //
+        // It is also the right thing on its own terms: this tool does not
+        // leave background processes on an operator's machine.
+        sweep(pgid);
+
         if let Some(t) = stdin_thread {
             let _ = t.join();
         }
@@ -573,6 +586,27 @@ impl Runner for Real {
     fn policy(&self) -> Policy {
         self.policy
     }
+}
+
+/// Take whatever is left of a process group: SIGTERM, up to [`GRACE`] to go,
+/// then SIGKILL.
+///
+/// Called once the child has been reaped, so an empty group is the normal
+/// case and both signals are then a no-op — `killpg` answers `ESRCH`, which
+/// is the answer "nobody was left" and not an error worth a sentence.
+fn sweep(pgid: Pid) {
+    let _ = killpg(pgid, Signal::SIGTERM);
+    let since = Instant::now();
+    while since.elapsed() < GRACE && group_is_alive(pgid) {
+        std::thread::sleep(POLL);
+    }
+    let _ = killpg(pgid, Signal::SIGKILL);
+}
+
+/// Signal 0: does this process group still have members? The one question
+/// `kill` answers without doing anything.
+fn group_is_alive(pgid: Pid) -> bool {
+    killpg(pgid, None).is_ok()
 }
 
 /// Check the exit code against what the command expects, and turn a refusal
@@ -864,14 +898,60 @@ mod tests {
         assert!(!pgrep("987655"), "a grandchild outlived its group");
     }
 
-    /// Is any process still running with this in its command line?
+    #[test]
+    fn a_grandchild_holding_the_pipe_does_not_outlast_the_command() {
+        // sh backgrounds the sleep and exits at once. The sleep inherits the
+        // stdout pipe, so joining the reader without sweeping the group would
+        // wait for the sleep — eleven days, with a five-second deadline set.
+        let cmd = sh("sleep 987657 & echo hi", Duration::from_secs(5));
+        let began = Instant::now();
+        let out = Real::new(Policy::real()).run(&cmd).unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(3),
+            "it waited {:?}",
+            began.elapsed()
+        );
+        assert_eq!(out.trimmed(), "hi", "and the real output still arrived");
+        assert_eq!(out.status, 0);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!pgrep("987657"), "the background sleep was left running");
+    }
+
+    /// Is any process still RUNNING with this in its command line?
+    ///
+    /// A zombie does not count. Once a killed background process's parent is
+    /// gone, the entry stays in the process table until init gets round to
+    /// reaping it, and on a busy machine that is long enough to make this
+    /// test fail for something that is not true: a zombie holds no file
+    /// descriptor, so it is not what these tests are about.
     fn pgrep(needle: &str) -> bool {
         let out = Command::new("pgrep")
             .arg("-f")
             .arg(needle)
             .output()
             .expect("pgrep is in coreutils' neighbourhood and in the dev shell");
-        out.status.success() && !out.stdout.is_empty()
+        if !out.status.success() {
+            return false;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|pid| pid.trim().parse::<i32>().ok())
+            .any(|pid| !is_zombie(pid))
+    }
+
+    fn is_zombie(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // "<pid> (comm) <state> …", and `comm` may itself contain spaces
+            // and parentheses — so the state is the first character after the
+            // LAST closing parenthesis.
+            Ok(text) => {
+                text.rfind(')')
+                    .and_then(|i| text[i + 1..].trim_start().chars().next())
+                    == Some('Z')
+            }
+            // Gone between pgrep and this read. Not running is the answer.
+            Err(_) => true,
+        }
     }
 
     #[test]
