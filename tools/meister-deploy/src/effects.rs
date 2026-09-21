@@ -96,10 +96,11 @@ impl RealFiles {
     /// A write is a `local-write`, and the policy that decides about
     /// `nix build` decides about this too.
     ///
-    /// Note for M2: `plan --offline` is specified to write a provisional plan
-    /// from a snapshot. That is a deliberate exception to this rule and has
-    /// to be made one explicitly — by giving that path a policy of its own,
-    /// not by softening the rule here.
+    /// Note for M2: there is no exception to this for `plan --offline`. The
+    /// offline contract is "no nix, no network, no file written", so an
+    /// offline plan is provisional and goes to stdout; `--out` together with
+    /// `--offline` is refused with a sentence rather than given a policy of
+    /// its own.
     fn may_write(&self, path: &Path) -> Result<()> {
         match self.policy.admits(Effect::LocalWrite) {
             Ok(()) => Ok(()),
