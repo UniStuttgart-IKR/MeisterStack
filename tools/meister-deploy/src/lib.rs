@@ -30,6 +30,7 @@ pub mod manifest;
 pub mod nix;
 pub mod observation;
 pub mod plan;
+pub mod receipt;
 pub mod release;
 pub mod run;
 pub mod source;
