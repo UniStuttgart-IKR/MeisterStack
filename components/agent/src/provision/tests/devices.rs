@@ -96,38 +96,45 @@ fn a_host_input_node_another_vm_holds_is_refused_before_anything_is_built() {
         },
     };
 
+    // Two character devices that exist on every Linux, a build sandbox
+    // included. The driver asks for a character device and tells two of them
+    // apart by their device number, so these stand in for two evdev nodes —
+    // and the test no longer reads whatever /dev/input/event0 happens to be on
+    // the machine that runs it, or fails on one that has none.
+    const NODE_A: &str = "/dev/null";
+    const NODE_B: &str = "/dev/zero";
+
     // The guest that has the node, as a record in the store — which is the
     // only place a claim lives, and why a teardown gives the node back.
     let holder = VmId::new_v4();
     let mut held = spec_record();
-    held.spec.devices = vec![evdev("/dev/input/event0")];
+    held.spec.devices = vec![evdev(NODE_A)];
     store.put(&holder, &held).expect("the holder's record");
 
     let err = provisioner
-        .check_device_admission(
-            &VmId::new_v4(),
-            &spec(1, 256, vec![evdev("/dev/input/event0")]),
-        )
+        .check_device_admission(&VmId::new_v4(), &spec(1, 256, vec![evdev(NODE_A)]))
         .expect_err("the node is taken");
     // The whole chain: anyhow's outermost message is the context the
     // provisioner adds, and the driver's sentence is under it.
     let err = format!("{err:#}");
-    assert!(err.contains("/dev/input/event0"), "{err}");
+    assert!(err.contains(NODE_A), "{err}");
     assert!(err.contains(&holder.to_string()), "{err}");
     assert!(err.contains("input"), "the message names the driver: {err}");
 
-    // A different host device is a different claim, and a fifo device
-    // claims nothing at all.
+    // A different host device is a different claim.
     provisioner
-        .check_device_admission(
-            &VmId::new_v4(),
-            &spec(1, 256, vec![evdev("/dev/input/event1")]),
-        )
+        .check_device_admission(&VmId::new_v4(), &spec(1, 256, vec![evdev(NODE_B)]))
         .expect("another node is not this node");
-    provisioner
+    // And an input device that names no host node is not a claim on nothing:
+    // since the driver hands every guest an upstream vhost-device-input there
+    // is no fifo profile left, so admission refuses it, in words, before
+    // anything is built.
+    let err = provisioner
         .check_device_admission(
             &VmId::new_v4(),
             &spec(1, 256, vec![device("input", PartitionSpec::Mediated)]),
         )
-        .expect("a device with no host node to claim");
+        .expect_err("an input device has to name its host node");
+    let err = format!("{err:#}");
+    assert!(err.contains("params.evdev"), "{err}");
 }
