@@ -48,7 +48,9 @@ else
     bad "cargo build -p meister-deploy" "$(tail -5 "$T/build.log")"
     echo; echo "abgebrochen: $fail FAIL"; exit 1
 fi
-DEPLOY="$ROOT/target/release/meister-deploy"
+# A shared build directory is a fact about the machine, not about the tree:
+# cargo honours CARGO_TARGET_DIR, so the script that runs its output does too.
+DEPLOY="${CARGO_TARGET_DIR:-$ROOT/target}/release/meister-deploy"
 
 # Welche Knoten der Plan als Blech kennt — nur die haben eine
 # nixosConfiguration, gegen die sich vergleichen laesst.
