@@ -20,9 +20,9 @@
 # that knows its own fqdn can name it in the plan, and a plan node bakes it —
 # so `meisterstack.roles = [ ... "addons" ]` is what turns this file on, and
 # the generic OpenNebula image (roles = [ ]) does not carry these six at all.
-# one-context says so in one sentence if a context asks for addons on an image
-# built without them, which is a better answer than six units that are present
-# and misconfigured.
+# The context renderer says so in one sentence if a context asks for addons on
+# an image built without them, which is a better answer than six units that
+# are present and misconfigured.
 #
 # No secret is in the nix store. The four files below are pushed to
 # /opt/meisterstack/pki the way certificates are (`meister-deploy keys push`),
@@ -35,7 +35,7 @@ let
   cfg = config.meisterstack.addons;
   enabled = builtins.elem "addons" config.meisterstack.roles;
 
-  pki = "/opt/meisterstack/pki";
+  pki = config.meisterstack.pki.dir;
   state = "/var/lib/meister-data/addons";
 
   # What `meister-deploy keys init` writes into the CA directory and `keys
@@ -87,17 +87,28 @@ let
   };
 
   # Every unit of this role waits for the same two things: the serving pair
-  # from the lab CA, and the marker one-context writes when the role is named.
+  # from the lab CA, and the marker the renderer writes when the role is named.
   gated = extra: {
-    # After one-context, like every other unit here: it is what writes the
+    # After the renderer, like every other unit here: it is what writes the
     # marker, and a condition evaluated on a file that is about to appear is a
     # unit that stays skipped while everybody wonders why.
-    after = [ "one-context.service" ];
-    wants = [ "one-context.service" ];
-    unitConfig.ConditionPathExists = [
-      "/run/meisterstack/addons.enabled"
-      "${pki}/serving.crt"
-    ] ++ extra;
+    #
+    # `after` unconditionally (ordering against a unit that is not on this
+    # machine is a no-op) and `wants` only where the renderer exists — wanting
+    # a unit that does not exist is a job systemd cannot satisfy.
+    after = [ "meister-context.service" ];
+    wants = lib.mkIf config.meisterstack.context.enable [ "meister-context.service" ];
+    #
+    # The marker only where something writes it. On an appliance the renderer
+    # does, when MEISTER_ROLE names addons — the image may carry these six
+    # units and still be booted as something else. A managed host has no
+    # renderer and no second opinion: it was BUILT with the role, and a
+    # condition on a file nobody writes would be six units that can never
+    # start and no sentence saying why.
+    unitConfig.ConditionPathExists =
+      lib.optional config.meisterstack.context.enable
+        "${config.meisterstack.configDir}/addons.enabled"
+      ++ [ "${pki}/serving.crt" ] ++ extra;
   };
 in
 {

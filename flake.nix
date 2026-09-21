@@ -35,7 +35,13 @@
 
       # The role-agnostic image for OpenNebula: every unit ships, and the
       # CONTEXT decides at boot which of them starts.
-      genericModules = [ self.nixosModules.default ];
+      #
+      # `appliance` and not `default` since M1: `default` is the SERVICES, and
+      # they decide nothing about the machine — no stateVersion, no firewall,
+      # no console, and no units at all without a role. This image is a whole
+      # machine and needs all of it, which is what the appliance profile is
+      # (nix/appliance.nix, and it pulls in the renderer and the provider).
+      genericModules = [ self.nixosModules.appliance ];
 
       # Everything a planned node is: our modules, what the plan says about
       # this node, and the operator's own files. One list, used by the images
@@ -47,41 +53,40 @@
       ] ++ node.modules;
     in
     {
-      # What a host that is not ours imports. `default` is the whole stack
-      # with nothing selected — `meisterstack.roles` decides what runs — and
-      # the single modules are there for a configuration that wants to compose
-      # by hand:
+      # What a host that is not ours imports.
       #
       #   imports = [ meisterstack.nixosModules.default ];
       #   meisterstack.roles = [ "cloud" "cluster" ];
       #   meisterstack.cloud.settings = { ... };
       #
-      # `nixosConfigurations` below builds every planned node out of exactly
-      # these, so there is one road into this stack rather than a second one
-      # to keep in step with the first.
+      # `default` is `services`: the units, their config files, their users
+      # and their state — and NOTHING about the machine. No stateVersion, no
+      # firewall, no dhcp, no bootloader, no `fileSystems."/"`, no console.
+      # Somebody else's NixOS host has answers to all of those already, and
+      # `checks.services-are-pure` holds this export to it.
+      #
+      # Beside it are the three PROFILES, which are allowed to decide such
+      # things because each of them is a whole machine:
+      #
+      #   appliance  today's image: the services, the boot renderer, the
+      #              OpenNebula provider, and base.nix' host-global set.
+      #   managed    a host meister-deploy deploys to: nix on, config files
+      #              complete at build time, no renderer.
+      #   context    the boot renderer on its own, for a host that wants one
+      #              without the rest of the appliance.
+      #
+      # The single service modules (etcd, controllers, agent, …) are NOT
+      # exported any more. They stopped standing on their own in M1: they
+      # read `meisterstack.unitsFor`, `binDir`, `pki.dir` and `configDir`,
+      # which nix/services.nix declares, and an export that only works next
+      # to another export is a promise that cannot be kept.
       nixosModules = {
-        roles = ./nix/roles.nix;
-        base = ./nix/base.nix;
-        one-context = ./nix/one-context.nix;
-        etcd = ./nix/etcd.nix;
-        controllers = ./nix/controllers.nix;
-        agent = ./nix/agent.nix;
-        addons = ./nix/addons.nix;
-        data = ./nix/data.nix;
-        observability = ./nix/observability.nix;
-        default = {
-          imports = [
-            self.nixosModules.roles
-            self.nixosModules.base
-            self.nixosModules.one-context
-            self.nixosModules.etcd
-            self.nixosModules.controllers
-            self.nixosModules.agent
-            self.nixosModules.addons
-            self.nixosModules.data
-            self.nixosModules.observability
-          ];
-        };
+        services = ./nix/services.nix;
+        managed = ./nix/managed.nix;
+        appliance = ./nix/appliance.nix;
+        context = ./nix/context.nix;
+        provider-opennebula = ./nix/provider-opennebula.nix;
+        default = self.nixosModules.services;
       };
 
       # One image per PLANNED node, and the generic one beside them.
