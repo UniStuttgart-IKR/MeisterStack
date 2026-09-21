@@ -39,7 +39,7 @@ enum Verb {
     /// Print the JSON Schema of a contract object, so that whatever produces
     /// one — a Nix derivation, another tool, a person — can be held to it.
     Schema {
-        /// `nix-manifest`, `resolved-fleet` or `check-result`
+        /// `nix-manifest`, `resolved-fleet`, `release` or `check-result`
         kind: String,
     },
 
@@ -236,17 +236,18 @@ fn run() -> Result<bool> {
     }
 }
 
-/// The contract objects that have a schema today. The rest — plan, release,
-/// receipt — arrive with M2 and M3, and asking for one now says so rather
-/// than printing an empty object.
+/// The contract objects that have a schema today. The rest — plan, receipt —
+/// arrive later in M2, and asking for one now says so rather than printing an
+/// empty object.
 fn print_schema(kind: &str) -> Result<bool> {
     let schema = match kind {
         "nix-manifest" => schemars::schema_for!(manifest::NixManifest),
         "resolved-fleet" => schemars::schema_for!(manifest::ResolvedFleet),
         "check-result" => schemars::schema_for!(meister_deploy::checks::CheckResult),
+        "release" => schemars::schema_for!(meister_deploy::release::ReleaseManifest),
         other => anyhow::bail!(
             "there is no schema called {other:?}; this tool knows nix-manifest, \
-             resolved-fleet and check-result."
+             resolved-fleet, release and check-result."
         ),
     };
     println!("{}", serde_json::to_string_pretty(&schema)?);

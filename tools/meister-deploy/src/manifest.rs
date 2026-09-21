@@ -866,6 +866,20 @@ fn schema_of(text: &str, origin: &str) -> Result<String> {
     }
 }
 
+/// Check the `schema` field, then parse the whole thing — the way every
+/// contract file in this tool is read. Public because the contracts that
+/// come after these two ([`crate::release`], [`crate::plan`],
+/// [`crate::receipt`]) are read exactly the same way, and a second copy of
+/// "which sentence for which kind of malformed file" would drift.
+pub fn parse_checked<T: serde::de::DeserializeOwned>(
+    text: &str,
+    origin: &str,
+    kind: &str,
+) -> Result<T> {
+    check_schema(text, origin, kind)?;
+    parse(text, origin, kind)
+}
+
 fn parse<T: serde::de::DeserializeOwned>(text: &str, origin: &str, kind: &str) -> Result<T> {
     // `from_str` rather than `from_value`: it keeps the line and column, and
     // a line number is what somebody staring at a 4000-line manifest needs.
