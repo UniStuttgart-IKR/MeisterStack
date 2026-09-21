@@ -1245,9 +1245,13 @@ dependencies = [
  "chrono",
  "clap",
  "nix 0.31.3",
+ "schemars",
  "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "toml",
+ "uuid",
 ]
 
 [[package]]

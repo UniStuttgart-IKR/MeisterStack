@@ -4,16 +4,20 @@
 
 //! `meister-deploy` — the plan, the order, and the evidence.
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
+use meister_deploy::effects::{Files, RealFiles};
 use meister_deploy::legacy::fleet::Plan;
 use meister_deploy::legacy::ops::{self, Ctx};
 use meister_deploy::legacy::remote::Ssh;
 use meister_deploy::legacy::run::Real;
+use meister_deploy::manifest::{self, Contract};
+use meister_deploy::run::Policy;
 
 #[derive(Parser)]
 #[command(
@@ -30,6 +34,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Verb {
+    /// Print the JSON Schema of a contract object, so that whatever produces
+    /// one — a Nix derivation, another tool, a person — can be held to it.
+    Schema {
+        /// `nix-manifest`, `resolved-fleet` or `check-result`
+        kind: String,
+    },
+
+    /// Check a file against the contracts. Reads nothing else and asks
+    /// nobody anything.
+    Validate {
+        /// A `nix-manifest/1` or `resolved-fleet/1` json file, or `-` for
+        /// standard input
+        #[arg(long)]
+        manifest: String,
+    },
+
     /// The tool as it was before v1: the `fleet.toml` of schema 1, the rsync
     /// push to the context fleet, `nixos-rebuild --target-host` for metal.
     /// Kept whole, with the same flags, because twelve VMs are served by it
@@ -138,6 +158,8 @@ fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
+            // Diagnostics on stderr, always: stdout carries the answer, and
+            // `--json` has to stay machine-readable even when it is empty.
             eprintln!("meister-deploy: {e:#}");
             ExitCode::FAILURE
         }
@@ -147,7 +169,62 @@ fn main() -> ExitCode {
 fn run() -> Result<bool> {
     let cli = Cli::parse();
     match &cli.cmd {
+        Verb::Schema { kind } => print_schema(kind),
+        Verb::Validate { manifest } => validate_manifest(manifest),
         Verb::Legacy(legacy) => run_legacy(legacy),
+    }
+}
+
+/// The contract objects that have a schema today. The rest — plan, release,
+/// receipt — arrive with M2 and M3, and asking for one now says so rather
+/// than printing an empty object.
+fn print_schema(kind: &str) -> Result<bool> {
+    let schema = match kind {
+        "nix-manifest" => schemars::schema_for!(manifest::NixManifest),
+        "resolved-fleet" => schemars::schema_for!(manifest::ResolvedFleet),
+        "check-result" => schemars::schema_for!(meister_deploy::checks::CheckResult),
+        other => anyhow::bail!(
+            "there is no schema called {other:?}; this tool knows nix-manifest, \
+             resolved-fleet and check-result."
+        ),
+    };
+    println!("{}", serde_json::to_string_pretty(&schema)?);
+    Ok(true)
+}
+
+fn validate_manifest(from: &str) -> Result<bool> {
+    let (text, origin) = if from == "-" {
+        // Standard input is not a file, so it does not go through `Files`;
+        // it is also the only way a Nix check can hand a manifest over
+        // without writing it into the store first.
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .context("reading the manifest from standard input failed")?;
+        (text, "standard input".to_string())
+    } else {
+        let path = Path::new(from);
+        let files = RealFiles::new(Policy::real());
+        (files.read_to_string(path)?, from.to_string())
+    };
+
+    match manifest::parse_contract(&text, &origin) {
+        Ok(contract) => {
+            println!("ok: {origin} is a {}", contract.describe());
+            if let Contract::NixManifest(_) = contract {
+                // Saying what was NOT checked is part of the answer: these
+                // types are a shape, and a shape is not a fleet.
+                eprintln!(
+                    "note: the shape was checked, not the fleet. Store paths were not \
+                     looked up and no host was asked anything."
+                );
+            }
+            Ok(true)
+        }
+        Err(e) => {
+            eprintln!("meister-deploy: {e:#}");
+            Ok(false)
+        }
     }
 }
 
