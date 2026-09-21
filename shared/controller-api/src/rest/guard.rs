@@ -661,7 +661,8 @@ impl Tier {
     }
 }
 
-/// Assemble the authenticator chain the config asks for.
+/// Which links this configuration will stand up, and every refusal that does
+/// not need a file.
 ///
 /// A link that has nothing to work with is left out rather than added and
 /// left useless — but only when the chain was defaulted. A chain that NAMES
@@ -671,13 +672,20 @@ impl Tier {
 /// `serves_sessions` is whether this process also listens on its gRPC session
 /// port, and it decides the one refusal below that is not about the REST edge
 /// at all — see `mtls_or_no_peers`.
-pub fn build_chain(
+///
+/// Separate from [`build_chain`] so that `--check-config` can run it. Building
+/// the chain opens the client CA, reads the bearer token file and fetches the
+/// provider's discovery document; a configuration check that needs those is a
+/// check that only answers on the host it is checking, and D12 asks for one
+/// that answers anywhere. What this half does NOT cover is therefore
+/// everything that needs the file: an unreadable CA, an empty token file, and
+/// the OIDC provider's own settings.
+pub fn check_chain(
     cfg: &AuthConfig,
-    client_ca: Option<&std::path::Path>,
-    base: Option<&std::path::Path>,
+    has_client_ca: bool,
     tier: Tier,
     serves_sessions: bool,
-) -> Result<AuthChain> {
+) -> Result<Vec<&'static str>> {
     let explicit = cfg.chain.is_some();
     let names: Vec<String> = cfg
         .chain
@@ -701,8 +709,7 @@ pub fn build_chain(
         );
     }
 
-    let mut links: Vec<Box<dyn crate::auth::Authenticator>> = Vec::new();
-    // What went in, in order, for the discovery document. Collected here
+    // What will go in, in order, for the discovery document. Collected here
     // rather than read back off the config, because the config NAMES links
     // that are then left out for want of a CA or a token file, and what a
     // client needs to know is which ones are actually standing.
@@ -710,10 +717,7 @@ pub fn build_chain(
     for name in &names {
         match name.as_str() {
             "oidc" => match &cfg.oidc {
-                Some(oidc) if tier == Tier::Cloud => {
-                    links.push(Box::new(build_oidc(oidc, base)?));
-                    built.push("oidc");
-                }
+                Some(_) if tier == Tier::Cloud => built.push("oidc"),
                 Some(_) => anyhow::bail!(
                     "auth.oidc is configured at the cluster tier, which keeps no user \
                      directory and so cannot turn a token's name into a role. Machines \
@@ -724,44 +728,15 @@ pub fn build_chain(
                 }
                 None => {}
             },
-            "mtls" => match client_ca {
-                Some(ca) => {
-                    let ca = pki::pem::resolve(base, ca);
-                    links.push(Box::new(crate::auth::MtlsAuthenticator::from_pem_file(
-                        &ca,
-                    )?));
+            "mtls" => {
+                if has_client_ca {
                     built.push("mtls");
-                    info!(ca = %ca.display(), "mtls authenticator");
+                } else if explicit {
+                    anyhow::bail!("auth.chain names \"mtls\" but no client_ca is configured");
                 }
-                None if explicit => {
-                    anyhow::bail!("auth.chain names \"mtls\" but no client_ca is configured")
-                }
-                None => {}
-            },
+            }
             "bearer" => match &cfg.bearer_token_file {
-                Some(path) => {
-                    let path = pki::pem::resolve(base, path);
-                    let token = std::fs::read_to_string(&path)
-                        .with_context(|| format!("reading the bearer token {}", path.display()))?
-                        .trim()
-                        .to_string();
-                    if token.is_empty() {
-                        anyhow::bail!("{} is empty", path.display());
-                    }
-                    let identity = Identity::new(
-                        cfg.bearer_identity
-                            .clone()
-                            .unwrap_or_else(|| "dev-bearer".to_string()),
-                        cfg.bearer_groups
-                            .clone()
-                            .unwrap_or_else(|| vec![crate::auth::GROUP_MASTERS.to_string()]),
-                    );
-                    warn!(identity = %identity, "static bearer token enabled, development path");
-                    links.push(Box::new(crate::auth::BearerAuthenticator::new(
-                        token, identity,
-                    )));
-                    built.push("bearer");
-                }
+                Some(_) => built.push("bearer"),
                 None if explicit => anyhow::bail!(
                     "auth.chain names \"bearer\" but no auth.bearer_token_file is configured"
                 ),
@@ -777,6 +752,65 @@ pub fn build_chain(
     // first: "no bearer_token_file" is a sentence about one line of the
     // config, and this one is about the whole shape of it.
     mtls_or_no_peers(&names, explicit, serves_sessions)?;
+    Ok(built)
+}
+
+/// Assemble the authenticator chain the config asks for.
+///
+/// [`check_chain`] decides WHICH links stand; this opens the files they need
+/// and stands them up. Nothing is decided twice.
+pub fn build_chain(
+    cfg: &AuthConfig,
+    client_ca: Option<&std::path::Path>,
+    base: Option<&std::path::Path>,
+    tier: Tier,
+    serves_sessions: bool,
+) -> Result<AuthChain> {
+    let built = check_chain(cfg, client_ca.is_some(), tier, serves_sessions)?;
+    let mut links: Vec<Box<dyn crate::auth::Authenticator>> = Vec::new();
+    for name in &built {
+        match *name {
+            "oidc" => {
+                let oidc = cfg.oidc.as_ref().expect("check_chain named it");
+                links.push(Box::new(build_oidc(oidc, base)?));
+            }
+            "mtls" => {
+                let ca = pki::pem::resolve(base, client_ca.expect("check_chain named it"));
+                links.push(Box::new(crate::auth::MtlsAuthenticator::from_pem_file(
+                    &ca,
+                )?));
+                info!(ca = %ca.display(), "mtls authenticator");
+            }
+            "bearer" => {
+                let path = pki::pem::resolve(
+                    base,
+                    cfg.bearer_token_file
+                        .as_ref()
+                        .expect("check_chain named it"),
+                );
+                let token = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading the bearer token {}", path.display()))?
+                    .trim()
+                    .to_string();
+                if token.is_empty() {
+                    anyhow::bail!("{} is empty", path.display());
+                }
+                let identity = Identity::new(
+                    cfg.bearer_identity
+                        .clone()
+                        .unwrap_or_else(|| "dev-bearer".to_string()),
+                    cfg.bearer_groups
+                        .clone()
+                        .unwrap_or_else(|| vec![crate::auth::GROUP_MASTERS.to_string()]),
+                );
+                warn!(identity = %identity, "static bearer token enabled, development path");
+                links.push(Box::new(crate::auth::BearerAuthenticator::new(
+                    token, identity,
+                )));
+            }
+            other => unreachable!("check_chain returned {other:?}"),
+        }
+    }
     Ok(AuthChain::named(links, built))
 }
 
