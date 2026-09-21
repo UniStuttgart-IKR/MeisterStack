@@ -162,14 +162,8 @@ fn run_legacy(cli: &LegacyCli) -> Result<bool> {
     // `render` is a pure function of the plan — no ssh, no nix, no host — so
     // it is answered before anything that could need a network.
     if let LegacyVerb::Render { node, out } = &cli.cmd {
-        let text = meister_deploy::legacy::render::module(&plan, plan.node(node)?);
-        match out {
-            Some(path) => {
-                std::fs::write(path, &text)?;
-                println!("==> {}", path.display());
-            }
-            None => print!("{text}"),
-        }
+        let node = plan.node(node)?;
+        meister_deploy::legacy::render::write_module(&plan, node, out.as_deref())?;
         return Ok(true);
     }
 

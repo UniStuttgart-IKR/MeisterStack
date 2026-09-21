@@ -12,6 +12,7 @@ description = "The fleet plan, and the order a deployment happens in"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 # killpg and sigaction: a deadline has to take the whole process group with
 # it, and the SIGINT the child no longer receives has to be caught here.

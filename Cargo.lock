@@ -1242,6 +1242,7 @@ name = "meister-deploy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "nix 0.31.3",
  "serde",

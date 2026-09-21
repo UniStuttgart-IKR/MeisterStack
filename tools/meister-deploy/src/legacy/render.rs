@@ -28,10 +28,32 @@
 //! belongs in a repository next to the configuration that imports it.
 
 use std::collections::BTreeMap;
+use std::path::Path;
+
+use anyhow::{Context, Result};
 
 use crate::legacy::fleet::{Node, Plan, Role};
 
 /// The MeisterStack options for one node, as a Nix module.
+/// Write it where the operator asked, and print where that was.
+///
+/// This lives here rather than in `main` because the pre-v1 path writes with
+/// `std::fs` and the v1 path writes through `crate::effects::Files`; keeping
+/// the old call inside `legacy` is what lets `tests/no_direct_effects.rs`
+/// hold the new code to the new door without rewriting the old one.
+pub fn write_module(plan: &Plan, node: &Node, out: Option<&Path>) -> Result<()> {
+    let text = module(plan, node);
+    match out {
+        Some(path) => {
+            std::fs::write(path, &text)
+                .with_context(|| format!("writing {} failed", path.display()))?;
+            println!("==> {}", path.display());
+        }
+        None => print!("{text}"),
+    }
+    Ok(())
+}
+
 pub fn module(plan: &Plan, node: &Node) -> String {
     let mut out = String::new();
     out.push_str("# SPDX-License-Identifier: MIT\n#\n");
