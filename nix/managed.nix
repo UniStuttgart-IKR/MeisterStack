@@ -36,6 +36,33 @@ let
   } env;
 
   deployDir = "/var/lib/meisterstack/deploy";
+
+  # MEISTER_HOSTS = "10.0.0.10 box.lab.example", several of them separated by
+  # commas: the /etc/hosts lines a fleet without a dns has to be told. It is
+  # the one context value that is not a config key, which is why it is here
+  # and not in nix/lib/render.nix.
+  #
+  # nix/fleet.nix calls it a CONTEXT value on purpose, because on an appliance
+  # /etc/hosts has exactly one owner — the renderer, the same one resolv.conf
+  # has — and a fleet can be re-pointed at a new addons box without rebuilding
+  # an image. A managed host has no renderer, so the owner here is
+  # `networking.hosts`, and re-pointing it is a new generation. Without this
+  # the cloud of such a host could not resolve the issuer in the token it is
+  # verifying (nix/addons.nix: origin, issuer, redirect and certificate are
+  # one and the same NAME).
+  hostEntries =
+    let
+      fields = entry: lib.filter (x: x != "")
+        (lib.splitString " " (lib.replaceStrings [ "\t" ] [ " " ] entry));
+      pair = entry:
+        let f = fields entry; in
+        if builtins.length f < 2 then null
+        else { name = builtins.head f; value = builtins.tail f; };
+    in
+    if ms.context.defaults ? MEISTER_HOSTS then
+      builtins.listToAttrs (lib.filter (p: p != null)
+        (map pair (lib.splitString "," ms.context.defaults.MEISTER_HOSTS)))
+    else { };
 in
 {
   imports = [ ./services.nix ];
@@ -153,6 +180,11 @@ in
     } // lib.optionalAttrs (rendered.etcd.member != null) {
       member = rendered.etcd.member;
     });
+
+    # The names this machine must resolve without a dns, from the same
+    # context. Merged with what NixOS puts there anyway (localhost), never
+    # replacing it.
+    networking.hosts = hostEntries;
 
     # The collector stays off, and this is a gap rather than a decision: its
     # config is not TOML, the boot renderer writes it from MEISTER_LOKI_URL,
