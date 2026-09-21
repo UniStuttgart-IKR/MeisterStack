@@ -40,7 +40,7 @@ enum Verb {
     /// one — a Nix derivation, another tool, a person — can be held to it.
     Schema {
         /// `nix-manifest`, `resolved-fleet`, `release`, `observation`,
-        /// `targets` or `check-result`
+        /// `targets`, `plan` or `check-result`
         kind: String,
     },
 
@@ -248,9 +248,10 @@ fn print_schema(kind: &str) -> Result<bool> {
         "release" => schemars::schema_for!(meister_deploy::release::ReleaseManifest),
         "observation" => schemars::schema_for!(meister_deploy::observation::Observations),
         "targets" => schemars::schema_for!(meister_deploy::observation::Targets),
+        "plan" => schemars::schema_for!(meister_deploy::plan::DeploymentPlan),
         other => anyhow::bail!(
             "there is no schema called {other:?}; this tool knows nix-manifest, \
-             resolved-fleet, release, observation, targets and check-result."
+             resolved-fleet, release, observation, targets, plan and check-result."
         ),
     };
     println!("{}", serde_json::to_string_pretty(&schema)?);
