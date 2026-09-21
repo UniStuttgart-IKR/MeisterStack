@@ -215,6 +215,25 @@ impl ApprovalClass {
     }
 }
 
+impl ApprovalClass {
+    /// The other direction, for `--approve <class>=<plan_id>`. An unknown
+    /// word lists the ones that exist rather than silently granting nothing.
+    pub fn parse(text: &str) -> Result<ApprovalClass> {
+        match text {
+            "none" => Ok(ApprovalClass::None),
+            "disruptive" => Ok(ApprovalClass::Disruptive),
+            "quorum" => Ok(ApprovalClass::Quorum),
+            "reboot" => Ok(ApprovalClass::Reboot),
+            "singleton" => Ok(ApprovalClass::Singleton),
+            "destructive" => Ok(ApprovalClass::Destructive),
+            other => bail!(
+                "{other:?} is not an approval class. This tool knows: disruptive, quorum, \
+                 reboot, singleton, destructive."
+            ),
+        }
+    }
+}
+
 impl std::fmt::Display for ApprovalClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -2526,6 +2545,256 @@ fn validity_for(
     out
 }
 
+// ---------------------------------------------------------------------------
+// What `apply` asks immediately before it changes anything
+// ---------------------------------------------------------------------------
+
+/// The answer to "is this plan still the truth?".
+///
+/// Three answers and not two, because "do not do this" and "ask again" call
+/// for different things from an operator. A quorum that got worse is a fleet
+/// to look at; a generation that moved is a plan to make again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Proceed,
+    /// Something is wrong that a new plan would not fix.
+    Stop {
+        reasons: Vec<String>,
+    },
+    /// The world moved. The same question asked again gets a usable answer.
+    Replan {
+        reasons: Vec<String>,
+    },
+}
+
+impl Verdict {
+    pub fn is_proceed(&self) -> bool {
+        matches!(self, Verdict::Proceed)
+    }
+
+    pub fn reasons(&self) -> &[String] {
+        match self {
+            Verdict::Proceed => &[],
+            Verdict::Stop { reasons } | Verdict::Replan { reasons } => reasons,
+        }
+    }
+}
+
+/// Re-check everything a plan assumed, against a snapshot taken just now.
+///
+/// This is the question `apply` asks before EVERY mutation, not once at the
+/// start: between the plan and the third host of a wave there is a rollout's
+/// worth of time, and a fleet does not hold still for it. Pure, like the
+/// planner — `now` arrives as a value and the snapshot arrives as data.
+///
+/// Only the hosts the plan may actually act on are re-checked. A host the
+/// plan already blocked is not re-examined: it was down when the plan was
+/// made, it is down now, and stopping the whole run over a fact the plan
+/// already wrote down would make every degraded fleet unrollable.
+pub fn validate_against(
+    plan: &DeploymentPlan,
+    release: &ReleaseManifest,
+    fresh: &Observations,
+    now: DateTime<Utc>,
+) -> Verdict {
+    let mut stop: Vec<String> = Vec::new();
+    let mut replan: Vec<String> = Vec::new();
+
+    if release.release_id != plan.release_id {
+        stop.push(format!(
+            "this plan was made for the release {} and the release handed to it is {}. \
+             A plan names the bytes it was made for; another build is another plan.",
+            plan.release_id, release.release_id
+        ));
+        // Everything below compares against artifacts, so there is nothing
+        // more to be learned from the wrong release.
+        return Verdict::Stop { reasons: stop };
+    }
+    if now >= plan.expires_at {
+        replan.push(format!(
+            "this plan expired at {} and it is {now}. What it knows about the fleet is that \
+             old; make it again.",
+            plan.expires_at
+        ));
+    }
+    if fresh.provisional {
+        stop.push(
+            "the snapshot handed to this check is provisional: nothing was asked of any host, \
+             so it cannot confirm anything the plan assumed."
+                .to_string(),
+        );
+    }
+
+    for id in &plan.selection.targets {
+        let planned = &plan.hosts[id];
+        if planned.verdict.blocks() {
+            continue;
+        }
+        // V12, at the last possible moment: the release still has to name
+        // the exact bytes this plan was made for.
+        match release.artifacts.get(id) {
+            None => stop.push(format!(
+                "the release no longer builds anything for {id}, and this plan has steps for it."
+            )),
+            Some(artifacts) => {
+                if artifacts.toplevel.store_path != planned.desired_system {
+                    stop.push(format!(
+                        "this plan takes {id} to {} and the release now says {}. \
+                         The build moved under the plan; make it again.",
+                        planned.desired_system, artifacts.toplevel.store_path
+                    ));
+                } else if artifacts.toplevel.nar_hash != planned.desired_nar_hash {
+                    stop.push(format!(
+                        "the system built for {id} is at the same store path and hashes to {} \
+                         rather than {}. Same name, different bytes: this plan is not about \
+                         what is in the store.",
+                        artifacts.toplevel.nar_hash, planned.desired_nar_hash
+                    ));
+                }
+            }
+        }
+
+        let before = plan.observation.host(id);
+        let Some(after) = fresh.host(id) else {
+            stop.push(format!(
+                "the fresh snapshot has no entry for {id}, and this plan has steps for it. \
+                 A step is not taken on a host nobody just looked at."
+            ));
+            continue;
+        };
+        if !after.reachable {
+            stop.push(format!(
+                "{id} does not answer any more; it did when this plan was made."
+            ));
+            continue;
+        }
+        let Some(before) = before else {
+            // The plan may act on it, so it saw it. If it did not, the plan
+            // is not one this check can vouch for.
+            stop.push(format!(
+                "this plan has steps for {id} and carries no observation of it, so there is \
+                 nothing to compare the fleet against."
+            ));
+            continue;
+        };
+
+        if before.identity.host_key_fingerprint != after.identity.host_key_fingerprint {
+            stop.push(format!(
+                "identity changed: {id} answered with {} when this plan was made and with {} \
+                 now.",
+                option(&before.identity.host_key_fingerprint),
+                option(&after.identity.host_key_fingerprint)
+            ));
+        }
+        if before.identity.machine_id != after.identity.machine_id {
+            stop.push(format!(
+                "{id} reports the machine id {} and reported {} when this plan was made; it is \
+                 not the same installation.",
+                option(&after.identity.machine_id),
+                option(&before.identity.machine_id)
+            ));
+        }
+        if before.current_system != after.current_system {
+            replan.push(format!(
+                "{id} now runs {} and ran {} when this plan was made; somebody deployed to it \
+                 in the meantime.",
+                option(&after.current_system),
+                option(&before.current_system)
+            ));
+        }
+        if before.generation != after.generation {
+            replan.push(format!(
+                "the system generation of {id} moved from {} to {} since this plan was made.",
+                before
+                    .generation
+                    .map(|g| g.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                after
+                    .generation
+                    .map(|g| g.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        if let Some(lock) = &after.lock
+            && before.lock.as_ref().map(|l| &l.run_id) != Some(&lock.run_id)
+        {
+            stop.push(format!(
+                "the run {} has taken {id} since this plan was made (operator {}). Two runs on \
+                 one host is the thing the lock exists to prevent.",
+                lock.run_id, lock.operator
+            ));
+        }
+        let new_txns: Vec<&str> = after
+            .open_txns
+            .iter()
+            .filter(|t| !before.open_txns.iter().any(|b| b.id == t.id))
+            .map(|t| t.id.as_str())
+            .collect();
+        if !new_txns.is_empty() {
+            stop.push(format!(
+                "{id} has picked up the transaction(s) {} since this plan was made; somebody \
+                 else is activating something on it.",
+                new_txns.join(", ")
+            ));
+        }
+    }
+
+    // The quorum arithmetic again, on the fresh facts and with the same
+    // function — a second implementation here would be a second answer to
+    // keep in step.
+    let selected: BTreeSet<String> = plan.selection.targets.iter().cloned().collect();
+    let (now_groups, _) = group_views(&release.resolved_fleet, fresh, &selected);
+    for (id, planned) in &plan.groups {
+        let Some(current) = now_groups.get(id) else {
+            continue;
+        };
+        if planned.blocked.is_none()
+            && let Some(why) = &current.blocked
+        {
+            stop.push(format!("{why} It could when this plan was made."));
+        } else if current.allowed_unavailable < planned.allowed_unavailable {
+            stop.push(format!(
+                "group {id} could afford to lose {} member(s) when this plan was made and can \
+                 afford {} now.",
+                planned.allowed_unavailable, current.allowed_unavailable
+            ));
+        }
+    }
+
+    if !stop.is_empty() {
+        Verdict::Stop { reasons: stop }
+    } else if !replan.is_empty() {
+        Verdict::Replan { reasons: replan }
+    } else {
+        Verdict::Proceed
+    }
+}
+
+fn option(value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| "nothing".to_string())
+}
+
+/// Which approvals this plan needs and nobody has granted for THIS plan.
+///
+/// A grant is a class and a plan id. The id is the whole mechanism: a
+/// `--approve reboot=<some other plan>` copied out of yesterday's terminal
+/// approves yesterday's plan, and it is not going to be mistaken for this
+/// one.
+pub fn approvals_missing(
+    plan: &DeploymentPlan,
+    granted: &[(ApprovalClass, String)],
+) -> Vec<ApprovalClass> {
+    plan.approvals
+        .iter()
+        .map(|a| a.class)
+        .filter(|class| {
+            !granted
+                .iter()
+                .any(|(given, for_plan)| given == class && for_plan == &plan.plan_id)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3642,5 +3911,259 @@ mod tests {
         }
         let refs: Vec<&str> = members.iter().map(String::as_str).collect();
         (with_new_systems(fleet, &refs, false), observation)
+    }
+
+    // -----------------------------------------------------------------
+    // validate_against
+    // -----------------------------------------------------------------
+
+    /// A plan over the one-box fleet, and the fresh snapshot `apply` would
+    /// take a moment later — identical until a test moves something.
+    fn about_to_apply() -> (ReleaseManifest, DeploymentPlan, Observations) {
+        let (release, observation) = upgrade(&["n1"], false);
+        let plan = planned(&release, "host=n1", &observation);
+        let fresh = observation;
+        (release, plan, fresh)
+    }
+
+    fn later() -> DateTime<Utc> {
+        at("2026-09-21T12:05:00Z")
+    }
+
+    #[test]
+    fn a_fleet_that_did_not_move_lets_the_plan_proceed() {
+        let (release, plan, fresh) = about_to_apply();
+        assert_eq!(
+            validate_against(&plan, &release, &fresh, later()),
+            Verdict::Proceed
+        );
+    }
+
+    #[test]
+    fn another_release_stops_the_run_before_anything_is_compared() {
+        let (_, plan, fresh) = about_to_apply();
+        let (other, _) = upgrade(&["n2"], false);
+        let verdict = validate_against(&plan, &other, &fresh, later());
+        assert!(matches!(verdict, Verdict::Stop { .. }));
+        assert!(verdict.reasons()[0].contains("another build is another plan"));
+    }
+
+    #[test]
+    fn an_artifact_that_moved_under_the_plan_stops_the_run() {
+        // V12: the store path is the same and the bytes are not.
+        let (mut release, plan, fresh) = about_to_apply();
+        release.artifacts.get_mut("n1").unwrap().toplevel.nar_hash = "sha256:rebuilt".to_string();
+        // The release id is recomputed the way a rebuild would produce one,
+        // so the check has to catch the artifact and not the id.
+        release.release_id = plan.release_id.clone();
+        let verdict = validate_against(&plan, &release, &fresh, later());
+        assert!(matches!(verdict, Verdict::Stop { .. }));
+        assert!(
+            verdict.reasons()[0].contains("Same name, different bytes"),
+            "{:?}",
+            verdict.reasons()
+        );
+    }
+
+    #[test]
+    fn an_expired_plan_is_made_again_and_not_run() {
+        let (release, plan, fresh) = about_to_apply();
+        let verdict = validate_against(&plan, &release, &fresh, at("2026-09-21T14:00:00Z"));
+        assert!(matches!(verdict, Verdict::Replan { .. }), "{verdict:?}");
+        assert!(verdict.reasons()[0].contains("expired at"));
+    }
+
+    #[test]
+    fn an_identity_that_changed_between_plan_and_apply_stops_the_run() {
+        let (release, plan, mut fresh) = about_to_apply();
+        fresh
+            .hosts
+            .get_mut("n1")
+            .unwrap()
+            .identity
+            .host_key_fingerprint = Some("SHA256:somebody-else".to_string());
+        let verdict = validate_against(&plan, &release, &fresh, later());
+        assert!(matches!(verdict, Verdict::Stop { .. }));
+        assert!(verdict.reasons()[0].contains("identity changed"));
+    }
+
+    #[test]
+    fn a_machine_id_that_changed_stops_the_run_too() {
+        let (release, plan, mut fresh) = about_to_apply();
+        fresh.hosts.get_mut("n1").unwrap().identity.machine_id = Some("reinstalled".to_string());
+        let verdict = validate_against(&plan, &release, &fresh, later());
+        assert!(matches!(verdict, Verdict::Stop { .. }));
+        assert!(verdict.reasons()[0].contains("not the same installation"));
+    }
+
+    #[test]
+    fn somebody_elses_deployment_asks_for_a_new_plan() {
+        let (release, plan, mut fresh) = about_to_apply();
+        let n1 = fresh.hosts.get_mut("n1").unwrap();
+        n1.current_system = Some("/nix/store/somebody-elses-system".to_string());
+        n1.generation = Some(43);
+        let verdict = validate_against(&plan, &release, &fresh, later());
+        assert!(matches!(verdict, Verdict::Replan { .. }), "{verdict:?}");
+        assert_eq!(verdict.reasons().len(), 2);
+        assert!(verdict.reasons()[0].contains("somebody deployed to it"));
+        assert!(verdict.reasons()[1].contains("generation of n1 moved"));
+    }
+
+    #[test]
+    fn a_lock_that_appeared_in_the_meantime_stops_the_run() {
+        let (release, plan, mut fresh) = about_to_apply();
+        fresh.hosts.get_mut("n1").unwrap().lock = Some(Lock {
+            run_id: "0192-other".to_string(),
+            operator: "somebody".to_string(),
+            pid: 9,
+            acquired_at: at("2026-09-21T12:01:00Z"),
+        });
+        let verdict = validate_against(&plan, &release, &fresh, later());
+        assert!(matches!(verdict, Verdict::Stop { .. }));
+        assert!(verdict.reasons()[0].contains("0192-other"));
+    }
+
+    #[test]
+    fn a_transaction_that_appeared_in_the_meantime_stops_the_run() {
+        let (release, plan, mut fresh) = about_to_apply();
+        fresh.hosts.get_mut("n1").unwrap().open_txns = vec![Txn {
+            id: "txn-9".to_string(),
+            state: TxnState::Pending,
+            target_system: None,
+            deadline: None,
+            run_id: None,
+        }];
+        let verdict = validate_against(&plan, &release, &fresh, later());
+        assert!(matches!(verdict, Verdict::Stop { .. }));
+        assert!(verdict.reasons()[0].contains("txn-9"));
+    }
+
+    #[test]
+    fn a_host_that_stopped_answering_stops_the_run() {
+        let (release, plan, mut fresh) = about_to_apply();
+        fresh.hosts.get_mut("n1").unwrap().reachable = false;
+        let verdict = validate_against(&plan, &release, &fresh, later());
+        assert!(matches!(verdict, Verdict::Stop { .. }));
+        assert!(verdict.reasons()[0].contains("does not answer any more"));
+    }
+
+    #[test]
+    fn a_quorum_that_got_worse_stops_the_run() {
+        let (release, mut observation) = three_member_cloud(0);
+        let plan = planned(&release, "group=cloud", &observation);
+        assert!(validate_against(&plan, &release, &observation, later()).is_proceed());
+
+        observation
+            .hosts
+            .get_mut("cloud-c")
+            .unwrap()
+            .etcd
+            .as_mut()
+            .unwrap()
+            .healthy = false;
+        let verdict = validate_against(&plan, &release, &observation, later());
+        assert!(matches!(verdict, Verdict::Stop { .. }), "{verdict:?}");
+        assert!(
+            verdict
+                .reasons()
+                .iter()
+                .any(|r| r.contains("It could when this plan was made")),
+            "{:?}",
+            verdict.reasons()
+        );
+    }
+
+    #[test]
+    fn a_provisional_snapshot_never_confirms_a_plan() {
+        let (release, plan, _) = about_to_apply();
+        let nothing = Observations::provisional(later());
+        let verdict = validate_against(&plan, &release, &nothing, later());
+        assert!(matches!(verdict, Verdict::Stop { .. }));
+        assert!(
+            verdict.reasons().iter().any(|r| r.contains("provisional")),
+            "{:?}",
+            verdict.reasons()
+        );
+    }
+
+    #[test]
+    fn a_host_the_plan_already_blocked_is_not_re_litigated() {
+        // n2 is unenrolled in the raw fixture, so the plan blocked it. That
+        // it is still unenrolled at apply time is not a reason to stop the
+        // hosts that are fine.
+        let base = onebox();
+        let running = release_of(base.clone());
+        let observation = observed(&running, at(TAKEN));
+        let release = with_new_systems(base, &["n1", "n2"], false);
+        let plan = planned(&release, "host=n1,host=n2", &observation);
+        assert_eq!(plan.hosts["n2"].verdict, HostVerdict::Unenrolled);
+        assert!(validate_against(&plan, &release, &observation, later()).is_proceed());
+    }
+
+    #[test]
+    fn a_label_added_afterwards_never_adds_a_host_to_a_frozen_plan() {
+        // The selection is a list, not an expression to evaluate again. A
+        // host that appears in the fresh snapshot — however broken — is not
+        // in this plan and does not stop it.
+        let (release, plan, mut fresh) = about_to_apply();
+        assert_eq!(plan.selection.targets, ["n1"]);
+        fresh.hosts.insert(
+            "newcomer".to_string(),
+            crate::observation::HostObservation::unreachable("it is on fire"),
+        );
+        assert!(validate_against(&plan, &release, &fresh, later()).is_proceed());
+        assert_eq!(plan.selection.targets, ["n1"], "still just n1");
+    }
+
+    // -----------------------------------------------------------------
+    // approvals
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn an_approval_for_another_plan_does_not_count() {
+        let (release, observation) = upgrade(&["box"], true);
+        let plan = planned(&release, "host=box", &observation);
+        let classes: Vec<ApprovalClass> = plan.approvals.iter().map(|a| a.class).collect();
+        assert!(classes.contains(&ApprovalClass::Reboot));
+
+        assert_eq!(approvals_missing(&plan, &[]), classes);
+        assert_eq!(
+            approvals_missing(
+                &plan,
+                &[(ApprovalClass::Reboot, "plan-from-yesterday".to_string())]
+            ),
+            classes,
+            "a grant for another plan approves that other plan"
+        );
+        let all: Vec<(ApprovalClass, String)> =
+            classes.iter().map(|c| (*c, plan.plan_id.clone())).collect();
+        assert!(approvals_missing(&plan, &all).is_empty());
+    }
+
+    #[test]
+    fn a_plan_that_needs_nothing_asks_for_nothing() {
+        let (release, observation) = upgrade(&["n1"], false);
+        let plan = planned(&release, "host=n1", &observation);
+        // A plain switch on a compute host: disruptive, and that is all.
+        assert_eq!(
+            plan.approvals.iter().map(|a| a.class).collect::<Vec<_>>(),
+            [ApprovalClass::Disruptive]
+        );
+    }
+
+    #[test]
+    fn an_approval_class_reads_back_from_what_it_prints() {
+        for class in [
+            ApprovalClass::None,
+            ApprovalClass::Disruptive,
+            ApprovalClass::Quorum,
+            ApprovalClass::Reboot,
+            ApprovalClass::Singleton,
+            ApprovalClass::Destructive,
+        ] {
+            assert_eq!(ApprovalClass::parse(class.as_str()).unwrap(), class);
+        }
+        let err = ApprovalClass::parse("whatever").unwrap_err().to_string();
+        assert!(err.contains("disruptive"), "{err}");
     }
 }
