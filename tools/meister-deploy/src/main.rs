@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use meister_deploy::effects::{Files, RealFiles};
+use meister_deploy::inventory::Inventory;
 use meister_deploy::legacy::fleet::Plan;
 use meister_deploy::legacy::ops::{self, Ctx};
 use meister_deploy::legacy::remote::Ssh;
@@ -41,13 +42,30 @@ enum Verb {
         kind: String,
     },
 
-    /// Check a file against the contracts. Reads nothing else and asks
-    /// nobody anything.
-    Validate {
-        /// A `nix-manifest/1` or `resolved-fleet/1` json file, or `-` for
-        /// standard input
+    /// What the inventory says: the hosts, their groups, and what each one
+    /// inherited. Reads one file and asks nobody anything.
+    Inventory {
+        /// The inventory
+        #[arg(short = 'f', long, default_value = "fleet.toml")]
+        fleet: PathBuf,
+        /// Print it as json instead of as a table
         #[arg(long)]
-        manifest: String,
+        json: bool,
+    },
+
+    /// Check the inventory, or a contract file, against the types. Reads
+    /// nothing else and asks nobody anything.
+    Validate {
+        /// The inventory
+        #[arg(short = 'f', long, default_value = "fleet.toml")]
+        fleet: PathBuf,
+        /// A `nix-manifest/1` or `resolved-fleet/1` json file, or `-` for
+        /// standard input, instead of the inventory
+        #[arg(long)]
+        manifest: Option<String>,
+        /// Also evaluate the operator flake
+        #[arg(long)]
+        nix: bool,
     },
 
     /// The tool as it was before v1: the `fleet.toml` of schema 1, the rsync
@@ -170,7 +188,12 @@ fn run() -> Result<bool> {
     let cli = Cli::parse();
     match &cli.cmd {
         Verb::Schema { kind } => print_schema(kind),
-        Verb::Validate { manifest } => validate_manifest(manifest),
+        Verb::Inventory { fleet, json } => show_inventory(fleet, *json),
+        Verb::Validate {
+            fleet,
+            manifest,
+            nix,
+        } => validate(fleet, manifest.as_deref(), *nix),
         Verb::Legacy(legacy) => run_legacy(legacy),
     }
 }
@@ -190,6 +213,59 @@ fn print_schema(kind: &str) -> Result<bool> {
     };
     println!("{}", serde_json::to_string_pretty(&schema)?);
     Ok(true)
+}
+
+fn show_inventory(path: &Path, json: bool) -> Result<bool> {
+    let files = RealFiles::new(Policy::real());
+    let inventory = Inventory::load(&files, path)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&inventory.report()?)?);
+    } else {
+        print!("{}", inventory.table()?);
+    }
+    Ok(true)
+}
+
+fn validate(fleet: &Path, manifest: Option<&str>, nix: bool) -> Result<bool> {
+    if nix {
+        // Not a silent success and not a silent skip: the flake half of
+        // this verb is lane 1B's, and saying so is the only honest answer
+        // this binary can give today.
+        anyhow::bail!(
+            "--nix needs the operator flake and its `meisterDeployment` attribute, \
+             which arrives with lane 1B. Without it, `validate` checks the inventory \
+             and `validate --manifest <file>` checks a contract object."
+        );
+    }
+    match manifest {
+        Some(from) => validate_manifest(from),
+        None => {
+            let files = RealFiles::new(Policy::real());
+            match Inventory::load(&files, fleet) {
+                Ok(inventory) => {
+                    println!(
+                        "ok: {} is a schema {} inventory for the fleet {:?}, {} host(s), \
+                         {} group(s)",
+                        fleet.display(),
+                        inventory.schema,
+                        inventory.fleet.name,
+                        inventory.hosts.len(),
+                        inventory.groups.len()
+                    );
+                    eprintln!(
+                        "note: the shape was checked, not the fleet. No address was \
+                         resolved, no host asked, and no deployment value derived — \
+                         that is what `resolve` and Nix do."
+                    );
+                    Ok(true)
+                }
+                Err(e) => {
+                    eprintln!("meister-deploy: {e:#}");
+                    Ok(false)
+                }
+            }
+        }
+    }
 }
 
 fn validate_manifest(from: &str) -> Result<bool> {

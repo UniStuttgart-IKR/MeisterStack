@@ -22,6 +22,7 @@ pub mod canonical;
 pub mod checks;
 pub mod effects;
 pub mod ids;
+pub mod inventory;
 pub mod legacy;
 pub mod manifest;
 pub mod run;
