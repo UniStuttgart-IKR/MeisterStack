@@ -15,15 +15,26 @@
 //! module therefore refuses a dirty tree outright, and `--dev` is the way to
 //! say "yes, I know" — at the price of a content snapshot, a secret scan and
 //! a `dev:` fingerprint that cannot be mistaken for a revision.
+//!
+//! The snapshot is MATERIALIZED, and that is not an optimization. Pointing
+//! nix at the working tree with `path:` would copy the whole directory into
+//! the store — including everything `.gitignore` excludes, which in the
+//! operator template is `keys/`, `.meister-deploy/runs/` and `result*`. A
+//! signing key would land world-readable in `/nix/store` and stay there, and
+//! an ignored-but-imported `local.nix` would change the evaluation without
+//! changing the fingerprint. So exactly the listed and scanned file set is
+//! copied to `.meister-deploy/snapshots/<content hash>/`, and nix evaluates
+//! that: what was hashed, what was scanned and what was evaluated are one
+//! set of bytes.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-use crate::effects::Files;
+use crate::effects::{Entry, Files};
 use crate::ids::{hex, sha256_hex};
 use crate::manifest::{DevMode, FlakeInput, SecretScan, Source};
 use crate::run::{Cmd, Effect, Runner};
@@ -31,6 +42,34 @@ use crate::run::{Cmd, Effect, Runner};
 /// Git answers in milliseconds on any tree this tool will meet; a minute is
 /// there for the case where it is answering from a cold network filesystem.
 const GIT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Where a snapshot of a dirty tree is kept, under the operator's repository
+/// so that it shares a filesystem with it and is covered by the template's
+/// `.gitignore`.
+pub const SNAPSHOT_DIR: &str = ".meister-deploy/snapshots";
+
+/// Where nix would evaluate a tree with this content hash.
+pub fn snapshot_dir(repo: &Path, content_hash: &str) -> PathBuf {
+    repo.join(SNAPSHOT_DIR).join(content_hash)
+}
+
+/// The marker that says a snapshot directory is complete. Kept BESIDE the
+/// directory rather than inside it, so that what nix evaluates is exactly the
+/// file set that was hashed and nothing else.
+fn snapshot_marker(repo: &Path, content_hash: &str) -> PathBuf {
+    repo.join(SNAPSHOT_DIR)
+        .join(format!("{content_hash}.complete"))
+}
+
+/// What `resolve` needs to know about a tree: how to name it in a manifest,
+/// and which directory nix is to be pointed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tree {
+    pub source: Source,
+    /// The repository itself for a clean tree; the materialized snapshot for
+    /// `--dev`. Never anything else.
+    pub eval_dir: PathBuf,
+}
 
 /// What a dirty tree looked like, before it was refused or snapshotted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -56,7 +95,7 @@ pub fn describe(
     repo: &Path,
     inventory: &Path,
     dev: bool,
-) -> Result<Source> {
+) -> Result<Tree> {
     if !repo.is_absolute() {
         bail!(
             "{} is not an absolute path, and a manifest has to name the tree it came \
@@ -76,16 +115,19 @@ pub fn describe(
     let flake_lock = read_flake_lock(files, repo)?;
 
     if worktree.is_clean() {
-        return Ok(Source {
-            repo_path: repo.to_string_lossy().into_owned(),
-            git_rev: Some(rev.clone()),
-            tree_hash: Some(tree.clone()),
-            dirty: false,
-            fingerprint: format!("git:{rev}:{tree}"),
-            dev_mode: None,
-            flake_lock,
-            inventory_path,
-            inventory_sha256,
+        return Ok(Tree {
+            source: Source {
+                repo_path: repo.to_string_lossy().into_owned(),
+                git_rev: Some(rev.clone()),
+                tree_hash: Some(tree.clone()),
+                dirty: false,
+                fingerprint: format!("git:{rev}:{tree}"),
+                dev_mode: None,
+                flake_lock,
+                inventory_path,
+                inventory_sha256,
+            },
+            eval_dir: repo.to_path_buf(),
         });
     }
 
@@ -93,30 +135,36 @@ pub fn describe(
         bail!("{}", dirty_refusal(repo, &worktree));
     }
 
-    let snapshot = snapshot(runner, files, repo)?;
+    let (snapshot, entries) = scan(runner, files, repo)?;
     if !snapshot.secret_scan.ok {
+        // Before a single byte is copied anywhere.
         bail!(
             "the working tree of {} carries what looks like key material: {}. \
-             A --dev resolve copies the whole tree into the nix store, where it is \
-             world-readable and stays. Move the keys out of the repository, or commit \
+             A --dev resolve copies those files into the nix store, where they are \
+             world-readable and stay. Move the keys out of the repository, or commit \
              the tree and resolve without --dev.",
             repo.display(),
             snapshot.secret_scan.hits.join(", ")
         );
     }
+    let eval_dir = materialize(files, repo, &snapshot.content_hash, &entries)?;
 
-    Ok(Source {
-        repo_path: repo.to_string_lossy().into_owned(),
-        git_rev: Some(rev),
-        tree_hash: Some(tree),
-        dirty: true,
-        // A different namespace on purpose: `dev:` in a receipt means nobody
-        // can check this tree out again, and that has to be unmissable.
-        fingerprint: format!("dev:{}", snapshot.content_hash),
-        dev_mode: Some(snapshot),
-        flake_lock,
-        inventory_path,
-        inventory_sha256,
+    Ok(Tree {
+        source: Source {
+            repo_path: repo.to_string_lossy().into_owned(),
+            git_rev: Some(rev),
+            tree_hash: Some(tree),
+            dirty: true,
+            // A different namespace on purpose: `dev:` in a receipt means
+            // nobody can check this tree out again, and that has to be
+            // unmissable.
+            fingerprint: format!("dev:{}", snapshot.content_hash),
+            dev_mode: Some(snapshot),
+            flake_lock,
+            inventory_path,
+            inventory_sha256,
+        },
+        eval_dir,
     })
 }
 
@@ -206,9 +254,16 @@ fn status(runner: &dyn Runner, repo: &Path) -> Result<Worktree> {
 }
 
 /// Everything git would show plus everything it would not: `-c` is cached,
-/// `-o` is other, `--exclude-standard` drops what `.gitignore` drops. The
-/// hash covers path AND content, so moving a file is a different snapshot.
-fn snapshot(runner: &dyn Runner, files: &dyn Files, repo: &Path) -> Result<DevMode> {
+/// `-o` is other, `--exclude-standard` drops what `.gitignore` drops.
+///
+/// The hash covers path, KIND and content, so moving a file, turning it into
+/// a link, or giving it the execute bit are each a different snapshot — all
+/// three change what nix would build.
+fn scan(
+    runner: &dyn Runner,
+    files: &dyn Files,
+    repo: &Path,
+) -> Result<(DevMode, Vec<(String, Entry)>)> {
     let listing = runner.run(&git_cmd(
         repo,
         &["ls-files", "-co", "--exclude-standard", "-z"],
@@ -217,6 +272,10 @@ fn snapshot(runner: &dyn Runner, files: &dyn Files, repo: &Path) -> Result<DevMo
         .stdout
         .split('\0')
         .filter(|e| !e.is_empty())
+        // Always, whatever the repository's .gitignore says: the snapshots
+        // live under here, and a snapshot that contained the snapshot
+        // directory would contain itself.
+        .filter(|path| !is_state_path(path))
         .map(str::to_string)
         .collect();
     paths.sort();
@@ -224,36 +283,114 @@ fn snapshot(runner: &dyn Runner, files: &dyn Files, repo: &Path) -> Result<DevMo
 
     let mut hasher = Sha256::new();
     let mut hits = Vec::new();
+    let mut entries = Vec::new();
     for path in &paths {
-        let bytes = files.read(&repo.join(path))?;
+        let full = repo.join(path);
+        let entry = files.entry(&full)?;
         // Length-prefixed and NUL-separated, so that "ab" + "c" and "a" +
         // "bc" cannot hash to the same snapshot.
         hasher.update(path.as_bytes());
         hasher.update(b"\0");
-        hasher.update(bytes.len().to_string().as_bytes());
-        hasher.update(b"\0");
-        hasher.update(&bytes);
-        if looks_like_a_secret(path, &bytes) {
-            hits.push(path.clone());
+        match &entry {
+            Entry::File { mode } => {
+                let bytes = files.read(&full)?;
+                hasher.update(if mode & 0o111 != 0 { b"fx" } else { b"f-" });
+                hasher.update(b"\0");
+                hasher.update(bytes.len().to_string().as_bytes());
+                hasher.update(b"\0");
+                hasher.update(&bytes);
+                if looks_like_a_secret(path, &bytes) {
+                    hits.push(path.clone());
+                }
+            }
+            Entry::Symlink { target } => {
+                // The link is hashed and copied as a link. Following it would
+                // be how a link to ~/.ssh/id_ed25519 becomes a key in the
+                // store; as a link it stays a dangling name.
+                let target = target.to_string_lossy();
+                hasher.update(b"l");
+                hasher.update(b"\0");
+                hasher.update(target.len().to_string().as_bytes());
+                hasher.update(b"\0");
+                hasher.update(target.as_bytes());
+                if named_like_a_secret(path) {
+                    hits.push(path.clone());
+                }
+            }
+            Entry::Other => bail!(
+                "{} is neither a regular file nor a symbolic link, and a --dev \
+                 snapshot copies nothing else. A socket, a fifo or a device node in \
+                 a flake is not something nix would evaluate either: take it out of \
+                 the repository, or add it to .gitignore.",
+                full.display()
+            ),
         }
+        entries.push((path.clone(), entry));
     }
 
     let untracked = status(runner, repo)?.untracked;
-    Ok(DevMode {
-        content_hash: hex(&hasher.finalize()),
-        untracked_files: untracked,
-        secret_scan: SecretScan {
-            ok: hits.is_empty(),
-            hits,
+    Ok((
+        DevMode {
+            content_hash: hex(&hasher.finalize()),
+            untracked_files: untracked,
+            secret_scan: SecretScan {
+                ok: hits.is_empty(),
+                hits,
+            },
         },
-    })
+        entries,
+    ))
+}
+
+/// Anything under the state directory, whatever the repository's `.gitignore`
+/// happens to say.
+fn is_state_path(path: &str) -> bool {
+    path == ".meister-deploy" || path.starts_with(".meister-deploy/")
+}
+
+/// Copy exactly the scanned file set to `.meister-deploy/snapshots/<hash>/`
+/// and return that directory.
+///
+/// The directory is named after its own content, so an existing complete one
+/// holds exactly these bytes and is reused. The completion marker sits beside
+/// the directory rather than in it: a run that died half way leaves no marker,
+/// and the next run rewrites every file over what is there — each write is
+/// atomic, and the set is the same set.
+fn materialize(
+    files: &dyn Files,
+    repo: &Path,
+    content_hash: &str,
+    entries: &[(String, Entry)],
+) -> Result<PathBuf> {
+    let dir = snapshot_dir(repo, content_hash);
+    let marker = snapshot_marker(repo, content_hash);
+    if files.exists(&marker) {
+        return Ok(dir);
+    }
+
+    files.create_dir_all(&dir)?;
+    for (path, entry) in entries {
+        let to = dir.join(path);
+        if let Some(parent) = to.parent() {
+            files.create_dir_all(parent)?;
+        }
+        match entry {
+            Entry::File { mode } => {
+                let bytes = files.read(&repo.join(path))?;
+                files.write_atomic(&to, &bytes, *mode)?;
+            }
+            Entry::Symlink { target } => files.symlink_atomic(target, &to)?,
+            Entry::Other => unreachable!("scan refused it"),
+        }
+    }
+    files.write_atomic(&marker, content_hash.as_bytes(), 0o644)?;
+    Ok(dir)
 }
 
 /// Two rules, and the second one is the one that catches the file nobody
 /// named `.key`: anything whose bytes carry a PEM private key header.
 fn looks_like_a_secret(path: &str, bytes: &[u8]) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    if name.ends_with(".key") || name == "secrets.key" {
+    if named_like_a_secret(path) {
         return true;
     }
     // Only text files are searched, and only the first part of them: a
@@ -264,6 +401,13 @@ fn looks_like_a_secret(path: &str, bytes: &[u8]) -> bool {
         return false;
     };
     text.lines().any(|line| line.contains("PRIVATE KEY"))
+}
+
+/// The name rule on its own — all a symbolic link can be judged by, since
+/// its bytes are a path and not a key.
+fn named_like_a_secret(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.ends_with(".key") || name == "secrets.key"
 }
 
 /// The inputs as the lock file pins them. Not the tool's own dependencies —
@@ -438,8 +582,10 @@ mod tests {
     fn a_clean_tree_is_named_by_its_revision_and_its_tree() {
         let runner = clean_git();
         let files = base_files();
-        let source = describe(&runner, &files, &repo(), Path::new("fleet.toml"), false).unwrap();
+        let tree = describe(&runner, &files, &repo(), Path::new("fleet.toml"), false).unwrap();
         runner.verify().unwrap();
+        assert_eq!(tree.eval_dir, repo(), "a clean tree is evaluated in place");
+        let source = tree.source;
 
         assert!(!source.dirty);
         assert_eq!(source.git_rev.as_deref(), Some(REV));
@@ -484,8 +630,7 @@ mod tests {
         assert_eq!(runner.calls(), listed);
 
         let files = base_files().given(repo().join("profiles/new.nix"), "{ }\n");
-        let source = dirty_dev(files, "fleet.toml\0profiles/new.nix\0");
-        assert!(source.is_ok());
+        assert!(dirty_dev(files, "fleet.toml\0profiles/new.nix\0").is_ok());
         let listed: Vec<String> = commands(&repo(), true).iter().map(|c| c.line()).collect();
         assert_eq!(listed.len(), 5, "{listed:?}");
     }
@@ -555,7 +700,13 @@ mod tests {
         assert!(!err.contains("hosts/old.nix"), "{err}");
     }
 
-    fn dirty_dev(files: MemFiles, listing: &str) -> Result<Source> {
+    fn dirty_dev(files: MemFiles, listing: &str) -> Result<Tree> {
+        dirty_dev_on(&files, listing)
+    }
+
+    /// The same, keeping the test filesystem so a test can read the snapshot
+    /// back out of it.
+    fn dirty_dev_on(files: &MemFiles, listing: &str) -> Result<Tree> {
         let runner = StrictFake::new()
             .expect(
                 Matcher::exact("git", ["rev-parse", "HEAD"]),
@@ -577,7 +728,7 @@ mod tests {
                 Matcher::exact("git", ["status", "--porcelain=v1", "-z"]),
                 Output::stdout("?? profiles/new.nix\0"),
             );
-        let out = describe(&runner, &files, &repo(), Path::new("fleet.toml"), true);
+        let out = describe(&runner, files, &repo(), Path::new("fleet.toml"), true);
         let _ = runner.verify();
         out
     }
@@ -585,7 +736,9 @@ mod tests {
     #[test]
     fn dev_mode_records_a_snapshot_of_what_is_really_there() {
         let files = base_files().given(repo().join("profiles/new.nix"), "{ }\n");
-        let source = dirty_dev(files, "fleet.toml\0profiles/new.nix\0").unwrap();
+        let source = dirty_dev(files, "fleet.toml\0profiles/new.nix\0")
+            .unwrap()
+            .source;
         assert!(source.dirty);
         assert!(
             source.fingerprint.starts_with("dev:"),
@@ -604,12 +757,14 @@ mod tests {
             base_files().given(repo().join("profiles/new.nix"), "{ }\n"),
             "fleet.toml\0profiles/new.nix\0",
         )
-        .unwrap();
+        .unwrap()
+        .source;
         let b = dirty_dev(
             base_files().given(repo().join("profiles/new.nix"), "{ } \n"),
             "fleet.toml\0profiles/new.nix\0",
         )
-        .unwrap();
+        .unwrap()
+        .source;
         assert_ne!(a.fingerprint, b.fingerprint);
     }
 
@@ -619,12 +774,14 @@ mod tests {
             base_files().given(repo().join("a.nix"), "{ }\n"),
             "a.nix\0fleet.toml\0",
         )
-        .unwrap();
+        .unwrap()
+        .source;
         let b = dirty_dev(
             base_files().given(repo().join("b.nix"), "{ }\n"),
             "b.nix\0fleet.toml\0",
         )
-        .unwrap();
+        .unwrap()
+        .source;
         assert_ne!(a.fingerprint, b.fingerprint, "the path is part of the hash");
     }
 
@@ -656,8 +813,215 @@ mod tests {
             repo().join("trust/external-ca.crt"),
             "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
         );
-        let source = dirty_dev(files, "fleet.toml\0trust/external-ca.crt\0").unwrap();
+        let source = dirty_dev(files, "fleet.toml\0trust/external-ca.crt\0")
+            .unwrap()
+            .source;
         assert!(source.dev_mode.unwrap().secret_scan.ok);
+    }
+
+    // ---------------------------------------------------------------
+    // The snapshot: what --dev copies, and what it must not copy.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn nix_is_pointed_at_the_snapshot_and_never_at_the_working_tree() {
+        let files = base_files().given(repo().join("profiles/new.nix"), "{ }\n");
+        let tree = dirty_dev_on(&files, "fleet.toml\0profiles/new.nix\0").unwrap();
+        let hash = tree.source.dev_mode.as_ref().unwrap().content_hash.clone();
+
+        assert_eq!(tree.eval_dir, snapshot_dir(&repo(), &hash));
+        assert_ne!(tree.eval_dir, repo());
+        assert!(tree.eval_dir.starts_with(repo().join(SNAPSHOT_DIR)));
+        // And the files really are there, with their content.
+        assert_eq!(
+            files
+                .content(tree.eval_dir.join("profiles/new.nix"))
+                .unwrap(),
+            b"{ }\n"
+        );
+        assert_eq!(
+            files.content(tree.eval_dir.join("fleet.toml")).unwrap(),
+            b"schema = 2\n"
+        );
+    }
+
+    #[test]
+    fn an_ignored_secret_reaches_neither_the_snapshot_nor_the_scan() {
+        // `keys/cache.sec` is in the working tree and NOT in the listing,
+        // which is exactly what `--exclude-standard` does to a .gitignore'd
+        // path. Pointing nix at the repository would have copied it into the
+        // store anyway; pointing it at the snapshot cannot.
+        let files = base_files()
+            .given(repo().join("profiles/new.nix"), "{ }\n")
+            .given(
+                repo().join("keys/cache.sec"),
+                "-----BEGIN PRIVATE KEY-----\nMIIB\n",
+            );
+        let tree = dirty_dev_on(&files, "fleet.toml\0profiles/new.nix\0").unwrap();
+
+        assert!(tree.source.dev_mode.as_ref().unwrap().secret_scan.ok);
+        assert!(
+            files
+                .content(tree.eval_dir.join("keys/cache.sec"))
+                .is_none(),
+            "an ignored key was copied into the snapshot"
+        );
+        for path in files.paths() {
+            let inside = path.starts_with(&tree.eval_dir);
+            assert!(
+                !inside || !path.to_string_lossy().contains("cache.sec"),
+                "{} is inside what nix will copy",
+                path.display()
+            );
+        }
+        // Nothing under the snapshot mentions the key, and the flake
+        // reference names the snapshot.
+        assert!(!crate::nix::flake_ref(&tree.eval_dir, true).contains("keys"));
+    }
+
+    #[test]
+    fn the_state_directory_is_never_part_of_a_snapshot_of_itself() {
+        // Even when a repository's .gitignore does not exclude it, so git
+        // lists it: a snapshot that contained the snapshot directory would
+        // contain itself, and grow by one copy per resolve.
+        let files = base_files()
+            .given(repo().join(".meister-deploy/runs/x/journal.jsonl"), "{}\n")
+            .given(
+                repo().join(".meister-deploy/snapshots/old/fleet.toml"),
+                "old\n",
+            );
+        let tree = dirty_dev_on(
+            &files,
+            "fleet.toml\0.meister-deploy/runs/x/journal.jsonl\0.meister-deploy/snapshots/old/fleet.toml\0",
+        )
+        .unwrap();
+        assert!(
+            files
+                .content(tree.eval_dir.join(".meister-deploy/runs/x/journal.jsonl"))
+                .is_none()
+        );
+        assert!(
+            files
+                .content(
+                    tree.eval_dir
+                        .join(".meister-deploy/snapshots/old/fleet.toml")
+                )
+                .is_none()
+        );
+        assert_eq!(
+            files.content(tree.eval_dir.join("fleet.toml")).unwrap(),
+            b"schema = 2\n"
+        );
+    }
+
+    #[test]
+    fn the_same_tree_twice_is_the_same_directory_written_once() {
+        let files = base_files().given(repo().join("profiles/new.nix"), "{ }\n");
+        let first = dirty_dev_on(&files, "fleet.toml\0profiles/new.nix\0").unwrap();
+        let wrote = files.attempts().len();
+        assert!(wrote > 0, "the first resolve wrote the snapshot");
+
+        let second = dirty_dev_on(&files, "fleet.toml\0profiles/new.nix\0").unwrap();
+        assert_eq!(first.eval_dir, second.eval_dir);
+        assert_eq!(
+            first.source.fingerprint, second.source.fingerprint,
+            "same content, same name"
+        );
+        assert_eq!(
+            files.attempts().len(),
+            wrote,
+            "the second resolve wrote nothing: {:?}",
+            &files.attempts()[wrote..]
+        );
+    }
+
+    #[test]
+    fn the_execute_bit_travels_and_changes_the_name() {
+        let plain = base_files().given(repo().join("hook.sh"), "#!/bin/sh\n");
+        let a = dirty_dev_on(&plain, "fleet.toml\0hook.sh\0").unwrap();
+
+        let exec = base_files().given_exec(repo().join("hook.sh"), "#!/bin/sh\n");
+        let b = dirty_dev_on(&exec, "fleet.toml\0hook.sh\0").unwrap();
+
+        assert_ne!(
+            a.source.fingerprint, b.source.fingerprint,
+            "a file that gained the execute bit is a different build"
+        );
+        assert_eq!(
+            exec.attempts()
+                .iter()
+                .filter(|a| a.contains("hook.sh"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![format!(
+                "write(0755) {}",
+                b.eval_dir.join("hook.sh").display()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_symbolic_link_is_copied_as_a_link_and_never_followed() {
+        // The dangerous case: a link out of the repository into a key. As a
+        // link it is a dangling name in the store; followed, it would be the
+        // key itself.
+        let files = base_files().given_symlink(repo().join("id"), "/home/silas/.ssh/id_ed25519");
+        let tree = dirty_dev_on(&files, "fleet.toml\0id\0").unwrap();
+
+        assert_eq!(
+            files.link_target(tree.eval_dir.join("id")).unwrap(),
+            PathBuf::from("/home/silas/.ssh/id_ed25519")
+        );
+        assert!(
+            files.content(tree.eval_dir.join("id")).is_none(),
+            "the link was followed and its target copied"
+        );
+    }
+
+    #[test]
+    fn a_link_that_points_somewhere_else_is_a_different_snapshot() {
+        let a = dirty_dev(
+            base_files().given_symlink(repo().join("cfg"), "hosts/a.nix"),
+            "cfg\0fleet.toml\0",
+        )
+        .unwrap()
+        .source;
+        let b = dirty_dev(
+            base_files().given_symlink(repo().join("cfg"), "hosts/b.nix"),
+            "cfg\0fleet.toml\0",
+        )
+        .unwrap()
+        .source;
+        assert_ne!(a.fingerprint, b.fingerprint);
+    }
+
+    #[test]
+    fn something_that_is_neither_a_file_nor_a_link_is_refused_with_a_sentence() {
+        let files = base_files().given_other(repo().join("agent.sock"));
+        let err = dirty_dev(files, "agent.sock\0fleet.toml\0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("agent.sock"), "{err}");
+        assert!(
+            err.contains("neither a regular file nor a symbolic link"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_key_in_the_listing_stops_the_resolve_before_anything_is_copied() {
+        let files = base_files().given(repo().join("keys/identity.key"), "not really a key");
+        let before = files.attempts().len();
+        let err = dirty_dev_on(&files, "fleet.toml\0keys/identity.key\0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("keys/identity.key"), "{err}");
+        assert_eq!(
+            files.attempts().len(),
+            before,
+            "the refusal happened after something had been written: {:?}",
+            files.attempts()
+        );
     }
 
     #[test]
@@ -679,7 +1043,9 @@ mod tests {
         let files = MemFiles::new()
             .given(repo().join("fleet.toml"), "schema = 2\n")
             .given(repo().join("flake.lock"), lock);
-        let source = describe(&runner, &files, &repo(), Path::new("fleet.toml"), false).unwrap();
+        let source = describe(&runner, &files, &repo(), Path::new("fleet.toml"), false)
+            .unwrap()
+            .source;
         assert_eq!(
             source.flake_lock["odd"].url,
             r#"{"narHash":"sha256-c=","type":"weird"}"#

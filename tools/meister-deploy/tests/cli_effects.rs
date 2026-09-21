@@ -183,6 +183,41 @@ fn a_dry_run_prints_the_command_lines_and_runs_none_of_them() {
 }
 
 #[test]
+fn a_dev_dry_run_creates_no_snapshot_directory() {
+    let sandbox = Sandbox::new();
+    let before = snapshot(sandbox.cwd.path());
+    let target = sandbox.out_path("manifest.json");
+
+    let out = sandbox.run(&[
+        "resolve",
+        "--repo",
+        ".",
+        "--out",
+        target.to_str().unwrap(),
+        "--dev",
+        "--dry-run",
+    ]);
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    let printed = stdout(&out);
+    // It says where the snapshot WOULD go, and the name it cannot know yet
+    // is spelled out as what it is.
+    assert!(
+        printed.contains(".meister-deploy/snapshots/<content-hash>"),
+        "{printed}"
+    );
+    assert!(printed.contains("path:"), "{printed}");
+    assert!(!printed.contains("git+file://"), "{printed}");
+
+    assert!(sandbox.calls().is_empty(), "{:?}", sandbox.calls());
+    assert!(
+        !sandbox.cwd.path().join(".meister-deploy").exists(),
+        "a dry run created the state directory"
+    );
+    assert_eq!(before, snapshot(sandbox.cwd.path()));
+}
+
+#[test]
 fn an_offline_resolve_refuses_and_touches_nothing() {
     let sandbox = Sandbox::new();
     let before_cwd = snapshot(sandbox.cwd.path());

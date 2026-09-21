@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -30,6 +30,22 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::run::{Effect, Policy};
+
+/// What a path in a working tree is, WITHOUT following a symbolic link.
+///
+/// The distinction is the whole point of `--dev`: a link that points at
+/// `~/.ssh/id_ed25519` is copied as a link and stays dangling in the nix
+/// store; the same path followed would copy the key itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entry {
+    /// A regular file, and the low nine bits of its mode. The execute bit is
+    /// kept because it is part of what nix hashes.
+    File { mode: u32 },
+    /// A symbolic link, and where it points, verbatim.
+    Symlink { target: PathBuf },
+    /// A directory, a socket, a fifo, a device node. Nothing this tool copies.
+    Other,
+}
 
 /// Every file this tool reads or writes goes through here.
 ///
@@ -50,6 +66,14 @@ pub trait Files {
     fn write_atomic(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()>;
 
     fn create_dir_all(&self, path: &Path) -> Result<()>;
+
+    /// What is at this path, without following a link.
+    fn entry(&self, path: &Path) -> Result<Entry>;
+
+    /// Make `link` point at `target`, replacing whatever is there. Atomic for
+    /// the same reason `write_atomic` is: a snapshot with half a link in it
+    /// is a snapshot nix would evaluate.
+    fn symlink_atomic(&self, target: &Path, link: &Path) -> Result<()>;
 
     /// Append one line and make it durable before returning. The journal's
     /// whole worth is that an entry written before an irreversible action is
@@ -143,6 +167,48 @@ impl Files for RealFiles {
         std::fs::create_dir_all(path).with_context(|| format!("creating {} failed", path.display()))
     }
 
+    fn entry(&self, path: &Path) -> Result<Entry> {
+        // `symlink_metadata` and not `metadata`: the second one follows.
+        let meta = std::fs::symlink_metadata(path)
+            .with_context(|| format!("looking at {} failed", path.display()))?;
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(path)
+                .with_context(|| format!("reading the link {} failed", path.display()))?;
+            Ok(Entry::Symlink { target })
+        } else if meta.is_file() {
+            Ok(Entry::File {
+                mode: meta.permissions().mode() & 0o777,
+            })
+        } else {
+            Ok(Entry::Other)
+        }
+    }
+
+    fn symlink_atomic(&self, target: &Path, link: &Path) -> Result<()> {
+        self.may_write(link)?;
+        let dir = link.parent().unwrap_or(Path::new("."));
+        let name = link
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "link".to_string());
+        let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+        // A leftover from a run that died between these two lines. It is ours
+        // by name and it is in the way.
+        let _ = std::fs::remove_file(&tmp);
+        std::os::unix::fs::symlink(target, &tmp)
+            .with_context(|| format!("linking {} to {} failed", tmp.display(), target.display()))?;
+        std::fs::rename(&tmp, link).with_context(|| {
+            format!(
+                "moving the link {} into place as {} failed",
+                tmp.display(),
+                link.display()
+            )
+        })?;
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("making the new {} durable failed", link.display()))
+    }
+
     fn append_fsync(&self, path: &Path, line: &str) -> Result<()> {
         self.may_write(path)?;
         let mut file = OpenOptions::new()
@@ -170,6 +236,11 @@ impl Files for RealFiles {
 pub struct MemFiles {
     policy: Policy,
     files: RefCell<BTreeMap<PathBuf, Vec<u8>>>,
+    modes: RefCell<BTreeMap<PathBuf, u32>>,
+    links: RefCell<BTreeMap<PathBuf, PathBuf>>,
+    /// Paths that are neither a file nor a link: what a test uses to make a
+    /// fifo or a socket appear in a listing.
+    others: RefCell<BTreeSet<PathBuf>>,
     dirs: RefCell<BTreeSet<PathBuf>>,
     attempts: RefCell<Vec<String>>,
 }
@@ -188,6 +259,29 @@ impl MemFiles {
     pub fn given(self, path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> MemFiles {
         self.files.borrow_mut().insert(path.into(), contents.into());
         self
+    }
+
+    /// The same, with the execute bit set.
+    pub fn given_exec(self, path: impl Into<PathBuf>, contents: impl Into<Vec<u8>>) -> MemFiles {
+        let path = path.into();
+        self.modes.borrow_mut().insert(path.clone(), 0o755);
+        self.given(path, contents)
+    }
+
+    pub fn given_symlink(self, link: impl Into<PathBuf>, target: impl Into<PathBuf>) -> MemFiles {
+        self.links.borrow_mut().insert(link.into(), target.into());
+        self
+    }
+
+    /// Something that is not a file and not a link — a fifo, a socket.
+    pub fn given_other(self, path: impl Into<PathBuf>) -> MemFiles {
+        self.others.borrow_mut().insert(path.into());
+        self
+    }
+
+    /// Where a link in this test filesystem points.
+    pub fn link_target(&self, path: impl AsRef<Path>) -> Option<PathBuf> {
+        self.links.borrow().get(path.as_ref()).cloned()
     }
 
     /// Every write, create or append this run asked for, refused ones
@@ -233,7 +327,10 @@ impl Files for MemFiles {
     }
 
     fn exists(&self, path: &Path) -> bool {
-        self.files.borrow().contains_key(path) || self.dirs.borrow().contains(path)
+        self.files.borrow().contains_key(path)
+            || self.dirs.borrow().contains(path)
+            || self.links.borrow().contains_key(path)
+            || self.others.borrow().contains(path)
     }
 
     fn write_atomic(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
@@ -247,6 +344,33 @@ impl Files for MemFiles {
     fn create_dir_all(&self, path: &Path) -> Result<()> {
         self.may_write("mkdir", path)?;
         self.dirs.borrow_mut().insert(path.to_path_buf());
+        Ok(())
+    }
+
+    fn entry(&self, path: &Path) -> Result<Entry> {
+        if let Some(target) = self.links.borrow().get(path) {
+            return Ok(Entry::Symlink {
+                target: target.clone(),
+            });
+        }
+        if self.others.borrow().contains(path) || self.dirs.borrow().contains(path) {
+            return Ok(Entry::Other);
+        }
+        if self.files.borrow().contains_key(path) {
+            let mode = self.modes.borrow().get(path).copied().unwrap_or(0o644);
+            return Ok(Entry::File { mode });
+        }
+        bail!(
+            "looking at {} failed: no such file in this test.",
+            path.display()
+        )
+    }
+
+    fn symlink_atomic(&self, target: &Path, link: &Path) -> Result<()> {
+        self.may_write(&format!("link(-> {})", target.display()), link)?;
+        self.links
+            .borrow_mut()
+            .insert(link.to_path_buf(), target.to_path_buf());
         Ok(())
     }
 
@@ -337,7 +461,6 @@ mod tests {
 
     #[test]
     fn an_atomic_write_leaves_no_temporary_and_the_mode_asked_for() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manifest.json");
         let files = RealFiles::new(Policy::real());

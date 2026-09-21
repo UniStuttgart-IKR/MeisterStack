@@ -16,13 +16,17 @@
 //! therefore refuses a repository without a lock file (see [`crate::source`])
 //! and forbids nix to write one.
 //!
-//! **The flake reference is never a bare path.** `getFlake` on a bare path
-//! copies the entire directory into the store — `target/`, `result` symlinks,
-//! whatever else is lying around — and a full disk during a rollout is a bad
-//! day. A clean tree is addressed as `git+file://`, which copies what git
-//! tracks and nothing else. A `--dev` tree has to be addressed as `path:`,
-//! because seeing the untracked files is the entire point of `--dev`; that
-//! copy is the price, and it is why `--dev` is not the default.
+//! **The flake reference is never a bare path, and `path:` never points at a
+//! working tree.** A clean tree is addressed as `git+file://`, which copies
+//! what git tracks and nothing else. A `--dev` tree cannot be: git would not
+//! show the untracked files, and seeing them is the whole point of `--dev`.
+//! But `path:` on the working tree would copy the entire directory into the
+//! store — `target/`, `result` symlinks, `keys/`, everything `.gitignore`
+//! excludes — so a signing key would end up world-readable in `/nix/store`
+//! and an ignored-but-imported file would change the evaluation without
+//! changing the fingerprint. So `--dev` points `path:` at the materialized
+//! snapshot [`crate::source`] writes: exactly the files that were listed,
+//! hashed and scanned, and nothing else.
 
 use std::path::Path;
 use std::time::Duration;
@@ -39,9 +43,13 @@ pub const MANIFEST_ATTR: &str = "meisterDeployment";
 /// will, and it is holding a lock while it does not.
 pub const EVAL_DEADLINE: Duration = Duration::from_secs(600);
 
-/// How to address the operator's repository. See the module note.
-pub fn flake_ref(repo: &Path, dev: bool) -> String {
-    let path = repo.display();
+/// How to address the directory nix is to evaluate. See the module note.
+///
+/// `dir` is the repository itself for a clean tree and the materialized
+/// snapshot for `--dev` — `crate::source::Tree::eval_dir` decides which, and
+/// this function only decides how to spell it.
+pub fn flake_ref(dir: &Path, dev: bool) -> String {
+    let path = dir.display();
     if dev {
         format!("path:{path}")
     } else {
@@ -145,13 +153,16 @@ mod tests {
             flake_ref(repo, false),
             "git+file:///home/silas/git/meisterstack-lab"
         );
+        // A dev run is never handed the repository — `describe` hands it the
+        // snapshot — but the spelling is `path:` either way.
+        let snapshot = repo.join(".meister-deploy/snapshots/9f2c");
         assert_eq!(
-            flake_ref(repo, true),
-            "path:/home/silas/git/meisterstack-lab"
+            flake_ref(&snapshot, true),
+            "path:/home/silas/git/meisterstack-lab/.meister-deploy/snapshots/9f2c"
         );
         // Never the bare path, whichever it is.
         assert!(!flake_ref(repo, false).starts_with('/'));
-        assert!(!flake_ref(repo, true).starts_with('/'));
+        assert!(!flake_ref(&snapshot, true).starts_with('/'));
     }
 
     #[test]

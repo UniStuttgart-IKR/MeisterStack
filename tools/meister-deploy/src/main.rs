@@ -286,14 +286,27 @@ fn resolve(
     let repo = std::path::absolute(repo)
         .with_context(|| format!("{} could not be made absolute", repo.display()))?;
     let selection = if hosts.is_empty() { None } else { Some(hosts) };
-    let flake_ref = nix::flake_ref(&repo, dev);
-    let eval = nix::eval_manifest_cmd(&flake_ref, selection);
-
     if dry_run {
         for cmd in source::commands(&repo, dev) {
             println!("{}", cmd.described());
         }
-        println!("{}", eval.line());
+        // A dev run evaluates a snapshot directory named after its own
+        // content, and that name cannot be known without reading the tree —
+        // which a dry run does not do. So the line is printed with the one
+        // segment that is not yet decided spelled out as what it is.
+        let eval_dir = if dev {
+            println!(
+                "# would then copy exactly those files to {}",
+                source::snapshot_dir(&repo, "<content-hash>").display()
+            );
+            source::snapshot_dir(&repo, "<content-hash>")
+        } else {
+            repo.clone()
+        };
+        println!(
+            "{}",
+            nix::eval_manifest_cmd(&nix::flake_ref(&eval_dir, dev), selection).line()
+        );
         println!("# would write {}", out.display());
         return Ok(true);
     }
@@ -305,10 +318,11 @@ fn resolve(
     let runner = Real::new(policy);
     let files = RealFiles::new(policy);
 
-    let source = source::describe(&runner, &files, &repo, fleet, dev)?;
+    let tree = source::describe(&runner, &files, &repo, fleet, dev)?;
+    let flake_ref = nix::flake_ref(&tree.eval_dir, dev);
     let text = nix::eval_manifest(&runner, &flake_ref, selection)?;
     let evaluated = NixManifest::from_json(&text, &format!("{flake_ref}#{}", nix::MANIFEST_ATTR))?;
-    let resolved = manifest::resolve(evaluated, source, tool(), RealClock.now())?;
+    let resolved = manifest::resolve(evaluated, tree.source, tool(), RealClock.now())?;
 
     files.write_atomic(out, &resolved.to_json()?, 0o644)?;
     // The id on stdout and nothing else, so that it can be captured; where
@@ -318,8 +332,10 @@ fn resolve(
     if resolved.source.dirty {
         eprintln!(
             "note: this manifest was resolved from a dirty tree. Its fingerprint is \
-             {} and nobody can check that tree out again.",
-            resolved.source.fingerprint
+             {} and nobody can check that tree out again. What nix evaluated is the \
+             snapshot in {}.",
+            resolved.source.fingerprint,
+            tree.eval_dir.display()
         );
     }
     Ok(true)
