@@ -1,0 +1,187 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+
+# What MeisterStack IS on a machine: the units, their config files, their
+# users and their state directories — and nothing about the machine itself.
+#
+# This module is the one a foreign host imports. It is therefore the module
+# that must not decide anything host-global: no `system.stateVersion`, no
+# firewall, no DHCP, no resolvconf, no bootloader, no `fileSystems."/"`, no
+# `nix.enable`, no console. Somebody else's NixOS host has answers to all of
+# those already, and a module that overrides them is a module nobody can
+# import twice. `checks.services-are-pure` in flake.nix holds this file to it
+# by evaluating a minimal host with and without these modules and comparing
+# exactly those attributes.
+#
+# What DOES decide host-global things are the two profiles beside this file:
+#
+#   nix/appliance.nix  the image the OpenNebula fleet boots — today's
+#                      base.nix, plus this file, plus the boot-time context
+#                      renderer.
+#   nix/managed.nix    a host `meister-deploy` deploys to: nix stays on, the
+#                      config files are complete at build time, and there is
+#                      no renderer at boot.
+#
+# The gate every service hangs on is `meisterstack.unitsFor`, which is
+# `meisterstack.roles` for everybody except the appliance: that image ships
+# every unit and lets the context decide at boot which of them starts, so it
+# sets the list to all three and the role list keeps meaning "what this
+# machine is".
+{ lib, pkgs, config, ... }:
+let
+  cfg = config.meisterstack;
+in
+{
+  imports = [
+    ./roles.nix
+    ./etcd.nix
+    ./controllers.nix
+    ./agent.nix
+    ./addons.nix
+    ./data.nix
+    ./observability.nix
+  ];
+
+  options.meisterstack = {
+    unitsFor = lib.mkOption {
+      type = lib.types.listOf (lib.types.enum [ "cloud" "cluster" "agent" ]);
+      default = lib.filter (r: r != "addons") cfg.roles;
+      internal = true;
+      description = ''
+        Which of the three boot-time roles this machine carries UNITS for.
+        Defaults to `meisterstack.roles`, and the appliance profile widens it
+        to all three because its image is role-agnostic: every unit ships and
+        the context decides at boot which of them starts.
+
+        `addons` is not in this list. That role is build time by construction
+        (nix/addons.nix says why: one name is the issuer, the origin, every
+        redirect url and the name in the certificate at once), so it hangs on
+        `meisterstack.roles` and on nothing else.
+      '';
+    };
+
+    binDir = lib.mkOption {
+      type = lib.types.str;
+      default = "/opt/meisterstack/bin";
+      example = "/run/current-system/sw/bin";
+      description = ''
+        The directory every unit of this stack takes its binaries from:
+        `ExecStart`, the `ConditionPathExists` that keeps a unit visibly
+        skipped until they are there, and the hypervisor path in the agent's
+        config all read this one option.
+
+        The default is where `deploy/push.sh` and `meister-deploy keys push`
+        have always put them — outside the nix store, so that an image swap
+        does not touch them. A host whose binaries come from a package points
+        this at that package's `bin` instead; the condition is then satisfied
+        by construction, which is the honest reading of "the binary is part
+        of this system".
+      '';
+    };
+
+    pki.dir = lib.mkOption {
+      type = lib.types.str;
+      default = "/opt/meisterstack/pki";
+      example = "/var/lib/meisterstack/pki";
+      description = ''
+        Where this machine's certificates and private keys live. The names in
+        it are FIXED — `ca.crt`, `serving.crt`, `serving.key`, `identity.crt`,
+        `identity.key` — because a serving certificate and an identity differ
+        per host while one config template serves them all.
+
+        Outside the nix store on purpose, in both profiles: a private key must
+        never travel in an image, and the store is world-readable.
+
+        The private keys belong to the user that reads them (`meister`, mode
+        0600). systemd credentials are NOT an option here: `LoadCredential`
+        hands the unit a `root:root 0440` file with an ACL, and all three of
+        this project's key loaders refuse a mode with group bits in it
+        (`shared/pki/src/pem.rs`, `shared/proto/src/lib.rs`,
+        `components/cli/src/config.rs`). Measured in a VM, M0 probe S11.
+      '';
+    };
+
+    configDir = lib.mkOption {
+      type = lib.types.str;
+      default = "/run/meisterstack";
+      example = "/etc/meisterstack";
+      description = ''
+        The directory the units read their `--config` from.
+
+        The default is where the boot-time renderer (nix/context.nix) writes
+        the completed files: the image bakes a TEMPLATE under
+        /etc/meisterstack, and the per-machine values — node id, controller
+        addresses, the cloud's whole [auth] table — are only known once the
+        machine has booted somewhere.
+
+        A managed host has no renderer and no context: Nix knows every one of
+        those values at build time, writes the complete file into /etc and
+        points this option at it. Then the config a unit reads is part of the
+        system generation, which is what makes a rollback a rollback.
+      '';
+    };
+
+    ports = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.attrsOf (lib.types.either lib.types.int lib.types.str));
+      readOnly = true;
+      default = {
+        cloud = { api = 3000; grpc = 50050; metrics = 9100; };
+        cluster = { api = 3001; grpc = 50051; metrics = 9101; };
+        agent = { metrics = 9102; migration = "49000-49099"; };
+        etcd = { client = 2379; peer = 2380; };
+      };
+      description = ''
+        The ports this stack listens on, per role — to be READ, not set.
+
+        No firewall rule is written by these modules, and that is the point:
+        a host's firewall belongs to the host, and a service module that
+        opens a port decides something host-global behind its owner's back.
+        So the numbers are published here instead, and an operator's own
+        `networking.firewall` can name them:
+
+          networking.firewall.allowedTCPPorts = with config.meisterstack.ports;
+            [ cloud.api cloud.grpc etcd.peer ];
+
+        Which of them this module actually sets: the three `metrics`
+        listeners (controllers.nix, agent.nix), the agent's `migration`
+        RANGE, and etcd's two (nix/etcd.nix — `client` is bound to loopback
+        and is here for completeness, `peer` is the one that crosses the
+        network). `api` and `grpc` are the binaries' own defaults, written
+        down because a plan derives addresses from them
+        (`MEISTER_CLOUD_ADDRS`, `MEISTER_CONTROLLER_ADDRS`) and an operator
+        opening a hole needs the number in one place.
+
+        The addons role is not in this list: its six services bring their own
+        nixpkgs modules and their own listeners, and `meisterstack.addons` is
+        where they are configured.
+      '';
+    };
+  };
+
+  config = {
+    # The service account both controllers run as, and the group that reaches
+    # the agent's socket. Stage 1 of privilege separation, and only that: no
+    # shell, no home, no login — an identity to drop to and a group to put an
+    # operator into, nothing else.
+    #
+    # The AGENT stays root by default, deliberately: it programs nftables,
+    # makes taps and bridges, opens /dev/kvm and hands VFIO devices to guests.
+    # What it gives away instead is its socket — `[paths] socket_group =
+    # "meister"` in agent.nix — so that `meister agent vm ls` on a node needs
+    # a group membership rather than sudo.
+    #
+    # Unconditional, and not behind a role: `socket_group` names this group in
+    # every rendered config, the key files under `pki.dir` are owned by this
+    # user on every host of this stack, and a `z` line in tmpfiles that names
+    # a user who does not exist is a boot-time error rather than a no-op. It
+    # is a system user with no shell; it decides nothing about the machine.
+    users.groups.meister = { };
+    users.users.meister = {
+      isSystemUser = true;
+      group = "meister";
+      description = "MeisterStack control plane";
+      shell = "${pkgs.shadow}/bin/nologin";
+    };
+  };
+}

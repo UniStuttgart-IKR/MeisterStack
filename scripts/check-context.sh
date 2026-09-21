@@ -3,16 +3,17 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# MeisterStack — Render-Test fuer nix/one-context.nix
+# MeisterStack — Render-Test fuer nix/context.nix + nix/provider-opennebula.nix
 #
 # Die teuersten Fehler dieses Repos lagen nicht im Rust, sondern in der einen
-# Stelle, an der eine Config entsteht: one-context stellt die per-VM-Werte VOR
+# Stelle, an der eine Config entsteht: der Renderer stellt die per-VM-Werte VOR
 # das gebackene Template (Top-Level-Keys) und haengt Sektionen DAHINTER an. Ein
 # [table]-Header an der falschen Seite verschluckt die Keys der jeweils anderen
 # — einmal in jede Richtung passiert, einmal davon einen halben Tag lang.
 #
 # Dieser Test faehrt GENAU den Skripttext, der ins Image geht: er schneidet ihn
-# aus nix/one-context.nix heraus, lenkt jeden absoluten Pfad in ein temporaeres
+# aus nix/context.nix und nix/provider-opennebula.nix heraus, setzt die zwei
+# Marken des Renderers ein, lenkt jeden absoluten Pfad in ein temporaeres
 # Wurzelverzeichnis um und laesst ihn gegen die ECHTEN gerenderten Templates
 # laufen. Danach wird jede der drei Dateien mit einem TOML-Parser gelesen: eine
 # Datei, in der ein Key in der falschen Table gelandet ist, faellt damit auf,
@@ -37,21 +38,131 @@ ok()  { printf '  ok   %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf '  FAIL %s\n' "$1"; shift; for l in "$@"; do printf '       %s\n' "$l"; done; fail=$((fail + 1)); }
 
 # --- 1. den Skripttext herausschneiden -------------------------------------
+#
+# Seit M1 sind es ZWEI Dateien: nix/context.nix rendert, und der Provider
+# (nix/provider-opennebula.nix) liefert das Stueck, das ein Medium anfasst.
+# Der Renderer traegt dafuer genau zwei Marken -- ${sourcesList} und
+# ${providerScript} -- und dieser Test setzt sie selbst ein. Jede DRITTE
+# Nix-Interpolation im Skripttext ist ein Abbruch: sie waere ein Wert, der
+# aus dem Modulsystem ins Skript laeuft, ohne dass dieser Test ihn kennt.
+#
 # Nix-Escapes zurueck nach bash: ''${x} ist im Nix-String das literale ${x},
 # und ''' ist das literale ''. Beides muss weg, sonst laeuft der Text nicht.
-BODY="$T/one-context.sh"
-python3 - "$ROOT/nix/one-context.nix" "$BODY" <<'PY' || exit 1
-import sys
-src, dst = sys.argv[1], sys.argv[2]
-s = open(src, encoding="utf-8").read()
-try:
-    i = s.index("script = ''") + len("script = ''")
-    j = s.index("\n    '';", i)
-except ValueError:
-    sys.exit("cannot find the `script = ''...''` block in " + src)
-body = s[i:j].replace("''${", "${").replace("'''", "''")
-open(dst, "w", encoding="utf-8").write(body)
+#
+# Drei Koerper entstehen daraus:
+#   $BODY         Renderer + LEGACY-Provider  -- was die Appliance heute faehrt
+#   $BODY_STRICT  Renderer + STRICT-Provider  -- der neue Leser (Abschnitt N)
+#   $BODY_BARE    Renderer ohne Provider      -- ein Plan-Knoten (Abschnitt O)
+BODY="$T/render-legacy.sh"
+BODY_STRICT="$T/render-strict.sh"
+BODY_BARE="$T/render-bare.sh"
+python3 - "$ROOT/nix" "$T" <<'PY' || exit 1
+import os, re, sys
+
+nixdir, out = sys.argv[1], sys.argv[2]
+
+
+def cut(path, binding, closing):
+    """Den Rumpf eines `<binding> = ''...''` aus einer .nix-Datei schneiden."""
+    s = open(path, encoding="utf-8").read()
+    head = binding + " = ''"
+    try:
+        i = s.index(head) + len(head)
+        j = s.index("\n" + closing + "'';", i)
+    except ValueError:
+        sys.exit("cannot find the `%s = ''...''` block in %s" % (binding, path))
+    return dedent(s[i:j])
+
+
+def dedent(raw):
+    """Was Nix mit einem ''-String macht, bevor er ins Image geht: die erste
+    Zeile ist der Umbruch hinter '' und faellt weg, und die kleinste
+    Einrueckung aller nicht-leeren Zeilen wird von allen abgezogen.
+
+    Ohne das hier laeuft der Test einen anderen Text als die Maschine --
+    gemessen an genau einer Zeile: der Alloy-Heredoc endet auf `ALLOY` in
+    Spalte 0, und zwei Leerzeichen davor machen aus dem ganzen Rest des
+    Skripts einen Syntaxfehler."""
+    lines = raw.split("\n")
+    if lines and lines[0].strip() == "":
+        lines = lines[1:]
+    indents = [len(l) - len(l.lstrip(" \t")) for l in lines if l.strip()]
+    n = min(indents) if indents else 0
+    return "\n".join(l[n:] if l.strip() else l for l in lines)
+
+
+def interpolations(raw):
+    """Jede Nix-Interpolation im Rohtext, also jedes ${...}, vor dem KEIN ''
+    steht (das waere die Escape-Form und damit shell)."""
+    found = []
+    for m in re.finditer(r"\$\{", raw):
+        if raw[max(0, m.start() - 2):m.start()] == "''":
+            continue
+        end = raw.index("}", m.start())
+        found.append(raw[m.start() + 2:end])
+    return found
+
+
+def unescape(raw):
+    return raw.replace("''${", "${").replace("'''", "''")
+
+
+renderer = cut(os.path.join(nixdir, "context.nix"), "script", "      ")
+marks = interpolations(renderer)
+if sorted(marks) != ["providerScript", "sourcesList"]:
+    sys.exit(
+        "nix/context.nix interpoliert %s in den Skripttext; dieser Test kennt nur "
+        "sourcesList und providerScript. Marke eintragen ODER den Wert aus dem "
+        "Skript heraushalten." % (marks,)
+    )
+
+provider = os.path.join(nixdir, "provider-opennebula.nix")
+blocks = {}
+for name in ("legacyScript", "strictScript"):
+    raw = cut(provider, name, "  ")
+    stray = interpolations(raw)
+    if stray:
+        sys.exit(
+            "nix/provider-opennebula.nix interpoliert %s in %s; die beiden Skripte "
+            "muessen reines shell bleiben, sonst kann dieser Test sie nicht fahren "
+            "(die Optionen kommen ueber die meister_one_*-Variablen)." % (stray, name)
+        )
+    blocks[name] = unescape(raw)
+
+# Der Test setzt die vier Variablen selbst, die das Modul sonst als Praeambel
+# vor den strikten Leser schreibt.
+preamble = "\n".join([
+    "meister_one_device=/dev/disk/by-label/CONTEXT",
+    "meister_one_interface=eth0",
+    "meister_one_network=1",
+    "meister_one_wait=0",
+    "",
+])
+
+# Absolute Pfade, wie sie im Image stehen: die Umlenkung unten fasst sie
+# genauso an wie jeden anderen Pfad im Skript, und die Pfadwache sieht sie.
+body = unescape(renderer).replace("${sourcesList}", "/etc/meisterstack/context.env")
+for name, block in [
+    ("render-legacy.sh", blocks["legacyScript"]),
+    ("render-strict.sh", preamble + blocks["strictScript"]),
+    ("render-bare.sh", ""),
+]:
+    open(os.path.join(out, name), "w", encoding="utf-8").write(
+        body.replace("${providerScript}", block)
+    )
 PY
+
+# Und der billigste Beweis, dass die drei Koerper ueberhaupt Skripte sind.
+# Ein zusammengesetzter Text, der nicht parst, faellt sonst erst dreissig
+# Pruefungen spaeter auf, als "Datei fehlt" — genau so ist es beim Umbau
+# passiert (der Alloy-Heredoc, s. dedent() oben).
+for b in "$BODY" "$BODY_STRICT" "$BODY_BARE"; do
+    if ! err="$(bash -n "$b" 2>&1)"; then
+        bad "der zusammengesetzte Skripttext $(basename "$b") parst" "$err"
+        echo; echo "abgebrochen: $fail FAIL"; exit 1
+    fi
+done
+ok "alle drei Skriptkoerper parsen (Renderer + legacy / strict / ohne Provider)"
 
 echo
 echo "A. die Pfadwache: jeder absolute Pfad ist bekannt und umgelenkt"
@@ -71,7 +182,8 @@ KNOWN=(
     /root/.ssh                     # SSH_PUBLIC_KEY
     /run/meisterstack              # die gerenderten Configs
     /run/meister-role              # was diese VM laut Kontext ist
-    /run/one-context               # der Mountpoint des Kontext-Laufwerks
+    /run/one-context               # Mountpoint des LEGACY-Lesers
+    /run/meister-context           # Mountpoint des STRIKTEN Lesers
     /context.sh                    # relativ zu $mnt, kein eigener Pfad
     //                             # aus http://$ip:2380 und ${x// /}
 )
@@ -81,12 +193,12 @@ while read -r p; do
         case "$p" in "$k"*) continue 2;; esac
     done
     unknown+=("$p")
-done < <(grep -vE '^\s*#' "$BODY" | grep -oE '/[A-Za-z0-9._/@-]+' | sort -u)
+done < <(grep -hvE '^\s*#' "$BODY" "$BODY_STRICT" | grep -oE '/[A-Za-z0-9._/@-]+' | sort -u)
 
 if [ ${#unknown[@]} -eq 0 ]; then
-    ok "kein unbekannter absoluter Pfad in one-context.nix"
+    ok "kein unbekannter absoluter Pfad in context.nix + provider-opennebula.nix"
 else
-    bad "one-context.nix fasst Pfade an, die dieser Test nicht umlenkt" \
+    bad "der Renderer fasst Pfade an, die dieser Test nicht umlenkt" \
         "${unknown[@]}" \
         "-> in KNOWN und in die Umlenkung aufnehmen, sonst trifft der Test das echte System"
     echo; echo "abgebrochen: $fail FAIL"; exit 1
@@ -97,6 +209,7 @@ sed -i \
     -e "s#/etc/meisterstack#$T/etc/meisterstack#g" \
     -e "s#/run/meisterstack#$T/run/meisterstack#g" \
     -e "s#/run/one-context#$T/run/one-context#g" \
+    -e "s#/run/meister-context#$T/run/meister-context#g" \
     -e "s#/run/meister-role#$T/run/meister-role#g" \
     -e "s#/dev/disk/by-label/CONTEXT#$T/context.dev#g" \
     -e "s#/proc/sys/kernel/hostname#$T/hostname#g" \
@@ -104,7 +217,7 @@ sed -i \
     -e "s#/etc/static/hosts#$T/static-hosts#g" \
     -e "s#/etc/hosts#$T/hosts#g" \
     -e "s#/root/.ssh#$T/root/.ssh#g" \
-    "$BODY"
+    "$BODY" "$BODY_STRICT" "$BODY_BARE"
 
 # mount/umount/systemctl/ip tun hier nichts: das Kontext-"Laufwerk" ist eine
 # Datei, die schon am Mountpoint liegt, und gestartet wird in diesem Test
@@ -208,6 +321,38 @@ render_planned_ctx() {
     printf '%s\n' "${baked[@]}" > "$T/etc/meisterstack/context.env"
     printf '%s\n' "${ctx[@]}" > "$T/run/one-context/context.sh"
     bash "$BODY" > "$T/$name.log" 2>&1
+    rm -f "$T/etc/meisterstack/context.env"
+}
+
+# render_strict <name> <gebackene Zeilen> -- <Zeilen des Mediums> — der STRIKTE
+# Leser: dasselbe Wurzelverzeichnis, aber der Mountpoint und der Koerper des
+# neuen Providers.
+render_strict() {
+    local name=$1; shift
+    local baked=() ctx=() cur=baked
+    for arg in "$@"; do
+        if [ "$arg" = "--" ]; then cur=ctx; continue; fi
+        if [ "$cur" = baked ]; then baked+=("$arg"); else ctx+=("$arg"); fi
+    done
+    rm -rf "$T/run" "$T/hostname" "$T/root"
+    mkdir -p "$T/run/meister-context/provider" "$T/etc/meisterstack"
+    echo "agent-1a" > "$T/hostname"
+    : > "$T/context.dev"
+    printf '%s\n' "${baked[@]}" > "$T/etc/meisterstack/context.env"
+    printf '%s\n' "${ctx[@]}" > "$T/run/meister-context/provider/context.sh"
+    bash "$BODY_STRICT" > "$T/$name.log" 2>&1
+    rm -f "$T/etc/meisterstack/context.env"
+}
+
+# render_none <name> <gebackene Zeilen> — der Renderer OHNE Provider: kein
+# Medium, kein Mountpoint, nichts, was etwas anfassen koennte.
+render_none() {
+    local name=$1; shift
+    rm -rf "$T/run" "$T/hostname" "$T/context.dev"
+    mkdir -p "$T/run" "$T/etc/meisterstack"
+    echo "box" > "$T/hostname"
+    printf '%s\n' "$@" > "$T/etc/meisterstack/context.env"
+    bash "$BODY_BARE" > "$T/$name.log" 2>&1
     rm -f "$T/etc/meisterstack/context.env"
 }
 
@@ -595,8 +740,8 @@ else
     grepfor "alloy.service liest genau die gerenderte Datei" \
         'ExecStart=.*/alloy run /run/meisterstack/alloy\.alloy' "$unit/alloy.service" \
         "$(grep ExecStart "$unit/alloy.service")"
-    grepfor "alloy.service startet nach one-context" \
-        '^After=.*one-context\.service' "$unit/alloy.service" \
+    grepfor "alloy.service startet nach dem Renderer" \
+        '^After=.*meister-context\.service' "$unit/alloy.service" \
         "$(grep '^After=' "$unit/alloy.service")"
 fi
 
@@ -668,7 +813,7 @@ echo "J. die [auth]-Tabelle der Cloud: mit Issuer und ohne"
 # Warum das hier und nicht im Image steht: `chain` mit "oidc" ohne
 # [auth.oidc] ist ein Startfehler, `issuer` ist ein PFLICHTFELD (also waere
 # ein gebackenes [auth.oidc] ohne Issuer ein Parse-Fehler), und ein Append
-# kann keine [table] neu definieren. Also rendert one-context die ganze
+# kann keine [table] neu definieren. Also rendert der Renderer die ganze
 # Tabelle -- und dieser Abschnitt ist der Beweis, dass beide Zweige gueltiges
 # TOML mit den richtigen Werten ergeben.
 render oidc \
@@ -732,14 +877,14 @@ expect "mit MEISTER_OIDC_CA: die Kette nennt weiter beide Links" \
 
 # Eine CA ohne Issuer rendert nirgends -- [auth.oidc] entsteht ja nicht. Das
 # still zu schlucken saehe aus wie ein Provider, dem nicht vertraut wird,
-# also sagt one-context es auf der Konsole.
+# also sagt der Renderer es auf der Konsole.
 render caonly \
     'MEISTER_ROLE=cloud' \
     'MEISTER_OIDC_CA=/opt/meisterstack/pki/ca.crt'
 
 expect "CA ohne Issuer: es entsteht kein [auth.oidc]" \
     "<absent>" "$(tomlget "$CLOUD" auth.oidc)"
-grepfor "CA ohne Issuer: one-context warnt auf der Konsole" \
+grepfor "CA ohne Issuer: der Renderer warnt auf der Konsole" \
     'MEISTER_OIDC_CA is set but MEISTER_OIDC_ISSUER is not' "$T/caonly.log" \
     "$(cat "$T/caonly.log")"
 
@@ -830,7 +975,7 @@ expect "der Cluster bekommt kein [auth.oidc]" \
 echo
 echo "K. der gebackene Kontext: ein Plan-Knoten ohne Kontext-Laufwerk"
 
-# nix/roles.nix backt /etc/meisterstack/context.env, one-context liest sie
+# nix/roles.nix backt /etc/meisterstack/context.env, der Renderer liest sie
 # BEVOR es das Laufwerk sucht. Das ist der ganze zweite Weg in dieselben
 # Module: eine Kiste aus dem Plan, oder ein fremder NixOS-Host, bekommt exakt
 # dieselben Dateien wie eine OpenNebula-VM -- nur die Quelle der Variablen ist
@@ -902,6 +1047,116 @@ expect "der Kontext ueberschreibt den Plan" \
 expect "was der Kontext nicht nennt, bleibt der Plan" \
     "http://10.0.0.10:4317" \
     "$(tomlget "$T/run/meisterstack/cluster.toml" otlp_endpoint)"
+
+echo
+echo "N. der strikte Leser: das Medium ist Daten und kein Skript"
+
+# Der Grund fuer diesen Abschnitt steht in nix/provider-opennebula.nix: der
+# alte Weg SOURCT context.sh als root, bevor das Netz oben ist. Wer das
+# Medium schreibt, schreibt damit ein Startskript. Der strikte Leser parst
+# stattdessen, und zwar genau eine Grammatik (KEY='value'), gegen eine
+# Allowlist von sechs Schluesseln, mit einer Pruefung je Wert.
+#
+# Die Fixture ist feindlich gemeint: sie will die Rolle aendern, einen
+# Befehl unterschieben, einen fremden Schluessel setzen und einen
+# ssh-Zugang legen. Nichts davon darf ankommen -- und der eine gueltige
+# Wert daneben MUSS ankommen, sonst prueft der Test nur, dass nichts geht.
+render_strict hostile \
+    'MEISTER_ROLE=agent' \
+    'MEISTER_CONTROLLER_ADDRS=10.128.1.104:50051' \
+    -- \
+    "MEISTER_ROLE='cloud'" \
+    "SET_HOSTNAME='\$(reboot)'" \
+    "SSH_PUBLIC_KEY='rm -rf /'" \
+    "ONEAPP_SECRET='geheim'" \
+    "export FOO=1" \
+    "ETH0_IP='10.128.1.77'" \
+    "ETH0_MASK='255.255.255.0'"
+
+expect "die Rolle kommt aus dem Plan, nicht vom Medium" \
+    "agent" "$(cat "$T/run/meister-role" 2>/dev/null)"
+expect "der node_id bleibt der Hostname der Kiste" \
+    "agent-1a" "$(tomlget "$T/run/meisterstack/agent.toml" node_id)"
+expect "der Hostname wurde nicht ueberschrieben" \
+    "agent-1a" "$(cat "$T/hostname")"
+grepfor "MEISTER_ROLE vom Medium wird benannt und verworfen" \
+    'ignored, MEISTER_ROLE belongs to the plan' "$T/hostile.log" \
+    "$(cat "$T/hostile.log")"
+grepfor "ein fremder Schluessel wird benannt und verworfen" \
+    'ignored, ONEAPP_SECRET is not one of the six keys' "$T/hostile.log" \
+    "$(cat "$T/hostile.log")"
+grepfor "eine Zeile, die keine KEY='value' ist, wird benannt und verworfen" \
+    "ignored, not KEY='value': export FOO=1" "$T/hostile.log" \
+    "$(cat "$T/hostile.log")"
+grepfor "ein Hostname, der keiner ist, wird abgewiesen" \
+    'SET_HOSTNAME is not a DNS label' "$T/hostile.log" \
+    "$(cat "$T/hostile.log")"
+grepfor "ein ssh-Key, der keiner ist, wird abgewiesen" \
+    'SSH_PUBLIC_KEY is not a key line' "$T/hostile.log" \
+    "$(cat "$T/hostile.log")"
+if [ -e "$T/root/.ssh/authorized_keys" ]; then
+    bad "kein Zugang aus dem Medium" "$T/root/.ssh/authorized_keys existiert"
+else
+    ok "kein Zugang aus dem Medium: authorized_keys wurde nicht angelegt"
+fi
+grepfor "der eine gueltige Wert kommt trotzdem an" \
+    'context: eth0 is 10\.128\.1\.77/24' "$T/hostile.log" \
+    "$(cat "$T/hostile.log")"
+
+# Und die Gegenprobe: wohlgeformte Werte werden genommen. Sonst waere der
+# Abschnitt darueber nur der Beweis, dass ein kaputter Parser alles ablehnt.
+render_strict friendly \
+    'MEISTER_ROLE=agent' \
+    -- \
+    "SET_HOSTNAME='agent-9z'" \
+    "SSH_PUBLIC_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForTheTestOnly silas@manacor'"
+
+expect "ein DNS-Label wird gesetzt" "agent-9z" "$(cat "$T/hostname")"
+if [ -f "$T/root/.ssh/authorized_keys" ]; then
+    grepfor "ein echter ed25519-Key wird eingetragen" \
+        '^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5' "$T/root/.ssh/authorized_keys" \
+        "$(cat "$T/root/.ssh/authorized_keys")"
+else
+    bad "ein echter ed25519-Key wird eingetragen" "authorized_keys fehlt"
+fi
+
+echo
+echo "O. ohne Medium und ohne Provider: die gebackene Datei ist der ganze Kontext"
+
+# L02 des Gesamtbriefs, und der Normalfall fuer jeden verwalteten Host: es
+# gibt kein Laufwerk, keinen Provider und nichts, was gemountet wuerde --
+# der Renderer liest ausschliesslich /etc/meisterstack/context.env. Das ist
+# derselbe Koerper wie oben, nur mit leerem providerScript, also prueft
+# dieser Abschnitt auch, dass die Marke ueberhaupt leer sein DARF.
+render_none nomedium \
+    'MEISTER_ROLE=cloud,cluster' \
+    'MEISTER_CLUSTER_NAME=box' \
+    'MEISTER_CLOUD_NAME=box' \
+    'MEISTER_CLOUD_ADVERTISE_API=10.0.0.10:3000' \
+    'MEISTER_CLUSTER_ADVERTISE_API=10.0.0.10:3001' \
+    'MEISTER_OTLP_ENDPOINT=http://10.0.0.10:4317'
+
+expect "cloud.toml traegt den Namen aus der gebackenen Datei" \
+    "box" "$(tomlget "$T/run/meisterstack/cloud.toml" cloud_name)"
+expect "cloud.toml traegt seine eigene advertise_api" \
+    "10.0.0.10:3000" "$(tomlget "$T/run/meisterstack/cloud.toml" advertise_api)"
+expect "cluster.toml traegt seine eigene advertise_api" \
+    "10.0.0.10:3001" "$(tomlget "$T/run/meisterstack/cluster.toml" advertise_api)"
+expect "die Telemetrie erreicht beide Rollen" \
+    "http://10.0.0.10:4317" \
+    "$(tomlget "$T/run/meisterstack/cloud.toml" otlp_endpoint)"
+expect "der node_id kommt weiter vom Hostnamen" \
+    "box" "$(tomlget "$T/run/meisterstack/agent.toml" node_id)"
+expect "die Rollen kommen aus der gebackenen Datei" \
+    "cloud cluster" "$(cat "$T/run/meister-role" 2>/dev/null)"
+grepfor "der Renderer sagt, welche Datei sein Kontext war" \
+    'plan: .*/etc/meisterstack/context.env, role cloud,cluster' "$T/nomedium.log" \
+    "$(cat "$T/nomedium.log")"
+if grep -q 'CONTEXT' "$T/nomedium.log"; then
+    bad "ohne Provider wird kein Medium gesucht" "$(grep CONTEXT "$T/nomedium.log")"
+else
+    ok "ohne Provider wird kein Medium gesucht und keines erwaehnt"
+fi
 
 echo
 echo "==> $pass ok, $fail FAIL"

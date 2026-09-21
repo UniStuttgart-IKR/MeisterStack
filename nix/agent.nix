@@ -2,22 +2,33 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# The agent role for lab VMs: GPU-less agent nodes that host tiny nested
-# VMs (the ONE hosts must provide nested virt — /dev/kvm inside the VM).
-# The image bakes an agent config TEMPLATE without node_id/controller_addr;
-# one-context completes it at boot (/run/meisterstack/agent.toml) from the
-# hostname and MEISTER_CONTROLLER_ADDR. Binaries and guest assets arrive
-# via push.sh into /opt/meisterstack — the unit stays quietly skipped
-# until they exist.
+# The agent role: nodes that host guests (a nested-virt host must provide
+# /dev/kvm inside the VM).
+#
+# The APPLIANCE image bakes an agent config TEMPLATE without
+# node_id/controller_addr; the context renderer completes it at boot
+# (nix/context.nix, <configDir>/agent.toml) from the hostname and
+# MEISTER_CONTROLLER_ADDR, and binaries and guest assets arrive via push.sh
+# into `meisterstack.binDir` — the unit stays quietly skipped until they
+# exist. A MANAGED host has neither: `meisterstack.agent.generated` carries
+# the same keys, written by Nix before the machine boots.
 { lib, pkgs, config, ... }:
 let
   toml = pkgs.formats.toml { };
+  cfg = config.meisterstack;
 
-  physnets = config.meisterstack.agent.physnets;
-  inputBackend = config.meisterstack.agent.inputBackend;
+  physnets = cfg.agent.physnets;
+  inputBackend = cfg.agent.inputBackend;
 
-  unprivileged = config.meisterstack.agent.unprivileged;
-  capabilities = config.meisterstack.agent.capabilities;
+  unprivileged = cfg.agent.unprivileged;
+  capabilities = cfg.agent.capabilities;
+  volumes = cfg.agent.volumes;
+
+  # Where a guest's disks and the RECORD of them live. One directory, named
+  # once: `[paths] volume_dir`, `[paths] db_path`, the import driver's state
+  # and the mount below are the same place, and `meisterstack.agent.volumes`
+  # only decides which BLOCK is mounted there.
+  volumeDir = "/var/lib/meisterstack/volumes";
 
   # The cgroup of THIS unit, which is what `cgroup_root` becomes when the
   # agent is not root: a system unit's cgroup is
@@ -44,11 +55,12 @@ let
   defaults = {
     # The one exception, kept on purpose. It equals the binary's own default
     # (default_stop_grace_secs in components/agent/src/config.rs) and so
-    # carries no information — but one-context PREPENDS the per-VM keys
-    # (node_id, controller_addr) in front of this template, and the rule that
-    # makes prepending safe is that the template starts with top-level keys
-    # rather than with a [table] header. Leaving one here keeps that property
-    # true by construction, and one-context.nix names this key as the reason.
+    # carries no information — but the context renderer PREPENDS the per-VM
+    # keys (node_id, controller_addr) in front of this template, and the rule
+    # that makes prepending safe is that the template starts with top-level
+    # keys rather than with a [table] header. Leaving one here keeps that
+    # property true by construction, and nix/context.nix names this key as
+    # the reason.
     stop_grace_secs = 30;
 
     # The binary defaults to "nothing listens", deliberately: the endpoint is
@@ -58,7 +70,7 @@ let
     # api socket: that one is the node's local admin API, this is a scrape
     # port. 9102, one above the two controller ports (controllers.nix), so
     # that a box carrying two roles never has two listeners on one port.
-    metrics_listen = "0.0.0.0:9102";
+    metrics_listen = "0.0.0.0:${toString cfg.ports.agent.metrics}";
 
     # The session credential. Same reasoning as controllers.nix: private keys
     # do not travel in a qcow2, so they live in /opt/meisterstack/pki, which
@@ -69,16 +81,16 @@ let
     # All three together, never a subset: a cert without a ca is a start-up
     # error on purpose (config.rs::session_tls — this node would present its
     # key to whoever answered on that address).
-    controller_ca = "/opt/meisterstack/pki/ca.crt";
-    controller_cert = "/opt/meisterstack/pki/identity.crt";
-    controller_key = "/opt/meisterstack/pki/identity.key";
+    controller_ca = "${cfg.pki.dir}/ca.crt";
+    controller_cert = "${cfg.pki.dir}/identity.crt";
+    controller_key = "${cfg.pki.dir}/identity.key";
 
     # All five are REQUIRED by the binary — [paths] has no defaults — so
     # baking them is not duplication. Two of the five deviate from
     # config/examples/agent.toml, both deliberately:
     #
-    #   run_dir     the example's /run/meisterstack is where one-context
-    #               renders the CONFIG files (agent.toml, etcd.env). The
+    #   run_dir     the example's /run/meisterstack is where the renderer
+    #               writes the CONFIG files (agent.toml, etcd.env). The
     #               agent's sockets and per-VM scratch get their own
     #               subdirectory rather than sharing that one.
     #   image_dir   the example's /var/lib/… is the FHS answer for a
@@ -95,10 +107,10 @@ let
       # so the driver's `deprovision` never ran and the claims stayed on the
       # disk for a volume that no longer existed. Bytes that outlive an image
       # swap need bookkeeping that outlives it too.
-      db_path = "/var/lib/meisterstack/volumes/agent.redb";
+      db_path = "${volumeDir}/agent.redb";
       run_dir = "/run/meisterstack/agent";
       image_dir = "/opt/meisterstack/images";
-      volume_dir = "/var/lib/meisterstack/volumes";
+      volume_dir = volumeDir;
       # Root's agent makes its own directory under the mount root and asks
       # systemd for nothing. An unprivileged one cannot: `/sys/fs/cgroup` is
       # not writable for anybody else, so its root has to BE the subtree
@@ -107,7 +119,7 @@ let
       # Who may talk to this node's admin socket besides root. The agent
       # itself stays root — it writes nftables rules, makes taps, opens
       # /dev/kvm — but its socket does not have to be root-only for that:
-      # 0660 owned by `meister` (base.nix) means `meister agent vm ls` on a
+      # 0660 owned by `meister` (nix/services.nix) means `meister agent vm ls` on a
       # node is a group membership instead of sudo. There is no authenticator
       # on this socket, so the group IS the access rule.
       socket_group = "meister";
@@ -117,12 +129,12 @@ let
     # deviate from nothing — /opt/meisterstack/bin is where push.sh puts the
     # patched build, and 5000 ms is what the example shows.
     hypervisor.cloud-hypervisor = {
-      binary = "/opt/meisterstack/bin/cloud-hypervisor";
+      binary = "${cfg.binDir}/cloud-hypervisor";
       timeout_ms = 5000;
       # Absent, this node REFUSES to receive a live migration, and says so
       # (components/agent/src/migration.rs) — which is the right default for
       # a config somebody wrote by hand and the wrong one for an image whose
-      # whole fleet is on one lab switch with no firewall (base.nix). A
+      # whole fleet is on one lab switch with no firewall (nix/appliance.nix). A
       # hundred ports, because each incoming stream is its own listener and a
       # node may be receiving more than one guest at a time.
       #
@@ -130,7 +142,7 @@ let
       # or a different one named in its own settings — that is what makes it
       # a range in the config rather than "any free port": somebody has to be
       # able to write the rule down.
-      migration_ports = "49000-49099";
+      migration_ports = cfg.ports.agent.migration;
     };
 
     network = {
@@ -173,7 +185,7 @@ let
     # absent and a node that has one says so in its own settings.
     volume = {
       nvmeof = { };
-      nvmeof-import.state_dir = "/var/lib/meisterstack/volumes/nvmeof-import";
+      nvmeof-import.state_dir = "${volumeDir}/nvmeof-import";
     };
 
     # Empty on purpose rather than absent: these are GPU-less lab nodes, and
@@ -189,6 +201,113 @@ let
   };
 in
 {
+  options.meisterstack.agent.frr.enable = lib.mkOption {
+    type = lib.types.bool;
+    default = builtins.elem "agent" cfg.unitsFor;
+    defaultText = lib.literalExpression ''an agent node runs it'';
+    description = ''
+      Whether FRR itself runs beside the agent, and not only the package.
+
+      `vtysh` is a CLIENT: it talks to the daemons over their vty sockets in
+      /run/frr, so a node that has the binary and no daemon answers every call
+      with "failed to connect to any daemons" — which is exactly what
+      `[network.bgp]` would have got. The package alone was what this image
+      had, and manacor showed the other half of the same gap from the outside:
+      no announcement, so the routed /29 had to be reached by a static route
+      somebody typed.
+
+      bgpd is the only daemon named. zebra and staticd are started by the
+      module whatever is asked for, and they are the two the driver needs
+      beside it — zebra holds the routing table vtysh writes into. No `config`
+      is given: what this node says to its peers is the AGENT's to render
+      (drivers/linux-network/src/frr.rs writes a fragment and `vtysh -f`
+      merges it), and a second author of the same configuration is how two
+      halves start disagreeing about what is announced.
+
+      On by default on an agent node, and it costs a node with no
+      `[network.bgp]` one idle daemon: the appliance image is generic and the
+      section arrives at BOOT from the context (MEISTER_BGP_*), so a daemon
+      that were conditional on build-time knowledge would be missing on
+      exactly the machines that turn out to need it. A managed node whose plan
+      names no BGP can turn it off.
+    '';
+  };
+
+  options.meisterstack.agent.nvmeTcp.enable = lib.mkOption {
+    type = lib.types.bool;
+    default = builtins.elem "agent" cfg.unitsFor;
+    defaultText = lib.literalExpression ''an agent node loads it'';
+    description = ''
+      Whether `nvme_tcp` is loaded at boot for the NVMe-oF attacher.
+
+      `nvme` reads the topology out of /sys/class/nvme BEFORE it opens
+      /dev/nvme-fabrics, and that directory does not exist until nvme_core is
+      loaded. On a node with no PCIe nvme disk — every VM in this lab —
+      nothing has loaded it, so the very first thing the driver does dies with
+      "Failed to scan topology: No such file or directory" and never reaches
+      the connect that would have autoloaded the module. Measured on
+      agent-2b: the same discover succeeds the moment nvme_tcp is in.
+
+      nvme_tcp and not nvme_fabrics: it depends on the other two and pulls
+      them in, and tcp is the transport this fleet's fabric speaks. A host
+      with an RDMA card wants nvme_rdma beside it, which is a fact about that
+      host's hardware and belongs in that host's own configuration.
+    '';
+  };
+
+  options.meisterstack.agent.volumes = {
+    device = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "/dev/disk/by-label/meister-volumes";
+      example = "/dev/disk/by-id/nvme-SAMSUNG_MZQL2960HCJR_S6PENX0T123456";
+      description = ''
+        The block this node keeps its guests' disks on, mounted at
+        ${volumeDir}. `null` keeps them on the root disk.
+
+        A guest's disks are the one thing on an agent that is BIG and that
+        must outlive an image swap — the root disk of these lab VMs is 3.4 GiB
+        with a 2.2 GiB image on it, so a single provisioned volume fills it.
+        By LABEL rather than by device name in the default, because which slot
+        a disk lands in is not a promise anybody made: /dev/vdb quietly became
+        sda+vda twice in the lab, and etcd lived on the root disk without
+        saying so.
+      '';
+    };
+    required = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether the agent may run WITHOUT that block.
+
+        False (the default) mounts it `nofail`: a node whose disk was not
+        attached comes up and keeps its volumes on the root disk, which is the
+        honest degraded state and not an emergency shell — and what the lab
+        has done since the block existed.
+
+        True is the other answer, for a node whose disks are its job: no
+        `nofail`, and the agent unit REQUIRES the mount. A node that silently
+        provisions onto its root disk fills it and then fails at the worst
+        moment, and "the volume block is not here" is a sentence worth
+        stopping for.
+      '';
+    };
+  };
+
+  options.meisterstack.agent.generated = lib.mkOption {
+    type = toml.type;
+    default = { };
+    internal = true;
+    description = ''
+      The per-machine keys of the agent config — node_id, the controller
+      addresses, the network sections — merged BETWEEN the role defaults and
+      the operator's `settings`.
+
+      Empty on an appliance, where the context renderer writes exactly these
+      at boot; filled by nix/managed.nix from `meisterstack.context.defaults`
+      through nix/lib/render.nix, where there is no renderer to write them.
+    '';
+  };
+
   options.meisterstack.agent.physnets = lib.mkOption {
     type = lib.types.attrsOf lib.types.str;
     default = { };
@@ -298,371 +417,382 @@ in
       reference for what may go in it, and config/examples/hardened/agent.toml
       for a node that is not on a lab switch.
 
-      node_id and controller_addr are NOT settable here — one-context writes
-      them into /run/meisterstack/agent.toml at boot from the hostname and the
-      OpenNebula context, and a key in both places would be a duplicate TOML
-      key and a parse error.
+      node_id and controller_addr are NOT settable here ON AN APPLIANCE —
+      there the context renderer writes them into <configDir>/agent.toml at
+      boot from the hostname and the context, and a key in both places would
+      be a duplicate TOML key and a parse error.
+
+      On a managed host they are not written at boot but BAKED
+      (`meisterstack.agent.generated`, from nix/lib/render.nix), and this
+      option still wins over them: there is one file, written once, and
+      naming a key twice in it is not possible.
     '';
   };
 
-  config = {
-    # The storage/network backends the drivers shell out to (M4.6/M5.1):
-    # lvm2 for the thin driver, virtiofsd for FsShare volumes, frr for
-    # BGP/EVPN, nftables for the tap guards, nvme-cli for the nvmeof
-    # attacher. In the image = a stable path (/run/current-system/sw/bin) for
-    # the config files, and push.sh has nothing extra to ship.
-    environment.systemPackages = with pkgs; [ lvm2 virtiofsd frr nftables nvme-cli iputils ];
+  # Three gates, because three different questions. The UNITS and their files
+  # hang on the role; the routing daemon and the fabric's kernel module are
+  # switches of their own that follow the role by default; and the volume
+  # block is a mount, which is the one thing a service module has no business
+  # making unconditional.
+  config = lib.mkMerge [
+    (lib.mkIf (builtins.elem "agent" cfg.unitsFor) {
+      # The storage/network backends the drivers shell out to (M4.6/M5.1):
+      # lvm2 for the thin driver, virtiofsd for FsShare volumes, frr for
+      # BGP/EVPN, nftables for the tap guards, nvme-cli for the nvmeof
+      # attacher. In the image = a stable path (/run/current-system/sw/bin) for
+      # the config files, and push.sh has nothing extra to ship.
+      environment.systemPackages = with pkgs; [ lvm2 virtiofsd frr nftables nvme-cli iputils ];
 
-    # FRR itself, running, and not only the package.
-    #
-    # `vtysh` is a CLIENT: it talks to the daemons over their vty sockets in
-    # /run/frr, so a node that has the binary and no daemon answers every call
-    # with "failed to connect to any daemons" — which is exactly what
-    # `[network.bgp]` would have got. The package alone was what this image
-    # had, and manacor showed the other half of the same gap from the outside:
-    # no announcement, so the routed /29 had to be reached by a static route
-    # somebody typed.
-    #
-    # bgpd is the only daemon named. zebra and staticd are started by the
-    # module whatever is asked for, and they are the two the driver needs
-    # beside it — zebra holds the routing table vtysh writes into. No `config`
-    # is given: what this node says to its peers is the AGENT's to render
-    # (drivers/linux-network/src/frr.rs writes a fragment and `vtysh -f`
-    # merges it), and a second author of the same configuration is how two
-    # halves start disagreeing about what is announced.
-    #
-    # On unconditionally, on every node of this role, and it costs a node with
-    # no `[network.bgp]` one idle daemon: the image is generic and the section
-    # arrives at BOOT from the context (MEISTER_BGP_*), so a daemon that were
-    # conditional on build-time knowledge would be missing on exactly the
-    # machines that turn out to need it.
-    services.frr.bgpd.enable = true;
+      # FRR itself — the daemon and not only the package — is
+      # `meisterstack.agent.frr.enable`, and so is the reason it exists.
 
-    # And the kernel half of the same backend, at boot rather than on demand.
-    #
-    # `nvme` reads the topology out of /sys/class/nvme BEFORE it opens
-    # /dev/nvme-fabrics, and that directory does not exist until nvme_core is
-    # loaded. On a node with no PCIe nvme disk — every VM in this lab —
-    # nothing has loaded it, so the very first thing this driver does dies
-    # with "Failed to scan topology: No such file or directory" and never
-    # reaches the connect that would have autoloaded the module. Measured on
-    # agent-2b: the same discover succeeds the moment nvme_tcp is in.
-    #
-    # nvme_tcp and not nvme_fabrics: it depends on the other two and pulls
-    # them in, and tcp is the transport this fleet's fabric speaks. A host
-    # with an RDMA card wants nvme_rdma beside it, which is a fact about that
-    # host's hardware and belongs in that host's own configuration.
-    boot.kernelModules = [ "nvme_tcp" ];
-
-    environment.etc."meisterstack/agent.toml".source =
-      toml.generate "agent.toml"
-        (lib.recursiveUpdate
-          (lib.recursiveUpdate defaults
-            # Only when there is one. An empty `[network.provider]` table would
-            # be a section without its required `physnets` key, which is a
-            # start-up error and not "no gateway slot" — the agent tells the
-            # two apart by the SECTION being there.
-            (lib.optionalAttrs (physnets != { }) { network.provider = { inherit physnets; }; }))
-          # The device half of the same rule: a section that is THERE is what
-          # makes the agent build the driver, so the absent option has to
-          # render no `[device.input]` at all rather than one with an empty
-          # binary — which would be a start-up error on every node in the
-          # fleet instead of "this node serves no virtio-input".
+      environment.etc."meisterstack/agent.toml".source =
+        toml.generate "agent.toml"
           (lib.recursiveUpdate
-            (lib.optionalAttrs (inputBackend != null) {
-              device.input.binary = inputBackend;
-            })
-            config.meisterstack.agent.settings));
+            (lib.recursiveUpdate defaults
+              # Only when there is one. An empty `[network.provider]` table would
+              # be a section without its required `physnets` key, which is a
+              # start-up error and not "no gateway slot" — the agent tells the
+              # two apart by the SECTION being there.
+              (lib.optionalAttrs (physnets != { }) { network.provider = { inherit physnets; }; }))
+            # The device half of the same rule: a section that is THERE is what
+            # makes the agent build the driver, so the absent option has to
+            # render no `[device.input]` at all rather than one with an empty
+            # binary — which would be a start-up error on every node in the
+            # fleet instead of "this node serves no virtio-input".
+            (lib.recursiveUpdate
+              (lib.recursiveUpdate
+                (lib.optionalAttrs (inputBackend != null) {
+                  device.input.binary = inputBackend;
+                })
+                # What a context would have appended at boot, on a host where
+                # nobody will (nix/managed.nix). Above the two option-driven
+                # sections and below `settings`, which is the order the renderer
+                # has: the context beats the template, and what the operator
+                # typed beats both.
+                cfg.agent.generated)
+              cfg.agent.settings));
 
-    systemd.tmpfiles.rules = [
-      "d /opt/meisterstack/images 0755 root root -"
-      "d /var/lib/meisterstack 0755 root root -"
-    ] ++ lib.optionals unprivileged [
-      # The three directories [paths] names, given to the user that now has
-      # to write them. tmpfiles and not `StateDirectory=`/`RuntimeDirectory=`,
-      # because these paths are absolute in a config template one-context
-      # renders — systemd's own directory options would put them under
-      # /var/lib/<name> and /run/<name> and the agent would be told about a
-      # different place than the one that was created.
+      systemd.tmpfiles.rules = [
+        "d /opt/meisterstack/images 0755 root root -"
+        "d /var/lib/meisterstack 0755 root root -"
+      ] ++ lib.optionals unprivileged [
+        # The three directories [paths] names, given to the user that now has
+        # to write them. tmpfiles and not `StateDirectory=`/`RuntimeDirectory=`,
+        # because these paths are absolute in a config template the renderer
+        # completes — systemd's own directory options would put them under
+        # /var/lib/<name> and /run/<name> and the agent would be told about a
+        # different place than the one that was created.
+        #
+        # `/run/meisterstack` stays root-owned: the renderer writes agent.toml
+        # and etcd.env into it, and the agent only reads those.
+        "d /run/meisterstack/agent 0750 meister meister -"
+        "d ${volumeDir} 0750 meister meister -"
+        # The session credential, which the agent opens at start-up.
+        #
+        # `meister:meister 0600` and not `root:meister 0640`, which is what this
+        # line said until M1: every key loader in this project refuses a mode
+        # with group bits in it (`mode & 0o077 != 0` in shared/pki/src/pem.rs,
+        # shared/proto/src/lib.rs and components/cli/src/config.rs), so the
+        # 0640 line was a start-up error waiting for the first unprivileged
+        # agent that reached it. The owner is the reader, and nobody else looks
+        # — root reads it anyway.
+        #
+        # This is also why there are no systemd credentials here: measured in a
+        # VM (M0 probe S11), `LoadCredential` hands the unit a root:root 0440
+        # file whose group bits are an ACL mask, and all three loaders refuse
+        # exactly that. Loosening them is not on the table.
+        #
+        # The certificate and the CA are public by construction
+        # (nix/appliance.nix says why); only the key needs this.
+        "z ${cfg.pki.dir}/identity.key 0600 meister meister -"
+      ];
+
+      # The device half of the same rule. On this fleet's own hosts /dev/kvm is
+      # 0666 root:kvm, and then the group buys nothing — but that is a property
+      # of one distribution's udev defaults (systemd ships
+      # `KERNEL=="kvm", GROUP="kvm", MODE="{{DEV_KVM_MODE}}"`, and the
+      # substitution is the packager's). Written down here so that an agent
+      # which is not root has a documented way in on any node of this role,
+      # rather than depending on which mode the image happened to be built
+      # with. 0660 and not 0666 is the tighter of the two, and the group is the
+      # access rule.
+      services.udev.extraRules = lib.mkIf unprivileged ''
+        KERNEL=="kvm", GROUP="kvm", MODE="0660"
+      '';
+
+      # The VMM's own user, created and not yet used.
       #
-      # `/run/meisterstack` stays root-owned: one-context renders agent.toml
-      # and etcd.env into it, and the agent only reads those.
-      "d /run/meisterstack/agent 0750 meister meister -"
-      "d /var/lib/meisterstack/volumes 0750 meister meister -"
-      # The session credential, which the agent opens at start-up. push.sh
-      # leaves the key 0600 root, so without this line an unprivileged agent
-      # refuses to start on a line about a file it cannot read. The
-      # certificate and the CA are public by construction (nix/base.nix says
-      # why); only the key needs the group.
-      "z /opt/meisterstack/pki/identity.key 0640 root meister -"
-    ];
+      # Stage 3 of `design/privilege-separation.md`: cloud-hypervisor and the
+      # vhost-user backends beside it get their own account, so that a guest
+      # breaking out of the VMM lands in a process that owns nothing. That is
+      # the other lane's work (`Command::uid/gid` at the spawn, plus the file
+      # ownership that has to follow it); the account is here because a user
+      # that appears in the same release as the code which drops to it is a
+      # rollout with two ways to fail.
+      #
+      # The groups are the VMM's reason to exist: `kvm` for the vcpu ioctls,
+      # `video`/`render` for a GPU node's nodes, `input` for an evdev backend.
+      # No shell, no home, no password.
+      users.groups.meister-vmm = { };
+      users.users.meister-vmm = {
+        isSystemUser = true;
+        group = "meister-vmm";
+        extraGroups = [ "kvm" "video" "render" "input" ];
+        description = "MeisterStack VMM (unprivileged, stage 3)";
+        shell = "${pkgs.shadow}/bin/nologin";
+      };
 
-    # The device half of the same rule. On this fleet's own hosts /dev/kvm is
-    # 0666 root:kvm, and then the group buys nothing — but that is a property
-    # of one distribution's udev defaults (systemd ships
-    # `KERNEL=="kvm", GROUP="kvm", MODE="{{DEV_KVM_MODE}}"`, and the
-    # substitution is the packager's). Written down here so that an agent
-    # which is not root has a documented way in on any node of this role,
-    # rather than depending on which mode the image happened to be built
-    # with. 0660 and not 0666 is the tighter of the two, and the group is the
-    # access rule.
-    services.udev.extraRules = lib.mkIf unprivileged ''
-      KERNEL=="kvm", GROUP="kvm", MODE="0660"
-    '';
+      # The agent's own device groups are NOT set here. `meister` is
+      # nix/services.nix' account and the CONTROLLERS run as it too — a membership
+      # in the system database would hand /dev/kvm to two services that have no
+      # business with it. It belongs to this unit instead, as
+      # `SupplementaryGroups=` below, which systemd documents as extending
+      # rather than replacing what the database says.
 
-    # The VMM's own user, created and not yet used.
-    #
-    # Stage 3 of `design/privilege-separation.md`: cloud-hypervisor and the
-    # vhost-user backends beside it get their own account, so that a guest
-    # breaking out of the VMM lands in a process that owns nothing. That is
-    # the other lane's work (`Command::uid/gid` at the spawn, plus the file
-    # ownership that has to follow it); the account is here because a user
-    # that appears in the same release as the code which drops to it is a
-    # rollout with two ways to fail.
-    #
-    # The groups are the VMM's reason to exist: `kvm` for the vcpu ioctls,
-    # `video`/`render` for a GPU node's nodes, `input` for an evdev backend.
-    # No shell, no home, no password.
-    users.groups.meister-vmm = { };
-    users.users.meister-vmm = {
-      isSystemUser = true;
-      group = "meister-vmm";
-      extraGroups = [ "kvm" "video" "render" "input" ];
-      description = "MeisterStack VMM (unprivileged, stage 3)";
-      shell = "${pkgs.shadow}/bin/nologin";
-    };
+      systemd.services.meister-agent = {
+        description = "MeisterStack agent";
+        # The mount is ordering and NOT a requirement while the block is
+        # `nofail`, which is the whole point of `after` rather than
+        # `RequiresMountsFor`: a node whose disk was not attached is meant to
+        # come up and keep its volumes on the root disk, and a hard requirement
+        # here would turn that honest degraded state into a node that never
+        # starts. What the ordering buys is the other half — the agent must not
+        # open its store under a mount point that is about to be mounted OVER,
+        # which would hide both the records and the bytes they describe.
+        #
+        # `meisterstack.agent.volumes.required = true` is the deployment that
+        # says the opposite, and then the requirement is added below: a node
+        # whose disks are its job should stop rather than quietly provision
+        # onto its root disk.
+        after = [
+          "meister-context.service"
+          "network-online.target"
+          "var-lib-meisterstack-volumes.mount"
+        ];
+        # Every external binary the drivers resolve over PATH, because a systemd
+        # unit's PATH does NOT contain /run/current-system/sw/bin —
+        # systemPackages alone serves the ssh shell, not this unit.
+        #
+        # What each one is for, and when it is missed:
+        #   nftables    nft. The only HARD one: mac-pinning is promised for
+        #               every VM this stack boots, so an agent that cannot
+        #               write rules refuses to start rather than pretend.
+        #   lvm2        lvs/lvcreate/lvremove, for [volume.lvm-thin] — unless
+        #               that section names a bin_dir, which is the escape for a
+        #               host where lvm2 is elsewhere.
+        #   qemu-utils  qemu-img, also [volume.lvm-thin]: it writes the base
+        #               image onto the fresh LV and reads qcow2 as well as raw.
+        #   util-linux  mount, and nfs-utils its mount.nfs helper — needed only
+        #               by [volume.nfs] with manage_mount = true, which is the
+        #               shape where the driver mounts the share itself.
+        #   iproute2    ip, only with [network.provider]: `ip netns` builds a
+        #               router's namespace and pins it under /var/run/netns, so
+        #               that `ip netns exec meister-rt-<uuid> ip a` shows an
+        #               operator what the agent built. Missed only by a node
+        #               that was given a router.
+        #   procps      sysctl, the same section: ip_forward and the two
+        #               arp_ignore values INSIDE the router's namespace, which
+        #               is why it is `ip netns exec … sysctl` and not a write to
+        #               this process's /proc.
+        #   iputils     arping, the same section again: the gratuitous ARP a
+        #               router sends the moment it becomes the active one. Best
+        #               effort at the point of use — a node without it fails a
+        #               failover over by five seconds of somebody else's ARP
+        #               cache and nothing worse — which is why it is here and
+        #               not a ConditionPathExists.
+        #   frr         vtysh, only with [network.bgp].
+        #   curl        fetching a base image registered with `image create
+        #               --from-url`. Missed only by a node asked to boot such an
+        #               image, and then it is a named error at the point of use
+        #               ("is curl on the agent's PATH?") rather than a mystery:
+        #               the vm goes Failed with that sentence, and the Image
+        #               object goes Failed with it too, which is what the whole
+        #               fetch-and-report road exists for.
+        #   virtiofsd   NOT resolved over PATH by the driver: [volume.nfs]
+        #               names a path to it. It is here so that a config may name
+        #               the bare word, and in systemPackages above so that
+        #               /run/current-system/sw/bin/virtiofsd is a stable path a
+        #               config can point at.
+        #   nvme-cli    nvme, for [volume.nvmeof] — connect, list-subsys,
+        #               id-ns, disconnect. Missed the same way lvm2 would be:
+        #               the attacher's own sentence ("Is nvme-cli installed,
+        #               and is this process root?") at the first volume that
+        #               needed the fabric, and not before. The escape is the
+        #               same too, a bin_dir in that section. Its kernel half is
+        #               boot.kernelModules below, and that one is not optional.
 
-    # The agent's own device groups are NOT set here. `meister` is
-    # nix/base.nix' account and the CONTROLLERS run as it too — a membership
-    # in the system database would hand /dev/kvm to two services that have no
-    # business with it. It belongs to this unit instead, as
-    # `SupplementaryGroups=` below, which systemd documents as extending
-    # rather than replacing what the database says.
+        # Everything except nftables fails later and less clearly than at
+        # start-up: at the first VM that needed the backend in question.
+        #
+        # NOT here, and deliberately: nvidia-smi. The nvrm driver calls it
+        # best-effort to warn about persistence mode, and these lab nodes are
+        # GPU-less by design; a node with a card gets the NVIDIA packages from
+        # its own configuration, not from this role.
+        path = with pkgs; [
+          nftables
+          iproute2
+          procps
+          iputils
+          frr
+          lvm2
+          virtiofsd
+          qemu-utils
+          util-linux
+          nfs-utils
+          curl
+          nvme-cli
+        ];
+        unitConfig = {
+          # All three must have been pushed before the agent can do anything.
+          # The CA is on the list for the same reason as at the controllers: the
+          # template names controller_ca/cert/key, and a missing one of them is a
+          # start-up error, so a node that push.sh has not reached yet waits
+          # visibly instead of restarting every two seconds.
+          ConditionPathExists = [
+            "${cfg.binDir}/meister-agent"
+            "${cfg.binDir}/cloud-hypervisor"
+            "${cfg.pki.dir}/ca.crt"
+          ];
+        } // lib.optionalAttrs (volumes.device != null && volumes.required) {
+          # The other half of `volumes.required`: no `nofail` on the mount, and
+          # the unit does not start without it.
+          RequiresMountsFor = volumeDir;
+        };
+        serviceConfig = {
+          ExecStart = "${cfg.binDir}/meister-agent --config ${cfg.configDir}/agent.toml";
+          Restart = "always";
+          RestartSec = 2;
+          Environment = "RUST_LOG=info";
+
+          # Two lines of sandbox, and deliberately not the set the controllers
+          # get (controllers.nix). This process IS the privileged half: it
+          # programs nftables, creates taps and bridges, opens /dev/kvm and
+          # hands PCI devices through vfio. PrivateDevices would take /dev/kvm
+          # and the vfio nodes away, PrivateTmp would hide the sockets the VMM
+          # and virtiofsd share, ProtectKernelTunables would stop it writing
+          # the sysctls a bridge needs, and mdev needs sysfs writes besides.
+          # These two cost it nothing:
+          ProtectHome = true;
+          # AF_NETLINK is how routes, links and nftables are programmed;
+          # AF_VSOCK is the guest agent channel. Neither is optional here.
+          RestrictAddressFamilies = "AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_VSOCK";
+          # And the line that pays for the one above. ProtectHome gives the unit
+          # a mount namespace of its own, and a router's network namespace is
+          # PINNED by a bind mount (`ip netns add` puts it under /run/netns) --
+          # so without this the pin lives only inside that private namespace.
+          # Three things followed, all seen in the lab on 2026-09-10:
+          #
+          #   * every router netns died with the agent on a restart, because the
+          #     mount namespace that held its only reference went away;
+          #   * a zero-byte file stayed behind in the host's /run/netns, so the
+          #     next `ip netns add` of the same name would fail with EEXIST;
+          #   * `ip netns exec meister-rt-<uid> ...` on the machine answered
+          #     "Invalid argument" -- the file is there and is not a mount --
+          #     which is exactly the command drivers/linux-network's own module
+          #     doc tells an operator to run.
+          #
+          # `MountFlags = shared` makes the unit's mounts propagate back to the
+          # host, which is what a service that creates namespaces for other
+          # things to use has to do. It does not widen what the process may
+          # touch; it says that what it mounts is not private to it.
+          MountFlags = "shared";
+        } // lib.optionalAttrs unprivileged {
+          # --- the agent as `meister`, with exactly its capabilities ---------
+          #
+          # Model C of the reference study, and it is only honest for a
+          # compute-only node: the moment CAP_SYS_ADMIN is in the list below,
+          # this is root with extra steps (capabilities(7): "the new root").
+          # The full node keeps running as root, which is the default.
+          User = "meister";
+          Group = "meister";
+
+          # The device nodes this agent opens, by group rather than by
+          # capability — which is how every reference does it (Kata: "crw-rw----
+          # root:kvm" plus a supplemental group; QEMU: "configure UNIX groups
+          # for access to /dev/kvm, /dev/net/tun"). `kvm` for the guest,
+          # `video`/`render` for a GPU node, `input` for an evdev backend.
+          SupplementaryGroups = [ "kvm" "video" "render" "input" ];
+
+          # Exactly what the option says, in both sets. Ambient, because the
+          # drivers work by execing `nft` and `ip` and those need the
+          # capability themselves; bounding, so the list is a ceiling and not
+          # just a starting point.
+          AmbientCapabilities = capabilities;
+          CapabilityBoundingSet = capabilities;
+
+          # Written out, not `Delegate=yes`: the list IS the claim, and
+          # docker.service (measured on this machine) writes it out for the
+          # same reason. `cpuset` is in it because `cgroup_cpuset` in the agent
+          # config is worthless without it — and because a system unit is the
+          # only kind of unit that can have it (see `unitCgroup`).
+          #
+          # Delegation does not enable anything by itself: systemd's own
+          # documentation says "you have to do that manually by writing to
+          # cgroup.subtree_control", which is what drivers/cgroup does.
+          Delegate = "cpu cpuset io memory pids";
+          # cgroup v2 forbids processes in an inner node, so the agent cannot
+          # sit in the directory it also wants to put VM slices under. systemd
+          # 254+ does the move itself with this; the agent does it too, at
+          # start-up, and finds nothing left to do. Both, because the two are
+          # the same directory and either one alone is a node that limits
+          # nothing.
+          DelegateSubgroup = "supervisor";
+
+          # `DeviceAllow=` and NOT `PrivateDevices=yes` — the trap the study
+          # names, and systemd's own man page says it: "When access to some but
+          # not all devices must be possible, the DeviceAllow= setting might be
+          # used instead". PrivateDevices would give this unit a /dev with no
+          # /dev/kvm in it, which is a node that cannot boot a guest.
+          #
+          # `closed` leaves the harmless pseudo-devices (null, zero, random,
+          # tty) and nothing else. char-drm and char-input are whole device
+          # groups because their numbers are the host's to choose; a GPU node
+          # with an NVIDIA card needs its own line beside these, which is a
+          # fact about that node and belongs in its own configuration.
+          DevicePolicy = "closed";
+          DeviceAllow = [
+            "/dev/kvm rw"
+            "/dev/net/tun rw"
+            "/dev/vhost-net rw"
+            "/dev/vhost-vsock rw"
+            "char-drm rw"
+            "char-input r"
+          ];
+        };
+      };
+    })
+
+    (lib.mkIf cfg.agent.frr.enable { services.frr.bgpd.enable = true; })
+
+    (lib.mkIf cfg.agent.nvmeTcp.enable { boot.kernelModules = [ "nvme_tcp" ]; })
 
     # The volume block, by the same rule etcd's follows (nix/etcd.nix): a
     # labelled disk or the root disk, and which one is a sentence somebody
     # wrote down rather than a surprise.
     #
-    # A guest's disks are the one thing on an agent that is BIG and that must
-    # outlive an image swap — the root disk of these lab VMs is 3.4 GiB with
-    # a 2.2 GiB image on it, so a single provisioned volume fills it — and
     # `[paths] volume_dir` above names exactly this directory. Mounting the
     # block AT that path rather than pointing the config at the block is what
     # makes it work from the generic image: the rendered agent.toml is one
     # file for the whole fleet, and a per-VM key inside its [paths] table is
-    # not something a context can append (nix/one-context.nix explains the
+    # not something a context can append (nix/context.nix explains the
     # prepend/append rule that forbids it).
     #
-    # nofail, like the etcd mount: a node whose block was not attached comes
-    # up and keeps its volumes on the root disk, which is the honest degraded
-    # state and not an emergency shell.
-    fileSystems."/var/lib/meisterstack/volumes" = {
-      device = "/dev/disk/by-label/meister-volumes";
-      fsType = "ext4";
-      options = [ "nofail" "x-systemd.device-timeout=5s" ];
-    };
-
-    systemd.services.meister-agent = {
-      description = "MeisterStack agent";
-      # The mount is ordering and NOT a requirement, which is the whole point
-      # of it being `after` rather than `RequiresMountsFor`: the block is
-      # `nofail`, a node whose disk was not attached is meant to come up and
-      # keep its volumes on the root disk, and a hard requirement here would
-      # turn that honest degraded state into a node that never starts. What
-      # the ordering buys is the other half — the agent must not open its
-      # store under a mount point that is about to be mounted OVER, which
-      # would hide both the records and the bytes they describe.
-      after = [
-        "one-context.service"
-        "network-online.target"
-        "var-lib-meisterstack-volumes.mount"
-      ];
-      # Every external binary the drivers resolve over PATH, because a systemd
-      # unit's PATH does NOT contain /run/current-system/sw/bin —
-      # systemPackages alone serves the ssh shell, not this unit.
-      #
-      # What each one is for, and when it is missed:
-      #   nftables    nft. The only HARD one: mac-pinning is promised for
-      #               every VM this stack boots, so an agent that cannot
-      #               write rules refuses to start rather than pretend.
-      #   lvm2        lvs/lvcreate/lvremove, for [volume.lvm-thin] — unless
-      #               that section names a bin_dir, which is the escape for a
-      #               host where lvm2 is elsewhere.
-      #   qemu-utils  qemu-img, also [volume.lvm-thin]: it writes the base
-      #               image onto the fresh LV and reads qcow2 as well as raw.
-      #   util-linux  mount, and nfs-utils its mount.nfs helper — needed only
-      #               by [volume.nfs] with manage_mount = true, which is the
-      #               shape where the driver mounts the share itself.
-      #   iproute2    ip, only with [network.provider]: `ip netns` builds a
-      #               router's namespace and pins it under /var/run/netns, so
-      #               that `ip netns exec meister-rt-<uuid> ip a` shows an
-      #               operator what the agent built. Missed only by a node
-      #               that was given a router.
-      #   procps      sysctl, the same section: ip_forward and the two
-      #               arp_ignore values INSIDE the router's namespace, which
-      #               is why it is `ip netns exec … sysctl` and not a write to
-      #               this process's /proc.
-      #   iputils     arping, the same section again: the gratuitous ARP a
-      #               router sends the moment it becomes the active one. Best
-      #               effort at the point of use — a node without it fails a
-      #               failover over by five seconds of somebody else's ARP
-      #               cache and nothing worse — which is why it is here and
-      #               not a ConditionPathExists.
-      #   frr         vtysh, only with [network.bgp].
-      #   curl        fetching a base image registered with `image create
-      #               --from-url`. Missed only by a node asked to boot such an
-      #               image, and then it is a named error at the point of use
-      #               ("is curl on the agent's PATH?") rather than a mystery:
-      #               the vm goes Failed with that sentence, and the Image
-      #               object goes Failed with it too, which is what the whole
-      #               fetch-and-report road exists for.
-      #   virtiofsd   NOT resolved over PATH by the driver: [volume.nfs]
-      #               names a path to it. It is here so that a config may name
-      #               the bare word, and in systemPackages above so that
-      #               /run/current-system/sw/bin/virtiofsd is a stable path a
-      #               config can point at.
-      #   nvme-cli    nvme, for [volume.nvmeof] — connect, list-subsys,
-      #               id-ns, disconnect. Missed the same way lvm2 would be:
-      #               the attacher's own sentence ("Is nvme-cli installed,
-      #               and is this process root?") at the first volume that
-      #               needed the fabric, and not before. The escape is the
-      #               same too, a bin_dir in that section. Its kernel half is
-      #               boot.kernelModules below, and that one is not optional.
-
-      # Everything except nftables fails later and less clearly than at
-      # start-up: at the first VM that needed the backend in question.
-      #
-      # NOT here, and deliberately: nvidia-smi. The nvrm driver calls it
-      # best-effort to warn about persistence mode, and these lab nodes are
-      # GPU-less by design; a node with a card gets the NVIDIA packages from
-      # its own configuration, not from this role.
-      path = with pkgs; [
-        nftables
-        iproute2
-        procps
-        iputils
-        frr
-        lvm2
-        virtiofsd
-        qemu-utils
-        util-linux
-        nfs-utils
-        curl
-        nvme-cli
-      ];
-      unitConfig = {
-        # All three must have been pushed before the agent can do anything.
-        # The CA is on the list for the same reason as at the controllers: the
-        # template names controller_ca/cert/key, and a missing one of them is a
-        # start-up error, so a node that push.sh has not reached yet waits
-        # visibly instead of restarting every two seconds.
-        ConditionPathExists = [
-          "/opt/meisterstack/bin/meister-agent"
-          "/opt/meisterstack/bin/cloud-hypervisor"
-          "/opt/meisterstack/pki/ca.crt"
-        ];
+    # A mount is the one thing a service module must not make unconditional
+    # — it is a statement about the machine — so it hangs on an option with
+    # a device in it, and `device = null` is a node that keeps its guests'
+    # disks on the root disk and says so.
+    (lib.mkIf (builtins.elem "agent" cfg.unitsFor && volumes.device != null) {
+      fileSystems.${volumeDir} = {
+        device = volumes.device;
+        fsType = "ext4";
+        # nofail, like the etcd mount: a node whose block was not attached
+        # comes up and keeps its volumes on the root disk, which is the
+        # honest degraded state and not an emergency shell. `required = true`
+        # is the deployment that would rather not come up.
+        options = lib.optional (!volumes.required) "nofail"
+          ++ [ "x-systemd.device-timeout=5s" ];
       };
-      serviceConfig = {
-        ExecStart = "/opt/meisterstack/bin/meister-agent --config /run/meisterstack/agent.toml";
-        Restart = "always";
-        RestartSec = 2;
-        Environment = "RUST_LOG=info";
-
-        # Two lines of sandbox, and deliberately not the set the controllers
-        # get (controllers.nix). This process IS the privileged half: it
-        # programs nftables, creates taps and bridges, opens /dev/kvm and
-        # hands PCI devices through vfio. PrivateDevices would take /dev/kvm
-        # and the vfio nodes away, PrivateTmp would hide the sockets the VMM
-        # and virtiofsd share, ProtectKernelTunables would stop it writing
-        # the sysctls a bridge needs, and mdev needs sysfs writes besides.
-        # These two cost it nothing:
-        ProtectHome = true;
-        # AF_NETLINK is how routes, links and nftables are programmed;
-        # AF_VSOCK is the guest agent channel. Neither is optional here.
-        RestrictAddressFamilies = "AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_VSOCK";
-        # And the line that pays for the one above. ProtectHome gives the unit
-        # a mount namespace of its own, and a router's network namespace is
-        # PINNED by a bind mount (`ip netns add` puts it under /run/netns) --
-        # so without this the pin lives only inside that private namespace.
-        # Three things followed, all seen in the lab on 2026-09-10:
-        #
-        #   * every router netns died with the agent on a restart, because the
-        #     mount namespace that held its only reference went away;
-        #   * a zero-byte file stayed behind in the host's /run/netns, so the
-        #     next `ip netns add` of the same name would fail with EEXIST;
-        #   * `ip netns exec meister-rt-<uid> ...` on the machine answered
-        #     "Invalid argument" -- the file is there and is not a mount --
-        #     which is exactly the command drivers/linux-network's own module
-        #     doc tells an operator to run.
-        #
-        # `MountFlags = shared` makes the unit's mounts propagate back to the
-        # host, which is what a service that creates namespaces for other
-        # things to use has to do. It does not widen what the process may
-        # touch; it says that what it mounts is not private to it.
-        MountFlags = "shared";
-      } // lib.optionalAttrs unprivileged {
-        # --- the agent as `meister`, with exactly its capabilities ---------
-        #
-        # Model C of the reference study, and it is only honest for a
-        # compute-only node: the moment CAP_SYS_ADMIN is in the list below,
-        # this is root with extra steps (capabilities(7): "the new root").
-        # The full node keeps running as root, which is the default.
-        User = "meister";
-        Group = "meister";
-
-        # The device nodes this agent opens, by group rather than by
-        # capability — which is how every reference does it (Kata: "crw-rw----
-        # root:kvm" plus a supplemental group; QEMU: "configure UNIX groups
-        # for access to /dev/kvm, /dev/net/tun"). `kvm` for the guest,
-        # `video`/`render` for a GPU node, `input` for an evdev backend.
-        SupplementaryGroups = [ "kvm" "video" "render" "input" ];
-
-        # Exactly what the option says, in both sets. Ambient, because the
-        # drivers work by execing `nft` and `ip` and those need the
-        # capability themselves; bounding, so the list is a ceiling and not
-        # just a starting point.
-        AmbientCapabilities = capabilities;
-        CapabilityBoundingSet = capabilities;
-
-        # Written out, not `Delegate=yes`: the list IS the claim, and
-        # docker.service (measured on this machine) writes it out for the
-        # same reason. `cpuset` is in it because `cgroup_cpuset` in the agent
-        # config is worthless without it — and because a system unit is the
-        # only kind of unit that can have it (see `unitCgroup`).
-        #
-        # Delegation does not enable anything by itself: systemd's own
-        # documentation says "you have to do that manually by writing to
-        # cgroup.subtree_control", which is what drivers/cgroup does.
-        Delegate = "cpu cpuset io memory pids";
-        # cgroup v2 forbids processes in an inner node, so the agent cannot
-        # sit in the directory it also wants to put VM slices under. systemd
-        # 254+ does the move itself with this; the agent does it too, at
-        # start-up, and finds nothing left to do. Both, because the two are
-        # the same directory and either one alone is a node that limits
-        # nothing.
-        DelegateSubgroup = "supervisor";
-
-        # `DeviceAllow=` and NOT `PrivateDevices=yes` — the trap the study
-        # names, and systemd's own man page says it: "When access to some but
-        # not all devices must be possible, the DeviceAllow= setting might be
-        # used instead". PrivateDevices would give this unit a /dev with no
-        # /dev/kvm in it, which is a node that cannot boot a guest.
-        #
-        # `closed` leaves the harmless pseudo-devices (null, zero, random,
-        # tty) and nothing else. char-drm and char-input are whole device
-        # groups because their numbers are the host's to choose; a GPU node
-        # with an NVIDIA card needs its own line beside these, which is a
-        # fact about that node and belongs in its own configuration.
-        DevicePolicy = "closed";
-        DeviceAllow = [
-          "/dev/kvm rw"
-          "/dev/net/tun rw"
-          "/dev/vhost-net rw"
-          "/dev/vhost-vsock rw"
-          "char-drm rw"
-          "char-input r"
-        ];
-      };
-    };
-  };
+    })
+  ];
 }

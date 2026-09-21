@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+
 # The tier's etcd. Single-member and loopback-only by default: the controller
 # on the same VM is the only client (Oakestra-style — each tier's etcd is
 # private to its controller).
@@ -19,7 +23,7 @@
 # Optional persistence: attach a second disk in OpenNebula, mkfs.ext4 once,
 # and /var/lib/etcd survives image updates; without it the mount is skipped
 # (nofail) and etcd lives on the root disk.
-{ lib, config, ... }:
+{ lib, pkgs, config, ... }:
 let
   cfg = config.meisterstack.etcd;
   clustered = cfg.peers != { };
@@ -27,6 +31,23 @@ let
 in
 {
   options.meisterstack.etcd = {
+    enable = lib.mkOption {
+      type = lib.types.bool;
+      default = builtins.any (r: r == "cloud" || r == "cluster")
+        config.meisterstack.unitsFor;
+      defaultText = lib.literalExpression ''a controller tier runs one'';
+      description = ''
+        Whether this machine runs the etcd its controller talks to. The
+        default is "yes if it carries a controller role": each tier's etcd is
+        private to its controller (Oakestra-style), so an agent-only node has
+        no reason to run one — and a host that imports these modules without
+        naming a role gets no database it did not ask for.
+
+        The appliance image is every tier at once (`meisterstack.unitsFor`),
+        so there this is on, exactly as it has always been.
+      '';
+    };
+
     peers = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = { };
@@ -57,7 +78,15 @@ in
     };
   };
 
-  config = {
+  config = lib.mkIf cfg.enable {
+    # etcdctl on the box, for the same reason `alloy` is in
+    # nix/observability.nix: the first question about a control plane that is
+    # not answering is what its database says, and `deploy/check.sh` and
+    # `meister-deploy` both ask it over ssh. It travelled in nix/base.nix
+    # until M1, which made it a property of the IMAGE rather than of the
+    # database it talks to.
+    environment.systemPackages = [ pkgs.etcd ];
+
     assertions = [
       {
         assertion = !clustered || cfg.peers ? ${cfg.member};
@@ -123,14 +152,20 @@ in
       options = [ "nofail" "x-systemd.device-timeout=5s" ];
     };
 
-    # The runtime twin of `peers`: one-context renders ETCD_* into this file
-    # from MEISTER_ETCD_PEERS/_MEMBER/_TOKEN. EnvironmentFile overrides the
-    # module's Environment=, so a context-driven lab clusters the SAME
-    # role-agnostic image that build-time `peers` clusters for NixOS-first
-    # deployments. Absent file (the `-`) = exactly the baked behaviour.
-    systemd.services.etcd = {
-      after = [ "one-context.service" ];
-      serviceConfig.EnvironmentFile = "-/run/meisterstack/etcd.env";
+    # The runtime twin of `peers`: the context renderer writes ETCD_* into
+    # this file from MEISTER_ETCD_PEERS/_MEMBER/_TOKEN. EnvironmentFile
+    # overrides the module's Environment=, so a context-driven lab clusters
+    # the SAME role-agnostic image that build-time `peers` clusters for
+    # NixOS-first deployments. Absent file (the `-`) = exactly the baked
+    # behaviour.
+    #
+    # Only where a renderer exists. A managed host sets `peers`, `member` and
+    # `clusterToken` above — Nix knows them at build time — and a second
+    # author of the same three values at boot is how two halves start
+    # disagreeing about who is in the Raft.
+    systemd.services.etcd = lib.mkIf config.meisterstack.context.enable {
+      after = [ "meister-context.service" ];
+      serviceConfig.EnvironmentFile = "-${config.meisterstack.configDir}/etcd.env";
     };
   };
 }

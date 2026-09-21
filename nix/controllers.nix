@@ -2,9 +2,13 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# Both controller units ship in the one image; the OpenNebula context
+# Both controller units ship in the appliance image; the context
 # (MEISTER_ROLE) starts the right one. ConditionPathExists keeps a unit
 # quietly skipped until push.sh delivered its binary.
+#
+# On every other host a unit is built only for the role that host carries
+# (`meisterstack.unitsFor`, nix/services.nix): the appliance is the one image
+# that does not know at build time what it will be.
 #
 # Central cluster setup: everything configurable lives in
 # meisterstack.<role>.settings (free-form TOML), merged over the role
@@ -39,13 +43,13 @@ let
   #
   # The names are FIXED and the same on every host, which is the whole trick:
   # a serving certificate and an identity differ per VM, and one template
-  # serves them all. Either the template names per-host paths and one-context
+  # serves them all. Either the template names per-host paths and the renderer
   # renders them, or the push decides which file gets the fixed name. The
   # second: it keeps the template dumb and the decision where the operator is
   # already thinking per host — and a certificate that landed on the wrong
   # host then fails at the handshake, with a name in the message, instead of
   # at rendering time with nothing to look at.
-  pki = "/opt/meisterstack/pki";
+  pki = cfg.pki.dir;
 
   # Both controller roles serve TLS and demand a client certificate for it.
   # A chain that names a link it cannot build is a start-up error by design
@@ -74,19 +78,19 @@ let
   #   2. `OidcConfig.issuer` is a required String. A baked `[auth.oidc]`
   #      waiting for an issuer is not a quiet no-op, it is a PARSE error on
   #      every VM that never gets one.
-  #   3. one-context APPENDS section overrides, and TOML has no way to
-  #      redefine a `[table]` an append arrives after.
+  #   3. the context renderer APPENDS section overrides, and TOML has no way
+  #      to redefine a `[table]` an append arrives after.
   #
   # So the whole table has one owner, and the only owner that knows whether
-  # this deployment has an identity provider is one-context, at boot, holding
-  # MEISTER_OIDC_ISSUER. What it gets from here is the rest: two ready-made
-  # fragments, one of which it concatenates onto the rendered cloud.toml. The
-  # values stay in this file, where the rest of the cloud's auth lives, and
+  # this deployment has an identity provider is the context renderer, at
+  # boot, holding MEISTER_OIDC_ISSUER. What it gets from here is the rest:
+  # two ready-made fragments, one of which it concatenates onto the rendered
+  # cloud.toml. The values stay in this file, where the cloud's auth lives, and
   # TOML quoting stays Nix's problem rather than a shell's.
   #
   # `[auth.oidc]` is LAST in the oidc fragment (toml.generate orders it so,
   # and the check-context render test holds it there), which is what lets
-  # one-context append the single `issuer` line into it.
+  # the renderer append the single `issuer` line into it.
   #
   # No ca_cert for the provider: the lab's Keycloak is plain http. That is
   # THE deviation from the hardened profile in this whole file, and it is
@@ -104,7 +108,7 @@ let
       # `aud` unless an audience mapper says otherwise (the lab's mapper says
       # "meister"), and Kanidm writes the name of the oauth2 client itself and
       # has no mapper to say anything else with. So it travels with the issuer
-      # — one-context renders it from MEISTER_OIDC_AUDIENCE — and defaults to
+      # — the renderer takes it from MEISTER_OIDC_AUDIENCE — and defaults to
       # the "meister" this file used to bake, so that an image swap under the
       # lab's existing context changes nothing.
       #
@@ -116,7 +120,7 @@ let
   };
 
   cloudDefaults = serving // {
-    metrics_listen = "0.0.0.0:9100";
+    metrics_listen = "0.0.0.0:${toString cfg.ports.cloud.metrics}";
     # The cloud's own client identity — `CN=system:cloud:<cloud_name>`, the
     # file push.sh gives the fixed name `identity` to. The cluster tier below
     # has had it since it learned to dial the cloud; this tier needed it the
@@ -140,7 +144,7 @@ let
   };
 
   clusterDefaults = serving // clusterAuth // {
-    metrics_listen = "0.0.0.0:9101";
+    metrics_listen = "0.0.0.0:${toString cfg.ports.cluster.metrics}";
     # The other direction, and separate from `serving` because the two
     # directions are: this is how a cluster DIALS the cloud, and the identity
     # it presents there is `CN=system:cluster:<name>` — the file push.sh gives
@@ -152,7 +156,12 @@ let
 
   controller = name: {
     description = "MeisterStack ${name}-controller";
-    after = [ "etcd.service" "one-context.service" ];
+    # `meister-context.service` exists only where there IS a boot renderer
+    # (the appliance). Ordering against a unit that is not on this machine is
+    # a no-op in systemd, which is why this line is not behind a condition:
+    # it says "after the renderer, if there is one" and costs nothing where
+    # there is not.
+    after = [ "etcd.service" "meister-context.service" ];
     wants = [ "etcd.service" ];
     # The binary, and now also the CA. `client_ca` without `tls_cert`/`tls_key`
     # is a hard start-up error (rest.rs::server_tls, grpc.rs::server_tls, and
@@ -162,13 +171,15 @@ let
     # ConditionPathExists=/opt/meisterstack/pki/ca.crt was not met, which is a
     # sentence an operator can act on — a restart loop is not.
     unitConfig.ConditionPathExists = [
-      "/opt/meisterstack/bin/meister-${name}-controller"
+      "${cfg.binDir}/meister-${name}-controller"
       "${pki}/ca.crt"
     ];
     serviceConfig = {
-      # one-context renders /etc templates to /run and appends per-VM values
-      # (e.g. cluster_name) from the context — units consume the /run copy.
-      ExecStart = "/opt/meisterstack/bin/meister-${name}-controller --config /run/meisterstack/${name}.toml";
+      # Where the config comes from is `meisterstack.configDir`: the boot
+      # renderer's /run copy on an appliance (it appends per-VM values such as
+      # cluster_name from the context), and the complete /etc file that Nix
+      # wrote on a managed host.
+      ExecStart = "${cfg.binDir}/meister-${name}-controller --config ${cfg.configDir}/${name}.toml";
       Restart = "always";
       RestartSec = 2;
       Environment = "RUST_LOG=info";
@@ -176,7 +187,7 @@ let
       # A controller is a network daemon that reads two files and talks to
       # etcd on loopback. It needs none of the rest of a machine, so it gets
       # none of it. What it reads it reads as `meister`: the rendered config
-      # (root:meister 0640, one-context.nix) and its own key (meister 0600,
+      # (root:meister 0640, nix/context.nix) and its own key (meister 0600,
       # deploy/push.sh pki).
       User = "meister";
       Group = "meister";
@@ -224,8 +235,25 @@ in
         Empty (the default) = the role defaults above and, for everything they
         do not name, the binary's own — which are the lab topology.
         cluster_name, cloud_addr and cloud_addrs are normally left out here and
-        written by one-context from the OpenNebula context instead — a key in
+        written by the context renderer from the context instead — a key in
         both places would be a duplicate TOML key.
+      '';
+    };
+
+    cluster.generated = lib.mkOption {
+      type = toml.type;
+      default = { };
+      internal = true;
+      description = ''
+        The per-machine keys of the cluster-controller config, merged BETWEEN
+        the role defaults and the operator's `settings` — so a deployment can
+        still override one of them, and the defaults still lose to both.
+
+        Empty on an appliance: there the same keys are written at boot by the
+        context renderer, which is the only thing that knows where this image
+        was started. `nix/managed.nix` fills it from
+        `meisterstack.context.defaults` through `nix/lib/render.nix`, so that
+        both roads render the same file out of the same input.
       '';
     };
     cloud.settings = lib.mkOption {
@@ -237,30 +265,78 @@ in
         so config/examples/hardened/cloud.toml is worth reading before any
         deployment that is reachable from outside the lab.
 
-        NOT `auth`: this tier's whole [auth] table is appended by one-context
-        at boot (see cloudAuthMtls/cloudAuthOidc above and the reason it has
+        NOT `auth`: this tier's whole [auth] table is appended by the context
+        renderer (nix/context.nix) at boot (see cloudAuthMtls/cloudAuthOidc above and the reason it has
         to be one owner). A key here would be a duplicate [auth] table and a
         parse error on the VM. The values live in cloudAuthOidc; the issuer
-        comes from MEISTER_OIDC_ISSUER.
+        comes from MEISTER_OIDC_ISSUER — and on a managed host, where there is
+        no renderer, by `meisterstack.cloud.generated` at build time.
+      '';
+    };
+
+    cloud.authFragments = lib.mkOption {
+      type = lib.types.attrsOf toml.type;
+      internal = true;
+      readOnly = true;
+      default = { mtls = cloudAuthMtls; oidc = cloudAuthOidc; };
+      description = ''
+        The two halves of the cloud's [auth] table, for whoever has to finish
+        it: the boot renderer reads them as files under /etc, and
+        nix/lib/render.nix reads them as values. `client_id` and
+        `username_claim` are decisions about this stack rather than about a
+        deployment, so they have exactly one owner — this file — and both
+        roads take them from here instead of typing them again.
+      '';
+    };
+
+    cloud.generated = lib.mkOption {
+      type = toml.type;
+      default = { };
+      internal = true;
+      description = ''
+        The cloud-controller's per-machine keys, the counterpart of
+        `meisterstack.cluster.generated` — including the whole [auth] table on
+        a managed host, where nothing appends it at boot.
       '';
     };
   };
 
-  config = {
-    environment.etc."meisterstack/cluster.toml".source =
-      toml.generate "cluster.toml" (lib.recursiveUpdate clusterDefaults cfg.cluster.settings);
-    environment.etc."meisterstack/cloud.toml".source =
-      toml.generate "cloud.toml" (lib.recursiveUpdate cloudDefaults cfg.cloud.settings);
+  # One tier, one gate. A host that is not a cluster carries no
+  # cluster-controller unit and no cluster.toml — where the appliance is
+  # every tier at once because its image does not know yet (nix/services.nix,
+  # `unitsFor`).
+  config = lib.mkMerge [
+    (lib.mkIf (builtins.elem "cluster" cfg.unitsFor) {
+      environment.etc."meisterstack/cluster.toml".source =
+        toml.generate "cluster.toml"
+          (lib.recursiveUpdate
+            (lib.recursiveUpdate clusterDefaults cfg.cluster.generated)
+            cfg.cluster.settings);
+      systemd.services.meister-cluster-controller = controller "cluster";
+    })
 
-    # The two halves of the cloud's [auth] table; one-context picks one and
-    # appends it. Fragments and not templates: nothing consumes these on their
-    # own, and a role that does not exist has no config file.
-    environment.etc."meisterstack/cloud-auth-mtls.toml".source =
-      toml.generate "cloud-auth-mtls.toml" cloudAuthMtls;
-    environment.etc."meisterstack/cloud-auth-oidc.toml".source =
-      toml.generate "cloud-auth-oidc.toml" cloudAuthOidc;
+    (lib.mkIf (builtins.elem "cloud" cfg.unitsFor) {
+      environment.etc."meisterstack/cloud.toml".source =
+        toml.generate "cloud.toml"
+          (lib.recursiveUpdate
+            (lib.recursiveUpdate cloudDefaults cfg.cloud.generated)
+            cfg.cloud.settings);
+      systemd.services.meister-cloud-controller = controller "cloud";
+    })
 
-    systemd.services.meister-cloud-controller = controller "cloud";
-    systemd.services.meister-cluster-controller = controller "cluster";
-  };
+    # The two halves of the cloud's [auth] table; the boot renderer picks one
+    # and appends it. Fragments and not templates: nothing consumes these on
+    # their own, and a role that does not exist has no config file.
+    #
+    # Only where a renderer exists. A managed host has its whole [auth] table
+    # baked into cloud.toml (`cloud.generated`), and two fragments beside it
+    # that nobody reads would be a second answer to the question "where does
+    # this cloud's auth come from".
+    (lib.mkIf (builtins.elem "cloud" cfg.unitsFor && cfg.context.enable) {
+      environment.etc."meisterstack/cloud-auth-mtls.toml".source =
+        toml.generate "cloud-auth-mtls.toml" cloudAuthMtls;
+      environment.etc."meisterstack/cloud-auth-oidc.toml".source =
+        toml.generate "cloud-auth-oidc.toml" cloudAuthOidc;
+    })
+  ];
 }
