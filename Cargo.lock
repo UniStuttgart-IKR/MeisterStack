@@ -1243,6 +1243,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "nix 0.31.3",
  "serde",
  "tempfile",
  "toml",

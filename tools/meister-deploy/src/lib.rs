@@ -19,3 +19,4 @@
 //! `meister-deploy legacy <verb>`; it carries the context fleet until L3.
 
 pub mod legacy;
+pub mod run;
