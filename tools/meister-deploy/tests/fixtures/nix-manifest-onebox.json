@@ -1,0 +1,595 @@
+{
+  "schema": "meister-deploy/nix-manifest/1",
+  "inventory": {
+    "fleet": {
+      "name": "one-box",
+      "domain": "lab",
+      "schema": 2
+    },
+    "groups": {
+      "box": {
+        "kind": "raft",
+        "members": [
+          "box"
+        ],
+        "quorum": {
+          "size": 1
+        },
+        "profiles": [
+          "base",
+          "controller"
+        ],
+        "rollout": {
+          "canary_class": null,
+          "max_unavailable": 1,
+          "reboot": "approve"
+        }
+      },
+      "compute": {
+        "kind": "compute",
+        "members": [
+          "n1",
+          "n2"
+        ],
+        "quorum": null,
+        "profiles": [
+          "base",
+          "compute-cpu"
+        ],
+        "rollout": {
+          "canary_class": "compute-cpu",
+          "max_unavailable": 1,
+          "reboot": "approve"
+        }
+      }
+    },
+    "hosts": {
+      "box": {
+        "name": "meister-box",
+        "address": "10.0.0.10",
+        "deployment": "nixos",
+        "ssh": {
+          "user": "root",
+          "port": 22,
+          "host_key_fingerprint": "SHA256:5ZqB3rJZ4S1q0mQHq1n8Xx0yv2nQ0h2cQ8oO1pWd3kI"
+        },
+        "roles": [
+          "cloud",
+          "cluster",
+          "agent",
+          "addons"
+        ],
+        "groups": [
+          "box"
+        ],
+        "controller_group": null,
+        "site": "ikr-lab",
+        "failure_domain": "rack1",
+        "networks": {
+          "management": {
+            "address": "10.0.0.10",
+            "prefix": 24,
+            "interface": "eno1",
+            "gateway": "10.0.0.1"
+          },
+          "storage": null,
+          "tenant": null,
+          "bmc": null
+        },
+        "profiles": [
+          "base",
+          "controller"
+        ],
+        "modules": [
+          "hosts/box.nix"
+        ],
+        "deviations": {},
+        "hardware": {
+          "cpu": "AMD EPYC 7302P",
+          "memory_gb": 128,
+          "gpus": [],
+          "nics": [
+            {
+              "name": "eno1",
+              "mac": "52:54:00:00:00:10",
+              "role": "management",
+              "rdma": false
+            }
+          ],
+          "capabilities": [
+            "kvm"
+          ]
+        },
+        "install": {
+          "disk": {
+            "serial": "S6PENX0T123456",
+            "wwn": null,
+            "size_bytes": 960197124096
+          },
+          "layout": "disko/single-nvme.nix",
+          "preserve": [
+            "/var/lib/meister-data"
+          ]
+        }
+      },
+      "n1": {
+        "name": "meister-n1",
+        "address": "10.0.0.11",
+        "deployment": "nixos",
+        "ssh": {
+          "user": "root",
+          "port": 22,
+          "host_key_fingerprint": "SHA256:9wLp2xK0sVvR6fQ1mB7nT4cY8dE3hJ5aZ0gU2iO4rXs"
+        },
+        "roles": [
+          "agent"
+        ],
+        "groups": [
+          "compute"
+        ],
+        "controller_group": "box",
+        "site": "ikr-lab",
+        "failure_domain": "rack1",
+        "networks": {
+          "management": {
+            "address": "10.0.0.11",
+            "prefix": 24,
+            "interface": "eno1",
+            "gateway": "10.0.0.1"
+          },
+          "storage": null,
+          "tenant": null,
+          "bmc": null
+        },
+        "profiles": [
+          "base",
+          "compute-cpu"
+        ],
+        "modules": [],
+        "deviations": {},
+        "hardware": {
+          "cpu": "AMD EPYC 7302P",
+          "memory_gb": 64,
+          "gpus": [],
+          "nics": [
+            {
+              "name": "eno1",
+              "mac": "52:54:00:00:00:11",
+              "role": "management",
+              "rdma": false
+            }
+          ],
+          "capabilities": [
+            "kvm"
+          ]
+        },
+        "install": {
+          "disk": {
+            "serial": "S6PENX0T123457",
+            "wwn": null,
+            "size_bytes": 480103981056
+          },
+          "layout": "disko/single-nvme.nix",
+          "preserve": [
+            "/var/lib/meister-data"
+          ]
+        }
+      },
+      "n2": {
+        "name": "meister-n2",
+        "address": "10.0.0.12",
+        "deployment": "nixos",
+        "ssh": {
+          "user": "root",
+          "port": 22,
+          "host_key_fingerprint": null
+        },
+        "roles": [
+          "agent"
+        ],
+        "groups": [
+          "compute"
+        ],
+        "controller_group": "box",
+        "site": "ikr-lab",
+        "failure_domain": "rack1",
+        "networks": {
+          "management": {
+            "address": "10.0.0.12",
+            "prefix": 24,
+            "interface": "eno1",
+            "gateway": "10.0.0.1"
+          },
+          "storage": null,
+          "tenant": null,
+          "bmc": null
+        },
+        "profiles": [
+          "base",
+          "compute-cpu"
+        ],
+        "modules": [],
+        "deviations": {},
+        "hardware": {
+          "cpu": "AMD EPYC 7302P",
+          "memory_gb": 64,
+          "gpus": [],
+          "nics": [
+            {
+              "name": "eno1",
+              "mac": "52:54:00:00:00:12",
+              "role": "management",
+              "rdma": false
+            }
+          ],
+          "capabilities": [
+            "kvm"
+          ]
+        },
+        "install": {
+          "disk": {
+            "serial": "S6PENX0T123458",
+            "wwn": null,
+            "size_bytes": 480103981056
+          },
+          "layout": "disko/single-nvme.nix",
+          "preserve": [
+            "/var/lib/meister-data"
+          ]
+        }
+      }
+    },
+    "services": {
+      "observability-external": {
+        "kind": "observability",
+        "managed": false,
+        "host": null,
+        "endpoint": {
+          "loki": "http://10.0.5.10:3100/loki/api/v1/push"
+        },
+        "trust_ref": "trust/external-ca.crt",
+        "required": false
+      }
+    }
+  },
+  "hosts": {
+    "box": {
+      "effective_settings": {
+        "agent": {
+          "node": {
+            "id": "box",
+            "controller_addrs": [
+              "10.0.0.10:50051"
+            ]
+          },
+          "paths": {
+            "state": "/var/lib/meisterstack/agent",
+            "socket": "/run/meisterstack/agent.sock"
+          },
+          "tls": {
+            "identity": "/run/credentials/meister-agent.service/identity.key"
+          }
+        },
+        "cloud": {
+          "listen": {
+            "api": "10.0.0.10:3000",
+            "session": "10.0.0.10:50050"
+          },
+          "etcd": {
+            "endpoints": [
+              "https://10.0.0.10:2379"
+            ]
+          }
+        },
+        "cluster": {
+          "listen": {
+            "api": "10.0.0.10:3001",
+            "session": "10.0.0.10:50051"
+          },
+          "cloud_addrs": [
+            "10.0.0.10:50050"
+          ]
+        },
+        "etcd": {
+          "name": "box",
+          "initial_cluster": "box=https://10.0.0.10:2380"
+        },
+        "observability": null
+      },
+      "build": {
+        "toplevel_drv": "/nix/store/dddddddddddddddddddddddddddddddd-nixos-system-box-25.11.drv",
+        "toplevel_out": "/nix/store/oooooooooooooooooooooooooooooooo-nixos-system-box-25.11",
+        "installer_drv": "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-nixos-installer-box.drv",
+        "disk_image_drv": null,
+        "boot": {
+          "kernel_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-linux-6.12.41/bzImage",
+          "initrd_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-initrd-linux-6.12.41/initrd",
+          "kernel_version": "6.12.41",
+          "kernel_params_sha256": "3b8fkkkkkkkk"
+        }
+      },
+      "config_artifacts": {
+        "agent_toml_out": "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-agent.toml",
+        "cloud_toml_out": "/nix/store/cccccccccccccccccccccccccccccccc-cloud.toml",
+        "cluster_toml_out": "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cluster.toml"
+      },
+      "secret_refs": [
+        {
+          "id": "identity",
+          "kind": "identity_key",
+          "source": {
+            "kind": "target-generated",
+            "ref": "system:node:box"
+          },
+          "target_path": "/var/lib/meisterstack/pki/identity.key",
+          "owner": "root",
+          "mode": "0600",
+          "delivery": "systemd-credential",
+          "reload": {
+            "unit": "meister-agent.service",
+            "action": "restart"
+          }
+        },
+        {
+          "id": "ca-bundle",
+          "kind": "ca_bundle",
+          "source": {
+            "kind": "operator-file",
+            "ref": "../labpki/ca.crt"
+          },
+          "target_path": "/var/lib/meisterstack/pki/ca.crt",
+          "owner": "root",
+          "mode": "0644",
+          "delivery": "file",
+          "reload": null
+        },
+        {
+          "id": "serving",
+          "kind": "serving_key",
+          "source": {
+            "kind": "meister-ca",
+            "ref": "system:cloud:box"
+          },
+          "target_path": "/var/lib/meisterstack/pki/serving.key",
+          "owner": "root",
+          "mode": "0600",
+          "delivery": "systemd-credential",
+          "reload": {
+            "unit": "meister-cloud-controller.service",
+            "action": "restart"
+          }
+        }
+      ],
+      "persistence": [
+        {
+          "path": "/var/lib/meister-data",
+          "device_ref": "label:meister-data",
+          "required": true,
+          "preserve_on_reinstall": true
+        },
+        {
+          "path": "/var/lib/etcd",
+          "device_ref": "label:etcd-data",
+          "required": true,
+          "preserve_on_reinstall": true
+        }
+      ],
+      "checks": {
+        "required": [
+          "units",
+          "session",
+          "mounts"
+        ],
+        "functional": [
+          "vm-lifecycle"
+        ]
+      },
+      "rollout": {
+        "canary_class": "one-box",
+        "max_unavailable": 1,
+        "reboot": "approve"
+      }
+    },
+    "n1": {
+      "effective_settings": {
+        "agent": {
+          "node": {
+            "id": "n1",
+            "controller_addrs": [
+              "10.0.0.10:50051"
+            ]
+          },
+          "paths": {
+            "state": "/var/lib/meisterstack/agent",
+            "socket": "/run/meisterstack/agent.sock"
+          },
+          "tls": {
+            "identity": "/run/credentials/meister-agent.service/identity.key"
+          }
+        },
+        "cloud": null,
+        "cluster": null,
+        "etcd": null,
+        "observability": null
+      },
+      "build": {
+        "toplevel_drv": "/nix/store/dddddddddddddddddddddddddddddddd-nixos-system-n1-25.11.drv",
+        "toplevel_out": "/nix/store/oooooooooooooooooooooooooooooooo-nixos-system-n1-25.11",
+        "installer_drv": null,
+        "disk_image_drv": null,
+        "boot": {
+          "kernel_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-linux-6.12.41/bzImage",
+          "initrd_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-initrd-linux-6.12.41/initrd",
+          "kernel_version": "6.12.41",
+          "kernel_params_sha256": "3b8fkkkkkkkk"
+        }
+      },
+      "config_artifacts": {
+        "agent_toml_out": "/nix/store/n1n1n1n1n1n1n1n1zzzzzzzzzzzzzzzz-agent.toml"
+      },
+      "secret_refs": [
+        {
+          "id": "identity",
+          "kind": "identity_key",
+          "source": {
+            "kind": "target-generated",
+            "ref": "system:node:n1"
+          },
+          "target_path": "/var/lib/meisterstack/pki/identity.key",
+          "owner": "root",
+          "mode": "0600",
+          "delivery": "systemd-credential",
+          "reload": {
+            "unit": "meister-agent.service",
+            "action": "restart"
+          }
+        },
+        {
+          "id": "ca-bundle",
+          "kind": "ca_bundle",
+          "source": {
+            "kind": "operator-file",
+            "ref": "../labpki/ca.crt"
+          },
+          "target_path": "/var/lib/meisterstack/pki/ca.crt",
+          "owner": "root",
+          "mode": "0644",
+          "delivery": "file",
+          "reload": null
+        }
+      ],
+      "persistence": [
+        {
+          "path": "/var/lib/meister-data",
+          "device_ref": "label:meister-data",
+          "required": true,
+          "preserve_on_reinstall": true
+        }
+      ],
+      "checks": {
+        "required": [
+          "units",
+          "session",
+          "mounts"
+        ],
+        "functional": []
+      },
+      "rollout": {
+        "canary_class": "compute-cpu",
+        "max_unavailable": 1,
+        "reboot": "approve"
+      }
+    },
+    "n2": {
+      "effective_settings": {
+        "agent": {
+          "node": {
+            "id": "n2",
+            "controller_addrs": [
+              "10.0.0.10:50051"
+            ]
+          },
+          "paths": {
+            "state": "/var/lib/meisterstack/agent",
+            "socket": "/run/meisterstack/agent.sock"
+          },
+          "tls": {
+            "identity": "/run/credentials/meister-agent.service/identity.key"
+          }
+        },
+        "cloud": null,
+        "cluster": null,
+        "etcd": null,
+        "observability": null
+      },
+      "build": {
+        "toplevel_drv": "/nix/store/dddddddddddddddddddddddddddddddd-nixos-system-n2-25.11.drv",
+        "toplevel_out": "/nix/store/oooooooooooooooooooooooooooooooo-nixos-system-n2-25.11",
+        "installer_drv": null,
+        "disk_image_drv": null,
+        "boot": {
+          "kernel_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-linux-6.12.41/bzImage",
+          "initrd_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-initrd-linux-6.12.41/initrd",
+          "kernel_version": "6.12.41",
+          "kernel_params_sha256": "3b8fkkkkkkkk"
+        }
+      },
+      "config_artifacts": {
+        "agent_toml_out": "/nix/store/n2n2n2n2n2n2n2n2zzzzzzzzzzzzzzzz-agent.toml"
+      },
+      "secret_refs": [
+        {
+          "id": "identity",
+          "kind": "identity_key",
+          "source": {
+            "kind": "target-generated",
+            "ref": "system:node:n2"
+          },
+          "target_path": "/var/lib/meisterstack/pki/identity.key",
+          "owner": "root",
+          "mode": "0600",
+          "delivery": "systemd-credential",
+          "reload": {
+            "unit": "meister-agent.service",
+            "action": "restart"
+          }
+        },
+        {
+          "id": "ca-bundle",
+          "kind": "ca_bundle",
+          "source": {
+            "kind": "operator-file",
+            "ref": "../labpki/ca.crt"
+          },
+          "target_path": "/var/lib/meisterstack/pki/ca.crt",
+          "owner": "root",
+          "mode": "0644",
+          "delivery": "file",
+          "reload": null
+        }
+      ],
+      "persistence": [
+        {
+          "path": "/var/lib/meister-data",
+          "device_ref": "label:meister-data",
+          "required": true,
+          "preserve_on_reinstall": true
+        }
+      ],
+      "checks": {
+        "required": [
+          "units",
+          "session",
+          "mounts"
+        ],
+        "functional": []
+      },
+      "rollout": {
+        "canary_class": "compute-cpu",
+        "max_unavailable": 1,
+        "reboot": "approve"
+      }
+    }
+  },
+  "packages": {
+    "meisterstack": {
+      "drv": "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-meisterstack-0.1.0.drv",
+      "version": "0.1.0",
+      "src_rev": "f83cd70e0b1d1f0b4c8b9c2a0a1b2c3d4e5f6071"
+    },
+    "cloud_hypervisor": {
+      "drv": "/nix/store/hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-cloud-hypervisor-meister-v53.0.drv",
+      "version": "v53.0",
+      "patches_sha256": [
+        "2f1c9a0b3d4e5f60718293a4b5c6d7e8f9012345678901234567890abcdef012",
+        "8b7a6c5d4e3f20110293a4b5c6d7e8f9012345678901234567890abcdef01234",
+        "c3d2e1f00918273645a4b5c6d7e8f9012345678901234567890abcdef0123456"
+      ]
+    },
+    "leandro": null,
+    "guest_tiny": {
+      "drv": "/nix/store/gggggggggggggggggggggggggggggggg-guest-tiny.drv",
+      "version": "6.12.41"
+    }
+  }
+}

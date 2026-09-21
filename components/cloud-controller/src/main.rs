@@ -31,6 +31,12 @@ struct Args {
     /// TOML config; missing file = built-in defaults. Flags override it.
     #[arg(long, default_value = "/etc/meisterstack/cloud.toml")]
     config: std::path::PathBuf,
+    /// Read the config, check it, say so and exit. Starts nothing: no
+    /// listener, no etcd connection, and nothing that opens a file the
+    /// config points at — so a build host can check a config for a machine
+    /// it is not.
+    #[arg(long)]
+    check_config: bool,
     /// REST API listen address (the end API of the stack)
     #[arg(long)]
     listen_api: Option<String>,
@@ -337,9 +343,48 @@ fn signing(cfg: &Config) -> anyhow::Result<Option<Arc<api::Signing>>> {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.check_config {
+        check_config(&args);
+    }
+    run(args)
+}
+
+/// Exit 0 and one line on stdout, or exit 1 and the sentence of whichever
+/// checker refused, on stderr.
+///
+/// What this covers is `resolve_config` — the file, the flags, and the
+/// checks it already runs (`RequeueConfig::into_policy`, `Overcommit::check`,
+/// `SchedulerConfig::into_scheduler`, `NetworkConfig::into_backend`) — plus
+/// the half of the authenticator chain that needs no file. What it does not
+/// cover is everything that opens one: the client CA, the bearer token, the
+/// provider's discovery document. See `rest::check_chain`.
+fn check_config(args: &Args) -> ! {
+    let verdict = resolve_config(args).and_then(|cfg| {
+        let serves_sessions = !cfg.listen_session.trim().is_empty();
+        controller_api::rest::check_chain(
+            &cfg.auth,
+            cfg.client_ca.is_some(),
+            controller_api::rest::Tier::Cloud,
+            serves_sessions,
+        )?;
+        Ok(())
+    });
+    match verdict {
+        Ok(()) => {
+            println!("ok: {}", args.config.display());
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("meister-cloud-controller: {e:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
+#[tokio::main]
+async fn run(args: Args) -> anyhow::Result<()> {
     let cfg = resolve_config(&args)?;
     telemetry::init(telemetry::Setup {
         service_name: "meister-cloud-controller",

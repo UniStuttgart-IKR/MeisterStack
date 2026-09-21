@@ -30,14 +30,17 @@ Bootstrap-Token je Raft-Gruppe, `cluster_name` und `cloud_name`, die
 `advertise_api`, die Scrape-Liste und der OIDC-Issuer. Ein Plan sagt, wer
 zu welcher Gruppe gehoert; die Adressen folgen.
 
+Diese sieben Verben stehen seit meister-deploy v1 unter `legacy`, weil `plan`
+dort eine Datei meint und nicht mehr diese Tabelle:
+
 ```
-meister-deploy plan            # die Tabelle: was ist, und was sollte sein
-meister-deploy image <knoten>  # raw-efi fuer diese Kiste (oder `generic`, oder `all`)
-meister-deploy keys init       # CA, Zertifikate, die drei Geheimnisse
-meister-deploy keys push       # unter die festen Namen, Agents zuerst
-meister-deploy push            # rollen: Agents, Cluster, Clouds, Addons
-meister-deploy check           # Units, Sessions, Platten — und was die API sagt
-meister-deploy render <knoten> # der Knoten als importierbares Nix-Modul
+meister-deploy legacy plan            # die Tabelle: was ist, und was sollte sein
+meister-deploy legacy image <knoten>  # raw-efi fuer diese Kiste (oder `generic`, oder `all`)
+meister-deploy legacy keys init       # CA, Zertifikate, die drei Geheimnisse
+meister-deploy legacy keys push       # unter die festen Namen, Agents zuerst
+meister-deploy legacy push            # rollen: Agents, Cluster, Clouds, Addons
+meister-deploy legacy check           # Units, Sessions, Platten — und was die API sagt
+meister-deploy legacy render <knoten> # der Knoten als importierbares Nix-Modul
 ```
 
 `meister deploy …` ruft dasselbe Binary auf, wenn es neben der CLI oder

@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 
-use crate::fleet::{Kind, Node, Plan, Role};
-use crate::remote::{Probe, Ssh, probe};
-use crate::run::{Cmd, Runner, must};
+use crate::legacy::fleet::{Kind, Node, Plan, Role};
+use crate::legacy::remote::{Probe, Ssh, probe};
+use crate::legacy::run::{Cmd, Runner, must};
 
 pub struct Ctx<'a> {
     pub plan: &'a Plan,
@@ -863,7 +863,7 @@ fn relevant(node: &Node, unit: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::Fake;
+    use crate::legacy::run::Fake;
 
     /// The lab of `lab/LAB.md`, as a plan: a cloud of three, cluster-1 of
     /// three, cluster-2 alone, five agents, and no disks — twelve context
@@ -1461,7 +1461,7 @@ address = "10.128.1.104"
         let ssh = Ssh::default();
         let mut c = ctx(&plan, &fake, &ssh);
         c.offline = true;
-        crate::ops::plan(&c).unwrap();
+        crate::legacy::ops::plan(&c).unwrap();
         assert!(fake.lines().is_empty(), "{:?}", fake.lines());
     }
 
@@ -1487,7 +1487,7 @@ address = "10.128.1.104"
                 "system=/nix/store/ccc-sys\nunit=meister-agent:active\n",
             );
         let ssh = Ssh::default();
-        crate::ops::plan(&ctx(&plan, &fake, &ssh)).unwrap();
+        crate::legacy::ops::plan(&ctx(&plan, &fake, &ssh)).unwrap();
         let ssh_calls = fake.lines().iter().filter(|l| l.starts_with("ssh")).count();
         assert_eq!(ssh_calls, 2, "one round trip per host: {:?}", fake.lines());
     }

@@ -1116,6 +1116,7 @@ dependencies = [
  "meister-telemetry",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -1165,6 +1166,7 @@ dependencies = [
  "meister-telemetry",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -1242,10 +1244,16 @@ name = "meister-deploy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "nix 0.31.3",
+ "schemars",
  "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "toml",
+ "uuid",
 ]
 
 [[package]]

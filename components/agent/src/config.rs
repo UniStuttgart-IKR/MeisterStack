@@ -793,7 +793,17 @@ impl AgentConfig {
         }
     }
 
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
+    /// Read the file and check everything that can be checked anywhere.
+    ///
+    /// Everything except the one thing that can only be checked HERE: the
+    /// socket group has to exist on the machine that will open the socket,
+    /// and looking it up is what separates this from [`AgentConfig::load`].
+    /// `meister-agent --check-config` runs this and nothing else, so that a
+    /// build host can check a configuration for a node it is not.
+    ///
+    /// No file named by the configuration is opened, and nothing is started:
+    /// paths are resolved against the configuration's directory, not read.
+    pub fn parse(path: &Path) -> anyhow::Result<Self> {
         let raw = read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
         let mut config: AgentConfig =
@@ -814,6 +824,25 @@ impl AgentConfig {
                 *p = base.join(&*p);
             }
         }
+
+        // The three pure readers of this file, run for their refusals and
+        // not for their results. Each of them turns a written value into
+        // something the agent will need later — a firewall range, a BGP
+        // session, a bridge address — and each of them is the only place
+        // that says what is wrong with the value. Running them at start-up
+        // is what keeps a typo from becoming a VM that never gets a network.
+        config.nft_config().context("[network] guarded_ranges")?;
+        config.bgp_config().context("[network.bgp]")?;
+        config
+            .parsed_bridge_addr()
+            .context("[network] bridge_addr")?;
+
+        Ok(config)
+    }
+
+    /// [`AgentConfig::parse`], plus the check that only this machine can do.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let config = AgentConfig::parse(path)?;
 
         // Resolved here and not where the socket is bound, because that
         // happens in a spawned task whose error only reaches the log: a group

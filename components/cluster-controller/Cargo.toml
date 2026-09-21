@@ -36,6 +36,9 @@ chrono = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
+# A config file of the test's own, in a directory nobody else is in: the
+# check-config tests write one per case and read the working directory back.
+tempfile = { workspace = true }
 # The router's own routing table, exercised without a store behind it: a
 # `oneshot` with a method no route registers separates "this path is served"
 # (405) from "this path is not" (404) without any handler running. See the
