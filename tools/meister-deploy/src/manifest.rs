@@ -587,6 +587,16 @@ pub struct ResolvedFleet {
     pub hosts: BTreeMap<String, ResolvedHost>,
     pub services: BTreeMap<String, Service>,
     pub packages: Packages,
+    /// Whether this describes only part of the fleet — `resolve --hosts a,b`.
+    ///
+    /// A partial manifest LOOKS complete: it has an inventory, groups and
+    /// packages, and a plan built over it would quietly cover two hosts of
+    /// seventy. So it says so, and M2's `plan` refuses a fleet-wide plan over
+    /// one and requires its selection to be a subset of `evaluated_hosts`.
+    pub partial: bool,
+    /// The hosts this manifest was resolved for — the keys of `hosts`, stated
+    /// where a reader will look for them.
+    pub evaluated_hosts: Vec<String>,
 }
 
 impl ResolvedFleet {
@@ -618,11 +628,17 @@ impl ResolvedFleet {
 /// it. Pure: no clock, no file, no command — `now` and `source` are handed
 /// in, which is what makes "the same tree resolves to the same id" a test
 /// rather than a hope.
+///
+/// `selection` is what `--hosts` asked for, or `None` for the whole fleet.
+/// It is checked rather than trusted: the restriction happens in Nix, and if
+/// the evaluated set and the asked-for set ever drift apart, a partial
+/// manifest would be silently wrong about which hosts it covers.
 pub fn resolve(
     nix: NixManifest,
     source: Source,
     tool: Tool,
     now: DateTime<Utc>,
+    selection: Option<&[String]>,
 ) -> Result<ResolvedFleet> {
     if nix.schema != NIX_MANIFEST_SCHEMA {
         bail!(
@@ -717,6 +733,31 @@ pub fn resolve(
         }
     }
 
+    if let Some(selection) = selection {
+        let asked: BTreeSet<&String> = selection.iter().collect();
+        let got: BTreeSet<&String> = hosts.keys().collect();
+        if asked != got {
+            let missing: Vec<&str> = asked.difference(&got).map(|s| s.as_str()).collect();
+            let extra: Vec<&str> = got.difference(&asked).map(|s| s.as_str()).collect();
+            bail!(
+                "this resolve asked for {} and got {}{}{}.",
+                selection.join(", "),
+                hosts.keys().cloned().collect::<Vec<_>>().join(", "),
+                if missing.is_empty() {
+                    String::new()
+                } else {
+                    format!("; nothing was evaluated for {}", missing.join(", "))
+                },
+                if extra.is_empty() {
+                    String::new()
+                } else {
+                    format!("; nobody asked for {}", extra.join(", "))
+                }
+            );
+        }
+    }
+    let evaluated_hosts: Vec<String> = hosts.keys().cloned().collect();
+
     let mut resolved = ResolvedFleet {
         schema: RESOLVED_FLEET_SCHEMA.to_string(),
         // Filled in below. It is over everything else, so it cannot be here
@@ -730,6 +771,8 @@ pub fn resolve(
         hosts,
         services: inventory.services,
         packages,
+        partial: selection.is_some(),
+        evaluated_hosts,
     };
     resolved.manifest_id = content_id(IdKind::Manifest, &resolved)?;
     Ok(resolved)
@@ -902,7 +945,7 @@ mod tests {
     #[test]
     fn a_resolved_fleet_survives_a_round_trip() {
         let manifest = NixManifest::from_json(&fixture(), "the fixture").unwrap();
-        let resolved = resolve(manifest, source(), tool(), now()).unwrap();
+        let resolved = resolve(manifest, source(), tool(), now(), None).unwrap();
         let text = String::from_utf8(resolved.to_json().unwrap()).unwrap();
         let again = ResolvedFleet::from_json(&text, "the round trip").unwrap();
         assert_eq!(resolved, again);
@@ -912,7 +955,7 @@ mod tests {
     #[test]
     fn resolve_derives_nothing_and_joins_everything() {
         let manifest = NixManifest::from_json(&fixture(), "the fixture").unwrap();
-        let resolved = resolve(manifest.clone(), source(), tool(), now()).unwrap();
+        let resolved = resolve(manifest.clone(), source(), tool(), now(), None).unwrap();
         let host = &resolved.hosts["box"];
         // From the inventory half...
         assert_eq!(host.address, "10.0.0.10");
@@ -934,6 +977,7 @@ mod tests {
             source(),
             tool(),
             now(),
+            None,
         )
         .unwrap();
         let b = resolve(
@@ -941,6 +985,7 @@ mod tests {
             source(),
             tool(),
             now(),
+            None,
         )
         .unwrap();
         assert_eq!(a.manifest_id, b.manifest_id);
@@ -954,6 +999,7 @@ mod tests {
             source(),
             tool(),
             now(),
+            None,
         )
         .unwrap();
         let mut dev_source = source();
@@ -972,6 +1018,7 @@ mod tests {
             dev_source,
             tool(),
             now(),
+            None,
         )
         .unwrap();
         assert_ne!(clean.manifest_id, dev.manifest_id);
@@ -985,6 +1032,7 @@ mod tests {
             source(),
             tool(),
             now(),
+            None,
         )
         .unwrap();
         let b = resolve(
@@ -992,6 +1040,7 @@ mod tests {
             source(),
             tool(),
             later,
+            None,
         )
         .unwrap();
         // `created_at` differs and the id does not: the timestamp says when
@@ -1002,10 +1051,121 @@ mod tests {
     }
 
     #[test]
+    fn the_same_tree_at_two_paths_is_the_same_manifest() {
+        let here = resolve(
+            NixManifest::from_json(&fixture(), "a").unwrap(),
+            source(),
+            tool(),
+            now(),
+            None,
+        )
+        .unwrap();
+        let mut elsewhere_source = source();
+        elsewhere_source.repo_path = "/build/ci/checkout-4711".to_string();
+        let there = resolve(
+            NixManifest::from_json(&fixture(), "b").unwrap(),
+            elsewhere_source,
+            tool(),
+            now(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(here.source.repo_path, there.source.repo_path);
+        assert_eq!(
+            here.manifest_id, there.manifest_id,
+            "the same commit cloned onto a CI runner is the same fleet"
+        );
+        assert!(there.id_matches().unwrap());
+    }
+
+    #[test]
+    fn a_newer_build_of_the_tool_resolves_to_the_same_manifest() {
+        let old = resolve(
+            NixManifest::from_json(&fixture(), "a").unwrap(),
+            source(),
+            tool(),
+            now(),
+            None,
+        )
+        .unwrap();
+        let newer = resolve(
+            NixManifest::from_json(&fixture(), "b").unwrap(),
+            source(),
+            Tool {
+                name: "meister-deploy".to_string(),
+                version: "0.2.0".to_string(),
+                git_rev: Some("aaaaaaa".to_string()),
+            },
+            now(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(old.tool, newer.tool);
+        assert_eq!(old.manifest_id, newer.manifest_id);
+    }
+
+    #[test]
+    fn a_changed_host_is_still_a_changed_manifest() {
+        // The other half of the bargain: what the fleet SAYS decides the id.
+        let before = resolve(
+            NixManifest::from_json(&fixture(), "a").unwrap(),
+            source(),
+            tool(),
+            now(),
+            None,
+        )
+        .unwrap();
+        let mut changed = NixManifest::from_json(&fixture(), "b").unwrap();
+        changed.inventory.hosts.get_mut("n1").unwrap().address = "10.0.0.99".to_string();
+        let after = resolve(changed, source(), tool(), now(), None).unwrap();
+        assert_ne!(before.manifest_id, after.manifest_id);
+    }
+
+    #[test]
+    fn a_partial_resolve_says_so_and_lists_what_it_covers() {
+        let whole = resolve(
+            NixManifest::from_json(&fixture(), "a").unwrap(),
+            source(),
+            tool(),
+            now(),
+            None,
+        )
+        .unwrap();
+        assert!(!whole.partial);
+        assert_eq!(whole.evaluated_hosts, vec!["box", "n1", "n2"]);
+
+        let mut subset = NixManifest::from_json(&fixture(), "b").unwrap();
+        subset.hosts.remove("n2");
+        subset.inventory.hosts.remove("n2");
+        subset.inventory.groups.get_mut("compute").unwrap().members = vec!["n1".to_string()];
+        let selection = vec!["box".to_string(), "n1".to_string()];
+        let part = resolve(subset, source(), tool(), now(), Some(&selection)).unwrap();
+        assert!(part.partial);
+        assert_eq!(part.evaluated_hosts, vec!["box", "n1"]);
+        assert_ne!(
+            part.manifest_id, whole.manifest_id,
+            "it is a different statement"
+        );
+    }
+
+    #[test]
+    fn a_selection_the_evaluation_did_not_honour_is_refused() {
+        // The restriction happens in nix; if it ever stops matching what was
+        // asked for, a partial manifest would be wrong about its own extent.
+        let manifest = NixManifest::from_json(&fixture(), "a").unwrap();
+        let selection = vec!["box".to_string(), "n1".to_string()];
+        let err = resolve(manifest, source(), tool(), now(), Some(&selection))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("asked for box, n1"), "{err}");
+        assert!(err.contains("nobody asked for n2"), "{err}");
+    }
+
+    #[test]
     fn a_half_evaluated_manifest_is_refused() {
         let mut manifest = NixManifest::from_json(&fixture(), "the fixture").unwrap();
         manifest.hosts.remove("n2");
-        let err = resolve(manifest, source(), tool(), now())
+        let err = resolve(manifest, source(), tool(), now(), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("n2"), "{err}");
@@ -1022,7 +1182,7 @@ mod tests {
             .unwrap()
             .groups
             .push("compute_pro6000".to_string());
-        let err = resolve(manifest, source(), tool(), now())
+        let err = resolve(manifest, source(), tool(), now(), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("n1 is in group compute_pro6000"), "{err}");
@@ -1038,7 +1198,7 @@ mod tests {
             .unwrap()
             .members
             .push("n7".to_string());
-        let err = resolve(manifest, source(), tool(), now())
+        let err = resolve(manifest, source(), tool(), now(), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("group box lists n7"), "{err}");
@@ -1112,6 +1272,7 @@ mod tests {
             source(),
             tool(),
             now(),
+            None,
         )
         .unwrap();
         let text = String::from_utf8(resolved.to_json().unwrap()).unwrap();
@@ -1126,6 +1287,7 @@ mod tests {
             source(),
             tool(),
             now(),
+            None,
         )
         .unwrap();
         let text = String::from_utf8(resolved.to_json().unwrap())

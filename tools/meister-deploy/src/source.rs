@@ -103,14 +103,17 @@ pub fn describe(
             repo.display()
         );
     }
+    // Checked before a single command runs: a bad argument should not cost a
+    // git invocation, and the test for it should not have to expect one.
+    let inventory_path = inventory_relative_to(repo, inventory)?;
+
     let rev = git(runner, repo, &["rev-parse", "HEAD"])?;
     // `HEAD^{tree}` and not HEAD: two commits with different messages and the
     // same content build the same system, and the tree hash is what says so.
     let tree = git(runner, repo, &["rev-parse", "HEAD^{tree}"])?;
     let worktree = status(runner, repo)?;
 
-    let inventory_path = inventory.to_string_lossy().into_owned();
-    let inventory_bytes = files.read(&repo.join(inventory))?;
+    let inventory_bytes = files.read(&repo.join(&inventory_path))?;
     let inventory_sha256 = sha256_hex(&inventory_bytes);
     let flake_lock = read_flake_lock(files, repo)?;
 
@@ -166,6 +169,39 @@ pub fn describe(
         },
         eval_dir,
     })
+}
+
+/// The inventory as a path INSIDE the repository.
+///
+/// It goes into the manifest and therefore into its id, so it has to say
+/// which file rather than where that file happened to be mounted: the same
+/// repository checked out twice must name the same inventory. An absolute
+/// path under the repository is made relative; one outside it is refused,
+/// because nix could not read it either.
+fn inventory_relative_to(repo: &Path, inventory: &Path) -> Result<String> {
+    let relative = if inventory.is_absolute() {
+        inventory.strip_prefix(repo).map_err(|_| {
+            anyhow::anyhow!(
+                "the inventory {} is not inside {}. Nix reads it as part of the flake, \
+                 so it has to live in the repository.",
+                inventory.display(),
+                repo.display()
+            )
+        })?
+    } else {
+        inventory
+    };
+    if relative
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        bail!(
+            "the inventory path {} climbs out of the repository. Nix reads it as part \
+             of the flake, so it has to live inside.",
+            inventory.display()
+        );
+    }
+    Ok(relative.to_string_lossy().into_owned())
 }
 
 fn dirty_refusal(repo: &Path, worktree: &Worktree) -> String {
@@ -633,6 +669,46 @@ mod tests {
         assert!(dirty_dev(files, "fleet.toml\0profiles/new.nix\0").is_ok());
         let listed: Vec<String> = commands(&repo(), true).iter().map(|c| c.line()).collect();
         assert_eq!(listed.len(), 5, "{listed:?}");
+    }
+
+    #[test]
+    fn the_inventory_is_named_relative_to_the_repository() {
+        let runner = clean_git();
+        let files = base_files();
+        let source = describe(&runner, &files, &repo(), &repo().join("fleet.toml"), false)
+            .unwrap()
+            .source;
+        assert_eq!(
+            source.inventory_path, "fleet.toml",
+            "an absolute path under the repository is stored as what it is"
+        );
+    }
+
+    #[test]
+    fn an_inventory_outside_the_repository_is_refused() {
+        let runner = StrictFake::new();
+        let files = MemFiles::new();
+        let err = describe(
+            &runner,
+            &files,
+            &repo(),
+            Path::new("/etc/meisterstack/fleet.toml"),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not inside"), "{err}");
+
+        let err = describe(
+            &runner,
+            &files,
+            &repo(),
+            Path::new("../other/fleet.toml"),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("climbs out"), "{err}");
     }
 
     #[test]

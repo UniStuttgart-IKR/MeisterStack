@@ -322,13 +322,20 @@ fn resolve(
     let flake_ref = nix::flake_ref(&tree.eval_dir, dev);
     let text = nix::eval_manifest(&runner, &flake_ref, selection)?;
     let evaluated = NixManifest::from_json(&text, &format!("{flake_ref}#{}", nix::MANIFEST_ATTR))?;
-    let resolved = manifest::resolve(evaluated, tree.source, tool(), RealClock.now())?;
+    let resolved = manifest::resolve(evaluated, tree.source, tool(), RealClock.now(), selection)?;
 
     files.write_atomic(out, &resolved.to_json()?, 0o644)?;
     // The id on stdout and nothing else, so that it can be captured; where
     // it went goes to stderr like every other diagnostic.
     println!("{}", resolved.manifest_id);
     eprintln!("==> {}", out.display());
+    if resolved.partial {
+        eprintln!(
+            "note: this manifest covers {} of the fleet's hosts and says so \
+             (\"partial\": true). A plan over it is a plan over those hosts.",
+            resolved.evaluated_hosts.len()
+        );
+    }
     if resolved.source.dirty {
         eprintln!(
             "note: this manifest was resolved from a dirty tree. Its fingerprint is \

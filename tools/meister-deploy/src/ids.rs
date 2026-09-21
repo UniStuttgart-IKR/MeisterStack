@@ -19,6 +19,16 @@
 //! input. Removing it rather than setting it to null or to a placeholder
 //! keeps one definition instead of three conventions.
 //!
+//! Three more fields are removed, and for one reason: they say WHERE and WITH
+//! WHAT, not WHAT. `created_at` is when the question was asked. `source.
+//! repo_path` is the directory the repository happened to be cloned into —
+//! the same commit checked out on a CI runner is the same fleet. `tool` is
+//! which build of this binary did the asking. If any of them were in the
+//! hash, "this is the manifest I reviewed" would only be true on one machine
+//! on one afternoon, and that sentence is the entire point of a content id.
+//! Anything those three actually CHANGE about the manifest changes the
+//! manifest, and therefore the id.
+//!
 //! The fourth id, `run_id`, names an EVENT and not content: two runs of the
 //! same plan are two runs. It is a UUIDv7, so the id sorts by time, which is
 //! what a state directory full of `runs/<run-id>/` wants.
@@ -58,15 +68,16 @@ impl IdKind {
         }
     }
 
-    /// Everything left out of the hash: the id itself, because it cannot
-    /// contain itself, and `created_at`, because it says WHEN and not WHAT.
-    ///
-    /// Leaving the timestamp in would make every resolve of one unchanged
-    /// tree a different manifest, and the whole point of a content id is that
-    /// an operator can say "this is the manifest I reviewed" — a sentence
-    /// that is worth nothing if reviewing it again renames it.
-    pub fn excluded(self) -> [&'static str; 2] {
-        [self.field(), "created_at"]
+    /// Everything left out of the hash, as dotted paths into the object. See
+    /// the module note for why each one is here.
+    pub fn excluded(self) -> &'static [&'static str] {
+        match self {
+            IdKind::Manifest => &["manifest_id", "created_at", "tool", "source.repo_path"],
+            // A release and a plan embed a manifest that already carries its
+            // own id, so the same three fields inside it are covered by that.
+            IdKind::Release => &["release_id", "created_at", "build_env"],
+            IdKind::Plan => &["plan_id", "created_at"],
+        }
     }
 }
 
@@ -79,12 +90,13 @@ impl IdKind {
 pub fn content_id<T: Serialize>(kind: IdKind, object: &T) -> anyhow::Result<String> {
     let mut value = serde_json::to_value(object)
         .map_err(|e| anyhow::anyhow!("this object could not be written as json: {e}"))?;
-    let map = value.as_object_mut().ok_or_else(|| {
-        anyhow::anyhow!("a {} id is only defined for a json object", kind.prefix())
-    })?;
-    // Absent is fine: the id is computed before it is set.
-    for field in kind.excluded() {
-        map.remove(field);
+    if !value.is_object() {
+        anyhow::bail!("a {} id is only defined for a json object", kind.prefix());
+    }
+    // Absent is fine: the id is computed before it is set, and a field this
+    // kind does not have yet is a field nobody has to hash.
+    for path in kind.excluded() {
+        remove_path(&mut value, path);
     }
     let digest = Sha256::digest(canonical::to_vec(&value));
     Ok(format!("{}-{}", kind.prefix(), hex(&digest)))
@@ -97,6 +109,21 @@ pub fn run_id(now: DateTime<Utc>) -> Uuid {
     let seconds = now.timestamp().max(0) as u64;
     let nanos = now.timestamp_subsec_nanos();
     Uuid::new_v7(Timestamp::from_unix(NoContext, seconds, nanos))
+}
+
+/// Remove `a.b.c` from a JSON object, if it is there. Only objects are walked
+/// — there is no field inside an array this needs to reach, and inventing a
+/// syntax for one would be inventing a query language.
+fn remove_path(value: &mut serde_json::Value, path: &str) {
+    let Some((head, rest)) = path.split_once('.') else {
+        if let Some(map) = value.as_object_mut() {
+            map.remove(path);
+        }
+        return;
+    };
+    if let Some(inner) = value.as_object_mut().and_then(|m| m.get_mut(head)) {
+        remove_path(inner, rest);
+    }
 }
 
 /// The sha256 of some bytes, as lower-case hex — the same digest
@@ -124,9 +151,14 @@ mod tests {
         json!({
             "manifest_id": "manifest-whatever-was-there-before",
             "created_at": "2026-09-21T10:00:00Z",
+            "tool": {"name": "meister-deploy", "version": "0.1.0", "git_rev": "f83cd70"},
             "fleet": {"name": "one-box", "domain": "lab", "schema": 2},
             "hosts": {"box": {"address": "10.0.0.10"}},
-            "source": {"fingerprint": "git:f83cd70:8a1c", "dirty": false}
+            "source": {
+                "repo_path": "/home/silas/git/meisterstack-lab",
+                "fingerprint": "git:f83cd70:8a1c",
+                "dirty": false
+            }
         })
     }
 
@@ -196,6 +228,46 @@ mod tests {
             content_id(IdKind::Manifest, &later).unwrap(),
             "the same tree resolved twice is the same manifest"
         );
+    }
+
+    #[test]
+    fn where_the_repository_sits_is_not_part_of_what_it_says() {
+        let mut elsewhere = manifest_like();
+        elsewhere["source"]["repo_path"] = json!("/build/ci/checkout-4711");
+        assert_eq!(
+            content_id(IdKind::Manifest, &manifest_like()).unwrap(),
+            content_id(IdKind::Manifest, &elsewhere).unwrap(),
+            "the same commit cloned somewhere else is the same fleet"
+        );
+        // And the rest of `source` still counts.
+        let mut other_tree = manifest_like();
+        other_tree["source"]["fingerprint"] = json!("git:0000000:1111111");
+        assert_ne!(
+            content_id(IdKind::Manifest, &manifest_like()).unwrap(),
+            content_id(IdKind::Manifest, &other_tree).unwrap()
+        );
+    }
+
+    #[test]
+    fn which_build_of_the_tool_asked_is_not_part_of_the_answer() {
+        let mut newer = manifest_like();
+        newer["tool"]["git_rev"] = json!("aaaaaaa");
+        newer["tool"]["version"] = json!("0.2.0");
+        assert_eq!(
+            content_id(IdKind::Manifest, &manifest_like()).unwrap(),
+            content_id(IdKind::Manifest, &newer).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_dotted_exclusion_removes_only_that_field() {
+        let mut value = json!({"source": {"a": 1, "repo_path": "/x"}, "repo_path": "/y"});
+        remove_path(&mut value, "source.repo_path");
+        assert_eq!(value, json!({"source": {"a": 1}, "repo_path": "/y"}));
+        // A path that is not there is not an error.
+        remove_path(&mut value, "source.nothing.here");
+        remove_path(&mut value, "nothing");
+        assert_eq!(value, json!({"source": {"a": 1}, "repo_path": "/y"}));
     }
 
     #[test]
