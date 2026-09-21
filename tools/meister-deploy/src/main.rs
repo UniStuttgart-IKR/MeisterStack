@@ -11,14 +11,15 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use meister_deploy::effects::{Files, RealFiles};
+use meister_deploy::effects::{Clock, Files, RealClock, RealFiles};
 use meister_deploy::inventory::Inventory;
 use meister_deploy::legacy::fleet::Plan;
 use meister_deploy::legacy::ops::{self, Ctx};
 use meister_deploy::legacy::remote::Ssh;
-use meister_deploy::legacy::run::Real;
-use meister_deploy::manifest::{self, Contract};
-use meister_deploy::run::Policy;
+use meister_deploy::legacy::run::Real as LegacyRunner;
+use meister_deploy::manifest::{self, Contract, NixManifest, Tool};
+use meister_deploy::run::{Cancel, Policy, Real};
+use meister_deploy::{nix, source};
 
 #[derive(Parser)]
 #[command(
@@ -66,6 +67,34 @@ enum Verb {
         /// Also evaluate the operator flake
         #[arg(long)]
         nix: bool,
+    },
+
+    /// Evaluate the operator's flake and write the manifest: which host is
+    /// what, which system each one will run, and which tree that came from.
+    Resolve {
+        /// The operator's repository
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Where to write the manifest
+        #[arg(short = 'o', long)]
+        out: PathBuf,
+        /// The inventory, relative to the repository
+        #[arg(short = 'f', long, default_value = "fleet.toml")]
+        fleet: PathBuf,
+        /// Resolve a dirty tree, recording a content snapshot instead of a
+        /// revision. The whole working tree is copied into the nix store.
+        #[arg(long)]
+        dev: bool,
+        /// Only these hosts, comma-separated. The result describes that
+        /// sub-fleet and nothing else.
+        #[arg(long, value_delimiter = ',')]
+        hosts: Vec<String>,
+        /// Print the command lines that would run, and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Refuse rather than reach outside this process
+        #[arg(long)]
+        offline: bool,
     },
 
     /// The tool as it was before v1: the `fleet.toml` of schema 1, the rsync
@@ -194,6 +223,15 @@ fn run() -> Result<bool> {
             manifest,
             nix,
         } => validate(fleet, manifest.as_deref(), *nix),
+        Verb::Resolve {
+            repo,
+            out,
+            fleet,
+            dev,
+            hosts,
+            dry_run,
+            offline,
+        } => resolve(repo, out, fleet, *dev, hosts, *dry_run, *offline),
         Verb::Legacy(legacy) => run_legacy(legacy),
     }
 }
@@ -212,6 +250,78 @@ fn print_schema(kind: &str) -> Result<bool> {
         ),
     };
     println!("{}", serde_json::to_string_pretty(&schema)?);
+    Ok(true)
+}
+
+/// Which binary wrote a manifest. `git_rev` is null unless the build set it —
+/// the nix package does, a `cargo build` on somebody's laptop does not, and
+/// claiming a revision that was not checked would be worse than saying so.
+fn tool() -> Tool {
+    Tool {
+        name: "meister-deploy".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        git_rev: option_env!("MEISTER_GIT_REV").map(str::to_string),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve(
+    repo: &Path,
+    out: &Path,
+    fleet: &Path,
+    dev: bool,
+    hosts: &[String],
+    dry_run: bool,
+    offline: bool,
+) -> Result<bool> {
+    if offline {
+        anyhow::bail!(
+            "resolve needs nix to evaluate the operator flake, and --offline forbids it. \
+             There is nothing on disk this verb could answer from: the manifest IS the \
+             evaluation."
+        );
+    }
+    // Absolute, because `source.repo_path` in the manifest has to mean the
+    // same thing to whoever reads it later.
+    let repo = std::path::absolute(repo)
+        .with_context(|| format!("{} could not be made absolute", repo.display()))?;
+    let selection = if hosts.is_empty() { None } else { Some(hosts) };
+    let flake_ref = nix::flake_ref(&repo, dev);
+    let eval = nix::eval_manifest_cmd(&flake_ref, selection);
+
+    if dry_run {
+        for cmd in source::commands(&repo, dev) {
+            println!("{}", cmd.described());
+        }
+        println!("{}", eval.line());
+        println!("# would write {}", out.display());
+        return Ok(true);
+    }
+
+    let policy = Policy::real();
+    // From here on something can take minutes, and a Ctrl-C has to reach the
+    // child rather than leave a `nix eval` behind.
+    Cancel::on_sigint()?;
+    let runner = Real::new(policy);
+    let files = RealFiles::new(policy);
+
+    let source = source::describe(&runner, &files, &repo, fleet, dev)?;
+    let text = nix::eval_manifest(&runner, &flake_ref, selection)?;
+    let evaluated = NixManifest::from_json(&text, &format!("{flake_ref}#{}", nix::MANIFEST_ATTR))?;
+    let resolved = manifest::resolve(evaluated, source, tool(), RealClock.now())?;
+
+    files.write_atomic(out, &resolved.to_json()?, 0o644)?;
+    // The id on stdout and nothing else, so that it can be captured; where
+    // it went goes to stderr like every other diagnostic.
+    println!("{}", resolved.manifest_id);
+    eprintln!("==> {}", out.display());
+    if resolved.source.dirty {
+        eprintln!(
+            "note: this manifest was resolved from a dirty tree. Its fingerprint is \
+             {} and nobody can check that tree out again.",
+            resolved.source.fingerprint
+        );
+    }
     Ok(true)
 }
 
@@ -306,7 +416,7 @@ fn validate_manifest(from: &str) -> Result<bool> {
 
 fn run_legacy(cli: &LegacyCli) -> Result<bool> {
     let plan = Plan::load(&cli.fleet)?;
-    let runner = Real {
+    let runner = LegacyRunner {
         dry_run: cli.dry_run,
         verbose: cli.verbose,
     };

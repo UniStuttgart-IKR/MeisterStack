@@ -978,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn the_id_is_over_the_content_and_not_over_the_time() {
+    fn the_same_tree_resolved_again_is_the_same_manifest() {
         let later = now() + chrono::TimeDelta::hours(3);
         let a = resolve(
             NixManifest::from_json(&fixture(), "a").unwrap(),
@@ -994,11 +994,11 @@ mod tests {
             later,
         )
         .unwrap();
-        // `created_at` IS part of the content, deliberately: two resolves at
-        // two times are two manifests, and a receipt has to be able to say
-        // which one it used. This test pins that decision rather than
-        // assuming the opposite.
-        assert_ne!(a.manifest_id, b.manifest_id);
+        // `created_at` differs and the id does not: the timestamp says when
+        // the question was asked, not what the answer was.
+        assert_ne!(a.created_at, b.created_at);
+        assert_eq!(a.manifest_id, b.manifest_id);
+        assert!(b.id_matches().unwrap());
     }
 
     #[test]

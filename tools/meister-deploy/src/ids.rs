@@ -57,6 +57,17 @@ impl IdKind {
             IdKind::Plan => "plan_id",
         }
     }
+
+    /// Everything left out of the hash: the id itself, because it cannot
+    /// contain itself, and `created_at`, because it says WHEN and not WHAT.
+    ///
+    /// Leaving the timestamp in would make every resolve of one unchanged
+    /// tree a different manifest, and the whole point of a content id is that
+    /// an operator can say "this is the manifest I reviewed" — a sentence
+    /// that is worth nothing if reviewing it again renames it.
+    pub fn excluded(self) -> [&'static str; 2] {
+        [self.field(), "created_at"]
+    }
 }
 
 /// The id of a contract object: `<kind>-<sha256 of its canonical json, with
@@ -72,7 +83,9 @@ pub fn content_id<T: Serialize>(kind: IdKind, object: &T) -> anyhow::Result<Stri
         anyhow::anyhow!("a {} id is only defined for a json object", kind.prefix())
     })?;
     // Absent is fine: the id is computed before it is set.
-    map.remove(kind.field());
+    for field in kind.excluded() {
+        map.remove(field);
+    }
     let digest = Sha256::digest(canonical::to_vec(&value));
     Ok(format!("{}-{}", kind.prefix(), hex(&digest)))
 }
@@ -86,7 +99,15 @@ pub fn run_id(now: DateTime<Utc>) -> Uuid {
     Uuid::new_v7(Timestamp::from_unix(NoContext, seconds, nanos))
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// The sha256 of some bytes, as lower-case hex — the same digest
+/// `sha256sum` prints, so that anything this tool names can be checked by
+/// hand.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+/// Bytes as lower-case hex.
+pub fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         out.push_str(&format!("{b:02x}"));
@@ -167,6 +188,17 @@ mod tests {
     }
 
     #[test]
+    fn the_time_of_a_resolve_is_not_part_of_what_it_resolved() {
+        let mut later = manifest_like();
+        later["created_at"] = json!("2026-09-21T14:05:00Z");
+        assert_eq!(
+            content_id(IdKind::Manifest, &manifest_like()).unwrap(),
+            content_id(IdKind::Manifest, &later).unwrap(),
+            "the same tree resolved twice is the same manifest"
+        );
+    }
+
+    #[test]
     fn the_kind_is_in_the_id_and_the_digest_is_whole() {
         let id = content_id(IdKind::Plan, &json!({"plan_id": "", "a": 1})).unwrap();
         assert!(id.starts_with("plan-"), "{id}");
@@ -199,6 +231,14 @@ mod tests {
         assert_eq!(
             id,
             "manifest-44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        );
+    }
+
+    #[test]
+    fn a_digest_is_the_one_sha256sum_prints() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 

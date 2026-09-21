@@ -25,4 +25,6 @@ pub mod ids;
 pub mod inventory;
 pub mod legacy;
 pub mod manifest;
+pub mod nix;
 pub mod run;
+pub mod source;

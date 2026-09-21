@@ -20,17 +20,35 @@ use std::path::PathBuf;
 /// What a deployment value looks like when it is being derived rather than
 /// read. Every one of these was in the old `fleet.rs`.
 const FORBIDDEN: &[(&str, &str)] = &[
-    ("MEISTER_", "an environment variable is a rendered setting, and Nix renders"),
-    (":50051", "a port is a setting, and settings come from the manifest"),
-    (":3000", "a port is a setting, and settings come from the manifest"),
-    (":50050", "a port is a setting, and settings come from the manifest"),
+    (
+        "MEISTER_",
+        "an environment variable is a rendered setting, and Nix renders",
+    ),
+    (
+        ":50051",
+        "a port is a setting, and settings come from the manifest",
+    ),
+    (
+        ":3000",
+        "a port is a setting, and settings come from the manifest",
+    ),
+    (
+        ":50050",
+        "a port is a setting, and settings come from the manifest",
+    ),
     (":2379", "an etcd endpoint is derived by Nix from the group"),
     (":2380", "an etcd peer url is derived by Nix from the group"),
-    ("controller_addrs", "an agent's controllers are derived by Nix"),
+    (
+        "controller_addrs",
+        "an agent's controllers are derived by Nix",
+    ),
     ("cloud_addrs", "a cluster's clouds are derived by Nix"),
     ("advertise", "an advertised address is derived by Nix"),
     ("initial_cluster", "a raft peer set is derived by Nix"),
-    ("bootstrap_token", "a token is never derived from a plan file"),
+    (
+        "bootstrap_token",
+        "a token is never derived from a plan file",
+    ),
 ];
 
 #[test]
