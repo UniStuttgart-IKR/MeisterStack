@@ -18,7 +18,7 @@
 # their repository owns. What it does decide is what deploying REQUIRES: nix
 # stays on and takes signed closures only, the keys live outside the store,
 # and there are directories for the transaction records the helper writes.
-{ lib, pkgs, config, ... }:
+{ lib, config, ... }:
 let
   cfg = config.meisterstack.managed;
   ms = config.meisterstack;
