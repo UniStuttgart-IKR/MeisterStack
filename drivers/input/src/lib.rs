@@ -243,7 +243,10 @@ impl DeviceDriver for InputDriver {
         claimed: &[(agent_api::VmId, DeviceSpec)],
     ) -> device::Result<()> {
         for (index, (id, spec)) in requested.iter().enumerate() {
-            Self::source(spec)?;
+            // The path is what the operator typed and the only name they can
+            // look up on the host; the device number is what decides, because
+            // it also catches an alias made with mknod. A refusal says both.
+            let path = Self::source(spec)?;
             let Some(node) = Self::claimed_node(spec) else {
                 continue;
             };
@@ -253,9 +256,10 @@ impl DeviceDriver for InputDriver {
                 .find(|(_, held)| Self::claimed_node(held) == Some(node))
             {
                 return Err(DeviceError::InvalidSpec(format!(
-                    "host input device {} is already claimed by vm {holder} on this node; \
-                     one evdev node belongs to one guest at a time (device {id})",
-                    node
+                    "host input device {} (device number {node}) is already claimed by vm \
+                     {holder} on this node; one evdev node belongs to one guest at a time \
+                     (device {id})",
+                    path.display()
                 )));
             }
 
@@ -264,9 +268,10 @@ impl DeviceDriver for InputDriver {
                 .find(|(_, other)| Self::claimed_node(other) == Some(node))
             {
                 return Err(DeviceError::InvalidSpec(format!(
-                    "host input device {} is named twice by this vm, by device {twin} and \
-                     by device {id}; one evdev node belongs to one guest at a time",
-                    node
+                    "host input device {} (device number {node}) is named twice by this vm, \
+                     by device {twin} and by device {id}; one evdev node belongs to one guest \
+                     at a time",
+                    path.display()
                 )));
             }
         }

@@ -32,10 +32,10 @@ echo
 echo "A. smoke.sh greppt auf Felder, die es gibt"
 
 # observe_has <vm> <feld> greppt die JSON-Antwort von `agent observe`. Deren
-# Felder sind die von `Observed` in reconcile.rs. Ein Name, den es dort nicht
+# Felder sind die von `Observed` in reconcile/observe.rs. Ein Name, den es dort nicht
 # gibt, meldet sich als FAIL des Lifecycle-Teils und sieht damit aus wie ein
 # kaputter Agent statt wie ein veralteter Test.
-OBSERVED="components/agent/src/reconcile.rs"
+OBSERVED="components/agent/src/reconcile/observe.rs"
 fields="$(sed -n '/^pub struct Observed {/,/^}/p' "$OBSERVED" \
           | sed -n 's/^ *pub \([a-z_][a-z0-9_]*\):.*/\1/p')"
 if [ -z "$fields" ]; then
