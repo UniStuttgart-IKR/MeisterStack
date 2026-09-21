@@ -120,7 +120,12 @@
         module-options =
           let
             evaluated = nixpkgs.lib.nixosSystem {
-              modules = genericModules ++ [{
+              # The appliance plus `managed`: the table documents every
+              # option this flake exports, and the two profiles are mutually
+              # exclusive only in their `enable`, not in their declarations.
+              # Without this line the managed half of the stack would have no
+              # documentation at all.
+              modules = genericModules ++ [ self.nixosModules.managed ] ++ [{
                 nixpkgs.hostPlatform = system;
                 fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
                 boot.loader.grub.device = "nodev";
@@ -272,6 +277,205 @@
         # build` in that directory would pass it. So the check needs no
         # network, and it still fails the moment `nixosModules.default` stops
         # standing on its own.
+        # nix/services.nix decides nothing about the machine, and this is
+        # what holds it to that. A minimal host is evaluated three times —
+        # without our modules, with them and no role, and with them and the
+        # agent role — and the attributes below have to come out the same.
+        #
+        # They are not a taste: each one is a decision somebody else's NixOS
+        # configuration has already made. A module that sets `stateVersion`,
+        # turns a firewall off or names a bootloader cannot be imported into
+        # a host that is not ours, and `nixosModules.default` is exactly
+        # that import.
+        #
+        # With no role the list is longer, because a machine that carries no
+        # unit of ours should carry no etcd, no collector, no routing daemon,
+        # no kernel module and no mount of ours either.
+        services-are-pure =
+          let
+            probe = modules: (nixpkgs.lib.nixosSystem {
+              modules = [{ nixpkgs.hostPlatform = system; }] ++ modules;
+            }).config;
+
+            bare = probe [ ];
+            noRole = probe [ self.nixosModules.services ];
+            agentRole = probe [
+              self.nixosModules.services
+              { meisterstack.roles = [ "agent" ]; }
+            ];
+
+            hostGlobal = c: {
+              "networking.useDHCP" = c.networking.useDHCP;
+              "networking.firewall.enable" = c.networking.firewall.enable;
+              "networking.resolvconf.enable" = c.networking.resolvconf.enable;
+              "networking.usePredictableInterfaceNames" =
+                c.networking.usePredictableInterfaceNames;
+              "nix.enable" = c.nix.enable;
+              "system.stateVersion" = c.system.stateVersion;
+              "boot.kernelParams" = c.boot.kernelParams;
+              "boot.loader.grub.enable" = c.boot.loader.grub.enable;
+              "boot.loader.grub.device" = c.boot.loader.grub.device;
+              "boot.loader.systemd-boot.enable" = c.boot.loader.systemd-boot.enable;
+              "boot.loader.efi.canTouchEfiVariables" =
+                c.boot.loader.efi.canTouchEfiVariables;
+            };
+
+            roleLess = c: hostGlobal c // {
+              "services.etcd.enable" = c.services.etcd.enable;
+              "services.alloy.enable" = c.services.alloy.enable;
+              "services.frr.bgpd.enable" = c.services.frr.bgpd.enable;
+              "boot.kernelModules" = c.boot.kernelModules;
+              "fileSystems" = lib.attrNames c.fileSystems;
+            };
+
+            differing = f: a: b:
+              lib.filter (k: (f a).${k} != (f b).${k}) (lib.attrNames (f a));
+
+            bad =
+              map (k: "with no role, ${k} is not what it was") (differing roleLess bare noRole)
+              ++ map (k: "with the agent role, ${k} is not what it was")
+                (differing hostGlobal bare agentRole);
+          in
+          pkgs.runCommand "services-are-pure" { } (
+            if bad == [ ] then ''
+              echo "nixosModules.services changed nothing host-global, with and without a role"
+              touch $out
+            '' else ''
+              ${lib.concatMapStrings (l: "echo ${lib.escapeShellArg l}\n") bad}
+              echo "-> nix/services.nix decides only what MeisterStack is, never what the machine is"
+              exit 1
+            ''
+          );
+
+        # Two renderers, one input, one answer.
+        #
+        # nix/context.nix completes the config files while the machine boots;
+        # nix/lib/render.nix does the same at build time for a managed host.
+        # This check takes ONE node of the example plan, runs the boot
+        # renderer's own script text against that node's context.env, and
+        # compares the result with the file Nix wrote — as parsed TOML and
+        # not as text, because whitespace and key order are not the question.
+        #
+        # The script comes out of the built unit rather than out of the
+        # source file, so what runs here is what would run on the machine,
+        # provider block and all. Every absolute path it touches is
+        # redirected into $TMPDIR the way scripts/check-context.sh does it,
+        # and mount/umount/systemctl/ip are stubs: there is no medium in a
+        # sandbox, which is exactly the shape a plan node boots in.
+        render-parity =
+          let
+            # The managed twin of a planned node. `pki.dir` is pinned to the
+            # appliance's value because the question here is what the
+            # RENDERER produces, not where a managed host keeps its keys —
+            # that difference is a decision of nix/managed.nix and would
+            # otherwise be reported as a mismatch of `controller_ca`.
+            managedFor = node: (nixpkgs.lib.nixosSystem {
+              modules = [
+                { nixpkgs.hostPlatform = system; }
+                self.nixosModules.services
+                self.nixosModules.managed
+                {
+                  meisterstack.managed.enable = true;
+                  meisterstack.managed.trustedPublicKeys = [ "render-parity:not-a-real-key" ];
+                  meisterstack.pki.dir = "/opt/meisterstack/pki";
+                }
+                (plan.nodeModule node)
+              ] ++ node.modules;
+            }).config;
+
+            parity = node:
+              let
+                appliance = self.nixosConfigurations.${node.name}.config;
+                managed = managedFor node;
+                roles = managed.meisterstack.unitsFor;
+                etcOf = c: name: c.environment.etc."meisterstack/${name}.toml".source;
+              in
+              ''
+                echo "== ${node.name}: ${lib.concatStringsSep "," roles}"
+                root=$TMPDIR/${node.name}
+                mkdir -p $root/etc/meisterstack $root/run $root/bin $root/root
+                for stub in mount umount systemctl ip; do
+                  printf '#!/bin/sh\nexit 0\n' > $root/bin/$stub
+                  chmod +x $root/bin/$stub
+                done
+                install -m0644 ${appliance.environment.etc."meisterstack/context.env".source} \
+                  $root/etc/meisterstack/context.env
+                ${lib.concatMapStrings (name: ''
+                  install -m0644 ${etcOf appliance name} $root/etc/meisterstack/${name}.toml
+                '') (map (r: if r == "agent" then "agent" else r) roles)}
+                ${lib.optionalString (builtins.elem "cloud" roles) ''
+                  install -m0644 ${appliance.environment.etc."meisterstack/cloud-auth-mtls.toml".source} \
+                    $root/etc/meisterstack/cloud-auth-mtls.toml
+                  install -m0644 ${appliance.environment.etc."meisterstack/cloud-auth-oidc.toml".source} \
+                    $root/etc/meisterstack/cloud-auth-oidc.toml
+                ''}
+                echo "${node.name}" > $root/hostname
+                : > $root/static-hosts
+
+                cat ${pkgs.writeText "meister-context-${node.name}.sh"
+                  appliance.systemd.services.meister-context.script} > $root/render.sh
+                sed -i \
+                  -e "s#/etc/meisterstack#$root/etc/meisterstack#g" \
+                  -e "s#/run/meisterstack#$root/run/meisterstack#g" \
+                  -e "s#/run/meister-context#$root/run/meister-context#g" \
+                  -e "s#/run/one-context#$root/run/one-context#g" \
+                  -e "s#/run/meister-role#$root/run/meister-role#g" \
+                  -e "s#/dev/disk/by-label/CONTEXT#$root/no-such-medium#g" \
+                  -e "s#/proc/sys/kernel/hostname#$root/hostname#g" \
+                  -e "s#/etc/resolv.conf#$root/resolv.conf#g" \
+                  -e "s#/etc/static/hosts#$root/static-hosts#g" \
+                  -e "s#/etc/hosts#$root/hosts#g" \
+                  -e "s#/root/.ssh#$root/root/.ssh#g" \
+                  $root/render.sh
+                PATH="$root/bin:$PATH" ${pkgs.bash}/bin/bash $root/render.sh > $root/render.log 2>&1 \
+                  || { echo "the renderer exited non-zero:"; cat $root/render.log; exit 1; }
+
+                ${lib.concatMapStrings (name: ''
+                  python3 ${compare} ${node.name} ${name} \
+                    $root/run/meisterstack/${name}.toml ${etcOf managed name}
+                '') roles}
+              '';
+
+            compare = pkgs.writeText "render-parity.py" ''
+              import sys, tomllib
+
+              node, role, booted, built = sys.argv[1:5]
+              with open(booted, "rb") as fh:
+                  a = tomllib.load(fh)
+              with open(built, "rb") as fh:
+                  b = tomllib.load(fh)
+
+
+              def flat(d, prefix=""):
+                  out = {}
+                  for k, v in d.items():
+                      key = prefix + k
+                      if isinstance(v, dict):
+                          out.update(flat(v, key + "."))
+                      else:
+                          out[key] = v
+                  return out
+
+
+              fa, fb = flat(a), flat(b)
+              bad = []
+              for key in sorted(set(fa) | set(fb)):
+                  if fa.get(key, "<absent>") != fb.get(key, "<absent>"):
+                      bad.append("  %s: renderer %r, nix %r"
+                                 % (key, fa.get(key, "<absent>"), fb.get(key, "<absent>")))
+              if bad:
+                  print("%s/%s.toml differs between the two renderers:" % (node, role))
+                  print("\n".join(bad))
+                  sys.exit(1)
+              print("  ok   %s/%s.toml is the same file both ways (%d keys)" % (node, role, len(fa)))
+            '';
+          in
+          pkgs.runCommand "render-parity"
+            { nativeBuildInputs = [ pkgs.python3 ]; }
+            (lib.concatMapStrings parity
+              (lib.filter (n: builtins.elem n.name [ "box" "n1" ]) plan.metalNodes)
+              + "touch $out\n");
+
         foreign-flake =
           let
             foreign = (import ./examples/fleet/foreign-flake/flake.nix).outputs {
