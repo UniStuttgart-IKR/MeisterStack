@@ -21,11 +21,14 @@
 pub mod canonical;
 pub mod checks;
 pub mod effects;
+#[cfg(test)]
+pub mod fixtures;
 pub mod ids;
 pub mod inventory;
 pub mod legacy;
 pub mod manifest;
 pub mod nix;
+pub mod observation;
 pub mod release;
 pub mod run;
 pub mod source;
