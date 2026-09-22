@@ -95,7 +95,13 @@ let
     # key this fleet really signs with is generated while the test runs and
     # reaches the target through `extra-keys.conf` below — which is the road
     # M0 probe S12 measured.
-    meisterstack.managed.trustedPublicKeys = [ "vm-update-placeholder:AAAA" ];
+    # The shape matters as much as the value: nix PARSES every entry of
+    # `trusted-public-keys` when it opens the store, and a key that is not
+    # 32 base64 bytes makes every copy fail with "public key is not valid" —
+    # including the ones signed with a key that IS trusted. Measured here.
+    meisterstack.managed.trustedPublicKeys = [
+      "vm-update-placeholder:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    ];
     nix.extraOptions = ''
       !include /etc/nix/extra-keys.conf
     '';
@@ -184,11 +190,61 @@ pkgs.testers.runNixOSTest {
       environment.etc."meister-generation".text = "A";
     };
 
-    # 192.168.1.3, never started. It is system B: the same host with one
-    # file changed.
-    unused = { ... }: {
+    # Never started. It is system B: the same host with one file changed.
+    #
+    # `nodeNumber` is forced to the target's, and that is not cosmetic: the
+    # test framework derives each node's MAC address from it and writes a
+    # udev rule with that MAC INTO THE INITRD. A spare node with a number of
+    # its own would therefore have a different initrd, the planner would
+    # rightly call the change a reboot class, and this test would be about
+    # the boot menu instead of about the update path. Two systems of one
+    # machine have to be the same machine in everything the boot depends on.
+    unused = { nodes, ... }: {
       imports = [ targetCommon ];
       environment.etc."meister-generation".text = "B";
+      # The same udev rule the TARGET has, and this is not cosmetic: the
+      # test framework derives each node's MAC address from its position in
+      # the node list and writes a rule with that MAC INTO THE INITRD. A
+      # spare node with a number of its own therefore has a different
+      # initrd, the planner rightly calls the change a reboot class, and
+      # this test would be about the boot menu instead of about the update
+      # path. Two systems of one machine have to be the same machine in
+      # everything the boot depends on — so the rule is the one node 2 gets,
+      # built with the framework's own function rather than typed out.
+      # (`virtualisation.test.nodeNumber` itself is read-only.)
+      # The TARGET's boot-time udev rules, verbatim.
+      #
+      # Not cosmetic: the test framework derives each node's MAC address
+      # from its position in the node list and writes a rule with that MAC
+      # into the INITRD (nixos/lib/testing/network.nix). A spare node with a
+      # number of its own therefore has a different initrd, the planner
+      # rightly calls the change a reboot class, and this test would be
+      # about the boot menu instead of about the update path. Two systems of
+      # one machine have to be the same machine in everything a boot depends
+      # on — and taking the value from the other node is the only spelling
+      # of that which cannot drift.
+      boot.initrd.services.udev.rules =
+        lib.mkForce nodes.target.boot.initrd.services.udev.rules;
+      # And the etcd member name, which NixOS derives from the host name and
+      # which is the one identity a rollout compares against the inventory
+      # (the topology check of D8). A spare system that called itself
+      # something else would look like a membership change — which is
+      # exactly what that check is for, and exactly not what this is.
+      services.etcd.name = lib.mkForce nodes.target.services.etcd.name;
+      # And the ADDRESS, for the same reason one step further on: the
+      # framework gives each node `192.168.1.<its number>`, so a switch to
+      # this system would reconfigure the machine's interface to an address
+      # the operator is not talking to — and the host would be gone the
+      # moment it took the new system. Measured: it was.
+      # Only the two address families, because the evaluated value of the
+      # other node still carries the deprecated `ip4`/`ip6` aliases and
+      # copying those would print a renaming warning for a value nobody
+      # wrote here.
+      networking.interfaces = lib.mkForce (
+        lib.mapAttrs
+          (_: i: { inherit (i) ipv4 ipv6; })
+          nodes.target.networking.interfaces
+      );
     };
   };
 
@@ -205,11 +261,17 @@ pkgs.testers.runNixOSTest {
     target.succeed("ip -4 addr show eth1 | grep -q 'inet 192.168.1.2/24'")
 
     # --- the operator's repository ------------------------------------
-    operator.succeed("mkdir -p /root/.ssh /root/fleet /root/keys")
+    # The manifests, releases and plans go BESIDE the repository: a file
+    # written into the tree it describes makes that tree dirty, and a dirty
+    # tree is refused — which is a rule this test should not have to work
+    # around. The state directory stays in the repository, where an operator
+    # keeps it, and is ignored there.
+    operator.succeed("mkdir -p /root/.ssh /root/fleet /root/keys /root/out")
     operator.copy_from_host("${keys.snakeOilPrivateKey}", "/root/.ssh/id_ed25519")
     operator.succeed("chmod 600 /root/.ssh/id_ed25519")
     operator.succeed("cp /etc/vm-fleet/fleet.toml /root/fleet/fleet.toml")
     operator.succeed("cp /etc/vm-fleet/flake.lock /root/fleet/flake.lock")
+    operator.succeed("printf '.meister-deploy/\n' > /root/fleet/.gitignore")
     operator.succeed("chmod 644 /root/fleet/fleet.toml /root/fleet/flake.lock")
 
     # Enrolment, out of band: the host key is read off the MACHINE and
@@ -228,6 +290,16 @@ pkgs.testers.runNixOSTest {
         operator.succeed(
             f"sed -i 's|SHA256:PLACEHOLDER-THE-TEST-FILLS-THIS-IN|{fingerprint}|' "
             f"/etc/vm-fleet/nix-manifest-{name}.json"
+        )
+
+    # What the two evaluations say about booting. They have to agree, or the
+    # change between them is a reboot and this test would be about something
+    # else; printed so that a reader of the log can see that they do.
+    for name in ["a", "b"]:
+        print(
+            name
+            + ": "
+            + operator.succeed(f"jq -c '.hosts.target.build.boot' /etc/vm-fleet/nix-manifest-{name}.json")
         )
 
     # A manifest names the tree it came from, so there has to be one.
@@ -251,6 +323,14 @@ pkgs.testers.runNixOSTest {
     target.succeed("systemctl restart nix-daemon.service")
     target.wait_until_succeeds("nix config show | grep -q vm-update", timeout=30)
 
+    # What `nixos-install` leaves behind and a test machine does not have:
+    # a system profile. Without it there is no answer to "what does this
+    # host boot next", and a host that cannot say that is a host the planner
+    # will not call unchanged — rightly.
+    target.succeed(
+        "nix-env -p /nix/var/nix/profiles/system --set \"$(readlink -f /run/current-system)\""
+    )
+
     # The identity a host of this fleet has. Two files and nothing behind
     # them: what `enrolled` asks is whether the machine HAS an identity, and
     # delivering a real one is `keys deliver` in M3.
@@ -264,20 +344,20 @@ pkgs.testers.runNixOSTest {
         """resolve -> build: the two verbs that turn an evaluation into a release."""
         operator.succeed(
             f"cd /root/fleet && meister-deploy resolve --from /etc/vm-fleet/{manifest} "
-            f"--repo /root/fleet --out m-{name}.json"
+            f"--repo /root/fleet --out /root/out/m-{name}.json"
         )
         operator.succeed(
-            f"cd /root/fleet && meister-deploy build --manifest m-{name}.json "
-            f"--sign-key /root/keys/signing.sec --repo /root/fleet --out r-{name}.json"
+            f"cd /root/fleet && meister-deploy build --manifest /root/out/m-{name}.json "
+            f"--sign-key /root/keys/signing.sec --repo /root/fleet --out /root/out/r-{name}.json"
         )
-        return f"/root/fleet/r-{name}.json"
+        return f"/root/out/r-{name}.json"
 
     def make_plan(release, name):
         operator.succeed(
             f"cd /root/fleet && meister-deploy plan --release {release} --select all "
-            f"--repo /root/fleet --identity /root/.ssh/id_ed25519 --out p-{name}.json"
+            f"--repo /root/fleet --identity /root/.ssh/id_ed25519 --out /root/out/p-{name}.json"
         )
-        return f"/root/fleet/p-{name}.json"
+        return f"/root/out/p-{name}.json"
 
     def approvals(plan):
         text = operator.succeed(f"cat {plan}")
@@ -362,14 +442,24 @@ pkgs.testers.runNixOSTest {
     )
     assert "the fleet moved under this plan" in refused, refused
 
-    # The whole chain again IS a no-op, which is what idempotence means for
-    # a tool whose plan is a document (V10, after a change).
-    plan_b2 = make_plan(release_b, "b2")
-    the_plan = json.loads(operator.succeed(f"cat {plan_b2}"))
-    assert the_plan["hosts"]["target"]["verdict"] == "unchanged", the_plan["hosts"]
-    run = apply(plan_b2, release_b)
-    assert receipt_of(run)["hosts"]["target"]["outcome"] == "unchanged"
-    assert generation() == "B"
+    # A switch leaves the machine RUNNING one system and having BOOTED
+    # another, and the planner says so: the next plan over the same release
+    # is the reboot that makes the two the same, and nothing else. It is
+    # read here and not carried out — the boot half lives in
+    # nix/tests/activate.nix — because a rollout that called a switched host
+    # finished would be hiding a pending reboot.
+    plan_pending = make_plan(release_b, "pending")
+    the_plan = json.loads(operator.succeed(f"cat {plan_pending}"))
+    assert the_plan["hosts"]["target"]["verdict"] == "change", the_plan["hosts"]
+    steps = [a["kind"] for a in the_plan["actions"] if a["blocked"] is None]
+    assert "reboot" in steps, steps
+    assert "stage" not in steps, ("what is already there is not staged again", steps)
+    assert "activate" not in steps, ("there is nothing left to activate", steps)
+    # And it says WHY, in the words of the plan rather than of this test.
+    said = " ".join(
+        reason for a in the_plan["actions"] for reason in a["preconditions"]
+    )
+    assert "has not booted it" in said, said
 
     # --- and back ------------------------------------------------------
     plan_back = make_plan(release_a, "back")
@@ -379,12 +469,26 @@ pkgs.testers.runNixOSTest {
     assert generation() == "A", "the target was not brought back"
     print("the host was changed and brought back, both with a receipt")
 
+    # And NOW it is unchanged: it runs what it booted and what the release
+    # says. So the whole chain again is two steps and no commands — which is
+    # what idempotence means for a tool whose plan is a document (V10).
+    plan_noop = make_plan(release_a, "noop")
+    the_plan = json.loads(operator.succeed(f"cat {plan_noop}"))
+    assert the_plan["hosts"]["target"]["verdict"] == "unchanged", the_plan["hosts"]
+    run = apply(plan_noop, release_a)
+    assert receipt_of(run)["hosts"]["target"]["outcome"] == "unchanged"
+    assert generation() == "A"
+    assert json.loads(target.succeed("meister-activate --json txn list")) == []
+
     # --- V18: a host somebody else holds --------------------------------
+    # The plan is made first and the host is taken afterwards, which is the
+    # order this actually happens in: somebody else starts a run between the
+    # planning and the applying.
+    plan_v18 = make_plan(release_b, "v18")
     target.succeed(
         "meister-activate lock acquire --run somebody-elses-run "
         "--operator somebody@elsewhere --pid 4242"
     )
-    plan_v18 = make_plan(release_b, "v18")
     refused = operator.fail(
         f"cd /root/fleet && meister-deploy apply --plan {plan_v18} --release {release_b} "
         f"--repo /root/fleet --identity /root/.ssh/id_ed25519 "
@@ -400,12 +504,12 @@ pkgs.testers.runNixOSTest {
     # it in the file changes the release's own id, and the id is checked
     # before anything else happens.
     operator.succeed(
-        "cd /root/fleet && jq '.artifacts.target.toplevel.nar_hash = \"sha256-somethingelse\"' "
-        "r-b.json > r-tampered.json"
+        "jq '.artifacts.target.toplevel.nar_hash = \"sha256-somethingelse\"' "
+        "/root/out/r-b.json > /root/out/r-tampered.json"
     )
     refused = operator.fail(
         f"cd /root/fleet && meister-deploy apply --plan {plan_v18} "
-        "--release /root/fleet/r-tampered.json --repo /root/fleet "
+        "--release /root/out/r-tampered.json --repo /root/fleet "
         "--identity /root/.ssh/id_ed25519 --inventory /root/fleet/fleet.toml 2>&1"
     )
     assert "edited after it was built" in refused, refused
@@ -423,9 +527,11 @@ pkgs.testers.runNixOSTest {
         f"--repo /root/fleet --identity /root/.ssh/id_ed25519 "
         f"--inventory /root/fleet/fleet.toml {approvals(plan_v17)}"
     )
-    operator.wait_until_succeeds(
-        "grep -l action.irreversible /root/fleet/.meister-deploy/runs/*/journal.jsonl",
-        timeout=120,
+    # The moment to kill it is when the TARGET holds the record: the journal
+    # line is written BEFORE the command, so killing on the line alone would
+    # kill a run that had not yet reached the machine — and prove nothing.
+    target.wait_until_succeeds(
+        "meister-activate --json txn list | grep -q pending", timeout=180
     )
     operator.succeed("systemctl kill -s SIGKILL apply-v17.service || true")
     operator.wait_until_fails("systemctl is-active apply-v17.service", timeout=60)
@@ -440,12 +546,14 @@ pkgs.testers.runNixOSTest {
     assert open_txns[0]["state"] == "pending", open_txns
 
     # A fresh plan is refused while that record is there, and says why.
-    operator.succeed(
+    # `execute` and not `succeed`: exit 2 is "blocked", which is an answer
+    # and not a failure — and the driver's `succeed` runs `set -e`.
+    status, _ = operator.execute(
         f"cd /root/fleet && meister-deploy plan --release {release_b} --select all "
-        f"--repo /root/fleet --identity /root/.ssh/id_ed25519 --out p-blocked.json; "
-        "test $? -le 2"
+        f"--repo /root/fleet --identity /root/.ssh/id_ed25519 --out /root/out/p-blocked.json"
     )
-    blocked = json.loads(operator.succeed("cat /root/fleet/p-blocked.json"))
+    assert status == 2, f"a blocked plan is exit 2, not {status}"
+    blocked = json.loads(operator.succeed("cat /root/out/p-blocked.json"))
     reasons = " ".join(blocked["hosts"]["target"]["reasons"])
     assert "apply --resume" in reasons, reasons
 
