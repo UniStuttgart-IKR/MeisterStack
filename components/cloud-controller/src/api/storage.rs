@@ -467,6 +467,7 @@ pub(super) async fn create_volume(
     }
     check_one_seed(&body)?;
     if let Some(image) = body.spec.base_image.as_deref().filter(|i| !i.is_empty()) {
+        check_image_readable(&st.store, &who, image).await?;
         check_base_image(&st.store, image).await?;
     }
     if let Some(named) = body.spec.from_snapshot.as_deref().filter(|s| !s.is_empty()) {

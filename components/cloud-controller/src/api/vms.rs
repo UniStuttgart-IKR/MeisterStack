@@ -279,11 +279,51 @@ pub(super) async fn check_base_image(store: &EtcdStore, name: &str) -> Result<()
             )))
         }
         Ok(_) => Ok(()),
-        Err(StoreError::NotFound(_)) => Err(invalid(format!(
-            "unknown base_image {name:?}; register it first (meister image create)"
-        ))),
+        Err(StoreError::NotFound(_)) => Err(unknown_base_image(name)),
         Err(e) => Err(e.into()),
     }
+}
+
+/// That this caller may use that base image at all: the read rule `get_image`
+/// applies, asked again where the image is USED.
+///
+/// Naming an image in a disk is a way of reading it — its bytes end up on a
+/// disk the naming tenant can read every one of — so a reference must not
+/// reach further than `GET /images/<name>` does. Found by review: a member
+/// who knew the name of another tenant's private image could boot from it,
+/// because the reference was only asked whether the image exists.
+///
+/// The refusal is the one an unknown name gets, and this is asked BEFORE
+/// `check_base_image`: a caller who may not read an image must not learn from
+/// the answer that it exists, nor what a node said about it when it failed.
+///
+/// At the two create edges and only there — a VM's disks, a volume's seed.
+/// An update cannot name a new base image (the boot entry and every inline
+/// disk are frozen by `VM_OWNED`, `spec.baseImage` by `VOLUME_OWNED`), so what
+/// an update carries was asked about when it was bound, by whoever bound it;
+/// asking the updating caller again would lock a member out of a VM an admin
+/// built for them.
+pub(super) async fn check_image_readable(
+    store: &EtcdStore,
+    who: &Grant,
+    name: &str,
+) -> Result<(), ApiError> {
+    let image = match store.get::<Image>(name).await {
+        Ok(image) => image,
+        Err(StoreError::NotFound(_)) => return Err(unknown_base_image(name)),
+        Err(e) => return Err(e.into()),
+    };
+    who.allows(
+        Scope::image(image.spec.tenant.as_deref(), image.spec.public),
+        Verb::Read,
+    )
+    .map_err(|_| unknown_base_image(name))
+}
+
+fn unknown_base_image(name: &str) -> ApiError {
+    invalid(format!(
+        "unknown base_image {name:?}; register it first (meister image create)"
+    ))
 }
 
 /// Fields on a volume that the control plane owns, refused when a client
@@ -541,6 +581,11 @@ pub(super) async fn create_vm_traced(
         return Err(invalid("metadata.name must be set"));
     }
     check_envelope(&body)?;
+    // Before `validate_vm_spec`, which describes an image it finds unusable:
+    // see `check_image_readable`.
+    for image in base_images(&body.spec.vm) {
+        check_image_readable(&st.store, &who, &image).await?;
+    }
     validate_vm_spec(&st.store, &body.spec).await?;
 
     // Whose it is, decided before anything is written: named by the client,

@@ -635,6 +635,8 @@ macro_rules! patch_object {
 // this file says `use <child>::*` and sees the handlers the router names. So
 // a handler that moves between two of them needs no import changed at either
 // end, and the router below stays one line per route.
+#[cfg(test)]
+mod admission_tests;
 mod clusters;
 mod csrs;
 #[path = "events.rs"]
