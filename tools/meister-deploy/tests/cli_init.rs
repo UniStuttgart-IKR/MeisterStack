@@ -113,6 +113,42 @@ fn a_fresh_directory_becomes_a_deployment_repository() {
     );
 }
 
+// --- lane 4C: N6 ----------------------------------------------------------
+
+#[test]
+fn the_first_command_of_the_sentence_has_a_directory_to_write_into() {
+    let tmp = tempfile::tempdir().unwrap();
+    let empty = tmp.path().join("no-programs-here");
+    std::fs::create_dir(&empty).unwrap();
+    let repo = tmp.path().join("fleet");
+
+    let (ok, stdout, stderr) = run(&["init", repo.to_str().unwrap()], &empty);
+    assert!(ok, "{stderr}");
+
+    // Step 1 of the sentence `init` prints is
+    // `nix-store --generate-binary-cache-key <fleet> keys/signing.sec
+    // signing.pub`, and nix does not make the directory: without this the
+    // very first thing an operator types fails (gate M1 finding N6).
+    let keys = repo.join("keys");
+    assert!(
+        keys.is_dir(),
+        "init left no keys/ to write the key into\n{stdout}"
+    );
+    assert!(stdout.contains("keys"), "{stdout}");
+
+    // It is empty and it stays out of git: the SECRET half lives there and
+    // the public half (`signing.pub`) belongs beside it, in the repository.
+    assert_eq!(std::fs::read_dir(&keys).unwrap().count(), 0);
+    let ignored = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
+    assert!(ignored.lines().any(|l| l.trim() == "keys/"), "{ignored}");
+
+    // And the key really can be written there, which is the whole point.
+    std::fs::write(keys.join("signing.sec"), "my-fleet:c2VjcmV0\n").unwrap();
+    assert!(keys.join("signing.sec").exists());
+}
+
+// --- end lane 4C ----------------------------------------------------------
+
 #[test]
 fn the_meisterstack_input_can_be_pointed_at_a_checkout() {
     let tmp = tempfile::tempdir().unwrap();
@@ -175,5 +211,8 @@ fn a_dry_run_lists_the_files_and_writes_none_of_them() {
         "{stdout}"
     );
     assert!(stderr.contains("--dry-run wrote nothing"), "{stderr}");
+    // Including the two directories, so that the list is the list.
+    assert!(stdout.contains(".meister-deploy"), "{stdout}");
+    assert!(stdout.trim_end().ends_with("keys"), "{stdout}");
     assert!(!repo.exists(), "a dry run created the directory");
 }

@@ -3416,6 +3416,11 @@ fn validate_with_nix(fleet: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Where a fleet's signing key lives, relative to the operator's
+/// repository. In the template's `.gitignore`; the PUBLIC half
+/// (`signing.pub`) is beside it and is committed.
+const KEYS_DIR: &str = "keys";
+
 /// `init <dir>`: the repository a deployment starts from.
 ///
 /// Writes once, into an empty or absent directory, and never into a
@@ -3432,9 +3437,12 @@ fn init(dir: &Path, flake_ref: Option<&str>, dry_run: bool) -> Result<bool> {
             println!("{}", dir.join(file.path).display());
         }
         println!("{}", dir.join(".meister-deploy").display());
+        // --- lane 4C ---
+        println!("{}", dir.join(KEYS_DIR).display());
+        // --- end lane 4C ---
         eprintln!(
-            "note: --dry-run wrote nothing. {} file(s) and one directory would be created; \
-             `nix flake lock` would then be run in {}.",
+            "note: --dry-run wrote nothing. {} file(s) and two directories would be \
+             created; `nix flake lock` would then be run in {}.",
             template::FILES.len(),
             dir.display()
         );
@@ -3489,6 +3497,23 @@ fn init(dir: &Path, flake_ref: Option<&str>, dry_run: bool) -> Result<bool> {
     let state = dir.join(".meister-deploy");
     files.create_dir_all(&state)?;
     println!("{}", state.display());
+
+    // --- lane 4C: N6 --------------------------------------------------
+    //
+    // And `keys/`, because step 1 of the sentence below is
+    // `nix-store --generate-binary-cache-key <fleet> keys/signing.sec
+    // signing.pub` and nix does not make the directory: without this the
+    // very first thing an operator types fails with "No such file or
+    // directory" (gate M1, finding N6; lane L1 hit it again as B1).
+    //
+    // No `.gitkeep`: `keys/` is in the template's .gitignore, so a file in
+    // it to keep it in git would be a file git ignores. What this verb
+    // leaves behind is a directory on the disk, which is what the command
+    // needs.
+    // --- end lane 4C ---
+    let keys = dir.join(KEYS_DIR);
+    files.create_dir_all(&keys)?;
+    println!("{}", keys.display());
 
     // The lock file, and ONLY through nix. Writing one by hand would be
     // claiming a set of revisions nobody resolved.
