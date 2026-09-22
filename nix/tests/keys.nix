@@ -194,6 +194,12 @@ pkgs.testers.runNixOSTest {
     unused = { nodes, ... }: {
       imports = [ boxCommon ];
       environment.etc."meister-generation".text = "B";
+      # The fleet's host module gives every host of this fleet the hostname
+      # the INVENTORY gives it, so both nodes are called `box` — and the
+      # test driver names its machine variables after that. This one keeps
+      # the hostname (it is the same machine) and takes a name of its own
+      # for the driver and for the store path.
+      system.name = lib.mkForce "unused";
       boot.initrd.services.udev.rules =
         lib.mkForce nodes.box.boot.initrd.services.udev.rules;
       services.etcd.name = lib.mkForce nodes.box.services.etcd.name;
