@@ -171,6 +171,16 @@
             };
           in
           doc.optionsJSON;
+        # The example fleet's own outputs, so that what `nix flake check`
+        # checks can also be looked at by hand:
+        #
+        #   nix build .#example-manifest && jq . result
+        #   nix build .#example-installer   # the native iso-installer (M3)
+        example-manifest = example.packages.${system}.manifest;
+        example-installer = example.packages.${system}.box-installer;
+        example-disk-image = example.packages.${system}.box-disk-image;
+        example-managed-disk-image = example.packages.${system}.managed-disk-image;
+
         # The generic appliance image, unchanged: the twelve context VMs of
         # the lab boot this, and they will until their migration is done
         # (L3). It is the one image that is NOT a fleet host — no hostname,
