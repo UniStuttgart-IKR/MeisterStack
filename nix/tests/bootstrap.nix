@@ -53,8 +53,29 @@ let
   # imported into the HOST — so it is in the medium as well (the ISO is a
   # sub-evaluation of the same modules), which is how the test can read a
   # console a person would read.
-  instrumented = generation: extra: { ... }: {
+  instrumented = generation: extra: { config, ... }: {
     imports = [ "${nixpkgs}/nixos/modules/testing/test-instrumentation.nix" ];
+    # What this fleet listens on, opened where it listens.
+    #
+    # In an operator's repository this line lives in `profiles/base.nix` —
+    # the template writes it there, because a host's firewall belongs to the
+    # host and the service modules publish the numbers rather than opening
+    # them (`meisterstack.ports`, nix/services.nix). This test has no
+    # profiles, so it lives with the rest of the test's own half.
+    #
+    # Measured, not assumed: without it the agent's session to its cluster is
+    # dropped by the CLUSTER host's firewall — `tcp connect error: deadline
+    # has elapsed`, every few seconds, for as long as the run waited — while
+    # the cluster's own session to the cloud on the same machine came up
+    # fine. A node that cannot register is a node that never appears in
+    # `meister node ls`.
+    networking.firewall.allowedTCPPorts = with config.meisterstack.ports; [
+      cloud.api
+      cloud.grpc
+      cluster.api
+      cluster.grpc
+      etcd.peer
+    ];
     # Required by nix/managed.nix. The key this fleet really signs with is
     # generated while the test runs and reaches the targets through
     # `extra-keys.conf` (the road M0 probe S12 measured). The SHAPE matters
