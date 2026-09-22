@@ -802,9 +802,15 @@ pkgs.testers.runNixOSTest {
     assert drain and drain[0]["result"] == "ok", drain
     assert any("0 guest(s) left on n1" in e for e in drain[0]["evidence"]), drain
     assert any("node drain n1 --cluster cp" in r for r in drain[0]["cmd_refs"]), drain
-    assert "schedulable" in operator.succeed(
+    # …and the uncordon gave the node back: the READY column of `node ls` is
+    # `yes` / `cordoned` / `draining` / `no` (components/cli/src/output.rs),
+    # so what a finished rollout looks like is the absence of the other three.
+    after = operator.succeed(
         "cd /root/fleet && meister --config cli.toml -p cloud node ls --cluster cp"
     )
+    print(after)
+    assert "cordoned" not in after, after
+    assert "draining" not in after, after
     elapsed("updated")
 
     # ---------------------------------------------------------------
