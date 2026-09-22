@@ -103,17 +103,13 @@ let
     while true; do /bin/busybox sleep 3600; done
   '';
 
-  # busybox' acpid takes the CLASSIC acpid configuration: one file per rule,
-  # with an `event=` regular expression and an `action=` command line — NOT
-  # a directory named after the event code. Measured: with the directory
-  # layout the button press is accepted by the hypervisor (HTTP 204) and
-  # nothing happens in the guest, which is the worst of the two failures.
-  powerRule = writeText "guest-tiny-power.conf" ''
-    event=button/power.*
-    action=/etc/acpi/power.sh
-  '';
-
-  powerHandler = writeText "guest-tiny-power.sh" ''
+  # busybox' acpid with `-c CONFDIR` looks for ONE path per event:
+  # `<confdir>/<device>/<code>`. Measured with `ms_tiny=debug`, which is why
+  # that switch exists: a press arrives as `acpid: PWRF/00000080`, and
+  # anything else in the directory is never looked at. The classic
+  # `event=`/`action=` rule files are the OTHER acpid's format and are
+  # silently ignored here.
+  powerHandler = writeText "guest-tiny-power" ''
     #!/bin/sh
     echo "MS-S0-POWEROFF"
     /bin/busybox poweroff -f
@@ -125,7 +121,7 @@ let
       passthru = { inherit marker; };
     } ''
     root=$PWD/root
-    mkdir -p $root/bin $root/lib/modules $root/etc/acpi $root/proc $root/sys $root/dev
+    mkdir -p $root/bin $root/lib/modules $root/etc/acpi/PWRF $root/proc $root/sys $root/dev
 
     cp ${busybox}/bin/busybox $root/bin/busybox
     chmod +x $root/bin/busybox
@@ -135,8 +131,7 @@ let
     ln -s busybox $root/bin/sh
 
     install -m0755 ${init} $root/init
-    install -m0644 ${powerRule} $root/etc/acpi/power.conf
-    install -m0755 ${powerHandler} $root/etc/acpi/power.sh
+    install -m0755 ${powerHandler} $root/etc/acpi/PWRF/00000080
 
     # The two modules this guest loads, out of the SAME kernel it boots — a
     # module from anywhere else would not load, and a guest that cannot hear
