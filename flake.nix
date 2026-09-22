@@ -317,6 +317,14 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # An empty virtual disk becomes a host that boots itself, and a
+          # second medium refuses to do it again (M3A: V06 part 1, V07 —
+          # and the boot-mode rollback on a real ESP, which 2C could not
+          # measure on a machine started with `-kernel`).
+          vm-install-blank-disk = import ./nix/tests/install.nix {
+            inherit nixpkgs lib pkgs system self disko;
+          };
+
           # The boot renderer and the build-time renderer, on the same input.
           # Both fleets: one-box has a raft group of ONE (no etcd variables),
           # ha has three (1A §8, open point 6).
