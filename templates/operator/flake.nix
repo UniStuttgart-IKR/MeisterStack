@@ -31,10 +31,14 @@
 
   outputs = { self, nixpkgs, meisterstack, disko, ... }@inputs:
     let
+      # The GPU stack, or `null`. `or null` and not a commented-out line: the
+      # input above is optional, and a fleet that adds it should have to
+      # uncomment ONE place and not three.
+      leandro = inputs.leandro or null;
+
       fleet = meisterstack.lib.mkFleet
         {
-          inherit nixpkgs meisterstack disko;
-          # leandro = inputs.leandro or null;
+          inherit nixpkgs meisterstack disko leandro;
         }
         {
           # Who is in this fleet, and what each host is.
@@ -43,7 +47,7 @@
           # Your half: everything that is a decision about a MACHINE rather
           # than about MeisterStack — stateVersion, filesystems, firewall,
           # sshd. A host gets the profiles its inventory entry names.
-          profiles = import ./profiles.nix { inherit (nixpkgs) lib; };
+          profiles = import ./profiles.nix { inherit (nixpkgs) lib; inherit leandro; };
         };
     in
     fleet // {

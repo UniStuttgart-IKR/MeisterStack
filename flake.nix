@@ -423,6 +423,15 @@
               touch $out
             '';
 
+          # --- lane 4C ---
+          # The template's GPU profile, with and without the input nobody
+          # declares. nix/tests/gpu-profile.nix says why a stub is the
+          # honest way to measure the second branch.
+          gpu-profile = import ./nix/tests/gpu-profile.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+          # --- end lane 4C ---
+
           # An inventory that cannot be deployed cannot be built.
           inventory-conflicts = import ./nix/tests/inventory-conflicts.nix {
             inherit lib pkgs inventoryLib;
