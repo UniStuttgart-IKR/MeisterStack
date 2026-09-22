@@ -127,7 +127,55 @@ in
           python3 ${compare} ${id} ${name} \
             $root/run/meisterstack/${name}.toml ${etcOf managed name}
         '') roles}
+        ${lib.optionalString (managed.meisterstack.etcd.peers != { }) ''
+          python3 ${compareEtcd} ${id} $root/run/meisterstack/etcd.env ${etcdExpected id}
+        ''}
       '';
+
+    # The etcd half, which the TOMLs do not carry: the boot renderer writes
+    # ETCD_* into an env file the unit reads, and a managed host sets
+    # `services.etcd.*` instead. Lane 1A could not compare them because the
+    # one-box fleet has a raft group of ONE and the variables are empty
+    # there (1A §8, point 6); with examples/fleet/ha.toml they are not.
+    etcdExpected = id:
+      let etcd = (managedFor id).services.etcd; in
+      pkgs.writeText "etcd-expected-${id}.json" (builtins.toJSON {
+        ETCD_NAME = etcd.name;
+        ETCD_INITIAL_CLUSTER = lib.concatStringsSep "," etcd.initialCluster;
+        ETCD_INITIAL_CLUSTER_STATE = etcd.initialClusterState;
+        ETCD_INITIAL_CLUSTER_TOKEN = etcd.initialClusterToken;
+        ETCD_LISTEN_PEER_URLS = lib.concatStringsSep "," etcd.listenPeerUrls;
+        ETCD_INITIAL_ADVERTISE_PEER_URLS =
+          lib.concatStringsSep "," etcd.initialAdvertisePeerUrls;
+      });
+
+    compareEtcd = pkgs.writeText "render-parity-etcd.py" ''
+      import json, sys
+
+      node, booted, built = sys.argv[1:4]
+      env = {}
+      with open(booted) as fh:
+          for line in fh:
+              line = line.strip()
+              if not line or line.startswith("#") or "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              env[key] = value
+      with open(built) as fh:
+          want = json.load(fh)
+
+      bad = []
+      for key in sorted(want):
+          if env.get(key, "<absent>") != want[key]:
+              bad.append("  %s: renderer %r, nix %r"
+                         % (key, env.get(key, "<absent>"), want[key]))
+      if bad:
+          print("%s/etcd.env differs between the two renderers:" % node)
+          print("\n".join(bad))
+          sys.exit(1)
+      print("  ok   %s/etcd.env is the same membership both ways (%d keys)"
+            % (node, len(want)))
+    '';
 
     compare = pkgs.writeText "render-parity.py" ''
       import sys, tomllib
