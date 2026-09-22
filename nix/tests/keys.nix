@@ -505,14 +505,17 @@ pkgs.testers.runNixOSTest {
 
     # --- and now there is nothing left to deliver ------------------------
     #
-    # The other half of the comparison the action came out of: what the
-    # host has is what this repository holds, so an upgrade plans no
-    # delivery at all and the host is simply unchanged.
+    # The other half of the comparison the action came out of: what the host
+    # has is what this repository holds, so a plan made now asks for no
+    # delivery at all — and for no stage either, because the closure is
+    # there. What is left is the reboot a switch owes (nix/tests/update.nix
+    # reads the same shape and says why); this test is not about that half.
     status, plan_noop = make_plan(release_b, "noop")
     the_plan = json.loads(operator.succeed(f"cat {plan_noop}"))
     kinds = [a["kind"] for a in the_plan["actions"] if a["blocked"] is None]
+    print("after the bootstrap: " + ", ".join(kinds))
     assert "deliver-secret" not in kinds, kinds
-    assert the_plan["hosts"]["box"]["verdict"] == "unchanged", the_plan["hosts"]
+    assert "stage" not in kinds, kinds
     assert status == 0, status
 
     # --- step 7: V09, the rest — a real mTLS session ---------------------
