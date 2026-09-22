@@ -112,6 +112,14 @@ pub struct BuildOptions {
     /// `--builders`, offered to nix in the order they were given.
     pub builders: Vec<String>,
     pub substituters: Vec<String>,
+    /// `--max-jobs`, as a string because nix takes `auto` as well as a
+    /// number. Passed on unread: what a sensible parallelism is on the
+    /// machine that builds is that machine's question, not this tool's.
+    pub max_jobs: Option<String>,
+    /// `--option <name> <value>`, for the settings that have no flag of
+    /// their own. Sorted, so that the release records them in one order and
+    /// two runs with the same options produce the same `build_env`.
+    pub options: BTreeMap<String, String>,
     /// Only these hosts. A build of part of a fleet is for looking at, not
     /// for releasing — see [`Builder::realise`].
     pub hosts: Option<Vec<String>>,
@@ -291,11 +299,38 @@ pub fn build_cmd(drv: &str, options: &BuildOptions) -> Cmd {
         "--no-link",
         "--print-out-paths",
     ]);
-    cmd = with_builders(cmd, options);
+    cmd = with_nix_options(cmd, options);
     cmd.arg(format!("{drv}^*"))
 }
 
-fn with_builders(cmd: Cmd, options: &BuildOptions) -> Cmd {
+/// `nix build --no-link --json <drv1>^* <drv2>^* …`: the whole fleet, once.
+///
+/// One invocation and not one per derivation, and the reason is nix's
+/// scheduler: seventy systems handed over separately are seventy build
+/// graphs built one after the other, where one graph is seventy roots nix
+/// schedules across `--max-jobs` and `--builders` at the same time and whose
+/// shared dependencies — one kernel, one nixpkgs, one meisterstack — are
+/// realised once by construction rather than found in the store seventy
+/// times.
+///
+/// `--json` and not `--print-out-paths`, which is what the per-derivation
+/// road used: with several installables the printed paths are a LIST, and
+/// deciding which of seventy systems a path belongs to by its position in
+/// that list would be a guess. The json answer names the `drvPath` beside
+/// every output, so the mapping is nix's own statement.
+pub fn build_many_cmd(drvs: &[String], options: &BuildOptions) -> Cmd {
+    let cmd = Cmd::new(Effect::Build, "nix", BUILD_DEADLINE).args(["build", "--no-link", "--json"]);
+    let cmd = with_nix_options(cmd, options);
+    cmd.args(drvs.iter().map(|drv| format!("{drv}^*")))
+}
+
+/// The flags this tool hands nix untouched: where it may build, what it may
+/// fetch from, how much at once, and whatever else the operator named.
+///
+/// Recorded in `build_env` as well, because a release built on a farm and a
+/// release built on a laptop are the same release and the question "where
+/// did this come from" still has an answer.
+fn with_nix_options(cmd: Cmd, options: &BuildOptions) -> Cmd {
     let mut cmd = cmd;
     if !options.builders.is_empty() {
         cmd = cmd.args(["--builders".to_string(), options.builders.join(" ; ")]);
@@ -303,7 +338,38 @@ fn with_builders(cmd: Cmd, options: &BuildOptions) -> Cmd {
     if !options.substituters.is_empty() {
         cmd = cmd.args(["--substituters".to_string(), options.substituters.join(" ")]);
     }
+    if let Some(jobs) = &options.max_jobs {
+        cmd = cmd.args(["--max-jobs".to_string(), jobs.clone()]);
+    }
+    for (name, value) in &options.options {
+        cmd = cmd.args(["--option".to_string(), name.clone(), value.clone()]);
+    }
     cmd
+}
+
+/// What one entry of `nix build --json` says.
+#[derive(Debug, Deserialize)]
+struct RawBuildResult {
+    #[serde(rename = "drvPath")]
+    drv_path: String,
+    #[serde(default)]
+    outputs: BTreeMap<String, String>,
+}
+
+/// Read `nix build --json`: derivation path -> the output paths it made.
+pub fn parse_build_json(text: &str, origin: &str) -> Result<BTreeMap<String, Vec<String>>> {
+    let results: Vec<RawBuildResult> = serde_json::from_str(text)
+        .map_err(|e| anyhow::anyhow!("{origin} did not answer with a build result: {e}."))?;
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for result in results {
+        // `outputs` is keyed by output NAME (`out`, `dev`, …) and the names
+        // are sorted here so that a derivation with two of them is refused
+        // with the same sentence twice rather than with whichever order nix
+        // happened to answer in.
+        let paths: Vec<String> = result.outputs.into_values().collect();
+        out.entry(result.drv_path).or_default().extend(paths);
+    }
+    Ok(out)
 }
 
 /// `nix path-info --json --closure-size <paths…>`, of the local store.
@@ -384,26 +450,33 @@ impl Builder<'_> {
         self.require_signing_key(&resolved, &hosts)?;
 
         self.ensure_present(&drvs)?;
-        let mut outputs: BTreeMap<String, String> = BTreeMap::new();
+
+        // The artifacts, in ONE nix invocation: every system, every bundle
+        // and every package of the fleet as one build graph.
+        //
+        // The check derivations are NOT in it, and that is the one thing
+        // this does not batch. A check is a data object — id, status,
+        // expected, observed, reason, duration — and a batch that failed
+        // would answer "nix exited 1" for all of them together. So each one
+        // is asked on its own, with `AnyExit`, and a required check that
+        // does not pass is a sentence that names it. In a real fleet these
+        // are few: `checks.required` is usually `units, session, mounts`,
+        // which are questions about a running host and belong to `check`.
+        let artifacts: Vec<&Derivation> =
+            drvs.iter().filter(|d| d.kind != DrvKind::Check).collect();
+        let outputs = self.build_artifacts(&artifacts)?;
+
         let mut checks: Vec<CheckResult> = Vec::new();
-        for drv in &drvs {
-            match drv.kind {
-                DrvKind::Check => {
-                    let result = self.build_check(drv, &resolved)?;
-                    if result.status != Status::Pass {
-                        bail!(
-                            "the required check {} did not pass, so there is no release: {}",
-                            result.id,
-                            result.reason
-                        );
-                    }
-                    checks.push(result);
-                }
-                _ => {
-                    let out = self.build_one(drv)?;
-                    outputs.insert(drv.what.clone(), out);
-                }
+        for drv in drvs.iter().filter(|d| d.kind == DrvKind::Check) {
+            let result = self.build_check(drv, &resolved)?;
+            if result.status != Status::Pass {
+                bail!(
+                    "the required check {} did not pass, so there is no release: {}",
+                    result.id,
+                    result.reason
+                );
             }
+            checks.push(result);
         }
 
         // A partial build is for looking at. It cannot be a release, because
@@ -578,35 +651,73 @@ impl Builder<'_> {
         );
     }
 
-    /// Build one derivation and hand back its output path.
-    fn build_one(&self, drv: &Derivation) -> Result<String> {
-        let out = self.runner.run(&build_cmd(&drv.drv, &self.options))?;
-        let mut paths: Vec<&str> = out
-            .stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect();
-        match paths.len() {
-            1 => Ok(paths.remove(0).to_string()),
-            0 => bail!(
-                "nix built {} and printed no output path. Nothing can be named in a release \
-                 that nobody can point at.",
-                drv.drv
-            ),
-            // A derivation with several outputs: the manifest names one out
-            // path per derivation, so which of them it meant is not this
-            // tool's to guess.
-            _ => bail!(
-                "the derivation {} for {} has {} outputs ({}), and the manifest names one. \
-                 The one derivation has to expose a single output per host, package and \
-                 check.",
-                drv.drv,
-                drv.what,
-                paths.len(),
-                paths.join(", ")
-            ),
+    /// Build these derivations in one nix invocation, and say which output
+    /// belongs to which of them.
+    ///
+    /// The mapping is nix's own (`drvPath` beside `outputs` in the json
+    /// answer) and not the order of the arguments: a release that named
+    /// seventy systems by the position of a line in a list would be a
+    /// release that is right until nix reorders its output.
+    ///
+    /// Two derivations of one manifest may be the same path — two hosts of a
+    /// fleet can be the same system — so the arguments are deduplicated and
+    /// the answer is read back per `what`.
+    fn build_artifacts(&self, drvs: &[&Derivation]) -> Result<BTreeMap<String, String>> {
+        if drvs.is_empty() {
+            return Ok(BTreeMap::new());
         }
+        let mut wanted: Vec<String> = drvs.iter().map(|d| d.drv.clone()).collect();
+        wanted.sort();
+        wanted.dedup();
+
+        let cmd = build_many_cmd(&wanted, &self.options);
+        let out = self.runner.run(&cmd)?;
+        let built = parse_build_json(&out.stdout, &cmd.line())?;
+
+        let mut outputs = BTreeMap::new();
+        for drv in drvs {
+            let paths = built.get(&drv.drv).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "nix built the fleet and said nothing about {} (for {}). Nothing can be \
+                     named in a release that nobody can point at.",
+                    drv.drv,
+                    drv.what
+                )
+            })?;
+            match paths.len() {
+                1 => {
+                    outputs.insert(drv.what.clone(), paths[0].clone());
+                }
+                0 => bail!(
+                    "nix built {} and printed no output path. Nothing can be named in a \
+                     release that nobody can point at.",
+                    drv.drv
+                ),
+                // A derivation with several outputs: the manifest names one
+                // out path per derivation, so which of them it meant is not
+                // this tool's to guess.
+                _ => bail!(
+                    "the derivation {} for {} has {} outputs ({}), and the manifest names \
+                     one. The one derivation has to expose a single output per host, \
+                     package and check.",
+                    drv.drv,
+                    drv.what,
+                    paths.len(),
+                    paths.join(", ")
+                ),
+            }
+        }
+        Ok(outputs)
+    }
+
+    /// One derivation, through the same road as seventy. Used by `image`,
+    /// which builds exactly one medium.
+    fn build_one(&self, drv: &Derivation) -> Result<String> {
+        let outputs = self.build_artifacts(&[drv])?;
+        outputs
+            .into_values()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("nix built {} and said nothing about it.", drv.drv))
     }
 
     /// A check that passes by building.
@@ -912,10 +1023,14 @@ impl Builder<'_> {
             system: system.trimmed().to_string(),
             builders: self.options.builders.clone(),
             substituters: self.options.substituters.clone(),
+            max_jobs: self.options.max_jobs.clone(),
+            options: self.options.options.clone(),
             signing_key_name: match &self.options.sign_key {
                 Some(key) => Some(self.key_name(key)?),
                 None => None,
             },
+            // Filled by `--cache`, which is the next position of this lane.
+            cache_url: None,
             // "relaxed" is nix's third value and it is not a sandbox.
             sandbox: sandbox.trimmed() == "true",
         })
@@ -1365,6 +1480,15 @@ mod tests {
     /// whether the store reports a signature afterwards. They are two
     /// arguments and not one because the interesting failure is a sign that
     /// ran and left nothing behind.
+    /// What `nix build --json` answers for these derivation/output pairs.
+    fn build_json(pairs: &[(String, String)]) -> String {
+        let results: Vec<serde_json::Value> = pairs
+            .iter()
+            .map(|(drv, out)| serde_json::json!({ "drvPath": drv, "outputs": { "out": out } }))
+            .collect();
+        serde_json::to_string(&results).unwrap()
+    }
+
     fn expect_build(fleet: &ResolvedFleet, sign: bool, signed: bool) -> StrictFake {
         let drvs: Vec<String> = derivations(fleet, &["box".to_string()])
             .into_iter()
@@ -1380,20 +1504,30 @@ mod tests {
             Matcher::prefix("nix", ["path-info", "--json"]),
             Output::stdout("{}"),
         );
-        for (drv, out) in drvs.iter().zip(outs.iter()) {
-            fake = fake.expect(
-                Matcher::exact(
-                    "nix",
-                    [
-                        "build".to_string(),
-                        "--no-link".to_string(),
-                        "--print-out-paths".to_string(),
-                        format!("{drv}^*"),
-                    ],
-                ),
-                Output::stdout(format!("{out}\n")),
-            );
-        }
+        // ONE build over the whole list, answered the way nix answers
+        // `--json`: an object per derivation, naming its own `drvPath`.
+        // Sorted, because `build_artifacts` sorts and deduplicates what it
+        // hands nix.
+        let mut sorted: Vec<(String, String)> = drvs
+            .iter()
+            .cloned()
+            .zip(outs.iter().cloned())
+            .collect::<Vec<_>>();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        fake = fake.expect(
+            Matcher::exact(
+                "nix",
+                [
+                    "build".to_string(),
+                    "--no-link".to_string(),
+                    "--json".to_string(),
+                ]
+                .into_iter()
+                .chain(sorted.iter().map(|(drv, _)| format!("{drv}^*")))
+                .collect::<Vec<_>>(),
+            ),
+            Output::stdout(build_json(&sorted)),
+        );
         if sign {
             fake = fake.expect(
                 Matcher::prefix("nix", ["store", "sign", "--recursive", "--key-file"]),
@@ -1839,24 +1973,35 @@ mod tests {
             Matcher::prefix("nix", ["path-info", "--json"]),
             Output::stdout("{}"),
         );
-        for (i, drv) in drvs.iter().enumerate() {
-            runner = runner.expect(
-                Matcher::exact(
-                    "nix",
-                    [
-                        "build".to_string(),
-                        "--no-link".to_string(),
-                        "--print-out-paths".to_string(),
-                        format!("{drv}^*"),
-                    ],
-                ),
-                Output::stdout(if i == 0 {
-                    "/nix/store/somethingelse-nixos-system-box-25.11\n".to_string()
-                } else {
-                    format!("/nix/store/pkg{i}-package\n")
-                }),
-            );
-        }
+        let mut pairs: Vec<(String, String)> = drvs
+            .iter()
+            .enumerate()
+            .map(|(i, drv)| {
+                (
+                    drv.clone(),
+                    if i == 0 {
+                        "/nix/store/somethingelse-nixos-system-box-25.11".to_string()
+                    } else {
+                        format!("/nix/store/pkg{i}-package")
+                    },
+                )
+            })
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        runner = runner.expect(
+            Matcher::exact(
+                "nix",
+                [
+                    "build".to_string(),
+                    "--no-link".to_string(),
+                    "--json".to_string(),
+                ]
+                .into_iter()
+                .chain(pairs.iter().map(|(drv, _)| format!("{drv}^*")))
+                .collect::<Vec<_>>(),
+            ),
+            Output::stdout(build_json(&pairs)),
+        );
         let files = files_with_config(&fleet);
         let clock = FakeClock::fixed();
         let builder = Builder {
@@ -1890,37 +2035,30 @@ mod tests {
             Matcher::prefix("nix", ["path-info", "--json"]),
             Output::stdout("{}"),
         );
-        runner = runner.expect(
-            Matcher::exact(
-                "nix",
-                [
-                    "build".to_string(),
-                    "--no-link".to_string(),
-                    "--print-out-paths".to_string(),
-                    format!("{drv}^*"),
-                ],
-            ),
-            Output::stdout(format!("{out}\n")),
-        );
+        let mut pairs: Vec<(String, String)> = vec![(drv.clone(), out.clone())];
         for name in ["meisterstack", "cloud_hypervisor", "guest_tiny"] {
             let drv = match name {
                 "meisterstack" => fleet.packages.meisterstack.drv.clone(),
                 "cloud_hypervisor" => fleet.packages.cloud_hypervisor.drv.clone(),
                 _ => fleet.packages.guest_tiny.drv.clone(),
             };
-            runner = runner.expect(
-                Matcher::exact(
-                    "nix",
-                    [
-                        "build".to_string(),
-                        "--no-link".to_string(),
-                        "--print-out-paths".to_string(),
-                        format!("{drv}^*"),
-                    ],
-                ),
-                Output::stdout(format!("/nix/store/{name}-out\n")),
-            );
+            pairs.push((drv, format!("/nix/store/{name}-out")));
         }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        runner = runner.expect(
+            Matcher::exact(
+                "nix",
+                [
+                    "build".to_string(),
+                    "--no-link".to_string(),
+                    "--json".to_string(),
+                ]
+                .into_iter()
+                .chain(pairs.iter().map(|(d, _)| format!("{d}^*")))
+                .collect::<Vec<_>>(),
+            ),
+            Output::stdout(build_json(&pairs)),
+        );
         let files = files_with_config(&fleet);
         let clock = FakeClock::fixed();
         let builder = Builder {

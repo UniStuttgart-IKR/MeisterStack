@@ -436,6 +436,17 @@ struct BuildArgs {
     #[arg(long)]
     substituters: Vec<String>,
 
+    // --- lane 4C: what nix is handed and where the result goes ----------
+    /// How many derivations nix may build at once: a number, or `auto`.
+    /// Passed on unread and recorded in the release.
+    #[arg(long)]
+    max_jobs: Option<String>,
+
+    /// A nix setting with no flag of its own: `--option <name> <value>`.
+    /// Repeatable, recorded in the release.
+    #[arg(long, num_args = 2, value_names = ["NAME", "VALUE"])]
+    option: Vec<String>,
+    // --- end lane 4C ----------------------------------------------------
     /// The inventory the `[operator] signing_key` reference is read from.
     /// Defaults to the one the manifest was resolved from.
     #[arg(long)]
@@ -1332,6 +1343,10 @@ fn build(args: &BuildArgs) -> Result<bool> {
             sign_key,
             builders: args.builders.clone(),
             substituters: args.substituters.clone(),
+            // --- lane 4C ---
+            max_jobs: args.max_jobs.clone(),
+            options: nix_options(&args.option)?,
+            // --- end lane 4C ---
             hosts,
         },
         state: Some(state),
@@ -1375,6 +1390,40 @@ fn build(args: &BuildArgs) -> Result<bool> {
 fn repo_of(resolved: &manifest::ResolvedFleet) -> PathBuf {
     PathBuf::from(&resolved.source.repo_path)
 }
+
+// --- lane 4C --------------------------------------------------------------
+
+/// `--option <name> <value>`, repeated, as the pairs nix is handed.
+///
+/// A map and not a list: nix takes the last value for a repeated setting,
+/// so two `--option cores` on one command line are one setting, and a
+/// release that recorded both would be recording a question rather than an
+/// answer. The same name twice with different values is therefore refused
+/// here rather than silently narrowed.
+fn nix_options(flat: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for pair in flat.chunks(2) {
+        // clap's `num_args = 2` guarantees the pairing; the match is here
+        // because a slice does not carry that guarantee into the types.
+        let [name, value] = pair else {
+            anyhow::bail!(
+                "--option takes a name and a value; {:?} is half of one.",
+                pair
+            );
+        };
+        if let Some(had) = out.insert(name.clone(), value.clone())
+            && &had != value
+        {
+            anyhow::bail!(
+                "--option {name} was given twice, as {had:?} and as {value:?}. nix would take \
+                 the last one and the release would record one of two answers, so say which."
+            );
+        }
+    }
+    Ok(out)
+}
+
+// --- end lane 4C ----------------------------------------------------------
 
 // --- lane 3A: media -------------------------------------------------------
 

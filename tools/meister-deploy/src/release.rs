@@ -52,10 +52,25 @@ pub struct BuildEnv {
     /// Remote builders that were offered, in the order nix got them.
     pub builders: Vec<String>,
     pub substituters: Vec<String>,
+    /// `--max-jobs`, as nix was given it (a number or `auto`). Null when it
+    /// was not given: then nix used its own setting, and naming a number
+    /// here would be this tool inventing one.
+    pub max_jobs: Option<String>,
+    /// `--option <name> <value>`, whatever the operator passed on.
+    pub options: BTreeMap<String, String>,
     /// The name of the key `nix store sign` used, never the key. A managed
     /// host runs with `require-sigs = true`, so an unsigned closure is one
     /// `nix copy` will refuse at the far end (M0 S12).
     pub signing_key_name: Option<String>,
+    /// Where this release's closures were pushed after they were signed
+    /// (`build --cache <store>`), or null for a release that lives only in
+    /// the store it was built in.
+    ///
+    /// It is a statement about what HAPPENED and not an instruction: a
+    /// target fetches from the substituters its own configuration names
+    /// (`meisterstack.managed.substituters`), never from a url it was handed
+    /// with a closure.
+    pub cache_url: Option<String>,
     pub sandbox: bool,
 }
 

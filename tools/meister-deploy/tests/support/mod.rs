@@ -91,7 +91,10 @@ pub fn build_env() -> BuildEnv {
         system: "x86_64-linux".to_string(),
         builders: Vec::new(),
         substituters: vec!["https://cache.nixos.org".to_string()],
+        max_jobs: None,
+        options: BTreeMap::new(),
         signing_key_name: Some("fleet-1".to_string()),
+        cache_url: None,
         sandbox: true,
     }
 }
