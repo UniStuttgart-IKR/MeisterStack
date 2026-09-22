@@ -112,7 +112,9 @@ pkgs.testers.runNixOSTest {
         os.chmod(path, 0o644)
         return path
 
-    def machine(name, disk):
+    def instance(name, disk):
+        # (`machine` is taken: with exactly one node in `nodes`, the driver
+        # binds that name to it.)
         # ONE disk each. The image itself is read on `reader` (see the
         # header): a second disk with the same root label is a coin toss
         # for stage 1.
@@ -124,8 +126,8 @@ pkgs.testers.runNixOSTest {
         return track(create_machine(" ".join(flags), name=name))
 
     start = time.time()
-    a = machine("first", copy_of("first"))
-    b = machine("second", copy_of("second"))
+    a = instance("first", copy_of("first"))
+    b = instance("second", copy_of("second"))
     a.start()
     b.start()
     # The reader's data disk (see `nodes.reader`): the untouched image, by
