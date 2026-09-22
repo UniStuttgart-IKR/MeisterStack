@@ -1650,12 +1650,10 @@ mod tests {
             })
             .collect();
         assert_eq!(catalogue, vec!["input/evdev"]);
-        for profile in ["evdev"] {
-            assert!(
-                common::capability::offers(&catalogue, DRIVER_INPUT, Some(profile)),
-                "a vm asking for input/{profile} fits this node"
-            );
-        }
+        assert!(
+            common::capability::offers(&catalogue, DRIVER_INPUT, Some("evdev")),
+            "a vm asking for input/evdev fits this node"
+        );
         assert!(common::capability::offers(&catalogue, DRIVER_INPUT, None));
         assert!(!common::capability::offers(
             &catalogue,
