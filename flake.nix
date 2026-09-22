@@ -305,6 +305,12 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # What a private key on a managed host looks like, and what the
+          # loader says when it does not (M0 probe S11, M2C).
+          vm-credentials = import ./nix/tests/credentials.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # The boot renderer and the build-time renderer, on the same input.
           # Both fleets: one-box has a raft group of ONE (no etcd variables),
           # ha has three (1A §8, open point 6).
