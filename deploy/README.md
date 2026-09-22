@@ -33,32 +33,39 @@ Bootstrap-Token je Raft-Gruppe, `cluster_name` und `cloud_name`, die
 `advertise_api`, die Scrape-Liste und der OIDC-Issuer. Ein Plan sagt, wer
 zu welcher Gruppe gehoert; die Adressen folgen.
 
-Die Verben von v1, soweit sie da sind:
+## Die Verben
 
-```
-meister-deploy init <dir>             # das Betreiber-Repo: fleet.toml, Profile, Checks
-meister-deploy inventory [--json]     # die Hosts und was jeder geerbt hat (offline)
-meister-deploy validate [--nix]       # die Gestalt der Datei; mit --nix auch die Flake
-meister-deploy resolve -o m.json      # das Manifest: welcher Baum, welche Systeme
-meister-deploy schema <art>           # das JSON Schema eines Vertrags
-```
+Abgelesen an `tools/meister-deploy/src/main.rs`. Die **Effektklasse** ist die
+des Werkzeugs selbst (`run::Effect`): `--offline` laesst nur `offline` durch,
+`--dry-run` nur `offline` und `read` — beides sind Eigenschaften des
+Programms und keine Zusage in Prosa. **Exit** ist 0 = ja, 1 = es hat nicht
+funktioniert, 2 = es hat funktioniert und die Antwort ist nein (ein Plan, der
+etwas nicht anfassen will; ein Lauf, der auf einen Provider wartet).
 
-Diese sieben Verben stehen seit meister-deploy v1 unter `legacy`, weil `plan`
-dort eine Datei meint und nicht mehr diese Tabelle:
+| Verb | Effektklasse | `--dry-run` | `--offline` | Exit |
+|---|---|---|---|---|
+| `init <dir>` | local-write | listet die Dateien, schreibt nichts | – | 0/1 |
+| `inventory [--json]` | offline | – | – | 0/1 |
+| `validate [--nix] [--manifest <f>]` | offline (mit `--nix`: nix-eval) | – | – | 0/1 |
+| `resolve --out m.json [--from f] [--dev] [--hosts …]` | nix-eval + local-write | zeigt die Kommandozeile, schreibt nichts | verweigert | 0/1 |
+| `build --manifest m.json --out r.json [--sign-key …]` | build + local-write | zeigt die Derivationen | verweigert | 0/1 |
+| `image --release r.json --host <id> --kind installer\|disk\|direct-boot` | build | zeigt die Kommandozeile | verweigert | 0/1 |
+| `install --plan p.json --release r.json --host <id> --approve destructive=<plan_id>` | build (Medium) + local-write | druckt das Blatt, baut nichts | verweigert | 0/1/2 |
+| `plan --release r.json --select <expr> [--kind upgrade\|bootstrap\|install]` | read + local-write | fragt die Hosts, schreibt nichts | Schnappschuss-frei, `provisional`, nur nach stdout | 0/2 |
+| `apply --plan p.json --release r.json [--resume <run>] [--takeover <run>]` | target-write | schaut, prueft, nennt die Schritte — keine Sperre, kein Journal | – | 0/1/2 |
+| `status` / `check --release r.json [--suite readiness]` | read | – | antwortet aus dem letzten Schnappschuss | 0/2 |
+| `report --run <id>` | offline (liest das Zustandsverzeichnis) | – | – | 0/1 |
+| `keys enroll <host> --fingerprint SHA256:…` | read + local-write | zeigt den Schluessel, schreibt nicht | verweigert | 0/1 |
+| `keys csr --host <id> --kind identity\|serving [--as <tier>]` | target-write (der Schluessel entsteht am Ziel) | zeigt das Subjekt | – | 0/1 |
+| `keys issue --host <id> --kind node\|cluster\|cloud\|serving` | key (offline, nur diese Maschine) | zeigt das Subjekt | – | 0/1 |
+| `gc --keep N` | local-write (nur GC-Wurzeln) | nennt die Releases | – | 0/1 |
+| `schema <art>` | offline | – | – | 0/1 |
+| `legacy plan\|image\|push\|check\|keys\|render` | wie vor v1 | wie vor v1 | – | 0/1 |
 
-```
-meister-deploy legacy plan            # die Tabelle: was ist, und was sollte sein
-meister-deploy legacy image <knoten>  # raw-efi fuer diese Kiste (oder `generic`, oder `all`)
-meister-deploy legacy keys init       # CA, Zertifikate, die drei Geheimnisse
-meister-deploy legacy keys push       # unter die festen Namen, Agents zuerst
-meister-deploy legacy push            # rollen: Agents, Cluster, Clouds, Addons
-meister-deploy legacy check           # Units, Sessions, Platten — und was die API sagt
-meister-deploy legacy render <knoten> # der Knoten als importierbares Nix-Modul
-```
-
-`meister deploy …` ruft dasselbe Binary auf, wenn es neben der CLI oder
-im PATH liegt. Jeder Aufruf sagt, was er tut, bevor er es tut; `--dry-run`
-sagt es und tut es nicht.
+Genehmigt wird ausschliesslich mit `--approve <klasse>=<plan_id>`; ein
+globales `--force` gibt es nicht, und eine Freigabe nennt den Plan, fuer den
+sie gilt. `meister deploy …` ruft dasselbe Binary auf, wenn es neben der CLI
+oder im PATH liegt.
 
 ### Warum `push` ein Programm ist und keine Schleife
 
@@ -111,19 +118,65 @@ Die Zertifikate kommen in keinem Fall aus dem Nix-Store: `keys push` legt
 sie nach `/opt/meisterstack/pki`, und bis dahin bleiben die Units sichtbar
 uebersprungen.
 
-## Erstinstallation ohne `dd`
+## Von der leeren Platte zur laufenden Flotte
 
-`nix build .#image-<knoten>` und `dd` ist der kurze Weg, wenn die Platte
-erreichbar ist. Ist sie es nicht, ist **nixos-anywhere** die dokumentierte
-Alternative: es kexect einen NixOS-Installer auf eine Kiste, die schon
-irgendein Linux mit SSH faehrt, partitioniert mit disko und installiert
-`.#nixosConfigurations.<knoten>` — dasselbe System, das auch im Image
-liegt, also aendert sich am Plan nichts. Was fehlt, ist ein
-disko-Layout; der Plan traegt heute nur `disk` und `data`, nicht die
-Partitionierung. Deshalb steht hier ein Absatz und kein Output.
+Zwoelf Zeilen, und jede davon laeuft so in `nix/tests/bootstrap.nix` —
+`checks.vm-bootstrap-fleet` ist dieser Ablauf gegen zwei leere virtuelle
+Platten.
 
-`.#iso-<knoten>` ist der dritte Weg: dasselbe System als Installer-ISO,
-fuer eine Kiste, an der man mit einem Stick steht.
+```
+meister-deploy resolve --repo . --out m.json                 # das Manifest dieses Baums
+meister-deploy build --manifest m.json --sign-key keys/signing.sec --out r.json
+meister-deploy plan --release r.json --select all --kind install --out p-install.json
+meister-deploy install --plan p-install.json --release r.json --host box \
+    --approve destructive=<plan_id>                          # baut das Medium, druckt das Blatt
+#   Medium booten. Auf der Konsole der Maschine:
+#     meister-install confirm --host box --disk <serial>
+#   Die letzte Zeile ist   HOST KEY FINGERPRINT  SHA256:…
+meister-deploy keys enroll box --fingerprint SHA256:…        # known_hosts, ausser Band geprueft
+meister-deploy keys csr --host box --kind identity --as cluster --manifest m.json
+meister-deploy keys issue --host box --kind cluster --manifest m.json
+meister-deploy plan --release r.json --select all --kind bootstrap --out p-boot.json
+meister-deploy apply --plan p-boot.json --release r.json --approve singleton=<plan_id> …
+meister-deploy check --release r.json                        # Exit 0 = die Flotte ist, was sie sein soll
+```
+
+Danach ist ein Update dieselbe Strecke ohne die ersten fuenf Zeilen:
+`resolve` -> `build` -> `plan` -> `apply`. Ein Host mit
+`boot = "direct"` haelt bei einem Kernelwechsel an (`provider-reboot`): der
+Lauf endet mit Exit 2, einer JSON-Zeile mit Kernel, Initrd und
+Kommandozeile, und geht nach `apply --resume <run-id>` weiter, sobald der
+Provider die Maschine damit gestartet hat.
+
+### nixos-anywhere als Alternative
+
+**nixos-anywhere** installiert dieselben Systeme ohne Medium: es kexect
+einen NixOS-Installer auf eine Kiste, die schon irgendein Linux mit SSH
+faehrt, partitioniert mit demselben disko-Layout
+(`install.layout` im Inventar) und installiert
+`.#nixosConfigurations.<id>`. Der Rest des Vertrags bleibt danach
+unveraendert: `keys enroll` mit dem Fingerprint, den die Maschine zeigt,
+dann `plan --kind bootstrap` und `apply`.
+
+Was es nicht tut, und weshalb hier trotzdem ein Medium gebaut wird:
+
+* Es prueft **keine Datentraegerfreigabe**. `meister-install confirm`
+  loest die Serial aus `lsblk -J` auf, vergleicht sie mit der im Inventar,
+  besteht auf Eindeutigkeit (zwei Platten mit derselben Serial sind ein
+  Abbruch) und zeigt Groesse, Modell und Umfang, bevor irgendetwas
+  formatiert wird. nixos-anywhere bekommt ein Ziel genannt und glaubt es.
+* Es hinterlaesst **keine Installationsmarke**.
+  `/etc/meister-install/installed.json` ist der Grund, dass ein zweites
+  Booten desselben Mediums die Platte in Ruhe laesst, bis jemand
+  `--reinstall` sagt.
+* Es setzt eine **SSH-Verbindung voraus**, die es schon gibt — und damit
+  einen Host, dem man bereits vertraut. Das Medium braucht das nicht: der
+  Fingerprint kommt von der Konsole, und `keys enroll` ist die Stelle, an
+  der die Flotte ihn annimmt.
+
+Fuer eine Kiste, die ohnehin schon erreichbar ist und deren Platte niemand
+anders beansprucht, ist nixos-anywhere der kuerzere Weg. Fuer eine leere
+Maschine, an der jemand steht, ist es das Medium.
 
 ## Die Kontext-Flotte (OpenNebula)
 
