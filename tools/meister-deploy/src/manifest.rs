@@ -251,15 +251,23 @@ pub struct SecretSource {
     pub reference: String,
 }
 
+/// How key material gets to the place a unit reads it.
+///
+/// One way, and one way only: a file, owned by the service user, mode
+/// `0600`, under the fleet's `pki.dir`. There WAS a second way — systemd's
+/// `LoadCredential` — and it was measured in a VM in M0 (probe S11) and
+/// dropped: systemd puts a credential in `/run/credentials/<unit>/` as
+/// `root:root 0440`, and every loader in this codebase refuses a key whose
+/// group can read it (`pki/pem.rs`, `proto/lib.rs`, `cli/config.rs`). The
+/// options were to loosen the loaders or to stop using credentials for
+/// keys. Loosening a refusal that exists to keep a private key private is
+/// not a trade this fleet makes, so the enum has one variant and the
+/// contract has one answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Delivery {
     /// Written to `target_path` with `owner` and `mode`.
     File,
-    /// Handed to the unit by systemd; the unit reads it under
-    /// `/run/credentials/<unit>/`. Nothing on disk is readable by the
-    /// service user, which is what the loaders' group-bit refusal wants.
-    SystemdCredential,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1328,7 +1336,24 @@ mod tests {
         let manifest = NixManifest::from_json(&fixture(), "the fixture").unwrap();
         let secret = &manifest.hosts["box"].secret_refs[0];
         assert_eq!(secret.mode, "0600");
-        assert_eq!(secret.delivery, Delivery::SystemdCredential);
+        assert_eq!(secret.delivery, Delivery::File);
         assert_eq!(secret.source.kind, SecretSourceKind::TargetGenerated);
+    }
+
+    #[test]
+    fn a_key_handed_over_by_systemd_is_not_a_delivery_this_tool_speaks() {
+        // M0's probe S11 measured what `LoadCredential` produces and the
+        // loaders refuse it. A manifest that asks for it is a manifest from
+        // before that decision, and it gets a sentence rather than a key
+        // nobody can read.
+        let text = fixture().replace(
+            "\"delivery\": \"file\"",
+            "\"delivery\": \"systemd-credential\"",
+        );
+        let err = NixManifest::from_json(&text, "an older manifest")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("systemd-credential"), "{err}");
+        assert!(err.contains("`file`"), "{err}");
     }
 }
