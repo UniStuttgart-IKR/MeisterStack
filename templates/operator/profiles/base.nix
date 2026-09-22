@@ -11,14 +11,18 @@
   # then leave it alone.
   system.stateVersion = "25.11";
 
-  # Where the system lives once it is on a disk.
+  # NO `fileSystems` here, and that is deliberate.
   #
-  # Until the first install (`meister-deploy install`, which partitions with
-  # disko out of `install.layout`), this is the honest place for it: a label
-  # is a fact about a disk somebody already partitioned. A host that has its
-  # own layout puts it in hosts/<id>.nix instead.
-  fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
-  fileSystems."/boot" = { device = "/dev/disk/by-label/ESP"; fsType = "vfat"; };
+  # A host this tool installs names a `layout` in its `install` table, and
+  # `lib.mkFleet` imports that disko module into the host: the partition
+  # table and the filesystems then come out of ONE file, and `disko` is
+  # their only author. A `fileSystems."/"` in this profile would be a second
+  # author for the same mount — the one case where the two disagree is a
+  # machine that comes up on the wrong disk, and neither half would say so.
+  #
+  # A host this tool does NOT install — a machine somebody else partitioned,
+  # or one taken over — says where its root is in its own module, and
+  # hosts/cp-1.nix shows exactly that.
 
   # Your rules. `meisterstack.ports` is what the stack LISTENS on — it opens
   # nothing and closes nothing — so the numbers are named here, once.

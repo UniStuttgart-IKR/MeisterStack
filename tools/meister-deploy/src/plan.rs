@@ -585,6 +585,17 @@ pub struct DeploymentPlan {
     /// Every class this plan needs, once each. The gate for
     /// `--approve <class>=<plan_id>`.
     pub approvals: Vec<Approval>,
+
+    // --- lane 3A: first installation ------------------------------------
+    /// Whether an `install` plan may act on a disk that already carries an
+    /// installation.
+    ///
+    /// Part of the plan and therefore part of the `plan_id`, which is the
+    /// whole point: an approval is bound to a plan id, so approving a plan
+    /// that installs two blank machines can never be carried over to one
+    /// that reinstalls a running host. Always false for every other kind.
+    pub reinstall: bool,
+    // --- end lane 3A ----------------------------------------------------
 }
 
 impl DeploymentPlan {
@@ -879,6 +890,11 @@ pub struct WorkloadControl {
 pub struct PlanPolicy {
     pub kind: PlanKind,
     pub valid_for_secs: u64,
+    // --- lane 3A: first installation ---
+    /// `plan --kind install --reinstall`: act on a disk that already
+    /// carries an installation. Ignored by every other kind.
+    pub reinstall: bool,
+    // --- end lane 3A ---
     /// `[operator] cli_config` / `cli_profile` from the inventory. `None`
     /// blocks every interrupting step on a host with the agent role.
     ///
@@ -906,6 +922,7 @@ impl PlanPolicy {
         PlanPolicy {
             kind,
             valid_for_secs: DEFAULT_VALIDITY_SECS,
+            reinstall: false,
             workload_control: None,
             confirm_within_switch_secs: CONFIRM_WITHIN_SWITCH_SECS,
             confirm_within_boot_secs: CONFIRM_WITHIN_BOOT_SECS,
@@ -926,6 +943,12 @@ impl PlanPolicy {
         self.expected_credentials = expected;
         self
     }
+    // --- lane 3A: first installation ---
+    pub fn with_reinstall(mut self, reinstall: bool) -> PlanPolicy {
+        self.reinstall = reinstall;
+        self
+    }
+    // --- end lane 3A ---
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,6 +1165,11 @@ pub fn plan(
                 granted_at: None,
             })
             .collect(),
+        // --- lane 3A ---
+        // Only an install can reinstall; saying `false` anywhere else keeps
+        // the field from being a switch somebody could flip on an upgrade.
+        reinstall: policy.kind == PlanKind::Install && policy.reinstall,
+        // --- end lane 3A ---
     };
     plan.plan_id = plan.content_id()?;
     for approval in &mut plan.approvals {
@@ -1499,6 +1527,16 @@ fn decide_host(
     let host = &fleet.hosts[id];
     let artifacts = &release.artifacts[id];
     let desired = &artifacts.toplevel.store_path;
+
+    // --- lane 3A: first installation ---
+    // An install asks a different question of the same facts, so it gets
+    // its own function rather than five `if kind == Install` scattered
+    // through this one: here an unreachable host is the NORMAL case and a
+    // host that answers is the one that has to be argued about.
+    if policy.kind == PlanKind::Install {
+        return decide_install_host(release, id, observation, policy);
+    }
+    // --- end lane 3A ---
 
     let mut d = HostDecision {
         verdict: HostVerdict::Change,
@@ -1909,6 +1947,194 @@ fn pending_deliveries(
         })
         .count()
 }
+
+// --- lane 3A: first installation ------------------------------------------
+
+/// What an `install` plan says about one host.
+///
+/// The facts are the same as an upgrade's; the reading of them is not. A
+/// host nobody can reach is exactly what an install is FOR, so it is a
+/// `change` here and an `unreachable` there. A host that answers and runs a
+/// system is the dangerous case — the disk of a running machine is somebody's
+/// data — so it is blocked unless the plan says `--reinstall` out loud, and
+/// that word is part of the plan id (which is what an approval is bound to).
+///
+/// What this never does is decide that a disk is blank. Nobody can decide
+/// that from a workstation: the serial, the size, the layout's device and
+/// the installation mark are all facts about a machine somebody is standing
+/// in front of, and `meister-install confirm` is what reads them there.
+fn decide_install_host(
+    release: &ReleaseManifest,
+    id: &str,
+    observation: &Observations,
+    policy: &PlanPolicy,
+) -> HostDecision {
+    let fleet = &release.resolved_fleet;
+    let host = &fleet.hosts[id];
+    let mut d = HostDecision {
+        verdict: HostVerdict::Change,
+        reasons: Vec::new(),
+        stop_all: Vec::new(),
+        stop_disruptive: Vec::new(),
+        current_system: None,
+        // A machine that is being installed comes up from nothing. Saying
+        // "no reboot needed" about it would be a sentence about a machine
+        // that is not running yet.
+        reboot_required: true,
+        // An install is a whole system, never just a file (lane 3B's form).
+        secrets_only: false,
+        reboot_only: false,
+        needs_maintenance: false,
+        class: class_of(host),
+        canary_rank: u8::from(host.rollout.canary_class.is_none()),
+        tier_rank: tier_rank(host, policy.kind),
+        preconditions: Vec::new(),
+        unknowns: Vec::new(),
+    };
+
+    if host.deployment == crate::manifest::Deployment::Context {
+        d.stop_all.push(format!(
+            "{id} is deployed as `context`: it is a vm somebody else instantiated, and this \
+             tool never installs one."
+        ));
+        return settle(d, HostVerdict::Blocked);
+    }
+
+    let Some(install) = &host.install else {
+        d.stop_all.push(format!(
+            "{id} has no `install` table, so nothing says which disk this tool would be \
+             allowed to destroy. A host is installed by naming its disk: `install = {{ disk = \
+             {{ serial = \"…\", size_gb = … }}, layout = \"disko/…\" }}` in the inventory. \
+             Until then {id} is a machine somebody else installed, and `plan --kind upgrade` \
+             is how it is taken forward."
+        ));
+        return settle(d, HostVerdict::Blocked);
+    };
+
+    d.preconditions.push(format!(
+        "{id} is installed onto the disk with the serial {} ({} GB) from a medium built for \
+         this host, and onto no other",
+        install.disk.serial,
+        install.disk.size_bytes / 1_000_000_000
+    ));
+    d.preconditions.push(format!(
+        "the layout {} decides the partition table, and the medium carries it",
+        install.layout
+    ));
+    for path in &install.preserve {
+        d.preconditions
+            .push(format!("{path} must not be on that disk"));
+    }
+
+    match observation.host(id) {
+        None => d.preconditions.push(format!(
+            "the snapshot taken at {} has no entry for {id}, which is what a machine that has \
+             not been installed yet looks like",
+            observation.taken_at
+        )),
+        Some(obs) if !obs.reachable => d.preconditions.push(format!(
+            "{id} did not answer when the snapshot was taken, which is what a machine that has \
+             not been installed yet looks like"
+        )),
+        Some(obs) => {
+            d.current_system = obs.current_system.clone();
+            let running = obs
+                .current_system
+                .clone()
+                .unwrap_or_else(|| "a system nobody could read".to_string());
+            if policy.reinstall {
+                d.preconditions.push(format!(
+                    "{id} answers and runs {running}; this plan says `--reinstall`, so that \
+                     machine's disk, its host key and its machine id are destroyed"
+                ));
+            } else {
+                d.stop_all.push(format!(
+                    "{id} answers and already runs {running}. Installing over it destroys that \
+                     machine's data, its host key and its machine id. If that is what you \
+                     mean, `plan --kind install --reinstall` says so — and the approval is \
+                     bound to THAT plan's id, so this one cannot be used for it."
+                ));
+            }
+        }
+    }
+
+    // An install never asks a group for permission: nothing of this host is
+    // running, so there is no quorum to keep and no guest to move. What
+    // protects the fleet here is that the disk is destroyed by a person
+    // standing in front of one machine.
+    let verdict = if d.stop_all.is_empty() {
+        HostVerdict::Change
+    } else {
+        HostVerdict::Blocked
+    };
+    settle(d, verdict)
+}
+
+/// The steps of an install: what the plan can say about a person in front of
+/// a machine.
+///
+/// Three, and only the middle one does anything. There is no `stage` (the
+/// closure travels in the medium), no `lock` (nothing on that host could be
+/// holding one), no `activate` (`nixos-install` is the activation) and no
+/// `confirm` (a machine with no previous generation has nothing to fall back
+/// to). `apply` refuses to carry an `install` action out at all — the
+/// destruction happens at the target, by a person, through
+/// `meister-install confirm` — and the plan is the sheet they work from.
+fn install_specs(release: &ReleaseManifest, id: &str, decision: &HostDecision) -> Vec<StepSpec> {
+    let fleet = &release.resolved_fleet;
+    let host = &fleet.hosts[id];
+    let desired = release.artifacts[id].toplevel.store_path.clone();
+    let mut specs = vec![
+        step(ActionKind::Preflight, Disruption::None)
+            .maybe_from(decision.current_system.clone())
+            .to(desired.clone()),
+    ];
+    if let Some(install) = &host.install {
+        // What this step does to what is RUNNING, which on a machine nobody
+        // can reach is nothing. A blank box that is about to be installed
+        // interrupts no service and moves no guest, so its plan asks for
+        // `destructive` and nothing else; a reinstall over a host that
+        // answers interrupts everything on it, and its plan says so by
+        // asking for `disruptive` as well. The disk is destroyed either
+        // way, and that is the class both of them share.
+        let disruption = if decision.current_system.is_some() {
+            Disruption::Reboot
+        } else {
+            Disruption::None
+        };
+        specs.push(
+            step(ActionKind::Install, disruption)
+                .from(format!(
+                    "the disk {} ({} GB)",
+                    install.disk.serial,
+                    install.disk.size_bytes / 1_000_000_000
+                ))
+                .to(desired)
+                .because(format!(
+                    "boot the medium `meister-deploy install --plan <p.json> --host {id}` \
+                     built, and type `meister-install confirm --host {id} --disk {}` on its \
+                     console",
+                    install.disk.serial
+                ))
+                .because(format!(
+                    "{id} boots {} afterwards, and the medium's last line is the host key \
+                     fingerprint `meister-deploy keys enroll {id} --fingerprint …` needs",
+                    host.build.boot.mode
+                )),
+        );
+    }
+    specs.push(
+        step(ActionKind::Verify, Disruption::None)
+            .to(host.checks.required.join(", "))
+            .because(
+                "after the machine has been enrolled and bootstrapped — an installed host that \
+                 carries no identity yet is `unenrolled`, which is a state and never a pass",
+            ),
+    );
+    specs
+}
+
+// --- end lane 3A ----------------------------------------------------------
 
 /// The verdict, and the sentences behind it. An unchanged host keeps its
 /// group's troubles out of its own reasons: nothing is being done to it, so
@@ -2335,7 +2561,11 @@ fn steps_for(
     let obs = observation.host(id);
 
     let mut specs: Vec<StepSpec> = Vec::new();
-    if decision.verdict == HostVerdict::Unchanged {
+    // --- lane 3A: first installation ---
+    if policy.kind == PlanKind::Install {
+        specs = install_specs(release, id, decision);
+    } else if decision.verdict == HostVerdict::Unchanged {
+        // --- end lane 3A ---
         // Two steps, and neither of them touches anything. A host that
         // already runs what the release says is not staged, not activated
         // and not handed a secret (V10).
@@ -2550,7 +2780,11 @@ fn steps_for(
     // The step that actually takes the host forward is the one that carries
     // the edges; everything else on the host is ordered by the wave and by
     // the host being its own parallel group.
-    let carries_edges = if decision.reboot_only {
+    let carries_edges = if policy.kind == PlanKind::Install {
+        // --- lane 3A ---
+        ActionKind::Install
+        // --- end lane 3A ---
+    } else if decision.reboot_only {
         ActionKind::Reboot
     } else {
         ActionKind::Activate
@@ -2591,7 +2825,21 @@ fn steps_for(
             reboot_required,
             approval_class: classes.iter().copied().max().unwrap_or(ApprovalClass::None),
             rollback: rollback_for(spec.kind, decision, policy),
-            validity: validity_for(spec.kind, id, host, obs, artifacts, groups),
+            // --- lane 3A ---
+            // An install has nothing a workstation can re-check before the
+            // step runs: the machine is not reachable (that is the point),
+            // the fleet has no host key for it yet, and what has to still
+            // be true when a partition table is destroyed — the serial, the
+            // size, the layout's device, the absence of an installation
+            // mark — is checked by `meister-install confirm` standing in
+            // front of it. A `Reachable` condition here would be a plan
+            // that contradicts its own purpose.
+            validity: if policy.kind == PlanKind::Install {
+                Vec::new()
+            } else {
+                validity_for(spec.kind, id, host, obs, artifacts, groups)
+            },
+            // --- end lane 3A ---
             blocked,
         });
     }
@@ -3489,6 +3737,213 @@ mod tests {
         assert_eq!(back, with);
         assert_eq!(back.expected_credentials["n1"]["ca-bundle"], "sha256:aaaa");
         assert!(back.id_matches().unwrap());
+    }
+
+    // -----------------------------------------------------------------
+    // lane 3A: first installation
+    // -----------------------------------------------------------------
+
+    /// A fleet nobody has ever reached: no host answered when the snapshot
+    /// was taken, which is what a rack of new machines looks like.
+    fn nothing_installed_yet() -> (ReleaseManifest, Observations) {
+        let release = release_of(onebox_enrolled());
+        let mut observation = observed(&release, at(TAKEN));
+        for host in observation.hosts.values_mut() {
+            host.reachable = false;
+            host.current_system = None;
+            host.booted_system = None;
+            host.next_boot_system = None;
+        }
+        (release, observation)
+    }
+
+    fn install_plan(
+        release: &ReleaseManifest,
+        expr: &str,
+        observation: &Observations,
+        reinstall: bool,
+    ) -> DeploymentPlan {
+        plan(
+            release,
+            expr,
+            observation,
+            None,
+            &plan_policy(PlanKind::Install).with_reinstall(reinstall),
+            at(NOW),
+        )
+        .expect("an install plans")
+    }
+
+    #[test]
+    fn a_machine_nobody_can_reach_is_exactly_what_an_install_is_for() {
+        let (release, observation) = nothing_installed_yet();
+        let plan = install_plan(&release, "host=n1", &observation, false);
+
+        assert_eq!(plan.kind, PlanKind::Install);
+        assert!(!plan.reinstall);
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Change);
+        assert_eq!(
+            kinds(&plan, "n1"),
+            [
+                ActionKind::Preflight,
+                ActionKind::Install,
+                ActionKind::Verify
+            ]
+        );
+
+        let install = action(&plan, "n1", ActionKind::Install);
+        assert_eq!(install.approval_class, ApprovalClass::Destructive);
+        // Nothing is running on a machine nobody can reach, so nothing is
+        // interrupted: the one question is whether the disk may go.
+        assert_eq!(install.disruption, Disruption::None);
+        assert!(!install.is_blocked());
+        // The payload a person works from: which disk, how big, which
+        // system, which command.
+        assert!(
+            install
+                .current
+                .as_deref()
+                .unwrap()
+                .contains("S6PENX0T123457")
+        );
+        assert!(
+            install
+                .desired
+                .as_deref()
+                .unwrap()
+                .contains("nixos-system-n1")
+        );
+        let said = install.preconditions.join(" ");
+        assert!(
+            said.contains("meister-install confirm --host n1 --disk S6PENX0T123457"),
+            "{said}"
+        );
+        assert!(said.contains("keys enroll n1"), "{said}");
+
+        // Nothing this workstation could re-check just before a disk on the
+        // other side of a room is formatted.
+        assert!(install.validity.is_empty(), "{:?}", install.validity);
+        assert_eq!(install.rollback.mode, RollbackMode::None);
+
+        // …and the plan asks for the one approval that means "destroy".
+        assert_eq!(
+            plan.approvals.iter().map(|a| a.class).collect::<Vec<_>>(),
+            [ApprovalClass::Destructive]
+        );
+    }
+
+    #[test]
+    fn a_host_that_answers_is_not_installed_over_by_accident() {
+        // Everything is running: an ordinary fleet, planned as an install.
+        let release = release_of(onebox_enrolled());
+        let observation = observed(&release, at(TAKEN));
+        let plan = install_plan(&release, "host=n1", &observation, false);
+
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Blocked);
+        let why = plan.hosts["n1"].reasons.join(" ");
+        assert!(why.contains("already runs"), "{why}");
+        assert!(why.contains("--reinstall"), "{why}");
+        assert!(action(&plan, "n1", ActionKind::Install).is_blocked());
+
+        // With the word said out loud it is not blocked any more…
+        let deliberate = install_plan(&release, "host=n1", &observation, true);
+        assert_eq!(deliberate.hosts["n1"].verdict, HostVerdict::Change);
+        assert!(deliberate.reinstall);
+        let install = action(&deliberate, "n1", ActionKind::Install);
+        assert!(!install.is_blocked());
+        // This one DOES interrupt something: the machine answers and runs a
+        // system, so the plan asks for that as well as for the disk.
+        assert_eq!(install.disruption, Disruption::Reboot);
+        let classes: Vec<ApprovalClass> = deliberate.approvals.iter().map(|a| a.class).collect();
+        assert!(classes.contains(&ApprovalClass::Destructive), "{classes:?}");
+        assert!(classes.contains(&ApprovalClass::Disruptive), "{classes:?}");
+        let said = deliberate.hosts["n1"].reasons.join(" ");
+        assert!(
+            said.is_empty(),
+            "a host that is not blocked has no reasons: {said}"
+        );
+
+        // …and it is a DIFFERENT plan, which is what makes the approval
+        // impossible to carry over.
+        assert_ne!(plan.plan_id, deliberate.plan_id);
+    }
+
+    #[test]
+    fn a_host_with_no_install_table_says_what_is_missing() {
+        let mut fleet = onebox_enrolled();
+        fleet.hosts.get_mut("n1").expect("n1").install = None;
+        fleet.manifest_id =
+            crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("hashes");
+        let release = release_of(fleet);
+        let mut observation = observed(&release, at(TAKEN));
+        observation.hosts.get_mut("n1").expect("n1").reachable = false;
+
+        let plan = install_plan(&release, "host=n1", &observation, false);
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Blocked);
+        let why = plan.hosts["n1"].reasons.join(" ");
+        assert!(why.contains("no `install` table"), "{why}");
+        assert!(why.contains("plan --kind upgrade"), "{why}");
+        // And there is no install step at all: there is no disk to name.
+        assert_eq!(
+            kinds(&plan, "n1"),
+            [ActionKind::Preflight, ActionKind::Verify]
+        );
+    }
+
+    #[test]
+    fn an_install_plan_stages_nothing_and_locks_nothing() {
+        // The closure travels in the medium and the machine is not running,
+        // so every step an upgrade needs would be a step against a host
+        // that is not there.
+        let (release, observation) = nothing_installed_yet();
+        let plan = install_plan(&release, "all", &observation, false);
+        for host in ["box", "n1", "n2"] {
+            let steps = kinds(&plan, host);
+            for unwanted in [
+                ActionKind::Stage,
+                ActionKind::Lock,
+                ActionKind::Activate,
+                ActionKind::Confirm,
+                ActionKind::Reboot,
+                ActionKind::Unlock,
+            ] {
+                assert!(
+                    !steps.contains(&unwanted),
+                    "{host} has a {unwanted}: {steps:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_reinstall_flag_is_only_ever_true_for_an_install() {
+        let (release, observation) = upgrade(&["n1"], false);
+        let plan = plan(
+            &release,
+            "all",
+            &observation,
+            None,
+            &plan_policy(PlanKind::Upgrade).with_reinstall(true),
+            at(NOW),
+        )
+        .expect("plans");
+        assert!(
+            !plan.reinstall,
+            "an upgrade can never carry a word that means `destroy this disk`"
+        );
+    }
+
+    #[test]
+    fn a_host_that_is_deployed_as_context_is_never_installed() {
+        let (release, observation) = nothing_installed_yet();
+        let mut fleet = release.resolved_fleet.clone();
+        fleet.hosts.get_mut("n1").expect("n1").deployment = crate::manifest::Deployment::Context;
+        fleet.manifest_id =
+            crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("hashes");
+        let release = release_of(fleet);
+        let plan = install_plan(&release, "host=n1", &observation, false);
+        let why = plan.hosts["n1"].reasons.join(" ");
+        assert!(why.contains("never installs one"), "{why}");
     }
 
     #[test]

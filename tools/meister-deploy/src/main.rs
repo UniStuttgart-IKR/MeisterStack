@@ -137,6 +137,18 @@ enum Verb {
     /// host anything.
     Build(BuildArgs),
 
+    // --- lane 3A: media -------------------------------------------------
+    /// Build one medium of one host out of a release: the installer ISO, a
+    /// prebuilt disk, or the bundle a hypervisor is handed. Evaluates
+    /// nothing and asks no host anything.
+    Image(ImageArgs),
+
+    /// Prepare the first installation of a host: build its medium, keep it
+    /// where the collector cannot take it, and print the sheet somebody
+    /// carries to the machine. Destroys nothing — the disk is formatted at
+    /// the target, by a person, with `meister-install confirm`.
+    Install(InstallArgs),
+    // --- end lane 3A ----------------------------------------------------
     /// Work out which hosts may be taken forward, in which order, and what
     /// has to still be true when it happens. Reads a release and a snapshot
     /// of the fleet; asks no host anything of its own.
@@ -445,6 +457,89 @@ struct BuildArgs {
     offline: bool,
 }
 
+// --- lane 3A: media -------------------------------------------------------
+#[derive(Args)]
+struct ImageArgs {
+    /// The release from `build`
+    #[arg(long)]
+    release: PathBuf,
+
+    /// Which host's medium
+    #[arg(long)]
+    host: String,
+
+    /// `installer`, `disk` or `direct-boot`
+    #[arg(long)]
+    kind: String,
+
+    /// Link the result into this directory, under a name that says which
+    /// host it belongs to
+    #[arg(short = 'o', long)]
+    out: Option<PathBuf>,
+
+    /// The operator's repository, whose state directory keeps the
+    /// garbage-collector root. Defaults to the one the manifest was resolved
+    /// from.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// Print the command line that would build it, and build nothing
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Refuse rather than reach outside this process
+    #[arg(long)]
+    offline: bool,
+
+    /// Print the result as json instead of as lines
+    #[arg(long)]
+    json: bool,
+}
+#[derive(Args)]
+struct InstallArgs {
+    /// The plan from `plan --kind install`
+    #[arg(long)]
+    plan: PathBuf,
+
+    /// The release the plan was made for. Required and checked, like
+    /// `apply`: the medium is built out of the derivation the RELEASE
+    /// names, and another build is another release.
+    #[arg(long)]
+    release: PathBuf,
+
+    /// Which host's medium
+    #[arg(long)]
+    host: String,
+
+    /// `--approve destructive=<plan_id>`. The plan's own id, so an approval
+    /// cannot be carried over from a plan somebody read yesterday.
+    #[arg(long = "approve")]
+    approve: Vec<String>,
+
+    /// Link the medium here as well, for writing to a stick
+    #[arg(short = 'o', long)]
+    out: Option<PathBuf>,
+
+    /// The operator's repository, whose state directory keeps the medium
+    /// and its collector root. Defaults to the one the manifest was
+    /// resolved from.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// Print the sheet and build nothing
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Refuse rather than reach outside this process
+    #[arg(long)]
+    offline: bool,
+
+    /// Print the media record as json instead of the sheet
+    #[arg(long)]
+    json: bool,
+}
+// --- end lane 3A ----------------------------------------------------------
+
 #[derive(Args)]
 struct ApplyArgs {
     /// The plan from `plan`
@@ -517,10 +612,18 @@ struct PlanArgs {
     #[arg(long)]
     select: String,
 
-    /// `upgrade` or `bootstrap`
+    /// `upgrade`, `bootstrap` or `install`
     #[arg(long, default_value = "upgrade")]
     kind: String,
 
+    // --- lane 3A: first installation ---
+    /// With `--kind install`: plan an installation over a host that already
+    /// answers and runs a system. It destroys that machine's data, its host
+    /// key and its machine id, and it is part of the plan id — so an
+    /// approval for a plan without it can never be used for one with it.
+    #[arg(long)]
+    reinstall: bool,
+    // --- end lane 3A ---
     /// A `targets/1` file from a provider adapter: where each host answers
     #[arg(long)]
     targets: Option<PathBuf>,
@@ -732,6 +835,10 @@ fn run() -> Result<Answer> {
         )
         .map(Answer::from),
         Verb::Build(args) => build(args).map(Answer::from),
+        // --- lane 3A: media ---
+        Verb::Image(args) => image(args).map(Answer::from),
+        Verb::Install(args) => install(args),
+        // --- end lane 3A ---
         Verb::Status(look) => status(look),
         Verb::Check { look, suite } => check(look, suite),
         Verb::Plan(args) => make_plan(args),
@@ -1269,6 +1376,275 @@ fn repo_of(resolved: &manifest::ResolvedFleet) -> PathBuf {
     PathBuf::from(&resolved.source.repo_path)
 }
 
+// --- lane 3A: media -------------------------------------------------------
+
+/// `image --release r.json --host <id> --kind installer|disk|direct-boot`.
+///
+/// One derivation out of the release, built, measured, rooted. It evaluates
+/// nothing: the derivation path IS the evaluation the release was made from,
+/// so a medium built here belongs to that release and not to whatever the
+/// operator's flake says today.
+fn image(args: &ImageArgs) -> Result<bool> {
+    if args.offline {
+        anyhow::bail!(
+            "image builds a medium, and --offline forbids it. There is nothing on disk this \
+             verb could answer from: the medium IS the build."
+        );
+    }
+    let kind = build::ImageKind::parse(&args.kind)?;
+    let policy = if args.dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+
+    let text = files.read_to_string(&args.release)?;
+    let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
+
+    if args.dry_run {
+        let drv = build::image_drv(&release, &args.host, kind)?;
+        println!(
+            "{}",
+            build::build_cmd(&drv, &build::BuildOptions::default()).line()
+        );
+        eprintln!(
+            "note: nothing was built, nothing was rooted and nothing was linked. The \
+             derivation above is the one the release {} names for {} as its {kind} medium.",
+            release.release_id, args.host
+        );
+        return Ok(true);
+    }
+
+    // A medium can take an hour to build, and a Ctrl-C has to reach it.
+    Cancel::on_sigint()?;
+    let runner = Real::new(policy).verbose(true);
+    let repo = args
+        .repo
+        .clone()
+        .unwrap_or_else(|| repo_of(&release.resolved_fleet));
+    let builder = build::Builder {
+        runner: &runner,
+        files: &files,
+        clock: &RealClock,
+        options: build::BuildOptions::default(),
+        state: Some(StateDir::in_repo(&repo)),
+    };
+    let result = builder.image(&release, &args.host, kind, args.out.as_deref())?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("{}", result.file.as_deref().unwrap_or(&result.store_path));
+        if let (Some(sha256), Some(size)) = (&result.sha256, result.size) {
+            eprintln!("    sha256 {sha256}");
+            eprintln!("    size   {size} bytes ({} MiB)", size / (1024 * 1024));
+        }
+        if let Some(root) = &result.gc_root {
+            eprintln!("    root   {root}");
+        }
+        if let Some(link) = &result.linked_to {
+            eprintln!("    linked {link}");
+        }
+    }
+    Ok(true)
+}
+
+/// `install --plan p.json --release r.json --host <id> --approve destructive=<plan_id>`.
+///
+/// It prepares an installation and carries none out. What it does is build
+/// the medium, put it where a collector cannot take it, write down what it
+/// is, and print the sheet somebody reads standing in front of the machine.
+/// The disk is destroyed there, by a person, by `meister-install confirm` —
+/// which is why `apply` refuses an `install` action and this verb exists
+/// beside it.
+///
+/// The approval is asked for all the same, and it is the plan's own id:
+/// somebody has said "yes, this machine, this disk" before a medium that
+/// will format it is written anywhere.
+fn install(args: &InstallArgs) -> Result<Answer> {
+    if args.offline {
+        anyhow::bail!(
+            "install builds an installer medium, and --offline forbids it. There is nothing \
+             on disk this verb could answer from: the medium IS the build."
+        );
+    }
+    let policy = if args.dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+
+    let text = files.read_to_string(&args.plan)?;
+    let the_plan = plan::DeploymentPlan::from_json(&text, &args.plan.display().to_string())?;
+    let text = files.read_to_string(&args.release)?;
+    let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
+
+    if the_plan.kind != PlanKind::Install {
+        anyhow::bail!(
+            "{} is a `{}` plan, and this verb prepares an `install`. `plan --kind install \
+             --select host={}` is what makes one.",
+            args.plan.display(),
+            the_plan.kind,
+            args.host
+        );
+    }
+    if the_plan.release_id != release.release_id {
+        anyhow::bail!(
+            "the plan {} was made for the release {} and {} is {}. A medium is built out of \
+             the derivation a release names, so these two have to be the same release.",
+            the_plan.plan_id,
+            the_plan.release_id,
+            args.release.display(),
+            release.release_id
+        );
+    }
+    let Some(host_plan) = the_plan.hosts.get(&args.host) else {
+        anyhow::bail!(
+            "the plan {} does not cover {}; it covers {}.",
+            the_plan.plan_id,
+            args.host,
+            the_plan.selection.targets.join(", ")
+        );
+    };
+    if let Some(action) = the_plan
+        .actions
+        .iter()
+        .find(|a| a.host == args.host && a.kind == plan::ActionKind::Install)
+        && let Some(why) = &action.blocked
+    {
+        eprintln!("meister-deploy: {why}");
+        eprintln!(
+            "note: no medium was built. A plan that blocks the installation of {} is a plan \
+             that says this machine must not be installed right now.",
+            args.host
+        );
+        return Ok(Answer::Blocked);
+    }
+    let _ = host_plan;
+
+    // The approval, and it is the plan's own id.
+    let granted = parse_approvals(&args.approve)?;
+    let missing = plan::approvals_missing(&the_plan, &granted);
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "this installation needs {}, and nobody granted {}. Writing a medium that \
+             formats a disk is the point at which somebody says yes: \
+             `--approve destructive={}`.",
+            the_plan
+                .approvals
+                .iter()
+                .map(|a| a.class.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            missing
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            the_plan.plan_id
+        );
+    }
+
+    let resolved_host = release
+        .resolved_fleet
+        .hosts
+        .get(&args.host)
+        .ok_or_else(|| anyhow::anyhow!("the release knows nothing about {}", args.host))?;
+    let installed = resolved_host.install.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} has no `install` table, so nothing says which disk a medium of it would be \
+             about.",
+            args.host
+        )
+    })?;
+    let facts = meister_deploy::install::SheetFacts {
+        fleet: release.resolved_fleet.fleet.name.clone(),
+        serial: installed.disk.serial.clone(),
+        boot_mode: resolved_host.build.boot.mode,
+        preserve: installed.preserve.clone(),
+        reinstall: the_plan.reinstall,
+    };
+
+    let repo = args
+        .repo
+        .clone()
+        .unwrap_or_else(|| repo_of(&release.resolved_fleet));
+    let state = StateDir::in_repo(&repo);
+    let media = meister_deploy::install::media_dir(&state);
+
+    if args.dry_run {
+        let drv = build::image_drv(&release, &args.host, build::ImageKind::Installer)?;
+        println!(
+            "{}",
+            build::build_cmd(&drv, &build::BuildOptions::default()).line()
+        );
+        eprintln!(
+            "note: nothing was built and nothing was written. A real run puts the medium \
+             under {} and prints the sheet.",
+            media.display()
+        );
+        return Ok(Answer::Yes);
+    }
+
+    Cancel::on_sigint()?;
+    let runner = Real::new(policy).verbose(true);
+    let builder = build::Builder {
+        runner: &runner,
+        files: &files,
+        clock: &RealClock,
+        options: build::BuildOptions::default(),
+        state: Some(StateDir::in_repo(&repo)),
+    };
+    let built = builder.image(
+        &release,
+        &args.host,
+        build::ImageKind::Installer,
+        Some(&media),
+    )?;
+    let file = built.file.clone().ok_or_else(|| {
+        anyhow::anyhow!("the installer build of {} produced no iso file", args.host)
+    })?;
+
+    // Beside the link, so that the next `install` — and whoever picks this
+    // up tomorrow — can say which plan and which release this medium is.
+    let record = meister_deploy::install::MediaRecord {
+        schema: meister_deploy::install::MEDIA_SCHEMA.to_string(),
+        host: args.host.clone(),
+        plan_id: the_plan.plan_id.clone(),
+        release_id: release.release_id.clone(),
+        iso: built.linked_to.clone().unwrap_or_else(|| file.clone()),
+        store_path: file,
+        sha256: built.sha256.clone().unwrap_or_default(),
+        size: built.size.unwrap_or(0),
+        built_at: RealClock.now(),
+    };
+    files.write_atomic(
+        &media.join(format!("{}.json", args.host)),
+        &record.to_json()?,
+        0o644,
+    )?;
+
+    if let Some(dir) = &args.out {
+        files.create_dir_all(dir)?;
+        files.symlink_atomic(
+            Path::new(&record.store_path),
+            &dir.join(format!("{}.iso", args.host)),
+        )?;
+        eprintln!("    also linked into {}", dir.display());
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&record)?);
+    } else {
+        print!("{}", meister_deploy::install::sheet(&record, &facts));
+    }
+    Ok(Answer::Yes)
+}
+
+// --- end lane 3A ----------------------------------------------------------
+
 /// The `[operator] signing_key` reference, from the inventory the manifest
 /// was resolved from.
 ///
@@ -1451,15 +1827,27 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
     let kind = match args.kind.as_str() {
         "upgrade" => PlanKind::Upgrade,
         "bootstrap" => PlanKind::Bootstrap,
-        other @ ("install" | "keys-rotate" | "keys-revoke" | "retire") => anyhow::bail!(
+        // --- lane 3A: first installation ---
+        "install" => PlanKind::Install,
+        // --- end lane 3A ---
+        other @ ("keys-rotate" | "keys-revoke" | "retire") => anyhow::bail!(
             "the plan kind {other:?} is a contract this tool already speaks and a plan it \
-             cannot build yet: `install` arrives with M3, `keys-rotate`, `keys-revoke` and \
-             `retire` with M5."
+             cannot build yet: `keys-rotate`, `keys-revoke` and `retire` arrive with M5."
         ),
         other => anyhow::bail!(
-            "{other:?} is not a plan kind. This tool builds `upgrade` and `bootstrap`."
+            "{other:?} is not a plan kind. This tool builds `upgrade`, `bootstrap` and \
+             `install`."
         ),
     };
+    // --- lane 3A ---
+    if args.reinstall && kind != PlanKind::Install {
+        anyhow::bail!(
+            "--reinstall belongs to `plan --kind install`: it says that a disk which already \
+             carries an installation may be destroyed. An upgrade never touches a partition \
+             table."
+        );
+    }
+    // --- end lane 3A ---
 
     let (control, note) = workload_control(&files, &release, args.inventory.as_deref());
     if let Some(note) = note {
@@ -1484,7 +1872,8 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
         targets.as_ref(),
         &plan::PlanPolicy::new(kind)
             .with_workload_control(control)
-            .with_expected_credentials(expected),
+            .with_expected_credentials(expected)
+            .with_reinstall(args.reinstall),
         RealClock.now(),
     )?;
 

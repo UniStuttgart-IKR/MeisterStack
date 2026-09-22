@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+#
+# The fleet of nix/tests/install-direct.nix: one host whose hypervisor hands
+# it its kernel.
+#
+# The same shape as nix/tests/fleet/box, and one word different: `boot =
+# "direct"`. That word takes the boot loader out of the guest, takes the ESP
+# out of the layout, and makes `<id>-direct-boot` — a kernel, an initrd and a
+# command line — the thing a provider is handed.
+
+schema = 2
+
+[fleet]
+name = "vm-direct"
+domain = "vm.example"
+
+[defaults]
+ssh = { user = "root", port = 22 }
+profiles = [ ]
+rollout = { max_unavailable = 1, reboot = "approve" }
+checks = { required = [ ] }
+
+[[group]]
+id = "cp"
+kind = "raft"
+
+# Roles cloud+cluster and not `agent`, for the same reason as the box fleet:
+# a fleet of one host has to be a whole control plane (a cloud places guests
+# on clusters, a cluster registers with a cloud), and what is under test here
+# is the boot mode and not the role. An agent that boots direct is the lab's
+# ordinary case and lives in the integration test.
+[[host]]
+id = "n1"
+name = "n1"
+deployment = "nixos"
+roles = ["cloud", "cluster"]
+groups = ["cp"]
+controller_group = "cp"
+site = "vm"
+boot = "direct"
+networks.management = { address = "192.168.1.3", prefix = 24, interface = "eth1" }
+install = { disk = { serial = "MEISTERDIRECT1", size_gb = 16 }, layout = "disko/single-direct.nix", preserve = [] }
+modules = ["hosts/n1.nix"]

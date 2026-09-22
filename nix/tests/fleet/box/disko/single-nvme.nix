@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
-# One NVMe: an EFI system partition and the rest as the root filesystem.
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+
+# nix/tests/install.nix' copy of templates/operator/disko/single-nvme.nix:
+# one disk, an EFI system partition of 1G and the rest as the root
+# filesystem.
 #
-# Used by the first install (`meister-deploy install`, M3), which partitions
-# with disko out of the layout the inventory's `install.layout` names. The
-# DEVICE is not in here: it belongs to the host (hosts/<id>.nix binds it
-# through /dev/disk/by-id by the disk's serial), because a layout is a shape
-# and a device is a machine.
+# A copy and not an import, because that is what an operator has: the
+# template writes this file into their repository and it becomes theirs. The
+# test uses it the way `lib.mkFleet` uses any layout — imported into the host
+# whose inventory entry names it in `install.layout`.
 #
-# Measured in M0 probe S6 against the pinned nixpkgs: `disko.devices` of this
-# shape evaluates, and `fileSystems."/".device` comes out as
-# /dev/disk/by-partlabel/disk-main-root.
+# The DEVICE is not in here: hosts/box.nix binds it.
 {
   # This layout makes an ESP, so a host that uses it boots itself
   # (`boot = "uefi"` in the inventory). nix/lib/inventory.nix compares the

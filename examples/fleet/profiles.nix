@@ -21,12 +21,14 @@
     # be imported into a host that already has one.
     system.stateVersion = "25.11";
 
-    # Where this example's systems live once they are on a disk. Until M3
-    # brings disko, the plan says nothing about partitions and the host
-    # module does — which is the honest split: a label is a fact about a
-    # disk somebody already partitioned.
-    fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
-    fileSystems."/boot" = { device = "/dev/disk/by-label/ESP"; fsType = "vfat"; };
+    # NO `fileSystems` here: a host this tool installs names a `layout` in
+    # its `install` table, lib.mkFleet imports that disko module, and disko
+    # is then the only author of that host's mounts. A line here would be a
+    # second author for the same mount, and the one case where two authors
+    # disagree is a machine that came up on the wrong disk.
+    #
+    # A host that is NOT installed by this tool says where its root is
+    # itself — the `adopted` profile below is that answer, written once.
 
     # The example fleet is a lab on one switch; a real operator's base
     # profile is where their own rules go. What matters here is that the
@@ -50,6 +52,17 @@
     meisterstack.managed.trustedPublicKeys = [
       "example-fleet-not-a-real-key:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     ];
+  };
+
+  # A machine somebody else partitioned.
+  #
+  # The counterpart of an `install` table: no layout, no disko, so the
+  # filesystems are stated here by LABEL — a fact about a disk that already
+  # exists. examples/fleet/ha.toml gives this profile to every host, because
+  # that fleet is about the etcd road and not about installing anything.
+  adopted = { ... }: {
+    fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
+    fileSystems."/boot" = { device = "/dev/disk/by-label/ESP"; fsType = "vfat"; };
   };
 
   controller = { ... }: {

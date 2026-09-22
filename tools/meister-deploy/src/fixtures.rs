@@ -96,6 +96,7 @@ pub fn artifacts_for(resolved: &ResolvedFleet) -> BTreeMap<String, HostArtifacts
                     },
                     installer_iso: None,
                     disk_image: None,
+                    direct_boot: None,
                     boot: BootArtifacts {
                         kernel_store_path: host.build.boot.kernel_out.clone(),
                         initrd_store_path: host.build.boot.initrd_out.clone(),
@@ -160,6 +161,57 @@ pub fn onebox_enrolled() -> ResolvedFleet {
     fleet.manifest_id =
         crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
     fleet
+}
+
+/// The same fleet with one host turned into a direct-boot guest.
+///
+/// The fixture's three hosts all boot themselves, which is the common case
+/// and the one most tests are about. A test about the OTHER boot mode needs
+/// a host whose kernel comes from outside, and building a second fixture
+/// file for one field would be two fixtures to keep in step. The manifest id
+/// is recomputed, because a fleet whose content was edited and whose id was
+/// not is a fleet `validate` refuses.
+pub fn with_direct_host(mut fleet: ResolvedFleet, id: &str) -> ResolvedFleet {
+    {
+        let host = fleet
+            .hosts
+            .get_mut(id)
+            .unwrap_or_else(|| panic!("{id} is in the fixture"));
+        host.build.boot.mode = crate::manifest::BootMode::Direct;
+        host.build.boot.cmdline = Some(format!("loglevel=4 init={}/init", host.build.toplevel_out));
+        host.build.direct_boot_drv = Some(format!("/nix/store/bbbb{id}-{id}-direct-boot.drv"));
+        // A machine with no boot loader has no EFI disk image either, and
+        // the manifest says so: `lib.mkFleet` builds none for such a host.
+        host.build.disk_image_drv = None;
+    }
+    fleet.manifest_id =
+        crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
+    fleet
+}
+
+/// The bundle that belongs to such a host: the paths its own manifest
+/// promised, plus the directory that holds them.
+pub fn bundle_for(fleet: &ResolvedFleet, id: &str) -> crate::release::DirectBoot {
+    let host = &fleet.hosts[id];
+    crate::release::DirectBoot {
+        kernel: crate::release::ImageArtifact {
+            store_path: host.build.boot.kernel_out.clone(),
+            sha256: "1".repeat(64),
+            size: 12_000_000,
+        },
+        initrd: crate::release::ImageArtifact {
+            store_path: host.build.boot.initrd_out.clone(),
+            sha256: "2".repeat(64),
+            size: 48_000_000,
+        },
+        cmdline: host
+            .build
+            .boot
+            .cmdline
+            .clone()
+            .expect("a direct host carries a command line"),
+        bundle_store_path: format!("/nix/store/bbbb{id}-{id}-direct-boot"),
+    }
 }
 
 /// A release in which the named hosts got a new system — which is what a

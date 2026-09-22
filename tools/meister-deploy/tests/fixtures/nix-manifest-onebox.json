@@ -109,7 +109,8 @@
           "layout": "disko/single-nvme.nix",
           "preserve": [
             "/var/lib/meister-data"
-          ]
+          ],
+          "authorized_keys": []
         }
       },
       "n1": {
@@ -172,7 +173,8 @@
           "layout": "disko/single-nvme.nix",
           "preserve": [
             "/var/lib/meister-data"
-          ]
+          ],
+          "authorized_keys": []
         }
       },
       "n2": {
@@ -235,7 +237,8 @@
           "layout": "disko/single-nvme.nix",
           "preserve": [
             "/var/lib/meister-data"
-          ]
+          ],
+          "authorized_keys": []
         }
       }
     },
@@ -305,8 +308,11 @@
           "kernel_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-linux-6.12.41/bzImage",
           "initrd_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-initrd-linux-6.12.41/initrd",
           "kernel_version": "6.12.41",
-          "kernel_params_sha256": "3b8fkkkkkkkk"
-        }
+          "kernel_params_sha256": "3b8fkkkkkkkk",
+          "mode": "uefi",
+          "cmdline": null
+        },
+        "direct_boot_drv": null
       },
       "config_artifacts": {
         "agent_toml_out": "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-agent.toml",
@@ -421,8 +427,11 @@
           "kernel_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-linux-6.12.41/bzImage",
           "initrd_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-initrd-linux-6.12.41/initrd",
           "kernel_version": "6.12.41",
-          "kernel_params_sha256": "3b8fkkkkkkkk"
-        }
+          "kernel_params_sha256": "3b8fkkkkkkkk",
+          "mode": "uefi",
+          "cmdline": null
+        },
+        "direct_boot_drv": null
       },
       "config_artifacts": {
         "agent_toml_out": "/nix/store/n1n1n1n1n1n1n1n1zzzzzzzzzzzzzzzz-agent.toml"
@@ -511,8 +520,11 @@
           "kernel_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-linux-6.12.41/bzImage",
           "initrd_out": "/nix/store/kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-initrd-linux-6.12.41/initrd",
           "kernel_version": "6.12.41",
-          "kernel_params_sha256": "3b8fkkkkkkkk"
-        }
+          "kernel_params_sha256": "3b8fkkkkkkkk",
+          "mode": "uefi",
+          "cmdline": null
+        },
+        "direct_boot_drv": null
       },
       "config_artifacts": {
         "agent_toml_out": "/nix/store/n2n2n2n2n2n2n2n2zzzzzzzzzzzzzzzz-agent.toml"

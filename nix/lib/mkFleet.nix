@@ -27,12 +27,16 @@
 #   right here).
 { nixpkgs
 , meisterstack
-  # Declared and passed through rather than used: the disko layout a host
-  # names in `install.layout` is read by the INSTALLER (M3), and importing it
-  # here would give a host two authors for its filesystems — its own module
-  # and a partition table. The input exists so that an operator's
-  # `disko.follows = "meisterstack/disko"` has something to follow and so
-  # that M3 has it without a lock-file change.
+  # The partition tables. A host with an `install` table names a layout, and
+  # THIS is where that layout is imported — together with disko's own module,
+  # which is what turns `disko.devices` into `fileSystems`. From then on
+  # disko is the only author of that host's mounts, which is why the
+  # operator's own profiles set none (templates/operator/profiles/base.nix
+  # says so where somebody will read it).
+  #
+  # Null is allowed and is a fleet that installs nothing: a host with an
+  # `install` table then gets a sentence rather than a partition table
+  # nobody imported.
 , disko ? null
   # The pre-v1 image generator. Only needed where a format has not been
   # measured against the native `system.build.images` yet.
@@ -69,6 +73,8 @@ let
 
   inv = (import ./inventory.nix { inherit lib; }).load inventory;
 
+  directBoot = import ./direct-boot.nix { inherit lib; };
+
   pkgs = import nixpkgs {
     inherit system;
     overlays = [ (import ../overlay.nix) ] ++ pkgsOverlays;
@@ -94,6 +100,29 @@ let
   # afternoon.
   platform = { nixpkgs.pkgs = pkgs; };
 
+  # The partition table of a host this fleet installs, plus the module that
+  # turns it into filesystems.
+  #
+  # Only for a host with an `install` table: a machine somebody else
+  # partitioned has no layout to import, and disko's module on such a host
+  # would add an activation script that formats nothing and a `fileSystems`
+  # set that is empty — a second author with nothing to say. The path is
+  # relative to the INVENTORY file (the same rule as `modules = [ … ]`), so
+  # that a layout is a file of the operator's repository and not a name this
+  # flake has to know.
+  layoutFor = id:
+    let h = inv.hosts.${id}; in
+    if h.install == null then [ ]
+    else if disko == null then
+      throw ("host ${id} has an install table (layout ${h.install.layout}) and mkFleet was "
+        + "called without the `disko` input, so there is nothing to turn a partition table "
+        + "into filesystems. Pass `disko` — an operator's flake does that with "
+        + "`disko.follows = \"meisterstack/disko\"`.")
+    else [
+      disko.nixosModules.disko
+      (inv.planDir + "/${h.install.layout}")
+    ];
+
   modulesFor = id:
     [
       platform
@@ -106,22 +135,58 @@ let
         meisterstack.managed.enable = true;
       }
       (inv.hostModule id)
+      # The installer MEDIUM of this host, which is a medium and not this
+      # host: nix/install.nix says what is in it and why. It lives in
+      # `image.modules.iso-installer` — the sub-evaluation the image is built
+      # in — because `isoImage.*` set on a host is an option that does not
+      # exist (M0 finding A10).
+      #
+      # `{ config, ... }:` and not `configs.${id}`: reading the evaluated
+      # host out of the attribute set this list BUILDS would be a recursion
+      # that only laziness keeps from closing. The module argument is the
+      # same value with none of that.
+      ({ config, ... }: lib.mkIf (inv.hosts.${id}.install != null) {
+        image.modules.iso-installer = import ../install.nix {
+          inherit id;
+          host = inv.hosts.${id};
+          target = config;
+          fleet = inv.fleet;
+        };
+
+        # And the disk IMAGE brings its own partition table, so the host's
+        # layout has to step aside inside it.
+        #
+        # A `<id>-disk-image` is a prebuilt filesystem somebody writes to a
+        # disk or registers with a provider; the image builder decides where
+        # its root is (`/dev/disk/by-label/nixos`, nixos/modules/
+        # virtualisation/disk-image.nix) and it says so without a priority.
+        # disko says the same thing about the partition table it would
+        # CREATE, also without a priority, and two unprioritised definitions
+        # of one `device` is an evaluation error — measured, the moment the
+        # layout started being imported. Turning disko's config off inside
+        # the image is the honest reading: nothing partitions anything here,
+        # so the layout has nothing to say.
+        #
+        # Inside the `install` condition, and that is not tidiness either: a
+        # host with no install table never imported disko, so setting one of
+        # its options there is an option that does not exist — measured, on
+        # the ha example, which has no install tables at all.
+        image.modules.raw-efi = { ... }: { disko.enableConfig = false; };
+        image.modules.qemu = { ... }: { disko.enableConfig = false; };
+      })
       {
-        # The installer MEDIUM is not this host, and one of its settings
-        # collides with one of ours: nixpkgs' installation-device profile
+        # A host with no `install` table is never installed by this tool, so
+        # its medium carries no target and settles only the one option the
+        # two profiles disagree about: nixpkgs' installation-device profile
         # says `PermitRootLogin = "yes"` and nix/managed.nix says
         # `"prohibit-password"`, both as defaults, which is a conflict rather
-        # than a precedence. It is settled here, in the sub-evaluation the
-        # image is built in (`image.modules.<format>` — setting an
-        # `isoImage.*` option in the host itself is the trap M0 A10 named),
-        # and settled towards the stricter of the two: the installer of a
-        # managed host is reached with a key or not at all (D9), and it never
-        # has a root password to begin with (`nixos-install --no-root-passwd`).
+        # than a precedence.
         image.modules.iso-installer = { lib, ... }: {
           services.openssh.settings.PermitRootLogin = lib.mkForce "prohibit-password";
         };
       }
     ]
+    ++ layoutFor id
     ++ map (profileFor id) inv.hosts.${id}.profiles
     ++ inv.hosts.${id}.modulePaths
     ++ extraFor id
@@ -146,6 +211,16 @@ let
       })
     else configs.${id}.system.build.images.iso-installer;
 
+  # A prebuilt disk for a host that boots itself.
+  #
+  # Only for a `uefi` host, and that is not a gap: `raw-efi` IS an EFI image
+  # — it makes an ESP and installs systemd-boot into it — so an image of that
+  # format for a machine that has no boot loader would be an image that
+  # contradicts its own host (measured: the two `mkDefault`s for
+  # `boot.loader.systemd-boot.enable` are a conflict, which is the module
+  # system saying exactly this). A direct-boot host's road is the installer
+  # medium plus the bundle `<id>-direct-boot`, which is the pair its provider
+  # loads.
   diskImageFor = id:
     if imageSource "disk" == "nixos-generators" then
       (if nixos-generators == null
@@ -158,6 +233,14 @@ let
       })
     else configs.${id}.system.build.images.raw-efi;
 
+  # The kernel, the initrd and the command line of a host that boots
+  # `direct`, in one directory for the provider to take. Only for those
+  # hosts: a uefi host reads its own boot menu, and a bundle for it would be
+  # a directory nothing ever loads — which is why `packages.<id>-direct-boot`
+  # does not exist for one.
+  directHostIds = lib.filter (id: inv.hosts.${id}.boot == "direct") ids;
+  directBootFor = id: directBoot.bundleOf pkgs id configs.${id};
+
   # A managed host with NO identity: no host name of a fleet member, no
   # roles, no keys. It is what a lab boots two or three fresh VMs from (L2)
   # before `keys enroll` and the first `apply` make each of them a host —
@@ -169,6 +252,17 @@ let
       ../services.nix
       ../managed.nix
       { meisterstack.managed.enable = true; }
+      # It IS a qemu image — `system.build.images.qemu` — and a qcow2 whose
+      # initrd has no virtio driver is a qcow2 that boots a kernel, waits
+      # twenty-two seconds for a root filesystem no driver can see, and
+      # panics with "Attempted to kill init". Measured, in
+      # `checks.vm-two-instances-same-image`, on both copies at once.
+      #
+      # This is the one hardware statement this flake makes, and it makes it
+      # because the format already did: a host of a fleet gets its drivers
+      # from its own module (that is what a `hardware-configuration.nix`
+      # is), and this image has no host.
+      "${nixpkgs}/nixos/modules/profiles/qemu-guest.nix"
     ]
     # The fleet's DEFAULT profiles — `[defaults] profiles` — and not one
     # host's: this image is every host and none of them. Taking the first
@@ -182,7 +276,10 @@ let
   imagesOf = builtins.listToAttrs (map
     (id: lib.nameValuePair id {
       installerDrv = (installerFor id).drvPath;
-      diskImageDrv = (diskImageFor id).drvPath;
+      diskImageDrv =
+        if builtins.elem id directHostIds then null else (diskImageFor id).drvPath;
+      directBootDrv =
+        if builtins.elem id directHostIds then (directBootFor id).drvPath else null;
     })
     ids);
 
@@ -253,7 +350,7 @@ let
       nixSide = pkgs.writeText "inventory-nix.json" (builtins.toJSON
         (lib.mapAttrs
           (_: h: {
-            inherit (h) profiles;
+            inherit (h) profiles boot;
             ssh = h.ssh;
             rollout = h.rollout;
             checks = h.checks;
@@ -291,9 +388,12 @@ in
       (lib.concatMap
         (id: [
           (lib.nameValuePair "${id}-installer" (installerFor id))
-          (lib.nameValuePair "${id}-disk-image" (diskImageFor id))
           (lib.nameValuePair "${id}-toplevel" configs.${id}.system.build.toplevel)
-        ])
+        ]
+        ++ lib.optional (!(builtins.elem id directHostIds))
+          (lib.nameValuePair "${id}-disk-image" (diskImageFor id))
+        ++ lib.optional (builtins.elem id directHostIds)
+          (lib.nameValuePair "${id}-direct-boot" (directBootFor id)))
         ids)
     // {
       managed-disk-image = genericManaged.config.system.build.images.qemu;

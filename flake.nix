@@ -180,6 +180,12 @@
         example-installer = example.packages.${system}.box-installer;
         example-disk-image = example.packages.${system}.box-disk-image;
         example-managed-disk-image = example.packages.${system}.managed-disk-image;
+        # The other boot mode: what a provider is handed for the example
+        # fleet's one `boot = "direct"` host — a kernel, an initrd and the
+        # command line that names the system they belong to.
+        #
+        #   nix build .#example-direct-boot && cat result/cmdline
+        example-direct-boot = example.packages.${system}.n2-direct-boot;
 
         # The generic appliance image, unchanged: the twelve context VMs of
         # the lab boot this, and they will until their migration is done
@@ -319,21 +325,99 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # An empty virtual disk becomes a host that boots itself, and a
+          # second medium refuses to do it again (M3A: V06 part 1, V07 —
+          # and the boot-mode rollback on a real ESP, which 2C could not
+          # measure on a machine started with `-kernel`).
+          vm-install-blank-disk = import ./nix/tests/install.nix {
+            inherit nixpkgs lib pkgs system self disko;
+          };
+
+          # The other boot mode: a guest with no boot loader at all, started
+          # by the test driver out of the bundle its provider would be
+          # handed (M3A position 8).
+          vm-install-direct-boot = import ./nix/tests/install-direct.nix {
+            inherit nixpkgs lib pkgs system self disko;
+          };
+
+          # One image, two machines, two identities (M3A position 9: V08,
+          # L04). The thing a lab's `managed-disk-image` stands on.
+          vm-two-instances-same-image = import ./nix/tests/two-instances.nix {
+            inherit nixpkgs lib pkgs system self disko;
+          };
+
           # The boot renderer and the build-time renderer, on the same input.
           # Both fleets: one-box has a raft group of ONE (no etcd variables),
           # ha has three (1A §8, open point 6).
           render-parity = import ./nix/tests/render-parity.nix {
-            inherit nixpkgs lib pkgs system self;
+            inherit nixpkgs lib pkgs system self disko;
             inv = example.inventory;
             hostIds = [ "box" "n1" ];
             profiles = exampleProfiles;
           };
           render-parity-ha = import ./nix/tests/render-parity.nix {
-            inherit nixpkgs lib pkgs system self;
+            inherit nixpkgs lib pkgs system self disko;
             inv = exampleHa.inventory;
             hostIds = [ "cp-a" "cp-b" "a1" ];
             profiles = exampleProfiles;
           };
+
+          # An installer medium carries no secret (D9).
+          #
+          # The cheap half of the claim, and the one `nix flake check` can
+          # afford: the CLOSURE of what the medium embeds — the target's
+          # system and the disko script `isoImage.storeContents` names — has
+          # no path whose name looks like key material, and the `/etc` that
+          # system ships has nothing in it that says PRIVATE KEY. The
+          # complete form, over the mounted ISO itself, is measured once in
+          # `checks.vm-install-blank-disk`, because walking a 1.4 GiB
+          # squashfs is not a thing to do on every evaluation.
+          #
+          # `closureInfo` and not `nix path-info -r`: a check is a
+          # derivation, and a derivation that shelled out to the daemon
+          # would be a check about the machine it ran on.
+          installer-no-secrets =
+            let
+              host = example.nixosConfigurations.box.config;
+              embedded = [
+                host.system.build.toplevel
+                host.system.build.diskoScript
+              ];
+              closure = pkgs.closureInfo { rootPaths = embedded; };
+            in
+            pkgs.runCommand "installer-no-secrets" { } ''
+              echo "== the closure the example installer embeds"
+              wc -l < ${closure}/store-paths
+
+              # A store path whose NAME ends in .key or .sec, or that calls
+              # itself secrets. None of this stack's key material is ever in
+              # the store — it is written to the target by `keys deliver`
+              # (M3B) — so a path like that is either somebody's accident or
+              # a dependency that carries an example key, and both are
+              # things to look at before an image travels.
+              if grep -E '\.(key|sec)$|secrets$' ${closure}/store-paths > bad-names; then
+                echo "the medium would carry key material:"
+                cat bad-names
+                exit 1
+              fi
+
+              # And the one place a private key would actually be read from:
+              # the /etc this system ships. `-R` and not `-r`, because a
+              # NixOS /etc is a tree of symlinks into the store and `-r`
+              # would walk past all of it.
+              # `-s` as well: a NixOS /etc has dangling symlinks in it (a
+              # font configuration that points at a version directory which
+              # is not there), and a check that printed a warning about one
+              # would be a check somebody learns to ignore.
+              if grep -RIls 'PRIVATE KEY' ${host.system.build.toplevel}/etc > bad-files; then
+                echo "the medium would carry a private key in /etc:"
+                cat bad-files
+                exit 1
+              fi
+
+              echo "  ok   no key material in the closure and none in /etc"
+              touch $out
+            '';
 
           # An inventory that cannot be deployed cannot be built.
           inventory-conflicts = import ./nix/tests/inventory-conflicts.nix {
@@ -345,6 +429,27 @@
             inherit lib pkgs;
             configs = lib.mapAttrs (_: s: s.config) example.nixosConfigurations;
           };
+
+          # The bundle of the one direct-boot host, built: three names in a
+          # directory, and the command line names the toplevel whose `init`
+          # the kernel is to start. Cheap — the kernel and the initrd are the
+          # ones `example-topology` builds anyway — and it is what keeps the
+          # second boot mode a thing that EXISTS rather than a field in a
+          # contract.
+          example-direct-boot = pkgs.runCommand "direct-boot-is-three-files" { } ''
+            bundle=${example.packages.${system}.n2-direct-boot}
+            test -e "$bundle/kernel" || { echo "no kernel in the bundle"; exit 1; }
+            test -e "$bundle/initrd" || { echo "no initrd in the bundle"; exit 1; }
+            grep -q ' init=/nix/store/.*-nixos-system-n2-.*/init$' "$bundle/cmdline"               || { echo "the command line does not name n2's init:"; cat "$bundle/cmdline"; exit 1; }
+            # And the two names point INTO the store rather than at a copy:
+            # many hosts share one kernel, and a copy per host would be a
+            # gigabyte per host for no fact anybody gains.
+            case "$(readlink -f "$bundle/kernel")" in
+              /nix/store/*) ;;
+              *) echo "the kernel is not a store path"; exit 1 ;;
+            esac
+            touch $out
+          '';
 
           # One CPU host, built. The smallest thing that proves a fleet host
           # is a real system: an agent with no controller of its own, whose

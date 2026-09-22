@@ -88,6 +88,11 @@ pub enum DrvKind {
     Package,
     /// A check the manifest requires: it passes by building.
     Check,
+    /// The kernel, the initrd and the command line of a host that boots
+    /// `direct`, in one directory. Built here and not by `image`, because a
+    /// direct-boot host cannot be started at all without it: it is part of
+    /// the release the way a toplevel is, not an image somebody may want.
+    DirectBoot,
 }
 
 /// One derivation this build will realise.
@@ -127,6 +132,15 @@ pub fn derivations(resolved: &ResolvedFleet, hosts: &[String]) -> Vec<Derivation
                 kind: DrvKind::Toplevel,
                 drv: host.build.toplevel_drv.clone(),
             });
+            // Right after its own system, because it is part of how that
+            // system gets started rather than a thing beside it.
+            if let Some(drv) = &host.build.direct_boot_drv {
+                out.push(Derivation {
+                    what: direct_boot_key(id),
+                    kind: DrvKind::DirectBoot,
+                    drv: drv.clone(),
+                });
+            }
         }
     }
     let packages = &resolved.packages;
@@ -169,6 +183,12 @@ pub fn derivations(resolved: &ResolvedFleet, hosts: &[String]) -> Vec<Derivation
         }
     }
     out
+}
+
+/// What a host's direct-boot bundle is keyed under in the outputs map. Not
+/// the host id: that key is the toplevel's.
+pub fn direct_boot_key(host: &str) -> String {
+    format!("{host}-direct-boot")
 }
 
 /// The id a check derivation is recorded under: `/nix/store/<hash>-config-box.drv`
@@ -767,10 +787,11 @@ impl Builder<'_> {
                         closure_size: measured.closure_size,
                         signatures: measured.signatures.clone(),
                     },
-                    // `build` does not make images; `image` (M3) does, and
+                    // `build` does not make images; `image` does, and
                     // `bind` allows an unbuilt one.
                     installer_iso: None,
                     disk_image: None,
+                    direct_boot: self.direct_boot(id, host, outputs)?,
                     // Straight from the manifest: these three fields are
                     // what the reboot class is decided on, and `bind`
                     // refuses them if they differ from the evaluation.
@@ -784,6 +805,68 @@ impl Builder<'_> {
             );
         }
         Ok(out)
+    }
+
+    /// The bundle of a host that boots `direct`, measured.
+    ///
+    /// The kernel and the initrd are named by the paths the MANIFEST
+    /// promised rather than by anything found in the bundle: those two are
+    /// what `bind` compares and what the planner decides a reboot class on,
+    /// and reading them back out of a directory of symlinks would be a
+    /// second source for one fact. What the bundle contributes is the
+    /// directory itself — one name a provider adapter can be handed — and
+    /// the sha256 of the two files, which is what an adapter uploads them
+    /// under.
+    fn direct_boot(
+        &self,
+        id: &str,
+        host: &crate::manifest::ResolvedHost,
+        outputs: &BTreeMap<String, String>,
+    ) -> Result<Option<crate::release::DirectBoot>> {
+        if host.build.boot.mode != crate::manifest::BootMode::Direct {
+            return Ok(None);
+        }
+        let bundle = outputs.get(&direct_boot_key(id)).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{id} boots direct and nothing was built for its bundle; the manifest has to \
+                 name a `direct_boot_drv` for such a host."
+            )
+        })?;
+        let cmdline = host.build.boot.cmdline.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{id} boots direct and its manifest carries no command line. A provider that \
+                 is handed a kernel and an initrd and no `init=` boots the new kernel into \
+                 whatever userland the initrd finds."
+            )
+        })?;
+        Ok(Some(crate::release::DirectBoot {
+            kernel: self.file_artifact(id, "kernel", &host.build.boot.kernel_out)?,
+            initrd: self.file_artifact(id, "initrd", &host.build.boot.initrd_out)?,
+            cmdline,
+            bundle_store_path: bundle.clone(),
+        }))
+    }
+
+    /// One file of the store, by its bytes. Read rather than asked of nix:
+    /// what a hypervisor loads is the FILE, and `nix path-info` answers
+    /// about the store object that holds it.
+    fn file_artifact(
+        &self,
+        id: &str,
+        what: &str,
+        path: &str,
+    ) -> Result<crate::release::ImageArtifact> {
+        let bytes = self.files.read(std::path::Path::new(path)).map_err(|e| {
+            anyhow::anyhow!(
+                "the {what} of {id} ({path}) could not be read after the build: {e}. A release \
+                 names no file it has not measured."
+            )
+        })?;
+        Ok(crate::release::ImageArtifact {
+            store_path: path.to_string(),
+            sha256: sha256_hex(&bytes),
+            size: bytes.len() as u64,
+        })
     }
 
     fn packages(
@@ -877,6 +960,19 @@ impl Builder<'_> {
                 .run(&add_root_cmd(&link, &artifacts.toplevel.store_path))?;
             roots.push(link);
         }
+        for (id, artifacts) in &release.artifacts {
+            // The bundle is its own store path and is NOT in the toplevel's
+            // closure — it is a directory of symlinks into it — so a root on
+            // the system does not keep it. A provider that is handed a
+            // bundle path a collector removed between `build` and the reboot
+            // is a guest that does not come up.
+            if let Some(bundle) = &artifacts.direct_boot {
+                let link = dir.join(direct_boot_key(id));
+                self.runner
+                    .run(&add_root_cmd(&link, &bundle.bundle_store_path))?;
+                roots.push(link);
+            }
+        }
         for (name, package) in &release.packages {
             let link = dir.join(format!("pkg-{name}"));
             self.runner.run(&add_root_cmd(&link, &package.store_path))?;
@@ -891,6 +987,263 @@ impl Builder<'_> {
             0o644,
         )?;
         Ok(roots)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// image
+// ---------------------------------------------------------------------------
+
+/// Which of a host's three media is wanted.
+///
+/// One verb and three kinds rather than three verbs, because what differs
+/// between them is one derivation path out of the same manifest: an
+/// installer ISO, a prebuilt disk, and the bundle a hypervisor loads. What
+/// they have in common is everything else — the release says which
+/// derivation, the build is the release's and not a fresh evaluation, and
+/// the result gets a garbage-collector root so that the file an operator is
+/// about to write to a stick is still there when they get to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageKind {
+    Installer,
+    Disk,
+    DirectBoot,
+}
+
+impl ImageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImageKind::Installer => "installer",
+            ImageKind::Disk => "disk",
+            ImageKind::DirectBoot => "direct-boot",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<ImageKind> {
+        match text {
+            "installer" => Ok(ImageKind::Installer),
+            "disk" => Ok(ImageKind::Disk),
+            "direct-boot" => Ok(ImageKind::DirectBoot),
+            other => bail!(
+                "{other:?} is not a kind of medium. This tool builds `installer` (the ISO a \
+                 machine is installed from), `disk` (a prebuilt EFI disk image) and \
+                 `direct-boot` (the kernel, the initrd and the command line a hypervisor is \
+                 handed)."
+            ),
+        }
+    }
+
+    /// What the FILE inside the output is called, by its extension. The
+    /// derivations of nixpkgs put their result in a directory next to a
+    /// `nix-support` folder, so "the image" is not the out path itself.
+    fn extensions(self) -> &'static [&'static str] {
+        match self {
+            ImageKind::Installer => &["iso"],
+            ImageKind::Disk => &["raw", "qcow2", "img", "vhd", "vmdk"],
+            // A bundle is three files and stays a directory.
+            ImageKind::DirectBoot => &[],
+        }
+    }
+}
+
+impl std::fmt::Display for ImageKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+/// What `image` produced, as it is printed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ImageResult {
+    pub schema: String,
+    pub host: String,
+    pub kind: String,
+    pub release_id: String,
+    /// The derivation's output — a directory for every kind this tool makes.
+    pub store_path: String,
+    /// The one file inside it that is the medium, or null for a bundle,
+    /// which is three.
+    pub file: Option<String>,
+    pub sha256: Option<String>,
+    pub size: Option<u64>,
+    /// Where the collector was told to leave it.
+    pub gc_root: Option<String>,
+    /// Where a copy was linked, if `--out` asked for one.
+    pub linked_to: Option<String>,
+}
+
+pub const IMAGE_SCHEMA: &str = "meister-deploy/image/1";
+
+/// The derivation this release names for that host and that kind, or the
+/// sentence that says why there is none.
+pub fn image_drv(release: &ReleaseManifest, host: &str, kind: ImageKind) -> Result<String> {
+    let resolved = &release.resolved_fleet;
+    let Some(entry) = resolved.hosts.get(host) else {
+        bail!(
+            "the release {} knows nothing about {host}; it covers {}.",
+            release.release_id,
+            resolved.evaluated_hosts.join(", ")
+        );
+    };
+    let drv = match kind {
+        ImageKind::Installer => entry.build.installer_drv.clone(),
+        ImageKind::Disk => entry.build.disk_image_drv.clone(),
+        ImageKind::DirectBoot => entry.build.direct_boot_drv.clone(),
+    };
+    drv.ok_or_else(|| match kind {
+        ImageKind::Installer => anyhow::anyhow!(
+            "{host} has no installer medium in this release. A host gets one from \
+             `lib.mkFleet`, which builds it for every host of a fleet — so a manifest without \
+             one was resolved from a flake that does not build this host at all."
+        ),
+        ImageKind::Disk => anyhow::anyhow!(
+            "{host} has no disk image in this release: it boots {}. A `raw-efi` image makes an \
+             ESP and installs systemd-boot into it, which is not what a machine whose \
+             hypervisor hands it a kernel does with its disk. `--kind direct-boot` is that \
+             host's medium.",
+            entry.build.boot.mode
+        ),
+        ImageKind::DirectBoot => anyhow::anyhow!(
+            "{host} has no direct-boot bundle in this release: it boots {}. A uefi host reads \
+             its own boot menu, so there is nobody outside it to hand a kernel to. `--kind \
+             installer` is how that host is first put on a disk.",
+            entry.build.boot.mode
+        ),
+    })
+}
+
+impl Builder<'_> {
+    /// Build one medium of one host, and say exactly what came out.
+    ///
+    /// The derivation is the one the RELEASE names, for the same reason
+    /// `build` uses the manifest's: a medium that was built from a fresh
+    /// evaluation would be a medium nobody can bind to the release an
+    /// operator is holding. Nothing is evaluated here.
+    pub fn image(
+        &self,
+        release: &ReleaseManifest,
+        host: &str,
+        kind: ImageKind,
+        out_dir: Option<&std::path::Path>,
+    ) -> Result<ImageResult> {
+        let drv = image_drv(release, host, kind)?;
+        let out = self.build_one(&Derivation {
+            what: format!("{host}-{kind}"),
+            kind: DrvKind::Package,
+            drv,
+        })?;
+
+        let file = self.medium_in(&out, kind)?;
+        let (sha256, size) = match &file {
+            Some(path) => {
+                let bytes = self.files.read(std::path::Path::new(path))?;
+                (Some(sha256_hex(&bytes)), Some(bytes.len() as u64))
+            }
+            None => (None, None),
+        };
+
+        // A root on the OUT path and not on the file inside it: the file is
+        // part of that store object, and the collector counts objects.
+        let gc_root = match &self.state {
+            Some(state) => {
+                let dir = state.gcroot_dir(&release.release_id);
+                self.files.create_dir_all(&dir)?;
+                let link = dir.join(format!("{host}-{kind}"));
+                self.runner.run(&add_root_cmd(&link, &out))?;
+                Some(link.display().to_string())
+            }
+            None => None,
+        };
+
+        let linked_to = match out_dir {
+            Some(dir) => {
+                self.files.create_dir_all(dir)?;
+                let name = match (&file, kind) {
+                    (Some(path), _) => format!(
+                        "{host}-{}",
+                        std::path::Path::new(path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| kind.to_string())
+                    ),
+                    (None, _) => format!("{host}-{kind}"),
+                };
+                let link = dir.join(name);
+                let target = file.clone().unwrap_or_else(|| out.clone());
+                self.files
+                    .symlink_atomic(std::path::Path::new(&target), &link)?;
+                Some(link.display().to_string())
+            }
+            None => None,
+        };
+
+        Ok(ImageResult {
+            schema: IMAGE_SCHEMA.to_string(),
+            host: host.to_string(),
+            kind: kind.to_string(),
+            release_id: release.release_id.clone(),
+            store_path: out,
+            file,
+            sha256,
+            size,
+            gc_root,
+            linked_to,
+        })
+    }
+
+    /// The one file inside a medium's output directory, by extension.
+    ///
+    /// Named rather than guessed: an ISO derivation puts its result in
+    /// `iso/` beside a `nix-support/` directory, so "the only file in there"
+    /// is not an answer, and a tool that printed the wrong path would send
+    /// somebody to write a text file to a USB stick. Two candidates is an
+    /// error that names both.
+    fn medium_in(&self, out: &str, kind: ImageKind) -> Result<Option<String>> {
+        let extensions = kind.extensions();
+        if extensions.is_empty() {
+            return Ok(None);
+        }
+        let mut found: Vec<PathBuf> = Vec::new();
+        let mut stack = vec![PathBuf::from(out)];
+        while let Some(dir) = stack.pop() {
+            for entry in self.files.list_dir(&dir)? {
+                // `Entry::Other` is everything that is neither a regular
+                // file nor a symlink, which inside a store output is a
+                // directory. A fifo would be walked into and the listing
+                // would say so, which is a better answer than a silent skip.
+                match self.files.entry(&entry)? {
+                    crate::effects::Entry::Other => stack.push(entry),
+                    _ => {
+                        let matches = entry
+                            .extension()
+                            .map(|e| extensions.contains(&e.to_string_lossy().as_ref()))
+                            .unwrap_or(false);
+                        if matches {
+                            found.push(entry);
+                        }
+                    }
+                }
+            }
+        }
+        found.sort();
+        match found.len() {
+            1 => Ok(Some(found[0].display().to_string())),
+            0 => bail!(
+                "{out} holds no file ending in {}, so this build produced no {kind} medium \
+                 anybody could write anywhere.",
+                extensions.join(" or ")
+            ),
+            _ => bail!(
+                "{out} holds {} files that could be the {kind} medium ({}); this tool will not \
+                 pick one of them for you.",
+                found.len(),
+                found
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
     }
 }
 
@@ -1109,6 +1462,140 @@ mod tests {
             drvs[0].drv, fleet.hosts["box"].build.toplevel_drv,
             "the host's own derivation"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // The bundle and the verb `image` (M3A position 3)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn a_direct_host_gets_its_bundle_built_right_after_its_own_system() {
+        let fleet = crate::fixtures::with_direct_host(onebox_enrolled(), "n1");
+        let drvs = derivations(&fleet, &["n1".to_string(), "n2".to_string()]);
+        let listed: Vec<(&str, DrvKind)> = drvs.iter().map(|d| (d.what.as_str(), d.kind)).collect();
+        assert_eq!(listed[0], ("n1", DrvKind::Toplevel));
+        assert_eq!(listed[1], ("n1-direct-boot", DrvKind::DirectBoot));
+        assert_eq!(listed[2], ("n2", DrvKind::Toplevel));
+        assert!(
+            !listed.iter().any(|(what, _)| *what == "n2-direct-boot"),
+            "a uefi host has no bundle: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn the_release_names_the_derivation_of_each_kind_of_medium() {
+        let fleet = crate::fixtures::with_direct_host(onebox_enrolled(), "n1");
+        let mut artifacts = crate::fixtures::artifacts_for(&fleet);
+        artifacts.get_mut("n1").unwrap().direct_boot =
+            Some(crate::fixtures::bundle_for(&fleet, "n1"));
+        let release = bind(
+            fleet,
+            artifacts,
+            BTreeMap::new(),
+            Vec::new(),
+            crate::fixtures::build_env(),
+            Vec::new(),
+            crate::fixtures::reproducibility(),
+            crate::fixtures::at("2026-09-22T11:00:00Z"),
+        )
+        .expect("binds");
+
+        assert!(
+            image_drv(&release, "box", ImageKind::Installer)
+                .unwrap()
+                .ends_with("nixos-installer-box.drv")
+        );
+        assert!(
+            image_drv(&release, "n1", ImageKind::DirectBoot)
+                .unwrap()
+                .contains("direct-boot")
+        );
+
+        // And the two that do not exist say WHY rather than "null".
+        let err = image_drv(&release, "n1", ImageKind::Disk)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("it boots direct"), "{err}");
+        assert!(err.contains("--kind direct-boot"), "{err}");
+
+        let err = image_drv(&release, "box", ImageKind::DirectBoot)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("it boots uefi"), "{err}");
+        assert!(err.contains("its own boot menu"), "{err}");
+
+        let err = image_drv(&release, "nowhere", ImageKind::Installer)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("knows nothing about nowhere"), "{err}");
+    }
+
+    #[test]
+    fn a_kind_that_is_not_one_lists_the_three_that_are() {
+        let err = ImageKind::parse("usb").unwrap_err().to_string();
+        assert!(err.contains("installer"), "{err}");
+        assert!(err.contains("direct-boot"), "{err}");
+    }
+
+    /// The image inside a nixpkgs image output, which is never the out path
+    /// itself: an ISO derivation puts its result in `iso/` beside a
+    /// `nix-support/` directory full of text files.
+    fn medium_of(files: &MemFiles, out: &str, kind: ImageKind) -> Result<Option<String>> {
+        let runner = StrictFake::new();
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files,
+            clock: &clock,
+            options: BuildOptions::default(),
+            state: None,
+        };
+        let found = builder.medium_in(out, kind);
+        runner.verify().expect("nothing was run");
+        found
+    }
+
+    #[test]
+    fn the_medium_is_the_one_file_with_the_right_ending() {
+        let out = "/nix/store/iiii-nixos-iso";
+        // The directories are registered as well: a walk asks what each
+        // entry IS, and a test store where nothing is a directory would be
+        // a test of a shape no store has.
+        let files = MemFiles::new()
+            .given_other(format!("{out}/iso"))
+            .given_other(format!("{out}/nix-support"))
+            .given(format!("{out}/iso/nixos-25.11.iso"), "not really an iso")
+            .given(
+                format!("{out}/nix-support/hydra-build-products"),
+                "file iso ...",
+            );
+        assert_eq!(
+            medium_of(&files, out, ImageKind::Installer).unwrap(),
+            Some(format!("{out}/iso/nixos-25.11.iso"))
+        );
+
+        // A bundle is three files and stays a directory.
+        assert_eq!(medium_of(&files, out, ImageKind::DirectBoot).unwrap(), None);
+
+        // Nothing that could be one is a sentence, not an empty answer.
+        let empty = MemFiles::new()
+            .given_other(format!("{out}/nix-support"))
+            .given(format!("{out}/nix-support/x"), "x");
+        let err = medium_of(&empty, out, ImageKind::Installer)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("holds no file ending in iso"), "{err}");
+
+        // And two is a sentence that names both rather than a coin toss.
+        let two = MemFiles::new()
+            .given_other(format!("{out}/iso"))
+            .given(format!("{out}/iso/a.iso"), "a")
+            .given(format!("{out}/iso/b.iso"), "b");
+        let err = medium_of(&two, out, ImageKind::Installer)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a.iso"), "{err}");
+        assert!(err.contains("b.iso"), "{err}");
     }
 
     #[test]

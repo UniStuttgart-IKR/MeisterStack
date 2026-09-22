@@ -59,6 +59,7 @@ pub const FILES: &[File] = &[
     file!("hosts/cp-1.nix"),
     file!("hosts/a1.nix"),
     file!("disko/single-nvme.nix"),
+    file!("disko/single-direct.nix"),
     file!("tests/default.nix"),
     file!("known_hosts"),
     file!(".gitignore"),

@@ -204,6 +204,45 @@ pub struct Install {
     /// Paths a reinstall keeps. Checked against `persistence` before an
     /// install is planned.
     pub preserve: Vec<String>,
+    /// PUBLIC ssh keys that may reach the installer MEDIUM, and the thing
+    /// that decides whether that medium has an sshd at all. Empty is the
+    /// default and means the console is the only way in — which is the right
+    /// answer for an image somebody carries to a machine by hand.
+    pub authorized_keys: Vec<String>,
+}
+
+/// How a host gets its kernel: the contract's copy of
+/// [`crate::inventory::BootMode`].
+///
+/// Two types for one word, like [`RebootPolicy`] beside it, and for the same
+/// reason: this one is part of a JSON contract that other programs read
+/// (`deny_unknown_fields`, a JSON Schema, a stable spelling), and the other
+/// is how a TOML file somebody edits is parsed. Nix writes this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BootMode {
+    /// The machine boots itself: an ESP, systemd-boot, a boot menu — and
+    /// therefore a way back from a boot (`bootctl set-oneshot`).
+    Uefi,
+    /// A hypervisor hands it kernel, initrd and command line. No loader
+    /// inside, no boot menu, and the next boot is the provider's fact and
+    /// not the guest's.
+    Direct,
+}
+
+impl BootMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BootMode::Uefi => "uefi",
+            BootMode::Direct => "direct",
+        }
+    }
+}
+
+impl std::fmt::Display for BootMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -316,6 +355,18 @@ pub struct Boot {
     /// without any store path changing.
     pub kernel_params_sha256: String,
     pub kernel_version: String,
+    /// Who decides which of the three above this machine actually starts.
+    pub mode: BootMode,
+    /// For a `direct` host: the whole command line its provider is handed,
+    /// `<kernel params> init=<toplevel>/init`. Null for a `uefi` host, which
+    /// reads its own boot menu and has nobody outside it to hand anything
+    /// to.
+    ///
+    /// The `init=` is why this is not the same as the kernel params: a NixOS
+    /// system is started by `<toplevel>/init`, and a guest whose loader does
+    /// not say which toplevel would boot a new kernel into whatever userland
+    /// the initrd finds.
+    pub cmdline: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -328,7 +379,13 @@ pub struct Build {
     /// manifest time; the release is what records that it exists.
     pub toplevel_out: String,
     pub installer_drv: Option<String>,
+    /// Null for a `direct` host: `raw-efi` IS an EFI image — it makes an ESP
+    /// and installs systemd-boot into it — so an image of that format for a
+    /// machine with no boot loader would contradict its own host.
     pub disk_image_drv: Option<String>,
+    /// The kernel, the initrd and the command line in one directory, for a
+    /// host whose hypervisor loads them. Null for a `uefi` host.
+    pub direct_boot_drv: Option<String>,
     pub boot: Boot,
 }
 

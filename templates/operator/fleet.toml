@@ -20,6 +20,17 @@ name = "my-fleet"
 [defaults]
 ssh = { user = "root", port = 22 }
 profiles = ["base"]
+# How these machines are booted, where nobody says otherwise. `uefi` is a
+# machine that boots itself — an ESP, systemd-boot, and with it the boot-mode
+# rollback (`meister-activate activate --mode boot`, which sets a one-shot
+# boot entry so that a system nobody confirms is booted exactly once).
+# `direct` is a guest whose hypervisor hands it kernel, initrd and command
+# line: no loader inside, no ESP, and no boot-mode rollback — its new kernel
+# arrives through the provider (`meister-deploy build` exports the bundle).
+# `bios` is not offered: grub has no `bootctl set-oneshot`, so a fleet that
+# installed it could not promise the way back. Settable per group and per
+# host as well.
+boot = "uefi"
 # `reboot = "approve"` is the conservative end: a reboot nobody approved is
 # the failure this tool exists to prevent. `auto` and `never` are the others.
 rollout = { max_unavailable = 1, reboot = "approve" }
@@ -75,9 +86,13 @@ networks.management = { address = "10.0.0.10", prefix = 24, interface = "eno1" }
 # What this host keeps across a deployment, by LABEL and never by device
 # path: which slot a disk lands in is not a promise anybody made.
 # persistence = [{ path = "/var/lib/meister-data", device = "label:meister-data", required = true }]
-# The first install (M3) needs the disk's own serial — `lsblk -o SERIAL` —
-# because /dev/sda is a name the kernel hands out in boot order.
-# install = { disk = { serial = "…", size_gb = 960 }, layout = "disko/single-nvme.nix", preserve = ["/var/lib/meister-data"] }
+# The first install needs the disk's own serial — `lsblk -o SERIAL` —
+# because /dev/sda is a name the kernel hands out in boot order. `layout` is
+# the disko module that decides the partition table, relative to THIS file:
+# `disko/single-nvme.nix` for a uefi host, `disko/single-direct.nix` for a
+# direct one. `authorized_keys` is optional and PUBLIC: it is what gives the
+# installer medium an sshd at all, and without it the console is the way in.
+# install = { disk = { serial = "…", size_gb = 960 }, layout = "disko/single-nvme.nix", preserve = ["/var/lib/meister-data"], authorized_keys = ["<the one line of your ~/.ssh/id_ed25519.pub>"] }
 # This machine's own files, relative to THIS file.
 modules = ["hosts/cp-1.nix"]
 

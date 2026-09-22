@@ -30,6 +30,23 @@ let
   knownReboot = [ "auto" "approve" "never" ];
   knownDeployments = [ "nixos" "context" ];
 
+  # How a machine of this fleet gets its kernel.
+  #
+  # `uefi` is a machine that boots itself: an ESP, systemd-boot, and with it
+  # the boot-mode rollback of `meister-activate` (`bootctl set-oneshot`, D5).
+  # `direct` is a machine whose kernel, initrd and command line are handed to
+  # it from OUTSIDE — a hypervisor's direct kernel boot — so it carries no
+  # boot loader at all and has no boot-mode rollback; what it keeps is the
+  # switch rollback, which is userland and works unchanged.
+  #
+  # `bios` is deliberately not one of them: a grub host has no `bootctl` and
+  # therefore no way back from a boot that does not come up, and installing a
+  # boot loader whose rollback this tool cannot arrange would be a guarantee
+  # it cannot keep. A BIOS machine can still be a host of this fleet — it
+  # keeps grub through its own host module — it is just not one this flake
+  # installs.
+  knownBootModes = [ "uefi" "direct" ];
+
   # The order roles are DEPLOYED in, and therefore the order they are written
   # in: the bottom tier first, so that a controller never issues a command the
   # tier below it does not understand yet.
@@ -164,6 +181,11 @@ let
           host_key = (h.ssh or { }).host_key or null;
         };
         profiles = accumulate h (x: x.profiles or [ ]);
+        # How this machine is booted. `uefi` by default, because a machine
+        # that boots itself is the only one that can take a boot back by
+        # itself (D5); `direct` is the deliberate other answer for a guest
+        # whose hypervisor loads the kernel.
+        boot = settle h "boot" (x: x.boot or null) "uefi";
         rollout = {
           max_unavailable =
             settle h "rollout.max_unavailable" (x: (x.rollout or { }).max_unavailable or null) 1;
@@ -218,6 +240,7 @@ let
           deviations = h.deviations or { };
           ssh = eff.ssh;
           profiles = eff.profiles;
+          boot = eff.boot;
           rollout = eff.rollout;
           checks = eff.checks;
           has = role: builtins.elem role roles;
@@ -299,6 +322,31 @@ let
             ++ (lib.optional (!(builtins.elem h.rollout.reboot knownReboot))
               ("${where}: host ${h.id} has rollout.reboot = ${h.rollout.reboot}; it is "
                 + lib.concatStringsSep ", " knownReboot))
+            # The sentence for `bios` is its own, because it is the answer
+            # somebody will try and the reason it is refused is not obvious
+            # from a list of two words.
+            ++ (lib.optional (h.boot == "bios")
+              ("${where}: host ${h.id} asks for boot = \"bios\". v1 installs uefi or direct; "
+                + "a BIOS host keeps grub through its own host module and has no boot "
+                + "fallback, because `bootctl set-oneshot` is what a boot fallback is made "
+                + "of and grub has no equivalent."))
+            ++ (lib.optional (h.boot != "bios" && !(builtins.elem h.boot knownBootModes))
+              ("${where}: host ${h.id} has boot = ${builtins.toJSON h.boot}; a host of this "
+                + "fleet boots " + lib.concatStringsSep " or " knownBootModes))
+            ++ (lib.optional (h.install != null && !(h.install ? layout))
+              ("${where}: host ${h.id} has an install table without a layout. The layout is "
+                + "the disko module that decides the partition table, named relative to this "
+                + "file — there is no default, because a default partition table is a "
+                + "default answer to which bytes get destroyed."))
+            ++ (map
+              (k: "${where}: host ${h.id} names ${builtins.toJSON k} in "
+                + "install.authorized_keys, and that is not an ssh public key. This list is "
+                + "PUBLIC halves only (`ssh-ed25519 AAAA…`), because it is baked into an "
+                + "installer medium that anybody who holds the medium can read.")
+              (lib.filter
+                (k: !(builtins.isString k)
+                  || builtins.match "(ssh|ecdsa|sk)-[^ ]+ [A-Za-z0-9+/=]+( .*)?" k == null)
+                (if h.install == null then [ ] else h.install.authorized_keys or [ ])))
             ++ (lib.optional (h.deployment == "nixos" && h.management == null)
               ("${where}: host ${h.id} is deployed as nixos and has no networks.management, "
                 + "which is the address it would be reached at"))
@@ -501,14 +549,54 @@ let
           meisterstack.cluster.settings = (h.deviations.settings or { }).cluster or { };
           meisterstack.agent.settings = (h.deviations.settings or { }).agent or { };
 
-          # The bootloader of a host this tool installs: systemd-boot,
-          # because the boot-mode rollback of `meister-activate` (M2) is
-          # `bootctl set-oneshot` and grub has no equivalent (gate M0 (b)).
-          # mkDefault throughout: a BIOS box keeps grub through its own host
-          # module, and then it has no boot-mode rollback — a documented
-          # limit rather than a silent one.
-          boot.loader.systemd-boot.enable = lib.mkDefault true;
-          boot.loader.efi.canTouchEfiVariables = lib.mkDefault true;
+          # The bootloader of a host this tool installs, and it follows from
+          # `boot` and from nothing else.
+          #
+          # `uefi`: systemd-boot, because the boot-mode rollback of
+          # `meister-activate` (M2) is `bootctl set-oneshot` and grub has no
+          # equivalent (gate M0 (b)).
+          #
+          # `direct`: no loader at all. The hypervisor holds the kernel, the
+          # initrd and the command line, so a loader inside the guest would
+          # be a menu nothing ever reads — and `canTouchEfiVariables` would
+          # be an install-time failure on a machine that has no efivarfs.
+          # What such a host loses is named rather than hidden:
+          # `activate --mode boot` refuses there (D5, measured in
+          # nix/tests/activate.nix), and the way forward for a new kernel is
+          # the provider (`provider-reboot`, M3 integration).
+          #
+          # mkDefault throughout: a host module may say something else and
+          # answer for it — a BIOS box keeps grub that way, and then it has
+          # no boot-mode rollback either.
+          boot.loader.systemd-boot.enable = lib.mkDefault (h.boot == "uefi");
+          boot.loader.efi.canTouchEfiVariables = lib.mkDefault (h.boot == "uefi");
+          boot.loader.grub.enable = lib.mkDefault false;
+
+          # And the two halves of the install have to agree about the ESP.
+          # The layout is the one that knows — it is the file that either
+          # makes an EF00 partition or does not — so it says so
+          # (`meisterstack.install.hasEsp`, nix/managed.nix) and this is
+          # where the two are compared. Only for a host this tool installs: a
+          # machine somebody else partitioned has no layout to ask.
+          assertions = lib.optionals (h.install != null) [
+            {
+              assertion = h.boot != "uefi" || config.meisterstack.install.hasEsp;
+              message =
+                "host ${h.id} boots uefi and its layout ${h.install.layout} says it makes no "
+                + "EFI system partition (meisterstack.install.hasEsp = false). systemd-boot "
+                + "would have nowhere to install itself, and the machine would come back "
+                + "from its first reboot with no way to start. Use a layout with an ESP, or "
+                + "set boot = \"direct\" for this host.";
+            }
+            {
+              assertion = h.boot != "direct" || !config.meisterstack.install.hasEsp;
+              message =
+                "host ${h.id} boots direct and its layout ${h.install.layout} makes an EFI "
+                + "system partition (meisterstack.install.hasEsp = true). Nothing would ever "
+                + "write to it: a direct-boot guest is handed its kernel from outside and "
+                + "installs no loader. Use a layout without an ESP, or set boot = \"uefi\".";
+            }
+          ];
 
           # NO `fileSystems`, and that is the change from schema 1: where the
           # disk is partitioned is disko's answer (M3) or the operator's host
@@ -588,6 +676,11 @@ let
             };
             layout = h.install.layout;
             preserve = h.install.preserve or [ ];
+            # PUBLIC keys, and the list is what decides whether the installer
+            # medium has an sshd at all (nix/install.nix). Empty means the
+            # console is the only way in, which is the right default for a
+            # medium that is carried to a machine by hand.
+            authorized_keys = h.install.authorized_keys or [ ];
           };
       };
 

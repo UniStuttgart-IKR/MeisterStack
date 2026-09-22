@@ -23,7 +23,10 @@ domain = "lab.example"
 
 [defaults]
 ssh = { user = "root", port = 22 }
-profiles = ["base"]
+# `adopted`, because no host of this fleet carries an `install` table: these
+# are machines somebody else partitioned, and that profile is where their
+# filesystems are stated. A fleet this tool installs gets them from disko.
+profiles = ["base", "adopted"]
 rollout = { max_unavailable = 1, reboot = "approve" }
 checks = { required = ["units", "session", "mounts"] }
 

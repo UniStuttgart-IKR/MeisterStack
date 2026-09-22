@@ -27,6 +27,7 @@ pub mod execute;
 #[cfg(test)]
 pub mod fixtures;
 pub mod ids;
+pub mod install;
 pub mod inventory;
 pub mod legacy;
 pub mod manifest;
