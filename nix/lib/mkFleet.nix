@@ -152,17 +152,6 @@ let
           target = config;
           fleet = inv.fleet;
         };
-      })
-      {
-        # A host with no `install` table is never installed by this tool, so
-        # its medium carries no target and settles only the one option the
-        # two profiles disagree about: nixpkgs' installation-device profile
-        # says `PermitRootLogin = "yes"` and nix/managed.nix says
-        # `"prohibit-password"`, both as defaults, which is a conflict rather
-        # than a precedence.
-        image.modules.iso-installer = { lib, ... }: {
-          services.openssh.settings.PermitRootLogin = lib.mkForce "prohibit-password";
-        };
 
         # And the disk IMAGE brings its own partition table, so the host's
         # layout has to step aside inside it.
@@ -177,8 +166,24 @@ let
         # layout started being imported. Turning disko's config off inside
         # the image is the honest reading: nothing partitions anything here,
         # so the layout has nothing to say.
+        #
+        # Inside the `install` condition, and that is not tidiness either: a
+        # host with no install table never imported disko, so setting one of
+        # its options there is an option that does not exist — measured, on
+        # the ha example, which has no install tables at all.
         image.modules.raw-efi = { ... }: { disko.enableConfig = false; };
         image.modules.qemu = { ... }: { disko.enableConfig = false; };
+      })
+      {
+        # A host with no `install` table is never installed by this tool, so
+        # its medium carries no target and settles only the one option the
+        # two profiles disagree about: nixpkgs' installation-device profile
+        # says `PermitRootLogin = "yes"` and nix/managed.nix says
+        # `"prohibit-password"`, both as defaults, which is a conflict rather
+        # than a precedence.
+        image.modules.iso-installer = { lib, ... }: {
+          services.openssh.settings.PermitRootLogin = lib.mkForce "prohibit-password";
+        };
       }
     ]
     ++ layoutFor id
