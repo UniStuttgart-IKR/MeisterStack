@@ -144,6 +144,10 @@
           cloud-hypervisor-meister
           vhost-device-input
           guest-tiny
+          # The CA an operator issues with: `nix run .#meister-ca`, or on
+          # the PATH of the machine that holds the CA key. NOT on a fleet
+          # host — nix/overlay.nix says why.
+          meister-ca
           ;
 
         module-options =
