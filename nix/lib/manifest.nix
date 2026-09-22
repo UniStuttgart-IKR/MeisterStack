@@ -33,6 +33,8 @@
 let
   inherit (inventory) hosts;
 
+  directBoot = import ./direct-boot.nix { inherit lib; };
+
   # Only the hosts this flake builds a system for. A `context` host has no
   # closure to name, and nix/lib/inventory.nix leaves it out of the inventory
   # half for the same reason, so the two key sets stay equal — which
@@ -67,7 +69,10 @@ let
     };
 
   bootOf = id:
-    let cfg = configs.${id}; in
+    let
+      cfg = configs.${id};
+      mode = hosts.${id}.boot;
+    in
     {
       kernel_out = "${cfg.system.build.kernel}/${cfg.system.boot.loader.kernelFile}";
       initrd_out = "${cfg.system.build.initialRamdisk}/${cfg.system.boot.loader.initrdFile}";
@@ -77,6 +82,17 @@ let
       kernel_params_sha256 =
         builtins.hashString "sha256" (lib.concatStringsSep " " cfg.boot.kernelParams);
       kernel_version = cfg.boot.kernelPackages.kernel.version;
+      # Who decides which of the three above this machine actually starts.
+      # `uefi` means the machine does, out of its own boot menu, and a plan
+      # can say "it will boot this" by reading the system profile. `direct`
+      # means the PROVIDER does, from outside, and then the next boot is not
+      # a fact about the guest at all — which is why the mode travels with
+      # the boot block rather than sitting in the inventory half only.
+      inherit mode;
+      # …and for a direct host, the exact string that provider is handed.
+      # Null for a uefi host, because there is nothing outside it to hand
+      # anything to.
+      cmdline = if mode == "direct" then directBoot.cmdlineOf cfg else null;
     };
 
   buildOf = id:
@@ -95,6 +111,10 @@ let
       toplevel_out = cfg.system.build.toplevel.outPath;
       installer_drv = img.installerDrv or null;
       disk_image_drv = img.diskImageDrv or null;
+      # The kernel, the initrd and the command line in one directory, for a
+      # host whose hypervisor loads them. Null for a uefi host, which has no
+      # such hypervisor.
+      direct_boot_drv = img.directBootDrv or null;
       boot = bootOf id;
     };
 

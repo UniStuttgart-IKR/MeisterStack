@@ -74,15 +74,42 @@ pub struct StoreArtifact {
     pub signatures: Vec<String>,
 }
 
-/// An image file: an installer ISO or a disk image. Named by its sha256
-/// rather than a nar hash, because what is written to a USB stick or
-/// registered with a provider is the file, not the store object.
+/// A FILE this release names: an installer ISO, a disk image, a kernel, an
+/// initrd. Named by its sha256 rather than a nar hash, because what is
+/// written to a USB stick or handed to a hypervisor is the file, not the
+/// store object that holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImageArtifact {
     pub store_path: String,
     pub sha256: String,
     pub size: u64,
+}
+
+/// What a provider is handed to start a `boot = "direct"` host.
+///
+/// Three values and no derivation: the provider loads the kernel, the initrd
+/// and this command line, and the machine comes up running the system the
+/// `init=` in it names. The store paths are the SAME ones
+/// `crate::manifest::Boot` promised — many hosts of a fleet share one
+/// kernel and one initrd, and the store is what deduplicates them — so what
+/// is per host is the command line alone.
+///
+/// meister-deploy never uploads any of this anywhere. Putting the bundle
+/// where a hypervisor can reach it is the provider adapter's job; this
+/// record is what tells the adapter which bytes it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DirectBoot {
+    pub kernel: ImageArtifact,
+    pub initrd: ImageArtifact,
+    /// `<kernel params> init=<toplevel>/init`, byte for byte as the file
+    /// `cmdline` in the bundle holds it.
+    pub cmdline: String,
+    /// The directory that holds the three above as `kernel`, `initrd` and
+    /// `cmdline` — what `meister-deploy image --kind direct-boot` prints and
+    /// what a garbage-collector root of this release protects.
+    pub bundle_store_path: String,
 }
 
 /// What this release makes a host boot. Kept beside the toplevel because a
@@ -119,6 +146,11 @@ pub struct HostArtifacts {
     /// different fleet.
     pub installer_iso: Option<ImageArtifact>,
     pub disk_image: Option<ImageArtifact>,
+    /// Present for exactly the hosts the manifest calls `direct`: a release
+    /// for such a host without its bundle is a release its provider cannot
+    /// boot, and one for a uefi host with a bundle is a bundle nothing
+    /// loads. [`bind`] holds both directions.
+    pub direct_boot: Option<DirectBoot>,
     pub boot: BootArtifacts,
     /// Keyed as `config_artifacts` in the manifest: `agent_toml_out`, …
     pub config_files: BTreeMap<String, ConfigArtifact>,
@@ -325,6 +357,48 @@ pub fn bind(
             &built.boot.kernel_params_sha256,
         )?;
 
+        // The bundle exists for exactly the hosts that boot `direct`, and in
+        // both directions: a release for such a host without one is a
+        // release its provider cannot boot, and one for a uefi host is a
+        // directory nothing ever loads. Unlike the images below, this is not
+        // optional work — `build` makes it, because it is part of how the
+        // host is started at all.
+        match (&built.direct_boot, host.build.boot.mode) {
+            (Some(bundle), crate::manifest::BootMode::Direct) => {
+                expect_same(
+                    id,
+                    "the direct-boot kernel",
+                    &host.build.boot.kernel_out,
+                    &bundle.kernel.store_path,
+                )?;
+                expect_same(
+                    id,
+                    "the direct-boot initrd",
+                    &host.build.boot.initrd_out,
+                    &bundle.initrd.store_path,
+                )?;
+                let promised = host.build.boot.cmdline.as_deref().unwrap_or_default();
+                expect_same(
+                    id,
+                    "the direct-boot command line",
+                    promised,
+                    &bundle.cmdline,
+                )?;
+            }
+            (None, crate::manifest::BootMode::Direct) => bail!(
+                "{id} boots direct and this release carries no direct-boot bundle for it. A \
+                 direct-boot host is started by its provider out of a kernel, an initrd and a \
+                 command line, and a release that names none of them is a release nobody can \
+                 boot that host from."
+            ),
+            (Some(_), crate::manifest::BootMode::Uefi) => bail!(
+                "a direct-boot bundle was built for {id} and its manifest says it boots uefi. \
+                 A uefi host reads its own boot menu; the bundle would be a directory nothing \
+                 ever loads."
+            ),
+            (None, crate::manifest::BootMode::Uefi) => {}
+        }
+
         // An image only exists where the evaluation said there would be one.
         // The other direction is fine: `build` may leave an ISO unbuilt.
         if built.installer_iso.is_some() && host.build.installer_drv.is_none() {
@@ -453,6 +527,124 @@ mod tests {
         assert_ne!(
             first.release_id, second.release_id,
             "the same fleet built to different bytes is a different release"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // The bundle of a direct-boot host (M3A position 3)
+    // ---------------------------------------------------------------
+
+    fn direct_release(
+        mutate: impl FnOnce(&mut BTreeMap<String, HostArtifacts>, &ResolvedFleet),
+    ) -> Result<ReleaseManifest> {
+        let resolved = crate::fixtures::with_direct_host(onebox(), "n1");
+        let mut artifacts = artifacts_for(&resolved);
+        mutate(&mut artifacts, &resolved);
+        bind(
+            resolved,
+            artifacts,
+            BTreeMap::new(),
+            Vec::new(),
+            build_env(),
+            Vec::new(),
+            reproducibility(),
+            at("2026-09-22T11:00:00Z"),
+        )
+    }
+
+    #[test]
+    fn a_direct_host_carries_the_bundle_its_manifest_promised() {
+        let release = direct_release(|artifacts, fleet| {
+            artifacts.get_mut("n1").unwrap().direct_boot =
+                Some(crate::fixtures::bundle_for(fleet, "n1"));
+        })
+        .expect("it binds");
+        let bundle = release.artifacts["n1"]
+            .direct_boot
+            .as_ref()
+            .expect("n1 boots direct");
+        assert_eq!(
+            bundle.kernel.store_path,
+            release.resolved_fleet.hosts["n1"].build.boot.kernel_out
+        );
+        assert!(bundle.cmdline.contains("init=/nix/store/"), "{bundle:?}");
+        // And nobody else got one.
+        assert!(release.artifacts["box"].direct_boot.is_none());
+        assert!(release.artifacts["n2"].direct_boot.is_none());
+    }
+
+    #[test]
+    fn a_direct_host_without_a_bundle_is_a_release_nobody_can_boot_it_from() {
+        let err = direct_release(|_, _| {}).unwrap_err().to_string();
+        assert!(err.contains("no direct-boot bundle"), "{err}");
+        assert!(err.contains("started by its provider"), "{err}");
+    }
+
+    #[test]
+    fn a_uefi_host_with_a_bundle_is_refused_too() {
+        let resolved = crate::fixtures::with_direct_host(onebox(), "n1");
+        let mut artifacts = artifacts_for(&resolved);
+        artifacts.get_mut("n1").unwrap().direct_boot =
+            Some(crate::fixtures::bundle_for(&resolved, "n1"));
+        // …and one for a host that reads its own boot menu.
+        let mut stray = crate::fixtures::bundle_for(&resolved, "n1");
+        stray.bundle_store_path = "/nix/store/bbbbbox-box-direct-boot".to_string();
+        artifacts.get_mut("box").unwrap().direct_boot = Some(stray);
+        let err = bind(
+            resolved,
+            artifacts,
+            BTreeMap::new(),
+            Vec::new(),
+            build_env(),
+            Vec::new(),
+            reproducibility(),
+            at("2026-09-22T11:00:00Z"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("boots uefi"), "{err}");
+        assert!(err.contains("nothing ever loads"), "{err}");
+    }
+
+    #[test]
+    fn a_bundle_that_names_another_kernel_or_another_command_line_is_refused() {
+        let err = direct_release(|artifacts, fleet| {
+            let mut bundle = crate::fixtures::bundle_for(fleet, "n1");
+            bundle.kernel.store_path = "/nix/store/somebody-elses-linux/bzImage".to_string();
+            artifacts.get_mut("n1").unwrap().direct_boot = Some(bundle);
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("direct-boot kernel"), "{err}");
+
+        let err = direct_release(|artifacts, fleet| {
+            let mut bundle = crate::fixtures::bundle_for(fleet, "n1");
+            bundle.cmdline = "loglevel=4".to_string();
+            artifacts.get_mut("n1").unwrap().direct_boot = Some(bundle);
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("direct-boot command line"), "{err}");
+    }
+
+    #[test]
+    fn a_changed_bundle_is_a_different_release() {
+        let first = direct_release(|artifacts, fleet| {
+            artifacts.get_mut("n1").unwrap().direct_boot =
+                Some(crate::fixtures::bundle_for(fleet, "n1"));
+        })
+        .expect("binds");
+        let second = direct_release(|artifacts, fleet| {
+            let mut bundle = crate::fixtures::bundle_for(fleet, "n1");
+            // The same paths, different bytes: a rebuilt initrd.
+            bundle.initrd.sha256 = "3".repeat(64);
+            artifacts.get_mut("n1").unwrap().direct_boot = Some(bundle);
+        })
+        .expect("binds");
+        assert_eq!(first.manifest_id, second.manifest_id);
+        assert_ne!(
+            first.release_id, second.release_id,
+            "the bytes a provider loads are part of what a release IS"
         );
     }
 

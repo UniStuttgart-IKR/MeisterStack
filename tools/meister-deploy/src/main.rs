@@ -137,6 +137,12 @@ enum Verb {
     /// host anything.
     Build(BuildArgs),
 
+    // --- lane 3A: media -------------------------------------------------
+    /// Build one medium of one host out of a release: the installer ISO, a
+    /// prebuilt disk, or the bundle a hypervisor is handed. Evaluates
+    /// nothing and asks no host anything.
+    Image(ImageArgs),
+    // --- end lane 3A ----------------------------------------------------
     /// Work out which hosts may be taken forward, in which order, and what
     /// has to still be true when it happens. Reads a release and a snapshot
     /// of the fleet; asks no host anything of its own.
@@ -296,6 +302,46 @@ struct BuildArgs {
     #[arg(long)]
     offline: bool,
 }
+
+// --- lane 3A: media -------------------------------------------------------
+#[derive(Args)]
+struct ImageArgs {
+    /// The release from `build`
+    #[arg(long)]
+    release: PathBuf,
+
+    /// Which host's medium
+    #[arg(long)]
+    host: String,
+
+    /// `installer`, `disk` or `direct-boot`
+    #[arg(long)]
+    kind: String,
+
+    /// Link the result into this directory, under a name that says which
+    /// host it belongs to
+    #[arg(short = 'o', long)]
+    out: Option<PathBuf>,
+
+    /// The operator's repository, whose state directory keeps the
+    /// garbage-collector root. Defaults to the one the manifest was resolved
+    /// from.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// Print the command line that would build it, and build nothing
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Refuse rather than reach outside this process
+    #[arg(long)]
+    offline: bool,
+
+    /// Print the result as json instead of as lines
+    #[arg(long)]
+    json: bool,
+}
+// --- end lane 3A ----------------------------------------------------------
 
 #[derive(Args)]
 struct ApplyArgs {
@@ -584,6 +630,9 @@ fn run() -> Result<Answer> {
         )
         .map(Answer::from),
         Verb::Build(args) => build(args).map(Answer::from),
+        // --- lane 3A: media ---
+        Verb::Image(args) => image(args).map(Answer::from),
+        // --- end lane 3A ---
         Verb::Status(look) => status(look),
         Verb::Check { look, suite } => check(look, suite),
         Verb::Plan(args) => make_plan(args),
@@ -1117,6 +1166,82 @@ fn build(args: &BuildArgs) -> Result<bool> {
 fn repo_of(resolved: &manifest::ResolvedFleet) -> PathBuf {
     PathBuf::from(&resolved.source.repo_path)
 }
+
+// --- lane 3A: media -------------------------------------------------------
+
+/// `image --release r.json --host <id> --kind installer|disk|direct-boot`.
+///
+/// One derivation out of the release, built, measured, rooted. It evaluates
+/// nothing: the derivation path IS the evaluation the release was made from,
+/// so a medium built here belongs to that release and not to whatever the
+/// operator's flake says today.
+fn image(args: &ImageArgs) -> Result<bool> {
+    if args.offline {
+        anyhow::bail!(
+            "image builds a medium, and --offline forbids it. There is nothing on disk this \
+             verb could answer from: the medium IS the build."
+        );
+    }
+    let kind = build::ImageKind::parse(&args.kind)?;
+    let policy = if args.dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+
+    let text = files.read_to_string(&args.release)?;
+    let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
+
+    if args.dry_run {
+        let drv = build::image_drv(&release, &args.host, kind)?;
+        println!(
+            "{}",
+            build::build_cmd(&drv, &build::BuildOptions::default()).line()
+        );
+        eprintln!(
+            "note: nothing was built, nothing was rooted and nothing was linked. The \
+             derivation above is the one the release {} names for {} as its {kind} medium.",
+            release.release_id, args.host
+        );
+        return Ok(true);
+    }
+
+    // A medium can take an hour to build, and a Ctrl-C has to reach it.
+    Cancel::on_sigint()?;
+    let runner = Real::new(policy).verbose(true);
+    let repo = args
+        .repo
+        .clone()
+        .unwrap_or_else(|| repo_of(&release.resolved_fleet));
+    let builder = build::Builder {
+        runner: &runner,
+        files: &files,
+        clock: &RealClock,
+        options: build::BuildOptions::default(),
+        state: Some(StateDir::in_repo(&repo)),
+    };
+    let result = builder.image(&release, &args.host, kind, args.out.as_deref())?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("{}", result.file.as_deref().unwrap_or(&result.store_path));
+        if let (Some(sha256), Some(size)) = (&result.sha256, result.size) {
+            eprintln!("    sha256 {sha256}");
+            eprintln!("    size   {size} bytes ({} MiB)", size / (1024 * 1024));
+        }
+        if let Some(root) = &result.gc_root {
+            eprintln!("    root   {root}");
+        }
+        if let Some(link) = &result.linked_to {
+            eprintln!("    linked {link}");
+        }
+    }
+    Ok(true)
+}
+
+// --- end lane 3A ----------------------------------------------------------
 
 /// The `[operator] signing_key` reference, from the inventory the manifest
 /// was resolved from.

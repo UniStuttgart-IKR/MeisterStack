@@ -113,6 +113,7 @@ pub fn artifacts_for(resolved: &ResolvedFleet) -> BTreeMap<String, HostArtifacts
                     },
                     installer_iso: None,
                     disk_image: None,
+                    direct_boot: None,
                     boot: BootArtifacts {
                         kernel_store_path: host.build.boot.kernel_out.clone(),
                         initrd_store_path: host.build.boot.initrd_out.clone(),
