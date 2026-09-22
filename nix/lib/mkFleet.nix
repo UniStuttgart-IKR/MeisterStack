@@ -198,7 +198,21 @@ let
     };
   };
 
-  manifestJson = pkgs.writeText "meister-deployment.json" (builtins.toJSON meisterDeployment);
+  # The manifest as a FILE, for the check below — and without its string
+  # context, which is the whole point of this line.
+  #
+  # `meisterDeployment` is full of store paths: `toplevel_out` is an
+  # `outPath`, `toplevel_drv` and the two image derivations are `drvPath`s.
+  # Written into a derivation, each of those strings carries a dependency
+  # with it, so `nix build` of this text file builds the systems AND the
+  # disk images of every host — measured: a `nix flake check` of the example
+  # fleet started building `nixos-disk-image` and ate the disk. A manifest is
+  # a DESCRIPTION: `meister-deploy resolve` produces it with `nix eval`, which
+  # builds nothing, and the check that validates its SHAPE must not build a
+  # fleet either. What the paths mean is checked elsewhere and later — the
+  # RELEASE (M2) is what records that a path exists and what its nar hash is.
+  manifestJson = pkgs.writeText "meister-deployment.json"
+    (builtins.unsafeDiscardStringContext (builtins.toJSON meisterDeployment));
 
   # --- checks -----------------------------------------------------------
   binaryOf = role: if role == "agent" then "meister-agent" else "meister-${role}-controller";
