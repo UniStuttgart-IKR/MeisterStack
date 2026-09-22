@@ -319,6 +319,25 @@
         "cloud_toml_out": "/nix/store/cccccccccccccccccccccccccccccccc-cloud.toml",
         "cluster_toml_out": "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cluster.toml"
       },
+      "units": [
+        "dbus.service",
+        "etcd.service",
+        "grafana.service",
+        "kanidm.service",
+        "loki.service",
+        "meister-addons-dirs.service",
+        "meister-agent.service",
+        "meister-cloud-controller.service",
+        "meister-cluster-controller.service",
+        "nix-daemon.service",
+        "nscd.service",
+        "prometheus.service",
+        "sshd.service",
+        "systemd-journald.service",
+        "systemd-networkd.service",
+        "systemd-udevd.service",
+        "tempo.service"
+      ],
       "secret_refs": [
         {
           "id": "identity",
@@ -436,6 +455,16 @@
       "config_artifacts": {
         "agent_toml_out": "/nix/store/n1n1n1n1n1n1n1n1zzzzzzzzzzzzzzzz-agent.toml"
       },
+      "units": [
+        "dbus.service",
+        "meister-agent.service",
+        "nix-daemon.service",
+        "nscd.service",
+        "sshd.service",
+        "systemd-journald.service",
+        "systemd-networkd.service",
+        "systemd-udevd.service"
+      ],
       "secret_refs": [
         {
           "id": "identity",
@@ -529,6 +558,16 @@
       "config_artifacts": {
         "agent_toml_out": "/nix/store/n2n2n2n2n2n2n2n2zzzzzzzzzzzzzzzz-agent.toml"
       },
+      "units": [
+        "dbus.service",
+        "meister-agent.service",
+        "nix-daemon.service",
+        "nscd.service",
+        "sshd.service",
+        "systemd-journald.service",
+        "systemd-networkd.service",
+        "systemd-udevd.service"
+      ],
       "secret_refs": [
         {
           "id": "identity",
