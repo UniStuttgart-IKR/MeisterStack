@@ -854,6 +854,13 @@ pkgs.testers.runNixOSTest {
     assert drain and drain[0]["result"] == "ok", drain
     assert any("0 guest(s) left on n1" in e for e in drain[0]["evidence"]), drain
     assert any("node drain n1 --cluster cp" in r for r in drain[0]["cmd_refs"]), drain
+    # …and the host was given back whole: `node uncordon` alone leaves
+    # `spec.drain` where the drain put it, and a node that is still draining
+    # is a node the scheduler never places on again.
+    uncordon = [a for a in receipt["hosts"]["n1"]["actions"] if a["kind"] == "uncordon"]
+    assert uncordon and any(
+        "node undrain n1 --cluster cp" in r for r in uncordon[0]["cmd_refs"]
+    ), uncordon
     # …and the uncordon gave the node back: the READY column of `node ls` is
     # `yes` / `cordoned` / `draining` / `no` (components/cli/src/output.rs),
     # so what a finished rollout looks like is the absence of the other three.

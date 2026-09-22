@@ -638,6 +638,9 @@ fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
                 ok(),
             )
             .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            // Two commands, because a rollout took two things: the drain
+            // and the cordon. `node uncordon` gives back only the second.
+            .expect(cli("undrain", "n1"), Output::stdout(""))
             .expect(cli("uncordon", "n1"), Output::stdout(""))
             .expect(
                 helper("n1", &["txn", "retire", "--txn", "run-1", "--run", "run-1"]),
@@ -727,6 +730,9 @@ fn an_activation_whose_connection_died_is_decided_by_the_host_and_not_by_ssh() {
                 Output::failing(255, ""),
             )
             .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            // Two commands, because a rollout took two things: the drain
+            // and the cordon. `node uncordon` gives back only the second.
+            .expect(cli("undrain", "n1"), Output::stdout(""))
             .expect(cli("uncordon", "n1"), Output::stdout(""))
             .expect(helper("n1", &["txn", "retire"]), ok())
             .expect(helper("n1", &["lock", "release"]), ok())
@@ -1018,6 +1024,9 @@ fn a_resume_after_an_irreversible_step_asks_the_target_and_does_not_repeat_it() 
             .expect(helper("box", &["lock", "acquire"]), ok())
             .expect(helper("n1", &["lock", "acquire"]), ok())
             .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            // Two commands, because a rollout took two things: the drain
+            // and the cordon. `node uncordon` gives back only the second.
+            .expect(cli("undrain", "n1"), Output::stdout(""))
             .expect(cli("uncordon", "n1"), Output::stdout(""))
             .expect(helper("n1", &["txn", "retire", "--txn", "run-1"]), ok())
             .expect(helper("n1", &["lock", "release"]), ok())
@@ -1149,6 +1158,9 @@ fn a_reboot_class_host_waits_for_the_system_it_was_meant_to_boot() {
                 Output::failing(255, "Connection closed by remote host"),
             )
             .expect(helper("n1", &["confirm"]), ok())
+            // Two commands, because a rollout took two things: the drain
+            // and the cordon. `node uncordon` gives back only the second.
+            .expect(cli("undrain", "n1"), Output::stdout(""))
             .expect(cli("uncordon", "n1"), Output::stdout(""))
             .expect(helper("n1", &["txn", "retire"]), ok())
             .expect(helper("n1", &["lock", "release"]), ok())
@@ -1992,6 +2004,9 @@ fn a_resume_after_the_provider_has_been_asks_the_machine_and_finishes() {
         StrictFake::new()
             .expect(helper("box", &["lock", "acquire", "--run", "run-1"]), ok())
             .expect(helper("n1", &["lock", "acquire", "--run", "run-1"]), ok())
+            // Two commands, because a rollout took two things: the drain
+            // and the cordon. `node uncordon` gives back only the second.
+            .expect(cli("undrain", "n1"), Output::stdout(""))
             .expect(cli("uncordon", "n1"), Output::stdout(""))
             .expect(
                 helper("n1", &["txn", "retire", "--txn", "run-1", "--run", "run-1"]),

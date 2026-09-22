@@ -723,9 +723,11 @@ impl<'a> Executor<'a> {
                 self.begin(journal, id, action)?;
                 let mut evidence = Vec::new();
                 let mut refs = Vec::new();
-                let cmd = self.workload_cmd(id, action.kind)?;
-                refs.push(cmd.line());
-                self.runner.run(&cmd)?;
+                for verb in self.workload_verbs(id, action) {
+                    let cmd = self.workload_cmd(id, verb)?;
+                    refs.push(cmd.line());
+                    self.runner.run(&cmd)?;
+                }
                 if action.kind == ActionKind::Drain {
                     let guests = self.wait_for_drain(id)?;
                     evidence.push(format!("{guests} guest(s) left on {id}"));
@@ -1285,10 +1287,40 @@ impl<'a> Executor<'a> {
     /// Not over ssh on the node: cordoning is a statement to the control
     /// plane about a node, and a node is not the authority on whether it may
     /// be drained.
-    fn workload_cmd(&self, id: &str, kind: ActionKind) -> Result<Cmd> {
+    /// Which cli verbs one maintenance step is, in the order they run.
+    ///
+    /// Giving a host back is two things, because taking it was: `node
+    /// drain` sets `spec.drain` and `node cordon` sets `spec.schedulable`,
+    /// and `node uncordon` gives back only the second. A node whose
+    /// `spec.drain` is still true is a node the scheduler never places on
+    /// again — so a rollout that only uncordoned would hand back a machine
+    /// that looks healthy in every check and takes no work. Measured in
+    /// `checks.vm-bootstrap-fleet`: after a green update `meister node ls`
+    /// said `n1  draining  0 moved, 0 leaving, 0 staying (done)`.
+    ///
+    /// The undrain comes FIRST: `node drain` implies the cordon, so undoing
+    /// it and then uncordoning ends with a node that is both schedulable
+    /// and not draining, whichever order the far side applies them in.
+    fn workload_verbs(&self, id: &str, action: &Action) -> Vec<&'static str> {
+        match action.kind {
+            ActionKind::Cordon => vec!["cordon"],
+            ActionKind::Drain => vec!["drain"],
+            _ if self
+                .plan
+                .actions_for(id)
+                .iter()
+                .any(|a| a.kind == ActionKind::Drain && !a.is_blocked()) =>
+            {
+                vec!["undrain", "uncordon"]
+            }
+            _ => vec!["uncordon"],
+        }
+    }
+
+    fn workload_cmd(&self, id: &str, verb: &str) -> Result<Cmd> {
         let control = self.options.workload.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "this step needs `meister node {kind}` and the inventory names no `[operator] \
+                "this step needs `meister node {verb}` and the inventory names no `[operator] \
                  cli_config`. A plan made with that reference blocks the step instead; this \
                  run was given one that does not have it."
             )
@@ -1309,11 +1341,7 @@ impl<'a> Executor<'a> {
         }
         Ok(cmd
             .arg("node")
-            .arg(match kind {
-                ActionKind::Cordon => "cordon",
-                ActionKind::Drain => "drain",
-                _ => "uncordon",
-            })
+            .arg(verb)
             .arg(id)
             .arg("--cluster")
             .arg(group))
