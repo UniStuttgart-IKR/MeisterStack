@@ -253,7 +253,7 @@ let
       nixSide = pkgs.writeText "inventory-nix.json" (builtins.toJSON
         (lib.mapAttrs
           (_: h: {
-            inherit (h) profiles;
+            inherit (h) profiles boot;
             ssh = h.ssh;
             rollout = h.rollout;
             checks = h.checks;

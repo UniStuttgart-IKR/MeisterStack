@@ -88,6 +88,66 @@ pub struct HostSsh {
     pub host_key: Option<String>,
 }
 
+/// How a machine of this fleet gets its kernel.
+///
+/// The twin of `knownBootModes` in nix/lib/inventory.nix, and the reason
+/// there are exactly two: a boot this tool cannot take back is a boot this
+/// tool does not arrange. `uefi` has systemd-boot and therefore
+/// `bootctl set-oneshot`; `direct` has a hypervisor holding the kernel and
+/// no loader at all, so it keeps the switch rollback and loses the boot one.
+/// `bios` is refused by name, with the reason, because it is the answer
+/// somebody will try.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootMode {
+    /// An ESP, systemd-boot, a boot menu — and a way back from a boot.
+    #[default]
+    Uefi,
+    /// Kernel, initrd and command line come from outside the machine.
+    Direct,
+}
+
+impl BootMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BootMode::Uefi => "uefi",
+            BootMode::Direct => "direct",
+        }
+    }
+
+    /// Hand-written rather than derived, so that `bios` gets the sentence it
+    /// has earned instead of serde's "unknown variant".
+    pub fn parse(text: &str) -> Result<BootMode> {
+        match text {
+            "uefi" => Ok(BootMode::Uefi),
+            "direct" => Ok(BootMode::Direct),
+            "bios" => bail!(
+                "boot = \"bios\": v1 installs uefi or direct; a BIOS host keeps grub through \
+                 its own host module and has no boot fallback, because `bootctl set-oneshot` \
+                 is what a boot fallback is made of and grub has no equivalent."
+            ),
+            other => bail!(
+                "boot = {other:?}: a host of this fleet boots uefi (it has an ESP and a boot \
+                 menu of its own) or direct (a hypervisor hands it kernel, initrd and command \
+                 line)."
+            ),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BootMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<BootMode, D::Error> {
+        let text = String::deserialize(d)?;
+        BootMode::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::fmt::Display for BootMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RebootPolicy {
@@ -138,6 +198,9 @@ pub struct Defaults {
     pub ssh: SshOverrides,
     #[serde(default)]
     pub profiles: Vec<String>,
+    /// How these machines are booted, where nobody says otherwise.
+    #[serde(default)]
+    pub boot: Option<BootMode>,
     #[serde(default)]
     pub rollout: RolloutOverrides,
     #[serde(default)]
@@ -189,6 +252,10 @@ pub struct Group {
     pub profiles: Vec<String>,
     #[serde(default)]
     pub ssh: SshOverrides,
+    /// A group of machines that are all booted the same way — a rack of
+    /// guests on one hypervisor, say.
+    #[serde(default)]
+    pub boot: Option<BootMode>,
     #[serde(default)]
     pub rollout: RolloutOverrides,
     #[serde(default)]
@@ -304,6 +371,12 @@ pub struct Install {
     pub layout: String,
     #[serde(default)]
     pub preserve: Vec<String>,
+    /// PUBLIC ssh keys that may reach the installer MEDIUM. Empty — the
+    /// default — is a medium with no sshd at all, and then the console is
+    /// the only way in. The list is baked into an image anybody holding the
+    /// medium can read, which is why only public halves belong in it.
+    #[serde(default)]
+    pub authorized_keys: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -369,6 +442,10 @@ pub struct Host {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub hardware: Hardware,
+    /// How this machine is booted. Precedence like every other scalar:
+    /// defaults < group < host.
+    #[serde(default)]
+    pub boot: Option<BootMode>,
     #[serde(default)]
     pub install: Option<Install>,
     #[serde(default)]
@@ -474,6 +551,7 @@ pub struct Settings {
     /// wins: a profile list is an import order, and reordering it changes
     /// which module's option definition is the last word.
     pub profiles: Vec<String>,
+    pub boot: BootMode,
     pub rollout: EffectiveRollout,
     pub checks: EffectiveChecks,
 }
@@ -672,6 +750,19 @@ impl Inventory {
         )?
         .unwrap_or(DEFAULT_SSH_PORT);
 
+        // The default is `uefi`, and it is the conservative one: a machine
+        // that boots itself is the only one that can take a boot back by
+        // itself (D5).
+        let boot = settle(
+            host_id,
+            "boot",
+            &groups,
+            host.boot,
+            |g| g.boot,
+            self.defaults.boot,
+        )?
+        .unwrap_or_default();
+
         let max_unavailable = settle(
             host_id,
             "rollout.max_unavailable",
@@ -729,6 +820,7 @@ impl Inventory {
                 host_key: host.ssh.host_key.clone(),
             },
             profiles,
+            boot,
             rollout: EffectiveRollout {
                 max_unavailable,
                 reboot,
@@ -919,6 +1011,36 @@ fn check_install(host_id: &str, install: &Install, origin: &str) -> Result<()> {
             }
             if install.layout.is_empty() {
                 bail!("{origin}: host {host_id} has an install table with no layout.");
+            }
+            // Public halves only. The list is baked into an installer image
+            // that anybody holding the medium can read, so a private key
+            // that landed here by a slip of the hand would be a private key
+            // on a USB stick in a server room.
+            for key in &install.authorized_keys {
+                if key.contains("PRIVATE KEY") {
+                    bail!(
+                        "{origin}: host {host_id} has something with \"PRIVATE KEY\" in it \
+                         under install.authorized_keys. That list is baked into an installer \
+                         medium, which is a file anybody who holds the medium can read. Only \
+                         public halves belong in it."
+                    );
+                }
+                let looks_like_a_key = key
+                    .split_once(' ')
+                    .map(|(kind, rest)| {
+                        (kind.starts_with("ssh-")
+                            || kind.starts_with("ecdsa-")
+                            || kind.starts_with("sk-"))
+                            && !rest.trim().is_empty()
+                    })
+                    .unwrap_or(false);
+                if !looks_like_a_key {
+                    bail!(
+                        "{origin}: host {host_id} names {key:?} in install.authorized_keys, \
+                         and that is not an ssh public key. One line per key, as \
+                         `~/.ssh/id_ed25519.pub` holds it: `ssh-ed25519 AAAA... comment`."
+                    );
+                }
             }
             Ok(())
         }
@@ -1216,6 +1338,148 @@ mod tests {
     fn a_group_id_may_carry_an_underscore_because_it_is_never_in_dns() {
         let inventory = parse(fixture()).unwrap();
         assert!(inventory.groups.contains_key("compute_pro6000"));
+    }
+
+    // ---------------------------------------------------------------
+    // How a machine is booted (M3A position 1)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn a_host_boots_uefi_unless_somebody_said_otherwise() {
+        let inventory = parse(fixture()).unwrap();
+        for id in ["cloud-a", "gpu-01", "ctx-agent-1"] {
+            assert_eq!(
+                inventory.effective(id).unwrap().boot,
+                BootMode::Uefi,
+                "{id} inherited the default"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_follows_defaults_then_group_then_host() {
+        // Defaults reach everybody.
+        let text = fixture().replace(
+            "[defaults]\nssh = { user = \"root\", port = 22 }",
+            "[defaults]\nboot = \"direct\"\nssh = { user = \"root\", port = 22 }",
+        );
+        let inventory = parse(&text).unwrap();
+        assert_eq!(
+            inventory.effective("cloud-a").unwrap().boot,
+            BootMode::Direct
+        );
+
+        // A group overrides the defaults for its members and nobody else.
+        let text = text.replace(
+            "id = \"compute_pro6000\"\nkind = \"compute\"",
+            "id = \"compute_pro6000\"\nkind = \"compute\"\nboot = \"uefi\"",
+        );
+        let inventory = parse(&text).unwrap();
+        assert_eq!(inventory.effective("gpu-01").unwrap().boot, BootMode::Uefi);
+        assert_eq!(
+            inventory.effective("cloud-a").unwrap().boot,
+            BootMode::Direct
+        );
+
+        // And the host has the last word.
+        let text = text.replace(
+            "id = \"gpu-01\"\nname = \"agent-2b\"",
+            "id = \"gpu-01\"\nname = \"agent-2b\"\nboot = \"direct\"",
+        );
+        let inventory = parse(&text).unwrap();
+        assert_eq!(
+            inventory.effective("gpu-01").unwrap().boot,
+            BootMode::Direct
+        );
+    }
+
+    #[test]
+    fn two_groups_that_disagree_about_boot_are_a_sentence() {
+        let text = fixture()
+            .replace(
+                "id = \"cloud\"\nkind = \"raft\"",
+                "id = \"cloud\"\nkind = \"raft\"\nboot = \"uefi\"",
+            )
+            .replace(
+                "id = \"compute_pro6000\"\nkind = \"compute\"",
+                "id = \"compute_pro6000\"\nkind = \"compute\"\nboot = \"direct\"",
+            )
+            .replace(
+                "groups = [\"compute_pro6000\"]",
+                "groups = [\"compute_pro6000\", \"cloud\"]",
+            );
+        // The conflict is found while the file is read, not when somebody
+        // asks: an inventory that cannot be settled is not an inventory.
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("set boot on the host"), "{err}");
+        assert!(err.contains("cannot both decide it"), "{err}");
+    }
+
+    #[test]
+    fn bios_is_refused_by_name_and_says_why() {
+        let text = fixture().replace(
+            "id = \"cloud-a\"\nname = \"meister-cloud\"",
+            "id = \"cloud-a\"\nname = \"meister-cloud\"\nboot = \"bios\"",
+        );
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("uefi or direct"), "{err}");
+        assert!(err.contains("no boot fallback"), "{err}");
+
+        // And a word that is neither lists the two that are.
+        let text = fixture().replace(
+            "id = \"cloud-a\"\nname = \"meister-cloud\"",
+            "id = \"cloud-a\"\nname = \"meister-cloud\"\nboot = \"netboot\"",
+        );
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("netboot"), "{err}");
+        assert!(err.contains("uefi"), "{err}");
+    }
+
+    #[test]
+    fn an_installer_medium_carries_public_keys_and_only_those() {
+        let with_key = |keys: &str| {
+            fixture().replace(
+                "layout = \"disko/single-nvme.nix\", preserve = [\"/var/lib/meister-data\"] }",
+                &format!(
+                    "layout = \"disko/single-nvme.nix\", preserve = [\"/var/lib/meister-data\"], \
+                     authorized_keys = [{keys}] }}"
+                ),
+            )
+        };
+
+        let ok = parse(&with_key(
+            "\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA silas@manacor\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            ok.hosts["cloud-a"]
+                .install
+                .as_ref()
+                .unwrap()
+                .authorized_keys
+                .len(),
+            1
+        );
+
+        // An empty list is the default and means: no sshd on the medium.
+        let none = parse(fixture()).unwrap();
+        assert!(
+            none.hosts["cloud-a"]
+                .install
+                .as_ref()
+                .unwrap()
+                .authorized_keys
+                .is_empty()
+        );
+
+        let err = parse(&with_key("\"hunter2\"")).unwrap_err().to_string();
+        assert!(err.contains("not an ssh public key"), "{err}");
+
+        let err = parse(&with_key("\"-----BEGIN OPENSSH PRIVATE KEY----- b64\""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PRIVATE KEY"), "{err}");
+        assert!(err.contains("anybody who holds the medium"), "{err}");
     }
 
     #[test]

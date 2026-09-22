@@ -412,10 +412,18 @@ fn an_unknown_selector_lists_what_exists_and_writes_nothing() {
 
 #[test]
 fn a_missing_cli_reference_is_a_note_and_the_plan_says_which_steps_it_blocks() {
-    // D7: no `[operator] cli_config` anywhere. The inventory the manifest
-    // names does not exist in this sandbox, which is the ordinary case for a
-    // plan made away from the operator's repository.
+    // D7: no `[operator] cli_config` anywhere, which is the ordinary case
+    // for a plan made away from the operator's repository.
+    //
+    // The inventory is NAMED here rather than left to the manifest's own
+    // `source.repo_path`. That path is a real directory on the machine this
+    // fixture was written on (`~/git/meisterstack-lab`), so a test that
+    // relied on it being absent passed only until somebody created the lab
+    // repository — measured: it went red the day lane L1's directory
+    // appeared, in a worktree that had not touched this code. A test about
+    // a missing reference has to name the file it means.
     let sandbox = Sandbox::new();
+    let missing = sandbox.cwd.path().join("no-such-inventory.toml");
     let out = sandbox.run(&[
         "plan",
         "--release",
@@ -424,6 +432,8 @@ fn a_missing_cli_reference_is_a_note_and_the_plan_says_which_steps_it_blocks() {
         "host=n1",
         "--observation",
         "snap.json",
+        "--inventory",
+        missing.to_str().unwrap(),
     ]);
     assert_eq!(code(&out), 2, "{}", stderr(&out));
     let why = stderr(&out);

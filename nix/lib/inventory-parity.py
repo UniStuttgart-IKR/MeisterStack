@@ -42,6 +42,8 @@ for host in sorted(set(rust_hosts) & set(nix)):
                        % (host, key, a["ssh"].get(key), b["ssh"].get(key)))
     if a["profiles"] != b["profiles"]:
         bad.append("  %s profiles: tool %r, flake %r" % (host, a["profiles"], b["profiles"]))
+    if a["boot"] != b["boot"]:
+        bad.append("  %s boot: tool %r, flake %r" % (host, a["boot"], b["boot"]))
     for key in ("max_unavailable", "reboot", "canary"):
         if a["rollout"].get(key) != b["rollout"].get(key):
             bad.append("  %s rollout.%s: tool %r, flake %r"
