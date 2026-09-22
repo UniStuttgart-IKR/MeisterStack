@@ -198,6 +198,19 @@ let
           required = accumulate h (x: (x.checks or { }).required or [ ]);
           functional = accumulate h (x: (x.checks or { }).functional or [ ]);
         };
+        # The binary caches this host may FETCH from, in the order nix tries
+        # them. Accumulated rather than settled, for the same reason
+        # `profiles` is: a list of substituters is an order, and a group that
+        # adds a regional mirror is adding one rather than replacing what the
+        # fleet already had.
+        #
+        # Empty is the default and is a host that is only ever pushed to —
+        # the whole closure comes over ssh and nothing a third party put in a
+        # cache can surprise it. What makes a cache safe once it is named is
+        # `meisterstack.managed.trustedPublicKeys`: a substituted path is
+        # held to `require-sigs = true` exactly like a pushed one, so the
+        # fleet's own signing key is what makes its own cache usable.
+        substituters = accumulate h (x: (x.managed or { }).substituters or [ ]);
       };
 
       # --- the hosts -------------------------------------------------------
@@ -243,6 +256,7 @@ let
           boot = eff.boot;
           rollout = eff.rollout;
           checks = eff.checks;
+          substituters = eff.substituters;
           has = role: builtins.elem role roles;
           # The raft group this host is a member of, if any: the group whose
           # kind says its members form a quorum. A host in two of them would
@@ -543,6 +557,17 @@ let
             (builtins.any (p: p.device == "label:meister-data") h.persistence)
             "meister-data";
 
+          # Where this host may fetch a closure from, as the inventory said
+          # it. One list, one place: `build --cache` pushes a release into a
+          # store and `managed.substituters` is what lets a host pull from
+          # one, and having the second half live in an operator's profile
+          # while the first is a flag would make "does this fleet use its
+          # cache" a question nobody can answer from one file.
+          #
+          # mkDefault, so a host module that knows better (a machine behind a
+          # slow link, a machine that must never fetch) keeps its own answer.
+          meisterstack.managed.substituters = lib.mkDefault h.substituters;
+
           # Per-host overrides, in one named place, so that a review can list
           # the hosts that are not like the others by grepping for one word.
           meisterstack.cloud.settings = (h.deviations.settings or { }).cloud or { };
@@ -652,7 +677,7 @@ let
           tenant = network (h.networks.tenant or null);
           bmc = network (h.networks.bmc or null);
         };
-        inherit (h) profiles modules deviations;
+        inherit (h) profiles modules deviations substituters;
         hardware = {
           cpu = h.hardware.cpu or null;
           memory_gb = h.hardware.memory_gb or null;

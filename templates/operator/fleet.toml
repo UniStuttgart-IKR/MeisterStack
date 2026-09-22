@@ -35,6 +35,14 @@ boot = "uefi"
 # the failure this tool exists to prevent. `auto` and `never` are the others.
 rollout = { max_unavailable = 1, reboot = "approve" }
 checks = { required = ["units", "session"] }
+# Binary caches these machines may FETCH a closure from, in the order nix
+# tries them. Empty (the default) is a fleet that is only ever pushed to: the
+# whole closure travels over ssh and nothing somebody else put in a cache can
+# surprise it. Name one here and `meister-deploy build --cache <store>` is
+# what puts this fleet's own releases into it — signed with the same key, so
+# a fetched path is held to exactly the rule a pushed one is. Settable per
+# group and per host as well; the lists accumulate rather than replace.
+# managed = { substituters = ["http://build.example/cache"] }
 
 # References to what you already have. No secret is named here, and none may
 # be: this file is committed.

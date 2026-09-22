@@ -52,6 +52,13 @@ for host in sorted(set(rust_hosts) & set(nix)):
         if a["checks"].get(key) != b["checks"].get(key):
             bad.append("  %s checks.%s: tool %r, flake %r"
                        % (host, key, a["checks"].get(key), b["checks"].get(key)))
+    # An accumulating list like `profiles`, and it decides where a machine
+    # may fetch a closure from: the two halves disagreeing here would mean a
+    # host substitutes from a cache `meister-deploy inventory` never showed
+    # the operator.
+    if a["substituters"] != b["substituters"]:
+        bad.append("  %s substituters: tool %r, flake %r"
+                   % (host, a["substituters"], b["substituters"]))
 
 if bad:
     print("the two readers of this inventory disagree:")

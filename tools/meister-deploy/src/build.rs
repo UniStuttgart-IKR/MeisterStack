@@ -120,6 +120,11 @@ pub struct BuildOptions {
     /// their own. Sorted, so that the release records them in one order and
     /// two runs with the same options produce the same `build_env`.
     pub options: BTreeMap<String, String>,
+    /// Where this release's closures are pushed once they are signed:
+    /// `file:///srv/cache`, an `s3://` bucket, an `ssh-ng://` store. A nix
+    /// store url, handed to `nix copy --to` unread — which urls nix speaks
+    /// is nix's question and not a list this tool keeps in step with it.
+    pub cache: Option<String>,
     /// Only these hosts. A build of part of a fleet is for looking at, not
     /// for releasing — see [`Builder::realise`].
     pub hosts: Option<Vec<String>>,
@@ -401,6 +406,30 @@ pub fn sign_cmd(key: &std::path::Path, paths: &[String]) -> Cmd {
         .redact(key)
 }
 
+/// How long pushing a fleet's closures into a cache may take. Seventy
+/// system closures are tens of gigabytes of nar over whatever link the cache
+/// is on.
+pub const CACHE_DEADLINE: Duration = Duration::from_secs(2 * 3600);
+
+/// `nix copy --to <cache> <paths…>`: the closures, into the store a fleet
+/// fetches from.
+///
+/// After signing, and that is the whole order: `nix copy` carries the
+/// signatures that are in the local store when it runs, and a cache full of
+/// unsigned paths is a cache a managed host refuses to fetch from —
+/// `require-sigs = true` is as true for a substituter as for an `ssh-ng://`
+/// push (M0 probe S12).
+///
+/// No `--no-check-sigs`, no `--all`, and nothing about the target hosts:
+/// this pushes exactly the paths this release names, and what a host is
+/// allowed to fetch is decided by that host's own configuration.
+pub fn cache_copy_cmd(cache: &str, paths: &[String]) -> Cmd {
+    Cmd::new(Effect::Build, "nix", CACHE_DEADLINE)
+        .args(["copy", "--to"])
+        .arg(cache.to_string())
+        .args(paths.iter().cloned())
+}
+
 /// `nix-store --realise --add-root <link> <path>`: an indirect root, so the
 /// closure survives a `nix-collect-garbage` between `build` and `apply`.
 pub fn add_root_cmd(link: &std::path::Path, store_path: &str) -> Cmd {
@@ -448,6 +477,7 @@ impl Builder<'_> {
             bail!("this manifest names no derivation to build.");
         }
         self.require_signing_key(&resolved, &hosts)?;
+        self.require_a_key_for_the_cache()?;
 
         self.ensure_present(&drvs)?;
 
@@ -517,6 +547,14 @@ impl Builder<'_> {
         to_measure.dedup();
         let info = self.measure(&to_measure)?;
         self.require_signatures(&resolved, &hosts, &outputs, &info)?;
+
+        // Into the cache, after the signatures are on and after they have
+        // been checked: a cache is only worth having if what a host pulls
+        // out of it is what a host would have accepted over ssh. A push that
+        // fails is a build that fails — a release whose `cache_url` named a
+        // store the closures never reached would be a release that lies
+        // about where they are.
+        self.push_to_cache(&to_measure)?;
 
         let artifacts = self.host_artifacts(&resolved, &hosts, &outputs, &info, config_files)?;
         let packages = self.packages(&drvs, &outputs, &info)?;
@@ -608,6 +646,23 @@ impl Builder<'_> {
              --generate-binary-cache-key <fleet> <secret> <public>`, and put the public \
              half in `meisterstack.managed.trustedPublicKeys`.",
             managed.join(", ")
+        );
+    }
+
+    /// A cache of unsigned closures is a cache no host of this fleet can
+    /// fetch from, and finding that out after an hour of copying is finding
+    /// it out too late.
+    fn require_a_key_for_the_cache(&self) -> Result<()> {
+        if self.options.cache.is_none() || self.options.sign_key.is_some() {
+            return Ok(());
+        }
+        bail!(
+            "this build would push into {} and has no signing key. A managed host fetches \
+             from a substituter under the same rule it takes an ssh-ng:// push under — \
+             `require-sigs = true` — so an unsigned cache is a cache every host of this \
+             fleet would refuse. Pass `--sign-key <file>`, or `[operator] signing_key` in \
+             the inventory.",
+            self.options.cache.as_deref().unwrap_or_default()
         );
     }
 
@@ -848,6 +903,27 @@ impl Builder<'_> {
         Ok(info)
     }
 
+    /// Push the whole release into the cache the operator named.
+    ///
+    /// One `nix copy` over every path of the release, for the same reason
+    /// the build is one `nix build`: seventy closures that share a kernel,
+    /// a nixpkgs and one meisterstack are one graph to walk, and seventy
+    /// invocations would query the cache for the shared half seventy times.
+    ///
+    /// A build with no `--cache` runs no command here at all — not an empty
+    /// one, not a probe. That is what makes `cache_url: null` in a release a
+    /// statement rather than an absence.
+    fn push_to_cache(&self, paths: &[String]) -> Result<()> {
+        let Some(cache) = &self.options.cache else {
+            return Ok(());
+        };
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.runner.run(&cache_copy_cmd(cache, paths))?;
+        Ok(())
+    }
+
     /// Every managed host's system carries a signature.
     fn require_signatures(
         &self,
@@ -1029,8 +1105,7 @@ impl Builder<'_> {
                 Some(key) => Some(self.key_name(key)?),
                 None => None,
             },
-            // Filled by `--cache`, which is the next position of this lane.
-            cache_url: None,
+            cache_url: self.options.cache.clone(),
             // "relaxed" is nix's third value and it is not a sandbox.
             sandbox: sandbox.trimmed() == "true",
         })
@@ -1480,6 +1555,22 @@ mod tests {
     /// whether the store reports a signature afterwards. They are two
     /// arguments and not one because the interesting failure is a sign that
     /// ran and left nothing behind.
+    /// The paths a green `expect_build` ends up measuring, sorted and
+    /// deduplicated the way `realise` hands them to `path-info`, `store
+    /// sign` and the cache.
+    fn measured_paths(fleet: &ResolvedFleet) -> Vec<String> {
+        let _ = fleet;
+        let mut paths = vec![
+            TOPLEVEL.to_string(),
+            "/nix/store/pppppppppppppppppppppppppppppppp-meisterstack".to_string(),
+            "/nix/store/cccccccccccccccccccccccccccccccc-cloud-hypervisor".to_string(),
+            "/nix/store/gggggggggggggggggggggggggggggggg-guest-tiny".to_string(),
+        ];
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     /// What `nix build --json` answers for these derivation/output pairs.
     fn build_json(pairs: &[(String, String)]) -> String {
         let results: Vec<serde_json::Value> = pairs
@@ -1490,6 +1581,16 @@ mod tests {
     }
 
     fn expect_build(fleet: &ResolvedFleet, sign: bool, signed: bool) -> StrictFake {
+        expect_build_into(fleet, sign, signed, None)
+    }
+
+    /// The same, for a build that pushes its release into a cache.
+    fn expect_build_into(
+        fleet: &ResolvedFleet,
+        sign: bool,
+        signed: bool,
+        cache: Option<&str>,
+    ) -> StrictFake {
         let drvs: Vec<String> = derivations(fleet, &["box".to_string()])
             .into_iter()
             .map(|d| d.drv)
@@ -1548,11 +1649,19 @@ mod tests {
                 )
             })
             .collect();
-        fake.expect(
+        fake = fake.expect(
             Matcher::prefix("nix", ["path-info", "--json", "--closure-size"]),
             Output::stdout(serde_json::to_string(&info).unwrap()),
-        )
-        .expect(
+        );
+        // --- lane 4C: after the measurement, before `build_env` ---
+        if let Some(cache) = cache {
+            fake = fake.expect(
+                Matcher::prefix("nix", ["copy", "--to", cache]),
+                Output::stdout(""),
+            );
+        }
+        // --- end lane 4C ---
+        fake.expect(
             Matcher::exact("nix", ["--version"]),
             Output::stdout("nix (Nix) 2.35.2\n"),
         )
@@ -1774,6 +1883,115 @@ mod tests {
         assert!(err.contains("trustedPublicKeys"), "{err}");
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
     }
+
+    // --- lane 4C: the cache ---------------------------------------------
+
+    #[test]
+    fn a_cache_without_a_signing_key_is_refused_before_anything_is_built() {
+        let mut fleet = one_host();
+        // A context fleet, so that the MANAGED-host rule is not what
+        // refuses: what is under test is the cache's own rule.
+        fleet.hosts.get_mut("box").unwrap().deployment = Deployment::Context;
+        let runner = StrictFake::new();
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                cache: Some("file:///srv/cache".to_string()),
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let err = builder.realise(fleet).unwrap_err().to_string();
+        runner.verify().unwrap();
+        assert!(err.contains("file:///srv/cache"), "{err}");
+        assert!(err.contains("require-sigs"), "{err}");
+        assert!(err.contains("--sign-key"), "{err}");
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    #[test]
+    fn a_build_with_a_cache_pushes_once_after_signing_and_says_so_in_the_release() {
+        let fleet = one_host();
+        let fleet_paths = fleet.clone();
+        let runner = expect_build_into(&fleet, true, true, Some("file:///srv/cache"));
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                cache: Some("file:///srv/cache".to_string()),
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let built = builder.realise(fleet).expect("a green build with a cache");
+        runner.verify().unwrap();
+
+        let calls = runner.calls();
+        let copies: Vec<&String> = calls.iter().filter(|c| c.starts_with("nix copy")).collect();
+        assert_eq!(copies.len(), 1, "one push for the whole release: {calls:?}");
+        // And it names every path the release names — the systems AND the
+        // packages, because a host that fetches a system from a cache that
+        // lacks half its closure has fetched nothing.
+        for path in measured_paths(&fleet_paths) {
+            assert!(copies[0].contains(&path), "{path} is not in {}", copies[0]);
+        }
+        // After the signing, because a cache of unsigned paths is a cache
+        // every host refuses.
+        let signed_at = calls.iter().position(|c| c.contains("store sign")).unwrap();
+        let pushed_at = calls
+            .iter()
+            .position(|c| c.starts_with("nix copy"))
+            .unwrap();
+        assert!(signed_at < pushed_at, "{calls:?}");
+
+        assert_eq!(
+            built.release.build_env.cache_url.as_deref(),
+            Some("file:///srv/cache")
+        );
+        assert_eq!(
+            built.release.build_env.signing_key_name.as_deref(),
+            Some("fleet-1"),
+            "a target has to be told which key to trust"
+        );
+    }
+
+    #[test]
+    fn a_build_without_a_cache_runs_no_copy_at_all() {
+        let fleet = one_host();
+        // The strict fake has no `nix copy` expectation, so a probe, an
+        // empty push or a "does the cache exist" round trip would fail here.
+        let runner = expect_build(&fleet, true, true);
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let built = builder.realise(fleet).expect("a green build");
+        runner.verify().unwrap();
+        assert!(
+            !runner.calls().iter().any(|c| c.starts_with("nix copy")),
+            "{:?}",
+            runner.calls()
+        );
+        assert_eq!(built.release.build_env.cache_url, None);
+    }
+
+    // --- end lane 4C ----------------------------------------------------
 
     #[test]
     fn a_green_build_binds_what_the_manifest_promised() {

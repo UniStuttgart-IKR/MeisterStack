@@ -111,7 +111,8 @@
             "/var/lib/meister-data"
           ],
           "authorized_keys": []
-        }
+        },
+        "substituters": []
       },
       "n1": {
         "name": "meister-n1",
@@ -175,7 +176,10 @@
             "/var/lib/meister-data"
           ],
           "authorized_keys": []
-        }
+        },
+        "substituters": [
+          "http://box.lab:8080/cache"
+        ]
       },
       "n2": {
         "name": "meister-n2",
@@ -239,7 +243,8 @@
             "/var/lib/meister-data"
           ],
           "authorized_keys": []
-        }
+        },
+        "substituters": []
       }
     },
     "services": {

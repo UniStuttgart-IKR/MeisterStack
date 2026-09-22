@@ -446,6 +446,13 @@ struct BuildArgs {
     /// Repeatable, recorded in the release.
     #[arg(long, num_args = 2, value_names = ["NAME", "VALUE"])]
     option: Vec<String>,
+
+    /// Push the signed closures into this nix store once they are built:
+    /// `file:///srv/cache`, `s3://bucket`, `ssh-ng://host`. Recorded in the
+    /// release as `build_env.cache_url`. A host fetches from it only if its
+    /// own `meisterstack.managed.substituters` names it.
+    #[arg(long)]
+    cache: Option<String>,
     // --- end lane 4C ----------------------------------------------------
     /// The inventory the `[operator] signing_key` reference is read from.
     /// Defaults to the one the manifest was resolved from.
@@ -1313,7 +1320,12 @@ fn build(args: &BuildArgs) -> Result<bool> {
         }
         eprintln!(
             "note: nothing was built and no release was written. A real run realises these \
-             derivations, signs them and writes --out."
+             derivations in ONE `nix build`, signs them{} and writes --out.",
+            // --- lane 4C ---
+            match &args.cache {
+                Some(cache) => format!(", pushes them into {cache}"),
+                None => String::new(),
+            } // --- end lane 4C ---
         );
         return Ok(true);
     }
@@ -1346,6 +1358,7 @@ fn build(args: &BuildArgs) -> Result<bool> {
             // --- lane 4C ---
             max_jobs: args.max_jobs.clone(),
             options: nix_options(&args.option)?,
+            cache: args.cache.clone(),
             // --- end lane 4C ---
             hosts,
         },
@@ -1383,6 +1396,25 @@ fn build(args: &BuildArgs) -> Result<bool> {
                 .unwrap_or_default()
         );
     }
+    // --- lane 4C ---
+    if let Some(cache) = &built.release.build_env.cache_url {
+        eprintln!(
+            "    {} path(s) pushed into {cache}, signed by {}",
+            built.release.artifacts.len() + built.release.packages.len(),
+            built
+                .release
+                .build_env
+                .signing_key_name
+                .as_deref()
+                .unwrap_or("nobody")
+        );
+        eprintln!(
+            "note: a host fetches from that store only if its own \
+             `meisterstack.managed.substituters` names it — the release records where the \
+             closures went and instructs nobody."
+        );
+    }
+    // --- end lane 4C ---
     Ok(true)
 }
 

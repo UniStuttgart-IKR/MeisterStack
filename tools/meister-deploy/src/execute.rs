@@ -1236,8 +1236,38 @@ impl<'a> Executor<'a> {
             .clone()
             .unwrap_or_else(|| artifacts.toplevel.store_path.clone());
 
-        let copy = Cmd::new(Effect::TargetWrite, "nix", COPY_DEADLINE)
-            .arg("copy")
+        // --- lane 4C: the cache is a shortcut INSIDE the copy -------------
+        //
+        // `--substitute-on-destination` lets the far store fetch what it can
+        // reach itself and leaves this side to send only what it cannot. It
+        // is asked for when two things are true at once: the release says
+        // its closures were pushed into a cache, and this host's own
+        // configuration names substituters. Without the first there is
+        // nothing out there to fetch; without the second the target fetches
+        // from nowhere and the flag is a round trip for nothing.
+        //
+        // What does NOT change is the command: there is still one `nix
+        // copy`, it still ends with the whole closure on the target, and the
+        // `nix path-info --store ssh-ng://` below still compares what
+        // arrived against the release. A cache that is stale, empty or
+        // unreachable therefore costs time and never correctness — nix falls
+        // back to the bytes on this side. And a path the target pulled out
+        // of a cache carries the same signature requirement as a path this
+        // side pushed: `require-sigs = true` is a property of the target's
+        // store, not of the road.
+        let substitute = self.release.build_env.cache_url.is_some()
+            && self
+                .release
+                .resolved_fleet
+                .hosts
+                .get(id)
+                .map(|host| !host.substituters.is_empty())
+                .unwrap_or(false);
+        let mut copy = Cmd::new(Effect::TargetWrite, "nix", COPY_DEADLINE).arg("copy");
+        if substitute {
+            copy = copy.arg("--substitute-on-destination");
+        }
+        let copy = copy
             .arg("--to")
             .arg(target.store_url())
             .arg(&toplevel)
@@ -1246,6 +1276,7 @@ impl<'a> Executor<'a> {
             // way (2A), and then nothing is copied.
             .env("NIX_SSHOPTS", self.ssh.nix_sshopts(target.port)?);
         self.runner.run(&copy)?;
+        // --- end lane 4C ---
 
         // The same question `build` asks of the local store, asked of the
         // target's. This is V12 at the last possible moment: a path with the
@@ -1273,10 +1304,21 @@ impl<'a> Executor<'a> {
 
         let stage = self.helper_cmd(id, &["stage", &toplevel])?;
         self.runner.run(&stage)?;
-        Ok(vec![
+        let mut evidence = vec![
             format!("{toplevel} is on {id}"),
             format!("nar hash {seen} as the release says"),
-        ])
+        ];
+        // --- lane 4C ---
+        if substitute {
+            evidence.push(format!(
+                "{id} was allowed to fetch from its own substituters ({})",
+                self.release.resolved_fleet.hosts[id]
+                    .substituters
+                    .join(", ")
+            ));
+        }
+        // --- end lane 4C ---
+        Ok(evidence)
     }
 
     /// `meister node cordon|drain|uncordon`, on the WORKSTATION, through the

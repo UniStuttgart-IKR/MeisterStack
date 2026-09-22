@@ -55,7 +55,20 @@
     lib.optional (builtins.pathExists ../signing.pub)
       (lib.fileContents ../signing.pub);
 
-  # Binary caches these hosts may fetch from. Empty is a host that is only
-  # ever pushed to, which is the smaller attack surface.
-  meisterstack.managed.substituters = [ ];
+  # NO `meisterstack.managed.substituters` here, and that is deliberate.
+  #
+  # Which caches a host may fetch from belongs in `fleet.toml`, under
+  # `[defaults] managed.substituters` (or on a group, or on one host), for
+  # one reason: the other half of that answer is a flag,
+  # `meister-deploy build --cache <store>`, and "does this fleet use a
+  # cache" should be a question one file answers. The inventory sets the
+  # option with `mkDefault`, so a host module of yours that knows better —
+  # a machine behind a slow link, a machine that must never fetch — keeps
+  # its own answer.
+  #
+  # Empty (the default) is a host that is only ever pushed to: the whole
+  # closure comes over ssh and nothing somebody else put in a cache can
+  # surprise it. A named cache is held to the same rule: `require-sigs` is
+  # a property of this host's store, so a substituted path needs a
+  # signature by the key above just as a pushed one does.
 }

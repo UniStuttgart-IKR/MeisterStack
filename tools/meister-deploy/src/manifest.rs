@@ -505,6 +505,15 @@ pub struct InventoryHost {
     pub hardware: Hardware,
     /// Null for a host that is never installed by this tool.
     pub install: Option<Install>,
+    /// The binary caches this host is configured to FETCH from
+    /// (`meisterstack.managed.substituters`), in the order nix tries them.
+    ///
+    /// Here because a stage has to know it: `nix copy --to ssh-ng://` can
+    /// let the far store pull what it can reach itself, and whether that is
+    /// worth asking for is a fact about the target's configuration. Empty is
+    /// a host that fetches from nowhere and is only ever pushed to, which is
+    /// the smaller attack surface and the default.
+    pub substituters: Vec<String>,
 }
 
 /// A host as Nix evaluated it: what it will run, and what has to be true.
@@ -664,6 +673,8 @@ pub struct ResolvedHost {
     pub install: Option<Install>,
     pub checks: HostChecks,
     pub rollout: Rollout,
+    /// The binary caches this host fetches from, in nix's order.
+    pub substituters: Vec<String>,
 }
 
 /// `manifest.json`: one fleet, one tree, one id.
@@ -809,6 +820,7 @@ pub fn resolve(
                 install: host.install,
                 checks: built.checks,
                 rollout: built.rollout,
+                substituters: host.substituters,
             },
         );
     }
