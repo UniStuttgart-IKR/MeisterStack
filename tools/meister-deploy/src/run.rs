@@ -573,7 +573,7 @@ impl Runner for Real {
                  The last thing it said was: {}",
                 cmd.line(),
                 cmd.deadline,
-                tail(&cmd.redacted(&stderr))
+                last_lines(&cmd.redacted(&stderr))
             );
         }
         if cancelled {
@@ -635,14 +635,17 @@ fn finish(cmd: &Cmd, out: Output) -> Result<Output> {
         "{} exited {}. It said: {}",
         cmd.line(),
         out.status,
-        tail(&cmd.redacted(said))
+        last_lines(&cmd.redacted(said))
     );
 }
 
 /// The last few lines of what a tool said. `nix` can produce a screen of
 /// progress before the one line that matters, and the one line that matters
 /// is at the end.
-fn tail(text: &str) -> String {
+///
+/// Public because a failed check records what the thing it ran said, and it
+/// records it the same way an error does.
+pub fn last_lines(text: &str) -> String {
     let text = text.trim();
     if text.is_empty() {
         return "(nothing)".to_string();

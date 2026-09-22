@@ -18,6 +18,7 @@
 //! The pre-v1 tool is whole under [`legacy`] and reachable as
 //! `meister-deploy legacy <verb>`; it carries the context fleet until L3.
 
+pub mod build;
 pub mod canonical;
 pub mod checks;
 pub mod effects;

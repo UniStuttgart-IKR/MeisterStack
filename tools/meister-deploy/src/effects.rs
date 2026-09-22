@@ -99,6 +99,12 @@ pub trait Files {
     /// An empty list for a directory that is not there — a state directory
     /// nobody has written to yet holds no runs, and that is an answer.
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
+
+    /// Remove an EMPTY directory. Not a recursive delete: the only
+    /// directories this tool removes are ones it has just emptied itself
+    /// (a release's garbage-collector roots), and a recursive delete in a
+    /// deployment tool is a foot-gun waiting for a wrong path.
+    fn remove_dir(&self, path: &Path) -> Result<()>;
 }
 
 /// The directory a file lives in, as something that can be opened.
@@ -300,6 +306,15 @@ impl Files for RealFiles {
             .with_context(|| format!("making the removal of {} durable failed", path.display()))
     }
 
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        self.may_write(path)?;
+        match std::fs::remove_dir(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {} failed", path.display())),
+        }
+    }
+
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
@@ -495,6 +510,20 @@ impl Files for MemFiles {
         self.files.borrow_mut().remove(path);
         self.modes.borrow_mut().remove(path);
         self.links.borrow_mut().remove(path);
+        Ok(())
+    }
+
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        self.may_write("rmdir", path)?;
+        let left = self.list_dir(path)?;
+        if !left.is_empty() {
+            bail!(
+                "removing {} failed: it still holds {} entry/entries in this test.",
+                path.display(),
+                left.len()
+            );
+        }
+        self.dirs.borrow_mut().remove(path);
         Ok(())
     }
 

@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
+use meister_deploy::build;
 use meister_deploy::effects::{Clock, Files, RealClock, RealFiles};
 use meister_deploy::inventory::Inventory;
 use meister_deploy::legacy::fleet::Plan;
@@ -104,10 +105,30 @@ enum Verb {
         offline: bool,
     },
 
+    /// Realise the derivations the manifest names, sign them, measure them,
+    /// and write the release that binds them. Builds no image and asks no
+    /// host anything.
+    Build(BuildArgs),
+
     /// Work out which hosts may be taken forward, in which order, and what
     /// has to still be true when it happens. Reads a release and a snapshot
     /// of the fleet; asks no host anything of its own.
     Plan(PlanArgs),
+
+    /// Drop the garbage-collector roots of all but the newest N releases.
+    /// Removes no store path: whether a closure goes is `nix store gc`'s
+    /// decision.
+    Gc {
+        /// How many releases keep their roots
+        #[arg(long, default_value_t = 3)]
+        keep: usize,
+        /// The operator's repository, which is where the state directory is
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Say which roots would go, and remove nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     /// What a run did: its journal, folded, and its receipt once it has one.
     /// Reads the state directory and asks no host anything.
@@ -128,6 +149,48 @@ enum Verb {
     /// Kept whole, with the same flags, because twelve VMs are served by it
     /// today and `plan` means something else from v1 on.
     Legacy(LegacyCli),
+}
+
+#[derive(Args)]
+struct BuildArgs {
+    /// The manifest from `resolve`
+    #[arg(long)]
+    manifest: PathBuf,
+
+    /// Where to write the release
+    #[arg(short = 'o', long)]
+    out: Option<PathBuf>,
+
+    /// Only these hosts, comma-separated. A build of part of a fleet is for
+    /// looking at: a release covers every host of its manifest.
+    #[arg(long, value_delimiter = ',')]
+    host: Vec<String>,
+
+    /// The nix signing key to sign the release with. Without it, the
+    /// inventory's `[operator] signing_key` is used.
+    #[arg(long)]
+    sign_key: Option<PathBuf>,
+
+    /// Remote builders, in the order nix is to be offered them. Repeatable.
+    #[arg(long)]
+    builders: Vec<String>,
+
+    /// Substituters to build from. Repeatable.
+    #[arg(long)]
+    substituters: Vec<String>,
+
+    /// The inventory the `[operator] signing_key` reference is read from.
+    /// Defaults to the one the manifest was resolved from.
+    #[arg(long)]
+    inventory: Option<PathBuf>,
+
+    /// Print the derivations that would be built, and build nothing
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Refuse rather than reach outside this process
+    #[arg(long)]
+    offline: bool,
 }
 
 #[derive(Args)]
@@ -320,7 +383,13 @@ fn run() -> Result<Answer> {
             dry_run,
             offline,
         } => resolve(repo, out, fleet, *dev, hosts, *dry_run, *offline).map(Answer::from),
+        Verb::Build(args) => build(args).map(Answer::from),
         Verb::Plan(args) => make_plan(args),
+        Verb::Gc {
+            keep,
+            repo,
+            dry_run,
+        } => gc(*keep, repo, *dry_run).map(Answer::from),
         Verb::Report { run, repo, json } => report(run, repo, *json).map(Answer::from),
         Verb::Legacy(legacy) => run_legacy(legacy).map(Answer::from),
     }
@@ -442,6 +511,215 @@ fn resolve(
             tree.eval_dir.display()
         );
     }
+    Ok(true)
+}
+
+/// Realise what the manifest promised.
+fn build(args: &BuildArgs) -> Result<bool> {
+    if args.offline {
+        anyhow::bail!(
+            "build needs nix to realise the manifest's derivations, and --offline forbids \
+             it. There is nothing on disk this verb could answer from: the release IS the \
+             build."
+        );
+    }
+    let policy = if args.dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+
+    let text = files.read_to_string(&args.manifest)?;
+    let resolved = manifest::ResolvedFleet::from_json(&text, &args.manifest.display().to_string())?;
+    let hosts = if args.host.is_empty() {
+        None
+    } else {
+        Some(args.host.clone())
+    };
+
+    if args.dry_run {
+        // The list, and nothing else. It is the same list a real run walks,
+        // from the same function.
+        let selected = hosts
+            .clone()
+            .unwrap_or_else(|| resolved.evaluated_hosts.clone());
+        for drv in build::derivations(&resolved, &selected) {
+            println!("{}\t{}", drv.what, drv.drv);
+        }
+        eprintln!(
+            "note: nothing was built and no release was written. A real run realises these \
+             derivations, signs them and writes --out."
+        );
+        return Ok(true);
+    }
+
+    // The signing key: `--sign-key` first, then the inventory's reference.
+    // Which one it came from is said out loud, because a release signed
+    // with the wrong key is a release no host of the fleet takes.
+    let (sign_key, note) = match &args.sign_key {
+        Some(path) => (Some(path.clone()), None),
+        None => signing_key(&files, &resolved, args.inventory.as_deref()),
+    };
+    if let Some(note) = note {
+        eprintln!("note: {note}");
+    }
+
+    // From here on something can take hours, and a Ctrl-C has to reach the
+    // build rather than leave it running.
+    Cancel::on_sigint()?;
+    let runner = Real::new(policy).verbose(true);
+    let state = StateDir::in_repo(&repo_of(&resolved));
+    let builder = build::Builder {
+        runner: &runner,
+        files: &files,
+        clock: &RealClock,
+        options: build::BuildOptions {
+            sign_key,
+            builders: args.builders.clone(),
+            substituters: args.substituters.clone(),
+            hosts,
+        },
+        state: Some(state),
+    };
+    let built = builder.realise(resolved)?;
+
+    match &args.out {
+        Some(path) => {
+            files.write_atomic(path, &built.release.to_json()?, 0o644)?;
+            println!("{}", built.release.release_id);
+            eprintln!("==> {}", path.display());
+        }
+        // No file: the release itself is the answer, whole, on stdout —
+        // the same shape `plan` has.
+        None => print!("{}", String::from_utf8(built.release.to_json()?)?),
+    }
+    for (host, artifacts) in &built.release.artifacts {
+        eprintln!(
+            "    {host:<14} {} ({} signature(s), closure {} MiB)",
+            artifacts.toplevel.store_path,
+            artifacts.toplevel.signatures.len(),
+            artifacts.toplevel.closure_size / (1024 * 1024)
+        );
+    }
+    if !built.roots.is_empty() {
+        eprintln!(
+            "    {} garbage-collector root(s) under {}",
+            built.roots.len(),
+            built
+                .roots
+                .first()
+                .and_then(|p| p.parent())
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+    }
+    Ok(true)
+}
+
+/// Where the manifest was resolved from, as an absolute path.
+fn repo_of(resolved: &manifest::ResolvedFleet) -> PathBuf {
+    PathBuf::from(&resolved.source.repo_path)
+}
+
+/// The `[operator] signing_key` reference, from the inventory the manifest
+/// was resolved from.
+///
+/// Missing is not an error here: `build` itself refuses a managed host
+/// without a key, with the sentence that says what to do. This only looks.
+fn signing_key(
+    files: &dyn Files,
+    resolved: &manifest::ResolvedFleet,
+    override_path: Option<&Path>,
+) -> (Option<PathBuf>, Option<String>) {
+    let repo = repo_of(resolved);
+    let inventory_path = match override_path {
+        Some(path) => path.to_path_buf(),
+        None => repo.join(&resolved.source.inventory_path),
+    };
+    let Ok(text) = files.read_to_string(&inventory_path) else {
+        return (None, None);
+    };
+    let Ok(inventory) = Inventory::parse(&text, &inventory_path.display().to_string()) else {
+        return (None, None);
+    };
+    match inventory
+        .operator
+        .as_ref()
+        .and_then(|operator| operator.signing_key.clone())
+    {
+        Some(key) => {
+            // Relative to the inventory, which is relative to the
+            // repository: a key path that only worked from one directory
+            // would be a key path that works on one afternoon.
+            let path = if Path::new(&key).is_absolute() {
+                PathBuf::from(&key)
+            } else {
+                inventory_path
+                    .parent()
+                    .map(|dir| dir.join(&key))
+                    .unwrap_or_else(|| PathBuf::from(&key))
+            };
+            (
+                Some(path),
+                Some(format!(
+                    "signing this release with the key `[operator] signing_key` names in {}.",
+                    inventory_path.display()
+                )),
+            )
+        }
+        None => (None, None),
+    }
+}
+
+/// Drop the roots of all but the newest N releases.
+fn gc(keep: usize, repo: &Path, dry_run: bool) -> Result<bool> {
+    let policy = if dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+    let state = StateDir::in_repo(repo);
+    let all = build::roots(&files, &state)?;
+    if all.is_empty() {
+        eprintln!(
+            "note: {} protects no release; there is nothing to remove.",
+            state.gcroots_dir().display()
+        );
+        return Ok(true);
+    }
+    let (remove, kept) = build::gc_plan(&all, keep);
+    for dir in &remove {
+        println!(
+            "{}\t{} root(s){}",
+            dir.release_id,
+            dir.links.len(),
+            if dry_run { "  (would remove)" } else { "" }
+        );
+        if !dry_run {
+            build::remove_roots(&files, dir)?;
+        }
+    }
+    eprintln!(
+        "==> {} release(s) {}, {} kept{}",
+        remove.len(),
+        if dry_run {
+            "would lose their roots"
+        } else {
+            "unprotected"
+        },
+        kept.len(),
+        if all.iter().any(|r| r.created_at.is_none()) {
+            " (a directory with no .created stamp is never removed)"
+        } else {
+            ""
+        }
+    );
+    eprintln!(
+        "note: no store path was removed. Whether an unprotected closure goes is \
+         `nix store gc`'s decision, and this tool does not make it."
+    );
     Ok(true)
 }
 
