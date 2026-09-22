@@ -165,6 +165,11 @@ pkgs.testers.runNixOSTest {
       # python3: the http server that puts `/root/cache` on the wire, which
       # is what a real operator's cache is reached over (lane 4C).
       environment.systemPackages = [ pkgs.meisterstack pkgs.git pkgs.jq pkgs.python3 ];
+      # The cache's port, and it has to be said out loud: a NixOS host has a
+      # firewall on by default, sshd opens its own port and nothing opens
+      # this one. Without this line the target's `nix copy --from http://…`
+      # hangs on a port that is filtered rather than closed.
+      networking.firewall.allowedTCPPorts = [ 8080 ];
       nix.settings.experimental-features = [ "nix-command" ];
       virtualisation.writableStore = true;
       virtualisation.memorySize = 3072;
@@ -423,55 +428,6 @@ pkgs.testers.runNixOSTest {
     # --- V10: a fleet that already runs the release ---------------------
     release_a = deploy("a", "nix-manifest-a.json")
 
-    # --- lane 4C: what went into the cache, and who can take it out -----
-    #
-    # (1) The release says where its closures went, beside the name of the
-    #     key they were signed with. It is a statement about what happened
-    #     and instructs nobody: what a host may FETCH is decided by that
-    #     host's own configuration.
-    the_release = json.loads(operator.succeed(f"cat {release_a}"))
-    assert the_release["build_env"]["cache_url"] == CACHE, the_release["build_env"]
-    assert the_release["build_env"]["signing_key_name"] == "vm-update", the_release["build_env"]
-    top_a = the_release["artifacts"]["target"]["toplevel"]["store_path"]
-
-    # (2) The cache really holds that closure, and the SIGNATURE travelled
-    #     with it — which is the whole reason the push happens after the
-    #     signing and not before.
-    in_cache = json.loads(
-        operator.succeed(f"nix path-info --json --sigs --store '{CACHE}' {top_a}")
-    )
-    print("what the cache says about the toplevel: " + json.dumps(in_cache, indent=2))
-    sigs = list(in_cache.values())[0]["signatures"] if "info" not in in_cache \
-        else list(in_cache["info"].values())[0]["signatures"]
-    assert any(s.startswith("vm-update:") for s in sigs), sigs
-
-    # (3) And the TARGET can take it out of there by itself, over http,
-    #     with `require-sigs = true` on. This is the claim that matters: a
-    #     fleet's own cache is usable exactly because the closures in it
-    #     carry the signature the fleet already trusts.
-    target.succeed("rm -rf /root/from-cache && mkdir -p /root/from-cache")
-    target.succeed(
-        f"nix copy --no-check-sigs=false --from http://192.168.1.1:8080 "
-        f"--to /root/from-cache {top_a}"
-    )
-    target.succeed(f"test -e /root/from-cache/{top_a}/init")
-    print("the target fetched " + top_a + " out of the operator's cache, signature and all")
-
-    # And the other half, which is what makes that guarantee worth having:
-    # an UNSIGNED path out of the same cache is refused by the same store.
-    # `nix store sign` writes into the local store only, so the operator
-    # makes a path the release never signed and pushes it.
-    operator.succeed("echo not-signed > /root/unsigned.txt")
-    unsigned = operator.succeed(
-        "nix store add-path --name unsigned /root/unsigned.txt"
-    ).strip()
-    operator.succeed(f"nix copy --to '{CACHE}' {unsigned}")
-    refused = target.fail(
-        f"nix copy --from http://192.168.1.1:8080 {unsigned} 2>&1"
-    )
-    assert "signature" in refused, refused
-    print("and an unsigned path out of the same cache is refused: " + refused.strip().splitlines()[-1])
-    # --- end lane 4C ---
     plan_a = make_plan(release_a, "a")
     the_plan = json.loads(operator.succeed(f"cat {plan_a}"))
     assert the_plan["hosts"]["target"]["verdict"] == "unchanged", the_plan["hosts"]
@@ -488,6 +444,57 @@ pkgs.testers.runNixOSTest {
 
     # --- the change -----------------------------------------------------
     release_b = deploy("b", "nix-manifest-b.json")
+
+    # --- lane 4C: what went into the cache, and who can take it out -----
+    #
+    # Here and not after release A on purpose: A is the system this target
+    # is RUNNING, so it is already in its store and fetching it would prove
+    # nothing. B is a system this machine has never seen.
+    #
+    # (1) The release says where its closures went, beside the name of the
+    #     key they were signed with. It is a statement about what happened
+    #     and instructs nobody: what a host may FETCH is decided by that
+    #     host's own configuration.
+    the_release = json.loads(operator.succeed(f"cat {release_b}"))
+    assert the_release["build_env"]["cache_url"] == CACHE, the_release["build_env"]
+    assert the_release["build_env"]["signing_key_name"] == "vm-update", the_release["build_env"]
+    top_b = the_release["artifacts"]["target"]["toplevel"]["store_path"]
+    target.fail(f"test -e {top_b}/init")
+
+    # (2) The cache really holds that closure, and the SIGNATURE travelled
+    #     with it — which is the whole reason the push happens after the
+    #     signing and not before.
+    in_cache = json.loads(
+        operator.succeed(f"nix path-info --json --sigs --store '{CACHE}' {top_b}")
+    )
+    entries = in_cache["info"] if "info" in in_cache else in_cache
+    sigs = list(entries.values())[0]["signatures"]
+    print("what the cache says about the toplevel: " + json.dumps(sigs))
+    assert any(s.startswith("vm-update:") for s in sigs), sigs
+
+    # (3) And the TARGET takes it out of there by itself, over http, into
+    #     its own store — the one with `require-sigs = true`. No
+    #     `--no-check-sigs` anywhere on that line, and that is the point: a
+    #     fleet's own cache is usable exactly because the closures in it
+    #     carry the signature the fleet already trusts.
+    target.succeed(f"nix copy --from http://192.168.1.1:8080 {top_b}")
+    target.succeed(f"test -e {top_b}/init")
+    print("the target fetched " + top_b + " out of the operator's cache, signature and all")
+
+    # And the other half, which is what makes that guarantee worth having:
+    # an UNSIGNED path out of the same cache is refused by the same store.
+    # `nix store sign` writes into the local store only, so a path the
+    # release never signed and that was pushed anyway is exactly that case.
+    # `nix-store --add` and not `nix store add-path`, which is a deprecated
+    # alias in 2.35 and prints a warning this test would have to filter.
+    operator.succeed("echo not-signed > /root/unsigned.txt")
+    unsigned = operator.succeed("nix-store --add /root/unsigned.txt").strip()
+    operator.succeed(f"nix copy --to '{CACHE}' {unsigned}")
+    refused = target.fail(f"nix copy --from http://192.168.1.1:8080 {unsigned} 2>&1")
+    assert "signature" in refused, refused
+    print("and an unsigned path out of the same cache is refused: "
+          + refused.strip().splitlines()[-1])
+    # --- end lane 4C ---
     plan_b = make_plan(release_b, "b")
     the_plan = json.loads(operator.succeed(f"cat {plan_b}"))
     assert the_plan["hosts"]["target"]["verdict"] == "change", the_plan["hosts"]
