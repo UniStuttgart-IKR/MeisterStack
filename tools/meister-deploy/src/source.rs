@@ -129,6 +129,10 @@ pub fn describe(
                 flake_lock,
                 inventory_path,
                 inventory_sha256,
+                // This function describes a TREE. Whether the evaluation of
+                // it happened here is the caller's to say, and `resolve
+                // --from` is the one caller that fills this in.
+                provided_evaluation: None,
             },
             eval_dir: repo.to_path_buf(),
         });
@@ -166,6 +170,7 @@ pub fn describe(
             flake_lock,
             inventory_path,
             inventory_sha256,
+            provided_evaluation: None,
         },
         eval_dir,
     })

@@ -550,6 +550,26 @@ pub struct Source {
     pub flake_lock: BTreeMap<String, FlakeInput>,
     pub inventory_path: String,
     pub inventory_sha256: String,
+    /// Null when this tool evaluated the flake itself, which is the normal
+    /// case. Set when the evaluation was handed over (`resolve --from`).
+    ///
+    /// The distinction is worth a field rather than a note, because it is
+    /// the one thing a reader of a manifest cannot work out afterwards: the
+    /// SOURCE below is this repository either way — read with git, here —
+    /// but whether the systems named in the manifest are what that tree
+    /// evaluates to was checked by somebody else. The digest is of the file
+    /// that was handed over, so the claim is at least nameable.
+    pub provided_evaluation: Option<ProvidedEvaluation>,
+}
+
+/// An evaluation this tool did not perform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProvidedEvaluation {
+    /// What the file was called where it was read.
+    pub origin: String,
+    /// sha256 of its bytes.
+    pub sha256: String,
 }
 
 /// A host, whole: what the inventory said and what Nix evaluated, joined.
@@ -922,6 +942,7 @@ mod tests {
             )]),
             inventory_path: "fleet.toml".to_string(),
             inventory_sha256: "9f2c".to_string(),
+            provided_evaluation: None,
         }
     }
 

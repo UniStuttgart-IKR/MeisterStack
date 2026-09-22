@@ -109,6 +109,13 @@ enum Verb {
         /// The inventory, relative to the repository
         #[arg(short = 'f', long, default_value = "fleet.toml")]
         fleet: PathBuf,
+        /// Take the evaluation from this `nix-manifest/1` file instead of
+        /// running `nix eval` here. For a workstation that cannot evaluate
+        /// the flake — a build machine did it, or a test VM was handed the
+        /// answer. The SOURCE is still read from the repository below, so
+        /// the fingerprint is this tree's and not the file's.
+        #[arg(long)]
+        from: Option<PathBuf>,
         /// Resolve a dirty tree, recording a content snapshot instead of a
         /// revision. The whole working tree is copied into the nix store.
         #[arg(long)]
@@ -560,11 +567,22 @@ fn run() -> Result<Answer> {
             repo,
             out,
             fleet,
+            from,
             dev,
             hosts,
             dry_run,
             offline,
-        } => resolve(repo, out, fleet, *dev, hosts, *dry_run, *offline).map(Answer::from),
+        } => resolve(
+            repo,
+            out,
+            fleet,
+            from.as_deref(),
+            *dev,
+            hosts,
+            *dry_run,
+            *offline,
+        )
+        .map(Answer::from),
         Verb::Build(args) => build(args).map(Answer::from),
         Verb::Status(look) => status(look),
         Verb::Check { look, suite } => check(look, suite),
@@ -624,6 +642,7 @@ fn resolve(
     repo: &Path,
     out: &Path,
     fleet: &Path,
+    from: Option<&Path>,
     dev: bool,
     hosts: &[String],
     dry_run: bool,
@@ -644,6 +663,11 @@ fn resolve(
     if dry_run {
         for cmd in source::commands(&repo, dev) {
             println!("{}", cmd.described());
+        }
+        if let Some(path) = from {
+            println!("# would read the evaluation from {}", path.display());
+            println!("# would write {}", out.display());
+            return Ok(true);
         }
         // A dev run evaluates a snapshot directory named after its own
         // content, and that name cannot be known without reading the tree —
@@ -673,10 +697,45 @@ fn resolve(
     let runner = Real::new(policy);
     let files = RealFiles::new(policy);
 
-    let tree = source::describe(&runner, &files, &repo, fleet, dev)?;
-    let flake_ref = nix::flake_ref(&tree.eval_dir, dev);
-    let text = nix::eval_manifest(&runner, &flake_ref, selection)?;
-    let evaluated = NixManifest::from_json(&text, &format!("{flake_ref}#{}", nix::MANIFEST_ATTR))?;
+    let mut tree = source::describe(&runner, &files, &repo, fleet, dev)?;
+    // Where the evaluation comes from. Two roads, one result: the flake is
+    // evaluated here, or an evaluation of it was handed over. What is NOT
+    // handed over is the SOURCE — `tree` above is this repository, read
+    // with git, so a manifest still names the tree it came from and a dirty
+    // one is still refused. What the manifest then says about the
+    // difference is `source.provided_evaluation`, because it is the one
+    // thing a later reader could not work out.
+    let (evaluated, origin) = match from {
+        Some(path) => {
+            let text = files.read_to_string(path)?;
+            let origin = path.display().to_string();
+            // The same door `validate --manifest` opens, so that a file
+            // handed to this flag is read by the same parser and refused
+            // with the same sentence — including a file that is a manifest
+            // of the WRONG kind, which is the likely mistake.
+            let evaluated = match manifest::parse_contract(&text, &origin)? {
+                Contract::NixManifest(evaluated) => *evaluated,
+                other => anyhow::bail!(
+                    "{origin} is a {}. `resolve --from` reads an EVALUATION — what \
+                     `nix eval <repo>#meisterDeployment` prints, schema {} — and turns it \
+                     into a manifest; it does not take one that has already been resolved.",
+                    other.describe(),
+                    manifest::NIX_MANIFEST_SCHEMA
+                ),
+            };
+            tree.source.provided_evaluation = Some(manifest::ProvidedEvaluation {
+                origin: origin.clone(),
+                sha256: meister_deploy::ids::sha256_hex(text.as_bytes()),
+            });
+            (evaluated, origin)
+        }
+        None => {
+            let flake_ref = nix::flake_ref(&tree.eval_dir, dev);
+            let text = nix::eval_manifest(&runner, &flake_ref, selection)?;
+            let origin = format!("{flake_ref}#{}", nix::MANIFEST_ATTR);
+            (NixManifest::from_json(&text, &origin)?, origin)
+        }
+    };
     let resolved = manifest::resolve(evaluated, tree.source, tool(), RealClock.now(), selection)?;
 
     files.write_atomic(out, &resolved.to_json()?, 0o644)?;
@@ -684,6 +743,15 @@ fn resolve(
     // it went goes to stderr like every other diagnostic.
     println!("{}", resolved.manifest_id);
     eprintln!("==> {}", out.display());
+    if from.is_some() {
+        eprintln!(
+            "note: nothing was evaluated here. The systems in this manifest are the ones \
+             {origin} names, and whether they are what {} evaluates to is that file's \
+             producer to answer for. The source fingerprint is this repository's, and the \
+             manifest says so in `source.provided_evaluation`.",
+            repo.display()
+        );
+    }
     if resolved.partial {
         eprintln!(
             "note: this manifest covers {} of the fleet's hosts and says so \

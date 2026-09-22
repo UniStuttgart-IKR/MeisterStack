@@ -55,6 +55,7 @@ fn source() -> Source {
         flake_lock: BTreeMap::new(),
         inventory_path: "fleet.toml".to_string(),
         inventory_sha256: "0".repeat(64),
+        provided_evaluation: None,
     }
 }
 
