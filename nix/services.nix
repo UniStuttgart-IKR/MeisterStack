@@ -61,6 +61,72 @@ in
       '';
     };
 
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.meisterstack or (throw (
+        "meisterstack.package has no default here: this nixpkgs has no `meisterstack` "
+        + "attribute, so the overlay that declares it is not in it. Add "
+        + "`nixpkgs.overlays = [ meisterstack.overlays.default ];` (lib.mkFleet does "
+        + "that for you), or set meisterstack.package to your own build."));
+      defaultText = lib.literalExpression "pkgs.meisterstack";
+      description = ''
+        The package the units of this stack take their binaries from.
+
+        Read only where `meisterstack.binDir` is derived from it — which is
+        what nix/managed.nix does and what nix/appliance.nix does not: an
+        appliance gets its binaries pushed into /opt/meisterstack/bin and
+        this option is never forced there. That is also why the default may
+        be a package that the operator's nixpkgs does not have: a foreign
+        host importing `nixosModules.default` without the overlay is a
+        perfectly good host, as long as it says where its binaries are.
+      '';
+    };
+
+    runtime = lib.mkOption {
+      type = lib.types.package;
+      internal = true;
+      default =
+        if builtins.elem "agent" cfg.unitsFor
+        then
+          pkgs.symlinkJoin
+            {
+              name = "meisterstack-runtime-${cfg.package.version or "0"}";
+              paths = [ cfg.package cfg.agent.vmm.package ];
+            }
+        else cfg.package;
+      defaultText = lib.literalExpression "pkgs.meisterstack-runtime";
+      description = ''
+        The ONE directory `meisterstack.binDir` can point at, built out of
+        the packages this host needs.
+
+        `binDir` is a directory and not a list of binaries, and the agent's
+        unit names two programs in it — `meister-agent` and
+        `cloud-hypervisor` — so on a host with the agent role the two
+        packages have to be joined into one path. A host without that role
+        gets the workspace package alone rather than a hypervisor it never
+        starts.
+      '';
+    };
+
+    binariesInStore = lib.mkOption {
+      type = lib.types.bool;
+      internal = true;
+      readOnly = true;
+      default = lib.hasPrefix "${builtins.storeDir}/" cfg.binDir;
+      description = ''
+        Whether `binDir` is a store path, and therefore whether the
+        `ConditionPathExists` lines on BINARIES mean anything.
+
+        On an appliance they mean a great deal: /opt/meisterstack/bin is
+        filled by a push, and a unit that waits visibly is better than one
+        that restarts every two seconds. A store path is part of the system
+        that names it — it is there or the system does not exist — so the
+        same condition would only be a line that can never fail. The
+        conditions on KEY material stay either way: keys are pushed on both
+        roads.
+      '';
+    };
+
     binDir = lib.mkOption {
       type = lib.types.str;
       default = "/opt/meisterstack/bin";

@@ -170,10 +170,9 @@ let
     # starting is the honest state: `systemctl status` then says
     # ConditionPathExists=/opt/meisterstack/pki/ca.crt was not met, which is a
     # sentence an operator can act on — a restart loop is not.
-    unitConfig.ConditionPathExists = [
-      "${cfg.binDir}/meister-${name}-controller"
-      "${pki}/ca.crt"
-    ];
+    unitConfig.ConditionPathExists =
+      lib.optional (!cfg.binariesInStore) "${cfg.binDir}/meister-${name}-controller"
+      ++ [ "${pki}/ca.crt" ];
     serviceConfig = {
       # Where the config comes from is `meisterstack.configDir`: the boot
       # renderer's /run copy on an appliance (it appends per-VM values such as

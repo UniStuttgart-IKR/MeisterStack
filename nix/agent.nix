@@ -333,6 +333,26 @@ in
     '';
   };
 
+  options.meisterstack.agent.vmm.package = lib.mkOption {
+    type = lib.types.package;
+    default = pkgs.cloud-hypervisor-meister or (throw (
+      "meisterstack.agent.vmm.package has no default here: this nixpkgs has no "
+      + "`cloud-hypervisor-meister` attribute, so the overlay that declares it is not "
+      + "in it. Add `nixpkgs.overlays = [ meisterstack.overlays.default ];` "
+      + "(lib.mkFleet does that for you), or set the option to your own build."));
+    defaultText = lib.literalExpression "pkgs.cloud-hypervisor-meister";
+    description = ''
+      The hypervisor this node's agent starts guests with: cloud-hypervisor
+      with this repository's patch series (nix/packages/cloud-hypervisor.nix
+      says why it is not nixpkgs' own).
+
+      Read only where `meisterstack.binDir` is derived from a package — an
+      appliance has its hypervisor pushed into /opt/meisterstack/bin — and
+      joined with `meisterstack.package` into one directory there, because
+      the agent's unit names both programs in `binDir`.
+    '';
+  };
+
   options.meisterstack.agent.inputBackend = lib.mkOption {
     type = lib.types.nullOr lib.types.str;
     default = null;
@@ -649,11 +669,16 @@ in
           # template names controller_ca/cert/key, and a missing one of them is a
           # start-up error, so a node that push.sh has not reached yet waits
           # visibly instead of restarting every two seconds.
-          ConditionPathExists = [
-            "${cfg.binDir}/meister-agent"
-            "${cfg.binDir}/cloud-hypervisor"
-            "${cfg.pki.dir}/ca.crt"
-          ];
+          ConditionPathExists =
+            # The two binaries only where they are a push away
+            # (`meisterstack.binariesInStore`, nix/services.nix): out of a
+            # package they are part of this system, and a condition that
+            # cannot fail is a condition that says nothing.
+            lib.optionals (!cfg.binariesInStore) [
+              "${cfg.binDir}/meister-agent"
+              "${cfg.binDir}/cloud-hypervisor"
+            ]
+            ++ [ "${cfg.pki.dir}/ca.crt" ];
         } // lib.optionalAttrs (volumes.device != null && volumes.required) {
           # The other half of `volumes.required`: no `nofail` on the mount, and
           # the unit does not start without it.

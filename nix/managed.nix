@@ -150,6 +150,14 @@ in
       }
     ];
 
+    # The binaries are part of the system, out of the store, and that is the
+    # whole difference to an appliance: no push, no `.new` file left behind
+    # by an interrupted rsync, no question which tree they were built from.
+    # `meisterstack.runtime` (nix/services.nix) is the one directory the
+    # agent's unit can name both of its programs in; `mkDefault` because an
+    # operator who builds their own may say so.
+    meisterstack.binDir = lib.mkDefault "${ms.runtime}/bin";
+
     # The config files are complete and in /etc, so that is where the units
     # read them — and that is what makes the configuration a generation
     # rather than a thing that happens at boot.
