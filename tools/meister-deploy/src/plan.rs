@@ -948,6 +948,14 @@ struct HostDecision {
     /// Switched and never booted: nothing to stage, nothing to activate, and
     /// a reboot is the whole job.
     reboot_only: bool,
+    /// The system is what the release says and a file on it is not: nothing
+    /// to stage, nothing to activate, and putting the file there is the
+    /// whole job (lane 3B).
+    ///
+    /// A shape of its own rather than an ordinary `change`, because an
+    /// activation of the system a host already runs would take its lock,
+    /// drain its guests and move its profile for a certificate.
+    secrets_only: bool,
     /// Whether this host needs its guests got out of the way first.
     needs_maintenance: bool,
     class: String,
@@ -1500,6 +1508,7 @@ fn decide_host(
         current_system: None,
         reboot_required: false,
         reboot_only: false,
+        secrets_only: false,
         needs_maintenance: false,
         class: class_of(host),
         canary_rank: u8::from(host.rollout.canary_class.is_none()),
@@ -1619,6 +1628,54 @@ fn decide_host(
             d.current_system = obs.current_system.clone();
             d.reboot_required = true;
             return settle(d, HostVerdict::Unenrolled);
+        }
+    }
+
+    // --- lane 3B: what a bootstrap has to be able to deliver -------------
+    //
+    // Only in a bootstrap, and only for a file the host has NOT got. An
+    // upgrade acts on a host that already carries its identity (the check
+    // above refuses one that does not), and a certificate the operator
+    // keeps somewhere this tool was never told about is not a reason to
+    // refuse to roll a running fleet forward. A bootstrap is the other
+    // case: its whole job is to put the files there, and a bootstrap that
+    // cannot is a bootstrap that would leave the host half made.
+    if policy.kind == PlanKind::Bootstrap {
+        let expected = policy.expected_credentials.get(id);
+        for secret in &host.secret_refs {
+            if secret.source.kind == crate::manifest::SecretSourceKind::TargetGenerated {
+                continue;
+            }
+            let on_the_host = obs.credentials.get(&secret.id).cloned().flatten();
+            if on_the_host.is_some() {
+                continue;
+            }
+            if expected.is_some_and(|e| e.contains_key(&secret.id)) {
+                continue;
+            }
+            d.stop_all.push(match secret.source.kind {
+                crate::manifest::SecretSourceKind::MeisterCa => format!(
+                    "{id} has no {} and this workstation has nothing to deliver: nobody has \
+                     issued it. Run `keys csr --host {id} --kind {}` — the key is made on the \
+                     host and only the request travels — and then `keys issue --host {id} \
+                     --kind <node|cluster|cloud|serving> …`.",
+                    secret.target_path,
+                    if crate::observe::is_certificate(&secret.target_path)
+                        && secret.target_path.contains("serving")
+                    {
+                        "serving"
+                    } else {
+                        "identity"
+                    }
+                ),
+                crate::manifest::SecretSourceKind::OperatorFile => format!(
+                    "{id} has no {} and this workstation has no file to deliver for it: the \
+                     fleet says it comes from {} (an operator file, under `[operator] \
+                     ca_dir`), and there is nothing there.",
+                    secret.target_path, secret.source.reference
+                ),
+                crate::manifest::SecretSourceKind::TargetGenerated => unreachable!("skipped"),
+            });
         }
     }
 
@@ -1786,20 +1843,61 @@ fn decide_host(
         });
     }
 
+    // --- lane 3B: a file that is not what it should be ------------------
+    //
+    // A host whose SYSTEM is what the release says can still be missing a
+    // certificate, or be holding one that has been renewed here. That is
+    // not "unchanged" — something has to happen to it — and it is not an
+    // ordinary change either: staging and activating a system the host
+    // already runs would take its lock and move its profile for a file.
+    let deliveries = pending_deliveries(host, obs, policy.expected_credentials.get(id));
+    if unchanged && deliveries > 0 {
+        d.secrets_only = true;
+        d.preconditions.push(format!(
+            "{id} runs what the release says and {deliveries} of its file(s) are not what              this repository holds; nothing is staged and nothing is activated"
+        ));
+    }
+    let settled = unchanged && !d.secrets_only;
+
     let verdict = if !d.stop_all.is_empty() {
         HostVerdict::Blocked
-    } else if unchanged {
+    } else if settled {
         HostVerdict::Unchanged
     } else if !d.stop_disruptive.is_empty() {
         HostVerdict::Blocked
     } else {
         HostVerdict::Change
     };
-    if unchanged {
+    if settled {
         d.reboot_required = false;
         d.needs_maintenance = false;
     }
+    if d.secrets_only {
+        // Nothing boots and nothing stops: the steps are preflight, the
+        // lock, the files, a verify and the lock back.
+        d.reboot_required = false;
+    }
     settle(d, verdict)
+}
+
+/// How many of this host's secrets are not what the operator's disk says
+/// they should be (lane 3B). The same predicate the steps are built from,
+/// asked once before the verdict.
+fn pending_deliveries(
+    host: &crate::manifest::ResolvedHost,
+    obs: &crate::observation::HostObservation,
+    expected: Option<&crate::pki::ExpectedCredentials>,
+) -> usize {
+    host.secret_refs
+        .iter()
+        .filter(|secret| {
+            crate::pki::needs_delivery(
+                secret,
+                expected.and_then(|e| e.get(&secret.id)),
+                obs.credentials.get(&secret.id),
+            )
+        })
+        .count()
 }
 
 /// The verdict, and the sentences behind it. An unchanged host keeps its
@@ -2260,43 +2358,69 @@ fn steps_for(
                 ),
         );
 
-        if policy.kind == PlanKind::Bootstrap {
-            for secret in &host.secret_refs {
-                // A key that was made on the target never travels. Delivering
-                // one would mean this workstation had it, which is the whole
-                // thing `meister-activate keygen` exists to avoid.
-                if secret.source.kind == crate::manifest::SecretSourceKind::TargetGenerated {
-                    continue;
-                }
-                let restarts = secret
-                    .reload
-                    .as_ref()
-                    .map(|r| r.action == "restart")
-                    .unwrap_or(false);
-                specs.push(
-                    step(
-                        ActionKind::DeliverSecret,
-                        if restarts {
-                            Disruption::Service
-                        } else {
-                            Disruption::None
-                        },
-                    )
-                    .maybe_from(
-                        obs.and_then(|o| o.credentials.get(&secret.id).cloned())
-                            .flatten(),
-                    )
-                    .to(format!("{} at {}", secret.id, secret.target_path))
-                    .because(format!(
-                        "a bootstrap puts {} in place before the system that reads it is \
-                         activated",
-                        secret.id
-                    )),
-                );
+        // --- lane 3B: what has to be put there, and only that ----------
+        //
+        // One step per secret whose WANTED state and whose SEEN state
+        // differ, in either kind of plan. A bootstrap is not special here:
+        // what makes it a bootstrap is that everything differs, because
+        // nothing is there yet.
+        //
+        // The comparison is `crate::pki::needs_delivery`, and its asymmetry
+        // is the point. A public file — a certificate, a CA bundle, a CRL —
+        // is compared by CONTENT, because the probe may hash it and the
+        // operator's copy may be hashed here. A private file is compared
+        // only by EXISTENCE: the probe answers `mode:… owner:…` for one, and
+        // a digest of a private key would be a digest of a private key,
+        // travelling into a journal and a receipt. So a `secrets.key` that
+        // is there stays; replacing it does not rotate anything, it makes
+        // what the cloud encrypted with it unreadable. That is `keys rotate`
+        // (M5) and it is a plan of its own.
+        let expected_here = policy.expected_credentials.get(id);
+        for secret in &host.secret_refs {
+            let seen = obs.map(|o| o.credentials.get(&secret.id));
+            let want = expected_here.and_then(|e| e.get(&secret.id));
+            if !crate::pki::needs_delivery(secret, want, seen.flatten()) {
+                continue;
             }
+            // A restart is an interruption only of something that is
+            // running. In a bootstrap the units are off — they wait on a CA
+            // certificate that has not arrived — and calling that step
+            // disruptive would ask for an approval to interrupt nothing.
+            let restarts = secret
+                .reload
+                .as_ref()
+                .is_some_and(|r| r.action == "restart");
+            let unit_running = secret.reload.as_ref().is_some_and(|r| {
+                obs.is_some_and(|o| o.units.get(&r.unit).map(String::as_str) == Some("active"))
+            });
+            specs.push(
+                step(
+                    ActionKind::DeliverSecret,
+                    if restarts && unit_running {
+                        Disruption::Service
+                    } else {
+                        Disruption::None
+                    },
+                )
+                .maybe_from(
+                    obs.and_then(|o| o.credentials.get(&secret.id).cloned())
+                        .flatten(),
+                )
+                .to(format!("{} at {}", secret.id, secret.target_path))
+                .because(match seen.flatten() {
+                    Some(None) | None => format!(
+                        "{id} has no {} and the fleet says it needs one",
+                        secret.target_path
+                    ),
+                    Some(Some(_)) => format!(
+                        "what {id} has at {} is not what this repository holds for it",
+                        secret.target_path
+                    ),
+                }),
+            );
         }
 
-        if !decision.reboot_only {
+        if !decision.reboot_only && !decision.secrets_only {
             specs.push(
                 step(ActionKind::Stage, Disruption::None)
                     .maybe_from(decision.current_system.clone())
@@ -2340,7 +2464,11 @@ fn steps_for(
             );
         }
 
-        if decision.reboot_only {
+        if decision.secrets_only {
+            // Nothing else. The system is already the one the release
+            // builds; what was wrong was a file, and it has just been
+            // written.
+        } else if decision.reboot_only {
             specs.push(
                 step(ActionKind::Reboot, Disruption::Reboot)
                     .maybe_from(obs.and_then(|o| o.booted_system.clone()))
@@ -2385,7 +2513,7 @@ fn steps_for(
                           not tell",
                 ),
         );
-        if !decision.reboot_only {
+        if !decision.reboot_only && !decision.secrets_only {
             specs.push(
                 step(ActionKind::Confirm, Disruption::None)
                     .to("the activation is kept")
@@ -3005,7 +3133,10 @@ mod tests {
     // The planner, host by host
     // -----------------------------------------------------------------
 
-    use crate::fixtures::{observed, onebox_enrolled, plan_policy, release_of, with_new_systems};
+    use crate::fixtures::{
+        expected_credentials, observed, onebox_enrolled, plan_policy,
+        plan_policy_with_certificates, release_of, with_new_systems,
+    };
     use crate::observation::{Lock, Txn, TxnState};
 
     const NOW: &str = "2026-09-21T12:00:00Z";
@@ -3045,6 +3176,267 @@ mod tests {
             .into_iter()
             .find(|a| a.kind == kind)
             .unwrap_or_else(|| panic!("{host} has no {kind} in this plan"))
+    }
+
+    // --- lane 3B: deliver-secret out of wanted against seen -----------
+
+    /// A fleet nobody has bootstrapped: nothing is on any host, everything
+    /// has been issued here. Every deliverable secret is delivered, in tier
+    /// order, before the system that reads it is activated — and the key
+    /// the target made itself never travels.
+    #[test]
+    fn a_bootstrap_delivers_what_the_hosts_have_not_got_and_nothing_else() {
+        let base = onebox_enrolled();
+        let running = release_of(base.clone());
+        let mut observation = observed(&running, at(TAKEN));
+        for host in observation.hosts.values_mut() {
+            host.enrolled = false;
+            host.credentials.values_mut().for_each(|v| *v = None);
+            // Before a bootstrap the units wait on a CA certificate that
+            // has not arrived.
+            host.units
+                .values_mut()
+                .for_each(|v| *v = "inactive".to_string());
+        }
+        let release = with_new_systems(base, &["box", "n1", "n2"], false);
+        let policy = plan_policy_with_certificates(PlanKind::Bootstrap, &release.resolved_fleet);
+        let plan = plan(&release, "all", &observation, None, &policy, at(NOW)).unwrap();
+
+        for id in ["box", "n1", "n2"] {
+            let host = &release.resolved_fleet.hosts[id];
+            let delivered: Vec<&str> = plan
+                .actions_for(id)
+                .into_iter()
+                .filter(|a| a.kind == ActionKind::DeliverSecret)
+                .filter_map(|a| a.desired.as_deref())
+                .collect();
+            let travelling = host
+                .secret_refs
+                .iter()
+                .filter(|s| s.source.kind != crate::manifest::SecretSourceKind::TargetGenerated)
+                .count();
+            assert_eq!(delivered.len(), travelling, "{id}: {delivered:?}");
+            // The key the host made itself is not among them, whatever else
+            // is: delivering one would mean this workstation had it.
+            assert!(
+                !delivered.iter().any(|d| d.starts_with("identity ")),
+                "{id}: {delivered:?}"
+            );
+            let steps = kinds(&plan, id);
+            let last_deliver = steps
+                .iter()
+                .rposition(|k| *k == ActionKind::DeliverSecret)
+                .expect("a bootstrap delivers");
+            let activate = steps
+                .iter()
+                .position(|k| *k == ActionKind::Activate)
+                .expect("and activates afterwards");
+            assert!(last_deliver < activate, "{id}: {steps:?}");
+            // Writing a file is not interrupting anything, and the units
+            // are not running yet.
+            for action in plan
+                .actions_for(id)
+                .into_iter()
+                .filter(|a| a.kind == ActionKind::DeliverSecret)
+            {
+                assert_eq!(action.disruption, Disruption::None, "{id}: {action:?}");
+                assert_eq!(
+                    action.approval_class,
+                    ApprovalClass::None,
+                    "{id}: {action:?}"
+                );
+                assert!(action.blocked.is_none(), "{id}: {action:?}");
+            }
+        }
+        // Tier order: the thing that is talked TO comes first in a
+        // bootstrap.
+        assert!(plan.hosts["box"].wave < plan.hosts["n1"].wave);
+    }
+
+    /// The same fleet, already running: the wanted state and the seen state
+    /// agree, so nothing is delivered at all.
+    #[test]
+    fn a_fleet_that_already_has_its_certificates_is_handed_nothing() {
+        let base = onebox_enrolled();
+        let running = release_of(base.clone());
+        let observation = observed(&running, at(TAKEN));
+        let release = with_new_systems(base, &["n1"], false);
+        let policy = plan_policy_with_certificates(PlanKind::Upgrade, &release.resolved_fleet);
+        let plan = plan(&release, "all", &observation, None, &policy, at(NOW)).unwrap();
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| a.kind == ActionKind::DeliverSecret),
+            "{:?}",
+            plan.actions
+                .iter()
+                .filter(|a| a.kind == ActionKind::DeliverSecret)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// One CA certificate was renewed on the workstation. Exactly one step
+    /// per host, in an ordinary upgrade, and nothing else moves.
+    #[test]
+    fn a_changed_certificate_is_one_step_per_host_in_an_upgrade() {
+        let base = onebox_enrolled();
+        let running = release_of(base.clone());
+        let observation = observed(&running, at(TAKEN));
+        let release = with_new_systems(base, &["n1"], false);
+        let mut expected = expected_credentials(&release.resolved_fleet);
+        for secrets in expected.values_mut() {
+            if let Some(value) = secrets.get_mut("ca-bundle") {
+                *value = "sha256:a-new-certificate-authority".to_string();
+            }
+        }
+        let policy = plan_policy(PlanKind::Upgrade).with_expected_credentials(expected);
+        let plan = plan(&release, "all", &observation, None, &policy, at(NOW)).unwrap();
+
+        for id in ["box", "n1", "n2"] {
+            let delivered: Vec<&str> = plan
+                .actions_for(id)
+                .into_iter()
+                .filter(|a| a.kind == ActionKind::DeliverSecret)
+                .filter_map(|a| a.desired.as_deref())
+                .collect();
+            assert_eq!(delivered.len(), 1, "{id}: {delivered:?}");
+            assert!(delivered[0].starts_with("ca-bundle "), "{delivered:?}");
+        }
+        // Even a host whose system does not change is handed the new
+        // certificate — and it stops being `unchanged`, because something
+        // has to happen to it. What happens is exactly that: no stage, no
+        // activate, no confirm, nothing rebooted. Activating a system the
+        // host already runs would take its lock and move its profile for a
+        // file.
+        assert_eq!(plan.hosts["n2"].verdict, HostVerdict::Change);
+        assert_eq!(
+            kinds(&plan, "n2"),
+            [
+                ActionKind::Preflight,
+                ActionKind::Lock,
+                ActionKind::DeliverSecret,
+                ActionKind::Verify,
+                ActionKind::Unlock
+            ]
+        );
+        assert!(!plan.hosts["n2"].reboot_required);
+        // Writing a file interrupts nothing, so none of n2's own steps asks
+        // anybody for anything. (The plan as a whole needs `disruptive`,
+        // because n1's system really does change.)
+        for step in plan.actions_for("n2") {
+            assert_eq!(step.approval_class, ApprovalClass::None, "{step:?}");
+            assert_eq!(step.disruption, Disruption::None, "{step:?}");
+        }
+        let why = &plan.hosts["n2"].reasons;
+        assert!(why.is_empty(), "nothing is in the way: {why:?}");
+        let said: String = plan
+            .actions_for("n2")
+            .into_iter()
+            .flat_map(|a| a.preconditions.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            said.contains("nothing is staged and nothing is activated"),
+            "{said}"
+        );
+    }
+
+    /// A restart of a unit that IS running interrupts a service; the same
+    /// step in a bootstrap, where the unit waits on the file being
+    /// delivered, interrupts nothing.
+    #[test]
+    fn a_restart_is_an_interruption_only_of_something_that_runs() {
+        let base = onebox_enrolled();
+        let running = release_of(base.clone());
+        let mut observation = observed(&running, at(TAKEN));
+        observation
+            .hosts
+            .get_mut("n1")
+            .unwrap()
+            .credentials
+            .insert("ca-bundle".to_string(), None);
+        let release = with_new_systems(base, &["n1"], false);
+        let policy = plan_policy_with_certificates(PlanKind::Upgrade, &release.resolved_fleet);
+        let plan = plan(&release, "host=n1", &observation, None, &policy, at(NOW)).unwrap();
+        let deliver = action(&plan, "n1", ActionKind::DeliverSecret);
+        // The fixture's ca-bundle has no reload at all, so nothing is
+        // poked and nothing is interrupted.
+        assert_eq!(deliver.disruption, Disruption::None, "{deliver:?}");
+    }
+
+    /// A private file that is there stays there. A `secrets.key` is the key
+    /// the cloud encrypted with; replacing it does not rotate anything.
+    #[test]
+    fn a_secret_the_host_already_holds_is_never_replaced() {
+        let base = onebox_enrolled();
+        let running = release_of(base.clone());
+        let observation = observed(&running, at(TAKEN));
+        let release = with_new_systems(base, &["box"], false);
+        // The operator has a copy and it is a different file. It changes
+        // nothing: what is on the host is what was encrypted with.
+        let mut expected = expected_credentials(&release.resolved_fleet);
+        expected
+            .get_mut("box")
+            .unwrap()
+            .insert("serving".to_string(), crate::pki::PRESENT.to_string());
+        let policy = plan_policy(PlanKind::Upgrade).with_expected_credentials(expected);
+        let held = plan(&release, "host=box", &observation, None, &policy, at(NOW)).unwrap();
+        assert!(
+            !kinds(&held, "box").contains(&ActionKind::DeliverSecret),
+            "{:?}",
+            kinds(&held, "box")
+        );
+
+        // And when it is NOT there, it is delivered — that is the one case.
+        let mut fresh = observation.clone();
+        fresh
+            .hosts
+            .get_mut("box")
+            .unwrap()
+            .credentials
+            .insert("serving".to_string(), None);
+        let missing = plan(&release, "host=box", &fresh, None, &policy, at(NOW)).unwrap();
+        assert!(kinds(&missing, "box").contains(&ActionKind::DeliverSecret));
+    }
+
+    /// A bootstrap that cannot deliver is a bootstrap that would leave the
+    /// host half made, and it says which verb was never run.
+    #[test]
+    fn a_bootstrap_without_an_issued_certificate_is_blocked_and_names_the_verb() {
+        let base = onebox_enrolled();
+        let running = release_of(base.clone());
+        let mut observation = observed(&running, at(TAKEN));
+        for host in observation.hosts.values_mut() {
+            host.enrolled = false;
+            host.credentials.values_mut().for_each(|v| *v = None);
+        }
+        let release = with_new_systems(base, &["box"], false);
+        // Nothing issued at all.
+        let plan = plan(
+            &release,
+            "host=box",
+            &observation,
+            None,
+            &plan_policy(PlanKind::Bootstrap),
+            at(NOW),
+        )
+        .unwrap();
+        assert_eq!(plan.hosts["box"].verdict, HostVerdict::Blocked);
+        let why = plan.hosts["box"].reasons.join(" ");
+        assert!(why.contains("keys csr --host box"), "{why}");
+        assert!(why.contains("keys issue --host box"), "{why}");
+        assert!(
+            why.contains("ca_dir"),
+            "the operator file is named too: {why}"
+        );
+
+        // An UPGRADE of a running host is not blocked by the same absence:
+        // the fleet is up, and a certificate this tool was never shown is
+        // not a reason to refuse to roll it forward.
+        let observation = observed(&running, at(TAKEN));
+        let upgrade = planned(&release, "host=box", &observation);
+        assert_eq!(upgrade.hosts["box"].verdict, HostVerdict::Change);
     }
 
     // --- lane 3B: the new field of the contract -----------------------
@@ -3378,7 +3770,12 @@ mod tests {
         let base = onebox_enrolled();
         let running = release_of(base.clone());
         let mut observation = observed(&running, at(TAKEN));
-        observation.hosts.get_mut("n2").unwrap().enrolled = false;
+        let n2 = observation.hosts.get_mut("n2").unwrap();
+        n2.enrolled = false;
+        // And a host that has no identity has not been given the fleet's CA
+        // certificate either: that is the file it would check one against,
+        // and it is what this bootstrap has to deliver (lane 3B).
+        n2.credentials.insert("ca-bundle".to_string(), None);
         let release = with_new_systems(base, &["n2"], false);
 
         let upgraded = planned(&release, "host=n2", &observation);
@@ -3392,11 +3789,16 @@ mod tests {
             "host=n2",
             &observation,
             None,
-            &plan_policy(PlanKind::Bootstrap),
+            &plan_policy_with_certificates(PlanKind::Bootstrap, &release.resolved_fleet),
             at(NOW),
         )
         .unwrap();
-        assert_eq!(bootstrapped.hosts["n2"].verdict, HostVerdict::Change);
+        assert_eq!(
+            bootstrapped.hosts["n2"].verdict,
+            HostVerdict::Change,
+            "{:?}",
+            bootstrapped.hosts["n2"].reasons
+        );
         assert!(
             kinds(&bootstrapped, "n2").contains(&ActionKind::DeliverSecret),
             "{:?}",
@@ -3739,7 +4141,7 @@ mod tests {
             "all",
             &observation,
             None,
-            &plan_policy(PlanKind::Bootstrap),
+            &plan_policy_with_certificates(PlanKind::Bootstrap, &release.resolved_fleet),
             at(NOW),
         )
         .unwrap();

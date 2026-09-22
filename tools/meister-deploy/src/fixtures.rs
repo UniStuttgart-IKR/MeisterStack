@@ -301,10 +301,46 @@ fn etcd_view(fleet: &ResolvedFleet, id: &str) -> Option<EtcdView> {
     })
 }
 
+/// What the operator's own disk holds when every certificate of this fleet
+/// has been issued — and it matches, secret for secret, what
+/// [`observed`] puts on the hosts.
+///
+/// The public files by content (the same string the snapshot carries), the
+/// private ones by existence. A key the target made itself has no local
+/// half at all and is not in here, which is the whole point of it.
+pub fn expected_credentials(
+    fleet: &ResolvedFleet,
+) -> BTreeMap<String, crate::pki::ExpectedCredentials> {
+    let mut out = BTreeMap::new();
+    for (id, host) in &fleet.hosts {
+        let mut secrets = crate::pki::ExpectedCredentials::new();
+        for secret in &host.secret_refs {
+            if secret.source.kind == crate::manifest::SecretSourceKind::TargetGenerated {
+                continue;
+            }
+            let value = if crate::observe::is_certificate(&secret.target_path) {
+                format!("fingerprint-of-{}", secret.id)
+            } else {
+                crate::pki::PRESENT.to_string()
+            };
+            secrets.insert(secret.id.clone(), value);
+        }
+        if !secrets.is_empty() {
+            out.insert(id.clone(), secrets);
+        }
+    }
+    out
+}
+
 /// An operator who has the cli the drain needs.
 pub fn plan_policy(kind: PlanKind) -> PlanPolicy {
     PlanPolicy::new(kind).with_workload_control(Some(WorkloadControl {
         cli_config: "cli.toml".to_string(),
         cli_profile: Some("cloud-mtls".to_string()),
     }))
+}
+
+/// The same operator, with every certificate of `fleet` issued.
+pub fn plan_policy_with_certificates(kind: PlanKind, fleet: &ResolvedFleet) -> PlanPolicy {
+    plan_policy(kind).with_expected_credentials(expected_credentials(fleet))
 }

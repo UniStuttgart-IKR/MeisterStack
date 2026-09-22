@@ -1640,6 +1640,173 @@ mod tests {
         refuse_ca_in_repo(repo, Path::new("/home/silas/labpki")).unwrap();
     }
 
+    // --- position 5: wanted against seen ------------------------------
+
+    /// Where the local half of each kind of secret reference lives.
+    #[test]
+    fn each_source_says_where_its_local_half_is() {
+        use crate::manifest::{Delivery, SecretKind, SecretRef, SecretSource, SecretSourceKind};
+        let repo = Path::new("/home/silas/fleet");
+        let ca = Path::new("/home/silas/labpki");
+        let secret = |kind, source, reference: &str, target: &str| SecretRef {
+            id: "x".to_string(),
+            kind,
+            source: SecretSource {
+                kind: source,
+                reference: reference.to_string(),
+            },
+            target_path: target.to_string(),
+            owner: "meister".to_string(),
+            mode: "0644".to_string(),
+            delivery: Delivery::File,
+            reload: None,
+        };
+        // A key the target made itself has no local half, and must not.
+        assert_eq!(
+            local_source(
+                repo,
+                ca,
+                "n1",
+                &secret(
+                    SecretKind::IdentityKey,
+                    SecretSourceKind::TargetGenerated,
+                    "system:node:n1",
+                    "/var/lib/meisterstack/pki/identity.key"
+                )
+            ),
+            None
+        );
+        // The CA's own file: under `[operator] ca_dir`.
+        assert_eq!(
+            local_source(
+                repo,
+                ca,
+                "n1",
+                &secret(
+                    SecretKind::CaBundle,
+                    SecretSourceKind::OperatorFile,
+                    "../labpki/ca.crt",
+                    "/var/lib/meisterstack/pki/ca.crt"
+                )
+            ),
+            Some(PathBuf::from("/home/silas/labpki/ca.crt"))
+        );
+        // What `keys issue` wrote: named after the FILE it becomes on the
+        // host, so that a host with two controller tiers and two references
+        // to one `identity.crt` has one local file.
+        assert_eq!(
+            local_source(
+                repo,
+                ca,
+                "n1",
+                &secret(
+                    SecretKind::IdentityKey,
+                    SecretSourceKind::MeisterCa,
+                    "system:node:n1",
+                    "/var/lib/meisterstack/pki/identity.crt"
+                )
+            ),
+            Some(PathBuf::from(
+                "/home/silas/fleet/pki/issued/n1/identity.crt"
+            ))
+        );
+    }
+
+    /// A public file by content, a private one by existence — and never the
+    /// other way round.
+    #[test]
+    fn what_may_be_hashed_is_hashed_and_what_may_not_is_only_there() {
+        let fleet = crate::fixtures::onebox_enrolled();
+        let repo = Path::new("/home/silas/fleet");
+        let ca = Path::new("/home/silas/labpki");
+        let files = MemFiles::new()
+            .given(
+                "/home/silas/labpki/ca.crt",
+                "a certificate authority
+",
+            )
+            .given(
+                "/home/silas/fleet/pki/issued/box/serving.key",
+                "a key
+",
+            );
+        let expected = expected_for_host(&files, repo, ca, "box", &fleet.hosts["box"]);
+        assert_eq!(
+            expected["ca-bundle"],
+            format!(
+                "sha256:{}",
+                crate::ids::sha256_hex(b"a certificate authority\n")
+            )
+        );
+        // The fixture's `serving` reference is a KEY. It is there, and that
+        // is all this says about it: a digest of a private key would travel
+        // into a journal and a receipt.
+        assert_eq!(expected["serving"], PRESENT);
+        assert!(expected.values().all(|v| !v.contains("a key")));
+        // The identity key was made on the target and has no local half.
+        assert!(!expected.contains_key("identity"), "{expected:?}");
+
+        // n1 has the same fleet-wide CA file and nothing of its own: no
+        // certificate has been issued for it, so there is nothing else to
+        // compare and nothing else to deliver.
+        let bare = expected_for_host(&files, repo, ca, "n1", &fleet.hosts["n1"]);
+        assert_eq!(
+            bare.keys().collect::<Vec<_>>(),
+            vec!["ca-bundle"],
+            "{bare:?}"
+        );
+        // And when the CA file is not there either, the answer is empty
+        // rather than a guess.
+        let nothing = expected_for_host(&MemFiles::new(), repo, ca, "n1", &fleet.hosts["n1"]);
+        assert!(nothing.is_empty(), "{nothing:?}");
+    }
+
+    /// The whole rule, in one table.
+    #[test]
+    fn when_a_file_has_to_be_put_there_and_when_it_does_not() {
+        use crate::manifest::{Delivery, SecretKind, SecretRef, SecretSource, SecretSourceKind};
+        let make = |source, target: &str| SecretRef {
+            id: "x".to_string(),
+            kind: SecretKind::CaBundle,
+            source: SecretSource {
+                kind: source,
+                reference: "r".to_string(),
+            },
+            target_path: target.to_string(),
+            owner: "meister".to_string(),
+            mode: "0644".to_string(),
+            delivery: Delivery::File,
+            reload: None,
+        };
+        let public = make(SecretSourceKind::OperatorFile, "/pki/ca.crt");
+        let private = make(SecretSourceKind::OperatorFile, "/pki/secrets.key");
+        let theirs = make(SecretSourceKind::TargetGenerated, "/pki/identity.key");
+
+        let digest = "sha256:aaaa".to_string();
+        let other = Some("sha256:bbbb".to_string());
+        let present = PRESENT.to_string();
+        let mode = Some("mode:600 owner:meister:meister".to_string());
+
+        // Public: missing, different, same.
+        assert!(needs_delivery(&public, Some(&digest), Some(&None)));
+        assert!(needs_delivery(&public, Some(&digest), None));
+        assert!(needs_delivery(&public, Some(&digest), Some(&other)));
+        assert!(!needs_delivery(
+            &public,
+            Some(&digest),
+            Some(&Some(digest.clone()))
+        ));
+        // Private: only when it is not there. A `secrets.key` that IS there
+        // is the key the cloud encrypted with; replacing it does not rotate
+        // anything.
+        assert!(needs_delivery(&private, Some(&present), Some(&None)));
+        assert!(!needs_delivery(&private, Some(&present), Some(&mode)));
+        // A key the target made: never, whatever anybody thinks they have.
+        assert!(!needs_delivery(&theirs, Some(&digest), Some(&None)));
+        // Nothing local: nothing to deliver. The planner makes the sentence.
+        assert!(!needs_delivery(&public, None, Some(&None)));
+    }
+
     #[test]
     fn where_a_host_is_reached_comes_from_the_inventory() {
         let text = include_str!("../tests/fixtures/fleet-v2.toml");

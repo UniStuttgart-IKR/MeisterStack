@@ -1462,12 +1462,26 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
     if let Some(note) = note {
         eprintln!("note: {note}");
     }
+    // --- lane 3B: what this workstation has for the hosts ---------------
+    let (expected, note) = expected_credentials(
+        &files,
+        &release,
+        &args.select,
+        args.repo.as_deref(),
+        args.inventory.as_deref(),
+    );
+    if let Some(note) = note {
+        eprintln!("note: {note}");
+    }
+    // --- end lane 3B ----------------------------------------------------
     let plan = plan::plan(
         &release,
         &args.select,
         &observation,
         targets.as_ref(),
-        &plan::PlanPolicy::new(kind).with_workload_control(control),
+        &plan::PlanPolicy::new(kind)
+            .with_workload_control(control)
+            .with_expected_credentials(expected),
         RealClock.now(),
     )?;
 
@@ -1552,6 +1566,61 @@ fn workload_control(
             )),
         ),
     }
+}
+
+/// What this workstation holds for each selected host's secrets (lane 3B).
+///
+/// The certificates `keys issue` wrote under `<repo>/pki/issued/`, and the
+/// operator files under `[operator] ca_dir`. Hashed where they may be
+/// hashed and named `present` where they may not — the asymmetry is
+/// `crate::pki::expected_for_host`, and the read-only probe of 2A fills the
+/// other side of the comparison the same way round.
+///
+/// A file that is not there is simply absent from the answer, and so is a
+/// whole fleet whose inventory could not be read: the planner turns the
+/// absence into a blocked host with the verb to run in the sentence, which
+/// is more useful than refusing to make a plan.
+fn expected_credentials(
+    files: &dyn Files,
+    release: &ReleaseManifest,
+    select: &str,
+    repo: Option<&Path>,
+    inventory: Option<&Path>,
+) -> (
+    BTreeMap<String, meister_deploy::pki::ExpectedCredentials>,
+    Option<String>,
+) {
+    let fleet = &release.resolved_fleet;
+    let Ok(selected) = plan::select(fleet, select) else {
+        // An unusable selector is the planner's sentence to make, not this
+        // function's.
+        return (BTreeMap::new(), None);
+    };
+    let repo = repo
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(&fleet.source.repo_path));
+    let inventory_file = match inventory {
+        Some(path) => path.to_path_buf(),
+        None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
+    };
+    let named = match Inventory::load(files, &inventory_file) {
+        Ok(parsed) => parsed.operator.as_ref().and_then(|o| o.ca_dir.clone()),
+        Err(_) => None,
+    };
+    let Some(named) = named else {
+        return (
+            BTreeMap::new(),
+            Some(format!(
+                "{} names no `[operator] ca_dir`, so this plan does not know where the CA's                  files are. A host that is missing one is blocked with the verb that makes                  it.",
+                inventory_file.display()
+            )),
+        );
+    };
+    let ca = meister_deploy::pki::ca_dir(&repo, &fleet.source.inventory_path, &named);
+    (
+        meister_deploy::pki::expected_credentials(files, &repo, &ca, fleet, &selected),
+        None,
+    )
 }
 
 /// What a person reads on stderr while the plan itself goes to stdout.
