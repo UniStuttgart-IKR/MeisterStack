@@ -755,7 +755,19 @@ pkgs.testers.runNixOSTest {
     ))
 
     # And the operator's own cli reaches the control plane it just installed.
-    nodes = operator.succeed("cd /root/fleet && meister --config cli.toml -p cloud node ls --cluster cp")
+    #
+    # `wait_until_succeeds` and not `succeed`: the session is authenticated
+    # (the line above says so) and the node OBJECT is written afterwards, so
+    # asking two seconds later answered "no nodes known here" — a race, and
+    # it was measured before it was guessed.
+    operator.wait_until_succeeds(
+        "cd /root/fleet && meister --config cli.toml -p cloud node ls --cluster cp "
+        "| grep -q n1",
+        timeout=180,
+    )
+    nodes = operator.succeed(
+        "cd /root/fleet && meister --config cli.toml -p cloud node ls --cluster cp"
+    )
     print(nodes)
     assert "n1" in nodes, nodes
 
