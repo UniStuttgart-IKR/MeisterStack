@@ -247,6 +247,17 @@ let
       ../services.nix
       ../managed.nix
       { meisterstack.managed.enable = true; }
+      # It IS a qemu image — `system.build.images.qemu` — and a qcow2 whose
+      # initrd has no virtio driver is a qcow2 that boots a kernel, waits
+      # twenty-two seconds for a root filesystem no driver can see, and
+      # panics with "Attempted to kill init". Measured, in
+      # `checks.vm-two-instances-same-image`, on both copies at once.
+      #
+      # This is the one hardware statement this flake makes, and it makes it
+      # because the format already did: a host of a fleet gets its drivers
+      # from its own module (that is what a `hardware-configuration.nix`
+      # is), and this image has no host.
+      "${nixpkgs}/nixos/modules/profiles/qemu-guest.nix"
     ]
     # The fleet's DEFAULT profiles — `[defaults] profiles` — and not one
     # host's: this image is every host and none of them. Taking the first

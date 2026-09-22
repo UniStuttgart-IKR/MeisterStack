@@ -332,6 +332,12 @@
             inherit nixpkgs lib pkgs system self disko;
           };
 
+          # One image, two machines, two identities (M3A position 9: V08,
+          # L04). The thing a lab's `managed-disk-image` stands on.
+          vm-two-instances-same-image = import ./nix/tests/two-instances.nix {
+            inherit nixpkgs lib pkgs system self disko;
+          };
+
           # The boot renderer and the build-time renderer, on the same input.
           # Both fleets: one-box has a raft group of ONE (no etcd variables),
           # ha has three (1A §8, open point 6).
