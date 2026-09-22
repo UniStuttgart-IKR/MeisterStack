@@ -987,14 +987,26 @@ impl<'a> Executor<'a> {
 
         // And the unit that reads it, if it is running.
         if let Some(reload) = &secret.reload {
-            let active = self.runner.run(&self.ssh.ask(
-                &target,
-                &format!(
-                    "systemctl is-active {}",
-                    crate::run::shell_quote(&reload.unit)
-                ),
-                REMOTE_DEADLINE,
-            ))?;
+            // `Codes([0, 1, 3])` and not the `ask` default: `systemctl
+            // is-active` answers 3 for a unit that is inactive or failed,
+            // and 3 is the answer this question is asked for. 255 stays an
+            // error, which is how "ssh could not connect" is told apart
+            // from "the unit is not running". (Measured: the first run of
+            // this VM test ended the whole wave on an exit 3 that said
+            // `inactive`.)
+            let active = self.runner.run(
+                &self
+                    .ssh
+                    .ask(
+                        &target,
+                        &format!(
+                            "systemctl is-active {}",
+                            crate::run::shell_quote(&reload.unit)
+                        ),
+                        REMOTE_DEADLINE,
+                    )
+                    .expect(Expect::Codes(vec![0, 1, 3])),
+            )?;
             if active.trimmed() == "active" {
                 let cmd = self.ssh.exec(
                     &target,
