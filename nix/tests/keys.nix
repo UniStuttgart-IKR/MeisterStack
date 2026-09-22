@@ -74,14 +74,10 @@ let
     site = "vm"
     networks.management = { address = "192.168.1.1", prefix = 24, interface = "eth1" }
     ssh.host_key = "SHA256:PLACEHOLDER-THE-TEST-FILLS-THIS-IN"
-    # A deviation, and a FINDING rather than a preference (see the lane's
-    # report): `nix/lib/inventory.nix` renders `MEISTER_CLOUD_ADDRS` as a
-    # bare `address:port`, and the tier that dials builds a tonic endpoint
-    # out of it -- which refuses a url with no scheme ("invalid URL, scheme
-    # is missing", measured here). The lab's hand-written context carries
-    # `https://...`; the one derivation does not put it there. Until that is
-    # fixed in the derivation, this host says it itself.
-    deviations.settings.cluster = { cloud_addrs = ["https://192.168.1.1:50050"] }
+    # No deviation for `cloud_addrs`: the cluster's session with the cloud
+    # below is proof that the ONE derivation renders an address the dialing
+    # tier accepts (finding N1 of lane 3B -- a bare `address:port` was
+    # refused by tonic; the derivation now carries the scheme).
   '';
 
   inv = inventoryLib.load fleetToml;

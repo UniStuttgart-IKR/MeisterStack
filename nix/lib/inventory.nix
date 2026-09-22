@@ -373,12 +373,22 @@ let
       hosts = if errors == [ ] then hosts' else throw (builtins.head errors);
 
       # --- the derivations, which live here and nowhere else ---------------
+      # A session address carries its scheme. The tier that dials builds a
+      # tonic endpoint out of the string (shared/proto/src/lib.rs
+      # `session_endpoint`), and tonic refuses a url without one at connect
+      # time ("invalid URL, scheme is missing" -- measured in
+      # nix/tests/keys.nix, in a loop every 30 s, with a cluster that never
+      # reached its cloud). The lab's hand-written context has always said
+      # `https://`; this derivation has to say it too, and it is `https`
+      # because the session ports speak mTLS and nothing else.
+      sessionUrl = c: port: "https://${c.address}:${toString port}";
+
       controllerAddrsOf = h:
         let gid = if h.controllerGroup != null then h.controllerGroup else h.raftGroup; in
         if gid == null then [ ]
-        else map (c: "${c.address}:${toString ports.clusterSession}") (clusterHostsOf gid);
+        else map (c: sessionUrl c ports.clusterSession) (clusterHostsOf gid);
 
-      cloudAddrsOf = _: map (c: "${c.address}:${toString ports.cloudSession}") cloudHosts;
+      cloudAddrsOf = _: map (c: sessionUrl c ports.cloudSession) cloudHosts;
 
       # `id=ip,…` for a member of a raft group of more than one, and nothing
       # at all for a group of one: an empty peer set IS the loopback single
