@@ -201,6 +201,21 @@ in
     # like a collector that is merely idle.
     meisterstack.observability.enable = lib.mkDefault false;
 
+    # The two programs a deployment TYPES on this host, as opposed to the
+    # ones its units exec.
+    #
+    # `meisterstack.binDir` is what an ExecStart names, and an ExecStart is
+    # not a PATH. Both halves of M2 reach this host over ssh and type a bare
+    # word: `meister-activate status --json` is how the observation asks what
+    # is open here and `meister-activate activate` is how a rollout moves the
+    # profile (D5), and the read-only probe finds it with
+    # `command -v meister-activate` (tools/meister-deploy/src/observe.rs). The
+    # same probe counts this node's guests with `meister --endpoint
+    # unix://<socket> agent vm ls`, which is the drain check D7 stands on. So
+    # the package that carries both goes on the system path — the hypervisor
+    # does not, because nobody types that one.
+    environment.systemPackages = [ ms.package ];
+
     # What starts at boot. On an appliance the renderer starts the units it
     # was told to (`systemctl start` per MEISTER_ROLE); here the roles are
     # known at build time, so the units say so themselves — and a host that

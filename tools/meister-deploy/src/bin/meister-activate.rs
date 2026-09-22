@@ -1,0 +1,474 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+// SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+
+//! `meister-activate` — the half of a deployment that runs on the target.
+//!
+//! It is the second binary of the `meister-deploy` crate (D5) and it shares
+//! the crate's contract types, so what it prints with `--json` is exactly
+//! what the workstation parses: `meister-deploy schema activate-status`.
+//! It is in the closure of every managed host (nix/managed.nix), runs as
+//! root, and knows nothing about the fleet — no manifest, no network, no
+//! inventory. What it knows is this machine's system profile and the two
+//! directories under `/var/lib/meisterstack/deploy`.
+//!
+//! Why this is a program and not a line of shell in an `ssh` command: the
+//! rollback story of M2 stands on a transaction record that is on the disk
+//! BEFORE the profile moves and that survives the machine going away in the
+//! middle of a switch. See [`meister_deploy::activate`] for the order and
+//! the reasons.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+
+use meister_deploy::activate::{Helper, Mode, SYSTEM_PROFILE, TxnRecord, ok_reply};
+use meister_deploy::effects::{RealClock, RealFiles};
+use meister_deploy::observe::DEPLOY_DIR;
+use meister_deploy::run::{Cancel, Policy, Real};
+
+#[derive(Parser)]
+#[command(
+    name = "meister-activate",
+    about = "Move this host's system generation, and write down the way back",
+    long_about = "Runs on the target, as root. `meister-deploy apply` drives it over ssh; an \
+                  operator can drive it by hand, which is the point of it being a program. \
+                  Every command takes --json."
+)]
+struct Cli {
+    /// Where the transaction records and the lock live
+    #[arg(long, default_value = DEPLOY_DIR, global = true)]
+    deploy_dir: PathBuf,
+
+    /// The system profile to move
+    #[arg(long, default_value = SYSTEM_PROFILE, global = true)]
+    profile: PathBuf,
+
+    /// Print the answer as json instead of as a line
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Print every command before it runs
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
+    #[command(subcommand)]
+    cmd: Verb,
+}
+
+#[derive(Subcommand)]
+enum Verb {
+    /// What this host is: the three system facts, the generation, the booted
+    /// kernel, the open transactions and the lock. Changes nothing.
+    Status,
+
+    /// Is this system here, whole, and is it a system? Writes nothing.
+    Stage {
+        /// The store path of the system
+        toplevel: String,
+    },
+
+    /// Move this host to a system, with a way back.
+    Activate {
+        /// The transaction id — letters, digits, `-` and `_`
+        #[arg(long)]
+        txn: String,
+        /// The store path of the system to activate
+        #[arg(long)]
+        toplevel: String,
+        /// `switch` changes the running system now; `boot` leaves it alone
+        /// and makes the new one the next boot (systemd-boot only)
+        #[arg(long, default_value = "switch")]
+        mode: String,
+        /// How many seconds this host waits for a `confirm` before it takes
+        /// itself back. 0 arms no timer, for an operator who is watching.
+        #[arg(long, default_value_t = 300)]
+        confirm_within: u64,
+        /// The run this activation belongs to
+        #[arg(long)]
+        run: Option<String>,
+    },
+
+    /// Keep it: stop the revert timer and say so in the record.
+    Confirm {
+        #[arg(long)]
+        txn: String,
+    },
+
+    /// Take it back: the previous system, and the reason in the record.
+    Revert {
+        #[arg(long)]
+        txn: String,
+        /// Why — it goes into the record, which is what somebody reads
+        /// afterwards
+        #[arg(long)]
+        because: Option<String>,
+    },
+
+    /// The transaction records this host holds.
+    Txn {
+        #[command(subcommand)]
+        cmd: TxnVerb,
+    },
+
+    /// Who is deploying to this host.
+    Lock {
+        #[command(subcommand)]
+        cmd: LockVerb,
+    },
+
+    /// Delete the generations nothing needs any more and collect the store.
+    /// Keeps the running system, the booted one, and the newest N besides.
+    Gc {
+        #[arg(long, default_value_t = 3)]
+        keep: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum TxnVerb {
+    /// Every record, open or finished
+    List,
+    /// One record
+    Show {
+        #[arg(long)]
+        txn: String,
+    },
+    /// The run that owns a finished record says it is done with it. Until
+    /// then the record is what makes the next plan refuse to start over.
+    Retire {
+        #[arg(long)]
+        txn: String,
+        /// The run that owns it
+        #[arg(long)]
+        run: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LockVerb {
+    /// Take this host for a run, or say who has it
+    Acquire {
+        #[arg(long)]
+        run: String,
+        /// Who is deploying, as the workstation knows them
+        #[arg(long)]
+        operator: String,
+        /// The operator process that holds it, for a person who has to find
+        /// out whether it is still alive. 0 when nobody said.
+        #[arg(long, default_value_t = 0)]
+        pid: u32,
+    },
+    /// Give it back. Only the run that holds it may.
+    Release {
+        #[arg(long)]
+        run: String,
+    },
+    /// Take a named run's lock, deliberately
+    TakeOver {
+        /// The run whose lock is taken — it has to be the one that is there
+        #[arg(long)]
+        of_run: String,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        operator: String,
+        #[arg(long, default_value_t = 0)]
+        pid: u32,
+    },
+    /// What the lock file says
+    Show,
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // Diagnostics on stderr, always: stdout carries the answer, and
+            // `--json` has to stay machine-readable even when it is empty.
+            eprintln!("meister-activate: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    // A switch can take minutes, and a Ctrl-C has to reach the child rather
+    // than leave a half-finished `switch-to-configuration` behind.
+    Cancel::on_sigint()?;
+    let policy = Policy::real();
+    let runner = Real::new(policy).verbose(cli.verbose);
+    let files = RealFiles::new(policy);
+    // The binary that is running, so that a revert timer names a store path
+    // pinned by the generation that holds it rather than a symlink the
+    // activation is about to move.
+    let own_exe = std::env::current_exe()
+        .context("this program could not find its own path, and a revert timer has to name it")?;
+    let helper = Helper::new(&runner, &files, &RealClock, cli.deploy_dir.clone(), own_exe)
+        .with_profile(cli.profile.clone());
+
+    match &cli.cmd {
+        Verb::Status => {
+            let status = helper.status()?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print!("{}", status_lines(&status));
+            }
+        }
+        Verb::Stage { toplevel } => {
+            helper.stage(toplevel)?;
+            answer(
+                &cli,
+                "stage",
+                serde_json::json!({ "toplevel": toplevel }),
+                &format!("{toplevel} is here, whole, and is a NixOS system."),
+            )?;
+        }
+        Verb::Activate {
+            txn,
+            toplevel,
+            mode,
+            confirm_within,
+            run,
+        } => {
+            let record = helper.activate(
+                txn,
+                toplevel,
+                Mode::parse(mode)?,
+                *confirm_within,
+                run.as_deref(),
+            )?;
+            answer(
+                &cli,
+                "activate",
+                serde_json::to_value(&record)?,
+                &describe(&record),
+            )?;
+        }
+        Verb::Confirm { txn } => {
+            let record = helper.confirm(txn)?;
+            answer(
+                &cli,
+                "confirm",
+                serde_json::to_value(&record)?,
+                &describe(&record),
+            )?;
+        }
+        Verb::Revert { txn, because } => {
+            let record = helper.revert(txn, because.as_deref())?;
+            answer(
+                &cli,
+                "revert",
+                serde_json::to_value(&record)?,
+                &describe(&record),
+            )?;
+        }
+        Verb::Txn { cmd } => match cmd {
+            TxnVerb::List => {
+                let records = helper.records()?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&records)?);
+                } else {
+                    for record in &records {
+                        println!("{}", describe(record));
+                    }
+                }
+            }
+            TxnVerb::Show { txn } => {
+                let record = helper.record(txn)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&record)?);
+                } else {
+                    print!("{}", show_lines(&record));
+                }
+            }
+            TxnVerb::Retire { txn, run } => {
+                let record = helper.retire(txn, run.as_deref())?;
+                answer(
+                    &cli,
+                    "retire",
+                    serde_json::to_value(&record)?,
+                    &format!("the record of {} is retired.", record.id),
+                )?;
+            }
+        },
+        Verb::Lock { cmd } => match cmd {
+            LockVerb::Acquire { run, operator, pid } => {
+                let lock = helper.lock_acquire(run, operator, *pid)?;
+                answer(
+                    &cli,
+                    "lock",
+                    serde_json::to_value(&lock)?,
+                    &format!(
+                        "this host is held by the run {} ({}).",
+                        lock.run_id, lock.operator
+                    ),
+                )?;
+            }
+            LockVerb::Release { run } => {
+                let lock = helper.lock_release(run)?;
+                answer(
+                    &cli,
+                    "unlock",
+                    serde_json::to_value(&lock)?,
+                    &match &lock {
+                        Some(lock) => format!("the run {} has given this host back.", lock.run_id),
+                        None => "nobody held this host.".to_string(),
+                    },
+                )?;
+            }
+            LockVerb::TakeOver {
+                of_run,
+                run,
+                operator,
+                pid,
+            } => {
+                let lock = helper.lock_take_over(of_run, run, operator, *pid)?;
+                answer(
+                    &cli,
+                    "lock",
+                    serde_json::to_value(&lock)?,
+                    &format!("the run {run} has taken this host over from {of_run}."),
+                )?;
+            }
+            LockVerb::Show => {
+                let lock = helper.read_lock()?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&lock)?);
+                } else {
+                    match &lock {
+                        Some(lock) => println!(
+                            "run {} since {} (operator {}, pid {})",
+                            lock.run_id, lock.acquired_at, lock.operator, lock.pid
+                        ),
+                        None => println!("nobody holds this host"),
+                    }
+                }
+            }
+        },
+        Verb::Gc { keep } => {
+            let outcome = helper.gc(*keep)?;
+            answer(
+                &cli,
+                "gc",
+                serde_json::to_value(&outcome)?,
+                &format!(
+                    "{} generation(s) deleted, {} kept, {} finished record(s) removed. No \
+                     generation of any other profile was touched.",
+                    outcome.removed.len(),
+                    outcome.kept.len(),
+                    outcome.archives_removed
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// One answer, in whichever of the two shapes was asked for.
+fn answer(cli: &Cli, what: &str, value: serde_json::Value, line: &str) -> Result<()> {
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&ok_reply(what, value))?);
+    } else {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn describe(record: &TxnRecord) -> String {
+    format!(
+        "{} {} ({}) {} -> {}{}",
+        record.id,
+        record.state_word(),
+        record.mode,
+        record
+            .previous
+            .toplevel
+            .as_deref()
+            .unwrap_or("nothing")
+            .rsplit('/')
+            .next()
+            .unwrap_or("-"),
+        record.desired.rsplit('/').next().unwrap_or("-"),
+        match &record.reason {
+            Some(why) => format!(": {why}"),
+            None => String::new(),
+        }
+    )
+}
+
+fn show_lines(record: &TxnRecord) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("txn      {}\n", record.id));
+    out.push_str(&format!("state    {}\n", record.state_word()));
+    out.push_str(&format!("mode     {}\n", record.mode));
+    out.push_str(&format!(
+        "run      {}\n",
+        record.run_id.as_deref().unwrap_or("-")
+    ));
+    out.push_str(&format!(
+        "previous {} (generation {})\n",
+        record.previous.toplevel.as_deref().unwrap_or("-"),
+        record
+            .previous
+            .generation
+            .map(|g| g.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    out.push_str(&format!("desired  {}\n", record.desired));
+    out.push_str(&format!("started  {}\n", record.started_at));
+    out.push_str(&format!(
+        "deadline {}\n",
+        record
+            .deadline
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "none (nobody is waiting for a confirm)".to_string())
+    ));
+    if let Some(why) = &record.reason {
+        out.push_str(&format!("reason   {why}\n"));
+    }
+    out
+}
+
+fn status_lines(status: &meister_deploy::observe::ActivateStatus) -> String {
+    let mut out = String::new();
+    let or = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".to_string());
+    out.push_str(&format!("current    {}\n", or(&status.current_system)));
+    out.push_str(&format!("booted     {}\n", or(&status.booted_system)));
+    out.push_str(&format!("next boot  {}\n", or(&status.next_boot_system)));
+    out.push_str(&format!(
+        "generation {}\n",
+        status
+            .generation
+            .map(|g| g.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    out.push_str(&format!("kernel     {}\n", or(&status.kernel_running)));
+    match &status.kernel_booted {
+        Some(boot) => out.push_str(&format!(
+            "booted kernel {} (params {})\n",
+            boot.kernel_store_path, boot.kernel_params_sha256
+        )),
+        None => out.push_str("booted kernel -\n"),
+    }
+    for txn in &status.open_txns {
+        out.push_str(&format!(
+            "open txn   {} {:?} -> {}\n",
+            txn.id,
+            txn.state,
+            txn.target_system.as_deref().unwrap_or("-")
+        ));
+    }
+    match &status.lock {
+        Some(lock) => out.push_str(&format!(
+            "lock       run {} (operator {}, pid {})\n",
+            lock.run_id, lock.operator, lock.pid
+        )),
+        None => out.push_str("lock       nobody\n"),
+    }
+    out
+}

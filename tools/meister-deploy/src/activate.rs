@@ -1,0 +1,2150 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+// SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+
+//! What runs ON the target, and why it has to be a program of its own.
+//!
+//! `meister-activate` is the second binary of this crate (D5). It knows no
+//! network, no manifest and no fleet: it moves the system profile of the
+//! machine it is on, and it writes down what it did before it does it. The
+//! whole rollback story of M2 stands on that record, because the operator's
+//! journal can only say what happened up to the line it managed to write —
+//! and the interesting failures are the ones where the machine goes away in
+//! the middle of the sentence. The target can answer the rest, and this is
+//! the program that answers.
+//!
+//! Three properties are the reason this is not a shell script that `ssh`
+//! pipes in:
+//!
+//! * **The record is written first, durably.** `txn/<id>.json` lands with a
+//!   temporary plus rename plus fsync BEFORE the profile moves, so a machine
+//!   that dies during `switch-to-configuration` still has a record that says
+//!   which generation it came from. A resume asks for that record
+//!   ([`crate::receipt::next_step`]) and never repeats an activation blind.
+//! * **The way back is armed before the way forward.** The revert timer is a
+//!   transient systemd unit, and it is created BEFORE `nix-env --set`. That
+//!   is a deliberate departure from the order the lane brief wrote down (it
+//!   says "afterwards"): `switch-to-configuration switch` restarts sshd, so
+//!   the connection this program runs over can die in the middle of it — and
+//!   a revert timer that is armed after the switch is a revert timer that a
+//!   cut connection means the machine never gets. V16 ("SSH cut during the
+//!   activation, and the target takes itself back") is only true this way
+//!   round. The cost is that a failure between arming and switching has to
+//!   disarm it again, which [`Helper::activate`] does.
+//! * **Nothing decides by itself what is open.** A record is retired by the
+//!   run that owns it (`txn retire`), not by reaching a state. So a run that
+//!   was interrupted leaves its record behind, which is exactly what makes
+//!   the next plan refuse to start over ([`crate::plan`] blocks on any open
+//!   transaction) and a resume able to find out what happened.
+//!
+//! Everything goes through [`Runner`], [`Files`] and [`Clock`], on the
+//! target as much as on the workstation: the command lines are then
+//! readable in a unit test, which is the only place the ones that reboot a
+//! machine can be read at all.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, TimeDelta, Utc};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::effects::{Clock, Entry, Files};
+use crate::ids::sha256_hex;
+use crate::observation::{BootedKernel, Lock, Txn, TxnState};
+use crate::observe::{ACTIVATE_STATUS_SCHEMA, ActivateStatus};
+use crate::run::{Cmd, Effect, Expect, Runner};
+
+/// The transaction record's own schema. Read by this program and by nobody
+/// else — the fleet sees it through `status --json`
+/// ([`crate::observe::ActivateStatus`]) — but versioned all the same,
+/// because it is a file that has to be readable by the NEXT version of this
+/// program after a reboot.
+pub const TXN_SCHEMA: &str = "meister-deploy/activate-txn/1";
+
+/// The profile every NixOS system boots from.
+pub const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
+
+/// What `/run` says about the system that is running and the one that booted.
+pub const CURRENT_SYSTEM: &str = "/run/current-system";
+pub const BOOTED_SYSTEM: &str = "/run/booted-system";
+
+/// How long the small local commands may take. A `systemctl is-active` that
+/// takes a minute is a machine in trouble, and hanging here would hang the
+/// rollout that is waiting for the answer.
+const QUICK: Duration = Duration::from_secs(30);
+
+/// How long `switch-to-configuration` may take. It stops and starts every
+/// unit of the system; on a host with guests on it that is not quick, and a
+/// deadline that cut it off half way would be worse than waiting.
+const SWITCH: Duration = Duration::from_secs(900);
+
+/// How long the garbage collector may take. It walks the whole store.
+const COLLECT: Duration = Duration::from_secs(3600);
+
+/// Which way an activation goes, and therefore which way it comes back.
+///
+/// Not [`crate::plan::RollbackMode`], which has a third value: `none` is a
+/// statement about a step that changes nothing, and "activate in mode none"
+/// is not a thing this program can be asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// The running system changes now, and `switch-to-configuration switch`
+    /// takes it back when nobody confirms.
+    Switch,
+    /// The running system is left alone and the next boot is the new one.
+    /// The way back is the boot entry, which is why it needs systemd-boot.
+    Boot,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Switch => "switch",
+            Mode::Boot => "boot",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Mode> {
+        match text {
+            "switch" => Ok(Mode::Switch),
+            "boot" => Ok(Mode::Boot),
+            other => bail!(
+                "{other:?} is not an activation mode. `switch` changes the running system \
+                 now; `boot` leaves it alone and makes the new one the next boot."
+            ),
+        }
+    }
+
+    /// The argument `switch-to-configuration` takes for this mode.
+    fn switch_argument(self) -> &'static str {
+        match self {
+            Mode::Switch => "switch",
+            Mode::Boot => "boot",
+        }
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+/// Where a machine was before an activation, in the only two terms a way
+/// back can be expressed in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SystemPoint {
+    /// The store path of the system. Null only on a machine whose profile
+    /// could not be read, and then an activation is refused rather than
+    /// recorded with a hole in it.
+    pub toplevel: Option<String>,
+    pub generation: Option<u64>,
+}
+
+/// One transaction, on disk, on the target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TxnRecord {
+    pub schema: String,
+    pub id: String,
+    /// The run that opened it, so that a second operator can see whose it
+    /// is. Optional because a hand-driven activation has no run.
+    pub run_id: Option<String>,
+    pub previous: SystemPoint,
+    pub desired: String,
+    pub mode: Mode,
+    pub started_at: DateTime<Utc>,
+    /// When the revert timer fires. Null when there is none — a
+    /// `--confirm-within 0` activation, which is the one an operator drives
+    /// by hand.
+    pub deadline: Option<DateTime<Utc>>,
+    pub state: TxnState,
+    /// Why it is in that state, for the two states that have a reason:
+    /// `reverted` and `inconsistent`.
+    pub reason: Option<String>,
+    /// When the state last moved. The record is the evidence, and evidence
+    /// without a time on it is half of one.
+    pub changed_at: DateTime<Utc>,
+}
+
+impl TxnRecord {
+    pub fn to_json(&self) -> Result<Vec<u8>> {
+        let mut bytes = serde_json::to_vec_pretty(self)
+            .map_err(|e| anyhow::anyhow!("writing the transaction record failed: {e}"))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    pub fn from_json(text: &str, origin: &str) -> Result<TxnRecord> {
+        crate::manifest::parse_checked(text, origin, TXN_SCHEMA)
+    }
+
+    /// Whether this transaction is still in flight: something was done and
+    /// nobody has said how it ended.
+    pub fn is_open(&self) -> bool {
+        matches!(
+            self.state,
+            TxnState::Staged | TxnState::Pending | TxnState::Inconsistent
+        )
+    }
+
+    /// The state in the spelling a sentence and a table use.
+    pub fn state_word(&self) -> &'static str {
+        self.state.as_str_lower()
+    }
+
+    /// The transaction as the fleet sees it, through `status --json`.
+    pub fn view(&self) -> Txn {
+        Txn {
+            id: self.id.clone(),
+            state: self.state,
+            target_system: Some(self.desired.clone()),
+            deadline: self.deadline,
+            run_id: self.run_id.clone(),
+        }
+    }
+}
+
+/// A transaction id has to be a file name and nothing more.
+///
+/// `--txn ../../../etc/shadow` would otherwise be a path this program
+/// writes to as root. The allowed set is what a uuid, a run id and a
+/// hand-typed name need and no more.
+fn check_id(id: &str) -> Result<()> {
+    let ok = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        bail!(
+            "{id:?} is not a transaction id this program will write: a transaction is a file \
+             in its own directory, so the id may hold letters, digits, `-` and `_` only, and \
+             at most 128 of them."
+        );
+    }
+    Ok(())
+}
+
+/// The state of the machine, and the tools to change it.
+pub struct Helper<'a> {
+    pub runner: &'a dyn Runner,
+    pub files: &'a dyn Files,
+    pub clock: &'a dyn Clock,
+    /// `/var/lib/meisterstack/deploy` on a real host; a temporary directory
+    /// in a test. The records and the lock live under it.
+    pub deploy_dir: PathBuf,
+    /// The system profile. An argument so that a test can move one that is
+    /// not this machine's.
+    pub profile: PathBuf,
+    /// This program, as the revert timer will have to name it. Its own path
+    /// rather than `/run/current-system/sw/bin/meister-activate`: the timer
+    /// has to survive an activation that changes what that name points at,
+    /// and a store path is pinned by the generation that holds it.
+    pub own_exe: PathBuf,
+}
+
+impl<'a> Helper<'a> {
+    pub fn new(
+        runner: &'a dyn Runner,
+        files: &'a dyn Files,
+        clock: &'a dyn Clock,
+        deploy_dir: impl Into<PathBuf>,
+        own_exe: impl Into<PathBuf>,
+    ) -> Helper<'a> {
+        Helper {
+            runner,
+            files,
+            clock,
+            deploy_dir: deploy_dir.into(),
+            profile: PathBuf::from(SYSTEM_PROFILE),
+            own_exe: own_exe.into(),
+        }
+    }
+
+    pub fn with_profile(mut self, profile: impl Into<PathBuf>) -> Helper<'a> {
+        self.profile = profile.into();
+        self
+    }
+
+    pub fn txn_dir(&self) -> PathBuf {
+        self.deploy_dir.join("txn")
+    }
+
+    pub fn txn_path(&self, id: &str) -> PathBuf {
+        self.txn_dir().join(format!("{id}.json"))
+    }
+
+    /// Where a retired record goes. Not `<id>.json`, because the read-only
+    /// probe of a host globs exactly that name to find what is open
+    /// ([`crate::observe::ProbeSpec::script`]) — an archive that answered
+    /// that glob would block every plan after a successful run.
+    pub fn txn_archive(&self, id: &str) -> PathBuf {
+        self.txn_dir().join(format!("{id}.json.done"))
+    }
+
+    pub fn lock_dir(&self) -> PathBuf {
+        self.deploy_dir.join("lock")
+    }
+
+    pub fn lock_path(&self) -> PathBuf {
+        self.lock_dir().join("owner.json")
+    }
+
+    // -----------------------------------------------------------------
+    // status
+    // -----------------------------------------------------------------
+
+    /// What this machine is, in the contract lane 2A's probe merges.
+    ///
+    /// Every field is what could be read and null where it could not: a
+    /// helper that guessed a system path would be a helper that made a
+    /// rollout act on a guess.
+    pub fn status(&self) -> Result<ActivateStatus> {
+        Ok(ActivateStatus {
+            schema: ACTIVATE_STATUS_SCHEMA.to_string(),
+            current_system: self.resolve(Path::new(CURRENT_SYSTEM)),
+            booted_system: self.resolve(Path::new(BOOTED_SYSTEM)),
+            // The system profile IS the next boot: `switch-to-configuration
+            // boot` installs the entry for the generation the profile points
+            // at, and a `--mode boot` activation sets the one-shot entry to
+            // that same generation. What happens the boot AFTER an
+            // unconfirmed one is the previous generation, and that is the
+            // transaction's business rather than this field's.
+            next_boot_system: self.resolve(&self.profile),
+            generation: self.generation(),
+            kernel_running: self.kernel_running(),
+            kernel_booted: self.kernel_booted(),
+            open_txns: self.open_txns()?,
+            lock: self.read_lock()?,
+        })
+    }
+
+    /// Follow a chain of symbolic links to the thing at the end of it.
+    ///
+    /// `/run/current-system` is one link to a store path; the system profile
+    /// is a link to `system-42-link`, which is a link to a store path. Both
+    /// have to come out as the store path a release names. `None` for
+    /// anything that cannot be read, which on a host that has never been
+    /// deployed to is the normal answer.
+    fn resolve(&self, path: &Path) -> Option<String> {
+        let mut at = path.to_path_buf();
+        let mut followed = 0;
+        while followed < 8 {
+            match self.files.entry(&at) {
+                Ok(Entry::Symlink { target }) => {
+                    at = if target.is_absolute() {
+                        target
+                    } else {
+                        at.parent().unwrap_or(Path::new("/")).join(target)
+                    };
+                    followed += 1;
+                }
+                // A store path is a directory, which is where the chain ends.
+                Ok(_) => return Some(at.display().to_string()),
+                // A link that points at something that is not there: what the
+                // link SAYS is still the answer — a system whose closure has
+                // been collected is a fact worth reporting, and whether the
+                // path is valid is `stage`'s question, asked with the tool
+                // that can answer it. Only a path that was not even a link is
+                // nothing.
+                Err(_) if followed > 0 => return Some(at.display().to_string()),
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// `system-42-link` -> 42. From the unresolved link, because the
+    /// resolved one is a store path and carries no generation number.
+    fn generation(&self) -> Option<u64> {
+        let Ok(Entry::Symlink { target }) = self.files.entry(&self.profile) else {
+            return None;
+        };
+        generation_of(&target)
+    }
+
+    fn kernel_running(&self) -> Option<String> {
+        let cmd = Cmd::new(Effect::Read, "uname", QUICK).arg("-r");
+        self.runner
+            .run(&cmd)
+            .ok()
+            .filter(|out| out.ok())
+            .map(|out| out.trimmed().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// The three fields a release promises about a boot, read off the
+    /// generation that actually booted.
+    ///
+    /// All three or none: the planner compares them as a triple, and a
+    /// half-read triple would compare unequal and cost a reboot nobody
+    /// needed. `kernel-params` is hashed rather than carried, because the
+    /// command line can hold a token and a digest cannot.
+    fn kernel_booted(&self) -> Option<BootedKernel> {
+        // Through the store path rather than through `/run/booted-system/…`:
+        // the three files are IN the generation, and naming them there is
+        // what makes the answer a fact about a generation rather than about
+        // a symlink that a later activation moves.
+        let booted = PathBuf::from(self.resolve(Path::new(BOOTED_SYSTEM))?);
+        let kernel = self.resolve(&booted.join("kernel"))?;
+        let initrd = self.resolve(&booted.join("initrd"))?;
+        let params = self.files.read(&booted.join("kernel-params")).ok()?;
+        Some(BootedKernel {
+            kernel_store_path: kernel,
+            initrd_store_path: initrd,
+            kernel_params_sha256: sha256_hex(&params),
+        })
+    }
+
+    // -----------------------------------------------------------------
+    // the transaction records
+    // -----------------------------------------------------------------
+
+    /// Every record in the transaction directory, newest name last.
+    ///
+    /// A file that does not parse is not dropped: it becomes a record in
+    /// state `inconsistent`, because a half-written transaction record is
+    /// the single most important thing a resume can find — it means a
+    /// machine died while writing one, and guessing past it is how the wrong
+    /// generation gets confirmed.
+    pub fn records(&self) -> Result<Vec<TxnRecord>> {
+        let mut out = Vec::new();
+        for path in self.files.list_dir(&self.txn_dir())? {
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let text = match self.files.read_to_string(&path) {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
+            match TxnRecord::from_json(&text, &path.display().to_string()) {
+                Ok(record) => out.push(record),
+                Err(e) => out.push(TxnRecord {
+                    schema: TXN_SCHEMA.to_string(),
+                    id: id.to_string(),
+                    run_id: None,
+                    previous: SystemPoint {
+                        toplevel: None,
+                        generation: None,
+                    },
+                    desired: String::new(),
+                    mode: Mode::Switch,
+                    started_at: self.clock.now(),
+                    deadline: None,
+                    state: TxnState::Inconsistent,
+                    reason: Some(format!(
+                        "{} could not be read as a transaction record: {e:#}",
+                        path.display()
+                    )),
+                    changed_at: self.clock.now(),
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The records that are still in flight, as the fleet sees them.
+    fn open_txns(&self) -> Result<Vec<Txn>> {
+        Ok(self
+            .records()?
+            .into_iter()
+            .filter(TxnRecord::is_open)
+            .map(|r| r.view())
+            .collect())
+    }
+
+    pub fn record(&self, id: &str) -> Result<TxnRecord> {
+        check_id(id)?;
+        let path = self.txn_path(id);
+        let text = self.files.read_to_string(&path).with_context(|| {
+            format!(
+                "there is no transaction {id} on this host ({} could not be read)",
+                path.display()
+            )
+        })?;
+        TxnRecord::from_json(&text, &path.display().to_string())
+    }
+
+    /// Write a record so that it is on the disk when this returns.
+    ///
+    /// 0600 and root-owned by the directory it is in: the record says which
+    /// generation a machine will roll back to, and a file anybody could edit
+    /// would be a file anybody could use to choose that generation.
+    fn write_record(&self, record: &TxnRecord) -> Result<()> {
+        self.files.create_dir_all(&self.txn_dir())?;
+        self.files
+            .write_atomic(&self.txn_path(&record.id), &record.to_json()?, 0o600)
+    }
+
+    // -----------------------------------------------------------------
+    // stage
+    // -----------------------------------------------------------------
+
+    /// Is this system here, whole, and is it a system?
+    ///
+    /// `nix-store --check-validity --recursive` rather than the
+    /// `nix path-info` the lane brief names: it answers for the WHOLE
+    /// closure rather than for the top of it, and it needs no experimental
+    /// feature — a host whose `nix-command` is off would refuse the
+    /// `path-info` form for a reason that has nothing to do with the
+    /// question. The signature was checked by the `nix copy` that brought it
+    /// here (`require-sigs = true`, M0 probe S12); checking it again here
+    /// would be checking the same thing with the weaker tool.
+    ///
+    /// Writes nothing, and that is the point of the verb: a staged host is a
+    /// host whose running system has not been touched.
+    pub fn stage(&self, toplevel: &str) -> Result<()> {
+        let cmd = Cmd::new(Effect::Read, "nix-store", SWITCH)
+            .arg("--check-validity")
+            .arg("--recursive")
+            .arg(toplevel);
+        self.runner.run(&cmd).with_context(|| {
+            format!(
+                "{toplevel} is not here as a whole closure. `nix copy --to ssh-ng://` has to \
+                 carry all of it before anything is activated."
+            )
+        })?;
+        let switcher = Path::new(toplevel).join("bin/switch-to-configuration");
+        if !self.files.exists(&switcher) {
+            bail!(
+                "{toplevel} is in the store and is not a NixOS system: it has no \
+                 bin/switch-to-configuration, so nothing here could activate it."
+            );
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // activate
+    // -----------------------------------------------------------------
+
+    /// Move this machine to a new system, having first written down where it
+    /// was and armed the way back.
+    ///
+    /// The order is the guarantee, and it is this:
+    ///
+    /// 1. refuse if somebody else holds the host or a transaction is open;
+    /// 2. read where the machine is now — the way back is a fact about this
+    ///    machine and not something the caller may assert;
+    /// 3. write the record, `fsync`ed;
+    /// 4. arm the revert timer (see the module documentation for why here
+    ///    and not at the end);
+    /// 5. move the profile and run `switch-to-configuration`;
+    /// 6. in boot mode, point the one-shot entry at the new generation and
+    ///    leave the DEFAULT on the old one — which is what makes an
+    ///    unconfirmed boot a boot that happens once.
+    ///
+    /// Anything that fails from step 5 on disarms the timer and marks the
+    /// record `reverted` with the reason, because a machine that was not
+    /// moved must not be left with a timer that will move it back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn activate(
+        &self,
+        id: &str,
+        toplevel: &str,
+        mode: Mode,
+        confirm_within: u64,
+        run_id: Option<&str>,
+    ) -> Result<TxnRecord> {
+        check_id(id)?;
+        self.refuse_if_held(run_id)?;
+        if let Some(open) = self.records()?.iter().find(|r| r.is_open()) {
+            bail!(
+                "this host already has the transaction {} open ({}). One at a time: confirm \
+                 it, revert it, or read it with `meister-activate txn show --txn {}`.",
+                open.id,
+                open.state.as_str_lower(),
+                open.id
+            );
+        }
+        self.stage(toplevel)?;
+
+        let previous = SystemPoint {
+            toplevel: self.resolve(&self.profile),
+            generation: self.generation(),
+        };
+        if previous.toplevel.is_none() {
+            bail!(
+                "{} does not resolve to a system, so there would be nothing to roll back to. \
+                 A host is installed before it is deployed to.",
+                self.profile.display()
+            );
+        }
+        // Boot mode is only a mode where there is a boot menu to put an
+        // entry in. Refused BEFORE anything is written, because the whole
+        // point of the mode is the way back (D5's documented limit).
+        if mode == Mode::Boot {
+            self.require_systemd_boot()?;
+            if previous.generation.is_none() {
+                bail!(
+                    "this host's system profile does not name a generation, so there is no \
+                     boot entry to fall back to. Use --mode switch."
+                );
+            }
+        }
+
+        let now = self.clock.now();
+        let deadline = (confirm_within > 0).then(|| {
+            now + TimeDelta::try_seconds(confirm_within as i64).unwrap_or_else(TimeDelta::zero)
+        });
+        let mut record = TxnRecord {
+            schema: TXN_SCHEMA.to_string(),
+            id: id.to_string(),
+            run_id: run_id.map(str::to_string),
+            previous,
+            desired: toplevel.to_string(),
+            mode,
+            started_at: now,
+            deadline,
+            state: TxnState::Pending,
+            reason: None,
+            changed_at: now,
+        };
+        self.write_record(&record)?;
+
+        if deadline.is_some()
+            && let Err(e) = self.arm_timer(id, confirm_within)
+        {
+            // Nothing has been touched, so the transaction is closed rather
+            // than left pending for a timer that does not exist. `reverted`
+            // is the state for "the machine is on `previous`", and never
+            // having left it is a case of that.
+            record.state = TxnState::Reverted;
+            record.changed_at = self.clock.now();
+            record.reason = Some(format!("{e:#}"));
+            self.write_record(&record)?;
+            return Err(e);
+        }
+
+        match self.go_forward(&record) {
+            Ok(()) => Ok(record),
+            Err(e) => {
+                // The machine may be half way: the profile can have moved
+                // and the switch failed after it. So it is put BACK here
+                // rather than left to a timer that may not have been armed —
+                // and if that fails too, the record says `inconsistent`,
+                // which is what makes a resume stop and ask for a person
+                // ([`crate::receipt::next_step`]).
+                let because = format!("the activation itself failed: {e:#}");
+                match self.revert(id, Some(&because)) {
+                    Ok(_) => Err(e.context(format!(
+                        "{id} was taken back to {}",
+                        record
+                            .previous
+                            .toplevel
+                            .as_deref()
+                            .unwrap_or("its previous system")
+                    ))),
+                    Err(back) => {
+                        record.state = TxnState::Inconsistent;
+                        record.changed_at = self.clock.now();
+                        record.reason =
+                            Some(format!("{because}; and so did the way back: {back:#}"));
+                        self.write_record(&record)?;
+                        Err(e.context(format!(
+                            "and {id} could not be taken back either ({back:#}); this host \
+                             needs a person"
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move the profile, switch, and in boot mode arrange the menu.
+    fn go_forward(&self, record: &TxnRecord) -> Result<()> {
+        let set = Cmd::new(Effect::TargetWrite, "nix-env", SWITCH)
+            .arg("-p")
+            .arg(self.profile.display().to_string())
+            .arg("--set")
+            .arg(&record.desired);
+        self.runner.run(&set)?;
+
+        let switcher = Path::new(&record.desired).join("bin/switch-to-configuration");
+        let switch = Cmd::new(Effect::TargetWrite, switcher.display().to_string(), SWITCH)
+            .arg(record.mode.switch_argument());
+        self.runner.run(&switch)?;
+
+        let generation = self.generation();
+        if record.mode == Mode::Boot {
+            let new = generation.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the system profile does not name a generation after the switch, so the \
+                     boot entry to try once cannot be named."
+                )
+            })?;
+            let previous = record.previous.generation.ok_or_else(|| {
+                anyhow::anyhow!("this transaction records no previous generation.")
+            })?;
+            // The default goes BACK to the old generation and the new one is
+            // tried once. `switch-to-configuration boot` has just written
+            // loader.conf with the new generation as the default, and leaving
+            // it there would mean an unconfirmed boot loop into a system
+            // nobody could reach. The EFI variable wins over loader.conf,
+            // which is what makes this one command enough.
+            self.runner.run(
+                &Cmd::new(Effect::TargetWrite, "bootctl", QUICK)
+                    .arg("set-default")
+                    .arg(entry_of(previous)),
+            )?;
+            self.runner.run(
+                &Cmd::new(Effect::TargetWrite, "bootctl", QUICK)
+                    .arg("set-oneshot")
+                    .arg(entry_of(new)),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// systemd-boot, or a sentence that says what a grub host can have.
+    fn require_systemd_boot(&self) -> Result<()> {
+        let cmd = Cmd::new(Effect::Read, "bootctl", QUICK)
+            .arg("is-installed")
+            .expect(Expect::Codes(vec![0, 1]));
+        let out = self.runner.run(&cmd)?;
+        if out.ok() && out.trimmed() == "yes" {
+            return Ok(());
+        }
+        bail!(
+            "there is no boot fallback on this host: bootctl says systemd-boot is not \
+             installed ({}), and a one-shot boot entry is the only way a machine that does \
+             not come up can take itself back. Use --mode switch, or confirm this boot by \
+             hand after it comes up.",
+            if out.trimmed().is_empty() {
+                "no answer"
+            } else {
+                out.trimmed()
+            }
+        );
+    }
+
+    /// The transient unit that reverts this transaction when nobody speaks.
+    ///
+    /// `systemd-run --on-active` and not a timer file: a unit file would be
+    /// part of some generation, and this has to belong to neither the old nor
+    /// the new one — that is precisely why it survives
+    /// `switch-to-configuration`, which stops and starts the units the two
+    /// generations declare and knows nothing about this one.
+    ///
+    /// It does not survive a reboot, and that is the documented limit of the
+    /// switch mode's safety net: in boot mode the net is the boot entry.
+    fn arm_timer(&self, id: &str, seconds: u64) -> Result<()> {
+        let cmd = Cmd::new(Effect::TargetWrite, "systemd-run", QUICK)
+            .arg(format!("--on-active={seconds}"))
+            .arg(format!("--unit={}", timer_unit(id)))
+            // So that the transient unit disappears once it has run: a
+            // failed unit that stays loaded is a unit the next activation of
+            // the same id cannot create.
+            .arg("--collect")
+            .arg(format!(
+                "--description=meister-deploy reverts the transaction {id} unless it is \
+                 confirmed"
+            ))
+            .arg(self.own_exe.display().to_string())
+            .arg("revert")
+            .arg("--txn")
+            .arg(id)
+            .arg("--deploy-dir")
+            .arg(self.deploy_dir.display().to_string())
+            .arg("--profile")
+            .arg(self.profile.display().to_string())
+            .arg("--because")
+            .arg("nobody confirmed this activation before its deadline");
+        self.runner.run(&cmd).with_context(|| {
+            format!(
+                "the revert timer for {id} could not be armed, so this activation has no way \
+                 back and was not started."
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Stop the timer, and be sure it is stopped.
+    ///
+    /// Two commands, because `systemctl stop` of a unit that is already gone
+    /// exits non-zero and that is not a failure — while a timer that is
+    /// still armed after a confirm IS one, and would revert a machine
+    /// somebody has just accepted.
+    fn stop_timer(&self, id: &str) -> Result<()> {
+        let unit = timer_unit(id);
+        let stop = Cmd::new(Effect::TargetWrite, "systemctl", QUICK)
+            .arg("stop")
+            .arg(format!("{unit}.timer"))
+            .expect(Expect::AnyExit);
+        self.runner.run(&stop)?;
+        let check = Cmd::new(Effect::Read, "systemctl", QUICK)
+            .arg("is-active")
+            .arg(format!("{unit}.timer"))
+            .expect(Expect::AnyExit);
+        let out = self.runner.run(&check)?;
+        let state = out.trimmed();
+        if state == "active" || state == "activating" {
+            bail!(
+                "the revert timer {unit}.timer is still {state} after being told to stop. \
+                 Nothing else was changed: a confirmation that leaves the timer running \
+                 would be taken back by it."
+            );
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // confirm and revert
+    // -----------------------------------------------------------------
+
+    /// Keep it. The timer goes first, then the record says so.
+    pub fn confirm(&self, id: &str) -> Result<TxnRecord> {
+        let mut record = self.record(id)?;
+        match record.state {
+            TxnState::Confirmed => return Ok(record),
+            TxnState::Reverted => bail!(
+                "the transaction {id} was already reverted ({}). A machine that has gone back \
+                 is not confirmed afterwards; plan again.",
+                record.reason.as_deref().unwrap_or("no reason recorded")
+            ),
+            TxnState::Inconsistent => bail!(
+                "the record of {id} does not say a coherent thing, so there is nothing here \
+                 to confirm. Read it with `meister-activate txn show --txn {id}`."
+            ),
+            TxnState::Staged | TxnState::Pending => {}
+        }
+        if record.deadline.is_some() {
+            self.stop_timer(id)?;
+        }
+        if record.mode == Mode::Boot {
+            // The one-shot has been consumed by the boot that got us here;
+            // what is left is the default, which still points at the old
+            // generation. Making the new one the default is the whole
+            // content of "confirmed" in boot mode.
+            let generation = self.generation().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the system profile does not name a generation, so the boot entry to \
+                     make the default cannot be named. The timer is stopped and the record \
+                     is untouched."
+                )
+            })?;
+            self.runner.run(
+                &Cmd::new(Effect::TargetWrite, "bootctl", QUICK)
+                    .arg("set-default")
+                    .arg(entry_of(generation)),
+            )?;
+        }
+        record.state = TxnState::Confirmed;
+        record.changed_at = self.clock.now();
+        self.write_record(&record)?;
+        Ok(record)
+    }
+
+    /// Take it back. Called by an operator, by `apply` when a check fails,
+    /// and by the timer when nobody says anything at all.
+    pub fn revert(&self, id: &str, because: Option<&str>) -> Result<TxnRecord> {
+        let mut record = self.record(id)?;
+        match record.state {
+            TxnState::Confirmed => bail!(
+                "the transaction {id} was confirmed, so it is not reverted: what a machine \
+                 was confirmed on is what it runs. Plan the old system again if it has to go \
+                 back."
+            ),
+            // Idempotent on purpose: the timer and an operator can both
+            // arrive here, and the second one must not fail a rollout.
+            TxnState::Reverted => return Ok(record),
+            TxnState::Staged | TxnState::Pending | TxnState::Inconsistent => {}
+        }
+        let previous = record.previous.toplevel.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "the record of {id} names no previous system, so there is nothing to go back \
+                 to. This needs a person: read it with `meister-activate txn show --txn {id}`."
+            )
+        })?;
+
+        // The timer first, so that a revert that takes a while is not
+        // started twice.
+        if record.deadline.is_some() {
+            let _ = self.stop_timer(id);
+        }
+        let set = Cmd::new(Effect::TargetWrite, "nix-env", SWITCH)
+            .arg("-p")
+            .arg(self.profile.display().to_string())
+            .arg("--set")
+            .arg(&previous);
+        self.runner.run(&set)?;
+        let switcher = Path::new(&previous).join("bin/switch-to-configuration");
+        self.runner.run(
+            &Cmd::new(Effect::TargetWrite, switcher.display().to_string(), SWITCH)
+                .arg(record.mode.switch_argument()),
+        )?;
+        if record.mode == Mode::Boot {
+            // Clear the one-shot — the machine has not rebooted yet, so the
+            // entry that was to be tried once must not be tried at all — and
+            // put the default back where it was.
+            self.runner.run(
+                &Cmd::new(Effect::TargetWrite, "bootctl", QUICK)
+                    .arg("set-oneshot")
+                    .arg(""),
+            )?;
+            if let Some(generation) = record.previous.generation {
+                self.runner.run(
+                    &Cmd::new(Effect::TargetWrite, "bootctl", QUICK)
+                        .arg("set-default")
+                        .arg(entry_of(generation)),
+                )?;
+            }
+        }
+
+        record.state = TxnState::Reverted;
+        record.changed_at = self.clock.now();
+        record.reason = Some(because.unwrap_or("no reason was given").to_string());
+        self.write_record(&record)?;
+        Ok(record)
+    }
+
+    /// The run that owns a record says it is done with it.
+    ///
+    /// This is what makes "an open transaction" mean "a run that was
+    /// interrupted" rather than "a host that has ever been deployed to". The
+    /// archive lands before the record goes, so a crash in between leaves
+    /// both — and both-present is read as still open, which is the
+    /// conservative half of the two.
+    pub fn retire(&self, id: &str, run_id: Option<&str>) -> Result<TxnRecord> {
+        let record = self.record(id)?;
+        if let (Some(asked), Some(owner)) = (run_id, record.run_id.as_deref())
+            && asked != owner
+        {
+            bail!(
+                "the transaction {id} belongs to the run {owner} and {asked} asked to retire \
+                 it. A record is retired by the run that opened it."
+            );
+        }
+        if record.is_open() {
+            bail!(
+                "the transaction {id} is {} and is not retired: a record is the only thing \
+                 that says a machine may still have to go back.",
+                record.state.as_str_lower()
+            );
+        }
+        self.files
+            .write_atomic(&self.txn_archive(id), &record.to_json()?, 0o600)?;
+        self.files.remove_file(&self.txn_path(id))?;
+        Ok(record)
+    }
+
+    // -----------------------------------------------------------------
+    // the lock
+    // -----------------------------------------------------------------
+
+    /// Who holds this host, or nobody.
+    ///
+    /// A file at the lock path that this program did not write is `None`
+    /// here and is never overwritten: it might be somebody's lock in a
+    /// spelling this version does not know.
+    pub fn read_lock(&self) -> Result<Option<Lock>> {
+        let path = self.lock_path();
+        if !self.files.exists(&path) {
+            return Ok(None);
+        }
+        let text = self.files.read_to_string(&path)?;
+        Ok(serde_json::from_str::<Lock>(&text).ok())
+    }
+
+    /// Take the host, or say who has it.
+    ///
+    /// `O_EXCL` on `lock/owner.json` and not `mkdir lock/`, which is what
+    /// the lane brief says: the directory is created by the tmpfiles rules of
+    /// nix/managed.nix before anything runs, so a `mkdir` of it could never
+    /// be the thing two runs race for. An exclusive create of the file
+    /// inside it is that thing, and it is the same file the read-only probe
+    /// already reads.
+    pub fn lock_acquire(&self, run_id: &str, operator: &str, pid: u32) -> Result<Lock> {
+        let record = Lock {
+            run_id: run_id.to_string(),
+            operator: operator.to_string(),
+            pid,
+            acquired_at: self.clock.now(),
+        };
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|e| anyhow::anyhow!("writing the lock record failed: {e}"))?;
+        self.files.create_dir_all(&self.lock_dir())?;
+        match self.files.create_new(&self.lock_path(), &bytes, 0o600) {
+            Ok(()) => Ok(record),
+            Err(e) => match self.read_lock()? {
+                // The same run asking twice is asking whether it may act,
+                // and the answer is yes.
+                Some(held) if held.run_id == run_id => Ok(held),
+                Some(held) => bail!(
+                    "this host is held by the run {} since {} (operator {}, pid {}). \
+                     Continue that run with `apply --resume {}`, or take it over with \
+                     `apply --takeover {}` once you know it is gone. A lock here never \
+                     expires by itself.",
+                    held.run_id,
+                    held.acquired_at,
+                    held.operator,
+                    held.pid,
+                    held.run_id,
+                    held.run_id
+                ),
+                None => bail!(
+                    "{} exists and is not a lock record this program wrote ({e:#}). Read it, \
+                     and remove it by hand if it is rubbish; nothing here overwrites a file \
+                     that might be somebody's lock.",
+                    self.lock_path().display()
+                ),
+            },
+        }
+    }
+
+    /// Give it back. Only the run that holds it may.
+    pub fn lock_release(&self, run_id: &str) -> Result<Option<Lock>> {
+        match self.read_lock()? {
+            None => Ok(None),
+            Some(held) if held.run_id == run_id => {
+                self.files.remove_file(&self.lock_path())?;
+                Ok(Some(held))
+            }
+            Some(held) => bail!(
+                "the run {run_id} does not hold this host; the run {} does (operator {}). A \
+                 lock is released by the run that took it.",
+                held.run_id,
+                held.operator
+            ),
+        }
+    }
+
+    /// Take a named run's lock, deliberately. The id has to match what is
+    /// there, so that a takeover cannot take over a run that started while
+    /// somebody was reading the refusal.
+    pub fn lock_take_over(
+        &self,
+        of_run: &str,
+        run_id: &str,
+        operator: &str,
+        pid: u32,
+    ) -> Result<Lock> {
+        match self.read_lock()? {
+            None => self.lock_acquire(run_id, operator, pid),
+            Some(held) if held.run_id == of_run => {
+                self.files.remove_file(&self.lock_path())?;
+                self.lock_acquire(run_id, operator, pid)
+            }
+            Some(held) => bail!(
+                "this host is held by the run {}, not by {of_run}. Nothing was taken over.",
+                held.run_id
+            ),
+        }
+    }
+
+    /// Refuse to touch a host somebody else holds.
+    fn refuse_if_held(&self, run_id: Option<&str>) -> Result<()> {
+        match self.read_lock()? {
+            None => Ok(()),
+            Some(held) if Some(held.run_id.as_str()) == run_id => Ok(()),
+            Some(held) => bail!(
+                "this host is held by the run {} (operator {}, pid {}), and this is {}. \
+                 Nothing was changed.",
+                held.run_id,
+                held.operator,
+                held.pid,
+                run_id.unwrap_or("no run at all")
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // gc
+    // -----------------------------------------------------------------
+
+    /// Keep the running system, the booted one, and the newest N besides
+    /// them; collect what nothing points at any more.
+    ///
+    /// Refuses while a transaction is open, and that is the whole safety of
+    /// the verb: the generation an unconfirmed activation would roll back to
+    /// is a generation that must not be collected, and no amount of
+    /// arithmetic here is worth more than asking the operator to finish what
+    /// they started.
+    ///
+    /// `nix-collect-garbage` without `-d`: deleting old generations of EVERY
+    /// profile on the machine — including a user's — is not this program's
+    /// business, and the generations it is about have just been named
+    /// explicitly.
+    pub fn gc(&self, keep: usize) -> Result<GcOutcome> {
+        if let Some(open) = self.records()?.iter().find(|r| r.is_open()) {
+            bail!(
+                "the transaction {} is {} on this host, and the generation it would roll back \
+                 to must not be collected. Confirm it or revert it first.",
+                open.id,
+                open.state.as_str_lower()
+            );
+        }
+        let generations = self.generations()?;
+        let current = self.generation();
+        let booted = self.resolve(Path::new(BOOTED_SYSTEM));
+        let booted_generation = generations
+            .iter()
+            .find(|g| booted.is_some() && self.resolve(&self.generation_link(g.number)) == booted)
+            .map(|g| g.number);
+
+        let mut keep_set: Vec<u64> = Vec::new();
+        keep_set.extend(current);
+        keep_set.extend(booted_generation);
+        // The newest N below the current one, so that "keep 3" is three
+        // generations somebody can go back to and not three including the
+        // one that is running.
+        let mut older: Vec<u64> = generations
+            .iter()
+            .map(|g| g.number)
+            .filter(|n| Some(*n) != current && Some(*n) != booted_generation)
+            .collect();
+        older.sort_unstable_by(|a, b| b.cmp(a));
+        keep_set.extend(older.iter().take(keep).copied());
+        keep_set.sort_unstable();
+        keep_set.dedup();
+
+        let remove: Vec<u64> = generations
+            .iter()
+            .map(|g| g.number)
+            .filter(|n| !keep_set.contains(n))
+            .collect();
+
+        if !remove.is_empty() {
+            let mut cmd = Cmd::new(Effect::TargetWrite, "nix-env", COLLECT)
+                .arg("-p")
+                .arg(self.profile.display().to_string())
+                .arg("--delete-generations");
+            for number in &remove {
+                cmd = cmd.arg(number.to_string());
+            }
+            self.runner.run(&cmd)?;
+        }
+        self.runner.run(&Cmd::new(
+            Effect::TargetWrite,
+            "nix-collect-garbage",
+            COLLECT,
+        ))?;
+
+        // And the archives of finished transactions, of which the newest N
+        // are worth keeping for the same reason the generations are.
+        let mut archives: Vec<PathBuf> = self
+            .files
+            .list_dir(&self.txn_dir())?
+            .into_iter()
+            .filter(|p| p.to_string_lossy().ends_with(".json.done"))
+            .collect();
+        archives.sort();
+        let drop_count = archives.len().saturating_sub(keep);
+        let mut archives_removed = 0;
+        for path in archives.into_iter().take(drop_count) {
+            self.files.remove_file(&path)?;
+            archives_removed += 1;
+        }
+
+        Ok(GcOutcome {
+            kept: keep_set,
+            removed: remove,
+            archives_removed,
+        })
+    }
+
+    fn generation_link(&self, number: u64) -> PathBuf {
+        let dir = self.profile.parent().unwrap_or(Path::new("/"));
+        let name = self
+            .profile
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "system".to_string());
+        dir.join(format!("{name}-{number}-link"))
+    }
+
+    /// The generations of the system profile, as `nix-env` lists them.
+    fn generations(&self) -> Result<Vec<Generation>> {
+        let cmd = Cmd::new(Effect::Read, "nix-env", QUICK)
+            .arg("-p")
+            .arg(self.profile.display().to_string())
+            .arg("--list-generations");
+        let out = self.runner.run(&cmd)?;
+        Ok(parse_generations(&out.stdout))
+    }
+}
+
+/// One generation of the system profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Generation {
+    pub number: u64,
+    pub current: bool,
+}
+
+/// What `gc` did, for the report and for a test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GcOutcome {
+    pub kept: Vec<u64>,
+    pub removed: Vec<u64>,
+    pub archives_removed: usize,
+}
+
+/// `  42   2026-09-20 11:02:33   (current)` -> 42, current.
+///
+/// The number is the first field of every line `nix-env
+/// --list-generations` prints, and `(current)` marks one of them.
+pub fn parse_generations(text: &str) -> Vec<Generation> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(first) = fields.next() else {
+            continue;
+        };
+        let Ok(number) = first.parse::<u64>() else {
+            continue;
+        };
+        out.push(Generation {
+            number,
+            current: line.contains("(current)"),
+        });
+    }
+    out
+}
+
+/// `system-42-link` -> 42.
+fn generation_of(link: &Path) -> Option<u64> {
+    let name = link.file_name()?.to_string_lossy().into_owned();
+    let rest = name.strip_suffix("-link")?;
+    let (_, number) = rest.rsplit_once('-')?;
+    number.parse().ok()
+}
+
+/// The systemd-boot entry NixOS writes for a generation.
+///
+/// The name is NixOS's own (`nixos-generation-<n>.conf`, from the
+/// systemd-boot builder). A specialisation adds a suffix, and a host that
+/// uses one has no boot fallback here — which is the same class of limit as
+/// grub and is documented with it.
+fn entry_of(generation: u64) -> String {
+    format!("nixos-generation-{generation}.conf")
+}
+
+/// The transient unit that would revert a transaction.
+pub fn timer_unit(id: &str) -> String {
+    format!("meister-revert-{id}")
+}
+
+impl TxnState {
+    /// The state in the spelling a sentence uses. On the observation type
+    /// rather than beside it, because there is one spelling of these five
+    /// words and the json is the other half of it.
+    pub(crate) fn as_str_lower(self) -> &'static str {
+        match self {
+            TxnState::Staged => "staged",
+            TxnState::Pending => "pending",
+            TxnState::Confirmed => "confirmed",
+            TxnState::Reverted => "reverted",
+            TxnState::Inconsistent => "inconsistent",
+        }
+    }
+}
+
+/// A reply for a caller that wanted json. Every verb answers with one, so
+/// that `--json` is a property of the program rather than of each verb.
+pub fn ok_reply(what: &str, value: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "what": what, "result": value })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::effects::{FakeClock, MemFiles};
+    use crate::run::{Matcher, Output, Policy, StrictFake};
+
+    const TOP: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-nixos-system-box-25.11";
+    const PREV: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-system-box-25.11";
+
+    fn clock() -> FakeClock {
+        FakeClock::at(crate::fixtures::at("2026-09-22T12:00:00Z"))
+    }
+
+    /// A host that runs PREV as generation 41, with the new closure in the
+    /// store and the deploy directories in place.
+    fn host() -> MemFiles {
+        MemFiles::new()
+            .given_symlink("/run/current-system", PREV)
+            .given_symlink("/run/booted-system", PREV)
+            .given_symlink("/nix/var/nix/profiles/system", "system-41-link")
+            .given_symlink("/nix/var/nix/profiles/system-41-link", PREV)
+            .given_symlink(format!("{PREV}/kernel"), "/nix/store/kkkk-linux/bzImage")
+            .given_symlink(format!("{PREV}/initrd"), "/nix/store/kkkk-initrd/initrd")
+            .given(format!("{PREV}/kernel-params"), "init=/nix/store/x/init\n")
+            .given_exec(format!("{PREV}/bin/switch-to-configuration"), "#!/bin/sh\n")
+            .given_exec(format!("{TOP}/bin/switch-to-configuration"), "#!/bin/sh\n")
+    }
+
+    /// An empty argument list, spelled so that inference has a type.
+    fn none() -> Vec<String> {
+        Vec::new()
+    }
+
+    fn valid(top: &str) -> Matcher {
+        Matcher::exact("nix-store", ["--check-validity", "--recursive", top])
+    }
+
+    fn helper<'a>(runner: &'a StrictFake, files: &'a MemFiles, clock: &'a FakeClock) -> Helper<'a> {
+        helper_with(runner, files, clock)
+    }
+
+    fn helper_with<'a>(
+        runner: &'a dyn Runner,
+        files: &'a MemFiles,
+        clock: &'a FakeClock,
+    ) -> Helper<'a> {
+        Helper::new(runner, files, clock, "/var/lib/meisterstack/deploy", "/exe")
+    }
+
+    /// A runner that moves the profile link the way `nix-env --set` does.
+    ///
+    /// The boot mode names TWO generations — the one to fall back to and the
+    /// one to try once — and the second of them only exists after the
+    /// profile has moved. A fake filesystem that cannot change during the
+    /// call could not tell the two numbers apart, and a test in which they
+    /// are the same number would prove nothing about the thing that matters.
+    struct Moving<'a> {
+        inner: StrictFake,
+        files: &'a MemFiles,
+        link: &'a str,
+    }
+
+    impl Runner for Moving<'_> {
+        fn run(&self, cmd: &Cmd) -> Result<Output> {
+            let out = self.inner.run(cmd)?;
+            if cmd.program == "nix-env" && cmd.args.iter().any(|a| a == "--set") {
+                self.files.symlink_atomic(
+                    Path::new(self.link),
+                    Path::new("/nix/var/nix/profiles/system"),
+                )?;
+            }
+            Ok(out)
+        }
+
+        fn policy(&self) -> Policy {
+            self.inner.policy()
+        }
+    }
+
+    #[test]
+    fn status_reads_three_system_facts_and_resolves_two_links_deep() {
+        let files = host();
+        let runner =
+            StrictFake::new().expect(Matcher::exact("uname", ["-r"]), Output::stdout("6.12.41\n"));
+        let clock = clock();
+        let status = helper(&runner, &files, &clock).status().unwrap();
+        assert_eq!(status.schema, ACTIVATE_STATUS_SCHEMA);
+        assert_eq!(status.current_system.as_deref(), Some(PREV));
+        assert_eq!(status.booted_system.as_deref(), Some(PREV));
+        // Through system-41-link, which is the second link in the chain.
+        assert_eq!(status.next_boot_system.as_deref(), Some(PREV));
+        assert_eq!(status.generation, Some(41));
+        assert_eq!(status.kernel_running.as_deref(), Some("6.12.41"));
+        let boot = status.kernel_booted.expect("the booted kernel is readable");
+        assert_eq!(boot.kernel_store_path, "/nix/store/kkkk-linux/bzImage");
+        assert_eq!(
+            boot.kernel_params_sha256,
+            sha256_hex(b"init=/nix/store/x/init\n")
+        );
+        assert!(status.open_txns.is_empty());
+        assert!(status.lock.is_none());
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn what_cannot_be_read_is_null_and_never_a_default() {
+        // A machine with nothing: no profile, no /run, no uname.
+        let files = MemFiles::new();
+        let runner =
+            StrictFake::new().expect(Matcher::exact("uname", ["-r"]), Output::failing(1, "no"));
+        let clock = clock();
+        let status = helper(&runner, &files, &clock).status().unwrap();
+        assert!(status.current_system.is_none());
+        assert!(status.booted_system.is_none());
+        assert!(status.next_boot_system.is_none());
+        assert!(status.generation.is_none());
+        assert!(status.kernel_running.is_none());
+        assert!(status.kernel_booted.is_none());
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_half_read_boot_triple_is_no_triple() {
+        // The kernel link is there and the params file is not: the planner
+        // compares three fields, and two of them plus a guess would cost a
+        // reboot nobody needed.
+        let files = MemFiles::new()
+            .given_symlink("/run/booted-system", PREV)
+            .given_symlink(format!("{PREV}/kernel"), "/nix/store/kkkk-linux/bzImage")
+            .given_symlink(format!("{PREV}/initrd"), "/nix/store/kkkk-initrd/initrd");
+        let runner =
+            StrictFake::new().expect(Matcher::exact("uname", ["-r"]), Output::stdout("6.12.41"));
+        let clock = clock();
+        assert!(
+            helper(&runner, &files, &clock)
+                .status()
+                .unwrap()
+                .kernel_booted
+                .is_none()
+        );
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn stage_asks_for_the_whole_closure_and_writes_nothing() {
+        let files = host();
+        let runner = StrictFake::new().expect(valid(TOP), Output::stdout(""));
+        let clock = clock();
+        helper(&runner, &files, &clock).stage(TOP).unwrap();
+        runner.verify().unwrap();
+        assert!(
+            files.attempts().is_empty(),
+            "stage wrote something: {:?}",
+            files.attempts()
+        );
+    }
+
+    #[test]
+    fn a_store_path_that_is_not_a_system_is_refused_by_name() {
+        let files = host();
+        let runner =
+            StrictFake::new().expect(valid("/nix/store/zzzz-not-a-system"), Output::stdout(""));
+        let clock = clock();
+        let err = helper(&runner, &files, &clock)
+            .stage("/nix/store/zzzz-not-a-system")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bin/switch-to-configuration"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    /// The whole of a switch-mode activation, in order.
+    #[test]
+    fn an_activation_writes_the_record_then_arms_the_timer_then_switches() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(valid(TOP), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemd-run", ["--on-active=300"]),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(
+                    "nix-env",
+                    ["-p", "/nix/var/nix/profiles/system", "--set", TOP],
+                ),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(&format!("{TOP}/bin/switch-to-configuration"), ["switch"]),
+                Output::stdout(""),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let record = helper
+            .activate("run-1", TOP, Mode::Switch, 300, Some("run-1"))
+            .unwrap();
+        runner.verify().unwrap();
+
+        assert_eq!(record.state, TxnState::Pending);
+        assert_eq!(record.previous.toplevel.as_deref(), Some(PREV));
+        assert_eq!(record.previous.generation, Some(41));
+        assert_eq!(record.desired, TOP);
+        assert_eq!(
+            record.deadline,
+            Some(crate::fixtures::at("2026-09-22T12:05:00Z"))
+        );
+
+        // The record was on the disk before the profile moved: the writes and
+        // the commands interleave, and the order is what a resume stands on.
+        let attempts = files.attempts();
+        assert!(
+            attempts
+                .iter()
+                .any(|a| a.contains("write(0600)") && a.contains("txn/run-1.json")),
+            "{attempts:?}"
+        );
+        // And it reads back as the record it wrote.
+        assert_eq!(helper.record("run-1").unwrap(), record);
+    }
+
+    #[test]
+    fn the_timer_command_names_this_binary_and_this_deploy_directory() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(valid(TOP), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemd-run", ["--on-active=20"]),
+                Output::stdout(""),
+            )
+            .expect(Matcher::prefix("nix-env", ["-p"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix(&format!("{TOP}/bin/switch-to-configuration"), ["switch"]),
+                Output::stdout(""),
+            );
+        let clock = clock();
+        Helper::new(
+            &runner,
+            &files,
+            &clock,
+            "/tmp/deploy",
+            "/nix/store/exe/bin/x",
+        )
+        .activate("t1", TOP, Mode::Switch, 20, None)
+        .unwrap();
+        let line = runner
+            .calls()
+            .into_iter()
+            .find(|c| c.starts_with("systemd-run"))
+            .expect("the timer was armed");
+        assert!(line.contains("--unit=meister-revert-t1"), "{line}");
+        assert!(
+            line.contains("/nix/store/exe/bin/x revert --txn t1"),
+            "{line}"
+        );
+        assert!(line.contains("--deploy-dir /tmp/deploy"), "{line}");
+        assert!(line.contains("--collect"), "{line}");
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_switch_that_fails_puts_the_host_back_and_records_why() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(valid(TOP), Output::stdout(""))
+            .expect(Matcher::prefix("systemd-run", none()), Output::stdout(""))
+            .expect(Matcher::prefix("nix-env", ["-p"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix(&format!("{TOP}/bin/switch-to-configuration"), none()),
+                Output::failing(1, "the activation script failed"),
+            )
+            // The way back: the timer goes, the profile goes back, and the
+            // OLD system's own switcher runs. The profile may have moved
+            // already, so this is not optional politeness.
+            .expect(
+                Matcher::exact("systemctl", ["stop", "meister-revert-r2.timer"]),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact("systemctl", ["is-active", "meister-revert-r2.timer"]),
+                Output::failing(3, ""),
+            )
+            .expect(
+                Matcher::exact(
+                    "nix-env",
+                    ["-p", "/nix/var/nix/profiles/system", "--set", PREV],
+                ),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(&format!("{PREV}/bin/switch-to-configuration"), ["switch"]),
+                Output::stdout(""),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let err = format!(
+            "{:#}",
+            helper
+                .activate("r2", TOP, Mode::Switch, 300, None)
+                .unwrap_err()
+        );
+        assert!(err.contains("switch-to-configuration"), "{err}");
+        assert!(err.contains("was taken back to"), "{err}");
+        runner.verify().unwrap();
+        let record = helper.record("r2").unwrap();
+        assert_eq!(record.state, TxnState::Reverted);
+        assert!(
+            record
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("the activation itself failed"),
+            "{record:?}"
+        );
+    }
+
+    #[test]
+    fn a_host_that_cannot_be_put_back_says_inconsistent_and_not_reverted() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(valid(TOP), Output::stdout(""))
+            .expect(Matcher::prefix("systemd-run", none()), Output::stdout(""))
+            .expect(Matcher::prefix("nix-env", ["-p"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix(&format!("{TOP}/bin/switch-to-configuration"), none()),
+                Output::failing(1, "the activation script failed"),
+            )
+            .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemctl", ["is-active"]),
+                Output::failing(3, ""),
+            )
+            .expect(
+                Matcher::prefix("nix-env", ["-p"]),
+                Output::failing(1, "the profile could not be moved"),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let err = format!(
+            "{:#}",
+            helper
+                .activate("r5", TOP, Mode::Switch, 300, None)
+                .unwrap_err()
+        );
+        assert!(err.contains("needs a person"), "{err}");
+        runner.verify().unwrap();
+        let record = helper.record("r5").unwrap();
+        assert_eq!(record.state, TxnState::Inconsistent);
+        assert!(record.is_open(), "an inconsistent record is still open");
+    }
+
+    #[test]
+    fn an_activation_whose_timer_cannot_be_armed_never_moves_the_profile() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(valid(TOP), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemd-run", none()),
+                Output::failing(1, "Failed to start transient timer unit"),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let err = format!(
+            "{:#}",
+            helper
+                .activate("r6", TOP, Mode::Switch, 300, None)
+                .unwrap_err()
+        );
+        assert!(err.contains("has no way back and was not started"), "{err}");
+        runner.verify().unwrap();
+        let record = helper.record("r6").unwrap();
+        assert_eq!(record.state, TxnState::Reverted);
+        assert!(!record.is_open());
+    }
+
+    #[test]
+    fn a_second_activation_on_top_of_an_open_one_is_refused() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(valid(TOP), Output::stdout(""))
+            .expect(Matcher::prefix("systemd-run", none()), Output::stdout(""))
+            .expect(Matcher::prefix("nix-env", ["-p"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix(&format!("{TOP}/bin/switch-to-configuration"), none()),
+                Output::stdout(""),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.activate("a", TOP, Mode::Switch, 300, None).unwrap();
+        let err = helper
+            .activate("b", TOP, Mode::Switch, 300, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already has the transaction a open"), "{err}");
+        assert!(err.contains("pending"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn an_activation_on_a_host_somebody_else_holds_is_refused_before_anything() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.lock_acquire("other", "silas@manacor", 4711).unwrap();
+        let err = helper
+            .activate("mine", TOP, Mode::Switch, 300, Some("mine"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("held by the run other"), "{err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+        // Not one command ran, and no record was written.
+        runner.verify().unwrap();
+        assert!(helper.record("mine").is_err());
+    }
+
+    #[test]
+    fn the_run_that_holds_the_host_may_activate_on_it() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(valid(TOP), Output::stdout(""))
+            .expect(Matcher::prefix("systemd-run", none()), Output::stdout(""))
+            .expect(Matcher::prefix("nix-env", ["-p"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix(&format!("{TOP}/bin/switch-to-configuration"), none()),
+                Output::stdout(""),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.lock_acquire("mine", "silas@manacor", 1).unwrap();
+        helper
+            .activate("mine", TOP, Mode::Switch, 300, Some("mine"))
+            .unwrap();
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn confirm_stops_the_timer_and_then_says_so() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(
+                Matcher::exact("systemctl", ["stop", "meister-revert-c1.timer"]),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact("systemctl", ["is-active", "meister-revert-c1.timer"]),
+                Output::failing(3, "inactive"),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&pending("c1", Mode::Switch)).unwrap();
+        let record = helper.confirm("c1").unwrap();
+        assert_eq!(record.state, TxnState::Confirmed);
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_confirm_whose_timer_will_not_stop_changes_nothing() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemctl", ["is-active"]),
+                Output::stdout("active"),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&pending("c2", Mode::Switch)).unwrap();
+        let err = helper.confirm("c2").unwrap_err().to_string();
+        assert!(err.contains("still active"), "{err}");
+        assert_eq!(helper.record("c2").unwrap().state, TxnState::Pending);
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn revert_puts_the_profile_back_and_records_the_reason() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemctl", ["is-active"]),
+                Output::failing(3, ""),
+            )
+            .expect(
+                Matcher::exact(
+                    "nix-env",
+                    ["-p", "/nix/var/nix/profiles/system", "--set", PREV],
+                ),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(&format!("{PREV}/bin/switch-to-configuration"), ["switch"]),
+                Output::stdout(""),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&pending("r1", Mode::Switch)).unwrap();
+        let record = helper
+            .revert("r1", Some("a readiness check failed"))
+            .unwrap();
+        assert_eq!(record.state, TxnState::Reverted);
+        assert_eq!(record.reason.as_deref(), Some("a readiness check failed"));
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_second_revert_is_the_same_answer_and_runs_nothing() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let mut record = pending("r3", Mode::Switch);
+        record.state = TxnState::Reverted;
+        record.reason = Some("the timer fired".to_string());
+        helper.write_record(&record).unwrap();
+        let again = helper.revert("r3", Some("and then a person")).unwrap();
+        assert_eq!(again.reason.as_deref(), Some("the timer fired"));
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_confirmed_transaction_is_not_reverted() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let mut record = pending("r4", Mode::Switch);
+        record.state = TxnState::Confirmed;
+        helper.write_record(&record).unwrap();
+        let err = helper.revert("r4", Some("the timer fired")).unwrap_err();
+        assert!(
+            err.to_string().contains("was confirmed"),
+            "{}",
+            err.to_string()
+        );
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn boot_mode_needs_systemd_boot_and_says_what_grub_can_have() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(valid(TOP), Output::stdout(""))
+            .expect(
+                Matcher::exact("bootctl", ["is-installed"]),
+                Output::stdout("no"),
+            );
+        let clock = clock();
+        let err = helper(&runner, &files, &clock)
+            .activate("b1", TOP, Mode::Boot, 900, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no boot fallback"), "{err}");
+        assert!(err.contains("--mode switch"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_boot_activation_tries_the_new_entry_once_and_leaves_the_old_default() {
+        // After the switch the profile points at generation 42.
+        let files = host()
+            .given_symlink("/nix/var/nix/profiles/system-42-link", TOP)
+            .given_symlink(format!("{TOP}/kernel"), "/nix/store/nnnn-linux/bzImage");
+        let runner = StrictFake::new()
+            .expect(valid(TOP), Output::stdout(""))
+            .expect(
+                Matcher::exact("bootctl", ["is-installed"]),
+                Output::stdout("yes"),
+            )
+            .expect(Matcher::prefix("systemd-run", none()), Output::stdout(""))
+            .expect(Matcher::prefix("nix-env", ["-p"]), Output::stdout(""))
+            .expect(
+                Matcher::exact(&format!("{TOP}/bin/switch-to-configuration"), ["boot"]),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact("bootctl", ["set-default", "nixos-generation-41.conf"]),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact("bootctl", ["set-oneshot", "nixos-generation-42.conf"]),
+                Output::stdout(""),
+            );
+        let clock = clock();
+        let runner = Moving {
+            inner: runner,
+            files: &files,
+            link: "system-42-link",
+        };
+        let helper = helper_with(&runner, &files, &clock);
+        let record = helper.activate("b2", TOP, Mode::Boot, 900, None).unwrap();
+        assert_eq!(record.mode, Mode::Boot);
+        // The fallback is the generation it CAME from, read before the move.
+        assert_eq!(record.previous.generation, Some(41));
+        runner.inner.verify().unwrap();
+    }
+
+    #[test]
+    fn confirming_a_boot_activation_makes_the_new_entry_the_default() {
+        // The machine has rebooted into generation 42 by the time a confirm
+        // arrives, which is why the link is where it is in this fixture.
+        let files = host().given_symlink("/nix/var/nix/profiles/system-42-link", TOP);
+        files
+            .symlink_atomic(
+                Path::new("system-42-link"),
+                Path::new("/nix/var/nix/profiles/system"),
+            )
+            .unwrap();
+        let runner = StrictFake::new()
+            .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemctl", ["is-active"]),
+                Output::failing(3, ""),
+            )
+            .expect(
+                Matcher::exact("bootctl", ["set-default", "nixos-generation-42.conf"]),
+                Output::stdout(""),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&pending("b3", Mode::Boot)).unwrap();
+        assert_eq!(helper.confirm("b3").unwrap().state, TxnState::Confirmed);
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_record_that_does_not_parse_is_inconsistent_and_not_ignored() {
+        let files = host().given(
+            "/var/lib/meisterstack/deploy/txn/half.json",
+            "{\"schema\":\"meister-deploy/activate-txn/1\",\"id\":\"ha",
+        );
+        let runner = StrictFake::new();
+        let clock = clock();
+        let records = helper(&runner, &files, &clock).records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, TxnState::Inconsistent);
+        assert_eq!(records[0].id, "half");
+        assert!(records[0].is_open());
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_retired_record_is_not_open_any_more_and_the_glob_does_not_find_it() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let mut record = pending("done", Mode::Switch);
+        record.state = TxnState::Confirmed;
+        record.run_id = Some("run-9".to_string());
+        helper.write_record(&record).unwrap();
+        helper.retire("done", Some("run-9")).unwrap();
+        assert!(helper.records().unwrap().is_empty());
+        assert!(files.exists(&helper.txn_archive("done")));
+        // And the archive's name is not what the read-only probe globs.
+        assert!(
+            helper
+                .txn_archive("done")
+                .display()
+                .to_string()
+                .ends_with(".json.done")
+        );
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn an_open_record_is_not_retired_and_not_by_another_run() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let mut record = pending("open", Mode::Switch);
+        record.run_id = Some("run-1".to_string());
+        helper.write_record(&record).unwrap();
+        let err = helper
+            .retire("open", Some("run-1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is pending and is not retired"), "{err}");
+
+        record.state = TxnState::Confirmed;
+        helper.write_record(&record).unwrap();
+        let err = helper
+            .retire("open", Some("run-2"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("belongs to the run run-1"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_transaction_id_is_a_file_name_and_nothing_more() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        for bad in ["../../etc/shadow", "a/b", "", "a b", "a;rm -rf /"] {
+            let err = helper
+                .activate(bad, TOP, Mode::Switch, 300, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("is not a transaction id"), "{bad}: {err}");
+        }
+        runner.verify().unwrap();
+        assert!(files.attempts().is_empty(), "{:?}", files.attempts());
+    }
+
+    #[test]
+    fn the_lock_is_one_door_and_the_second_run_reads_who_has_it() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let first = helper.lock_acquire("run-a", "silas@manacor", 42).unwrap();
+        assert_eq!(first.run_id, "run-a");
+        // The same run again is not an error: it is asking whether it may.
+        assert_eq!(
+            helper.lock_acquire("run-a", "silas@manacor", 42).unwrap(),
+            first
+        );
+        let err = helper
+            .lock_acquire("run-b", "silas@manacor", 43)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("held by the run run-a"), "{err}");
+        assert!(err.contains("--takeover run-a"), "{err}");
+        assert!(err.contains("never expires"), "{err}");
+
+        // And only the holder gives it back.
+        let err = helper.lock_release("run-b").unwrap_err().to_string();
+        assert!(err.contains("does not hold this host"), "{err}");
+        assert!(helper.lock_release("run-a").unwrap().is_some());
+        assert!(helper.read_lock().unwrap().is_none());
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn the_lock_record_is_exactly_what_the_read_only_probe_parses() {
+        // `observation::Lock` denies unknown fields, and the probe reads
+        // owner.json straight into it: a fifth key here would make every
+        // observation of a locked host blind to the lock.
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.lock_acquire("run-a", "silas@manacor", 42).unwrap();
+        let text = String::from_utf8(files.content(helper.lock_path()).unwrap()).unwrap();
+        let parsed: Lock = serde_json::from_str(&text).expect("the probe's own parse");
+        assert_eq!(parsed.run_id, "run-a");
+        assert_eq!(parsed.pid, 42);
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_takeover_names_the_run_it_takes_over() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.lock_acquire("run-a", "silas@manacor", 1).unwrap();
+        let err = helper
+            .lock_take_over("run-x", "run-b", "silas@manacor", 2)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("held by the run run-a, not by run-x"), "{err}");
+        let taken = helper
+            .lock_take_over("run-a", "run-b", "silas@manacor", 2)
+            .unwrap();
+        assert_eq!(taken.run_id, "run-b");
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn gc_keeps_the_current_the_booted_and_n_others() {
+        let files = host();
+        // The machine runs 41 and booted 38.
+        let files = files.given_symlink("/nix/var/nix/profiles/system-38-link", "/nix/store/b38");
+        let files = files.given_symlink("/run/booted-system", "/nix/store/b38");
+        let runner = StrictFake::new()
+            .expect(
+                Matcher::exact(
+                    "nix-env",
+                    ["-p", "/nix/var/nix/profiles/system", "--list-generations"],
+                ),
+                Output::stdout(
+                    "  36   2026-09-01 10:00:00\n  37   2026-09-02 10:00:00\n  \
+                     38   2026-09-03 10:00:00\n  39   2026-09-04 10:00:00\n  \
+                     40   2026-09-05 10:00:00\n  41   2026-09-06 10:00:00   (current)\n",
+                ),
+            )
+            .expect(
+                Matcher::exact(
+                    "nix-env",
+                    [
+                        "-p",
+                        "/nix/var/nix/profiles/system",
+                        "--delete-generations",
+                        "36",
+                        "37",
+                    ],
+                ),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact("nix-collect-garbage", none()),
+                Output::stdout(""),
+            );
+        let clock = clock();
+        let outcome = helper(&runner, &files, &clock).gc(2).unwrap();
+        assert_eq!(outcome.kept, vec![38, 39, 40, 41]);
+        assert_eq!(outcome.removed, vec![36, 37]);
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn gc_refuses_while_a_transaction_is_open() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&pending("g1", Mode::Switch)).unwrap();
+        let err = helper.gc(3).unwrap_err().to_string();
+        assert!(err.contains("must not be collected"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_dry_run_helper_refuses_every_mutation_before_it_spawns() {
+        // The effect classes are not decoration: the same policy that makes
+        // `--dry-run` real on the workstation makes it real here.
+        let files = host().with_policy(Policy::dry_run());
+        let runner = StrictFake::new()
+            .with_policy(Policy::dry_run())
+            .expect(valid(TOP), Output::stdout(""));
+        let clock = clock();
+        let err = helper(&runner, &files, &clock)
+            .activate("d1", TOP, Mode::Switch, 300, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--dry-run"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_generation_listing_is_read_by_its_first_field() {
+        let parsed = parse_generations(
+            "   1   2026-01-01 00:00:00\n  42   2026-09-06 10:00:00   (current)\nrubbish\n",
+        );
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].number, 42);
+        assert!(parsed[1].current);
+        assert!(!parsed[0].current);
+    }
+
+    #[test]
+    fn a_mode_is_one_of_two_words() {
+        assert_eq!(Mode::parse("switch").unwrap(), Mode::Switch);
+        assert_eq!(Mode::parse("boot").unwrap(), Mode::Boot);
+        let err = Mode::parse("reboot").unwrap_err().to_string();
+        assert!(err.contains("is not an activation mode"), "{err}");
+    }
+
+    #[test]
+    fn a_record_round_trips_through_its_own_schema() {
+        let record = pending("rt", Mode::Boot);
+        let text = String::from_utf8(record.to_json().unwrap()).unwrap();
+        assert_eq!(TxnRecord::from_json(&text, "a test").unwrap(), record);
+        // And a record of another schema is a sentence, not a guess.
+        let wrong = text.replace(TXN_SCHEMA, "meister-deploy/activate-txn/2");
+        let err = TxnRecord::from_json(&wrong, "a test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("activate-txn/2"), "{err}");
+    }
+
+    fn pending(id: &str, mode: Mode) -> TxnRecord {
+        let now = crate::fixtures::at("2026-09-22T12:00:00Z");
+        TxnRecord {
+            schema: TXN_SCHEMA.to_string(),
+            id: id.to_string(),
+            run_id: None,
+            previous: SystemPoint {
+                toplevel: Some(PREV.to_string()),
+                generation: Some(41),
+            },
+            desired: TOP.to_string(),
+            mode,
+            started_at: now,
+            deadline: Some(now + TimeDelta::try_seconds(300).unwrap()),
+            state: TxnState::Pending,
+            reason: None,
+            changed_at: now,
+        }
+    }
+}
