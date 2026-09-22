@@ -467,8 +467,16 @@ fn validate_with_nix(fleet: &Path) -> Result<bool> {
              and not in the flake, {} is in the flake and not in the inventory. A host \
              that only one of the two readers sees is a host nobody deploys.",
             fleet.display(),
-            if only_mine.is_empty() { "nothing".to_string() } else { only_mine.join(", ") },
-            if only_theirs.is_empty() { "nothing".to_string() } else { only_theirs.join(", ") },
+            if only_mine.is_empty() {
+                "nothing".to_string()
+            } else {
+                only_mine.join(", ")
+            },
+            if only_theirs.is_empty() {
+                "nothing".to_string()
+            } else {
+                only_theirs.join(", ")
+            },
         );
     }
     if evaluated.fleet.name != inventory.fleet.name {

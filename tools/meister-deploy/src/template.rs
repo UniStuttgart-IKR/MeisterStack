@@ -133,7 +133,10 @@ mod tests {
             .lines()
             .filter(|l| l.trim_start().starts_with("meisterstack.url = \""))
             .count();
-        assert_eq!(definitions, 1, "more than one meisterstack.url in the template");
+        assert_eq!(
+            definitions, 1,
+            "more than one meisterstack.url in the template"
+        );
         // The comment survives untouched, which is where the reason for
         // pinning is written.
         assert!(mine.contains("MeisterStack/<rev>"), "{mine}");

@@ -199,8 +199,8 @@ impl Files for RealFiles {
         for entry in std::fs::read_dir(path)
             .with_context(|| format!("reading the directory {} failed", path.display()))?
         {
-            let entry =
-                entry.with_context(|| format!("reading the directory {} failed", path.display()))?;
+            let entry = entry
+                .with_context(|| format!("reading the directory {} failed", path.display()))?;
             out.push(entry.path());
         }
         out.sort();

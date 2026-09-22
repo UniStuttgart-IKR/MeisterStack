@@ -315,8 +315,14 @@ fn a_refusal_is_exit_one_and_a_sentence_on_stderr() {
     let calls = sandbox.calls();
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert!(calls[0].starts_with("nix "), "{calls:?}");
-    assert!(calls[0].contains("[eval] [--json] [--no-write-lock-file]"), "{calls:?}");
-    assert!(calls[0].contains("meisterDeployment.inventory"), "{calls:?}");
+    assert!(
+        calls[0].contains("[eval] [--json] [--no-write-lock-file]"),
+        "{calls:?}"
+    );
+    assert!(
+        calls[0].contains("meisterDeployment.inventory"),
+        "{calls:?}"
+    );
     assert!(stderr(&out).contains("exited 97"), "{}", stderr(&out));
 }
 

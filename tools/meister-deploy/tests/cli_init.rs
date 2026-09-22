@@ -122,12 +122,7 @@ fn the_meisterstack_input_can_be_pointed_at_a_checkout() {
 
     let reference = "git+file:///home/x/MeisterStack?ref=main";
     let (ok, _, stderr) = run(
-        &[
-            "init",
-            repo.to_str().unwrap(),
-            "--meisterstack",
-            reference,
-        ],
+        &["init", repo.to_str().unwrap(), "--meisterstack", reference],
         &empty,
     );
     assert!(ok, "{stderr}");
@@ -136,7 +131,10 @@ fn the_meisterstack_input_can_be_pointed_at_a_checkout() {
         flake.contains(&format!("meisterstack.url = \"{reference}\";")),
         "{flake}"
     );
-    assert!(!flake.contains("github:UniStuttgart-IKR/MeisterStack\";"), "{flake}");
+    assert!(
+        !flake.contains("github:UniStuttgart-IKR/MeisterStack\";"),
+        "{flake}"
+    );
 }
 
 #[test]
@@ -156,7 +154,11 @@ fn a_directory_that_is_not_empty_is_refused_and_nothing_in_it_changes() {
         stderr.contains("is not empty") && stderr.contains("merges with nothing"),
         "{stderr}"
     );
-    assert_eq!(before, snapshot(&repo), "it changed something on the way out");
+    assert_eq!(
+        before,
+        snapshot(&repo),
+        "it changed something on the way out"
+    );
 }
 
 #[test]
@@ -168,7 +170,10 @@ fn a_dry_run_lists_the_files_and_writes_none_of_them() {
 
     let (ok, stdout, stderr) = run(&["init", repo.to_str().unwrap(), "--dry-run"], &empty);
     assert!(ok, "{stderr}");
-    assert!(stdout.contains("flake.nix") && stdout.contains("fleet.toml"), "{stdout}");
+    assert!(
+        stdout.contains("flake.nix") && stdout.contains("fleet.toml"),
+        "{stdout}"
+    );
     assert!(stderr.contains("--dry-run wrote nothing"), "{stderr}");
     assert!(!repo.exists(), "a dry run created the directory");
 }

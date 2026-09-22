@@ -50,10 +50,7 @@ fn every_file_of_the_template_is_in_the_binary_and_the_other_way_round() {
     // a lock somebody committed here would pin revisions for every fleet.
     on_disk.remove("flake.lock");
 
-    let embedded: BTreeSet<String> = template::FILES
-        .iter()
-        .map(|f| f.path.to_string())
-        .collect();
+    let embedded: BTreeSet<String> = template::FILES.iter().map(|f| f.path.to_string()).collect();
 
     let missing: Vec<&String> = on_disk.difference(&embedded).collect();
     let extra: Vec<&String> = embedded.difference(&on_disk).collect();
@@ -71,8 +68,7 @@ fn what_the_binary_carries_is_what_the_directory_holds() {
         let on_disk = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("reading {} failed: {e}", path.display()));
         assert_eq!(
-            on_disk,
-            file.body,
+            on_disk, file.body,
             "{} differs between the directory and the binary",
             file.path
         );
