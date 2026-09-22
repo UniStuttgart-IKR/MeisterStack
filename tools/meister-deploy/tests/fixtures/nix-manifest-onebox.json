@@ -267,7 +267,7 @@
           },
           "paths": {
             "state": "/var/lib/meisterstack/agent",
-            "socket": "/run/meisterstack/agent.sock"
+            "run_dir": "/run/meisterstack/agent"
           },
           "tls": {
             "identity": "/var/lib/meisterstack/pki/identity.key"
@@ -407,7 +407,7 @@
           },
           "paths": {
             "state": "/var/lib/meisterstack/agent",
-            "socket": "/run/meisterstack/agent.sock"
+            "run_dir": "/run/meisterstack/agent"
           },
           "tls": {
             "identity": "/var/lib/meisterstack/pki/identity.key"
@@ -500,7 +500,7 @@
           },
           "paths": {
             "state": "/var/lib/meisterstack/agent",
-            "socket": "/run/meisterstack/agent.sock"
+            "run_dir": "/run/meisterstack/agent"
           },
           "tls": {
             "identity": "/var/lib/meisterstack/pki/identity.key"

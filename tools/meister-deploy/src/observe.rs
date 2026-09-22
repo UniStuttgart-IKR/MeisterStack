@@ -465,15 +465,34 @@ fn certificate_beside(key_path: &str) -> String {
 }
 
 /// Where the node socket is, as the host's own configuration names it.
+///
+/// Out of `paths.run_dir`, because that is the key an agent's configuration
+/// actually has: the agent opens `<run_dir>/agent.sock`
+/// (`components/agent/src/lib.rs`), and `paths.socket` is not a field of
+/// `PathsConfig` at all — `--check-config` would refuse a file that named
+/// one.
+///
+/// This line used to read `paths.socket` and fall back to
+/// `/run/meisterstack/agent.sock`, which is one directory above the socket
+/// of every host this fleet renders. The cost was not a wrong answer but a
+/// SILENT one: `[ -S … ]` was false, the probe wrote no `vms=` line,
+/// `vms_running` stayed `None`, and every drain of a real agent waited ten
+/// minutes and then refused the step it was protecting
+/// ("n1 still carries an unknown number of guests after 600s"). Measured in
+/// `checks.vm-bootstrap-fleet`, on the first drain this project ever ran
+/// against a machine.
 fn agent_socket_of(host: &ResolvedHost) -> String {
     host.effective_settings
         .agent
         .as_ref()
         .and_then(|a| a.get("paths"))
-        .and_then(|p| p.get("socket"))
+        .and_then(|p| p.get("run_dir"))
         .and_then(|s| s.as_str())
-        .unwrap_or("/run/meisterstack/agent.sock")
-        .to_string()
+        .map(|dir| format!("{}/agent.sock", dir.trim_end_matches('/')))
+        // The run directory the fleet's own derivation gives every agent
+        // (nix/agent.nix). A manifest without it is one this tool did not
+        // make, and guessing the other spelling would guess the bug above.
+        .unwrap_or_else(|| "/run/meisterstack/agent/agent.sock".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,7 +1220,8 @@ mod tests {
         );
         assert_eq!(
             spec.agent_socket.as_deref(),
-            Some("/run/meisterstack/agent.sock")
+            Some("/run/meisterstack/agent/agent.sock"),
+            "the socket is `<run_dir>/agent.sock`, which is what the agent opens"
         );
         assert_eq!(
             spec.etcd.as_ref().unwrap().member_name.as_deref(),
