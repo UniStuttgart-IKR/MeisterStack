@@ -130,6 +130,7 @@
         # target/release. nix/packages/*.nix carries the rationale for each.
         inherit (pkgs)
           meisterstack
+          meisterstack-static
           meisterstack-runtime
           cloud-hypervisor-meister
           vhost-device-input

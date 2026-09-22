@@ -26,6 +26,17 @@ final: prev: {
 
   guest-tiny = final.callPackage ./packages/guest-tiny.nix { };
 
+  # The same five binaries, statically linked. The legacy context fleet gets
+  # its binaries pushed into /opt/meisterstack/bin on a host whose libc is
+  # not ours (`meister-deploy legacy context-push`, M2C), so that push needs
+  # a binary that depends on nothing — which is what deploy/push.sh built by
+  # hand in `nix develop .#musl` until now.
+  #
+  # `pkgsStatic` and not a cross toolchain by hand: if it builds, it is one
+  # attribute; if it does not, the devShells.musl road stays and the report
+  # says so rather than a half-working package pretending otherwise.
+  meisterstack-static = final.pkgsStatic.callPackage ./packages/meisterstack.nix { };
+
   meisterstack-runtime = final.symlinkJoin {
     name = "meisterstack-runtime-${final.meisterstack.version}";
     paths = [ final.meisterstack final.cloud-hypervisor-meister ];
