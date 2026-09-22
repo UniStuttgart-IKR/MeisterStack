@@ -29,7 +29,7 @@ use meister_deploy::observation::{
 use support::{at, observed, onebox, release_of, with_new_systems};
 
 const BIN: &str = env!("CARGO_BIN_EXE_meister-deploy");
-const SHIMS: [&str; 4] = ["nix", "ssh", "git", "rsync"];
+const SHIMS: [&str; 5] = ["nix", "ssh", "git", "rsync", "ssh-keygen"];
 
 struct Sandbox {
     cwd: tempfile::TempDir,
@@ -47,12 +47,16 @@ impl Sandbox {
         let log = shims.path().join("calls.log");
         for name in SHIMS {
             let path = shims.path().join(name);
+            // The whole line in ONE append: several hosts are asked at
+            // once, and three writes per call would interleave into
+            // nonsense exactly when the parallelism is what is being
+            // tested.
             std::fs::write(
                 &path,
                 format!(
-                    "#!/bin/sh\nprintf '%s' \"{name}\" >> \"$MEISTER_SHIM_LOG\"\n\
-                     for a in \"$@\"; do printf ' [%s]' \"$a\" >> \"$MEISTER_SHIM_LOG\"; done\n\
-                     printf '\\n' >> \"$MEISTER_SHIM_LOG\"\nexit 97\n"
+                    "#!/bin/sh\nline=\"{name}\"\n\
+                     for a in \"$@\"; do line=\"$line [$a]\"; done\n\
+                     printf '%s\\n' \"$line\" >> \"$MEISTER_SHIM_LOG\"\nexit 97\n"
                 ),
             )
             .unwrap();
@@ -234,15 +238,52 @@ fn offline_and_out_together_is_a_refusal_with_a_sentence() {
 }
 
 #[test]
-fn without_a_snapshot_and_without_offline_it_says_where_that_arrives() {
+fn without_a_snapshot_it_asks_the_hosts_and_nobody_who_is_not_enrolled() {
+    // The snapshot used to arrive with lane 2A; it is here now. What this
+    // pins is the ORDER: the fleet's own `known_hosts` is consulted first,
+    // and a host with no key in it is never connected to. The shims answer
+    // 97 to everything, so every lookup fails, so no `ssh` may appear in
+    // the log at all.
     let sandbox = Sandbox::new();
-    let out = sandbox.run(&["plan", "--release", "release.json", "--select", "all"]);
-    assert_eq!(code(&out), 1);
-    assert!(stdout(&out).is_empty(), "no silent success");
-    let why = stderr(&out);
-    assert!(why.contains("--observation <file>"), "{why}");
-    assert!(why.contains("arrives with lane 2A"), "{why}");
-    assert!(sandbox.calls().is_empty());
+    let before = snapshot_of(sandbox.cwd.path());
+    let out = sandbox.run(&[
+        "plan",
+        "--release",
+        "release.json",
+        "--select",
+        "all",
+        "--inventory",
+        "fleet.toml",
+        "--dry-run",
+    ]);
+    // Blocked, not failed: a plan over a fleet nobody could look at is a
+    // plan that refuses to interrupt anything.
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let calls = sandbox.calls();
+    assert!(
+        calls.iter().all(|c| c.starts_with("ssh-keygen")),
+        "only the local lookup ran: {calls:?}"
+    );
+    assert_eq!(calls.len(), 3, "one lookup per host: {calls:?}");
+    assert!(
+        calls.iter().any(|c| c.contains("[-F] [10.0.0.10]")),
+        "{calls:?}"
+    );
+    // A dry run keeps nothing: no plan file, no snapshot.
+    assert_eq!(snapshot_of(sandbox.cwd.path()), before);
+    let plan: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("a plan on stdout");
+    assert_eq!(plan["observation"]["provisional"], serde_json::json!(false));
+    for host in ["box", "n1", "n2"] {
+        assert_eq!(
+            plan["observation"]["hosts"][host]["reachable"],
+            serde_json::json!(false),
+            "{host}"
+        );
+        assert_eq!(
+            plan["hosts"][host]["verdict"],
+            serde_json::json!("unreachable")
+        );
+    }
 }
 
 #[test]

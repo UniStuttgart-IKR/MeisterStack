@@ -48,12 +48,16 @@ impl Sandbox {
             // `#!/bin/sh` by absolute path, and only shell builtins in the
             // body: PATH holds nothing but this directory while the binary
             // runs, so the shim cannot call anything either.
+            // The whole line in ONE append: several hosts are asked at
+            // once, and three writes per call would interleave into
+            // nonsense exactly when the parallelism is what is being
+            // tested.
             std::fs::write(
                 &path,
                 format!(
-                    "#!/bin/sh\nprintf '%s' \"{name}\" >> \"$MEISTER_SHIM_LOG\"\n\
-                     for a in \"$@\"; do printf ' [%s]' \"$a\" >> \"$MEISTER_SHIM_LOG\"; done\n\
-                     printf '\\n' >> \"$MEISTER_SHIM_LOG\"\nexit 97\n"
+                    "#!/bin/sh\nline=\"{name}\"\n\
+                     for a in \"$@\"; do line=\"$line [$a]\"; done\n\
+                     printf '%s\\n' \"$line\" >> \"$MEISTER_SHIM_LOG\"\nexit 97\n"
                 ),
             )
             .unwrap();

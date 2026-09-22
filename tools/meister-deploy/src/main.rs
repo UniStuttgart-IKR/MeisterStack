@@ -282,7 +282,8 @@ struct PlanArgs {
     #[arg(long)]
     targets: Option<PathBuf>,
 
-    /// An `observation/1` snapshot of the fleet to plan from
+    /// An `observation/1` snapshot of the fleet to plan from. Without it,
+    /// the frozen target set is asked — and nothing else is.
     #[arg(long)]
     observation: Option<PathBuf>,
 
@@ -290,6 +291,25 @@ struct PlanArgs {
     /// provisional and every interrupting step in it is blocked
     #[arg(long)]
     offline: bool,
+
+    /// Ask the hosts, and write nothing at all: no plan file and no
+    /// snapshot in the state directory
+    #[arg(long)]
+    dry_run: bool,
+
+    /// The operator's repository: its `known_hosts` is what the connections
+    /// are checked against. Defaults to the one the manifest was resolved
+    /// from.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// The ssh key to offer
+    #[arg(long)]
+    identity: Option<PathBuf>,
+
+    /// How many hosts to ask at once
+    #[arg(long, default_value_t = observe::DEFAULT_CONCURRENCY)]
+    at_once: usize,
 
     /// The inventory the `[operator] cli_config` reference is read from.
     /// Defaults to the one the manifest was resolved from.
@@ -1044,18 +1064,10 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
              something to apply. It goes to standard output."
         );
     }
-    if !args.offline && args.observation.is_none() {
-        // Not a silent success and not an empty plan: taking a snapshot of
-        // a fleet is lane 2A's, and saying so is the only honest answer.
-        anyhow::bail!(
-            "plan needs to know what the fleet is running. Pass a snapshot with \
-             --observation <file>, or --offline for a provisional plan that asks nobody \
-             anything. Taking the snapshot itself arrives with lane 2A."
-        );
-    }
-
     let policy = if args.offline {
         Policy::offline()
+    } else if args.dry_run {
+        Policy::dry_run()
     } else {
         Policy::real()
     };
@@ -1063,20 +1075,63 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
 
     let text = files.read_to_string(&args.release)?;
     let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
-
-    let observation = match &args.observation {
-        Some(path) => {
-            let text = files.read_to_string(path)?;
-            Observations::from_json(&text, &path.display().to_string())?
-        }
-        None => Observations::provisional(RealClock.now()),
-    };
     let targets = match &args.targets {
         Some(path) => {
             let text = files.read_to_string(path)?;
             Some(Targets::from_json(&text, &path.display().to_string())?)
         }
         None => None,
+    };
+
+    let observation = match (&args.observation, args.offline) {
+        // A snapshot somebody else took — `status`, an earlier `plan`, a
+        // test. It travels into the plan unchanged.
+        (Some(path), _) => {
+            let text = files.read_to_string(path)?;
+            Observations::from_json(&text, &path.display().to_string())?
+        }
+        // Nothing was asked, and the plan says so: every interrupting step
+        // in it is blocked, because nothing is known about any host.
+        (None, true) => Observations::provisional(RealClock.now()),
+        // Ask — and ask exactly the hosts this plan is about. A plan over
+        // three hosts that probed seventy would be a plan that touched
+        // sixty-seven machines nobody asked it to look at.
+        (None, false) => {
+            let fleet = &release.resolved_fleet;
+            let selected = plan::select(fleet, &args.select)?;
+            let repo = args
+                .repo
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(&fleet.source.repo_path));
+            let endpoints = match &targets {
+                Some(targets) => observation::bind_targets(fleet, targets, &selected)?,
+                None => observation::manifest_endpoints(fleet, &selected)?,
+            };
+            Cancel::on_sigint()?;
+            let runner = Real::new(policy);
+            let ssh = transport::Ssh::for_repo(&repo).with_identity(args.identity.clone());
+            let prober = observe::SshProber::new(&runner, &ssh);
+            let probes: Vec<observe::HostProbe> = selected
+                .iter()
+                .map(|id| {
+                    observe::HostProbe::new(
+                        transport::Target::from_endpoint(id, &endpoints[id]),
+                        observe::ProbeSpec::for_host(&fleet.hosts[id]),
+                    )
+                })
+                .collect();
+            let snapshot = observe::observe_fleet(&prober, &probes, RealClock.now(), args.at_once)?;
+            // Kept before the plan is made, not after: a snapshot is
+            // evidence about a moment, and a planner that then refuses
+            // (a cycle, a group that cannot afford it) must not take the
+            // evidence with it. A dry run keeps nothing.
+            if !args.dry_run {
+                let state = StateDir::in_repo(&repo);
+                let path = state.save_observation(&files, &snapshot, None)?;
+                eprintln!("==> {}", path.display());
+            }
+            snapshot
+        }
     };
 
     let kind = match args.kind.as_str() {
@@ -1105,14 +1160,23 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
         RealClock.now(),
     )?;
 
-    match &args.out {
-        Some(path) => {
+    match (&args.out, args.dry_run) {
+        (Some(path), false) => {
             files.write_atomic(path, &plan.to_json()?, 0o644)?;
             println!("{}", plan.plan_id);
             eprintln!("==> {}", path.display());
         }
+        (Some(path), true) => {
+            // The hosts were asked and nothing was written, which is what a
+            // dry run of this verb is: the plan is on stdout instead.
+            print!("{}", String::from_utf8(plan.to_json()?)?);
+            eprintln!(
+                "note: {} was not written, and no snapshot was kept.",
+                path.display()
+            );
+        }
         // No file: the plan itself is the answer, whole, on stdout.
-        None => print!("{}", String::from_utf8(plan.to_json()?)?),
+        (None, _) => print!("{}", String::from_utf8(plan.to_json()?)?),
     }
     eprint!("{}", plan_summary(&plan));
     Ok(if plan.is_blocked() {
