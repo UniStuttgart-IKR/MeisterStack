@@ -135,17 +135,31 @@ let
         meisterstack.managed.enable = true;
       }
       (inv.hostModule id)
+      # The installer MEDIUM of this host, which is a medium and not this
+      # host: nix/install.nix says what is in it and why. It lives in
+      # `image.modules.iso-installer` — the sub-evaluation the image is built
+      # in — because `isoImage.*` set on a host is an option that does not
+      # exist (M0 finding A10).
+      #
+      # `{ config, ... }:` and not `configs.${id}`: reading the evaluated
+      # host out of the attribute set this list BUILDS would be a recursion
+      # that only laziness keeps from closing. The module argument is the
+      # same value with none of that.
+      ({ config, ... }: lib.mkIf (inv.hosts.${id}.install != null) {
+        image.modules.iso-installer = import ../install.nix {
+          inherit id;
+          host = inv.hosts.${id};
+          target = config;
+          fleet = inv.fleet;
+        };
+      })
       {
-        # The installer MEDIUM is not this host, and one of its settings
-        # collides with one of ours: nixpkgs' installation-device profile
+        # A host with no `install` table is never installed by this tool, so
+        # its medium carries no target and settles only the one option the
+        # two profiles disagree about: nixpkgs' installation-device profile
         # says `PermitRootLogin = "yes"` and nix/managed.nix says
         # `"prohibit-password"`, both as defaults, which is a conflict rather
-        # than a precedence. It is settled here, in the sub-evaluation the
-        # image is built in (`image.modules.<format>` — setting an
-        # `isoImage.*` option in the host itself is the trap M0 A10 named),
-        # and settled towards the stricter of the two: the installer of a
-        # managed host is reached with a key or not at all (D9), and it never
-        # has a root password to begin with (`nixos-install --no-root-passwd`).
+        # than a precedence.
         image.modules.iso-installer = { lib, ... }: {
           services.openssh.settings.PermitRootLogin = lib.mkForce "prohibit-password";
         };
