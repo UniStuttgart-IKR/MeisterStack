@@ -536,6 +536,13 @@ impl Journal {
     }
 
     /// Write it, durably, and hand back what was written.
+    ///
+    /// A write that fails keeps its sequence number, and the next line is
+    /// therefore the one after it: `fold` then reports a gap, which is
+    /// exactly what happened — a line was lost. Handing the number back
+    /// would be tidier and would let a retry write a second line with the
+    /// same `seq`, and a journal with two of one number is a journal
+    /// nobody can fold.
     pub fn append(&self, files: &dyn Files, event: JournalEvent) -> Result<JournalEvent> {
         let mut event = event;
         event.seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
