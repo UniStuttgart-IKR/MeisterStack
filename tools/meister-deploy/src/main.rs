@@ -21,8 +21,10 @@ use meister_deploy::legacy::run::Real as LegacyRunner;
 use meister_deploy::manifest::{self, Contract, NixManifest, Tool};
 use meister_deploy::observation::{Observations, Targets};
 use meister_deploy::plan::{self, PlanKind};
+use meister_deploy::receipt;
 use meister_deploy::release::ReleaseManifest;
 use meister_deploy::run::{Cancel, Policy, Real};
+use meister_deploy::state::{self, StateDir};
 use meister_deploy::{nix, source};
 
 #[derive(Parser)]
@@ -106,6 +108,20 @@ enum Verb {
     /// has to still be true when it happens. Reads a release and a snapshot
     /// of the fleet; asks no host anything of its own.
     Plan(PlanArgs),
+
+    /// What a run did: its journal, folded, and its receipt once it has one.
+    /// Reads the state directory and asks no host anything.
+    Report {
+        /// The run id, as `apply` printed it
+        #[arg(long)]
+        run: String,
+        /// The operator's repository, which is where the state directory is
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Print the receipt as json instead of as a table
+        #[arg(long)]
+        json: bool,
+    },
 
     /// The tool as it was before v1: the `fleet.toml` of schema 1, the rsync
     /// push to the context fleet, `nixos-rebuild --target-host` for metal.
@@ -305,6 +321,7 @@ fn run() -> Result<Answer> {
             offline,
         } => resolve(repo, out, fleet, *dev, hosts, *dry_run, *offline).map(Answer::from),
         Verb::Plan(args) => make_plan(args),
+        Verb::Report { run, repo, json } => report(run, repo, *json).map(Answer::from),
         Verb::Legacy(legacy) => run_legacy(legacy).map(Answer::from),
     }
 }
@@ -658,6 +675,233 @@ fn plan_summary(plan: &plan::DeploymentPlan) -> String {
         out.push('\n');
     }
     out
+}
+
+/// What a run did.
+///
+/// The journal is the evidence and the receipt is the summary of it, so this
+/// prefers the receipt when there is one and folds the journal when there is
+/// not — a run that was interrupted has no receipt, and that is exactly the
+/// run somebody wants to read. Whatever the journal does not add up to
+/// (`breaks`) and a last line that was torn off by a power cut are printed
+/// rather than swallowed.
+///
+/// Exit 0 means a report was produced, whatever it says: a rollout that
+/// failed is not this verb failing. Exit 1 means there is nothing here to
+/// report.
+fn report(run: &str, repo: &Path, json: bool) -> Result<bool> {
+    let files = RealFiles::new(Policy::real());
+    let state = StateDir::in_repo(repo);
+
+    if !files.exists(&state.run_dir(run)) {
+        let known = state.runs(&files)?;
+        anyhow::bail!(
+            "{} holds no run {run}. {}",
+            state.runs_dir().display(),
+            if known.is_empty() {
+                "There are no runs in it at all.".to_string()
+            } else {
+                format!(
+                    "It holds {}.",
+                    known
+                        .iter()
+                        .rev()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        );
+    }
+
+    let journal_path = state.journal_path(run);
+    let read = if files.exists(&journal_path) {
+        Some(state::read_journal(&files, &journal_path)?)
+    } else {
+        None
+    };
+
+    // The receipt, either as it was written or as it would be written right
+    // now. The second one is marked: a receipt this verb folded is a report
+    // about a run that has not ended.
+    let (receipt, finished) = if files.exists(&state.receipt_path(run)) {
+        (Some(state.read_receipt(&files, run)?), true)
+    } else {
+        match (&read, files.exists(&state.plan_copy_path(run))) {
+            (Some(read), true) => {
+                let text = files.read_to_string(&state.plan_copy_path(run))?;
+                let plan = plan::DeploymentPlan::from_json(
+                    &text,
+                    &state.plan_copy_path(run).display().to_string(),
+                )?;
+                let folded = receipt::fold(&read.events)?;
+                let reference = state::journal_ref(&files, &journal_path)?;
+                (
+                    Some(receipt::receipt(
+                        &plan,
+                        &folded,
+                        &reference,
+                        RealClock.now(),
+                    )),
+                    false,
+                )
+            }
+            _ => (None, false),
+        }
+    };
+
+    match (&receipt, json) {
+        (Some(receipt), true) => println!("{}", String::from_utf8(receipt.to_json()?)?),
+        (Some(receipt), false) => {
+            print!("{}", receipt_table(receipt));
+            if !finished {
+                // On stderr, like every other diagnostic: stdout is the
+                // report, and a note about how it was made is not part of
+                // it.
+                eprintln!(
+                    "note: run {run} wrote no receipt of its own, so this one was folded from \
+                     its journal just now. The run has not ended."
+                );
+            }
+        }
+        (None, _) => {
+            // No plan copy, so no receipt can be folded. The journal is
+            // still evidence, and printing it is more use than a refusal.
+            let Some(read) = &read else {
+                anyhow::bail!(
+                    "run {run} has neither a journal nor a receipt in {}; there is nothing \
+                     to report.",
+                    state.run_dir(run).display()
+                );
+            };
+            let folded = receipt::fold(&read.events)?;
+            print!("{}", run_state_table(run, &folded));
+            eprintln!(
+                "note: this run has no copy of its plan in {}, so no receipt could be folded \
+                 from it. What is above is the journal.",
+                state.run_dir(run).display()
+            );
+        }
+    }
+
+    if let Some(read) = &read
+        && let Some(torn) = &read.torn
+    {
+        eprintln!("note: {torn}");
+    }
+    Ok(true)
+}
+
+/// The receipt as a person reads it.
+fn receipt_table(receipt: &receipt::DeploymentReceipt) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "==> run {}  plan {}  release {}\n",
+        receipt.run_id, receipt.plan_id, receipt.release_id
+    ));
+    out.push_str(&format!(
+        "    outcome: {}   started {}   ended {}\n",
+        receipt.outcome,
+        stamp(receipt.started_at),
+        stamp(receipt.ended_at),
+    ));
+    if let Some(operator) = &receipt.operator {
+        out.push_str(&format!(
+            "    operator: {}@{}\n",
+            operator.user, operator.workstation
+        ));
+    }
+    out.push_str(&format!(
+        "    {:<14} {:<18} {:<18} {:>7}  {}\n",
+        "HOST", "OUTCOME", "STATE", "ACTIONS", "SYSTEM"
+    ));
+    for (id, host) in &receipt.hosts {
+        let system = match (&host.before.system, &host.after.system) {
+            (Some(before), Some(after)) if before == after => short(before).to_string(),
+            (Some(before), Some(after)) => format!("{} -> {}", short(before), short(after)),
+            (Some(before), None) => short(before).to_string(),
+            (None, Some(after)) => short(after).to_string(),
+            (None, None) => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "    {id:<14} {:<18} {:<18} {:>7}  {system}\n",
+            host.outcome,
+            host.state,
+            host.actions.len()
+        ));
+    }
+    if !receipt.untouched.is_empty() {
+        out.push_str(&format!(
+            "    untouched: {}\n",
+            receipt.untouched.join(", ")
+        ));
+    }
+    for check in &receipt.checks {
+        out.push_str(&format!(
+            "    check {} on {}: {}\n",
+            check.id,
+            check
+                .subject
+                .host
+                .as_deref()
+                .or(check.subject.resource.as_deref())
+                .unwrap_or("the fleet"),
+            check.status
+        ));
+    }
+    for break_ in &receipt.breaks {
+        out.push_str(&format!("    break: {break_}\n"));
+    }
+    out.push_str(&format!(
+        "    journal: {} (sha256 {})\n",
+        receipt.journal_path, receipt.journal_sha256
+    ));
+    out
+}
+
+/// A journal with no plan beside it, as a person reads it.
+fn run_state_table(run: &str, state: &receipt::RunState) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "==> run {run}  plan {}  {} line(s)\n",
+        state.plan_id, state.last_seq
+    ));
+    out.push_str(&format!(
+        "    {:<14} {:<18} {:>7}  {}\n",
+        "HOST", "STATE", "ACTIONS", "OPEN"
+    ));
+    for (id, host) in &state.hosts {
+        out.push_str(&format!(
+            "    {id:<14} {:<18} {:>7}  {}\n",
+            host.state,
+            host.actions.len(),
+            host.open_irreversible
+                .as_ref()
+                .map(|open| format!("{} (seq {})", open.kind, open.seq))
+                .unwrap_or_default()
+        ));
+    }
+    for break_ in &state.breaks {
+        out.push_str(&format!("    break: {break_}\n"));
+    }
+    out
+}
+
+/// A timestamp as every other line of this tool spells one: UTC, seconds,
+/// and a `Z` rather than a `+00:00` that a reader has to translate.
+fn stamp(at: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    at.map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// The last two segments of a store path: a table of full ones is a table
+/// nobody can read, and the hash is in the name.
+fn short(store_path: &str) -> &str {
+    store_path
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .unwrap_or(store_path)
 }
 
 fn show_inventory(path: &Path, json: bool) -> Result<bool> {

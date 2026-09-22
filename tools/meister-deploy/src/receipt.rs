@@ -289,6 +289,25 @@ pub enum Outcome {
     Aborted,
 }
 
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Success => "success",
+            Outcome::Failed => "failed",
+            Outcome::Partial => "partial",
+            Outcome::Aborted => "aborted",
+        }
+    }
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `f.pad` and not `write_str`: a column that is asked to be twelve
+        // wide has to be twelve wide, or the table is not one.
+        f.pad(self.as_str())
+    }
+}
+
 /// What one host came to. The five that are not `success` or `failed` are
 /// the ones a two-valued outcome would have to lie about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -331,6 +350,19 @@ impl HostOutcome {
         }
     }
 
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HostOutcome::Success => "success",
+            HostOutcome::Failed => "failed",
+            HostOutcome::Unchanged => "unchanged",
+            HostOutcome::Unreached => "unreached",
+            HostOutcome::Skipped => "skipped",
+            HostOutcome::Unknown => "unknown",
+            HostOutcome::RolledBack => "rolled-back",
+            HostOutcome::RecoveryRequired => "recovery-required",
+        }
+    }
+
     fn is_failure(self) -> bool {
         matches!(
             self,
@@ -340,6 +372,12 @@ impl HostOutcome {
 
     fn is_forward(self) -> bool {
         matches!(self, HostOutcome::Success | HostOutcome::Unchanged)
+    }
+}
+
+impl std::fmt::Display for HostOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
     }
 }
 
@@ -956,6 +994,41 @@ pub fn unfinished(plan: &DeploymentPlan, state: &RunState) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_an_outcome_is_called_in_a_table_is_what_it_is_called_in_json() {
+        // Two spellings of one name drift apart the first time somebody adds
+        // a variant, and then a receipt says one thing and its table says
+        // another.
+        for outcome in [
+            Outcome::Success,
+            Outcome::Failed,
+            Outcome::Partial,
+            Outcome::Aborted,
+        ] {
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert_eq!(json.trim_matches('"'), outcome.as_str());
+        }
+        for outcome in [
+            HostOutcome::Success,
+            HostOutcome::Failed,
+            HostOutcome::Unchanged,
+            HostOutcome::Unreached,
+            HostOutcome::Skipped,
+            HostOutcome::Unknown,
+            HostOutcome::RolledBack,
+            HostOutcome::RecoveryRequired,
+        ] {
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert_eq!(json.trim_matches('"'), outcome.as_str());
+        }
+        // And a column asked to be wide is wide.
+        assert_eq!(format!("[{:<10}]", Outcome::Partial), "[partial   ]");
+        assert_eq!(
+            format!("[{:<18}]", HostOutcome::RecoveryRequired),
+            "[recovery-required ]"
+        );
+    }
     use crate::fixtures::{
         at, observed, onebox_enrolled, plan_policy, release_of, with_new_systems,
     };

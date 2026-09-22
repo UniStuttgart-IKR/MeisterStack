@@ -16,7 +16,10 @@ chrono.workspace = true
 clap.workspace = true
 # killpg and sigaction: a deadline has to take the whole process group with
 # it, and the SIGINT the child no longer receives has to be caught here.
-nix = { workspace = true }
+# `hostname` on top of the workspace's features: a lock record has to name
+# the machine its pid is on, or the pid is a number that means something
+# different on every host that shares the state directory.
+nix = { workspace = true, features = ["hostname"] }
 # The contracts: JSON on the wire, a JSON Schema for the `schema` verb, a
 # sha256 for every content id, a uuid v7 for every run.
 schemars.workspace = true
