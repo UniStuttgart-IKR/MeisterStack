@@ -77,7 +77,29 @@ let
         if install.disk ? size_gb then install.disk.size_gb * 1000000000
         else throw "host ${id}: install.disk has no size_gb";
     };
+    # Every block device the LAYOUT names, as the host's module bound it.
+    #
+    # Not in the brief's list and here on purpose: the installer is given a
+    # SERIAL and has to end up at the device the partition table will be
+    # written to, and the two are bound by a name only the host module knows
+    # (`/dev/disk/by-id/nvme-<model>_<serial>` on one transport,
+    # `virtio-<serial>` on another — M0 probe S7). The alternative was to
+    # read the device out of the disko SCRIPT, which is grepping a shell
+    # script for a path, and the one time that goes wrong is the time it
+    # formats the wrong disk.
+    layout_devices = lib.mapAttrsToList (_: d: d.device) (target.disko.devices.disk or { });
     preserve = install.preserve or [ ];
+    # What the preserved paths live ON. `preserve` is a list of paths and
+    # `meister-install` has to decide whether each one is on the disk it is
+    # about to destroy; a path alone cannot answer that, and the answer is
+    # in the inventory the operator wrote.
+    persistence = map
+      (p: {
+        inherit (p) path;
+        device_ref = p.device;
+        required = p.required or true;
+      })
+      (host.persistence or [ ]);
   };
 in
 {
@@ -133,6 +155,12 @@ in
     '';
     mode = "0444";
   };
+
+  # Where `meister-install` mounts a partition for a moment while it looks
+  # for an installation mark. Shipped rather than made on the spot, so that
+  # `meister-install confirm --dry-run` — which writes nothing at all — can
+  # still look.
+  systemd.tmpfiles.rules = [ "d /run/meister-install/probe 0700 root root -" ];
 
   # The way in, or the absence of one.
   #
