@@ -338,6 +338,34 @@ in
       systemd.services.meister-cluster-controller = controller "cluster";
     })
 
+    # --- lane 3-integration (finding N2 of lane 3B) --------------------
+    #
+    # The mode of a controller's private keys, enforced at every boot.
+    # `nix/agent.nix` has had this for the unprivileged agent since 1A and
+    # the controllers had nothing: a key somebody loosened by hand stayed
+    # loosened on a controller and closed itself again on an agent, and the
+    # loaders of this stack refuse a key with group bits in its mode
+    # (`mode & 0o077 != 0` in shared/pki/src/pem.rs and shared/proto) — so a
+    # host that survived a `chmod 640` was a host whose control plane would
+    # not start after the next reboot.
+    #
+    # `z` and not `d`: the file is put there by a deployment
+    # (`deliver-secret`, lane 3B) and this rule only says what its mode has
+    # to be; on a host where it is not there yet, `z` does nothing.
+    #
+    # The `identity.key` line is left to the agent module where that module
+    # already writes it, because two identical tmpfiles lines for one path
+    # are a duplicate systemd complains about rather than a rule twice.
+    (lib.mkIf
+      (builtins.elem "cluster" cfg.unitsFor || builtins.elem "cloud" cfg.unitsFor)
+      {
+        systemd.tmpfiles.rules =
+          lib.optional (!(builtins.elem "agent" cfg.unitsFor && cfg.agent.unprivileged))
+            "z ${pki}/identity.key 0600 meister meister -"
+          ++ [ "z ${pki}/serving.key 0600 meister meister -" ];
+      })
+    # --- end lane 3-integration ----------------------------------------
+
     (lib.mkIf (builtins.elem "cloud" cfg.unitsFor) {
       meisterstack.cloud.effective = lib.recursiveUpdate
         (lib.recursiveUpdate cloudDefaults cfg.cloud.generated)
