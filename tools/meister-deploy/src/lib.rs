@@ -29,6 +29,7 @@ pub mod legacy;
 pub mod manifest;
 pub mod nix;
 pub mod observation;
+pub mod observe;
 pub mod plan;
 pub mod receipt;
 pub mod release;
