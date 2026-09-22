@@ -44,3 +44,4 @@ pub mod source;
 pub mod state;
 pub mod template;
 pub mod transport;
+pub mod verify;
