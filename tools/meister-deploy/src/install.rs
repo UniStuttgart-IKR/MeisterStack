@@ -887,6 +887,124 @@ impl<'a> Installer<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The workstation half: what `meister-deploy install` leaves behind
+// ---------------------------------------------------------------------------
+
+pub const MEDIA_SCHEMA: &str = "meister-deploy/install-media/1";
+
+/// What was built for one host, so that a second `install` says "this is the
+/// medium" instead of building a second one.
+///
+/// It lives beside the medium in the state directory rather than inside the
+/// plan, because a plan is a document about a fleet at a moment and this is a
+/// FILE on this workstation: which iso, of which release, for which plan, and
+/// what its bytes hash to — the last one so that whoever writes it to a stick
+/// can check they wrote the right thing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MediaRecord {
+    pub schema: String,
+    pub host: String,
+    pub plan_id: String,
+    pub release_id: String,
+    /// The link in the state directory, which is also its collector root.
+    pub iso: String,
+    /// The file in the store the link points at.
+    pub store_path: String,
+    pub sha256: String,
+    pub size: u64,
+    pub built_at: DateTime<Utc>,
+}
+
+impl MediaRecord {
+    pub fn to_json(&self) -> Result<Vec<u8>> {
+        let mut bytes = serde_json::to_vec_pretty(self)
+            .map_err(|e| anyhow::anyhow!("writing the media record as json failed: {e}"))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    pub fn from_json(text: &str, origin: &str) -> Result<MediaRecord> {
+        crate::manifest::parse_checked(text, origin, MEDIA_SCHEMA)
+    }
+}
+
+/// Where the media of a deployment live: `<repo>/.meister-deploy/media`.
+pub fn media_dir(state: &crate::state::StateDir) -> PathBuf {
+    state.root().join("media")
+}
+
+/// The sheet somebody carries to the machine.
+///
+/// Printed rather than written, and written rather than assumed: everything
+/// in it is a fact out of the plan and the release, in the order a person
+/// needs it — which disk, which command, what comes back, and where that
+/// goes. The one thing it must never become is a list of steps somebody can
+/// follow without reading, so the disk's serial is in every one of them.
+pub fn sheet(record: &MediaRecord, target: &SheetFacts) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\nThe installer medium for {} of the fleet {}:\n\n",
+        record.host, target.fleet
+    ));
+    out.push_str(&format!("    {}\n", record.iso));
+    out.push_str(&format!("    sha256 {}\n", record.sha256));
+    out.push_str(&format!(
+        "    {} bytes ({} MiB), release {}\n\n",
+        record.size,
+        record.size / (1024 * 1024),
+        record.release_id
+    ));
+    out.push_str("Write it to a stick or attach it as virtual media, and boot the machine\n");
+    out.push_str(&format!(
+        "with the disk whose serial is {}. Nothing happens by itself: on the\n",
+        target.serial
+    ));
+    out.push_str("console, type\n\n");
+    out.push_str(&format!(
+        "    meister-install confirm --host {} --disk {}{}\n\n",
+        record.host,
+        target.serial,
+        if target.reinstall { " --reinstall" } else { "" }
+    ));
+    out.push_str("It shows you the disk, its model and its size, and what it is about to\n");
+    out.push_str("destroy, before it destroys anything. Then it prints one line:\n\n");
+    out.push_str("    HOST KEY FINGERPRINT  SHA256:…\n\n");
+    out.push_str("Write that down and bring it back here:\n\n");
+    out.push_str(&format!(
+        "    meister-deploy keys enroll {} --fingerprint SHA256:…\n\n",
+        record.host
+    ));
+    out.push_str(&match target.boot_mode {
+        BootMode::Uefi => format!("Afterwards {} boots from its own disk.\n", record.host),
+        BootMode::Direct => format!(
+            "Afterwards {} has NO boot loader: its provider has to load the kernel, the\n\
+             initrd and the command line of this release (`meister-deploy image --release \
+             … \n--host {} --kind direct-boot`).\n",
+            record.host, record.host
+        ),
+    });
+    if !target.preserve.is_empty() {
+        out.push_str(&format!(
+            "\nThese paths must not be on that disk, and the installer refuses if they \
+             are:\n    {}\n",
+            target.preserve.join("\n    ")
+        ));
+    }
+    out
+}
+
+/// The facts the sheet needs out of the release, gathered once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SheetFacts {
+    pub fleet: String,
+    pub serial: String,
+    pub boot_mode: BootMode,
+    pub preserve: Vec<String>,
+    pub reinstall: bool,
+}
+
 /// `label:meister-data` -> `/dev/disk/by-label/meister-data`.
 ///
 /// `serial:` is not turned into a path on purpose: a serial names a DISK and

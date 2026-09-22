@@ -369,9 +369,11 @@ fn a_blocked_plan_is_exit_two_and_still_a_plan() {
 #[test]
 fn a_plan_kind_that_does_not_exist_yet_says_which_milestone_it_arrives_in() {
     let sandbox = Sandbox::new();
+    // `install` is no longer one of these: lane 3A built it, and
+    // tests/cli_install.rs is where it is argued about.
     for (kind, needle) in [
-        ("install", "arrives with M3"),
-        ("keys-rotate", "with M5"),
+        ("keys-rotate", "arrive with M5"),
+        ("retire", "arrive with M5"),
         ("nonsense", "is not a plan kind"),
     ] {
         let out = sandbox.run(&[
