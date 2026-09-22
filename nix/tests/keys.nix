@@ -84,9 +84,23 @@ let
   # switch between them changes a file and no unit — which is what keeps the
   # test driver's backdoor alive across it.
   boxCommon = { ... }: {
-    imports = [ self.nixosModules.services self.nixosModules.managed ];
-    meisterstack.roles = [ "cloud" "cluster" ];
+    imports = [
+      self.nixosModules.services
+      self.nixosModules.managed
+      # The module `lib.mkFleet` gives a host of this fleet: its roles, and
+      # the per-host values the one derivation computes from the inventory
+      # — the cluster's name, the address it dials the cloud at, the etcd
+      # membership. Without it a controller comes up with its built-in
+      # defaults and "runs standalone", which is a test about nothing. (The
+      # first run of this test measured exactly that.)
+      (inv.hostModule "box")
+    ];
     meisterstack.managed.enable = true;
+    # A test node boots with `-kernel` and has no ESP, and the fleet's host
+    # module asks for systemd-boot (gate M0 (b)). Both loaders off is what
+    # nixos-test-base wants.
+    boot.loader.systemd-boot.enable = lib.mkForce false;
+    boot.loader.efi.canTouchEfiVariables = lib.mkForce false;
     # The cloud's key-encryption key: the one DATA secret of this fleet, and
     # the one file the planner must never replace once it is there (a present
     # `secrets.key` is the key the stored secrets were encrypted with).
@@ -282,7 +296,11 @@ pkgs.testers.runNixOSTest {
     operator.succeed("test -f /root/ca/ca.key && test -f /root/ca/ca.crt")
     # And the cloud's key-encryption key, which is an OPERATOR FILE: this
     # tool never makes one and never replaces one.
-    operator.succeed("head -c 32 /dev/urandom | base64 > /root/ca/secrets.key")
+    # 64 hex characters and no newline: the cloud reads 32 raw bytes or 64
+    # hex, and anything else is a start-up error naming the length it got.
+    operator.succeed(
+        "openssl rand -hex 32 | tr -d '\n' > /root/ca/secrets.key && chmod 600 /root/ca/secrets.key"
+    )
 
     # What `nixos-install` leaves and a test machine does not have.
     box.succeed(
