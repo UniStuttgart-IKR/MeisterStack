@@ -52,6 +52,56 @@ pub fn generate_key_and_csr(common_name: &str) -> Result<KeyAndCsr> {
     })
 }
 
+/// Another request over a key that is already on this machine.
+///
+/// The idempotent half of enrolment. `meister-activate keygen` is run over
+/// ssh by a rollout that can be interrupted, and a second run must not make
+/// a SECOND identity: a host with two keys has two identities, and the one
+/// the certificate was issued over is then a coin toss. So the key stays and
+/// only the request is made again.
+///
+/// The key is read as a value rather than a path because the caller here
+/// goes through its own file door (`meister-deploy`'s `Files` trait); this
+/// function opens nothing.
+pub fn csr_for_key(key_pem: &str, common_name: &str) -> Result<String> {
+    if common_name.is_empty() {
+        bail!("a certificate request needs a name");
+    }
+    let key = KeyPair::from_pem(key_pem)
+        .map_err(|e| anyhow::anyhow!("reading the key this request is to be made over: {e}"))?;
+    let mut params = CertificateParams::new(Vec::new())
+        .map_err(|e| anyhow::anyhow!("building the request: {e}"))?;
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, common_name);
+    params.distinguished_name = dn;
+    let csr = params
+        .serialize_request(&key)
+        .map_err(|e| anyhow::anyhow!("signing the request: {e}"))?;
+    csr.pem()
+        .map_err(|e| anyhow::anyhow!("encoding the request: {e}"))
+}
+
+/// A name for a key that is safe to print: the sha256 of its PUBLIC half
+/// in SubjectPublicKeyInfo form, as hex.
+///
+/// What it is for is comparing — "is the key on that host still the one the
+/// certificate was issued over" — without anything that could be mistaken
+/// for the key itself ever reaching a log, a journal or a receipt.
+pub fn public_key_sha256(key_pem: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let key = KeyPair::from_pem(key_pem)
+        .map_err(|e| anyhow::anyhow!("reading the key to name its public half: {e}"))?;
+    // The PEM of the SubjectPublicKeyInfo: the same bytes any tool would
+    // print for this key, so the digest is one somebody can reproduce with
+    // `openssl pkey -pubout`.
+    let digest = Sha256::digest(key.public_key_pem().as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    Ok(out)
+}
+
 /// The name a request is made out to, having established that the request
 /// parses and that the key inside it signed it.
 ///
@@ -113,6 +163,39 @@ mod tests {
     #[test]
     fn a_request_without_a_name_is_refused() {
         assert!(generate_key_and_csr("").is_err());
+        assert!(csr_for_key(&generate_key_and_csr("a").unwrap().key_pem, "").is_err());
+    }
+
+    /// The property a resumed enrolment stands on: asking the same key for a
+    /// second request does not make a second key.
+    #[test]
+    fn a_second_request_over_the_same_key_is_the_same_key() {
+        let made = generate_key_and_csr("system:node:n1").unwrap();
+        let again = csr_for_key(&made.key_pem, "system:node:n1").unwrap();
+        assert!(again.starts_with("-----BEGIN CERTIFICATE REQUEST-----"));
+        assert_eq!(requested_name(&again).unwrap(), "system:node:n1");
+        // Same key, so the same public half — which is what a certificate is
+        // issued over.
+        assert_eq!(
+            public_key_sha256(&made.key_pem).unwrap(),
+            public_key_sha256(&made.key_pem).unwrap()
+        );
+        let other = generate_key_and_csr("system:node:n1").unwrap();
+        assert_ne!(
+            public_key_sha256(&made.key_pem).unwrap(),
+            public_key_sha256(&other.key_pem).unwrap(),
+            "two keys are two keys"
+        );
+    }
+
+    /// The digest is a digest and never the key.
+    #[test]
+    fn the_public_name_of_a_key_is_hex_and_carries_nothing_of_the_key() {
+        let made = generate_key_and_csr("alice").unwrap();
+        let name = public_key_sha256(&made.key_pem).unwrap();
+        assert_eq!(name.len(), 64, "{name}");
+        assert!(name.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        assert!(public_key_sha256("not a key at all").is_err());
     }
 
     #[test]

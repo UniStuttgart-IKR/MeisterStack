@@ -24,7 +24,9 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use meister_deploy::activate::{Helper, Mode, SYSTEM_PROFILE, TxnRecord, ok_reply};
+use meister_deploy::activate::{
+    DEFAULT_PKI_DIR, Helper, KeyKind, Mode, SYSTEM_PROFILE, TxnRecord, ok_reply,
+};
 use meister_deploy::effects::{RealClock, RealFiles};
 use meister_deploy::observe::DEPLOY_DIR;
 use meister_deploy::run::{Cancel, Policy, Real};
@@ -41,6 +43,10 @@ struct Cli {
     /// Where the transaction records and the lock live
     #[arg(long, default_value = DEPLOY_DIR, global = true)]
     deploy_dir: PathBuf,
+
+    /// Where this host's key material lives (`meisterstack.pki.dir`)
+    #[arg(long, default_value = DEFAULT_PKI_DIR, global = true)]
+    pki_dir: PathBuf,
 
     /// The system profile to move
     #[arg(long, default_value = SYSTEM_PROFILE, global = true)]
@@ -125,6 +131,30 @@ enum Verb {
         #[arg(long, default_value_t = 3)]
         keep: usize,
     },
+
+    // --- lane 3B ------------------------------------------------------
+    /// Make this host's own key, and print a certificate request over it.
+    ///
+    /// The private half is made here and never leaves: what goes back to
+    /// the operator is a request, which is a public key and a name. An
+    /// existing key is kept and asked for another request, so running this
+    /// twice is not two identities; `--replace` is the deliberate other
+    /// answer.
+    Keygen {
+        /// The name to ask for, e.g. `system:node:n1`. The CA writes its
+        /// own subject either way — the request is a request.
+        #[arg(long)]
+        subject: String,
+        /// Which key: `identity` (what this host dials with) or `serving`
+        /// (what a client checks this address against)
+        #[arg(long, default_value = "identity")]
+        kind: String,
+        /// Make a NEW key even though one is there. A rotation, or a host
+        /// that was reinstalled — never a repair.
+        #[arg(long)]
+        replace: bool,
+    },
+    // --- end lane 3B --------------------------------------------------
 }
 
 #[derive(Subcommand)]
@@ -217,7 +247,8 @@ fn run() -> Result<()> {
         // The PATH this process has, for the transient unit that may have to
         // revert the activation. Read here rather than in the library, which
         // reads no environment of its own.
-        .with_timer_path(std::env::var("PATH").unwrap_or_default());
+        .with_timer_path(std::env::var("PATH").unwrap_or_default())
+        .with_pki_dir(cli.pki_dir.clone());
 
     match &cli.cmd {
         Verb::Status => {
@@ -374,6 +405,36 @@ fn run() -> Result<()> {
                 ),
             )?;
         }
+        // --- lane 3B --------------------------------------------------
+        Verb::Keygen {
+            subject,
+            kind,
+            replace,
+        } => {
+            let outcome = helper.keygen(subject, KeyKind::parse(kind)?, *replace)?;
+            // NOT through `answer`: this one has a shape the workstation
+            // parses (`meister_deploy::pki::KeygenReply`), and wrapping it
+            // in the helper's usual `{ok, …}` envelope would make the
+            // request a field of a field. The request itself is what a
+            // human wants on stdout too, because the next thing anybody
+            // does with it is hand it to the CA.
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                eprintln!(
+                    "{} {} for {} ({})",
+                    if outcome.created {
+                        "made a new key"
+                    } else {
+                        "kept the key that was here and made another request"
+                    },
+                    helper.key_path(KeyKind::parse(kind)?).display(),
+                    outcome.subject,
+                    outcome.public_key_sha256
+                );
+                print!("{}", outcome.csr_pem);
+            }
+        } // --- end lane 3B ----------------------------------------------
     }
     Ok(())
 }

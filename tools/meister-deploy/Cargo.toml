@@ -20,6 +20,13 @@ clap.workspace = true
 # the machine its pid is on, or the pid is a number that means something
 # different on every host that shares the state directory.
 nix = { workspace = true, features = ["hostname"] }
+# The ONE reason this crate knows any cryptography: `meister-activate keygen`
+# makes a key pair and a certificate request ON THE TARGET, with the same
+# curve and the same request shape the controllers expect — so it has to be
+# the same code, not a second implementation that agrees today. Nothing else
+# in this crate touches a key: the CA is `tools/meister-ca` behind the
+# runner, and a certificate is a file this tool moves and never opens.
+pki = { package = "meister-pki", path = "../../shared/pki" }
 # The contracts: JSON on the wire, a JSON Schema for the `schema` verb, a
 # sha256 for every content id, a uuid v7 for every run.
 schemars.workspace = true

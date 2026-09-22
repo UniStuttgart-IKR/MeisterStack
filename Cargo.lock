@@ -1246,6 +1246,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "meister-pki",
  "nix 0.31.3",
  "schemars",
  "serde",

@@ -83,6 +83,20 @@ const SWITCH: Duration = Duration::from_secs(900);
 /// How long the garbage collector may take. It walks the whole store.
 const COLLECT: Duration = Duration::from_secs(3600);
 
+/// Where a managed host keeps its key material (`meisterstack.pki.dir` of
+/// `nix/managed.nix`). The directory is created by that profile's tmpfiles
+/// rules before anything runs; this is the default so that an operator at a
+/// console types no path.
+pub const DEFAULT_PKI_DIR: &str = "/var/lib/meisterstack/pki";
+
+/// Who reads a key on a managed host.
+///
+/// The service user, and therefore the OWNER — `meister:meister 0600` and
+/// not `root:meister 0640`, because every key loader in this project
+/// refuses a mode with group bits in it (M0 probe S11, Gate M0 "D1
+/// changed"). Root reads it anyway.
+pub const KEY_OWNER: &str = "meister";
+
 /// What a transient unit gets to find its programs in when nobody says
 /// otherwise.
 ///
@@ -262,6 +276,10 @@ pub struct Helper<'a> {
     /// read of this process's environment, so that a test can pin it and so
     /// that this module reads no environment of its own.
     pub timer_path: String,
+    /// Where this host's key material lives (`meisterstack.pki.dir`). An
+    /// argument for the same reason the profile is one: a test moves a
+    /// directory that is not this machine's.
+    pub pki_dir: PathBuf,
 }
 
 impl<'a> Helper<'a> {
@@ -280,7 +298,15 @@ impl<'a> Helper<'a> {
             profile: PathBuf::from(SYSTEM_PROFILE),
             own_exe: own_exe.into(),
             timer_path: SYSTEM_PATH.to_string(),
+            pki_dir: PathBuf::from(DEFAULT_PKI_DIR),
         }
+    }
+
+    /// Where the keys are, for a host whose `meisterstack.pki.dir` is not
+    /// the default and for a test.
+    pub fn with_pki_dir(mut self, dir: impl Into<PathBuf>) -> Helper<'a> {
+        self.pki_dir = dir.into();
+        self
     }
 
     /// The `PATH` the revert timer runs with. The binary passes its own.
@@ -1204,6 +1230,151 @@ impl<'a> Helper<'a> {
         let out = self.runner.run(&cmd)?;
         Ok(parse_generations(&out.stdout))
     }
+
+    // -----------------------------------------------------------------
+    // keygen (lane 3B)
+    // -----------------------------------------------------------------
+
+    /// Make this host's own key, and hand out a request over it.
+    ///
+    /// **The private half is made here and stays here.** That is the whole
+    /// of D10 and the reason this is a command of the TARGET's helper
+    /// rather than a verb of the workstation: a workstation that generated
+    /// node keys would be a workstation holding every identity of the
+    /// fleet, and its backup would be the fleet.
+    ///
+    /// Idempotent on purpose. A rollout can be interrupted between the
+    /// `ssh` that started this and the answer coming back, and the operator
+    /// will run it again. Without `--replace` an existing key is LEFT
+    /// ALONE and only a new request is made over it — because a second key
+    /// would be a second identity, and the certificate that was issued over
+    /// the first one would then be a certificate for a key nobody has.
+    ///
+    /// `--replace` is what a rotation is made of (M5A) and what a
+    /// reinstalled host needs; it is a flag rather than the default for the
+    /// same reason.
+    pub fn keygen(&self, subject: &str, kind: KeyKind, replace: bool) -> Result<KeygenOutcome> {
+        let path = self.key_path(kind);
+        let had = self.files.exists(&path);
+
+        let (key_pem, created) = if had && !replace {
+            // Read, and never printed: what leaves this function is a
+            // request and a digest.
+            let existing = self.files.read_to_string(&path).with_context(|| {
+                format!(
+                    "{} is there and could not be read. It is this host's identity; \
+                     `keygen --replace` would make a new one, and that is a decision \
+                     rather than a repair.",
+                    path.display()
+                )
+            })?;
+            (existing, false)
+        } else {
+            let made = pki::generate_key_and_csr(subject)
+                .map_err(|e| anyhow::anyhow!("making a key pair for {subject}: {e}"))?;
+            // 0600 from the start, never chmod'ed onto an existing file:
+            // `Files::write_atomic` opens the temporary with the mode and
+            // renames it into place, so there is no moment in which this
+            // file is readable by anybody but its owner. That is exactly
+            // what `pki::pem::write_secret` does, and it goes through this
+            // crate's file door instead so that `--dry-run` refuses it and
+            // a unit test can watch it (tests/no_direct_effects.rs).
+            self.files
+                .create_dir_all(path.parent().unwrap_or_else(|| Path::new(DEFAULT_PKI_DIR)))?;
+            self.files
+                .write_atomic(&path, made.key_pem.as_bytes(), 0o600)?;
+            // And the owner is the user that reads it. Root wrote it, so
+            // the file was never readable by anybody else in between.
+            // `chown` through the runner because there is no door for it —
+            // a file's owner is not something `Files` knows about.
+            self.runner.run(
+                &Cmd::new(Effect::Key, "chown", QUICK)
+                    .arg(format!("{KEY_OWNER}:{KEY_OWNER}"))
+                    .arg(path.display().to_string()),
+            )?;
+            (made.key_pem, true)
+        };
+
+        // The request is made over the key either way: a fresh key and an
+        // existing one are asked the same question, which is what makes a
+        // second run of this command an answer rather than a change.
+        let csr_pem = pki::csr_for_key(&key_pem, subject)
+            .map_err(|e| anyhow::anyhow!("making a certificate request for {subject}: {e}"))?;
+        let public_key_sha256 = pki::public_key_sha256(&key_pem)
+            .map_err(|e| anyhow::anyhow!("naming the public half of {}: {e}", path.display()))?;
+
+        Ok(KeygenOutcome {
+            subject: subject.to_string(),
+            kind: kind.as_str().to_string(),
+            csr_pem,
+            public_key_sha256,
+            created,
+        })
+    }
+
+    /// Where a key of this kind lives on this host.
+    pub fn key_path(&self, kind: KeyKind) -> PathBuf {
+        self.pki_dir.join(format!("{}.key", kind.as_str()))
+    }
+}
+
+/// Which of the two keys a managed host holds.
+///
+/// Two and not one, because they answer different questions: `identity.key`
+/// is what this machine DIALS with (`CN=system:…`), `serving.key` is what a
+/// client checks this ADDRESS against (`CN=<host name>`, with SANs). The
+/// file names are the ones `nix/agent.nix` and `nix/controllers.nix` put
+/// into every rendered configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    Identity,
+    Serving,
+}
+
+impl KeyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyKind::Identity => "identity",
+            KeyKind::Serving => "serving",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<KeyKind> {
+        match text {
+            "identity" => Ok(KeyKind::Identity),
+            "serving" => Ok(KeyKind::Serving),
+            other => bail!(
+                "{other:?} is not a key this host keeps. There are two: `identity` (what this \
+                 machine dials with) and `serving` (what a client checks this address \
+                 against)."
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for KeyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+/// What `keygen` answers with.
+///
+/// There is no field for the key and there must not be: this object is
+/// printed as json on stdout, travels back over ssh and is read by a
+/// workstation that writes parts of it into a repository somebody commits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeygenOutcome {
+    pub subject: String,
+    pub kind: String,
+    pub csr_pem: String,
+    /// sha256 of the public half, hex. A name for the key that is safe
+    /// everywhere the key is not.
+    pub public_key_sha256: String,
+    /// False when a key was already here and this only made another
+    /// request over it.
+    pub created: bool,
 }
 
 /// One generation of the system profile.
@@ -2164,6 +2335,191 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("activate-txn/2"), "{err}");
+    }
+
+    // --- lane 3B: keygen ---------------------------------------------
+
+    const PKI: &str = "/var/lib/meisterstack/pki";
+
+    fn chown(path: &str) -> Matcher {
+        Matcher::exact("chown", ["meister:meister", path])
+    }
+
+    /// The property the whole of D10 rests on: the key is made here, it is
+    /// written 0600, and what comes back is a request.
+    #[test]
+    fn a_key_is_made_on_the_host_and_only_a_request_leaves_it() {
+        let runner =
+            StrictFake::new().expect(chown(&format!("{PKI}/identity.key")), Output::default());
+        let files = MemFiles::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let out = helper
+            .keygen("system:node:n1", KeyKind::Identity, false)
+            .unwrap();
+        runner.verify().unwrap();
+
+        assert!(out.created);
+        assert_eq!(out.subject, "system:node:n1");
+        assert_eq!(out.kind, "identity");
+        assert!(
+            out.csr_pem
+                .starts_with("-----BEGIN CERTIFICATE REQUEST-----")
+        );
+        assert_eq!(out.public_key_sha256.len(), 64);
+
+        // The key is on the host.
+        let written =
+            String::from_utf8(files.content(format!("{PKI}/identity.key")).unwrap()).unwrap();
+        assert!(written.contains("PRIVATE KEY"), "{written}");
+        // And in the answer there is no line of it.
+        for line in written
+            .lines()
+            .filter(|l| !l.starts_with("-----") && l.len() > 16)
+        {
+            assert!(!out.csr_pem.contains(line), "a line of the key travelled");
+        }
+        let printed = serde_json::to_string(&out).unwrap();
+        assert!(!printed.contains("PRIVATE KEY"), "{printed}");
+    }
+
+    /// 0600 from the start: created with the mode, not chmod'ed onto a file
+    /// that was briefly readable (M0 probe S11, Gate M0 "D1 changed").
+    #[test]
+    fn the_key_is_written_with_the_mode_it_has_to_have() {
+        let runner =
+            StrictFake::new().expect(chown(&format!("{PKI}/serving.key")), Output::default());
+        let files = MemFiles::new();
+        let clock = clock();
+        helper(&runner, &files, &clock)
+            .keygen("meister-box", KeyKind::Serving, false)
+            .unwrap();
+        runner.verify().unwrap();
+        assert!(
+            files
+                .attempts()
+                .iter()
+                .any(|a| a == &format!("write(0600) {PKI}/serving.key")),
+            "{:?}",
+            files.attempts()
+        );
+        // And the owner is the user that reads it, set by the one command
+        // this function runs.
+        assert_eq!(
+            runner.calls(),
+            vec![format!("chown meister:meister {PKI}/serving.key")]
+        );
+    }
+
+    /// An interrupted rollout runs this again. A second key would be a
+    /// second identity, and the certificate issued over the first would be
+    /// a certificate for a key nobody has.
+    #[test]
+    fn a_second_run_keeps_the_key_and_makes_another_request() {
+        let first_runner =
+            StrictFake::new().expect(chown(&format!("{PKI}/identity.key")), Output::default());
+        let files = MemFiles::new();
+        let clock = clock();
+        let first = helper(&first_runner, &files, &clock)
+            .keygen("system:node:n1", KeyKind::Identity, false)
+            .unwrap();
+        first_runner.verify().unwrap();
+        let key = files.content(format!("{PKI}/identity.key")).unwrap();
+
+        // No chown, no write: the second run only reads.
+        let runner = StrictFake::new();
+        let again = helper(&runner, &files, &clock)
+            .keygen("system:node:n1", KeyKind::Identity, false)
+            .unwrap();
+        runner.verify().unwrap();
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert!(!again.created);
+        assert_eq!(files.content(format!("{PKI}/identity.key")).unwrap(), key);
+        assert_eq!(again.public_key_sha256, first.public_key_sha256);
+        assert!(
+            again
+                .csr_pem
+                .starts_with("-----BEGIN CERTIFICATE REQUEST-----")
+        );
+    }
+
+    #[test]
+    fn replace_is_the_deliberate_other_answer() {
+        let first_runner =
+            StrictFake::new().expect(chown(&format!("{PKI}/identity.key")), Output::default());
+        let files = MemFiles::new();
+        let clock = clock();
+        let first = helper(&first_runner, &files, &clock)
+            .keygen("system:node:n1", KeyKind::Identity, false)
+            .unwrap();
+        first_runner.verify().unwrap();
+
+        let runner =
+            StrictFake::new().expect(chown(&format!("{PKI}/identity.key")), Output::default());
+        let replaced = helper(&runner, &files, &clock)
+            .keygen("system:node:n1", KeyKind::Identity, true)
+            .unwrap();
+        runner.verify().unwrap();
+        assert!(replaced.created);
+        assert_ne!(replaced.public_key_sha256, first.public_key_sha256);
+    }
+
+    /// The two keys are two files, under the names every rendered
+    /// configuration of this fleet points at.
+    #[test]
+    fn the_two_kinds_are_two_files() {
+        let runner = StrictFake::new()
+            .expect(chown(&format!("{PKI}/identity.key")), Output::default())
+            .expect(chown(&format!("{PKI}/serving.key")), Output::default());
+        let files = MemFiles::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper
+            .keygen("system:cluster:cp", KeyKind::Identity, false)
+            .unwrap();
+        helper
+            .keygen("meister-box", KeyKind::Serving, false)
+            .unwrap();
+        runner.verify().unwrap();
+        assert!(files.content(format!("{PKI}/identity.key")).is_some());
+        assert!(files.content(format!("{PKI}/serving.key")).is_some());
+        assert_eq!(
+            helper.key_path(KeyKind::Identity).display().to_string(),
+            format!("{PKI}/identity.key")
+        );
+        assert!(KeyKind::parse("identity").is_ok());
+        assert!(KeyKind::parse("serving").is_ok());
+        let err = KeyKind::parse("ca").unwrap_err();
+        assert!(err.to_string().contains("identity"), "{err}");
+    }
+
+    /// A dry run makes no key: the refusal comes from the file door, before
+    /// anything exists.
+    #[test]
+    fn a_dry_run_makes_nothing() {
+        let runner = StrictFake::new().with_policy(Policy::dry_run());
+        let files = MemFiles::new().with_policy(Policy::dry_run());
+        let clock = clock();
+        let err = helper(&runner, &files, &clock)
+            .keygen("system:node:n1", KeyKind::Identity, false)
+            .unwrap_err();
+        assert!(err.to_string().contains("--dry-run"), "{err}");
+        assert!(files.content(format!("{PKI}/identity.key")).is_none());
+        runner.verify().unwrap();
+    }
+
+    /// A key that is there and cannot be read is not a key to replace by
+    /// accident.
+    #[test]
+    fn an_unreadable_key_is_a_sentence_and_not_a_new_identity() {
+        let runner = StrictFake::new();
+        let files = MemFiles::new().given_other(format!("{PKI}/identity.key"));
+        let clock = clock();
+        let err = helper(&runner, &files, &clock)
+            .keygen("system:node:n1", KeyKind::Identity, false)
+            .unwrap_err();
+        assert!(err.to_string().contains("--replace"), "{err}");
+        runner.verify().unwrap();
     }
 
     fn pending(id: &str, mode: Mode) -> TxnRecord {

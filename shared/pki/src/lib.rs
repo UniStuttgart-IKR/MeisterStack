@@ -23,7 +23,7 @@ pub mod tls;
 
 pub use ca::Ca;
 pub use cert::{CertInfo, fingerprint};
-pub use csr::{KeyAndCsr, generate_key_and_csr, requested_name};
+pub use csr::{KeyAndCsr, csr_for_key, generate_key_and_csr, public_key_sha256, requested_name};
 pub use pem::{load_certs, load_private_key, write_secret};
 
 /// The one crypto provider this stack uses.
