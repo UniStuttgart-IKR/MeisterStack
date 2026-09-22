@@ -406,17 +406,18 @@ pub fn issued_path(repo: &Path, host_id: &str, file: &str) -> PathBuf {
 /// The directory `tools/meister-ca` keeps the CA in, as the inventory names
 /// it.
 ///
-/// Relative to the inventory FILE, which is what `[operator] ca_dir = "../labpki"`
-/// means and what every other reference in that table means.
-pub fn ca_dir(repo: &Path, inventory_path: &str, ca_dir: &str) -> PathBuf {
-    let base = repo.join(inventory_path);
-    let base = base.parent().unwrap_or(repo);
-    let named = Path::new(ca_dir);
+/// Relative to the inventory FILE THAT WAS READ — which is what
+/// `[operator] ca_dir = "../labpki"` means, and what every other reference
+/// in that table means. The file and not the repository, because
+/// `--inventory <somewhere else>` is a real flag and a relative reference in
+/// a file hangs off that file.
+pub fn ca_dir(inventory_file: &Path, named: &str) -> PathBuf {
+    let named = Path::new(named);
     if named.is_absolute() {
-        named.to_path_buf()
-    } else {
-        normalise(&base.join(named))
+        return named.to_path_buf();
     }
+    let base = inventory_file.parent().unwrap_or(Path::new("."));
+    normalise(&base.join(named))
 }
 
 /// `a/b/../c` -> `a/c`, without asking the filesystem.
@@ -1622,20 +1623,25 @@ mod tests {
     #[test]
     fn the_ca_directory_hangs_off_the_inventory_and_not_off_the_cwd() {
         assert_eq!(
-            ca_dir(Path::new("/home/silas/fleet"), "fleet.toml", "../labpki"),
+            ca_dir(Path::new("/home/silas/fleet/fleet.toml"), "../labpki"),
             PathBuf::from("/home/silas/labpki")
         );
         assert_eq!(
             ca_dir(
-                Path::new("/home/silas/fleet"),
-                "etc/fleet.toml",
+                Path::new("/home/silas/fleet/etc/fleet.toml"),
                 "../../labpki"
             ),
             PathBuf::from("/home/silas/labpki")
         );
         assert_eq!(
-            ca_dir(Path::new("/home/silas/fleet"), "fleet.toml", "/srv/ca"),
+            ca_dir(Path::new("/home/silas/fleet/fleet.toml"), "/srv/ca"),
             PathBuf::from("/srv/ca")
+        );
+        // An inventory somewhere else entirely: `--inventory` is a flag, and
+        // a relative reference in a file hangs off that file.
+        assert_eq!(
+            ca_dir(Path::new("/tmp/elsewhere/fleet.toml"), "../ca"),
+            PathBuf::from("/tmp/ca")
         );
     }
 

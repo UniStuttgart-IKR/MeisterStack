@@ -1603,7 +1603,7 @@ fn expected_credentials(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(&fleet.source.repo_path));
     let inventory_file = match inventory {
-        Some(path) => path.to_path_buf(),
+        Some(path) => inventory_path(&repo, path),
         None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
     };
     let Some(ca) = ca_directory(files, release, Some(&repo), inventory) else {
@@ -1639,8 +1639,11 @@ fn ca_directory(
     let repo = repo
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(&fleet.source.repo_path));
+    // A relative `--inventory` hangs off the repository, the same rule
+    // `--fleet` follows everywhere else; without one, the file the manifest
+    // was resolved from.
     let inventory_file = match inventory {
-        Some(path) => path.to_path_buf(),
+        Some(path) => inventory_path(&repo, path),
         None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
     };
     let named = Inventory::load(files, &inventory_file)
@@ -1648,11 +1651,7 @@ fn ca_directory(
         .operator
         .as_ref()
         .and_then(|o| o.ca_dir.clone())?;
-    Some(meister_deploy::pki::ca_dir(
-        &repo,
-        &fleet.source.inventory_path,
-        &named,
-    ))
+    Some(meister_deploy::pki::ca_dir(&inventory_file, &named))
 }
 
 /// What a person reads on stderr while the plan itself goes to stdout.
@@ -2381,7 +2380,7 @@ fn keys_issue(
 
     // The CA directory, from the inventory the manifest names.
     let inventory_file = match inventory {
-        Some(path) => path.to_path_buf(),
+        Some(path) => inventory_path(repo, path),
         None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
     };
     let parsed = Inventory::load(&files, &inventory_file)?;
@@ -2397,7 +2396,7 @@ fn keys_issue(
                 inventory_file.display()
             )
         })?;
-    let ca = pki::ca_dir(repo, &fleet.source.inventory_path, &named);
+    let ca = pki::ca_dir(&inventory_file, &named);
     pki::refuse_ca_in_repo(repo, &ca)?;
 
     // The request. Read before anything is decided about it, and checked:
