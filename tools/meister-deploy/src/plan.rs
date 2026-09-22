@@ -117,6 +117,21 @@ pub enum ActionKind {
     Drain,
     Activate,
     Reboot,
+    // --- lane 3-integration: the boot nobody inside the machine owns ------
+    /// The machine has to come up on a kernel its PROVIDER loads.
+    ///
+    /// A `boot = "direct"` host carries no boot loader (3A): its hypervisor
+    /// is handed a kernel, an initrd and a command line, and what the guest
+    /// says about its next boot is a statement about its system profile and
+    /// not about what will actually start. So a reboot that has to take a
+    /// new kernel cannot be `systemctl reboot` — the machine would come back
+    /// on the bytes the provider loaded last time, which are the old ones.
+    ///
+    /// `apply` does not carry this step out. It stops at it, with the bundle
+    /// and with exit 2; whoever arranges the provider does the loading and
+    /// the reboot, and comes back with `apply --resume <run-id>`.
+    ProviderReboot,
+    // --- end lane 3-integration -------------------------------------------
     Verify,
     Confirm,
     Uncordon,
@@ -137,6 +152,7 @@ impl ActionKind {
             ActionKind::Drain => "drain",
             ActionKind::Activate => "activate",
             ActionKind::Reboot => "reboot",
+            ActionKind::ProviderReboot => "provider-reboot",
             ActionKind::Verify => "verify",
             ActionKind::Confirm => "confirm",
             ActionKind::Uncordon => "uncordon",
@@ -150,6 +166,11 @@ impl ActionKind {
     /// Whether this step, once begun, cannot be taken back by this tool.
     /// The journal writes `action.irreversible` before exactly these, and a
     /// resume never repeats one blind (V17).
+    ///
+    /// `provider-reboot` is not one of them, and that is the point of it:
+    /// this tool never starts it, so there is nothing it could half-do. What
+    /// it writes is a halt, and asking the machine again whether it has
+    /// booted the desired system is a question, not a repetition.
     pub fn is_irreversible(self) -> bool {
         matches!(
             self,
@@ -391,6 +412,24 @@ pub struct Action {
     /// a blocked step is never silently dropped, because a plan that leaves
     /// out what it refused is a plan that looks smaller than the job.
     pub blocked: Option<String>,
+
+    // --- lane 3-integration: what a provider is handed --------------------
+    /// The three values a hypervisor has to load for an
+    /// [`ActionKind::ProviderReboot`], and nothing on any other step.
+    ///
+    /// In the plan and not only in the release, for the same reason the
+    /// observation is in the plan: the halt is read by an adapter that has a
+    /// plan and a run id, and a step that says "reboot it" without saying
+    /// WITH WHAT is a step nobody can carry out. It is part of the
+    /// `plan_id`, so an approval for a reboot into one kernel can never be
+    /// carried over to a reboot into another.
+    ///
+    /// Absent — not null — on every other step and in every plan without a
+    /// direct-boot host, so that a plan of an all-uefi fleet hashes to
+    /// exactly what it hashed to before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_boot: Option<crate::release::DirectBoot>,
+    // --- end lane 3-integration -------------------------------------------
 }
 
 impl Action {
@@ -971,6 +1010,15 @@ struct HostDecision {
     /// Switched and never booted: nothing to stage, nothing to activate, and
     /// a reboot is the whole job.
     reboot_only: bool,
+    /// The reboot this host needs is one only its provider can do
+    /// (`boot = "direct"`, lane 3A): there is no boot loader in the machine,
+    /// so the kernel that starts is the one the hypervisor was handed.
+    ///
+    /// Derived rather than asked twice: it decides the STEP
+    /// (`provider-reboot` instead of `reboot`) and it decides the way back
+    /// of the activation before it (`switch`, never `boot` — the helper
+    /// refuses boot mode on a machine with no boot menu, measured in 3A).
+    provider_reboot: bool,
     /// The system is what the release says and a file on it is not: nothing
     /// to stage, nothing to activate, and putting the file there is the
     /// whole job (lane 3B).
@@ -1546,6 +1594,7 @@ fn decide_host(
         current_system: None,
         reboot_required: false,
         reboot_only: false,
+        provider_reboot: false,
         secrets_only: false,
         needs_maintenance: false,
         class: class_of(host),
@@ -1907,6 +1956,50 @@ fn decide_host(
     }
     let settled = unchanged && !d.secrets_only;
 
+    // --- lane 3-integration: a kernel this machine does not choose --------
+    //
+    // On a `boot = "direct"` host the boot half of a release is loaded from
+    // OUTSIDE: `next_boot_system` is the system profile, and the hypervisor
+    // is what decides which kernel actually starts (3A measured exactly
+    // that). So every reboot such a host needs — a new kernel, a new
+    // initrd, a new command line, or a switch that was never booted — is a
+    // `provider-reboot` and never a `systemctl reboot`, which would bring
+    // the machine back on the bytes the provider loaded last time.
+    d.provider_reboot = !settled
+        && !d.secrets_only
+        && (d.reboot_required || d.reboot_only)
+        && host.build.boot.mode == crate::manifest::BootMode::Direct;
+    if d.provider_reboot && artifacts.direct_boot.is_none() {
+        // `release::bind` will not make such a release — it refuses a direct
+        // host without a bundle in both directions (3A). This is the second
+        // door all the same: a plan is the document an adapter acts on, and
+        // a `provider-reboot` whose payload is missing is a step whose whole
+        // content would be missing.
+        d.stop_all.push(format!(
+            "the release carries no direct-boot bundle for {id}, and {id} boots through its \
+             provider: taking it forward needs a kernel, an initrd and a command line for \
+             somebody to load. Build the release again with a tool that knows the boot mode \
+             (`meister-deploy build`)."
+        ));
+    }
+    if d.provider_reboot && host.checks.required.iter().any(|c| c == "booted") {
+        // Between the switch and the provider's reboot this host RUNS the
+        // release and has BOOTED the previous one — that is what a direct
+        // boot mode means, and it is the state the plan asks its operator
+        // to confirm in. A required `booted` check makes the verify before
+        // that confirmation fail, which would take the switch back and
+        // leave the rollout exactly where it started. Saying so here is
+        // cheaper than letting a fleet roll itself back once per kernel.
+        d.stop_disruptive.push(format!(
+            "{id} boots through its provider and its inventory requires the check `booted`. \
+             Between the switch and the provider's reboot this host runs the release and has \
+             booted the one before it, so that check cannot pass and the verify before the \
+             confirmation would take the switch back. Take `booted` out of the required checks \
+             of {id} (the `system` check stays required and still compares what it runs), or \
+             leave this host to a plan that changes no kernel."
+        ));
+    }
+
     let verdict = if !d.stop_all.is_empty() {
         HostVerdict::Blocked
     } else if settled {
@@ -1984,6 +2077,10 @@ fn decide_install_host(
         // An install is a whole system, never just a file (lane 3B's form).
         secrets_only: false,
         reboot_only: false,
+        // An install has no way back and no way forward through a provider
+        // either: the machine is not running, and what starts it afterwards
+        // is the medium's own business (3A prints the sentence).
+        provider_reboot: false,
         needs_maintenance: false,
         class: class_of(host),
         canary_rank: u8::from(host.rollout.canary_class.is_none()),
@@ -2709,30 +2806,46 @@ fn steps_for(
             // builds; what was wrong was a file, and it has just been
             // written.
         } else if decision.reboot_only {
-            specs.push(
-                step(ActionKind::Reboot, Disruption::Reboot)
-                    .maybe_from(obs.and_then(|o| o.booted_system.clone()))
-                    .to(desired.clone())
-                    .because(
-                        "this system was switched to and never booted, so there is nothing to \
-                         activate and nothing to take back: if it does not come up, the way \
-                         back is the boot menu",
-                    ),
-            );
+            if !decision.provider_reboot {
+                specs.push(
+                    step(ActionKind::Reboot, Disruption::Reboot)
+                        .maybe_from(obs.and_then(|o| o.booted_system.clone()))
+                        .to(desired.clone())
+                        .because(
+                            "this system was switched to and never booted, so there is nothing \
+                             to activate and nothing to take back: if it does not come up, the \
+                             way back is the boot menu",
+                        ),
+                );
+            }
+            // A direct-boot host gets its reboot below, after the verify: it
+            // is the provider that does it, and this tool only stops there.
         } else {
             specs.push(
                 step(ActionKind::Activate, Disruption::Service)
                     .maybe_from(decision.current_system.clone())
                     .to(desired.clone())
-                    .because(if decision.reboot_required {
-                        "the boot half of this release changed, so the profile is moved and the \
-                         new system takes over at the next boot (--mode boot)"
-                    } else {
-                        "nothing in the boot half changed, so this takes effect at once \
-                         (--mode switch)"
+                    .because(match (decision.reboot_required, decision.provider_reboot) {
+                        // Direct boot: the activation is the USERLAND half
+                        // and runs in switch mode, because the way back a
+                        // boot-mode activation needs is a boot menu and this
+                        // machine has none (3A: the helper refuses it).
+                        (_, true) => {
+                            "this host boots through its provider, so the activation moves the \
+                             userland at once (--mode switch) and the kernel follows when the \
+                             provider loads the new bundle"
+                        }
+                        (true, false) => {
+                            "the boot half of this release changed, so the profile is moved and \
+                             the new system takes over at the next boot (--mode boot)"
+                        }
+                        (false, false) => {
+                            "nothing in the boot half changed, so this takes effect at once \
+                             (--mode switch)"
+                        }
                     }),
             );
-            if decision.reboot_required {
+            if decision.reboot_required && !decision.provider_reboot {
                 specs.push(
                     step(ActionKind::Reboot, Disruption::Reboot)
                         .maybe_from(obs.and_then(|o| o.booted_system.clone()))
@@ -2763,6 +2876,56 @@ fn steps_for(
                     ),
             );
         }
+        // --- lane 3-integration: the step this tool stops at ---------------
+        //
+        // LAST, and after the confirmation on purpose. The machine's own way
+        // back is a timer of five minutes; arranging a provider — uploading
+        // a kernel, editing a template, telling a hypervisor to restart a
+        // guest — is a thing that takes as long as it takes. A halt in front
+        // of an unconfirmed activation would therefore be a halt in front of
+        // a machine that takes itself back while somebody works.
+        //
+        // The order costs one honest oddity, and the sentence below says it:
+        // between the switch and the provider's reboot the host RUNS the
+        // release and has BOOTED the one before it.
+        if decision.provider_reboot {
+            let bundle = release.artifacts[id].direct_boot.as_ref();
+            specs.push(
+                step(ActionKind::ProviderReboot, Disruption::Reboot)
+                    .maybe_from(obs.and_then(|o| o.booted_system.clone()))
+                    .to(desired.clone())
+                    .because(match bundle {
+                        Some(b) => format!(
+                            "this tool does not reboot it: the provider has to load the kernel \
+                             {}, the initrd {} and the command line {:?}, and start the machine \
+                             with them",
+                            b.kernel.store_path, b.initrd.store_path, b.cmdline
+                        ),
+                        // The host's own decision has blocked it already —
+                        // `decide_host` refuses a direct host whose release
+                        // carries no bundle. The step still says what is
+                        // missing rather than saying nothing.
+                        None => format!(
+                            "this release carries no direct-boot bundle for {id}, so there is \
+                             nothing a provider could be handed"
+                        ),
+                    })
+                    .because(
+                        "until that happens the host runs the new userland on the kernel it \
+                         booted before, which is consistent and is not the release: the \
+                         command line it is running names the previous system",
+                    ),
+            );
+            specs.push(
+                step(ActionKind::Verify, Disruption::None)
+                    .to(host.checks.required.join(", "))
+                    .because(
+                        "and now what it booted is what it runs — the first thing this step \
+                         reads is `booted_system`",
+                    ),
+            );
+        }
+        // --- end lane 3-integration ----------------------------------------
         if decision.needs_maintenance {
             specs.push(
                 step(ActionKind::Uncordon, Disruption::None)
@@ -2800,7 +2963,10 @@ fn steps_for(
             needed.extend(classes.iter().copied());
         }
         let reboot_required = decision.reboot_required
-            && matches!(spec.kind, ActionKind::Activate | ActionKind::Reboot);
+            && matches!(
+                spec.kind,
+                ActionKind::Activate | ActionKind::Reboot | ActionKind::ProviderReboot
+            );
         let mut preconditions = spec.preconditions;
         if spec.kind == ActionKind::Preflight {
             preconditions.extend(decision.preconditions.iter().cloned());
@@ -2841,6 +3007,16 @@ fn steps_for(
             },
             // --- end lane 3A ---
             blocked,
+            // --- lane 3-integration ---
+            // On the one step that is carried out somewhere else, and
+            // nowhere else: every other step of this plan is something this
+            // tool does itself and needs no payload to do it.
+            provider_boot: if spec.kind == ActionKind::ProviderReboot {
+                artifacts.direct_boot.clone()
+            } else {
+                None
+            },
+            // --- end lane 3-integration ---
         });
     }
     (actions, needed)
@@ -2897,7 +3073,10 @@ fn approval_classes(
     }
     out.insert(ApprovalClass::Disruptive);
     if decision.reboot_required
-        && matches!(kind, ActionKind::Activate | ActionKind::Reboot)
+        && matches!(
+            kind,
+            ActionKind::Activate | ActionKind::Reboot | ActionKind::ProviderReboot
+        )
         && host.rollout.reboot == crate::manifest::RebootPolicy::Approve
     {
         out.insert(ApprovalClass::Reboot);
@@ -2926,6 +3105,17 @@ fn approval_classes(
 fn rollback_for(kind: ActionKind, decision: &HostDecision, policy: &PlanPolicy) -> Rollback {
     if kind != ActionKind::Activate {
         return Rollback::none();
+    }
+    // A machine with no boot menu has no boot-mode way back: `bootctl
+    // set-oneshot` is what a boot rollback IS, and a direct-boot guest has
+    // no ESP to write it into (3A measured the helper refusing it). What is
+    // left is the userland half, and that is exactly what a switch takes
+    // back.
+    if decision.provider_reboot {
+        return Rollback {
+            mode: RollbackMode::Switch,
+            confirm_within_secs: policy.confirm_within_switch_secs,
+        };
     }
     if decision.reboot_required {
         Rollback {
@@ -2992,7 +3182,7 @@ fn validity_for(
             nar_hash: artifacts.toplevel.nar_hash.clone(),
         });
     }
-    if matches!(kind, Cordon | Drain | Activate | Reboot) {
+    if matches!(kind, Cordon | Drain | Activate | Reboot | ProviderReboot) {
         for group in &host.groups {
             if let Some(view) = groups.get(group)
                 && view.kind == GroupKind::Raft
@@ -4133,6 +4323,268 @@ mod tests {
         let reboot = action(&plan, "n1", ActionKind::Reboot);
         assert_eq!(reboot.current, previous);
         assert_eq!(reboot.desired.as_deref(), Some(desired.as_str()));
+    }
+
+    // --- lane 3-integration: the boot nobody inside the machine owns ---
+
+    /// The same fleet with `n1` turned into a guest whose hypervisor loads
+    /// its kernel, and a release that moves it.
+    fn upgrade_direct(new_kernel: bool) -> (ReleaseManifest, Observations) {
+        let base = crate::fixtures::with_direct_host(onebox_enrolled(), "n1");
+        let running = crate::fixtures::direct_release_of(base.clone());
+        let observation = observed(&running, at(TAKEN));
+        let release = crate::fixtures::direct_release_of(crate::fixtures::with_new_toplevels(
+            base,
+            &["n1"],
+            new_kernel,
+        ));
+        (release, observation)
+    }
+
+    #[test]
+    fn a_kernel_change_on_a_direct_host_is_a_provider_reboot_with_the_bundle() {
+        let (release, observation) = upgrade_direct(true);
+        let plan = planned(&release, "host=n1", &observation);
+
+        assert!(plan.hosts["n1"].reboot_required);
+        let steps = kinds(&plan, "n1");
+        assert!(
+            steps.contains(&ActionKind::ProviderReboot),
+            "a host whose kernel comes from outside is rebooted from outside: {steps:?}"
+        );
+        assert!(
+            !steps.contains(&ActionKind::Reboot),
+            "`systemctl reboot` would come back on the bytes the provider loaded last: {steps:?}"
+        );
+
+        // The way back of the activation is the userland one, because the
+        // other one is a boot menu this machine has not got.
+        let activate = action(&plan, "n1", ActionKind::Activate);
+        assert_eq!(activate.rollback.mode, RollbackMode::Switch);
+        assert_eq!(
+            activate.rollback.confirm_within_secs,
+            CONFIRM_WITHIN_SWITCH_SECS
+        );
+
+        // …and the confirmation comes BEFORE the halt, or the machine would
+        // take itself back while somebody arranges a hypervisor.
+        let order: Vec<ActionKind> = steps.clone();
+        let at_of = |kind: ActionKind| {
+            order
+                .iter()
+                .position(|k| *k == kind)
+                .unwrap_or_else(|| panic!("{kind} is not in {order:?}"))
+        };
+        assert!(at_of(ActionKind::Activate) < at_of(ActionKind::Verify));
+        assert!(at_of(ActionKind::Verify) < at_of(ActionKind::Confirm));
+        assert!(at_of(ActionKind::Confirm) < at_of(ActionKind::ProviderReboot));
+        assert_eq!(
+            order.iter().filter(|k| **k == ActionKind::Verify).count(),
+            2,
+            "one verify for the switch and one for what the provider booted: {order:?}"
+        );
+
+        let halt = action(&plan, "n1", ActionKind::ProviderReboot);
+        assert_eq!(halt.disruption, Disruption::Reboot);
+        assert!(halt.reboot_required);
+        // `reboot = approve` in the fixture, so somebody says yes to this.
+        assert_eq!(halt.approval_class, ApprovalClass::Reboot);
+        assert!(
+            plan.approvals
+                .iter()
+                .any(|a| a.class == ApprovalClass::Reboot),
+            "{:?}",
+            plan.approvals
+        );
+
+        // The payload: the bytes a provider is handed, in the plan itself.
+        let bundle = halt
+            .provider_boot
+            .as_ref()
+            .expect("the step carries the bundle it is about");
+        let from_release = release.artifacts["n1"]
+            .direct_boot
+            .as_ref()
+            .expect("a direct host has a bundle");
+        assert_eq!(bundle, from_release);
+        assert!(
+            bundle
+                .cmdline
+                .contains(&release.artifacts["n1"].toplevel.store_path),
+            "the command line names the system the kernel is to start: {}",
+            bundle.cmdline
+        );
+        // And nothing else carries one.
+        for step in plan.actions_for("n1") {
+            if step.kind != ActionKind::ProviderReboot {
+                assert!(step.provider_boot.is_none(), "{:?}", step.kind);
+            }
+        }
+        // The sentence the halt is read with.
+        let said = halt.preconditions.join(" ");
+        assert!(said.contains(&bundle.kernel.store_path), "{said}");
+        assert!(said.contains(&bundle.initrd.store_path), "{said}");
+        assert!(said.contains("the kernel it booted before"), "{said}");
+    }
+
+    #[test]
+    fn the_same_kernel_change_on_a_uefi_host_is_an_ordinary_reboot() {
+        // The counter-probe of the test above, on the same fixture with the
+        // one field that differs.
+        let (release, observation) = upgrade(&["n1"], true);
+        let plan = planned(&release, "host=n1", &observation);
+        let steps = kinds(&plan, "n1");
+        assert!(steps.contains(&ActionKind::Reboot), "{steps:?}");
+        assert!(!steps.contains(&ActionKind::ProviderReboot), "{steps:?}");
+        assert_eq!(
+            action(&plan, "n1", ActionKind::Activate).rollback.mode,
+            RollbackMode::Boot
+        );
+        assert_eq!(
+            steps.iter().filter(|k| **k == ActionKind::Verify).count(),
+            1,
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn a_userland_change_on_a_direct_host_reboots_nothing() {
+        // The kernel, the initrd and the command line are the same three
+        // fields for both boot modes: a release that changes none of them
+        // needs no provider and no reboot.
+        let (release, observation) = upgrade_direct(false);
+        let plan = planned(&release, "host=n1", &observation);
+        let steps = kinds(&plan, "n1");
+        assert!(!plan.hosts["n1"].reboot_required, "{steps:?}");
+        assert!(!steps.contains(&ActionKind::ProviderReboot), "{steps:?}");
+        assert!(!steps.contains(&ActionKind::Reboot), "{steps:?}");
+        assert_eq!(
+            steps.iter().filter(|k| **k == ActionKind::Verify).count(),
+            1,
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn switched_and_never_booted_on_a_direct_host_waits_for_its_provider() {
+        // The shape a halt leaves behind when somebody re-plans instead of
+        // resuming: the host runs the release and booted the one before it.
+        // `systemctl reboot` here would bring it back on the old kernel and
+        // the run would wait ten minutes for a boot that already happened.
+        let (release, observation) = upgrade_direct(true);
+        let desired = release.artifacts["n1"].toplevel.store_path.clone();
+        let mut observation = observation;
+        let n1 = observation.hosts.get_mut("n1").unwrap();
+        n1.current_system = Some(desired.clone());
+        n1.next_boot_system = Some(desired.clone());
+        let plan = planned(&release, "host=n1", &observation);
+
+        let steps = kinds(&plan, "n1");
+        assert!(!steps.contains(&ActionKind::Stage), "{steps:?}");
+        assert!(!steps.contains(&ActionKind::Activate), "{steps:?}");
+        assert!(!steps.contains(&ActionKind::Reboot), "{steps:?}");
+        assert!(steps.contains(&ActionKind::ProviderReboot), "{steps:?}");
+        let halt = action(&plan, "n1", ActionKind::ProviderReboot);
+        assert!(halt.provider_boot.is_some());
+        assert_eq!(halt.desired.as_deref(), Some(desired.as_str()));
+    }
+
+    #[test]
+    fn a_direct_host_under_reboot_never_is_blocked_like_any_other() {
+        let base = crate::fixtures::with_direct_host(onebox_enrolled(), "n1");
+        let running = crate::fixtures::direct_release_of(base.clone());
+        let observation = observed(&running, at(TAKEN));
+        let mut fleet = base;
+        fleet.hosts.get_mut("n1").unwrap().rollout.reboot = crate::manifest::RebootPolicy::Never;
+        let release = crate::fixtures::direct_release_of(crate::fixtures::with_new_toplevels(
+            fleet,
+            &["n1"],
+            true,
+        ));
+        let plan = planned(&release, "host=n1", &observation);
+
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Blocked);
+        let halt = action(&plan, "n1", ActionKind::ProviderReboot);
+        let why = halt.blocked.as_deref().unwrap_or_default();
+        assert!(why.contains("reboot = never"), "{why}");
+        assert!(plan.approvals.is_empty(), "{:?}", plan.approvals);
+    }
+
+    #[test]
+    fn a_release_without_the_bundle_of_a_direct_host_is_refused_by_name() {
+        // `release::bind` will not make one (3A holds both directions), so
+        // this is the second door: a plan is what an adapter acts on, and a
+        // halt whose payload is missing is a halt nobody can carry out.
+        let (release, observation) = upgrade_direct(true);
+        let mut release = release;
+        release.artifacts.get_mut("n1").unwrap().direct_boot = None;
+        let plan = planned(&release, "host=n1", &observation);
+
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Blocked);
+        let why = plan.hosts["n1"].reasons.join(" ");
+        assert!(why.contains("no direct-boot bundle for n1"), "{why}");
+    }
+
+    #[test]
+    fn a_required_booted_check_on_a_direct_host_is_said_before_it_rolls_back() {
+        // Between the switch and the provider's reboot such a host runs the
+        // release and has booted the one before it. A required `booted`
+        // therefore fails the verify in front of the confirmation, and the
+        // switch would be taken back once per kernel — so the plan says so
+        // instead of doing it.
+        let base = crate::fixtures::with_direct_host(onebox_enrolled(), "n1");
+        let running = crate::fixtures::direct_release_of(base.clone());
+        let observation = observed(&running, at(TAKEN));
+        let mut fleet = base;
+        fleet
+            .hosts
+            .get_mut("n1")
+            .unwrap()
+            .checks
+            .required
+            .push("booted".to_string());
+        let release = crate::fixtures::direct_release_of(crate::fixtures::with_new_toplevels(
+            fleet,
+            &["n1"],
+            true,
+        ));
+        let plan = planned(&release, "host=n1", &observation);
+
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Blocked);
+        let why = plan.hosts["n1"].reasons.join(" ");
+        assert!(why.contains("requires the check `booted`"), "{why}");
+        // …and a uefi host with the same required check is untouched by it.
+        let (release, observation) = upgrade(&["n2"], true);
+        let plan = planned(&release, "host=n2", &observation);
+        assert_eq!(plan.hosts["n2"].verdict, HostVerdict::Change);
+    }
+
+    #[test]
+    fn a_plan_with_a_provider_reboot_round_trips_through_its_own_json() {
+        let (release, observation) = upgrade_direct(true);
+        let plan = planned(&release, "host=n1", &observation);
+        let text = String::from_utf8(plan.to_json().unwrap()).unwrap();
+        let back = DeploymentPlan::from_json(&text, "the round trip").expect("it parses back");
+        assert_eq!(back, plan);
+        assert!(back.id_matches().unwrap());
+        // The one step that carries a payload is the one that spells it out
+        // in the file, and no other step gains a null field.
+        assert!(text.contains("\"provider-reboot\""), "{text}");
+        assert_eq!(
+            text.matches("\"provider_boot\"").count(),
+            1,
+            "only the halt carries one"
+        );
+    }
+
+    #[test]
+    fn a_plan_of_a_fleet_that_boots_itself_hashes_to_what_it_always_did() {
+        // The new field is absent rather than null on every other plan, so
+        // adding it did not rename every id in every operator's repository.
+        let (release, observation) = upgrade(&["n1"], true);
+        let plan = planned(&release, "host=n1", &observation);
+        let text = String::from_utf8(plan.to_json().unwrap()).unwrap();
+        assert!(!text.contains("provider_boot"), "{text}");
     }
 
     #[test]

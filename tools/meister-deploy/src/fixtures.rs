@@ -214,14 +214,18 @@ pub fn bundle_for(fleet: &ResolvedFleet, id: &str) -> crate::release::DirectBoot
     }
 }
 
-/// A release in which the named hosts got a new system — which is what a
-/// changed profile or a changed input actually looks like: a new evaluation,
-/// a new manifest, a new set of store paths.
-pub fn with_new_systems(
+/// The same fleet after a new evaluation: the named hosts got a new system —
+/// which is what a changed profile or a changed input actually looks like: a
+/// new evaluation, a new manifest, a new set of store paths.
+///
+/// Separate from [`with_new_systems`] because a fleet with a direct-boot host
+/// cannot become a release without its bundles ([`direct_release_of`]), and a
+/// test about the second boot mode needs the fleet in between.
+pub fn with_new_toplevels(
     mut fleet: ResolvedFleet,
     hosts: &[&str],
     new_kernel: bool,
-) -> ReleaseManifest {
+) -> ResolvedFleet {
     for id in hosts {
         let host = fleet
             .hosts
@@ -235,10 +239,50 @@ pub fn with_new_systems(
             host.build.boot.kernel_params_sha256 = "3b8fnnnnnnnn".to_string();
             host.build.boot.kernel_version = "6.12.48".to_string();
         }
+        // The command line of a direct-boot host names the system its kernel
+        // is to start, so a new toplevel is a new command line. A fixture
+        // that kept the old one would describe a guest booting the system
+        // before the one this release builds.
+        if host.build.boot.mode == crate::manifest::BootMode::Direct {
+            host.build.boot.cmdline =
+                Some(format!("loglevel=4 init={}/init", host.build.toplevel_out));
+            host.build.direct_boot_drv = Some(format!("/nix/store/next{id}-{id}-direct-boot.drv"));
+        }
     }
     fleet.manifest_id =
         crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
-    release_of(fleet)
+    fleet
+}
+
+/// A release in which the named hosts got a new system.
+pub fn with_new_systems(fleet: ResolvedFleet, hosts: &[&str], new_kernel: bool) -> ReleaseManifest {
+    release_of(with_new_toplevels(fleet, hosts, new_kernel))
+}
+
+/// [`release_of`] for a fleet that has direct-boot hosts: each of them
+/// carries the bundle its provider is handed, because `release::bind` refuses
+/// a release in which one does not.
+pub fn direct_release_of(resolved: ResolvedFleet) -> ReleaseManifest {
+    let mut artifacts = artifacts_for(&resolved);
+    for (id, host) in &resolved.hosts {
+        if host.build.boot.mode == crate::manifest::BootMode::Direct {
+            artifacts
+                .get_mut(id)
+                .expect("every host of the fleet has artifacts")
+                .direct_boot = Some(bundle_for(&resolved, id));
+        }
+    }
+    bind(
+        resolved,
+        artifacts,
+        BTreeMap::new(),
+        Vec::new(),
+        build_env(),
+        Vec::new(),
+        reproducibility(),
+        at("2026-09-21T11:00:00Z"),
+    )
+    .expect("the fixture binds")
 }
 
 /// Every host of this release, running exactly what it says, with nothing in

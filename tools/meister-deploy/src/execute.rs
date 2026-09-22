@@ -853,6 +853,16 @@ impl<'a> Executor<'a> {
                     action.kind
                 );
             }
+            // --- lane 3-integration: the halt is position 2 ---------------
+            ActionKind::ProviderReboot => {
+                bail!(
+                    "the step {} on {id} is a {} and this tool stops at it; carrying the halt \
+                     out is the next position of this lane. Nothing was done to {id} in this \
+                     step.",
+                    action.seq,
+                    action.kind
+                );
+            }
         }
         Ok(())
     }

@@ -27,7 +27,7 @@ use meister_deploy::manifest::ResolvedFleet;
 use meister_deploy::plan::{self, DeploymentPlan, PlanKind, PlanPolicy};
 use meister_deploy::release::ReleaseManifest;
 
-use support::{at, observed, onebox, probe_answer, release_of};
+use support::{observed, onebox, probe_answer, release_of};
 
 const BIN: &str = env!("CARGO_BIN_EXE_meister-deploy");
 
@@ -109,14 +109,23 @@ impl Sandbox {
         // The fleet runs the release: so the plan is a no-op plan, which is
         // the one an `apply` may carry out without any approval at all.
         let release = release_of(fleet.clone());
-        let observation = observed(&release, at("2026-09-22T12:00:00Z"));
+        // The clock of the MACHINE, not a literal: a plan carries an
+        // `expires_at` (`created_at` plus an hour) and the binary under test
+        // reads the real clock to compare against it. A fixture pinned to a
+        // date is a test that passes until that hour goes by and is red for
+        // ever after — measured: this file went red on the afternoon of the
+        // day its literal named. What the other tests of this crate pin with
+        // a fake clock is the CONTENT of a plan; what is pinned here is what
+        // a program does against a fleet right now.
+        let now = chrono::Utc::now();
+        let observation = observed(&release, now);
         let the_plan = plan::plan(
             &release,
             "all",
             &observation,
             None,
             &PlanPolicy::new(PlanKind::Upgrade),
-            at("2026-09-22T12:00:00Z"),
+            now,
         )
         .expect("the fixture plans");
 
