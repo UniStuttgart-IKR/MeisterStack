@@ -388,7 +388,12 @@ impl Ssh {
 /// the sha256 of its wire bytes, base64 without padding, which is exactly
 /// what `ssh-keygen -l` computes; doing it here rather than in a second
 /// round trip keeps the enrolment check at one command.
-fn fingerprint_of(keygen_output: &str) -> Option<String> {
+///
+/// Public because `keys enroll` fingerprints what `ssh-keyscan` answered
+/// with in exactly this way. A second implementation of "what a host key
+/// hashes to" would be a second answer to the one question this fleet's
+/// trust hangs on.
+pub fn fingerprint_of(keygen_output: &str) -> Option<String> {
     for line in keygen_output.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {

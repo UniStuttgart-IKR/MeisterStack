@@ -33,6 +33,7 @@ pub mod manifest;
 pub mod nix;
 pub mod observation;
 pub mod observe;
+pub mod pki;
 pub mod plan;
 pub mod readiness;
 pub mod receipt;

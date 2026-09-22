@@ -193,12 +193,72 @@ enum Verb {
         json: bool,
     },
 
+    // --- lane 3B: enrolment and certificates (one block, one verb) -----
+    /// Host keys and certificates: enrol a machine against a fingerprint
+    /// somebody read off its console, ask it for a certificate request, and
+    /// have `tools/meister-ca` sign one. Puts nothing on a host — that is
+    /// the plan's `deliver-secret`, and `apply` carries it out.
+    Keys {
+        #[command(subcommand)]
+        cmd: KeysCmd,
+    },
+    // --- end lane 3B ---------------------------------------------------
     /// The tool as it was before v1: the `fleet.toml` of schema 1, the rsync
     /// push to the context fleet, `nixos-rebuild --target-host` for metal.
     /// Kept whole, with the same flags, because twelve VMs are served by it
     /// today and `plan` means something else from v1 on.
     Legacy(LegacyCli),
 }
+
+// --- lane 3B: the `keys` verbs ------------------------------------------
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// Write a host's key into `<repo>/known_hosts`, after checking it
+    /// against the fingerprint you typed.
+    ///
+    /// The fingerprint comes from the machine's console, its BMC or the
+    /// installer's own output — never from this command. That is the whole
+    /// point: `ssh-keyscan` reports whatever answers on the address, and
+    /// believing it would make an impersonating host self-certifying.
+    Enroll {
+        /// The host id, as the inventory spells it
+        host: String,
+        /// `SHA256:…`, read off the console of the machine you mean
+        #[arg(long)]
+        fingerprint: String,
+        /// Replace a key this fleet already has for that host
+        #[arg(long)]
+        replace: bool,
+        /// Why — written into `known_hosts` above the new line
+        #[arg(long)]
+        reason: Option<String>,
+        /// The operator's repository: its `known_hosts` is the file that is
+        /// written, and its inventory says where the host is
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// The inventory, relative to the repository or absolute
+        #[arg(short = 'f', long, default_value = "fleet.toml")]
+        fleet: PathBuf,
+        /// A manifest from `resolve`, when there is one. A host that was
+        /// never resolved is read out of the inventory instead — which is
+        /// the normal case, because enrolment comes before the first
+        /// `resolve` of a fresh machine.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Ask the host, and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Refuse rather than reach outside this process
+        #[arg(long)]
+        offline: bool,
+        /// Print the result as json
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+// --- end lane 3B --------------------------------------------------------
 
 /// What `status` and `check` both need: which fleet, which hosts, where
 /// they answer, and whether to ask at all.
@@ -594,6 +654,9 @@ fn run() -> Result<Answer> {
         } => gc(*keep, repo, *dry_run).map(Answer::from),
         Verb::Apply(args) => apply(args),
         Verb::Report { run, repo, json } => report(run, repo, *json).map(Answer::from),
+        // --- lane 3B ---------------------------------------------------
+        Verb::Keys { cmd } => keys(cmd).map(Answer::from),
+        // --- end lane 3B -----------------------------------------------
         Verb::Legacy(legacy) => run_legacy(legacy).map(Answer::from),
     }
 }
@@ -1839,6 +1902,164 @@ fn report(run: &str, repo: &Path, json: bool) -> Result<bool> {
     }
     Ok(true)
 }
+
+// ---------------------------------------------------------------------------
+// lane 3B: keys
+// ---------------------------------------------------------------------------
+
+fn keys(cmd: &KeysCmd) -> Result<bool> {
+    match cmd {
+        KeysCmd::Enroll {
+            host,
+            fingerprint,
+            replace,
+            reason,
+            repo,
+            fleet,
+            manifest,
+            dry_run,
+            offline,
+            json,
+        } => keys_enroll(
+            host,
+            fingerprint,
+            *replace,
+            reason.as_deref(),
+            repo,
+            fleet,
+            manifest.as_deref(),
+            *dry_run,
+            *offline,
+            *json,
+        ),
+    }
+}
+
+/// Where the inventory is: the path as given when it is absolute, and under
+/// the repository when it is not — the same rule every other verb applies to
+/// `--fleet`.
+fn inventory_path(repo: &Path, fleet: &Path) -> PathBuf {
+    if fleet.is_absolute() {
+        fleet.to_path_buf()
+    } else {
+        repo.join(fleet)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn keys_enroll(
+    host: &str,
+    fingerprint: &str,
+    replace: bool,
+    reason: Option<&str>,
+    repo: &Path,
+    fleet: &Path,
+    manifest: Option<&Path>,
+    dry_run: bool,
+    offline: bool,
+    json: bool,
+) -> Result<bool> {
+    if offline {
+        anyhow::bail!(
+            "enrolling a host means asking it what key it shows, and --offline forbids \
+             asking. There is nothing on this disk that could answer it: the whole point of \
+             this step is that the machine and the person at its console say the same thing."
+        );
+    }
+    let policy = if dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+    let runner = Real::new(policy);
+
+    // The manifest when there is one, the inventory otherwise. A fresh host
+    // has no manifest yet — it cannot be reached, so nothing that reaches it
+    // can have run — and the inventory is the file that exists at that
+    // point.
+    let target = match manifest {
+        Some(path) => {
+            let text = files.read_to_string(path)?;
+            let resolved = manifest::ResolvedFleet::from_json(&text, &path.display().to_string())?;
+            let entry = resolved.hosts.get(host).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} names no host {host:?}; it covers {}.",
+                    path.display(),
+                    resolved.evaluated_hosts.join(", ")
+                )
+            })?;
+            meister_deploy::pki::target_from_host(host, entry)
+        }
+        None => {
+            let path = inventory_path(repo, fleet);
+            let inventory = Inventory::load(&files, &path)?;
+            meister_deploy::pki::target_from_inventory(&inventory, host)?
+        }
+    };
+
+    let known_hosts = repo.join("known_hosts");
+    let done = meister_deploy::pki::enroll(
+        &runner,
+        &files,
+        &known_hosts,
+        &target,
+        fingerprint,
+        replace,
+        reason,
+        RealClock.now(),
+    )?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "host": done.host_id,
+                "known_hosts_name": done.known_hosts_name,
+                "fingerprint": done.fingerprint,
+                "changed": done.changed,
+                "replaced": done.replaced,
+                "known_hosts": known_hosts.display().to_string(),
+                "inventory_line": done.toml_line,
+            }))?
+        );
+        return Ok(true);
+    }
+
+    if !done.changed {
+        println!(
+            "{} is already enrolled with {} in {}.",
+            done.host_id,
+            done.fingerprint,
+            known_hosts.display()
+        );
+        return Ok(true);
+    }
+    if let Some(before) = &done.replaced {
+        println!("{} replaced {before}", done.host_id);
+    }
+    println!(
+        "{} {} -> {}",
+        done.host_id,
+        done.fingerprint,
+        known_hosts.display()
+    );
+    // The inventory is Silas' file: comments, order and all. This tool
+    // prints the line and does not edit it — a tool that rewrites the file
+    // it is configured by is a tool whose diffs nobody reads.
+    eprintln!(
+        "note: put this into the `[[host]]` block of {} for {}:\n    {}\nThen run `resolve` \
+         again — the manifest carries the fingerprint the planner compares against, and it \
+         has to say what {} says.",
+        inventory_path(repo, fleet).display(),
+        done.host_id,
+        done.toml_line,
+        known_hosts.display()
+    );
+    Ok(true)
+}
+
+// --- end lane 3B ------------------------------------------------------------
 
 /// The receipt as a person reads it.
 fn receipt_table(receipt: &receipt::DeploymentReceipt) -> String {
