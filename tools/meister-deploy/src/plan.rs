@@ -557,6 +557,24 @@ pub struct DeploymentPlan {
     /// The snapshot this plan was made from, embedded. A plan that does not
     /// carry its facts cannot be argued with afterwards.
     pub observation: Observations,
+    /// What each selected host's secrets SHOULD be, read off the
+    /// OPERATOR's disk when the plan was made: `secret_refs[].id` to
+    /// `sha256:<hex>` for a file whose content may be compared, and
+    /// `present` for one whose may not (lane 3B).
+    ///
+    /// The second half of the comparison the action `deliver-secret` comes
+    /// out of; the first half is `observation.hosts.<id>.credentials`. It
+    /// is in the plan rather than only in the planner's head for the same
+    /// reason the observation is: a plan that says a file has to be
+    /// delivered and does not say what it compared is a plan nobody can
+    /// argue with. It is part of the `plan_id`, so a plan made before a
+    /// certificate was issued and one made after are two plans.
+    ///
+    /// A host with nothing to compare is simply absent, and so is a secret
+    /// whose local file is not there — which is what the planner turns into
+    /// a blocked host with `keys csr` and `keys issue` in the sentence.
+    #[serde(default)]
+    pub expected_credentials: BTreeMap<String, BTreeMap<String, String>>,
     /// Where each selected host is reached, frozen with the selection. A
     /// target set is only frozen if the addresses are frozen with it.
     pub endpoints: BTreeMap<String, Endpoint>,
@@ -871,6 +889,16 @@ pub struct PlanPolicy {
     pub workload_control: Option<WorkloadControl>,
     pub confirm_within_switch_secs: u64,
     pub confirm_within_boot_secs: u64,
+    /// What the operator's own disk holds for each host's secrets
+    /// (`crate::pki::expected_credentials`), host id to
+    /// `secret_refs[].id` to `sha256:<hex>` or `present`.
+    ///
+    /// It arrives with the policy rather than out of the release for the
+    /// same reason `workload_control` does: it is a property of the
+    /// WORKSTATION. The same release planned on a machine that has not
+    /// issued the certificates yet is a different, more careful plan, and
+    /// the plan says so.
+    pub expected_credentials: BTreeMap<String, crate::pki::ExpectedCredentials>,
 }
 
 impl PlanPolicy {
@@ -881,11 +909,21 @@ impl PlanPolicy {
             workload_control: None,
             confirm_within_switch_secs: CONFIRM_WITHIN_SWITCH_SECS,
             confirm_within_boot_secs: CONFIRM_WITHIN_BOOT_SECS,
+            expected_credentials: BTreeMap::new(),
         }
     }
 
     pub fn with_workload_control(mut self, control: Option<WorkloadControl>) -> PlanPolicy {
         self.workload_control = control;
+        self
+    }
+
+    /// What the operator has on disk for each host's secrets (lane 3B).
+    pub fn with_expected_credentials(
+        mut self,
+        expected: BTreeMap<String, crate::pki::ExpectedCredentials>,
+    ) -> PlanPolicy {
+        self.expected_credentials = expected;
         self
     }
 }
@@ -1076,6 +1114,12 @@ pub fn plan(
             required_unreachable,
         },
         observation: observation.clone(),
+        expected_credentials: policy
+            .expected_credentials
+            .iter()
+            .filter(|(id, _)| selected.contains(*id))
+            .map(|(id, secrets)| (id.clone(), secrets.clone()))
+            .collect(),
         endpoints,
         groups,
         hosts,
@@ -3001,6 +3045,48 @@ mod tests {
             .into_iter()
             .find(|a| a.kind == kind)
             .unwrap_or_else(|| panic!("{host} has no {kind} in this plan"))
+    }
+
+    // --- lane 3B: the new field of the contract -----------------------
+
+    /// A new field of the plan is a new field of the `plan_id` and a new
+    /// field of the round trip, or it is a field that quietly does nothing.
+    #[test]
+    fn what_the_operator_had_on_disk_travels_in_the_plan_and_is_part_of_its_id() {
+        let (release, observation) = upgrade(&["n1"], false);
+        let bare = planned(&release, "all", &observation);
+        assert!(bare.expected_credentials.is_empty());
+
+        let mut expected: BTreeMap<String, crate::pki::ExpectedCredentials> = BTreeMap::new();
+        expected.insert(
+            "n1".to_string(),
+            BTreeMap::from([("ca-bundle".to_string(), "sha256:aaaa".to_string())]),
+        );
+        // And a host nobody selected, to see it stay out.
+        expected.insert(
+            "nobody".to_string(),
+            BTreeMap::from([("ca-bundle".to_string(), "sha256:bbbb".to_string())]),
+        );
+        let policy = plan_policy(PlanKind::Upgrade).with_expected_credentials(expected);
+        let with = plan(&release, "all", &observation, None, &policy, at(NOW))
+            .expect("this fixture plans");
+
+        assert_eq!(
+            with.expected_credentials.keys().collect::<Vec<_>>(),
+            vec!["n1"],
+            "a host outside the selection is not in the plan"
+        );
+        assert_ne!(
+            with.plan_id, bare.plan_id,
+            "a different thing on the operator's disk is a different plan"
+        );
+
+        // It reads back, it still hashes to its id, and the field survives.
+        let text = String::from_utf8(with.to_json().unwrap()).unwrap();
+        let back = DeploymentPlan::from_json(&text, "the round trip").unwrap();
+        assert_eq!(back, with);
+        assert_eq!(back.expected_credentials["n1"]["ca-bundle"], "sha256:aaaa");
+        assert!(back.id_matches().unwrap());
     }
 
     #[test]

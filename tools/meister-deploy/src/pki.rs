@@ -26,6 +26,7 @@
 //! road to a target, past the locks and past the journal, is precisely what
 //! D6 exists to prevent.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -807,6 +808,181 @@ pub fn parse_describe(text: &str, path: &str) -> Issued {
         }
     }
     issued
+}
+
+// ---------------------------------------------------------------------------
+// What should be on a host, so that the planner can compare it with what is
+// ---------------------------------------------------------------------------
+
+/// What `deliver-secret` would put on a host, by `secret_refs[].id`.
+///
+/// A digest for a file that may be hashed — a certificate, a CA bundle, a
+/// CRL — and the word `present` for one that may not. The planner compares
+/// this with [`crate::observation::HostObservation::credentials`], which the
+/// read-only probe fills the same way round (2A): `sha256:<hex>` for the
+/// public files, `mode:… owner:…` for the private ones.
+///
+/// So a public file is compared by CONTENT and a private one only by
+/// existence, and that asymmetry is deliberate: the digest of a private key
+/// is a digest of a private key, and it would travel into a journal, a
+/// receipt and whatever ticket the receipt is attached to.
+pub type ExpectedCredentials = BTreeMap<String, String>;
+
+/// The word for a secret that is there and whose content nobody compares.
+pub const PRESENT: &str = "present";
+
+/// Where the local half of one secret reference lives, or `None` when there
+/// is no local half at all.
+///
+/// Three sources, three answers (`nix/lib/manifest.nix` writes them):
+///
+/// * `operator-file` — the ref IS a path, relative to the inventory file:
+///   `[operator] ca_dir = "../labpki"` makes `ca.crt` into `../labpki/ca.crt`.
+/// * `meister-ca` — what `keys issue` wrote, under the repository, named
+///   after the file it becomes on the target. Named after the FILE and not
+///   after the kind, because a host that carries two controller tiers has
+///   one `identity.crt` and two secret references to it.
+/// * `target-generated` — there is no local half, and there must not be.
+pub fn local_source(
+    repo: &Path,
+    ca_dir: &Path,
+    host_id: &str,
+    secret: &crate::manifest::SecretRef,
+) -> Option<PathBuf> {
+    use crate::manifest::SecretSourceKind;
+    match secret.source.kind {
+        SecretSourceKind::TargetGenerated => None,
+        SecretSourceKind::OperatorFile => {
+            let named = Path::new(&secret.source.reference);
+            Some(if named.is_absolute() {
+                named.to_path_buf()
+            } else {
+                // The reference is written relative to the inventory, and
+                // `ca_dir` was resolved from the same place, so the tail
+                // after the ca directory's own name is what is left.
+                match named.file_name() {
+                    Some(file) => ca_dir.join(file),
+                    None => repo.join(named),
+                }
+            })
+        }
+        SecretSourceKind::MeisterCa => Some(issued_path(
+            repo,
+            host_id,
+            base_name(&secret.target_path).as_str(),
+        )),
+    }
+}
+
+/// The last path segment of a target path, which is the name the file has on
+/// the host and the name it gets here.
+pub fn base_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// What every secret of this host should be, read off the operator's disk.
+///
+/// A missing local file is not an error here: the planner turns it into a
+/// blocked host with a sentence that names the verb to run
+/// (`keys csr` / `keys issue`), which is more useful than a plan that
+/// refuses to exist.
+pub fn expected_for_host(
+    files: &dyn Files,
+    repo: &Path,
+    ca_dir: &Path,
+    host_id: &str,
+    host: &ResolvedHost,
+) -> ExpectedCredentials {
+    let mut out = ExpectedCredentials::new();
+    for secret in &host.secret_refs {
+        let Some(path) = local_source(repo, ca_dir, host_id, secret) else {
+            continue;
+        };
+        if !files.exists(&path) {
+            continue;
+        }
+        if crate::observe::is_certificate(&secret.target_path) {
+            match files.read(&path) {
+                Ok(bytes) => {
+                    out.insert(
+                        secret.id.clone(),
+                        format!("sha256:{}", crate::ids::sha256_hex(&bytes)),
+                    );
+                }
+                // Unreadable is not "absent": leaving it out would make the
+                // planner ask for a certificate to be issued that is
+                // already there. The plan blocks on it either way, and the
+                // sentence it gets is about the file that could not be
+                // read.
+                Err(_) => {
+                    out.insert(secret.id.clone(), "unreadable".to_string());
+                }
+            }
+        } else {
+            // A private file: it is there, and that is all this says.
+            out.insert(secret.id.clone(), PRESENT.to_string());
+        }
+    }
+    out
+}
+
+/// The same for every host of a selection.
+pub fn expected_credentials(
+    files: &dyn Files,
+    repo: &Path,
+    ca_dir: &Path,
+    fleet: &crate::manifest::ResolvedFleet,
+    hosts: &[String],
+) -> BTreeMap<String, ExpectedCredentials> {
+    let mut out = BTreeMap::new();
+    for id in hosts {
+        let Some(host) = fleet.hosts.get(id) else {
+            continue;
+        };
+        let expected = expected_for_host(files, repo, ca_dir, id, host);
+        if !expected.is_empty() {
+            out.insert(id.clone(), expected);
+        }
+    }
+    out
+}
+
+/// When `deliver-secret` is what happens next, per secret.
+///
+/// The rule, and the whole of it:
+///
+/// * a file the target has not got -> deliver it;
+/// * a PUBLIC file whose digest differs -> deliver it;
+/// * a PRIVATE file that is there -> leave it alone, whatever it is. A
+///   `secrets.key` on a cloud is the key its stored secrets were encrypted
+///   with; replacing it does not rotate anything, it makes what is stored
+///   unreadable. Rotation is `keys rotate` (M5) and it is a plan of its own.
+/// * a key the target made itself -> never.
+pub fn needs_delivery(
+    secret: &crate::manifest::SecretRef,
+    expected: Option<&String>,
+    observed: Option<&Option<String>>,
+) -> bool {
+    use crate::manifest::SecretSourceKind;
+    if secret.source.kind == SecretSourceKind::TargetGenerated {
+        return false;
+    }
+    let Some(expected) = expected else {
+        // Nothing local to deliver. The planner says so in its own sentence.
+        return false;
+    };
+    match observed {
+        // Not there, or the probe says it is not there.
+        None | Some(None) => true,
+        Some(Some(seen)) => {
+            if expected == PRESENT {
+                // It is there, and a private file that is there stays.
+                false
+            } else {
+                seen != expected
+            }
+        }
+    }
 }
 
 #[cfg(test)]
