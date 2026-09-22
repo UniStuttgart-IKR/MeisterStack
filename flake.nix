@@ -311,6 +311,14 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # The exit criterion of lane 3B: a fresh host is enrolled against
+          # a fingerprint read off its console, makes its own key, gets a
+          # certificate this fleet's CA issued over it, and the control
+          # plane on it authenticates with it (M3B, V09 rest, D10).
+          vm-keys-roundtrip = import ./nix/tests/keys.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # The boot renderer and the build-time renderer, on the same input.
           # Both fleets: one-box has a raft group of ONE (no etcd variables),
           # ha has three (1A §8, open point 6).
