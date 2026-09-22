@@ -23,6 +23,7 @@ pub mod build;
 pub mod canonical;
 pub mod checks;
 pub mod effects;
+pub mod execute;
 #[cfg(test)]
 pub mod fixtures;
 pub mod ids;
