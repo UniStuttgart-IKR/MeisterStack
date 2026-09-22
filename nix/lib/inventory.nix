@@ -630,7 +630,7 @@ let
     {
       inherit schema where planDir ports;
       fleet = { name = header.name; inherit domain schema; };
-      inherit operator hosts;
+      inherit operator hosts defaults;
       groups = groupsRaw;
       services = servicesRaw;
       hostIds = lib.attrNames hosts;

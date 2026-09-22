@@ -169,7 +169,13 @@ let
       ../services.nix
       ../managed.nix
       { meisterstack.managed.enable = true; }
-    ] ++ map (profileFor "managed-disk-image") ((inv.hosts.${builtins.head ids} or { }).profiles or [ ])
+    ]
+    # The fleet's DEFAULT profiles — `[defaults] profiles` — and not one
+    # host's: this image is every host and none of them. Taking the first
+    # host's list would have made the image depend on which host happens to
+    # sort first, and `builtins.head` on a fleet with no nixos host would
+    # have thrown where a sentence belongs.
+    ++ map (profileFor "managed-disk-image") (inv.defaults.profiles or [ ])
     ++ extraModules;
   };
 
