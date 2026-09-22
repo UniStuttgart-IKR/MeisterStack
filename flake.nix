@@ -340,6 +340,15 @@
             inherit nixpkgs lib pkgs system self disko;
           };
 
+          # The exit criterion of M3: two empty disks become a fleet, the
+          # fleet takes an update over the same verbs, and a kernel change
+          # stops in front of the provider of the host that has no boot
+          # menu (V06 complete, V09 rest, L10 "installation", D7's first
+          # real run, provider-reboot halt and resume).
+          vm-bootstrap-fleet = import ./nix/tests/bootstrap.nix {
+            inherit nixpkgs lib pkgs system self disko;
+          };
+
           # One image, two machines, two identities (M3A position 9: V08,
           # L04). The thing a lab's `managed-disk-image` stands on.
           vm-two-instances-same-image = import ./nix/tests/two-instances.nix {
