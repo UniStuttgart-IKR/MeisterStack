@@ -82,17 +82,17 @@ let
       [ -f /lib/modules/$m.ko ] && /bin/busybox insmod /lib/modules/$m.ko
     done
     if [ -e /dev/input/event0 ]; then
-      # `ms_tiny=debug` keeps acpid in the foreground with its own logging
-      # on the console: when a button press does not arrive, the question is
-      # always which event string it produced.
-      if /bin/busybox grep -q 'ms_tiny=debug' /proc/cmdline 2>/dev/null; then
-        /bin/busybox acpid -f -d -c /etc/acpi &
-        echo "MS-S0-ACPI: listening (debug)"
-      else
-      /bin/busybox acpid -c /etc/acpi \
-        && echo "MS-S0-ACPI: listening on $(/bin/busybox cat /sys/class/input/event0/device/name 2>/dev/null)" \
-        || echo "MS-S0-ACPI: acpid did not start; the power button will not be seen"
-      fi
+      # In the FOREGROUND, as a job of init, and never as a daemon: measured,
+      # a daemonized busybox acpid answers the very same button press with
+      # nothing at all (the press is accepted by the hypervisor, HTTP 204,
+      # and the guest stays up), while `-f` powers the guest down every
+      # time. As a job its own messages also land on the console, which is
+      # the only diagnostic channel a guest this small has.
+      # `ms_tiny=debug` adds acpid's own event logging on top.
+      dbg=""
+      /bin/busybox grep -q 'ms_tiny=debug' /proc/cmdline 2>/dev/null && dbg="-d"
+      /bin/busybox acpid -f $dbg -c /etc/acpi &
+      echo "MS-S0-ACPI: listening on $(/bin/busybox cat /sys/class/input/event0/device/name 2>/dev/null)"
     else
       echo "MS-S0-ACPI: no input node for the power button; it will not be seen"
     fi
