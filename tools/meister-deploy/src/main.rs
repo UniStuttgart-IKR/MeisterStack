@@ -253,6 +253,13 @@ struct BuildArgs {
     #[arg(long)]
     inventory: Option<PathBuf>,
 
+    /// The operator's repository, whose state directory keeps the release's
+    /// garbage-collector roots. Defaults to the one the manifest was
+    /// resolved from — which is a path from ANOTHER machine when the
+    /// manifest came from one, and then this is the flag to pass.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
     /// Print the derivations that would be built, and build nothing
     #[arg(long)]
     dry_run: bool,
@@ -902,7 +909,8 @@ fn build(args: &BuildArgs) -> Result<bool> {
     // build rather than leave it running.
     Cancel::on_sigint()?;
     let runner = Real::new(policy).verbose(true);
-    let state = StateDir::in_repo(&repo_of(&resolved));
+    let repo = args.repo.clone().unwrap_or_else(|| repo_of(&resolved));
+    let state = StateDir::in_repo(&repo);
     let builder = build::Builder {
         runner: &runner,
         files: &files,
