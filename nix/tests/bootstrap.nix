@@ -652,8 +652,8 @@ pkgs.testers.runNixOSTest {
         assert "BEGIN CERTIFICATE REQUEST" in text, text
         assert "PRIVATE KEY" not in text, "a key left a host"
 
-    for host, kinds in [("box", ["cluster", "serving"]), ("n1", ["node"])]:
-        for kind in kinds:
+    for host, ca_kinds in [("box", ["cluster", "serving"]), ("n1", ["node"])]:
+        for kind in ca_kinds:
             operator.succeed(
                 f"cd /root/fleet && meister-deploy keys issue --host {host} --kind {kind} "
                 f"--manifest /root/out/m-b.json --repo /root/fleet "
@@ -799,9 +799,10 @@ pkgs.testers.runNixOSTest {
     status, plan_c = make_plan(release_c, "c")
     assert status == 0, status
     the_plan = read(plan_c)
-    kinds = {a["kind"] for a in the_plan["actions"] if not a["blocked"]}
-    assert "deliver-secret" not in kinds, "what the hosts have is what this repository holds"
-    assert "stage" in kinds and "activate" in kinds, kinds
+    planned_kinds = [a["kind"] for a in the_plan["actions"] if not a["blocked"]]
+    assert "deliver-secret" not in planned_kinds, \
+        "what the hosts have is what this repository holds"
+    assert "stage" in planned_kinds and "activate" in planned_kinds, planned_kinds
     # The agent is the host that carries guests, so it is the host that is
     # cordoned and drained — through the operator's cli (D7).
     n1_steps = [a["kind"] for a in the_plan["actions"] if a["host"] == "n1" and not a["blocked"]]
