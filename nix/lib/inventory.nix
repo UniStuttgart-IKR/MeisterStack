@@ -557,17 +557,6 @@ let
             (builtins.any (p: p.device == "label:meister-data") h.persistence)
             "meister-data";
 
-          # Where this host may fetch a closure from, as the inventory said
-          # it. One list, one place: `build --cache` pushes a release into a
-          # store and `managed.substituters` is what lets a host pull from
-          # one, and having the second half live in an operator's profile
-          # while the first is a flag would make "does this fleet use its
-          # cache" a question nobody can answer from one file.
-          #
-          # mkDefault, so a host module that knows better (a machine behind a
-          # slow link, a machine that must never fetch) keeps its own answer.
-          meisterstack.managed.substituters = lib.mkDefault h.substituters;
-
           # Per-host overrides, in one named place, so that a review can list
           # the hosts that are not like the others by grepping for one word.
           meisterstack.cloud.settings = (h.deviations.settings or { }).cloud or { };
