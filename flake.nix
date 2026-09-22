@@ -325,6 +325,13 @@
             inherit nixpkgs lib pkgs system self disko;
           };
 
+          # The other boot mode: a guest with no boot loader at all, started
+          # by the test driver out of the bundle its provider would be
+          # handed (M3A position 8).
+          vm-install-direct-boot = import ./nix/tests/install-direct.nix {
+            inherit nixpkgs lib pkgs system self disko;
+          };
+
           # The boot renderer and the build-time renderer, on the same input.
           # Both fleets: one-box has a raft group of ONE (no etcd variables),
           # ha has three (1A §8, open point 6).
