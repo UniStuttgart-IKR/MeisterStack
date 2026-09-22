@@ -1191,3 +1191,215 @@ fn the_placement_is_read_back_out_of_the_object() {
     assert_eq!(placement_of(r#"{"spec":{}}"#), (None, None));
     assert_eq!(phase_of("not json"), None);
 }
+
+// ---------------------------------------------------------------------------
+// the gpu suite: pinned, not run
+// ---------------------------------------------------------------------------
+
+/// The fleet with n1 turned into a passthrough host: one device declared,
+/// the capability declared, and the snapshot measuring it.
+fn gpu_world(pci: &str) -> (ReleaseManifest, Observations) {
+    let mut fleet = onebox_enrolled();
+    {
+        let host = fleet.hosts.get_mut("n1").expect("n1 is in the fixture");
+        host.hardware.gpus = vec![crate::manifest::Gpu {
+            model: "NVIDIA RTX 2070".to_string(),
+            pci: pci.to_string(),
+            selected_for: None,
+        }];
+        host.hardware.capabilities.push("vfio".to_string());
+        host.checks.functional.push("gpu".to_string());
+    }
+    fleet.manifest_id = content_id(IdKind::Manifest, &fleet).expect("a manifest hashes");
+    let mut release = release_with_guest();
+    release.resolved_fleet = fleet;
+    release.release_id = content_id(IdKind::Release, &release).expect("a release hashes");
+    let observation = observed(&release, at("2026-09-22T19:00:00Z"));
+    (release, observation)
+}
+
+#[test]
+fn the_gpu_suite_hands_the_device_out_and_back_five_times_and_pins_every_line() {
+    let pci = "0000:01:00.0";
+    let (release, observation) = gpu_world(pci);
+    let files = MemFiles::new();
+    let clock = FakeClock::at(at("2026-09-22T19:00:00Z"));
+
+    // One device is declared, so one guest per round, five rounds.
+    let mut fake = StrictFake::new();
+    let mut n = 0usize;
+    for _ in 0..5 {
+        n += 1;
+        fake = fake
+            .expect(
+                Matcher::prefix("meister", cli_args(&["vm", "create", &guest(n), "-f"])),
+                created(&guest(n), "n1"),
+            )
+            .expect(
+                Matcher::exact("meister", cli_args(&["vm", "get", &guest(n)])),
+                phase(&guest(n), "n1", "Running"),
+            );
+        let mut rm = head();
+        rm.extend(["--yes", "vm", "rm"].iter().map(|a| a.to_string()));
+        rm.push(guest(n));
+        fake = fake
+            .expect(Matcher::exact("meister", rm), Output::stdout(""))
+            .expect(
+                Matcher::exact("meister", cli_args(&["vm", "ls"])),
+                listing(&[]),
+            );
+    }
+    // The refusal: a PCI address in a domain nothing uses has to be turned
+    // down, and the refusal is the pass.
+    fake = fake.expect(
+        Matcher::prefix(
+            "meister",
+            cli_args(&["vm", "create", &format!("{}-refusal", tag()), "-f"]),
+        ),
+        Output::failing(1, "no device 'ffff:ff:1f.7' is configured on this node"),
+    );
+
+    let mut verifier = Verifier::new(
+        &fake,
+        &files,
+        &clock,
+        state(),
+        &release,
+        &observation,
+        vec!["n1".to_string()],
+        options(Suite::Gpu),
+    )
+    .as_mock();
+    let run = verifier.run().expect("the suite runs");
+    fake.verify().expect("every expectation was used");
+
+    // The spec that went to the node carried the device, exactly as the
+    // agent's catalogue spells one.
+    let spec = files
+        .content(
+            state()
+                .run_dir(RUN)
+                .join("specs")
+                .join(format!("{}.json", guest(1))),
+        )
+        .expect("a guest spec was written");
+    let value: serde_json::Value = serde_json::from_slice(&spec).unwrap();
+    assert_eq!(value["devices"][0]["driver"], "vfio");
+    assert_eq!(value["devices"][0]["params"]["pci_address"], pci);
+
+    let by_id = |id: &str| run.checks.iter().filter(|c| c.id == id).collect::<Vec<_>>();
+    assert_eq!(by_id("gpu.create").len(), 5);
+    assert_eq!(by_id("gpu.in-guest").len(), 5);
+    assert!(
+        by_id("gpu.in-guest")
+            .iter()
+            .all(|c| c.status == Status::Unknown),
+        "a guest that cannot be asked must not answer `pass`"
+    );
+    let refusal = by_id("gpu.refusal");
+    assert_eq!(refusal.len(), 1);
+    assert_eq!(refusal[0].status, Status::Pass);
+    assert!(refusal[0].observed.contains("refused"), "{:?}", refusal[0]);
+
+    // The computation half, and the sentence that says what would have to
+    // exist for it to be run.
+    let compute = by_id("gpu.compute");
+    assert_eq!(compute.len(), 1);
+    assert_eq!(compute[0].status, Status::NotApplicable);
+    assert!(
+        compute[0].reason.contains("CUDA or nvrm userland"),
+        "{}",
+        compute[0].reason
+    );
+
+    // `gpu.in-guest` is `unknown` and the inventory makes this suite a
+    // required one for n1, so the run is blocked — a suite that could not
+    // look inside the guest has not shown a passthrough.
+    assert!(!crate::checks::acceptance(&run.checks).is_accepted());
+    assert!(
+        run.ledger
+            .resources
+            .iter()
+            .all(|r| r.state == ResourceState::Deleted),
+        "{:?}",
+        run.ledger.resources
+    );
+}
+
+#[test]
+fn a_backend_that_takes_a_device_it_does_not_have_is_a_failure_and_the_guest_is_cleaned_up() {
+    let (release, observation) = gpu_world("0000:01:00.0");
+    let files = MemFiles::new();
+    let clock = FakeClock::at(at("2026-09-22T19:00:00Z"));
+
+    let mut fake = StrictFake::new();
+    let mut n = 0usize;
+    for _ in 0..5 {
+        n += 1;
+        let mut rm = head();
+        rm.extend(["--yes", "vm", "rm"].iter().map(|a| a.to_string()));
+        rm.push(guest(n));
+        fake = fake
+            .expect(
+                Matcher::prefix("meister", cli_args(&["vm", "create", &guest(n), "-f"])),
+                created(&guest(n), "n1"),
+            )
+            .expect(
+                Matcher::exact("meister", cli_args(&["vm", "get", &guest(n)])),
+                phase(&guest(n), "n1", "Running"),
+            )
+            .expect(Matcher::exact("meister", rm), Output::stdout(""))
+            .expect(
+                Matcher::exact("meister", cli_args(&["vm", "ls"])),
+                listing(&[]),
+            );
+    }
+    let refusal_name = format!("{}-refusal", tag());
+    let mut rm = head();
+    rm.extend(["--yes", "vm", "rm"].iter().map(|a| a.to_string()));
+    rm.push(refusal_name.clone());
+    fake = fake
+        .expect(
+            Matcher::prefix("meister", cli_args(&["vm", "create", &refusal_name, "-f"])),
+            created(&refusal_name, "n1"),
+        )
+        // It was accepted, so it is this run's to take back.
+        .expect(Matcher::exact("meister", rm), Output::stdout(""))
+        .expect(
+            Matcher::exact("meister", cli_args(&["vm", "ls"])),
+            listing(&[]),
+        );
+
+    let mut verifier = Verifier::new(
+        &fake,
+        &files,
+        &clock,
+        state(),
+        &release,
+        &observation,
+        vec!["n1".to_string()],
+        options(Suite::Gpu),
+    )
+    .as_mock();
+    let run = verifier.run().expect("the suite runs");
+    fake.verify().expect("every expectation was used");
+
+    let refusal = run
+        .checks
+        .iter()
+        .find(|c| c.id == "gpu.refusal")
+        .expect("the refusal was checked");
+    assert_eq!(refusal.status, Status::Fail);
+    assert!(
+        refusal.reason.contains("nothing on this machine"),
+        "{refusal:?}"
+    );
+    assert!(
+        run.ledger
+            .resources
+            .iter()
+            .any(|r| r.name == refusal_name && r.state == ResourceState::Deleted),
+        "the guest the refusal test accidentally made was not taken back: {:?}",
+        run.ledger.resources
+    );
+}
