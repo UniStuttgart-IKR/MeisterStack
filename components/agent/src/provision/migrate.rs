@@ -320,6 +320,19 @@ impl Provisioner {
     /// The other half is FAILURE, and until it was asked there was nothing to
     /// end this wait but the ceiling — ten minutes of a command that answers
     /// nothing while the guest it was about has been running here all along.
+    ///
+    /// **A quiet socket is the prompt, and the PROCESS is the evidence.**
+    /// `probe` is an API request, and an API request fails for more reasons
+    /// than an exit: a VMM whose API thread is slow under a busy transfer, a
+    /// socket this agent cannot open for a moment. Read as "gone", any of
+    /// them wrote `Migrated`, forgot the pid and let go of the disks of a
+    /// guest that was still running here (F06). So a silent socket is
+    /// followed by the question the observation already asks
+    /// (`Observed::vmm_alive`): is the recorded pid still this VM's VMM?
+    /// `owns_pid` reads the uuid off `/proc/<pid>/cmdline`, which is empty
+    /// for a zombie and foreign for a reused number — both traps above say
+    /// "no" there. Silent and still there is alive-but-unreachable, nothing
+    /// is concluded from it, and the ceiling, if it comes, says so.
     async fn watch_the_send(
         &self,
         id: &VmId,
@@ -329,18 +342,31 @@ impl Provisioner {
     ) -> Departure {
         let ceiling = self.ceilings.migrate_out;
         let deadline = started + ceiling;
+        // The process the send started from. `begin_migrate_out` refuses a
+        // record without one, so `None` is a record somebody changed under
+        // the send — and then nothing can be proved gone, which keeps the
+        // guest here until the ceiling.
+        let vmm = self.store.get(id).ok().flatten().and_then(|r| r.vmm_pid);
         loop {
-            if !hypervisor.probe(id).await {
+            let silent = if hypervisor.probe(id).await {
+                if let Some(why) = migratable.send_failed(id).await {
+                    return Departure::StillHere(why);
+                }
+                false
+            } else if vmm.is_some_and(|pid| !hypervisor.owns_pid(id, pid)) {
                 return Departure::Gone;
-            }
-            if let Some(why) = migratable.send_failed(id).await {
-                return Departure::StillHere(why);
-            }
+            } else {
+                true
+            };
             if std::time::Instant::now() >= deadline {
-                return Departure::StillHere(format!(
+                let mut why = format!(
                     "the transfer has not ended within {}s and this node stopped watching it",
                     ceiling.as_secs()
-                ));
+                );
+                if silent {
+                    why.push_str("; the vmm is still running and not answering its api");
+                }
+                return Departure::StillHere(why);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
