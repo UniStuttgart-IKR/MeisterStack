@@ -2665,3 +2665,62 @@ fn a_destroy_that_has_been_quittanced_has_not_let_go_of_the_disk() {
         Release::WaitingForNode("agent-1a")
     );
 }
+
+/// F04, the cluster half: the cloud's larger size becomes this tier's desired
+/// size, and the ordinary resize becomes due.
+///
+/// `handle_create_volume` used to answer a create for a uid it already held
+/// with "nothing to change — a volume's spec is immutable", which stopped
+/// being true when `sizeGib` became growable. The stuck state was: cloud spec
+/// 20 GiB, cluster spec 10 GiB, backend 10 GiB, and no pass that would ever
+/// move any of them.
+#[test]
+fn a_cloud_volume_grown_after_it_was_seen_is_grown_here() {
+    // Fully observed at 10 GiB: made, reported, settled.
+    let mut v = controller_api::resources::new_volume(
+        "data",
+        controller_api::VolumeSpec {
+            pool: "fast".into(),
+            size_gib: 10,
+            ..Default::default()
+        },
+    );
+    v.metadata.generation = 1;
+    v.status.node = Some("agent-1".into());
+    v.status.size_gib = 10;
+    v.status.reported = Some(controller_api::VolumeReported::by(
+        "agent-1",
+        VolumePhaseKind::Ready,
+        controller_api::VolumeReason::Unrecorded,
+        None,
+        Utc::now(),
+    ));
+    v.settle(Utc::now());
+    assert_eq!(next_for(&v), Next::Settled);
+
+    let cloud = |gib: u64| controller_api::VolumeSpec {
+        pool: "fast".into(),
+        size_gib: gib,
+        ..Default::default()
+    };
+
+    assert!(crate::cloud::grow_to_cloud_size(&mut v, &cloud(20)));
+    assert_eq!(
+        v.spec.size_gib, 20,
+        "the cloud's size is this tier's intent"
+    );
+    assert_eq!(v.metadata.generation, 2, "and the spec moved, so did this");
+    assert_eq!(
+        next_for(&v),
+        Next::Resize("agent-1"),
+        "which is exactly what the ordinary resize is waiting for"
+    );
+
+    // The same create again is a no-op, and an older one arriving late —
+    // two cloud replicas around a speaker change — does not take the size
+    // back down.
+    assert!(!crate::cloud::grow_to_cloud_size(&mut v, &cloud(20)));
+    assert!(!crate::cloud::grow_to_cloud_size(&mut v, &cloud(10)));
+    assert_eq!(v.spec.size_gib, 20);
+    assert_eq!(v.metadata.generation, 2);
+}

@@ -44,6 +44,27 @@ pub(super) async fn dispatch_volumes(
     Ok(())
 }
 
+/// Whether the cluster has to be sent this volume (again).
+///
+/// Dedup by evidence, exactly as the VM half does: a volume the cluster
+/// already names in its status is a volume the cluster already has, and
+/// re-sending the create every five seconds would be a write per pass down
+/// there for nothing. `observed_at` is set by the mirror and by nothing else,
+/// so it is precisely "the cluster has spoken about this".
+///
+/// But having spoken about the volume is not having its current SPEC, and
+/// that half is the one `hand_down` already asks for a VM: a generation here
+/// that was never sent. `observedGeneration` is what this tier SENT (written
+/// below, after the send, and by nothing else), so the comparison is "there
+/// is a spec here the cluster has never been told about" and not a guess
+/// about what the cluster did with it. Found by review: `spec.sizeGib` became
+/// growable at this edge with storage B, the dedup never let the new size
+/// down, and the object said 20 GiB while the cluster held 10 for ever.
+pub(super) fn needs_dispatch(volume: &controller_api::Volume) -> bool {
+    volume.status.observed_at.is_none()
+        || volume.metadata.generation > volume.status.observed_generation
+}
+
 pub(super) async fn dispatch_volume(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -96,12 +117,7 @@ pub(super) async fn dispatch_volume(
         return Ok(());
     }
 
-    // Dedup by evidence, exactly as the VM half does: a volume the cluster
-    // already names in its status is a volume the cluster already has, and
-    // re-sending the create every five seconds would be a write per pass down
-    // there for nothing. `observed_at` is set by the mirror and by nothing
-    // else, so it is precisely "the cluster has spoken about this".
-    if volume.status.observed_at.is_some() {
+    if !needs_dispatch(&volume) {
         return Ok(());
     }
     let spec_json = serde_json::to_string(&volume.spec)?;
