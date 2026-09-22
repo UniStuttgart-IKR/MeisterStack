@@ -396,6 +396,9 @@ pkgs.testers.runNixOSTest {
         "key = \"../ca/operator.key\" }' "
         "> /root/fleet/cli.toml"
     )
+    # …and it belongs to the repository, so it is committed like the rest:
+    # `resolve` refuses a tree with an uncommitted file in it.
+    commit("the operator's cli")
 
     def deploy(name, manifest):
         """resolve -> build: the two verbs that turn an evaluation into a

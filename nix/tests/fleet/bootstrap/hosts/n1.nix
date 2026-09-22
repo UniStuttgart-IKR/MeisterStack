@@ -37,6 +37,22 @@
   # already has its address from the plan must not have a second author.
   networking.useDHCP = false;
 
+  # The one thing an agent cannot do without: `/dev/kvm`.
+  #
+  # An agent that has a hypervisor configured and cannot open it refuses to
+  # start at all — "a node whose whole purpose is running guests would answer
+  # every create with the same error for as long as it was left up"
+  # (components/agent/src/drivers.rs). Inside a test VM the device exists
+  # only if the module is loaded, and nothing loads it by itself.
+  #
+  # `kvm-intel` because that is the machine this test runs on (nested
+  # virtualisation is on there: /sys/module/kvm_intel/parameters/nested = 1).
+  # On an AMD workstation the line would say `kvm-amd`, and on a host without
+  # nested virtualisation the agent of this test would not come up at all —
+  # which the test would then say rather than hide. A
+  # `hardware-configuration.nix` is where a fact about a machine belongs.
+  boot.kernelModules = [ "kvm-intel" ];
+
   # The disk the layout shapes. A virtio disk with a serial gets
   # /dev/disk/by-id/virtio-<serial> and no model in the name (M0 probe S7),
   # which is why the installer compares this device with the serial it was
