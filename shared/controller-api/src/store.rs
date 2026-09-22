@@ -311,6 +311,19 @@ impl EtcdStore {
     }
 
     pub async fn list<T: Resource>(&self) -> Result<Vec<T>> {
+        Ok(self.list_counted().await?.0)
+    }
+
+    /// `list`, and how many keys the SAME answer held.
+    ///
+    /// For the callers whose correctness rests on the list being all of them:
+    /// fewer objects than keys means something did not decode. They used to
+    /// ask `count` for the second number, which is a second read at a later
+    /// revision — so an object created between the two made a complete list
+    /// look short, and a quota check under concurrent creates refused with
+    /// "some vm objects did not decode" about objects that decoded fine.
+    /// Found by the F03 stress test; one response cannot disagree with itself.
+    pub async fn list_counted<T: Resource>(&self) -> Result<(Vec<T>, usize)> {
         let dir = self.dir(T::RESOURCE);
         let resp = timed(
             "list",
@@ -330,7 +343,7 @@ impl EtcdStore {
                                  error = format!("{e:#}"), "skipping undecodable object"),
             }
         }
-        Ok(out)
+        Ok((out, resp.kvs().len()))
     }
 
     /// Record that this peer has just spoken, in a key of its own.

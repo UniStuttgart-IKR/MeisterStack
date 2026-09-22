@@ -556,3 +556,54 @@ async fn two_resizes_into_one_slot_are_one_resize() {
         .sum();
     assert_eq!(sizes, 7, "six and one, inside ten");
 }
+
+/// No gate at all: sixteen creates at once across two replicas, room for two.
+///
+/// The tests above force the one interleaving that used to break; this one
+/// lets the runtime pick, and holds the rule over whatever it picked. Every
+/// request is either admitted or told about the quota — none of them is told
+/// about a race it did not cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an etcd; see the module note"]
+async fn two_slots_are_two_vms_under_any_interleaving() {
+    let (one, two) = two_replicas("f03-many").await;
+    let tenant = racing_tenant(
+        &one,
+        controller_api::TenantQuota {
+            max_vms: Some(2),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut asks = tokio::task::JoinSet::new();
+    for i in 0..16 {
+        let st = if i % 2 == 0 { one.clone() } else { two.clone() };
+        let tenant = tenant.clone();
+        asks.spawn(async move {
+            create_vm_as(
+                &st,
+                member(&tenant),
+                vm(&format!("vm-{i}"), &tenant, None, 1),
+            )
+            .await
+        });
+    }
+    let (mut admitted, mut refused) = (0, 0);
+    while let Some(answer) = asks.join_next().await {
+        match answer.expect("the task") {
+            Ok(_) => admitted += 1,
+            Err(e) => {
+                assert_eq!(
+                    e.status(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{}",
+                    e.message()
+                );
+                assert!(e.message().contains("its quota is 2"), "{}", e.message());
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!((admitted, refused), (2, 14));
+}

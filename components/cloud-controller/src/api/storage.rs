@@ -363,8 +363,8 @@ pub(super) fn pick_storage_pool<'a>(
 /// cost of undercounting is two tenants on one address, here it is a pool
 /// quietly overcommitted past the disk that is actually in the machine.
 pub(super) async fn all_volumes(st: &ApiState) -> Result<Vec<Volume>, ApiError> {
-    let volumes = st.store.list::<Volume>().await?;
-    if volumes.len() != st.store.count::<Volume>().await? {
+    let (volumes, keys) = st.store.list_counted::<Volume>().await?;
+    if volumes.len() != keys {
         return Err(conflict(
             "some volume objects did not decode, so how much storage is held cannot be \
              established; refusing rather than handing out room twice",

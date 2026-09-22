@@ -499,8 +499,8 @@ pub(super) async fn check_quota(
     if object.spec.quota.is_unset() {
         return Ok(Some(fence));
     }
-    let vms = st.store.list::<Vm>().await?;
-    if vms.len() != st.store.count::<Vm>().await? {
+    let (vms, keys) = st.store.list_counted::<Vm>().await?;
+    if vms.len() != keys {
         return Err(conflict(
             "cannot tell how much this tenant is holding (some vm objects did not decode); \
              refusing to let it grow",
