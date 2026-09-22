@@ -299,11 +299,14 @@ enum KeysCmd {
         json: bool,
     },
 
-    /// Sign a request with the fleet's CA, offline.
+    /// Sign a request with the fleet's CA, on this machine alone.
     ///
     /// The subject is this tool's decision and not the request's: a request
     /// is a public key and a wish. The CA key stays in `[operator] ca_dir`
     /// and never reaches a host.
+    ///
+    /// No network and therefore no `--offline`: signing needs nothing but
+    /// this computer, so there is nothing for that flag to refuse.
     Issue {
         /// The host the certificate is for
         #[arg(long)]
