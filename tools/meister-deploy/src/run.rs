@@ -393,6 +393,27 @@ impl Cancel {
         self.0.load(Ordering::SeqCst) || INTERRUPTED.load(Ordering::SeqCst)
     }
 
+    /// Work on, even when the connection that started this went away.
+    ///
+    /// For the target-side helper: it is started over ssh, and the very
+    /// thing it does — `switch-to-configuration` — restarts sshd and the
+    /// network under its own connection. A `SIGHUP` at that moment would
+    /// kill it between moving the profile and arming the way back, which is
+    /// the one place this program must not be interrupted. Measured in
+    /// nix/tests/update.nix: the switch finished and the operator's ssh
+    /// came back 255 with nothing to say.
+    ///
+    /// Only the helper calls this. `meister-deploy` on a workstation has a
+    /// terminal, and a program that ignores its hangup there would be a
+    /// program somebody cannot close a laptop on.
+    pub fn ignore_sighup() -> Result<()> {
+        let action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        // SAFETY: SIG_IGN installs no handler; there is no code to be
+        // async-signal-safe about.
+        unsafe { sigaction(Signal::SIGHUP, &action) }.context("ignoring SIGHUP failed")?;
+        Ok(())
+    }
+
     /// Install the SIGINT handler once, for the whole process. Called from
     /// `main`, never from a library path: a library that installs signal
     /// handlers behind its caller's back is a library that breaks the next

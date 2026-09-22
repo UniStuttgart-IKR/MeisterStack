@@ -79,6 +79,13 @@ pub const DRAIN_WAIT: Duration = Duration::from_secs(600);
 /// How long a host may take to come back from a reboot.
 pub const REBOOT_WAIT: Duration = Duration::from_secs(600);
 
+/// How long a host gets to answer again after an activation.
+///
+/// `switch-to-configuration` restarts sshd and the network, so the
+/// connection that started it can die with it — and the first question
+/// asked afterwards can go unanswered without anything being wrong.
+pub const SETTLE_WAIT: Duration = Duration::from_secs(120);
+
 /// How often a bounded wait asks again.
 pub const POLL: Duration = Duration::from_secs(5);
 
@@ -110,6 +117,9 @@ pub struct ApplyOptions {
     pub workload: Option<WorkloadControl>,
     pub drain_wait: Duration,
     pub reboot_wait: Duration,
+    /// How long a host gets to answer again after a step that restarts its
+    /// network.
+    pub settle_wait: Duration,
     pub poll: Duration,
 }
 
@@ -123,6 +133,7 @@ impl ApplyOptions {
             workload: None,
             drain_wait: DRAIN_WAIT,
             reboot_wait: REBOOT_WAIT,
+            settle_wait: SETTLE_WAIT,
             poll: POLL,
         }
     }
@@ -620,6 +631,11 @@ impl<'a> Executor<'a> {
                 self.set_state(hosts, id, HostState::Activating);
                 let cmd = self.activate_cmd(id, action, &txn)?;
                 let line = cmd.line();
+                let next = if action.rollback.mode == RollbackMode::Boot {
+                    HostState::AwaitingReboot
+                } else {
+                    HostState::Verifying
+                };
                 match self.runner.run(&cmd) {
                     Ok(_) => {
                         self.end(
@@ -630,27 +646,51 @@ impl<'a> Executor<'a> {
                             Vec::new(),
                             vec![line],
                         )?;
-                        let next = if action.rollback.mode == RollbackMode::Boot {
-                            HostState::AwaitingReboot
-                        } else {
-                            HostState::Verifying
-                        };
                         self.move_to(journal, id, hosts, next, None)?;
                     }
                     Err(e) => {
-                        self.end(
-                            journal,
-                            id,
-                            action,
-                            ActionResult::Failed,
-                            vec![format!("{e:#}")],
-                            vec![line],
-                        )?;
-                        // The helper puts the host back itself when its own
-                        // step fails, and it says so in the record. What is
-                        // left here is to find out which of the two
-                        // happened, and the target is the one that knows.
-                        return self.after_a_failed_activation(journal, id, hosts, e);
+                        // The connection may have died BECAUSE the activation
+                        // worked: `switch-to-configuration` restarts sshd and
+                        // the network under the very connection that started
+                        // it, and an ssh that comes back 255 with nothing to
+                        // say is not evidence about a machine. Measured in
+                        // nix/tests/update.nix, where the switch had finished
+                        // and the operator called the run failed. So the
+                        // TARGET is asked, and it is asked after it has had
+                        // time to answer again.
+                        let (seen, view) = self.settled_view(id, Some(&txn));
+                        if matches!(view, TxnView::Pending { .. }) {
+                            self.end(
+                                journal,
+                                id,
+                                action,
+                                ActionResult::Ok,
+                                vec![
+                                    format!("the connection did not survive the switch: {e:#}"),
+                                    format!(
+                                        "{id} holds the transaction {txn} and is waiting for a \
+                                         word"
+                                    ),
+                                ],
+                                vec![line],
+                            )?;
+                            self.move_to(journal, id, hosts, next, seen.as_ref())?;
+                        } else {
+                            self.end(
+                                journal,
+                                id,
+                                action,
+                                ActionResult::Failed,
+                                vec![format!("{e:#}")],
+                                vec![line],
+                            )?;
+                            // The helper puts the host back itself when its
+                            // own step fails, and it says so in the record.
+                            // What is left is to find out which of the two
+                            // happened, and the target is the one that knows.
+                            return self
+                                .after_a_failed_activation(journal, id, hosts, e, seen, view);
+                        }
                     }
                 }
             }
@@ -1113,24 +1153,27 @@ impl<'a> Executor<'a> {
     /// writes the reason into the record (see [`crate::activate`]), so the
     /// question here is which of the two happened — and the target is the
     /// one that knows. Nothing is activated again either way.
+    #[allow(clippy::too_many_arguments)]
     fn after_a_failed_activation(
         &self,
         journal: &Journal,
         id: &str,
         hosts: &mut BTreeMap<String, HostRunState>,
         why: anyhow::Error,
+        observed: Option<HostObservation>,
+        view: TxnView,
     ) -> Result<()> {
-        let txn = self.entry(hosts, id).txn.clone();
-        let observed = self.observe_one(id).ok();
-        let view = match (&observed, txn.as_deref()) {
-            (Some(obs), id_of) => TxnView::of(obs, id_of),
-            (None, _) => TxnView::None,
-        };
+        let answered = observed.as_ref().map(|o| o.reachable).unwrap_or(false);
         let state = match view {
             TxnView::Reverted => HostState::RolledBack,
             TxnView::Pending { .. } | TxnView::Inconsistent => HostState::RecoveryRequired,
             TxnView::Confirmed => HostState::Committed,
-            TxnView::None if observed.is_some() => HostState::Failed,
+            // It answered and holds no record: nothing was activated, and
+            // that is a fact rather than a silence.
+            TxnView::None if answered => HostState::Failed,
+            // It did not answer. What happened is what a resume is for, and
+            // guessing here would be guessing about a machine that may be
+            // half way through a switch.
             TxnView::None => HostState::Unknown,
         };
         self.move_to(journal, id, hosts, state, observed.as_ref())?;
@@ -1141,9 +1184,42 @@ impl<'a> Executor<'a> {
                 HostState::RecoveryRequired => "it has a transaction that needs a person",
                 HostState::Committed => "the transaction is confirmed, which nobody here did",
                 HostState::Failed => "nothing was activated",
-                _ => "nothing at all",
+                _ =>
+                    "nothing at all — it did not answer, so `apply --resume` is what asks \
+                      it again",
             }
         );
+    }
+
+    /// What the target says about a transaction, once it is answering again.
+    ///
+    /// A bounded wait and not one question: the step that just failed is the
+    /// one that restarts the network, so the first answer after it is likely
+    /// to be no answer at all — and reading that as "nothing happened" is
+    /// the worst of the possible wrong readings.
+    fn settled_view(&self, id: &str, txn: Option<&str>) -> (Option<HostObservation>, TxnView) {
+        let started = self.clock.now();
+        let mut last: Option<HostObservation> = None;
+        loop {
+            if let Ok(obs) = self.observe_one(id) {
+                if obs.reachable {
+                    let view = TxnView::of(&obs, txn);
+                    return (Some(obs), view);
+                }
+                last = Some(obs);
+            }
+            if self.clock.now() - started
+                > chrono::TimeDelta::from_std(self.options.settle_wait)
+                    .unwrap_or_else(|_| chrono::TimeDelta::zero())
+            {
+                let view = last
+                    .as_ref()
+                    .map(|obs| TxnView::of(obs, txn))
+                    .unwrap_or(TxnView::None);
+                return (last, view);
+            }
+            self.clock.sleep(self.options.poll);
+        }
     }
 
     // -----------------------------------------------------------------

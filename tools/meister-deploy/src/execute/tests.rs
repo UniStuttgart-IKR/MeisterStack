@@ -60,6 +60,9 @@ struct TableLook {
     txns: RefCell<BTreeMap<String, Txn>>,
     /// Hosts that never come back from their reboot.
     lost: RefCell<BTreeSet<String>>,
+    /// Hosts whose activation leaves the record a real one leaves: pending,
+    /// waiting for a word.
+    keeps_the_record: RefCell<BTreeSet<String>>,
     asked: RefCell<Vec<String>>,
 }
 
@@ -78,6 +81,7 @@ impl TableLook {
             broken: RefCell::new(BTreeSet::new()),
             txns: RefCell::new(BTreeMap::new()),
             lost: RefCell::new(BTreeSet::new()),
+            keeps_the_record: RefCell::new(BTreeSet::new()),
             asked: RefCell::new(Vec::new()),
         }
     }
@@ -85,6 +89,23 @@ impl TableLook {
     /// The new system of this host comes up with a unit that failed.
     fn breaks(self, id: &str) -> TableLook {
         self.broken.borrow_mut().insert(id.to_string());
+        self
+    }
+
+    /// This host's activation leaves a pending transaction behind, as a
+    /// real one does until somebody confirms it.
+    fn keeps_the_record(self, id: &str, txn: &str, top: &str) -> TableLook {
+        self.keeps_the_record.borrow_mut().insert(id.to_string());
+        self.txns.borrow_mut().insert(
+            format!("pending:{id}"),
+            Txn {
+                id: txn.to_string(),
+                state: TxnState::Pending,
+                target_system: Some(top.to_string()),
+                deadline: Some(at("2026-09-22T12:05:00Z")),
+                run_id: Some(txn.to_string()),
+            },
+        );
         self
     }
 
@@ -180,7 +201,18 @@ impl<'a> World<'a> {
 
 impl Runner for World<'_> {
     fn run(&self, cmd: &Cmd) -> Result<Output> {
-        let out = self.inner.run(cmd)?;
+        let out = self.inner.run(cmd);
+        // A command whose CONNECTION dropped — ssh's own 255 — still
+        // happened on the far side. That is the case this fake exists to be
+        // able to show, and it is what an activation over ssh does to its
+        // own connection.
+        let happened = match &out {
+            Ok(_) => true,
+            Err(e) => format!("{e:#}").contains("exited 255"),
+        };
+        if !happened {
+            return out;
+        }
         // Which host this was about: the ssh destination, `root@10.0.0.11`.
         let host = cmd
             .args
@@ -195,6 +227,20 @@ impl Runner for World<'_> {
         if let Some(host) = host {
             if says("activate") {
                 self.look.set(&host, Phase::After);
+                if self.look.keeps_the_record.borrow().contains(&host) {
+                    let record = self
+                        .look
+                        .txns
+                        .borrow()
+                        .get(&format!("pending:{host}"))
+                        .cloned();
+                    if let Some(record) = record {
+                        self.look.txns.borrow_mut().insert(host.clone(), record);
+                    }
+                } else {
+                    self.look.txns.borrow_mut().remove(&host);
+                }
+            } else if says("confirm") {
                 self.look.txns.borrow_mut().remove(&host);
             } else if says("revert") {
                 self.look.set(&host, Phase::Before);
@@ -214,7 +260,7 @@ impl Runner for World<'_> {
                 );
             }
         }
-        Ok(out)
+        out
     }
 
     fn policy(&self) -> Policy {
@@ -607,6 +653,65 @@ fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
     };
     assert!(at_of("ActionBegin:activate") < at_of("ActionIrreversible:activate"));
     assert!(at_of("ActionIrreversible:activate") < at_of("ActionEnd:activate"));
+}
+
+#[test]
+fn an_activation_whose_connection_died_is_decided_by_the_host_and_not_by_ssh() {
+    // The case the VM test found: `switch-to-configuration` restarts sshd
+    // and the network under the very connection that started it, so the
+    // activation succeeds and the ssh comes back 255 with nothing to say.
+    // What decides is the transaction record on the target.
+    let fx = Fixture::changing(&["n1"], false);
+    let look = TableLook::new(&fx).keeps_the_record("n1", "run-1", &fx.top("n1"));
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(Matcher::prefix("nix", ["copy"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix("nix", ["path-info"]),
+                Output::stdout(fx.path_info("n1")),
+            )
+            .expect(helper("n1", &["stage"]), ok())
+            .expect(cli("cordon", "n1"), Output::stdout(""))
+            .expect(cli("drain", "n1"), Output::stdout(""))
+            .expect(
+                helper("n1", &["activate"]),
+                // ssh's own code for "the connection went away", and
+                // nothing on stderr — `LogLevel=ERROR` swallows the rest.
+                Output::failing(255, ""),
+            )
+            .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["txn", "retire"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let applied = fx
+        .executor(&runner, &look, fx.options())
+        .run()
+        .expect("the rollout runs");
+    assert_eq!(applied.stopped, None, "{:?}", applied.stopped);
+    runner.verify().expect("every expectation was used");
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+    // And the receipt says what happened rather than hiding it.
+    let evidence: Vec<String> = applied.receipt.hosts["n1"]
+        .actions
+        .iter()
+        .flat_map(|a| a.evidence.clone())
+        .collect();
+    assert!(
+        evidence
+            .iter()
+            .any(|e| e.contains("did not survive the switch")),
+        "{evidence:?}"
+    );
+    assert!(
+        !runner.calls().iter().any(|c| c.contains("revert")),
+        "a host that had activated was taken back: {:?}",
+        runner.calls()
+    );
 }
 
 #[test]

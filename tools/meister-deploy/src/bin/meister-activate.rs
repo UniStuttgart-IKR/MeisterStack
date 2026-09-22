@@ -199,6 +199,11 @@ fn run() -> Result<()> {
     // A switch can take minutes, and a Ctrl-C has to reach the child rather
     // than leave a half-finished `switch-to-configuration` behind.
     Cancel::on_sigint()?;
+    // And the connection this was started over may die while it works: the
+    // switch restarts sshd and the network. Being killed between moving the
+    // profile and arming the way back is the one thing this program must
+    // not do.
+    Cancel::ignore_sighup()?;
     let policy = Policy::real();
     let runner = Real::new(policy).verbose(cli.verbose);
     let files = RealFiles::new(policy);
