@@ -22,6 +22,16 @@ pub(super) async fn on_status(
         warn!("status report before hello, ignoring");
         return;
     };
+    // Only the node's current session speaks for it. A report still buffered
+    // on a stream the node has since replaced was built before the reconnect,
+    // and every write below stamps it with the moment it was READ: ingested,
+    // it would put the node's capacity, conditions, heartbeat and VM phases
+    // back to what they were (F08). Nothing is lost by dropping it — the node
+    // says it all again on the new session within ten seconds.
+    if !session.registry.speaks_for(id, &session.tx) {
+        debug!(node = id, "report on a superseded session, ignoring");
+        return;
+    }
     // What the node says about base images goes into the cluster-wide view,
     // whatever the rest of the ingest does: it is a fact about that node's
     // disk and does not depend on any VM object being readable. The
