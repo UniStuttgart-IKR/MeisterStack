@@ -1403,3 +1403,320 @@ fn a_backend_that_takes_a_device_it_does_not_have_is_a_failure_and_the_guest_is_
         run.ledger.resources
     );
 }
+
+// ---------------------------------------------------------------------------
+// the rdma suite: pinned, not run
+// ---------------------------------------------------------------------------
+
+/// The fixture fleet with a fabric: n1 and n2 on one storage network, `box`
+/// on another one of its own, so that a peer is a declared peer and never a
+/// nearby one.
+fn fabric_world() -> (ReleaseManifest, Observations) {
+    let mut fleet = onebox_enrolled();
+    for (id, last, net) in [("n1", 11u8, 200u8), ("n2", 12, 200), ("box", 10, 201)] {
+        let host = fleet.hosts.get_mut(id).expect("the fixture has it");
+        host.hardware.nics.push(crate::manifest::Nic {
+            name: "mlx0".to_string(),
+            mac: format!("b8:ce:f6:00:00:{last:02x}"),
+            role: "storage".to_string(),
+            rdma: true,
+        });
+        host.hardware.capabilities.push("rdma".to_string());
+        host.networks.storage = Some(crate::manifest::Network {
+            address: format!("10.{net}.0.{last}"),
+            prefix: 24,
+            interface: Some("mlx0".to_string()),
+            gateway: None,
+        });
+        host.checks.functional.push("rdma".to_string());
+    }
+    fleet.manifest_id = content_id(IdKind::Manifest, &fleet).expect("a manifest hashes");
+    let mut release = release_with_guest();
+    release.resolved_fleet = fleet;
+    release.release_id = content_id(IdKind::Release, &release).expect("a release hashes");
+    let observation = observed(&release, at("2026-09-22T19:00:00Z"));
+    (release, observation)
+}
+
+fn ssh_for_tests() -> crate::transport::Ssh {
+    crate::transport::Ssh::with_known_hosts("/repo/known_hosts")
+}
+
+/// The argv an `ssh` of this transport carries to `id`.
+fn ssh_argv(
+    ssh: &crate::transport::Ssh,
+    release: &ReleaseManifest,
+    id: &str,
+    rest: &[&str],
+) -> Vec<String> {
+    let host = &release.resolved_fleet.hosts[id];
+    let mut args = ssh.opts(host.ssh.port);
+    args.push(format!("{}@{}", host.ssh.user, host.address));
+    args.extend(rest.iter().map(|a| crate::run::shell_quote(a)));
+    args
+}
+
+fn endpoints_of(
+    release: &ReleaseManifest,
+    hosts: &[String],
+) -> BTreeMap<String, crate::observation::Endpoint> {
+    crate::observation::manifest_endpoints(&release.resolved_fleet, hosts)
+        .expect("the fixture has addresses")
+}
+
+#[test]
+fn the_rdma_suite_runs_a_server_then_a_client_and_every_line_is_pinned() {
+    let (release, observation) = fabric_world();
+    let files = MemFiles::new();
+    let clock = FakeClock::at(at("2026-09-22T19:00:00Z"));
+    let ssh = ssh_for_tests();
+    let hosts = vec!["n1".to_string(), "n2".to_string()];
+    // n1 < n2, so n1 is the server end and its storage address is the one
+    // both tools are pointed at.
+    let addr = "10.200.0.11";
+    let tag = tag();
+
+    let mut fake = StrictFake::new();
+    for (server_argv, client_argv, log) in [
+        (
+            rping_server(addr).join(" "),
+            rping_client(addr),
+            format!("/tmp/{tag}-rping.log"),
+        ),
+        (
+            ib_send_lat_server().join(" "),
+            ib_send_lat_client(addr),
+            format!("/tmp/{tag}-lat.log"),
+        ),
+        (
+            ib_write_bw_server().join(" "),
+            ib_write_bw_client(addr),
+            format!("/tmp/{tag}-bw.log"),
+        ),
+    ] {
+        let start = format!("{server_argv} > {log} 2>&1 & echo $!");
+        let stop = format!("kill 4711 2>/dev/null; cat {log} 2>/dev/null; true");
+        let client: Vec<&str> = client_argv.iter().map(String::as_str).collect();
+        fake = fake
+            // Server first, and on the server end.
+            .expect(
+                Matcher::exact("ssh", ssh_argv(&ssh, &release, "n1", &["sh", "-c", &start])),
+                Output::stdout("4711\n"),
+            )
+            // Then the client, on the other end.
+            .expect(
+                Matcher::exact("ssh", ssh_argv(&ssh, &release, "n2", &client)),
+                Output::stdout(match client[0] {
+                    "rping" => include_str!("../../tests/fixtures/rdma/rping.txt"),
+                    "ib_send_lat" => include_str!("../../tests/fixtures/rdma/ib_send_lat.txt"),
+                    _ => include_str!("../../tests/fixtures/rdma/ib_write_bw.txt"),
+                }),
+            )
+            // Then the server goes, whatever the client did.
+            .expect(
+                Matcher::exact("ssh", ssh_argv(&ssh, &release, "n1", &["sh", "-c", &stop])),
+                Output::stdout(""),
+            );
+    }
+
+    let mut verifier = Verifier::new(
+        &fake,
+        &files,
+        &clock,
+        state(),
+        &release,
+        &observation,
+        hosts.clone(),
+        options(Suite::Rdma),
+    )
+    .over_ssh(&ssh, endpoints_of(&release, &hosts));
+    let run = verifier.run().expect("the suite runs");
+    fake.verify().expect("every expectation was used");
+
+    let by_id = |id: &str| {
+        run.checks
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap_or_else(|| panic!("{id} was not checked: {:?}", run.checks))
+    };
+    let ping = by_id("rdma.ping");
+    assert_eq!(ping.status, Status::Pass);
+    assert_eq!(ping.observed, "10 round trips, no error");
+    assert_eq!(ping.subject.resource.as_deref(), Some("n1<->n2"));
+
+    let latency = by_id("rdma.latency");
+    assert_eq!(latency.status, Status::Pass);
+    assert_eq!(latency.observed, "typical 1.19 us, worst 18.42 us");
+
+    let bandwidth = by_id("rdma.bandwidth");
+    assert_eq!(bandwidth.status, Status::Pass);
+    assert_eq!(
+        bandwidth.observed,
+        "average 5946.88 MB/s, peak 5947.72 MB/s"
+    );
+
+    // The snapshot measured a fabric device on both ends, so all three are
+    // hardware evidence — and each one names both ends.
+    let (hardware, _) = run.hardware_evidence();
+    assert_eq!(hardware.len(), 3, "{hardware:?}");
+    for check in hardware {
+        assert_eq!(check.evidence.len(), 2, "{check:?}");
+        assert!(
+            check
+                .evidence
+                .iter()
+                .all(|e| e.kind == EvidenceKind::Hardware)
+        );
+    }
+    assert_eq!(run.outcome, Outcome::Success);
+    // Nothing was created, so nothing is in the ledger: this suite measures
+    // and makes nothing.
+    assert!(
+        run.ledger.resources.is_empty(),
+        "{:?}",
+        run.ledger.resources
+    );
+}
+
+#[test]
+fn a_pair_where_one_end_does_not_answer_is_skipped_and_blocks() {
+    let (release, mut observation) = fabric_world();
+    observation.hosts.insert(
+        "n2".to_string(),
+        HostObservation::unreachable("no route to host"),
+    );
+    let files = MemFiles::new();
+    let clock = FakeClock::at(at("2026-09-22T19:00:00Z"));
+    let ssh = ssh_for_tests();
+    let hosts = vec!["n1".to_string(), "n2".to_string()];
+    let fake = StrictFake::new();
+
+    let mut verifier = Verifier::new(
+        &fake,
+        &files,
+        &clock,
+        state(),
+        &release,
+        &observation,
+        hosts.clone(),
+        options(Suite::Rdma),
+    )
+    .over_ssh(&ssh, endpoints_of(&release, &hosts));
+    let run = verifier.run().expect("the suite runs");
+    fake.verify().expect("nothing was run");
+
+    let pair = run
+        .checks
+        .iter()
+        .find(|c| c.id == "rdma.pair")
+        .expect("the pair was judged");
+    assert_eq!(pair.status, Status::Skipped);
+    assert!(pair.required, "the inventory names this suite for n1");
+    assert!(
+        pair.reason.contains("not the same as it having worked"),
+        "{}",
+        pair.reason
+    );
+    match crate::checks::acceptance(&run.checks) {
+        crate::checks::Acceptance::Blocked { reasons } => {
+            assert!(reasons[0].contains("rdma.pair on n1<->n2"), "{reasons:?}")
+        }
+        crate::checks::Acceptance::Accepted => panic!("a required skip has to block (V22)"),
+    }
+}
+
+#[test]
+fn a_host_on_its_own_storage_network_is_nobody_s_peer() {
+    let (release, observation) = fabric_world();
+    let files = MemFiles::new();
+    let clock = FakeClock::at(at("2026-09-22T19:00:00Z"));
+    let ssh = ssh_for_tests();
+    let hosts = vec!["box".to_string()];
+    let fake = StrictFake::new();
+
+    let mut verifier = Verifier::new(
+        &fake,
+        &files,
+        &clock,
+        state(),
+        &release,
+        &observation,
+        hosts.clone(),
+        options(Suite::Rdma),
+    )
+    .over_ssh(&ssh, endpoints_of(&release, &hosts));
+    let run = verifier.run().expect("the suite runs");
+    fake.verify().expect("nothing was run");
+
+    assert_eq!(run.checks.len(), 1);
+    assert_eq!(run.checks[0].status, Status::NotApplicable);
+    assert!(
+        run.checks[0].observed.contains("no other selected host"),
+        "{}",
+        run.checks[0].observed
+    );
+}
+
+#[test]
+fn a_pair_somebody_named_by_hand_has_to_be_one_the_inventory_declares() {
+    let (release, observation) = fabric_world();
+    let files = MemFiles::new();
+    let clock = FakeClock::at(at("2026-09-22T19:00:00Z"));
+    let ssh = ssh_for_tests();
+    let hosts = vec!["n1".to_string(), "n2".to_string()];
+    let fake = StrictFake::new();
+    let mut options = options(Suite::Rdma);
+    // `cloud-a` is not in this fixture at all; `n1:ghost` is a host nobody
+    // has.
+    options.pairs = vec![("n1".to_string(), "ghost".to_string())];
+
+    let mut verifier = Verifier::new(
+        &fake,
+        &files,
+        &clock,
+        state(),
+        &release,
+        &observation,
+        hosts.clone(),
+        options,
+    )
+    .over_ssh(&ssh, endpoints_of(&release, &hosts));
+    let run = verifier.run().expect("the suite answers");
+    fake.verify().expect("nothing was run");
+
+    let stopped = run
+        .checks
+        .iter()
+        .find(|c| c.id == "rdma.run")
+        .expect("it said why it stopped");
+    assert_eq!(stopped.status, Status::Unknown);
+    assert!(stopped.reason.contains("ghost"), "{}", stopped.reason);
+}
+
+#[test]
+fn what_the_three_tools_say_is_read_off_the_row_and_not_guessed() {
+    let rping = include_str!("../../tests/fixtures/rdma/rping.txt");
+    assert_eq!(rping_rounds(rping), 10);
+    assert_eq!(rping_rounds("nothing happened"), 0);
+
+    let latency = latency_of(include_str!("../../tests/fixtures/rdma/ib_send_lat.txt"))
+        .expect("the sample has a row");
+    assert_eq!(latency.min, 1.10);
+    assert_eq!(latency.max, 18.42);
+    assert_eq!(latency.typical, 1.19);
+
+    let bandwidth = bandwidth_of(include_str!("../../tests/fixtures/rdma/ib_write_bw.txt"))
+        .expect("the sample has a row");
+    assert_eq!(bandwidth.peak, 5947.72);
+    assert_eq!(bandwidth.average, 5946.88);
+
+    // A latency row read as a bandwidth would give a plausible number out of
+    // the wrong column, so the column count decides and the answer is None.
+    assert_eq!(
+        bandwidth_of(include_str!("../../tests/fixtures/rdma/ib_send_lat.txt")),
+        None
+    );
+    // A tool that printed only its banner is not a measurement.
+    assert_eq!(latency_of("---- Send Latency Test ----"), None);
+    assert_eq!(bandwidth_of(""), None);
+}

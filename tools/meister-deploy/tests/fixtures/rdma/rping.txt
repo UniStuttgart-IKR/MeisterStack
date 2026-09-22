@@ -1,0 +1,49 @@
+created cm_id 0x55f2a1b2c010
+cma_event type RDMA_CM_EVENT_ADDR_RESOLVED cma_id 0x55f2a1b2c010 (parent)
+cma_event type RDMA_CM_EVENT_ROUTE_RESOLVED cma_id 0x55f2a1b2c010 (parent)
+rdma_resolve_addr - rdma_resolve_route successful
+created pd 0x55f2a1b2d1a0
+created channel 0x55f2a1b2d2c0
+created cq 0x55f2a1b2d3e0
+created qp 0x55f2a1b2d500
+rping_setup_buffers called on cb 0x55f2a1b2b010
+allocated & registered buffers...
+cq_thread started.
+cma_event type RDMA_CM_EVENT_ESTABLISHED cma_id 0x55f2a1b2c010 (parent)
+ESTABLISHED
+rdma_connect successful
+RDMA addr 55f2a1b2d600 rkey 1a0100 len 64
+send completion
+recv completion
+ping data: rdma-ping-0: ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqr
+send completion
+recv completion
+ping data: rdma-ping-1: BCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrs
+send completion
+recv completion
+ping data: rdma-ping-2: CDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrst
+send completion
+recv completion
+ping data: rdma-ping-3: DEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstu
+send completion
+recv completion
+ping data: rdma-ping-4: EFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuv
+send completion
+recv completion
+ping data: rdma-ping-5: FGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvw
+send completion
+recv completion
+ping data: rdma-ping-6: GHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwx
+send completion
+recv completion
+ping data: rdma-ping-7: HIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxy
+send completion
+recv completion
+ping data: rdma-ping-8: IJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz
+send completion
+recv completion
+ping data: rdma-ping-9: JKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz[
+cq_thread disconnected.
+cma_event type RDMA_CM_EVENT_DISCONNECTED cma_id 0x55f2a1b2c010 (parent)
+client DISCONNECT EVENT...
+rping_free_buffers called on cb 0x55f2a1b2b010

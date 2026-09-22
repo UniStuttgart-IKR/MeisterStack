@@ -543,6 +543,18 @@ let
             (builtins.any (p: p.device == "label:meister-data") h.persistence)
             "meister-data";
 
+          # --- lane 4B: a card is a fact about a machine ----------------
+          #
+          # A host whose inventory declares an RDMA nic gets the fabric
+          # tools `verify --suite rdma` drives (nix/rdma.nix). Gated on the
+          # agent role as well: a controller with a storage card is not a
+          # machine this suite measures between, and a closure carries what
+          # it is used for.
+          meisterstack.agent.rdma.enable =
+            h.has "agent"
+            && builtins.any (n: n.rdma or false) (h.hardware.nics or [ ]);
+          # --- end lane 4B ----------------------------------------------
+
           # Per-host overrides, in one named place, so that a review can list
           # the hosts that are not like the others by grepping for one word.
           meisterstack.cloud.settings = (h.deviations.settings or { }).cloud or { };

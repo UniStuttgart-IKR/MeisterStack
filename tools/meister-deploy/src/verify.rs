@@ -79,6 +79,19 @@ pub const POLL: Duration = Duration::from_secs(2);
 /// The whole run, when nobody said otherwise.
 pub const DEADLINE: Duration = Duration::from_secs(1800);
 
+/// How long ONE fabric measurement may take.
+pub const FABRIC_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How many round trips `rping` is asked for. Ten, because one proves a
+/// connection and ten prove it keeps working — and because a hundred would
+/// make a failure take a hundred times as long to find.
+pub const RPING_ROUNDS: usize = 10;
+
+/// How long each perftest measurement runs, in seconds. Five: long enough
+/// that a link settles, short enough that a fleet of pairs is minutes and
+/// not an afternoon.
+pub const FABRIC_SECONDS: u32 = 5;
+
 /// How many guests may be alive at once when nobody said otherwise.
 ///
 /// Two, so that the default run makes three guests per host: one on its own
@@ -335,6 +348,13 @@ pub struct Options {
     pub settle: Duration,
     pub poll: Duration,
     pub cli_deadline: Duration,
+    /// `--pairs <a>:<b>`, for the rdma suite. Empty means every pair the
+    /// inventory declares among the selected hosts.
+    pub pairs: Vec<(String, String)>,
+    /// How long ONE fabric measurement may take. Longer than a cli call,
+    /// because `ib_write_bw -D 10` is ten seconds of work by construction
+    /// and a fabric that is being set up takes longer than one that is.
+    pub fabric: Duration,
 }
 
 impl Options {
@@ -349,6 +369,8 @@ impl Options {
             settle: SETTLE,
             poll: POLL,
             cli_deadline: CLI_DEADLINE,
+            pairs: Vec::new(),
+            fabric: FABRIC_DEADLINE,
         }
     }
 }
@@ -374,6 +396,10 @@ pub struct Verifier<'a> {
     state: StateDir,
     release: &'a ReleaseManifest,
     observation: &'a Observations,
+    /// How both ends of a fabric pair are reached. `None` for a run that
+    /// only drives the operator's cli, which is every guest suite.
+    ssh: Option<&'a crate::transport::Ssh>,
+    endpoints: BTreeMap<String, crate::observation::Endpoint>,
     hosts: Vec<String>,
     options: Options,
     ledger: Ledger,
@@ -414,6 +440,8 @@ impl<'a> Verifier<'a> {
             state,
             release,
             observation,
+            ssh: None,
+            endpoints: BTreeMap::new(),
             hosts,
             options,
             ledger,
@@ -435,6 +463,18 @@ impl<'a> Verifier<'a> {
     /// claim to be more than a mock.
     pub fn as_mock(mut self) -> Verifier<'a> {
         self.mock = true;
+        self
+    }
+
+    /// How to reach both ends of a fabric pair. Only the rdma suite needs
+    /// it; the guest suites talk to a control plane and never to a host.
+    pub fn over_ssh(
+        mut self,
+        ssh: &'a crate::transport::Ssh,
+        endpoints: BTreeMap<String, crate::observation::Endpoint>,
+    ) -> Verifier<'a> {
+        self.ssh = Some(ssh);
+        self.endpoints = endpoints;
         self
     }
 
@@ -1377,79 +1417,414 @@ impl<'a> Verifier<'a> {
 
     // --- suite: rdma ------------------------------------------------------
 
-    /// Only between hosts that declare an RDMA nic on the same storage
-    /// network, and only between the pairs the inventory actually names.
+    /// Three measurements between two hosts that DECLARE a fabric to each
+    /// other, and nothing between any other two.
+    ///
+    /// A round trip, a latency and a bandwidth, each server-on-A and
+    /// client-on-B over ssh, each its own [`CheckResult`]. The declaration
+    /// is what makes a pair: two hosts with `hardware.nics[].rdma = true` on
+    /// the same `networks.storage`. This suite never guesses a peer — a
+    /// bandwidth test invents neither of its two ends — and it never reads a
+    /// number off a machine whose snapshot has no fabric device.
     fn rdma(&mut self) -> Result<()> {
         let hosts = self.hosts.clone();
-        let peers = rdma_peers(self.fleet(), &hosts);
-        for id in hosts {
+        let pairs = self.pairs()?;
+        // Every host of the selection gets a verdict, even the ones that
+        // are in no pair: a suite that silently covered two of seventy
+        // hosts is a suite whose green line means nothing.
+        for id in &hosts {
             self.keep_going()?;
-            let Some(host) = self.fleet().hosts.get(&id).cloned() else {
+            let Some(host) = self.fleet().hosts.get(id).cloned() else {
                 continue;
             };
-            match applicability(Suite::Rdma, self.fleet(), &id, &host) {
-                Applicability::No(reason) => {
-                    let mut check =
-                        self.check("rdma", &id, Subject::host(&id), Status::NotApplicable);
-                    check.expected =
-                        "a host declaring hardware.nics[].rdma and a storage network".to_string();
-                    check.observed = reason.clone();
-                    check.reason = reason;
-                    self.record(check);
-                    continue;
-                }
-                Applicability::Yes => {}
+            if let Applicability::No(reason) = applicability(Suite::Rdma, self.fleet(), id, &host) {
+                let mut check = self.check("rdma", id, Subject::host(id), Status::NotApplicable);
+                check.expected =
+                    "a host declaring hardware.nics[].rdma and a storage network".to_string();
+                check.observed = reason.clone();
+                check.reason = reason;
+                self.record(check);
+                continue;
             }
-            let Some(peer) = peers.get(&id).and_then(|p| p.first()).cloned() else {
-                let mut check = self.check("rdma", &id, Subject::host(&id), Status::NotApplicable);
+            if !pairs.iter().any(|(a, b)| a == id || b == id) {
+                let mut check = self.check("rdma", id, Subject::host(id), Status::NotApplicable);
                 check.expected = "a declared peer on the same storage network".to_string();
-                check.observed = "this host declares rdma and no other host shares its \
-                                  storage network"
-                    .to_string();
+                check.observed =
+                    "this host declares rdma and no other selected host shares its storage \
+                     network"
+                        .to_string();
                 check.reason =
-                    "a bandwidth test needs two ends, and this suite invents neither of them"
+                    "a fabric measurement needs two ends, and this suite invents neither of \
+                     them. `--pairs <a>:<b>` names one explicitly."
                         .to_string();
                 self.record(check);
                 continue;
-            };
-            if let Some(reason) = self.unreachable(&id).or_else(|| self.unreachable(&peer)) {
-                let mut check = self.check("rdma", &id, Subject::host(&id), Status::Skipped);
-                check.expected = format!("{id} and {peer} both answering");
+            }
+        }
+
+        for (server, client) in pairs {
+            self.keep_going()?;
+            let subject = Subject::resource(format!("{server}<->{client}"));
+            if let Some(reason) = self
+                .unreachable(&server)
+                .or_else(|| self.unreachable(&client))
+            {
+                // Declared and unreachable: `skipped`, and a required
+                // `skipped` blocks (V22). Never `not_applicable`, which is
+                // the one non-pass that lets a run through.
+                let mut check = self.check("rdma.pair", &server, subject, Status::Skipped);
+                check.expected = format!("{server} and {client} both answering");
                 check.observed = reason.clone();
-                check.reason = format!("{reason} The declared fabric was not exercised.");
+                check.reason = format!(
+                    "{reason} The declared fabric between them was not exercised, which is \
+                     not the same as it having worked."
+                );
                 self.record(check);
                 continue;
             }
-            if !self.measured(&id, "rdma") {
-                let mut check = self.check("rdma", &id, Subject::host(&id), Status::Fail);
-                check.expected = "a device under /sys/class/infiniband".to_string();
-                check.observed = "the snapshot of this host has no rdma capability".to_string();
-                check.reason = "the inventory declares an RDMA nic and the machine has no fabric \
-                     device: one of the two is wrong."
-                    .to_string();
-                self.record(check);
-                continue;
+            for end in [&server, &client] {
+                if !self.measured(end, "rdma") {
+                    let mut check = self.check("rdma.pair", &server, subject.clone(), Status::Fail);
+                    check.expected =
+                        "a device under /sys/class/infiniband at both ends".to_string();
+                    check.observed = format!("the snapshot of {end} has no rdma capability");
+                    check.reason =
+                        "the inventory declares an RDMA nic on this machine and the machine \
+                         has no fabric device: one of the two is wrong, and no number was \
+                         taken to paper over it."
+                            .to_string();
+                    check.evidence.push(Evidence {
+                        kind: EvidenceKind::Command,
+                        reference: format!("observation of {end}: capabilities"),
+                    });
+                    self.record(check);
+                    return Ok(());
+                }
             }
-            // Declared, reachable and measured: this is where the pair test
-            // would run. It has never run — nothing in this estate declares
-            // RDMA — so the command lines are pinned and the verdict is
-            // honest about it.
-            let mut check = self.check("rdma", &id, Subject::host(&id), Status::Unknown);
-            check.expected = format!("{RDMA_PLAN} between {id} and {peer}");
-            check.observed = "not run".to_string();
-            check.reason = format!(
-                "the pair test is `{}` at {id} and `{}` at {peer}; it has never been run \
-                 against hardware, so this says unknown rather than claiming a number.",
-                ibv_devinfo(&host),
-                ib_write_bw(&peer)
-            );
-            check.evidence.push(Evidence {
-                kind: EvidenceKind::Command,
-                reference: ibv_devinfo(&host),
-            });
-            self.record(check);
+            self.rdma_ping(&server, &client)?;
+            self.rdma_latency(&server, &client)?;
+            self.rdma_bandwidth(&server, &client)?;
         }
         Ok(())
+    }
+
+    /// The pairs to measure: what `--pairs` named, or every declared pair of
+    /// the selection, each one once.
+    fn pairs(&self) -> Result<Vec<(String, String)>> {
+        if !self.options.pairs.is_empty() {
+            for (a, b) in &self.options.pairs {
+                for id in [a, b] {
+                    let host = self.fleet().hosts.get(id).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--pairs names {id}, and the fleet {:?} has no such host.",
+                            self.fleet().fleet.name
+                        )
+                    })?;
+                    if let Applicability::No(reason) =
+                        applicability(Suite::Rdma, self.fleet(), id, host)
+                    {
+                        bail!(
+                            "--pairs names {a}:{b}, and {reason} A pair this tool measures is \
+                             one the inventory declares."
+                        );
+                    }
+                }
+            }
+            return Ok(self.options.pairs.clone());
+        }
+        let peers = rdma_peers(self.fleet(), &self.hosts);
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (id, others) in &peers {
+            for other in others {
+                // Each unordered pair once: which end is the server is this
+                // suite's decision and the lower id takes it, so two runs
+                // of the same fleet measure the same direction.
+                if id < other {
+                    out.push((id.clone(), other.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// A server that does not block this run.
+    ///
+    /// The three tools are all server-on-one-end, client-on-the-other, and
+    /// every server of them BLOCKS until a client has been and gone. The
+    /// only runner these tests may use is a strict sequence, so a server in
+    /// the foreground would hold the run for ever — and a second thread
+    /// would be concurrency no test could fix. So the server is started in
+    /// the background ON THE TARGET, its pid comes back on stdout, and it is
+    /// killed afterwards whatever the client did.
+    fn start_server(&self, host: &str, argv: &[String], log: &str) -> Result<(Cmd, String)> {
+        let target = self.target(host)?;
+        let script = format!(
+            "{} > {log} 2>&1 & echo $!",
+            argv.iter()
+                .map(|a| crate::run::shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let cmd = self.ssh()?.exec(
+            &target,
+            ["sh", "-c", &script],
+            Effect::TargetWrite,
+            self.options.cli_deadline,
+        );
+        let out = self.runner.run(&cmd)?;
+        Ok((cmd, out.trimmed().to_string()))
+    }
+
+    /// Take the server down, and say nothing if it had already gone: these
+    /// servers exit on their own when their client disconnects, and a kill
+    /// of a pid that is not there is the normal case rather than an error.
+    fn stop_server(&self, host: &str, pid: &str, log: &str) -> Result<String> {
+        let target = self.target(host)?;
+        let script = format!("kill {pid} 2>/dev/null; cat {log} 2>/dev/null; true");
+        let cmd = self.ssh()?.exec(
+            &target,
+            ["sh", "-c", &script],
+            Effect::TargetWrite,
+            self.options.cli_deadline,
+        );
+        Ok(self.runner.run(&cmd)?.stdout)
+    }
+
+    fn client(&self, host: &str, argv: &[String]) -> Result<(Cmd, Result<crate::run::Output>)> {
+        let target = self.target(host)?;
+        let cmd = self
+            .ssh()?
+            .exec(&target, argv, Effect::TargetWrite, self.options.fabric)
+            .expect(Expect::AnyExit);
+        let out = self.runner.run(&cmd);
+        Ok((cmd, out))
+    }
+
+    /// `rping`: does a round trip complete at all, ten times over?
+    fn rdma_ping(&mut self, server: &str, client: &str) -> Result<()> {
+        let address = self.storage_address(server)?;
+        let log = format!("/tmp/{}-rping.log", self.ledger.tag);
+        let started = self.clock.now();
+        let subject = Subject::resource(format!("{server}<->{client}"));
+        let mut check = self.check("rdma.ping", server, subject, Status::Fail);
+        check.expected = format!("{RPING_ROUNDS} round trips {client} -> {server} ({address})");
+
+        let server_argv = rping_server(&address);
+        let (server_cmd, pid) = self.start_server(server, &server_argv, &log)?;
+        let client_argv = rping_client(&address);
+        let (client_cmd, answer) = self.client(client, &client_argv)?;
+        let server_said = self.stop_server(server, &pid, &log)?;
+
+        check.duration_ms = self.since(started);
+        check.evidence.push(Evidence {
+            kind: self.fabric_evidence(server),
+            reference: server_cmd.line(),
+        });
+        check.evidence.push(Evidence {
+            kind: self.fabric_evidence(client),
+            reference: client_cmd.line(),
+        });
+        match answer {
+            Ok(out) if out.ok() => {
+                let rounds = rping_rounds(&out.stdout);
+                if rounds >= RPING_ROUNDS {
+                    check.status = Status::Pass;
+                    check.observed = format!("{rounds} round trips, no error");
+                    check.reason = format!(
+                        "a connection was made over the fabric between {client} and {server} \
+                         and data went both ways; nothing short of a working fabric does that"
+                    );
+                } else {
+                    check.observed = format!("{rounds} of {RPING_ROUNDS} round trips");
+                    check.reason = format!(
+                        "the client returned 0 and the fabric carried fewer rounds than it \
+                         was asked for. The server said: {}",
+                        last_lines(&server_said)
+                    );
+                }
+            }
+            Ok(out) => {
+                check.observed = format!("rping exited {}", out.status);
+                check.reason = format!(
+                    "{}. The server at {server} said: {}",
+                    last_lines(&out.stderr),
+                    last_lines(&server_said)
+                );
+            }
+            Err(e) => {
+                check.status = Status::Unknown;
+                check.observed = "the client could not be run".to_string();
+                check.reason = format!("{e:#}");
+            }
+        }
+        self.record(check);
+        Ok(())
+    }
+
+    /// `ib_send_lat`: how long one message takes, typically and at worst.
+    fn rdma_latency(&mut self, server: &str, client: &str) -> Result<()> {
+        let address = self.storage_address(server)?;
+        let log = format!("/tmp/{}-lat.log", self.ledger.tag);
+        let started = self.clock.now();
+        let subject = Subject::resource(format!("{server}<->{client}"));
+        let mut check = self.check("rdma.latency", server, subject, Status::Fail);
+        check.expected = format!("a latency for {client} -> {server} ({address}), in us");
+
+        let (server_cmd, pid) = self.start_server(server, &ib_send_lat_server(), &log)?;
+        let (client_cmd, answer) = self.client(client, &ib_send_lat_client(&address))?;
+        let server_said = self.stop_server(server, &pid, &log)?;
+
+        check.duration_ms = self.since(started);
+        check.evidence.push(Evidence {
+            kind: self.fabric_evidence(server),
+            reference: server_cmd.line(),
+        });
+        check.evidence.push(Evidence {
+            kind: self.fabric_evidence(client),
+            reference: client_cmd.line(),
+        });
+        match answer {
+            Ok(out) if out.ok() => match latency_of(&out.stdout) {
+                Some(latency) => {
+                    check.status = Status::Pass;
+                    check.observed = format!(
+                        "typical {:.2} us, worst {:.2} us",
+                        latency.typical, latency.max
+                    );
+                    check.reason =
+                        "measured end to end over the fabric; the worst case is the number \
+                         a storage path is actually held to"
+                            .to_string();
+                }
+                None => {
+                    check.status = Status::Unknown;
+                    check.observed = "the output had no row this tool could read".to_string();
+                    check.reason = format!(
+                        "ib_send_lat returned 0 and printed: {}",
+                        last_lines(&out.stdout)
+                    );
+                }
+            },
+            Ok(out) => {
+                check.observed = format!("ib_send_lat exited {}", out.status);
+                check.reason = format!(
+                    "{}. The server at {server} said: {}",
+                    last_lines(&out.stderr),
+                    last_lines(&server_said)
+                );
+            }
+            Err(e) => {
+                check.status = Status::Unknown;
+                check.observed = "the client could not be run".to_string();
+                check.reason = format!("{e:#}");
+            }
+        }
+        self.record(check);
+        Ok(())
+    }
+
+    /// `ib_write_bw`: how much the fabric carries.
+    fn rdma_bandwidth(&mut self, server: &str, client: &str) -> Result<()> {
+        let address = self.storage_address(server)?;
+        let log = format!("/tmp/{}-bw.log", self.ledger.tag);
+        let started = self.clock.now();
+        let subject = Subject::resource(format!("{server}<->{client}"));
+        let mut check = self.check("rdma.bandwidth", server, subject, Status::Fail);
+        check.expected = format!("a bandwidth for {client} -> {server} ({address}), in MB/s");
+
+        let (server_cmd, pid) = self.start_server(server, &ib_write_bw_server(), &log)?;
+        let (client_cmd, answer) = self.client(client, &ib_write_bw_client(&address))?;
+        let server_said = self.stop_server(server, &pid, &log)?;
+
+        check.duration_ms = self.since(started);
+        check.evidence.push(Evidence {
+            kind: self.fabric_evidence(server),
+            reference: server_cmd.line(),
+        });
+        check.evidence.push(Evidence {
+            kind: self.fabric_evidence(client),
+            reference: client_cmd.line(),
+        });
+        match answer {
+            Ok(out) if out.ok() => match bandwidth_of(&out.stdout) {
+                Some(bandwidth) => {
+                    check.status = Status::Pass;
+                    check.observed = format!(
+                        "average {:.2} MB/s, peak {:.2} MB/s",
+                        bandwidth.average, bandwidth.peak
+                    );
+                    check.reason =
+                        "measured end to end over the fabric; the average is what a copy \
+                         between these two machines gets"
+                            .to_string();
+                }
+                None => {
+                    check.status = Status::Unknown;
+                    check.observed = "the output had no row this tool could read".to_string();
+                    check.reason = format!(
+                        "ib_write_bw returned 0 and printed: {}",
+                        last_lines(&out.stdout)
+                    );
+                }
+            },
+            Ok(out) => {
+                check.observed = format!("ib_write_bw exited {}", out.status);
+                check.reason = format!(
+                    "{}. The server at {server} said: {}",
+                    last_lines(&out.stderr),
+                    last_lines(&server_said)
+                );
+            }
+            Err(e) => {
+                check.status = Status::Unknown;
+                check.observed = "the client could not be run".to_string();
+                check.reason = format!("{e:#}");
+            }
+        }
+        self.record(check);
+        Ok(())
+    }
+
+    /// The address on the fabric, which is `networks.storage` and never the
+    /// management address: a measurement over the wrong wire is a number
+    /// that looks like an answer.
+    fn storage_address(&self, id: &str) -> Result<String> {
+        let host = self
+            .fleet()
+            .hosts
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("{id} is not a host of this release"))?;
+        host.networks
+            .storage
+            .as_ref()
+            .map(|n| n.address.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{id} declares an rdma nic and no networks.storage, so there is no \
+                     address on the fabric to measure to."
+                )
+            })
+    }
+
+    fn ssh(&self) -> Result<&crate::transport::Ssh> {
+        self.ssh.ok_or_else(|| {
+            anyhow::anyhow!(
+                "this suite reaches both ends over ssh and this run was given no transport."
+            )
+        })
+    }
+
+    fn target(&self, id: &str) -> Result<crate::transport::Target> {
+        let endpoint = self.endpoints.get(id).ok_or_else(|| {
+            anyhow::anyhow!("nothing in this run says where {id} answers, so it was not asked.")
+        })?;
+        Ok(crate::transport::Target::from_endpoint(id, endpoint))
+    }
+
+    /// `hardware` only where the SNAPSHOT of that machine found a fabric
+    /// device — the same rule the guest suites follow, for the same reason.
+    fn fabric_evidence(&self, id: &str) -> EvidenceKind {
+        self.evidence_kind(id, "rdma")
     }
 
     // --- cleanup ----------------------------------------------------------
@@ -1808,23 +2183,159 @@ const NO_SUCH_PCI: &str = "ffff:ff:1f.7";
 const GPU_PLAN: &str = "two guests with one PCI device each, five times over, then a \
                         create with a device that does not exist (which has to be refused)";
 
-const RDMA_PLAN: &str = "ibv_devinfo at both ends and one ib_write_bw pair";
+const RDMA_PLAN: &str = "a round trip (rping), a latency (ib_send_lat) and a bandwidth \
+                         (ib_write_bw) between each declared pair, server on one end and \
+                         client on the other";
 
-/// `ibv_devinfo` at a host, as it would be typed. Pinned rather than run.
-pub fn ibv_devinfo(host: &ResolvedHost) -> String {
-    let nic = host
-        .hardware
-        .nics
-        .iter()
-        .find(|n| n.rdma)
-        .map(|n| n.name.as_str())
-        .unwrap_or("?");
-    format!("ibv_devinfo -v  # for the fabric behind {nic}")
+// --- the four command lines, in one place --------------------------------
+//
+// One function per end of each tool, so that the server line and the client
+// line of a measurement cannot drift apart — and so that a test can pin all
+// four without reaching into the driver.
+//
+// No `-d <device>`: the tools take the first fabric device, and which one a
+// machine calls `mlx5_0` is a fact this tool has no business guessing. An
+// estate with two cards names the address it wants in `networks.storage`,
+// which is what these lines carry.
+
+/// `rping -s`: listen on the fabric address of the server end.
+pub fn rping_server(address: &str) -> Vec<String> {
+    vec![
+        "rping".to_string(),
+        "-s".to_string(),
+        "-a".to_string(),
+        address.to_string(),
+        "-C".to_string(),
+        RPING_ROUNDS.to_string(),
+        "-v".to_string(),
+    ]
 }
 
-/// The other end of the pair, as it would be typed.
-pub fn ib_write_bw(peer: &str) -> String {
-    format!("ib_write_bw -d <device> -D 10 {peer}")
+/// `rping -c`: connect to it, ten times over.
+pub fn rping_client(address: &str) -> Vec<String> {
+    vec![
+        "rping".to_string(),
+        "-c".to_string(),
+        "-a".to_string(),
+        address.to_string(),
+        "-C".to_string(),
+        RPING_ROUNDS.to_string(),
+        "-v".to_string(),
+    ]
+}
+
+/// `ib_send_lat`, listening. `-F` because these machines do not have their
+/// cpu frequency pinned and the tool otherwise refuses to start rather than
+/// report a slightly noisy number.
+pub fn ib_send_lat_server() -> Vec<String> {
+    vec![
+        "ib_send_lat".to_string(),
+        "-F".to_string(),
+        "-D".to_string(),
+        FABRIC_SECONDS.to_string(),
+    ]
+}
+
+pub fn ib_send_lat_client(address: &str) -> Vec<String> {
+    vec![
+        "ib_send_lat".to_string(),
+        "-F".to_string(),
+        "-D".to_string(),
+        FABRIC_SECONDS.to_string(),
+        address.to_string(),
+    ]
+}
+
+pub fn ib_write_bw_server() -> Vec<String> {
+    vec![
+        "ib_write_bw".to_string(),
+        "-F".to_string(),
+        "-D".to_string(),
+        FABRIC_SECONDS.to_string(),
+    ]
+}
+
+pub fn ib_write_bw_client(address: &str) -> Vec<String> {
+    vec![
+        "ib_write_bw".to_string(),
+        "-F".to_string(),
+        "-D".to_string(),
+        FABRIC_SECONDS.to_string(),
+        address.to_string(),
+    ]
+}
+
+// --- what the three tools say --------------------------------------------
+//
+// All three print a table with a header and one row of numbers, and the row
+// is read BY POSITION with the column count checked. Reading it by header
+// name is what one would want and is not possible: perftest's headers hold
+// spaces (`BW average[MB/sec]`), so a split on white space does not line up
+// with the columns. So: the row is the last line whose every token is a
+// number, its length says which tool's row it is, and a row of the wrong
+// length is `None` — an `unknown` check with the raw output in it, never a
+// number read out of the wrong column.
+
+/// How many round trips `rping -v` reported.
+pub fn rping_rounds(text: &str) -> usize {
+    text.lines().filter(|l| l.contains("ping data:")).count()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Latency {
+    pub min: f64,
+    pub max: f64,
+    pub typical: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bandwidth {
+    pub peak: f64,
+    pub average: f64,
+}
+
+/// The last all-numeric row of a perftest table, as numbers.
+fn numeric_row(text: &str) -> Option<Vec<f64>> {
+    text.lines()
+        .rev()
+        .filter_map(|line| {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() < 4 {
+                return None;
+            }
+            tokens
+                .iter()
+                .map(|t| t.parse::<f64>().ok())
+                .collect::<Option<Vec<f64>>>()
+        })
+        .next()
+}
+
+/// `#bytes #iterations t_min t_max t_typical t_avg t_stdev 99% 99.9%`
+pub fn latency_of(text: &str) -> Option<Latency> {
+    let row = numeric_row(text)?;
+    if row.len() < 5 {
+        return None;
+    }
+    Some(Latency {
+        min: row[2],
+        max: row[3],
+        typical: row[4],
+    })
+}
+
+/// `#bytes #iterations BW_peak BW_average MsgRate`
+pub fn bandwidth_of(text: &str) -> Option<Bandwidth> {
+    let row = numeric_row(text)?;
+    // Exactly five: a latency row has nine, and reading its `t_typical` as a
+    // bandwidth would print a plausible number that means nothing.
+    if row.len() != 5 {
+        return None;
+    }
+    Some(Bandwidth {
+        peak: row[2],
+        average: row[3],
+    })
 }
 
 // ---------------------------------------------------------------------------

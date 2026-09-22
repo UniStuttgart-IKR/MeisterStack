@@ -436,6 +436,16 @@ struct VerifyArgs {
     #[arg(long)]
     host: Vec<String>,
 
+    /// `<a>:<b>`, for the rdma suite: measure between exactly these two,
+    /// with the server end first. Repeatable. Without it, every pair the
+    /// inventory declares among the selected hosts is measured.
+    #[arg(long)]
+    pairs: Vec<String>,
+
+    /// How long ONE fabric measurement may take, in seconds.
+    #[arg(long, default_value_t = meister_deploy::verify::FABRIC_DEADLINE.as_secs())]
+    fabric_deadline: u64,
+
     /// `verify=<release_id>`. The approval names the RELEASE and not a
     /// plan: this verb rolls nothing out, so there is no plan for an
     /// approval to hang on, and what somebody is saying yes to is guests
@@ -2739,8 +2749,15 @@ fn verify(args: &VerifyArgs) -> Result<Answer> {
     options.control = control;
     options.settle = std::time::Duration::from_secs(args.settle);
     options.poll = std::time::Duration::from_secs(args.poll.max(1));
+    options.fabric = std::time::Duration::from_secs(args.fabric_deadline);
+    options.pairs = parse_pairs(&args.pairs)?;
 
     let clock = RealClock;
+    // The rdma suite is the one that reaches the hosts themselves: it runs a
+    // server on one end and a client on the other. The guest suites talk to
+    // a control plane and to nothing else, and are given no transport at all
+    // so that they cannot.
+    let ssh = transport::Ssh::for_repo(&repo).with_identity(args.identity.clone());
     let mut verifier = Verifier::new(
         &runner,
         &files,
@@ -2748,9 +2765,13 @@ fn verify(args: &VerifyArgs) -> Result<Answer> {
         state,
         &release,
         &observation,
-        selected,
+        selected.clone(),
         options,
     );
+    if suite == Suite::Rdma {
+        let endpoints = observation::manifest_endpoints(&release.resolved_fleet, &selected)?;
+        verifier = verifier.over_ssh(&ssh, endpoints);
+    }
 
     if args.dry_run {
         print!("{}", verify::listing(&verifier.steps()));
@@ -2801,6 +2822,28 @@ fn verify(args: &VerifyArgs) -> Result<Answer> {
             Ok(Answer::Yes)
         }
     }
+}
+
+/// `--pairs <a>:<b>`, as the operator typed it.
+fn parse_pairs(given: &[String]) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for text in given {
+        let Some((a, b)) = text.split_once(':') else {
+            anyhow::bail!(
+                "{text:?} is not a pair. The form is `--pairs <server>:<client>`, two host                  ids of this fleet."
+            );
+        };
+        if a.trim().is_empty() || b.trim().is_empty() {
+            anyhow::bail!("{text:?} names only one end, and a fabric measurement has two.");
+        }
+        if a == b {
+            anyhow::bail!(
+                "{text:?} names {a} at both ends. A loopback measurement says nothing about                  a fabric between two machines."
+            );
+        }
+        out.push((a.to_string(), b.to_string()));
+    }
+    Ok(out)
 }
 
 /// `--approve verify=<release_id>`, as the operator typed it.
