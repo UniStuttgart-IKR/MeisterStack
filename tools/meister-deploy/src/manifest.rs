@@ -863,6 +863,31 @@ pub fn resolve(
             );
         }
     }
+    // --- lane 4C: B2 -------------------------------------------------
+    //
+    // A manifest with no host in it is not a small manifest, it is a
+    // manifest about nothing: every verb after this one would work and do
+    // nothing — `build` would build the packages, `plan` would produce a
+    // plan with no actions, `apply` would report success — and the operator
+    // would be looking at a green run over an empty fleet.
+    //
+    // nix/lib/inventory.nix already refuses a file with no `[[host]]` at
+    // all, so the only way to get here is a fleet whose hosts are all
+    // `deployment = "context"`: those have no closure, no toplevel and no
+    // `build`, and the pre-v1 push serves them until L3. Found in lane L1,
+    // where a lab inventory of twelve context VMs resolved to a silent
+    // manifest of zero hosts (finding B2).
+    if hosts.is_empty() {
+        bail!(
+            "the fleet {:?} has no host this flake builds a system for, so there is nothing \
+             to resolve. Every host of it is `deployment = \"context\"` — a VM somebody else \
+             instantiated, with no closure of its own — and those are served by \
+             `meister-deploy legacy context-push` until they are migrated. Give a host \
+             `deployment = \"nixos\"` to deploy it with this tool.",
+            inventory.fleet.name
+        );
+    }
+    // --- end lane 4C ---------------------------------------------------
     let evaluated_hosts: Vec<String> = hosts.keys().cloned().collect();
 
     let mut resolved = ResolvedFleet {
@@ -1122,6 +1147,36 @@ mod tests {
                 .contains(&"meister-agent.service".to_string())
         );
     }
+
+    // --- lane 4C: B2 -------------------------------------------------
+    #[test]
+    fn a_fleet_of_context_hosts_only_is_a_sentence_and_not_an_empty_manifest() {
+        let mut manifest = NixManifest::from_json(&fixture(), "the fixture").unwrap();
+        // What nix/lib/inventory.nix produces for a fleet whose hosts are
+        // all `deployment = "context"`: the inventory half keeps the
+        // groups and the fleet's name, and both host maps are empty.
+        manifest.inventory.hosts.clear();
+        manifest.hosts.clear();
+        for group in manifest.inventory.groups.values_mut() {
+            group.members.clear();
+        }
+        manifest.inventory.services.clear();
+
+        let err = resolve(manifest, source(), tool(), now(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one-box"), "it names the fleet: {err}");
+        assert!(
+            err.contains("no host this flake builds a system for"),
+            "{err}"
+        );
+        assert!(err.contains("context"), "{err}");
+        assert!(
+            err.contains("legacy context-push"),
+            "it says the way: {err}"
+        );
+    }
+    // --- end lane 4C ---------------------------------------------------
 
     #[test]
     fn a_changed_unit_list_is_a_different_manifest_id() {
