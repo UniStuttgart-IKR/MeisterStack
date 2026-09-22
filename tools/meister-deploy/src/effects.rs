@@ -70,6 +70,15 @@ pub trait Files {
     /// What is at this path, without following a link.
     fn entry(&self, path: &Path) -> Result<Entry>;
 
+    /// What is IN this directory, one level deep, as full paths. Reading, so
+    /// no policy gate — `--dry-run` and `--offline` both read.
+    ///
+    /// It exists for one question: `init` may only write into a directory
+    /// that is empty or absent, and "empty" is not a thing `exists` can
+    /// answer. A verb that wrote into a directory it had not looked at would
+    /// be a verb that can overwrite somebody's repository.
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
+
     /// Make `link` point at `target`, replacing whatever is there. Atomic for
     /// the same reason `write_atomic` is: a snapshot with half a link in it
     /// is a snapshot nix would evaluate.
@@ -183,6 +192,19 @@ impl Files for RealFiles {
         } else {
             Ok(Entry::Other)
         }
+    }
+
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(path)
+            .with_context(|| format!("reading the directory {} failed", path.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("reading the directory {} failed", path.display()))?;
+            out.push(entry.path());
+        }
+        out.sort();
+        Ok(out)
     }
 
     fn symlink_atomic(&self, target: &Path, link: &Path) -> Result<()> {
@@ -365,6 +387,23 @@ impl Files for MemFiles {
             "looking at {} failed: no such file in this test.",
             path.display()
         )
+    }
+
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        let prefix = path.to_path_buf();
+        let mut out: Vec<PathBuf> = self
+            .files
+            .borrow()
+            .keys()
+            .chain(self.dirs.borrow().iter())
+            .chain(self.links.borrow().keys())
+            .chain(self.others.borrow().iter())
+            .filter(|p| p.parent() == Some(prefix.as_path()))
+            .cloned()
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     fn symlink_atomic(&self, target: &Path, link: &Path) -> Result<()> {

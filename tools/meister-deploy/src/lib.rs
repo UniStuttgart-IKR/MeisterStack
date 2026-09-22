@@ -28,3 +28,4 @@ pub mod manifest;
 pub mod nix;
 pub mod run;
 pub mod source;
+pub mod template;

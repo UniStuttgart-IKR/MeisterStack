@@ -4,6 +4,7 @@
 
 //! `meister-deploy` — the plan, the order, and the evidence.
 
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -12,14 +13,14 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use meister_deploy::effects::{Clock, Files, RealClock, RealFiles};
-use meister_deploy::inventory::Inventory;
+use meister_deploy::inventory::{self, Inventory};
 use meister_deploy::legacy::fleet::Plan;
 use meister_deploy::legacy::ops::{self, Ctx};
 use meister_deploy::legacy::remote::Ssh;
 use meister_deploy::legacy::run::Real as LegacyRunner;
 use meister_deploy::manifest::{self, Contract, NixManifest, Tool};
-use meister_deploy::run::{Cancel, Policy, Real};
-use meister_deploy::{nix, source};
+use meister_deploy::run::{Cancel, Policy, Real, Runner};
+use meister_deploy::{nix, source, template};
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +42,21 @@ enum Verb {
     Schema {
         /// `nix-manifest`, `resolved-fleet` or `check-result`
         kind: String,
+    },
+
+    /// Write a deployment repository: the inventory, the profiles, the
+    /// per-host files, the disk layout and the checks. Writes only into an
+    /// empty or absent directory, and never touches a MeisterStack checkout.
+    Init {
+        /// Where the repository goes
+        dir: PathBuf,
+        /// The `meisterstack` input to write into its flake.nix — a revision
+        /// for a deployment that is made twice, a local checkout for a test
+        #[arg(long)]
+        meisterstack: Option<String>,
+        /// List the files and write nothing
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// What the inventory says: the hosts, their groups, and what each one
@@ -217,6 +233,11 @@ fn run() -> Result<bool> {
     let cli = Cli::parse();
     match &cli.cmd {
         Verb::Schema { kind } => print_schema(kind),
+        Verb::Init {
+            dir,
+            meisterstack,
+            dry_run,
+        } => init(dir, meisterstack.as_deref(), *dry_run),
         Verb::Inventory { fleet, json } => show_inventory(fleet, *json),
         Verb::Validate {
             fleet,
@@ -361,14 +382,7 @@ fn show_inventory(path: &Path, json: bool) -> Result<bool> {
 
 fn validate(fleet: &Path, manifest: Option<&str>, nix: bool) -> Result<bool> {
     if nix {
-        // Not a silent success and not a silent skip: the flake half of
-        // this verb is lane 1B's, and saying so is the only honest answer
-        // this binary can give today.
-        anyhow::bail!(
-            "--nix needs the operator flake and its `meisterDeployment` attribute, \
-             which arrives with lane 1B. Without it, `validate` checks the inventory \
-             and `validate --manifest <file>` checks a contract object."
-        );
+        return validate_with_nix(fleet);
     }
     match manifest {
         Some(from) => validate_manifest(from),
@@ -399,6 +413,192 @@ fn validate(fleet: &Path, manifest: Option<&str>, nix: bool) -> Result<bool> {
             }
         }
     }
+}
+
+/// `validate --nix`: what the inventory says, and what the flake makes of it.
+///
+/// Two readers, one file (D2). This verb asks the expensive reader — Nix —
+/// for the CHEAP half of its answer (`meisterDeployment.inventory`, derived
+/// without evaluating a single module) and compares the fleet it describes
+/// with the fleet this binary read out of the TOML. What it cannot see is
+/// whether a host's system builds; that is `resolve` and then `build`.
+fn validate_with_nix(fleet: &Path) -> Result<bool> {
+    let fleet = std::path::absolute(fleet)
+        .with_context(|| format!("{} could not be made absolute", fleet.display()))?;
+    // The repository is the directory the inventory lives in, because that is
+    // where its flake is. An inventory somewhere else is a fleet whose
+    // deployment repository nobody named.
+    let repo = fleet
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no directory to evaluate", fleet.display()))?;
+
+    let policy = Policy::real();
+    let files = RealFiles::new(policy);
+    let inventory = Inventory::load(&files, &fleet)?;
+
+    Cancel::on_sigint()?;
+    let runner = Real::new(policy);
+    // `git+file://` and never a bare path or `path:`: what is evaluated is
+    // what git tracks, so this verb cannot copy an ignored `keys/` into the
+    // store on the way (the fix N1 of lane 1C). The price is that
+    // uncommitted changes are not in the answer, and the note below says so.
+    let flake_ref = nix::flake_ref(repo, false);
+    let text = nix::eval_inventory(&runner, &flake_ref)?;
+
+    let evaluated: manifest::NixInventory = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "{flake_ref}#{}.inventory is not the shape this tool reads",
+            nix::MANIFEST_ATTR
+        )
+    })?;
+
+    let mine: BTreeSet<&String> = inventory
+        .hosts
+        .iter()
+        .filter(|(_, h)| h.deployment == inventory::Deployment::Nixos)
+        .map(|(id, _)| id)
+        .collect();
+    let theirs: BTreeSet<&String> = evaluated.hosts.keys().collect();
+    if mine != theirs {
+        let only_mine: Vec<&str> = mine.difference(&theirs).map(|s| s.as_str()).collect();
+        let only_theirs: Vec<&str> = theirs.difference(&mine).map(|s| s.as_str()).collect();
+        anyhow::bail!(
+            "{} and {flake_ref} do not describe the same fleet: {} is in the inventory \
+             and not in the flake, {} is in the flake and not in the inventory. A host \
+             that only one of the two readers sees is a host nobody deploys.",
+            fleet.display(),
+            if only_mine.is_empty() { "nothing".to_string() } else { only_mine.join(", ") },
+            if only_theirs.is_empty() { "nothing".to_string() } else { only_theirs.join(", ") },
+        );
+    }
+    if evaluated.fleet.name != inventory.fleet.name {
+        anyhow::bail!(
+            "the inventory calls this fleet {:?} and the flake calls it {:?}.",
+            inventory.fleet.name,
+            evaluated.fleet.name
+        );
+    }
+
+    println!(
+        "ok: {} and {flake_ref} describe the fleet {:?}, {} nixos host(s): {}",
+        fleet.display(),
+        evaluated.fleet.name,
+        theirs.len(),
+        theirs
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    eprintln!(
+        "note: the flake was evaluated as git sees it, so uncommitted changes are not in \
+         this answer. What was compared is the inventory half of `meisterDeployment` — \
+         the hosts and the fleet's name — and not whether their systems build; that is \
+         `resolve` and `build`."
+    );
+    Ok(true)
+}
+
+/// `init <dir>`: the repository a deployment starts from.
+///
+/// Writes once, into an empty or absent directory, and never into a
+/// MeisterStack checkout: the files come out of this binary
+/// (`crate::template`), so the verb works offline and the template is the one
+/// this version was built with.
+fn init(dir: &Path, flake_ref: Option<&str>, dry_run: bool) -> Result<bool> {
+    let dir = std::path::absolute(dir)
+        .with_context(|| format!("{} could not be made absolute", dir.display()))?;
+
+    if dry_run {
+        // The list, and not a word about having written anything.
+        for file in template::FILES {
+            println!("{}", dir.join(file.path).display());
+        }
+        println!("{}", dir.join(".meister-deploy").display());
+        eprintln!(
+            "note: --dry-run wrote nothing. {} file(s) and one directory would be created; \
+             `nix flake lock` would then be run in {}.",
+            template::FILES.len(),
+            dir.display()
+        );
+        return Ok(true);
+    }
+
+    let policy = Policy::real();
+    let files = RealFiles::new(policy);
+
+    // An empty or absent directory, and nothing else. A repository somebody
+    // already has is a repository this verb must not write into — there is
+    // no merge here, and the files it writes are the ones an operator edits.
+    if files.exists(&dir) {
+        let existing = files.list_dir(&dir)?;
+        if !existing.is_empty() {
+            anyhow::bail!(
+                "{} is not empty ({} entries, e.g. {}). `init` writes a whole repository \
+                 and merges with nothing: give it a new directory, or empty this one.",
+                dir.display(),
+                existing.len(),
+                existing
+                    .iter()
+                    .take(3)
+                    .map(|p| p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
+    // The one file that is not copied verbatim: the flake reference of the
+    // `meisterstack` input.
+    let reference = flake_ref.unwrap_or(template::DEFAULT_FLAKE_REF);
+    for file in template::FILES {
+        let path = dir.join(file.path);
+        if let Some(parent) = path.parent() {
+            files.create_dir_all(parent)?;
+        }
+        let body = if file.path == "flake.nix" {
+            template::with_flake_ref(file.body, reference)
+        } else {
+            file.body.to_string()
+        };
+        files.write_atomic(&path, body.as_bytes(), file.mode)?;
+        println!("{}", path.display());
+    }
+    // The state directory, so that the first `resolve` has somewhere to put
+    // its snapshot and its journal. It is in the template's .gitignore.
+    let state = dir.join(".meister-deploy");
+    files.create_dir_all(&state)?;
+    println!("{}", state.display());
+
+    // The lock file, and ONLY through nix. Writing one by hand would be
+    // claiming a set of revisions nobody resolved.
+    let runner = Real::new(policy);
+    match runner.run(&nix::flake_lock_cmd(&dir)) {
+        Ok(_) => println!("{}", dir.join("flake.lock").display()),
+        Err(e) => eprintln!(
+            "note: `nix flake lock` in {} did not run ({e}). The repository is complete \
+             except for flake.lock; run `nix flake lock` there before the first build. \
+             This tool does not write a lock file itself, because a lock file it made up \
+             would name revisions nobody resolved.",
+            dir.display()
+        ),
+    }
+
+    eprintln!(
+        "==> {}\n    1. a signing key, whose public half every host of this fleet trusts:\n\
+         \x20      nix-store --generate-binary-cache-key {} keys/signing.sec signing.pub\n\
+         \x20   2. git init && git add -A   (a flake sees only what git tracks)\n\
+         \x20   3. edit fleet.toml, then: nix flake check\n\
+         \x20   4. meister-deploy resolve --repo . --out manifest.json",
+        dir.display(),
+        dir.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "my-fleet".to_string())
+    );
+    Ok(true)
 }
 
 fn validate_manifest(from: &str) -> Result<bool> {
