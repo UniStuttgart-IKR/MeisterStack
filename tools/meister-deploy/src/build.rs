@@ -125,6 +125,10 @@ pub struct BuildOptions {
     /// store url, handed to `nix copy --to` unread — which urls nix speaks
     /// is nix's question and not a list this tool keeps in step with it.
     pub cache: Option<String>,
+    /// Build every host's system a second time and let nix compare, so that
+    /// `reproducibility.bit_identical_verified` is a measurement rather than
+    /// a hope. Expensive by construction: it is the whole fleet, twice.
+    pub verify_reproducible: bool,
     /// Only these hosts. A build of part of a fleet is for looking at, not
     /// for releasing — see [`Builder::realise`].
     pub hosts: Option<Vec<String>>,
@@ -406,6 +410,35 @@ pub fn sign_cmd(key: &std::path::Path, paths: &[String]) -> Cmd {
         .redact(key)
 }
 
+/// `nix build --rebuild --no-link <drv>^*`: build it AGAIN, on top of the
+/// output that is already there, and let nix compare.
+///
+/// nix does the comparison itself and refuses with "may not be
+/// deterministic: output … differs", which is a better answer than hashing
+/// two nars here would be: nix knows which output of a multi-output
+/// derivation differed and it knows what to do with a fixed-output one.
+///
+/// One derivation per call and not the whole fleet in one, which is the
+/// opposite of [`build_many_cmd`] and deliberately so: what this produces is
+/// a per-host VERDICT, and a batch that exited 1 would say "something in the
+/// fleet differed" — the one thing an operator cannot act on.
+pub fn rebuild_cmd(drv: &str, options: &BuildOptions) -> Cmd {
+    let cmd =
+        Cmd::new(Effect::Build, "nix", BUILD_DEADLINE).args(["build", "--rebuild", "--no-link"]);
+    // `--builders` and `--substituters` on purpose, `--max-jobs` and the
+    // operator's `--option`s too: the question is whether THIS build
+    // environment produces the same bytes twice, so it has to be the same
+    // build environment.
+    let cmd = with_nix_options(cmd, options);
+    cmd.arg(format!("{drv}^*")).expect(Expect::AnyExit)
+}
+
+/// What nix says when a rebuild came out different. Matched rather than
+/// guessed at, because every other non-zero exit is a check that could not
+/// be MADE — a builder that went away, a disk that filled — and reporting
+/// that as "not reproducible" would be this tool inventing a finding.
+const NOT_DETERMINISTIC: &str = "may not be deterministic";
+
 /// How long pushing a fleet's closures into a cache may take. Seventy
 /// system closures are tens of gigabytes of nar over whatever link the cache
 /// is on.
@@ -532,6 +565,11 @@ impl Builder<'_> {
 
         self.check_promises(&resolved, &hosts, &outputs)?;
 
+        // Was it the same build twice? Asked here, next to the build it is
+        // a claim about, and only when the operator asked for it: this
+        // builds every host's system a SECOND time.
+        let reproducibility = self.verify_reproducible(&resolved, &hosts)?;
+
         let mut to_measure: Vec<String> = outputs.values().cloned().collect();
         // The configuration files are in the closure of the systems that
         // read them, so they exist once the toplevels are built; they are
@@ -570,15 +608,7 @@ impl Builder<'_> {
             Vec::new(),
             build_env,
             checks,
-            Reproducibility {
-                // The manifest was resolved from a locked tree — `resolve`
-                // refuses one without a `flake.lock` — so the inputs are
-                // pinned. Whether the bytes come out the same twice is a
-                // different claim, and nobody has checked it here.
-                inputs_pinned: true,
-                bit_identical_verified: false,
-                method: None,
-            },
+            reproducibility,
             self.clock.now(),
         )?;
 
@@ -901,6 +931,67 @@ impl Builder<'_> {
             );
         }
         Ok(info)
+    }
+
+    /// Build every host's system a second time and say whether the bytes
+    /// came out the same.
+    ///
+    /// Without `--verify-reproducible` this runs nothing and answers
+    /// `bit_identical_verified: false, method: null` — which is the honest
+    /// shape of "nobody checked", and the reason the two fields are
+    /// separate from `inputs_pinned`. Pinned inputs are a reason to EXPECT
+    /// the same bytes and never evidence of them.
+    ///
+    /// A rebuild that could not be MADE — a builder that went away, a disk
+    /// that filled, a derivation nix refused for some other reason — stops
+    /// the build with what nix said. An operator who asked for a
+    /// verification and got `false` without one would have been told
+    /// something that is not true.
+    fn verify_reproducible(
+        &self,
+        resolved: &ResolvedFleet,
+        hosts: &[String],
+    ) -> Result<Reproducibility> {
+        // The manifest was resolved from a locked tree — `resolve` refuses
+        // one without a `flake.lock` — so the inputs are pinned either way.
+        let pinned = Reproducibility {
+            inputs_pinned: true,
+            bit_identical_verified: false,
+            method: None,
+            differences: Vec::new(),
+        };
+        if !self.options.verify_reproducible {
+            return Ok(pinned);
+        }
+        let mut differences = Vec::new();
+        for id in hosts {
+            let host = &resolved.hosts[id];
+            let drv = &host.build.toplevel_drv;
+            let cmd = rebuild_cmd(drv, &self.options);
+            let out = self.runner.run(&cmd)?;
+            if out.ok() {
+                continue;
+            }
+            let said = crate::run::last_lines(out.stderr.trim());
+            if !said.contains(NOT_DETERMINISTIC) {
+                bail!(
+                    "the rebuild of {id} could not be made, so this release cannot say \
+                     whether it is reproducible. `{}` exited {} and said: {said}",
+                    cmd.line(),
+                    out.status
+                );
+            }
+            differences.push(format!("{id} ({drv}): {said}"));
+        }
+        Ok(Reproducibility {
+            inputs_pinned: true,
+            bit_identical_verified: differences.is_empty(),
+            // Named even when the answer is `false`: what makes this field
+            // worth anything is that somebody can tell "checked and
+            // different" from "not checked".
+            method: Some("nix build --rebuild".to_string()),
+            differences,
+        })
     }
 
     /// Push the whole release into the cache the operator named.
@@ -1533,17 +1624,22 @@ mod tests {
     /// whether the store reports a signature afterwards. They are two
     /// arguments and not one because the interesting failure is a sign that
     /// ran and left nothing behind.
-    /// The paths a green `expect_build` ends up measuring, sorted and
-    /// deduplicated the way `realise` hands them to `path-info`, `store
-    /// sign` and the cache.
-    fn measured_paths(fleet: &ResolvedFleet) -> Vec<String> {
-        let _ = fleet;
-        let mut paths = vec![
+    /// The four outputs of the one-host fixture, in the order
+    /// [`derivations`] lists their derivations: the host, then the packages.
+    fn outputs_in_derivation_order() -> Vec<String> {
+        vec![
             TOPLEVEL.to_string(),
             "/nix/store/pppppppppppppppppppppppppppppppp-meisterstack".to_string(),
             "/nix/store/cccccccccccccccccccccccccccccccc-cloud-hypervisor".to_string(),
             "/nix/store/gggggggggggggggggggggggggggggggg-guest-tiny".to_string(),
-        ];
+        ]
+    }
+
+    /// The same, sorted and deduplicated the way `realise` hands them to
+    /// `path-info`, `store sign` and the cache.
+    fn measured_paths(fleet: &ResolvedFleet) -> Vec<String> {
+        let _ = fleet;
+        let mut paths = outputs_in_derivation_order();
         paths.sort();
         paths.dedup();
         paths
@@ -1559,26 +1655,26 @@ mod tests {
     }
 
     fn expect_build(fleet: &ResolvedFleet, sign: bool, signed: bool) -> StrictFake {
-        expect_build_into(fleet, sign, signed, None)
+        expect_build_into(fleet, sign, signed, None, None)
     }
 
-    /// The same, for a build that pushes its release into a cache.
+    /// The same, for a build that verifies its own reproducibility and/or
+    /// pushes its release into a cache. Both steps sit at fixed points of
+    /// the order `realise` walks — the rebuild right after the build, the
+    /// push right after the measurement — and the strict fake is in that
+    /// order, which is what makes these tests statements about the order.
     fn expect_build_into(
         fleet: &ResolvedFleet,
         sign: bool,
         signed: bool,
         cache: Option<&str>,
+        rebuild: Option<Output>,
     ) -> StrictFake {
         let drvs: Vec<String> = derivations(fleet, &["box".to_string()])
             .into_iter()
             .map(|d| d.drv)
             .collect();
-        let outs: Vec<String> = vec![
-            TOPLEVEL.to_string(),
-            "/nix/store/pppppppppppppppppppppppppppppppp-meisterstack".to_string(),
-            "/nix/store/cccccccccccccccccccccccccccccccc-cloud-hypervisor".to_string(),
-            "/nix/store/gggggggggggggggggggggggggggggggg-guest-tiny".to_string(),
-        ];
+        let outs: Vec<String> = outputs_in_derivation_order();
         let mut fake = StrictFake::new().expect(
             Matcher::prefix("nix", ["path-info", "--json"]),
             Output::stdout("{}"),
@@ -1607,6 +1703,11 @@ mod tests {
             ),
             Output::stdout(build_json(&sorted)),
         );
+        // --- lane 4C: the rebuild is next to the build it is about ---
+        if let Some(reply) = rebuild {
+            fake = fake.expect(Matcher::prefix("nix", ["build", "--rebuild"]), reply);
+        }
+        // --- end lane 4C ---
         if sign {
             fake = fake.expect(
                 Matcher::prefix("nix", ["store", "sign", "--recursive", "--key-file"]),
@@ -1895,7 +1996,7 @@ mod tests {
     fn a_build_with_a_cache_pushes_once_after_signing_and_says_so_in_the_release() {
         let fleet = one_host();
         let fleet_paths = fleet.clone();
-        let runner = expect_build_into(&fleet, true, true, Some("file:///srv/cache"));
+        let runner = expect_build_into(&fleet, true, true, Some("file:///srv/cache"), None);
         let files = files_with_config(&fleet);
         let clock = FakeClock::fixed();
         let builder = Builder {
@@ -1967,6 +2068,166 @@ mod tests {
             runner.calls()
         );
         assert_eq!(built.release.build_env.cache_url, None);
+    }
+
+    #[test]
+    fn without_the_flag_a_release_says_nobody_checked() {
+        let fleet = one_host();
+        // The strict fake expects no `--rebuild`, so a probe would fail here.
+        let runner = expect_build(&fleet, true, true);
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let built = builder.realise(fleet).expect("a green build");
+        runner.verify().unwrap();
+        let repro = &built.release.reproducibility;
+        assert!(repro.inputs_pinned, "the tree was locked");
+        assert!(!repro.bit_identical_verified);
+        assert_eq!(
+            repro.method, None,
+            "null is what `nobody checked` looks like"
+        );
+        assert!(repro.differences.is_empty());
+    }
+
+    #[test]
+    fn a_rebuild_that_matched_is_the_only_thing_that_sets_the_flag() {
+        let fleet = one_host();
+        let runner = expect_build_into(&fleet, true, true, None, Some(Output::stdout("")));
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                verify_reproducible: true,
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let built = builder.realise(fleet).expect("a green build");
+        runner.verify().unwrap();
+        let repro = &built.release.reproducibility;
+        assert!(repro.bit_identical_verified);
+        assert_eq!(repro.method.as_deref(), Some("nix build --rebuild"));
+        assert!(repro.differences.is_empty());
+    }
+
+    #[test]
+    fn a_rebuild_that_differed_is_a_finding_and_not_a_failure() {
+        let fleet = one_host();
+        let runner = expect_build_into(
+            &fleet,
+            true,
+            true,
+            None,
+            Some(Output::failing(
+                1,
+                "error: derivation '/nix/store/dddd-nixos-system-box-25.11.drv' may not be \
+                 deterministic: output '/nix/store/oooo-nixos-system-box-25.11' differs",
+            )),
+        );
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                verify_reproducible: true,
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        // A release that is not bit-identical is still a release: what it
+        // says about itself is the finding.
+        let built = builder
+            .realise(fleet)
+            .expect("a build that is still a build");
+        runner.verify().unwrap();
+        let repro = &built.release.reproducibility;
+        assert!(!repro.bit_identical_verified);
+        assert_eq!(
+            repro.method.as_deref(),
+            Some("nix build --rebuild"),
+            "checked-and-different has to be tellable from not-checked"
+        );
+        assert_eq!(repro.differences.len(), 1);
+        assert!(
+            repro.differences[0].starts_with("box ("),
+            "{:?}",
+            repro.differences
+        );
+        assert!(
+            repro.differences[0].contains("may not be deterministic"),
+            "{:?}",
+            repro.differences
+        );
+    }
+
+    #[test]
+    fn a_rebuild_that_could_not_be_made_says_so_instead_of_answering_false() {
+        let fleet = one_host();
+        // Built by hand and not from `expect_build_into`: this build stops
+        // AT the rebuild, so a fake that expected the steps after it would
+        // fail on the unused expectations rather than on the finding.
+        let mut pairs: Vec<(String, String)> = derivations(&fleet, &["box".to_string()])
+            .into_iter()
+            .map(|d| d.drv)
+            .zip(outputs_in_derivation_order())
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let runner = StrictFake::new()
+            .expect(
+                Matcher::prefix("nix", ["path-info", "--json"]),
+                Output::stdout("{}"),
+            )
+            .expect(
+                Matcher::prefix("nix", ["build", "--no-link", "--json"]),
+                Output::stdout(build_json(&pairs)),
+            )
+            .expect(
+                Matcher::prefix("nix", ["build", "--rebuild"]),
+                Output::failing(
+                    1,
+                    "error: unable to start any build; either increase '--max-jobs' or \
+                     enable remote builds",
+                ),
+            );
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                verify_reproducible: true,
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let err = builder.realise(fleet).unwrap_err().to_string();
+        assert!(err.contains("could not be made"), "{err}");
+        assert!(err.contains("unable to start any build"), "{err}");
+        // And nothing was signed: the refusal came before the key was used.
+        assert!(
+            !runner.calls().iter().any(|c| c.contains("store sign")),
+            "{:?}",
+            runner.calls()
+        );
     }
 
     // --- end lane 4C ----------------------------------------------------

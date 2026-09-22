@@ -205,6 +205,14 @@ pub struct Reproducibility {
     pub bit_identical_verified: bool,
     /// How it was verified, when it was. Null otherwise.
     pub method: Option<String>,
+    /// The systems that did NOT come out the same, one sentence each, with
+    /// what nix said about them.
+    ///
+    /// Empty when nothing was checked — which `method: null` already says —
+    /// and empty when everything matched. A list rather than a count,
+    /// because "the release is not reproducible" is a thing somebody has to
+    /// act on and the first question is always which host.
+    pub differences: Vec<String>,
 }
 
 /// `release.json`: one manifest, one set of built artifacts, one id.

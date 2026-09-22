@@ -154,6 +154,7 @@ pub fn release_of(resolved: ResolvedFleet) -> ReleaseManifest {
             inputs_pinned: true,
             bit_identical_verified: false,
             method: None,
+            differences: Vec::new(),
         },
         at("2026-09-21T11:00:00Z"),
     )
@@ -283,6 +284,7 @@ pub fn direct_release_of(resolved: ResolvedFleet) -> ReleaseManifest {
             inputs_pinned: true,
             bit_identical_verified: false,
             method: None,
+            differences: Vec::new(),
         },
         at("2026-09-21T11:00:00Z"),
     )

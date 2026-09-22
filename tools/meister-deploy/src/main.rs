@@ -470,6 +470,13 @@ struct BuildArgs {
     /// own `meisterstack.managed.substituters` names it.
     #[arg(long)]
     cache: Option<String>,
+
+    /// Build every host's system a SECOND time and let nix compare, so that
+    /// the release's `bit_identical_verified` is a measurement. Expensive
+    /// by construction — it is the whole fleet, twice — and without it the
+    /// release says `false` with `method: null`, which is "nobody checked".
+    #[arg(long)]
+    verify_reproducible: bool,
     // --- end lane 4C ----------------------------------------------------
     /// The inventory the `[operator] signing_key` reference is read from.
     /// Defaults to the one the manifest was resolved from.
@@ -1391,6 +1398,7 @@ fn build(args: &BuildArgs) -> Result<bool> {
             max_jobs: args.max_jobs.clone(),
             options: nix_options(&args.option)?,
             cache: args.cache.clone(),
+            verify_reproducible: args.verify_reproducible,
             // --- end lane 4C ---
             hosts,
         },

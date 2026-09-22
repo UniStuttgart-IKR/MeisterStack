@@ -129,6 +129,7 @@ pub fn reproducibility() -> Reproducibility {
         inputs_pinned: true,
         bit_identical_verified: false,
         method: None,
+        differences: Vec::new(),
     }
 }
 
