@@ -1642,6 +1642,12 @@ fn decide_host(
     // cannot is a bootstrap that would leave the host half made.
     if policy.kind == PlanKind::Bootstrap {
         let expected = policy.expected_credentials.get(id);
+        // One sentence per FILE, not per reference. The one derivation
+        // writes a `secret_refs` entry per file AND unit (the id is
+        // `<file>-<role>`), so a host with two controller tiers has two
+        // references to one `identity.crt` — and saying the same thing
+        // twice is how a blocked plan becomes unreadable.
+        let mut said: BTreeSet<&str> = BTreeSet::new();
         for secret in &host.secret_refs {
             if secret.source.kind == crate::manifest::SecretSourceKind::TargetGenerated {
                 continue;
@@ -1651,6 +1657,9 @@ fn decide_host(
                 continue;
             }
             if expected.is_some_and(|e| e.contains_key(&secret.id)) {
+                continue;
+            }
+            if !said.insert(secret.target_path.as_str()) {
                 continue;
             }
             d.stop_all.push(match secret.source.kind {
