@@ -503,6 +503,18 @@ pkgs.testers.runNixOSTest {
         f"cat /root/fleet/.meister-deploy/runs/{run}/receipt.json"
     ), "the key-encryption key is in the receipt"
 
+    # --- and now there is nothing left to deliver ------------------------
+    #
+    # The other half of the comparison the action came out of: what the
+    # host has is what this repository holds, so an upgrade plans no
+    # delivery at all and the host is simply unchanged.
+    status, plan_noop = make_plan(release_b, "noop")
+    the_plan = json.loads(operator.succeed(f"cat {plan_noop}"))
+    kinds = [a["kind"] for a in the_plan["actions"] if a["blocked"] is None]
+    assert "deliver-secret" not in kinds, kinds
+    assert the_plan["hosts"]["box"]["verdict"] == "unchanged", the_plan["hosts"]
+    assert status == 0, status
+
     # --- step 7: V09, the rest — a real mTLS session ---------------------
     #
     # Not a mode and not a digest: the cluster controller registers with the
@@ -564,12 +576,20 @@ pkgs.testers.runNixOSTest {
     box.succeed(f"chmod 600 {pki}/identity.key")
     box.succeed("systemctl restart meister-cluster-controller.service")
 
-    # --- step 9: and now there is nothing left to deliver ----------------
-    status, plan_noop = make_plan(release_b, "noop")
-    the_plan = json.loads(operator.succeed(f"cat {plan_noop}"))
+    # --- step 9: and the certificates outlived the cold start ------------
+    #
+    # Only the secrets, and that is on purpose: a test VM always boots the
+    # kernel the framework started it with, so after `shutdown` + `start`
+    # the machine runs system A again whatever its profile says. That is
+    # the framework and not the fleet (nix/tests/activate.nix measures the
+    # boot half on a machine of its own), so what is asserted here is the
+    # part this lane is about — the files survived the reboot, and a plan
+    # made now asks for none of them.
+    status, plan_after = make_plan(release_b, "after")
+    the_plan = json.loads(operator.succeed(f"cat {plan_after}"))
     kinds = [a["kind"] for a in the_plan["actions"] if a["blocked"] is None]
     assert "deliver-secret" not in kinds, kinds
-    assert the_plan["hosts"]["box"]["verdict"] == "unchanged", the_plan["hosts"]
+    assert the_plan["hosts"]["box"]["verdict"] in ("unchanged", "change"), the_plan["hosts"]
     assert status == 0, status
 
     print("meister-deploy: a fresh host was enrolled, made its own key, and the "
