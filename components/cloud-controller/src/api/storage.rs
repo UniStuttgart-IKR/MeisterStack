@@ -373,6 +373,30 @@ pub(super) async fn all_volumes(st: &ApiState) -> Result<Vec<Volume>, ApiError> 
     Ok(volumes)
 }
 
+/// Would this tenant still be inside its ceiling in `pool` with a volume of
+/// `gib` in it?
+///
+/// One rejection path, and it is the one in `controller_api::quota`. A
+/// second sum computed here would be a second answer to "is this tenant over
+/// its limit", and the wrong one is whichever an operator is not looking at.
+/// Asked by the create and by the resize, and `except` is the difference
+/// between them: the volume being resized comes out of the sum so that its
+/// new size can go back in. `None` on a create.
+pub(super) async fn check_storage_quota(
+    st: &ApiState,
+    pool: &StoragePool,
+    tenant: &str,
+    gib: u64,
+    except: Option<&str>,
+) -> Result<(), ApiError> {
+    let held =
+        quota::StorageUsage::of(tenant, &pool.metadata.name, &all_volumes(st).await?, except);
+    let Err(why) = quota::check_storage(pool, tenant, held.plus(gib)) else {
+        return Ok(());
+    };
+    Err(conflict(why))
+}
+
 pub(super) async fn list_volumes(
     State(st): State<ApiState>,
     caller: Caller,
@@ -477,14 +501,7 @@ pub(super) async fn create_volume(
     let pools = st.store.list::<StoragePool>().await?;
     let pool = pick_storage_pool(&pools, Some(body.spec.pool.as_str()))?;
 
-    // One rejection path, and it is the one in `controller_api::quota`. A
-    // second sum computed here would be a second answer to "is this tenant
-    // over its limit", and the wrong one is whichever an operator is not
-    // looking at.
-    let held = quota::StorageUsage::of(&owner, &pool.metadata.name, &all_volumes(&st).await?, None);
-    if let Err(why) = quota::check_storage(pool, &owner, held.plus(body.spec.size_gib)) {
-        return Err(conflict(why));
-    }
+    check_storage_quota(&st, pool, &owner, body.spec.size_gib, None).await?;
 
     let mut spec = body.spec;
     spec.tenant = owner.clone();
@@ -609,6 +626,22 @@ pub(super) async fn update_volume(
 
     keep_server_owned(&mut body.metadata, &current.metadata);
     check_owned(&current, &body, VOLUME_OWNED)?;
+    // A resize is the same act as creating a volume that size, and it goes
+    // through the same arithmetic: this volume comes out of the sum and its
+    // new size goes back in. Only when it GROWS — an edit that holds no more
+    // than it did is not a storage question, even for a tenant an operator
+    // has since put under its own usage.
+    if body.spec.size_gib > current.spec.size_gib {
+        let pool: StoragePool = st.store.get(&current.spec.pool).await?;
+        check_storage_quota(
+            &st,
+            &pool,
+            &current.spec.tenant,
+            body.spec.size_gib,
+            Some(&name),
+        )
+        .await?;
+    }
     body.status = current.status.clone();
     controller_api::carry_generation(&current, &mut body)?;
     match dry.preview(&body) {

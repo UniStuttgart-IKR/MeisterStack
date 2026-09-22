@@ -278,3 +278,94 @@ async fn an_image_is_used_on_the_terms_it_is_read_on() {
         .await
         .expect("an admin reads every image, so it may use every image");
 }
+
+/// A PUT of a volume, as a client that read it and changed the size sends it.
+async fn resize_volume_as(
+    st: &ApiState,
+    who: (Caller, CallerRole, CallerTenant),
+    name: &str,
+    gib: u64,
+) -> Result<Volume, ApiError> {
+    let mut body: Volume = st.store.get(name).await.expect("the volume");
+    body.spec.size_gib = gib;
+    let (caller, role, tenant) = who;
+    update_volume(
+        State(st.clone()),
+        Path(name.to_string()),
+        caller,
+        role,
+        tenant,
+        DryRun::default(),
+        Json(body),
+    )
+    .await
+    .map(|Json(v)| v)
+}
+
+/// Give `tenant` a ceiling of `gib` in the default pool.
+async fn storage_quota(st: &ApiState, tenant: &str, gib: u64) {
+    st.store
+        .mutate::<StoragePool, _>("disks", |p| {
+            p.spec.quota.insert(tenant.to_string(), gib);
+        })
+        .await
+        .expect("the pool");
+}
+
+// --- F02: growing a volume is creating that much storage ------------------
+
+/// `StorageUsage::of` has had an `except` since it was written, "so that
+/// resizing one is measured exactly like creating one that size" — and the
+/// resize never asked it. `spec.sizeGib` became growable with storage B and
+/// went through `check_owned` and nothing else, so a tenant with ten GiB made
+/// a one-GiB volume and grew it to a hundred.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn growing_a_volume_is_held_to_the_ceiling_creating_it_would_be() {
+    let st = cloud("f02").await;
+    storage_quota(&st, "b", 10).await;
+
+    create_volume_as(&st, member("b"), volume("data", "b", 1, None))
+        .await
+        .expect("one GiB of ten");
+
+    let refused = resize_volume_as(&st, member("b"), "data", 100)
+        .await
+        .expect_err("a hundred GiB is past a ceiling of ten");
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert!(
+        refused.message().contains("quota there is 10 GiB"),
+        "the sentence names the ceiling: {}",
+        refused.message()
+    );
+    let held: Volume = st.store.get("data").await.expect("the volume");
+    assert_eq!(held.spec.size_gib, 1, "and the spec did not move");
+
+    // The volume's own old size comes out of the sum and its new size goes
+    // back in: ten exactly is inside a ceiling of ten, eleven is not.
+    resize_volume_as(&st, member("b"), "data", 10)
+        .await
+        .expect("growing to the ceiling itself");
+    resize_volume_as(&st, member("b"), "data", 11)
+        .await
+        .expect_err("one past it");
+
+    // And an edit that does not grow anything is not a quota question at all,
+    // even for a tenant an operator has since put under water.
+    storage_quota(&st, "b", 5).await;
+    let mut body: Volume = st.store.get("data").await.expect("the volume");
+    body.spec.description = "still ten".into();
+    let (caller, role, tenant) = member("b");
+    update_volume(
+        State(st.clone()),
+        Path("data".to_string()),
+        caller,
+        role,
+        tenant,
+        DryRun::default(),
+        Json(body),
+    )
+    .await
+    .map(|Json(v)| v)
+    .expect("a description is not storage");
+}
