@@ -82,9 +82,17 @@ let
       [ -f /lib/modules/$m.ko ] && /bin/busybox insmod /lib/modules/$m.ko
     done
     if [ -e /dev/input/event0 ]; then
+      # `ms_tiny=debug` keeps acpid in the foreground with its own logging
+      # on the console: when a button press does not arrive, the question is
+      # always which event string it produced.
+      if /bin/busybox grep -q 'ms_tiny=debug' /proc/cmdline 2>/dev/null; then
+        /bin/busybox acpid -f -d -c /etc/acpi &
+        echo "MS-S0-ACPI: listening (debug)"
+      else
       /bin/busybox acpid -c /etc/acpi \
         && echo "MS-S0-ACPI: listening on $(/bin/busybox cat /sys/class/input/event0/device/name 2>/dev/null)" \
         || echo "MS-S0-ACPI: acpid did not start; the power button will not be seen"
+      fi
     else
       echo "MS-S0-ACPI: no input node for the power button; it will not be seen"
     fi
