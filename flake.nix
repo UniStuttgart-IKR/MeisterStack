@@ -16,7 +16,13 @@
   outputs = { self, nixpkgs, nixos-generators }:
     let
       system = "x86_64-linux";
-      pkgs = nixpkgs.legacyPackages.${system};
+      # With this repository's own packages in it (nix/overlay.nix): the
+      # modules reach them through `pkgs.meisterstack`, so the flake that
+      # declares them has to be evaluating a nixpkgs that has them.
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [ self.overlays.default ];
+      };
       lib = nixpkgs.lib;
 
       fleetLib = import ./nix/fleet.nix { inherit lib; };
@@ -110,7 +116,26 @@
       # nothing about the plan changes. It needs a disko layout the plan does
       # not carry today, which is why it is a paragraph in deploy/README.md
       # rather than an output here.
+      # What this repository builds, for a nixpkgs that is not ours.
+      #
+      #   nixpkgs.overlays = [ meisterstack.overlays.default ];
+      #   environment.systemPackages = [ pkgs.meisterstack ];
+      #
+      # nix/overlay.nix says why it is an overlay rather than only the
+      # `packages` output below.
+      overlays.default = import ./nix/overlay.nix;
+
       packages.${system} = {
+        # The binaries, out of Nix rather than out of somebody's
+        # target/release. nix/packages/*.nix carries the rationale for each.
+        inherit (pkgs)
+          meisterstack
+          meisterstack-runtime
+          cloud-hypervisor-meister
+          vhost-device-input
+          guest-tiny
+          ;
+
         # The options a foreign host sees. A configuration that imports
         # `nixosModules.default` gets option NAMES and nothing else — no brief,
         # no worked example — so the module's own descriptions are the
