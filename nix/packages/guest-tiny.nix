@@ -43,6 +43,9 @@
 
 let
   kernel = linuxPackages.kernel;
+  # nixpkgs splits a kernel into three outputs, and the modules are not in
+  # the one that holds the bzImage.
+  modules = kernel.modules or kernel;
   busybox = pkgsStatic.busybox;
 
   # The line the suites wait for. One string, in one place: the agent's own
@@ -71,11 +74,13 @@ let
       /bin/busybox sleep 30
     fi
 
-    # evdev is built INTO the pinned nixpkgs kernel (CONFIG_INPUT_EVDEV=y),
-    # so the module below is usually absent and that is not a fault; what
-    # decides whether the button can be heard is whether there is an input
-    # node to read, so that is what is looked at.
-    [ -f /lib/modules/evdev.ko ] && /bin/busybox insmod /lib/modules/evdev.ko 2>/dev/null
+    # Both are MODULES in the pinned nixpkgs kernel — measured:
+    # CONFIG_INPUT_EVDEV=m and CONFIG_ACPI_BUTTON=m — so the power button
+    # has no input node until they are loaded. evdev first, because it is
+    # the handler that creates the node the button then appears as.
+    for m in evdev button; do
+      [ -f /lib/modules/$m.ko ] && /bin/busybox insmod /lib/modules/$m.ko
+    done
     if [ -e /dev/input/event0 ]; then
       /bin/busybox acpid -c /etc/acpi \
         && echo "MS-S0-ACPI: listening on $(/bin/busybox cat /sys/class/input/event0/device/name 2>/dev/null)" \
@@ -116,17 +121,22 @@ let
     install -m0755 ${init} $root/init
     install -m0755 ${powerHandler} $root/etc/acpi/PWRF/00000080
 
-    # The one module this guest loads, out of the SAME kernel it boots — an
-    # evdev from anywhere else would not load, and a guest that cannot hear
-    # the power button says so rather than hanging.
-    mod=${kernel}/lib/modules/${kernel.modDirVersion}/kernel/drivers/input/evdev.ko
-    if [ -f "$mod.xz" ]; then
-      xz -dc "$mod.xz" > $root/lib/modules/evdev.ko
-    elif [ -f "$mod" ]; then
-      cp "$mod" $root/lib/modules/evdev.ko
-    else
-      echo "note: this kernel has no evdev module; the guest will say so on its console"
-    fi
+    # The two modules this guest loads, out of the SAME kernel it boots — a
+    # module from anywhere else would not load, and a guest that cannot hear
+    # the power button says so on its console rather than hanging. They live
+    # in the kernel's `modules` output, not next to the bzImage.
+    for m in drivers/input/evdev drivers/acpi/button; do
+      src=${modules}/lib/modules/${kernel.modDirVersion}/kernel/$m
+      name=$(basename $m).ko
+      if [ -f "$src.ko.xz" ]; then
+        xz -dc "$src.ko.xz" > $root/lib/modules/$name
+      elif [ -f "$src.ko" ]; then
+        cp "$src.ko" $root/lib/modules/$name
+      else
+        echo "this kernel has neither $src.ko nor $src.ko.xz" >&2
+        exit 1
+      fi
+    done
 
     ( cd $root && find . -print0 | cpio --null -o -H newc --quiet ) | gzip -9 > initrd.gz
     install -Dm0644 initrd.gz $out
