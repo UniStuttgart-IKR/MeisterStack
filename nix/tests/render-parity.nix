@@ -24,16 +24,30 @@
 # borrow) and the host list is an argument, so that a fleet with a raft group
 # of THREE can be checked too — on a one-box fleet the etcd variables are
 # empty and this check never sees them (1A §8, open point 6).
-{ nixpkgs, lib, pkgs, system, self, inv, hostIds, profiles ? { } }:
+{ nixpkgs, lib, pkgs, system, self, disko, inv, hostIds, profiles ? { } }:
 let
   profileOf = name: profiles.${name} or { };
+
+  # disko's module, with its CONFIG off.
+  #
+  # A host module of an operator binds the disk its layout shapes
+  # (`disko.devices.disk.main.device` in hw/<id>.nix), so the option has to
+  # exist wherever a host module is evaluated — and this check evaluates two
+  # twins of a host that lib.mkFleet did not build. What must NOT happen here
+  # is disko deriving `fileSystems`: both twins below state their own root,
+  # the question this check asks is about the RENDERER, and a partition table
+  # would only be a second author for a mount nobody boots.
+  diskoDeclaredOnly = [
+    disko.nixosModules.disko
+    { disko.enableConfig = false; }
+  ];
 
   # The same host as an APPLIANCE: the boot renderer, the provider block and
   # base.nix' host-global set. The profiles are left OUT here — they are the
   # operator's answers about a managed machine, and the appliance profile has
   # its own — so what the two sides share is exactly the inventory.
   applianceFor = id: (nixpkgs.lib.nixosSystem {
-    modules = [
+    modules = diskoDeclaredOnly ++ [
       { nixpkgs.hostPlatform = system; nixpkgs.overlays = [ self.overlays.default ]; }
       self.nixosModules.appliance
       (inv.hostModule id)
@@ -53,7 +67,7 @@ in
     # that difference is a decision of nix/managed.nix and would
     # otherwise be reported as a mismatch of `controller_ca`.
     managedFor = id: (nixpkgs.lib.nixosSystem {
-      modules = [
+      modules = diskoDeclaredOnly ++ [
         { nixpkgs.hostPlatform = system; nixpkgs.overlays = [ self.overlays.default ]; }
         self.nixosModules.services
         self.nixosModules.managed

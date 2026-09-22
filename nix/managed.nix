@@ -67,6 +67,40 @@ in
 {
   imports = [ ./services.nix ];
 
+  # What the LAYOUT knows and nobody else does.
+  #
+  # `install.layout` in the inventory names a disko module, and that module
+  # is the one file that decides whether this machine has an EFI system
+  # partition — it either makes an EF00 partition or it does not.
+  # nix/lib/inventory.nix compares the answer against `boot` (uefi needs one,
+  # direct must not have one), which is a comparison somebody has to be able
+  # to make without parsing a partition table. So the layout says it out
+  # loud, here, in one line.
+  #
+  # Declared outside `config` and outside the `managed.enable` gate on
+  # purpose: a layout is imported into a host by lib.mkFleet whether or not
+  # that host is managed, and an option that only exists sometimes is an
+  # option a layout cannot set.
+  options.meisterstack.install.hasEsp = lib.mkOption {
+    type = lib.types.bool;
+    default = false;
+    example = true;
+    description = ''
+      Whether the disk layout of this host makes an EFI system partition.
+
+      Set by the layout (`templates/operator/disko/single-nvme.nix` says
+      `true`, `disko/single-direct.nix` says `false`), read by the inventory
+      module, and never guessed: a `boot = "uefi"` host whose layout makes no
+      ESP would install systemd-boot nowhere and come back from its first
+      reboot with no way to start, and a `boot = "direct"` host with an ESP
+      would carry a partition nothing ever writes to.
+
+      The default is `false`, which is the safe direction: a host that names
+      no layout at all has no ESP this flake knows about, and only a
+      `boot = "uefi"` host with an `install` table is held to it.
+    '';
+  };
+
   options.meisterstack.managed = {
     enable = lib.mkOption {
       type = lib.types.bool;

@@ -11,6 +11,12 @@
 # shape evaluates, and `fileSystems."/".device` comes out as
 # /dev/disk/by-partlabel/disk-main-root.
 {
+  # This layout makes an ESP, so a host that uses it boots itself
+  # (`boot = "uefi"` in the inventory). nix/lib/inventory.nix compares the
+  # two and refuses the mismatch rather than installing a boot loader
+  # nowhere.
+  meisterstack.install.hasEsp = true;
+
   disko.devices.disk.main = {
     type = "disk";
     # Set in hosts/<id>.nix:

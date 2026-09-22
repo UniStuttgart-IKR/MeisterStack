@@ -180,6 +180,12 @@
         example-installer = example.packages.${system}.box-installer;
         example-disk-image = example.packages.${system}.box-disk-image;
         example-managed-disk-image = example.packages.${system}.managed-disk-image;
+        # The other boot mode: what a provider is handed for the example
+        # fleet's one `boot = "direct"` host — a kernel, an initrd and the
+        # command line that names the system they belong to.
+        #
+        #   nix build .#example-direct-boot && cat result/cmdline
+        example-direct-boot = example.packages.${system}.n2-direct-boot;
 
         # The generic appliance image, unchanged: the twelve context VMs of
         # the lab boot this, and they will until their migration is done
@@ -315,13 +321,13 @@
           # Both fleets: one-box has a raft group of ONE (no etcd variables),
           # ha has three (1A §8, open point 6).
           render-parity = import ./nix/tests/render-parity.nix {
-            inherit nixpkgs lib pkgs system self;
+            inherit nixpkgs lib pkgs system self disko;
             inv = example.inventory;
             hostIds = [ "box" "n1" ];
             profiles = exampleProfiles;
           };
           render-parity-ha = import ./nix/tests/render-parity.nix {
-            inherit nixpkgs lib pkgs system self;
+            inherit nixpkgs lib pkgs system self disko;
             inv = exampleHa.inventory;
             hostIds = [ "cp-a" "cp-b" "a1" ];
             profiles = exampleProfiles;
@@ -337,6 +343,27 @@
             inherit lib pkgs;
             configs = lib.mapAttrs (_: s: s.config) example.nixosConfigurations;
           };
+
+          # The bundle of the one direct-boot host, built: three names in a
+          # directory, and the command line names the toplevel whose `init`
+          # the kernel is to start. Cheap — the kernel and the initrd are the
+          # ones `example-topology` builds anyway — and it is what keeps the
+          # second boot mode a thing that EXISTS rather than a field in a
+          # contract.
+          example-direct-boot = pkgs.runCommand "direct-boot-is-three-files" { } ''
+            bundle=${example.packages.${system}.n2-direct-boot}
+            test -e "$bundle/kernel" || { echo "no kernel in the bundle"; exit 1; }
+            test -e "$bundle/initrd" || { echo "no initrd in the bundle"; exit 1; }
+            grep -q ' init=/nix/store/.*-nixos-system-n2-.*/init$' "$bundle/cmdline"               || { echo "the command line does not name n2's init:"; cat "$bundle/cmdline"; exit 1; }
+            # And the two names point INTO the store rather than at a copy:
+            # many hosts share one kernel, and a copy per host would be a
+            # gigabyte per host for no fact anybody gains.
+            case "$(readlink -f "$bundle/kernel")" in
+              /nix/store/*) ;;
+              *) echo "the kernel is not a store path"; exit 1 ;;
+            esac
+            touch $out
+          '';
 
           # One CPU host, built. The smallest thing that proves a fleet host
           # is a real system: an agent with no controller of its own, whose

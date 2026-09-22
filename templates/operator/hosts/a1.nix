@@ -16,5 +16,12 @@
   # out in boot order. The layout itself is disko/single-nvme.nix, and the
   # inventory's `install.layout` is what names it.
   #
-  # disko.devices.disk.main.device = "/dev/disk/by-id/nvme-SAMSUNG_MZ…_S6PENX0T123456";
+  # disko.devices.disk.main.device = "/dev/disk/by-id/nvme-SAMSUNG_MZ..._S6PENX0T123456";
+
+  # …and until this host HAS an install table, it is a machine somebody else
+  # partitioned, so it says where its root is itself. Delete these two lines
+  # on the day `install` in fleet.toml names a layout: disko writes them
+  # then, and two authors for one mount is one too many.
+  fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
+  fileSystems."/boot" = { device = "/dev/disk/by-label/ESP"; fsType = "vfat"; };
 }
