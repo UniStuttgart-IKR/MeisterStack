@@ -298,6 +298,13 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # The exit criterion of M2: an operator workstation changes a
+          # managed host over ssh and brings it back, with a receipt for
+          # both (M2C).
+          vm-managed-update = import ./nix/tests/update.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # The boot renderer and the build-time renderer, on the same input.
           # Both fleets: one-box has a raft group of ONE (no etcd variables),
           # ha has three (1A §8, open point 6).
