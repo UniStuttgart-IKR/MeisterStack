@@ -1908,7 +1908,17 @@ fn decide_host(
     }
 
     // --- the guests, and whether they can be got out of the way -----------
-    d.needs_maintenance = !unchanged && host.roles.iter().any(|r| r == "agent");
+    //
+    // `obs.enrolled` is in this condition and not only the role, and the
+    // case it is about is a BOOTSTRAP: a host that carries no identity of
+    // its own has never been able to authenticate to the cluster that hands
+    // out work, so there is nothing on it to move. Asking a cluster to
+    // cordon a node it has never seen is asking for an error message in the
+    // middle of a rollout instead of a rollout. Everywhere else this changes
+    // nothing — an upgrade of a host without an identity is `unenrolled` and
+    // blocked several screens above.
+    d.needs_maintenance =
+        !unchanged && host.roles.iter().any(|r| r == "agent") && obs.enrolled;
     if d.needs_maintenance && policy.workload_control.is_none() {
         d.stop_disruptive.push(format!(
             "{id} carries guests and the inventory has no `[operator] cli_config`, so this \
@@ -4323,6 +4333,44 @@ mod tests {
         let reboot = action(&plan, "n1", ActionKind::Reboot);
         assert_eq!(reboot.current, previous);
         assert_eq!(reboot.desired.as_deref(), Some(desired.as_str()));
+    }
+
+    #[test]
+    fn a_bootstrap_does_not_cordon_a_node_the_cluster_has_never_seen() {
+        // The first `apply` of an agent's life: it has a host key, it has no
+        // certificate, and the cluster it will report to does not know it
+        // exists. `meister node cordon n1 --cluster …` would be a command
+        // about a node nobody ever registered.
+        let base = onebox_enrolled();
+        let running = release_of(base.clone());
+        let mut observation = observed(&running, at(TAKEN));
+        for host in observation.hosts.values_mut() {
+            host.enrolled = false;
+            host.credentials.values_mut().for_each(|v| *v = None);
+            host.units
+                .values_mut()
+                .for_each(|v| *v = "inactive".to_string());
+        }
+        let release = with_new_systems(base, &["box", "n1", "n2"], false);
+        let policy = plan_policy_with_certificates(PlanKind::Bootstrap, &release.resolved_fleet);
+        let plan = plan(&release, "all", &observation, None, &policy, at(NOW)).unwrap();
+
+        for id in ["box", "n1", "n2"] {
+            let steps = kinds(&plan, id);
+            assert!(!steps.contains(&ActionKind::Cordon), "{id}: {steps:?}");
+            assert!(!steps.contains(&ActionKind::Drain), "{id}: {steps:?}");
+            assert!(!steps.contains(&ActionKind::Uncordon), "{id}: {steps:?}");
+            assert!(steps.contains(&ActionKind::Activate), "{id}: {steps:?}");
+        }
+
+        // …and the same fleet once it HAS its identities is drained like any
+        // other: what changed is the state of the host, not the kind of plan.
+        let enrolled = observed(&release_of(onebox_enrolled()), at(TAKEN));
+        let with_identities =
+            crate::plan::plan(&release, "all", &enrolled, None, &policy, at(NOW)).unwrap();
+        let steps = kinds(&with_identities, "n1");
+        assert!(steps.contains(&ActionKind::Cordon), "{steps:?}");
+        assert!(steps.contains(&ActionKind::Drain), "{steps:?}");
     }
 
     // --- lane 3-integration: the boot nobody inside the machine owns ---

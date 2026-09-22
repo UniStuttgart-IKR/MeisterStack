@@ -349,6 +349,21 @@ pkgs.testers.runNixOSTest {
         "> /root/fleet/flake.lock"
     )
 
+    def commit(what):
+        """A manifest names the TREE it came from, and `resolve` refuses a
+        dirty one — so every file this test writes into the repository is
+        committed before the next evaluation, which is also what an operator
+        does with them: `known_hosts`, the requests and the certificates are
+        public and belong in git (lane 3B)."""
+        operator.succeed("git -C /root/fleet add -A")
+        operator.succeed(
+            f"git -C /root/fleet -c user.name=test -c user.email=test@example "
+            f"commit -q --allow-empty -m {shlex.quote(what)}"
+        )
+
+    operator.succeed("git -C /root/fleet init -q")
+    commit("the fleet")
+
     operator.succeed(
         "nix-store --generate-binary-cache-key vm-bootstrap "
         "/root/keys/signing.sec /root/keys/signing.pub"
@@ -574,11 +589,7 @@ pkgs.testers.runNixOSTest {
                 f"sed -i 's|SHA256:PLACEHOLDER-THE-TEST-FILLS-IN-{host}|{fingerprint}|' "
                 f"/etc/vm-fleet/nix-manifest-{name}.json"
             )
-    operator.succeed("git -C /root/fleet init -q")
-    operator.succeed("git -C /root/fleet add -A")
-    operator.succeed(
-        "git -C /root/fleet -c user.name=test -c user.email=test@example commit -qm 'the fleet'"
-    )
+    commit("the fingerprints the machines showed")
 
     # ---------------------------------------------------------------
     # 5. What an upgrade may not do, and what a bootstrap needs first
@@ -649,6 +660,7 @@ pkgs.testers.runNixOSTest {
     )
     assert "CN=system:node:n1" in subject, subject
     assert "O=system:nodes" in subject, subject
+    commit("the requests and the certificates")
     elapsed("enrolled and issued")
 
     # ---------------------------------------------------------------
@@ -817,6 +829,7 @@ pkgs.testers.runNixOSTest {
     ), halt_action["provider_boot"]
     assert "reboot" in {a["class"] for a in the_plan["approvals"]}, the_plan["approvals"]
 
+    booted_before = n1.succeed("readlink -f /run/booted-system").strip()
     # The agent goes first (a node is taken forward before the tier that
     # gives it orders), so the run stops before it ever reaches box.
     out = timed("apply until the halt", lambda: apply(plan_d, release_d, expect=2))
@@ -827,9 +840,13 @@ pkgs.testers.runNixOSTest {
     kernel_d, initrd_d, cmdline_d = bundle_of(BUNDLE_D)
     assert halt["bundle"]["cmdline"] == cmdline_d, (halt["bundle"], cmdline_d)
     assert os.path.realpath(halt["bundle"]["kernel"]["store_path"]) == kernel_d
-    assert generation(n1) == "C", "the switch moved the userland and not the boot"
-    assert n1.succeed("readlink -f /run/booted-system").strip() == \
-        os.path.realpath("/run/booted-system"), "nothing rebooted it"
+    # The switch moved the USERLAND and left the boot where it was: that is
+    # what a direct-boot host looks like between its activation and its
+    # provider's reboot, and it is why the confirmation comes first.
+    assert n1.succeed("readlink -f /run/booted-system").strip() == booted_before, \
+        "something rebooted n1"
+    assert n1.succeed("readlink -f /run/current-system").strip() != booted_before, \
+        "the switch did not take"
 
     # The counter-probe: a resume BEFORE the provider did its half is the
     # same answer again, and nothing moves.
