@@ -25,9 +25,11 @@
 #   the first thing on the wire.
 # * **Poweroff is honoured, and how is visible.** The ACPI power button
 #   reaches userspace as an input event, so busybox' acpid plus `evdev.ko`
-#   out of the same kernel is what turns `ch-remote power-button` into a
-#   clean shutdown. If that module is not there, init SAYS so on the console
-#   instead of looking like a guest that ignores a shutdown.
+#   out of the same kernel is what turns a power button press into a clean
+#   shutdown — and in the pinned nixpkgs kernel evdev is built in, so no
+#   module is needed at all. Either way init SAYS on the console whether it
+#   can hear the button, instead of looking like a guest that ignores a
+#   shutdown.
 { lib
 , stdenvNoCC
 , runCommand
@@ -69,13 +71,17 @@ let
       /bin/busybox sleep 30
     fi
 
-    if [ -f /lib/modules/evdev.ko ] && /bin/busybox insmod /lib/modules/evdev.ko; then
-      /bin/busybox mkdir -p /etc/acpi
-      /bin/busybox acpid -c /etc/acpi 2>/dev/null \
-        && echo "MS-S0-ACPI: listening" \
+    # evdev is built INTO the pinned nixpkgs kernel (CONFIG_INPUT_EVDEV=y),
+    # so the module below is usually absent and that is not a fault; what
+    # decides whether the button can be heard is whether there is an input
+    # node to read, so that is what is looked at.
+    [ -f /lib/modules/evdev.ko ] && /bin/busybox insmod /lib/modules/evdev.ko 2>/dev/null
+    if [ -e /dev/input/event0 ]; then
+      /bin/busybox acpid -c /etc/acpi \
+        && echo "MS-S0-ACPI: listening on $(/bin/busybox cat /sys/class/input/event0/device/name 2>/dev/null)" \
         || echo "MS-S0-ACPI: acpid did not start; the power button will not be seen"
     else
-      echo "MS-S0-ACPI: no evdev in this kernel; the power button will not be seen"
+      echo "MS-S0-ACPI: no input node for the power button; it will not be seen"
     fi
 
     echo "MS-S0-DONE"
