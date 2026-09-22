@@ -72,7 +72,7 @@ let
     groups = ["cp"]
     controller_group = "cp"
     site = "vm"
-    networks.management = { address = "192.168.1.2", prefix = 24, interface = "eth1" }
+    networks.management = { address = "192.168.1.1", prefix = 24, interface = "eth1" }
     ssh.host_key = "SHA256:PLACEHOLDER-THE-TEST-FILLS-THIS-IN"
   '';
 
@@ -127,8 +127,14 @@ pkgs.testers.runNixOSTest {
   name = "meister-keys-roundtrip";
 
   nodes = {
-    # 192.168.1.1. The workstation: the tool, the CA script, a git
-    # repository, a signing key and both of the target's closures.
+    # The workstation: the tool, the CA script, a git repository, a signing
+    # key and both of the target's closures.
+    #
+    # The test framework numbers the nodes in the order Nix sorts their
+    # names and gives each `192.168.1.<number>`, so `box` is .1 and this is
+    # .2. Which is which does not matter as long as the INVENTORY says what
+    # the machine really has — and the first assertion of the script is
+    # exactly that.
     operator = { nodes, ... }: {
       environment.systemPackages = [
         pkgs.meisterstack
@@ -160,7 +166,7 @@ pkgs.testers.runNixOSTest {
       environment.etc."vm-fleet/nix-manifest-b.json".source = manifestOf nodes.unused;
     };
 
-    # 192.168.1.2. The managed host, fresh: no certificate of any kind, and
+    # The managed host, fresh: no certificate of any kind, and
     # its units waiting on a CA certificate that has never arrived.
     box = { ... }: {
       imports = [ boxCommon ];
@@ -192,7 +198,7 @@ pkgs.testers.runNixOSTest {
     box.start()
     operator.wait_for_unit("multi-user.target")
     box.wait_for_unit("sshd.service")
-    box.succeed("ip -4 addr show eth1 | grep -q 'inet 192.168.1.2/24'")
+    box.succeed("ip -4 addr show eth1 | grep -q 'inet 192.168.1.1/24'")
 
     pki = "${pki}"
 
@@ -235,7 +241,7 @@ pkgs.testers.runNixOSTest {
     print(out)
     assert "ssh.host_key" in out, out
     known = operator.succeed("cat /root/fleet/known_hosts")
-    assert known.startswith("192.168.1.2 ssh-ed25519 "), known
+    assert known.startswith("192.168.1.1 ssh-ed25519 "), known
 
     # Twice is not a change.
     again = operator.succeed(
@@ -411,7 +417,7 @@ pkgs.testers.runNixOSTest {
         "openssl x509 -in /root/fleet/pki/issued/box/serving.crt -noout -subject -ext subjectAltName"
     )
     assert "CN=box" in serving, serving
-    assert "IP Address:192.168.1.2" in serving, serving
+    assert "IP Address:192.168.1.1" in serving, serving
     # And the CA never made a key for either of them.
     operator.fail("test -e /root/fleet/pki/issued/box/identity.key")
 
