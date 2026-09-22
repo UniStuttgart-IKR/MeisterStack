@@ -15,18 +15,18 @@
 #
 # So this test does the thing that would expose it: it copies one image
 # twice, boots both copies at once, and asks each of them who it is. And it
-# looks INSIDE the image as well — mounted read-only on a THIRD machine —
-# because "the identity is made at first boot" is only true if the image did
-# not carry one to begin with.
+# looks INSIDE the image as well — the untouched file, hot-plugged read-only
+# into the first machine AFTER it has booted — because "the identity is made
+# at first boot" is only true if the image did not carry one to begin with.
 #
-# Why a third machine and not a second disk on one of the two: the image's
-# root is `/dev/disk/by-label/nixos`, and a copy of the image hung next to
-# it as a second disk carries the SAME label. Stage 1 then mounts whichever
-# of the two udev linked last — measured: under the load of a full
-# `nix flake check` the read-only one won, init exited 1 and the kernel
-# panicked 1.4 s in, while the same test had passed twice on its own. The
-# reader below is an ordinary test node (its root is the driver's, not a
-# label), so the pristine image is only ever a data disk there.
+# Why after the boot and not as a second disk from the start: the image's
+# root is `/dev/disk/by-label/nixos`, and a copy of the image next to it
+# carries the SAME label. Stage 1 then mounts whichever of the two udev
+# linked last — measured: under the load of a full `nix flake check` the
+# read-only one won, init exited 1 and the kernel panicked 1.4 s in, while
+# the same test had passed twice on its own. A disk that appears once root
+# is mounted cannot be chosen as root, and the mount below goes by the
+# disk's serial, never by the label.
 { nixpkgs, lib, pkgs, system, self, disko }:
 
 let
@@ -59,23 +59,7 @@ in
 pkgs.testers.runNixOSTest {
   name = "meister-two-instances-same-image";
 
-  nodes = {
-    # The machine that looks inside the untouched image. An ordinary test
-    # node — booted by the driver with `-kernel`, its root is not found by a
-    # label — with the image itself attached read-only as a data disk.
-    #
-    # The file is named by a symlink the script makes before this node is
-    # started, because the image's file name is the image builder's choice
-    # (the script globs for it) and a qemu option is a string fixed here.
-    # `/build` is `$NIX_BUILD_TOP` inside the sandbox every check runs in;
-    # the script asserts that before it relies on it.
-    reader = { ... }: {
-      virtualisation.qemu.options = [
-        "-drive file=/build/pristine.qcow2,if=none,id=pristine,format=qcow2,readonly=on"
-        "-device virtio-blk-pci,drive=pristine,serial=PRISTINE"
-      ];
-    };
-  };
+  nodes = { };
 
   testScript = ''
     import glob
@@ -113,11 +97,9 @@ pkgs.testers.runNixOSTest {
         return path
 
     def instance(name, disk):
-        # (`machine` is taken: with exactly one node in `nodes`, the driver
-        # binds that name to it.)
-        # ONE disk each. The image itself is read on `reader` (see the
-        # header): a second disk with the same root label is a coin toss
-        # for stage 1.
+        # ONE disk each at boot. The image itself is hot-plugged into the
+        # first machine later (see the header): a second disk with the same
+        # root label at boot is a coin toss for stage 1.
         flags = [
             QEMU, "-m", "2048", "-smp", "2",
             "-drive", f"file={disk},if=none,id=root,format=qcow2,cache=unsafe",
@@ -130,11 +112,6 @@ pkgs.testers.runNixOSTest {
     b = instance("second", copy_of("second"))
     a.start()
     b.start()
-    # The reader's data disk (see `nodes.reader`): the untouched image, by
-    # the name its qemu command line was given.
-    assert work == "/build", f"NIX_BUILD_TOP is {work!r}, and nodes.reader names /build"
-    os.symlink(IMAGE, f"{work}/pristine.qcow2")
-    reader.start()
     a.wait_for_unit("multi-user.target")
     b.wait_for_unit("multi-user.target")
     print(f"[timing] two machines from one image: {time.time() - start:.0f} s")
@@ -167,11 +144,14 @@ pkgs.testers.runNixOSTest {
         assert left == "0", f"{name} has {left} file(s) under {PKI}"
 
     # ---------------------------------------------------------------
-    # And the image itself carried none of it — read on the third machine,
-    # from the untouched file, read-only.
+    # And the image itself carried none of it — the untouched file,
+    # hot-plugged read-only now that the first machine's root is mounted.
     # ---------------------------------------------------------------
-    reader.wait_for_unit("multi-user.target")
-    a, booted = reader, a
+    a.send_monitor_command(
+        f"drive_add 0 file={IMAGE},if=none,id=pristine,format=qcow2,readonly=on"
+    )
+    a.send_monitor_command("device_add virtio-blk-pci,drive=pristine,serial=PRISTINE")
+    a.wait_until_succeeds("test -b /dev/disk/by-id/virtio-PRISTINE", timeout=30)
     a.succeed("mkdir -p /mnt/pristine")
     # The root filesystem of the pristine image, whichever partition it is.
     root = a.succeed(
@@ -227,7 +207,6 @@ pkgs.testers.runNixOSTest {
     a.succeed("umount /mnt/pristine")
 
     a.shutdown()
-    booted.shutdown()
     b.shutdown()
     print("one image, two machines, two identities — and the image had none")
   '';
