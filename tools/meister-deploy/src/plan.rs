@@ -1917,8 +1917,7 @@ fn decide_host(
     // middle of a rollout instead of a rollout. Everywhere else this changes
     // nothing — an upgrade of a host without an identity is `unenrolled` and
     // blocked several screens above.
-    d.needs_maintenance =
-        !unchanged && host.roles.iter().any(|r| r == "agent") && obs.enrolled;
+    d.needs_maintenance = !unchanged && host.roles.iter().any(|r| r == "agent") && obs.enrolled;
     if d.needs_maintenance && policy.workload_control.is_none() {
         d.stop_disruptive.push(format!(
             "{id} carries guests and the inventory has no `[operator] cli_config`, so this \
