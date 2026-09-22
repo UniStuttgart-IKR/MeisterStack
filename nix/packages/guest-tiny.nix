@@ -56,7 +56,11 @@ let
   init = writeText "guest-tiny-init" ''
     #!/bin/sh
     # The whole userspace of this guest.
-    /bin/busybox mkdir -p /proc /sys /dev
+    # /var/log because busybox' acpid opens /var/log/acpid.log unless it is
+    # logging to stderr, and dies with "No such file or directory" if the
+    # directory is missing — measured, and it looked exactly like a guest
+    # that ignores the power button.
+    /bin/busybox mkdir -p /proc /sys /dev /var/log
     /bin/busybox mount -t proc proc /proc 2>/dev/null
     /bin/busybox mount -t sysfs sys /sys 2>/dev/null
     /bin/busybox mount -t devtmpfs dev /dev 2>/dev/null
@@ -121,7 +125,7 @@ let
       passthru = { inherit marker; };
     } ''
     root=$PWD/root
-    mkdir -p $root/bin $root/lib/modules $root/etc/acpi/PWRF $root/proc $root/sys $root/dev
+    mkdir -p $root/bin $root/lib/modules $root/etc/acpi/PWRF $root/proc $root/sys $root/dev $root/var/log
 
     cp ${busybox}/bin/busybox $root/bin/busybox
     chmod +x $root/bin/busybox
