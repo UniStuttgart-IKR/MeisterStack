@@ -453,6 +453,16 @@ struct VerifyArgs {
     #[arg(long, default_value_t = meister_deploy::verify::DEADLINE.as_secs())]
     deadline: u64,
 
+    /// How long ONE guest gets to reach a phase, in seconds. A guest that
+    /// boots in a second still needs a control plane that answers, so this
+    /// is a wait on the answer rather than on the guest.
+    #[arg(long, default_value_t = meister_deploy::verify::SETTLE.as_secs())]
+    settle: u64,
+
+    /// How often to ask, in seconds, while waiting.
+    #[arg(long, default_value_t = meister_deploy::verify::POLL.as_secs())]
+    poll: u64,
+
     /// Leave the guests standing instead of deleting them, and say which.
     /// A suite that deleted nothing has not shown a lifecycle, so every
     /// delete is then `skipped` and a required suite is blocked.
@@ -2727,6 +2737,8 @@ fn verify(args: &VerifyArgs) -> Result<Answer> {
     options.deadline = std::time::Duration::from_secs(args.deadline);
     options.keep = args.keep;
     options.control = control;
+    options.settle = std::time::Duration::from_secs(args.settle);
+    options.poll = std::time::Duration::from_secs(args.poll.max(1));
 
     let clock = RealClock;
     let mut verifier = Verifier::new(
