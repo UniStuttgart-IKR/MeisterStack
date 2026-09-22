@@ -438,7 +438,11 @@ impl ProbeSpec {
 }
 
 /// Whether a path holds public material this tool may hash.
-fn is_certificate(path: &str) -> bool {
+///
+/// Public, because the readiness check that judges a key's mode has to make
+/// the same distinction from the same rule: a certificate is described by
+/// its digest, a key by its mode.
+pub fn is_certificate(path: &str) -> bool {
     path.ends_with(".crt") || path.ends_with(".pem") || path.ends_with(".crl")
 }
 

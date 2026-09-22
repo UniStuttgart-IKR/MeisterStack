@@ -32,6 +32,7 @@ pub mod nix;
 pub mod observation;
 pub mod observe;
 pub mod plan;
+pub mod readiness;
 pub mod receipt;
 pub mod release;
 pub mod run;

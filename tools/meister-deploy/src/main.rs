@@ -20,12 +20,15 @@ use meister_deploy::legacy::ops::{self, Ctx};
 use meister_deploy::legacy::remote::Ssh;
 use meister_deploy::legacy::run::Real as LegacyRunner;
 use meister_deploy::manifest::{self, Contract, NixManifest, Tool};
-use meister_deploy::observation::{Observations, Targets};
+use meister_deploy::observation::{self, Observations, Targets};
+use meister_deploy::observe;
 use meister_deploy::plan::{self, PlanKind};
+use meister_deploy::readiness;
 use meister_deploy::receipt;
 use meister_deploy::release::ReleaseManifest;
 use meister_deploy::run::{Cancel, Policy, Real};
 use meister_deploy::state::{self, StateDir};
+use meister_deploy::transport;
 use meister_deploy::{nix, source};
 
 #[derive(Parser)]
@@ -47,7 +50,8 @@ enum Verb {
     /// one — a Nix derivation, another tool, a person — can be held to it.
     Schema {
         /// `nix-manifest`, `resolved-fleet`, `release`, `observation`,
-        /// `targets`, `plan`, `receipt`, `journal-event` or `check-result`
+        /// `activate-status`, `targets`, `plan`, `status`, `receipt`,
+        /// `journal-event` or `check-result`
         kind: String,
     },
 
@@ -130,6 +134,23 @@ enum Verb {
         dry_run: bool,
     },
 
+    /// What the fleet looks like right now: one read-only round trip per
+    /// host, and the readiness checks drawn from it. Changes nothing.
+    Status(LookArgs),
+
+    /// The readiness checks as a verdict: exit 0 when every required check
+    /// passed, 2 when one of them did not. Creates no test VM and writes no
+    /// etcd key.
+    Check {
+        #[command(flatten)]
+        look: LookArgs,
+        /// Which suite. `readiness` is the one that reads; `vm-lifecycle`,
+        /// `gpu` and `rdma` do work on the fleet and arrive with `verify`
+        /// in M4.
+        #[arg(long, default_value = "readiness")]
+        suite: String,
+    },
+
     /// What a run did: its journal, folded, and its receipt once it has one.
     /// Reads the state directory and asks no host anything.
     Report {
@@ -149,6 +170,54 @@ enum Verb {
     /// Kept whole, with the same flags, because twelve VMs are served by it
     /// today and `plan` means something else from v1 on.
     Legacy(LegacyCli),
+}
+
+/// What `status` and `check` both need: which fleet, which hosts, where
+/// they answer, and whether to ask at all.
+#[derive(Args)]
+struct LookArgs {
+    /// The release to compare against, from `build`
+    #[arg(long)]
+    release: Option<PathBuf>,
+
+    /// A manifest from `resolve`, when there is no release yet. Then
+    /// nothing is compared against a desired system.
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+
+    /// Which hosts: `all`, `host=<id>`, `group=<g>`, `role=<r>`,
+    /// `profile=<p>`, `site=<s>`
+    #[arg(long, default_value = "all")]
+    select: String,
+
+    /// A `targets/1` file from a provider adapter: where each host answers
+    #[arg(long)]
+    targets: Option<PathBuf>,
+
+    /// The operator's repository: its `known_hosts` is what every
+    /// connection is checked against, and its state directory is where the
+    /// snapshot is kept. Defaults to the one the manifest was resolved
+    /// from.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// The ssh key to offer. Without it, ssh uses what it is configured
+    /// with.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+
+    /// How many hosts to ask at once
+    #[arg(long, default_value_t = observe::DEFAULT_CONCURRENCY)]
+    at_once: usize,
+
+    /// Do not ask anybody: answer from the last snapshot in the state
+    /// directory
+    #[arg(long)]
+    offline: bool,
+
+    /// Print the snapshot and the checks as json instead of a table
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -384,6 +453,8 @@ fn run() -> Result<Answer> {
             offline,
         } => resolve(repo, out, fleet, *dev, hosts, *dry_run, *offline).map(Answer::from),
         Verb::Build(args) => build(args).map(Answer::from),
+        Verb::Status(look) => status(look),
+        Verb::Check { look, suite } => check(look, suite),
         Verb::Plan(args) => make_plan(args),
         Verb::Gc {
             keep,
@@ -409,10 +480,14 @@ fn print_schema(kind: &str) -> Result<bool> {
         "plan" => schemars::schema_for!(meister_deploy::plan::DeploymentPlan),
         "receipt" => schemars::schema_for!(meister_deploy::receipt::DeploymentReceipt),
         "journal-event" => schemars::schema_for!(meister_deploy::receipt::JournalEvent),
+        "status" => schemars::schema_for!(readiness::StatusReport),
+        // The contract lane 2C's `meister-activate status --json` answers
+        // with, and the second source `observe` merges into an observation.
+        "activate-status" => schemars::schema_for!(observe::ActivateStatus),
         other => anyhow::bail!(
             "there is no schema called {other:?}; this tool knows nix-manifest, \
-             resolved-fleet, release, observation, targets, plan, receipt, \
-             journal-event and check-result."
+             resolved-fleet, release, observation, activate-status, targets, plan, \
+             status, receipt, journal-event and check-result."
         ),
     };
     println!("{}", serde_json::to_string_pretty(&schema)?);
@@ -512,6 +587,244 @@ fn resolve(
         );
     }
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// status and check
+// ---------------------------------------------------------------------------
+
+/// The fleet, the hosts, the snapshot and the verdicts — what both
+/// read-only verbs work from.
+struct Looked {
+    fleet: manifest::ResolvedFleet,
+    release: Option<ReleaseManifest>,
+    selected: Vec<String>,
+    observation: Observations,
+    checks: Vec<meister_deploy::checks::CheckResult>,
+    /// Where the snapshot was written, for a run that asked.
+    written: Option<PathBuf>,
+}
+
+/// Look at the fleet: one round trip per host, or the last snapshot on disk.
+fn look(args: &LookArgs) -> Result<Looked> {
+    let policy = if args.offline {
+        Policy::offline()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+
+    // A release is the better answer where there is one: it says what each
+    // host SHOULD run, and without that a status can only say what is.
+    let (fleet, release) = match (&args.release, &args.manifest) {
+        (Some(path), _) => {
+            let text = files.read_to_string(path)?;
+            let release = ReleaseManifest::from_json(&text, &path.display().to_string())?;
+            (release.resolved_fleet.clone(), Some(release))
+        }
+        (None, Some(path)) => {
+            let text = files.read_to_string(path)?;
+            (
+                manifest::ResolvedFleet::from_json(&text, &path.display().to_string())?,
+                None,
+            )
+        }
+        (None, None) => anyhow::bail!(
+            "this needs to know what the fleet is: pass --release <file> from `build`, or \
+             --manifest <file> from `resolve` to look without comparing against a release."
+        ),
+    };
+
+    let selected = plan::select(&fleet, &args.select)?;
+    let repo = args
+        .repo
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(&fleet.source.repo_path));
+    let state = StateDir::in_repo(&repo);
+
+    let (observation, written) = if args.offline {
+        let snapshot = state.load_latest_observation(&files)?;
+        eprintln!(
+            "note: nothing was asked of any host. This is the snapshot of {}, and a fleet \
+             moves.",
+            snapshot.taken_at.to_rfc3339()
+        );
+        (snapshot, None)
+    } else {
+        let endpoints = match &args.targets {
+            Some(path) => {
+                let text = files.read_to_string(path)?;
+                let targets = observation::Targets::from_json(&text, &path.display().to_string())?;
+                observation::bind_targets(&fleet, &targets, &selected)?
+            }
+            None => observation::manifest_endpoints(&fleet, &selected)?,
+        };
+        Cancel::on_sigint()?;
+        let runner = Real::new(policy);
+        let ssh = transport::Ssh::for_repo(&repo).with_identity(args.identity.clone());
+        let prober = observe::SshProber::new(&runner, &ssh);
+        let probes: Vec<observe::HostProbe> = selected
+            .iter()
+            .map(|id| {
+                observe::HostProbe::new(
+                    transport::Target::from_endpoint(id, &endpoints[id]),
+                    observe::ProbeSpec::for_host(&fleet.hosts[id]),
+                )
+            })
+            .collect();
+        let snapshot = observe::observe_fleet(&prober, &probes, RealClock.now(), args.at_once)?;
+        let path = state.save_observation(&files, &snapshot, None)?;
+        (snapshot, Some(path))
+    };
+
+    let checks = readiness::readiness_of(&fleet, &selected, &observation, release.as_ref());
+    Ok(Looked {
+        fleet,
+        release,
+        selected,
+        observation,
+        checks,
+        written,
+    })
+}
+
+fn status(args: &LookArgs) -> Result<Answer> {
+    let looked = look(args)?;
+    if args.json {
+        println!("{}", String::from_utf8(report_of(&looked)?.to_json()?)?);
+    } else {
+        print!("{}", status_table(&looked));
+    }
+    if let Some(path) = &looked.written {
+        eprintln!("==> {}", path.display());
+    }
+    // `status` reports; it does not judge. A fleet with a failing check is
+    // not this verb failing, and `check` is the verb that says so with an
+    // exit code.
+    Ok(Answer::Yes)
+}
+
+fn check(args: &LookArgs, suite: &str) -> Result<Answer> {
+    if suite != "readiness" {
+        anyhow::bail!(
+            "the suite {suite:?} does work on the fleet — it starts guests, it uses \
+             hardware — so it is not something `check` does. `check --suite readiness` is \
+             what reads; `verify --suite {suite}` arrives with M4 and takes a budget, a \
+             deadline and an approval."
+        );
+    }
+    let looked = look(args)?;
+    if args.json {
+        println!("{}", String::from_utf8(report_of(&looked)?.to_json()?)?);
+    } else {
+        print!("{}", status_table(&looked));
+    }
+    if let Some(path) = &looked.written {
+        eprintln!("==> {}", path.display());
+    }
+    match meister_deploy::checks::acceptance(&looked.checks) {
+        meister_deploy::checks::Acceptance::Accepted => {
+            eprintln!(
+                "==> every required check passed on {} host(s).",
+                looked.selected.len()
+            );
+            Ok(Answer::Yes)
+        }
+        meister_deploy::checks::Acceptance::Blocked { reasons } => {
+            for reason in &reasons {
+                eprintln!("    blocked: {reason}");
+            }
+            eprintln!(
+                "==> {} required check(s) did not pass. This is not a failure of this tool: \
+                 the fleet is not ready.",
+                reasons.len()
+            );
+            Ok(Answer::Blocked)
+        }
+    }
+}
+
+fn report_of(looked: &Looked) -> Result<readiness::StatusReport> {
+    Ok(readiness::StatusReport {
+        schema: readiness::STATUS_SCHEMA.to_string(),
+        release_id: looked.release.as_ref().map(|r| r.release_id.clone()),
+        manifest_id: looked.fleet.manifest_id.clone(),
+        generated_at: RealClock.now(),
+        observation: looked.observation.clone(),
+        checks: looked.checks.clone(),
+    })
+}
+
+/// One line per host, and then every check that did not pass.
+fn status_table(looked: &Looked) -> String {
+    use meister_deploy::checks::Status;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "==> {} host(s) of the fleet {:?}, as of {}\n",
+        looked.selected.len(),
+        looked.fleet.fleet.name,
+        looked.observation.taken_at.format("%Y-%m-%dT%H:%M:%SZ")
+    ));
+    // The store path last, and not padded: it is the one column whose
+    // width is not this tool's to choose, and a padded one would push
+    // every other column out of line.
+    out.push_str(&format!(
+        "    {:<14} {:<9} {:<6} {:>4}  {:<28} {}\n",
+        "HOST", "REACHABLE", "ENROLL", "GEN", "CHECKS", "SYSTEM"
+    ));
+    for id in &looked.selected {
+        let obs = looked.observation.host(id);
+        let checks: Vec<&meister_deploy::checks::CheckResult> = looked
+            .checks
+            .iter()
+            .filter(|c| c.subject.host.as_deref() == Some(id.as_str()))
+            .collect();
+        let count = |status: Status| checks.iter().filter(|c| c.status == status).count();
+        let summary = format!(
+            "{} pass, {} fail, {} unknown",
+            count(Status::Pass),
+            count(Status::Fail),
+            count(Status::Unknown)
+        );
+        out.push_str(&format!(
+            "    {id:<14} {:<9} {:<6} {:>4}  {:<28} {}\n",
+            match obs {
+                Some(obs) if obs.reachable => "yes",
+                Some(_) => "no",
+                None => "-",
+            },
+            match obs {
+                Some(obs) if obs.enrolled => "yes",
+                Some(_) => "no",
+                None => "-",
+            },
+            obs.and_then(|o| o.generation)
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            summary,
+            obs.and_then(|o| o.current_system.as_deref())
+                .map(short)
+                .unwrap_or("-"),
+        ));
+    }
+    // Then the ones that matter, once each, with what they expected.
+    for check in &looked.checks {
+        if matches!(check.status, Status::Pass | Status::NotApplicable) {
+            continue;
+        }
+        out.push_str(&format!(
+            "    {} {} on {}: {}\n",
+            if check.required {
+                "REQUIRED"
+            } else {
+                "optional"
+            },
+            check.id,
+            check.subject.host.as_deref().unwrap_or("the fleet"),
+            check.reason
+        ));
+    }
+    out
 }
 
 /// Realise what the manifest promised.

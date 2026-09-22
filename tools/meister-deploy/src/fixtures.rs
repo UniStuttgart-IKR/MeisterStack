@@ -196,16 +196,16 @@ pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observati
     for (id, host) in &fleet.hosts {
         let artifacts = &release.artifacts[id];
         let system = artifacts.toplevel.store_path.clone();
-        let mut units = BTreeMap::new();
-        for role in &host.roles {
-            let unit = match role.as_str() {
-                "agent" => "meister-agent.service",
-                "cluster" => "meister-cluster-controller.service",
-                "cloud" => "meister-cloud-controller.service",
-                _ => continue,
-            };
-            units.insert(unit.to_string(), "active".to_string());
-        }
+        // Every unit the probe of this host asks about, so that a fixture
+        // is what a real snapshot of a healthy host looks like: a unit the
+        // probe asked about and nobody answered is `unknown` to the
+        // readiness checks, and a fixture that left half of them out would
+        // make a healthy host look half-read.
+        let units: BTreeMap<String, String> = crate::observe::ProbeSpec::for_host(host)
+            .units
+            .into_iter()
+            .map(|unit| (unit, "active".to_string()))
+            .collect();
         hosts.insert(
             id.clone(),
             HostObservation {
