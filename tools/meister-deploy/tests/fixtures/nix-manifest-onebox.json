@@ -267,7 +267,7 @@
             "socket": "/run/meisterstack/agent.sock"
           },
           "tls": {
-            "identity": "/run/credentials/meister-agent.service/identity.key"
+            "identity": "/var/lib/meisterstack/pki/identity.key"
           }
         },
         "cloud": {
@@ -324,7 +324,7 @@
           "target_path": "/var/lib/meisterstack/pki/identity.key",
           "owner": "root",
           "mode": "0600",
-          "delivery": "systemd-credential",
+          "delivery": "file",
           "reload": {
             "unit": "meister-agent.service",
             "action": "restart"
@@ -353,7 +353,7 @@
           "target_path": "/var/lib/meisterstack/pki/serving.key",
           "owner": "root",
           "mode": "0600",
-          "delivery": "systemd-credential",
+          "delivery": "file",
           "reload": {
             "unit": "meister-cloud-controller.service",
             "action": "restart"
@@ -404,7 +404,7 @@
             "socket": "/run/meisterstack/agent.sock"
           },
           "tls": {
-            "identity": "/run/credentials/meister-agent.service/identity.key"
+            "identity": "/var/lib/meisterstack/pki/identity.key"
           }
         },
         "cloud": null,
@@ -438,7 +438,7 @@
           "target_path": "/var/lib/meisterstack/pki/identity.key",
           "owner": "root",
           "mode": "0600",
-          "delivery": "systemd-credential",
+          "delivery": "file",
           "reload": {
             "unit": "meister-agent.service",
             "action": "restart"
@@ -494,7 +494,7 @@
             "socket": "/run/meisterstack/agent.sock"
           },
           "tls": {
-            "identity": "/run/credentials/meister-agent.service/identity.key"
+            "identity": "/var/lib/meisterstack/pki/identity.key"
           }
         },
         "cloud": null,
@@ -528,7 +528,7 @@
           "target_path": "/var/lib/meisterstack/pki/identity.key",
           "owner": "root",
           "mode": "0600",
-          "delivery": "systemd-credential",
+          "delivery": "file",
           "reload": {
             "unit": "meister-agent.service",
             "action": "restart"

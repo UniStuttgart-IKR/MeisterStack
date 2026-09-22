@@ -70,15 +70,6 @@ pub trait Files {
     /// What is at this path, without following a link.
     fn entry(&self, path: &Path) -> Result<Entry>;
 
-    /// What is IN this directory, one level deep, as full paths. Reading, so
-    /// no policy gate — `--dry-run` and `--offline` both read.
-    ///
-    /// It exists for one question: `init` may only write into a directory
-    /// that is empty or absent, and "empty" is not a thing `exists` can
-    /// answer. A verb that wrote into a directory it had not looked at would
-    /// be a verb that can overwrite somebody's repository.
-    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
-
     /// Make `link` point at `target`, replacing whatever is there. Atomic for
     /// the same reason `write_atomic` is: a snapshot with half a link in it
     /// is a snapshot nix would evaluate.
@@ -88,6 +79,46 @@ pub trait Files {
     /// whole worth is that an entry written before an irreversible action is
     /// on the disk when the machine that was writing it goes away.
     fn append_fsync(&self, path: &Path, line: &str) -> Result<()>;
+
+    /// Create this file, or fail because somebody else already did.
+    ///
+    /// The other half of [`Files::write_atomic`]: that one replaces what is
+    /// there, and this one refuses to. It is what a lock is — `O_EXCL` is
+    /// the only thing on a POSIX filesystem that two processes can race for
+    /// and have exactly one of them win — so it is a door of its own rather
+    /// than a flag on the other, which somebody would eventually pass the
+    /// wrong way round.
+    fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()>;
+
+    /// Remove a file. `Ok(())` when it was not there: this is used to
+    /// release a lock and to drop a garbage-collector root, and in both
+    /// cases "it is gone" is the outcome asked for.
+    fn remove_file(&self, path: &Path) -> Result<()>;
+
+    /// What is directly in this directory, sorted, without walking into it.
+    /// An empty list for a directory that is not there — a state directory
+    /// nobody has written to yet holds no runs, and that is an answer.
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
+
+    /// Remove an EMPTY directory. Not a recursive delete: the only
+    /// directories this tool removes are ones it has just emptied itself
+    /// (a release's garbage-collector roots), and a recursive delete in a
+    /// deployment tool is a foot-gun waiting for a wrong path.
+    fn remove_dir(&self, path: &Path) -> Result<()>;
+}
+
+/// The directory a file lives in, as something that can be opened.
+///
+/// `Path::new("plan.json").parent()` is `Some("")` and not `None`, and an
+/// empty path opens nothing: the temporary lands beside the file either way,
+/// the rename works, and only the directory `fsync` fails — so a bare
+/// relative `--out` used to write the file and then report an error about
+/// it. Both spellings of "the current directory" become `.` here.
+fn parent_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
 }
 
 /// The real one. Refuses every write a `--dry-run` or an `--offline` run is
@@ -133,7 +164,7 @@ impl Files for RealFiles {
 
     fn write_atomic(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         self.may_write(path)?;
-        let dir = path.parent().unwrap_or(Path::new("."));
+        let dir = parent_of(path);
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -194,22 +225,9 @@ impl Files for RealFiles {
         }
     }
 
-    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(path)
-            .with_context(|| format!("reading the directory {} failed", path.display()))?
-        {
-            let entry = entry
-                .with_context(|| format!("reading the directory {} failed", path.display()))?;
-            out.push(entry.path());
-        }
-        out.sort();
-        Ok(out)
-    }
-
     fn symlink_atomic(&self, target: &Path, link: &Path) -> Result<()> {
         self.may_write(link)?;
-        let dir = link.parent().unwrap_or(Path::new("."));
+        let dir = parent_of(link);
         let name = link
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -249,6 +267,72 @@ impl Files for RealFiles {
             .with_context(|| format!("appending to {} failed", path.display()))?;
         file.sync_all()
             .with_context(|| format!("making the new line in {} durable failed", path.display()))
+    }
+
+    fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+        self.may_write(path)?;
+        // Not through a temporary and a rename: a rename REPLACES, and the
+        // whole point here is to lose the race rather than win it silently.
+        // `O_EXCL` is the one operation two processes can both attempt and
+        // exactly one succeed at.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(path)
+            .with_context(|| format!("creating {} failed", path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("writing {} failed", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("making {} durable failed", path.display()))?;
+        // The directory too: a lock that is not durable is a lock a power
+        // cut hands to the next run.
+        std::fs::File::open(parent_of(path))
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("making the new {} durable failed", path.display()))
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        self.may_write(path)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(e).with_context(|| format!("removing {} failed", path.display()));
+            }
+        }
+        std::fs::File::open(parent_of(path))
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("making the removal of {} durable failed", path.display()))
+    }
+
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        self.may_write(path)?;
+        match std::fs::remove_dir(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {} failed", path.display())),
+        }
+    }
+
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {} failed", path.display()));
+            }
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading {} failed", path.display()))?;
+            out.push(entry.path());
+        }
+        // Sorted, so that a listing is the same listing twice: a receipt
+        // that names runs in the order a directory happened to hand them
+        // over is a receipt nobody can diff.
+        out.sort();
+        Ok(out)
     }
 }
 
@@ -389,23 +473,6 @@ impl Files for MemFiles {
         )
     }
 
-    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
-        let prefix = path.to_path_buf();
-        let mut out: Vec<PathBuf> = self
-            .files
-            .borrow()
-            .keys()
-            .chain(self.dirs.borrow().iter())
-            .chain(self.links.borrow().keys())
-            .chain(self.others.borrow().iter())
-            .filter(|p| p.parent() == Some(prefix.as_path()))
-            .cloned()
-            .collect();
-        out.sort();
-        out.dedup();
-        Ok(out)
-    }
-
     fn symlink_atomic(&self, target: &Path, link: &Path) -> Result<()> {
         self.may_write(&format!("link(-> {})", target.display()), link)?;
         self.links
@@ -421,6 +488,66 @@ impl Files for MemFiles {
         buf.extend_from_slice(line.as_bytes());
         buf.push(b'\n');
         Ok(())
+    }
+
+    fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+        self.may_write(&format!("create_new({mode:04o})"), path)?;
+        if self.exists(path) {
+            bail!(
+                "creating {} failed: it already exists in this test.",
+                path.display()
+            );
+        }
+        self.files
+            .borrow_mut()
+            .insert(path.to_path_buf(), bytes.to_vec());
+        self.modes.borrow_mut().insert(path.to_path_buf(), mode);
+        Ok(())
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        self.may_write("remove", path)?;
+        self.files.borrow_mut().remove(path);
+        self.modes.borrow_mut().remove(path);
+        self.links.borrow_mut().remove(path);
+        Ok(())
+    }
+
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        self.may_write("rmdir", path)?;
+        let left = self.list_dir(path)?;
+        if !left.is_empty() {
+            bail!(
+                "removing {} failed: it still holds {} entry/entries in this test.",
+                path.display(),
+                left.len()
+            );
+        }
+        self.dirs.borrow_mut().remove(path);
+        Ok(())
+    }
+
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        // Whatever lies directly under this path, whether somebody made the
+        // directory in this test or only put a file in it.
+        let mut out = BTreeSet::new();
+        let mut take = |candidate: &Path| {
+            if let Ok(rest) = candidate.strip_prefix(path)
+                && let Some(first) = rest.components().next()
+            {
+                out.insert(path.join(first));
+            }
+        };
+        for known in self.files.borrow().keys() {
+            take(known);
+        }
+        for known in self.dirs.borrow().iter() {
+            take(known);
+        }
+        for known in self.links.borrow().keys() {
+            take(known);
+        }
+        Ok(out.into_iter().collect())
     }
 }
 
@@ -497,6 +624,28 @@ impl Clock for FakeClock {
 
 #[cfg(test)]
 mod tests {
+    use super::parent_of;
+
+    #[test]
+    fn a_bare_relative_name_lives_in_the_current_directory() {
+        assert_eq!(
+            parent_of(std::path::Path::new("plan.json")),
+            std::path::Path::new(".")
+        );
+        assert_eq!(
+            parent_of(std::path::Path::new("out/plan.json")),
+            std::path::Path::new("out")
+        );
+        assert_eq!(
+            parent_of(std::path::Path::new("/tmp/plan.json")),
+            std::path::Path::new("/tmp")
+        );
+        assert_eq!(
+            parent_of(std::path::Path::new("/")),
+            std::path::Path::new(".")
+        );
+    }
+
     use super::*;
 
     #[test]

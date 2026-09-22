@@ -159,6 +159,17 @@ pub struct Operator {
     /// Where `tools/meister-ca` keeps its directory, relative to this file.
     #[serde(default)]
     pub ca_dir: Option<String>,
+    /// The nix signing key `build` signs a release with, relative to this
+    /// file.
+    ///
+    /// A PATH and not a key: this file is committed, and the file it points
+    /// at belongs in `.gitignore`. It is named here rather than passed on
+    /// every command because a fleet has one signing key, its public half
+    /// stands in `meisterstack.managed.trustedPublicKeys`, and a release
+    /// signed with a different one is a release no host of this fleet will
+    /// take (M0 probe S12).
+    #[serde(default)]
+    pub signing_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

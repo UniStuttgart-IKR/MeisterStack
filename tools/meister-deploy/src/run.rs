@@ -25,13 +25,12 @@
 //! accepted the connection and then stopped talking: both hang forever, and a
 //! rollout that hangs holds a lock on a fleet.
 
-use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -84,7 +83,7 @@ impl Effect {
 
 impl std::fmt::Display for Effect {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -250,13 +249,24 @@ impl Cmd {
 /// An allowlist rather than a list of dangerous characters: a glob, a brace, a
 /// backtick or a newline in a path all change what a pasted line means, and a
 /// denylist is a list somebody forgets to extend.
-fn shell_quote(a: &str) -> String {
-    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
-    if !a.is_empty() && a.chars().all(safe) {
+///
+/// Public because one string this tool produces is not printed but EXECUTED
+/// by something else: `NIX_SSHOPTS` is handed to nix, which splits it. See
+/// [`crate::transport::Ssh::nix_sshopts`], which uses the same predicate to
+/// decide when a path cannot be passed that way at all.
+pub fn shell_quote(a: &str) -> String {
+    if is_bare(a) {
         a.to_string()
     } else {
         format!("'{}'", a.replace('\'', r"'\''"))
     }
+}
+
+/// Whether a string is a word every shell — and nix's own tokenizer — reads
+/// back as exactly one argument, without quotes around it.
+pub fn is_bare(a: &str) -> bool {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+    !a.is_empty() && a.chars().all(safe)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -563,7 +573,7 @@ impl Runner for Real {
                  The last thing it said was: {}",
                 cmd.line(),
                 cmd.deadline,
-                tail(&cmd.redacted(&stderr))
+                last_lines(&cmd.redacted(&stderr))
             );
         }
         if cancelled {
@@ -625,14 +635,17 @@ fn finish(cmd: &Cmd, out: Output) -> Result<Output> {
         "{} exited {}. It said: {}",
         cmd.line(),
         out.status,
-        tail(&cmd.redacted(said))
+        last_lines(&cmd.redacted(said))
     );
 }
 
 /// The last few lines of what a tool said. `nix` can produce a screen of
 /// progress before the one line that matters, and the one line that matters
 /// is at the end.
-fn tail(text: &str) -> String {
+///
+/// Public because a failed check records what the thing it ran said, and it
+/// records it the same way an error does.
+pub fn last_lines(text: &str) -> String {
     let text = text.trim();
     if text.is_empty() {
         return "(nothing)".to_string();
@@ -711,12 +724,27 @@ impl Matcher {
 /// pre-v1 fake did neither — it answered anything with a default success and
 /// forgot what it was asked — which is how a test could pass while the code
 /// under it ran a command the test had never thought about.
+///
+/// Its state is behind a `Mutex` rather than a `RefCell` so that it is
+/// `Sync`, like [`Real`]: code that asks several hosts at once takes a
+/// `&(dyn Runner + Sync)`, and a fake that could not stand in for the real
+/// runner there would mean that path is only ever exercised for real. The
+/// expectations stay a strict SEQUENCE — a test that lets two threads
+/// through this at once is a test whose command order is a race, and it
+/// will say so by failing.
 pub struct StrictFake {
     policy: Policy,
-    expects: RefCell<VecDeque<(Matcher, Output)>>,
-    calls: RefCell<Vec<String>>,
-    unexpected: RefCell<Vec<String>>,
-    checked: Cell<bool>,
+    expects: Mutex<VecDeque<(Matcher, Output)>>,
+    calls: Mutex<Vec<String>>,
+    unexpected: Mutex<Vec<String>>,
+    checked: AtomicBool,
+}
+
+/// One lock, one sentence: a poisoned mutex here means a test panicked
+/// while holding it, and the panic that poisoned it is the failure worth
+/// reading.
+fn held<T>(guard: std::sync::LockResult<T>) -> T {
+    guard.expect("a StrictFake is only locked in its own methods")
 }
 
 impl Default for StrictFake {
@@ -729,10 +757,10 @@ impl StrictFake {
     pub fn new() -> StrictFake {
         StrictFake {
             policy: Policy::real(),
-            expects: RefCell::new(VecDeque::new()),
-            calls: RefCell::new(Vec::new()),
-            unexpected: RefCell::new(Vec::new()),
-            checked: Cell::new(false),
+            expects: Mutex::new(VecDeque::new()),
+            calls: Mutex::new(Vec::new()),
+            unexpected: Mutex::new(Vec::new()),
+            checked: AtomicBool::new(false),
         }
     }
 
@@ -743,23 +771,23 @@ impl StrictFake {
 
     /// The next command must match this, and will be answered with that.
     pub fn expect(self, matcher: Matcher, reply: Output) -> StrictFake {
-        self.expects.borrow_mut().push_back((matcher, reply));
+        held(self.expects.lock()).push_back((matcher, reply));
         self
     }
 
     /// Every command line that reached this runner, in order, redacted the
     /// same way a log line would be.
     pub fn calls(&self) -> Vec<String> {
-        self.calls.borrow().clone()
+        held(self.calls.lock()).clone()
     }
 
     /// Every expectation was used and no unexpected command arrived. A test
     /// that calls this takes responsibility for the answer; a test that does
     /// not gets the same verdict from `Drop`, as a panic.
     pub fn verify(&self) -> Result<()> {
-        self.checked.set(true);
-        let unused = self.expects.borrow();
-        let unexpected = self.unexpected.borrow();
+        self.checked.store(true, Ordering::SeqCst);
+        let unused = held(self.expects.lock());
+        let unexpected = held(self.unexpected.lock());
         if unused.is_empty() && unexpected.is_empty() {
             return Ok(());
         }
@@ -794,7 +822,7 @@ impl Drop for StrictFake {
         // A test that already failed gets one message, not two: panicking
         // inside a panic aborts the process and takes the real failure's
         // output with it.
-        if self.checked.get() || std::thread::panicking() {
+        if self.checked.load(Ordering::SeqCst) || std::thread::panicking() {
             return;
         }
         if let Err(e) = self.verify() {
@@ -807,8 +835,8 @@ impl Runner for StrictFake {
     fn run(&self, cmd: &Cmd) -> Result<Output> {
         self.policy.gate(cmd)?;
         let line = cmd.line();
-        self.calls.borrow_mut().push(line.clone());
-        let mut expects = self.expects.borrow_mut();
+        held(self.calls.lock()).push(line.clone());
+        let mut expects = held(self.expects.lock());
         match expects.front() {
             Some((matcher, _)) if matcher.matches(cmd) => {
                 let (_, reply) = expects.pop_front().expect("just matched it");
@@ -818,12 +846,12 @@ impl Runner for StrictFake {
             Some((matcher, _)) => {
                 let wanted = matcher.describe();
                 drop(expects);
-                self.unexpected.borrow_mut().push(line.clone());
+                held(self.unexpected.lock()).push(line.clone());
                 bail!("this runner expected `{wanted}` and got `{line}`.");
             }
             None => {
                 drop(expects);
-                self.unexpected.borrow_mut().push(line.clone());
+                held(self.unexpected.lock()).push(line.clone());
                 bail!("this runner expected nothing more and got `{line}`.");
             }
         }

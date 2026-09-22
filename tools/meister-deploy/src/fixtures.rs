@@ -1,0 +1,309 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+// SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+
+//! The fleet the unit tests of this crate argue about.
+//!
+//! One fixture, built from the file lane 1B has to produce —
+//! `tests/fixtures/nix-manifest-onebox.json`, read through the real
+//! [`crate::manifest::NixManifest`] parser and the real
+//! [`crate::manifest::resolve`]. So a test about a plan is a test about a
+//! manifest that would actually validate, and a change to the contract
+//! breaks these tests where it should: at the contract.
+//!
+//! Three hosts: `box` (cloud, cluster, agent, addons — a raft group of ONE,
+//! which is the singleton case), `n1` and `n2` (agents in the `compute`
+//! group). Compiled only for tests.
+
+use std::collections::BTreeMap;
+
+use chrono::{DateTime, Utc};
+
+use crate::manifest::{NixManifest, ResolvedFleet, Source, Tool};
+use crate::observation::{
+    BootedKernel, EtcdMember, EtcdView, HostObservation, Identity, Mount, Observations,
+};
+use crate::plan::{PlanKind, PlanPolicy, WorkloadControl};
+use crate::release::{
+    BootArtifacts, BuildEnv, ConfigArtifact, HostArtifacts, ReleaseManifest, Reproducibility,
+    StoreArtifact, bind,
+};
+
+/// The one-box fixture, resolved. Three hosts: `box` (four roles, a raft
+/// group of one), `n1` and `n2` (compute).
+pub fn onebox() -> ResolvedFleet {
+    let text = include_str!("../tests/fixtures/nix-manifest-onebox.json");
+    let nix = NixManifest::from_json(text, "the one-box fixture").expect("the fixture parses");
+    crate::manifest::resolve(nix, source(), tool(), at("2026-09-21T10:00:00Z"), None)
+        .expect("the fixture resolves")
+}
+
+pub fn at(ts: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(ts)
+        .expect("a literal this file controls")
+        .with_timezone(&Utc)
+}
+
+fn source() -> Source {
+    Source {
+        repo_path: "/home/silas/git/meisterstack-lab".to_string(),
+        git_rev: Some("f83cd70".to_string()),
+        tree_hash: Some("8a1c".to_string()),
+        dirty: false,
+        fingerprint: "git:f83cd70:8a1c".to_string(),
+        dev_mode: None,
+        flake_lock: BTreeMap::new(),
+        inventory_path: "fleet.toml".to_string(),
+        inventory_sha256: "0".repeat(64),
+    }
+}
+
+fn tool() -> Tool {
+    Tool {
+        name: "meister-deploy".to_string(),
+        version: "0.1.0".to_string(),
+        git_rev: None,
+    }
+}
+
+pub fn build_env() -> BuildEnv {
+    BuildEnv {
+        nix_version: "2.35.2".to_string(),
+        system: "x86_64-linux".to_string(),
+        builders: Vec::new(),
+        substituters: vec!["https://cache.nixos.org".to_string()],
+        signing_key_name: Some("fleet-1".to_string()),
+        sandbox: true,
+    }
+}
+
+/// Artifacts that say exactly what the manifest promised.
+pub fn artifacts_for(resolved: &ResolvedFleet) -> BTreeMap<String, HostArtifacts> {
+    resolved
+        .hosts
+        .iter()
+        .map(|(id, host)| {
+            (
+                id.clone(),
+                HostArtifacts {
+                    toplevel: StoreArtifact {
+                        store_path: host.build.toplevel_out.clone(),
+                        nar_hash: format!("sha256:{id}-toplevel"),
+                        nar_size: 1_000_000,
+                        closure_size: 2_000_000_000,
+                        signatures: vec![format!("fleet-1:{id}")],
+                    },
+                    installer_iso: None,
+                    disk_image: None,
+                    boot: BootArtifacts {
+                        kernel_store_path: host.build.boot.kernel_out.clone(),
+                        initrd_store_path: host.build.boot.initrd_out.clone(),
+                        kernel_params_sha256: host.build.boot.kernel_params_sha256.clone(),
+                    },
+                    config_files: host
+                        .config_artifacts
+                        .iter()
+                        .map(|(name, path)| {
+                            (
+                                name.clone(),
+                                ConfigArtifact {
+                                    store_path: path.clone(),
+                                    sha256: "0".repeat(64),
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+            )
+        })
+        .collect()
+}
+
+pub fn reproducibility() -> Reproducibility {
+    Reproducibility {
+        inputs_pinned: true,
+        bit_identical_verified: false,
+        method: None,
+    }
+}
+
+pub fn release_of(resolved: ResolvedFleet) -> ReleaseManifest {
+    let artifacts = artifacts_for(&resolved);
+    bind(
+        resolved,
+        artifacts,
+        BTreeMap::new(),
+        Vec::new(),
+        build_env(),
+        Vec::new(),
+        reproducibility(),
+        at("2026-09-21T11:00:00Z"),
+    )
+    .expect("the fixture binds")
+}
+
+/// The same fleet with every host enrolled.
+///
+/// `n2` has no host key in the file on purpose — it is the fixture's
+/// unenrolled host — and most tests about a rollout are not about that, so
+/// they start from here. The manifest id is recomputed, because a fleet
+/// whose content was edited and whose id was not is a fleet
+/// `validate` refuses.
+pub fn onebox_enrolled() -> ResolvedFleet {
+    let mut fleet = onebox();
+    for (id, host) in fleet.hosts.iter_mut() {
+        if host.ssh.host_key_fingerprint.is_none() {
+            host.ssh.host_key_fingerprint = Some(format!("SHA256:enrolled-{id}"));
+        }
+    }
+    fleet.manifest_id =
+        crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
+    fleet
+}
+
+/// A release in which the named hosts got a new system — which is what a
+/// changed profile or a changed input actually looks like: a new evaluation,
+/// a new manifest, a new set of store paths.
+pub fn with_new_systems(
+    mut fleet: ResolvedFleet,
+    hosts: &[&str],
+    new_kernel: bool,
+) -> ReleaseManifest {
+    for id in hosts {
+        let host = fleet
+            .hosts
+            .get_mut(*id)
+            .unwrap_or_else(|| panic!("{id} is in the fixture"));
+        host.build.toplevel_drv = format!("/nix/store/next{id}-nixos-system-{id}-25.11.drv");
+        host.build.toplevel_out = format!("/nix/store/next{id}-nixos-system-{id}-25.11");
+        if new_kernel {
+            host.build.boot.kernel_out = "/nix/store/next-linux-6.12.48/bzImage".to_string();
+            host.build.boot.initrd_out = "/nix/store/next-initrd-linux-6.12.48/initrd".to_string();
+            host.build.boot.kernel_params_sha256 = "3b8fnnnnnnnn".to_string();
+            host.build.boot.kernel_version = "6.12.48".to_string();
+        }
+    }
+    fleet.manifest_id =
+        crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
+    release_of(fleet)
+}
+
+/// Every host of this release, running exactly what it says, with nothing in
+/// the way. The starting point every test about a rollout departs from.
+pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observations {
+    let fleet = &release.resolved_fleet;
+    let mut hosts = BTreeMap::new();
+    for (id, host) in &fleet.hosts {
+        let artifacts = &release.artifacts[id];
+        let system = artifacts.toplevel.store_path.clone();
+        // Every unit the probe of this host asks about, so that a fixture
+        // is what a real snapshot of a healthy host looks like: a unit the
+        // probe asked about and nobody answered is `unknown` to the
+        // readiness checks, and a fixture that left half of them out would
+        // make a healthy host look half-read.
+        let units: BTreeMap<String, String> = crate::observe::ProbeSpec::for_host(host)
+            .units
+            .into_iter()
+            .map(|unit| (unit, "active".to_string()))
+            .collect();
+        hosts.insert(
+            id.clone(),
+            HostObservation {
+                reachable: true,
+                identity: Identity {
+                    hostname: Some(host.name.clone()),
+                    machine_id: Some(format!("machine-id-of-{id}")),
+                    host_key_fingerprint: host
+                        .ssh
+                        .host_key_fingerprint
+                        .clone()
+                        .or_else(|| Some(format!("SHA256:seen-{id}"))),
+                },
+                current_system: Some(system.clone()),
+                booted_system: Some(system.clone()),
+                next_boot_system: Some(system),
+                generation: Some(42),
+                kernel_running: Some(host.build.boot.kernel_version.clone()),
+                kernel_booted: Some(BootedKernel {
+                    kernel_store_path: artifacts.boot.kernel_store_path.clone(),
+                    initrd_store_path: artifacts.boot.initrd_store_path.clone(),
+                    kernel_params_sha256: artifacts.boot.kernel_params_sha256.clone(),
+                }),
+                units,
+                mounts: host
+                    .persistence
+                    .iter()
+                    .map(|p| Mount {
+                        path: p.path.clone(),
+                        device: p.device_ref.replace("label:", "/dev/disk/by-label/"),
+                        fstype: "ext4".to_string(),
+                    })
+                    .collect(),
+                credentials: host
+                    .secret_refs
+                    .iter()
+                    .map(|s| (s.id.clone(), Some(format!("fingerprint-of-{}", s.id))))
+                    .collect(),
+                etcd: etcd_view(fleet, id),
+                vms_running: host.roles.iter().any(|r| r == "agent").then_some(0),
+                open_txns: Vec::new(),
+                lock: None,
+                capabilities: host.hardware.capabilities.clone(),
+                enrolled: true,
+                unknown_reason: None,
+            },
+        );
+    }
+    Observations {
+        schema: crate::observation::OBSERVATION_SCHEMA.to_string(),
+        taken_at,
+        provisional: false,
+        hosts,
+    }
+}
+
+/// What etcd would report on a host that is a member of a raft group: the
+/// membership the fleet itself declares in `initial_cluster`.
+fn etcd_view(fleet: &ResolvedFleet, id: &str) -> Option<EtcdView> {
+    let host = fleet.hosts.get(id)?;
+    let in_raft = host.groups.iter().any(|g| {
+        fleet
+            .groups
+            .get(g)
+            .map(|group| group.kind == crate::manifest::GroupKind::Raft)
+            .unwrap_or(false)
+    });
+    if !in_raft {
+        return None;
+    }
+    let declared = host
+        .effective_settings
+        .etcd
+        .as_ref()?
+        .get("initial_cluster")?
+        .as_str()?
+        .to_string();
+    let members = declared
+        .split(',')
+        .filter_map(|entry| entry.trim().split_once('='))
+        .map(|(name, url)| EtcdMember {
+            id: format!("{name}-member-id"),
+            name: name.to_string(),
+            peer_urls: vec![url.to_string()],
+            healthy: true,
+        })
+        .collect::<Vec<_>>();
+    Some(EtcdView {
+        member_id: Some(format!("{id}-member-id")),
+        healthy: true,
+        members,
+    })
+}
+
+/// An operator who has the cli the drain needs.
+pub fn plan_policy(kind: PlanKind) -> PlanPolicy {
+    PlanPolicy::new(kind).with_workload_control(Some(WorkloadControl {
+        cli_config: "cli.toml".to_string(),
+        cli_profile: Some("cloud-mtls".to_string()),
+    }))
+}

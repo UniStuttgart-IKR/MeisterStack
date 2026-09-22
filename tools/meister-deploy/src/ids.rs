@@ -76,7 +76,11 @@ impl IdKind {
             // A release and a plan embed a manifest that already carries its
             // own id, so the same three fields inside it are covered by that.
             IdKind::Release => &["release_id", "created_at", "build_env"],
-            IdKind::Plan => &["plan_id", "created_at"],
+            // `expires_at` is `created_at` plus a constant, so it says WHEN
+            // as well — and leaving it in would mean the same release and
+            // the same observation planned twice were two plans, which is
+            // exactly the property an approval quotes.
+            IdKind::Plan => &["plan_id", "created_at", "expires_at"],
         }
     }
 }
