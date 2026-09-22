@@ -250,13 +250,24 @@ impl Cmd {
 /// An allowlist rather than a list of dangerous characters: a glob, a brace, a
 /// backtick or a newline in a path all change what a pasted line means, and a
 /// denylist is a list somebody forgets to extend.
-fn shell_quote(a: &str) -> String {
-    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
-    if !a.is_empty() && a.chars().all(safe) {
+///
+/// Public because one string this tool produces is not printed but EXECUTED
+/// by something else: `NIX_SSHOPTS` is handed to nix, which splits it. See
+/// [`crate::transport::Ssh::nix_sshopts`], which uses the same predicate to
+/// decide when a path cannot be passed that way at all.
+pub fn shell_quote(a: &str) -> String {
+    if is_bare(a) {
         a.to_string()
     } else {
         format!("'{}'", a.replace('\'', r"'\''"))
     }
+}
+
+/// Whether a string is a word every shell — and nix's own tokenizer — reads
+/// back as exactly one argument, without quotes around it.
+pub fn is_bare(a: &str) -> bool {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+    !a.is_empty() && a.chars().all(safe)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
