@@ -382,17 +382,23 @@ pub(super) async fn all_volumes(st: &ApiState) -> Result<Vec<Volume>, ApiError> 
 /// Asked by the create and by the resize, and `except` is the difference
 /// between them: the volume being resized comes out of the sum so that its
 /// new size can go back in. `None` on a create.
+///
+/// The yes comes with the tenant's fence, read before the volumes are, and
+/// the caller writes through it — the same door `check_quota` hands out, and
+/// for the same reason (F03): two volumes that each saw the room for one
+/// were two writes to two keys, and nothing arbitrated them.
 pub(super) async fn check_storage_quota(
     st: &ApiState,
     pool: &StoragePool,
     tenant: &str,
     gib: u64,
     except: Option<&str>,
-) -> Result<(), ApiError> {
+) -> Result<Fence, ApiError> {
+    let fence = st.store.fence(&quota::fence(tenant)).await?;
     let held =
         quota::StorageUsage::of(tenant, &pool.metadata.name, &all_volumes(st).await?, except);
     let Err(why) = quota::check_storage(pool, tenant, held.plus(gib)) else {
-        return Ok(());
+        return Ok(fence);
     };
     Err(conflict(why))
 }
@@ -501,8 +507,6 @@ pub(super) async fn create_volume(
     let pools = st.store.list::<StoragePool>().await?;
     let pool = pick_storage_pool(&pools, Some(body.spec.pool.as_str()))?;
 
-    check_storage_quota(&st, pool, &owner, body.spec.size_gib, None).await?;
-
     let mut spec = body.spec;
     spec.tenant = owner.clone();
     spec.pool = pool.metadata.name.clone();
@@ -512,10 +516,18 @@ pub(super) async fn create_volume(
     // ever uses, and until the first report the object then named a path that
     // was nowhere.
     let volume = new_volume(&body.metadata.name, spec);
-    let created = match dry.preview(&volume) {
-        Some(preview) => preview,
-        None => st.store.create(&volume).await?,
-    };
+    // The quota and the write as one decision: see `admission`.
+    let (st_, volume_, owner_) = (&st, &volume, owner.as_str());
+    let created = admit(owner_, move || async move {
+        let fence = check_storage_quota(st_, pool, owner_, volume_.spec.size_gib, None).await?;
+        #[cfg(test)]
+        super::admission_tests::admission_gate(owner_).await;
+        match dry.preview(volume_) {
+            Some(preview) => Ok(Some(preview)),
+            None => create_under(st_, volume_, Some(&fence)).await,
+        }
+    })
+    .await?;
 
     info!(volume = %created.metadata.name, tenant = %owner, pool = %created.spec.pool,
           size_gib = created.spec.size_gib, "volume reserved");
@@ -631,23 +643,30 @@ pub(super) async fn update_volume(
     // new size goes back in. Only when it GROWS — an edit that holds no more
     // than it did is not a storage question, even for a tenant an operator
     // has since put under its own usage.
-    if body.spec.size_gib > current.spec.size_gib {
-        let pool: StoragePool = st.store.get(&current.spec.pool).await?;
-        check_storage_quota(
-            &st,
-            &pool,
-            &current.spec.tenant,
-            body.spec.size_gib,
-            Some(&name),
-        )
-        .await?;
-    }
+    // And through the same fence, see `admission`.
     body.status = current.status.clone();
     controller_api::carry_generation(&current, &mut body)?;
-    match dry.preview(&body) {
-        Some(preview) => Ok(Json(preview)),
-        None => Ok(Json(st.store.update(&body).await?)),
+    if body.spec.size_gib <= current.spec.size_gib {
+        return match dry.preview(&body) {
+            Some(preview) => Ok(Json(preview)),
+            None => Ok(Json(st.store.update(&body).await?)),
+        };
     }
+    let pool: StoragePool = st.store.get(&current.spec.pool).await?;
+    let tenant = current.spec.tenant.as_str();
+    let (st_, body_, pool_, name_) = (&st, &body, &pool, name.as_str());
+    let stored = admit(tenant, move || async move {
+        let fence =
+            check_storage_quota(st_, pool_, tenant, body_.spec.size_gib, Some(name_)).await?;
+        #[cfg(test)]
+        super::admission_tests::admission_gate(tenant).await;
+        match dry.preview(body_) {
+            Some(preview) => Ok(Some(preview)),
+            None => update_under(st_, body_, Some(&fence)).await,
+        }
+    })
+    .await?;
+    Ok(Json(stored))
 }
 
 /// Give the storage back — or say so, and wait.

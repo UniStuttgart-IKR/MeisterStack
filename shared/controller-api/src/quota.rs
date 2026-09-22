@@ -47,6 +47,17 @@
 use crate::resources::{StoragePool, TenantQuota, TenantUsage, Vm, Volume, VolumePhaseKind};
 use crate::scheduler::Capacity;
 
+/// The fence every write that makes `tenant` hold more goes through — VMs
+/// and storage alike, one door per tenant. See [`crate::store::Fence`].
+///
+/// Everything below here answers "would this tenant be inside its ceiling";
+/// the fence is what makes that answer still true at the moment of the write.
+/// Without it the check was a check-then-act, and two admissions that both
+/// looked before either wrote both got in (F03).
+pub fn fence(tenant: &str) -> String {
+    format!("quota/{tenant}")
+}
+
 /// What a tenant holds, and what it would hold.
 ///
 /// One type for both, because the check is the same question either way:
