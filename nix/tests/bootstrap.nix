@@ -885,7 +885,7 @@ pkgs.testers.runNixOSTest {
     n1.shutdown()
     n1 = provider_boot("n1-rebooted", kernel_d, initrd_d, cmdline_d, "52:54:00:12:01:03")
     timed("provider reboot", lambda: (n1.start(allow_reboot=True), n1.wait_for_unit("multi-user.target")))
-    assert f"meister.round=D" in n1.succeed("cat /proc/cmdline")
+    assert "meister.round=D" in n1.succeed("cat /proc/cmdline")
 
     # …and now the resume finishes n1 and goes on to box, which reboots
     # itself through the helper.
