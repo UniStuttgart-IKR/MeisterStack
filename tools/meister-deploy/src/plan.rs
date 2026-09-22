@@ -1502,8 +1502,22 @@ fn decide_host(
         return settle(d, HostVerdict::Unreachable);
     }
 
-    // --- identity -------------------------------------------------------
-    let mut unenrolled = false;
+    // --- identity, which is two things and not one ------------------------
+    //
+    // SSH enrollment is the host key in the operator's `known_hosts` (D10).
+    // Every connection this tool makes runs with `StrictHostKeyChecking=yes`
+    // against that file, so a host the fleet has no key for cannot be talked
+    // to AT ALL — not by an upgrade and not by a bootstrap either. A
+    // bootstrap does not create it: `keys enroll` does, from a fingerprint a
+    // person read off a console or an installer's output.
+    //
+    // The SERVICE identity is a certificate, and that is what a bootstrap
+    // delivers. A host that answers on a known key and carries no
+    // certificate yet is exactly what `--kind bootstrap` is for.
+    //
+    // Conflating the two would make a bootstrap plan steps over a transport
+    // that cannot open, and the failure would arrive as an ssh error in the
+    // middle of a rollout rather than as a sentence before it.
     match (
         &host.ssh.host_key_fingerprint,
         &obs.identity.host_key_fingerprint,
@@ -1521,24 +1535,32 @@ fn decide_host(
             "the snapshot does not say which host key answered for {id}, so this tool cannot \
              tell whether it is the machine the fleet enrolled."
         )),
-        (None, _) => unenrolled = true,
+        (None, _) => {
+            d.stop_all.push(format!(
+                "the fleet has no host key for {id}, so nothing can connect to it: every ssh \
+                 this tool makes checks the key against the operator's known_hosts. Run \
+                 `keys enroll {id} --fingerprint SHA256:…` first, with the fingerprint from \
+                 the machine's console or its installer output — a bootstrap delivers \
+                 certificates, it does not enroll a host key."
+            ));
+            d.current_system = obs.current_system.clone();
+            d.reboot_required = true;
+            return settle(d, HostVerdict::Unenrolled);
+        }
     }
-    if unenrolled || !obs.enrolled {
-        let why = format!(
-            "{id} is installed and not enrolled: {}. An upgrade acts on a host the fleet can \
-             identify; a bootstrap is what gives it an identity.",
-            if unenrolled {
-                "the fleet has no host key for it"
-            } else {
-                "the host reports no identity of its own"
-            }
-        );
+    if !obs.enrolled {
+        // No service identity of its own. That is the state a bootstrap
+        // exists to leave behind, and the state an upgrade cannot act from.
         if policy.kind == PlanKind::Bootstrap {
             d.preconditions.push(format!(
-                "{id} is not enrolled yet, which is what this bootstrap is for"
+                "{id} has no identity of its own yet, which is what this bootstrap delivers"
             ));
         } else {
-            d.stop_all.push(why);
+            d.stop_all.push(format!(
+                "{id} is installed and reports no identity of its own. An upgrade acts on a \
+                 host that is already part of the fleet; `plan --kind bootstrap` is what \
+                 delivers the certificates that make it one."
+            ));
             d.current_system = obs.current_system.clone();
             d.reboot_required = true;
             return settle(d, HostVerdict::Unenrolled);
@@ -3219,22 +3241,55 @@ mod tests {
     }
 
     #[test]
-    fn a_host_the_fleet_has_no_key_for_is_unenrolled_and_an_upgrade_cannot_act() {
+    fn a_host_the_fleet_has_no_key_for_is_blocked_in_every_kind_of_plan() {
         // n2 has no host key in the fixture — that is exactly this state.
+        // Nothing can connect to it, so nothing can be planned for it: a
+        // bootstrap delivers certificates and does not enroll an ssh key.
         let base = onebox();
         let running = release_of(base.clone());
         let observation = observed(&running, at(TAKEN));
         let release = with_new_systems(base, &["n2"], false);
+        for kind in [PlanKind::Upgrade, PlanKind::Bootstrap] {
+            let made = plan(
+                &release,
+                "host=n2",
+                &observation,
+                None,
+                &plan_policy(kind),
+                at(NOW),
+            )
+            .unwrap();
+            assert_eq!(made.hosts["n2"].verdict, HostVerdict::Unenrolled, "{kind}");
+            let why = &made.hosts["n2"].reasons[0];
+            assert!(why.contains("no host key for n2"), "{kind}: {why}");
+            assert!(
+                why.contains("keys enroll n2 --fingerprint"),
+                "{kind}: {why}"
+            );
+            assert!(
+                action(&made, "n2", ActionKind::Activate).is_blocked(),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_with_a_key_and_no_certificate_is_what_a_bootstrap_is_for() {
+        // The other half of the same distinction: the ssh key is enrolled,
+        // the service identity is not. An upgrade cannot act; a bootstrap
+        // is exactly the plan that delivers it.
+        let base = onebox_enrolled();
+        let running = release_of(base.clone());
+        let mut observation = observed(&running, at(TAKEN));
+        observation.hosts.get_mut("n2").unwrap().enrolled = false;
+        let release = with_new_systems(base, &["n2"], false);
+
         let upgraded = planned(&release, "host=n2", &observation);
         assert_eq!(upgraded.hosts["n2"].verdict, HostVerdict::Unenrolled);
-        assert!(
-            upgraded.hosts["n2"].reasons[0].contains("installed and not enrolled"),
-            "{:?}",
-            upgraded.hosts["n2"].reasons
-        );
-        assert!(action(&upgraded, "n2", ActionKind::Activate).is_blocked());
+        let why = &upgraded.hosts["n2"].reasons[0];
+        assert!(why.contains("reports no identity of its own"), "{why}");
+        assert!(why.contains("--kind bootstrap"), "{why}");
 
-        // A bootstrap is what gives it an identity, so it is allowed there.
         let bootstrapped = plan(
             &release,
             "host=n2",
@@ -3245,6 +3300,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bootstrapped.hosts["n2"].verdict, HostVerdict::Change);
+        assert!(
+            kinds(&bootstrapped, "n2").contains(&ActionKind::DeliverSecret),
+            "{:?}",
+            kinds(&bootstrapped, "n2")
+        );
     }
 
     #[test]
