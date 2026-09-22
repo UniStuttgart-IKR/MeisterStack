@@ -63,6 +63,11 @@ struct TableLook {
     /// Hosts whose activation leaves the record a real one leaves: pending,
     /// waiting for a word.
     keeps_the_record: RefCell<BTreeSet<String>>,
+    /// Hosts whose kernel comes from OUTSIDE (lane 3-integration): an
+    /// activation moves their userland and leaves what they booted exactly
+    /// where it was, because the thing that decides that is a hypervisor.
+    /// [`TableLook::provider_boots`] is the test playing that hypervisor.
+    from_outside: RefCell<BTreeSet<String>>,
     asked: RefCell<Vec<String>>,
 }
 
@@ -82,8 +87,23 @@ impl TableLook {
             txns: RefCell::new(BTreeMap::new()),
             lost: RefCell::new(BTreeSet::new()),
             keeps_the_record: RefCell::new(BTreeSet::new()),
+            from_outside: RefCell::new(BTreeSet::new()),
             asked: RefCell::new(Vec::new()),
         }
+    }
+
+    /// This host has no boot loader: what it RUNS follows an activation and
+    /// what it BOOTED does not (lane 3-integration).
+    fn boots_from_outside(self, id: &str) -> TableLook {
+        self.from_outside.borrow_mut().insert(id.to_string());
+        self
+    }
+
+    /// The test as the provider: the bundle was loaded and the machine was
+    /// restarted, so from now on it answers with what the release says it
+    /// booted.
+    fn provider_boots(&self, id: &str) {
+        self.from_outside.borrow_mut().remove(id);
     }
 
     /// The new system of this host comes up with a unit that failed.
@@ -168,6 +188,13 @@ impl Look for TableLook {
                 HostObservation::unreachable(format!("{id} is rebooting"))
             }
         };
+        // A guest whose kernel is loaded from outside: the switch moved its
+        // userland, and its boot is still the one the provider last started
+        // it with.
+        if phase == Phase::After && self.from_outside.borrow().contains(&id) {
+            obs.booted_system = self.before[&id].booted_system.clone();
+            obs.kernel_booted = self.before[&id].kernel_booted.clone();
+        }
         if phase == Phase::After && self.broken.borrow().contains(&id) {
             obs.units
                 .insert("meister-agent.service".to_string(), "failed".to_string());
@@ -295,6 +322,21 @@ impl Fixture {
         let before = release_of(onebox_enrolled());
         let observation = observed(&before, at(NOW));
         Fixture::of(release, observation, "all")
+    }
+
+    /// The same, with `n1` turned into a guest whose hypervisor loads its
+    /// kernel — and a release that changes exactly that (lane
+    /// 3-integration).
+    fn changing_direct(new_kernel: bool) -> Fixture {
+        let base = crate::fixtures::with_direct_host(onebox_enrolled(), "n1");
+        let before = crate::fixtures::direct_release_of(base.clone());
+        let observation = observed(&before, at(NOW));
+        let release = crate::fixtures::direct_release_of(crate::fixtures::with_new_toplevels(
+            base,
+            &["n1"],
+            new_kernel,
+        ));
+        Fixture::of(release, observation, "host=n1")
     }
 
     /// A fleet that already runs the release.
@@ -1712,4 +1754,301 @@ fn a_unit_is_poked_only_when_it_is_running() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// lane 3-integration: the step this tool does not take
+// ---------------------------------------------------------------------------
+
+/// Everything a direct-boot host's rollout runs BEFORE the halt, in order.
+/// The halt itself is what each of the three tests below does differently.
+fn up_to_the_halt(fx: &Fixture) -> StrictFake {
+    let top = fx.top("n1");
+    StrictFake::new()
+        .expect(helper("box", &["lock", "acquire", "--run", "run-1"]), ok())
+        .expect(helper("n1", &["lock", "acquire", "--run", "run-1"]), ok())
+        .expect(
+            Matcher::exact("nix", ["copy", "--to", "ssh-ng://root@10.0.0.11", &top]),
+            Output::stdout(""),
+        )
+        .expect(
+            Matcher::prefix("nix", ["path-info", "--json", "--closure-size"]),
+            Output::stdout(fx.path_info("n1")),
+        )
+        .expect(helper("n1", &["stage", &top]), ok())
+        .expect(cli("cordon", "n1"), Output::stdout(""))
+        .expect(cli("drain", "n1"), Output::stdout(""))
+        .expect(
+            helper(
+                "n1",
+                &[
+                    "activate",
+                    "--txn",
+                    "run-1",
+                    "--toplevel",
+                    &top,
+                    // The userland half, and only it: a boot-mode activation
+                    // needs a boot menu, and this machine has none.
+                    "--mode",
+                    "switch",
+                    "--confirm-within",
+                    "300",
+                    "--run",
+                    "run-1",
+                ],
+            ),
+            ok(),
+        )
+        .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+}
+
+#[test]
+fn a_direct_host_stops_in_front_of_its_provider_and_writes_the_bundle_down() {
+    let fx = Fixture::changing_direct(true);
+    assert_eq!(
+        kinds(&fx.plan, "n1"),
+        [
+            ActionKind::Preflight,
+            ActionKind::Lock,
+            ActionKind::Stage,
+            ActionKind::Cordon,
+            ActionKind::Drain,
+            ActionKind::Activate,
+            ActionKind::Verify,
+            ActionKind::Confirm,
+            ActionKind::ProviderReboot,
+            ActionKind::Verify,
+            ActionKind::Uncordon,
+            ActionKind::Unlock,
+        ],
+        "these expectations are written for exactly this sequence"
+    );
+    let look = TableLook::new(&fx).boots_from_outside("n1");
+    // The locks go back when the run ends, which a halt is: holding a fleet
+    // while somebody arranges a hypervisor would be holding it for hours.
+    let runner = World::new(
+        up_to_the_halt(&fx)
+            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok())
+            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok()),
+        &look,
+    );
+
+    let applied = fx
+        .executor(&runner, &look, fx.options())
+        .run()
+        .expect("a halt is an answer and not an error");
+    runner.verify().expect("every expectation was used");
+
+    // Nothing rebooted anything: no `systemctl reboot` and no second
+    // activation anywhere in what this run ran.
+    for call in runner.calls() {
+        assert!(!call.contains("systemctl reboot"), "{call}");
+    }
+
+    let wait = applied
+        .waiting
+        .expect("the run says what it is waiting for");
+    assert_eq!(wait.host, "n1");
+    assert_eq!(wait.run_id, "run-1");
+    let bundle = fx.release.artifacts["n1"]
+        .direct_boot
+        .clone()
+        .expect("a direct host has a bundle");
+    assert_eq!(wait.bundle, bundle);
+
+    // The sentence names the three values and the way back.
+    let said = wait.sentence();
+    assert!(said.contains(&bundle.kernel.store_path), "{said}");
+    assert!(said.contains(&bundle.initrd.store_path), "{said}");
+    assert!(said.contains(&bundle.cmdline), "{said}");
+    assert!(said.contains("apply --resume run-1"), "{said}");
+
+    // …and the machine-readable form carries them as data.
+    let json = wait.to_json();
+    assert_eq!(json["waiting_for"], "provider-reboot");
+    assert_eq!(json["host"], "n1");
+    assert_eq!(json["resume"], "run-1");
+    assert_eq!(json["bundle"]["cmdline"], bundle.cmdline);
+    assert_eq!(
+        json["bundle"]["kernel"]["store_path"],
+        bundle.kernel.store_path
+    );
+
+    // The journal: the step began, it never ended, and the line that says
+    // where the run stopped carries the bundle.
+    let events = fx.journal_lines("run-1");
+    let begun = events.iter().any(|e| {
+        e.event == EventKind::ActionBegin
+            && e.payload.get("kind").and_then(|k| k.as_str()) == Some("provider-reboot")
+    });
+    assert!(begun, "the step is in the journal");
+    let ended = events.iter().any(|e| {
+        e.event == EventKind::ActionEnd
+            && e.payload.get("kind").and_then(|k| k.as_str()) == Some("provider-reboot")
+    });
+    assert!(!ended, "a step that did not happen has no end");
+    let halt = events
+        .iter()
+        .find(|e| e.to.as_deref() == Some("awaiting-reboot"))
+        .expect("the host is waiting for a reboot");
+    assert_eq!(halt.host.as_deref(), Some("n1"));
+    assert_eq!(
+        halt.payload["waiting_for"].as_str(),
+        Some("provider-reboot")
+    );
+    assert_eq!(halt.payload["bundle"]["cmdline"], bundle.cmdline);
+    assert!(
+        events.iter().any(|e| e.event == EventKind::RunEnd),
+        "the run ended rather than hanging"
+    );
+
+    // The receipt says where it stopped and does not call it success.
+    assert_eq!(applied.receipt.hosts["n1"].state, HostState::AwaitingReboot);
+    assert_ne!(applied.receipt.outcome, Outcome::Success);
+}
+
+#[test]
+fn a_resume_before_the_provider_has_been_halts_again_and_changes_nothing() {
+    // The counter-probe the lane brief asks for: `apply --resume` BEFORE the
+    // provider did its half is the same answer again, not a reboot and not a
+    // failure.
+    let fx = Fixture::changing_direct(true);
+    let look = TableLook::new(&fx).boots_from_outside("n1");
+    let runner = World::new(
+        up_to_the_halt(&fx)
+            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok())
+            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok()),
+        &look,
+    );
+    let first = fx
+        .executor(&runner, &look, fx.options())
+        .run()
+        .expect("the first run halts");
+    runner.verify().expect("every expectation was used");
+    assert!(first.waiting.is_some());
+
+    // The machine still boots what it booted. The resume takes the locks
+    // again, asks, and stops at the same place — no stage, no activation,
+    // no confirmation.
+    let mut options = fx.options();
+    options.resume = true;
+    let look = TableLook::new(&fx).boots_from_outside("n1");
+    look.set("n1", Phase::After);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire", "--run", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "acquire", "--run", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok())
+            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok()),
+        &look,
+    );
+    let again = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("a second halt is an answer too");
+    runner.verify().expect("nothing but the doors");
+    let wait = again.waiting.expect("it is still waiting");
+    assert_eq!(wait.host, "n1");
+    for call in runner.calls() {
+        assert!(!call.contains("activate"), "{call}");
+        assert!(!call.contains("stage"), "{call}");
+        assert!(!call.contains("systemctl reboot"), "{call}");
+    }
+    assert_eq!(again.receipt.hosts["n1"].state, HostState::AwaitingReboot);
+}
+
+#[test]
+fn a_resume_after_the_provider_has_been_asks_the_machine_and_finishes() {
+    let fx = Fixture::changing_direct(true);
+    let look = TableLook::new(&fx).boots_from_outside("n1");
+    let runner = World::new(
+        up_to_the_halt(&fx)
+            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok())
+            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok()),
+        &look,
+    );
+    fx.executor(&runner, &look, fx.options())
+        .run()
+        .expect("the first run halts");
+    runner.verify().expect("every expectation was used");
+
+    // The provider loaded the bundle and restarted the guest. Everything the
+    // resume does after that is: look, and finish.
+    let look = TableLook::new(&fx);
+    look.set("n1", Phase::After);
+    look.provider_boots("n1");
+    let mut options = fx.options();
+    options.resume = true;
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire", "--run", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "acquire", "--run", "run-1"]), ok())
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(
+                helper("n1", &["txn", "retire", "--txn", "run-1", "--run", "run-1"]),
+                ok(),
+            )
+            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok())
+            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok()),
+        &look,
+    );
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("every expectation was used");
+
+    assert!(applied.waiting.is_none(), "it is not waiting any more");
+    assert_eq!(applied.stopped, None, "{:?}", applied.stopped);
+    assert_eq!(applied.receipt.outcome, Outcome::Success);
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+    assert_eq!(applied.receipt.hosts["n1"].state, HostState::Committed);
+    // Nothing was activated a second time and nothing was copied again.
+    for call in runner.calls() {
+        assert!(!call.contains("nix copy"), "{call}");
+        assert!(!call.contains("meister-activate --json activate"), "{call}");
+    }
+    // The step that did happen says what the machine answered.
+    let evidence = applied.receipt.hosts["n1"]
+        .actions
+        .iter()
+        .filter(|a| a.kind == ActionKind::ProviderReboot)
+        .flat_map(|a| a.evidence.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(evidence.contains(&fx.top("n1")), "{evidence}");
+}
+
+#[test]
+fn a_halt_and_a_resume_are_the_v17_table_and_not_a_recovery() {
+    // The table itself, which is what a resume of a host that never opened a
+    // transaction stands on: a `reboot_only` direct host is switched,
+    // unbooted and holds no record at all, and asking the txn view first
+    // would call that `recovery-required`.
+    use crate::receipt::{HostRun, Step, next_step};
+
+    let mut run = HostRun::new("n1");
+    run.state = HostState::AwaitingReboot;
+    run.actions.push(crate::receipt::ActionRun {
+        seq: 7,
+        kind: ActionKind::ProviderReboot,
+        started: at(NOW),
+        ended: None,
+        result: None,
+        evidence: Vec::new(),
+        cmd_refs: Vec::new(),
+    });
+    for view in [TxnView::None, TxnView::Confirmed] {
+        assert_eq!(
+            next_step(&run, &view),
+            Step::AtTheProviderReboot,
+            "{view:?}"
+        );
+    }
+
+    // And once the step has ended, the table is the ordinary one again.
+    run.actions[0].ended = Some(at(NOW));
+    run.actions[0].result = Some(ActionResult::Ok);
+    run.state = HostState::Verifying;
+    assert_eq!(next_step(&run, &TxnView::Confirmed), Step::VerifyOnly);
 }

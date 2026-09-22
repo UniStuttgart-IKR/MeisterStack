@@ -2277,6 +2277,24 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
     if let Some(why) = &applied.stopped {
         eprintln!("==> {why}");
     }
+    // --- lane 3-integration: the halt ------------------------------------
+    //
+    // On stdout and on one line, whatever `--json` says: the thing that
+    // reads this is the launcher that will do the loading and the
+    // rebooting, and it must not have to parse a table or a sentence for
+    // three store paths. (stdout already carries the run id on a line of
+    // its own, so a second line is the shape this verb already has.)
+    if let Some(wait) = &applied.waiting {
+        println!("{}", serde_json::to_string(&wait.to_json())?);
+        eprintln!(
+            "==> {} is waiting for its provider. Nothing else was started.",
+            wait.host
+        );
+        // An answer, not a failure: exit 2 is what this tool says when it
+        // worked and the fleet is not where the plan wants it yet.
+        return Ok(Answer::Blocked);
+    }
+    // --- end lane 3-integration -------------------------------------------
     match (applied.receipt.outcome, applied.blocked.is_empty()) {
         (receipt::Outcome::Success, true) => Ok(Answer::Yes),
         // It worked, and the plan refused to touch something. Exit 2 is

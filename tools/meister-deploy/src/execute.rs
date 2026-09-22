@@ -159,7 +159,86 @@ pub struct Applied {
     /// Hosts whose steps the plan refused. Not a failure of the run — the
     /// plan said so before it started.
     pub blocked: Vec<String>,
+    // --- lane 3-integration ---
+    /// Set when the run stopped in front of a `provider-reboot`: which host,
+    /// which bytes somebody has to load, and the run to come back to. Not a
+    /// failure — the exit code is 2, the same "this is an answer and not a
+    /// crash" a blocked plan gets.
+    pub waiting: Option<ProviderWait>,
+    // --- end lane 3-integration ---
 }
+
+// --- lane 3-integration: the halt ------------------------------------------
+
+/// A run that stopped in front of the one step it may not take.
+///
+/// It is an error type because that is how it travels out of the step it
+/// happened in — but it is not a failure of anything: the rollout did
+/// everything it could do from here, and what is left is a hypervisor
+/// somebody else drives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderWait {
+    pub host: String,
+    pub run_id: String,
+    pub bundle: crate::release::DirectBoot,
+}
+
+impl ProviderWait {
+    /// The sentence a person reads, with the three values and the command
+    /// that comes after them.
+    pub fn sentence(&self) -> String {
+        format!(
+            "the provider has to load kernel {} ({}) / initrd {} ({}) / cmdline {:?} for host \
+             {} and reboot it; then `meister-deploy apply --resume {}`.",
+            short_hash(&self.bundle.kernel.sha256),
+            self.bundle.kernel.store_path,
+            short_hash(&self.bundle.initrd.sha256),
+            self.bundle.initrd.store_path,
+            self.bundle.cmdline,
+            self.host,
+            self.run_id
+        )
+    }
+
+    /// The same, for the thing that will actually do it. A launcher
+    /// (`lab.py boot publish` + `lab.py reboot` in L2) reads this rather
+    /// than the sentence: three store paths and a command line are what it
+    /// needs, and reading them out of prose is how an adapter breaks the
+    /// first time somebody improves the wording.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "waiting_for": "provider-reboot",
+            "host": self.host,
+            "bundle": self.bundle,
+            "resume": self.run_id,
+        })
+    }
+}
+
+impl std::fmt::Display for ProviderWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.sentence())
+    }
+}
+
+impl std::error::Error for ProviderWait {}
+
+/// The first twelve characters of a `sha256:…` or a bare digest, for a
+/// sentence somebody compares by eye against what they uploaded.
+fn short_hash(digest: &str) -> String {
+    let bare = digest.strip_prefix("sha256:").unwrap_or(digest);
+    bare.chars().take(12).collect()
+}
+
+/// Why [`Executor::walk_waves`] stopped, when it did.
+enum Stop {
+    /// A host did not come through, and the sentence says which and why.
+    Failed(String),
+    /// The plan reached the step this tool does not take.
+    Provider(ProviderWait),
+}
+
+// --- end lane 3-integration ------------------------------------------------
 
 /// How this run looks at a host.
 ///
@@ -345,9 +424,19 @@ impl<'a> Executor<'a> {
             stopped = Some(format!("{e:#}"));
         }
 
+        // --- lane 3-integration ---
+        let mut waiting: Option<ProviderWait> = None;
         if stopped.is_none() {
-            stopped = self.walk_waves(&journal, &mut hosts);
+            match self.walk_waves(&journal, &mut hosts) {
+                None => {}
+                Some(Stop::Failed(why)) => stopped = Some(why),
+                Some(Stop::Provider(wait)) => {
+                    stopped = Some(wait.sentence());
+                    waiting = Some(wait);
+                }
+            }
         }
+        // --- end lane 3-integration ---
 
         // Whatever happened, the locks this run took go back — otherwise the
         // next run needs `--takeover` for a rollout that simply ended.
@@ -377,6 +466,7 @@ impl<'a> Executor<'a> {
                 .filter(|(_, h)| h.verdict.blocks())
                 .map(|(id, _)| id.clone())
                 .collect(),
+            waiting,
         })
     }
 
@@ -391,7 +481,7 @@ impl<'a> Executor<'a> {
         &self,
         journal: &Journal,
         hosts: &mut BTreeMap<String, HostRunState>,
-    ) -> Option<String> {
+    ) -> Option<Stop> {
         for wave in 0..=self.plan.last_wave() {
             let in_wave: Vec<String> = self
                 .plan
@@ -409,24 +499,34 @@ impl<'a> Executor<'a> {
             let mut failed: Vec<String> = Vec::new();
             for id in &in_wave {
                 if self.cancel.is_cancelled() {
-                    return Some(format!(
+                    return Some(Stop::Failed(format!(
                         "this run was interrupted before {id}; what was already started is in \
                          the journal and on the hosts."
-                    ));
+                    )));
                 }
                 match self.run_host(journal, id, wave, hosts) {
                     Ok(()) => {}
-                    Err(e) => {
-                        failed.push(format!("{id}: {e:#}"));
-                    }
+                    // --- lane 3-integration ---
+                    // A halt is not a failure and must not be folded into
+                    // one: the run did everything it could from here, and
+                    // what is left is outside this program. It ends the run
+                    // rather than the host, because the fleet's own order
+                    // is what a wave means — taking the next host forward
+                    // while this one runs a kernel nobody arranged yet
+                    // would be a rollout that overtook itself.
+                    Err(e) => match e.downcast::<ProviderWait>() {
+                        Ok(wait) => return Some(Stop::Provider(wait)),
+                        Err(e) => failed.push(format!("{id}: {e:#}")),
+                    },
+                    // --- end lane 3-integration ---
                 }
             }
             if !failed.is_empty() {
-                return Some(format!(
+                return Some(Stop::Failed(format!(
                     "wave {wave} did not come through: {}. Nothing of wave {} was started.",
                     failed.join("; "),
                     wave + 1
-                ));
+                )));
             }
         }
         None
@@ -459,6 +559,22 @@ impl<'a> Executor<'a> {
             match self.resume_point(journal, id, hosts)? {
                 Resume::Done => return Ok(()),
                 Resume::Carry => {}
+                // --- lane 3-integration ---
+                Resume::AtTheProviderReboot => {
+                    // The same set as after an activation, plus the
+                    // confirmation: a halt happens AFTER it, so repeating it
+                    // would be confirming a transaction that is already
+                    // confirmed (or none at all).
+                    skip.extend([
+                        ActionKind::Stage,
+                        ActionKind::DeliverSecret,
+                        ActionKind::Cordon,
+                        ActionKind::Drain,
+                        ActionKind::Activate,
+                        ActionKind::Confirm,
+                    ]);
+                }
+                // --- end lane 3-integration ---
                 Resume::AfterTheActivation { confirmed } => {
                     // Everything up to and including the activation happened
                     // on the machine, and the target is what said so. The
@@ -749,12 +865,18 @@ impl<'a> Executor<'a> {
                     // Two shapes reach it: a `deliver-secret` only host
                     // (lane 3B) and a `reboot_only` one (2B) — neither of
                     // them activates anything.
-                    if !self
-                        .plan
-                        .actions_for(id)
-                        .iter()
-                        .any(|a| a.kind == ActionKind::Confirm && !a.is_blocked())
-                    {
+                    //
+                    // `a.seq > action.seq` and not "has a confirm at all":
+                    // a direct-boot host verifies TWICE — once for the
+                    // switch, before the confirmation, and once for what
+                    // its provider booted, after the halt. The second one
+                    // is the last word on that host, and a host whose last
+                    // word was never written ends the run in whatever state
+                    // it last moved to, which the receipt reads as
+                    // `unknown` (lane 3-integration).
+                    if !self.plan.actions_for(id).iter().any(|a| {
+                        a.kind == ActionKind::Confirm && !a.is_blocked() && a.seq > action.seq
+                    }) {
                         self.move_to(journal, id, hosts, HostState::Committed, fresh.host(id))?;
                     }
                 } else {
@@ -795,7 +917,21 @@ impl<'a> Executor<'a> {
                     vec![line],
                 )?;
                 let fresh = fresh.unwrap_or_else(|| self.plan.observation.clone());
-                self.move_to(journal, id, hosts, HostState::Committed, fresh.host(id))?;
+                // Committed unless something still has to happen to this
+                // host. On a direct-boot host the confirmation is not the
+                // end: it is what makes the switch survive the wait in
+                // front of the provider's reboot (lane 3-integration).
+                // Calling it committed there would make a resume read
+                // `Done` and skip the reboot the plan exists for.
+                let more_to_come = self.plan.actions_for(id).iter().any(|a| {
+                    a.kind == ActionKind::ProviderReboot && !a.is_blocked() && a.seq > action.seq
+                });
+                let next = if more_to_come {
+                    HostState::Verifying
+                } else {
+                    HostState::Committed
+                };
+                self.move_to(journal, id, hosts, next, fresh.host(id))?;
             }
             ActionKind::Unlock => {
                 self.begin(journal, id, action)?;
@@ -853,16 +989,67 @@ impl<'a> Executor<'a> {
                     action.kind
                 );
             }
-            // --- lane 3-integration: the halt is position 2 ---------------
+            // --- lane 3-integration: the step this tool does not take -----
+            //
+            // Nothing is started here and nothing is waited for. The machine
+            // is asked one question — have you booted what this plan wants —
+            // and the two answers are "carry on" and "the run ends here,
+            // with the bytes somebody has to load".
+            //
+            // No polling, on purpose: what happens next is a person or an
+            // adapter uploading a kernel and telling a hypervisor to restart
+            // a guest, and a workstation that sat on an ssh connection for
+            // that would be a workstation that has to stay awake for it.
+            // The journal is what carries the run across the gap.
             ActionKind::ProviderReboot => {
-                bail!(
-                    "the step {} on {id} is a {} and this tool stops at it; carrying the halt \
-                     out is the next position of this lane. Nothing was done to {id} in this \
-                     step.",
-                    action.seq,
-                    action.kind
-                );
-            }
+                let fresh = fresh.expect("a provider-reboot is validated, so it was looked at");
+                let seen = fresh.host(id);
+                let desired = action
+                    .desired
+                    .clone()
+                    .unwrap_or_else(|| self.plan.hosts[id].desired_system.clone());
+                self.begin(journal, id, action)?;
+                let booted = seen.and_then(|o| o.booted_system.clone());
+                if booted.as_deref() == Some(desired.as_str()) {
+                    // The provider has been here. The evidence is the
+                    // machine's own answer and not this tool's memory of
+                    // having printed something.
+                    let mut evidence = vec![format!("{id} booted {desired}")];
+                    if let Some(kernel) = seen.and_then(|o| o.kernel_booted.as_ref()) {
+                        evidence.push(format!(
+                            "it booted the kernel {} with the initrd {}",
+                            kernel.kernel_store_path, kernel.initrd_store_path
+                        ));
+                    }
+                    self.end(journal, id, action, ActionResult::Ok, evidence, Vec::new())?;
+                    self.move_to(journal, id, hosts, HostState::Verifying, seen)?;
+                } else {
+                    let wait = self.provider_wait(id, action)?;
+                    let from = self.entry(hosts, id).state;
+                    // The halt, with the bundle in it: a run that comes back
+                    // tomorrow, or a person reading the journal, gets the
+                    // three values out of the file rather than out of a
+                    // terminal somebody closed.
+                    self.write(
+                        journal,
+                        EventKind::HostState,
+                        Some(id),
+                        Some((from, HostState::AwaitingReboot)),
+                        serde_json::json!({
+                            "system": seen.and_then(|o| o.current_system.clone()),
+                            "generation": seen.and_then(|o| o.generation),
+                            "booted": booted,
+                            "waiting_for": "provider-reboot",
+                            "bundle": wait.bundle,
+                            "resume": self.options.run_id,
+                        }),
+                    )?;
+                    self.set_state(hosts, id, HostState::AwaitingReboot);
+                    // The step keeps no `action.end`: it did not end. That is
+                    // what a resume reads to know where this run stopped.
+                    return Err(anyhow::Error::new(wait));
+                }
+            } // --- end lane 3-integration -----------------------------------
         }
         Ok(())
     }
@@ -1207,6 +1394,46 @@ impl<'a> Executor<'a> {
         .map(|cmd| cmd.expect(Expect::ExitZero))
     }
 
+    // --- lane 3-integration ---
+    /// What a provider has to be handed for this host, out of the plan and
+    /// with the release as the second reading.
+    ///
+    /// The PLAN first, because the plan is what an approval was given for:
+    /// a bundle read out of the release at this moment could be a bundle
+    /// somebody rebuilt since. They are compared, and a disagreement is a
+    /// sentence rather than a choice.
+    fn provider_wait(&self, id: &str, action: &Action) -> Result<ProviderWait> {
+        let from_plan = action.provider_boot.as_ref();
+        let from_release = self
+            .release
+            .artifacts
+            .get(id)
+            .and_then(|a| a.direct_boot.as_ref());
+        let bundle = match (from_plan, from_release) {
+            (Some(planned), Some(built)) if planned != built => bail!(
+                "the plan says {id} is to be booted from {} and the release now carries {}. \
+                 A halt hands somebody bytes to load, so the two have to be the same bytes; \
+                 make the plan again.",
+                planned.bundle_store_path,
+                built.bundle_store_path
+            ),
+            (Some(planned), _) => planned.clone(),
+            (None, Some(built)) => built.clone(),
+            (None, None) => bail!(
+                "the step {} on {id} is a provider-reboot and neither the plan nor the release \
+                 says which kernel, initrd and command line a provider would load. Nothing was \
+                 done to {id}.",
+                action.seq
+            ),
+        };
+        Ok(ProviderWait {
+            host: id.to_string(),
+            run_id: self.options.run_id.clone(),
+            bundle,
+        })
+    }
+    // --- end lane 3-integration ---
+
     /// Tell the host to reboot. The connection dies with it, and that is the
     /// expected answer rather than an error.
     fn reboot(&self, id: &str) -> Result<Vec<String>> {
@@ -1456,6 +1683,18 @@ impl<'a> Executor<'a> {
         match next_step(run, &view) {
             Step::Done => Ok(Resume::Done),
             Step::StartOver | Step::ResumeFromStage => Ok(Resume::Carry),
+            // --- lane 3-integration ---
+            Step::AtTheProviderReboot => {
+                // The transaction comes from the JOURNAL, and may be none:
+                // a host that was only waiting for its boot (switched, never
+                // booted) never opened one. What is skipped is the whole
+                // preparation, because it happened.
+                self.entry(hosts, id).txn = run.txn_id.clone();
+                self.entry(hosts, id).moved = run.txn_id.is_some();
+                self.set_state(hosts, id, HostState::AwaitingReboot);
+                Ok(Resume::AtTheProviderReboot)
+            }
+            // --- end lane 3-integration ---
             Step::VerifyOnly => {
                 self.entry(hosts, id).txn = run.txn_id.clone();
                 self.set_state(hosts, id, HostState::Verifying);
@@ -1990,6 +2229,11 @@ enum Resume {
     /// The activation is behind us. What is left is the verification and,
     /// unless somebody already confirmed, the confirmation.
     AfterTheActivation { confirmed: bool },
+    // --- lane 3-integration ---
+    /// The run stopped in front of the provider's reboot. Everything before
+    /// it happened; the step itself asks the machine again.
+    AtTheProviderReboot,
+    // --- end lane 3-integration ---
 }
 
 /// Whether a step changes something and therefore has to be preceded by a
@@ -2007,6 +2251,10 @@ fn needs_validation(kind: ActionKind) -> bool {
             | ActionKind::Drain
             | ActionKind::Activate
             | ActionKind::Reboot
+            // A provider-reboot changes nothing here and is validated all
+            // the same: the fresh look is the whole step — it is what
+            // decides between carrying on and stopping.
+            | ActionKind::ProviderReboot
             | ActionKind::Confirm
             | ActionKind::Uncordon
             | ActionKind::Install

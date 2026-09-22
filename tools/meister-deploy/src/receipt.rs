@@ -457,6 +457,28 @@ pub struct HostRun {
 }
 
 impl HostRun {
+    // --- lane 3-integration ---
+    /// The `provider-reboot` this run stopped in front of, if it did.
+    ///
+    /// In a journal a halt looks exactly like an interruption — a step that
+    /// began and has no end — and it is the one place where that is not a
+    /// question about what happened. This tool never starts a provider's
+    /// reboot, so a `provider-reboot` with no end means the run reached it,
+    /// wrote the bundle down and stopped; nothing was half-done, because
+    /// nothing was done.
+    ///
+    /// The LAST one and only then whether it ended: a resume that halted
+    /// again writes a second beginning, and a resume that got through wrote
+    /// an end after the first one.
+    pub fn open_provider_reboot(&self) -> Option<&ActionRun> {
+        self.actions
+            .iter()
+            .rev()
+            .find(|a| a.kind == ActionKind::ProviderReboot)
+            .filter(|a| a.ended.is_none())
+    }
+    // --- end lane 3-integration ---
+
     /// A host the journal says nothing about. What a resume starts from when
     /// the run died before it reached this host.
     pub fn new(id: impl Into<String>) -> HostRun {
@@ -770,6 +792,13 @@ pub enum Step {
     RecoveryRequired(String),
     /// There is nothing left to do here.
     Done,
+    // --- lane 3-integration ---
+    /// The run stopped in front of a `provider-reboot`. The preparation is
+    /// behind us — staged, delivered, switched and confirmed — and the step
+    /// itself is the question "has the provider been here", which the step
+    /// asks the machine rather than this table.
+    AtTheProviderReboot,
+    // --- end lane 3-integration ---
 }
 
 /// The V17 table.
@@ -780,6 +809,20 @@ pub enum Step {
 /// third arm: an irreversible step with no end in the journal is decided by
 /// the TARGET and never by repeating it.
 pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
+    // --- lane 3-integration: the halt, before anything else -------------
+    //
+    // First, because it is the only case in this table where the journal
+    // KNOWS what happened next: nothing. A halt has no target state to ask
+    // about — the machine may hold a confirmed transaction (a switch that
+    // was kept) or none at all (a host that was only waiting for its boot),
+    // and both are the same answer here. Asking the txn view first would
+    // send the second shape to `recovery-required`, which is what an
+    // irreversible step with no record means and is exactly not what this
+    // is.
+    if host.open_provider_reboot().is_some() {
+        return Step::AtTheProviderReboot;
+    }
+    // --- end lane 3-integration -----------------------------------------
     let began = host.open_irreversible.is_some() || host.state.past_the_point_of_no_return();
 
     if !began {
