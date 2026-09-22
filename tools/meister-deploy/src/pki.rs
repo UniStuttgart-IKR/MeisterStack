@@ -537,13 +537,15 @@ pub struct Subject {
 
 /// Which identity a host's `identity.key` is for, from its roles.
 ///
-/// A host with one controller role has one answer. A host that carries the
-/// cloud AND the cluster has two, and the fleet gives it ONE `identity.key`
-/// (`nix/controllers.nix` names `${pki.dir}/identity.crt` for both tiers) —
-/// so the operator has to say which, and this returns the list rather than
-/// guessing. Guessing here would mean signing the wrong tier's name onto the
-/// key a controller dials with, and the far end would reject it at the
-/// Hello with a message about a name nobody typed.
+/// A host with one of the three roles has one answer. A host that carries
+/// several has several, and the fleet still gives it ONE `identity.key`:
+/// `nix/controllers.nix` names `${pki.dir}/identity.crt` for the cloud tier
+/// AND for the cluster tier, and `nix/agent.nix` names the same file as the
+/// agent's `controller_cert`. So it holds one service identity, and which
+/// one is the operator's decision — this returns the candidates rather than
+/// guessing. Guessing would sign the wrong tier's name onto the key a
+/// controller dials with, and the far end would refuse the Hello with a
+/// name nobody typed.
 pub fn identity_kinds(host: &ResolvedHost) -> Vec<CaKind> {
     let mut out = Vec::new();
     if host.roles.iter().any(|r| r == "cloud") {
@@ -857,9 +859,16 @@ pub fn local_source(
             Some(if named.is_absolute() {
                 named.to_path_buf()
             } else {
-                // The reference is written relative to the inventory, and
-                // `ca_dir` was resolved from the same place, so the tail
-                // after the ca directory's own name is what is left.
+                // The reference is written relative to the INVENTORY
+                // (`../labpki/ca.crt`), and `ca_dir` was resolved from the
+                // same place — so what is left of it is its file name under
+                // that directory.
+                //
+                // The limit, said where it lives: only the last segment is
+                // kept, so a reference into a SUBDIRECTORY of `ca_dir`
+                // would be read flat. `nix/lib/manifest.nix` renders
+                // exactly `${caDir}/<file>` today, so this is precise; a
+                // deeper layout there needs a line here.
                 match named.file_name() {
                     Some(file) => ca_dir.join(file),
                     None => repo.join(named),
