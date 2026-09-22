@@ -1486,28 +1486,6 @@ pub fn roots(files: &dyn Files, state: &StateDir) -> Result<Vec<RootDir>> {
     Ok(out)
 }
 
-/// What `gc --keep N` would remove, and why it would leave the rest.
-pub fn gc_plan(all: &[RootDir], keep: usize) -> (Vec<&RootDir>, Vec<&RootDir>) {
-    let datable: Vec<&RootDir> = all.iter().filter(|r| r.created_at.is_some()).collect();
-    let undatable: Vec<&RootDir> = all.iter().filter(|r| r.created_at.is_none()).collect();
-    let cut = datable.len().saturating_sub(keep);
-    let (remove, kept) = datable.split_at(cut);
-    let mut keeping: Vec<&RootDir> = undatable;
-    keeping.extend(kept.iter().copied());
-    (remove.to_vec(), keeping)
-}
-
-/// Drop one release's roots. The store paths themselves are untouched:
-/// whether they go is `nix store gc`'s decision, not this tool's.
-pub fn remove_roots(files: &dyn Files, dir: &RootDir) -> Result<()> {
-    for link in &dir.links {
-        files.remove_file(link)?;
-    }
-    files.remove_file(&dir.path.join(STAMP))?;
-    files.remove_dir(&dir.path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2452,51 +2430,6 @@ mod tests {
     }
 
     #[test]
-    fn gc_keeps_the_newest_and_never_removes_what_it_cannot_date() {
-        let dirs = vec![
-            RootDir {
-                release_id: "release-old".to_string(),
-                path: PathBuf::from("/repo/.meister-deploy/gcroots/release-old"),
-                created_at: Some(crate::fixtures::at("2026-09-01T00:00:00Z")),
-                links: vec![PathBuf::from(
-                    "/repo/.meister-deploy/gcroots/release-old/box",
-                )],
-            },
-            RootDir {
-                release_id: "release-new".to_string(),
-                path: PathBuf::from("/repo/.meister-deploy/gcroots/release-new"),
-                created_at: Some(crate::fixtures::at("2026-09-21T00:00:00Z")),
-                links: vec![PathBuf::from(
-                    "/repo/.meister-deploy/gcroots/release-new/box",
-                )],
-            },
-            RootDir {
-                release_id: "release-undated".to_string(),
-                path: PathBuf::from("/repo/.meister-deploy/gcroots/release-undated"),
-                created_at: None,
-                links: vec![],
-            },
-        ];
-        let (remove, keep) = gc_plan(&dirs, 1);
-        assert_eq!(
-            remove
-                .iter()
-                .map(|r| r.release_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["release-old"]
-        );
-        assert!(
-            keep.iter().any(|r| r.release_id == "release-undated"),
-            "a directory this tool cannot date is one it does not remove"
-        );
-        assert!(keep.iter().any(|r| r.release_id == "release-new"));
-        // Keeping more than there are removes nothing.
-        let (remove, keep) = gc_plan(&dirs, 10);
-        assert!(remove.is_empty());
-        assert_eq!(keep.len(), 3);
-    }
-
-    #[test]
     fn the_roots_of_a_directory_are_read_back_newest_last() {
         let files = MemFiles::new()
             .given(
@@ -2526,9 +2459,22 @@ mod tests {
         assert_eq!(all[0].links.len(), 1, "the stamp is not a root");
         assert!(all[0].links[0].ends_with("box"));
 
-        let (remove, _) = gc_plan(&all, 1);
-        assert_eq!(remove.len(), 1);
-        remove_roots(&files, remove[0]).unwrap();
+        // What is DONE with them is `state::sweep` / `state::carry_out`,
+        // which is where the whole retention decision lives; here it is
+        // driven directly so that this test stays about the reader.
+        let sweep = crate::state::sweep(
+            &files,
+            &state,
+            &all,
+            &crate::state::Retention {
+                keep: 1,
+                ..crate::state::Retention::default()
+            },
+            crate::fixtures::at("2026-09-22T00:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(sweep.removals_of("release").len(), 1);
+        crate::state::carry_out(&files, &sweep).unwrap();
         assert!(
             !files.exists(std::path::Path::new(
                 "/repo/.meister-deploy/gcroots/release-a/box"

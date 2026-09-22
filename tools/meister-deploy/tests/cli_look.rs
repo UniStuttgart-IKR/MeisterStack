@@ -800,6 +800,113 @@ fn gc_keeps_the_newest_and_removes_no_store_path() {
     assert!(sandbox.calls().is_empty(), "{:?}", sandbox.calls());
 }
 
+// --- lane 4C: the other two things that pile up ---------------------------
+
+#[test]
+fn gc_leaves_the_snapshots_and_the_runs_alone_unless_it_is_asked() {
+    let sandbox = Sandbox::new();
+    let state = sandbox.state();
+    let observations = state.join("observations");
+    std::fs::create_dir_all(&observations).unwrap();
+    for name in [
+        "20260901T000000Z.json",
+        "20260921T000000Z.json",
+        "latest.json",
+    ] {
+        std::fs::write(observations.join(name), b"{}").unwrap();
+    }
+
+    // Nothing asked for: the snapshots are untouched and the note says
+    // which flag would have touched them.
+    let out = sandbox.run(&["gc", "--keep", "1", "--repo", "."]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(observations.join("20260901T000000Z.json").exists());
+    assert!(
+        stderr(&out).contains("--observations N"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains("--runs"), "{}", stderr(&out));
+
+    // Asked for: the oldest goes and `latest.json` never does.
+    let out = sandbox.run(&["gc", "--keep", "1", "--observations", "1", "--repo", "."]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(!observations.join("20260901T000000Z.json").exists());
+    assert!(observations.join("20260921T000000Z.json").exists());
+    assert!(
+        observations.join("latest.json").exists(),
+        "latest is never a candidate"
+    );
+}
+
+#[test]
+fn gc_never_removes_a_run_that_did_not_end_success() {
+    let sandbox = Sandbox::new();
+    let state = sandbox.state();
+    let good = "0192f0c0-0000-7000-8000-00000000000a";
+    let bad = "0192f0c0-0000-7000-8000-00000000000b";
+    for (run, outcome) in [(good, "success"), (bad, "failed")] {
+        let dir = state.join("runs").join(run);
+        std::fs::create_dir_all(dir.join("observations")).unwrap();
+        std::fs::write(dir.join("journal.jsonl"), b"{}\n").unwrap();
+        std::fs::write(
+            dir.join("receipt.json"),
+            format!(
+                r#"{{"schema":"meister-deploy/receipt/1","run_id":"{run}","plan_id":"p",
+                    "release_id":"r","started_at":"2026-09-01T00:00:00Z",
+                    "ended_at":"2026-09-01T00:10:00Z","operator":null,"outcome":"{outcome}",
+                    "hosts":{{}},"untouched":[],"checks":[],"breaks":[],
+                    "journal_path":"journal.jsonl","journal_sha256":"{}"}}"#,
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+    }
+
+    let out = sandbox.run(&["gc", "--keep", "0", "--runs", "--repo", "."]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        !state.join("runs").join(good).exists(),
+        "a finished run went"
+    );
+    assert!(
+        state.join("runs").join(bad).exists(),
+        "the one that failed is the one somebody has to read"
+    );
+    assert!(stderr(&out).contains("it ended failed"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no store path was removed"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(sandbox.calls().is_empty(), "{:?}", sandbox.calls());
+}
+
+#[test]
+fn an_age_guard_keeps_what_the_count_would_have_taken() {
+    let sandbox = Sandbox::new();
+    let roots = sandbox.state().join("gcroots");
+    // Both made just now: `--keep 0` alone would take both, and
+    // `--older-than 14` says neither is old enough to go at all.
+    for release in ["release-aaa", "release-bbb"] {
+        let dir = roots.join(release);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".created"),
+            format!("{}\n", chrono::Utc::now().to_rfc3339()),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/nix/store/does-not-matter", dir.join("box")).unwrap();
+    }
+    let out = sandbox.run(&["gc", "--keep", "0", "--older-than", "14", "--repo", "."]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(roots.join("release-aaa").exists(), "{}", stderr(&out));
+    assert!(roots.join("release-bbb").exists(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("14 day(s)"), "{}", stderr(&out));
+}
+
+// --- end lane 4C ----------------------------------------------------------
+
 // ---------------------------------------------------------------------------
 // the whole way through
 // ---------------------------------------------------------------------------

@@ -154,17 +154,34 @@ enum Verb {
     /// of the fleet; asks no host anything of its own.
     Plan(PlanArgs),
 
-    /// Drop the garbage-collector roots of all but the newest N releases.
-    /// Removes no store path: whether a closure goes is `nix store gc`'s
+    /// Drop the garbage-collector roots of all but the newest N releases,
+    /// and optionally trim the snapshots and the finished runs. Removes no
+    /// store path: whether an unprotected closure goes is `nix store gc`'s
     /// decision.
     Gc {
         /// How many releases keep their roots
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = state::DEFAULT_KEEP_RELEASES)]
         keep: usize,
+        // --- lane 4C: the other two things that pile up -----------------
+        /// A second guard: nothing younger than this many days is removed,
+        /// however far down the list it is. The recommended retention is
+        /// `--keep 3 --older-than 14`.
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<i64>,
+        /// Also keep only the newest N snapshots under `observations/`.
+        /// Without it they are left alone; `latest.json` is never removed.
+        #[arg(long, value_name = "N")]
+        observations: Option<usize>,
+        /// Also remove finished run directories. Never a run that did not
+        /// end `success`, and never one that wrote no receipt: those are
+        /// the ones somebody has to read.
+        #[arg(long)]
+        runs: bool,
+        // --- end lane 4C ------------------------------------------------
         /// The operator's repository, which is where the state directory is
         #[arg(long, default_value = ".")]
         repo: PathBuf,
-        /// Say which roots would go, and remove nothing
+        /// Say what would go, and remove nothing
         #[arg(long)]
         dry_run: bool,
     },
@@ -862,9 +879,24 @@ fn run() -> Result<Answer> {
         Verb::Plan(args) => make_plan(args),
         Verb::Gc {
             keep,
+            // --- lane 4C ---
+            older_than,
+            observations,
+            runs,
+            // --- end lane 4C ---
             repo,
             dry_run,
-        } => gc(*keep, repo, *dry_run).map(Answer::from),
+        } => gc(
+            &state::Retention {
+                keep: *keep,
+                older_than_days: *older_than,
+                observations: *observations,
+                runs: *runs,
+            },
+            repo,
+            *dry_run,
+        )
+        .map(Answer::from),
         Verb::Apply(args) => apply(args),
         Verb::Report { run, repo, json } => report(run, repo, *json).map(Answer::from),
         // --- lane 3B ---------------------------------------------------
@@ -1776,8 +1808,15 @@ fn signing_key(
     }
 }
 
-/// Drop the roots of all but the newest N releases.
-fn gc(keep: usize, repo: &Path, dry_run: bool) -> Result<bool> {
+// --- lane 4C --------------------------------------------------------------
+
+/// Stop keeping what this state directory no longer has a reason to keep.
+///
+/// Three kinds of thing and three rules — releases by count and age,
+/// snapshots by count and age, runs only when asked and never one that is
+/// evidence. The decision is made whole before anything is removed
+/// (`state::sweep`), so `--dry-run` prints exactly what a real run does.
+fn gc(retention: &state::Retention, repo: &Path, dry_run: bool) -> Result<bool> {
     let policy = if dry_run {
         Policy::dry_run()
     } else {
@@ -1785,47 +1824,67 @@ fn gc(keep: usize, repo: &Path, dry_run: bool) -> Result<bool> {
     };
     let files = RealFiles::new(policy);
     let state = StateDir::in_repo(repo);
-    let all = build::roots(&files, &state)?;
-    if all.is_empty() {
-        eprintln!(
-            "note: {} protects no release; there is nothing to remove.",
-            state.gcroots_dir().display()
-        );
-        return Ok(true);
-    }
-    let (remove, kept) = build::gc_plan(&all, keep);
-    for dir in &remove {
+    let roots = build::roots(&files, &state)?;
+    let sweep = state::sweep(&files, &state, &roots, retention, RealClock.now())?;
+
+    for removal in &sweep.remove {
         println!(
-            "{}\t{} root(s){}",
-            dir.release_id,
-            dir.links.len(),
+            "{}\t{}\t{} file(s){}",
+            removal.kind,
+            removal.what,
+            removal.entries(),
             if dry_run { "  (would remove)" } else { "" }
         );
-        if !dry_run {
-            build::remove_roots(&files, dir)?;
-        }
     }
-    eprintln!(
-        "==> {} release(s) {}, {} kept{}",
-        remove.len(),
-        if dry_run {
-            "would lose their roots"
-        } else {
-            "unprotected"
-        },
-        kept.len(),
-        if all.iter().any(|r| r.created_at.is_none()) {
-            " (a directory with no .created stamp is never removed)"
-        } else {
-            ""
+    if !dry_run {
+        state::carry_out(&files, &sweep)?;
+    }
+
+    for kind in ["release", "observation", "run"] {
+        let going = sweep.removals_of(kind).len();
+        let staying = sweep.kept_of(kind).len();
+        if going == 0 && staying == 0 {
+            continue;
         }
-    );
+        eprintln!(
+            "==> {kind}: {going} {}, {staying} kept",
+            if dry_run { "would go" } else { "removed" }
+        );
+    }
+    // Why each thing stayed, because "nothing happened" is the answer an
+    // operator most often has to act on — a run that is still there is a
+    // run that failed, and that is worth reading rather than guessing at.
+    for kept in &sweep.keep {
+        eprintln!("    kept {} {}: {}", kept.kind, kept.what, kept.why);
+    }
+    if roots.is_empty() {
+        eprintln!(
+            "note: {} protects no release.",
+            state.gcroots_dir().display()
+        );
+    }
+    if retention.observations.is_none() {
+        eprintln!(
+            "note: the snapshots under {} were not touched; `--observations N` is what \
+             trims them, and `latest.json` is never removed.",
+            state.observations_dir().display()
+        );
+    }
+    if !retention.runs {
+        eprintln!(
+            "note: the runs under {} were not touched; `--runs` is what removes the \
+             finished ones, and a run that did not end `success` is never one of them.",
+            state.runs_dir().display()
+        );
+    }
     eprintln!(
         "note: no store path was removed. Whether an unprotected closure goes is \
          `nix store gc`'s decision, and this tool does not make it."
     );
     Ok(true)
 }
+
+// --- end lane 4C ----------------------------------------------------------
 
 fn make_plan(args: &PlanArgs) -> Result<Answer> {
     if args.offline && args.out.is_some() {
