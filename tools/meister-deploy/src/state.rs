@@ -846,10 +846,13 @@ fn sweep_releases(
         out.keep.push(Kept {
             what: dir.release_id.clone(),
             kind: "release",
-            why: format!(
-                "it has no {} stamp, so this tool cannot say how old it is",
-                crate::build::STAMP
-            ),
+            // The reader knows WHY it could not date this one — no stamp at
+            // all, or a stamp it cannot read — and those are not the same
+            // thing to somebody deciding what to do about it.
+            why: dir
+                .undated_because
+                .clone()
+                .unwrap_or_else(|| "this tool cannot say how old it is".to_string()),
         });
     }
 }
@@ -1882,6 +1885,57 @@ mod tests {
             swept.kept_of("release")[0].why.contains(".created"),
             "{:?}",
             swept.kept_of("release")[0]
+        );
+    }
+
+    #[test]
+    fn a_stamp_this_tool_cannot_read_is_not_the_same_as_no_stamp() {
+        // Both are kept, and an operator has to be able to tell them
+        // apart: no stamp is a release from before this tool wrote them,
+        // an unreadable one is a file somebody edited. Found by running
+        // `gc` by hand against a stamp a shell had truncated.
+        let files = MemFiles::new()
+            .given(
+                "/repo/.meister-deploy/gcroots/release-edited/.created",
+                b"00Z\n".to_vec(),
+            )
+            .given_symlink(
+                "/repo/.meister-deploy/gcroots/release-edited/box",
+                "/nix/store/xxx-system",
+            )
+            .given_symlink(
+                "/repo/.meister-deploy/gcroots/release-stampless/box",
+                "/nix/store/yyy-system",
+            );
+        let state = state();
+        let roots = crate::build::roots(&files, &state).unwrap();
+        let swept = sweep(
+            &files,
+            &state,
+            &roots,
+            &Retention {
+                keep: 0,
+                ..Retention::default()
+            },
+            at("2030-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        assert!(swept.removals_of("release").is_empty(), "both are kept");
+        let why: BTreeMap<&str, &str> = swept
+            .kept_of("release")
+            .iter()
+            .map(|k| (k.what.as_str(), k.why.as_str()))
+            .collect();
+        assert!(
+            why["release-edited"].contains("\"00Z\"")
+                && why["release-edited"].contains("not a date"),
+            "{:?}",
+            why["release-edited"]
+        );
+        assert!(
+            why["release-stampless"].contains("has no .created stamp"),
+            "{:?}",
+            why["release-stampless"]
         );
     }
 

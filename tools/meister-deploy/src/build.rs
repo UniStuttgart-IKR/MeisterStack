@@ -1540,6 +1540,12 @@ pub struct RootDir {
     /// that carries none — which is never removed, because a directory this
     /// tool cannot date is one it does not know enough about.
     pub created_at: Option<DateTime<Utc>>,
+    /// Why there is no date, for the sentence `gc` prints. A directory with
+    /// NO stamp and one whose stamp cannot be read are both kept, and they
+    /// are not the same thing to an operator: the first is a release from
+    /// before this tool wrote stamps, the second is a file somebody edited.
+    /// `None` when there IS a date.
+    pub undated_because: Option<String>,
     pub links: Vec<PathBuf>,
 }
 
@@ -1551,11 +1557,25 @@ pub fn roots(files: &dyn Files, state: &StateDir) -> Result<Vec<RootDir>> {
             continue;
         };
         let stamp = dir.join(STAMP);
-        let created_at = files
-            .read_to_string(&stamp)
-            .ok()
-            .and_then(|text| DateTime::parse_from_rfc3339(text.trim()).ok())
-            .map(|t| t.with_timezone(&Utc));
+        let (created_at, undated_because) = match files.read_to_string(&stamp) {
+            Err(_) => (
+                None,
+                Some(format!(
+                    "it has no {STAMP} stamp, so this tool cannot say how old it is"
+                )),
+            ),
+            Ok(text) => match DateTime::parse_from_rfc3339(text.trim()) {
+                Ok(when) => (Some(when.with_timezone(&Utc)), None),
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "its {STAMP} stamp says {:?}, which is not a date this tool can read \
+                         ({e}), so it cannot say how old it is",
+                        text.trim()
+                    )),
+                ),
+            },
+        };
         let links = files
             .list_dir(&dir)?
             .into_iter()
@@ -1565,6 +1585,7 @@ pub fn roots(files: &dyn Files, state: &StateDir) -> Result<Vec<RootDir>> {
             release_id,
             path: dir,
             created_at,
+            undated_because,
             links,
         });
     }
