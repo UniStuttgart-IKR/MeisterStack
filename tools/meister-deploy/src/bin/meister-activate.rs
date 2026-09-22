@@ -208,7 +208,11 @@ fn run() -> Result<()> {
     let own_exe = std::env::current_exe()
         .context("this program could not find its own path, and a revert timer has to name it")?;
     let helper = Helper::new(&runner, &files, &RealClock, cli.deploy_dir.clone(), own_exe)
-        .with_profile(cli.profile.clone());
+        .with_profile(cli.profile.clone())
+        // The PATH this process has, for the transient unit that may have to
+        // revert the activation. Read here rather than in the library, which
+        // reads no environment of its own.
+        .with_timer_path(std::env::var("PATH").unwrap_or_default());
 
     match &cli.cmd {
         Verb::Status => {

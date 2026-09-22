@@ -291,6 +291,13 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # What the target-side helper does to a REAL machine: the profile
+          # moves, the timer fires, and a host nobody confirms comes back by
+          # itself (M2C).
+          vm-activate-semantics = import ./nix/tests/activate.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # The boot renderer and the build-time renderer, on the same input.
           # Both fleets: one-box has a raft group of ONE (no etcd variables),
           # ha has three (1A §8, open point 6).

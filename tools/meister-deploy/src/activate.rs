@@ -83,6 +83,18 @@ const SWITCH: Duration = Duration::from_secs(900);
 /// How long the garbage collector may take. It walks the whole store.
 const COLLECT: Duration = Duration::from_secs(3600);
 
+/// What a transient unit gets to find its programs in when nobody says
+/// otherwise.
+///
+/// `systemd-run` gives a transient service systemd's own default PATH —
+/// `/usr/bin:/bin` — and on a NixOS host there is no `nix-env` in either
+/// (measured: the first run of the VM test reverted nothing and said
+/// "nix-env could not be started"). This is the directory every program of
+/// a NixOS system is in, and it follows the system profile, so after a
+/// revert it is the OLD system's `nix-env` — which is the right one to be
+/// holding at that point.
+pub const SYSTEM_PATH: &str = "/run/current-system/sw/bin";
+
 /// Which way an activation goes, and therefore which way it comes back.
 ///
 /// Not [`crate::plan::RollbackMode`], which has a third value: `none` is a
@@ -246,6 +258,10 @@ pub struct Helper<'a> {
     /// has to survive an activation that changes what that name points at,
     /// and a store path is pinned by the generation that holds it.
     pub own_exe: PathBuf,
+    /// The `PATH` the revert timer's unit runs with. A value rather than a
+    /// read of this process's environment, so that a test can pin it and so
+    /// that this module reads no environment of its own.
+    pub timer_path: String,
 }
 
 impl<'a> Helper<'a> {
@@ -263,7 +279,17 @@ impl<'a> Helper<'a> {
             deploy_dir: deploy_dir.into(),
             profile: PathBuf::from(SYSTEM_PROFILE),
             own_exe: own_exe.into(),
+            timer_path: SYSTEM_PATH.to_string(),
         }
+    }
+
+    /// The `PATH` the revert timer runs with. The binary passes its own.
+    pub fn with_timer_path(mut self, path: impl Into<String>) -> Helper<'a> {
+        let path = path.into();
+        if !path.is_empty() {
+            self.timer_path = path;
+        }
+        self
     }
 
     pub fn with_profile(mut self, profile: impl Into<PathBuf>) -> Helper<'a> {
@@ -490,21 +516,26 @@ impl<'a> Helper<'a> {
 
     /// Is this system here, whole, and is it a system?
     ///
-    /// `nix-store --check-validity --recursive` rather than the
-    /// `nix path-info` the lane brief names: it answers for the WHOLE
-    /// closure rather than for the top of it, and it needs no experimental
-    /// feature — a host whose `nix-command` is off would refuse the
-    /// `path-info` form for a reason that has nothing to do with the
-    /// question. The signature was checked by the `nix copy` that brought it
-    /// here (`require-sigs = true`, M0 probe S12); checking it again here
-    /// would be checking the same thing with the weaker tool.
+    /// `nix-store --check-validity` rather than the `nix path-info` the lane
+    /// brief names: it needs no experimental feature — a host whose
+    /// `nix-command` is off would refuse the `path-info` form for a reason
+    /// that has nothing to do with the question — and it is the question in
+    /// the store's own words.
+    ///
+    /// It answers for the closure and not only for the top of it, and that
+    /// is a property of the store rather than a flag on the command: nix
+    /// keeps referential integrity, so a path is registered as valid only
+    /// once everything it references is. (The first draft of this asked for
+    /// `--recursive`, which `nix-store` does not have; the VM test said so.)
+    /// What it does NOT do is re-hash the bytes: that was the `nix copy`'s
+    /// job, with `require-sigs = true` behind it (M0 probe S12), and doing
+    /// it again here would be the same check with the weaker tool.
     ///
     /// Writes nothing, and that is the point of the verb: a staged host is a
     /// host whose running system has not been touched.
     pub fn stage(&self, toplevel: &str) -> Result<()> {
         let cmd = Cmd::new(Effect::Read, "nix-store", SWITCH)
             .arg("--check-validity")
-            .arg("--recursive")
             .arg(toplevel);
         self.runner.run(&cmd).with_context(|| {
             format!(
@@ -748,6 +779,9 @@ impl<'a> Helper<'a> {
                 "--description=meister-deploy reverts the transaction {id} unless it is \
                  confirmed"
             ))
+            // Without this the unit gets systemd's own default PATH and
+            // finds no `nix-env` — see [`SYSTEM_PATH`].
+            .arg(format!("--setenv=PATH={}", self.timer_path))
             .arg(self.own_exe.display().to_string())
             .arg("revert")
             .arg("--txn")
@@ -1287,7 +1321,7 @@ mod tests {
     }
 
     fn valid(top: &str) -> Matcher {
-        Matcher::exact("nix-store", ["--check-validity", "--recursive", top])
+        Matcher::exact("nix-store", ["--check-validity", top])
     }
 
     fn helper<'a>(runner: &'a StrictFake, files: &'a MemFiles, clock: &'a FakeClock) -> Helper<'a> {
@@ -1504,6 +1538,10 @@ mod tests {
             .find(|c| c.starts_with("systemd-run"))
             .expect("the timer was armed");
         assert!(line.contains("--unit=meister-revert-t1"), "{line}");
+        assert!(
+            line.contains("--setenv=PATH=/run/current-system/sw/bin"),
+            "the timer has to be able to find nix-env: {line}"
+        );
         assert!(
             line.contains("/nix/store/exe/bin/x revert --txn t1"),
             "{line}"
