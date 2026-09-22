@@ -15,9 +15,18 @@
 #
 # So this test does the thing that would expose it: it copies one image
 # twice, boots both copies at once, and asks each of them who it is. And it
-# looks INSIDE the image as well — mounted read-only as a second disk on one
-# of the two — because "the identity is made at first boot" is only true if
-# the image did not carry one to begin with.
+# looks INSIDE the image as well — the untouched file, hot-plugged read-only
+# into the first machine AFTER it has booted — because "the identity is made
+# at first boot" is only true if the image did not carry one to begin with.
+#
+# Why after the boot and not as a second disk from the start: the image's
+# root is `/dev/disk/by-label/nixos`, and a copy of the image next to it
+# carries the SAME label. Stage 1 then mounts whichever of the two udev
+# linked last — measured: under the load of a full `nix flake check` the
+# read-only one won, init exited 1 and the kernel panicked 1.4 s in, while
+# the same test had passed twice on its own. A disk that appears once root
+# is mounted cannot be chosen as root, and the mount below goes by the
+# disk's serial, never by the label.
 { nixpkgs, lib, pkgs, system, self, disko }:
 
 let
@@ -87,25 +96,20 @@ pkgs.testers.runNixOSTest {
         os.chmod(path, 0o644)
         return path
 
-    def machine(name, disk, pristine=False):
+    def instance(name, disk):
+        # ONE disk each at boot. The image itself is hot-plugged into the
+        # first machine later (see the header): a second disk with the same
+        # root label at boot is a coin toss for stage 1.
         flags = [
             QEMU, "-m", "2048", "-smp", "2",
             "-drive", f"file={disk},if=none,id=root,format=qcow2,cache=unsafe",
             "-device", f"virtio-blk-pci,drive=root,serial={name.upper()},bootindex=0",
         ]
-        if pristine:
-            # The image itself, untouched, read-only, as a second disk — so
-            # that what is IN it can be read by a machine rather than by a
-            # loop device the build sandbox is not allowed to make.
-            flags += [
-                "-drive", f"file={IMAGE},if=none,id=pristine,format=qcow2,readonly=on",
-                "-device", "virtio-blk-pci,drive=pristine,serial=PRISTINE",
-            ]
         return track(create_machine(" ".join(flags), name=name))
 
     start = time.time()
-    a = machine("first", copy_of("first"), pristine=True)
-    b = machine("second", copy_of("second"))
+    a = instance("first", copy_of("first"))
+    b = instance("second", copy_of("second"))
     a.start()
     b.start()
     a.wait_for_unit("multi-user.target")
@@ -140,8 +144,14 @@ pkgs.testers.runNixOSTest {
         assert left == "0", f"{name} has {left} file(s) under {PKI}"
 
     # ---------------------------------------------------------------
-    # And the image itself carried none of it.
+    # And the image itself carried none of it — the untouched file,
+    # hot-plugged read-only now that the first machine's root is mounted.
     # ---------------------------------------------------------------
+    a.send_monitor_command(
+        f"drive_add 0 file={IMAGE},if=none,id=pristine,format=qcow2,readonly=on"
+    )
+    a.send_monitor_command("device_add virtio-blk-pci,drive=pristine,serial=PRISTINE")
+    a.wait_until_succeeds("test -b /dev/disk/by-id/virtio-PRISTINE", timeout=30)
     a.succeed("mkdir -p /mnt/pristine")
     # The root filesystem of the pristine image, whichever partition it is.
     root = a.succeed(
