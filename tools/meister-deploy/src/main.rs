@@ -14,6 +14,7 @@ use clap::{Args, Parser, Subcommand};
 
 use meister_deploy::build;
 use meister_deploy::effects::{Clock, Files, RealClock, RealFiles};
+use meister_deploy::execute;
 use meister_deploy::inventory::{self, Inventory};
 use meister_deploy::legacy::fleet::Plan;
 use meister_deploy::legacy::ops::{self, Ctx};
@@ -166,6 +167,11 @@ enum Verb {
         suite: String,
     },
 
+    /// Carry out a plan: stage the closures, take the hosts through the
+    /// machine of §6 one wave at a time, and write the journal and the
+    /// receipt that say what happened.
+    Apply(ApplyArgs),
+
     /// What a run did: its journal, folded, and its receipt once it has one.
     /// Reads the state directory and asks no host anything.
     Report {
@@ -282,6 +288,66 @@ struct BuildArgs {
     /// Refuse rather than reach outside this process
     #[arg(long)]
     offline: bool,
+}
+
+#[derive(Args)]
+struct ApplyArgs {
+    /// The plan from `plan`
+    #[arg(long)]
+    plan: PathBuf,
+
+    /// The release the plan was made for. Required and checked: a plan
+    /// names the bytes it is about, and another build is another plan.
+    #[arg(long)]
+    release: PathBuf,
+
+    /// `--approve <class>=<plan_id>`, once per class the plan asks for.
+    /// The id is the plan's own, so an approval cannot be carried over
+    /// from one somebody read yesterday.
+    #[arg(long = "approve")]
+    approve: Vec<String>,
+
+    /// Continue the run with this id: its journal is folded and every host
+    /// is asked where it got to. Nothing irreversible is ever repeated.
+    #[arg(long)]
+    resume: Option<String>,
+
+    /// Take over the per-host locks of this run — after a fresh
+    /// observation and a re-validation, and never because time has passed.
+    #[arg(long)]
+    takeover: Option<String>,
+
+    /// The operator's repository: its `known_hosts` is what every
+    /// connection is checked against and its state directory is where the
+    /// journal goes. Defaults to the one the manifest was resolved from.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// The ssh key to offer
+    #[arg(long)]
+    identity: Option<PathBuf>,
+
+    /// The inventory the `[operator] cli_config` reference is read from
+    /// (D7). Defaults to the one the manifest was resolved from.
+    #[arg(long)]
+    inventory: Option<PathBuf>,
+
+    /// How long to wait for a host to be empty of guests, in seconds
+    #[arg(long, default_value_t = 600)]
+    drain_wait: u64,
+
+    /// How long to wait for a host to come back from a reboot, in seconds
+    #[arg(long, default_value_t = 600)]
+    reboot_wait: u64,
+
+    /// Look at the fleet, check the plan against it, print the steps — and
+    /// take no lock, copy nothing, write no journal
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Print the receipt as json instead of as a table
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -508,6 +574,7 @@ fn run() -> Result<Answer> {
             repo,
             dry_run,
         } => gc(*keep, repo, *dry_run).map(Answer::from),
+        Verb::Apply(args) => apply(args),
         Verb::Report { run, repo, json } => report(run, repo, *json).map(Answer::from),
         Verb::Legacy(legacy) => run_legacy(legacy).map(Answer::from),
     }
@@ -1358,6 +1425,235 @@ fn plan_summary(plan: &plan::DeploymentPlan) -> String {
         out.push('\n');
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// apply
+// ---------------------------------------------------------------------------
+
+/// Carry out a plan.
+///
+/// Four things happen here and the fifth is deliberately absent:
+///
+/// 1. the plan and the release are read and checked against each other —
+///    a plan names the bytes it is about;
+/// 2. the state directory's lock is taken for this run, which is the
+///    single-writer contract of D6 for this WORKSTATION (the fleet's own
+///    anchor is the per-host lock the executor takes);
+/// 3. [`meister_deploy::execute`] walks the plan;
+/// 4. the receipt is written and printed, and the exit code says what it
+///    came to.
+///
+/// What is absent: a `--force`. There is `--approve <class>=<plan_id>`, and
+/// an approval names the plan it is for.
+fn apply(args: &ApplyArgs) -> Result<Answer> {
+    let policy = if args.dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+
+    let text = files.read_to_string(&args.plan)?;
+    let the_plan = plan::DeploymentPlan::from_json(&text, &args.plan.display().to_string())?;
+    let text = files.read_to_string(&args.release)?;
+    let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
+    if release.release_id != the_plan.release_id {
+        anyhow::bail!(
+            "{} was made for the release {} and {} is {}. A plan names the bytes it was made \
+             for; another build is another plan.",
+            args.plan.display(),
+            the_plan.release_id,
+            args.release.display(),
+            release.release_id
+        );
+    }
+
+    let approvals = parse_approvals(&args.approve)?;
+    let repo = args
+        .repo
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(&release.resolved_fleet.source.repo_path));
+    let state = StateDir::in_repo(&repo);
+    let operator = state::current_operator();
+    let run_id = match &args.resume {
+        Some(id) => id.clone(),
+        None => meister_deploy::ids::run_id(RealClock.now()).to_string(),
+    };
+
+    // Ctrl-C has to reach the child: a `nix copy` of a nine-gigabyte closure
+    // or a `switch-to-configuration` on the other side of an ssh is what is
+    // running when somebody presses it.
+    Cancel::on_sigint()?;
+    let cancel = Cancel::new();
+    let mut runner = Real::new(policy);
+    runner.cancel = cancel.clone();
+    let ssh = transport::Ssh::for_repo(&repo).with_identity(args.identity.clone());
+    let prober = observe::SshProber::new(&runner, &ssh);
+    let look = execute::SshLook { prober: &prober };
+
+    if args.dry_run {
+        return dry_run(&the_plan, &release, &look, &state);
+    }
+
+    // The workstation's door. Taken before anything is looked at, given back
+    // whatever happens below.
+    let held = match &args.takeover {
+        Some(of_run) => {
+            state::take_over_lock(&files, &state, of_run, &run_id, &operator, RealClock.now())?
+        }
+        None => state::acquire_lock(&files, &state, &run_id, &operator, RealClock.now())?,
+    };
+    eprintln!(
+        "==> run {run_id}  plan {}  release {}",
+        the_plan.plan_id, the_plan.release_id
+    );
+    // The id on stdout and nothing else, so that a script can capture it and
+    // `report --run` it afterwards.
+    println!("{run_id}");
+
+    let (control, note) = workload_control(&files, &release, args.inventory.as_deref());
+    if let Some(note) = note {
+        eprintln!("note: {note}");
+    }
+    let mut options = execute::ApplyOptions::new(&run_id);
+    options.approvals = approvals;
+    options.resume = args.resume.is_some();
+    options.takeover = args.takeover.clone();
+    options.workload = control;
+    options.drain_wait = std::time::Duration::from_secs(args.drain_wait);
+    options.reboot_wait = std::time::Duration::from_secs(args.reboot_wait);
+
+    let executor = execute::Executor {
+        runner: &runner,
+        files: &files,
+        clock: &RealClock,
+        look: &look,
+        ssh: &ssh,
+        state: &state,
+        plan: &the_plan,
+        release: &release,
+        operator: receipt::Operator {
+            user: operator.user.clone(),
+            workstation: operator.workstation.clone(),
+        },
+        options,
+        cancel,
+    };
+    let applied = executor.run();
+
+    // The lock goes back whatever happened, and a failure to give it back is
+    // a note rather than the error somebody reads: the run's own outcome is
+    // the interesting one.
+    if let Err(e) = state::release_lock(&files, &state, &held.run_id) {
+        eprintln!(
+            "note: the lock on {} was not released: {e:#}",
+            repo.display()
+        );
+    }
+    let applied = applied?;
+
+    if args.json {
+        println!("{}", String::from_utf8(applied.receipt.to_json()?)?);
+    } else {
+        print!("{}", receipt_table(&applied.receipt));
+    }
+    eprintln!("==> {}", state.receipt_path(&run_id).display());
+    for id in &applied.blocked {
+        eprintln!(
+            "    blocked: {id}: {}",
+            the_plan.hosts[id].reasons.join("; ")
+        );
+    }
+    if let Some(why) = &applied.stopped {
+        eprintln!("==> {why}");
+    }
+    match (applied.receipt.outcome, applied.blocked.is_empty()) {
+        (receipt::Outcome::Success, true) => Ok(Answer::Yes),
+        // It worked, and the plan refused to touch something. Exit 2 is
+        // "blocked", which a script can tell from "this tool broke".
+        (receipt::Outcome::Success, false) => Ok(Answer::Blocked),
+        _ => Ok(Answer::No),
+    }
+}
+
+/// Look, check, and say what would be done.
+///
+/// No lock, no journal, no receipt — and the runner's policy refuses every
+/// command that is not a read, so this is a property of the program rather
+/// than a promise made here.
+fn dry_run(
+    the_plan: &plan::DeploymentPlan,
+    release: &ReleaseManifest,
+    look: &dyn execute::Look,
+    state: &StateDir,
+) -> Result<Answer> {
+    let mut fresh = the_plan.observation.clone();
+    fresh.taken_at = RealClock.now();
+    for id in &the_plan.selection.targets {
+        let Some(host) = release.resolved_fleet.hosts.get(id) else {
+            continue;
+        };
+        let Some(endpoint) = the_plan.endpoints.get(id) else {
+            continue;
+        };
+        let target = transport::Target::from_endpoint(id, endpoint);
+        fresh.hosts.insert(id.clone(), look.observe(host, &target));
+    }
+    let verdict = plan::validate_against(the_plan, release, &fresh, RealClock.now());
+    eprintln!(
+        "==> {} ({}, {} host(s), {} wave(s))",
+        the_plan.plan_id,
+        the_plan.kind,
+        the_plan.selection.targets.len(),
+        the_plan.last_wave() + 1
+    );
+    for action in &the_plan.actions {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            action.wave,
+            action.seq,
+            action.host,
+            action.kind,
+            match &action.blocked {
+                Some(why) => format!("blocked: {why}"),
+                None => action.desired.clone().unwrap_or_default(),
+            }
+        );
+    }
+    eprintln!(
+        "note: nothing was locked, nothing was copied and no journal was written. {} holds \
+         no run of this.",
+        state.runs_dir().display()
+    );
+    match verdict {
+        plan::Verdict::Proceed => {
+            eprintln!("==> the plan still matches the fleet.");
+            Ok(Answer::from(!the_plan.is_blocked()))
+        }
+        verdict => {
+            for reason in verdict.reasons() {
+                eprintln!("    {reason}");
+            }
+            eprintln!("==> this plan would not run against the fleet as it is now.");
+            Ok(Answer::Blocked)
+        }
+    }
+}
+
+/// `--approve <class>=<plan_id>`, as the operator typed it.
+fn parse_approvals(given: &[String]) -> Result<Vec<(plan::ApprovalClass, String)>> {
+    let mut out = Vec::new();
+    for text in given {
+        let Some((class, plan_id)) = text.split_once('=') else {
+            anyhow::bail!(
+                "{text:?} is not an approval. The form is `--approve <class>=<plan_id>`, and \
+                 the plan id is the one the plan you read prints."
+            );
+        };
+        out.push((plan::ApprovalClass::parse(class)?, plan_id.to_string()));
+    }
+    Ok(out)
 }
 
 /// What a run did.

@@ -475,3 +475,76 @@ pub fn fleet70_json() -> Value {
 pub fn fleet70() -> ResolvedFleet {
     resolve_value(fleet70_json())
 }
+
+/// What one host says to the read-only probe when it runs exactly what the
+/// release names.
+///
+/// Built from the release and the probe's own [`ProbeSpec`], so it is the
+/// answer of a healthy host rather than a string somebody kept in step by
+/// hand. Shared by the integration tests that shim `ssh`.
+pub fn probe_answer(fleet: &ResolvedFleet, release: &ReleaseManifest, id: &str) -> String {
+    use meister_deploy::observe::ProbeSpec;
+    let host = &fleet.hosts[id];
+    let artifacts = &release.artifacts[id];
+    let spec = ProbeSpec::for_host(host);
+    let system = &artifacts.toplevel.store_path;
+    let mut s = String::from("probe=start\n");
+    s.push_str(&format!("hostname={}\n", host.name));
+    s.push_str(&format!("machine_id=machine-id-of-{id}\n"));
+    s.push_str(&format!("current_system={system}\n"));
+    s.push_str(&format!("booted_system={system}\n"));
+    s.push_str(&format!("next_boot_system={system}\n"));
+    s.push_str("generation=42\n");
+    s.push_str(&format!(
+        "kernel_running={}\n",
+        host.build.boot.kernel_version
+    ));
+    s.push_str(&format!(
+        "kernel_booted={}\n",
+        artifacts.boot.kernel_store_path
+    ));
+    s.push_str(&format!(
+        "initrd_booted={}\n",
+        artifacts.boot.initrd_store_path
+    ));
+    s.push_str(&format!(
+        "kernel_params_sha256={}\n",
+        artifacts.boot.kernel_params_sha256
+    ));
+    for unit in &spec.units {
+        s.push_str(&format!("unit={unit}\tactive\n"));
+    }
+    for path in &spec.mounts {
+        s.push_str(&format!("mount={path}\t/dev/disk/by-label/data ext4\n"));
+    }
+    for cred in &spec.credentials {
+        if cred.public {
+            s.push_str(&format!("cred={}\tsha256:{}\n", cred.id, "ab".repeat(32)));
+        } else {
+            s.push_str(&format!(
+                "cred={}\tmode:600 owner:meister:meister\n",
+                cred.id
+            ));
+        }
+    }
+    for cert in &spec.identity_certs {
+        s.push_str(&format!("identity_cert={cert}\tpresent\n"));
+    }
+    for cap in &host.hardware.capabilities {
+        s.push_str(&format!("cap={cap}\n"));
+    }
+    if let Some(etcd) = &spec.etcd {
+        let name = etcd.member_name.clone().unwrap_or_else(|| id.to_string());
+        s.push_str(&format!(
+            "etcd_members={{\"members\":[{{\"ID\":1,\"name\":\"{name}\",\
+             \"peerURLs\":[\"https://{}:2380\"]}}]}}\n",
+            host.address
+        ));
+        s.push_str("etcd_health=[{\"endpoint\":\"http://127.0.0.1:2379\",\"health\":true}]\n");
+    }
+    if spec.agent_socket.is_some() {
+        s.push_str("vms=[]\n");
+    }
+    s.push_str("probe=end\n");
+    s
+}
