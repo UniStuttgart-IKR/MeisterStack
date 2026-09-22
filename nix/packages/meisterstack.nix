@@ -41,6 +41,15 @@ let
       (root + "/components")
       (root + "/drivers")
       (root + "/tools/meister-deploy")
+      # `meister-deploy init` carries the operator template inside the
+      # binary (`include_str!`, src/template.rs), so the template is
+      # something the BUILD reads — and therefore something the source has
+      # to contain, or the build fails in the sandbox with "file not found"
+      # (measured: it did, in the first `nix flake check` of this lane). It
+      # also means a change to the template changes the binaries and with
+      # them every host's toplevel, which is correct: the binary really is a
+      # different binary then.
+      (root + "/templates/operator")
     ];
   };
 
