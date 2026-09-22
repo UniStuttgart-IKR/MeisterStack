@@ -187,7 +187,11 @@ impl Runner for World<'_> {
             .iter()
             .find_map(|a| a.strip_prefix("root@"))
             .and_then(address_to_host);
-        let says = |word: &str| cmd.args.iter().any(|a| a == word);
+        // The quotes come off first: an argument that crosses an ssh is
+        // quoted for the shell on the other side, so the reboot arrives
+        // here as `'systemctl reboot'`. Whole words all the same —
+        // `meister-activate` is not an `activate`.
+        let says = |word: &str| cmd.args.iter().any(|a| a.trim_matches('\'') == word);
         if let Some(host) = host {
             if says("activate") {
                 self.look.set(&host, Phase::After);
@@ -396,7 +400,9 @@ fn reboot_of(id: &str) -> Matcher {
     out.push(format!("root@{address}"));
     out.push("sh".to_string());
     out.push("-c".to_string());
-    out.push("systemctl reboot".to_string());
+    // Quoted, because ssh joins its arguments and the remote shell splits
+    // them again — see [`crate::transport::Ssh::exec`].
+    out.push(crate::run::shell_quote("systemctl reboot"));
     Matcher::exact("ssh", out)
 }
 

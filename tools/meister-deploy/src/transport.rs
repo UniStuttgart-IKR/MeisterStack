@@ -244,16 +244,44 @@ impl Ssh {
     /// an error, which is how "ssh could not connect" is told apart from
     /// "the host said no".
     pub fn ask(&self, target: &Target, script: &str, deadline: Duration) -> Cmd {
-        Cmd::new(Effect::Read, "ssh", deadline)
+        // `sh -c` explicitly rather than relying on the remote login shell:
+        // the probe is POSIX sh and a host whose root shell is fish would
+        // run it as something else.
+        self.exec(target, ["sh", "-c", script], Effect::Read, deadline)
+            .expect(Expect::Codes(vec![0, 1]))
+    }
+
+    /// A command on the far side, quoted for the shell that will read it.
+    ///
+    /// **ssh does not carry an argument vector.** It JOINS what it is given
+    /// with spaces and hands the result to the remote login shell, which
+    /// splits it again by its own rules. So arguments that are separate
+    /// here arrive as different arguments there the moment one of them
+    /// holds a space, a quote or a newline — and two of the things this
+    /// tool sends do: the read-only probe, which is a whole shell script in
+    /// one argument, and every `--because <sentence>` a revert carries.
+    ///
+    /// Measured rather than reasoned about: the first run of
+    /// nix/tests/update.nix against a real sshd got an empty answer from
+    /// every host, because `ssh host sh -c '<script>'` reached the target as
+    /// `sh -c printf` with the rest of the script as positional arguments.
+    /// Every fake runner and every PATH shim in this crate had been happy
+    /// with it, because both of them receive an argv.
+    ///
+    /// So each argument is quoted HERE, by the same rule
+    /// [`crate::run::shell_quote`] uses everywhere else. They stay separate
+    /// arguments of the local `ssh` — which is what keeps a command line
+    /// readable in a log and matchable in a test — and they are already the
+    /// words the remote shell will read back.
+    pub fn exec<I, S>(&self, target: &Target, argv: I, effect: Effect, deadline: Duration) -> Cmd
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Cmd::new(effect, "ssh", deadline)
             .args(self.opts(target.port))
             .arg(target.destination())
-            // `sh -c` explicitly rather than relying on the remote login
-            // shell: the probe is POSIX sh and a host whose root shell is
-            // fish would run it as something else.
-            .arg("sh")
-            .arg("-c")
-            .arg(script)
-            .expect(Expect::Codes(vec![0, 1]))
+            .args(argv.into_iter().map(|a| shell_quote(a.as_ref())))
     }
 
     /// Put bytes on a host, at a path, with an owner and a mode.
@@ -291,12 +319,7 @@ impl Ssh {
             owner = shell_quote(owner),
             mode = shell_quote(mode),
         );
-        Cmd::new(Effect::TargetWrite, "ssh", deadline)
-            .args(self.opts(target.port))
-            .arg(target.destination())
-            .arg("sh")
-            .arg("-c")
-            .arg(script)
+        self.exec(target, ["sh", "-c", &script], Effect::TargetWrite, deadline)
             .stdin(bytes.to_vec())
             .redact(text)
     }
@@ -543,6 +566,84 @@ mod tests {
         assert_eq!(cmd.expect, Expect::Codes(vec![0, 1]));
         assert!(cmd.line().contains("root@10.0.0.11"), "{}", cmd.line());
         assert!(cmd.line().contains("sh -c"), "{}", cmd.line());
+    }
+
+    /// The one that the VM test found: ssh carries a STRING, not an argv.
+    #[test]
+    fn what_reaches_the_far_side_is_what_was_meant_even_when_it_has_spaces_in_it() {
+        // A script with quotes, spaces and a newline in it — which is what
+        // the read-only probe is — plus an argument that is a sentence,
+        // which is what `--because` carries.
+        let script = "printf 'a b\n' ; printf 'c\n'";
+        let cmd = ssh().ask(&target(), script, PROBE_DEADLINE);
+        // ssh joins everything after the destination with spaces and hands
+        // it to the remote login shell. So THAT is what has to parse back
+        // into the words that were meant: let a real shell do the parsing
+        // and print what it got, one argument per line.
+        let after = cmd
+            .args
+            .iter()
+            .skip_while(|a| !a.starts_with("root@"))
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let out = crate::run::Real::new(Policy::real())
+            .run(
+                &Cmd::new(Effect::Offline, "sh", Duration::from_secs(10))
+                    .arg("-c")
+                    // NUL-separated: one of the arguments HAS newlines in
+                    // it, and a newline-separated answer could not tell an
+                    // argument that contains one from two arguments.
+                    .arg(format!("set -- {after}; printf '%s\\0' \"$@\"")),
+            )
+            .unwrap();
+        let words: Vec<&str> = out.stdout.split('\0').filter(|w| !w.is_empty()).collect();
+        assert_eq!(
+            words,
+            vec!["sh", "-c", script],
+            "the far side would have seen something else than the three words that were meant"
+        );
+
+        let cmd = ssh().exec(
+            &target(),
+            [
+                "meister-activate",
+                "revert",
+                "--because",
+                "a unit did not come up",
+            ],
+            Effect::TargetWrite,
+            PROBE_DEADLINE,
+        );
+        let after = cmd
+            .args
+            .iter()
+            .skip_while(|a| !a.starts_with("root@"))
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let out = crate::run::Real::new(Policy::real())
+            .run(
+                &Cmd::new(Effect::Offline, "sh", Duration::from_secs(10))
+                    .arg("-c")
+                    .arg(format!("set -- {after}; printf '%s\\0' \"$@\"")),
+            )
+            .unwrap();
+        assert_eq!(
+            out.stdout
+                .split('\0')
+                .filter(|w| !w.is_empty())
+                .collect::<Vec<_>>(),
+            vec![
+                "meister-activate",
+                "revert",
+                "--because",
+                "a unit did not come up"
+            ],
+            "a reason with spaces in it became several arguments"
+        );
     }
 
     #[test]

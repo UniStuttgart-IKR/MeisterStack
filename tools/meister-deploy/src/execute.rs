@@ -1521,15 +1521,11 @@ impl<'a> Executor<'a> {
     /// string.
     fn helper_cmd(&self, id: &str, args: &[&str]) -> Result<Cmd> {
         let target = self.target(id)?;
-        let mut cmd = Cmd::new(Effect::TargetWrite, "ssh", ACTIVATE_DEADLINE)
-            .args(self.ssh.opts(target.port))
-            .arg(target.destination())
-            .arg("meister-activate")
-            .arg("--json");
-        for arg in args {
-            cmd = cmd.arg(*arg);
-        }
-        Ok(cmd)
+        let mut argv = vec!["meister-activate".to_string(), "--json".to_string()];
+        argv.extend(args.iter().map(|a| a.to_string()));
+        Ok(self
+            .ssh
+            .exec(&target, argv, Effect::TargetWrite, ACTIVATE_DEADLINE))
     }
 
     /// The transaction id of this run on this host. One per host per run:
