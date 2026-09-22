@@ -1854,7 +1854,8 @@ fn decide_host(
     if unchanged && deliveries > 0 {
         d.secrets_only = true;
         d.preconditions.push(format!(
-            "{id} runs what the release says and {deliveries} of its file(s) are not what              this repository holds; nothing is staged and nothing is activated"
+            "{id} runs what the release says and {deliveries} of its file(s) are not what \
+             this repository holds; nothing is staged and nothing is activated"
         ));
     }
     let settled = unchanged && !d.secrets_only;

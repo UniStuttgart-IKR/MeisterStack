@@ -1603,24 +1603,53 @@ fn expected_credentials(
         Some(path) => path.to_path_buf(),
         None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
     };
-    let named = match Inventory::load(files, &inventory_file) {
-        Ok(parsed) => parsed.operator.as_ref().and_then(|o| o.ca_dir.clone()),
-        Err(_) => None,
-    };
-    let Some(named) = named else {
+    let Some(ca) = ca_directory(files, release, Some(&repo), inventory) else {
         return (
             BTreeMap::new(),
             Some(format!(
-                "{} names no `[operator] ca_dir`, so this plan does not know where the CA's                  files are. A host that is missing one is blocked with the verb that makes                  it.",
+                "{} names no `[operator] ca_dir`, so this plan does not know where the CA's \
+                 files are. A host that is missing one is blocked with the verb that makes \
+                 it.",
                 inventory_file.display()
             )),
         );
     };
-    let ca = meister_deploy::pki::ca_dir(&repo, &fleet.source.inventory_path, &named);
     (
         meister_deploy::pki::expected_credentials(files, &repo, &ca, fleet, &selected),
         None,
     )
+}
+
+/// `[operator] ca_dir`, resolved against the inventory that named it.
+///
+/// `None` when there is no inventory to read or it names none. That is an
+/// answer and not a failure: a plan whose host is missing a file it cannot
+/// find is blocked with a sentence, which is more useful than a verb that
+/// refuses to run.
+fn ca_directory(
+    files: &dyn Files,
+    release: &ReleaseManifest,
+    repo: Option<&Path>,
+    inventory: Option<&Path>,
+) -> Option<PathBuf> {
+    let fleet = &release.resolved_fleet;
+    let repo = repo
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(&fleet.source.repo_path));
+    let inventory_file = match inventory {
+        Some(path) => path.to_path_buf(),
+        None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
+    };
+    let named = Inventory::load(files, &inventory_file)
+        .ok()?
+        .operator
+        .as_ref()
+        .and_then(|o| o.ca_dir.clone())?;
+    Some(meister_deploy::pki::ca_dir(
+        &repo,
+        &fleet.source.inventory_path,
+        &named,
+    ))
 }
 
 /// What a person reads on stderr while the plan itself goes to stdout.
@@ -1808,6 +1837,10 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
     options.workload = control;
     options.drain_wait = std::time::Duration::from_secs(args.drain_wait);
     options.reboot_wait = std::time::Duration::from_secs(args.reboot_wait);
+    // --- lane 3B: where the files this run may have to deliver are ------
+    options.repo = repo.clone();
+    options.ca_dir = ca_directory(&files, &release, Some(&repo), args.inventory.as_deref());
+    // --- end lane 3B ----------------------------------------------------
 
     let executor = execute::Executor {
         runner: &runner,
@@ -2160,7 +2193,8 @@ fn identity_kind_of(
         let kind = CaKind::parse(asked)?;
         if kind == CaKind::Serving {
             anyhow::bail!(
-                "`--as serving` is not an identity: the serving certificate is its own file                  and its own request. Use `keys csr --host {host_id} --kind serving`."
+                "`--as serving` is not an identity: the serving certificate is its own file \
+                 and its own request. Use `keys csr --host {host_id} --kind serving`."
             );
         }
         if !candidates.contains(&kind) {
@@ -2178,12 +2212,16 @@ fn identity_kind_of(
     }
     match candidates.as_slice() {
         [] => anyhow::bail!(
-            "{host_id} carries the role(s) {} and none of them has a service identity. Only              a cloud, a cluster or an agent dials anything.",
+            "{host_id} carries the role(s) {} and none of them has a service identity. Only \
+             a cloud, a cluster or an agent dials anything.",
             host.roles.join(", ")
         ),
         [one] => Ok(*one),
         many => anyhow::bail!(
-            "{host_id} carries {} and this fleet gives it ONE identity.key — every rendered              configuration names the same file. So it can hold one of {}, and which one is              your decision: pass `--as <kind>`. (A host that really has to be two tiers at              once needs two key files, and this fleet's modules do not render them.)",
+            "{host_id} carries {} and this fleet gives it ONE identity.key — every rendered \
+             configuration names the same file. So it can hold one of {}, and which one is \
+             your decision: pass `--as <kind>`. (A host that really has to be two tiers at \
+             once needs two key files, and this fleet's modules do not render them.)",
             host.roles.join(" and "),
             many.iter()
                 .map(|k| k.as_str())
@@ -2275,9 +2313,8 @@ fn keys_csr(
     }
     println!("{}", path.display());
     eprintln!(
-        "==> {host_id}: {} ({}), key {}
-    {}
-    next: meister-deploy keys issue --host          {host_id} --kind {} --manifest {}",
+        "==> {host_id}: {} ({}), key {}\n    {}\n    next: meister-deploy keys issue \
+         --host {host_id} --kind {} --manifest {}",
         if reply.created {
             "a new key was made on the host"
         } else {
@@ -2351,7 +2388,9 @@ fn keys_issue(
         .and_then(|o| o.ca_dir.clone())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "{} has no `[operator] ca_dir`, so this tool does not know which CA to sign                  with. It is a REFERENCE and not a secret — the directory it names holds the                  CA key, and it belongs outside this repository.",
+                "{} has no `[operator] ca_dir`, so this tool does not know which CA to sign \
+                 with. It is a REFERENCE and not a secret — the directory it names holds the \
+                 CA key, and it belongs outside this repository.",
                 inventory_file.display()
             )
         })?;
@@ -2377,12 +2416,17 @@ fn keys_issue(
     };
     let requested = pki::requested_name(&csr_text).map_err(|e| {
         anyhow::anyhow!(
-            "{source} is not a certificate request this CA will sign: {e}. Nothing was              signed."
+            "{source} is not a certificate request this CA will sign: {e}. Nothing was \
+             signed."
         )
     })?;
     if requested != subject.cn {
         anyhow::bail!(
-            "{source} asks to be {requested:?} and a {kind} certificate for {host_id} is              {:?}. The CA writes its own subject either way, so signing this would produce a              certificate for the right name over a key that asked for another one — which              means the request probably came from a different host or a different kind.              `keys csr --host {host_id} --kind {}` makes the matching one.",
+            "{source} asks to be {requested:?} and a {kind} certificate for {host_id} is \
+             {:?}. The CA writes its own subject either way, so signing this would produce a \
+             certificate for the right name over a key that asked for another one — which \
+             means the request probably came from a different host or a different kind. \
+             `keys csr --host {host_id} --kind {}` makes the matching one.",
             subject.cn,
             ca_kind.file_stem()
         );
@@ -2433,7 +2477,9 @@ fn keys_issue(
         issued.not_after.as_deref().unwrap_or("unknown")
     );
     eprintln!(
-        "note: it reaches the host with `plan` and `apply` — the action `deliver-secret`.          There is no verb that puts a file on a machine outside a run: a second road past          the locks and the journal is what D6 exists to prevent."
+        "note: it reaches the host with `plan` and `apply` — the action `deliver-secret`. \
+         There is no verb that puts a file on a machine outside a run: a second road past \
+         the locks and the journal is what D6 exists to prevent."
     );
     Ok(true)
 }

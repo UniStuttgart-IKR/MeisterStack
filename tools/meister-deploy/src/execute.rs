@@ -46,6 +46,7 @@
 //! justify it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -121,6 +122,13 @@ pub struct ApplyOptions {
     /// network.
     pub settle_wait: Duration,
     pub poll: Duration,
+    /// The operator's repository, where `keys issue` wrote the
+    /// certificates this run may have to deliver (lane 3B).
+    pub repo: PathBuf,
+    /// `[operator] ca_dir`, where the files the CA keeps live. `None` when
+    /// the inventory names none — and then a plan that needs one has
+    /// already blocked the host with the sentence that says so.
+    pub ca_dir: Option<PathBuf>,
 }
 
 impl ApplyOptions {
@@ -135,6 +143,8 @@ impl ApplyOptions {
             reboot_wait: REBOOT_WAIT,
             settle_wait: SETTLE_WAIT,
             poll: POLL,
+            repo: PathBuf::from("."),
+            ca_dir: None,
         }
     }
 }
@@ -729,6 +739,24 @@ impl<'a> Executor<'a> {
                         payload_checks,
                         Vec::new(),
                     )?;
+                    // A host whose plan has no `confirm` has nothing to
+                    // confirm: nothing was activated, so the way back is
+                    // not a timer on the target and this verify is where
+                    // the host is done. Without this it would end the run
+                    // in whatever state it last moved to, which the receipt
+                    // reads as `skipped` and the run as `aborted`.
+                    //
+                    // Two shapes reach it: a `deliver-secret` only host
+                    // (lane 3B) and a `reboot_only` one (2B) — neither of
+                    // them activates anything.
+                    if !self
+                        .plan
+                        .actions_for(id)
+                        .iter()
+                        .any(|a| a.kind == ActionKind::Confirm && !a.is_blocked())
+                    {
+                        self.move_to(journal, id, hosts, HostState::Committed, fresh.host(id))?;
+                    }
                 } else {
                     self.end_with_checks(
                         journal,
@@ -805,13 +833,21 @@ impl<'a> Executor<'a> {
                 }
                 self.end(journal, id, action, ActionResult::Ok, Vec::new(), refs)?;
             }
-            ActionKind::DeliverSecret
-            | ActionKind::Install
-            | ActionKind::Revoke
-            | ActionKind::Gc => {
+            // --- lane 3B ----------------------------------------------
+            ActionKind::DeliverSecret => {
+                self.begin(journal, id, action)?;
+                // NOT `action.irreversible`: replacing a file can be taken
+                // back by writing the old one, and the journal line that
+                // means "something started that cannot be undone" is worth
+                // exactly as much as the number of times it is true.
+                let evidence = self.deliver(id, action)?;
+                self.end(journal, id, action, ActionResult::Ok, evidence, Vec::new())?;
+            }
+            // --- end lane 3B ------------------------------------------
+            ActionKind::Install | ActionKind::Revoke | ActionKind::Gc => {
                 bail!(
                     "the step {} on {id} is a {} and this tool cannot do it yet: \
-                     deliver-secret and install arrive with M3, revoke with M5, gc with M4. \
+                     install arrives with M3A, revoke with M5, gc with M4. \
                      Nothing was done to {id} in this step.",
                     action.seq,
                     action.kind
@@ -824,6 +860,160 @@ impl<'a> Executor<'a> {
     // -----------------------------------------------------------------
     // the steps
     // -----------------------------------------------------------------
+
+    /// Put one file on a host, and ask the host what it now has (lane 3B).
+    ///
+    /// Three properties, and each one is a line below:
+    ///
+    /// * **The content travels on stdin and is redacted out of everything
+    ///   this run writes down.** `transport::Ssh::put` does both; what
+    ///   reaches the journal is a command line with `***` where the file
+    ///   was. A `secrets.key` in a receipt somebody attaches to a ticket is
+    ///   a secret that has left the building.
+    /// * **The evidence is what the HOST says afterwards, not what this
+    ///   workstation sent.** A public file is hashed there and the digest
+    ///   is the evidence; a private one is described by its mode and owner,
+    ///   which is what its loader refuses it for (M0 probe S11) and which
+    ///   is all that may be said about it.
+    /// * **A unit is poked only if it is running.** In a bootstrap the
+    ///   units are off — they wait on the very file being delivered — and a
+    ///   restart of something that is not running is a restart that starts
+    ///   it before the rest of its configuration is there.
+    ///
+    /// This is also the one action a host without a service identity may
+    /// receive. The planner refuses everything else to an `unenrolled`
+    /// host, and rightly: nothing can be verified about a machine that
+    /// cannot authenticate. But delivering the certificate is how it stops
+    /// being one, so a bootstrap's `deliver-secret` is exactly the step
+    /// that gets it there (2B's N5: the SSH host key is what a bootstrap
+    /// may not invent, the service identity is what it delivers).
+    fn deliver(&self, id: &str, action: &Action) -> Result<Vec<String>> {
+        let target = self.target(id)?;
+        let host = self.release.resolved_fleet.hosts.get(id).ok_or_else(|| {
+            anyhow::anyhow!("the release describes no host {id}, so it has no secrets either")
+        })?;
+        let wanted = action.desired.clone().unwrap_or_default();
+        // The plan wrote `<id> at <path>`, so the step is matched back
+        // against the reference it was made from rather than parsed out of
+        // a string: an id that contained the separator would otherwise
+        // deliver the wrong file.
+        let secret = host
+            .secret_refs
+            .iter()
+            .find(|s| format!("{} at {}", s.id, s.target_path) == wanted)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the step {} on {id} is about {wanted:?} and this release names no such \
+                     secret for it. The plan and the release do not describe the same fleet.",
+                    action.seq
+                )
+            })?;
+
+        let Some(source) = crate::pki::local_source(
+            &self.options.repo,
+            self.options.ca_dir.as_deref().unwrap_or(&self.options.repo),
+            id,
+            secret,
+        ) else {
+            bail!(
+                "{} is made on {id} itself and never travels — `meister-activate keygen` \
+                 makes it there and only the request comes back. A plan that asks for it to \
+                 be delivered is a plan this tool will not carry out.",
+                secret.target_path
+            );
+        };
+        if !self.files.exists(&source) {
+            bail!(
+                "{} is not there, and it is what {id} needs at {}. Nothing was sent. Issue \
+                 it first: `keys csr --host {id} --kind …` makes the request on the host, \
+                 `keys issue --host {id} --kind …` signs it.",
+                source.display(),
+                secret.target_path
+            );
+        }
+        let bytes = self.files.read(&source)?;
+
+        let put = self.ssh.put(
+            &target,
+            &secret.target_path,
+            &bytes,
+            &secret.mode,
+            &format!("{}:{}", secret.owner, secret.owner),
+            REMOTE_DEADLINE,
+        );
+        self.runner.run(&put)?;
+
+        // What the host has now, asked of the host. A public file by its
+        // digest, a private one by its mode and its owner — the same
+        // asymmetry the read-only probe of 2A uses, so the next snapshot
+        // says the same thing about it.
+        let public = crate::observe::is_certificate(&secret.target_path);
+        let question = if public {
+            format!(
+                "sha256sum {} 2>/dev/null | cut -d' ' -f1",
+                crate::run::shell_quote(&secret.target_path)
+            )
+        } else {
+            format!(
+                "stat -c 'mode:%a owner:%U:%G' {}",
+                crate::run::shell_quote(&secret.target_path)
+            )
+        };
+        let answer = self
+            .runner
+            .run(&self.ssh.ask(&target, &question, REMOTE_DEADLINE))?;
+        let seen = answer.trimmed().to_string();
+        let mut evidence = vec![format!(
+            "{} at {}: {}",
+            secret.id,
+            secret.target_path,
+            if public {
+                format!("sha256:{seen}")
+            } else {
+                seen.clone()
+            }
+        )];
+        if public {
+            let here = crate::ids::sha256_hex(&bytes);
+            if seen != here {
+                bail!(
+                    "{id} answered with sha256:{seen} for {} and this workstation sent \
+                     sha256:{here}. Something is between the two, or the file was replaced \
+                     between the write and the question.",
+                    secret.target_path
+                );
+            }
+        }
+
+        // And the unit that reads it, if it is running.
+        if let Some(reload) = &secret.reload {
+            let active = self.runner.run(&self.ssh.ask(
+                &target,
+                &format!(
+                    "systemctl is-active {}",
+                    crate::run::shell_quote(&reload.unit)
+                ),
+                REMOTE_DEADLINE,
+            ))?;
+            if active.trimmed() == "active" {
+                let cmd = self.ssh.exec(
+                    &target,
+                    ["systemctl", &reload.action, &reload.unit],
+                    Effect::TargetWrite,
+                    REMOTE_DEADLINE,
+                );
+                self.runner.run(&cmd)?;
+                evidence.push(format!("{} {}", reload.action, reload.unit));
+            } else {
+                evidence.push(format!(
+                    "{} was {} and was left alone",
+                    reload.unit,
+                    active.trimmed()
+                ));
+            }
+        }
+        Ok(evidence)
+    }
 
     /// Carry the closure, then check at the TARGET that what arrived is what
     /// the release names (V12), then let the helper say it is whole.

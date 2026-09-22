@@ -1359,3 +1359,357 @@ fn every_mutating_step_is_preceded_by_a_fresh_look() {
         assert!(!needs_validation(kind), "{kind} is a look or a door");
     }
 }
+
+// ---------------------------------------------------------------------------
+// lane 3B: deliver-secret
+// ---------------------------------------------------------------------------
+
+/// One host, one file to put there, and the operator's own copy of it on a
+/// fake disk.
+///
+/// `host=n1` and not the whole fleet: what these tests are about is the
+/// step, and a plan over one host is a plan whose every command is one of
+/// its own. The identity key of the fixture is `target-generated` and never
+/// travels, which is half of what is being shown.
+fn delivering() -> (Fixture, String) {
+    let release = release_of(onebox_enrolled());
+    let mut observation = observed(&release, at(NOW));
+    // n1 has never been handed the fleet's CA certificate.
+    let n1 = observation
+        .hosts
+        .get_mut("n1")
+        .expect("n1 is in the fixture");
+    n1.credentials.insert("ca-bundle".to_string(), None);
+    let expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
+    let plan = plan(
+        &release,
+        "host=n1",
+        &observation,
+        None,
+        &crate::fixtures::plan_policy(PlanKind::Upgrade).with_expected_credentials(expected),
+        at(NOW),
+    )
+    .expect("the fixture plans");
+    let contents = "a certificate authority\n".to_string();
+    let fx = Fixture {
+        release,
+        plan,
+        // The CA's own file where `[operator] ca_dir` says it is.
+        files: MemFiles::new().given("/ca/ca.crt", contents.clone()),
+        clock: FakeClock::at(at(NOW)),
+        state: StateDir::at("/repo/.meister-deploy"),
+        ssh: Ssh::with_known_hosts("/repo/known_hosts"),
+    };
+    (fx, contents)
+}
+
+/// The `ssh … sh -c '<script>'` a put or a question arrives as.
+fn shell_on(id: &str, script: &str) -> Matcher {
+    let address = match id {
+        "box" => "10.0.0.10",
+        "n1" => "10.0.0.11",
+        _ => "10.0.0.12",
+    };
+    let mut out = Ssh::with_known_hosts("/repo/known_hosts").opts(22);
+    out.push(format!("root@{address}"));
+    out.push("sh".to_string());
+    out.push("-c".to_string());
+    out.push(crate::run::shell_quote(script));
+    Matcher::exact("ssh", out)
+}
+
+fn deliver_options(fx: &Fixture) -> ApplyOptions {
+    let mut options = fx.options();
+    options.repo = PathBuf::from("/repo");
+    options.ca_dir = Some(PathBuf::from("/ca"));
+    options
+}
+
+const PUT_SCRIPT: &str = "set -e; d=$(dirname /var/lib/meisterstack/pki/ca.crt); mkdir -p \"$d\"; \
+                          t=$(mktemp \"$d/.meister.XXXXXX\"); cat > \"$t\"; chown root:root \"$t\"; \
+                          chmod 0644 \"$t\"; mv \"$t\" /var/lib/meisterstack/pki/ca.crt";
+
+const SHA_SCRIPT: &str = "sha256sum /var/lib/meisterstack/pki/ca.crt 2>/dev/null | cut -d' ' -f1";
+
+/// The commands one delivery is, in order: the lock, the put, the question,
+/// the lock back.
+fn delivery_runner<'a>(look: &'a TableLook, answer: Output) -> World<'a> {
+    World::new(
+        StrictFake::new()
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(shell_on("n1", PUT_SCRIPT), ok())
+            .expect(shell_on("n1", SHA_SCRIPT), answer)
+            .expect(helper("n1", &["lock", "release"]), ok()),
+        look,
+    )
+}
+
+/// The whole step: the file goes over, the HOST is asked what it now has,
+/// and the digest it answers with is the evidence.
+#[test]
+fn a_secret_is_put_there_and_the_host_says_what_it_has() {
+    let (fx, contents) = delivering();
+    let digest = crate::ids::sha256_hex(contents.as_bytes());
+    let look = TableLook::new(&fx);
+    let runner = delivery_runner(&look, Output::stdout(format!("{digest}\n")));
+    let applied = fx
+        .executor(&runner, &look, deliver_options(&fx))
+        .run()
+        .expect("a delivery applies");
+    runner.verify().expect("exactly those commands");
+
+    assert_eq!(applied.receipt.outcome, Outcome::Success);
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+    let steps: Vec<ActionKind> = applied.receipt.hosts["n1"]
+        .actions
+        .iter()
+        .map(|a| a.kind)
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ActionKind::Preflight,
+            ActionKind::Lock,
+            ActionKind::DeliverSecret,
+            ActionKind::Verify,
+            ActionKind::Unlock
+        ],
+        "nothing was staged and nothing was activated"
+    );
+    // The evidence is the digest the HOST computed.
+    let evidence = applied.receipt.hosts["n1"]
+        .actions
+        .iter()
+        .find(|a| a.kind == ActionKind::DeliverSecret)
+        .expect("the step is in the receipt")
+        .evidence
+        .join(" ");
+    assert!(evidence.contains(&format!("sha256:{digest}")), "{evidence}");
+    assert!(
+        evidence.contains("/var/lib/meisterstack/pki/ca.crt"),
+        "{evidence}"
+    );
+}
+
+/// The content travels on stdin and out of everything this run writes down.
+#[test]
+fn what_was_sent_is_not_in_the_journal() {
+    let (fx, contents) = delivering();
+    let digest = crate::ids::sha256_hex(contents.as_bytes());
+    let look = TableLook::new(&fx);
+    let runner = delivery_runner(&look, Output::stdout(format!("{digest}\n")));
+    fx.executor(&runner, &look, deliver_options(&fx))
+        .run()
+        .expect("it applies");
+    runner.verify().unwrap();
+
+    // Not in the command lines this run saw…
+    for call in runner.calls() {
+        assert!(!call.contains("a certificate authority"), "{call}");
+    }
+    // …and not in the journal it wrote. The redaction is a whole-string
+    // replacement (`transport::Ssh::put`), so what stands there is `***`.
+    let journal = String::from_utf8(
+        fx.files
+            .content(fx.state.journal_path("run-1"))
+            .expect("a journal was written"),
+    )
+    .unwrap();
+    assert!(!journal.contains("a certificate authority"), "{journal}");
+    assert!(journal.contains("deliver-secret"), "{journal}");
+    // And no `action.irreversible`: replacing a file can be taken back by
+    // writing the old one, and that line means something.
+    let kinds: Vec<EventKind> = fx
+        .journal_lines("run-1")
+        .into_iter()
+        .map(|e| e.event)
+        .collect();
+    assert!(!kinds.contains(&EventKind::ActionIrreversible), "{kinds:?}");
+}
+
+/// A file this workstation does not have is not a file it sends, and the
+/// sentence names the verb that makes it.
+#[test]
+fn a_certificate_nobody_issued_stops_the_step_before_the_connection() {
+    let (fx, _) = delivering();
+    // The operator's disk is empty after all.
+    let fx = Fixture {
+        files: MemFiles::new(),
+        ..fx
+    };
+    let look = TableLook::new(&fx);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok()),
+        &look,
+    );
+    let applied = fx
+        .executor(&runner, &look, deliver_options(&fx))
+        .run()
+        .expect("the run ends with a receipt");
+    runner.verify().expect("nothing was put anywhere");
+    assert_ne!(applied.receipt.outcome, Outcome::Success);
+    let why = applied.stopped.unwrap_or_default();
+    assert!(why.contains("/ca/ca.crt"), "{why}");
+    assert!(why.contains("keys issue"), "{why}");
+}
+
+/// The host answered with a different digest than what was sent. Somebody
+/// is between the two, and the run says so instead of calling it done.
+#[test]
+fn a_digest_the_host_does_not_agree_with_fails_the_step() {
+    let (fx, _) = delivering();
+    let look = TableLook::new(&fx);
+    let runner = delivery_runner(
+        &look,
+        Output::stdout("0000000000000000000000000000000000000000000000000000000000000000\n"),
+    );
+    let applied = fx
+        .executor(&runner, &look, deliver_options(&fx))
+        .run()
+        .expect("the run ends with a receipt");
+    runner.verify().unwrap();
+    assert_ne!(applied.receipt.outcome, Outcome::Success);
+    let why = applied.stopped.unwrap_or_default();
+    assert!(why.contains("Something is between the two"), "{why}");
+}
+
+/// A key the target made itself is never sent, whatever a plan says. The
+/// refusal is in the executor as well as in the planner, because the
+/// executor is the one that would have to read the file.
+#[test]
+fn a_key_the_target_made_is_never_delivered_even_if_a_plan_asks() {
+    let (fx, _) = delivering();
+    let look = TableLook::new(&fx);
+    let runner = World::new(StrictFake::new(), &look);
+    let executor = fx.executor(&runner, &look, deliver_options(&fx));
+    let mut action = fx
+        .plan
+        .actions_for("n1")
+        .into_iter()
+        .find(|a| a.kind == ActionKind::DeliverSecret)
+        .expect("the plan has one")
+        .clone();
+    // A step nobody would plan: the identity key of the fixture is
+    // `target-generated`.
+    action.desired = Some("identity at /var/lib/meisterstack/pki/identity.key".to_string());
+    let err = executor.deliver("n1", &action).unwrap_err();
+    assert!(err.to_string().contains("never travels"), "{err}");
+    assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    runner.verify().unwrap();
+}
+
+/// A unit that is running is restarted; one that is not is left alone —
+/// which is what a bootstrap is, because the unit is waiting for the very
+/// file being delivered.
+#[test]
+fn a_unit_is_poked_only_when_it_is_running() {
+    for running in [true, false] {
+        // The same fleet, except that the CA certificate has a unit hanging
+        // off it. (The fixture's own `ca-bundle` has no reload, which is
+        // what the tests above pin.)
+        let mut fleet = onebox_enrolled();
+        for secret in fleet
+            .hosts
+            .get_mut("n1")
+            .expect("n1 is in the fixture")
+            .secret_refs
+            .iter_mut()
+            .filter(|s| s.id == "ca-bundle")
+        {
+            // A unit that is NOT one of this host's role units, so that
+            // whether it runs is a question for the target alone and not
+            // one the readiness checks also have an opinion about.
+            secret.reload = Some(crate::manifest::Reload {
+                unit: "meister-trust.service".to_string(),
+                action: "restart".to_string(),
+            });
+        }
+        fleet.manifest_id =
+            crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("it hashes");
+        let release = release_of(fleet);
+        let mut observation = observed(&release, at(NOW));
+        observation
+            .hosts
+            .get_mut("n1")
+            .expect("n1 is in the fixture")
+            .credentials
+            .insert("ca-bundle".to_string(), None);
+        let expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
+        let plan = plan(
+            &release,
+            "host=n1",
+            &observation,
+            None,
+            &crate::fixtures::plan_policy(PlanKind::Upgrade).with_expected_credentials(expected),
+            at(NOW),
+        )
+        .expect("it plans");
+        let contents = "a certificate authority\n".to_string();
+        let digest = crate::ids::sha256_hex(contents.as_bytes());
+        let fx = Fixture {
+            release,
+            plan,
+            files: MemFiles::new().given("/ca/ca.crt", contents),
+            clock: FakeClock::at(at(NOW)),
+            state: StateDir::at("/repo/.meister-deploy"),
+            ssh: Ssh::with_known_hosts("/repo/known_hosts"),
+        };
+        let look = TableLook::new(&fx);
+        let mut fake = StrictFake::new()
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(shell_on("n1", PUT_SCRIPT), ok())
+            .expect(
+                shell_on("n1", SHA_SCRIPT),
+                Output::stdout(format!("{digest}\n")),
+            )
+            .expect(
+                shell_on("n1", "systemctl is-active meister-trust.service"),
+                Output::stdout(if running { "active\n" } else { "inactive\n" }),
+            );
+        if running {
+            fake = fake.expect(
+                Matcher::prefix("ssh", {
+                    let mut out = Ssh::with_known_hosts("/repo/known_hosts").opts(22);
+                    out.push("root@10.0.0.11".to_string());
+                    out.push("systemctl".to_string());
+                    out.push("restart".to_string());
+                    out.push("meister-trust.service".to_string());
+                    out
+                }),
+                ok(),
+            );
+        }
+        let runner = World::new(fake.expect(helper("n1", &["lock", "release"]), ok()), &look);
+        let applied = fx
+            .executor(&runner, &look, deliver_options(&fx))
+            .run()
+            .expect("it applies");
+        runner.verify().expect("exactly those commands");
+        assert_eq!(
+            applied.receipt.outcome,
+            Outcome::Success,
+            "running={running}"
+        );
+
+        let evidence = applied.receipt.hosts["n1"]
+            .actions
+            .iter()
+            .find(|a| a.kind == ActionKind::DeliverSecret)
+            .expect("the step is there")
+            .evidence
+            .join(" ");
+        if running {
+            assert!(
+                evidence.contains("restart meister-trust.service"),
+                "{evidence}"
+            );
+        } else {
+            assert!(
+                evidence.contains("was inactive and was left alone"),
+                "{evidence}"
+            );
+        }
+    }
+}
