@@ -16,6 +16,14 @@
 # directory to read. The second half is the grep below, because a path can
 # also travel as a STRING in a config file — `inputBackend`, a hypervisor
 # binary, a kernel — and a string like that would only fail on the machine.
+#
+# `/opt/meisterstack/bin` and not `/opt/meisterstack`: the BIN directory is
+# the one a push fills, and a managed host must name nothing in it. The
+# agent's `image_dir = /opt/meisterstack/images` is a state directory that
+# nix/agent.nix creates with tmpfiles on either road — measured here, because
+# the first version of this check refused it — and moving it to /var/lib on a
+# managed host would change every agent's configuration, which is a decision
+# for M2 rather than a grep.
 { lib, pkgs, configs }:
 
 let
@@ -31,14 +39,14 @@ pkgs.runCommand "no-developer-home" { } ''
   for f in ${lib.concatStringsSep " " (map toString files)}; do
     if [ -d "$f" ]; then
       # A toplevel: our own units, not all of nixpkgs'.
-      hits=$(grep -rl -e /home/ -e Leandro -e /opt/meisterstack \
+      hits=$(grep -rl -e /home/ -e Leandro -e /opt/meisterstack/bin \
         "$f"/etc/systemd/system/meister-*.service 2>/dev/null || true)
     else
-      hits=$(grep -l -e /home/ -e Leandro -e /opt/meisterstack "$f" 2>/dev/null || true)
+      hits=$(grep -l -e /home/ -e Leandro -e /opt/meisterstack/bin "$f" 2>/dev/null || true)
     fi
     if [ -n "$hits" ]; then
       echo "$hits names a path this fleet was not built from:"
-      grep -h -e /home/ -e Leandro -e /opt/meisterstack $hits | head -5
+      grep -h -e /home/ -e Leandro -e /opt/meisterstack/bin $hits | head -5
       bad=1
     fi
   done
