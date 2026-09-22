@@ -81,6 +81,20 @@ pub trait Files {
     fn append_fsync(&self, path: &Path, line: &str) -> Result<()>;
 }
 
+/// The directory a file lives in, as something that can be opened.
+///
+/// `Path::new("plan.json").parent()` is `Some("")` and not `None`, and an
+/// empty path opens nothing: the temporary lands beside the file either way,
+/// the rename works, and only the directory `fsync` fails — so a bare
+/// relative `--out` used to write the file and then report an error about
+/// it. Both spellings of "the current directory" become `.` here.
+fn parent_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
 /// The real one. Refuses every write a `--dry-run` or an `--offline` run is
 /// not allowed to make — and refuses it before the file is opened, so a
 /// refused run cannot leave a zero-length file behind either.
@@ -124,7 +138,7 @@ impl Files for RealFiles {
 
     fn write_atomic(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         self.may_write(path)?;
-        let dir = path.parent().unwrap_or(Path::new("."));
+        let dir = parent_of(path);
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -187,7 +201,7 @@ impl Files for RealFiles {
 
     fn symlink_atomic(&self, target: &Path, link: &Path) -> Result<()> {
         self.may_write(link)?;
-        let dir = link.parent().unwrap_or(Path::new("."));
+        let dir = parent_of(link);
         let name = link
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -458,6 +472,28 @@ impl Clock for FakeClock {
 
 #[cfg(test)]
 mod tests {
+    use super::parent_of;
+
+    #[test]
+    fn a_bare_relative_name_lives_in_the_current_directory() {
+        assert_eq!(
+            parent_of(std::path::Path::new("plan.json")),
+            std::path::Path::new(".")
+        );
+        assert_eq!(
+            parent_of(std::path::Path::new("out/plan.json")),
+            std::path::Path::new("out")
+        );
+        assert_eq!(
+            parent_of(std::path::Path::new("/tmp/plan.json")),
+            std::path::Path::new("/tmp")
+        );
+        assert_eq!(
+            parent_of(std::path::Path::new("/")),
+            std::path::Path::new(".")
+        );
+    }
+
     use super::*;
 
     #[test]
