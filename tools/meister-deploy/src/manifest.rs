@@ -516,6 +516,13 @@ pub struct NixHost {
     /// `{"agent_toml_out": "/nix/store/…-agent.toml"}`: the rendered
     /// configuration files, by role.
     pub config_artifacts: BTreeMap<String, String>,
+    /// Every systemd unit this host's system generation carries, by name.
+    ///
+    /// Names and not units: what a plan does with them is tell this stack's
+    /// units from the operator's own. A unit nobody here declared is a unit
+    /// whose disruption this tool cannot predict, which is what an
+    /// `unknowns[]` entry says out loud instead of guessing.
+    pub units: Vec<String>,
     pub secret_refs: Vec<SecretRef>,
     pub persistence: Vec<Persistence>,
     pub checks: HostChecks,
@@ -650,6 +657,8 @@ pub struct ResolvedHost {
     pub effective_settings: EffectiveSettings,
     pub build: Build,
     pub config_artifacts: BTreeMap<String, String>,
+    /// Every systemd unit this host's system generation carries, by name.
+    pub units: Vec<String>,
     pub secret_refs: Vec<SecretRef>,
     pub persistence: Vec<Persistence>,
     pub install: Option<Install>,
@@ -794,6 +803,7 @@ pub fn resolve(
                 effective_settings: built.effective_settings,
                 build: built.build,
                 config_artifacts: built.config_artifacts,
+                units: built.units,
                 secret_refs: built.secret_refs,
                 persistence: built.persistence,
                 install: host.install,
@@ -1068,6 +1078,61 @@ mod tests {
         assert_eq!(host.rollout.reboot, RebootPolicy::Approve);
         assert_eq!(host.checks.required, vec!["units", "session", "mounts"]);
         assert_eq!(resolved.schema, RESOLVED_FLEET_SCHEMA);
+    }
+
+    #[test]
+    fn a_host_carries_the_units_of_its_generation() {
+        let manifest = NixManifest::from_json(&fixture(), "the fixture").unwrap();
+        let resolved = resolve(manifest.clone(), source(), tool(), now(), None).unwrap();
+        // The list travels from the evaluated half to the resolved host
+        // whole and in order: a plan that reordered it would change the
+        // manifest id for nothing.
+        assert_eq!(resolved.hosts["box"].units, manifest.hosts["box"].units);
+        assert!(
+            resolved.hosts["box"]
+                .units
+                .contains(&"meister-cloud-controller.service".to_string()),
+            "{:?}",
+            resolved.hosts["box"].units
+        );
+        // And it is a per-host fact and not a fleet-wide one: an agent has
+        // no controller unit, which is exactly the difference a plan reads.
+        assert!(
+            !resolved.hosts["n1"]
+                .units
+                .contains(&"meister-cloud-controller.service".to_string()),
+            "{:?}",
+            resolved.hosts["n1"].units
+        );
+        assert!(
+            resolved.hosts["n1"]
+                .units
+                .contains(&"meister-agent.service".to_string())
+        );
+    }
+
+    #[test]
+    fn a_changed_unit_list_is_a_different_manifest_id() {
+        let before = resolve(
+            NixManifest::from_json(&fixture(), "a").unwrap(),
+            source(),
+            tool(),
+            now(),
+            None,
+        )
+        .unwrap();
+        let mut manifest = NixManifest::from_json(&fixture(), "b").unwrap();
+        manifest
+            .hosts
+            .get_mut("n1")
+            .unwrap()
+            .units
+            .push("somebody-elses.service".to_string());
+        let after = resolve(manifest, source(), tool(), now(), None).unwrap();
+        assert_ne!(
+            before.manifest_id, after.manifest_id,
+            "a unit an operator's own module brought onto a host is part of what that host is"
+        );
     }
 
     #[test]

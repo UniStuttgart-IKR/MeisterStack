@@ -125,6 +125,19 @@ let
         cfg.environment.etc."meisterstack/${role}.toml".source.outPath)
       cfg.meisterstack.unitsFor);
 
+  # Every unit this host's system generation carries, by name.
+  #
+  # The NAMES and not the units: a name is a string that costs nothing to
+  # produce (`systemd.units` is already forced by the toplevel beside it),
+  # while the unit texts would put a megabyte of shell into a manifest that
+  # is read, committed and diffed. What a plan does with them is say what an
+  # operator's OWN modules brought onto a host: a unit this stack does not
+  # name is a unit whose disruption nobody here can predict, which is the
+  # `unknowns[]` of D-C (lane 4A). So the list has to be the whole list —
+  # sorted, because `builtins.attrNames` is and a manifest that reordered
+  # itself would change its own id for nothing.
+  unitNames = id: builtins.attrNames configs.${id}.systemd.units;
+
   # --- the key material a host needs ------------------------------------
   #
   # Derived from the files the rendered configuration NAMES, not from a list
@@ -216,6 +229,7 @@ let
     };
     build = buildOf id;
     config_artifacts = configArtifacts id;
+    units = unitNames id;
     secret_refs = secretRefs id;
     persistence = map
       (p: {
