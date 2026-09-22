@@ -4,6 +4,7 @@
 
 //! `meister-deploy` — the plan, the order, and the evidence.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -580,21 +581,31 @@ fn plan_summary(plan: &plan::DeploymentPlan) -> String {
         plan.selection.targets.len(),
         plan.last_wave() + 1
     ));
+    out.push_str(&format!(
+        "    {:<14} {:<12} {:>4}  {:<16} {:>5}  {}\n",
+        "HOST", "VERDICT", "WAVE", "CLASS", "STEPS", "NOTE"
+    ));
     for (id, host) in &plan.hosts {
         let steps = plan.actions_for(id);
         let blocked = steps.iter().filter(|a| a.is_blocked()).count();
         out.push_str(&format!(
-            "    {id:<16} {:<12} wave {:<3} {:<24} {} step(s){}\n",
+            "    {id:<14} {:<12} {:>4}  {:<16} {:>5}  {}\n",
             host.verdict,
             host.wave,
             host.class,
             steps.len(),
-            if blocked > 0 {
-                format!(", {blocked} blocked")
-            } else if host.reboot_required {
-                ", reboot".to_string()
-            } else {
-                String::new()
+            match (blocked, host.reboot_required, host.canary) {
+                (0, false, false) => String::new(),
+                (0, reboot, canary) => [
+                    if reboot { "reboot" } else { "" },
+                    if canary { "canary" } else { "" }
+                ]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+                (n, _, _) => format!("{n} blocked"),
             }
         ));
     }
@@ -603,8 +614,25 @@ fn plan_summary(plan: &plan::DeploymentPlan) -> String {
             out.push_str(&format!("    group {id}: {why}\n"));
         }
     }
-    for reason in plan.blocked_reasons() {
+    // One sentence, however many steps it stopped. A quorum that is gone
+    // stops six steps on three hosts, and printing it eighteen times is how
+    // the one line that matters gets lost.
+    let mut by_reason: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
+    for action in &plan.actions {
+        if let Some(why) = &action.blocked {
+            by_reason
+                .entry(why.as_str())
+                .or_default()
+                .entry(action.host.as_str())
+                .or_default()
+                .push(action.kind.as_str());
+        }
+    }
+    for (reason, hosts) in by_reason {
         out.push_str(&format!("    blocked: {reason}\n"));
+        for (host, kinds) in hosts {
+            out.push_str(&format!("             {host}: {}\n", kinds.join(", ")));
+        }
     }
     for unknown in &plan.unknowns {
         out.push_str(&format!(

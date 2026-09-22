@@ -83,6 +83,17 @@ impl Sandbox {
         )
         .unwrap();
 
+        // So the files a test plans from can be read by hand, and the same
+        // run repeated at a terminal: `MEISTER_TEST_KEEP=<dir>` copies them
+        // out. Nothing in any test depends on it.
+        if let Ok(keep) = std::env::var("MEISTER_TEST_KEEP") {
+            let keep = Path::new(&keep);
+            std::fs::create_dir_all(keep).unwrap();
+            for name in ["release.json", "snap.json", "snap-moved.json", "fleet.toml"] {
+                std::fs::copy(cwd.path().join(name), keep.join(name)).unwrap();
+            }
+        }
+
         Sandbox {
             cwd,
             out: tempfile::tempdir().unwrap(),
@@ -269,11 +280,17 @@ fn an_offline_plan_is_provisional_blocks_the_interruptions_and_writes_nothing() 
             );
         }
     }
-    assert!(
-        stderr(&out).contains("provisional observation"),
-        "{}",
-        stderr(&out)
+    let why = stderr(&out);
+    assert!(why.contains("provisional observation"), "{why}");
+    // The table has a header, and one sentence stops eighteen steps once
+    // rather than eighteen times.
+    assert!(why.contains("HOST           VERDICT"), "{why}");
+    assert_eq!(
+        why.matches("needs an online observation").count(),
+        1,
+        "the same reason was printed more than once:\n{why}"
     );
+    assert!(why.contains("box: cordon, drain, activate"), "{why}");
 }
 
 #[test]

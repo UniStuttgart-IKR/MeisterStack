@@ -86,8 +86,11 @@ impl PlanKind {
 }
 
 impl std::fmt::Display for PlanKind {
+    /// `pad` and not `write_str`: the second one writes straight to the sink
+    /// and ignores the width a caller asked for, so `{:<12}` on one of these
+    /// would silently print an unpadded column.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -157,7 +160,7 @@ impl ActionKind {
 
 impl std::fmt::Display for ActionKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -236,7 +239,7 @@ impl ApprovalClass {
 
 impl std::fmt::Display for ApprovalClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -441,7 +444,7 @@ impl HostVerdict {
 
 impl std::fmt::Display for HostVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
