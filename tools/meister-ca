@@ -39,6 +39,9 @@ CURVE="prime256v1"
 
 CLOUDS=(); CLUSTERS=(); NODES=(); ADMINS=(); USERS=()
 SERVINGS=(); CLOUD_IDS=(); CLUSTER_IDS=()
+# The CSR path: a request somebody else made, signed here. No key is
+# generated for it and none is wanted -- that is the point of a request.
+SIGN_CSR=""; SIGN_KIND=""; SIGN_NAME=""; SIGN_SAN=""; SIGN_OUT=""
 
 usage() {
 	cat <<'USAGE'
@@ -68,6 +71,24 @@ usage: meister-ca [options]
                              default member). The group is LABELLING, not a
                              permission: the cloud reads the role off the User
                              object in its directory on every request.
+
+  Every form above makes a key AND a certificate, which is right for a lab
+  where this script is the only thing that exists. A fleet does it the other
+  way round: the key is made on the machine that will use it
+  (`meister-activate keygen`) and only the request travels. Then:
+
+  --sign-csr FILE            sign a request somebody else made. Generates NO
+                             key: what is signed is the public half in the
+                             request, and the private half never was here.
+  --kind KIND                node | cluster | cloud | serving -- which subject
+                             and which extensions the certificate gets. The CA
+                             decides the subject; the CN in the request is a
+                             request.
+  --name NAME                what the subject is built from: the node id, the
+                             cluster/cloud name, or the host name for serving
+  --san LIST                 extra SANs for --kind serving (comma separated)
+  --out FILE                 where the certificate goes
+                             (default: <dir>/issued/<name>-<kind>.crt)
 
 SANs are the addresses clients will use: bare names become DNS entries,
 anything that parses as an address becomes an IP entry. "localhost" and
@@ -102,6 +123,11 @@ while [ $# -gt 0 ]; do
 		--node)    NODES+=("$2"); shift 2 ;;
 		--admin)   ADMINS+=("$2"); shift 2 ;;
 		--user)    USERS+=("$2"); shift 2 ;;
+		--sign-csr) SIGN_CSR="$2"; shift 2 ;;
+		--kind)     SIGN_KIND="$2"; shift 2 ;;
+		--name)     SIGN_NAME="$2"; shift 2 ;;
+		--san)      SIGN_SAN="$2"; shift 2 ;;
+		--out)      SIGN_OUT="$2"; shift 2 ;;
 		-h|--help) usage; exit 0 ;;
 		*) die "unknown option $1 (try --help)" ;;
 	esac
@@ -182,6 +208,63 @@ keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=clientAuth
 subjectKeyIdentifier=hash
 authorityKeyIdentifier=keyid,issuer'
+
+# --- signing a request somebody else made ----------------------------------
+#
+# The other half of `meister-activate keygen`: the key was made on the machine
+# that will use it, and what arrives here is a public key and a name. This
+# branch generates nothing -- there is no `genpkey` in it -- and it is the only
+# path in this script that ends with a certificate whose private half was never
+# on this computer.
+#
+# The SUBJECT is ours. `openssl x509 -req -subj` overwrites the CN the request
+# carries, and no `-copy_extensions` is passed, so nothing the requester wrote
+# reaches the certificate: a request is a request. That is what makes it safe
+# to accept one from a machine that is being enrolled for the first time.
+if [ -n "$SIGN_CSR" ]; then
+	[ -f "$SIGN_CSR" ] || die "no such certificate request: $SIGN_CSR"
+	[ -n "$SIGN_NAME" ] || die "--sign-csr needs --name (what the subject is built from)"
+	case "$SIGN_KIND" in
+		node)    subj="/CN=system:node:$SIGN_NAME/O=system:nodes"       ; exts="$CLIENT_EXTS" ;;
+		cluster) subj="/CN=system:cluster:$SIGN_NAME/O=system:clusters" ; exts="$CLIENT_EXTS" ;;
+		cloud)   subj="/CN=system:cloud:$SIGN_NAME/O=system:clouds"     ; exts="$CLIENT_EXTS" ;;
+		serving) subj="/CN=$SIGN_NAME/O=system:controllers"
+		         exts="$SERVER_EXTS
+subjectAltName=$(sans_of "$SIGN_SAN")" ;;
+		"") die "--sign-csr needs --kind (node|cluster|cloud|serving)" ;;
+		*)  die "unknown --kind $SIGN_KIND (node|cluster|cloud|serving)" ;;
+	esac
+	[ "$SIGN_KIND" = "serving" ] || [ -z "$SIGN_SAN" ] || \
+		die "--san is only for --kind serving: a client certificate is checked on its CN"
+
+	# The request has to be signed by the key it carries, or it is a form and
+	# not a request: without this, anybody could submit somebody else's public
+	# key under their own name and have this CA vouch for a key they do not
+	# hold. `meister-deploy keys issue` checks the same thing before it gets
+	# here; this is the CA's own answer, for an operator who runs the script
+	# by hand.
+	openssl req -in "$SIGN_CSR" -noout -verify >/dev/null 2>&1 \
+		|| die "$SIGN_CSR is not signed by the key it carries"
+
+	out="${SIGN_OUT:-$DIR/issued/$SIGN_NAME-$SIGN_KIND.crt}"
+	mkdir -p "$(dirname "$out")"
+	ext="$(mktemp)"
+	printf '%s\n' "$exts" > "$ext"
+	# ADDITIVE: every issued certificate stays where it was written, because
+	# `--index-rebuild` (M5A) reads exactly these files to reconstruct
+	# index.txt, and a revocation that is not in the index is not a
+	# revocation (M0 probe S9).
+	openssl x509 -req -in "$SIGN_CSR" -CA "$CA_CRT" -CAkey "$CA_KEY" -CAcreateserial \
+		-out "$out" -days "$DAYS" -sha256 -extfile "$ext" -subj "$subj" 2>/dev/null \
+		|| { rm -f "$ext"; die "openssl refused to sign $SIGN_CSR"; }
+	rm -f "$ext"
+	serial="$(openssl x509 -in "$out" -noout -serial | cut -d= -f2)"
+	note "signed: $subj"
+	note "serial: $serial"
+	note "        $out"
+	printf '%s\n' "$out"
+	exit 0
+fi
 
 bundle() { printf '%s\n' "$*" >> "$BUNDLE"; }
 
