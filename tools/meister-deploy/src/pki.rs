@@ -919,11 +919,13 @@ pub fn expected_for_host(
                         format!("sha256:{}", crate::ids::sha256_hex(&bytes)),
                     );
                 }
-                // Unreadable is not "absent": leaving it out would make the
-                // planner ask for a certificate to be issued that is
-                // already there. The plan blocks on it either way, and the
-                // sentence it gets is about the file that could not be
-                // read.
+                // Unreadable is not "absent": leaving it out would make a
+                // bootstrap say that nobody has issued a certificate that
+                // is sitting right there. A word that is not a digest
+                // never equals what the host reports, so the file is
+                // planned for delivery — and the run then stops at the
+                // read, with the path in the sentence. One step later than
+                // a refusal, and about the right file either way.
                 Err(_) => {
                     out.insert(secret.id.clone(), "unreadable".to_string());
                 }
