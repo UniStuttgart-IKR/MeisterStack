@@ -354,6 +354,63 @@
             profiles = exampleProfiles;
           };
 
+          # An installer medium carries no secret (D9).
+          #
+          # The cheap half of the claim, and the one `nix flake check` can
+          # afford: the CLOSURE of what the medium embeds — the target's
+          # system and the disko script `isoImage.storeContents` names — has
+          # no path whose name looks like key material, and the `/etc` that
+          # system ships has nothing in it that says PRIVATE KEY. The
+          # complete form, over the mounted ISO itself, is measured once in
+          # `checks.vm-install-blank-disk`, because walking a 1.4 GiB
+          # squashfs is not a thing to do on every evaluation.
+          #
+          # `closureInfo` and not `nix path-info -r`: a check is a
+          # derivation, and a derivation that shelled out to the daemon
+          # would be a check about the machine it ran on.
+          installer-no-secrets =
+            let
+              host = example.nixosConfigurations.box.config;
+              embedded = [
+                host.system.build.toplevel
+                host.system.build.diskoScript
+              ];
+              closure = pkgs.closureInfo { rootPaths = embedded; };
+            in
+            pkgs.runCommand "installer-no-secrets" { } ''
+              echo "== the closure the example installer embeds"
+              wc -l < ${closure}/store-paths
+
+              # A store path whose NAME ends in .key or .sec, or that calls
+              # itself secrets. None of this stack's key material is ever in
+              # the store — it is written to the target by `keys deliver`
+              # (M3B) — so a path like that is either somebody's accident or
+              # a dependency that carries an example key, and both are
+              # things to look at before an image travels.
+              if grep -E '\.(key|sec)$|secrets$' ${closure}/store-paths > bad-names; then
+                echo "the medium would carry key material:"
+                cat bad-names
+                exit 1
+              fi
+
+              # And the one place a private key would actually be read from:
+              # the /etc this system ships. `-R` and not `-r`, because a
+              # NixOS /etc is a tree of symlinks into the store and `-r`
+              # would walk past all of it.
+              # `-s` as well: a NixOS /etc has dangling symlinks in it (a
+              # font configuration that points at a version directory which
+              # is not there), and a check that printed a warning about one
+              # would be a check somebody learns to ignore.
+              if grep -RIls 'PRIVATE KEY' ${host.system.build.toplevel}/etc > bad-files; then
+                echo "the medium would carry a private key in /etc:"
+                cat bad-files
+                exit 1
+              fi
+
+              echo "  ok   no key material in the closure and none in /etc"
+              touch $out
+            '';
+
           # An inventory that cannot be deployed cannot be built.
           inventory-conflicts = import ./nix/tests/inventory-conflicts.nix {
             inherit lib pkgs inventoryLib;
