@@ -412,10 +412,19 @@ fn an_unknown_selector_lists_what_exists_and_writes_nothing() {
 
 #[test]
 fn a_missing_cli_reference_is_a_note_and_the_plan_says_which_steps_it_blocks() {
-    // D7: no `[operator] cli_config` anywhere. The inventory the manifest
-    // names does not exist in this sandbox, which is the ordinary case for a
-    // plan made away from the operator's repository.
+    // D7: no `[operator] cli_config` anywhere, because the inventory that
+    // would carry it is not there — the ordinary case for a plan made away
+    // from the operator's repository.
+    //
+    // The path is named EXPLICITLY, inside this sandbox. Until lane 3B it
+    // was the one the fixture's `source.repo_path` points at, and that is a
+    // real directory on the machine this was written on: the day
+    // `~/git/meisterstack-lab` came into existence (lane L1), this test
+    // read a real fleet.toml and failed. A test about a missing file has to
+    // own the file it misses.
     let sandbox = Sandbox::new();
+    let absent = sandbox.cwd.path().join("no-such-inventory.toml");
+    assert!(!absent.exists());
     let out = sandbox.run(&[
         "plan",
         "--release",
@@ -424,6 +433,8 @@ fn a_missing_cli_reference_is_a_note_and_the_plan_says_which_steps_it_blocks() {
         "host=n1",
         "--observation",
         "snap.json",
+        "--inventory",
+        absent.to_str().unwrap(),
     ]);
     assert_eq!(code(&out), 2, "{}", stderr(&out));
     let why = stderr(&out);
