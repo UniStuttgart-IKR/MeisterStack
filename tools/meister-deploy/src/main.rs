@@ -256,6 +256,91 @@ enum KeysCmd {
         #[arg(long)]
         json: bool,
     },
+
+    /// Ask a host for a certificate request over a key it makes itself.
+    ///
+    /// The private half is generated on the target and stays there; what
+    /// comes back is the request, which lands under `<repo>/pki/csr/`.
+    /// Running it twice does not make a second identity — the host keeps
+    /// its key and answers with another request over it.
+    Csr {
+        /// The host id
+        #[arg(long)]
+        host: String,
+        /// Which key: `identity` (what the host dials with) or `serving`
+        /// (what a client checks its address against)
+        #[arg(long, default_value = "identity")]
+        kind: String,
+        /// Which identity, for a host that carries more than one tier:
+        /// node, cluster or cloud. One role means one answer and this can
+        /// be left out.
+        #[arg(long = "as", value_name = "KIND")]
+        as_kind: Option<String>,
+        /// Make a NEW key on the target although one is there. A rotation
+        /// or a reinstall, never a repair.
+        #[arg(long)]
+        replace: bool,
+        /// The manifest from `resolve`: it says where the host is and what
+        /// its subject would be
+        #[arg(long)]
+        manifest: PathBuf,
+        /// The operator's repository: its `known_hosts` is what the
+        /// connection is checked against, and the request lands under it
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// The ssh key to offer
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Print the command line and change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as json
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Sign a request with the fleet's CA, offline.
+    ///
+    /// The subject is this tool's decision and not the request's: a request
+    /// is a public key and a wish. The CA key stays in `[operator] ca_dir`
+    /// and never reaches a host.
+    Issue {
+        /// The host the certificate is for
+        #[arg(long)]
+        host: String,
+        /// node | cluster | cloud | serving
+        #[arg(long)]
+        kind: String,
+        /// The request. `-` reads it from standard input; without it, the
+        /// one `keys csr` left under `<repo>/pki/csr/`.
+        #[arg(long)]
+        csr: Option<String>,
+        /// Extra subject alternative names for `--kind serving`, comma
+        /// separated. The host name and its management address are always
+        /// in.
+        #[arg(long)]
+        san: Vec<String>,
+        /// How long the certificate is good for
+        #[arg(long)]
+        days: Option<u32>,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// The inventory the `[operator] ca_dir` reference is read from.
+        /// Defaults to the one the manifest was resolved from.
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+        /// `tools/meister-ca`. Looked up on PATH when it is a bare name.
+        #[arg(long, default_value = "meister-ca")]
+        meister_ca: PathBuf,
+        /// Print what would be signed and sign nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as json
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // --- end lane 3B --------------------------------------------------------
@@ -1932,7 +2017,356 @@ fn keys(cmd: &KeysCmd) -> Result<bool> {
             *offline,
             *json,
         ),
+        KeysCmd::Csr {
+            host,
+            kind,
+            as_kind,
+            replace,
+            manifest,
+            repo,
+            identity,
+            dry_run,
+            json,
+        } => keys_csr(
+            host,
+            kind,
+            as_kind.as_deref(),
+            *replace,
+            manifest,
+            repo,
+            identity.as_deref(),
+            *dry_run,
+            *json,
+        ),
+        KeysCmd::Issue {
+            host,
+            kind,
+            csr,
+            san,
+            days,
+            manifest,
+            repo,
+            inventory,
+            meister_ca,
+            dry_run,
+            json,
+        } => keys_issue(
+            host,
+            kind,
+            csr.as_deref(),
+            san,
+            *days,
+            manifest,
+            repo,
+            inventory.as_deref(),
+            meister_ca,
+            *dry_run,
+            *json,
+        ),
     }
+}
+
+/// The manifest, read through the same parser `validate --manifest` uses.
+fn read_manifest(files: &dyn Files, path: &Path) -> Result<manifest::ResolvedFleet> {
+    let text = files.read_to_string(path)?;
+    manifest::ResolvedFleet::from_json(&text, &path.display().to_string())
+}
+
+/// Which certificate a host's `identity.key` is for.
+///
+/// A host with one tier has one answer. A host that carries two — a cloud
+/// and a cluster, or a controller and an agent — has one `identity.key`
+/// (every rendered configuration of this fleet names the same path) and
+/// therefore ONE service identity, so the operator says which. Guessing
+/// would put the wrong tier's name on the key a controller dials with, and
+/// the far end would reject the Hello with a name nobody typed.
+fn identity_kind_of(
+    host_id: &str,
+    host: &manifest::ResolvedHost,
+    asked: Option<&str>,
+) -> Result<meister_deploy::pki::CaKind> {
+    use meister_deploy::pki::{CaKind, identity_kinds};
+    let candidates = identity_kinds(host);
+    if let Some(asked) = asked {
+        let kind = CaKind::parse(asked)?;
+        if kind == CaKind::Serving {
+            anyhow::bail!(
+                "`--as serving` is not an identity: the serving certificate is its own file                  and its own request. Use `keys csr --host {host_id} --kind serving`."
+            );
+        }
+        if !candidates.contains(&kind) {
+            anyhow::bail!(
+                "{host_id} carries the role(s) {} and cannot be a {kind}. It can be: {}.",
+                host.roles.join(", "),
+                candidates
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        return Ok(kind);
+    }
+    match candidates.as_slice() {
+        [] => anyhow::bail!(
+            "{host_id} carries the role(s) {} and none of them has a service identity. Only              a cloud, a cluster or an agent dials anything.",
+            host.roles.join(", ")
+        ),
+        [one] => Ok(*one),
+        many => anyhow::bail!(
+            "{host_id} carries {} and this fleet gives it ONE identity.key — every rendered              configuration names the same file. So it can hold one of {}, and which one is              your decision: pass `--as <kind>`. (A host that really has to be two tiers at              once needs two key files, and this fleet's modules do not render them.)",
+            host.roles.join(" and "),
+            many.iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn keys_csr(
+    host_id: &str,
+    kind: &str,
+    as_kind: Option<&str>,
+    replace: bool,
+    manifest_path: &Path,
+    repo: &Path,
+    identity: Option<&Path>,
+    dry_run: bool,
+    json: bool,
+) -> Result<bool> {
+    use meister_deploy::activate::KeyKind;
+    use meister_deploy::pki;
+
+    let policy = if dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+    let runner = Real::new(policy);
+
+    let file_kind = KeyKind::parse(kind)?;
+    let fleet = read_manifest(&files, manifest_path)?;
+    let host = fleet.hosts.get(host_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} names no host {host_id:?}; it covers {}.",
+            manifest_path.display(),
+            fleet.evaluated_hosts.join(", ")
+        )
+    })?;
+    let ca_kind = match file_kind {
+        KeyKind::Serving => pki::CaKind::Serving,
+        KeyKind::Identity => identity_kind_of(host_id, host, as_kind)?,
+    };
+    let subject = pki::subject_for(&fleet, host_id, ca_kind, &[])?;
+
+    let target = pki::target_from_host(host_id, host);
+    let ssh = transport::Ssh::for_repo(repo).with_identity(identity.map(Path::to_path_buf));
+    let cmd = pki::keygen_cmd(&ssh, &target, &subject.cn, file_kind.as_str(), replace);
+
+    if dry_run {
+        println!("{}", cmd.described());
+        eprintln!(
+            "note: nothing was asked and nothing was written. The request would land in {}.",
+            pki::csr_path(repo, host_id, file_kind.as_str()).display()
+        );
+        return Ok(true);
+    }
+
+    // Before the first connection: a host this fleet has not enrolled is a
+    // host ssh would refuse with "Host key verification failed", and the
+    // operator would then go looking for a broken machine instead of for
+    // the step that never happened.
+    ssh.require_enrolled(&runner, &target)?;
+    Cancel::on_sigint()?;
+    let out = runner.run(&cmd)?;
+    let reply = pki::parse_keygen(&out.stdout, host_id)?;
+
+    let path = pki::csr_path(repo, host_id, file_kind.as_str());
+    files.create_dir_all(path.parent().unwrap_or(repo))?;
+    files.write_atomic(&path, reply.csr_pem.as_bytes(), 0o644)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "host": host_id,
+                "kind": file_kind.as_str(),
+                "certificate_kind": ca_kind.as_str(),
+                "subject": subject.dn,
+                "requested_name": reply.subject,
+                "public_key_sha256": reply.public_key_sha256,
+                "created": reply.created,
+                "csr": path.display().to_string(),
+            }))?
+        );
+        return Ok(true);
+    }
+    println!("{}", path.display());
+    eprintln!(
+        "==> {host_id}: {} ({}), key {}
+    {}
+    next: meister-deploy keys issue --host          {host_id} --kind {} --manifest {}",
+        if reply.created {
+            "a new key was made on the host"
+        } else {
+            "the key that was already there answered again"
+        },
+        subject.dn,
+        reply.public_key_sha256,
+        path.display(),
+        ca_kind.as_str(),
+        manifest_path.display()
+    );
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn keys_issue(
+    host_id: &str,
+    kind: &str,
+    csr: Option<&str>,
+    san: &[String],
+    days: Option<u32>,
+    manifest_path: &Path,
+    repo: &Path,
+    inventory: Option<&Path>,
+    meister_ca: &Path,
+    dry_run: bool,
+    json: bool,
+) -> Result<bool> {
+    use meister_deploy::pki;
+
+    let policy = if dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+    let runner = Real::new(policy);
+
+    let ca_kind = pki::CaKind::parse(kind)?;
+    // Absolute, because the refusal below compares the CA directory with
+    // the repository, and `.` compared with `pki/ca` would say they have
+    // nothing to do with each other.
+    let repo = &std::path::absolute(repo)
+        .with_context(|| format!("{} could not be made absolute", repo.display()))?;
+    let fleet = read_manifest(&files, manifest_path)?;
+    if !fleet.hosts.contains_key(host_id) {
+        anyhow::bail!(
+            "{} names no host {host_id:?}; it covers {}.",
+            manifest_path.display(),
+            fleet.evaluated_hosts.join(", ")
+        );
+    }
+    let extra: Vec<String> = san
+        .iter()
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let subject = pki::subject_for(&fleet, host_id, ca_kind, &extra)?;
+
+    // The CA directory, from the inventory the manifest names.
+    let inventory_file = match inventory {
+        Some(path) => path.to_path_buf(),
+        None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
+    };
+    let parsed = Inventory::load(&files, &inventory_file)?;
+    let named = parsed
+        .operator
+        .as_ref()
+        .and_then(|o| o.ca_dir.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no `[operator] ca_dir`, so this tool does not know which CA to sign                  with. It is a REFERENCE and not a secret — the directory it names holds the                  CA key, and it belongs outside this repository.",
+                inventory_file.display()
+            )
+        })?;
+    let ca = pki::ca_dir(repo, &fleet.source.inventory_path, &named);
+    pki::refuse_ca_in_repo(repo, &ca)?;
+
+    // The request. Read before anything is decided about it, and checked:
+    // `requested_name` verifies that the key inside signed it, which is what
+    // tells a request from a form.
+    let source = csr.map(str::to_string).unwrap_or_else(|| {
+        pki::csr_path(repo, host_id, ca_kind.file_stem())
+            .display()
+            .to_string()
+    });
+    let csr_text = if source == "-" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .context("reading the certificate request from standard input failed")?;
+        text
+    } else {
+        files.read_to_string(Path::new(&source))?
+    };
+    let requested = pki::requested_name(&csr_text).map_err(|e| {
+        anyhow::anyhow!(
+            "{source} is not a certificate request this CA will sign: {e}. Nothing was              signed."
+        )
+    })?;
+    if requested != subject.cn {
+        anyhow::bail!(
+            "{source} asks to be {requested:?} and a {kind} certificate for {host_id} is              {:?}. The CA writes its own subject either way, so signing this would produce a              certificate for the right name over a key that asked for another one — which              means the request probably came from a different host or a different kind.              `keys csr --host {host_id} --kind {}` makes the matching one.",
+            subject.cn,
+            ca_kind.file_stem()
+        );
+    }
+
+    let out_path = pki::issued_path(repo, host_id, &format!("{}.crt", ca_kind.file_stem()));
+    let csr_on_disk = if source == "-" {
+        // The CA is a program and it reads a FILE. A request that arrived on
+        // standard input is put where `keys csr` would have put it, so that
+        // what was signed is still there afterwards — a certificate whose
+        // request nobody kept is a certificate nobody can check.
+        let kept = pki::csr_path(repo, host_id, ca_kind.file_stem());
+        files.create_dir_all(kept.parent().unwrap_or(repo))?;
+        files.write_atomic(&kept, csr_text.as_bytes(), 0o644)?;
+        kept
+    } else {
+        PathBuf::from(&source)
+    };
+    let sign = pki::sign_cmd(meister_ca, &ca, &csr_on_disk, &subject, &out_path, days);
+
+    if dry_run {
+        println!("{}", sign.described());
+        eprintln!(
+            "note: nothing was signed. It would be {} and land in {}.",
+            subject.dn,
+            out_path.display()
+        );
+        return Ok(true);
+    }
+
+    files.create_dir_all(out_path.parent().unwrap_or(repo))?;
+    runner.run(&sign)?;
+    let described = runner.run(&pki::describe_cmd("openssl", &out_path))?;
+    let issued = pki::parse_describe(&described.stdout, &out_path.display().to_string());
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&issued)?);
+        return Ok(true);
+    }
+    println!("{}", out_path.display());
+    eprintln!(
+        "==> {host_id}: {} {}
+    serial {}
+    until  {}",
+        subject.dn,
+        out_path.display(),
+        issued.serial.as_deref().unwrap_or("unknown"),
+        issued.not_after.as_deref().unwrap_or("unknown")
+    );
+    eprintln!(
+        "note: it reaches the host with `plan` and `apply` — the action `deliver-secret`.          There is no verb that puts a file on a machine outside a run: a second road past          the locks and the journal is what D6 exists to prevent."
+    );
+    Ok(true)
 }
 
 /// Where the inventory is: the path as given when it is absolute, and under

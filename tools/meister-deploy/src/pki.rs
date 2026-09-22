@@ -26,16 +26,36 @@
 //! road to a target, past the locks and past the journal, is precisely what
 //! D6 exists to prevent.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 
+use crate::activate::KeygenOutcome;
 use crate::effects::Files;
 use crate::manifest::ResolvedHost;
+
+/// Reading a certificate request — the one piece of X.509 this module does
+/// itself, and it does it through the crate the controllers use.
+///
+/// The signature check is the point: it proves the sender holds the private
+/// half of the key it asks to have certified. Without it, anybody could
+/// submit somebody else's public key under their own name and have this CA
+/// vouch for a key they do not have.
+pub use ::pki::requested_name;
+
 use crate::run::{Cmd, Effect, Expect, Runner};
-use crate::transport::{Target, fingerprint_of};
+use crate::transport::{Ssh, Target, fingerprint_of};
+
+/// Where a request waits for the CA, relative to the operator's repository.
+/// Public and committed: a request is a public key and a name.
+pub const CSR_DIR: &str = "pki/csr";
+
+/// Where an issued certificate lands, relative to the operator's repository.
+/// Also public, also committed — a certificate is what an operator wants to
+/// see in a diff.
+pub const ISSUED_DIR: &str = "pki/issued";
 
 /// How long `ssh-keyscan` may spend on one host, as its own `-T` and as the
 /// deadline of the command. Two numbers because a program that ignores its
@@ -366,6 +386,427 @@ pub fn target_from_host(host_id: &str, host: &ResolvedHost) -> Target {
         host.ssh.port,
         host.ssh.user.clone(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Where the operator's own files are
+// ---------------------------------------------------------------------------
+
+/// Where a request for this host and this file waits for the CA.
+pub fn csr_path(repo: &Path, host_id: &str, kind: &str) -> PathBuf {
+    repo.join(CSR_DIR).join(format!("{host_id}-{kind}.csr"))
+}
+
+/// Where the certificate for this host lands.
+pub fn issued_path(repo: &Path, host_id: &str, file: &str) -> PathBuf {
+    repo.join(ISSUED_DIR).join(host_id).join(file)
+}
+
+/// The directory `tools/meister-ca` keeps the CA in, as the inventory names
+/// it.
+///
+/// Relative to the inventory FILE, which is what `[operator] ca_dir = "../labpki"`
+/// means and what every other reference in that table means.
+pub fn ca_dir(repo: &Path, inventory_path: &str, ca_dir: &str) -> PathBuf {
+    let base = repo.join(inventory_path);
+    let base = base.parent().unwrap_or(repo);
+    let named = Path::new(ca_dir);
+    if named.is_absolute() {
+        named.to_path_buf()
+    } else {
+        normalise(&base.join(named))
+    }
+}
+
+/// `a/b/../c` -> `a/c`, without asking the filesystem.
+///
+/// The path is printed in error messages and compared against the
+/// repository below; `..` left in makes both of those unreadable, and
+/// `canonicalize` would be a file system call in a module that has a door
+/// for those.
+fn normalise(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Refuse a CA directory inside the repository.
+///
+/// The repository is committed; the CA key is the one file of this fleet
+/// that must never be. `.gitignore` would be the other answer and it is one
+/// edit away from being wrong — this is the answer that cannot be forgotten.
+pub fn refuse_ca_in_repo(repo: &Path, ca: &Path) -> Result<()> {
+    if ca.starts_with(repo) {
+        bail!(
+            "the CA directory {} is inside the operator repository {}. That repository is \
+             committed, and `ca.key` is the one file of this fleet that must not be. Put it \
+             beside the repository — `[operator] ca_dir = \"../labpki\"` — and nothing else \
+             has to be remembered.",
+            ca.display(),
+            repo.display()
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Subjects
+// ---------------------------------------------------------------------------
+
+/// Which identity the CA is being asked to certify.
+///
+/// The four `tools/meister-ca` knows, and the names are its names: this enum
+/// is what `--kind` is spelled with on both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaKind {
+    /// `CN=system:node:<host id>`, `O=system:nodes`. An agent.
+    Node,
+    /// `CN=system:cluster:<group>`, `O=system:clusters`.
+    Cluster,
+    /// `CN=system:cloud:<group>`, `O=system:clouds`.
+    Cloud,
+    /// `CN=<host name>`, `O=system:controllers`, with SANs. What a client
+    /// checks THIS ADDRESS against.
+    Serving,
+}
+
+impl CaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CaKind::Node => "node",
+            CaKind::Cluster => "cluster",
+            CaKind::Cloud => "cloud",
+            CaKind::Serving => "serving",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<CaKind> {
+        match text {
+            "node" => Ok(CaKind::Node),
+            "cluster" => Ok(CaKind::Cluster),
+            "cloud" => Ok(CaKind::Cloud),
+            "serving" => Ok(CaKind::Serving),
+            other => bail!(
+                "{other:?} is not a certificate kind. This tool knows: node, cluster, cloud, \
+                 serving."
+            ),
+        }
+    }
+
+    /// Whether this kind belongs in `identity.crt` or in `serving.crt`.
+    pub fn file_stem(self) -> &'static str {
+        match self {
+            CaKind::Serving => "serving",
+            _ => "identity",
+        }
+    }
+}
+
+impl std::fmt::Display for CaKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+/// The subject this fleet would put on a certificate of that kind for that
+/// host, and the name `meister-ca` needs to build it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subject {
+    pub kind: CaKind,
+    /// What goes into `--name`.
+    pub name: String,
+    /// The common name, which is what a request asks for and what the far
+    /// end compares a Hello against (`controller-api::Identity::may_speak_for`).
+    pub cn: String,
+    /// The whole distinguished name, for a person to read.
+    pub dn: String,
+    /// The SANs a serving certificate gets. Empty for the client kinds.
+    pub sans: Vec<String>,
+}
+
+/// Which identity a host's `identity.key` is for, from its roles.
+///
+/// A host with one controller role has one answer. A host that carries the
+/// cloud AND the cluster has two, and the fleet gives it ONE `identity.key`
+/// (`nix/controllers.nix` names `${pki.dir}/identity.crt` for both tiers) —
+/// so the operator has to say which, and this returns the list rather than
+/// guessing. Guessing here would mean signing the wrong tier's name onto the
+/// key a controller dials with, and the far end would reject it at the
+/// Hello with a message about a name nobody typed.
+pub fn identity_kinds(host: &ResolvedHost) -> Vec<CaKind> {
+    let mut out = Vec::new();
+    if host.roles.iter().any(|r| r == "cloud") {
+        out.push(CaKind::Cloud);
+    }
+    if host.roles.iter().any(|r| r == "cluster") {
+        out.push(CaKind::Cluster);
+    }
+    // The agent reads the SAME two files (`nix/agent.nix` names
+    // `${pki.dir}/identity.crt` as its `controller_cert`), so a host that
+    // carries an agent beside a controller is a third candidate and not a
+    // fourth file.
+    if host.roles.iter().any(|r| r == "agent") {
+        out.push(CaKind::Node);
+    }
+    out
+}
+
+/// The name of the tier a controller host belongs to.
+///
+/// The same rule `nix/lib/inventory.nix` renders `MEISTER_CLOUD_NAME` and
+/// `MEISTER_CLUSTER_NAME` with: the host's raft group, or the host id when
+/// it is in none. What the fleet actually rendered wins where it is there,
+/// because that is the name the far end will compare against.
+pub fn tier_name(
+    fleet: &crate::manifest::ResolvedFleet,
+    host_id: &str,
+    kind: CaKind,
+) -> Result<String> {
+    let host = fleet
+        .hosts
+        .get(host_id)
+        .ok_or_else(|| anyhow::anyhow!("there is no host {host_id:?} in this manifest."))?;
+    let rendered = match kind {
+        CaKind::Cloud => host
+            .effective_settings
+            .cloud
+            .as_ref()
+            .and_then(|c| c.get("cloud_name")),
+        CaKind::Cluster => host
+            .effective_settings
+            .cluster
+            .as_ref()
+            .and_then(|c| c.get("cluster_name")),
+        _ => None,
+    };
+    if let Some(name) = rendered.and_then(|v| v.as_str()) {
+        return Ok(name.to_string());
+    }
+    let raft = host.groups.iter().find(|g| {
+        fleet
+            .groups
+            .get(*g)
+            .is_some_and(|group| group.kind == crate::manifest::GroupKind::Raft)
+    });
+    Ok(raft.cloned().unwrap_or_else(|| host_id.to_string()))
+}
+
+/// What this fleet would have the CA write, for this host and this kind.
+pub fn subject_for(
+    fleet: &crate::manifest::ResolvedFleet,
+    host_id: &str,
+    kind: CaKind,
+    extra_sans: &[String],
+) -> Result<Subject> {
+    let host = fleet
+        .hosts
+        .get(host_id)
+        .ok_or_else(|| anyhow::anyhow!("there is no host {host_id:?} in this manifest."))?;
+    let (name, cn, organisation) = match kind {
+        CaKind::Node => (
+            host_id.to_string(),
+            format!("system:node:{host_id}"),
+            "system:nodes",
+        ),
+        CaKind::Cluster => {
+            let name = tier_name(fleet, host_id, kind)?;
+            let cn = format!("system:cluster:{name}");
+            (name, cn, "system:clusters")
+        }
+        CaKind::Cloud => {
+            let name = tier_name(fleet, host_id, kind)?;
+            let cn = format!("system:cloud:{name}");
+            (name, cn, "system:clouds")
+        }
+        CaKind::Serving => (host.name.clone(), host.name.clone(), "system:controllers"),
+    };
+    let dn = format!("CN={cn}, O={organisation}");
+    let mut sans: Vec<String> = Vec::new();
+    if kind == CaKind::Serving {
+        // What a client will have typed: the name the machine calls itself,
+        // and the address the fleet reaches it at. Both, because both are
+        // used — `cloud_addrs` is an address and a browser is a name.
+        sans.push(host.name.clone());
+        sans.push(host.address.clone());
+        for san in extra_sans {
+            if !sans.iter().any(|s| s == san) {
+                sans.push(san.clone());
+            }
+        }
+        sans.dedup();
+    } else if !extra_sans.is_empty() {
+        bail!(
+            "a {kind} certificate carries no subject alternative names: it is a CLIENT \
+             certificate, and what it is checked on is its CN. Only `--kind serving` takes \
+             --san."
+        );
+    }
+    Ok(Subject {
+        kind,
+        name,
+        cn,
+        dn,
+        sans,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The request, made on the target
+// ---------------------------------------------------------------------------
+
+/// How long the helper's `keygen` may take over ssh. Generating a P-256 key
+/// is instant; the deadline is for the connection.
+pub const KEYGEN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// `meister-activate keygen`, over ssh.
+///
+/// [`Effect::TargetWrite`] and not [`Effect::Read`], because a file can come
+/// into existence on the far side. It is the mildest target write there is —
+/// nothing that runs is restarted, and an existing key is left exactly as it
+/// is — but calling it a read would make `--dry-run` do it.
+pub fn keygen_cmd(ssh: &Ssh, target: &Target, subject: &str, file: &str, replace: bool) -> Cmd {
+    let mut argv = vec![
+        "meister-activate".to_string(),
+        "--json".to_string(),
+        "keygen".to_string(),
+        "--subject".to_string(),
+        subject.to_string(),
+        "--kind".to_string(),
+        file.to_string(),
+    ];
+    if replace {
+        argv.push("--replace".to_string());
+    }
+    ssh.exec(target, argv, Effect::TargetWrite, KEYGEN_DEADLINE)
+}
+
+/// What the helper answered, read back as the helper's own type.
+///
+/// `meister_deploy::activate::KeygenOutcome` and not a second struct beside
+/// it: the two ends of this pipe are the same crate, and a copy of a
+/// contract is a copy that drifts. The same decision `status --json` was
+/// made under (2A/2C).
+pub fn parse_keygen(text: &str, host_id: &str) -> Result<KeygenOutcome> {
+    let reply: KeygenOutcome = serde_json::from_str(text.trim()).with_context(|| {
+        format!("meister-activate keygen on {host_id} did not answer with the json this tool reads")
+    })?;
+    if !reply.csr_pem.contains("BEGIN CERTIFICATE REQUEST") {
+        bail!("meister-activate keygen on {host_id} answered without a certificate request in it.");
+    }
+    // The one thing that must never come back. Checked rather than trusted:
+    // this string is about to be written into a file in a repository
+    // somebody commits.
+    if reply.csr_pem.contains("PRIVATE KEY") {
+        bail!(
+            "meister-activate keygen on {host_id} answered with something that contains a \
+             PRIVATE KEY. Nothing was written. A request is a public key and a name; if what \
+             runs on that host sends a key, it is not the helper this tool speaks to."
+        );
+    }
+    Ok(reply)
+}
+
+// ---------------------------------------------------------------------------
+// The CA
+// ---------------------------------------------------------------------------
+
+/// How long `tools/meister-ca --sign-csr` may take. It is openssl on a
+/// small file.
+pub const SIGN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// `tools/meister-ca --dir <ca> --sign-csr <file> --kind <k> --name <n>`.
+pub fn sign_cmd(
+    meister_ca: &Path,
+    ca_dir: &Path,
+    csr: &Path,
+    subject: &Subject,
+    out: &Path,
+    days: Option<u32>,
+) -> Cmd {
+    let mut cmd = Cmd::new(
+        // It makes no key and it moves none; what it does is use the CA key
+        // to say something. That is the `key` class, and an `--offline` run
+        // is allowed to do it — signing a request needs nothing but this
+        // machine.
+        Effect::Key,
+        meister_ca.display().to_string(),
+        SIGN_DEADLINE,
+    )
+    .arg("--dir")
+    .arg(ca_dir.display().to_string())
+    .arg("--sign-csr")
+    .arg(csr.display().to_string())
+    .arg("--kind")
+    .arg(subject.kind.as_str())
+    .arg("--name")
+    .arg(&subject.name)
+    .arg("--out")
+    .arg(out.display().to_string());
+    if !subject.sans.is_empty() {
+        cmd = cmd.arg("--san").arg(subject.sans.join(","));
+    }
+    if let Some(days) = days {
+        cmd = cmd.arg("--days").arg(days.to_string());
+    }
+    cmd
+}
+
+/// What a certificate on disk says, without opening it with a parser of our
+/// own: `openssl x509` is already the tool that signed it.
+pub fn describe_cmd(openssl: &str, crt: &Path) -> Cmd {
+    Cmd::new(Effect::Offline, openssl, Duration::from_secs(30))
+        .arg("x509")
+        .arg("-in")
+        .arg(crt.display().to_string())
+        .arg("-noout")
+        .arg("-serial")
+        .arg("-subject")
+        .arg("-enddate")
+        .arg("-fingerprint")
+        .arg("-sha256")
+}
+
+/// The four fields `keys issue` prints, out of what `openssl x509` said.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Issued {
+    pub serial: Option<String>,
+    pub subject: Option<String>,
+    pub not_after: Option<String>,
+    pub sha256: Option<String>,
+    pub path: String,
+}
+
+pub fn parse_describe(text: &str, path: &str) -> Issued {
+    let mut issued = Issued {
+        path: path.to_string(),
+        ..Issued::default()
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "serial" => issued.serial = Some(value),
+            "subject" => issued.subject = Some(value),
+            "notAfter" => issued.not_after = Some(value),
+            k if k.starts_with("sha256 Fingerprint") || k == "SHA256 Fingerprint" => {
+                issued.sha256 = Some(value)
+            }
+            _ => {}
+        }
+    }
+    issued
 }
 
 #[cfg(test)]
@@ -750,6 +1191,277 @@ mod tests {
         )
         .unwrap();
         runner.verify().unwrap();
+    }
+
+    // --- position 3: subjects, the request, the CA --------------------
+
+    /// The four subjects, against `tools/meister-ca`'s own conventions
+    /// (its header, lines 19-22).
+    #[test]
+    fn the_four_subjects_are_the_ones_the_ca_writes() {
+        let fleet = crate::fixtures::onebox_enrolled();
+        // box is cloud+cluster+agent, and its one raft group is `box`.
+        let cloud = subject_for(&fleet, "box", CaKind::Cloud, &[]).unwrap();
+        assert_eq!(cloud.cn, "system:cloud:box");
+        assert_eq!(cloud.dn, "CN=system:cloud:box, O=system:clouds");
+        assert_eq!(cloud.name, "box");
+        assert!(cloud.sans.is_empty());
+
+        let cluster = subject_for(&fleet, "box", CaKind::Cluster, &[]).unwrap();
+        assert_eq!(cluster.dn, "CN=system:cluster:box, O=system:clusters");
+
+        // A node is named after the HOST ID and nothing else: the cluster
+        // checks this CN against the node_id in the agent's Hello.
+        let node = subject_for(&fleet, "n1", CaKind::Node, &[]).unwrap();
+        assert_eq!(node.dn, "CN=system:node:n1, O=system:nodes");
+        assert_eq!(node.name, "n1");
+
+        let serving = subject_for(&fleet, "box", CaKind::Serving, &[]).unwrap();
+        assert_eq!(serving.dn, "CN=meister-box, O=system:controllers");
+        // The name the machine calls itself AND the address the fleet
+        // reaches it at: both are typed by somebody.
+        assert!(
+            serving.sans.contains(&"meister-box".to_string()),
+            "{serving:?}"
+        );
+        assert!(
+            serving.sans.contains(&"10.0.0.10".to_string()),
+            "{serving:?}"
+        );
+    }
+
+    #[test]
+    fn a_client_certificate_takes_no_subject_alternative_name() {
+        let fleet = crate::fixtures::onebox_enrolled();
+        let err = subject_for(&fleet, "n1", CaKind::Node, &["extra".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("`--kind serving`"), "{err}");
+        let extra = subject_for(
+            &fleet,
+            "box",
+            CaKind::Serving,
+            &["box.lab".to_string(), "meister-box".to_string()],
+        )
+        .unwrap();
+        assert!(extra.sans.contains(&"box.lab".to_string()));
+        assert_eq!(
+            extra.sans.iter().filter(|s| *s == "meister-box").count(),
+            1,
+            "a name that is already in is not in twice: {extra:?}"
+        );
+    }
+
+    /// The name of a tier is the raft group's, the way
+    /// `nix/lib/inventory.nix` renders `MEISTER_CLUSTER_NAME` — and what
+    /// the fleet ACTUALLY rendered wins where it is there, because that is
+    /// the name the far end compares against.
+    #[test]
+    fn a_tier_is_named_after_its_raft_group_unless_the_fleet_said_otherwise() {
+        let mut fleet = crate::fixtures::onebox_enrolled();
+        assert_eq!(tier_name(&fleet, "box", CaKind::Cluster).unwrap(), "box");
+        let host = fleet.hosts.get_mut("box").unwrap();
+        host.effective_settings.cluster = Some(serde_json::json!({ "cluster_name": "cp-1" }));
+        assert_eq!(tier_name(&fleet, "box", CaKind::Cluster).unwrap(), "cp-1");
+        // A host in no raft group is named after itself.
+        assert_eq!(tier_name(&fleet, "n1", CaKind::Cloud).unwrap(), "n1");
+    }
+
+    /// A host that carries two tiers has ONE identity.key, so it has one
+    /// identity, and this tool says so rather than picking.
+    #[test]
+    fn which_identity_a_host_can_hold_comes_from_its_roles() {
+        let fleet = crate::fixtures::onebox_enrolled();
+        assert_eq!(
+            identity_kinds(&fleet.hosts["box"]),
+            vec![CaKind::Cloud, CaKind::Cluster, CaKind::Node]
+        );
+        assert_eq!(identity_kinds(&fleet.hosts["n1"]), vec![CaKind::Node]);
+    }
+
+    #[test]
+    fn a_kind_that_does_not_exist_lists_the_four_that_do() {
+        let err = CaKind::parse("admin").unwrap_err();
+        assert!(
+            err.to_string().contains("node, cluster, cloud, serving"),
+            "{err}"
+        );
+        for name in ["node", "cluster", "cloud", "serving"] {
+            assert_eq!(CaKind::parse(name).unwrap().as_str(), name);
+        }
+        assert_eq!(CaKind::Serving.file_stem(), "serving");
+        assert_eq!(CaKind::Node.file_stem(), "identity");
+    }
+
+    /// What the helper answers with is the helper's own type, and a reply
+    /// carrying a key is refused before it reaches a file.
+    #[test]
+    fn a_reply_that_carries_a_key_is_not_a_reply() {
+        let good = serde_json::json!({
+            "subject": "system:node:n1",
+            "kind": "identity",
+            "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nAAAA\n-----END CERTIFICATE REQUEST-----\n",
+            "public_key_sha256": "ab".repeat(32),
+            "created": true,
+        });
+        let parsed = parse_keygen(&good.to_string(), "n1").unwrap();
+        assert_eq!(parsed.subject, "system:node:n1");
+        assert!(parsed.created);
+
+        let mut bad = good.clone();
+        bad["csr_pem"] = serde_json::json!(
+            "-----BEGIN CERTIFICATE REQUEST-----\nA\n-----END CERTIFICATE REQUEST-----\n\n-----BEGIN PRIVATE KEY-----\nB\n-----END PRIVATE KEY-----\n"
+        );
+        let err = parse_keygen(&bad.to_string(), "n1").unwrap_err();
+        assert!(err.to_string().contains("PRIVATE KEY"), "{err}");
+
+        let mut empty = good;
+        empty["csr_pem"] = serde_json::json!("nothing at all");
+        let err = parse_keygen(&empty.to_string(), "n1").unwrap_err();
+        assert!(
+            err.to_string().contains("without a certificate request"),
+            "{err}"
+        );
+
+        assert!(parse_keygen("not json", "n1").is_err());
+    }
+
+    /// The command that asks a host for a request: it names the subject
+    /// this fleet decided on, and it is a target write.
+    #[test]
+    fn the_keygen_command_asks_for_the_subject_this_fleet_decided() {
+        let ssh = Ssh::with_known_hosts("/repo/known_hosts");
+        let target = Target::new("n1", "10.0.0.11", 22, "root");
+        let cmd = keygen_cmd(&ssh, &target, "system:node:n1", "identity", false);
+        assert_eq!(cmd.effect, Effect::TargetWrite);
+        let line = cmd.line();
+        assert!(line.contains("meister-activate --json keygen"), "{line}");
+        assert!(line.contains("--subject system:node:n1"), "{line}");
+        assert!(line.contains("--kind identity"), "{line}");
+        assert!(!line.contains("--replace"), "{line}");
+        assert!(line.contains("StrictHostKeyChecking=yes"), "{line}");
+        let replacing = keygen_cmd(&ssh, &target, "system:node:n1", "identity", true);
+        assert!(
+            replacing.line().contains("--replace"),
+            "{}",
+            replacing.line()
+        );
+    }
+
+    /// Signing is a `key` command: it needs no network, so `--offline` may
+    /// do it, and `--dry-run` may not.
+    #[test]
+    fn signing_is_a_key_command_and_names_what_it_signs() {
+        let subject = Subject {
+            kind: CaKind::Serving,
+            name: "meister-box".to_string(),
+            cn: "meister-box".to_string(),
+            dn: "CN=meister-box, O=system:controllers".to_string(),
+            sans: vec!["meister-box".to_string(), "10.0.0.10".to_string()],
+        };
+        let cmd = sign_cmd(
+            Path::new("/opt/meister-ca"),
+            Path::new("/home/silas/labpki"),
+            Path::new("/repo/pki/csr/box-serving.csr"),
+            &subject,
+            Path::new("/repo/pki/issued/box/serving.crt"),
+            Some(90),
+        );
+        assert_eq!(cmd.effect, Effect::Key);
+        let line = cmd.line();
+        assert!(line.contains("--dir /home/silas/labpki"), "{line}");
+        assert!(
+            line.contains("--sign-csr /repo/pki/csr/box-serving.csr"),
+            "{line}"
+        );
+        assert!(line.contains("--kind serving"), "{line}");
+        assert!(line.contains("--name meister-box"), "{line}");
+        assert!(line.contains("--san meister-box,10.0.0.10"), "{line}");
+        assert!(line.contains("--days 90"), "{line}");
+        // A dry run may not sign. There is no `--offline` on the verb at
+        // all: signing needs nothing but this machine, so there is nothing
+        // for that flag to refuse — and 1C's policy table, which says
+        // `--offline` runs only `offline` commands, is not loosened for one
+        // verb's convenience.
+        assert!(Policy::dry_run().admits(Effect::Key).is_err());
+
+        // A client certificate has no --san at all.
+        let node = Subject {
+            kind: CaKind::Node,
+            name: "n1".to_string(),
+            cn: "system:node:n1".to_string(),
+            dn: "CN=system:node:n1, O=system:nodes".to_string(),
+            sans: Vec::new(),
+        };
+        let line = sign_cmd(
+            Path::new("meister-ca"),
+            Path::new("/ca"),
+            Path::new("/repo/pki/csr/n1-identity.csr"),
+            &node,
+            Path::new("/repo/pki/issued/n1/identity.crt"),
+            None,
+        )
+        .line();
+        assert!(!line.contains("--san"), "{line}");
+        assert!(!line.contains("--days"), "{line}");
+    }
+
+    /// What `openssl x509` said, as four fields.
+    #[test]
+    fn the_four_fields_of_an_issued_certificate_are_read_back() {
+        let text = "serial=6435C9C4A191566C
+                    subject=CN=system:node:n1, O=system:nodes
+                    notAfter=Dec 20 16:55:20 2026 GMT
+                    sha256 Fingerprint=AB:CD:EF
+";
+        let issued = parse_describe(text, "/repo/pki/issued/n1/identity.crt");
+        assert_eq!(issued.serial.as_deref(), Some("6435C9C4A191566C"));
+        assert_eq!(
+            issued.subject.as_deref(),
+            Some("CN=system:node:n1, O=system:nodes")
+        );
+        assert_eq!(
+            issued.not_after.as_deref(),
+            Some("Dec 20 16:55:20 2026 GMT")
+        );
+        assert_eq!(issued.sha256.as_deref(), Some("AB:CD:EF"));
+        // A field nobody printed is null and never a guess.
+        let thin = parse_describe(
+            "serial=01
+",
+            "x",
+        );
+        assert_eq!(thin.not_after, None);
+    }
+
+    /// `[operator] ca_dir` is relative to the INVENTORY, which is what
+    /// every other reference in that table means.
+    #[test]
+    fn the_ca_directory_hangs_off_the_inventory_and_not_off_the_cwd() {
+        assert_eq!(
+            ca_dir(Path::new("/home/silas/fleet"), "fleet.toml", "../labpki"),
+            PathBuf::from("/home/silas/labpki")
+        );
+        assert_eq!(
+            ca_dir(
+                Path::new("/home/silas/fleet"),
+                "etc/fleet.toml",
+                "../../labpki"
+            ),
+            PathBuf::from("/home/silas/labpki")
+        );
+        assert_eq!(
+            ca_dir(Path::new("/home/silas/fleet"), "fleet.toml", "/srv/ca"),
+            PathBuf::from("/srv/ca")
+        );
+    }
+
+    /// The CA key is the one file of this fleet that must not be committed,
+    /// and a `.gitignore` is one edit away from being wrong.
+    #[test]
+    fn a_ca_inside_the_repository_is_refused() {
+        let repo = Path::new("/home/silas/fleet");
+        let err = refuse_ca_in_repo(repo, &repo.join("pki")).unwrap_err();
+        assert!(err.to_string().contains("is committed"), "{err}");
+        refuse_ca_in_repo(repo, Path::new("/home/silas/labpki")).unwrap();
     }
 
     #[test]
