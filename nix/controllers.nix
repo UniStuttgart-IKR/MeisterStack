@@ -170,10 +170,9 @@ let
     # starting is the honest state: `systemctl status` then says
     # ConditionPathExists=/opt/meisterstack/pki/ca.crt was not met, which is a
     # sentence an operator can act on — a restart loop is not.
-    unitConfig.ConditionPathExists = [
-      "${cfg.binDir}/meister-${name}-controller"
-      "${pki}/ca.crt"
-    ];
+    unitConfig.ConditionPathExists =
+      lib.optional (!cfg.binariesInStore) "${cfg.binDir}/meister-${name}-controller"
+      ++ [ "${pki}/ca.crt" ];
     serviceConfig = {
       # Where the config comes from is `meisterstack.configDir`: the boot
       # renderer's /run copy on an appliance (it appends per-VM values such as
@@ -289,6 +288,30 @@ in
       '';
     };
 
+    cluster.effective = lib.mkOption {
+      type = toml.type;
+      internal = true;
+      default = { };
+      description = ''
+        The file, as a VALUE: role defaults, then `generated`, then
+        `settings`, which is the order the renderer has. `environment.etc`
+        turns it into TOML, and `lib.mkFleet` puts the same attrset into
+        `meisterDeployment.hosts.<id>.effective_settings` — one merge with
+        two readers, rather than a second one in the manifest that could
+        drift from the file the unit actually reads.
+      '';
+    };
+
+    cloud.effective = lib.mkOption {
+      type = toml.type;
+      internal = true;
+      default = { };
+      description = ''
+        The cloud's config file as a value; see
+        `meisterstack.cluster.effective`.
+      '';
+    };
+
     cloud.generated = lib.mkOption {
       type = toml.type;
       default = { };
@@ -307,20 +330,20 @@ in
   # `unitsFor`).
   config = lib.mkMerge [
     (lib.mkIf (builtins.elem "cluster" cfg.unitsFor) {
+      meisterstack.cluster.effective = lib.recursiveUpdate
+        (lib.recursiveUpdate clusterDefaults cfg.cluster.generated)
+        cfg.cluster.settings;
       environment.etc."meisterstack/cluster.toml".source =
-        toml.generate "cluster.toml"
-          (lib.recursiveUpdate
-            (lib.recursiveUpdate clusterDefaults cfg.cluster.generated)
-            cfg.cluster.settings);
+        toml.generate "cluster.toml" cfg.cluster.effective;
       systemd.services.meister-cluster-controller = controller "cluster";
     })
 
     (lib.mkIf (builtins.elem "cloud" cfg.unitsFor) {
+      meisterstack.cloud.effective = lib.recursiveUpdate
+        (lib.recursiveUpdate cloudDefaults cfg.cloud.generated)
+        cfg.cloud.settings;
       environment.etc."meisterstack/cloud.toml".source =
-        toml.generate "cloud.toml"
-          (lib.recursiveUpdate
-            (lib.recursiveUpdate cloudDefaults cfg.cloud.generated)
-            cfg.cloud.settings);
+        toml.generate "cloud.toml" cfg.cloud.effective;
       systemd.services.meister-cloud-controller = controller "cloud";
     })
 

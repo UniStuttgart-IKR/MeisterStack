@@ -485,14 +485,23 @@ fn read_flake_lock(files: &dyn Files, repo: &Path) -> Result<BTreeMap<String, Fl
 
     let mut out = BTreeMap::new();
     for (name, target) in root {
-        let Some(key) = target.as_str() else {
-            bail!(
-                "{}: the input {name:?} of the root node is a follows path, and this \
-                 tool reads only direct inputs. Say what it follows in the flake, or \
-                 report this lock file.",
+        // Either a node key, or a `follows` path — an array of input names,
+        // relative to the root node, as nix writes it for
+        // `disko.follows = "meisterstack/disko"`. A followed input is not a
+        // different input: it is the SAME locked node, and that is what the
+        // manifest has to name. The operator template uses exactly this to
+        // keep one disko in a repository instead of two, so refusing it
+        // would have refused the template this tool writes itself.
+        let key = match target {
+            serde_json::Value::String(key) => key.clone(),
+            serde_json::Value::Array(_) => follow(nodes, root_name, name, target, &path)?,
+            other => bail!(
+                "{}: the input {name:?} of the root node is {other}, which is neither a \
+                 node key nor a follows path.",
                 path.display()
-            );
+            ),
         };
+        let key = key.as_str();
         let locked = nodes
             .get(key)
             .and_then(|n| n.get("locked"))
@@ -516,6 +525,90 @@ fn read_flake_lock(files: &dyn Files, repo: &Path) -> Result<BTreeMap<String, Fl
         );
     }
     Ok(out)
+}
+
+/// Resolve a `follows` path to the node it ends at.
+///
+/// A follows path is written from the ROOT of the lock file — `["meisterstack",
+/// "disko"]` means "the `disko` input of the root's `meisterstack` input" —
+/// and each step may itself be a follows, so this walks. The depth is bounded
+/// because a lock file is data from outside this process: a cycle in it must
+/// be a sentence and not a stack overflow.
+fn follow(
+    nodes: &serde_json::Map<String, serde_json::Value>,
+    root_name: &str,
+    input: &str,
+    target: &serde_json::Value,
+    lock: &Path,
+) -> Result<String> {
+    let path: Vec<String> = target
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|v| v.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if path.is_empty() || path.iter().any(|s| s.is_empty()) {
+        bail!(
+            "{}: the input {input:?} follows {target}, which is not a path of input names.",
+            lock.display()
+        );
+    }
+
+    let mut current = root_name.to_string();
+    let mut steps = 0usize;
+    let mut todo: Vec<String> = path.iter().rev().cloned().collect();
+    while let Some(segment) = todo.pop() {
+        steps += 1;
+        if steps > 32 {
+            bail!(
+                "{}: resolving what {input:?} follows went through 32 steps; this lock \
+                 file has a cycle in its follows.",
+                lock.display()
+            );
+        }
+        let inputs = nodes
+            .get(&current)
+            .and_then(|n| n.get("inputs"))
+            .and_then(|i| i.as_object())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}: {input:?} follows {}, but the node {current:?} has no inputs.",
+                    lock.display(),
+                    path.join("/")
+                )
+            })?;
+        let next = inputs.get(&segment).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: {input:?} follows {}, and the node {current:?} has no input \
+                 {segment:?}.",
+                lock.display(),
+                path.join("/")
+            )
+        })?;
+        match next {
+            serde_json::Value::String(key) => current = key.clone(),
+            serde_json::Value::Array(more) => {
+                // A follows that points at another follows: start over from
+                // the root with that path, then carry on with what is left.
+                current = root_name.to_string();
+                let mut rest: Vec<String> = more
+                    .iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect();
+                rest.reverse();
+                todo.extend(rest);
+            }
+            other => bail!(
+                "{}: {input:?} follows {}, and the input {segment:?} of {current:?} is \
+                 {other}.",
+                lock.display(),
+                path.join("/")
+            ),
+        }
+    }
+    Ok(current)
 }
 
 /// The locked input as a flake reference a person can paste. Where the shape
@@ -1109,6 +1202,72 @@ mod tests {
             .to_string();
         assert!(err.contains("nix flake lock"), "{err}");
         assert!(err.contains("side effect"), "{err}");
+    }
+
+    #[test]
+    fn a_followed_input_is_the_node_it_follows() {
+        // The shape the operator template writes: `disko.follows =
+        // "meisterstack/disko"`, so that a deployment has ONE disko and not
+        // two. In the lock file that is an array, and it has to resolve to
+        // the node meisterstack's disko is pinned to.
+        let lock = r#"{
+          "nodes": {
+            "root": {"inputs": {"nixpkgs": "nixpkgs", "meisterstack": "meisterstack",
+                                "disko": ["meisterstack", "disko"]}},
+            "nixpkgs": {"locked": {"type": "github", "owner": "NixOS", "repo": "nixpkgs",
+                                   "rev": "aaaa", "narHash": "sha256-n="}},
+            "meisterstack": {"inputs": {"disko": "disko"},
+                             "locked": {"type": "github", "owner": "UniStuttgart-IKR",
+                                        "repo": "MeisterStack", "rev": "bbbb",
+                                        "narHash": "sha256-m="}},
+            "disko": {"locked": {"type": "github", "owner": "nix-community",
+                                 "repo": "disko", "rev": "cccc", "narHash": "sha256-d="}}
+          }, "root": "root", "version": 7}"#;
+        let runner = clean_git();
+        let files = MemFiles::new()
+            .given(repo().join("fleet.toml"), "schema = 2\n")
+            .given(repo().join("flake.lock"), lock);
+        let source = describe(&runner, &files, &repo(), Path::new("fleet.toml"), false)
+            .unwrap()
+            .source;
+        let disko = &source.flake_lock["disko"];
+        assert_eq!(disko.rev.as_deref(), Some("cccc"), "{disko:?}");
+        assert_eq!(disko.nar_hash, "sha256-d=");
+        assert!(disko.url.contains("nix-community/disko"), "{disko:?}");
+        // And the input it went through is still its own entry.
+        assert_eq!(
+            source.flake_lock["meisterstack"].rev.as_deref(),
+            Some("bbbb")
+        );
+    }
+
+    #[test]
+    fn a_follows_that_leads_nowhere_is_a_sentence() {
+        let lock = r#"{"nodes": {"root": {"inputs": {"disko": ["meisterstack", "disko"]}}},
+                       "root": "root", "version": 7}"#;
+        let runner = clean_git();
+        let files = MemFiles::new()
+            .given(repo().join("fleet.toml"), "schema = 2\n")
+            .given(repo().join("flake.lock"), lock);
+        let err = describe(&runner, &files, &repo(), Path::new("fleet.toml"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("meisterstack/disko"), "{err}");
+        assert!(err.contains("no input"), "{err}");
+    }
+
+    #[test]
+    fn a_cycle_in_the_follows_is_a_sentence_and_not_a_stack_overflow() {
+        let lock = r#"{"nodes": {"root": {"inputs": {"a": ["b"], "b": ["a"]}}},
+                       "root": "root", "version": 7}"#;
+        let runner = clean_git();
+        let files = MemFiles::new()
+            .given(repo().join("fleet.toml"), "schema = 2\n")
+            .given(repo().join("flake.lock"), lock);
+        let err = describe(&runner, &files, &repo(), Path::new("fleet.toml"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cycle"), "{err}");
     }
 
     #[test]

@@ -307,12 +307,23 @@ fn a_refusal_is_exit_one_and_a_sentence_on_stderr() {
     assert!(stdout(&out).is_empty());
     assert!(stderr(&out).contains("broken.toml"), "{}", stderr(&out));
 
-    // And `--nix` is a refusal and not a silent pass, for as long as the
-    // flake half of it does not exist.
+    // And `--nix` really evaluates the flake now (lane 1B): it asks nix for
+    // the inventory half of `meisterDeployment`, once, and a nix that fails
+    // is a refusal with the command line in it — never a silent pass.
     let out = sandbox.run(&["validate", "--nix"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(stderr(&out).contains("lane 1B"), "{}", stderr(&out));
-    assert!(sandbox.calls().is_empty(), "{:?}", sandbox.calls());
+    let calls = sandbox.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].starts_with("nix "), "{calls:?}");
+    assert!(
+        calls[0].contains("[eval] [--json] [--no-write-lock-file]"),
+        "{calls:?}"
+    );
+    assert!(
+        calls[0].contains("meisterDeployment.inventory"),
+        "{calls:?}"
+    );
+    assert!(stderr(&out).contains("exited 97"), "{}", stderr(&out));
 }
 
 #[test]

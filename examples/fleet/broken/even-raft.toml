@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+#
+# A raft group of two: it tolerates exactly as many losses as a group of one
+# and costs a box. Refused at evaluation.
+schema = 2
+
+[fleet]
+name = "even"
+
+[[group]]
+id = "cp"
+kind = "raft"
+
+[[host]]
+id = "cp-a"
+name = "cp-a"
+deployment = "nixos"
+roles = ["cloud", "cluster"]
+groups = ["cp"]
+networks.management = { address = "10.3.0.11", prefix = 24 }
+
+[[host]]
+id = "cp-b"
+name = "cp-b"
+deployment = "nixos"
+roles = ["cluster"]
+groups = ["cp"]
+networks.management = { address = "10.3.0.12", prefix = 24 }

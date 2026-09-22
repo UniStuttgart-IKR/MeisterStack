@@ -14,22 +14,36 @@ HA und OpenNebula sind die Option nach oben, nicht der Anfang.
 Der ganze Aufbau, in zehn Zeilen:
 
 ```bash
-cp examples/fleet/one-box.toml fleet.toml   # 1. Plan schreiben: Adressen,
-$EDITOR fleet.toml                          #    Platten, Domain anpassen
-git add fleet.toml                          #    (ein Flake sieht nur, was in git ist)
-nix flake check                             # 2. Plan pruefen
-meister-deploy legacy keys init             # 3. CA, Zertifikate, drei Geheimnisse
-meister-deploy legacy image all --copy /var/tmp   # 4. je Knoten ein raw-efi-Image
-sudo dd if=/var/tmp/meisterstack-one-box-box-*.img of=/dev/nvme0n1 bs=4M status=progress
-                                            # 5. auf die Platte, je Kiste einmal
-#    booten, dann von hier aus:
-meister-deploy legacy keys push             # 6. Zertifikate auf die Kisten
-meister-deploy legacy check                 # 7. Units, Sessions, /dev/kvm, etcd
+meister-deploy init ~/my-fleet              # 1. das eigene Repo: fleet.toml,
+$EDITOR ~/my-fleet/fleet.toml               #    Profile, Hostmodule, Checks
+cd ~/my-fleet                               #    (Adressen, Platten, Domain)
+nix-store --generate-binary-cache-key my-fleet keys/signing.sec signing.pub
+                                            # 2. der Signierschluessel; die
+                                            #    oeffentliche Haelfte wird
+                                            #    committet, keys/ nicht
+git init && git add -A                      #    (ein Flake sieht nur, was in git ist)
+nix flake check                             # 3. Inventar, Konfigurationen, Manifest
+meister-deploy resolve --repo . -o m.json   # 4. das Manifest: welcher Baum,
+                                            #    welches System je Host
+```
+
+Ab hier geht es mit M2 weiter (`build`, `plan`, `apply`); bis dahin ist der
+Weg auf die Platte der von vorher, mit `legacy` davor und einem Plan in der
+ALTEN Form (`schema` fehlt dort, `[[node]]` statt `[[host]]` —
+`examples/fleet/lab.toml` ist so einer):
+
+```bash
+meister-deploy legacy -f lab.toml keys init         # CA, Zertifikate, Geheimnisse
+meister-deploy legacy -f lab.toml image all --copy /var/tmp
+sudo dd if=/var/tmp/meisterstack-*-box-*.img of=/dev/nvme0n1 bs=4M status=progress
+meister-deploy legacy -f lab.toml keys push
+meister-deploy legacy -f lab.toml check
 ```
 
 Das `legacy` gehoert seit meister-deploy v1 dazu: diese sieben Verben
-lesen `fleet.toml` in der alten Form weiter, und `plan` meint jetzt eine
-Datei auf der Platte statt der Tabelle auf dem Terminal.
+lesen den alten Plan weiter, und `plan` meint jetzt eine Datei auf der
+Platte statt der Tabelle auf dem Terminal. `examples/fleet/one-box.toml` ist
+seit 1B Schema 2 und damit die Vorlage fuer den NEUEN Weg.
 
 Das war es. Was danach noch von Hand kommt, steht unten.
 

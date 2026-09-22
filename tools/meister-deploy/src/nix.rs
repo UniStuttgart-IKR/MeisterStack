@@ -117,6 +117,39 @@ fn restrict_to(hosts: &[String]) -> String {
     )
 }
 
+/// `nix eval --json --no-write-lock-file <ref>#meisterDeployment.inventory`.
+///
+/// The CHEAP half of the manifest: `lib.mkFleet` derives it from `fleet.toml`
+/// without evaluating a single module, so `validate --nix` can ask "does the
+/// flake see the fleet I see?" in seconds rather than in the minutes a whole
+/// fleet's systems take.
+pub fn eval_inventory_cmd(flake_ref: &str) -> Cmd {
+    Cmd::new(Effect::NixEval, "nix", EVAL_DEADLINE).args([
+        "eval".to_string(),
+        "--json".to_string(),
+        "--no-write-lock-file".to_string(),
+        format!("{flake_ref}#{MANIFEST_ATTR}.inventory"),
+    ])
+}
+
+pub fn eval_inventory(runner: &dyn Runner, flake_ref: &str) -> Result<String> {
+    let out = runner.run(&eval_inventory_cmd(flake_ref))?;
+    Ok(out.stdout)
+}
+
+/// `nix flake lock` in a directory, which is the ONLY way this tool writes a
+/// lock file.
+///
+/// `init` calls it after writing the template, because a flake without a lock
+/// is a repository whose next evaluation writes one as a side effect — and a
+/// tool whose read-only verb changes a committed file is a tool nobody can
+/// run twice and compare (see the module note on `--no-write-lock-file`).
+pub fn flake_lock_cmd(dir: &Path) -> Cmd {
+    Cmd::new(Effect::NixEval, "nix", Duration::from_secs(300))
+        .args(["flake", "lock"])
+        .cwd(dir)
+}
+
 /// `nix path-info --json`, optionally against another store. Reading only:
 /// it says what a path's nar hash and closure size are, and M2's `build` and
 /// `stage` both compare that answer against the release.

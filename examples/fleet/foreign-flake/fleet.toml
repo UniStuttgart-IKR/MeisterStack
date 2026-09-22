@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+#
+# The inventory of a fleet of one, in somebody else's repository.
+schema = 2
+
+[fleet]
+name = "foreign"
+
+[defaults]
+profiles = ["base"]
+
+[[group]]
+id = "cp"
+kind = "raft"
+
+[[host]]
+id = "box"
+name = "box"
+deployment = "nixos"
+roles = ["cloud", "cluster", "agent"]
+groups = ["cp"]
+# No `static = true`: this host's network is this host's business, and the
+# address is here because the tool has to reach it.
+networks.management = { address = "10.0.0.10", prefix = 24, interface = "eth0" }

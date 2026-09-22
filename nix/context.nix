@@ -346,7 +346,16 @@ in
         } | render_config cluster
         {
           telemetry_keys
-          echo "node_id = \"$(cat /proc/sys/kernel/hostname)\""
+          # The plan's id if it was baked, the hostname otherwise. A host
+          # id is what a plan REFERS to and a hostname is what the machine
+          # calls itself; the two are allowed to differ (schema 2 has both),
+          # and the build-time renderer takes MEISTER_NODE_ID
+          # (nix/lib/render.nix). Without this fallback the two roads would
+          # write different node ids for the same host, and
+          # `checks.render-parity` would only be green as long as every id
+          # happened to equal its name. A context VM with no plan keeps the
+          # hostname, which is what this line always was.
+          echo "node_id = \"''${MEISTER_NODE_ID:-$(cat /proc/sys/kernel/hostname)}\""
           [ -n "''${MEISTER_CONTROLLER_ADDR:-}" ] \
             && echo "controller_addr = \"''${MEISTER_CONTROLLER_ADDR}\""
           [ -n "''${MEISTER_CONTROLLER_ADDRS:-}" ] \

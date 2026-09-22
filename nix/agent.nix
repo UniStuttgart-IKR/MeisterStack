@@ -293,6 +293,19 @@ in
     };
   };
 
+  options.meisterstack.agent.effective = lib.mkOption {
+    type = toml.type;
+    internal = true;
+    default = { };
+    description = ''
+      The agent's config file as a VALUE: role defaults, the two
+      option-driven sections, `generated`, then `settings`.
+      `environment.etc` turns it into TOML and `lib.mkFleet` puts the same
+      attrset into `meisterDeployment.hosts.<id>.effective_settings`, so the
+      manifest cannot describe a file different from the one the unit reads.
+    '';
+  };
+
   options.meisterstack.agent.generated = lib.mkOption {
     type = toml.type;
     default = { };
@@ -330,6 +343,26 @@ in
       role, which is why it is its own option rather than a line in `settings`
       — a fleet plan says it per machine, and a machine that has no spare NIC
       says nothing.
+    '';
+  };
+
+  options.meisterstack.agent.vmm.package = lib.mkOption {
+    type = lib.types.package;
+    default = pkgs.cloud-hypervisor-meister or (throw (
+      "meisterstack.agent.vmm.package has no default here: this nixpkgs has no "
+      + "`cloud-hypervisor-meister` attribute, so the overlay that declares it is not "
+      + "in it. Add `nixpkgs.overlays = [ meisterstack.overlays.default ];` "
+      + "(lib.mkFleet does that for you), or set the option to your own build."));
+    defaultText = lib.literalExpression "pkgs.cloud-hypervisor-meister";
+    description = ''
+      The hypervisor this node's agent starts guests with: cloud-hypervisor
+      with this repository's patch series (nix/packages/cloud-hypervisor.nix
+      says why it is not nixpkgs' own).
+
+      Read only where `meisterstack.binDir` is derived from a package — an
+      appliance has its hypervisor pushed into /opt/meisterstack/bin — and
+      joined with `meisterstack.package` into one directory there, because
+      the agent's unit names both programs in `binDir`.
     '';
   };
 
@@ -447,7 +480,9 @@ in
       # `meisterstack.agent.frr.enable`, and so is the reason it exists.
 
       environment.etc."meisterstack/agent.toml".source =
-        toml.generate "agent.toml"
+        toml.generate "agent.toml" cfg.agent.effective;
+
+      meisterstack.agent.effective =
           (lib.recursiveUpdate
             (lib.recursiveUpdate defaults
               # Only when there is one. An empty `[network.provider]` table would
@@ -649,11 +684,16 @@ in
           # template names controller_ca/cert/key, and a missing one of them is a
           # start-up error, so a node that push.sh has not reached yet waits
           # visibly instead of restarting every two seconds.
-          ConditionPathExists = [
-            "${cfg.binDir}/meister-agent"
-            "${cfg.binDir}/cloud-hypervisor"
-            "${cfg.pki.dir}/ca.crt"
-          ];
+          ConditionPathExists =
+            # The two binaries only where they are a push away
+            # (`meisterstack.binariesInStore`, nix/services.nix): out of a
+            # package they are part of this system, and a condition that
+            # cannot fail is a condition that says nothing.
+            lib.optionals (!cfg.binariesInStore) [
+              "${cfg.binDir}/meister-agent"
+              "${cfg.binDir}/cloud-hypervisor"
+            ]
+            ++ [ "${cfg.pki.dir}/ca.crt" ];
         } // lib.optionalAttrs (volumes.device != null && volumes.required) {
           # The other half of `volumes.required`: no `nofail` on the mount, and
           # the unit does not start without it.

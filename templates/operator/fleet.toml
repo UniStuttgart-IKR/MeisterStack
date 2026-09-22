@@ -1,0 +1,110 @@
+# The fleet: who is in it, what each host is, and where it is.
+#
+# This file is read by Nix (which derives every deployment value from it) and
+# by `meister-deploy` (which checks its shape). It carries no secret and no
+# key — it is committed.
+#
+#   meister-deploy inventory          the hosts and what each inherited
+#   meister-deploy validate           the shape, without touching nix
+#   nix flake check                   the shape AND the systems
+#   meister-deploy resolve -o m.json  the manifest a deployment starts from
+
+schema = 2
+
+[fleet]
+name = "my-fleet"
+# Needed only for a fleet with the `addons` role: kanidm is reached under a
+# NAME (its issuer is an https url and its certificate has to match it).
+# domain = "lab.example"
+
+[defaults]
+ssh = { user = "root", port = 22 }
+profiles = ["base"]
+# `reboot = "approve"` is the conservative end: a reboot nobody approved is
+# the failure this tool exists to prevent. `auto` and `never` are the others.
+rollout = { max_unavailable = 1, reboot = "approve" }
+checks = { required = ["units", "session"] }
+
+# References to what you already have. No secret is named here, and none may
+# be: this file is committed.
+# [operator]
+# cli_config = "cli.toml"       # the `meister` cli used to cordon and drain
+# cli_profile = "cloud-mtls"
+# ca_dir = "../my-fleet-pki"    # where tools/meister-ca keeps its directory
+
+# --- groups ---------------------------------------------------------------
+#
+# `raft` means the members form a quorum, so how many may be unavailable
+# follows from the size (1, 3 or 5) and is not a choice. `compute` means the
+# members are interchangeable workload carriers. `custom` is a grouping for
+# selection only.
+
+[[group]]
+id = "cp"
+kind = "raft"
+profiles = ["controller"]
+
+[[group]]
+id = "compute"
+kind = "compute"
+profiles = ["compute-cpu"]
+rollout = { canary = "compute-cpu" }
+
+# --- hosts ----------------------------------------------------------------
+
+[[host]]
+# What a plan refers to. It never changes and is never reused.
+id = "cp-1"
+# What the machine calls itself.
+name = "cp-1"
+# `nixos`: this repository builds its system and meister-deploy takes it
+# forward closure by closure. `context`: a VM somebody else instantiated.
+deployment = "nixos"
+roles = ["cloud", "cluster"]
+groups = ["cp"]
+site = "my-site"
+failure_domain = "rack1"
+# The address meister-deploy reaches this host at. Add `static = true` to
+# have the plan configure the interface; without it the address is
+# documentation and this host's own configuration owns its network.
+networks.management = { address = "10.0.0.10", prefix = 24, interface = "eno1" }
+# Written by `meister-deploy keys enroll cp-1 --fingerprint SHA256:…`, from
+# the fingerprint the installer or the console showed you — never from a
+# blind ssh-keyscan.
+# ssh.host_key = "SHA256:…"
+# What this host keeps across a deployment, by LABEL and never by device
+# path: which slot a disk lands in is not a promise anybody made.
+# persistence = [{ path = "/var/lib/meister-data", device = "label:meister-data", required = true }]
+# The first install (M3) needs the disk's own serial — `lsblk -o SERIAL` —
+# because /dev/sda is a name the kernel hands out in boot order.
+# install = { disk = { serial = "…", size_gb = 960 }, layout = "disko/single-nvme.nix", preserve = ["/var/lib/meister-data"] }
+# This machine's own files, relative to THIS file.
+modules = ["hosts/cp-1.nix"]
+
+[[host]]
+id = "a1"
+name = "a1"
+deployment = "nixos"
+roles = ["agent"]
+groups = ["compute"]
+# Which cluster this agent reports to. Nobody types an address twice: the
+# controller addresses are derived from the members of that group.
+controller_group = "cp"
+site = "my-site"
+failure_domain = "rack1"
+networks.management = { address = "10.0.0.11", prefix = 24, interface = "eno1" }
+# What a verification suite may assume of this machine. A capability that is
+# declared and missing blocks; one that is not declared makes its suite
+# `not_applicable`.
+capabilities = ["kvm"]
+modules = ["hosts/a1.nix"]
+
+# --- services this fleet depends on and does not deploy -------------------
+#
+# [[service]]
+# id = "observability-external"
+# kind = "observability"
+# managed = false
+# required = false
+# endpoint = { loki = "http://10.0.5.10:3100/loki/api/v1/push" }
+# trust_ref = "trust/external-ca.crt"

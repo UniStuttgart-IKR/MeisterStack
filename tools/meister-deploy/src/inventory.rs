@@ -209,6 +209,24 @@ pub struct Network {
     pub interface: Option<String>,
     #[serde(default)]
     pub gateway: Option<String>,
+    /// Whether the PLAN configures this interface, or only says where the
+    /// host is.
+    ///
+    /// Added by lane 1B, and the reason is a question nix/lib/inventory.nix
+    /// has to answer for every host: who owns the interface. The pre-v1
+    /// plan answered it for everybody at once (`networking.useDHCP =
+    /// mkForce (!(defaults ? prefix))`, nix/fleet.nix), which meant a fleet
+    /// that wrote down an address took the interface away from the host
+    /// whether it wanted that or not. Now the default is that the host owns
+    /// its network — an address in the inventory is how `meister-deploy`
+    /// reaches it — and `static = true` is the fleet saying otherwise.
+    ///
+    /// It is deliberately NOT in the manifest's `Network`: the manifest
+    /// names the address a host is reached at, and who configured the
+    /// interface is part of the SYSTEM, which the manifest names by its
+    /// derivation.
+    #[serde(default, rename = "static")]
+    pub r#static: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -973,6 +991,37 @@ mod tests {
 
     fn parse(text: &str) -> Result<Inventory> {
         Inventory::parse(text, "fleet.toml")
+    }
+
+    #[test]
+    fn a_network_belongs_to_the_host_unless_the_plan_says_static() {
+        // The default, which is the case an operator does not have to think
+        // about: the address is how this tool reaches the host, and the
+        // host's own configuration owns the interface.
+        let inventory = parse(fixture()).unwrap();
+        let net = inventory.hosts["cloud-a"]
+            .networks
+            .management
+            .as_ref()
+            .unwrap();
+        assert_eq!(net.address, "10.128.1.103");
+        assert!(!net.r#static, "an address is not a claim on the interface");
+
+        // And the fleet saying otherwise, which nix/lib/inventory.nix turns
+        // into `networking.interfaces.<if>.ipv4.addresses`.
+        let text = fixture().replace(
+            r#"networks.management = { address = "10.128.1.103", prefix = 24, interface = "eno1" }"#,
+            r#"networks.management = { address = "10.128.1.103", prefix = 24, interface = "eno1", static = true }"#,
+        );
+        let claimed = parse(&text).unwrap();
+        assert!(
+            claimed.hosts["cloud-a"]
+                .networks
+                .management
+                .as_ref()
+                .unwrap()
+                .r#static
+        );
     }
 
     #[test]

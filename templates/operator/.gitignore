@@ -1,0 +1,20 @@
+# What a deployment produces, and what it must never commit.
+
+# The state of this repository's runs: journals, receipts, observations,
+# locks, and the content snapshots `resolve --dev` materializes. It is local
+# to one operator's machine and some of it is large.
+.meister-deploy/
+
+# Private keys. The signing key's SECRET half lives here
+# (`nix-store --generate-binary-cache-key my-fleet keys/signing.sec
+# signing.pub`); the public half (`signing.pub`) is public and IS committed.
+# So are the ssh host keys in `known_hosts` — a public key is a fact, not a
+# secret.
+keys/
+
+# Build results.
+result
+result-*
+*.iso
+*.qcow2
+*.raw
