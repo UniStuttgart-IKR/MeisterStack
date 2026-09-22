@@ -61,6 +61,14 @@ in
           meisterstack.managed.enable = true;
           meisterstack.managed.trustedPublicKeys = [ "render-parity:not-a-real-key" ];
           meisterstack.pki.dir = "/opt/meisterstack/pki";
+          # And `binDir` for the same reason (1B): a managed host takes its
+          # binaries out of the store and an appliance out of the push
+          # directory, so the agent's `hypervisor.cloud-hypervisor.binary`
+          # differs between the two — by design, and held by
+          # `checks.managed-uses-the-package`. Pinning it here keeps this
+          # check about the RENDERER instead of reporting that difference
+          # once per agent host.
+          meisterstack.binDir = "/opt/meisterstack/bin";
         }
         (inv.hostModule id)
       ]
