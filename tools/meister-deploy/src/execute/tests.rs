@@ -336,7 +336,10 @@ impl Fixture {
             &["n1"],
             new_kernel,
         ));
-        Fixture::of(release, observation, "host=n1")
+        // The whole fleet, not only `n1`: the control-plane host is the
+        // fleet's anchor (D6) whether it changes or not, and a selection
+        // that leaves it out leaves the anchor out with it.
+        Fixture::of(release, observation, "all")
     }
 
     /// A fleet that already runs the release.
@@ -1828,8 +1831,12 @@ fn a_direct_host_stops_in_front_of_its_provider_and_writes_the_bundle_down() {
     // while somebody arranges a hypervisor would be holding it for hours.
     let runner = World::new(
         up_to_the_halt(&fx)
-            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok())
-            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok()),
+            // In host order, because that is the order the run gives the
+            // doors back in when it ends rather than when a host's own
+            // `unlock` step runs — and this run's last host never got that
+            // far.
+            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok()),
         &look,
     );
 
@@ -1916,8 +1923,8 @@ fn a_resume_before_the_provider_has_been_halts_again_and_changes_nothing() {
     let look = TableLook::new(&fx).boots_from_outside("n1");
     let runner = World::new(
         up_to_the_halt(&fx)
-            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok())
-            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok()),
+            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok()),
         &look,
     );
     let first = fx
@@ -1938,8 +1945,8 @@ fn a_resume_before_the_provider_has_been_halts_again_and_changes_nothing() {
         StrictFake::new()
             .expect(helper("box", &["lock", "acquire", "--run", "run-1"]), ok())
             .expect(helper("n1", &["lock", "acquire", "--run", "run-1"]), ok())
-            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok())
-            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok()),
+            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok()),
         &look,
     );
     let again = fx
@@ -1950,8 +1957,10 @@ fn a_resume_before_the_provider_has_been_halts_again_and_changes_nothing() {
     let wait = again.waiting.expect("it is still waiting");
     assert_eq!(wait.host, "n1");
     for call in runner.calls() {
-        assert!(!call.contains("activate"), "{call}");
-        assert!(!call.contains("stage"), "{call}");
+        // `meister-activate` is the name of the helper, so the word to look
+        // for is the SUBCOMMAND.
+        assert!(!call.contains("--json activate"), "{call}");
+        assert!(!call.contains("--json stage"), "{call}");
         assert!(!call.contains("systemctl reboot"), "{call}");
     }
     assert_eq!(again.receipt.hosts["n1"].state, HostState::AwaitingReboot);
@@ -1963,8 +1972,8 @@ fn a_resume_after_the_provider_has_been_asks_the_machine_and_finishes() {
     let look = TableLook::new(&fx).boots_from_outside("n1");
     let runner = World::new(
         up_to_the_halt(&fx)
-            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok())
-            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok()),
+            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release", "--run", "run-1"]), ok()),
         &look,
     );
     fx.executor(&runner, &look, fx.options())

@@ -50,6 +50,9 @@ struct Sandbox {
     /// What the `ssh` shim answers to an invocation of the helper: 97 is
     /// "this program was not supposed to run", 0 is "it worked".
     ssh_exit: i32,
+    /// The same for the operator's cli, which the cordon and the drain go
+    /// through (D7).
+    cli_exit: i32,
 }
 
 impl Sandbox {
@@ -88,6 +91,15 @@ impl Sandbox {
                      while IFS= read -r l; do printf '%s\\n' \"$l\"; done < \"$f\"; exit 0; \
                      fi\n\
                      exit 255\n"
+                ),
+                // The operator's own cli (D7), which a cordon and a drain
+                // go through. 97 is "this program was not supposed to run";
+                // a test that needs a drain to work says so.
+                "meister" => format!(
+                    "#!/bin/sh\nline=\"{name}\"\n\
+                     for a in \"$@\"; do line=\"$line [$a]\"; done\n\
+                     printf '%s\\n' \"$line\" >> \"$MEISTER_SHIM_LOG\"\n\
+                     exit ${{MEISTER_SHIM_CLI_EXIT:-97}}\n"
                 ),
                 _ => format!(
                     "#!/bin/sh\nline=\"{name}\"\n\
@@ -147,6 +159,7 @@ impl Sandbox {
             release,
             plan: the_plan,
             ssh_exit: 97,
+            cli_exit: 97,
         };
         for id in sandbox.fleet.hosts.keys() {
             sandbox.answer(id, &probe_answer(&sandbox.fleet, &sandbox.release, id));
@@ -181,6 +194,7 @@ impl Sandbox {
             .env("MEISTER_SHIM_LOG", &self.log)
             .env("MEISTER_SHIM_ANSWERS", self.answers.path())
             .env("MEISTER_SHIM_SSH_EXIT", self.ssh_exit.to_string())
+            .env("MEISTER_SHIM_CLI_EXIT", self.cli_exit.to_string())
             .env("HOME", self.home.path())
             .output()
             .expect("the binary was just built")
@@ -595,4 +609,199 @@ fn a_dry_run_behaves_the_same_with_the_network_taken_away() {
         snapshot_of(sandbox.cwd.path()),
         "the run in the namespace left something behind"
     );
+}
+
+// ---------------------------------------------------------------------------
+// lane 3-integration: the halt, at the real binary
+// ---------------------------------------------------------------------------
+
+/// A sandbox whose `n1` is a guest with no boot loader, switched to the
+/// release and still running the kernel its provider last handed it.
+///
+/// The shortest road to a `provider-reboot` that the shims can walk: nothing
+/// is staged (the closure is there), nothing is activated (the profile
+/// already points at it), and what is left is the boot — which is the one
+/// step this tool does not take.
+fn waiting_for_a_provider() -> Sandbox {
+    let mut sandbox = Sandbox::new();
+    let base = support::with_direct_host(sandbox.fleet.clone(), "n1");
+    let before = support::direct_release_of(base.clone());
+    let release = support::direct_release_of(support::with_new_toplevels(base, &["n1"], true));
+    let old = before.artifacts["n1"].toplevel.store_path.clone();
+    let new = release.artifacts["n1"].toplevel.store_path.clone();
+
+    // What the machine says: it RUNS the new system and it BOOTED the old
+    // one, because the thing that decides the second is a hypervisor.
+    let mut observation = observed(&before, chrono::Utc::now());
+    {
+        let n1 = observation.hosts.get_mut("n1").unwrap();
+        n1.current_system = Some(new.clone());
+        n1.next_boot_system = Some(new.clone());
+    }
+    let the_plan = plan::plan(
+        &release,
+        "all",
+        &observation,
+        None,
+        &PlanPolicy::new(PlanKind::Upgrade).with_workload_control(Some(
+            meister_deploy::plan::WorkloadControl {
+                cli_config: "cli.toml".to_string(),
+                cli_profile: Some("cloud-mtls".to_string()),
+            },
+        )),
+        chrono::Utc::now(),
+    )
+    .expect("the fixture plans");
+
+    std::fs::write(
+        sandbox.cwd.path().join("release.json"),
+        release.to_json().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        sandbox.cwd.path().join("plan.json"),
+        the_plan.to_json().unwrap(),
+    )
+    .unwrap();
+    sandbox.fleet = release.resolved_fleet.clone();
+    sandbox.release = release;
+    sandbox.plan = the_plan;
+    // The helper and the cli answer; the machine answers the probe with the
+    // two lines that make it a host waiting for its provider.
+    sandbox.ssh_exit = 0;
+    sandbox.cli_exit = 0;
+    for id in sandbox.fleet.hosts.keys() {
+        let mut answer = probe_answer(&sandbox.fleet, &before, id);
+        if id == "n1" {
+            answer = answer.replace(
+                &format!("current_system={old}"),
+                &format!("current_system={new}"),
+            );
+            answer = answer.replace(
+                &format!("next_boot_system={old}"),
+                &format!("next_boot_system={new}"),
+            );
+        }
+        sandbox.answer(id, &answer);
+    }
+    sandbox
+}
+
+#[test]
+fn a_halt_in_front_of_a_provider_is_exit_two_a_sentence_and_one_line_of_json() {
+    let sandbox = waiting_for_a_provider();
+    let approvals: Vec<String> = sandbox
+        .plan
+        .approvals
+        .iter()
+        .map(|a| format!("--approve {}={}", a.class, a.bound_plan_id))
+        .collect();
+    let mut args = vec![
+        "apply",
+        "--plan",
+        "plan.json",
+        "--release",
+        "release.json",
+        "--repo",
+        ".",
+        "--inventory",
+        "fleet.toml",
+    ];
+    let granted: Vec<&str> = approvals
+        .iter()
+        .flat_map(|a| a.split(' '))
+        .filter(|s| !s.is_empty())
+        .collect();
+    args.extend(granted);
+    let out = sandbox.run(&args);
+
+    // Exit 2: this tool worked and the fleet is not where the plan wants it
+    // yet. Not 1, which is "this tool broke".
+    assert_eq!(code(&out), 2, "{}\n{}", stdout(&out), stderr(&out));
+
+    let bundle = sandbox.release.artifacts["n1"]
+        .direct_boot
+        .clone()
+        .expect("a direct host carries a bundle");
+
+    // The sentence, for the person.
+    let said = stderr(&out);
+    assert!(said.contains(&bundle.kernel.store_path), "{said}");
+    assert!(said.contains(&bundle.initrd.store_path), "{said}");
+    assert!(said.contains(&bundle.cmdline), "{said}");
+    assert!(said.contains("apply --resume"), "{said}");
+
+    // The line, for the thing that will do it: one JSON object on stdout,
+    // parsed here rather than grepped.
+    let line = stdout(&out)
+        .lines()
+        .find(|l| l.starts_with('{') && l.contains("waiting_for"))
+        .expect("a launcher gets a line it can read")
+        .to_string();
+    let halt: serde_json::Value = serde_json::from_str(&line).expect("it is json");
+    assert_eq!(halt["waiting_for"], "provider-reboot");
+    assert_eq!(halt["host"], "n1");
+    assert_eq!(halt["bundle"]["cmdline"], bundle.cmdline);
+    assert_eq!(
+        halt["bundle"]["kernel"]["store_path"],
+        bundle.kernel.store_path
+    );
+    assert_eq!(
+        halt["bundle"]["initrd"]["store_path"],
+        bundle.initrd.store_path
+    );
+    let run = halt["resume"]
+        .as_str()
+        .expect("it names the run")
+        .to_string();
+
+    // Nothing was built, nothing was copied and nobody was rebooted.
+    for call in sandbox.calls() {
+        assert!(!call.starts_with("nix "), "{call}");
+        assert!(!call.contains("systemctl reboot"), "{call}");
+        assert!(!call.contains("[activate]"), "{call}");
+    }
+
+    // The journal has the step, has no end for it, and carries the bundle
+    // on the line that says where the run stopped.
+    let journal = std::fs::read_to_string(
+        sandbox
+            .state()
+            .join("runs")
+            .join(&run)
+            .join("journal.jsonl"),
+    )
+    .expect("the run wrote a journal");
+    let events: Vec<serde_json::Value> = journal
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("a journal line is json"))
+        .collect();
+    let begun = events
+        .iter()
+        .any(|e| e["event"] == "action.begin" && e["payload"]["kind"] == "provider-reboot");
+    assert!(begun, "{journal}");
+    let ended = events
+        .iter()
+        .any(|e| e["event"] == "action.end" && e["payload"]["kind"] == "provider-reboot");
+    assert!(!ended, "a step that did not happen has no end: {journal}");
+    let halt_line = events
+        .iter()
+        .find(|e| e["to"] == "awaiting-reboot")
+        .expect("the journal says where it stopped");
+    assert_eq!(halt_line["payload"]["waiting_for"], "provider-reboot");
+    assert_eq!(halt_line["payload"]["bundle"]["cmdline"], bundle.cmdline);
+    assert!(
+        events.iter().any(|e| e["event"] == "run.end"),
+        "the run ended rather than hanging: {journal}"
+    );
+
+    // And the receipt of that run says the same thing in its own words.
+    let receipt: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(sandbox.state().join("runs").join(&run).join("receipt.json"))
+            .expect("the run wrote a receipt"),
+    )
+    .expect("a receipt is json");
+    assert_eq!(receipt["hosts"]["n1"]["state"], "awaiting-reboot");
+    assert_ne!(receipt["outcome"], "success");
 }

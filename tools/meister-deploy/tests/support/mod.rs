@@ -183,6 +183,109 @@ pub fn with_new_systems(
     release_of(fleet)
 }
 
+// --- lane 3-integration: a host whose provider loads its kernel ----------
+
+/// The same fleet with one host turned into a `boot = "direct"` guest: no
+/// boot loader, a command line that names the system its kernel is to start,
+/// and therefore a bundle its provider is handed.
+pub fn with_direct_host(mut fleet: ResolvedFleet, id: &str) -> ResolvedFleet {
+    {
+        let host = fleet
+            .hosts
+            .get_mut(id)
+            .unwrap_or_else(|| panic!("{id} is in the fleet"));
+        host.build.boot.mode = meister_deploy::manifest::BootMode::Direct;
+        host.build.boot.cmdline = Some(format!("loglevel=4 init={}/init", host.build.toplevel_out));
+        host.build.direct_boot_drv = Some(format!("/nix/store/bbbb{id}-{id}-direct-boot.drv"));
+        host.build.disk_image_drv = None;
+    }
+    fleet.manifest_id =
+        meister_deploy::ids::content_id(meister_deploy::ids::IdKind::Manifest, &fleet)
+            .expect("a manifest hashes");
+    fleet
+}
+
+/// The same fleet after another evaluation, without binding it to a release:
+/// a fleet with a direct-boot host needs [`direct_release_of`] for that.
+pub fn with_new_toplevels(
+    mut fleet: ResolvedFleet,
+    hosts: &[&str],
+    new_kernel: bool,
+) -> ResolvedFleet {
+    for id in hosts {
+        let host = fleet
+            .hosts
+            .get_mut(*id)
+            .unwrap_or_else(|| panic!("{id} is in the fleet"));
+        host.build.toplevel_drv = format!("/nix/store/next{id}-nixos-system-{id}.drv");
+        host.build.toplevel_out = format!("/nix/store/next{id}-nixos-system-{id}");
+        if new_kernel {
+            host.build.boot.kernel_out = "/nix/store/next-linux-6.12.48/bzImage".to_string();
+            host.build.boot.initrd_out = "/nix/store/next-initrd-6.12.48/initrd".to_string();
+            host.build.boot.kernel_params_sha256 = "3b8fnnnnnnnn".to_string();
+            host.build.boot.kernel_version = "6.12.48".to_string();
+        }
+        if host.build.boot.mode == meister_deploy::manifest::BootMode::Direct {
+            host.build.boot.cmdline =
+                Some(format!("loglevel=4 init={}/init", host.build.toplevel_out));
+            host.build.direct_boot_drv = Some(format!("/nix/store/next{id}-{id}-direct-boot.drv"));
+        }
+    }
+    fleet.manifest_id =
+        meister_deploy::ids::content_id(meister_deploy::ids::IdKind::Manifest, &fleet)
+            .expect("a manifest hashes");
+    fleet
+}
+
+/// [`release_of`] for a fleet with direct-boot hosts: each of them carries
+/// the bundle its provider is handed, because `release::bind` refuses a
+/// release in which one does not.
+pub fn direct_release_of(resolved: ResolvedFleet) -> ReleaseManifest {
+    let mut artifacts = artifacts_for(&resolved);
+    for (id, host) in &resolved.hosts {
+        if host.build.boot.mode != meister_deploy::manifest::BootMode::Direct {
+            continue;
+        }
+        artifacts
+            .get_mut(id)
+            .expect("every host has artifacts")
+            .direct_boot = Some(meister_deploy::release::DirectBoot {
+            kernel: meister_deploy::release::ImageArtifact {
+                store_path: host.build.boot.kernel_out.clone(),
+                sha256: "1".repeat(64),
+                size: 12_000_000,
+            },
+            initrd: meister_deploy::release::ImageArtifact {
+                store_path: host.build.boot.initrd_out.clone(),
+                sha256: "2".repeat(64),
+                size: 48_000_000,
+            },
+            cmdline: host
+                .build
+                .boot
+                .cmdline
+                .clone()
+                .expect("a direct host carries a command line"),
+            bundle_store_path: format!("/nix/store/bbbb{id}-{id}-direct-boot"),
+        });
+    }
+    bind(
+        resolved,
+        artifacts,
+        BTreeMap::new(),
+        Vec::new(),
+        build_env(),
+        Vec::new(),
+        Reproducibility {
+            inputs_pinned: true,
+            bit_identical_verified: false,
+            method: None,
+        },
+        at("2026-09-21T11:00:00Z"),
+    )
+    .expect("the fixture binds")
+}
+
 /// Every host running exactly what this release says, with nothing in the
 /// way.
 pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observations {
