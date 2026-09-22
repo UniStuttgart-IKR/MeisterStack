@@ -65,10 +65,28 @@ impl Reconciler {
             .mutate(id, |r| r.unhealthy = Some(BACKEND_DIED_REASON.to_string()))
     }
 
+    /// Carry out `action` — if it is still the action.
+    ///
+    /// The plan was made without the node's lock and this takes it, so the
+    /// record can have moved in between, and one of the ways it moves is a
+    /// MIGRATION: `begin_migrate_out` writes `operation = MigratingOut` under
+    /// this very lock, and neither the phase nor the intent moves with it. A
+    /// check of those two alone let a stop decided a moment before a send
+    /// began kill the source VMM in the middle of the transfer (F07).
+    ///
+    /// So the question is asked again, whole: `plan`, over the record as it
+    /// is NOW, the same observation and the same instant. `plan` is pure, so
+    /// asking again costs nothing and cannot disagree with itself — whatever
+    /// it reads (operation, quarantine, pid, phase, intent) is covered, and a
+    /// field it does not read cannot change the answer. What is NOT asked
+    /// again is the world: observing under the lock would hold every command
+    /// on this node for the length of a probe, and the actions are built to
+    /// meet a world that moved (a stop of a VMM that is gone, a start of one
+    /// that is running).
     pub(super) async fn execute(
         &self,
         id: &VmId,
-        planned: (Phase, Desired),
+        planned: Planned<'_>,
         action: Action,
     ) -> Result<()> {
         if matches!(action, Action::None | Action::Blocked | Action::Quarantined) {
@@ -81,12 +99,18 @@ impl Reconciler {
             debug!("record gone before execute, skipping");
             return Ok(());
         };
-        if (current.phase, current.desired) != planned {
+        if (current.phase, current.desired) != (planned.record.phase, planned.record.desired) {
             debug!(
                 phase = ?current.phase,
                 desired = ?current.desired,
                 "record changed before execute, skipping"
             );
+            return Ok(());
+        }
+        let now_it_is = plan(&current, planned.observed, planned.at);
+        if now_it_is != action {
+            debug!(planned = ?action, now = ?now_it_is, operation = ?current.operation,
+                   "the plan no longer holds for the record as it is now, skipping");
             return Ok(());
         }
 

@@ -1614,3 +1614,94 @@ async fn a_vmm_that_never_answers_again_is_still_here_at_the_ceiling() {
     let said = line.message.expect("with a reason");
     assert!(said.contains("not answering"), "{said}");
 }
+
+/// F07: a plan made before a migration began is not carried out during it.
+///
+/// A pass reads the record, looks at the VMM and decides — all without the
+/// node's lock — and only `execute` takes it. `begin_migrate_out` takes the
+/// same lock and writes `operation = MigratingOut` under it. So a pass can
+/// decide from a record with no operation, wait at the lock while the send
+/// begins, and then act: `execute` used to compare the phase and the intent
+/// and nothing else, and neither of those moves when a send starts. Here the
+/// pass has decided to stop the VM, and a stop carried out into a running
+/// send kills the source VMM in the middle of the transfer.
+///
+/// The interleaving is forced, not hoped for: the test holds the node's lock
+/// the way the send does, lets the pass read and look, writes the marker the
+/// way the send writes it, and only then lets go.
+#[tokio::test]
+async fn a_plan_made_before_a_migration_began_is_not_carried_out_during_it() {
+    let (_temp, root) = migration_root("stale-plan");
+    let store = Arc::new(crate::store::Store::open(&root.join("src.redb")).expect("a store"));
+    let hv = Arc::new(MigratingVmm::new(true));
+    let drivers = migrating_drivers(&root, hv.clone());
+    let provisioner = Arc::new(provisioner_over(&root, store.clone(), drivers.clone()));
+    let ops = Arc::new(tokio::sync::Mutex::new(()));
+    let reconciler = Arc::new(crate::reconcile::Reconciler::new(
+        store.clone(),
+        drivers,
+        provisioner.clone(),
+        ops.clone(),
+    ));
+    let id = VmId::new_v4();
+    provisioner
+        .provision(id, migratable_spec(&store), Desired::Running, true)
+        .await
+        .expect("a running vm");
+    // An operator's stop, written the way `set_desired` writes it — without
+    // the pass `set_desired` runs afterwards, which is the one under test.
+    store
+        .mutate(&id, |r| r.desired = Desired::Stopped)
+        .expect("the intent");
+
+    // The node's lock, held the way `begin_migrate_out` holds it.
+    let lock = ops.lock().await;
+    let asked = hv.probes.load(std::sync::atomic::Ordering::SeqCst);
+    let pass = tokio::spawn({
+        let reconciler = reconciler.clone();
+        async move {
+            reconciler
+                .reconcile(id, crate::reconcile::Trigger::Manual)
+                .await
+        }
+    });
+    // The pass has read the record and is looking at the VMM: whatever it
+    // decides, it decides from a record with no operation on it. From here
+    // to `execute` nothing is awaited but the lock.
+    while hv.probes.load(std::sync::atomic::Ordering::SeqCst) == asked {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    // What the send writes under the lock before it answers.
+    store
+        .mutate(&id, |r| {
+            r.operation = Some(crate::types::Operation::MigratingOut {
+                peer: "tcp:10.0.0.9:49000".into(),
+            })
+        })
+        .expect("the marker");
+    drop(lock);
+
+    let decided = pass.await.expect("the task").expect("a pass");
+    assert_eq!(
+        decided,
+        crate::reconcile::Action::Stop,
+        "the plan WAS a stop, made from the record as it was before the send"
+    );
+    assert!(
+        !hv.said().iter().any(|l| l == "destroy"),
+        "and it was not carried out into the send: {:?}",
+        hv.said()
+    );
+    let record = store.get(&id).expect("a lookup").expect("a record");
+    assert!(
+        record.vmm_pid.is_some(),
+        "the sending vmm is still recorded"
+    );
+    assert!(
+        matches!(
+            record.operation,
+            Some(crate::types::Operation::MigratingOut { .. })
+        ),
+        "and the send still owns the vm"
+    );
+}
