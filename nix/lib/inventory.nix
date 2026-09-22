@@ -248,7 +248,12 @@ let
         else null;
 
       # --- everything that is wrong with this inventory, each with a sentence
-      errors =
+      #
+      # `seq schema` first, and that is not decoration: a schema 1 file has
+      # `[[node]]` and no `[[host]]`, so without it the first complaint would
+      # be "no [[host]]; there is nothing to deploy" — true, and the wrong
+      # sentence entirely for somebody holding the pre-v1 plan (measured).
+      errors = builtins.seq schema (
         (lib.optional (hostList == [ ])
           "${where}: no [[host]]; there is nothing to deploy")
         ++ (lib.optional (dups hostIds')
@@ -360,7 +365,7 @@ let
             ++ (lib.optional (!(s.managed or true) && (s.host or null) != null)
               ("${where}: service ${s.id} is not managed and names a host of this fleet. One of "
                 + "the two is wrong.")))
-          serviceList);
+          serviceList));
 
       # Forced by every consumer below, so a broken inventory fails at
       # EVALUATION — `nix flake check`, `nix build .#…` and `meister-deploy
