@@ -228,8 +228,18 @@ impl ProbeSpec {
                 // back.
                 public: is_certificate(&secret.target_path),
             });
-            if secret.kind == SecretKind::IdentityKey {
-                identity_certs.push(certificate_beside(&secret.target_path));
+            // The certificate beside a KEY. An identity is two files and
+            // the one derivation names both of them `identity_key` (the
+            // certificate is part of the identity), so a ref that already
+            // IS a certificate must not have another one derived from it —
+            // that would be `identity.crt.crt`, a file nobody writes, and
+            // every managed host would be `unenrolled` for ever. Measured
+            // in nix/tests/update.nix, where exactly that happened.
+            if secret.kind == SecretKind::IdentityKey && !is_certificate(&secret.target_path) {
+                let beside = certificate_beside(&secret.target_path);
+                if !identity_certs.contains(&beside) {
+                    identity_certs.push(beside);
+                }
             }
         }
 
@@ -1105,6 +1115,43 @@ mod tests {
         s.push_str("vms=[]\n");
         s.push_str("probe=end\n");
         s
+    }
+
+    /// What the VM test found: an identity is TWO files, and the one
+    /// derivation names both of them `identity_key`.
+    #[test]
+    fn a_certificate_that_is_itself_an_identity_ref_needs_no_certificate_beside_it() {
+        use crate::manifest::{Delivery, SecretKind, SecretRef, SecretSource};
+        let mut fleet = onebox_enrolled();
+        let host = fleet.hosts.get_mut("n1").expect("n1 is in the fixture");
+        // Exactly what nix/lib/manifest.nix writes for a managed host: one
+        // ref per file AND per unit, with the certificate carrying the same
+        // kind as the key, because it is part of the same identity.
+        host.secret_refs.push(SecretRef {
+            id: "identity-crt-agent".to_string(),
+            kind: SecretKind::IdentityKey,
+            source: SecretSource {
+                kind: crate::manifest::SecretSourceKind::MeisterCa,
+                reference: "system:node:n1".to_string(),
+            },
+            target_path: "/var/lib/meisterstack/pki/identity.crt".to_string(),
+            owner: "meister".to_string(),
+            mode: "0644".to_string(),
+            delivery: Delivery::File,
+            reload: None,
+        });
+        let spec = ProbeSpec::for_host(&fleet.hosts["n1"]);
+        assert_eq!(
+            spec.identity_certs,
+            vec!["/var/lib/meisterstack/pki/identity.crt".to_string()],
+            "a certificate had a certificate derived from it"
+        );
+        // And a host that has both files IS enrolled, which is the whole
+        // point: before this, every managed host was `unenrolled` for ever
+        // because nobody writes `identity.crt.crt`.
+        let answer = healthy_answer(&spec);
+        let obs = parse_probe(&answer, &spec, Some("SHA256:enrolled-n1".to_string()));
+        assert!(obs.enrolled, "{:?}", obs.credentials);
     }
 
     #[test]

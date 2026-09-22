@@ -67,7 +67,7 @@ let
     id = "target"
     name = "target"
     deployment = "nixos"
-    roles = ["cloud", "cluster", "agent"]
+    roles = ["cloud", "cluster"]
     groups = ["cp"]
     controller_group = "cp"
     site = "vm"
@@ -82,12 +82,14 @@ let
   # is what keeps the test driver's own backdoor alive across it.
   targetCommon = { ... }: {
     imports = [ self.nixosModules.services self.nixosModules.managed ];
-    meisterstack.roles = [ "cloud" "cluster" "agent" ];
-    # No routing daemon and no nvme-over-tcp in a test VM: neither is what
-    # this test is about, and both are modules the guest kernel would have
-    # to carry.
-    meisterstack.agent.frr.enable = false;
-    meisterstack.agent.nvmeTcp.enable = false;
+    # A control plane and no agent. The inventory insists that a cloud has a
+    # cluster and a cluster has a cloud, so a fleet of one host carries both
+    # — and NOT the agent role, because an agent that carries guests may
+    # only be interrupted through `meister node drain` (D7), and a drain
+    # against a control plane that is not really serving anything would be
+    # a step this test could only fake. What the drain does is pinned in
+    # execute.rs, against the command line it produces.
+    meisterstack.roles = [ "cloud" "cluster" ];
     meisterstack.managed.enable = true;
     # A placeholder, so that 1A's assertion is satisfied at build time. The
     # key this fleet really signs with is generated while the test runs and
