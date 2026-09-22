@@ -50,7 +50,20 @@ rustPlatform.buildRustPackage {
   buildInputs = [ openssl zstd ];
   env.OPENSSL_NO_VENDOR = true;
   env.ZSTD_SYS_USE_PKG_CONFIG = true;
-  cargoBuildFlags = [ "--bin" "cloud-hypervisor" ];
+  # Both binaries of the workspace, and the second one is not a convenience.
+  #
+  # `ch-remote` is how anything outside a running VMM talks to it: shutdown,
+  # pause, resume, `info`, hot-plug. The agent itself uses the VMM's HTTP api
+  # over the per-VM socket, so it needs neither — but a verification suite
+  # that has to stop a guest it started, and an operator on a node looking at
+  # why one will not die, both reach for `ch-remote`, and the alternative was
+  # curl against a unix socket by hand (lane 1B, open point 5; M4B's
+  # `vm-lifecycle` is the caller).
+  #
+  # `--bin` twice and not `--bins`: the workspace also builds test helpers,
+  # and a package that shipped whatever the upstream Cargo.toml grows next is
+  # a package whose closure changes without anybody deciding it.
+  cargoBuildFlags = [ "--bin" "cloud-hypervisor" "--bin" "ch-remote" ];
   # The test suite wants /dev/kvm, /dev/net/tun and io_uring; none of it is
   # available in the sandbox and none of it is ours.
   doCheck = false;
