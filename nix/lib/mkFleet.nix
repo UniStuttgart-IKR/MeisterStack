@@ -106,6 +106,21 @@ let
         meisterstack.managed.enable = true;
       }
       (inv.hostModule id)
+      {
+        # The installer MEDIUM is not this host, and one of its settings
+        # collides with one of ours: nixpkgs' installation-device profile
+        # says `PermitRootLogin = "yes"` and nix/managed.nix says
+        # `"prohibit-password"`, both as defaults, which is a conflict rather
+        # than a precedence. It is settled here, in the sub-evaluation the
+        # image is built in (`image.modules.<format>` — setting an
+        # `isoImage.*` option in the host itself is the trap M0 A10 named),
+        # and settled towards the stricter of the two: the installer of a
+        # managed host is reached with a key or not at all (D9), and it never
+        # has a root password to begin with (`nixos-install --no-root-passwd`).
+        image.modules.iso-installer = { lib, ... }: {
+          services.openssh.settings.PermitRootLogin = lib.mkForce "prohibit-password";
+        };
+      }
     ]
     ++ map (profileFor id) inv.hosts.${id}.profiles
     ++ inv.hosts.${id}.modulePaths
