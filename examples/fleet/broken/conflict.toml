@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+#
+# Two groups of equal rank, and they disagree about one key. Nix throws with
+# the host, the key and BOTH groups in the sentence; `meister-deploy validate`
+# says the same thing (inventory.rs). `checks.inventory-conflicts` evaluates
+# this file and requires the evaluation to fail.
+schema = 2
+
+[fleet]
+name = "conflict"
+
+[[group]]
+id = "rack-a"
+kind = "custom"
+rollout = { reboot = "never" }
+
+[[group]]
+id = "rack-b"
+kind = "custom"
+rollout = { reboot = "auto" }
+
+[[host]]
+id = "gpu-01"
+name = "gpu-01"
+deployment = "nixos"
+roles = ["agent"]
+groups = ["rack-a", "rack-b"]
+controller_group = "rack-a"
+networks.management = { address = "10.2.0.11", prefix = 24 }

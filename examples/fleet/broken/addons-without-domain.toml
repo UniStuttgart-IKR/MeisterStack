@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+#
+# An addons host and no [fleet] domain. Kanidm is reached under a NAME — its
+# issuer is an https url, its certificate has to match it, and its `domain` is
+# an `iname` that refuses anything starting with a digit — so an address is
+# not one. Refused here rather than discovered on the first boot (D-P6).
+schema = 2
+
+[fleet]
+name = "nodomain"
+
+[[group]]
+id = "box"
+kind = "raft"
+
+[[host]]
+id = "box"
+name = "box"
+deployment = "nixos"
+roles = ["cloud", "cluster", "addons"]
+groups = ["box"]
+networks.management = { address = "10.4.0.10", prefix = 24 }

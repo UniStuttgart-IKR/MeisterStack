@@ -293,6 +293,19 @@ in
     };
   };
 
+  options.meisterstack.agent.effective = lib.mkOption {
+    type = toml.type;
+    internal = true;
+    default = { };
+    description = ''
+      The agent's config file as a VALUE: role defaults, the two
+      option-driven sections, `generated`, then `settings`.
+      `environment.etc` turns it into TOML and `lib.mkFleet` puts the same
+      attrset into `meisterDeployment.hosts.<id>.effective_settings`, so the
+      manifest cannot describe a file different from the one the unit reads.
+    '';
+  };
+
   options.meisterstack.agent.generated = lib.mkOption {
     type = toml.type;
     default = { };
@@ -467,7 +480,9 @@ in
       # `meisterstack.agent.frr.enable`, and so is the reason it exists.
 
       environment.etc."meisterstack/agent.toml".source =
-        toml.generate "agent.toml"
+        toml.generate "agent.toml" cfg.agent.effective;
+
+      meisterstack.agent.effective =
           (lib.recursiveUpdate
             (lib.recursiveUpdate defaults
               # Only when there is one. An empty `[network.provider]` table would

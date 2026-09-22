@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+#
+# The other shape of the same fleet: a raft group of THREE, and two agents.
+#
+# It exists for one reason, and lane 1A named it (§8, open point 6): on a
+# one-box fleet the raft group has one member, so `MEISTER_ETCD_PEERS`,
+# `MEISTER_ETCD_MEMBER` and `MEISTER_ETCD_TOKEN` are empty and
+# `checks.render-parity` never compares them. Here they are not empty, so
+# the build-time renderer (nix/lib/render.nix) and the boot-time one
+# (nix/context.nix) are held to each other on the etcd road as well.
+#
+# No addons role and therefore no OIDC issuer: that half is covered by
+# examples/fleet/one-box.toml, and a second copy of it here would only make
+# the check slower.
+
+schema = 2
+
+[fleet]
+name = "ha"
+domain = "lab.example"
+
+[defaults]
+ssh = { user = "root", port = 22 }
+profiles = ["base"]
+rollout = { max_unavailable = 1, reboot = "approve" }
+checks = { required = ["units", "session", "mounts"] }
+
+[[group]]
+id = "cp"
+kind = "raft"
+profiles = ["controller"]
+
+[[group]]
+id = "compute"
+kind = "compute"
+profiles = ["compute-cpu"]
+rollout = { canary = "compute-cpu" }
+
+[[host]]
+id = "cp-a"
+name = "cp-a"
+deployment = "nixos"
+roles = ["cloud", "cluster"]
+groups = ["cp"]
+site = "ikr-lab"
+failure_domain = "rack1"
+networks.management = { address = "10.1.0.11", prefix = 24, interface = "eth0", gateway = "10.1.0.1", static = true }
+persistence = [{ path = "/var/lib/etcd", device = "label:etcd-data", required = true, preserve_on_reinstall = false }]
+
+[[host]]
+id = "cp-b"
+name = "cp-b"
+deployment = "nixos"
+roles = ["cluster"]
+groups = ["cp"]
+site = "ikr-lab"
+failure_domain = "rack2"
+networks.management = { address = "10.1.0.12", prefix = 24, interface = "eth0", gateway = "10.1.0.1", static = true }
+persistence = [{ path = "/var/lib/etcd", device = "label:etcd-data", required = true, preserve_on_reinstall = false }]
+
+[[host]]
+id = "cp-c"
+name = "cp-c"
+deployment = "nixos"
+roles = ["cluster"]
+groups = ["cp"]
+site = "ikr-lab"
+failure_domain = "rack3"
+networks.management = { address = "10.1.0.13", prefix = 24, interface = "eth0", gateway = "10.1.0.1", static = true }
+persistence = [{ path = "/var/lib/etcd", device = "label:etcd-data", required = true, preserve_on_reinstall = false }]
+
+[[host]]
+id = "a1"
+name = "a1"
+deployment = "nixos"
+roles = ["agent"]
+groups = ["compute"]
+controller_group = "cp"
+site = "ikr-lab"
+failure_domain = "rack1"
+networks.management = { address = "10.1.0.21", prefix = 24, interface = "eth0", gateway = "10.1.0.1", static = true }
+capabilities = ["kvm"]
+
+[[host]]
+id = "a2"
+name = "a2"
+deployment = "nixos"
+roles = ["agent"]
+groups = ["compute"]
+controller_group = "cp"
+site = "ikr-lab"
+failure_domain = "rack2"
+networks.management = { address = "10.1.0.22", prefix = 24, interface = "eth0", gateway = "10.1.0.1", static = true }
+capabilities = ["kvm"]

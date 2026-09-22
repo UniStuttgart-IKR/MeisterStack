@@ -2,52 +2,95 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# The normal case, and the plan this flake reads when the repository root has
-# no fleet.toml of its own: one box that is the whole control plane, and two
-# nodes it runs vms on. Copy it to ./fleet.toml, change the addresses and the
-# disks, `git add` it (a flake does not see untracked files), and every output
-# below is yours.
+# The worked example: one box that is the whole control plane, and two hosts
+# it runs vms on. Schema 2.
 #
-#   meister-deploy -f examples/fleet/one-box.toml plan
-#   nix build .#image-box
+# It is NOT the plan of this repository. MeisterStack builds no fleet out of
+# its own root any more — a deployment is an operator's own repository, and
+# `meister-deploy init <dir>` writes one. This file exists so that
+# `nix flake check` has a real fleet to check (`checks.example-cpu-host`,
+# `example-topology`, `render-parity`, `manifest-json`), and it is read
+# through `lib.mkFleet` exactly the way an operator's `fleet.toml` is.
+
+schema = 2
 
 [fleet]
-name   = "one-box"
+name = "one-box"
 domain = "lab.example"
-# Where meister-ca keeps its directory. NEVER inside the image: `keys push`
-# carries the files, `image` must not.
-ca     = "pki"
 
 [defaults]
-roles    = ["agent"]
-ssh_user = "root"
+ssh = { user = "root", port = 22 }
+profiles = ["base"]
+rollout = { max_unavailable = 1, reboot = "approve" }
+checks = { required = ["units", "session"] }
 
-# The box: all four roles, and therefore its own raft group of one — which is
-# the single-member etcd this stack has always run, said out loud.
-[[node]]
-name    = "box"
-group   = "box"
-roles   = ["cloud", "cluster", "agent", "addons"]
-address = "10.0.0.10"
-disk    = "/dev/vda"
-data    = "/dev/vdb"
-# The hardware of this box, which is not ours to model: kernel modules,
-# NVIDIA, Mellanox, a hardware-configuration.nix. Paths are relative to THIS
-# file, and they are imported into the node's system next to our modules.
+# The raft group of one: a single-member etcd, which is what this lab has
+# always run, said out loud rather than implied by a group nobody named.
+[[group]]
+id = "box"
+kind = "raft"
+profiles = ["controller"]
+
+# The workload carriers. Interchangeable, so one canary class for all of them.
+[[group]]
+id = "compute"
+kind = "compute"
+profiles = ["compute-cpu"]
+rollout = { canary = "compute-cpu" }
+
+[[host]]
+id = "box"
+name = "box"
+deployment = "nixos"
+roles = ["cloud", "cluster", "agent", "addons"]
+groups = ["box"]
+site = "ikr-lab"
+failure_domain = "rack1"
+# `static = true` is the plan claiming the interface. Without it the address
+# is documentation and the host's own configuration owns its network — which
+# is the right default for a box that gets its address from somewhere else.
+networks.management = { address = "10.0.0.10", prefix = 24, interface = "eth0", gateway = "10.0.0.1", static = true }
+install = { disk = { serial = "MEISTERBOX0001", size_gb = 960 }, layout = "disko/single-nvme.nix", preserve = ["/var/lib/meister-data"] }
+persistence = [{ path = "/var/lib/meister-data", device = "label:meister-data", required = true }]
+# The hardware of this box, which is not ours to model. Paths are relative to
+# THIS file and are imported into the host's system next to our modules.
 modules = ["hw/box.nix"]
+hardware = { cpu = "AMD Ryzen 7 3800X", memory_gb = 32 }
+capabilities = ["kvm"]
 
-# Two nodes. `group` names the CLUSTER they belong to, which is where their
-# controller_addrs come from — nobody types an address twice.
-[[node]]
-name    = "n1"
-group   = "box"
-address = "10.0.0.11"
-disk    = "/dev/vda"
-labels  = { zone = "rack1" }
+[[host]]
+id = "n1"
+name = "n1"
+deployment = "nixos"
+roles = ["agent"]
+groups = ["compute"]
+# Which cluster this agent reports to. Nobody types an address twice: the
+# controller addresses are derived from the members of that group.
+controller_group = "box"
+site = "ikr-lab"
+failure_domain = "rack1"
+networks.management = { address = "10.0.0.11", prefix = 24, interface = "eth0", gateway = "10.0.0.1", static = true }
+install = { disk = { serial = "MEISTERN10001", size_gb = 480 }, layout = "disko/single-nvme.nix", preserve = [] }
+capabilities = ["kvm"]
 
-[[node]]
-name    = "n2"
-group   = "box"
-address = "10.0.0.12"
-disk    = "/dev/vda"
-labels  = { zone = "rack2" }
+[[host]]
+id = "n2"
+name = "n2"
+deployment = "nixos"
+roles = ["agent"]
+groups = ["compute"]
+controller_group = "box"
+site = "ikr-lab"
+failure_domain = "rack2"
+networks.management = { address = "10.0.0.12", prefix = 24, interface = "eth0", gateway = "10.0.0.1", static = true }
+install = { disk = { serial = "MEISTERN20001", size_gb = 480 }, layout = "disko/single-nvme.nix", preserve = [] }
+capabilities = ["kvm"]
+
+# Something this fleet depends on and does not deploy. Observed, never
+# changed, and its being unreachable does not block a run here.
+[[service]]
+id = "observability-external"
+kind = "observability"
+managed = false
+required = false
+endpoint = { loki = "http://10.0.5.10:3100/loki/api/v1/push" }
