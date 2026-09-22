@@ -186,6 +186,7 @@ pkgs.testers.runNixOSTest {
     ISO_BOX = glob.glob("${fleetA.packages.${system}.box-installer}/iso/*.iso")[0]
     ISO_N1 = glob.glob("${fleetA.packages.${system}.n1-installer}/iso/*.iso")[0]
     BUNDLE_A = "${bundle fleetA "n1"}"
+    BUNDLE_B = "${bundle fleetB "n1"}"
     BUNDLE_D = "${bundle fleetD "n1"}"
     SYSTEM_A_N1 = "${toplevel fleetA "n1"}"
     SIZE = 16000000000
@@ -760,12 +761,26 @@ pkgs.testers.runNixOSTest {
         "| grep -qiE 'system:node:n1'",
         timeout=180,
     )
-    # The provider restarts the guest with the SAME bundle: same kernel, same
-    # command line, same system.
+    # A cold start, and the provider is handed the bundle of the system the
+    # bootstrap activated.
+    #
+    # The bundle of the system it was INSTALLED with would have been just as
+    # honest an answer and a different test: a direct-boot guest whose
+    # provider was never told about the new system comes back on the old one,
+    # consistently, because its command line names it (that is what the
+    # `booted` check says between an activation and a provider's reboot).
+    # What is measured here is the other half — the identity survives a cold
+    # start — so the guest is started with the bundle that matches what it
+    # runs, which is what `lab.py boot publish` hands a provider after a
+    # bootstrap (L2).
+    kernel_b, initrd_b, cmdline_b = bundle_of(BUNDLE_B)
     n1.shutdown()
-    n1 = provider_boot("n1-again", kernel, initrd, cmdline, "52:54:00:12:01:03")
+    n1 = provider_boot("n1-again", kernel_b, initrd_b, cmdline_b, "52:54:00:12:01:03")
     n1.start(allow_reboot=True)
     n1.wait_for_unit("multi-user.target")
+    assert n1.succeed("readlink -f /run/booted-system").strip() == \
+        n1.succeed("readlink -f /run/current-system").strip(), \
+        "after the provider loaded the new bundle, what it booted is what it runs"
     assert n1.succeed(
         "stat -c '%a %U:%G' /var/lib/meisterstack/pki/identity.key"
     ).strip() == "600 meister:meister"
