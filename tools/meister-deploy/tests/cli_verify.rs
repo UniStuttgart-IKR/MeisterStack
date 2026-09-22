@@ -785,3 +785,175 @@ fn the_contracts_this_verb_writes_have_a_schema_anybody_can_read() {
         assert!(schema.get("properties").is_some(), "{kind}: {schema}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// `report --run <id>` over a verification
+// ---------------------------------------------------------------------------
+
+/// A verification written by hand into the state directory, so that what
+/// `report` does with one is measured against bytes a test controls rather
+/// than against whatever a run happened to produce.
+fn a_verification(sandbox: &Sandbox, run: &str, checks: serde_json::Value) {
+    let dir = sandbox.state().join("runs").join(run);
+    std::fs::create_dir_all(&dir).unwrap();
+    let document = serde_json::json!({
+        "schema": "meister-deploy/verify/1",
+        "run_id": run,
+        "release_id": sandbox.release.release_id,
+        "manifest_id": sandbox.release.resolved_fleet.manifest_id,
+        "suite": "gpu",
+        "started_at": "2026-09-22T19:00:00Z",
+        "ended_at": "2026-09-22T19:05:00Z",
+        "outcome": "success",
+        "hosts": ["n1"],
+        "checks": checks,
+        "ledger": {
+            "schema": "meister-deploy/verify-ledger/1",
+            "run_id": run,
+            "release_id": sandbox.release.release_id,
+            "suite": "gpu",
+            "tag": format!("meister-verify-{run}"),
+            "started_at": "2026-09-22T19:00:00Z",
+            "resources": [],
+        },
+        "ledger_path": dir.join("ledger.json").display().to_string(),
+    });
+    std::fs::write(
+        dir.join("verify.json"),
+        serde_json::to_vec_pretty(&document).unwrap(),
+    )
+    .unwrap();
+}
+
+fn check(id: &str, status: &str, kind: &str, required: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "subject": { "host": "n1", "resource": null },
+        "required": required,
+        "status": status,
+        "expected": "a device in the guest",
+        "observed": "what was found",
+        "reason": "a sentence",
+        "duration_ms": 12,
+        "evidence": [{ "kind": kind, "ref": "vm g on node n1" }],
+        "release_id": null,
+        "config_id": null,
+    })
+}
+
+#[test]
+fn a_run_whose_evidence_is_a_mock_is_not_printed_as_a_hardware_proof() {
+    let sandbox = Sandbox::new();
+    let run = "0192f0c0-0000-7000-8000-00000000mock";
+    a_verification(
+        &sandbox,
+        run,
+        serde_json::json!([
+            check("gpu.create", "pass", "mock", false),
+            check("gpu.in-guest", "pass", "mock", false),
+        ]),
+    );
+
+    let out = sandbox.run(&["report", "--run", run, "--repo", "."]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    let (before, after) = text
+        .split_once("--- everything else ---")
+        .expect("the two sections are printed apart");
+    assert!(before.contains("--- hardware evidence ---"), "{text}");
+    assert!(
+        before.contains("(none."),
+        "a mock was printed under hardware evidence:\n{text}"
+    );
+    assert!(after.contains("gpu.create"), "{text}");
+    assert!(after.contains("gpu.in-guest"), "{text}");
+}
+
+#[test]
+fn a_run_with_hardware_evidence_prints_it_apart_and_names_it() {
+    let sandbox = Sandbox::new();
+    let run = "0192f0c0-0000-7000-8000-0000000000hw";
+    a_verification(
+        &sandbox,
+        run,
+        serde_json::json!([
+            check("gpu.create", "pass", "command", false),
+            check("gpu.in-guest", "pass", "hardware", false),
+        ]),
+    );
+
+    let out = sandbox.run(&["report", "--run", run, "--repo", "."]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    let (hardware, other) = text
+        .split_once("--- everything else ---")
+        .expect("the two sections are printed apart");
+    assert!(hardware.contains("gpu.in-guest"), "{text}");
+    assert!(hardware.contains("hardware: vm g on node n1"), "{text}");
+    assert!(!hardware.contains("gpu.create"), "{text}");
+    assert!(other.contains("gpu.create"), "{text}");
+}
+
+#[test]
+fn a_required_check_that_did_not_pass_makes_the_report_exit_two_and_say_which() {
+    let sandbox = Sandbox::new();
+    let run = "0192f0c0-0000-7000-8000-000000blocked";
+    a_verification(
+        &sandbox,
+        run,
+        serde_json::json!([
+            check("gpu.create", "pass", "hardware", true),
+            check("gpu.in-guest", "unknown", "hardware", true),
+        ]),
+    );
+
+    let out = sandbox.run(&["report", "--run", run, "--repo", "."]);
+    assert_eq!(code(&out), 2, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(
+        stderr(&out).contains("gpu.in-guest on n1 is unknown"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains("gpu suite"), "{}", stderr(&out));
+}
+
+#[test]
+fn the_json_report_separates_the_two_kinds_as_well() {
+    let sandbox = Sandbox::new();
+    let run = "0192f0c0-0000-7000-8000-00000000json";
+    a_verification(
+        &sandbox,
+        run,
+        serde_json::json!([
+            check("gpu.create", "pass", "mock", false),
+            check("gpu.in-guest", "pass", "hardware", false),
+        ]),
+    );
+
+    let out = sandbox.run(&["report", "--run", run, "--repo", ".", "--json"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let document: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(document["schema"], "meister-deploy/verify-report/1");
+    let hardware = document["hardware_evidence"].as_array().unwrap();
+    let other = document["other_evidence"].as_array().unwrap();
+    assert_eq!(hardware.len(), 1);
+    assert_eq!(hardware[0]["id"], "gpu.in-guest");
+    assert_eq!(other.len(), 1);
+    assert_eq!(other[0]["id"], "gpu.create");
+    assert!(document["blocked"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn a_verification_and_a_rollout_do_not_get_in_each_others_way() {
+    let sandbox = Sandbox::new();
+    // A run directory with neither is still the sentence it was.
+    let out = sandbox.run(&[
+        "report",
+        "--run",
+        "0192f0c0-0000-7000-8000-00000000none",
+        "--repo",
+        ".",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("holds no run"), "{}", stderr(&out));
+}

@@ -2535,3 +2535,128 @@ pub fn listing(steps: &[Step]) -> String {
 
 #[cfg(test)]
 mod tests;
+
+// ---------------------------------------------------------------------------
+// the report
+// ---------------------------------------------------------------------------
+
+pub const REPORT_SCHEMA: &str = "meister-deploy/verify-report/1";
+
+/// What a verification is worth, with the one line drawn that matters.
+///
+/// `hardware` evidence and everything else are printed apart, in the text
+/// and in the json, because a reader who cannot see the boundary will read
+/// a mock as a measurement — and `verify --suite gpu` against a strict fake
+/// produces exactly the shape of a green GPU report without a GPU having
+/// been anywhere near it.
+pub fn report_text(run: &VerifyRun) -> String {
+    let (hardware, other) = run.hardware_evidence();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "==> verify {}  suite {}  release {}\n",
+        run.run_id, run.suite, run.release_id
+    ));
+    out.push_str(&format!(
+        "    outcome: {}   started {}   ended {}\n",
+        run.outcome,
+        run.started_at.format("%Y-%m-%dT%H:%M:%SZ"),
+        run.ended_at.format("%Y-%m-%dT%H:%M:%SZ"),
+    ));
+    out.push_str(&format!("    hosts: {}\n", run.hosts.join(", ")));
+
+    out.push_str("--- hardware evidence ---\n");
+    if hardware.is_empty() {
+        out.push_str(
+            "    (none. Nothing in this run ran on a machine whose snapshot had the \n\
+             \x20    capability it was about, so nothing here is evidence about hardware.)\n",
+        );
+    } else {
+        for check in &hardware {
+            out.push_str(&check_line(check));
+            for evidence in check
+                .evidence
+                .iter()
+                .filter(|e| e.kind == EvidenceKind::Hardware)
+            {
+                out.push_str(&format!("        hardware: {}\n", evidence.reference));
+            }
+        }
+    }
+
+    out.push_str("--- everything else ---\n");
+    if other.is_empty() {
+        out.push_str("    (none)\n");
+    } else {
+        for check in &other {
+            out.push_str(&check_line(check));
+        }
+    }
+
+    let outstanding = run.ledger.outstanding();
+    if outstanding.is_empty() {
+        out.push_str(&format!(
+            "    ledger: {} resource(s), all deleted\n",
+            run.ledger.resources.len()
+        ));
+    } else {
+        out.push_str(&format!(
+            "    ledger: {} resource(s), {} NOT deleted: {}\n",
+            run.ledger.resources.len(),
+            outstanding.len(),
+            outstanding
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out
+}
+
+fn check_line(check: &CheckResult) -> String {
+    format!(
+        "    {:<16} {:<14} {:<24} {}\n",
+        check.id,
+        check.status,
+        check
+            .subject
+            .host
+            .as_deref()
+            .or(check.subject.resource.as_deref())
+            .unwrap_or("the fleet"),
+        if check.observed.is_empty() {
+            check.reason.as_str()
+        } else {
+            check.observed.as_str()
+        }
+    )
+}
+
+/// The same split, for a script.
+pub fn report_json(run: &VerifyRun) -> serde_json::Value {
+    let (hardware, other) = run.hardware_evidence();
+    serde_json::json!({
+        "schema": REPORT_SCHEMA,
+        "run_id": run.run_id,
+        "suite": run.suite,
+        "release_id": run.release_id,
+        "manifest_id": run.manifest_id,
+        "started_at": run.started_at,
+        "ended_at": run.ended_at,
+        "outcome": run.outcome,
+        "hosts": run.hosts,
+        "hardware_evidence": hardware,
+        "other_evidence": other,
+        "ledger": run.ledger,
+        "blocked": blocking(run),
+    })
+}
+
+/// The required checks that did not pass, each as the sentence `acceptance`
+/// makes of it. Empty is a verification somebody may quote.
+pub fn blocking(run: &VerifyRun) -> Vec<String> {
+    match crate::checks::acceptance(&run.checks) {
+        crate::checks::Acceptance::Accepted => Vec::new(),
+        crate::checks::Acceptance::Blocked { reasons } => reasons,
+    }
+}

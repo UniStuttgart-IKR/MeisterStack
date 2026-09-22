@@ -961,7 +961,7 @@ fn run() -> Result<Answer> {
             dry_run,
         } => gc(*keep, repo, *dry_run).map(Answer::from),
         Verb::Apply(args) => apply(args),
-        Verb::Report { run, repo, json } => report(run, repo, *json).map(Answer::from),
+        Verb::Report { run, repo, json } => report(run, repo, *json),
         // --- lane 4B ---------------------------------------------------
         Verb::Verify(args) => verify(args),
         // --- end lane 4B -----------------------------------------------
@@ -2516,7 +2516,7 @@ fn parse_approvals(given: &[String]) -> Result<Vec<(plan::ApprovalClass, String)
 /// Exit 0 means a report was produced, whatever it says: a rollout that
 /// failed is not this verb failing. Exit 1 means there is nothing here to
 /// report.
-fn report(run: &str, repo: &Path, json: bool) -> Result<bool> {
+fn report(run: &str, repo: &Path, json: bool) -> Result<Answer> {
     let files = RealFiles::new(Policy::real());
     let state = StateDir::in_repo(repo);
 
@@ -2541,6 +2541,48 @@ fn report(run: &str, repo: &Path, json: bool) -> Result<bool> {
             }
         );
     }
+
+    // --- lane 4B: a run may be a verification rather than a rollout ---
+    //
+    // The two write into the same run directory and are read by the same
+    // verb, because they are the same question — what did this run do and
+    // what did it find. A verification has no journal and no receipt; it has
+    // a ledger and a set of checks, and its report draws the one line that
+    // matters: what came off hardware, and what did not.
+    if files.exists(&state.verify_path(run)) {
+        let text = files.read_to_string(&state.verify_path(run))?;
+        let verification = meister_deploy::verify::VerifyRun::from_json(
+            &text,
+            &state.verify_path(run).display().to_string(),
+        )?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&meister_deploy::verify::report_json(&verification))?
+            );
+        } else {
+            print!("{}", meister_deploy::verify::report_text(&verification));
+        }
+        let blocked = meister_deploy::verify::blocking(&verification);
+        if blocked.is_empty() {
+            eprintln!(
+                "==> the {} suite passed every required check over {} host(s).",
+                verification.suite,
+                verification.hosts.len()
+            );
+            return Ok(Answer::Yes);
+        }
+        for reason in &blocked {
+            eprintln!("    blocked: {reason}");
+        }
+        eprintln!(
+            "==> {} required check(s) of the {} suite did not pass.",
+            blocked.len(),
+            verification.suite
+        );
+        return Ok(Answer::Blocked);
+    }
+    // --- end lane 4B --------------------------------------------------
 
     let journal_path = state.journal_path(run);
     let read = if files.exists(&journal_path) {
@@ -2617,7 +2659,7 @@ fn report(run: &str, repo: &Path, json: bool) -> Result<bool> {
     {
         eprintln!("note: {torn}");
     }
-    Ok(true)
+    Ok(Answer::Yes)
 }
 
 // ---------------------------------------------------------------------------
