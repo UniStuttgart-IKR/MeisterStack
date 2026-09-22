@@ -18,6 +18,9 @@ use meister_deploy::legacy::ops::{self, Ctx};
 use meister_deploy::legacy::remote::Ssh;
 use meister_deploy::legacy::run::Real as LegacyRunner;
 use meister_deploy::manifest::{self, Contract, NixManifest, Tool};
+use meister_deploy::observation::{Observations, Targets};
+use meister_deploy::plan::{self, PlanKind};
+use meister_deploy::release::ReleaseManifest;
 use meister_deploy::run::{Cancel, Policy, Real};
 use meister_deploy::{nix, source};
 
@@ -98,11 +101,55 @@ enum Verb {
         offline: bool,
     },
 
+    /// Work out which hosts may be taken forward, in which order, and what
+    /// has to still be true when it happens. Reads a release and a snapshot
+    /// of the fleet; asks no host anything of its own.
+    Plan(PlanArgs),
+
     /// The tool as it was before v1: the `fleet.toml` of schema 1, the rsync
     /// push to the context fleet, `nixos-rebuild --target-host` for metal.
     /// Kept whole, with the same flags, because twelve VMs are served by it
     /// today and `plan` means something else from v1 on.
     Legacy(LegacyCli),
+}
+
+#[derive(Args)]
+struct PlanArgs {
+    /// The release to plan, from `build`
+    #[arg(long)]
+    release: PathBuf,
+
+    /// Which hosts: `all`, `host=<id>`, `group=<g>`, `role=<r>`,
+    /// `profile=<p>`, `site=<s>`; a comma is a union, a leading `!` takes
+    /// away
+    #[arg(long)]
+    select: String,
+
+    /// `upgrade` or `bootstrap`
+    #[arg(long, default_value = "upgrade")]
+    kind: String,
+
+    /// A `targets/1` file from a provider adapter: where each host answers
+    #[arg(long)]
+    targets: Option<PathBuf>,
+
+    /// An `observation/1` snapshot of the fleet to plan from
+    #[arg(long)]
+    observation: Option<PathBuf>,
+
+    /// Plan without a snapshot and without writing anything: the result is
+    /// provisional and every interrupting step in it is blocked
+    #[arg(long)]
+    offline: bool,
+
+    /// The inventory the `[operator] cli_config` reference is read from.
+    /// Defaults to the one the manifest was resolved from.
+    #[arg(long)]
+    inventory: Option<PathBuf>,
+
+    /// Where to write the plan. Without it the plan goes to standard output.
+    #[arg(short = 'o', long)]
+    out: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -201,10 +248,33 @@ enum KeysVerb {
     },
 }
 
+/// What a verb came to, and what the shell is told.
+///
+/// Three codes and not two: a plan that refuses to interrupt a fleet did not
+/// FAIL — it worked, and the answer is no. A script that reads exit 1 for
+/// both cannot tell "this tool broke" from "this rollout is not safe right
+/// now", and the second one is the answer a rollout exists to give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// 0
+    Yes,
+    /// 1: it did not work.
+    No,
+    /// 2: it worked, and something in the result may not run.
+    Blocked,
+}
+
+impl From<bool> for Answer {
+    fn from(ok: bool) -> Answer {
+        if ok { Answer::Yes } else { Answer::No }
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::FAILURE,
+        Ok(Answer::Yes) => ExitCode::SUCCESS,
+        Ok(Answer::No) => ExitCode::FAILURE,
+        Ok(Answer::Blocked) => ExitCode::from(2),
         Err(e) => {
             // Diagnostics on stderr, always: stdout carries the answer, and
             // `--json` has to stay machine-readable even when it is empty.
@@ -214,16 +284,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<bool> {
+fn run() -> Result<Answer> {
     let cli = Cli::parse();
     match &cli.cmd {
-        Verb::Schema { kind } => print_schema(kind),
-        Verb::Inventory { fleet, json } => show_inventory(fleet, *json),
+        Verb::Schema { kind } => print_schema(kind).map(Answer::from),
+        Verb::Inventory { fleet, json } => show_inventory(fleet, *json).map(Answer::from),
         Verb::Validate {
             fleet,
             manifest,
             nix,
-        } => validate(fleet, manifest.as_deref(), *nix),
+        } => validate(fleet, manifest.as_deref(), *nix).map(Answer::from),
         Verb::Resolve {
             repo,
             out,
@@ -232,8 +302,9 @@ fn run() -> Result<bool> {
             hosts,
             dry_run,
             offline,
-        } => resolve(repo, out, fleet, *dev, hosts, *dry_run, *offline),
-        Verb::Legacy(legacy) => run_legacy(legacy),
+        } => resolve(repo, out, fleet, *dev, hosts, *dry_run, *offline).map(Answer::from),
+        Verb::Plan(args) => make_plan(args),
+        Verb::Legacy(legacy) => run_legacy(legacy).map(Answer::from),
     }
 }
 
@@ -354,6 +425,211 @@ fn resolve(
         );
     }
     Ok(true)
+}
+
+fn make_plan(args: &PlanArgs) -> Result<Answer> {
+    if args.offline && args.out.is_some() {
+        anyhow::bail!(
+            "--offline and --out are not both possible. An offline plan is provisional: it \
+             was made without asking any host anything, so it is something to read and not \
+             something to apply. It goes to standard output."
+        );
+    }
+    if !args.offline && args.observation.is_none() {
+        // Not a silent success and not an empty plan: taking a snapshot of
+        // a fleet is lane 2A's, and saying so is the only honest answer.
+        anyhow::bail!(
+            "plan needs to know what the fleet is running. Pass a snapshot with \
+             --observation <file>, or --offline for a provisional plan that asks nobody \
+             anything. Taking the snapshot itself arrives with lane 2A."
+        );
+    }
+
+    let policy = if args.offline {
+        Policy::offline()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+
+    let text = files.read_to_string(&args.release)?;
+    let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
+
+    let observation = match &args.observation {
+        Some(path) => {
+            let text = files.read_to_string(path)?;
+            Observations::from_json(&text, &path.display().to_string())?
+        }
+        None => Observations::provisional(RealClock.now()),
+    };
+    let targets = match &args.targets {
+        Some(path) => {
+            let text = files.read_to_string(path)?;
+            Some(Targets::from_json(&text, &path.display().to_string())?)
+        }
+        None => None,
+    };
+
+    let kind = match args.kind.as_str() {
+        "upgrade" => PlanKind::Upgrade,
+        "bootstrap" => PlanKind::Bootstrap,
+        other @ ("install" | "keys-rotate" | "keys-revoke" | "retire") => anyhow::bail!(
+            "the plan kind {other:?} is a contract this tool already speaks and a plan it \
+             cannot build yet: `install` arrives with M3, `keys-rotate`, `keys-revoke` and \
+             `retire` with M5."
+        ),
+        other => anyhow::bail!(
+            "{other:?} is not a plan kind. This tool builds `upgrade` and `bootstrap`."
+        ),
+    };
+
+    let (control, note) = workload_control(&files, &release, args.inventory.as_deref());
+    if let Some(note) = note {
+        eprintln!("note: {note}");
+    }
+    let plan = plan::plan(
+        &release,
+        &args.select,
+        &observation,
+        targets.as_ref(),
+        &plan::PlanPolicy::new(kind).with_workload_control(control),
+        RealClock.now(),
+    )?;
+
+    match &args.out {
+        Some(path) => {
+            files.write_atomic(path, &plan.to_json()?, 0o644)?;
+            println!("{}", plan.plan_id);
+            eprintln!("==> {}", path.display());
+        }
+        // No file: the plan itself is the answer, whole, on stdout.
+        None => print!("{}", String::from_utf8(plan.to_json()?)?),
+    }
+    eprint!("{}", plan_summary(&plan));
+    Ok(if plan.is_blocked() {
+        Answer::Blocked
+    } else {
+        Answer::Yes
+    })
+}
+
+/// The `[operator] cli_config` reference D7 needs, from the inventory the
+/// manifest was resolved from.
+///
+/// Missing is an answer and not a failure: without it every interrupting
+/// step on an agent is blocked with a sentence that says what to set, which
+/// is more useful than refusing to make a plan at all.
+fn workload_control(
+    files: &dyn Files,
+    release: &ReleaseManifest,
+    override_path: Option<&Path>,
+) -> (Option<plan::WorkloadControl>, Option<String>) {
+    let source = &release.resolved_fleet.source;
+    let path = match override_path {
+        Some(path) => path.to_path_buf(),
+        None => Path::new(&source.repo_path).join(&source.inventory_path),
+    };
+    let Ok(text) = files.read_to_string(&path) else {
+        return (
+            None,
+            Some(format!(
+                "{} could not be read, so this plan has no `[operator] cli_config`. Steps \
+                 that would interrupt an agent are blocked; pass --inventory <file> to point \
+                 at it.",
+                path.display()
+            )),
+        );
+    };
+    let inventory = match Inventory::parse(&text, &path.display().to_string()) {
+        Ok(inventory) => inventory,
+        Err(e) => {
+            return (
+                None,
+                Some(format!(
+                    "{} is not an inventory this tool reads ({e}), so this plan has no `[operator] cli_config`.",
+                    path.display()
+                )),
+            );
+        }
+    };
+    match inventory.operator.as_ref().and_then(|o| {
+        o.cli_config.as_ref().map(|config| plan::WorkloadControl {
+            cli_config: config.clone(),
+            cli_profile: o.cli_profile.clone(),
+        })
+    }) {
+        Some(control) => (Some(control), None),
+        None => (
+            None,
+            Some(format!(
+                "{} has no `[operator] cli_config`, so steps that would interrupt an agent \
+                 are blocked.",
+                path.display()
+            )),
+        ),
+    }
+}
+
+/// What a person reads on stderr while the plan itself goes to stdout.
+fn plan_summary(plan: &plan::DeploymentPlan) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "==> {} ({}, {} host(s), {} wave(s))\n",
+        plan.plan_id,
+        plan.kind,
+        plan.selection.targets.len(),
+        plan.last_wave() + 1
+    ));
+    for (id, host) in &plan.hosts {
+        let steps = plan.actions_for(id);
+        let blocked = steps.iter().filter(|a| a.is_blocked()).count();
+        out.push_str(&format!(
+            "    {id:<16} {:<12} wave {:<3} {:<24} {} step(s){}\n",
+            host.verdict,
+            host.wave,
+            host.class,
+            steps.len(),
+            if blocked > 0 {
+                format!(", {blocked} blocked")
+            } else if host.reboot_required {
+                ", reboot".to_string()
+            } else {
+                String::new()
+            }
+        ));
+    }
+    for (id, group) in &plan.groups {
+        if let Some(why) = &group.blocked {
+            out.push_str(&format!("    group {id}: {why}\n"));
+        }
+    }
+    for reason in plan.blocked_reasons() {
+        out.push_str(&format!("    blocked: {reason}\n"));
+    }
+    for unknown in &plan.unknowns {
+        out.push_str(&format!(
+            "    unknown: {}{}\n",
+            unknown
+                .host
+                .as_ref()
+                .map(|h| format!("{h}: "))
+                .unwrap_or_default(),
+            unknown.reason
+        ));
+    }
+    if !plan.approvals.is_empty() {
+        out.push_str("    needs: ");
+        out.push_str(
+            &plan
+                .approvals
+                .iter()
+                .map(|a| format!("--approve {}={}", a.class, a.bound_plan_id))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        out.push('\n');
+    }
+    out
 }
 
 fn show_inventory(path: &Path, json: bool) -> Result<bool> {

@@ -1,0 +1,479 @@
+// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+// SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+
+//! The fleets the integration tests argue about, built through the public
+//! API only — the same `NixManifest::from_json`, `resolve` and `bind` an
+//! operator's flake goes through. A fleet that would not validate is not a
+//! fleet these tests are allowed to prove anything about.
+//!
+//! The seventy-host manifest is GENERATED from the checked-in one-box
+//! fixture rather than checked in beside it: seventy hosts of JSON is
+//! something nobody reviews, and generating it from the file lane 1B has to
+//! produce keeps both honest at once.
+
+// Shared by two test binaries; each uses part of it.
+#![allow(dead_code)]
+
+use std::collections::BTreeMap;
+
+use chrono::{DateTime, Utc};
+use serde_json::{Value, json};
+
+use meister_deploy::manifest::{self, NixManifest, ResolvedFleet, Source, Tool};
+use meister_deploy::observation::{
+    BootedKernel, EtcdMember, EtcdView, HostObservation, Identity, Mount, OBSERVATION_SCHEMA,
+    Observations,
+};
+use meister_deploy::release::{
+    BootArtifacts, BuildEnv, ConfigArtifact, HostArtifacts, ReleaseManifest, Reproducibility,
+    StoreArtifact, bind,
+};
+
+pub fn at(ts: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(ts)
+        .expect("a literal these tests control")
+        .with_timezone(&Utc)
+}
+
+pub fn source() -> Source {
+    Source {
+        repo_path: "/home/silas/git/meisterstack-lab".to_string(),
+        git_rev: Some("f83cd70".to_string()),
+        tree_hash: Some("8a1c".to_string()),
+        dirty: false,
+        fingerprint: "git:f83cd70:8a1c".to_string(),
+        dev_mode: None,
+        flake_lock: BTreeMap::new(),
+        inventory_path: "fleet.toml".to_string(),
+        inventory_sha256: "0".repeat(64),
+    }
+}
+
+pub fn tool() -> Tool {
+    Tool {
+        name: "meister-deploy".to_string(),
+        version: "0.1.0".to_string(),
+        git_rev: None,
+    }
+}
+
+pub fn onebox_json() -> Value {
+    serde_json::from_str(include_str!("../fixtures/nix-manifest-onebox.json"))
+        .expect("the fixture is json")
+}
+
+/// The one-box fleet, resolved, with every host enrolled.
+pub fn onebox() -> ResolvedFleet {
+    resolve_value(onebox_json())
+}
+
+pub fn resolve_value(value: Value) -> ResolvedFleet {
+    let text = serde_json::to_string(&value).expect("a manifest is json");
+    let nix = NixManifest::from_json(&text, "the generated manifest").expect("it parses");
+    let mut fleet = manifest::resolve(nix, source(), tool(), at("2026-09-21T10:00:00Z"), None)
+        .expect("it resolves");
+    for (id, host) in fleet.hosts.iter_mut() {
+        if host.ssh.host_key_fingerprint.is_none() {
+            host.ssh.host_key_fingerprint = Some(format!("SHA256:enrolled-{id}"));
+        }
+    }
+    fleet.manifest_id =
+        meister_deploy::ids::content_id(meister_deploy::ids::IdKind::Manifest, &fleet)
+            .expect("a manifest hashes");
+    fleet
+}
+
+pub fn build_env() -> BuildEnv {
+    BuildEnv {
+        nix_version: "2.35.2".to_string(),
+        system: "x86_64-linux".to_string(),
+        builders: Vec::new(),
+        substituters: vec!["https://cache.nixos.org".to_string()],
+        signing_key_name: Some("fleet-1".to_string()),
+        sandbox: true,
+    }
+}
+
+pub fn artifacts_for(resolved: &ResolvedFleet) -> BTreeMap<String, HostArtifacts> {
+    resolved
+        .hosts
+        .iter()
+        .map(|(id, host)| {
+            (
+                id.clone(),
+                HostArtifacts {
+                    toplevel: StoreArtifact {
+                        store_path: host.build.toplevel_out.clone(),
+                        nar_hash: format!("sha256:{}", host.build.toplevel_out),
+                        nar_size: 1_000_000,
+                        closure_size: 2_000_000_000,
+                        signatures: vec![format!("fleet-1:{id}")],
+                    },
+                    installer_iso: None,
+                    disk_image: None,
+                    boot: BootArtifacts {
+                        kernel_store_path: host.build.boot.kernel_out.clone(),
+                        initrd_store_path: host.build.boot.initrd_out.clone(),
+                        kernel_params_sha256: host.build.boot.kernel_params_sha256.clone(),
+                    },
+                    config_files: host
+                        .config_artifacts
+                        .iter()
+                        .map(|(name, path)| {
+                            (
+                                name.clone(),
+                                ConfigArtifact {
+                                    store_path: path.clone(),
+                                    sha256: "0".repeat(64),
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+            )
+        })
+        .collect()
+}
+
+pub fn release_of(resolved: ResolvedFleet) -> ReleaseManifest {
+    let artifacts = artifacts_for(&resolved);
+    bind(
+        resolved,
+        artifacts,
+        BTreeMap::new(),
+        Vec::new(),
+        build_env(),
+        Vec::new(),
+        Reproducibility {
+            inputs_pinned: true,
+            bit_identical_verified: false,
+            method: None,
+        },
+        at("2026-09-21T11:00:00Z"),
+    )
+    .expect("the fixture binds")
+}
+
+/// A release in which the named hosts got a new system.
+pub fn with_new_systems(
+    mut fleet: ResolvedFleet,
+    hosts: &[String],
+    new_kernel: bool,
+) -> ReleaseManifest {
+    for id in hosts {
+        let host = fleet
+            .hosts
+            .get_mut(id)
+            .unwrap_or_else(|| panic!("{id} is in the fleet"));
+        host.build.toplevel_drv = format!("/nix/store/next{id}-nixos-system-{id}.drv");
+        host.build.toplevel_out = format!("/nix/store/next{id}-nixos-system-{id}");
+        if new_kernel {
+            host.build.boot.kernel_out = "/nix/store/next-linux-6.12.48/bzImage".to_string();
+            host.build.boot.initrd_out = "/nix/store/next-initrd-6.12.48/initrd".to_string();
+            host.build.boot.kernel_params_sha256 = "3b8fnnnnnnnn".to_string();
+            host.build.boot.kernel_version = "6.12.48".to_string();
+        }
+    }
+    fleet.manifest_id =
+        meister_deploy::ids::content_id(meister_deploy::ids::IdKind::Manifest, &fleet)
+            .expect("a manifest hashes");
+    release_of(fleet)
+}
+
+/// Every host running exactly what this release says, with nothing in the
+/// way.
+pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observations {
+    let fleet = &release.resolved_fleet;
+    let mut hosts = BTreeMap::new();
+    for (id, host) in &fleet.hosts {
+        let artifacts = &release.artifacts[id];
+        let system = artifacts.toplevel.store_path.clone();
+        let mut units = BTreeMap::new();
+        for role in &host.roles {
+            let unit = match role.as_str() {
+                "agent" => "meister-agent.service",
+                "cluster" => "meister-cluster-controller.service",
+                "cloud" => "meister-cloud-controller.service",
+                _ => continue,
+            };
+            units.insert(unit.to_string(), "active".to_string());
+        }
+        hosts.insert(
+            id.clone(),
+            HostObservation {
+                reachable: true,
+                identity: Identity {
+                    hostname: Some(host.name.clone()),
+                    machine_id: Some(format!("machine-id-of-{id}")),
+                    host_key_fingerprint: host
+                        .ssh
+                        .host_key_fingerprint
+                        .clone()
+                        .or_else(|| Some(format!("SHA256:seen-{id}"))),
+                },
+                current_system: Some(system.clone()),
+                booted_system: Some(system.clone()),
+                next_boot_system: Some(system),
+                generation: Some(42),
+                kernel_running: Some(host.build.boot.kernel_version.clone()),
+                kernel_booted: Some(BootedKernel {
+                    kernel_store_path: artifacts.boot.kernel_store_path.clone(),
+                    initrd_store_path: artifacts.boot.initrd_store_path.clone(),
+                    kernel_params_sha256: artifacts.boot.kernel_params_sha256.clone(),
+                }),
+                units,
+                mounts: host
+                    .persistence
+                    .iter()
+                    .map(|p| Mount {
+                        path: p.path.clone(),
+                        device: p.device_ref.replace("label:", "/dev/disk/by-label/"),
+                        fstype: "ext4".to_string(),
+                    })
+                    .collect(),
+                credentials: host
+                    .secret_refs
+                    .iter()
+                    .map(|s| (s.id.clone(), Some(format!("fingerprint-of-{}", s.id))))
+                    .collect(),
+                etcd: etcd_view(fleet, id),
+                vms_running: host.roles.iter().any(|r| r == "agent").then_some(0),
+                open_txns: Vec::new(),
+                lock: None,
+                capabilities: host.hardware.capabilities.clone(),
+                enrolled: true,
+                unknown_reason: None,
+            },
+        );
+    }
+    Observations {
+        schema: OBSERVATION_SCHEMA.to_string(),
+        taken_at,
+        provisional: false,
+        hosts,
+    }
+}
+
+fn etcd_view(fleet: &ResolvedFleet, id: &str) -> Option<EtcdView> {
+    let host = fleet.hosts.get(id)?;
+    let in_raft = host.groups.iter().any(|g| {
+        fleet
+            .groups
+            .get(g)
+            .map(|group| group.kind == meister_deploy::manifest::GroupKind::Raft)
+            .unwrap_or(false)
+    });
+    if !in_raft {
+        return None;
+    }
+    let declared = host
+        .effective_settings
+        .etcd
+        .as_ref()?
+        .get("initial_cluster")?
+        .as_str()?
+        .to_string();
+    let members = declared
+        .split(',')
+        .filter_map(|entry| entry.trim().split_once('='))
+        .map(|(name, url)| EtcdMember {
+            id: format!("{name}-member-id"),
+            name: name.to_string(),
+            peer_urls: vec![url.to_string()],
+            healthy: true,
+        })
+        .collect::<Vec<_>>();
+    Some(EtcdView {
+        member_id: Some(format!("{id}-member-id")),
+        healthy: true,
+        members,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Seventy hosts
+// ---------------------------------------------------------------------------
+
+/// The four hardware classes the agents come in.
+pub const CLASSES: [&str; 4] = ["compute-cpu", "compute-gpu", "compute-rdma", "compute-big"];
+
+/// The three hosts that carry two roles at once.
+pub const MULTI_ROLE: [&str; 3] = ["cluster-1-c", "cluster-2-b", "cluster-2-c"];
+
+/// A fleet of exactly seventy hosts, as a `nix-manifest/1`:
+///
+/// * 3 cloud controllers in one raft group,
+/// * 2 cluster groups of 3, also raft — three of those six also carry the
+///   agent role, which is what makes a multi-role host a real case here,
+/// * 61 agents in four hardware classes, each reporting to one of the two
+///   cluster groups.
+///
+/// Built from the one-box fixture's own hosts, so every field is one lane 1B
+/// has to produce and the whole thing goes through the real parser.
+pub fn fleet70_json() -> Value {
+    let template = onebox_json();
+    let controller = template["inventory"]["hosts"]["box"].clone();
+    let controller_built = template["hosts"]["box"].clone();
+    let agent = template["inventory"]["hosts"]["n1"].clone();
+    let agent_built = template["hosts"]["n1"].clone();
+
+    let mut inventory_hosts = serde_json::Map::new();
+    let mut built_hosts = serde_json::Map::new();
+    let mut groups = serde_json::Map::new();
+
+    let add = |id: &str,
+               inv: Value,
+               built: Value,
+               inventory_hosts: &mut serde_json::Map<String, Value>,
+               built_hosts: &mut serde_json::Map<String, Value>| {
+        inventory_hosts.insert(id.to_string(), inv);
+        built_hosts.insert(id.to_string(), built);
+    };
+
+    // --- the three raft groups ---------------------------------------
+    let raft: [(&str, Vec<String>, u8); 3] = [
+        (
+            "cloud",
+            vec!["cloud-a".into(), "cloud-b".into(), "cloud-c".into()],
+            1,
+        ),
+        (
+            "cluster-1",
+            vec![
+                "cluster-1-a".into(),
+                "cluster-1-b".into(),
+                "cluster-1-c".into(),
+            ],
+            2,
+        ),
+        (
+            "cluster-2",
+            vec![
+                "cluster-2-a".into(),
+                "cluster-2-b".into(),
+                "cluster-2-c".into(),
+            ],
+            3,
+        ),
+    ];
+    for (group, members, subnet) in &raft {
+        let peers: Vec<String> = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| format!("{m}=https://10.0.{subnet}.{}:2380", 10 + i))
+            .collect();
+        for (i, id) in members.iter().enumerate() {
+            let mut inv = controller.clone();
+            let mut built = controller_built.clone();
+            let address = format!("10.0.{subnet}.{}", 10 + i);
+            inv["name"] = json!(id);
+            inv["address"] = json!(address);
+            inv["networks"]["management"]["address"] = json!(address);
+            inv["groups"] = json!([group]);
+            inv["controller_group"] = Value::Null;
+            inv["modules"] = json!([]);
+            inv["ssh"]["host_key_fingerprint"] = json!(format!("SHA256:enrolled-{id}"));
+            inv["roles"] = if *group == "cloud" {
+                json!(["cloud"])
+            } else if MULTI_ROLE.contains(&id.as_str()) {
+                // One machine, two tiers, one interruption.
+                json!(["cluster", "agent"])
+            } else {
+                json!(["cluster"])
+            };
+            built["rollout"]["canary_class"] = json!("controller");
+            built["effective_settings"]["etcd"] = json!({
+                "name": id,
+                "initial_cluster": peers.join(","),
+            });
+            built["build"]["toplevel_drv"] = json!(format!("/nix/store/base{id}-system-{id}.drv"));
+            built["build"]["toplevel_out"] = json!(format!("/nix/store/base{id}-system-{id}"));
+            add(id, inv, built, &mut inventory_hosts, &mut built_hosts);
+        }
+        groups.insert(
+            (*group).to_string(),
+            json!({
+                "kind": "raft",
+                "members": members,
+                "quorum": {"size": members.len()},
+                "profiles": ["base", "controller"],
+                "rollout": {
+                    "canary_class": "controller",
+                    "max_unavailable": 1,
+                    "reboot": "approve"
+                }
+            }),
+        );
+    }
+
+    // --- sixty-one agents in four classes ------------------------------
+    let mut by_class: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for index in 1..=61u32 {
+        let id = format!("agent-{index:02}");
+        let class = CLASSES[(index as usize - 1) % CLASSES.len()];
+        let controller_group = if index % 2 == 0 {
+            "cluster-1"
+        } else {
+            "cluster-2"
+        };
+        let mut inv = agent.clone();
+        let mut built = agent_built.clone();
+        let address = format!("10.0.9.{index}");
+        inv["name"] = json!(id);
+        inv["address"] = json!(address);
+        inv["networks"]["management"]["address"] = json!(address);
+        inv["groups"] = json!([class]);
+        inv["controller_group"] = json!(controller_group);
+        inv["ssh"]["host_key_fingerprint"] = json!(format!("SHA256:enrolled-{id}"));
+        inv["profiles"] = json!(["base", class]);
+        if class == "compute-gpu" {
+            inv["hardware"]["gpus"] = json!([{
+                "model": "NVIDIA RTX PRO 6000",
+                "pci": "0000:41:00.0",
+                "selected_for": "vfio"
+            }]);
+            inv["hardware"]["capabilities"] = json!(["kvm", "vfio"]);
+        }
+        if class == "compute-rdma" {
+            inv["hardware"]["nics"] = json!([{
+                "name": "mlx0", "mac": format!("b8:ce:f6:00:00:{index:02x}"),
+                "role": "storage", "rdma": true
+            }]);
+            inv["hardware"]["capabilities"] = json!(["kvm", "rdma"]);
+        }
+        built["rollout"]["canary_class"] = json!(class);
+        built["build"]["toplevel_drv"] = json!(format!("/nix/store/base{id}-system-{id}.drv"));
+        built["build"]["toplevel_out"] = json!(format!("/nix/store/base{id}-system-{id}"));
+        by_class.entry(class).or_default().push(id.clone());
+        add(&id, inv, built, &mut inventory_hosts, &mut built_hosts);
+    }
+    for (class, members) in &by_class {
+        groups.insert(
+            (*class).to_string(),
+            json!({
+                "kind": "compute",
+                "members": members,
+                "quorum": Value::Null,
+                "profiles": ["base", class],
+                "rollout": {
+                    "canary_class": class,
+                    "max_unavailable": 2,
+                    "reboot": "approve"
+                }
+            }),
+        );
+    }
+
+    let mut manifest = template;
+    manifest["inventory"]["fleet"]["name"] = json!("seventy");
+    manifest["inventory"]["hosts"] = Value::Object(inventory_hosts);
+    manifest["inventory"]["groups"] = Value::Object(groups);
+    manifest["inventory"]["services"] = json!({});
+    manifest["hosts"] = Value::Object(built_hosts);
+    manifest
+}
+
+pub fn fleet70() -> ResolvedFleet {
+    resolve_value(fleet70_json())
+}

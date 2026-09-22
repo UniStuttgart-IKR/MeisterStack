@@ -997,11 +997,10 @@ pub fn plan(
         unknowns.extend(decision.unknowns.iter().cloned());
         decisions.insert(id.clone(), decision);
     }
-    let canaries = canaries_of(&decisions);
-
     // Then the order, from real edges and real capacities.
     let edges = dependencies(fleet, &selection, policy.kind);
     let order = topological(&selection, &decisions, &edges)?;
+    let canaries = canaries_of(&order, &decisions);
     let waves = assign_waves(fleet, &order, &decisions, &edges, &groups, &canaries);
 
     // And only then the steps.
@@ -1096,24 +1095,33 @@ pub fn plan(
     Ok(plan)
 }
 
-/// The first host of each class, by (marked, then id) — and only among the
-/// hosts that are actually going to move. A canary that changes nothing is
-/// evidence of nothing.
-fn canaries_of(decisions: &BTreeMap<String, HostDecision>) -> BTreeSet<String> {
-    let mut best: BTreeMap<&str, (u8, &String)> = BTreeMap::new();
-    for (id, decision) in decisions {
+/// The first host of each class IN THE ORDER, among the hosts that are
+/// actually going to move. A canary that changes nothing is evidence of
+/// nothing.
+///
+/// Taken from the order rather than from the ids, and that is the whole
+/// point. A class is a kernel and the hardware under it, so it can perfectly
+/// well span two tiers — the `controller` class of a fleet whose cluster and
+/// cloud hosts are the same shape does. The tier order is a safety rule: a
+/// node goes forward before the node that gives it orders. A canary is risk
+/// reduction. When the two disagree the order wins, and the canary is chosen
+/// from what the order permits; the alternative would be a plan that either
+/// breaks the tier rule or promises a canary that in fact rolls ninth.
+///
+/// The operator's own choice still counts, because `canary_rank` is part of
+/// how [`topological`] breaks a tie: among hosts the order leaves free, a
+/// host whose inventory names its class comes before one that only derived
+/// the same class.
+fn canaries_of(order: &[String], decisions: &BTreeMap<String, HostDecision>) -> BTreeSet<String> {
+    let mut first: BTreeMap<&str, &String> = BTreeMap::new();
+    for id in order {
+        let decision = &decisions[id];
         if !decision.acts() {
             continue;
         }
-        let candidate = (decision.canary_rank, id);
-        match best.get(decision.class.as_str()) {
-            Some(existing) if *existing <= candidate => {}
-            _ => {
-                best.insert(decision.class.as_str(), candidate);
-            }
-        }
+        first.entry(decision.class.as_str()).or_insert(id);
     }
-    best.values().map(|(_, id)| (*id).clone()).collect()
+    first.values().map(|id| (*id).clone()).collect()
 }
 
 // ---------------------------------------------------------------------------
