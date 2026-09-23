@@ -1562,7 +1562,6 @@ async fn abandon(
 async fn fail(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow::Result<()> {
     let name = migration.metadata.name.clone();
     warn!(migration = %name, vm = %migration.spec.vm, reason = %why, "migration failed");
-    release(store, migration).await;
     store
         .mutate::<VmMigration, _>(&name, |m| {
             let now = Utc::now();
@@ -1575,6 +1574,13 @@ async fn fail(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow
             ));
         })
         .await?;
+    // After the ending and not before it, and the order is the invariant's:
+    // a process killed between the two leaves a promise whose migration is
+    // FINAL, which is exactly what the reaper takes. The other order would
+    // leave a non-final migration with no room held, and the gap this whole
+    // object exists to close would be open again for the length of one
+    // destination's teardown.
+    release(store, migration).await;
     Ok(())
 }
 
