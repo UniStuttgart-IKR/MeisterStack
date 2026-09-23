@@ -493,10 +493,18 @@ pkgs.testers.runNixOSTest {
     # an UNSIGNED path out of the same cache is refused by the same store.
     # `nix store sign` writes into the local store only, so a path the
     # release never signed and that was pushed anyway is exactly that case.
-    # `nix-store --add` and not `nix store add-path`, which is a deprecated
-    # alias in 2.35 and prints a warning this test would have to filter.
-    operator.succeed("echo not-signed > /root/unsigned.txt")
-    unsigned = operator.succeed("nix-store --add /root/unsigned.txt").strip()
+    #
+    # The path has to be a BUILD OUTPUT and not something `nix-store --add`
+    # made: an added file is content-addressed, and a content-addressed
+    # path needs no signature by design — its name is its proof. Measured
+    # at gate M4: the `--add` version was accepted by the far store and the
+    # assertion below went red. An input-addressed output of a one-line
+    # derivation is what a real unsigned closure looks like.
+    unsigned = operator.succeed(
+        "nix-build --no-out-link -E 'derivation { name = \"unsigned\"; "
+        "system = \"x86_64-linux\"; builder = \"${pkgs.bash}/bin/bash\"; "
+        "args = [ \"-c\" \"echo not-signed > $out\" ]; }'"
+    ).strip()
     operator.succeed(f"nix copy --to '{CACHE}' {unsigned}")
     refused = target.fail(f"nix copy --from http://192.168.1.1:8080 {unsigned} 2>&1")
     assert "signature" in refused, refused
