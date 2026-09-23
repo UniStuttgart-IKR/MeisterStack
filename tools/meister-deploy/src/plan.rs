@@ -1412,6 +1412,18 @@ fn topology_verdict(
         let Some(etcd) = observation.host(member).and_then(|o| o.etcd.as_ref()) else {
             continue;
         };
+        // A view with no members at all is a host whose etcd unit is not
+        // running: `observe::etcd_view` returns exactly that shape for one,
+        // on purpose, so that "this member is down" is a view rather than an
+        // absence. About MEMBERSHIP it says nothing, and taking silence for
+        // "etcd does not know you" blocks the one case where nobody can
+        // possibly have answered — a bootstrap. Measured in the lab on
+        // 2026-09-23: a fresh managed image carries the etcd unit without
+        // starting it, so `plan --kind bootstrap` blocked its own control
+        // plane with "etcd does not know box".
+        if etcd.members.is_empty() {
+            continue;
+        }
         anybody_answered = true;
         for m in &etcd.members {
             observed
@@ -5006,6 +5018,34 @@ mod tests {
                 .any(|u| u.reason.contains("no etcd answer")),
             "{:?}",
             plan.unknowns
+        );
+    }
+
+    #[test]
+    fn an_etcd_that_is_not_running_yet_does_not_block_a_bootstrap() {
+        // Found in the lab (lane L2, 2026-09-23): a fresh managed image
+        // carries the etcd unit without starting it, so the probe answered
+        // `EtcdView { healthy: false, members: [] }` for every host of the
+        // group — `observe::etcd_view`'s deliberate shape for "this member
+        // is down". `topology_verdict` read that as "etcd answered and does
+        // not know you" and blocked activate, reboot and confirm on the one
+        // box the bootstrap was supposed to bring up.
+        //
+        // A view with no members at all says nothing about membership, and
+        // a bootstrap is precisely the case where nothing can have.
+        let (release, mut observation) = three_member_cloud(0);
+        for host in observation.hosts.values_mut() {
+            if let Some(etcd) = host.etcd.as_mut() {
+                etcd.healthy = false;
+                etcd.member_id = None;
+                etcd.members.clear();
+            }
+        }
+        let plan = planned(&release, "group=cloud", &observation);
+        let why = plan.groups["cloud"].blocked.clone().unwrap_or_default();
+        assert!(
+            !why.contains("migration sequence this tool does not have"),
+            "an etcd that is not running yet is not a membership change: {why}"
         );
     }
 
