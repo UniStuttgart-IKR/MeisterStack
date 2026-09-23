@@ -314,6 +314,12 @@
             import ./nix/tests/managed-may-read-its-provider.nix {
               inherit nixpkgs lib pkgs system self;
             };
+
+          # A node that says it has no NVMe fabric does not claim one
+          # (L2 finding N9).
+          no-fabric-no-claim = import ./nix/tests/no-fabric-no-claim.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
           # --- end lane 5C ---
 
           # What the target-side helper does to a REAL machine: the profile

@@ -46,7 +46,7 @@ let
   # base.nix' host-global set. The profiles are left OUT here — they are the
   # operator's answers about a managed machine, and the appliance profile has
   # its own — so what the two sides share is exactly the inventory.
-  applianceFor = id: (nixpkgs.lib.nixosSystem {
+  applianceFor = id: pinned: (nixpkgs.lib.nixosSystem {
     modules = diskoDeclaredOnly ++ [
       { nixpkgs.hostPlatform = system; nixpkgs.overlays = [ self.overlays.default ]; }
       self.nixosModules.appliance
@@ -56,6 +56,7 @@ let
         boot.loader.systemd-boot.enable = lib.mkForce false;
         boot.loader.grub.device = "nodev";
       }
+      pinned
     ] ++ inv.hosts.${id}.modulePaths;
   }).config;
 in
@@ -100,8 +101,22 @@ in
 
     parity = id:
       let
-        appliance = applianceFor id;
         managed = managedFor id;
+        # --- lane 5C ---
+        # The fourth pinned value, and it is here for the reason the three
+        # in `managedFor` are: the appliance twin gets no profiles (see
+        # above), and a profile is where `meisterstack.agent.nvmeTcp.enable`
+        # is answered — `compute-cpu` turns it off. Since lane 5C that
+        # option decides whether the node registers the NVMe-oF backends at
+        # all (L2 finding N9: a node that claims a fabric it cannot reach
+        # stays `Unprivileged` and gets nothing placed on it), so without
+        # this line the check would report one profile's decision once per
+        # agent host instead of comparing two renderers.
+        appliance = applianceFor id {
+          meisterstack.agent.nvmeTcp.enable =
+            lib.mkForce managed.meisterstack.agent.nvmeTcp.enable;
+        };
+        # --- end lane 5C ---
         roles = managed.meisterstack.unitsFor;
         etcOf = c: name: c.environment.etc."meisterstack/${name}.toml".source;
       in

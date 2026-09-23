@@ -188,10 +188,27 @@ let
     # Every other backend keeps needing a value nobody can guess for a
     # generic image — lvm-thin a volume group, nfs a share — so they stay
     # absent and a node that has one says so in its own settings.
-    volume = {
+    #
+    # --- lane 5C ---
+    # And both behind `meisterstack.agent.nvmeTcp.enable`, which is the
+    # option that says whether this node can reach a fabric at all.
+    #
+    # Measured in the lab (L2 finding N9, 2026-09-23): turning that option
+    # off did not take the two sections out of the rendered agent.toml, so
+    # the node kept CLAIMING the attacher, the attacher kept needing
+    # /dev/nvme-fabrics, and `meister node ls` showed `READY Unprivileged`
+    # for ever — the scheduler then places nothing on that node at all, not
+    # even a guest with a plain filesystem volume. That blocked L12.
+    #
+    # A driver with no section is a driver the agent does not build, which
+    # is exactly what "this node has no fabric" means. The option's default
+    # is `an agent node loads it`, so nothing changes for a node that says
+    # nothing; what changes is that a node which says no is believed.
+    volume = lib.optionalAttrs cfg.agent.nvmeTcp.enable {
       nvmeof = { };
       nvmeof-import.state_dir = "${volumeDir}/nvmeof-import";
     };
+    # --- end lane 5C ---
 
     # Empty on purpose rather than absent: these are GPU-less lab nodes, and
     # an empty table says "no device backends configured" out loud in the
