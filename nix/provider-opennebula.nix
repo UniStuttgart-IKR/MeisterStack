@@ -361,7 +361,20 @@ in
 
     network = lib.mkOption {
       type = lib.types.bool;
-      default = true;
+      # The module answers its own question. `hostOwnsInterface` is the
+      # reading of what this host already SAYS: a host that names a static
+      # address for the interface owns it, and one that names none (the
+      # generic managed image, and every VM at its first boot) lets the
+      # medium own it. With a flat `true` default, every managed host on a
+      # provider that also names its address in the inventory stopped at
+      # `resolve` with the assertion below and had to be told, by hand, per
+      # host, what the option's own description already says. Measured in
+      # the lab on 2026-09-23 (lane L4, finding W1): three controllers with
+      # static addresses, one sentence each, and an operator repository that
+      # had to carry a module to set a default nobody disagrees with.
+      default = !hostOwnsInterface;
+      defaultText = lib.literalMD
+        "`false` if this host names a static address for the interface, `true` otherwise";
       description = ''
         Whether the provider configures that interface at all.
 
