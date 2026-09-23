@@ -863,7 +863,7 @@ fn a_dry_run_shows_the_ca_the_commands_it_would_get() {
         "release.json",
         "--serial",
         "64:35:c9:c4",
-        "--reason",
+        "--crl-reason",
         "keyCompromise",
         "--dry-run",
     ]);
@@ -881,6 +881,69 @@ fn a_dry_run_shows_the_ca_the_commands_it_would_get() {
     assert!(
         !sandbox.cwd.path().join("pki/crl.pem").exists(),
         "a dry run wrote the list"
+    );
+}
+
+/// Astra finding F21, 2026-09-23: `keys revoke --crl-reason` is openssl's
+/// fixed vocabulary, not free text, and a value that is not on the list is
+/// refused before the CA is ever invoked.
+#[test]
+fn an_unknown_crl_reason_is_refused_before_the_ca_is_asked() {
+    let sandbox = Sandbox::new();
+    let release = support::release_of(sandbox.fleet.clone());
+    std::fs::write(
+        sandbox.cwd.path().join("release.json"),
+        release.to_json().unwrap(),
+    )
+    .unwrap();
+    let out = sandbox.run(&[
+        "keys",
+        "revoke",
+        "--release",
+        "release.json",
+        "--serial",
+        "64:35:c9:c4",
+        "--crl-reason",
+        "disk failure, replaced 2026-09-20",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("crl-reason"), "{}", stderr(&out));
+    assert!(
+        sandbox.calls().is_empty(),
+        "the CA was asked despite the bad reason: {:?}",
+        sandbox.calls()
+    );
+}
+
+/// Astra finding F21, 2026-09-23: `retire --reason` is free text for the
+/// record and `known_hosts`; it used to be forwarded to the CA as the CRL
+/// reason too, where free text does not fit openssl's fixed vocabulary.
+/// Without `--crl-reason`, the CA gets the default instead of the free
+/// text.
+#[test]
+fn retiring_forwards_the_default_crl_reason_and_not_the_free_text_one() {
+    let sandbox = Sandbox::new();
+    one_host_release(&sandbox, "box");
+    std::fs::create_dir_all(sandbox.path("pki/issued/box")).unwrap();
+    std::fs::write(sandbox.path("pki/issued/box/identity.crt"), "x").unwrap();
+
+    let out = sandbox.run(&[
+        "retire",
+        "box",
+        "--release",
+        "release-one.json",
+        "--inventory",
+        "fleet.toml",
+        "--reason",
+        "disk failure, replaced 2026-09-20",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let said = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(said.contains("cessationOfOperation"), "{said}");
+    assert!(
+        !said.contains("disk failure"),
+        "the free-text reason leaked into the CA command: {said}"
     );
 }
 

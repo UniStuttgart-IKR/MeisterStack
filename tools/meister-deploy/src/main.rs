@@ -257,9 +257,19 @@ enum Verb {
         /// The release the delivery plan is made from
         #[arg(long)]
         release: PathBuf,
-        /// Why — it lands in the record and above the `known_hosts` line
+        /// Why — it lands in the record and above the `known_hosts` line.
+        /// Free text, for a person to read; not the CRL reason (see
+        /// `--crl-reason`). Astra finding F21, 2026-09-23: this used to be
+        /// forwarded to the CA as the CRL reason too, and openssl's fixed
+        /// vocabulary rejects ordinary prose.
         #[arg(long)]
         reason: Option<String>,
+        /// The reason the revocation itself carries, from openssl's fixed
+        /// list: keyCompromise | superseded | cessationOfOperation | … .
+        /// Default: cessationOfOperation, since a retirement is usually
+        /// exactly that.
+        #[arg(long)]
+        crl_reason: Option<String>,
         /// The operator's repository
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -452,9 +462,14 @@ enum KeysCmd {
         /// refuse; this is how it is renewed.
         #[arg(long)]
         refresh: bool,
-        /// keyCompromise | superseded | cessationOfOperation | …
+        /// The reason the revocation itself carries, from openssl's fixed
+        /// list: keyCompromise | superseded | cessationOfOperation | … .
+        /// Default: unspecified. Named `--crl-reason` rather than
+        /// `--reason` (Astra finding F21, 2026-09-23) for the same reason
+        /// `retire` carries both: this one is the fixed vocabulary the CA
+        /// writes into the CRL, not free text.
         #[arg(long)]
-        reason: Option<String>,
+        crl_reason: Option<String>,
         /// The release the delivery plan is made from
         #[arg(long)]
         release: PathBuf,
@@ -1147,6 +1162,7 @@ fn run() -> Result<Answer> {
             host,
             release,
             reason,
+            crl_reason,
             repo,
             inventory,
             meister_ca,
@@ -1158,6 +1174,7 @@ fn run() -> Result<Answer> {
             host,
             release,
             reason: reason.as_deref(),
+            crl_reason: crl_reason.as_deref(),
             repo,
             inventory: inventory.as_deref(),
             meister_ca,
@@ -3703,7 +3720,7 @@ fn keys(cmd: &KeysCmd) -> Result<Answer> {
             serial,
             host,
             refresh,
-            reason,
+            crl_reason,
             release,
             select,
             repo,
@@ -3717,7 +3734,7 @@ fn keys(cmd: &KeysCmd) -> Result<Answer> {
             serial: serial.as_deref(),
             host: host.as_deref(),
             refresh: *refresh,
-            reason: reason.as_deref(),
+            crl_reason: crl_reason.as_deref(),
             release,
             select,
             repo,
@@ -4056,6 +4073,7 @@ struct RetireArgs<'a> {
     host: &'a str,
     release: &'a Path,
     reason: Option<&'a str>,
+    crl_reason: Option<&'a str>,
     repo: &'a Path,
     inventory: Option<&'a Path>,
     meister_ca: &'a Path,
@@ -4096,6 +4114,16 @@ fn retire(args: RetireArgs<'_>) -> Result<Answer> {
     };
     let files = RealFiles::new(policy);
     let runner = Real::new(policy);
+
+    // Astra finding F21, 2026-09-23: `--reason` is free text for the record
+    // and `known_hosts` (used further down, unchanged); this is the fixed
+    // vocabulary openssl writes into the CRL, checked here so a mistyped
+    // one is a sentence from this tool before anything else runs, not a
+    // `die` from the CA several layers down. A retirement that names no
+    // reason of its own is recorded as `cessationOfOperation`, since that
+    // is what retiring a host usually is.
+    let crl_reason = args.crl_reason.unwrap_or("cessationOfOperation");
+    pki::validate_crl_reason(crl_reason)?;
 
     let repo = &std::path::absolute(args.repo)
         .with_context(|| format!("{} could not be made absolute", args.repo.display()))?;
@@ -4159,7 +4187,7 @@ fn retire(args: RetireArgs<'_>) -> Result<Answer> {
             {
                 serials.push(serial);
             }
-            let cmd = pki::revoke_cmd(args.meister_ca, &ca, &what, args.reason);
+            let cmd = pki::revoke_cmd(args.meister_ca, &ca, &what, Some(crl_reason));
             ran.push(cmd.line());
             if args.dry_run {
                 println!("{}", cmd.described());
@@ -4758,7 +4786,7 @@ struct KeysRevokeArgs<'a> {
     serial: Option<&'a str>,
     host: Option<&'a str>,
     refresh: bool,
-    reason: Option<&'a str>,
+    crl_reason: Option<&'a str>,
     release: &'a Path,
     select: &'a str,
     repo: &'a Path,
@@ -4799,6 +4827,12 @@ fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
              nothing back and write the list again). Exactly one of the three."
         );
     }
+
+    // Astra finding F21, 2026-09-23: validated here so a mistyped
+    // `--crl-reason` is a sentence from this tool, not a `die` from the CA
+    // several layers down. Unset means unspecified, openssl's own default.
+    let crl_reason = args.crl_reason.unwrap_or("unspecified");
+    pki::validate_crl_reason(crl_reason)?;
 
     let repo = &std::path::absolute(args.repo)
         .with_context(|| format!("{} could not be made absolute", args.repo.display()))?;
@@ -4859,7 +4893,7 @@ fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
 
     let mut ran: Vec<String> = Vec::new();
     for what in &targets {
-        let cmd = pki::revoke_cmd(args.meister_ca, &ca, what, args.reason);
+        let cmd = pki::revoke_cmd(args.meister_ca, &ca, what, Some(crl_reason));
         ran.push(cmd.line());
         if args.dry_run {
             println!("{}", cmd.described());

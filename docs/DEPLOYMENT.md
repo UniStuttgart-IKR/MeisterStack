@@ -518,7 +518,7 @@ context VM at once.
 Taking one back:
 
 ```
-meister-deploy keys revoke --host n1 --reason keyCompromise \
+meister-deploy keys revoke --host n1 --crl-reason keyCompromise \
     --release release.json --inventory fleet.toml --out revoke.json
 meister-deploy apply --plan revoke.json --release release.json     # no approval needed
 ```

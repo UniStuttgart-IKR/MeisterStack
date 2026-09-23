@@ -595,7 +595,10 @@ pkgs.testers.runNixOSTest {
 
     out = operator.succeed(
         f"cd /root/fleet && meister-deploy keys revoke --serial {alice_serial} "
-        f"--reason keyCompromise --release {release_b} --repo /root/fleet "
+        # Astra finding F21, 2026-09-23: this used to be --reason; it is
+        # the openssl CRL reason, not free text, so the flag is now
+        # --crl-reason.
+        f"--crl-reason keyCompromise --release {release_b} --repo /root/fleet "
         "--identity /root/.ssh/id_ed25519 --inventory /root/fleet/fleet.toml "
         "--out /root/out/p-revoke.json 2>&1"
     )
@@ -732,7 +735,8 @@ pkgs.testers.runNixOSTest {
     ).strip()
     out = operator.succeed(
         f"cd /root/fleet && meister-deploy keys revoke --host box "
-        f"--reason keyCompromise --release {release_b} --repo /root/fleet "
+        # Astra finding F21, 2026-09-23: --reason -> --crl-reason, see above.
+        f"--crl-reason keyCompromise --release {release_b} --repo /root/fleet "
         "--identity /root/.ssh/id_ed25519 --inventory /root/fleet/fleet.toml "
         "--out /root/out/p-revoke-box.json 2>&1"
     )

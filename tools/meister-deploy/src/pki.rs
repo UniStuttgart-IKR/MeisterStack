@@ -587,6 +587,42 @@ pub fn rotation_of(
 /// files.
 pub const CA_DEADLINE: Duration = Duration::from_secs(120);
 
+/// The CRL reason codes `tools/meister-ca --reason` accepts, spelled
+/// exactly as it spells them.
+///
+/// Astra finding F21, 2026-09-23: `retire --reason` and `keys revoke
+/// --reason` used to forward THIS value straight from a free-text field --
+/// `retire`'s own "why", meant for the record and `known_hosts` -- and
+/// openssl's fixed vocabulary rejects ordinary prose. The two are separate
+/// flags now (`--reason` stays free text where a caller has one at all;
+/// `--crl-reason` is this list), and this is checked before the CA is ever
+/// invoked, so a mistyped one is a sentence from this tool rather than a
+/// `die` from a shell script several layers down.
+pub const CRL_REASONS: &[&str] = &[
+    "unspecified",
+    "keyCompromise",
+    "CACompromise",
+    "affiliationChanged",
+    "superseded",
+    "cessationOfOperation",
+    "certificateHold",
+    "removeFromCRL",
+    "privilegeWithdrawn",
+    "AACompromise",
+];
+
+/// Astra finding F21, 2026-09-23: see [`CRL_REASONS`].
+pub fn validate_crl_reason(reason: &str) -> Result<()> {
+    if CRL_REASONS.contains(&reason) {
+        Ok(())
+    } else {
+        bail!(
+            "unknown --crl-reason {reason} ({})",
+            CRL_REASONS.join(" | ")
+        )
+    }
+}
+
 /// `meister-ca --dir <ca> --index-rebuild --revoke <what> [--reason <r>]`.
 ///
 /// The rebuild travels with every revocation on purpose: it is additive and
@@ -2184,5 +2220,16 @@ mod tests {
         assert!(!target.address.is_empty());
         let err = target_from_inventory(&inventory, "nobody").unwrap_err();
         assert!(err.to_string().contains("no host \"nobody\""), "{err}");
+    }
+
+    /// Astra finding F21, 2026-09-23: the vocabulary openssl's `-crl_reason`
+    /// accepts, checked before the CA ever runs.
+    #[test]
+    fn a_crl_reason_is_one_of_the_fixed_openssl_vocabulary() {
+        for good in CRL_REASONS {
+            assert!(validate_crl_reason(good).is_ok(), "{good}");
+        }
+        let err = validate_crl_reason("disk failure, replaced 2026-09-20").unwrap_err();
+        assert!(err.to_string().contains("unknown --crl-reason"), "{err}");
     }
 }
