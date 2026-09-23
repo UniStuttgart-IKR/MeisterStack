@@ -286,6 +286,35 @@ fn check_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+// --- Astra finding F07, 2026-09-23 -----------------------------------------
+
+/// The pid out of a `<id>.deciding` file, which reads `<verb> pid <n> at
+/// <time>`. `None` for anything this program did not write.
+fn deciding_pid(held: &str) -> Option<u32> {
+    let rest = held.split_once(" pid ")?.1;
+    let digits = rest.split_whitespace().next()?;
+    digits.parse().ok()
+}
+
+/// Whether that process is on this machine. The same question, and the same
+/// answer, as the operator's lock asks of its own holder: signal 0 is what
+/// `kill` answers without doing anything, and `EPERM` means it exists and
+/// belongs to somebody else, which is still "it exists".
+fn is_running(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Ok(()) | Err(nix::errno::Errno::EPERM)
+    )
+}
+
+// --- end Astra finding F07 -------------------------------------------------
+
 /// The state of the machine, and the tools to change it.
 pub struct Helper<'a> {
     pub runner: &'a dyn Runner,
@@ -902,8 +931,72 @@ impl<'a> Helper<'a> {
     // confirm and revert
     // -----------------------------------------------------------------
 
+    /// Hold one transaction for the length of one decision.
+    ///
+    /// Astra finding F07, 2026-09-23: `confirm` and `revert` were both a
+    /// read, a look at the state, work on the machine and a write, with
+    /// nothing between them. The two arrive from different directions —
+    /// an operator (or `apply`) over ssh, and the transient revert timer on
+    /// the host itself — and they meet exactly at the deadline, which is
+    /// the moment this whole mechanism exists for. Interleaved, both read
+    /// `pending`, the revert puts the old system back and the confirm then
+    /// writes `confirmed`: the machine runs one system and its record says
+    /// the other, which is the one thing no resume can recover from.
+    ///
+    /// `O_EXCL` on a file beside the record, for the same reason the host
+    /// lock uses it and in the same directory — `records()` reads only
+    /// `<id>.json`, so this name is invisible to every reader. A holder
+    /// whose process is gone is not a holder: a machine that lost power
+    /// while deciding must not be a machine whose timer can never fire
+    /// again.
+    fn deciding<T>(&self, id: &str, what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let path = self.txn_dir().join(format!("{id}.deciding"));
+        self.files.create_dir_all(&self.txn_dir())?;
+        let mine = format!("{what} pid {} at {}", std::process::id(), self.clock.now());
+        if let Err(e) = self.files.create_new(&path, mine.as_bytes(), 0o600) {
+            let held = self.files.read_to_string(&path).unwrap_or_default();
+            // No exception for this process's own pid: nothing here decides
+            // one transaction inside another, so a holder that is running is
+            // a holder whatever its number is.
+            if let Some(pid) = deciding_pid(&held)
+                && is_running(pid)
+            {
+                bail!(
+                    "the transaction {id} is being decided right now ({}). A confirm and a \
+                     revert at once leave the machine on one system and the record saying the \
+                     other, so this one did nothing.",
+                    held.trim()
+                );
+            }
+            // Nobody is behind it. It is taken over, and the takeover is
+            // the same exclusive create once the stale one is gone.
+            self.files.remove_file(&path)?;
+            self.files
+                .create_new(&path, mine.as_bytes(), 0o600)
+                .with_context(|| {
+                    format!(
+                        "the transaction {id} could not be held for this decision ({e:#}), and the \
+                     record that was there ({}) could not be replaced either.",
+                        held.trim()
+                    )
+                })?;
+        }
+        let out = f();
+        // Given back whatever happened: a decision that failed is a
+        // decision somebody has to be able to make again.
+        if let Err(e) = self.files.remove_file(&path) {
+            eprintln!("note: {} was not removed: {e:#}", path.display());
+        }
+        out
+    }
+
     /// Keep it. The timer goes first, then the record says so.
     pub fn confirm(&self, id: &str) -> Result<TxnRecord> {
+        check_id(id)?;
+        self.deciding(id, "confirm", || self.confirm_held(id))
+    }
+
+    fn confirm_held(&self, id: &str) -> Result<TxnRecord> {
         let mut record = self.record(id)?;
         match record.state {
             TxnState::Confirmed => return Ok(record),
@@ -948,6 +1041,11 @@ impl<'a> Helper<'a> {
     /// Take it back. Called by an operator, by `apply` when a check fails,
     /// and by the timer when nobody says anything at all.
     pub fn revert(&self, id: &str, because: Option<&str>) -> Result<TxnRecord> {
+        check_id(id)?;
+        self.deciding(id, "revert", || self.revert_held(id, because))
+    }
+
+    fn revert_held(&self, id: &str, because: Option<&str>) -> Result<TxnRecord> {
         let mut record = self.record(id)?;
         match record.state {
             TxnState::Confirmed => bail!(
@@ -2532,6 +2630,75 @@ mod tests {
             .unwrap();
         assert_eq!(record.state, TxnState::Reverted);
         assert_eq!(record.reason.as_deref(), Some("a readiness check failed"));
+        runner.verify().unwrap();
+    }
+
+    // Astra finding F07, 2026-09-23.
+    #[test]
+    fn a_confirm_and_a_timer_revert_do_not_both_win() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&pending("d1", Mode::Switch)).unwrap();
+        // The timer is inside its decision: it has read the record and is
+        // on its way to `nix-env --set`. This process is what holds it, so
+        // the holder is demonstrably alive.
+        let held = helper.txn_dir().join("d1.deciding");
+        files
+            .write_atomic(
+                &held,
+                format!("revert pid {} at 2026-09-22T12:05:00Z", std::process::id()).as_bytes(),
+                0o600,
+            )
+            .unwrap();
+        let err = helper.confirm("d1").unwrap_err().to_string();
+        assert!(err.contains("being decided right now"), "{err}");
+        assert!(err.contains("revert pid"), "{err}");
+        assert_eq!(
+            helper.record("d1").unwrap().state,
+            TxnState::Pending,
+            "nothing was decided"
+        );
+        // And nothing was run: the timer was never stopped, so the way back
+        // is still armed.
+        runner.verify().unwrap();
+    }
+
+    // Astra finding F07, 2026-09-23.
+    #[test]
+    fn a_decision_whose_process_is_gone_does_not_block_the_next_one() {
+        // The other half of the door. A machine that lost power while
+        // deciding must not be a machine whose timer can never fire again,
+        // so a holder that is not a process is not a holder.
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemctl", ["is-active"]),
+                Output::failing(3, ""),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&pending("d2", Mode::Switch)).unwrap();
+        let held = helper.txn_dir().join("d2.deciding");
+        files
+            .write_atomic(
+                &held,
+                // Positive, and above every `pid_max` a Linux kernel hands
+                // out.
+                b"confirm pid 2147483646 at 2026-09-22T12:05:00Z",
+                0o600,
+            )
+            .unwrap();
+        let record = helper
+            .confirm("d2")
+            .expect("the stale holder is taken over");
+        assert_eq!(record.state, TxnState::Confirmed);
+        assert!(
+            !files.exists(&held),
+            "the decision gives the transaction back"
+        );
         runner.verify().unwrap();
     }
 
