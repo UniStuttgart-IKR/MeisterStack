@@ -276,9 +276,13 @@ pkgs.testers.runNixOSTest {
     )
     print("the medium carries no key material of this fleet and no private key")
 
+    # A serial that is not the medium's is refused BEFORE any disk is looked
+    # at (review finding F19): the typed serial is the consent, and it has to
+    # be the one this medium was made for.
     refused = two.fail("meister-install confirm --host box --disk NOTTHISONE 2>&1")
     print(refused)
-    assert "no disk with the serial NOTTHISONE" in refused, refused
+    assert "not the one this medium was made for" in refused, refused
+    assert SERIAL in refused, refused
     assert "Nothing was changed" in refused, refused
 
     refused = two.fail(f"meister-install confirm --host box --disk {SERIAL} 2>&1")
