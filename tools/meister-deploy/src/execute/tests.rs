@@ -1522,6 +1522,109 @@ fn a_resume_of_a_confirmed_but_uncleaned_host_uncordons_and_retires() {
     }
 }
 
+// Astra finding F19, 2026-09-23.
+#[test]
+fn a_resume_after_a_completed_reboot_does_not_reboot_again() {
+    // The machine went round and came back as the system the plan wants,
+    // and the run stopped before the confirm. `reboot` was not in the set a
+    // resume skips, and `wait_for_boot` only asks whether the booted system
+    // is the wanted one — which it is — so the resume sent `systemctl
+    // reboot` again. In `mode boot` that boots the OLD generation, because
+    // the one-shot is spent and the confirm that makes the new one the
+    // default has not run: a rollout one step from done undeployed itself.
+    let fx = Fixture::changing(&["n1"], true);
+    assert!(
+        kinds(&fx.plan, "n1").contains(&ActionKind::Reboot),
+        "a changed kernel is a reboot class: {:?}",
+        kinds(&fx.plan, "n1")
+    );
+    write_rebooted_journal(&fx, "run-1");
+    let look = TableLook::new(&fx).carrying(
+        "n1",
+        Txn {
+            id: "run-1".to_string(),
+            state: TxnState::Pending,
+            target_system: Some(fx.top("n1")),
+            deadline: Some(at("2026-09-22T12:05:00Z")),
+            run_id: Some("run-1".to_string()),
+        },
+    );
+    // The machine is back on what it booted, which is what it had to boot.
+    look.set("n1", Phase::After);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            .expect(cli("undrain", "n1"), Output::stdout(""))
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["txn", "retire", "--txn", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("every expectation was used");
+    assert_eq!(applied.stopped, None, "the resume stopped: {applied:?}");
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+    assert!(
+        !runner
+            .calls()
+            .iter()
+            .any(|c| c.contains("systemctl reboot")),
+        "the machine was rebooted a second time: {:?}",
+        runner.calls()
+    );
+}
+
+// Astra finding F19, 2026-09-23.
+#[test]
+fn a_resume_of_a_host_that_was_switched_and_never_booted_still_boots_it() {
+    // The other side of the same condition, and the reason it is read off
+    // the journal rather than set for every resume: a host whose run died
+    // between the activation and the reboot still has to go round.
+    let fx = Fixture::changing(&["n1"], true);
+    write_interrupted_journal(&fx, "run-1");
+    let look = TableLook::new(&fx).carrying(
+        "n1",
+        Txn {
+            id: "run-1".to_string(),
+            state: TxnState::Pending,
+            target_system: Some(fx.top("n1")),
+            deadline: Some(at("2026-09-22T12:05:00Z")),
+            run_id: Some("run-1".to_string()),
+        },
+    );
+    look.set("n1", Phase::After);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(reboot_of("n1"), Output::stdout(""))
+            .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            .expect(cli("undrain", "n1"), Output::stdout(""))
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["txn", "retire", "--txn", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("the reboot was sent");
+    assert_eq!(applied.stopped, None, "the resume stopped: {applied:?}");
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+}
+
 #[test]
 fn a_takeover_reaches_the_anchor_host_twice_and_that_is_the_point() {
     // The shape behind L2 finding N8, pinned where it is decided rather
@@ -1866,6 +1969,94 @@ fn write_interrupted_journal(fx: &Fixture, run: &str) {
         .host("n1")
         .payload(serde_json::json!({"action": activate, "kind": "activate", "txn": run})));
     // And here the workstation went away: no `action.end`, no `run.end`.
+}
+
+/// A reboot-class host that activated, went round, came back — and then the
+/// run stopped, before the verify and before the confirm.
+///
+/// Astra finding F19, 2026-09-23: this is the window in which a resume used
+/// to send `systemctl reboot` a second time.
+fn write_rebooted_journal(fx: &Fixture, run: &str) {
+    fx.state
+        .begin_run(&fx.files, run)
+        .expect("the run directory");
+    fx.files
+        .write_atomic(
+            &fx.state.plan_copy_path(run),
+            &fx.plan.to_json().expect("the plan"),
+            0o644,
+        )
+        .expect("the plan copy");
+    let journal = Journal::new(fx.state.journal_path(run), run, &fx.plan.plan_id);
+    let put = |event: JournalEvent| {
+        journal.append(&fx.files, event).expect("a line");
+    };
+    let seq_of = |kind: ActionKind| {
+        fx.plan
+            .actions_for("n1")
+            .into_iter()
+            .find(|a| a.kind == kind)
+            .unwrap_or_else(|| panic!("the plan has a {kind}"))
+            .seq
+    };
+    put(journal
+        .event(EventKind::RunStart, at(NOW))
+        .payload(serde_json::json!({"operator": {"user": "silas", "workstation": "manacor"}})));
+    put(journal
+        .event(EventKind::LockAcquire, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"run_id": run})));
+    for (from, to) in [
+        (HostState::Planned, HostState::Preflight),
+        (HostState::Preflight, HostState::Staged),
+        (HostState::Staged, HostState::MaintenanceReady),
+    ] {
+        put(journal
+            .event(EventKind::HostState, at(NOW))
+            .host("n1")
+            .transition(from, to)
+            .payload(serde_json::json!({})));
+    }
+    let activate = seq_of(ActionKind::Activate);
+    put(journal
+        .event(EventKind::ActionBegin, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate"})));
+    put(journal
+        .event(EventKind::ActionIrreversible, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate", "txn": run})));
+    put(journal
+        .event(EventKind::HostState, at(NOW))
+        .host("n1")
+        .transition(HostState::MaintenanceReady, HostState::Activating)
+        .payload(serde_json::json!({})));
+    put(journal
+        .event(EventKind::ActionEnd, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate", "result": "ok"})));
+    put(journal
+        .event(EventKind::HostState, at(NOW))
+        .host("n1")
+        .transition(HostState::Activating, HostState::AwaitingReboot)
+        .payload(serde_json::json!({})));
+    // The reboot, whole: the `action.end` is written only after
+    // `wait_for_boot` has seen the machine come back as what it had to be.
+    let reboot = seq_of(ActionKind::Reboot);
+    put(journal
+        .event(EventKind::ActionBegin, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": reboot, "kind": "reboot"})));
+    put(journal
+        .event(EventKind::ActionEnd, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": reboot, "kind": "reboot", "result": "ok"})));
+    put(journal
+        .event(EventKind::HostState, at(NOW))
+        .host("n1")
+        .transition(HostState::AwaitingReboot, HostState::Verifying)
+        .payload(serde_json::json!({})));
+    // And here the operator pressed ctrl-c: no verify, no confirm.
 }
 
 #[test]

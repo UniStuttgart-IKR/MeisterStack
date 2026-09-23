@@ -614,7 +614,10 @@ impl<'a> Executor<'a> {
                     }
                 }
                 // --- end lane 5A ---
-                Resume::AfterTheActivation { confirmed } => {
+                Resume::AfterTheActivation {
+                    confirmed,
+                    rebooted,
+                } => {
                     // Everything up to and including the activation happened
                     // on the machine, and the target is what said so. The
                     // preparation is not repeated — a second `nix copy` would
@@ -629,6 +632,31 @@ impl<'a> Executor<'a> {
                     if confirmed {
                         skip.insert(ActionKind::Confirm);
                     }
+                    // --- Astra finding F19, 2026-09-23 ---
+                    //
+                    // The reboot stands between the activation and the
+                    // confirmation and was not in this set, so an operator
+                    // who interrupted a run after the machine had come back
+                    // and before the confirm sent `systemctl reboot` again.
+                    // `wait_for_boot` cannot catch it: it asks whether the
+                    // booted system is the wanted one, which it already is,
+                    // and never whether THIS boot is a new one.
+                    //
+                    // And it is worse than a wasted reboot. In `mode boot`
+                    // the way back is the one-shot boot entry, which the
+                    // first boot consumed, and `confirm` — which has not run
+                    // — is what makes the new generation the default. So the
+                    // second reboot boots the OLD system, `wait_for_boot`
+                    // sits there reading "it booted <other>" until the
+                    // deadline, and a rollout that was one step from done
+                    // has quietly undeployed itself.
+                    //
+                    // Conditioned on the journal and not on the plan: a host
+                    // that was switched and never booted still has to boot.
+                    if rebooted {
+                        skip.insert(ActionKind::Reboot);
+                    }
+                    // --- end Astra finding F19 ---
                 }
             }
         }
@@ -2374,7 +2402,10 @@ impl<'a> Executor<'a> {
             Step::VerifyOnly => {
                 self.entry(hosts, id).txn = run.txn_id.clone();
                 self.move_to(journal, id, hosts, HostState::Verifying, Some(&observed))?;
-                Ok(Resume::AfterTheActivation { confirmed: true })
+                Ok(Resume::AfterTheActivation {
+                    confirmed: true,
+                    rebooted: run.rebooted(),
+                })
             }
             Step::VerifyAndConfirm => {
                 // The activation happened and the target is still waiting
@@ -2382,7 +2413,10 @@ impl<'a> Executor<'a> {
                 // never from a new one.
                 self.entry(hosts, id).txn = run.txn_id.clone();
                 self.move_to(journal, id, hosts, HostState::Verifying, Some(&observed))?;
-                Ok(Resume::AfterTheActivation { confirmed: false })
+                Ok(Resume::AfterTheActivation {
+                    confirmed: false,
+                    rebooted: run.rebooted(),
+                })
             }
             // --- end lane 5C ---
             Step::RolledBack => {
@@ -2918,7 +2952,11 @@ enum Resume {
     Carry,
     /// The activation is behind us. What is left is the verification and,
     /// unless somebody already confirmed, the confirmation.
-    AfterTheActivation { confirmed: bool },
+    ///
+    /// `rebooted` is Astra finding F19, 2026-09-23: on a host whose plan
+    /// holds a `reboot`, the reboot happens between the activation and the
+    /// confirmation, and the journal says whether it came through.
+    AfterTheActivation { confirmed: bool, rebooted: bool },
     // --- lane 3-integration ---
     /// The run stopped in front of the provider's reboot. Everything before
     /// it happened; the step itself asks the machine again.

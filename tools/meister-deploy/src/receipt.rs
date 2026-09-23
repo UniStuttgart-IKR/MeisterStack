@@ -479,6 +479,26 @@ impl HostRun {
     }
     // --- end lane 3-integration ---
 
+    /// Whether the machine has already been round: a `reboot` step of this
+    /// run that came through.
+    ///
+    /// Astra finding F19, 2026-09-23. The reboot sits between the activation
+    /// and the confirmation, and a resume skipped neither of the two — so an
+    /// operator who stopped a run in that window sent `systemctl reboot` a
+    /// second time. The evidence was always in the journal: the step writes
+    /// its `action.end` only after `wait_for_boot` has seen the machine come
+    /// back as the system the plan wants.
+    ///
+    /// The LAST one, like `open_provider_reboot`: a resume that did have to
+    /// reboot writes a second pair of lines.
+    pub fn rebooted(&self) -> bool {
+        self.actions
+            .iter()
+            .rev()
+            .find(|a| a.kind == ActionKind::Reboot)
+            .is_some_and(|a| a.result == Some(ActionResult::Ok))
+    }
+
     /// Whether this run gave the host back: the `unlock` step, which retires
     /// the transaction record on the target and releases the host's lock.
     ///
