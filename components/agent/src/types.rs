@@ -668,6 +668,11 @@ fn images_to_fetch(volumes: &[NewVolume]) -> Vec<crate::images::Source> {
                 name: name.to_string(),
                 url: url.to_string(),
                 sha256: sha256.to_string(),
+                // Whose registration these bytes are. Written into the spec
+                // by the cloud beside the url and the checksum, and empty on
+                // a standalone cluster that has no catalogue to mint one.
+                // See `images::Source::uid` for what the node does with it.
+                uid: v.base_image_uid.clone().unwrap_or_default(),
             });
         }
     }

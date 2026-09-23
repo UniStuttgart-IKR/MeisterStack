@@ -173,6 +173,21 @@ pub struct NewVolume {
     pub base_image_url: Option<String>,
     #[serde(default)]
     pub base_image_sha256: Option<String>,
+    /// The uid of the `Image` object the two fields above came from.
+    ///
+    /// Control-plane-owned exactly as they are, and written in beside them:
+    /// the catalogue name is global, so it is the one thing about an image
+    /// that cannot say WHICH registration a node fetched. Astra finding S02,
+    /// 2026-09-23: the node addresses its cache entry by this and the digest,
+    /// so one tenant's bytes can never answer for another tenant's image of
+    /// the same name.
+    ///
+    /// Absent on a standalone cluster with no cloud above it — there is no
+    /// catalogue there to mint a uid — and on every spec written before the
+    /// field existed. The node falls back to the digest alone, which is what
+    /// it always did.
+    #[serde(default)]
+    pub base_image_uid: Option<String>,
     /// How big, for a disk this node is to MAKE. Defaults so that a
     /// referenced entry need not name it — the size belongs to the volume
     /// that already exists — and an INLINE entry that names none is refused

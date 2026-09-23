@@ -69,6 +69,41 @@ pub struct Source {
     pub url: String,
     /// Lowercase hex, 64 characters.
     pub sha256: String,
+    /// The uid of the `Image` object these bytes were registered as.
+    ///
+    /// Astra finding S02, 2026-09-23: the cache entry was addressed by the
+    /// digest alone and the catalogue NAME is global, so two images that are
+    /// the same file to this node are the same cache entry however many
+    /// tenants registered them and whatever happened to their objects. The
+    /// uid is what makes an entry belong to the registration it was fetched
+    /// for: it is minted once, at the cloud, and never reused.
+    ///
+    /// Empty for a record written before the field existed, and for a
+    /// standalone cluster with no cloud above it to mint one. Then the entry
+    /// is addressed by the digest exactly as it always was — a cache that
+    /// silently stopped matching would re-download every image on the fleet.
+    #[serde(default)]
+    pub uid: String,
+}
+
+impl Source {
+    /// What this image is called inside the node's cache.
+    ///
+    /// The uid and the digest, and neither of them alone: the digest is what
+    /// makes the presence of the file proof that these are the right bytes,
+    /// and the uid is what keeps one registration's bytes from answering for
+    /// another's. The NAME is deliberately not in it — that is the namespace
+    /// two tenants share, and sharing it was the finding.
+    ///
+    /// The whole digest and not a prefix of it, because this is a file name
+    /// nobody types: a prefix would buy shorter `ls` output and pay for it
+    /// with a collision nobody would ever debug.
+    fn cache_key(&self) -> String {
+        match self.uid.is_empty() {
+            true => self.sha256.clone(),
+            false => format!("{}-{}", self.uid, self.sha256),
+        }
+    }
 }
 
 /// What this node has learned about an image, and what it tells the
@@ -232,8 +267,8 @@ impl Cache {
         self.dir.join(CACHE_DIR)
     }
 
-    fn cached(&self, sha256: &str) -> PathBuf {
-        self.cache_dir().join(sha256)
+    fn cached(&self, key: &str) -> PathBuf {
+        self.cache_dir().join(key)
     }
 
     /// What the volume drivers will open: `<image_dir>/<name>`.
@@ -497,7 +532,8 @@ impl Cache {
 
     async fn ensure_inner(&self, source: &Source) -> std::result::Result<(), FetchFailure> {
         check_digest(&source.sha256)?;
-        let cached = self.cached(&source.sha256);
+        check_uid(&source.uid)?;
+        let cached = self.cached(&source.cache_key());
         if tokio::fs::metadata(&cached).await.is_ok() {
             // The presence of a file under its own digest IS the proof that
             // the right bytes are here: nothing writes into the cache except
@@ -512,9 +548,11 @@ impl Cache {
         // Named after the digest and this process, so two agents on one
         // shared directory — and two fetches of two images in one agent —
         // cannot write into each other's partial file.
-        let partial =
-            self.cache_dir()
-                .join(format!("{}.partial.{}", source.sha256, std::process::id()));
+        let partial = self.cache_dir().join(format!(
+            "{}.partial.{}",
+            source.cache_key(),
+            std::process::id()
+        ));
         let fetched = fetch(&source.url, &partial, &self.bounds).await;
         // Whatever happened, the partial file is this function's to clean up.
         // An abandoned one is exactly what "a cancelled download leaves
@@ -581,9 +619,11 @@ impl Cache {
         // under the same name with a new checksum. The new content wins, and
         // the swap goes through a temporary name so that nothing ever opens a
         // half-replaced path.
-        let staged = self
-            .dir
-            .join(format!(".{}.linking.{}", source.sha256, std::process::id()));
+        let staged = self.dir.join(format!(
+            ".{}.linking.{}",
+            source.cache_key(),
+            std::process::id()
+        ));
         let _ = tokio::fs::remove_file(&staged).await;
         match tokio::fs::hard_link(cached, &staged).await {
             Ok(()) => {}
@@ -691,6 +731,24 @@ fn check_digest(sha256: &str) -> Result<()> {
     }
     if sha256.bytes().any(|b| b.is_ascii_uppercase()) {
         bail!("sha256 {sha256:?} must be lowercase");
+    }
+    Ok(())
+}
+
+/// A uid that is not one is refused before anything is downloaded.
+///
+/// The same reason `check_digest` exists and the same danger: the uid names
+/// the cache entry, so a value with a slash or a `..` in it would write
+/// outside the cache directory. What the cloud mints is a uuid; what is
+/// accepted here is the shape of one and nothing looser.
+fn check_uid(uid: &str) -> Result<()> {
+    if uid.is_empty() {
+        // An image registered by a cluster with no cloud above it, or a
+        // record written before the field existed. See `Source::uid`.
+        return Ok(());
+    }
+    if uid.len() > 64 || !uid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        bail!("image uid {uid:?} is not a uid");
     }
     Ok(())
 }
@@ -1000,6 +1058,7 @@ mod tests {
             name: "ubuntu.raw".into(),
             url: format!("http://127.0.0.1:{port}/ubuntu.raw"),
             sha256: digest_of(b"bytes that never arrive"),
+            uid: String::new(),
         };
 
         let started = std::time::Instant::now();
@@ -1057,6 +1116,7 @@ mod tests {
             name: "ubuntu.raw".into(),
             url: format!("file://{}", origin.display()),
             sha256: digest_of(&payload),
+            uid: String::new(),
         };
 
         let err = cache.ensure(&source).await.expect_err("past the budget");
@@ -1090,6 +1150,7 @@ mod tests {
             name: "ubuntu.raw".into(),
             url: format!("file://{}", origin.display()),
             sha256: digest_of(&payload),
+            uid: String::new(),
         };
 
         cache.ensure(&source).await.expect("fetched");
@@ -1097,7 +1158,10 @@ mod tests {
         let placed = images.join("ubuntu.raw");
         assert_eq!(std::fs::read(&placed).unwrap(), payload);
         // And in the cache under its own digest, which is what makes the
-        // second use free.
+        // second use free. The bare digest and not `<uid>-<digest>` because
+        // this source carries no uid: a cluster with no cloud above it mints
+        // none, and S02's key falls back to what it always was rather than
+        // making every node on such a fleet re-download everything.
         assert!(images.join(CACHE_DIR).join(&source.sha256).exists());
         assert_eq!(
             cache.report(),
@@ -1117,6 +1181,83 @@ mod tests {
         assert_eq!((a.ino(), a.dev()), (b.ino(), b.dev()));
     }
 
+    /// Two registrations of one name are two images, and one node's cache
+    /// keeps them apart.
+    ///
+    /// Astra finding S02, 2026-09-23: the cache entry was the digest alone
+    /// and the catalogue name is global — one namespace for every tenant on
+    /// the fleet — while `delete_image` at the cloud removes the object and
+    /// nothing a node holds. So a name deregistered by one tenant and
+    /// registered by another was, on the node, the same entry. The uid is
+    /// what an image cannot share: it is minted once and never reused.
+    #[tokio::test]
+    async fn two_images_of_one_name_do_not_share_a_cache_entry() {
+        let (_temp, dir) = scratch("uid");
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let cache = Cache::new(images.clone());
+
+        let theirs = b"the image one tenant registered".to_vec();
+        let mine = b"what somebody else put under the same name".to_vec();
+        let origin = dir.join("origin.raw");
+
+        std::fs::write(&origin, &theirs).unwrap();
+        let first = Source {
+            name: "ubuntu.raw".into(),
+            url: format!("file://{}", origin.display()),
+            sha256: digest_of(&theirs),
+            uid: "4f3c0000-0000-0000-0000-00000000000a".into(),
+        };
+        cache.ensure(&first).await.expect("fetched");
+
+        std::fs::write(&origin, &mine).unwrap();
+        let second = Source {
+            name: "ubuntu.raw".into(),
+            url: format!("file://{}", origin.display()),
+            sha256: digest_of(&mine),
+            uid: "9b210000-0000-0000-0000-00000000000b".into(),
+        };
+        cache.ensure(&second).await.expect("fetched");
+
+        let entries = |source: &Source| {
+            images
+                .join(CACHE_DIR)
+                .join(format!("{}-{}", source.uid, source.sha256))
+        };
+        assert!(entries(&first).exists(), "one entry per registration");
+        assert!(entries(&second).exists());
+        assert_ne!(entries(&first), entries(&second));
+        assert!(
+            !images.join(CACHE_DIR).join(&first.sha256).exists(),
+            "and nothing under the bare digest, which is the namespace they shared"
+        );
+        // The name follows the newest bytes, as it always has.
+        assert_eq!(std::fs::read(images.join("ubuntu.raw")).unwrap(), mine);
+
+        // Same uid, same digest, same entry: asking twice is asking once.
+        cache.ensure(&second).await.expect("already here");
+        assert_eq!(
+            std::fs::read_dir(images.join(CACHE_DIR))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .count(),
+            2
+        );
+    }
+
+    /// A uid names a file in the cache directory, so a value that is not one
+    /// is refused before anything is downloaded — the same rule and the same
+    /// danger as `check_digest`.
+    #[test]
+    fn a_uid_that_is_not_one_is_refused_before_anything_is_fetched() {
+        assert!(check_uid("4f3c0000-0000-0000-0000-00000000000a").is_ok());
+        assert!(check_uid("").is_ok(), "no cloud above this cluster");
+        assert!(check_uid("../../etc/passwd").is_err());
+        assert!(check_uid("a/b").is_err());
+        assert!(check_uid("a.b").is_err(), "a dot is a path component");
+        assert!(check_uid(&"a".repeat(65)).is_err());
+    }
+
     /// The checksum is what makes a fetched image usable, so bytes that do
     /// not match it leave nothing behind at all — not in the cache, not under
     /// the catalogue name, not as a partial file.
@@ -1134,6 +1275,7 @@ mod tests {
             name: "ubuntu.raw".into(),
             url: format!("file://{}", origin.display()),
             sha256: claimed.clone(),
+            uid: String::new(),
         };
 
         let err = cache.ensure(&source).await.expect_err("must not be usable");
@@ -1177,6 +1319,7 @@ mod tests {
             name: "ubuntu.raw".into(),
             url: format!("file://{}", dir.join("nothing-here.raw").display()),
             sha256: digest_of(b"anything"),
+            uid: String::new(),
         };
 
         assert!(cache.ensure(&source).await.is_err());
@@ -1222,6 +1365,7 @@ mod tests {
                 name: "ubuntu.raw".into(),
                 url: format!("file://{}", origin.display()),
                 sha256: digest_of(&first),
+                uid: String::new(),
             })
             .await
             .unwrap();
@@ -1233,6 +1377,7 @@ mod tests {
                 name: "ubuntu.raw".into(),
                 url: format!("file://{}", origin.display()),
                 sha256: digest_of(&second),
+                uid: String::new(),
             })
             .await
             .unwrap();

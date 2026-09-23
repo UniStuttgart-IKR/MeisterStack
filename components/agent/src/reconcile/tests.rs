@@ -908,6 +908,7 @@ fn a_path_image_is_the_one_no_source_entry_names() {
         name: "ubuntu.raw".into(),
         url: "https://example.invalid/ubuntu.raw".into(),
         sha256: "a".repeat(64),
+        uid: String::new(),
     }];
     assert_eq!(
         crate::provision::path_images(&spec),
