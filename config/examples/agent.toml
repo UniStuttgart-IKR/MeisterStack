@@ -236,8 +236,11 @@ volume_dir = "/var/lib/meisterstack/volumes"
 cgroup_root = "/sys/fs/cgroup/meisterstack"
 
 [hypervisor.cloud-hypervisor]
-# The patched build (see get_patched_binaries.sh) — stock cloud-hypervisor
-# does not have the generic-vhost-user device the GPU backends need.
+# The patched build (`nix/packages/cloud-hypervisor.nix`, attribute
+# `cloud-hypervisor-meister`) — stock cloud-hypervisor does not have the
+# generic-vhost-user device the GPU backends need. On a managed host this
+# path is not written down at all: the unit names the store path of the
+# package (`meisterstack.binDir = null`, nix/agent.nix).
 binary     = "/opt/meisterstack/bin/cloud-hypervisor"
 # How long one call to CH's API socket may take. This is a local unix socket;
 # anything slower than a second or two means the VMM is wedged, not busy.
