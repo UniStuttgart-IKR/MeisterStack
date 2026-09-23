@@ -1475,6 +1475,27 @@ fn group_views(
                     // is the case where an interruption IS an outage, which
                     // is what `approval_class: singleton` says out loud.
                     0
+                } else if unhealthy_now == size {
+                    // --- lane L4: a group that is not serving has no quorum
+                    // to protect.
+                    //
+                    // Measured in the lab on 2026-09-23: three fresh VMs,
+                    // a `bootstrap` plan, and all three blocked with "group
+                    // cp is at 0 of 3; no further member may go down."
+                    // Nothing could go down, because nothing was up — the
+                    // rule that exists to keep a live raft alive was
+                    // forbidding the plan that brings one into existence.
+                    // A THREE-member raft could therefore never be
+                    // bootstrapped by this tool; L2 never saw it because its
+                    // group had one member and `singleton` short-circuits.
+                    //
+                    // The rule is about an INVARIANT, and there is none
+                    // here: a group where no member answers is not serving,
+                    // so an interruption interrupts nobody. Whether that is
+                    // a bootstrap or an outage does not change the
+                    // arithmetic, and it must not: a plan is also how a
+                    // group that is completely down gets repaired.
+                    group.rollout.max_unavailable
                 } else if left == 0 {
                     blocked = Some(format!(
                         "group {id} is at {} of {size}; no further member may go down.",
@@ -6713,6 +6734,41 @@ mod tests {
         for host in ["cloud-a", "cloud-b"] {
             assert!(action(&plan, host, ActionKind::Activate).is_blocked());
         }
+    }
+
+    #[test]
+    fn a_raft_group_where_nothing_is_up_has_no_quorum_to_protect() {
+        // --- lane L4 ---
+        // Three fresh machines, none of them serving: this is what a
+        // `bootstrap` looks like, and what a group that is completely down
+        // looks like. Blocking here protects nothing and forbids the only
+        // plan that would bring the group back — measured in the lab, where
+        // three fresh VMs could not be bootstrapped at all.
+        let (release, observation) = three_member_cloud(3);
+        let plan = planned(&release, "group=cloud", &observation);
+        let view = &plan.groups["cloud"];
+        assert_eq!(view.size, 3);
+        assert_eq!(view.unhealthy_now, 3);
+        assert_eq!(
+            view.allowed_unavailable, 1,
+            "a group that is not serving allows what the rollout allows"
+        );
+        assert!(
+            view.blocked.is_none(),
+            "a group at 0 of 3 is not a degraded quorum: {:?}",
+            view.blocked
+        );
+        for host in ["cloud-a", "cloud-b", "cloud-c"] {
+            assert!(
+                !action(&plan, host, ActionKind::Activate).is_blocked(),
+                "{host} is blocked although nothing in its group is up"
+            );
+        }
+        // And the line that must NOT move with it: two of three is still a
+        // degraded quorum, and it still blocks.
+        let (release, observation) = three_member_cloud(1);
+        let plan = planned(&release, "group=cloud", &observation);
+        assert!(plan.groups["cloud"].blocked.is_some());
     }
 
     #[test]
