@@ -597,10 +597,27 @@ impl Sandbox {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(path)
             .map_err(|e| format!("the destination {} cannot be stat'ed: {e}", path.display()))?;
+        // What it goes back to afterwards. Normally whoever owns it now:
+        // the agent for a tmp file it has just made, `root:disk` for a
+        // device node udev made — restoring what was there is what keeps
+        // this from deciding anything about a device it did not create.
+        //
+        // Unless what is there is the converter itself. That is what a run
+        // which died between the hand-over and the hand-back leaves, and
+        // giving such a destination "back" to the converter would make the
+        // leftover permanent — and in the filesystem driver's case it would
+        // then be renamed into place as the guest's volume. So that one case
+        // goes to whoever runs this agent instead, which is the answer
+        // `vmm_user::give_back` gives for the same reason.
+        let (mut back_uid, mut back_gid) = (meta.uid(), meta.gid());
+        if back_uid == uid {
+            back_uid = nix::unistd::Uid::effective().as_raw();
+            back_gid = nix::unistd::Gid::effective().as_raw();
+        }
         let handed = HandedOver {
             path: path.to_path_buf(),
-            uid: meta.uid(),
-            gid: meta.gid(),
+            uid: back_uid,
+            gid: back_gid,
             chown: self.chown.clone(),
             given_back: false,
         };
@@ -1359,6 +1376,56 @@ mod tests {
             "given to the converter, then taken back"
         );
         assert!(fake.qemu_ran(), "and the conversion really happened");
+    }
+
+    /// A destination that is ALREADY the converter's is what a run that died
+    /// halfway leaves. It goes back to the agent and not to the converter,
+    /// because the filesystem driver renames that very file into place as
+    /// the guest's volume.
+    #[tokio::test]
+    async fn a_leftover_destination_goes_back_to_the_agent_and_not_to_the_converter() {
+        use std::os::unix::fs::MetadataExt;
+        let fake = Fake::new(true);
+        let src = fake.file("noble.qcow2");
+        let dst = fake.file("v.tmp");
+        let mine = std::fs::metadata(&dst).expect("stat");
+        // The sandbox is told the account resolves to whoever owns the
+        // destination, which is the state a crashed run leaves behind.
+        let chowns = fake.chowns.clone();
+        let sandbox = Sandbox::new(fake.bin("systemd-run")).resolved_as(
+            mine.uid(),
+            mine.gid(),
+            Arc::new(move |path, uid, gid| {
+                chowns.lock().expect("the recorded hand-overs").push((
+                    path.to_path_buf(),
+                    uid,
+                    gid,
+                ));
+                Ok(())
+            }),
+        );
+
+        convert(
+            &sandbox,
+            &fake.bin("qemu-img"),
+            &an_image(),
+            &src,
+            Destination::File(&dst),
+            "noble.qcow2",
+        )
+        .await
+        .expect("converted");
+
+        let recorded = fake.chowns();
+        let back = &recorded[1];
+        assert_eq!(
+            (back.1, back.2),
+            (
+                nix::unistd::Uid::effective().as_raw(),
+                nix::unistd::Gid::effective().as_raw()
+            ),
+            "the leftover is given to the agent, not back to the converter"
+        );
     }
 
     /// A destination that cannot be taken back fails the conversion, even
