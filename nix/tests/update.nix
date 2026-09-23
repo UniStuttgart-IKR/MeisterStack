@@ -459,7 +459,14 @@ pkgs.testers.runNixOSTest {
     assert the_release["build_env"]["cache_url"] == CACHE, the_release["build_env"]
     assert the_release["build_env"]["signing_key_name"] == "vm-update", the_release["build_env"]
     top_b = the_release["artifacts"]["target"]["toplevel"]["store_path"]
-    target.fail(f"test -e {top_b}/init")
+    # No "the target has never seen B" assertion here: the test frame
+    # mounts the BUILD HOST's store into every node (writableStore is an
+    # overlay on top of it), so every closure this test built is visible on
+    # the target before anybody copied anything. Measured at gate M4: the
+    # assertion was the one red line of the whole check. What the cache
+    # proves is therefore (2) and the unsigned refusal below — the
+    # SIGNATURE travels and the far store enforces it — not the transfer
+    # of bytes the shared store makes unobservable here.
 
     # (2) The cache really holds that closure, and the SIGNATURE travelled
     #     with it — which is the whole reason the push happens after the
@@ -479,7 +486,8 @@ pkgs.testers.runNixOSTest {
     #     carry the signature the fleet already trusts.
     target.succeed(f"nix copy --from http://192.168.1.1:8080 {top_b}")
     target.succeed(f"test -e {top_b}/init")
-    print("the target fetched " + top_b + " out of the operator's cache, signature and all")
+    print("the target took " + top_b + " through the operator's cache with its signature "
+          "(the bytes were already in the shared test store; the signature check is the proof)")
 
     # And the other half, which is what makes that guarantee worth having:
     # an UNSIGNED path out of the same cache is refused by the same store.
