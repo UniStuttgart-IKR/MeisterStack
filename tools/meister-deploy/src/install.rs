@@ -376,6 +376,27 @@ impl<'a> Installer<'a> {
     /// (b) Exactly one disk with that serial, and it is the size it should
     /// be.
     pub fn disk(&self, target: &InstallTarget, serial: &str, wwn: Option<&str>) -> Result<Chosen> {
+        // (b0) The serial that was typed IS the consent, so it has to be a
+        // serial, and it has to be the one this medium was made for. Found
+        // by the review (F19): the typed value was only ever used to pick a
+        // device and never compared with `target.disk.serial` — an empty
+        // string matched nothing and said so, but the serial of another
+        // disk in the same machine would have chosen that disk.
+        if serial.trim().is_empty() {
+            bail!(
+                "--disk needs the serial of the disk to install onto; an empty serial is not \
+                 consent. Nothing was changed."
+            );
+        }
+        if serial != target.disk.serial {
+            bail!(
+                "the serial you typed ({serial}) is not the one this medium was made for ({}): \
+                 host {} installs onto that disk and no other. Read the sticker again, or build \
+                 the medium for the machine you mean. Nothing was changed.",
+                target.disk.serial,
+                target.host
+            );
+        }
         let cmd = lsblk_cmd();
         let out = self.runner.run(&cmd)?;
         let devices = parse_lsblk(&out.stdout, &cmd.line())?;
@@ -1194,7 +1215,32 @@ mod tests {
 
     #[test]
     fn no_disk_with_that_serial_lists_the_ones_there_are() {
-        let runner = StrictFake::new().expect(lsblk_matcher(), Output::stdout(lsblk(&[], SIZE)));
+        // The medium's disk is not in this machine: the one that is there
+        // carries another serial.
+        let runner = StrictFake::new().expect(
+            lsblk_matcher(),
+            Output::stdout(lsblk(&[], SIZE).replace("MEISTERTEST01", "OTHERDISK99")),
+        );
+        let files = files_with(&target());
+        let clock = FakeClock::fixed();
+        let err = installer(&runner, &files, &clock)
+            .disk(&target(), "MEISTERTEST01", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no disk with the serial MEISTERTEST01"),
+            "{err}"
+        );
+        assert!(err.contains("OTHERDISK99"), "{err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    /// Review finding F19: the typed serial is the consent, so it is compared
+    /// with the one the medium was made for BEFORE any disk is looked at.
+    #[test]
+    fn a_serial_that_is_not_the_mediums_is_refused_before_any_disk_is_read() {
+        let runner = StrictFake::new();
         let files = files_with(&target());
         let clock = FakeClock::fixed();
         let err = installer(&runner, &files, &clock)
@@ -1202,11 +1248,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("no disk with the serial SOMETHINGELSE"),
+            err.contains("not the one this medium was made for"),
             "{err}"
         );
         assert!(err.contains("MEISTERTEST01"), "{err}");
         assert!(err.contains("Nothing was changed"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn an_empty_serial_is_not_consent() {
+        let runner = StrictFake::new();
+        let files = files_with(&target());
+        let clock = FakeClock::fixed();
+        let err = installer(&runner, &files, &clock)
+            .disk(&target(), "  ", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not consent"), "{err}");
         runner.verify().unwrap();
     }
 

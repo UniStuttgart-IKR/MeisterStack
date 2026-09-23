@@ -390,8 +390,9 @@ belongs to, what it waits for, and what it would do to the workload.
 
 **Approvals** are per class and bound to the plan:
 `--approve reboot=<plan_id>`, `disruptive=`, `singleton=`, `destructive=`,
-`quorum=`, `verify=`. There is no global `--force`, and an approval for one
-plan does not carry to another. `apply` without a needed approval is exit 2
+`quorum=`. There is no global `--force`, and an approval for one plan does
+not carry to another. `verify` is the one exception: it rolls nothing out,
+so its approval names the release (`--approve verify=<release_id>`). `apply` without a needed approval is exit 2
 with the sentence that says which class.
 
 **What `apply` does per host** (§6 of the design; `execute.rs`): preflight →
@@ -458,7 +459,7 @@ reboot and no bundle upload by this tool. Measured in
 
 ```
 meister-deploy verify --release release.json --suite vm-lifecycle \
-    --approve verify=<plan_id> --budget 3 --deadline 600
+    --approve verify=<release_id> --budget 3 --deadline 600
 ```
 
 It writes a ledger **before** it creates anything, tags everything
@@ -626,16 +627,17 @@ At 03:00, on the machine, without this tool:
 ```
 meister-activate status --json        # current / booted / next-boot, generation, open txns, lock
 meister-activate txn list
-meister-activate revert               # back to the previous system
-meister-activate confirm              # keep the current one, cancel the revert timer
-meister-activate lock show | lock release
+meister-activate revert --txn <id>    # back to the previous system (the id: `txn list`)
+meister-activate confirm --txn <id>   # keep the current one, cancel the revert timer
+meister-activate lock show
+meister-activate lock release --run <run-id>   # the run id is in `lock show`
 meister-activate gc --keep 3
 nixos-rebuild switch --flake /path/to/fleet#<host>     # the blunt instrument
 ```
 
 `meister-activate` is part of every managed host's closure, so it is there
-whatever else is broken. After a manual change, run `meister-deploy status`
-from the workstation: the host will show a system that no release names, and
+whatever else is broken. After a manual change, run `meister-deploy status
+--release release.json` from the workstation: the host will show a system that no release names, and
 that is what the drift looks like. The next `plan` will offer to put it back.
 
 `nixos-rebuild --target-host` from the workstation also still works and is

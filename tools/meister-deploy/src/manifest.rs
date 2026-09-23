@@ -889,9 +889,9 @@ pub fn resolve(
         bail!(
             "the fleet {:?} has no host this flake builds a system for, so there is nothing \
              to resolve. Every host of it is `deployment = \"context\"` — a VM somebody else \
-             instantiated, with no closure of its own — and those are served by \
-             `meister-deploy legacy context-push` until they are migrated. Give a host \
-             `deployment = \"nixos\"` to deploy it with this tool.",
+             instantiated, with no closure of its own — and those are served by the \
+             legacy push in the lab repository (`legacy/push.sh`) until they are migrated. \
+             Give a host `deployment = \"nixos\"` to deploy it with this tool.",
             inventory.fleet.name
         );
     }
@@ -1179,10 +1179,7 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("context"), "{err}");
-        assert!(
-            err.contains("legacy context-push"),
-            "it says the way: {err}"
-        );
+        assert!(err.contains("legacy/push.sh"), "it says the way: {err}");
     }
     // --- end lane 4C ---------------------------------------------------
 
