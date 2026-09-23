@@ -69,7 +69,10 @@ pub(super) async fn on_hello(session: &Session, hello: Hello) -> Option<String> 
     {
         return None;
     }
-    session.registry.register(&hello.node_id, &session.tx);
+    // --- lane 5A: which certificate this session is ---
+    session
+        .registry
+        .register(&hello.node_id, &session.tx, serial_of(&session.who));
     Some(hello.node_id)
 }
 

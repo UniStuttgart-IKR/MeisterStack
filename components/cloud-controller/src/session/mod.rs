@@ -93,6 +93,16 @@ struct Session {
     /// What this session last told us, and only ever set while it was the
     /// speaker (see `speaker`).
     report: Option<Report>,
+    // --- lane 5A ---
+    /// The serial of the certificate this session opened with, or `None`
+    /// when nothing authenticated it (anonymous mode, a bearer token).
+    ///
+    /// The only handle there is on a session that is already running: a
+    /// certificate that is revoked while it talks has to be findable, and
+    /// the name it claims is not enough — a rotation gives one cluster two
+    /// certificates, and only one of them is the one that was taken back.
+    serial: Option<String>,
+    // --- end lane 5A ---
 }
 
 /// What each cluster last said it is holding for this cloud, by cluster.
@@ -294,7 +304,14 @@ impl SessionRegistry {
     /// Register a connection under its cluster and hand back the id it keeps
     /// for the rest of its life. A second Hello on the same connection
     /// replaces its own entry and nobody else's.
-    fn open(&self, previous: Option<u64>, cluster: &str, tx: &CommandTx, at: DateTime<Utc>) -> u64 {
+    fn open(
+        &self,
+        previous: Option<u64>,
+        cluster: &str,
+        tx: &CommandTx,
+        at: DateTime<Utc>,
+        serial: Option<String>,
+    ) -> u64 {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(id) = previous {
             sessions.remove(&id);
@@ -310,10 +327,65 @@ impl SessionRegistry {
                 // A new session knows nothing yet, and the last one's list must
                 // not be mistaken for this one's.
                 report: None,
+                // --- lane 5A ---
+                serial,
+                // --- end lane 5A ---
             },
         );
         id
     }
+
+    // --- lane 5A: a certificate that was taken back while it talked -------
+    /// End every session whose certificate is on this list.
+    ///
+    /// The sessions are ended the way a refused Hello is ended — an error
+    /// down the stream — and NOT by taking the entry out of the map: the
+    /// stream unwinding is what runs `closed`, and `closed` is what marks
+    /// the cluster gone. Removing the entry here would take the teardown
+    /// away from the path that owns it, and the cloud would keep a cluster
+    /// listed that nobody can talk to.
+    ///
+    /// Returns what was ended, for the log line: a revocation nobody can see
+    /// in a journal is a revocation nobody can prove.
+    pub async fn drop_revoked(
+        &self,
+        list: &controller_api::auth::RevocationList,
+    ) -> Vec<(String, String)> {
+        let doomed: Vec<(u64, String, String, CommandTx)> = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions
+                .iter()
+                .filter_map(|(id, session)| {
+                    let serial = session.serial.as_ref()?;
+                    list.is_revoked(serial).then(|| {
+                        (
+                            *id,
+                            session.cluster.clone(),
+                            serial.clone(),
+                            session.tx.clone(),
+                        )
+                    })
+                })
+                .collect()
+        };
+        let mut ended = Vec::new();
+        for (id, cluster, serial, tx) in doomed {
+            warn!(
+                cluster = %cluster,
+                serial = %serial,
+                session = id,
+                "the certificate of a live session is revoked; ending it"
+            );
+            let _ = tx
+                .send(Err(Status::permission_denied(format!(
+                    "the certificate {serial} this session opened with is revoked"
+                ))))
+                .await;
+            ended.push((cluster, serial));
+        }
+        ended
+    }
+    // --- end lane 5A ------------------------------------------------------
 
     /// File a status against its session. True means this session speaks for
     /// its cluster, and so that its VM list is evidence and its aggregate is
@@ -490,6 +562,18 @@ struct Connection {
 }
 
 impl Connection {
+    // --- lane 5A ---
+    /// The serial of the certificate this connection authenticated with, or
+    /// `None` when nothing did. Read once, at the Hello, because `who` is
+    /// settled before the first message and never re-read.
+    fn serial(&self) -> Option<String> {
+        match &self.who {
+            controller_api::Authenticated::As(identity) => identity.serial.clone(),
+            controller_api::Authenticated::Anonymous => None,
+        }
+    }
+    // --- end lane 5A ---
+
     /// One session, message by message, until the stream ends or a Hello is
     /// refused. Whatever ends it, the close runs.
     async fn pump(self, mut inbound: Streaming<ClusterMessage>) {

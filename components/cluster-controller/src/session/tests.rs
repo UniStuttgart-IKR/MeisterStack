@@ -98,11 +98,13 @@ fn a_second_hello_replaces_the_entry_and_the_older_session_cannot_undo_it() {
     let (first, _first_rx) = mpsc::channel(1);
     let (second, _second_rx) = mpsc::channel(1);
 
-    registry.register("node-a", &first);
-    registry.register("node-a", &second);
+    registry.register("node-a", &first, None);
+    registry.register("node-a", &second, None);
     assert_eq!(registry.connected().len(), 1, "one node, not two entries");
     assert!(
-        registry.nodes.lock().unwrap()["node-a"].same_channel(&second),
+        registry.nodes.lock().unwrap()["node-a"]
+            .tx
+            .same_channel(&second),
         "the newer session is the one commands go to"
     );
 
@@ -627,9 +629,9 @@ async fn a_report_on_a_superseded_session_changes_nothing() {
     // A says Hello; B, the same node reconnecting, replaces it.
     let (a_tx, _a_rx) = mpsc::channel(16);
     let (b_tx, _b_rx) = mpsc::channel(16);
-    registry.register("n1", &a_tx);
+    registry.register("n1", &a_tx, None);
     let a = session(&a_tx);
-    registry.register("n1", &b_tx);
+    registry.register("n1", &b_tx, None);
     let b = session(&b_tx);
 
     let report = |vcpus: u32, pressure: bool, phase: &str| StatusReport {
@@ -685,4 +687,48 @@ async fn a_report_on_a_superseded_session_changes_nothing() {
     on_status(&b, Some("n1"), &report(32, false, "Running")).await;
     let now: Node = store.get("n1").await.unwrap();
     assert_eq!(now.status.capacity.vcpus, 32);
+}
+
+// --- lane 5A: the session that was already talking -------------------------
+
+/// A live agent session on a certificate that has just been taken back is
+/// ended, and the one beside it is not.
+///
+/// The entry stays where it is on purpose: `on_disconnect` is what marks the
+/// node not ready and takes its console endpoint off the object, and it only
+/// runs when the stream unwinds. Removing the entry here would make
+/// `disconnect` decide the session had been superseded — and a revoked node
+/// would stay listed as ready.
+#[tokio::test]
+async fn a_session_whose_certificate_was_revoked_is_ended() {
+    let registry = SessionRegistry::new();
+    let (tx_a, mut rx_a) = mpsc::channel(4);
+    let (tx_b, mut rx_b) = mpsc::channel(4);
+    registry.register("n1", &tx_a, Some("aa:bb:01".to_string()));
+    registry.register("n2", &tx_b, Some("cc:dd:02".to_string()));
+
+    let list = controller_api::auth::RevocationList {
+        serials: ["AABB01".to_string()]
+            .into_iter()
+            .map(|s| controller_api::auth::normalise_serial(&s))
+            .collect(),
+        crl_number: Some(4),
+        ..Default::default()
+    };
+    let ended = registry.drop_revoked(&list).await;
+    assert_eq!(ended, vec![("n1".to_string(), "aa:bb:01".to_string())]);
+
+    let said = rx_a
+        .try_recv()
+        .expect("the revoked session was told")
+        .expect_err("and told with an error");
+    assert!(said.to_string().contains("revoked"), "{said}");
+    assert!(
+        rx_b.try_recv().is_err(),
+        "a session nobody revoked was sent something"
+    );
+    assert!(
+        registry.connected().contains("n1"),
+        "the entry belongs to the stream; only its unwinding takes it away"
+    );
 }
