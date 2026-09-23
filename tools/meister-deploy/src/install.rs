@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::effects::{Clock, Files};
 use crate::manifest::BootMode;
-use crate::run::{Cmd, Effect, Expect, Runner};
+use crate::run::{Cmd, Effect, Expect, Runner, last_lines};
 
 /// What the medium was built with: which host, which disk, which system.
 pub const INSTALL_TARGET_SCHEMA: &str = "meister-deploy/install-target/1";
@@ -556,13 +556,46 @@ impl<'a> Installer<'a> {
         Ok(out.trimmed().to_string())
     }
 
+    /// The same question `real_path` asks, except that "this is not plugged
+    /// in" is a real, distinguishable answer here rather than a case folded
+    /// into every other failure.
+    ///
+    /// Astra finding F03c, 2026-09-23: `preserve` used to read ANY error
+    /// from `real_path` — a timed-out command, a refused policy, `realpath`
+    /// itself not being on PATH — as "not plugged in" and downgrade it to a
+    /// note. `realpath` without `-m` exits 1 exactly when the path does not
+    /// resolve (GNU coreutils), so that one exit code is read as "absent"
+    /// and everything else — a non-1 exit, a spawn failure, a timeout —
+    /// still propagates as the error it is, the same way `ssh.ask` already
+    /// tells "the host said no" (an exit code) apart from "ssh could not
+    /// connect" (an error).
+    fn real_path_if_present(&self, path: &str) -> Result<Option<String>> {
+        let cmd = Cmd::new(Effect::Read, "realpath", QUICK)
+            .arg(path)
+            .expect(Expect::Codes(vec![0, 1]));
+        let out = self.runner.run(&cmd).map_err(|e| {
+            anyhow::anyhow!("{path} could not be resolved ({e}). Nothing was changed.")
+        })?;
+        if out.status == 0 {
+            Ok(Some(out.trimmed().to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// (d) Whether this disk has been installed before.
     ///
     /// Every partition of it is mounted read-only for a moment and looked
     /// at. Read-only and nosuid/nodev because a disk somebody hands you is
-    /// not a disk you trust, and a mount that fails — a swap partition, an
-    /// ESP with no filesystem yet, an encrypted volume — is simply a
-    /// partition that carries no mark.
+    /// not a disk you trust.
+    ///
+    /// Astra finding F03b, 2026-09-23: a mount that failed used to be read
+    /// exactly like a mount that succeeded and found nothing — both let this
+    /// loop go on to the next partition, and a disk `meister-install` itself
+    /// put down (an ext4 root, a vfat ESP — both mount read-only without
+    /// trouble) mounting fails only for a reason worth stopping over. A
+    /// mount failure now bails: proceeding past it is how a reinstall could
+    /// silently skip the `--reinstall` consent it exists to require.
     pub fn mark(&self, chosen: &Chosen) -> Result<Option<(String, InstalledMark)>> {
         for partition in &chosen.partitions {
             // Made only when there is something to mount into it, and only
@@ -581,7 +614,14 @@ impl<'a> Installer<'a> {
                     .expect(Expect::AnyExit),
             )?;
             if !mounted.ok() {
-                continue;
+                bail!(
+                    "{} could not be mounted read-only to look for an installation mark: {}. \
+                     This program cannot tell whether the disk is already installed, and \
+                     going on as if it were not is exactly what `--reinstall` exists to \
+                     prevent. Nothing was changed.",
+                    partition.path,
+                    last_lines(&mounted.stderr)
+                );
             }
             let path = self.probe_dir.join(MARK_PATH);
             let found = self.files.read_to_string(&path).ok();
@@ -643,6 +683,26 @@ impl<'a> Installer<'a> {
                      destroyed. Nothing was changed."
                 );
             };
+            // Astra finding F03a, 2026-09-23: `device_of` deliberately
+            // returns `None` for every `serial:` reference — a serial names
+            // a DISK and not the filesystem a path lives on, so which
+            // partition it resolves to is a guess this tool will not make.
+            // But when that serial IS the disk about to be destroyed, no
+            // resolution is needed to know the answer: a textual match on
+            // the target's own serial is compared before the reference is
+            // handed to `device_of`, so this is not folded into the "check
+            // by hand" note below.
+            if entry.device_ref == format!("serial:{}", target.disk.serial) {
+                bail!(
+                    "cannot preserve {path}: its device is {} ({}), and that is the disk this \
+                     installer is about to destroy. This program copies nothing anywhere — \
+                     preserve means the bytes are not touched — so move that filesystem to \
+                     another disk, or take {path} out of `install.preserve`. Nothing was \
+                     changed.",
+                    entry.device_ref,
+                    chosen.device.path
+                );
+            }
             let Some(device) = device_of(&entry.device_ref)? else {
                 notes.push(format!(
                     "{path} is on {} and this tool does not resolve that kind of reference; \
@@ -651,7 +711,12 @@ impl<'a> Installer<'a> {
                 ));
                 continue;
             };
-            let Ok(real) = self.real_path(&device) else {
+            // Astra finding F03c, 2026-09-23: any failure resolving this
+            // device — not only "it does not exist" — used to become this
+            // same "not plugged in" note. `real_path_if_present` tells the
+            // two apart, so only a genuine absence is downgraded to a note;
+            // everything else still propagates as the error it is.
+            let Some(real) = self.real_path_if_present(&device)? else {
                 notes.push(format!(
                     "{path} is on {} ({device}), which is not plugged into this machine — so \
                      it is not on the disk about to be formatted either",
@@ -1076,7 +1141,10 @@ pub struct SheetFacts {
 /// what a persistent path lives on is a filesystem, so the answer would be a
 /// guess about which partition. It comes back as `None` and the summary says
 /// so, which is a person's job to check rather than a refusal this tool
-/// cannot justify.
+/// cannot justify — except for the one `serial:` this tool does not have to
+/// guess about: `preserve` (Astra finding F03a) compares the reference
+/// against the target's own disk serial before it ever reaches here, and
+/// refuses outright on that one match.
 pub fn device_of(device_ref: &str) -> Result<Option<String>> {
     let Some((kind, value)) = device_ref.split_once(':') else {
         bail!(
@@ -1427,23 +1495,22 @@ mod tests {
     #[test]
     fn a_disk_that_is_already_installed_is_not_installed_again() {
         let mark_json = String::from_utf8(a_mark().to_json().unwrap()).unwrap();
+        // Astra finding F03b, 2026-09-23: this used to give the ESP (the
+        // first partition) a failing mount, to show that `mark` fell
+        // through to the next partition on a mount failure — that fallback
+        // is gone (see `mark`'s doc comment and
+        // `a_partition_that_fails_to_mount_stops_the_look_for_a_mark`
+        // below), so this single partition mounts the way disko's own ext4
+        // root actually does: cleanly.
         let expectations = |fake: StrictFake| {
-            fake.expect(
-                lsblk_matcher(),
-                Output::stdout(lsblk(&["/dev/vdb1", "/dev/vdb2"], SIZE)),
-            )
-            .expect(realpath(DISK), Output::stdout("/dev/vdb\n"))
-            .expect(realpath(BY_ID), Output::stdout("/dev/vdb\n"))
-            // The ESP first, and it has no filesystem this medium can read.
-            .expect(
-                Matcher::prefix("mount", ["-o", "ro,nosuid,nodev", "/dev/vdb1"]),
-                Output::failing(32, "unknown filesystem type"),
-            )
-            .expect(
-                Matcher::prefix("mount", ["-o", "ro,nosuid,nodev", "/dev/vdb2"]),
-                Output::stdout(""),
-            )
-            .expect(Matcher::exact("umount", [PROBE_DIR]), Output::stdout(""))
+            fake.expect(lsblk_matcher(), Output::stdout(lsblk(&["/dev/vdb2"], SIZE)))
+                .expect(realpath(DISK), Output::stdout("/dev/vdb\n"))
+                .expect(realpath(BY_ID), Output::stdout("/dev/vdb\n"))
+                .expect(
+                    Matcher::prefix("mount", ["-o", "ro,nosuid,nodev", "/dev/vdb2"]),
+                    Output::stdout(""),
+                )
+                .expect(Matcher::exact("umount", [PROBE_DIR]), Output::stdout(""))
         };
 
         let files =
@@ -1459,6 +1526,31 @@ mod tests {
         assert!(err.contains("is already installed"), "{err}");
         assert!(err.contains("SHA256:theoldone"), "{err}");
         assert!(err.contains("--reinstall"), "{err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    /// Astra finding F03b, 2026-09-23: a mount failure on the partition that
+    /// carries the mark must not be read as "no mark" — that would let a
+    /// reinstall skip its own `--reinstall` consent requirement.
+    #[test]
+    fn a_partition_that_fails_to_mount_stops_the_look_for_a_mark() {
+        let runner = StrictFake::new()
+            .expect(lsblk_matcher(), Output::stdout(lsblk(&["/dev/vdb2"], SIZE)))
+            .expect(realpath(DISK), Output::stdout("/dev/vdb\n"))
+            .expect(realpath(BY_ID), Output::stdout("/dev/vdb\n"))
+            .expect(
+                Matcher::prefix("mount", ["-o", "ro,nosuid,nodev", "/dev/vdb2"]),
+                Output::failing(32, "wrong fs type, bad option, bad superblock"),
+            );
+        let files = files_with(&target());
+        let clock = FakeClock::fixed();
+        let err = installer(&runner, &files, &clock)
+            .confirm("box", "MEISTERTEST01", None, false, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not be mounted"), "{err}");
+        assert!(err.contains("/dev/vdb2"), "{err}");
         assert!(err.contains("Nothing was changed"), "{err}");
         runner.verify().unwrap();
     }
@@ -1561,6 +1653,85 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("says nothing about which device"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    /// Astra finding F03a, 2026-09-23: `serial:` is never resolved to a
+    /// path, but when it names the disk this installer is about to
+    /// destroy, no resolution is needed to know that — it is compared
+    /// textually against the target's own serial before `device_of` ever
+    /// sees it.
+    #[test]
+    fn a_preserved_serial_that_is_the_targets_own_is_a_refusal() {
+        let mut target = target();
+        target.preserve = vec!["/var/lib/meister-data".to_string()];
+        target.persistence = vec![Persistence {
+            path: "/var/lib/meister-data".to_string(),
+            device_ref: "serial:MEISTERTEST01".to_string(),
+            required: true,
+        }];
+        let chosen = Chosen {
+            device: BlockDevice {
+                name: "vdb".to_string(),
+                path: DISK.to_string(),
+                serial: Some("MEISTERTEST01".to_string()),
+                wwn: None,
+                size: Some(serde_json::json!(SIZE)),
+                kind: Some("disk".to_string()),
+                model: None,
+                children: Vec::new(),
+            },
+            partitions: Vec::new(),
+        };
+        let runner = StrictFake::new();
+        let files = files_with(&target);
+        let clock = FakeClock::fixed();
+        let err = installer(&runner, &files, &clock)
+            .preserve(&target, &chosen, "/dev/vdb")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("about to destroy"), "{err}");
+        assert!(err.contains("serial:MEISTERTEST01"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    /// Astra finding F03c, 2026-09-23: only a `realpath` exit of 1 ("no such
+    /// path") is read as "not plugged in"; a failure for any other reason
+    /// still propagates as the error it is.
+    #[test]
+    fn a_device_reference_resolution_failure_that_is_not_absence_is_an_error() {
+        let mut target = target();
+        target.preserve = vec!["/var/lib/meister-data".to_string()];
+        target.persistence = vec![Persistence {
+            path: "/var/lib/meister-data".to_string(),
+            device_ref: "label:meister-data".to_string(),
+            required: true,
+        }];
+        let chosen = Chosen {
+            device: BlockDevice {
+                name: "vdb".to_string(),
+                path: DISK.to_string(),
+                serial: Some("MEISTERTEST01".to_string()),
+                wwn: None,
+                size: Some(serde_json::json!(SIZE)),
+                kind: Some("disk".to_string()),
+                model: None,
+                children: Vec::new(),
+            },
+            partitions: Vec::new(),
+        };
+        let runner = StrictFake::new().expect(
+            realpath("/dev/disk/by-label/meister-data"),
+            Output::failing(2, "Permission denied"),
+        );
+        let files = files_with(&target);
+        let clock = FakeClock::fixed();
+        let err = installer(&runner, &files, &clock)
+            .preserve(&target, &chosen, "/dev/vdb")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not be resolved"), "{err}");
+        assert!(!err.contains("not plugged in"), "{err}");
         runner.verify().unwrap();
     }
 
