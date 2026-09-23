@@ -3594,6 +3594,41 @@ fn keys_issue(
     }
 
     let out_path = pki::issued_path(repo, host_id, &format!("{}.crt", ca_kind.file_stem()));
+    // --- lane 5A: one name, one certificate ---------------------------
+    //
+    // A second certificate for a name whose first one is still good is a
+    // second machine that can BE that name — which is exactly what a
+    // revocation exists to stop. The order is therefore enforced here: take
+    // the old one back, then issue the new one. It is the reinstall case
+    // (V24) and it is the only case in which this refusal fires, because a
+    // host that has never been issued anything has nothing to take back.
+    if files.exists(&out_path) {
+        let described = runner.run(&pki::describe_cmd("openssl", &out_path))?;
+        let old = pki::parse_describe(&described.stdout, &out_path.display().to_string());
+        let serial = old.serial.clone().unwrap_or_default();
+        let revoked = pki::revoked_here(&files, repo, &serial)?;
+        if revoked != Some(true) {
+            anyhow::bail!(
+                "{} already holds a {} certificate for {host_id} (serial {serial}){}. Issuing \
+                 a second one over a new key would leave TWO certificates that answer to \
+                 {:?}, and the fleet would accept either — which is what a machine that was \
+                 reinstalled, or one whose key leaked, looks like from the outside. Take the \
+                 old one back first:\n    meister-deploy keys revoke --host {host_id} \
+                 --reason superseded --release <release.json> --out revoke.json\n    \
+                 meister-deploy apply --plan revoke.json --release <release.json>\nand then \
+                 issue this one.",
+                out_path.display(),
+                ca_kind.file_stem(),
+                match revoked {
+                    None => " and this repository publishes no revocation list",
+                    Some(false) => " and it is not on this repository's revocation list",
+                    Some(true) => unreachable!("it was taken back"),
+                },
+                subject.cn
+            );
+        }
+    }
+    // --- end lane 5A --------------------------------------------------
     let csr_on_disk = if source == "-" {
         // The CA is a program and it reads a FILE. A request that arrived on
         // standard input is put where `keys csr` would have put it, so that

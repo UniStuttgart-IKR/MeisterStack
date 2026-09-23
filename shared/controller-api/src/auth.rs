@@ -481,18 +481,11 @@ impl RevocationList {
 /// Comparing serials is the whole of revocation, so the comparison is made
 /// in exactly one function and both sides go through it.
 pub fn normalise_serial(serial: &str) -> String {
-    let mut out: String = serial
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-    if out.len() % 2 == 1 {
-        out.insert(0, '0');
-    }
-    while out.len() > 2 && out.starts_with("00") {
-        out.drain(..2);
-    }
-    out
+    // In `pki` and not here, because the deployment tool compares serials
+    // too (`keys issue` refuses to hand out a second certificate for a name
+    // whose first one nobody took back) and it does not depend on this
+    // crate. One function, three callers, one meaning.
+    pki::tls::normalise_serial(serial)
 }
 
 /// What one look at the file came to.

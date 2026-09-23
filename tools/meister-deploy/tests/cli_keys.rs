@@ -883,3 +883,53 @@ fn a_dry_run_shows_the_ca_the_commands_it_would_get() {
         "a dry run wrote the list"
     );
 }
+
+/// V24, the half that is an ORDER: a machine that was reinstalled asks for a
+/// certificate under the name its predecessor still holds one for. The old
+/// one has to be taken back first, or the fleet would accept either.
+#[test]
+fn a_second_certificate_for_one_name_needs_the_first_one_taken_back() {
+    let sandbox = Sandbox::new();
+    sandbox.enrolled(true);
+    // A real request, so that the signature check has something true to
+    // check.
+    let made = pki::generate_key_and_csr("system:node:n1").unwrap();
+    std::fs::create_dir_all(sandbox.path("pki/csr")).unwrap();
+    std::fs::write(sandbox.path("pki/csr/n1-identity.csr"), &made.csr_pem).unwrap();
+    let out = sandbox.run(&[
+        "keys",
+        "issue",
+        "--host",
+        "n1",
+        "--kind",
+        "node",
+        "--manifest",
+        "manifest.json",
+        "--inventory",
+        "fleet.toml",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    // And now the machine was reinstalled: a new key, a new request, and a
+    // certificate this repository will not sign until the old one is gone.
+    let out = sandbox.run(&[
+        "keys",
+        "issue",
+        "--host",
+        "n1",
+        "--kind",
+        "node",
+        "--manifest",
+        "manifest.json",
+        "--inventory",
+        "fleet.toml",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let said = stderr(&out);
+    assert!(said.contains("keys revoke --host n1"), "{said}");
+    assert!(said.contains("0A0B"), "the serial of the old one: {said}");
+    assert!(
+        said.contains("no revocation list"),
+        "it says which of the two reasons it is: {said}"
+    );
+}

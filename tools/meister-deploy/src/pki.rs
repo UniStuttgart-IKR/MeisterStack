@@ -577,6 +577,26 @@ pub fn crl_describe_cmd(openssl: &str, crl: &Path) -> Cmd {
         .arg("-nextupdate")
 }
 
+/// Is this serial on the list this repository holds?
+///
+/// `None` when there is no list at all, which is a different answer from
+/// "not on it": a fleet that publishes no revocation list has taken nothing
+/// back, and a fleet whose list cannot be read is a fleet nobody should be
+/// issuing second certificates in.
+pub fn revoked_here(files: &dyn Files, repo: &Path, serial: &str) -> Result<Option<bool>> {
+    let path = crl_path(repo);
+    if !files.exists(&path) {
+        return Ok(None);
+    }
+    let crl = ::pki::tls::read_crl(&path)?;
+    let wanted = ::pki::tls::normalise_serial(serial);
+    Ok(Some(
+        crl.serials
+            .iter()
+            .any(|s| ::pki::tls::normalise_serial(s) == wanted),
+    ))
+}
+
 /// What a certificate this fleet issued for `host` is called on disk.
 ///
 /// `keys issue` writes `<repo>/pki/issued/<host>/<file>.crt`, one per kind.

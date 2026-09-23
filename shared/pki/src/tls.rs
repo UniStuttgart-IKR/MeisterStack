@@ -154,6 +154,34 @@ pub struct Crl {
     pub number: Option<u64>,
 }
 
+/// One spelling for a serial number, because this stack has three.
+///
+/// `x509-parser` prints `64:35:c9:…` (lowercase, colon separated) and it is
+/// what both a certificate and a CRL entry come out of here. openssl's
+/// `index.txt` and `x509 -serial` print `6435C9…` (upper case, no
+/// separators), and that is the one an operator reads off a receipt and
+/// retypes. A leading zero byte is DER's sign padding and says nothing about
+/// the number.
+///
+/// Comparing serials is the whole of revocation, so the comparison is made
+/// in exactly one function and every caller goes through it — the
+/// controllers' authenticator, the session registries, and the deployment
+/// tool, which all have to mean the same certificate by the same number.
+pub fn normalise_serial(serial: &str) -> String {
+    let mut out: String = serial
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if out.len() % 2 == 1 {
+        out.insert(0, '0');
+    }
+    while out.len() > 2 && out.starts_with("00") {
+        out.drain(..2);
+    }
+    out
+}
+
 /// Read a CRL file (PEM, as `openssl ca -gencrl` writes it).
 ///
 /// A file with no list in it is an error and not an empty list: "nothing is
