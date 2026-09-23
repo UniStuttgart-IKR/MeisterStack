@@ -3034,3 +3034,262 @@ fn a_resume_of_a_finished_rotation_does_nothing_at_all() {
     );
     assert_eq!(applied.receipt.outcome, Outcome::Success);
 }
+
+// --- lane 5B: what `scripts/check-push-pki.sh` asked ----------------------
+//
+// The pre-v1 road delivered certificates with `deploy/push.sh pki`: an rsync
+// of a staging directory under FIXED file names, followed by `chown` and
+// `chmod` at the far end. Four questions decided whether that was safe, and
+// a 264-line shell script with ssh and rsync stubs on `PATH` answered them
+// (28 checks). The script goes with M5B. These four tests are the same four
+// questions, asked of the road that replaced it — the plan's
+// `deliver-secret` steps and the executor that carries them out.
+//
+// They are stronger than the script was in one place and weaker in none:
+// question B used to be a fixed order (agents, clusters, clouds) and is now
+// the DIRECTION of the plan, which is the reverse for a bootstrap — and the
+// reason it is reversed is a fact about the fleet rather than a constant in
+// a script.
+
+/// A: every host gets the files its own roles name, and nobody else's.
+///
+/// This is the question the script existed for: two clusters with different
+/// names, and an rsync that puts one cluster's `identity.crt` on the other
+/// host. Here there is no staging directory and no fixed name to get wrong —
+/// a delivery step names the secret reference of ONE host, and the executor
+/// looks it up in that host's own `secret_refs` (`Executor::deliver`).
+#[test]
+fn every_host_gets_the_files_its_roles_name_and_no_others() {
+    let release = release_of(onebox_enrolled());
+    let fleet = &release.resolved_fleet;
+    // A bootstrap, because that is the plan in which everything is missing
+    // and therefore everything is delivered — so the snapshot has to be of
+    // hosts that have nothing yet.
+    let mut observation = observed(&release, at(NOW));
+    for host in observation.hosts.values_mut() {
+        for value in host.credentials.values_mut() {
+            *value = None;
+        }
+    }
+    let expected = crate::fixtures::expected_credentials(fleet);
+    let plan = plan(
+        &release,
+        "all",
+        &observation,
+        None,
+        &crate::fixtures::plan_policy(PlanKind::Bootstrap).with_expected_credentials(expected),
+        at(NOW),
+    )
+    .expect("a bootstrap plans");
+
+    let mut delivered: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for action in plan
+        .actions
+        .iter()
+        .filter(|a| a.kind == ActionKind::DeliverSecret)
+    {
+        delivered
+            .entry(action.host.clone())
+            .or_default()
+            .push(action.desired.clone().unwrap_or_default());
+    }
+    assert!(!delivered.is_empty(), "a bootstrap delivers something");
+
+    for (id, steps) in &delivered {
+        let host = &fleet.hosts[id];
+        for step in steps {
+            // The step says `<secret id> at <target path>`, and both halves
+            // have to be THIS host's.
+            let own = host
+                .secret_refs
+                .iter()
+                .any(|s| format!("{} at {}", s.id, s.target_path) == *step);
+            assert!(
+                own,
+                "{id} is handed {step:?}, which is not one of its own secret_refs: {:?}",
+                host.secret_refs
+                    .iter()
+                    .map(|s| format!("{} at {}", s.id, s.target_path))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // And nothing of another host's is in there. A cluster identity
+        // belongs to the GROUP, so two hosts may legitimately be handed the
+        // same file — what may not happen is a host being handed a
+        // reference it does not declare, which is what the loop above holds.
+        assert_eq!(
+            steps.len(),
+            steps.iter().collect::<BTreeSet<_>>().len(),
+            "{id} is handed the same file twice"
+        );
+    }
+}
+
+/// B: the order, and why it is not a constant.
+///
+/// `push.sh` went agents, then clusters, then clouds, always. That is right
+/// for an UPGRADE — the tier below is taken forward first, so a controller
+/// never issues a command the tier under it does not understand yet — and
+/// it is exactly wrong for a BOOTSTRAP, where a node has nothing to dial
+/// until the thing it dials exists. The planner derives the direction from
+/// the kind; these two assertions are the two directions.
+#[test]
+fn the_order_is_the_bottom_tier_first_and_a_bootstrap_is_the_other_way_round() {
+    // A release in which every host has a new system, because a plan only
+    // orders hosts it has something to do to.
+    let base = onebox_enrolled();
+    let running = release_of(base.clone());
+    let observation = observed(&running, at(NOW));
+    let release = crate::fixtures::with_new_systems(base, &["box", "n1", "n2"], false);
+
+    let first_seq = |plan: &crate::plan::DeploymentPlan, id: &str| -> u32 {
+        plan.actions
+            .iter()
+            .filter(|a| a.host == id)
+            .map(|a| a.seq)
+            .min()
+            .unwrap_or_else(|| panic!("{id} is in the plan"))
+    };
+
+    // Upgrade: the agents move before the box that carries the controllers.
+    let upgrade = plan(
+        &release,
+        "all",
+        &observation,
+        None,
+        &crate::fixtures::plan_policy(PlanKind::Upgrade),
+        at(NOW),
+    )
+    .expect("an upgrade plans");
+    assert!(
+        first_seq(&upgrade, "n1") < first_seq(&upgrade, "box"),
+        "an upgrade takes the bottom tier first"
+    );
+
+    // Bootstrap: the box comes up first, because n1 has nothing to talk to
+    // until it has.
+    let mut bare = observation.clone();
+    for host in bare.hosts.values_mut() {
+        for value in host.credentials.values_mut() {
+            *value = None;
+        }
+    }
+    let expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
+    let bootstrap = plan(
+        &release,
+        "all",
+        &bare,
+        None,
+        &crate::fixtures::plan_policy(PlanKind::Bootstrap).with_expected_credentials(expected),
+        at(NOW),
+    )
+    .expect("a bootstrap plans");
+    assert!(
+        first_seq(&bootstrap, "box") < first_seq(&bootstrap, "n1"),
+        "a bootstrap turns it around"
+    );
+}
+
+/// C: the modes, and who owns the file.
+///
+/// The script ran a real `chmod` in a temporary tree and read the result
+/// back. Here the mode is not something a step decides at all: it is a field
+/// of the secret reference the FLEET derived, and the executor passes it
+/// through to the far end verbatim. So there are two things to hold: the
+/// derivation gives a private file 0600 and a public one 0644, and the put
+/// carries exactly what the reference says.
+#[test]
+fn a_private_file_is_0600_at_the_far_end_and_a_public_one_0644() {
+    let release = release_of(onebox_enrolled());
+    for (id, host) in &release.resolved_fleet.hosts {
+        for secret in &host.secret_refs {
+            let private = secret.target_path.ends_with(".key");
+            let wanted = if private { "0600" } else { "0644" };
+            assert_eq!(
+                secret.mode,
+                wanted,
+                "{id}: {} is mode {}, and a {} file of this fleet is {wanted}",
+                secret.target_path,
+                secret.mode,
+                if private { "private" } else { "public" }
+            );
+            // And the owner travels with it: the loaders of this stack
+            // open a key only as the user that owns it (M0 probe S11), so
+            // an empty owner would be a file nobody can read.
+            assert!(
+                !secret.owner.is_empty(),
+                "{id}: {} names no owner",
+                secret.target_path
+            );
+        }
+    }
+
+    // And the mode the reference names is the mode the command carries. The
+    // whole script is asserted in `PUT_SCRIPT` above; this is the one line
+    // of it that this test is about.
+    assert!(
+        PUT_SCRIPT.contains("chmod 0644"),
+        "the put of a public file carries its mode: {PUT_SCRIPT}"
+    );
+}
+
+/// D: a file that is not here stops the run, names the host AND the file,
+/// and leaves nothing half-written on the target.
+#[test]
+fn a_secret_that_is_not_here_names_the_host_and_the_file_and_sends_nothing() {
+    let (mut fx, _) = delivering();
+    // The CA certificate is gone from the operator's machine.
+    fx.files = MemFiles::new();
+    let look = TableLook::new(&fx);
+    // The lock is taken and given back; nothing is put anywhere.
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok()),
+        &look,
+    );
+    let applied = fx
+        .executor(&runner, &look, deliver_options(&fx))
+        .run()
+        .expect("the run ends with a receipt rather than a panic");
+    runner.verify().expect("exactly those commands");
+
+    assert_ne!(
+        applied.receipt.hosts["n1"].outcome,
+        HostOutcome::Success,
+        "a delivery that could not happen is not a success"
+    );
+    assert_ne!(
+        applied.receipt.hosts["n1"]
+            .actions
+            .iter()
+            .find(|a| a.kind == ActionKind::DeliverSecret)
+            .and_then(|a| a.result),
+        Some(crate::receipt::ActionResult::Ok),
+        "the step that could not be done is not marked ok"
+    );
+    // The sentence is in the journal, where a resume and a report both read
+    // it. It has to name BOTH — the host, because a run covers many, and the
+    // file, because a run delivers many.
+    let journal = String::from_utf8(
+        fx.files
+            .content(fx.state.journal_path("run-1"))
+            .expect("a journal was written"),
+    )
+    .unwrap();
+    assert!(
+        journal.contains("n1"),
+        "the sentence names the host: {journal}"
+    );
+    assert!(
+        journal.contains("/var/lib/meisterstack/pki/ca.crt"),
+        "the sentence names the file: {journal}"
+    );
+    assert!(
+        !runner.calls().iter().any(|c| c.contains("mktemp")),
+        "something was written to the target: {:?}",
+        runner.calls()
+    );
+}
+
+// --- end lane 5B ---------------------------------------------------------
