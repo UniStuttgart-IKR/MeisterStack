@@ -441,6 +441,19 @@ impl VolumeProvider for NvmeofAttacher {
         ))
     }
 
+    /// The same refusal `provision` and `describe` give, one question over:
+    /// this half attaches namespaces and owns none, so it cannot say what is
+    /// held under a volume's id. Astra finding S13, 2026-09-23.
+    async fn probe(
+        &self,
+        _id: &VolumeId,
+        _spec: &VolumeSpec,
+    ) -> agent_api::storage::Result<Option<VolumeHandle>> {
+        Err(StorageError::Unsupported(
+            "nvmeof cannot say what is held under a volume id; ask its provider".into(),
+        ))
+    }
+
     fn locality(&self) -> Locality {
         Locality::Networked
     }

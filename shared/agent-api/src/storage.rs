@@ -411,6 +411,31 @@ pub trait VolumeProvider: Send + Sync {
     /// needed, so it can be asked of a volume nobody is holding.
     async fn describe(&self, handle: &VolumeHandle) -> Result<VolumeState>;
 
+    /// What this backend holds under `id`, asked WITHOUT a handle.
+    ///
+    /// `Some(handle)` means the bytes are there and that handle is what
+    /// `deprovision` takes; `None` means this backend has nothing under that
+    /// id. Every backend here already knows the answer — it is the same
+    /// lookup that makes `provision` idempotent, because each of them derives
+    /// its name from `id` — and until now none of them could be asked.
+    ///
+    /// **Why the handle cannot be assumed.** The agent writes its volume
+    /// record BEFORE it calls `provision`, so that a crash in the middle
+    /// leaves a record without a handle rather than nothing at all; a
+    /// provision that fails leaves the same shape behind. Either of those
+    /// records may sit in front of bytes the backend created before it broke.
+    /// A `deprovision` of one used to be answered with a tombstone and no
+    /// driver call at all — "no handle, so nothing was ever made" — which
+    /// declared a volume `Gone` one tier up while its data was still on the
+    /// pool, with the object that pointed at it deleted. Astra finding S13,
+    /// 2026-09-23.
+    ///
+    /// **No default, deliberately**, and the same argument `locality` makes:
+    /// a default would be an answer the author of the next backend never had
+    /// to think about, and the one thing a wrong `None` here does is call
+    /// somebody's data gone.
+    async fn probe(&self, id: &VolumeId, spec: &VolumeSpec) -> Result<Option<VolumeHandle>>;
+
     /// Where this backend's bytes are, once and for all.
     ///
     /// **No default, deliberately.** A default would be a value the author of
@@ -495,6 +520,35 @@ pub trait VolumeProvider: Send + Sync {
     async fn drop_snapshot(&self, handle: &VolumeHandle) -> Result<()> {
         let _ = handle;
         Err(StorageError::Unsupported("drop_snapshot".into()))
+    }
+
+    /// [`VolumeProvider::probe`], one object over: what this backend holds
+    /// under a SNAPSHOT id, asked without a handle.
+    ///
+    /// `volume` is the handle of the volume the snapshot was taken from, and
+    /// it is optional because two of the three backends that can snapshot do
+    /// not need it: a `filesystem` snapshot is a file named after the
+    /// snapshot's own id, and `nfs` delegates to it. `lvm-thin` does need it
+    /// — the volume group is on the volume's handle and nothing else on this
+    /// node knows which one it was — and says so rather than guessing.
+    ///
+    /// Defaulted, unlike `probe`, and the default is the honest answer rather
+    /// than a value nobody thought about: a backend that cannot snapshot
+    /// holds no snapshots, so `None` is true of it by construction. One that
+    /// CAN snapshot has to answer for itself, and `Unsupported` is what says
+    /// it has not been taught to — an error, so that a `drop_snapshot` of a
+    /// handle-less record refuses instead of tombstoning a copy that may
+    /// still be on the pool. Astra finding S13, 2026-09-23.
+    async fn probe_snapshot(
+        &self,
+        volume: Option<&VolumeHandle>,
+        id: &SnapshotId,
+    ) -> Result<Option<VolumeHandle>> {
+        let _ = (volume, id);
+        match self.snapshot_support() {
+            None => Ok(None),
+            Some(_) => Err(StorageError::Unsupported("probe_snapshot".into())),
+        }
     }
 
     /// Make a new, WRITEABLE volume holding what a snapshot holds.
@@ -888,10 +942,23 @@ mod tests {
                     size_bytes: h.size_bytes,
                 })
             }
+            async fn probe(&self, _: &VolumeId, _: &VolumeSpec) -> Result<Option<VolumeHandle>> {
+                Ok(None)
+            }
         }
 
         let plain = Plain;
         assert!(plain.snapshot_support().is_none());
+        // A backend that cannot snapshot holds no snapshots, so the default
+        // `probe_snapshot` is the honest `None` rather than a refusal — see
+        // Astra finding S13, 2026-09-23.
+        assert!(
+            plain
+                .probe_snapshot(None, &Uuid::nil())
+                .await
+                .expect("a backend with no snapshots answers")
+                .is_none()
+        );
 
         let handle = VolumeHandle {
             id: Uuid::nil(),

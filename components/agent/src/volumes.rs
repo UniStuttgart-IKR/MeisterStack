@@ -388,12 +388,6 @@ impl Volumes {
             return Ok(());
         }
 
-        let Some(handle) = record.handle.clone() else {
-            // Told to make it, never did — so there is nothing on any backend
-            // to remove, and the record was the only trace.
-            debug!("no handle; nothing was ever made");
-            return self.tombstone(id, Some(record.spec), None);
-        };
         let driver_name = record
             .spec
             .driver
@@ -407,6 +401,38 @@ impl Volumes {
             .ok_or_else(|| {
                 anyhow!("volume driver {driver_name:?} is not configured on this node")
             })?;
+
+        // A record with no handle is NOT a record of a volume that was never
+        // made. The intent is written before the driver call and a failed
+        // provision leaves the same shape behind, so the bytes may be on the
+        // pool with nothing on this node naming them; "no handle, nothing was
+        // ever made" tombstoned them, and a `Gone` releases the object one
+        // tier up. So the backend is asked. Astra finding S13, 2026-09-23.
+        //
+        // The probe's own failure is an error and not a tombstone: a backend
+        // that could not be asked has not said the bytes are absent, and the
+        // tier above is level-triggered and simply asks again.
+        let handle = match record.handle.clone() {
+            Some(handle) => handle,
+            None => {
+                let found = timed_driver(&driver_name, "probe", driver.probe(&id, &record.spec))
+                    .await
+                    .with_context(|| {
+                        format!("asking {driver_name} what it holds for volume {id}")
+                    })?;
+                match found {
+                    Some(found) => {
+                        warn!(backend = %found.backend,
+                              "a record with no handle, and the backend has the bytes after all");
+                        found
+                    }
+                    None => {
+                        debug!("no handle, and the backend holds nothing under this id");
+                        return self.tombstone(id, Some(record.spec), None);
+                    }
+                }
+            }
+        };
         timed_driver(&driver_name, "deprovision", driver.deprovision(&handle))
             .await
             .with_context(|| format!("deprovisioning volume {id} via {driver_name}"))?;
@@ -629,11 +655,48 @@ impl Volumes {
         if record.phase == SnapshotRecordPhase::Gone {
             return Ok(());
         }
-        let Some(handle) = record.handle.clone() else {
-            debug!("no handle; nothing was ever made");
-            return self.snapshot_tombstone(id, Some(record));
-        };
         let driver = self.driver(&record.driver)?;
+
+        // The volume half's argument, one object over: the intent is written
+        // before `snapshot` runs, so a record with no handle may sit in front
+        // of a copy that IS on the pool, and a tombstone over it releases the
+        // object one tier up while the bytes go on filling the volume's own
+        // room (D6 is what a stranded copy costs). Astra finding S13,
+        // 2026-09-23.
+        //
+        // The volume's handle comes along because `lvm-thin` needs it: a
+        // snapshot LV is in the volume's group and a snapshot record does not
+        // carry one. `None` is what a driver that needs it refuses on, and
+        // the refusal keeps the record rather than tombstoning it.
+        let handle = match record.handle.clone() {
+            Some(handle) => handle,
+            None => {
+                let of = self
+                    .store
+                    .get_volume(&record.volume)?
+                    .and_then(|v| v.handle);
+                let found = timed_driver(
+                    &record.driver,
+                    "probe_snapshot",
+                    driver.probe_snapshot(of.as_ref(), &id),
+                )
+                .await
+                .with_context(|| {
+                    format!("asking {} what it holds for snapshot {id}", record.driver)
+                })?;
+                match found {
+                    Some(found) => {
+                        warn!(backend = %found.backend,
+                              "a record with no handle, and the backend has the copy after all");
+                        found
+                    }
+                    None => {
+                        debug!("no handle, and the backend holds nothing under this id");
+                        return self.snapshot_tombstone(id, Some(record));
+                    }
+                }
+            }
+        };
         timed_driver(
             &record.driver,
             "drop_snapshot",
@@ -1669,6 +1732,20 @@ mod tests {
         ) -> agent_api::storage::Result<agent_api::storage::VolumeState> {
             self.inner.describe(handle).await
         }
+        async fn probe(
+            &self,
+            id: &VolumeId,
+            spec: &VolumeSpec,
+        ) -> agent_api::storage::Result<Option<VolumeHandle>> {
+            self.inner.probe(id, spec).await
+        }
+        async fn probe_snapshot(
+            &self,
+            volume: Option<&VolumeHandle>,
+            id: &SnapshotId,
+        ) -> agent_api::storage::Result<Option<VolumeHandle>> {
+            self.inner.probe_snapshot(volume, id).await
+        }
         async fn resize(
             &self,
             handle: &VolumeHandle,
@@ -1818,5 +1895,109 @@ mod tests {
             .await
             .expect_err("forget has the same guard");
         assert!(refused.chain().any(|c| c.is::<HeldByUnreadable>()));
+    }
+
+    /// A record with no handle is asked about before it is called `Gone`.
+    ///
+    /// Astra finding S13, 2026-09-23. The intent is written BEFORE the driver
+    /// runs and a failed provision leaves the same shape behind, so a
+    /// handle-less record is not proof that nothing was made — and the
+    /// deprovision answered one with a tombstone and no driver call at all.
+    /// `Gone` is the one word that releases the object one tier up, so the
+    /// volume was deleted from the control plane while its data stayed on the
+    /// pool, with nothing left pointing at it.
+    ///
+    /// Both directions, because only the pair is the rule: bytes that are
+    /// there are removed first, and a backend that really holds nothing still
+    /// gets its tombstone rather than an error.
+    #[tokio::test]
+    async fn a_record_with_no_handle_is_probed_before_it_is_called_gone() {
+        let (_temp, volumes, store, dir) = node("probe-before-gone");
+
+        // One that the backend does hold: made, and then the handle taken
+        // off the record, which is exactly what a crash between the write and
+        // the driver's answer leaves.
+        let made = VolumeId::new_v4();
+        volumes.provision(made, spec(4096)).await.expect("made");
+        let path = dir.join(format!("{made}.raw"));
+        assert!(path.exists());
+        let record = volumes.get(&made).unwrap().unwrap();
+        store
+            .put_volume(
+                &made,
+                &VolumeRecord {
+                    handle: None,
+                    phase: VolumeRecordPhase::Failed,
+                    reason: Some(VolumeReason::DriverRefused),
+                    message: Some("the answer was lost".into()),
+                    ..record
+                },
+            )
+            .expect("a record with no handle");
+
+        volumes.deprovision(made).await.expect("deprovisioned");
+        assert!(
+            !path.exists(),
+            "the backend was asked and the bytes it had went with the answer"
+        );
+        assert_eq!(
+            volumes.get(&made).unwrap().unwrap().phase,
+            VolumeRecordPhase::Gone
+        );
+
+        // And one the backend really has nothing for: the same tombstone, no
+        // error, because the guard may not turn a clean absence into a
+        // volume that never converges.
+        let never = VolumeId::new_v4();
+        store
+            .put_volume(
+                &never,
+                &VolumeRecord {
+                    spec: spec(4096),
+                    handle: None,
+                    phase: VolumeRecordPhase::Provisioning,
+                    reason: Some(VolumeReason::Working),
+                    message: None,
+                    gone_at: None,
+                },
+            )
+            .expect("an intent nothing followed");
+        volumes.deprovision(never).await.expect("tombstoned");
+        assert_eq!(
+            volumes.get(&never).unwrap().unwrap().phase,
+            VolumeRecordPhase::Gone
+        );
+
+        // The snapshot half, the same way round: a copy on the pool under a
+        // record that never got its handle.
+        let volume = VolumeId::new_v4();
+        volumes.provision(volume, spec(4096)).await.expect("made");
+        let snapshot = SnapshotId::new_v4();
+        volumes
+            .snapshot(snapshot, volume)
+            .await
+            .expect("a snapshot");
+        let copy = dir.join(format!("{snapshot}.snap"));
+        assert!(copy.exists());
+        let taken = store.get_snapshot(&snapshot).unwrap().unwrap();
+        store
+            .put_snapshot(
+                &snapshot,
+                &SnapshotRecord {
+                    handle: None,
+                    phase: SnapshotRecordPhase::Failed,
+                    reason: Some(SnapshotReason::DriverRefused),
+                    message: Some("the answer was lost".into()),
+                    ..taken
+                },
+            )
+            .expect("a snapshot record with no handle");
+
+        volumes.drop_snapshot(snapshot).await.expect("dropped");
+        assert!(!copy.exists(), "the copy went with the drop");
+        assert_eq!(
+            store.get_snapshot(&snapshot).unwrap().unwrap().phase,
+            SnapshotRecordPhase::Gone
+        );
     }
 }

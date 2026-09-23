@@ -244,6 +244,14 @@ impl agent_api::storage::VolumeProvider for PlainDisk {
         self.deprovisioned.lock().unwrap().push(h.id);
         Ok(())
     }
+    /// A fake that keeps no bytes holds none under any id.
+    async fn probe(
+        &self,
+        _: &VolumeId,
+        _: &agent_api::storage::VolumeSpec,
+    ) -> agent_api::storage::Result<Option<agent_api::storage::VolumeHandle>> {
+        Ok(None)
+    }
     async fn forget(&self, h: &agent_api::storage::VolumeHandle) -> agent_api::storage::Result<()> {
         self.forgotten.lock().unwrap().push(h.id);
         Ok(())
