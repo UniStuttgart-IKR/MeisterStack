@@ -60,6 +60,9 @@ struct TableLook {
     txns: RefCell<BTreeMap<String, Txn>>,
     /// Hosts that never come back from their reboot.
     lost: RefCell<BTreeSet<String>>,
+    /// How many more looks this host's etcd needs before it answers, the
+    /// way a real one does after a reboot (lane 4A).
+    etcd_late: RefCell<BTreeMap<String, u32>>,
     /// Hosts whose activation leaves the record a real one leaves: pending,
     /// waiting for a word.
     keeps_the_record: RefCell<BTreeSet<String>>,
@@ -86,6 +89,7 @@ impl TableLook {
             broken: RefCell::new(BTreeSet::new()),
             txns: RefCell::new(BTreeMap::new()),
             lost: RefCell::new(BTreeSet::new()),
+            etcd_late: RefCell::new(BTreeMap::new()),
             keeps_the_record: RefCell::new(BTreeSet::new()),
             from_outside: RefCell::new(BTreeSet::new()),
             asked: RefCell::new(Vec::new()),
@@ -142,6 +146,16 @@ impl TableLook {
         );
         self
     }
+
+    // --- lane 4A ---
+    /// This host's etcd answers only after `looks` more looks — which is
+    /// what a controller does after a reboot: sshd is up seconds before
+    /// the database is.
+    fn etcd_late(self, id: &str, looks: u32) -> TableLook {
+        self.etcd_late.borrow_mut().insert(id.to_string(), looks);
+        self
+    }
+    // --- end lane 4A ---
 
     /// This host is told to reboot and never comes back.
     fn never_returns(self, id: &str) -> TableLook {
@@ -213,6 +227,21 @@ impl Look for TableLook {
             obs.units
                 .insert("meister-agent.service".to_string(), "failed".to_string());
         }
+        // --- lane 4A ---
+        // A member that has not answered yet reports no members at all,
+        // which is what `observe::etcd_view` makes of a unit that is not
+        // active.
+        if let Some(left) = self.etcd_late.borrow_mut().get_mut(&id)
+            && *left > 0
+        {
+            *left -= 1;
+            obs.etcd = Some(crate::observation::EtcdView {
+                member_id: None,
+                healthy: false,
+                members: Vec::new(),
+            });
+        }
+        // --- end lane 4A ---
         if let Some(txn) = self.txns.borrow().get(&id) {
             obs.open_txns = vec![txn.clone()];
         }
@@ -2156,5 +2185,46 @@ fn a_store_that_filled_up_between_the_plan_and_the_run_stops_before_the_copy() {
         preflight.evidence.join(" ").contains("2000000000"),
         "{:?}",
         preflight.evidence
+    );
+}
+
+#[test]
+fn a_raft_member_is_not_back_until_its_database_is() {
+    // What `vm-kernel-change` found on a machine that had just rebooted:
+    // sshd answered at five seconds into the boot and etcd at thirteen,
+    // and in that window the host's own member list is EMPTY. The quorum
+    // arithmetic reads that as a member that is down and the topology
+    // check read it as a fleet that had changed — so the rollout stopped
+    // in the middle of the reboot it had asked for. `wait_for_boot` now
+    // waits for the database of a raft member, not only for the machine.
+    let fx = Fixture::changing(&["box"], true);
+    let look = TableLook::new(&fx).etcd_late("box", 2);
+    let runner = World::new(StrictFake::new(), &look);
+    let executor = fx.executor(&runner, &look, fx.options());
+
+    assert!(
+        executor.is_raft_member("box"),
+        "box is the raft group of this fixture"
+    );
+    assert!(
+        !executor.is_raft_member("n1"),
+        "n1 is compute, and its etcd is nobody's business"
+    );
+
+    // The machine has booted the release from the very first look; its
+    // database has not.
+    look.set("box", Phase::After);
+    let back = executor
+        .wait_for_boot("box", &fx.top("box"))
+        .expect("it does come back");
+    assert_eq!(back, fx.top("box"));
+    assert_eq!(
+        look.etcd_late.borrow()["box"],
+        0,
+        "it returned before the database had answered"
+    );
+    assert!(
+        !fx.clock.slept().is_empty(),
+        "a bounded wait that never sleeps is a spin"
     );
 }

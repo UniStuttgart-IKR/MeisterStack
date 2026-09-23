@@ -1412,6 +1412,26 @@ fn topology_verdict(
         let Some(etcd) = observation.host(member).and_then(|o| o.etcd.as_ref()) else {
             continue;
         };
+        // --- lane 4A ---
+        // An EMPTY member list is not an answer. `etcdctl member list` on
+        // a member that is running always names at least itself, so an
+        // empty list means the probe could not ask — the unit is down, or
+        // the machine has just rebooted and etcd has not started yet.
+        // Reading that as "the membership is empty" turns a member that is
+        // down into a MEMBERSHIP CHANGE, which is a different and much
+        // worse verdict, and it blocks the whole group.
+        //
+        // Measured in `vm-kernel-change`: a host came back from the reboot
+        // this very rollout asked for, sshd answered at five seconds and
+        // etcd at thirteen, and the run stopped with "the etcd membership
+        // of group cp is nothing and the fleet declares target". The
+        // `anybody_answered` guard below was meant for exactly this case
+        // and did not catch it, because a member whose unit is down still
+        // produces a view (`observe::etcd_view`).
+        if etcd.members.is_empty() {
+            continue;
+        }
+        // --- end lane 4A ---
         anybody_answered = true;
         for m in &etcd.members {
             observed
@@ -5346,6 +5366,59 @@ mod tests {
             "{:?}",
             action(&plan, "n1", ActionKind::Preflight).preconditions
         );
+    }
+
+    #[test]
+    fn a_member_that_could_not_be_asked_is_not_an_empty_membership() {
+        // What `vm-kernel-change` found: a host came back from the reboot
+        // this rollout asked for, sshd answered before etcd did, and its
+        // member list was empty. An empty list is "nobody could ask" — a
+        // live member always names at least itself — and reading it as a
+        // membership change blocks the whole group for a machine that is
+        // merely still starting.
+        let release = release_of(onebox_enrolled());
+        let mut observation = observed(&release, at(TAKEN));
+        let etcd = observation.hosts.get_mut("box").unwrap().etcd.as_mut();
+        let etcd = etcd.expect("box is a raft member");
+        etcd.members.clear();
+        etcd.healthy = false;
+        etcd.member_id = None;
+        let plan = planned(&release, "all", &observation);
+        let group = &plan.groups["box"];
+        // Down, yes — and a singleton has no budget to lose, so it is not
+        // blocked by that. What it must NOT say is that the fleet changed.
+        assert_eq!(group.unhealthy_now, 1, "{group:?}");
+        assert!(
+            group.blocked.is_none(),
+            "a member that is starting is not a membership change: {:?}",
+            group.blocked
+        );
+    }
+
+    #[test]
+    fn a_membership_that_really_moved_still_blocks() {
+        // The other side of the same coin: a member that ANSWERED with a
+        // list that is not the declared one is exactly what the check is
+        // for, and it still fires.
+        let release = release_of(onebox_enrolled());
+        let mut observation = observed(&release, at(TAKEN));
+        let etcd = observation
+            .hosts
+            .get_mut("box")
+            .unwrap()
+            .etcd
+            .as_mut()
+            .expect("box is a raft member");
+        etcd.members.push(crate::observation::EtcdMember {
+            id: "9".to_string(),
+            name: "somebody-else".to_string(),
+            peer_urls: vec!["https://10.0.0.99:2380".to_string()],
+            healthy: true,
+        });
+        let plan = planned(&release, "all", &observation);
+        let why = plan.groups["box"].blocked.clone().unwrap_or_default();
+        assert!(why.contains("somebody-else"), "{why}");
+        assert!(why.contains("membership"), "{why}");
     }
 
     // --- lane 4A: the units the operator owns -------------------------------

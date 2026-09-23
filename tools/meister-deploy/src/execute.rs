@@ -1515,6 +1515,17 @@ impl<'a> Executor<'a> {
     /// `known_hosts` (D10), so a machine with another key does not answer at
     /// all — and the `identity` comparison in
     /// [`crate::plan::validate_against`] catches the rest.
+    // --- lane 4A ---
+    /// Whether this host is a member of a raft group of this fleet — and
+    /// therefore a host whose etcd is part of what "back" means.
+    fn is_raft_member(&self, id: &str) -> bool {
+        let fleet = &self.release.resolved_fleet;
+        fleet.groups.values().any(|group| {
+            group.kind == crate::manifest::GroupKind::Raft && group.members.iter().any(|m| m == id)
+        })
+    }
+    // --- end lane 4A ---
+
     fn wait_for_boot(&self, id: &str, desired: &str) -> Result<String> {
         let started = self.clock.now();
         // What the last look said, for the sentence a person reads when the
@@ -1523,6 +1534,25 @@ impl<'a> Executor<'a> {
         loop {
             match self.observe_one(id) {
                 Ok(obs) if obs.reachable => match obs.booted_system.as_deref() {
+                    // --- lane 4A ---
+                    // A controller that has rebooted is not back until its
+                    // database is back. sshd answers seconds before etcd
+                    // does (measured in `vm-kernel-change`: sshd at five
+                    // seconds into the boot, etcd at thirteen), and in that
+                    // window the host's own member list is EMPTY — which
+                    // the quorum arithmetic reads as a member that is down
+                    // and the topology check read as a fleet that has
+                    // changed. Waiting here is cheaper and truer than
+                    // teaching two later rules about a machine that is
+                    // merely still starting.
+                    Some(booted)
+                        if booted == desired
+                            && self.is_raft_member(id)
+                            && !obs.etcd.as_ref().is_some_and(|e| e.healthy) =>
+                    {
+                        last = "it booted the release and its etcd has not answered yet".to_string()
+                    }
+                    // --- end lane 4A ---
                     Some(booted) if booted == desired => return Ok(booted.to_string()),
                     Some(other) => last = format!("it booted {other}"),
                     None => last = "it answered and could not say what it booted".to_string(),
