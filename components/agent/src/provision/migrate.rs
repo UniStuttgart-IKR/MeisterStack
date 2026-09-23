@@ -443,9 +443,31 @@ impl Provisioner {
         // for the same reason `create` does it: the process has to be inside
         // the guest's allowance before the guest's memory arrives, and the
         // whole of a migrating guest's memory arrives at once.
+        //
+        // And the failure is handled the way `create` handles it — kill the
+        // process, answer with the error — rather than warned about. Astra
+        // finding S17, 2026-09-23: this used to log and carry on, so the
+        // record went to `Receiving` with a VMM outside the guest's
+        // allowance, and the whole of a guest's memory then arrived into a
+        // process the node's accounting does not cover. It is also the one
+        // failure that leaves nothing behind to repair it: the pid is not on
+        // the record yet, so a teardown that ran later would tear down every
+        // part of this reception EXCEPT the VMM, and what is left is a
+        // listening process nobody has a record of.
         if let Err(e) = cgroup.attach_pid(vmm_pid) {
             warn!(error = %format!("{e:#}"), pid = vmm_pid,
-                      "could not put the receiving vmm in its slice");
+                  "could not put the receiving vmm in its slice; ending it");
+            // Best effort and logged, not propagated: the error the caller
+            // has to see is the one that made this reception impossible, and
+            // the teardown the caller runs next asks for this again.
+            if let Err(gone) = timed_driver(HYPERVISOR, "destroy", hypervisor.destroy(id)).await {
+                error!(error = %format!("{gone:#}"), pid = vmm_pid,
+                       "and the receiving vmm could not be ended either");
+            }
+            record.vmm_pid = None;
+            return Err(anyhow::Error::new(e).context(format!(
+                "putting the receiving vmm for vm {id} in its slice"
+            )));
         }
         record.phase = Phase::Receiving;
         // And the moment this node stops waiting. Written down beside the

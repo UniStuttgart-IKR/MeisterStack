@@ -473,6 +473,93 @@ fn migrating_provisioner_over(
     )
 }
 
+/// A confiner whose slices are not where it says they are.
+///
+/// `create_slice` hands back a handle naming a directory nothing ever made,
+/// so `attach_pid` fails with ENOENT — which is what a cgroup2 root that was
+/// unmounted or shadowed under a running agent looks like from up here, and
+/// the only way to reach that arm: the real `CgroupV2` under a temp directory
+/// makes ordinary directories, and a write into one of those succeeds.
+struct SlicelessConfiner(std::path::PathBuf);
+
+impl agent_api::ResourceConfiner for SlicelessConfiner {
+    fn create_slice(
+        &self,
+        name: &str,
+        _: Option<&agent_api::CgroupHandle>,
+        _: &agent_api::ResourceLimits,
+    ) -> agent_api::ConfinerResult<agent_api::CgroupHandle> {
+        Ok(self.open_slice(name))
+    }
+    fn destroy_slice(&self, _: &agent_api::CgroupHandle) -> agent_api::ConfinerResult<()> {
+        Ok(())
+    }
+    fn open_slice(&self, name: &str) -> agent_api::CgroupHandle {
+        agent_api::CgroupHandle {
+            path: self.0.join("no-such-cgroup-root").join(name),
+        }
+    }
+    fn pids_in_slice(&self, _: &str) -> agent_api::ConfinerResult<Vec<u32>> {
+        Ok(Vec::new())
+    }
+    fn kill_slice(&self, _: &str) -> agent_api::ConfinerResult<()> {
+        Ok(())
+    }
+}
+
+/// A reception that cannot put its VMM in the guest's slice ends the VMM and
+/// says so, rather than storing a record that says it is listening.
+///
+/// Astra finding S17, 2026-09-23. The attach failure was a WARN, and the
+/// record then went to `Receiving` with a VMM outside the guest's allowance —
+/// the whole of a migrating guest's memory arrives at once, into a process
+/// the node's accounting does not cover. Worse, the pid is not on the record
+/// at that point, so nothing left behind could have repaired it: a teardown
+/// would have given back the disks, the taps and the record and left a
+/// listening VMM nobody had a row for. `create` has always killed the process
+/// and returned the error (`process.rs`, `create_vm`), and this is the same
+/// shape.
+#[tokio::test]
+async fn a_receiver_that_cannot_enter_its_slice_is_not_stored_as_ready() {
+    let (_temp, root) = migration_root("mig-no-slice");
+    let store = Arc::new(crate::store::Store::open(&root.join("a.redb")).expect("a store"));
+    let hv = Arc::new(MigratingVmm::new(true));
+    let mut drivers = migrating_drivers(&root, hv.clone());
+    drivers.confiner = Arc::new(SlicelessConfiner(root.clone()));
+    let p = provisioner_over(&root, store.clone(), drivers);
+
+    let id = VmId::new_v4();
+    let err = p
+        .prepare_migration(id, migratable_spec(&store), "127.0.0.1:9000", true)
+        .await
+        .expect_err("a vmm that cannot enter its slice is not a reception");
+    assert!(
+        format!("{err:#}").contains("in its slice"),
+        "the error names what could not be done: {err:#}"
+    );
+
+    // The VMM was ended, not left listening.
+    assert!(
+        hv.said().iter().any(|l| l == "destroy"),
+        "the receiving vmm has to be ended: {:?}",
+        hv.said()
+    );
+    use agent_api::hypervisor::Hypervisor as _;
+    assert!(
+        hv.strays(&[]).await.is_empty(),
+        "and nothing of it is left running"
+    );
+
+    // And nothing on the store says this node is waiting for a guest. The
+    // teardown removes the record outright; a record that survived one would
+    // still have to be neither `Receiving` nor carrying a pid.
+    if let Some(record) = store.get(&id).expect("a read") {
+        assert_ne!(record.phase, Phase::Receiving, "{record:?}");
+        assert_eq!(record.vmm_pid, None, "{record:?}");
+        assert_eq!(record.receive_deadline, None, "{record:?}");
+    }
+}
+
 /// A directory of this test's own, and the guard that removes it again.
 ///
 /// The guard comes back with the path and every caller binds it: it owns the
