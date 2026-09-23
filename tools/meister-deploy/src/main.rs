@@ -3054,12 +3054,33 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
         eprint!("{}", what_is_left(&applied.receipt, &state, &run_id));
     }
     // --- end lane 5C ------------------------------------------------------
-    match (applied.receipt.outcome, applied.blocked.is_empty()) {
-        (receipt::Outcome::Success, true) => Ok(Answer::Yes),
+    Ok(answer_for(
+        applied.receipt.outcome,
+        applied.blocked.is_empty(),
+        applied.stopped.is_some(),
+    ))
+}
+
+/// What a finished `apply` exits with.
+///
+/// Astra finding F06, 2026-09-23: the stop reason was not in this. A run
+/// over ONE host that confirmed the activation and then failed its
+/// `uncordon` leaves that host `committed`, and a receipt whose every host
+/// is forward is a `success` — so the run printed the failure on stderr,
+/// wrote a receipt that says success, and exited 0. A script could not tell
+/// it from a rollout that came through, and the host was left cordoned with
+/// an open transaction record on it.
+///
+/// The receipt is about the HOSTS and stays that way; the exit code is
+/// about the RUN, and a run that stopped did not come through.
+fn answer_for(outcome: receipt::Outcome, nothing_blocked: bool, stopped: bool) -> Answer {
+    match (outcome, nothing_blocked, stopped) {
+        (_, _, true) => Answer::No,
+        (receipt::Outcome::Success, true, false) => Answer::Yes,
         // It worked, and the plan refused to touch something. Exit 2 is
         // "blocked", which a script can tell from "this tool broke".
-        (receipt::Outcome::Success, false) => Ok(Answer::Blocked),
-        _ => Ok(Answer::No),
+        (receipt::Outcome::Success, false, false) => Answer::Blocked,
+        _ => Answer::No,
     }
 }
 
@@ -5540,5 +5561,27 @@ fn validate_manifest(from: &str) -> Result<bool> {
             eprintln!("meister-deploy: {e:#}");
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Astra finding F06, 2026-09-23.
+    #[test]
+    fn a_run_that_stopped_does_not_exit_zero() {
+        use receipt::Outcome;
+        // The measured shape: one host, its activation confirmed, and the
+        // `uncordon` after it failed. Every host of the receipt is forward,
+        // so the receipt says success — and the run did not come through.
+        assert_eq!(answer_for(Outcome::Success, true, true), Answer::No);
+        // A run that stopped is a failure even where the plan also refused
+        // something: "it stopped" is the louder of the two.
+        assert_eq!(answer_for(Outcome::Success, false, true), Answer::No);
+        // And the three answers a run that did not stop still gives.
+        assert_eq!(answer_for(Outcome::Success, true, false), Answer::Yes);
+        assert_eq!(answer_for(Outcome::Success, false, false), Answer::Blocked);
+        assert_eq!(answer_for(Outcome::Partial, true, false), Answer::No);
     }
 }
