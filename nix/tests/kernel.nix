@@ -442,6 +442,7 @@ pkgs.testers.runNixOSTest {
     assert activate["rollback"]["mode"] == "switch", activate
     assert "reboot" not in {a["class"] for a in the_plan["approvals"]}, the_plan["approvals"]
 
+    desired_c = read(release_c)["artifacts"]["target"]["toplevel"]["store_path"]
     operator.succeed(apply_cmd(plan_c, release_c))
     receipt = receipt_of(last_run())
     assert receipt["outcome"] == "success", receipt
@@ -449,7 +450,16 @@ pkgs.testers.runNixOSTest {
     # The boot id did NOT move: an ordinary switch is an ordinary switch,
     # even on a machine that rebooted five minutes ago.
     assert boot_id() == second_boot, "a service change rebooted the machine"
-    assert booted() == current(), "a switch left the machine running something else"
+    # And a switch is a switch: what the machine RUNS moved, what it BOOTED
+    # did not. Those are two facts and the planner keeps them apart — the
+    # next plan over C is therefore the reboot that makes them one, and
+    # nothing else (the same shape nix/tests/update.nix pins).
+    assert current() == desired_c, (current(), desired_c)
+    assert booted() == desired, "a switch must not change what was booted"
+    pending = read(make_plan(release_c, "pending"))
+    assert pending["hosts"]["target"]["verdict"] == "change", pending["hosts"]
+    steps = [a["kind"] for a in pending["actions"] if a["blocked"] is None]
+    assert "reboot" in steps and "stage" not in steps and "activate" not in steps, steps
 
     # --- a host that said no ------------------------------------------------
     #
@@ -475,9 +485,16 @@ pkgs.testers.runNixOSTest {
     assert "reboot = never" in why, why
     assert "does not reboot a machine that said no" in why, why
     print("reboot = never: " + why)
-    # Blocked is not broken: the two steps that only look are still there.
-    free = {a["kind"] for a in never["actions"] if a["blocked"] is None}
-    assert free == {"preflight", "verify"}, free
+    # Blocked is not broken, and `reboot = never` is a `stop_disruptive`:
+    # it holds what INTERRUPTS. Looking is free, and so is copying a
+    # closure onto the machine — the same rule the quorum test measures.
+    def blocked_of(kind):
+        return [a["blocked"] for a in never["actions"] if a["kind"] == kind]
+
+    for kind in ["preflight", "verify"]:
+        assert blocked_of(kind) and all(b is None for b in blocked_of(kind)), kind
+    for kind in ["activate", "reboot"]:
+        assert blocked_of(kind) and all(b is not None for b in blocked_of(kind)), kind
     # And nothing happened to the machine over all of it.
     assert boot_id() == second_boot
     assert generation() == "C"
