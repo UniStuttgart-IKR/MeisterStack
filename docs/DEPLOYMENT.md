@@ -622,6 +622,27 @@ txn list` and `txn show` on the host tell you which generation it is on, and
 `meister-activate revert` puts it back. (Lane 5C is adding `txn retire
 --force` for the inconsistent case; until that is merged this is by hand.)
 
+**What the `state` of a transaction record means.** Every state but the last
+two is open: an open record blocks the next plan for that host and is not
+retired until somebody has said how it ended.
+
+| state | the machine | what finishes it |
+|---|---|---|
+| `staged` | untouched; the closure is there | `txn retire`, or an `activate` that carries on |
+| `pending` | on the new system, revert timer armed | `confirm` keeps it, `revert` or the deadline takes it back |
+| `confirming` | on the new system; a `confirm` began and did not finish | `confirm` again — it is idempotent and stops the timer if it is still armed. The deadline does **not** take such a host back: somebody decided, and the decision was written down before the timer was stopped. An operator's `revert` refuses it and names `revert --force --because "<why>"` for the case where the host has to go back anyway. |
+| `reverting` | on either system; a `revert` began and did not finish | `revert` again — the same profile and the same switch, safe to repeat. Nothing confirms this state. |
+| `confirmed` | on the new system, no timer | `txn retire` (the run that owns it) |
+| `reverted` | on the previous system | `txn retire` |
+| `inconsistent` | unknown | read it, then `txn retire --force --reason "<what you found>"` |
+
+The two `-ing` states exist because a decision used to be carried out before
+it was written down (Astra finding F07): a process that died between stopping
+the revert timer and writing `confirmed` left a record saying `pending` on a
+host that had no way back any more, and nothing anywhere said that a decision
+had been in flight. A resume reads `confirming` as "verify, then confirm" and
+never as a case for a person.
+
 **Never release a lock by waiting.** Locks in this tool are never released by
 a timeout — a lock whose owner is dead is still a statement that a run got
 that far.
@@ -637,6 +658,8 @@ meister-activate status --json        # current / booted / next-boot, generation
 meister-activate txn list
 meister-activate revert --txn <id>    # back to the previous system (the id: `txn list`)
 meister-activate confirm --txn <id>   # keep the current one, cancel the revert timer
+                                      # …and it finishes a `confirming` record
+meister-activate revert --txn <id> --force --because "<why>"   # over a confirmation in flight
 meister-activate lock show
 meister-activate lock release --run <run-id>   # the run id is in `lock show`
 meister-activate gc --keep 3
