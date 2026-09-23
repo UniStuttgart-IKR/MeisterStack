@@ -703,7 +703,15 @@ pub(super) async fn ingest_attachments(
         .iter()
         .filter_map(|r| {
             let vm = vms.iter().find(|v| v.metadata.uid == r.id)?;
-            (ours(vm) && !vm.spec.referenced_volumes().is_empty()).then_some((vm, r))
+            // Astra finding S18, 2026-09-23: a spec that no longer
+            // references any disk still needs its LAST report, or a stale
+            // `status.volumes` entry from before the spec was cleared is
+            // never rewritten — `observed_attachments` returns `[]` for an
+            // empty spec, and that is what clears it, but only if the vm is
+            // still let through here to receive one.
+            let has_something_to_settle =
+                !vm.spec.referenced_volumes().is_empty() || !vm.status.volumes.is_empty();
+            (ours(vm) && has_something_to_settle).then_some((vm, r))
         })
         .collect();
     if relevant.is_empty() {

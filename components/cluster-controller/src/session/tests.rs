@@ -312,6 +312,76 @@ fn a_hot_plug_closes_when_the_node_reports_the_disks_and_not_when_it_is_told() {
     assert!(observed_attachments(&vm(&[]), &[]).is_empty());
 }
 
+/// Astra finding S18, 2026-09-23: a spec that stops referencing any volume
+/// used to drop the vm out of `ingest_attachments` entirely —
+/// `!vm.spec.referenced_volumes().is_empty()` was the one condition that let
+/// a vm through — so the LAST report before the spec was cleared never got
+/// rewritten and stayed on `status.volumes` forever.
+/// `reconcile::vms::volume_drift` reads that field and disagrees with the
+/// now-empty spec for ever: one release (hot_plug/CreateInstance) every
+/// tick, never converging. `observed_attachments` already answers `[]` for
+/// an empty spec — the fix is letting the vm THROUGH to receive that answer.
+///
+/// `#[ignore]`: the ingest writes the store, and the workspace's ordinary run
+/// has no etcd. See `two_replicas_assigning_at_once_hand_out_two_namespaces`.
+#[tokio::test]
+#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+async fn the_last_volume_removed_from_the_spec_clears_the_status() {
+    let endpoint =
+        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+    let prefix = format!("/attach-test/{}", uuid::Uuid::new_v4());
+    let store = EtcdStore::connect(&[endpoint], &prefix)
+        .await
+        .expect("an etcd to talk to");
+
+    // Running on n1, spec references no disk any more, but the status still
+    // carries the one report wrote before the spec was cleared.
+    let mut web = vm("u-web");
+    web.spec.node_name = Some("n1".into());
+    web.status.volumes = vec![controller_api::VolumeAttachmentStatus {
+        name: "data-1".into(),
+        attached: true,
+    }];
+    web.status.reported = Some(controller_api::VmReported::by(
+        "n1",
+        VmPhaseKind::Running,
+        controller_api::VmReason::Unrecorded,
+        None,
+        chrono::Utc::now(),
+    ));
+    let created = store.create(&web).await.expect("the vm");
+    let vms = vec![created];
+
+    // The node's report: no disks attached, matching the empty spec.
+    let report = StatusReport {
+        vms: vec![proto::VmStatusReport {
+            attached_volumes: Vec::new(),
+            ..line("u-web")
+        }],
+        ..Default::default()
+    };
+    let ours = |v: &Vm| {
+        v.spec
+            .node_name
+            .as_deref()
+            .is_none_or(|bound| bound == "n1")
+    };
+    ingest_attachments(&store, &vms, &report, ours, chrono::Utc::now())
+        .await
+        .expect("attachment ingest");
+
+    let after: Vm = store.get("u-web").await.expect("the vm");
+    assert!(
+        after.status.volumes.is_empty(),
+        "the stale entry must clear: {:?}",
+        after.status.volumes
+    );
+    assert!(
+        crate::reconcile::volume_drift(&after).is_none(),
+        "an empty spec and an empty status agree; nothing left to release"
+    );
+}
+
 /// A destination that tore a failed migration down comes off `openOn`.
 ///
 /// The books said `openOn: ["agent-1a","agent-1b"]` while agent-1b held no
