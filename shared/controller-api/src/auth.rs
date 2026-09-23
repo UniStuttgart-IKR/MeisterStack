@@ -578,6 +578,25 @@ impl Revocations {
         &self.path
     }
 
+    /// Read the list and say what it holds, without keeping it.
+    ///
+    /// What `--check-config` needs: the file a running controller would
+    /// refuse to start without is read by the same code, so that the answer
+    /// is the same answer. A summary and not a bool, because "12 revoked
+    /// serials, crl number 4" is what tells an operator whether the file
+    /// they are looking at is the one they just wrote.
+    pub fn check(path: &Path) -> anyhow::Result<String> {
+        let list = Self::read(path, Utc::now())?;
+        Ok(format!(
+            "{}: {} revoked serial(s), crl number {}",
+            path.display(),
+            list.serials.len(),
+            list.crl_number
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ))
+    }
+
     /// A copy of what is currently enforced.
     pub fn list(&self) -> RevocationList {
         self.list.read().expect("revocation list").clone()
