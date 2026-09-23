@@ -648,12 +648,21 @@ the trade, and `status` is where the difference shows up.
 
 The lab's twelve OpenNebula VMs boot a generic image and render their
 configuration at boot from a CONTEXT medium. Since M5B none of that is in this
-repository: the image, the renderer, the OpenNebula reader, `push.sh`,
-`check.sh`, the template and `lab.toml` live in
-`~/git/meisterstack-lab/legacy/`, with their own render test (140 checks) and
-a parity proof that the image there is the *same derivation* (72 units, each
-the same store path). `deployment = "context"` is still a valid value here; a
-plan refuses such a host by name and points at that push.
+repository: the image, the renderer, `push.sh`, `check.sh`, the template and
+`lab.toml` live in `~/git/meisterstack-lab/legacy/`, with their own render
+test (140 checks) and a parity proof that the image there is the *same
+derivation* (72 units, each the same store path). `deployment = "context"` is
+still a valid value here; a plan refuses such a host by name and points at
+that push.
+
+What stayed is `nixosModules.provider-opennebula`: READING the medium a
+hypervisor handed a guest is not the same thing as rendering configuration
+at boot, and a managed host can want the first without the second — it was
+instantiated on OpenNebula and gets its address from there. It parses
+`context.sh` with a `KEY='value'` grammar and an allowlist of six keys
+(ETH0_IP/MASK/GATEWAY/DNS, SET_HOSTNAME, SSH_PUBLIC_KEY), never sources it,
+and takes no `MEISTER_*` off the medium: what a machine IS comes from the
+inventory.
 
 The way over, per VM (§8a of the design; **needs the lab, so it needs Silas'
 word**):

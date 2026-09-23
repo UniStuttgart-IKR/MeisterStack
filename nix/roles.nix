@@ -70,6 +70,42 @@ in
       '';
     };
 
+    # --- lane 5B: the one option the boot renderer used to declare ------
+    #
+    # `nix/context.nix` declared it and went with M5B. It stays because
+    # `nix/provider-opennebula.nix` sets it and that module is NOT legacy: a
+    # machine of this fleet can still be instantiated on OpenNebula, and
+    # then something has to read the medium it was handed.
+    #
+    # `context.sources` did NOT come along: it was the renderer's own list
+    # of files to read, nothing outside `nix/context.nix` ever set it or
+    # read it, and a declared option with no reader is a promise nobody
+    # keeps (measured against the merged tree, 2026-09-23).
+    #
+    # NOTE FOR THE MERGE: lane 5C moves this same declaration here for the
+    # same reason (its finding N5, `managed-may-read-its-provider`) and
+    # brings the CONSUMER with it — a minimal `meister-provider-context.service`
+    # in nix/services.nix. Keep 5C's block and drop this one; this block is
+    # a strict subset of it.
+    context.providerScript = lib.mkOption {
+      type = lib.types.lines;
+      default = "";
+      description = ''
+        Shell run before anything else reads a context: a provider's chance
+        to say where this machine was booted.
+
+        Empty (the default) is a machine whose whole context is its baked
+        files. `nixosModules.provider-opennebula` is the one implementation
+        today, and it is deliberately NOT part of `nixosModules.default`: a
+        reader that knows how to mount a CONTEXT cd is a reader that cannot
+        be used anywhere else.
+
+        What it may do is set MEISTER_* variables and configure the
+        interface it owns. What it must not do is render a config file.
+      '';
+    };
+    # --- end lane 5B ---------------------------------------------------
+
     context.defaults = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = { };

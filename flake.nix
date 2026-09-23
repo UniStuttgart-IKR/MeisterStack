@@ -82,16 +82,28 @@
       #              complete at build time, no renderer. `lib.mkFleet` gives
       #              it to every host the inventory calls `nixos`.
       #
-      # There used to be two more, `appliance` and `context`, and with them
-      # `provider-opennebula`: the image the twelve OpenNebula VMs of the lab
-      # boot, which renders its configuration files AT BOOT out of a context
-      # its provider hands it. They went with M5B (lane L3 has the parity
-      # evidence) and live in `~/git/meisterstack-lab/legacy/nix/`, which is
-      # where the fleet that boots them lives. A machine of THIS flake is a
-      # machine whose configuration was decided when it was built.
+      # There used to be two more: `appliance`, the image the twelve
+      # OpenNebula VMs of the lab boot, and `context`, the renderer that
+      # writes their configuration files AT BOOT out of a medium. They went
+      # with M5B (lane L3 has the parity evidence) and live in
+      # `~/git/meisterstack-lab/legacy/nix/`, which is where the fleet that
+      # boots them lives. A machine of THIS flake is a machine whose
+      # configuration was decided when it was built.
+      #
+      # `provider-opennebula` did NOT go with them (L3 finding B2): reading
+      # the medium a hypervisor handed a guest is not the same thing as
+      # rendering config files at boot, and a managed host can want the
+      # first without the second.
       nixosModules = {
         services = ./nix/services.nix;
         managed = ./nix/managed.nix;
+        # The reader of an OpenNebula CONTEXT medium. NOT in `default`, and
+        # not legacy either: a machine of this fleet can be instantiated on
+        # OpenNebula and then something has to read what it was handed. It
+        # parses `context.sh` with a `KEY='value'` grammar and an allowlist
+        # of six keys, never sources it, and takes no `MEISTER_*` off the
+        # medium — what a machine IS comes from its inventory.
+        provider-opennebula = ./nix/provider-opennebula.nix;
         default = self.nixosModules.services;
       };
 
@@ -149,11 +161,17 @@
         module-options =
           let
             evaluated = nixpkgs.lib.nixosSystem {
-              # The services plus `managed`: the table documents every option
-              # this flake exports. (It used to be the appliance plus
-              # `managed`, because the appliance declared the renderer's
-              # options; the renderer went with M5B and so did they.)
-              modules = [ self.nixosModules.services self.nixosModules.managed ] ++ [{
+              # Every module this flake exports, so that the table documents
+              # every option it exports. (It used to be the appliance plus
+              # `managed`; the appliance went with M5B, and the provider
+              # reader is named here explicitly because it is the one module
+              # that is not in `default` and still has four options an
+              # operator can set.)
+              modules = [
+                self.nixosModules.services
+                self.nixosModules.managed
+                self.nixosModules.provider-opennebula
+              ] ++ [{
                 nixpkgs.hostPlatform = system;
                 nixpkgs.overlays = [ self.overlays.default ];
                 fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
