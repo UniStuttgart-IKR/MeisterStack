@@ -531,6 +531,55 @@ enum KeysCmd {
         json: bool,
     },
     // --- end lane 5A ----------------------------------------------------
+
+    // --- lane 5B: certificates that are already there -------------------
+    /// Take certificates a CA of this fleet already issued into this
+    /// repository, so that they can be planned, compared and taken back.
+    ///
+    /// For a fleet that existed before this tool did. The certificates are
+    /// under whatever fixed names the old road gave them
+    /// (`system-node-<host>.crt`, `system-cluster-<group>.crt`), and this
+    /// verb is the mapping from those names to host ids — typed by a person,
+    /// because a file name is not an identity and guessing which machine a
+    /// certificate belongs to is exactly the mistake that ends in a host
+    /// presenting somebody else's name.
+    ///
+    /// The PRIVATE half is never copied, never read and never delivered. A
+    /// key that is already on a machine stays on that machine; what arrives
+    /// here is the public certificate, and `secret_refs` calls its source
+    /// `target-generated` — which is the truth: this workstation did not
+    /// make it and cannot make it again.
+    ///
+    /// No network, and therefore no `--offline`.
+    Import {
+        /// The directory the certificates are in
+        #[arg(long)]
+        from: PathBuf,
+        /// `<host id>=<file stem>`, once per certificate. The stem is the
+        /// file name without `.crt`.
+        #[arg(long = "map", value_name = "HOST=STEM")]
+        map: Vec<String>,
+        /// The manifest from `resolve`: it says what each host's subject
+        /// would be, which is what an imported certificate is held to
+        #[arg(long)]
+        manifest: PathBuf,
+        /// The operator's repository, where the certificates land
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// The inventory the `[operator] ca_dir` reference is read from
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+        /// `tools/meister-ca`. Looked up on PATH when it is a bare name.
+        #[arg(long, default_value = "meister-ca")]
+        meister_ca: PathBuf,
+        /// Say what would be imported and import nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as json
+        #[arg(long)]
+        json: bool,
+    },
+    // --- end lane 5B ----------------------------------------------------
 }
 
 /// What `status` and `check` both need: which fleet, which hosts, where
@@ -3510,8 +3559,298 @@ fn keys(cmd: &KeysCmd) -> Result<Answer> {
             json: *json,
         }),
         // --- end lane 5A ---
+        // --- lane 5B ---
+        KeysCmd::Import {
+            from,
+            map,
+            manifest,
+            repo,
+            inventory,
+            meister_ca,
+            dry_run,
+            json,
+        } => keys_import(KeysImportArgs {
+            from,
+            map,
+            manifest,
+            repo,
+            inventory: inventory.as_deref(),
+            meister_ca,
+            dry_run: *dry_run,
+            json: *json,
+        }),
+        // --- end lane 5B ---
     }
 }
+
+// --- lane 5B: certificates that are already there -------------------------
+
+/// Everything `keys import` was told.
+struct KeysImportArgs<'a> {
+    from: &'a Path,
+    map: &'a [String],
+    manifest: &'a Path,
+    repo: &'a Path,
+    inventory: Option<&'a Path>,
+    meister_ca: &'a Path,
+    dry_run: bool,
+    json: bool,
+}
+
+/// What one mapping turned out to be.
+#[derive(serde::Serialize)]
+struct Imported {
+    host: String,
+    stem: String,
+    kind: String,
+    cn: String,
+    serial: Option<String>,
+    not_after: Option<String>,
+    to: String,
+    /// What was found beside the certificate, and what was done about it —
+    /// which is nothing, in every case.
+    private_key: String,
+}
+
+/// Take certificates this fleet's CA already issued into the repository.
+///
+/// Every refusal happens before anything is written, and they are all the
+/// same refusal in different clothes: a certificate is an identity, and one
+/// that lands under the wrong host id is a machine that can speak as
+/// another. So the subject on the file has to be the subject this fleet
+/// would have issued for the host it is being mapped to, and if it is not,
+/// the mapping is wrong and nothing is copied.
+fn keys_import(args: KeysImportArgs<'_>) -> Result<Answer> {
+    use meister_deploy::effects::Entry;
+    use meister_deploy::pki;
+
+    let policy = if args.dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+    let runner = Real::new(policy);
+
+    if args.map.is_empty() {
+        anyhow::bail!(
+            "nothing to import: say which file belongs to which host, once per certificate, \
+             as `--map <host>=<stem>`. The stem is the file name without `.crt` — a lab that \
+             issued `system-node-manacor.crt` for the host `manacor` is \
+             `--map manacor=system-node-manacor`."
+        );
+    }
+    let repo = &std::path::absolute(args.repo)
+        .with_context(|| format!("{} could not be made absolute", args.repo.display()))?;
+    let fleet = read_manifest(&files, args.manifest)?;
+
+    // --- the mappings, before any file is touched ----------------------
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for entry in args.map {
+        let Some((host, stem)) = entry.split_once('=') else {
+            anyhow::bail!(
+                "{entry:?} is not a mapping. It is `<host id>=<file stem>`, for example \
+                 `--map cloud-a=system-cloud-meister`."
+            );
+        };
+        let (host, stem) = (host.trim(), stem.trim());
+        if host.is_empty() || stem.is_empty() {
+            anyhow::bail!("{entry:?} has an empty half.");
+        }
+        if !fleet.hosts.contains_key(host) {
+            anyhow::bail!(
+                "{} names no host {host:?}; it covers {}.",
+                args.manifest.display(),
+                fleet.evaluated_hosts.join(", ")
+            );
+        }
+        if let Some(first) = seen.insert(host.to_string(), stem.to_string()) {
+            anyhow::bail!(
+                "{host} is mapped twice, to {first:?} and to {stem:?}. A host of this fleet \
+                 holds ONE identity certificate and one serving certificate, and which is \
+                 which comes off the subject — so two client certificates for one host is a \
+                 question this tool cannot answer for you."
+            );
+        }
+    }
+
+    // --- read each one, and hold it to the fleet's own subject ---------
+    let mut plan: Vec<(Imported, Vec<u8>)> = Vec::new();
+    for (host, stem) in &seen {
+        let crt = args.from.join(format!("{stem}.crt"));
+        if !files.exists(&crt) {
+            anyhow::bail!(
+                "{} is not there. The directory holds: {}",
+                crt.display(),
+                match files.list_dir(args.from) {
+                    Ok(entries) if !entries.is_empty() => entries
+                        .iter()
+                        .filter_map(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    _ => "nothing this tool can read".to_string(),
+                }
+            );
+        }
+        let described = runner.run(&pki::describe_cmd("openssl", &crt))?;
+        let issued = pki::parse_describe(&described.stdout, &crt.display().to_string());
+        let subject = issued.subject.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "openssl read {} and printed no subject, so nobody can say whose certificate \
+                 it is. It is either not a certificate or not readable.",
+                crt.display()
+            )
+        })?;
+        let cn = pki::cn_of(&subject).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has the subject {subject:?} and no CN in it. Every certificate this \
+                 fleet checks is checked on its CN.",
+                crt.display()
+            )
+        })?;
+        let kind = pki::kind_from_cn(&cn);
+        let wanted = pki::subject_for(&fleet, host, kind, &[])?;
+        if wanted.cn != cn {
+            anyhow::bail!(
+                "{} carries CN={cn}, and a {kind} certificate of {host} in this fleet is \
+                 CN={}. Either the mapping is wrong — that file belongs to another machine — \
+                 or the fleet renamed something since it was issued. Nothing was copied.",
+                crt.display(),
+                wanted.cn
+            );
+        }
+
+        // The private half. It is LOOKED AT and nothing else: not read, not
+        // copied, not delivered. A key that is already on a machine belongs
+        // on that machine, and a key that travelled through a workstation
+        // is a key somebody has to assume is on the workstation.
+        let key = args.from.join(format!("{stem}.key"));
+        let private_key = match files.entry(&key) {
+            Ok(Entry::File { mode }) if mode & 0o077 == 0 => {
+                format!(
+                    "{} is beside it, {:o}, and stays there",
+                    key.display(),
+                    mode
+                )
+            }
+            Ok(Entry::File { mode }) => anyhow::bail!(
+                "{} is mode {:o}: it is readable by somebody who is not its owner. This tool \
+                 will not take the certificate of a key that is lying open — fix the mode \
+                 (`chmod 600`) and decide whether the key has to be replaced, because \
+                 anything that could read it may have.",
+                key.display(),
+                mode
+            ),
+            _ => format!(
+                "{} is not here, which is right when the key is on the target",
+                key.display()
+            ),
+        };
+
+        let to = pki::issued_path(repo, host, &format!("{}.crt", kind.file_stem()));
+        plan.push((
+            Imported {
+                host: host.clone(),
+                stem: stem.clone(),
+                kind: kind.as_str().to_string(),
+                cn,
+                serial: issued.serial.clone(),
+                not_after: issued.not_after.clone(),
+                to: to.display().to_string(),
+                private_key,
+            },
+            files.read(&crt)?,
+        ));
+    }
+
+    // --- and only now, the writes --------------------------------------
+    if args.dry_run {
+        for (what, _) in &plan {
+            println!(
+                "{} <- {}.crt  {} CN={} serial={}",
+                what.to,
+                what.stem,
+                what.kind,
+                what.cn,
+                what.serial.as_deref().unwrap_or("?")
+            );
+        }
+        eprintln!("note: nothing was written and the index was not rebuilt.");
+        return Ok(Answer::Yes);
+    }
+
+    for (what, bytes) in &plan {
+        let to = Path::new(&what.to);
+        files.create_dir_all(to.parent().unwrap_or(repo))?;
+        files.write_atomic(to, bytes, 0o644)?;
+        eprintln!("==> {}", what.to);
+    }
+
+    // The CA's own certificate, if this directory has one and the CA
+    // directory does not. Not overwritten: a CA that already has one is a
+    // CA whose trust anchor is not this import's business.
+    let inventory_file = match args.inventory {
+        Some(path) => inventory_path(repo, path),
+        None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
+    };
+    let parsed = Inventory::load(&files, &inventory_file)?;
+    let named = parsed
+        .operator
+        .as_ref()
+        .and_then(|o| o.ca_dir.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no `[operator] ca_dir`, so this tool does not know which CA these \
+                 certificates belong to — and the index that makes them revocable lives \
+                 there.",
+                inventory_file.display()
+            )
+        })?;
+    let ca = pki::ca_dir(&inventory_file, &named);
+    pki::refuse_ca_in_repo(repo, &ca)?;
+    let ca_crt = args.from.join("ca.crt");
+    if files.exists(&ca_crt) && !files.exists(&ca.join("ca.crt")) {
+        let bytes = files.read(&ca_crt)?;
+        files.create_dir_all(&ca)?;
+        files.write_atomic(&ca.join("ca.crt"), &bytes, 0o644)?;
+        eprintln!("==> {}", ca.join("ca.crt").display());
+    }
+
+    // And the index. Without it `meister-ca --revoke` has nothing to write
+    // into, so an imported certificate would be one this fleet can check
+    // and never take back. The rebuild is additive (M0 finding 7): a
+    // revocation that is already recorded stays recorded.
+    let rebuild = pki::index_rebuild_cmd(args.meister_ca, &ca);
+    runner.run(&rebuild)?;
+    eprintln!("==> {} (index rebuilt)", ca.display());
+
+    let taken: Vec<&Imported> = plan.iter().map(|(what, _)| what).collect();
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&taken)?);
+    } else {
+        for what in &taken {
+            println!(
+                "{:<14} {:<8} CN={} serial={} until {}",
+                what.host,
+                what.kind,
+                what.cn,
+                what.serial.as_deref().unwrap_or("?"),
+                what.not_after.as_deref().unwrap_or("?")
+            );
+        }
+    }
+    eprintln!(
+        "note: {} certificate(s) are in this repository and in the CA's index. No private \
+         key was read or copied: each one stays where it is, and the fleet's manifest calls \
+         its source `target-generated`. Commit `{}`.",
+        taken.len(),
+        pki::ISSUED_DIR
+    );
+    Ok(Answer::Yes)
+}
+
+// --- end lane 5B ----------------------------------------------------------
 
 // --- lane 5B: retiring a host ---------------------------------------------
 
