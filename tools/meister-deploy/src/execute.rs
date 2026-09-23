@@ -1985,12 +1985,20 @@ impl<'a> Executor<'a> {
     /// expected answer rather than an error.
     fn reboot(&self, id: &str) -> Result<Vec<String>> {
         let target = self.target(id)?;
-        let cmd = self
+        let mut cmd = self
             .ssh
             .ask(&target, "systemctl reboot", REMOTE_DEADLINE)
             // 255 is ssh's own "the connection went away", which is what a
             // machine that is rebooting does to it.
             .expect(Expect::AnyExit);
+        // Astra finding F20, 2026-09-23: `ask` tags every command it builds
+        // Effect::Read, correctly, for the probes it exists for — but a
+        // reboot is not a question, and this is the one call to `ask` in
+        // this crate for which that tag is wrong. Corrected here rather
+        // than in `ask` itself, which every genuinely read-only probe still
+        // depends on being Effect::Read (including `--dry-run`, which
+        // admits Read but must keep refusing this).
+        cmd.effect = Effect::TargetWrite;
         let line = cmd.line();
         self.runner.run(&cmd)?;
         Ok(vec![line])

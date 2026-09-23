@@ -327,33 +327,35 @@ fn scan(
     let mut entries = Vec::new();
     for path in &paths {
         let full = repo.join(path);
+        // Astra finding F16, 2026-09-23: `git ls-files -co --exclude-standard`
+        // reads the index, and still lists a file deleted in the working
+        // tree but not staged — `entry` would then fail with a bare "looking
+        // at ... failed", which is git's own answer read back as if this
+        // program had never asked it. Naming the exact, common cause first
+        // is worth a check `entry` cannot make for itself.
+        if !files.is_present(&full) {
+            bail!(
+                "{path} is tracked by git but not in the working tree — most likely deleted \
+                 there and not yet staged; `git ls-files -co --exclude-standard` lists the \
+                 index, not the working tree. `git add {path}` (or `git rm {path}`) if the \
+                 deletion is meant, or restore the file if it is not, then resolve --dev \
+                 again."
+            );
+        }
         let entry = files.entry(&full)?;
-        // Length-prefixed and NUL-separated, so that "ab" + "c" and "a" +
-        // "bc" cannot hash to the same snapshot.
-        hasher.update(path.as_bytes());
-        hasher.update(b"\0");
         match &entry {
-            Entry::File { mode } => {
+            Entry::File { .. } => {
                 let bytes = files.read(&full)?;
-                hasher.update(if mode & 0o111 != 0 { b"fx" } else { b"f-" });
-                hasher.update(b"\0");
-                hasher.update(bytes.len().to_string().as_bytes());
-                hasher.update(b"\0");
-                hasher.update(&bytes);
+                hash_entry(&mut hasher, path, &entry, &bytes);
                 if looks_like_a_secret(path, &bytes) {
                     hits.push(path.clone());
                 }
             }
-            Entry::Symlink { target } => {
+            Entry::Symlink { .. } => {
                 // The link is hashed and copied as a link. Following it would
                 // be how a link to ~/.ssh/id_ed25519 becomes a key in the
                 // store; as a link it stays a dangling name.
-                let target = target.to_string_lossy();
-                hasher.update(b"l");
-                hasher.update(b"\0");
-                hasher.update(target.len().to_string().as_bytes());
-                hasher.update(b"\0");
-                hasher.update(target.as_bytes());
+                hash_entry(&mut hasher, path, &entry, &[]);
                 if named_like_a_secret(path) {
                     hits.push(path.clone());
                 }
@@ -389,6 +391,39 @@ fn is_state_path(path: &str) -> bool {
     path == ".meister-deploy" || path.starts_with(".meister-deploy/")
 }
 
+/// Feed one entry's path, kind and content into a running hash, in the exact
+/// shape `scan` always hashed it in: length-prefixed and NUL-separated, so
+/// that "ab" + "c" and "a" + "bc" cannot hash to the same snapshot. `bytes`
+/// is a file's content, or empty for a symlink (its target is already inside
+/// `entry`).
+///
+/// Astra finding F15, 2026-09-23: shared between `scan`, which hashes what
+/// it just read, and `materialize`, which hashes what it is about to copy —
+/// one scheme, so the two cannot drift apart and silently stop checking the
+/// same thing.
+fn hash_entry(hasher: &mut Sha256, path: &str, entry: &Entry, bytes: &[u8]) {
+    hasher.update(path.as_bytes());
+    hasher.update(b"\0");
+    match entry {
+        Entry::File { mode } => {
+            hasher.update(if mode & 0o111 != 0 { b"fx" } else { b"f-" });
+            hasher.update(b"\0");
+            hasher.update(bytes.len().to_string().as_bytes());
+            hasher.update(b"\0");
+            hasher.update(bytes);
+        }
+        Entry::Symlink { target } => {
+            let target = target.to_string_lossy();
+            hasher.update(b"l");
+            hasher.update(b"\0");
+            hasher.update(target.len().to_string().as_bytes());
+            hasher.update(b"\0");
+            hasher.update(target.as_bytes());
+        }
+        Entry::Other => unreachable!("scan refused it"),
+    }
+}
+
 /// Copy exactly the scanned file set to `.meister-deploy/snapshots/<hash>/`
 /// and return that directory.
 ///
@@ -397,6 +432,13 @@ fn is_state_path(path: &str) -> bool {
 /// the directory rather than in it: a run that died half way leaves no marker,
 /// and the next run rewrites every file over what is there — each write is
 /// atomic, and the set is the same set.
+///
+/// Astra finding F15, 2026-09-23: `scan` hashed the bytes it read once, and
+/// this used to re-read the same files later, trusting that they still held
+/// what was hashed. They are hashed again HERE, as they are copied, with the
+/// same scheme (`hash_entry`) — a file that changed in between no longer
+/// gets published silently under the old hash; the marker is written only
+/// once the fresh hash still matches it.
 fn materialize(
     files: &dyn Files,
     repo: &Path,
@@ -410,6 +452,7 @@ fn materialize(
     }
 
     files.create_dir_all(&dir)?;
+    let mut hasher = Sha256::new();
     for (path, entry) in entries {
         let to = dir.join(path);
         if let Some(parent) = to.parent() {
@@ -418,11 +461,27 @@ fn materialize(
         match entry {
             Entry::File { mode } => {
                 let bytes = files.read(&repo.join(path))?;
+                hash_entry(&mut hasher, path, entry, &bytes);
                 files.write_atomic(&to, &bytes, *mode)?;
             }
-            Entry::Symlink { target } => files.symlink_atomic(target, &to)?,
+            Entry::Symlink { target } => {
+                hash_entry(&mut hasher, path, entry, &[]);
+                files.symlink_atomic(target, &to)?;
+            }
             Entry::Other => unreachable!("scan refused it"),
         }
+    }
+    let rehashed = hex(&hasher.finalize());
+    if rehashed != content_hash {
+        bail!(
+            "the working tree of {} changed while --dev was copying it: it was scanned as {} \
+             and just copied as {}. Something touched a file in between — an editor's \
+             autosave, a build running in the same tree — and this refuses rather than publish \
+             those bytes under the wrong hash. Run resolve --dev again.",
+            repo.display(),
+            content_hash,
+            rehashed
+        );
     }
     files.write_atomic(&marker, content_hash.as_bytes(), 0o644)?;
     Ok(dir)
@@ -925,6 +984,38 @@ mod tests {
         assert_eq!(dev.content_hash.len(), 64);
     }
 
+    /// Astra finding F15, 2026-09-23: `scan` hashes the bytes it reads;
+    /// `materialize` used to re-read the same files later and trust that
+    /// they still held what was hashed. A write landing in that gap must
+    /// not be published silently under the old hash.
+    #[test]
+    fn materialize_refuses_bytes_that_changed_since_the_scan() {
+        let files = base_files().given(repo().join("profiles/new.nix"), "{ }\n");
+        let runner = StrictFake::new()
+            .expect(
+                Matcher::exact("git", ["ls-files", "-co", "--exclude-standard", "-z"]),
+                Output::stdout("fleet.toml\0flake.lock\0profiles/new.nix\0"),
+            )
+            .expect(
+                Matcher::exact("git", ["status", "--porcelain=v1", "-z"]),
+                Output::stdout(""),
+            );
+        let (snapshot, entries) = scan(&runner, &files, &repo()).unwrap();
+        runner.verify().unwrap();
+
+        // The file changes after the scan hashed it and before materialize
+        // copies it — the exact race F15 named.
+        files
+            .write_atomic(&repo().join("profiles/new.nix"), b"{ changed }\n", 0o644)
+            .unwrap();
+
+        let err = materialize(&files, &repo(), &snapshot.content_hash, &entries)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed while --dev was copying"), "{err}");
+        assert!(err.contains(&snapshot.content_hash), "{err}");
+    }
+
     #[test]
     fn a_changed_byte_is_a_changed_snapshot() {
         let a = dirty_dev(
@@ -957,6 +1048,22 @@ mod tests {
         .unwrap()
         .source;
         assert_ne!(a.fingerprint, b.fingerprint, "the path is part of the hash");
+    }
+
+    /// Astra finding F16, 2026-09-23: `git ls-files -co --exclude-standard`
+    /// reads the index, and still lists a file that was deleted in the
+    /// working tree but not staged. `scan` must name that rather than let
+    /// `entry`'s bare "looking at ... failed" stand in for it.
+    #[test]
+    fn a_tracked_file_deleted_but_not_staged_is_a_named_refusal() {
+        // "gone.nix" is in the `ls-files` listing but was never `given` to
+        // this test filesystem — the same shape a real deletion leaves.
+        let files = base_files();
+        let err = dirty_dev(files, "fleet.toml\0gone.nix\0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gone.nix"), "{err}");
+        assert!(err.contains("not in the working tree"), "{err}");
     }
 
     #[test]
@@ -1050,7 +1157,7 @@ mod tests {
         }
         // Nothing under the snapshot mentions the key, and the flake
         // reference names the snapshot.
-        assert!(!crate::nix::flake_ref(&tree.eval_dir, true).contains("keys"));
+        assert!(!crate::nix::flake_ref(&tree.eval_dir, true, None).contains("keys"));
     }
 
     #[test]

@@ -70,6 +70,17 @@ pub trait Files {
     /// What is at this path, without following a link.
     fn entry(&self, path: &Path) -> Result<Entry>;
 
+    /// Whether anything at all is at this exact path — file, symlink or
+    /// other — without following a symlink to ask whether ITS target is
+    /// there too. `exists` follows; this does not.
+    ///
+    /// Astra finding F16, 2026-09-23: a caller that has to tell "this path
+    /// was deleted" apart from "this path is a dangling symlink, which is
+    /// allowed and stays dangling" cannot use `exists` for that — a dangling
+    /// symlink IS present and `exists` says it is not, because it followed
+    /// the link to a target that is not there.
+    fn is_present(&self, path: &Path) -> bool;
+
     /// Make `link` point at `target`, replacing whatever is there. Atomic for
     /// the same reason `write_atomic` is: a snapshot with half a link in it
     /// is a snapshot nix would evaluate.
@@ -236,6 +247,12 @@ impl Files for RealFiles {
         } else {
             Ok(Entry::Other)
         }
+    }
+
+    fn is_present(&self, path: &Path) -> bool {
+        // Same call `entry` makes: it does not follow, so a dangling
+        // symlink answers `true` here and `false` from `exists`.
+        std::fs::symlink_metadata(path).is_ok()
     }
 
     fn symlink_atomic(&self, target: &Path, link: &Path) -> Result<()> {
@@ -496,6 +513,14 @@ impl Files for MemFiles {
             "looking at {} failed: no such file in this test.",
             path.display()
         )
+    }
+
+    fn is_present(&self, path: &Path) -> bool {
+        // The same membership check `entry` makes: nothing here follows a
+        // link to ask whether its target is there too, so this and `exists`
+        // happen to agree in this fake filesystem (unlike `RealFiles`,
+        // where a dangling symlink tells them apart).
+        self.exists(path)
     }
 
     fn symlink_atomic(&self, target: &Path, link: &Path) -> Result<()> {

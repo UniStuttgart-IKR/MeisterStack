@@ -572,6 +572,29 @@ fn kinds(plan: &DeploymentPlan, id: &str) -> Vec<ActionKind> {
 
 // ---------------------------------------------------------------------------
 
+/// Astra finding F20, 2026-09-23: `reboot`'s command has to carry
+/// `Effect::TargetWrite`, not the `Effect::Read` every other `ssh.ask`
+/// caller gets — a `--dry-run` run's policy admits `Offline` and `Read`
+/// only, and a reboot tagged `Read` would have slipped through it.
+#[test]
+fn reboot_is_a_target_write_and_a_dry_run_refuses_it() {
+    let fx = Fixture::unchanged();
+    let look = TableLook::new(&fx);
+    let runner = World::new(StrictFake::new().with_policy(Policy::dry_run()), &look);
+    let err = fx
+        .executor(&runner, &look, fx.options())
+        .reboot("box")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("--dry-run permits only offline and read-only"),
+        "{err}"
+    );
+    // Nothing was matched against the runner's (empty) expectation queue:
+    // the policy gate refused the command before it got that far.
+    assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+}
+
 #[test]
 fn a_host_that_already_runs_the_release_is_journalled_and_not_touched() {
     // V10 at the executor: the plan gives it two steps and neither of them

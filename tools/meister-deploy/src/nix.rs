@@ -48,12 +48,23 @@ pub const EVAL_DEADLINE: Duration = Duration::from_secs(600);
 /// `dir` is the repository itself for a clean tree and the materialized
 /// snapshot for `--dev` — `crate::source::Tree::eval_dir` decides which, and
 /// this function only decides how to spell it.
-pub fn flake_ref(dir: &Path, dev: bool) -> String {
+///
+/// `rev`, for a clean tree, pins the `git+file://` reference to the exact
+/// commit `crate::source::describe` read (Astra finding F15, 2026-09-23): an
+/// unpinned reference has nix read whatever HEAD is at the moment it runs,
+/// which is not necessarily the rev the caller just captured and is about to
+/// put in the manifest. It is ignored for `--dev`, whose `path:` reference
+/// already names an immutable, content-addressed snapshot directory and
+/// needs no commit to pin it to.
+pub fn flake_ref(dir: &Path, dev: bool, rev: Option<&str>) -> String {
     let path = dir.display();
     if dev {
         format!("path:{path}")
     } else {
-        format!("git+file://{path}")
+        match rev {
+            Some(rev) => format!("git+file://{path}?rev={rev}"),
+            None => format!("git+file://{path}"),
+        }
     }
 }
 
@@ -183,19 +194,38 @@ mod tests {
     fn a_clean_tree_is_a_git_flake_and_a_dev_tree_is_a_path_flake() {
         let repo = Path::new("/home/silas/git/meisterstack-lab");
         assert_eq!(
-            flake_ref(repo, false),
+            flake_ref(repo, false, None),
             "git+file:///home/silas/git/meisterstack-lab"
         );
         // A dev run is never handed the repository — `describe` hands it the
         // snapshot — but the spelling is `path:` either way.
         let snapshot = repo.join(".meister-deploy/snapshots/9f2c");
         assert_eq!(
-            flake_ref(&snapshot, true),
+            flake_ref(&snapshot, true, None),
             "path:/home/silas/git/meisterstack-lab/.meister-deploy/snapshots/9f2c"
         );
         // Never the bare path, whichever it is.
-        assert!(!flake_ref(repo, false).starts_with('/'));
-        assert!(!flake_ref(&snapshot, true).starts_with('/'));
+        assert!(!flake_ref(repo, false, None).starts_with('/'));
+        assert!(!flake_ref(&snapshot, true, None).starts_with('/'));
+    }
+
+    /// Astra finding F15, 2026-09-23: a clean tree pins the rev `describe`
+    /// captured, so nix reads exactly that commit rather than whatever HEAD
+    /// happens to be when it runs; a dev tree needs no such pin — its
+    /// `path:` reference already names an immutable snapshot.
+    #[test]
+    fn a_clean_tree_is_pinned_to_the_rev_it_was_read_at() {
+        let repo = Path::new("/home/silas/git/meisterstack-lab");
+        assert_eq!(
+            flake_ref(repo, false, Some("f83cd70")),
+            "git+file:///home/silas/git/meisterstack-lab?rev=f83cd70"
+        );
+        let snapshot = repo.join(".meister-deploy/snapshots/9f2c");
+        assert_eq!(
+            flake_ref(&snapshot, true, Some("f83cd70")),
+            "path:/home/silas/git/meisterstack-lab/.meister-deploy/snapshots/9f2c",
+            "a rev has nothing to pin on a path: reference, and is ignored"
+        );
     }
 
     #[test]
