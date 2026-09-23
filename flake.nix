@@ -329,6 +329,17 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # --- lane 5A ---------------------------------------------------
+          # The exit criterion of lane 5A: a certificate that is taken back
+          # stops working at both ports and in a session that is already
+          # running, without anything being restarted — and the key that
+          # replaces it goes in in five phases that survive a `kill -9`
+          # (M5A, V24, D11).
+          vm-keys-revoke = import ./nix/tests/keys-revoke.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+          # --- end lane 5A -----------------------------------------------
+
           # An empty virtual disk becomes a host that boots itself, and a
           # second medium refuses to do it again (M3A: V06 part 1, V07 —
           # and the boot-mode rollback on a real ESP, which 2C could not

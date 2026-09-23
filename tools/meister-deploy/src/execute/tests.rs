@@ -2540,6 +2540,20 @@ fn a_rotation_is_prepared_overlapped_switched_verified_and_finished() {
     assert!(!journal.contains("BEGIN CERTIFICATE"), "{journal}");
     assert!(!journal.contains("PRIVATE KEY"), "{journal}");
     assert!(journal.contains(&digest), "the digest is the evidence");
+
+    // And the repository caught up with the host: what the planner compares
+    // every host against is now the certificate the host actually holds.
+    // Without this the next ordinary plan would deliver the old one back.
+    assert_eq!(
+        fx.files.content("/repo/pki/issued/box/identity.crt"),
+        Some(NEW_CERT.as_bytes().to_vec())
+    );
+    assert!(
+        fx.files
+            .content("/repo/pki/issued/box/identity.next.crt")
+            .is_none(),
+        "the rotation's file is still lying about"
+    );
 }
 
 /// A key that is not the one the plan was made for stops the run before

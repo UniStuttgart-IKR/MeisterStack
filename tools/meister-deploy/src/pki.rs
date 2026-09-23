@@ -609,6 +609,20 @@ pub fn issued_certs(files: &dyn Files, repo: &Path, host_id: &str) -> Vec<PathBu
         .unwrap_or_default()
         .into_iter()
         .filter(|p| p.extension().is_some_and(|e| e == "crt"))
+        // The ACTIVE ones. A rotation leaves two more behind — the one it
+        // is about (`<kind>.next.crt`) and the one it replaced
+        // (`<kind>.prev.crt`) — and neither of them is what this host is
+        // holding. The replaced one is usually worth taking back as well,
+        // and it is taken back by its serial, deliberately and one at a
+        // time.
+        .filter(|p| {
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            !name.contains(".next.") && !name.contains(".prev.")
+        })
         .collect();
     out.sort();
     out

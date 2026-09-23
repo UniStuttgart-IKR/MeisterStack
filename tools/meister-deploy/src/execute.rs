@@ -1184,17 +1184,40 @@ impl<'a> Executor<'a> {
                 let cmd = self.helper_cmd(id, &["keys", "remove", "--kind", &rotation.kind])?;
                 let line = cmd.line();
                 self.runner.run(&cmd)?;
-                self.end(
-                    journal,
-                    id,
-                    action,
-                    ActionResult::Ok,
-                    vec![format!(
-                        "the {} pair {id} used before this rotation is gone",
-                        rotation.kind
-                    )],
-                    vec![line],
-                )?;
+                // And the repository catches up with the host.
+                //
+                // Until this moment `<kind>.crt` in the repository is the
+                // certificate the host USED to hold, and it is what the
+                // planner compares every host against. Leaving it there
+                // would make the next ordinary plan deliver the old
+                // certificate back over the new one — undoing the rotation,
+                // quietly, in a plan nobody read as a rotation. So the
+                // rotation ends where it began: on this workstation.
+                let mut evidence = vec![format!(
+                    "the {} pair {id} used before this rotation is gone",
+                    rotation.kind
+                )];
+                let active = self
+                    .options
+                    .repo
+                    .join(crate::pki::ISSUED_DIR)
+                    .join(id)
+                    .join(format!("{}.crt", rotation.kind));
+                let source = self.options.repo.join(&rotation.source);
+                if self.files.exists(&source) {
+                    if self.files.exists(&active) {
+                        let previous = active.with_file_name(format!("{}.prev.crt", rotation.kind));
+                        self.files.rename(&active, &previous)?;
+                        evidence.push(format!(
+                            "{} is what {id} held before this rotation; it is still valid \
+                             until somebody takes it back (`keys revoke --serial …`)",
+                            previous.display()
+                        ));
+                    }
+                    self.files.rename(&source, &active)?;
+                    evidence.push(format!("{} is now what {id} holds", active.display()));
+                }
+                self.end(journal, id, action, ActionResult::Ok, evidence, vec![line])?;
                 let fresh = fresh.unwrap_or_else(|| self.plan.observation.clone());
                 self.move_to(journal, id, hosts, HostState::Committed, fresh.host(id))?;
             }
