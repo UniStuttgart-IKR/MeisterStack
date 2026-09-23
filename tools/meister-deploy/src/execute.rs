@@ -1186,13 +1186,18 @@ impl<'a> Executor<'a> {
 
         // And the unit that reads it, if it is running.
         if let Some(reload) = &secret.reload {
-            // `Codes([0, 1, 3])` and not the `ask` default: `systemctl
-            // is-active` answers 3 for a unit that is inactive or failed,
-            // and 3 is the answer this question is asked for. 255 stays an
-            // error, which is how "ssh could not connect" is told apart
-            // from "the unit is not running". (Measured: the first run of
-            // this VM test ended the whole wave on an exit 3 that said
-            // `inactive`.)
+            // `Codes([0, 1, 3, 4])` and not the `ask` default: `systemctl
+            // is-active` answers 3 for a unit that is inactive or failed
+            // and 4 for one this machine does not have, and both are the
+            // answer this question is asked for. 255 stays an error, which
+            // is how "ssh could not connect" is told apart from "the unit
+            // is not running". (Measured twice: the first run of this VM
+            // test ended the whole wave on an exit 3 that said `inactive`,
+            // and the first bootstrap in the lab — 2026-09-23, lane L2 —
+            // ended it on an exit 4, because a fresh host was still running
+            // the generic image and did not HAVE the controller unit yet.
+            // That is what a bootstrap is: the unit arrives with the
+            // closure, after the file it waits for.)
             let active = self.runner.run(
                 &self
                     .ssh
@@ -1204,7 +1209,7 @@ impl<'a> Executor<'a> {
                         ),
                         REMOTE_DEADLINE,
                     )
-                    .expect(Expect::Codes(vec![0, 1, 3])),
+                    .expect(Expect::Codes(vec![0, 1, 3, 4])),
             )?;
             if active.trimmed() == "active" {
                 let cmd = self.ssh.exec(

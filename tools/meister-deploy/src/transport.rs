@@ -200,6 +200,21 @@ impl Ssh {
             // parsed answer.
             "-o".to_string(),
             "LogLevel=ERROR".to_string(),
+            // This workstation's own ssh habits are not this fleet's.
+            // Measured in the lab (lane L2, 2026-09-23): an operator whose
+            // ssh config forwards X11 got
+            // "X11 forwarding request failed on channel 0" on the stderr of
+            // EVERY command, and therefore in the one sentence a failed wave
+            // prints — where it said nothing about the failure and hid what
+            // did. An agent is worse than noise: a rollout that carries a
+            // forwarded key into seventy hosts is a rollout that lends them
+            // the operator's identity.
+            "-o".to_string(),
+            "ForwardX11=no".to_string(),
+            "-o".to_string(),
+            "ForwardX11Trusted=no".to_string(),
+            "-o".to_string(),
+            "ForwardAgent=no".to_string(),
             "-p".to_string(),
             port.to_string(),
         ];
@@ -484,11 +499,18 @@ mod tests {
         assert!(opts.contains(&"ServerAliveInterval=15".to_string()));
         assert!(opts.contains(&"ServerAliveCountMax=3".to_string()));
         assert!(opts.contains(&"LogLevel=ERROR".to_string()));
+        // Nothing of this workstation's own ssh habits rides along. The X11
+        // pair was measured in the lab: an operator whose config forwards it
+        // got "X11 forwarding request failed on channel 0" on the stderr of
+        // every command, including the one sentence a failed wave prints.
+        assert!(opts.contains(&"ForwardX11=no".to_string()));
+        assert!(opts.contains(&"ForwardX11Trusted=no".to_string()));
+        assert!(opts.contains(&"ForwardAgent=no".to_string()));
         // Every `-o` is followed by exactly one value, so the vector is an
         // argv and not a string somebody has to re-split.
         let os = opts.iter().filter(|a| *a == "-o").count();
-        assert_eq!(os, 9, "{opts:?}");
-        assert_eq!(opts.len(), os * 2 + 2, "nine options, then -p and a port");
+        assert_eq!(os, 12, "{opts:?}");
+        assert_eq!(opts.len(), os * 2 + 2, "twelve options, then -p and a port");
         for (i, arg) in opts.iter().enumerate() {
             if arg == "-o" {
                 assert!(

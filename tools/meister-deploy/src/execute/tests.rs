@@ -1818,9 +1818,16 @@ fn a_key_the_target_made_is_never_delivered_even_if_a_plan_asks() {
 /// A unit that is running is restarted; one that is not is left alone —
 /// which is what a bootstrap is, because the unit is waiting for the very
 /// file being delivered.
+///
+/// Three cases and not two, and the third one was paid for in the lab
+/// (lane L2, 2026-09-23): a fresh host still runs the generic image, which
+/// has no roles and therefore does NOT HAVE the unit. `systemctl is-active`
+/// answers 4 for a unit this machine does not know, prints `inactive`, and
+/// the whole wave ended there — on the one host the bootstrap was about to
+/// give that unit to.
 #[test]
 fn a_unit_is_poked_only_when_it_is_running() {
-    for running in [true, false] {
+    for (running, code) in [(true, 0), (false, 3), (false, 4)] {
         // The same fleet, except that the CA certificate has a unit hanging
         // off it. (The fixture's own `ca-bundle` has no reload, which is
         // what the tests above pin.)
@@ -1881,7 +1888,14 @@ fn a_unit_is_poked_only_when_it_is_running() {
             )
             .expect(
                 shell_on("n1", "systemctl is-active meister-trust.service"),
-                Output::stdout(if running { "active\n" } else { "inactive\n" }),
+                // systemd prints the state on stdout whatever it exits
+                // with: `inactive` and 3 for a unit that is there and
+                // stopped, `inactive` and 4 for one that is not there.
+                Output {
+                    status: code,
+                    stdout: if running { "active\n" } else { "inactive\n" }.to_string(),
+                    stderr: String::new(),
+                },
             );
         if running {
             fake = fake.expect(
@@ -1905,7 +1919,7 @@ fn a_unit_is_poked_only_when_it_is_running() {
         assert_eq!(
             applied.receipt.outcome,
             Outcome::Success,
-            "running={running}"
+            "running={running} code={code}"
         );
 
         let evidence = applied.receipt.hosts["n1"]
