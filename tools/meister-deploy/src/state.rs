@@ -795,8 +795,16 @@ impl JournalRead {
 }
 
 /// Read a journal, tolerating exactly one torn line at the end.
+///
+/// Astra finding F05, 2026-09-23: the bytes are read and made into text
+/// here rather than by `read_to_string`, because a machine that lost power
+/// in the middle of a line can have cut it inside a multi-byte character,
+/// and `read_to_string` then fails with "stream did not contain valid
+/// UTF-8" before the tail handling below ever runs. A journal that cannot
+/// be read is a run that cannot be resumed, so the bad bytes become
+/// replacement characters and land in the fragment that is dropped anyway.
 pub fn read_journal(files: &dyn Files, path: &Path) -> Result<JournalRead> {
-    let text = files.read_to_string(path)?;
+    let text = String::from_utf8_lossy(&files.read(path)?).into_owned();
     let origin = path.display().to_string();
     // A line that is not followed by a newline was not finished: every line
     // this tool writes goes out as line plus newline in ONE write.
@@ -829,6 +837,55 @@ pub fn read_journal(files: &dyn Files, path: &Path) -> Result<JournalRead> {
     let whole = lines.join("\n");
     let events = parse_journal(&whole, &origin)?;
     Ok(JournalRead { events, torn })
+}
+
+/// Make the file end where its last whole line ends, and say what was
+/// found. `None` when there was nothing to repair.
+///
+/// Astra finding F05, 2026-09-23: [`read_journal`] tolerated a torn last
+/// line IN MEMORY and nothing ever touched the file. `Journal::resuming`
+/// only set the sequence counter, so the next `append_fsync` — O_APPEND —
+/// wrote its line directly behind the fragment. The result was a line that
+/// is two halves of two entries, and it is no longer the LAST line, so the
+/// tolerance above does not apply to it: the test
+/// `a_broken_line_that_is_not_the_last_one_is_not_a_power_cut` shows what
+/// happens then, which is that the whole journal is refused. One torn write
+/// made the run unreadable and unresumable from the second resume on.
+///
+/// The repair works on the raw text and never re-serialises an entry: the
+/// journal is evidence, and evidence that has been through this tool's
+/// serialiser a second time is a copy. Two shapes, exactly the two
+/// [`read_journal`] distinguishes — a fragment, which goes, and a whole
+/// line that lost only its newline, which gets the newline it is missing.
+pub fn repair_journal(files: &dyn Files, path: &Path) -> Result<Option<String>> {
+    if !files.exists(path) {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&files.read(path)?).into_owned();
+    if text.is_empty() || text.ends_with('\n') {
+        return Ok(None);
+    }
+    let origin = path.display().to_string();
+    let cut = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let (repaired, what) = match serde_json::from_str::<JournalEvent>(&text[cut..]) {
+        Ok(_) => (
+            format!("{text}\n"),
+            format!(
+                "the last line of {origin} was written without its newline; it parses, so it \
+                 is kept and the newline is now there. The run that wrote it did not get any \
+                 further."
+            ),
+        ),
+        Err(e) => (
+            text[..cut].to_string(),
+            format!(
+                "the last line of {origin} is not a whole entry ({e}); it was dropped and the \
+                 file now ends where the last whole line ends. Everything before it is intact."
+            ),
+        ),
+    };
+    files.write_atomic(path, repaired.as_bytes(), 0o600)?;
+    Ok(Some(what))
 }
 
 /// The journal and its digest, as a receipt names them.
@@ -1907,6 +1964,104 @@ mod tests {
             read.torn
         );
         fold(&read.events).expect("what is left is a journal");
+    }
+
+    // Astra finding F05, 2026-09-23.
+    #[test]
+    fn a_resume_after_a_torn_write_leaves_a_journal_that_folds() {
+        // Both shapes a machine that stopped in the middle leaves behind,
+        // and the same demand on each: after the repair and one more line,
+        // the file reads back whole. Before this it did not — the next
+        // append landed behind the fragment, and from the read after that
+        // on the journal was refused outright.
+        for (what, tail, kept) in [
+            ("a fragment", "{\"seq\":3,\"ts\":\"2026-09-2", 2usize),
+            ("no newline", "", 2usize),
+        ] {
+            let files = MemFiles::new();
+            let state = state();
+            let run = run_id();
+            let path = state.journal_path(&run);
+            let journal = Journal::new(&path, &run, "plan-abc");
+            for (seq, kind, host) in [
+                (1, EventKind::RunStart, None),
+                (2, EventKind::LockAcquire, Some("n1")),
+            ] {
+                let event = journal.event(kind, at("2026-09-21T12:00:00Z"));
+                let event = match host {
+                    Some(host) => event.host(host),
+                    None => event,
+                };
+                let written = journal.append(&files, event).unwrap();
+                assert_eq!(written.seq, seq);
+            }
+            let whole = String::from_utf8(files.content(&path).unwrap()).unwrap();
+            let broken = if tail.is_empty() {
+                // A whole line that lost only its newline.
+                whole.trim_end_matches('\n').to_string()
+            } else {
+                format!("{whole}{tail}")
+            };
+            let files = MemFiles::new().given(path.clone(), broken.into_bytes());
+
+            let note = repair_journal(&files, &path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{what} is something to repair"));
+            assert!(note.contains(&path.display().to_string()), "{note}");
+            // Nothing is left to report, because nothing is left torn.
+            let read = read_journal(&files, &path).unwrap();
+            assert_eq!(read.torn, None, "{what}: it was repaired");
+            assert_eq!(read.events.len(), kept, "{what}");
+
+            // And now the resume writes its next line, and the file still
+            // reads back as what it is.
+            let resumed = Journal::resuming(&path, &run, "plan-abc", read.last_seq());
+            let next = resumed
+                .append(
+                    &files,
+                    resumed.event(EventKind::RunEnd, at("2026-09-21T12:10:00Z")),
+                )
+                .unwrap();
+            assert_eq!(next.seq, kept as u64 + 1, "{what}");
+            let after = read_journal(&files, &path)
+                .unwrap_or_else(|e| panic!("{what}: the journal is unreadable: {e:#}"));
+            assert_eq!(after.torn, None, "{what}");
+            assert_eq!(after.events.len(), kept + 1, "{what}");
+            let folded = fold(&after.events).expect("it folds");
+            assert!(folded.breaks.is_empty(), "{what}: {:?}", folded.breaks);
+        }
+    }
+
+    // Astra finding F05, 2026-09-23.
+    #[test]
+    fn a_journal_cut_inside_a_character_is_still_a_journal() {
+        // `read_to_string` refused this file with "stream did not contain
+        // valid UTF-8" before any tail handling ran, so a power cut in the
+        // wrong byte made the run unresumable. The bad bytes are in the
+        // fragment, which is exactly what goes.
+        let files = MemFiles::new();
+        let state = state();
+        let run = run_id();
+        let path = state.journal_path(&run);
+        let journal = Journal::new(&path, &run, "plan-abc");
+        journal
+            .append(
+                &files,
+                journal.event(EventKind::RunStart, at("2026-09-21T12:00:00Z")),
+            )
+            .unwrap();
+        let mut bytes = files.content(&path).unwrap();
+        // The first two bytes of a three-byte character and nothing else.
+        bytes.extend_from_slice(b"{\"seq\":2,\"ts\":\"\xe2\x80");
+        let files = MemFiles::new().given(path.clone(), bytes);
+
+        let read = read_journal(&files, &path).expect("it is readable");
+        assert_eq!(read.events.len(), 1);
+        assert!(read.torn.is_some(), "and the fragment is reported");
+        assert!(repair_journal(&files, &path).unwrap().is_some());
+        let after = read_journal(&files, &path).unwrap();
+        assert_eq!(after.torn, None);
+        assert_eq!(after.events.len(), 1);
     }
 
     #[test]

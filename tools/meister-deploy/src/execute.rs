@@ -68,7 +68,7 @@ use crate::receipt::{
 };
 use crate::release::ReleaseManifest;
 use crate::run::{Cancel, Cmd, Effect, Expect, Runner};
-use crate::state::{Journal, StateDir, journal_ref, read_journal};
+use crate::state::{Journal, StateDir, journal_ref, read_journal, repair_journal};
 use crate::transport::{Ssh, Target};
 
 /// How long a guest-drain may take before the step is refused.
@@ -328,10 +328,18 @@ impl<'a> Executor<'a> {
 
         let journal_path = self.state.journal_path(&self.options.run_id);
         let (journal, resumed) = if self.options.resume {
-            let read = read_journal(self.files, &journal_path)?;
-            if let Some(torn) = &read.torn {
+            // Astra finding F05, 2026-09-23: the torn tail is repaired on
+            // the DISK and not only in this process's memory. Reporting it
+            // and leaving it there meant the next `append_fsync` wrote its
+            // line behind the fragment, and the fragment was then no longer
+            // the last line — which is the one shape `read_journal` refuses
+            // outright. This is the only place that repairs: `report` reads
+            // a journal and says what it found, and a reader does not
+            // rewrite evidence.
+            if let Some(torn) = repair_journal(self.files, &journal_path)? {
                 eprintln!("note: {torn}");
             }
+            let read = read_journal(self.files, &journal_path)?;
             let folded = fold(&read.events)?;
             if folded.plan_id != self.plan.plan_id {
                 bail!(
