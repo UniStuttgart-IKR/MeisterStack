@@ -22,8 +22,8 @@ use serde_json::{Value, json};
 
 use meister_deploy::manifest::{self, NixManifest, ResolvedFleet, Source, Tool};
 use meister_deploy::observation::{
-    BootedKernel, EtcdMember, EtcdView, HostObservation, Identity, Mount, OBSERVATION_SCHEMA,
-    Observations,
+    BootedKernel, EtcdMember, EtcdView, HostObservation, Identity, Mount, NetworkInterface,
+    OBSERVATION_SCHEMA, Observations, PciDevice,
 };
 use meister_deploy::release::{
     BootArtifacts, BuildEnv, ConfigArtifact, HostArtifacts, ReleaseManifest, Reproducibility,
@@ -346,6 +346,28 @@ pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observati
                 lock: None,
                 capabilities: host.hardware.capabilities.clone(),
                 enrolled: true,
+                // --- lane 4A: a machine that is what the fleet says ---
+                disk_free_nix_bytes: Some(40_000_000_000),
+                pci: host
+                    .hardware
+                    .gpus
+                    .iter()
+                    .map(|gpu| PciDevice {
+                        address: gpu.pci.clone(),
+                        vendor_device: "10de:2684".to_string(),
+                    })
+                    .collect(),
+                nics: host
+                    .hardware
+                    .nics
+                    .iter()
+                    .map(|nic| NetworkInterface {
+                        name: nic.name.clone(),
+                        mac: nic.mac.clone(),
+                    })
+                    .collect(),
+                generation_units: host.units.clone(),
+                // --- end lane 4A ---
                 unknown_reason: None,
             },
         );

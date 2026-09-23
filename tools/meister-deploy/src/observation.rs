@@ -160,6 +160,48 @@ pub struct Mount {
     pub fstype: String,
 }
 
+// --- lane 4A: what the machine under the closure is ------------------------
+//
+// Three facts a release cannot be talked out of and an inventory can only
+// CLAIM: how much room the store has, which cards are in the slots, which
+// interfaces answer. They are read for the preflight of §6 — a closure that
+// does not fit, a GPU that is not in the machine the fleet says it is in, a
+// NIC the inventory names and nobody can see.
+//
+// Addresses, ids and MACs, and nothing else. The vendor:device pair is what
+// tells one card from another; the rest of `lspci` — revisions, subsystem
+// ids, kernel drivers — would be a second inventory this tool would then
+// have to keep in step with the first.
+
+/// One PCI device, as the machine lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PciDevice {
+    /// The full domain address, `0000:41:00.0` — the spelling
+    /// `hardware.gpus[].pci` uses. `lspci -n` leaves the domain off on a
+    /// machine that has only domain 0, so the probe puts it back.
+    pub address: String,
+    /// `10de:2684`, lower case, as `lspci -n` prints it and as
+    /// `/sys/bus/pci/devices/*/{vendor,device}` spell it once the `0x` is
+    /// gone.
+    pub vendor_device: String,
+}
+
+/// One network interface, as the machine lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkInterface {
+    /// The kernel's name for it. NOT what `hardware.nics[].name` has to
+    /// match: a name is handed out at boot and a MAC is burned in, so the
+    /// MAC is what the preflight compares and the name is what it prints so
+    /// that a person can find the card.
+    pub name: String,
+    /// Lower case, colon separated, as `/sys/class/net/*/address` writes it.
+    pub mac: String,
+}
+
+// --- end lane 4A ---
+
 /// One host, as of `Observations::taken_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -207,6 +249,28 @@ pub struct HostObservation {
     /// Whether this host has an identity and a known host key — installed
     /// but not enrolled is a state of its own and never "healthy".
     pub enrolled: bool,
+    // --- lane 4A: the machine under the closure ---
+    /// Free bytes on the filesystem that carries `/nix`, as `df -B1` gives
+    /// them. Null when nobody could read it, which is not zero: zero would
+    /// block every host whose probe lost a line.
+    pub disk_free_nix_bytes: Option<u64>,
+    /// Every PCI device the machine lists. EMPTY means the probe found no
+    /// way to ask (no `lspci`, no `/sys/bus/pci`), and the preflight reads
+    /// it that way: an empty list is not "this machine has no cards".
+    pub pci: Vec<PciDevice>,
+    /// Every network interface with a MAC. Empty has the same meaning as
+    /// for `pci`.
+    pub nics: Vec<NetworkInterface>,
+    /// The units the RUNNING generation carries, by name, as they are listed
+    /// in `/run/current-system/etc/systemd/system`. The manifest's
+    /// `hosts.<id>.units[]` is the same question about the generation a
+    /// release would put there, and the difference between the two is what
+    /// the planner calls an unknown.
+    ///
+    /// Empty means nobody could list the directory — never "this generation
+    /// has no units".
+    pub generation_units: Vec<String>,
+    // --- end lane 4A ---
     /// Why this observation is not to be trusted, in one sentence. Any value
     /// here blocks the host: it is the probe saying it does not know.
     pub unknown_reason: Option<String>,
@@ -242,6 +306,12 @@ impl HostObservation {
             lock: None,
             capabilities: Vec::new(),
             enrolled: false,
+            // --- lane 4A ---
+            disk_free_nix_bytes: None,
+            pci: Vec::new(),
+            nics: Vec::new(),
+            generation_units: Vec::new(),
+            // --- end lane 4A ---
             unknown_reason: None,
         }
     }
@@ -253,6 +323,25 @@ impl HostObservation {
     pub fn has_capability(&self, name: &str) -> bool {
         self.capabilities.iter().any(|c| c == name)
     }
+
+    // --- lane 4A ---
+
+    /// Whether a PCI address the inventory names is in the machine.
+    ///
+    /// Case-insensitive on the hex, because `lspci` prints lower case and an
+    /// operator writing `0000:41:00.0` by hand from a datasheet may not.
+    pub fn has_pci(&self, address: &str) -> bool {
+        self.pci
+            .iter()
+            .any(|d| d.address.eq_ignore_ascii_case(address))
+    }
+
+    /// Whether a MAC the inventory names answered on some interface.
+    pub fn has_mac(&self, mac: &str) -> bool {
+        self.nics.iter().any(|n| n.mac.eq_ignore_ascii_case(mac))
+    }
+
+    // --- end lane 4A ---
 }
 
 /// A snapshot of a fleet, or of the part of it somebody looked at.

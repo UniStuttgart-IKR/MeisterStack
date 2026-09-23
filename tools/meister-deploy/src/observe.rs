@@ -367,14 +367,76 @@ impl ProbeSpec {
             ));
         }
 
-        s.push_str("if [ -e /dev/kvm ]; then printf 'cap=%s\\n' kvm; fi\n");
-        s.push_str("if [ -e /dev/vfio/vfio ]; then printf 'cap=%s\\n' vfio; fi\n");
+        // `-c` and not `-e`: both of these are character devices, and a
+        // regular file somebody left at that path is not a hypervisor.
+        s.push_str("if [ -c /dev/kvm ]; then printf 'cap=%s\\n' kvm; fi\n");
+        s.push_str("if [ -c /dev/vfio/vfio ]; then printf 'cap=%s\\n' vfio; fi\n");
         // The directory exists as soon as the ib core module is loaded, so
         // the question is whether it has a device in it.
         s.push_str(
             "if [ -n \"$(ls -A /sys/class/infiniband 2>/dev/null)\" ]; then \
              printf 'cap=%s\\n' rdma; fi\n",
         );
+
+        // --- lane 4A: the machine under the closure ---
+        //
+        // How much room the store has. `df` on `/nix` and not on `/`,
+        // because the two are the same filesystem on most hosts and are not
+        // on the ones where it matters. A `df` that does not know
+        // `--output` prints nothing and the answer is null, which is what
+        // "nobody could read it" has to look like — zero would block every
+        // host whose probe lost a line.
+        s.push_str(
+            "printf 'disk_free_nix=%s\\n' \
+             \"$(df -B1 --output=avail /nix 2>/dev/null | tail -n 1 | tr -d ' ')\"\n",
+        );
+
+        // Which cards are in the slots. sysfs first and `lspci` second, the
+        // other way round from what the lane brief says, and for a reason
+        // that is worth a line: `/sys/bus/pci/devices` is the kernel's own
+        // list, it is on every Linux host, and it needs no package in the
+        // closure — while `pciutils` is not in a managed host's closure at
+        // all, so the `lspci` road would be the road that is never taken on
+        // exactly the machines this tool manages. The vendor and device
+        // files hold `0x10de`, so the `0x` comes off; the directory name is
+        // already the full domain address the inventory spells.
+        s.push_str("if [ -d /sys/bus/pci/devices ]; then\n");
+        s.push_str("  for d in /sys/bus/pci/devices/*; do\n");
+        s.push_str(
+            "    if [ -r \"$d/vendor\" ]; then printf 'pci=%s\\t%s:%s\\n' \"${d##*/}\" \
+                    \"$(cut -c3- \"$d/vendor\" 2>/dev/null)\" \
+                    \"$(cut -c3- \"$d/device\" 2>/dev/null)\"; fi\n",
+        );
+        s.push_str("  done\n");
+        s.push_str("elif command -v lspci >/dev/null 2>/dev/null; then\n");
+        // `-D` and not plain `-n`: a machine with one PCI domain has its
+        // domain left off, and `41:00.0` is not the string an inventory
+        // holds. The columns of `lspci -Dn` are address, class, id.
+        s.push_str(
+            "  lspci -Dn 2>/dev/null | while read -r a c v r; do \
+                    printf 'pci=%s\\t%s\\n' \"$a\" \"$v\"; done\n",
+        );
+        s.push_str("fi\n");
+
+        // Which interfaces answer, by the name the kernel gave them and the
+        // MAC that is burned in. The MAC is what the preflight compares:
+        // `eth0` is a name handed out at boot.
+        s.push_str(
+            "for n in /sys/class/net/*; do \
+                    if [ -r \"$n/address\" ]; then printf 'nic=%s\\t%s\\n' \"${n##*/}\" \
+                    \"$(cat \"$n/address\" 2>/dev/null)\"; fi; done\n",
+        );
+
+        // The unit names the RUNNING generation carries. One line and not
+        // one per unit, because a NixOS system has some hundreds of them
+        // and seventy hosts would be twenty thousand lines of answer.
+        // `cd` in the substitution is a subshell, so nothing after this
+        // sees a different directory.
+        s.push_str(
+            "printf 'gen_units=%s\\n' \
+             \"$(cd /run/current-system/etc/systemd/system 2>/dev/null && printf '%s ' *)\"\n",
+        );
+        // --- end lane 4A ---
 
         if let Some(etcd) = &self.etcd {
             let url = shell_quote(&etcd.client_url);
@@ -641,6 +703,47 @@ pub fn parse_probe(
                     obs.capabilities.push(cap);
                 }
             }
+            // --- lane 4A ---
+            "disk_free_nix" => {
+                obs.disk_free_nix_bytes = some(value).and_then(|v| v.parse().ok());
+            }
+            "pci" => {
+                if let Some((address, id)) = value.split_once('\t')
+                    && let (Some(address), Some(id)) = (some(address), some(id))
+                {
+                    obs.pci.push(crate::observation::PciDevice {
+                        address: address.to_ascii_lowercase(),
+                        vendor_device: id.to_ascii_lowercase(),
+                    });
+                }
+            }
+            "nic" => {
+                if let Some((name, mac)) = value.split_once('\t')
+                    && let (Some(name), Some(mac)) = (some(name), some(mac))
+                    // Not an identity: `lo` and every other interface
+                    // without hardware behind it reports all zeroes, and a
+                    // fleet that declared that MAC would match all of them.
+                    && mac != "00:00:00:00:00:00"
+                {
+                    obs.nics.push(crate::observation::NetworkInterface {
+                        name,
+                        mac: mac.to_ascii_lowercase(),
+                    });
+                }
+            }
+            "gen_units" => {
+                obs.generation_units = value
+                    .split_whitespace()
+                    // What an empty directory leaves behind: the glob
+                    // itself. It is not a unit and it is not a host that
+                    // has none — it is a directory with nothing in it.
+                    .filter(|name| *name != "*")
+                    .map(str::to_string)
+                    .collect();
+                obs.generation_units.sort();
+                obs.generation_units.dedup();
+            }
+            // --- end lane 4A ---
             "etcd_members" => etcd_members = some(value),
             "etcd_health" => etcd_health = some(value),
             "vms" => obs.vms_running = some(value).and_then(|v| count_vms(&v)),
@@ -1123,6 +1226,14 @@ mod tests {
             s.push_str(&format!("identity_cert={cert}\tpresent\n"));
         }
         s.push_str("cap=kvm\n");
+        // --- lane 4A ---
+        s.push_str("disk_free_nix=41231765504\n");
+        s.push_str("pci=0000:00:01.0\t8086:1237\n");
+        s.push_str("pci=0000:41:00.0\t10de:2684\n");
+        s.push_str("nic=lo\t00:00:00:00:00:00\n");
+        s.push_str("nic=eno1\tB8:CE:F6:00:00:01\n");
+        s.push_str("gen_units=-.slice basic.target meister-agent.service sshd.service\n");
+        // --- end lane 4A ---
         s.push_str(
             "etcd_members={\"header\":{},\"members\":[{\"ID\":1234605616436508552,\
              \"name\":\"box\",\"peerURLs\":[\"https://10.0.0.10:2380\"],\
@@ -1286,6 +1397,100 @@ mod tests {
             Some("sha256:abc123")
         );
     }
+
+    // --- lane 4A: the machine under the closure ---
+
+    #[test]
+    fn the_hardware_of_a_healthy_host_is_read() {
+        let spec = spec_for("box");
+        let obs = parse_probe(&healthy_answer(&spec), &spec, None);
+
+        assert_eq!(obs.disk_free_nix_bytes, Some(41_231_765_504));
+
+        // Both devices, with the domain and in lower case, which is the
+        // spelling `hardware.gpus[].pci` uses.
+        assert_eq!(obs.pci.len(), 2, "{:?}", obs.pci);
+        assert!(obs.has_pci("0000:41:00.0"));
+        assert_eq!(obs.pci[1].vendor_device, "10de:2684");
+        // And an operator who typed the address in capitals still gets an
+        // answer about the same slot.
+        assert!(obs.has_pci("0000:41:00.0".to_uppercase().as_str()));
+        assert!(!obs.has_pci("0000:42:00.0"));
+
+        // The loopback MAC is not an identity, so it is not carried: a
+        // fleet that declared it would otherwise match every host.
+        assert_eq!(obs.nics.len(), 1, "{:?}", obs.nics);
+        assert_eq!(obs.nics[0].name, "eno1");
+        assert_eq!(obs.nics[0].mac, "b8:ce:f6:00:00:01", "lower case, always");
+        assert!(obs.has_mac("B8:CE:F6:00:00:01"));
+        assert!(!obs.has_mac("b8:ce:f6:00:00:99"));
+
+        // The generation's units, sorted, including the one whose name
+        // begins with a dash.
+        assert_eq!(
+            obs.generation_units,
+            vec![
+                "-.slice",
+                "basic.target",
+                "meister-agent.service",
+                "sshd.service"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_machine_that_could_not_be_asked_about_its_hardware_says_nothing_about_it() {
+        // Not zero, not an empty list that means "there is none": a probe
+        // whose `df` was not understood and whose sysfs was not there has
+        // NOT found a full disk and NOT found a machine without cards.
+        let spec = spec_for("box");
+        let answer = healthy_answer(&spec)
+            .replace("disk_free_nix=41231765504\n", "disk_free_nix=\n")
+            .replace("pci=0000:00:01.0\t8086:1237\n", "")
+            .replace("pci=0000:41:00.0\t10de:2684\n", "")
+            .replace("nic=lo\t00:00:00:00:00:00\n", "")
+            .replace("nic=eno1\tB8:CE:F6:00:00:01\n", "")
+            // An empty directory leaves the glob behind, and that is not a
+            // unit.
+            .replace(
+                "gen_units=-.slice basic.target meister-agent.service sshd.service\n",
+                "gen_units=*\n",
+            );
+        let obs = parse_probe(&answer, &spec, None);
+        assert_eq!(obs.disk_free_nix_bytes, None);
+        assert!(obs.pci.is_empty());
+        assert!(obs.nics.is_empty());
+        assert!(obs.generation_units.is_empty());
+        // And it is still a whole answer: not knowing a fact is not the
+        // same as a torn reply.
+        assert_eq!(obs.unknown_reason, None);
+    }
+
+    #[test]
+    fn the_probe_asks_the_kernel_before_it_asks_a_package() {
+        // sysfs is on every Linux host and needs nothing in the closure;
+        // `lspci` is the fallback and is spelled `-Dn`, because an address
+        // without its domain is not the string an inventory holds.
+        let script = spec_for("box").script();
+        assert!(
+            script.contains("/sys/bus/pci/devices"),
+            "the probe does not read the kernel's own list:\n{script}"
+        );
+        assert!(
+            script.contains("lspci -Dn"),
+            "the fallback would print addresses without a domain:\n{script}"
+        );
+        assert!(
+            script.contains("df -B1 --output=avail /nix"),
+            "the free space of the store is asked about /nix and not about /:\n{script}"
+        );
+        assert!(
+            script.contains("/run/current-system/etc/systemd/system"),
+            "nobody asks which units the running generation carries:\n{script}"
+        );
+    }
+
+    // --- end lane 4A ---
 
     #[test]
     fn a_path_that_is_not_a_mount_point_is_absent_and_not_a_mount() {
