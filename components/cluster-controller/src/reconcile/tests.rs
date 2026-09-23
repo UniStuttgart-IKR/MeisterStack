@@ -2088,6 +2088,72 @@ fn ready_router(name: &str) -> controller_api::Router {
     r
 }
 
+/// Astra finding S09, 2026-09-23: one address, two routers, and only one of
+/// them keeps it.
+///
+/// The interleaving that used to survive: `acme-a` and `acme-b` both cut
+/// `.10` out of the same stale listing. `acme-b` writes first and finds no
+/// conflict, `acme-a` writes second, sees `acme-b`, and keeps the address
+/// because it sorts lower -- which is the right answer for `acme-a`. Nothing
+/// ever asks `acme-b` again, because the old `ensure_external_addr` returned
+/// the moment `status.external_addr` was set, so two routers answered for one
+/// address on the provider wire until somebody deleted one of them.
+///
+/// Both halves are asserted here: the pass for the lower name keeps the
+/// address, and the pass for the higher name -- the one that used to be an
+/// early return -- gives it back.
+#[test]
+fn two_routers_that_both_wrote_the_same_external_address_do_not_both_keep_it() {
+    use controller_api::network::{AddressClaim, claim_external_addr};
+
+    let net = provider("ext", "ext");
+    // `ready_router` hands out `198.51.100.10/24`, so these two are the
+    // wreckage the race leaves behind: one address, two holders.
+    let mut held = vec![ready_router("acme-a"), ready_router("acme-b")];
+    assert_eq!(held[0].status.external_addr, held[1].status.external_addr);
+
+    // Pass one, the lower name: it holds the minimum of the two names, so it
+    // keeps what it has and nothing is written.
+    assert_eq!(
+        claim_external_addr(&held[0], &net, &held),
+        AddressClaim::Keep,
+        "the lowest name of the holders keeps the address"
+    );
+    // Pass one, the higher name. This is the pass the old shape never made.
+    assert_eq!(
+        claim_external_addr(&held[1], &net, &held),
+        AddressClaim::Yield,
+        "and every other holder gives it back"
+    );
+    held[1].status.external_addr.clear();
+    assert_eq!(
+        held.iter()
+            .filter(|r| r.status.external_addr == "198.51.100.10/24")
+            .count(),
+        1,
+        "exactly one router answers for the address"
+    );
+
+    // Pass two: level-triggered, so the loser has no address and takes the
+    // next free one, and the winner re-checks and still keeps its own.
+    assert_eq!(
+        claim_external_addr(&held[1], &net, &held),
+        AddressClaim::Take("198.51.100.11/24".to_string()),
+        "the next address out of the same allocation"
+    );
+    held[1].status.external_addr = "198.51.100.11/24".into();
+    assert_eq!(
+        claim_external_addr(&held[0], &net, &held),
+        AddressClaim::Keep
+    );
+    assert_eq!(
+        claim_external_addr(&held[1], &net, &held),
+        AddressClaim::Keep,
+        "and a settled pair is not rewritten every five seconds"
+    );
+    assert_ne!(held[0].status.external_addr, held[1].status.external_addr);
+}
+
 /// The happy plan, field by field: the provider network's facts and the
 /// router's own, resolved once, so that nothing behind the backend seam ever
 /// has to look an object up.

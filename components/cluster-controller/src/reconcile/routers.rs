@@ -295,7 +295,7 @@ async fn reconcile_router(
     Ok(())
 }
 
-/// Cut the router's external address, once, and look again.
+/// Cut the router's external address and look again -- every pass.
 ///
 /// The second look is what makes this safe without a lock: two replicas
 /// placing two different routers in the same instant both read the same free
@@ -304,52 +304,24 @@ async fn reconcile_router(
 /// replicas agree about which of them lost, and level-triggered, so the loser
 /// simply has no address again on the next pass and takes the next one. The
 /// same shape `create_routed_subnet` uses for the same reason.
+///
+/// Astra finding S09, 2026-09-23: it used to return here the moment
+/// `status.external_addr` was set, so the router that wrote FIRST -- the one
+/// that found no conflict when it looked -- never looked again. The rule and
+/// the re-check both live in `network::settle_external_addr` now, and the
+/// cloud tier asks the same function the same question.
 async fn ensure_external_addr(
     pass: &Pass<'_>,
     router: Router,
     networks: &[ProviderNetwork],
 ) -> anyhow::Result<Router> {
-    if !router.status.external_addr.is_empty() {
-        return Ok(router);
-    }
     let Some(network) = networks
         .iter()
         .find(|n| n.metadata.name == router.spec.provider_network)
     else {
         return Ok(router);
     };
-    let held = pass.store.list::<Router>().await?;
-    let Some(address) = network::cut_external_addr(network, &held) else {
-        return Ok(router);
-    };
-    let name = router.metadata.name.clone();
-    let taken = address.clone();
-    let router = pass
-        .store
-        .mutate::<Router, _>(&name, |r| r.status.external_addr = taken.clone())
-        .await?;
-
-    let others: Vec<String> = pass
-        .store
-        .list::<Router>()
-        .await?
-        .into_iter()
-        .filter(|r| r.metadata.name != name && r.status.external_addr == address)
-        .map(|r| r.metadata.name)
-        .collect();
-    // The higher name gives it up, which is a rule both replicas reach out of
-    // the same two names and no clock.
-    if others.iter().any(|other| other < &name) {
-        warn!(router = %name, address = %address, lost_to = ?others,
-              "lost the claim on this external address, taking it back");
-        let cleared = pass
-            .store
-            .mutate::<Router, _>(&name, |r| r.status.external_addr.clear())
-            .await?;
-        return Ok(cleared);
-    }
-    info!(router = %name, address = %address, "external address cut");
-    Ok(router)
+    Ok(network::settle_external_addr(pass.store, router, network).await?)
 }
 
 /// Derive the NAT rules and the announced prefixes, and write them if they
