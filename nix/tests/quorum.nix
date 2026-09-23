@@ -396,21 +396,30 @@ pkgs.testers.runNixOSTest {
     assert "no further member may go down" in (group["blocked"] or ""), group
     assert "cp is at 2 of 3" in group["blocked"], group
     print("V14: " + group["blocked"])
-    # Every member is blocked, and the two steps that only LOOK are not:
-    # a preflight is exactly the step that should report this.
-    for name in MEMBERS:
+    # The two members that still serve are blocked: they are what the quorum
+    # protects. The member that is down is not -- it does not go down again
+    # by being worked on, and it is the one host a degraded group most needs
+    # a plan for (lab finding W8, 2026-09-23: a bootstrap of three could be
+    # started and never finished, because the third member was refused once
+    # the first two formed a quorum). The steps that only LOOK are not
+    # blocked either: a preflight is exactly the step that should report this.
+    for name in ["r1", "r2"]:
         assert degraded["hosts"][name]["verdict"] == "blocked", degraded["hosts"][name]
+    assert degraded["hosts"]["r3"]["verdict"] == "change", degraded["hosts"]["r3"]
     # A lost quorum blocks what INTERRUPTS and nothing else — 2B's rule,
     # seen in a plan: taking a member's lock and copying a closure onto it
     # disturbs nobody, so those stay allowed and the activation does not.
     # (These hosts carry no agent role, so there is no cordon and no drain.)
-    def blocked_of(kind):
-        return [a["blocked"] for a in degraded["actions"] if a["kind"] == kind]
+    def blocked_of(kind, hosts=MEMBERS):
+        return [a["blocked"] for a in degraded["actions"]
+                if a["kind"] == kind and a["host"] in hosts]
 
     for kind in ["preflight", "verify", "lock", "stage", "unlock"]:
         assert blocked_of(kind) and all(b is None for b in blocked_of(kind)), kind
     for kind in ["activate", "confirm"]:
-        assert blocked_of(kind) and all(b is not None for b in blocked_of(kind)), kind
+        serving = blocked_of(kind, ["r1", "r2"])
+        assert serving and all(b is not None for b in serving), kind
+        assert all(b is None for b in blocked_of(kind, ["r3"])), kind
     print("blocked in a degraded group: " + ", ".join(sorted(
         {a["kind"] for a in degraded["actions"] if a["blocked"] is not None}
     )))
