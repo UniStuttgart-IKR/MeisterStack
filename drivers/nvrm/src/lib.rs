@@ -31,10 +31,97 @@ const NVRM_QUEUE_SIZES: [u16; 2] = [256, 256];
 /// guest RM client); the backend needs headroom.
 const NOFILE_LIMIT: u64 = 65536;
 
+/// Environment variables the extra `env` map may not set, by prefix.
+///
+/// These are the PROCESS's environment and not the backend's knobs. `LD_`
+/// decides which library a process loads; `PATH` and `HOME` are what `create`
+/// deliberately carries over from the agent and nothing else; `NVIDIA_`
+/// selects the card and the driver's behaviour on it. Astra finding S03,
+/// 2026-09-23.
+///
+/// A prefix list and not an exact one: `LD_PRELOAD` is the famous one and it
+/// is not the only one, and a list of names would be a list somebody has to
+/// keep up with.
+const PROTECTED_ENV: [&str; 4] = ["LD_", "PATH", "HOME", "NVIDIA_"];
+
+/// The `LEA_*` variables this driver writes itself, and which the extra `env`
+/// map therefore may not.
+///
+/// The other half of S03, and a list of NAMES rather than the `LEA_` prefix
+/// on purpose: the map exists so that a new backend knob needs no driver
+/// change, and refusing the whole prefix would take that away. What may not
+/// happen is an `env` entry arguing with a typed field — that is how the
+/// number `admit` counted and the number the backend ran with came to be two
+/// different things. Every name here is produced from a typed field or from
+/// the vGPU resolution, whether or not this particular device produced it:
+/// `LEA_VGPU_PROFILE_MIB` set by hand on a device with no vGPU type would be
+/// exactly the hole, and "it did not collide" is not a reason to allow it.
+const DRIVER_OWNED_ENV: [&str; 9] = [
+    "LEA_VRAM_LIMIT_MIB",
+    "LEA_VRAM_PROFILE_MIB",
+    "LEA_VRAM_RESERVE_MIB",
+    "LEA_MANAGED_COMPAT",
+    "LEA_ADMIN_PRIV",
+    "LEA_VGPU_TYPE",
+    "LEA_VGPU_PROFILE_MIB",
+    "LEA_VGPU_FB_MIB",
+    "LEA_VGPU_ENCODER_CAP",
+];
+
+/// The nvrm params a VM spec may carry.
+///
+/// Astra finding S03, 2026-09-23: `spec.params` was a free JSON map that
+/// deserialised into the whole of [`NvrmParams`] and won over everything the
+/// node had configured. Two of those fields are not tunables at all:
+/// `admin_priv` makes the backend keep `CAP_SYS_ADMIN`, and `env` is the
+/// process environment — which let a VM document set `LEA_VRAM_PROFILE_MIB`
+/// to any number it liked, over the top of the value `admit` had just counted
+/// against the node's budget, and would have let it set `LD_PRELOAD` if the
+/// backend had ever read one.
+///
+/// So the split is by WHO, not by shape: the node's own configuration
+/// (`[device.nvrm] defaults` and `[device.nvrm].profiles.*`, written by
+/// whoever runs the node) may say anything, and a spec — which arrives from a
+/// tenant through two control planes — may name the vGPU type it wants and
+/// nothing else. The profile id in `spec.profile` is the ordinary way to ask
+/// for more; it points at a section an operator wrote.
+///
+/// One list and not a check in three places: the agent refuses a spec that
+/// carries anything else while a person is still holding the request
+/// (`types::devices_with_ids`), and [`refuse_operator_only_params`] is the
+/// same rule at the point of use.
+pub const TENANT_SETTABLE_PARAMS: [&str; 1] = ["vgpu_type"];
+
+/// Refuse the nvrm params that only the node's own configuration may carry.
+///
+/// The sentence names the key and where it belongs, because the answer to
+/// "you may not set this" is almost always "an operator can, in the node's
+/// config" and a refusal that does not say so sends somebody looking for a
+/// bug. See [`TENANT_SETTABLE_PARAMS`].
+pub fn refuse_operator_only_params(params: &serde_json::Value) -> Result<(), String> {
+    let serde_json::Value::Object(fields) = params else {
+        return Err(format!("nvrm params must be an object, not {params}"));
+    };
+    for key in fields.keys() {
+        if TENANT_SETTABLE_PARAMS.contains(&key.as_str()) {
+            continue;
+        }
+        return Err(format!(
+            "nvrm params.{key} is the node's to set and not a spec's; a vm spec may name \
+             [{}] and a profile (spec.profile), and everything else comes from \
+             [device.nvrm] on the node",
+            TENANT_SETTABLE_PARAMS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// Tunables for one backend, merged `defaults < profile < spec.params`.
 /// Typed fields are the ones this driver has to reason about (validation,
-/// vGPU resolution, admission); `env` passes any LEA_* knob through verbatim
-/// and wins over the typed fields, so new backend knobs need no driver change.
+/// vGPU resolution, admission); `env` passes any LEA_* knob through verbatim,
+/// so a new backend knob needs no driver change.
+///
+/// What a SPEC may carry of this is [`TENANT_SETTABLE_PARAMS`] and no more.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NvrmParams {
@@ -67,6 +154,24 @@ impl NvrmParams {
             .env
             .extend(over.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         merged
+    }
+
+    /// What the backend will actually be allowed, in MiB, out of the merged
+    /// params it is started from.
+    ///
+    /// The same order the backend itself reads them in: an explicit cap wins,
+    /// then an explicit profile size, then whatever the vGPU type resolved to
+    /// on this card. `validate` has already refused a cap and a profile
+    /// together, so at most one of the first two is ever set.
+    ///
+    /// Astra finding S03, 2026-09-23: this used to be the vGPU profile alone,
+    /// so a device that named a cap was admitted for one number and run with
+    /// another.
+    fn admitted_mib(&self, vgpu: Option<&VgpuType>) -> u64 {
+        self.vram_limit_mib
+            .or(self.vram_profile_mib)
+            .or_else(|| vgpu.map(|v| v.profile_mib))
+            .unwrap_or(0)
     }
 
     fn validate(&self) -> device::Result<()> {
@@ -215,6 +320,12 @@ impl NvrmDriver {
             merged = merged.overlay(profile);
         }
         if let Some(params) = &spec.params {
+            // The same rule the agent applies to the document, applied again
+            // where the params are actually used: this is the only door a
+            // spec's params come through, and a driver that trusts a caller
+            // to have checked is a driver that is one new caller away from
+            // not being checked at all. Astra finding S03, 2026-09-23.
+            refuse_operator_only_params(params).map_err(DeviceError::InvalidSpec)?;
             let params: NvrmParams = serde_json::from_value(params.clone())
                 .map_err(|e| DeviceError::InvalidSpec(format!("invalid nvrm params: {e}")))?;
             merged = merged.overlay(&params);
@@ -246,43 +357,73 @@ impl NvrmDriver {
     /// Leandro overprovisions by design and only warns; the hard check here
     /// is opt-in via vram_budget_mib. max_instance is always enforced — it is
     /// the card's own per-type limit and exceeding it fails at VM boot anyway.
-    async fn admit(&self, id: &DeviceId, vgpu: Option<&VgpuType>) -> device::Result<u64> {
+    async fn admit(
+        &self,
+        id: &DeviceId,
+        params: &NvrmParams,
+        vgpu: Option<&VgpuType>,
+    ) -> device::Result<u64> {
         let active = self.active.lock().await;
-        let Some(vgpu) = vgpu else { return Ok(0) };
 
-        let same_type = active
-            .values()
-            .filter(|b| b.vgpu_type.as_deref() == Some(vgpu.vgpu_type.as_str()))
-            .count() as u64;
-        if same_type >= vgpu.max_instance {
-            return Err(DeviceError::InvalidSpec(format!(
-                "vGPU type {} allows {} instance(s) on this card, {} already active",
-                vgpu.vgpu_type, vgpu.max_instance, same_type
-            )));
+        // What this backend will actually be allowed, out of the same merged
+        // params the process is started from. Astra finding S03, 2026-09-23:
+        // admission used to count the resolved vGPU profile while the process
+        // was started with whatever `vram_limit_mib`/`vram_profile_mib` said
+        // — two numbers that never had to agree, so a node's budget was a
+        // statement about something nobody ran.
+        let wants = params.admitted_mib(vgpu);
+
+        if let Some(vgpu) = vgpu {
+            let same_type = active
+                .values()
+                .filter(|b| b.vgpu_type.as_deref() == Some(vgpu.vgpu_type.as_str()))
+                .count() as u64;
+            if same_type >= vgpu.max_instance {
+                return Err(DeviceError::InvalidSpec(format!(
+                    "vGPU type {} allows {} instance(s) on this card, {} already active",
+                    vgpu.vgpu_type, vgpu.max_instance, same_type
+                )));
+            }
         }
 
         let used: u64 = active.values().map(|b| b.admitted_mib).sum();
         if let Some(budget) = self.config.vram_budget_mib {
-            if used + vgpu.profile_mib > budget {
+            if used + wants > budget {
                 return Err(DeviceError::InvalidSpec(format!(
-                    "vram budget exceeded: {used} MiB active + {} MiB requested > {budget} MiB \
-                     (device {id})",
-                    vgpu.profile_mib
+                    "vram budget exceeded: {used} MiB active + {wants} MiB requested > \
+                     {budget} MiB (device {id})"
                 )));
             }
-        } else if used + vgpu.profile_mib > 0 {
+        } else if used + wants > 0 {
             debug!(
                 used_mib = used,
-                requested_mib = vgpu.profile_mib,
+                requested_mib = wants,
                 "no vram budget configured, admitting without a hard check"
             );
         }
-        Ok(vgpu.profile_mib)
+        Ok(wants)
     }
 
-    /// The full environment for one backend, in ascending precedence:
-    /// typed fields, vGPU resolution, then the free-form env map.
-    fn backend_env(params: &NvrmParams, vgpu: Option<&VgpuType>) -> Vec<(String, String)> {
+    /// The full environment for one backend: the typed fields, the vGPU
+    /// resolution, and then whatever else the node's configuration adds.
+    ///
+    /// Astra finding S03, 2026-09-23: `env` used to WIN over the typed
+    /// fields, which made the number `admit` counted and the number the
+    /// process ran with two different things. Now a key that a typed field
+    /// already wrote is a refusal rather than a silent replacement, so the
+    /// admitted budget is the started budget by construction, and the
+    /// variables that are the process's environment rather than the backend's
+    /// knobs cannot be set at all.
+    ///
+    /// Extra `LEA_*` keys nothing typed produced are still passed through,
+    /// which is what the map is for: a new backend knob needs no driver
+    /// change. They come from `[device.nvrm]` on the node and from nowhere
+    /// else — a spec carrying `env` is refused two tiers earlier, and again
+    /// in `effective_params`.
+    fn backend_env(
+        params: &NvrmParams,
+        vgpu: Option<&VgpuType>,
+    ) -> device::Result<Vec<(String, String)>> {
         let mut env: Vec<(String, String)> = Vec::new();
         let mut push = |k: &str, v: String| env.push((k.to_string(), v));
 
@@ -311,10 +452,26 @@ impl NvrmDriver {
         let mut extra: Vec<_> = params.env.iter().collect();
         extra.sort_unstable_by_key(|(k, _)| k.as_str());
         for (k, v) in extra {
-            env.retain(|(existing, _)| existing != k);
+            // The process's own environment, not the backend's knobs. A
+            // `LD_PRELOAD` or a `PATH` here would decide what binary the node
+            // runs and with what library, which is not a thing a device
+            // configuration gets to say.
+            if PROTECTED_ENV.iter().any(|p| k.starts_with(p)) {
+                return Err(DeviceError::InvalidSpec(format!(
+                    "nvrm env {k:?} is part of the process's own environment and cannot be set \
+                     here; [{}] are refused",
+                    PROTECTED_ENV.join(", ")
+                )));
+            }
+            if DRIVER_OWNED_ENV.contains(&k.as_str()) {
+                return Err(DeviceError::InvalidSpec(format!(
+                    "nvrm env {k:?} is written from a typed field; set the field and not the \
+                     variable, so that what this node admitted is what the backend runs with"
+                )));
+            }
             env.push((k.clone(), v.clone()));
         }
-        env
+        Ok(env)
     }
 }
 
@@ -474,9 +631,9 @@ impl DeviceDriver for NvrmDriver {
             None => None,
         };
 
-        let admitted_mib = self.admit(id, vgpu.as_ref()).await?;
+        let admitted_mib = self.admit(id, &params, vgpu.as_ref()).await?;
 
-        let env = Self::backend_env(&params, vgpu.as_ref());
+        let env = Self::backend_env(&params, vgpu.as_ref())?;
         debug!(
             vgpu_type = params.vgpu_type.as_deref().unwrap_or("-"),
             profile = spec.profile.as_deref().unwrap_or("-"),
@@ -624,19 +781,128 @@ mod tests {
         );
     }
 
+    /// This test used to be `free_env_overrides_typed_fields` and asserted
+    /// the opposite: that `env` WON over the typed fields.
+    ///
+    /// Astra finding S03, 2026-09-23 turned that behaviour round, so the test
+    /// turns round with it. What it encoded was the reason the finding
+    /// exists: the number this node admits a device for came from the typed
+    /// field and the number the backend ran with came from the map, and
+    /// nothing made the two agree. A backend knob that no typed field
+    /// produces still passes through — that is what the map is for — but a
+    /// key that argues with one is now a refusal a person reads.
     #[test]
-    fn free_env_overrides_typed_fields() {
+    fn free_env_may_not_argue_with_a_typed_field() {
         let params = p(serde_json::json!({
             "vram_limit_mib": 1024,
             "env": { "LEA_VRAM_LIMIT_MIB": "512" }
         }));
-        let env = NvrmDriver::backend_env(&params, None);
-        let vals: Vec<_> = env
-            .iter()
-            .filter(|(k, _)| k == "LEA_VRAM_LIMIT_MIB")
-            .collect();
-        assert_eq!(vals.len(), 1);
-        assert_eq!(vals[0].1, "512");
+        let err = NvrmDriver::backend_env(&params, None).expect_err("two numbers, one device");
+        let said = err.to_string();
+        assert!(said.contains("LEA_VRAM_LIMIT_MIB"), "{said}");
+        assert!(said.contains("typed field"), "{said}");
+
+        // A knob nothing typed produces is still passed through verbatim,
+        // which is the whole point of the map.
+        let params = p(serde_json::json!({
+            "vram_limit_mib": 1024,
+            "env": { "LEA_FD_CENSUS": "1" }
+        }));
+        let env = NvrmDriver::backend_env(&params, None).expect("a new knob is not an argument");
+        let get = |k: &str| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("LEA_FD_CENSUS"), Some("1"));
+        assert_eq!(get("LEA_VRAM_LIMIT_MIB"), Some("1024"));
+    }
+
+    /// The process's own environment is not a device knob.
+    ///
+    /// Astra finding S03, 2026-09-23: `create` clears the environment and
+    /// carries over exactly `PATH` and `HOME`, and an `env` map that could
+    /// set either — or an `LD_PRELOAD` — would decide which binary the node
+    /// runs and with which library.
+    #[test]
+    fn the_process_environment_is_not_a_device_knob() {
+        for key in ["LD_PRELOAD", "PATH", "HOME", "NVIDIA_VISIBLE_DEVICES"] {
+            let params = p(serde_json::json!({ "env": { key: "/tmp/mine" } }));
+            let err = NvrmDriver::backend_env(&params, None)
+                .err()
+                .unwrap_or_else(|| panic!("{key} must be refused"));
+            let said = err.to_string();
+            assert!(said.contains(key), "the refusal names it: {said}");
+        }
+    }
+
+    /// A spec may name the vGPU type it wants and nothing else.
+    ///
+    /// Astra finding S03, 2026-09-23: `spec.params` reached this driver as
+    /// the whole of `NvrmParams`, so a VM document could ask for
+    /// `admin_priv` — the backend keeping `CAP_SYS_ADMIN` — and could write
+    /// the process's environment. Both are the node's to decide, and the node
+    /// says so in `[device.nvrm]`.
+    #[test]
+    fn a_spec_may_name_a_vgpu_type_and_nothing_else() {
+        assert!(refuse_operator_only_params(&serde_json::json!({})).is_ok());
+        assert!(
+            refuse_operator_only_params(&serde_json::json!({ "vgpu_type": "RTX2070-4Q" })).is_ok()
+        );
+
+        for refused in ["admin_priv", "env", "vram_limit_mib", "vram_profile_mib"] {
+            let params = serde_json::json!({ refused: serde_json::Value::Null });
+            let said = refuse_operator_only_params(&params).expect_err("not a spec's to set");
+            assert!(said.contains(refused), "{said}");
+            assert!(
+                said.contains("device.nvrm"),
+                "and says where it belongs: {said}"
+            );
+        }
+        assert!(refuse_operator_only_params(&serde_json::json!("nvrm")).is_err());
+    }
+
+    /// What this node admitted is what the backend is started with.
+    ///
+    /// Astra finding S03, 2026-09-23: admission counted the resolved vGPU
+    /// profile while the process was started from the typed fields, so a
+    /// device that named a cap was admitted for one number and ran with
+    /// another. The test reads both out of the same params.
+    #[test]
+    fn the_admitted_budget_is_the_started_budget() {
+        let vgpu = VgpuType {
+            vgpu_type: "RTX2070-4Q".into(),
+            profile_mib: 4096,
+            fb_mib: 2816,
+            max_instance: 2,
+            encoder_cap: 50,
+        };
+        let value = |env: &[(String, String)], k: &str| {
+            env.iter()
+                .find(|(ek, _)| ek == k)
+                .map(|(_, v)| v.parse::<u64>().expect("a number"))
+        };
+
+        // A profile alone: what was resolved on the card is what is counted
+        // and what the backend reads.
+        let params = NvrmParams {
+            vgpu_type: Some("RTX2070-4Q".into()),
+            ..Default::default()
+        };
+        let env = NvrmDriver::backend_env(&params, Some(&vgpu)).expect("started");
+        assert_eq!(params.admitted_mib(Some(&vgpu)), 4096);
+        assert_eq!(value(&env, "LEA_VGPU_PROFILE_MIB"), Some(4096));
+
+        // A cap and no profile: the cap is the number, in both places.
+        let params = p(serde_json::json!({ "vram_limit_mib": 512 }));
+        let env = NvrmDriver::backend_env(&params, None).expect("started");
+        assert_eq!(params.admitted_mib(None), 512);
+        assert_eq!(value(&env, "LEA_VRAM_LIMIT_MIB"), Some(512));
+
+        // An explicit profile size and no vGPU type: the same again.
+        let params = p(serde_json::json!({ "vram_profile_mib": 2048 }));
+        let env = NvrmDriver::backend_env(&params, None).expect("started");
+        assert_eq!(params.admitted_mib(None), 2048);
+        assert_eq!(value(&env, "LEA_VRAM_PROFILE_MIB"), Some(2048));
+
+        // And a device that asks for nothing costs nothing.
+        assert_eq!(NvrmParams::default().admitted_mib(None), 0);
     }
 
     #[test]
@@ -648,7 +914,8 @@ mod tests {
             max_instance: 2,
             encoder_cap: 50,
         };
-        let env = NvrmDriver::backend_env(&NvrmParams::default(), Some(&vgpu));
+        let env = NvrmDriver::backend_env(&NvrmParams::default(), Some(&vgpu))
+            .expect("nothing argues with anything");
         let get = |k: &str| env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.as_str());
         assert_eq!(get("LEA_VGPU_TYPE"), Some("RTX2070-4Q"));
         assert_eq!(get("LEA_VGPU_PROFILE_MIB"), Some("4096"));

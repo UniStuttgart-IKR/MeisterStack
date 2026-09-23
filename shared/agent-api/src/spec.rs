@@ -223,8 +223,26 @@ pub struct NewDevice {
     #[serde(default, alias = "driver_name")]
     pub driver: Option<String>,
     pub partition: String,
+    /// The name of a section the NODE's configuration wrote. This is the
+    /// ordinary way to ask a device for more than its defaults, and it is the
+    /// safe one: what the name stands for was written by whoever runs the
+    /// node.
     #[serde(default)]
     pub profile: Option<String>,
+    /// What this device's driver is to make of the request, in the driver's
+    /// own vocabulary.
+    ///
+    /// Free-form here and NOT free-form at the node. Astra finding S03,
+    /// 2026-09-23: this map reached the nvrm driver as the whole of its
+    /// configuration — `admin_priv`, which keeps `CAP_SYS_ADMIN` in the
+    /// backend process, and `env`, which is that process's environment — so a
+    /// document could configure a backend the node was supposed to configure.
+    /// The node now refuses every key a driver has not declared a tenant's to
+    /// set (`agent::types::refuse_operator_only_device_params`), and the
+    /// refusal arrives while a person still holds the request.
+    ///
+    /// A schema cannot say this, because what is allowed depends on which
+    /// driver the device lands on and that is a fact about a node.
     #[serde(default)]
     pub params: Option<serde_json::Value>,
 }
