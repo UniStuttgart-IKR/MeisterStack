@@ -1025,6 +1025,27 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
         }
         TxnView::Pending { .. } => Step::VerifyAndConfirm,
         TxnView::Reverted => Step::RolledBack,
+        // Astra, alongside finding F19, 2026-09-23: a host that only had to
+        // BOOT never opened a transaction. Its plan has no `activate` and no
+        // `confirm` — the way back from a boot that does not come up is the
+        // boot menu, which is the documented limit of that class — so the
+        // journal records no `action.irreversible` and no txn id for it. A
+        // run that stopped between its `reboot` and its `verify` still
+        // reached `verifying`, which is past the point of no return, and
+        // fell into the arm below: "an irreversible step began and the
+        // target has no transaction record for it". It had not, and those
+        // hosts were not resumable at all.
+        //
+        // The guard is the JOURNAL's own txn id and two states, and it takes
+        // nothing away from the arm below: an activation writes its
+        // `action.irreversible`, with the txn in it, BEFORE the command that
+        // cannot be taken back, so a host that activated always has one.
+        TxnView::None
+            if host.txn_id.is_none()
+                && matches!(host.state, HostState::AwaitingReboot | HostState::Verifying) =>
+        {
+            Step::VerifyOnly
+        }
         TxnView::None => Step::RecoveryRequired(format!(
             "an irreversible step began on {} and the target has no transaction record for it. \
              The journal cannot say what happened after the line it managed to write, and \
@@ -1714,6 +1735,34 @@ mod tests {
         }
         let step = next_step(&mid_activation(), &TxnView::Inconsistent);
         assert!(matches!(step, Step::RecoveryRequired(_)));
+    }
+
+    // Astra, alongside finding F19, 2026-09-23.
+    #[test]
+    fn a_host_that_only_had_to_boot_is_not_a_recovery_case() {
+        // A `reboot_only` host has no `activate` and no `confirm`, so it
+        // opens no transaction and the journal records no txn id for it. A
+        // run that stopped between its `reboot` and its `verify` left it in
+        // `verifying`, which is past the point of no return — and the table
+        // then said "an irreversible step began and the target has no
+        // transaction record for it". It had not, and the host could not be
+        // resumed at all. What is left for it is the verify.
+        for state in [HostState::AwaitingReboot, HostState::Verifying] {
+            assert_eq!(
+                next_step(&host_in(state), &TxnView::None),
+                Step::VerifyOnly,
+                "{state}"
+            );
+        }
+        // And the arm this passes through is untouched where it belongs: a
+        // host that DID activate carries the txn its `action.irreversible`
+        // wrote before the command that cannot be taken back.
+        let mut activated = host_in(HostState::Verifying);
+        activated.txn_id = Some("txn-1".to_string());
+        let Step::RecoveryRequired(why) = next_step(&activated, &TxnView::None) else {
+            panic!("an activation whose record is gone needs a person");
+        };
+        assert!(why.contains("no transaction record"), "{why}");
     }
 
     #[test]
