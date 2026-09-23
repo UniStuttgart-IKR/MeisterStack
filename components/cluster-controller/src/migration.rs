@@ -116,6 +116,36 @@ pub fn phase_for(migrations: &[VmMigration], vm: &Vm) -> Option<VmMigrationPhase
         .find(|p| controller_api::second_open_is_a_migration(Some(*p)))
 }
 
+/// Does another record already name this VM and not be finished with it?
+///
+/// The rule `start_for_drain` has always kept for the road it owns — "at most
+/// one in flight per VM" — as a value, so that the other road can keep it
+/// too and so that it can be checked without a store.
+///
+/// Astra finding S06, 2026-09-23: `create_vm_migration` is idempotent by
+/// NAME and refuses nothing else, so two operators, or one operator and a
+/// retry under a fresh name, file two records for one guest. Both reach
+/// `prepare`, both choose a destination, and the second one's destination
+/// refuses the VM it already has a record of — a refusal this tier reads as
+/// "the destination could not open the disks" and answers with `abandon`,
+/// which destroys by the VM's uid on the node that is holding the FIRST
+/// migration's receiving VMM.
+///
+/// Every non-final record counts, `Pending` included, which is deliberate: a
+/// record that has not been acted on yet is one that will be acted on within
+/// the tick, and this is a question asked one line before a claim. So two
+/// records filed for one guest end with at most one of them building a
+/// destination, and in the worst case — two replicas asking in the same
+/// instant — with both failed and saying why. That is a pair of records an
+/// operator can act on, which the alternative was not.
+fn another_attempt_in_flight(all: &[VmMigration], mine: &VmMigration) -> bool {
+    all.iter().any(|m| {
+        m.metadata.name != mine.metadata.name
+            && m.spec.vm == mine.spec.vm
+            && !m.status.phase().kind().is_final()
+    })
+}
+
 /// What the DESTINATION says about a guest that is moving to it.
 ///
 /// Its own ingest, in its own file, and it exists because `ingest_status`'s
@@ -491,6 +521,40 @@ async fn prepare(
         Ok(target) => target,
         Err(why) => return fail(store, migration, why).await,
     };
+
+    // One guest is moved once. Astra finding S06, 2026-09-23: the claim CAS
+    // below is per MIGRATION, and two migration OBJECTS for one VM each win
+    // their own — `create_vm_migration` mints a record per name and refuses
+    // nothing, and the "at most one in flight" rule existed only inside
+    // `start_for_drain`. What the second attempt then did was not a second
+    // wasted preparation: the destination's agent refuses a VM it already has
+    // a record of (`prepare_migration`), this tier reads that refusal as "the
+    // destination could not open the disks", and `abandon` sends `Destroy`
+    // BY THE VM's UID — to the node that is holding the first migration's
+    // receiving VMM. The first move loses its destination to the second
+    // attempt's tidy-up.
+    //
+    // Read immediately before the claim, so that the window between the
+    // question and the answer is as short as this tier can make it, and
+    // `fail` rather than a quiet return: an operator who asked twice is owed
+    // a record saying which record is carrying the move.
+    let siblings: Vec<VmMigration> = match store.list().await {
+        Ok(m) => m,
+        Err(StoreError::NotFound(_)) => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    if another_attempt_in_flight(&siblings, migration) {
+        return fail(
+            store,
+            migration,
+            format!(
+                "another migration record for vm {} has not finished; one guest moves once, so \
+                 this record ends here and the other one carries the move",
+                migration.spec.vm
+            ),
+        )
+        .await;
+    }
 
     // The claim before the command, exactly as every other dispatch in this
     // tree: a CAS that loses means another replica is already preparing this
@@ -1435,6 +1499,66 @@ mod tests {
                 phase.as_str()
             );
         }
+    }
+
+    /// Astra finding S06, 2026-09-23: a second record for one guest is
+    /// refused before it claims a destination.
+    ///
+    /// `create_vm_migration` mints a record per NAME and says nothing about
+    /// how many name one vm, so two of them reach `prepare`. The second one's
+    /// destination refuses the vm it already has a record of, this tier reads
+    /// that as "the destination could not open the disks", and `abandon`
+    /// destroys BY THE VM's UID — on the node that is holding the first
+    /// migration's receiving VMM.
+    #[test]
+    fn a_second_record_for_one_guest_never_reaches_a_destination() {
+        let mine = migration("web-1", VmMigrationPhaseKind::Pending);
+        let sibling = |vm: &str, phase| {
+            let mut m = migration(vm, phase);
+            m.metadata.name = format!("{vm}-y");
+            m
+        };
+
+        // Nothing else on file, and the record's own entry in the list: this
+        // migration is the one carrying the move.
+        assert!(!another_attempt_in_flight(&[], &mine));
+        assert!(
+            !another_attempt_in_flight(std::slice::from_ref(&mine), &mine),
+            "a record is not another attempt at itself"
+        );
+
+        // Every phase that is not an ending, `Pending` included: a record
+        // nothing has acted on yet is one that will be acted on inside the
+        // tick, and this is asked one line before a claim.
+        for phase in [
+            VmMigrationPhaseKind::Pending,
+            VmMigrationPhaseKind::Preparing,
+            VmMigrationPhaseKind::Running,
+        ] {
+            assert!(
+                another_attempt_in_flight(&[sibling("web-1", phase)], &mine),
+                "{}",
+                phase.as_str()
+            );
+        }
+
+        // And the two endings, which have let go of both machines.
+        for phase in [
+            VmMigrationPhaseKind::Succeeded,
+            VmMigrationPhaseKind::Failed,
+        ] {
+            assert!(
+                !another_attempt_in_flight(&[sibling("web-1", phase)], &mine),
+                "{}",
+                phase.as_str()
+            );
+        }
+
+        // Another guest's move is not this guest's business.
+        assert!(!another_attempt_in_flight(
+            &[sibling("web-2", VmMigrationPhaseKind::Running)],
+            &mine
+        ));
     }
 
     /// Somebody else's migration is not this vm's permission — neither

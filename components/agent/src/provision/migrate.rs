@@ -203,6 +203,25 @@ impl Provisioner {
                 record.phase
             );
         }
+        // A send that is already running is not started again.
+        //
+        // Astra finding S06, 2026-09-23: the marker below was written over
+        // whatever was there, so a second `MigrateOut` for a guest that was
+        // already being sent overwrote the peer of the transfer in flight and
+        // started a second `migrate_out` against the same VMM. What the
+        // record then named was the second destination, so the task watching
+        // the first send wrote its outcome against the wrong address — and
+        // the guest would have been offered to two machines at once.
+        //
+        // The refusal names the address the guest is already going to,
+        // because that is what tells the caller which of the two migrations
+        // is the real one.
+        if let Some(Operation::MigratingOut { peer: under_way }) = &record.operation {
+            bail!(
+                "vm {id} is already being sent to {under_way}; a guest is sent to one machine \
+                 at a time"
+            );
+        }
         // Hands off for the length of the transfer. The guest is paused
         // near the end of it, and a pass that saw a paused guest under a
         // Running record would resume it — into a copy of itself.
