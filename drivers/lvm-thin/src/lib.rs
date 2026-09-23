@@ -52,6 +52,17 @@ pub struct LvmThinDriverConfig {
     /// which is right on a NixOS node and wrong nowhere in particular.
     pub bin_dir: Option<PathBuf>,
     pub qemu_img: PathBuf,
+    /// Where LVM's device nodes appear. `/dev` on every node there is; a
+    /// directory of ordinary files in the tests, which is what lets the
+    /// hand-over of the destination be exercised without a volume group.
+    pub dev_dir: PathBuf,
+    /// The unit `qemu-img` runs inside, for the probe and the conversion.
+    ///
+    /// Astra finding S01, 2026-09-23: the converter used to be a subprocess
+    /// of the agent, which on a node with `unprivileged = false` is root,
+    /// and what it reads is a file somebody else wrote. See
+    /// `agent_api::base_image`.
+    pub convert: agent_api::base_image::Sandbox,
 }
 
 pub struct LvmThinDriver {
@@ -206,8 +217,11 @@ impl LvmThinDriver {
         format!("{}/{}", self.config.vg, self.config.thin_pool)
     }
 
-    fn device_path(vg: &str, lv: &str) -> PathBuf {
-        PathBuf::from(format!("/dev/{vg}/{lv}"))
+    /// `/dev/<vg>/<lv>`: the symlink LVM keeps for an LV, which is what the
+    /// VMM is handed and what `canonicalize` turns into the node itself when
+    /// the converter has to be told about it by name.
+    fn device_path(&self, vg: &str, lv: &str) -> PathBuf {
+        self.config.dev_dir.join(vg).join(lv)
     }
 
     /// The handle for an LV at `dev`. One place, so that `provision`'s two
@@ -336,6 +350,13 @@ impl LvmThinDriver {
     /// decided again here — and an image naming a backing file or an external
     /// data file had that second file read into the guest's disk, by a
     /// converter that on a node with `unprivileged = false` is root.
+    ///
+    /// The second half of that finding is where it runs. Not here: in a
+    /// transient unit with no network, no capabilities and write access to
+    /// exactly one block device. That is also why the node is resolved
+    /// first — `DeviceAllow=` names the device itself, and so does the
+    /// ownership the converter is given for the length of the conversion and
+    /// loses again at the end of it.
     async fn write_base_image(
         &self,
         image: &agent_api::base_image::BaseImage,
@@ -343,19 +364,21 @@ impl LvmThinDriver {
         dev: &Path,
         name: &str,
     ) -> storage::Result<()> {
-        let out = tokio::process::Command::new(&self.config.qemu_img)
-            .args(agent_api::base_image::convert_argv(image, src, dev))
-            .output()
-            .await
-            .map_err(|e| StorageError::Backend(anyhow::anyhow!("running qemu-img convert: {e}")))?;
-        if !out.status.success() {
-            return Err(StorageError::Backend(anyhow::anyhow!(
-                "qemu-img convert {name} -> {}: {}",
-                dev.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        Ok(())
+        let node = tokio::fs::canonicalize(dev).await.map_err(|e| {
+            StorageError::Backend(anyhow::anyhow!(
+                "the lv {} has no device node to write onto: {e}",
+                dev.display()
+            ))
+        })?;
+        agent_api::base_image::convert(
+            &self.config.convert,
+            &self.config.qemu_img,
+            image,
+            src,
+            agent_api::base_image::Destination::Device(&node),
+            name,
+        )
+        .await
     }
 
     async fn remove_lv(&self, vg: &str, lv: &str) -> storage::Result<()> {
@@ -389,7 +412,7 @@ impl VolumeProvider for LvmThinDriver {
         let (vg, pool) = resolve_pool(&params, &self.config.vg, &self.config.thin_pool)?;
         let lv = lv_name(id);
         let staging = staging_lv_name(id);
-        let dev = Self::device_path(&vg, &lv);
+        let dev = self.device_path(&vg, &lv);
 
         // Idempotent like every other create in this tree: a re-provision of
         // the same volume finds its LV and is done. Only the FINAL name
@@ -425,8 +448,13 @@ impl VolumeProvider for LvmThinDriver {
                 // disk it describes, so the file's own length is the wrong
                 // number — and whether this node will convert it at all. See
                 // `agent_api::base_image` for what it refuses and why.
-                let image =
-                    agent_api::base_image::probe(&self.config.qemu_img, &path, name).await?;
+                let image = agent_api::base_image::probe(
+                    &self.config.convert,
+                    &self.config.qemu_img,
+                    &path,
+                    name,
+                )
+                .await?;
                 if image.virtual_size > spec.size_bytes {
                     return Err(StorageError::InvalidSpec(format!(
                         "size_bytes {} smaller than base image {name} ({} bytes raw)",
@@ -461,7 +489,7 @@ impl VolumeProvider for LvmThinDriver {
         // — a half-written volume that survives would be handed to the next
         // boot as if it were ready.
         if let Some((path, name, image)) = src {
-            let staging_dev = Self::device_path(&vg, &staging);
+            let staging_dev = self.device_path(&vg, &staging);
             info!(base = %path.display(), dev = %staging_dev.display(),
                   format = %image.format, "writing base image onto lv");
             if let Err(e) = self
@@ -560,7 +588,7 @@ impl VolumeProvider for LvmThinDriver {
     ) -> storage::Result<VolumeHandle> {
         let vg = self.vg_of(handle);
         let snap = snapshot_lv_name(id);
-        let dev = Self::device_path(&vg, &snap);
+        let dev = self.device_path(&vg, &snap);
         // Idempotent by the same rule everything else here follows: the name
         // is derived from the id, so a second call finds the first one's LV.
         if let Some(size) = self.lv_size_bytes(&vg, &snap).await? {
@@ -600,7 +628,7 @@ impl VolumeProvider for LvmThinDriver {
     ) -> storage::Result<VolumeHandle> {
         let vg = self.vg_of(snapshot);
         let lv = lv_name(id);
-        let dev = Self::device_path(&vg, &lv);
+        let dev = self.device_path(&vg, &lv);
         if let Some(size) = self.lv_size_bytes(&vg, &lv).await? {
             debug!(size_bytes = size, "thin volume already exists");
             return Ok(Self::handle(id, &dev, size, spec));
@@ -686,7 +714,7 @@ impl VolumeProvider for LvmThinDriver {
         let params = Self::params(spec)?;
         let (vg, _) = resolve_pool(&params, &self.config.vg, &self.config.thin_pool)?;
         let lv = lv_name(id);
-        let dev = Self::device_path(&vg, &lv);
+        let dev = self.device_path(&vg, &lv);
         Ok(self
             .lv_size_bytes(&vg, &lv)
             .await?
@@ -713,7 +741,7 @@ impl VolumeProvider for LvmThinDriver {
         };
         let vg = self.vg_of(volume);
         let snap = snapshot_lv_name(id);
-        let dev = Self::device_path(&vg, &snap);
+        let dev = self.device_path(&vg, &snap);
         Ok(self
             .lv_size_bytes(&vg, &snap)
             .await?
@@ -766,6 +794,8 @@ mod tests {
                 image_dir: PathBuf::from("/var/lib/meister/images"),
                 bin_dir: None,
                 qemu_img: PathBuf::from("qemu-img"),
+                dev_dir: PathBuf::from("/dev"),
+                convert: agent_api::base_image::Sandbox::default(),
             },
         }
     }
@@ -793,6 +823,11 @@ mod tests {
     /// the scripts starts a process of its own.
     struct FakeLvm {
         temp: tempfile::TempDir,
+        /// Every destination the sandbox was asked to hand over or take
+        /// back, in order. A test is not root and a build host has no
+        /// `meister-convert`, so the chowns are recorded rather than made —
+        /// everything else, the argv included, is what a node runs.
+        handed_over: std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, u32, u32)>>>,
     }
 
     impl FakeLvm {
@@ -804,10 +839,11 @@ mod tests {
                 .tempdir()
                 .expect("a temp dir");
             let root = temp.path();
-            for dir in ["bin", "state", "images"] {
+            for dir in ["bin", "state", "images", "dev/vg0"] {
                 std::fs::create_dir_all(root.join(dir)).expect("the fake's directories");
             }
             let state = root.join("state").display().to_string();
+            let dev = root.join("dev").join("vg0").display().to_string();
             let log = root.join("log").display().to_string();
 
             let scripts = [
@@ -845,14 +881,16 @@ mod tests {
                          *) shift;;\n\
                          esac\n\
                          done\n\
-                         printf '%s\\n' \"$size\" > \"{state}/$name\"\n"
+                         printf '%s\\n' \"$size\" > \"{state}/$name\"\n\
+                         : > \"{dev}/$name\"\n"
                     ),
                 ),
                 (
                     "lvrename",
                     format!(
                         "echo \"lvrename $*\" >> \"{log}\"\n\
-                         if [ -f \"{state}/$2\" ]; then mv \"{state}/$2\" \"{state}/$3\"; exit 0; fi\n\
+                         if [ -f \"{state}/$2\" ]; then mv \"{state}/$2\" \"{state}/$3\"\n\
+                         mv \"{dev}/$2\" \"{dev}/$3\" 2>/dev/null; exit 0; fi\n\
                          echo \"  Failed to find logical volume \\\"$2\\\"\" >&2\n\
                          exit 5\n"
                     ),
@@ -862,7 +900,22 @@ mod tests {
                     format!(
                         "echo \"lvremove $*\" >> \"{log}\"\n\
                          name=${{2#*/}}\n\
-                         rm -f \"{state}/$name\"\n"
+                         rm -f \"{state}/$name\" \"{dev}/$name\"\n"
+                    ),
+                ),
+                // The sandbox, as a script: it writes down the command line
+                // it was given — which is what the tests read — and then
+                // starts what comes after `--`, the way systemd would.
+                (
+                    "systemd-run",
+                    format!(
+                        "echo \"systemd-run $*\" >> \"{log}\"\n\
+                         if [ -f \"{state}/../no-unit\" ]; then\n\
+                         echo 'Failed to start transient service unit' >&2; exit 1\n\
+                         fi\n\
+                         while [ $# -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\n\
+                         shift\n\
+                         exec \"$@\"\n"
                     ),
                 ),
                 (
@@ -885,10 +938,14 @@ mod tests {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                     .expect("runnable");
             }
-            Self { temp }
+            Self {
+                temp,
+                handed_over: Default::default(),
+            }
         }
 
         fn driver(&self) -> LvmThinDriver {
+            let recorder = self.handed_over.clone();
             LvmThinDriver {
                 config: LvmThinDriverConfig {
                     vg: "vg0".into(),
@@ -897,8 +954,43 @@ mod tests {
                     image_dir: self.temp.path().join("images"),
                     bin_dir: Some(self.temp.path().join("bin")),
                     qemu_img: self.temp.path().join("bin").join("qemu-img"),
+                    dev_dir: self.temp.path().join("dev"),
+                    convert: agent_api::base_image::Sandbox::new(
+                        self.temp.path().join("bin").join("systemd-run"),
+                    )
+                    .resolved_as(
+                        4242,
+                        4343,
+                        std::sync::Arc::new(move |path: &Path, uid, gid| {
+                            recorder.lock().expect("the recorded hand-overs").push((
+                                path.to_path_buf(),
+                                uid,
+                                gid,
+                            ));
+                            Ok(())
+                        }),
+                    ),
                 },
             }
+        }
+
+        /// The device node an LV of this fake has, which is a file.
+        fn node(&self, name: &str) -> PathBuf {
+            self.temp.path().join("dev").join("vg0").join(name)
+        }
+
+        /// What the driver gave to the converter and took back again.
+        fn handed_over(&self) -> Vec<(PathBuf, u32, u32)> {
+            self.handed_over
+                .lock()
+                .expect("the recorded hand-overs")
+                .clone()
+        }
+
+        /// Make the transient unit refuse to start, the way a node without
+        /// the `meister-convert` account does.
+        fn break_the_unit(&self) {
+            std::fs::write(self.temp.path().join("no-unit"), b"").expect("the marker");
         }
 
         /// A base image the driver will find under its image_dir.
@@ -916,6 +1008,8 @@ mod tests {
                 format!("{size}\n"),
             )
             .expect("the lv");
+            std::fs::write(self.temp.path().join("dev").join("vg0").join(name), b"")
+                .expect("its device node");
         }
 
         fn has_lv(&self, name: &str) -> bool {
@@ -989,7 +1083,7 @@ mod tests {
         assert!(!fake.has_lv(&staging), "and the staging name is not");
         assert_eq!(
             handle.backend,
-            format!("/dev/vg0/{final_name}"),
+            fake.node(&final_name).display().to_string(),
             "the handle names the volume and not the name it was built under"
         );
     }
@@ -1077,6 +1171,127 @@ mod tests {
         assert!(
             format!("{err}").contains("interrupted"),
             "the failure carries qemu-img's own words: {err}"
+        );
+        assert!(!fake.has_lv(&lv_name(&id)), "no volume");
+        assert!(!fake.has_lv(&staging_lv_name(&id)), "and no leftover");
+
+        // Astra finding S01, 2026-09-23: and the device node went back to
+        // the agent, on the path that failed as much as on the one that
+        // worked. A node left owned by the converter is what the sandbox
+        // exists to prevent.
+        let handed = fake.handed_over();
+        assert_eq!(handed.len(), 2, "given over and taken back: {handed:?}");
+        assert_eq!(handed[0].1, 4242, "to the converter: {handed:?}");
+        assert_ne!(handed[1].1, 4242, "and back again: {handed:?}");
+        assert_eq!(handed[0].0, handed[1].0, "the same node: {handed:?}");
+    }
+
+    /// The image is read and written from inside a transient unit that has
+    /// one block device and nothing else.
+    ///
+    /// Astra finding S01, 2026-09-23, second half: `qemu-img` used to be a
+    /// subprocess of the agent, which on a node with `unprivileged = false`
+    /// is root, and what it parses is a file somebody else wrote. The
+    /// command line IS the sandbox, so this test reads the command line.
+    #[tokio::test]
+    async fn the_image_is_read_and_written_inside_the_unit_and_nowhere_else() {
+        let fake = FakeLvm::new();
+        let driver = fake.driver();
+        let id: VolumeId = Uuid::new_v4();
+        let spec = from_image(&fake.image("base.raw"));
+        let staging = staging_lv_name(&id);
+
+        driver.provision(&id, &spec).await.expect("provisioned");
+
+        let log = fake.log();
+        let units: Vec<&String> = log
+            .iter()
+            .filter(|l| l.starts_with("systemd-run"))
+            .collect();
+        assert_eq!(units.len(), 2, "the probe and the conversion: {log:?}");
+        for unit in &units {
+            for property in [
+                "User=meister-convert",
+                "NoNewPrivileges=yes",
+                "CapabilityBoundingSet=",
+                "PrivateNetwork=yes",
+                "RestrictAddressFamilies=none",
+                "ProtectSystem=strict",
+                "ProtectHome=yes",
+                "PrivateTmp=yes",
+                "SystemCallFilter=@system-service",
+                "MemoryMax=",
+                "CPUQuota=",
+                "RuntimeMaxSec=",
+                "--wait",
+                "--pipe",
+                "--collect",
+                "--quiet",
+            ] {
+                assert!(unit.contains(property), "{property} is missing from {unit}");
+            }
+            let image = fake.temp.path().join("images").join("base.raw");
+            assert!(
+                unit.contains(&format!("BindReadOnlyPaths={}", image.display())),
+                "the image is read-only and is the only thing bound in: {unit}"
+            );
+        }
+        // Nothing qemu-img ran was outside a unit.
+        assert!(
+            log.iter().all(|l| !l.starts_with("qemu-img")
+                || units.iter().any(|u| u.contains(&l["qemu-img ".len()..]))),
+            "every qemu-img is the tail of a unit: {log:?}"
+        );
+        // The destination is a block device, so the unit is told about the
+        // node and nothing is bound writable at all.
+        let handed = fake.handed_over();
+        assert_eq!(handed.len(), 2, "given over and taken back: {handed:?}");
+        let node = handed[0].0.display().to_string();
+        assert!(node.ends_with(&staging), "it is the staging node: {node}");
+        assert!(
+            units[1].contains(&format!("DeviceAllow={node} rw")),
+            "the one device it may write: {}",
+            units[1]
+        );
+        assert!(
+            !units[1].contains("BindPaths="),
+            "and nothing is bound writable: {}",
+            units[1]
+        );
+        assert!(
+            !units[1].contains("PrivateDevices=yes"),
+            "a private /dev would hide the node: {}",
+            units[1]
+        );
+        assert_eq!((handed[0].1, handed[0].2), (4242, 4343), "{handed:?}");
+        assert_ne!(handed[1].1, 4242, "and it is given back: {handed:?}");
+    }
+
+    /// A unit that will not start is a refusal. The agent does not read the
+    /// image itself instead, and the pool is left as it was.
+    ///
+    /// Astra finding S01, 2026-09-23: a fallback would mean the most
+    /// privileged path is the one that runs when something is wrong.
+    #[tokio::test]
+    async fn a_unit_that_does_not_start_refuses_rather_than_converting_here() {
+        let fake = FakeLvm::new();
+        let driver = fake.driver();
+        let id: VolumeId = Uuid::new_v4();
+        let spec = from_image(&fake.image("base.raw"));
+        fake.break_the_unit();
+
+        let err = driver
+            .provision(&id, &spec)
+            .await
+            .expect_err("nothing is converted outside the unit");
+        assert!(
+            format!("{err}").contains("Failed to start transient service unit"),
+            "the refusal carries what systemd said: {err}"
+        );
+        let log = fake.log();
+        assert!(
+            log.iter().all(|l| !l.starts_with("qemu-img")),
+            "qemu-img was never started: {log:?}"
         );
         assert!(!fake.has_lv(&lv_name(&id)), "no volume");
         assert!(!fake.has_lv(&staging_lv_name(&id)), "and no leftover");
@@ -1257,7 +1472,7 @@ mod tests {
     #[test]
     fn a_thin_volume_is_a_device_node_under_its_vg() {
         assert_eq!(
-            LvmThinDriver::device_path("meister-test", "vm-abc"),
+            driver("meister-test").device_path("meister-test", "vm-abc"),
             PathBuf::from("/dev/meister-test/vm-abc")
         );
     }
@@ -1339,7 +1554,7 @@ mod tests {
         assert_eq!(d.vg_of(&elsewhere), "vg9");
         let taken = LvmThinDriver::snapshot_handle(
             &snapshot,
-            &LvmThinDriver::device_path("vg9", &snapshot_lv_name(&snapshot)),
+            &d.device_path("vg9", &snapshot_lv_name(&snapshot)),
             1 << 30,
         );
         assert_eq!(taken.backend, format!("/dev/vg9/snap-{snapshot}"));

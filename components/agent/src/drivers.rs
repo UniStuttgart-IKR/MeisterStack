@@ -403,6 +403,13 @@ fn build_filesystem(
             .as_ref()
             .map(|f| f.qemu_img.clone())
             .unwrap_or_else(|| std::path::PathBuf::from("qemu-img")),
+        // Astra finding S01, 2026-09-23: qemu-img reads a file this node did
+        // not write, so it runs in a transient unit of its own rather than
+        // in the agent, which is root by default. The default sandbox is the
+        // one nix/services.nix provides the account for; there is no key to
+        // turn it off, because a node that cannot build the unit is meant to
+        // refuse the image rather than read it here.
+        convert: agent_api::base_image::Sandbox::default(),
     })?;
     Ok(Some(Arc::new(driver)))
 }
@@ -424,6 +431,13 @@ fn build_lvm_thin(
             .unwrap_or_else(|| cfg.paths.image_dir.clone()),
         bin_dir: l.bin_dir.clone(),
         qemu_img: l.qemu_img.clone(),
+        // Where LVM's symlinks are. Not a key: a node whose device nodes are
+        // not under /dev is not a node LVM runs on.
+        dev_dir: std::path::PathBuf::from("/dev"),
+        // Astra finding S01, 2026-09-23, as above: the base image is read
+        // and written by a transient unit with one block device, not by the
+        // agent.
+        convert: agent_api::base_image::Sandbox::default(),
     })?;
     Ok(Some(Arc::new(driver)))
 }

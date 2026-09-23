@@ -11,6 +11,7 @@
 //! driver, and the answer to `FilesystemBlockDriver`'s low cohesion is that
 //! half its methods never looked at it.
 
+use agent_api::base_image::{BaseImage, Destination, Sandbox};
 use agent_api::storage;
 use agent_api::storage::{SnapshotId, StorageError, VolumeId};
 use std::io::ErrorKind;
@@ -150,25 +151,42 @@ impl Room {
 /// `agent_api::base_image::probe` already judged, and a second detection at
 /// convert time would be a second decision about a file nothing checked
 /// again. Astra finding S01, 2026-09-23.
+///
+/// And it happens in a transient systemd unit rather than in this process,
+/// which is the other half of the same finding: this pool's agent is root
+/// by default, and `qemu-img` is a parser for a file somebody else wrote.
+/// `agent_api::base_image` says what the unit holds and why there is no
+/// road that runs the converter here instead.
 pub(crate) fn convert_to_raw(
+    sandbox: &Sandbox,
     qemu_img: &Path,
-    image: &agent_api::base_image::BaseImage,
+    image: &BaseImage,
     src: &Path,
     dst: &Path,
 ) -> std::io::Result<()> {
-    let out = std::process::Command::new(qemu_img)
-        .args(agent_api::base_image::convert_argv(image, src, dst))
-        .output()
-        .map_err(|e| std::io::Error::other(format!("running {}: {e}", qemu_img.display())))?;
-    if !out.status.success() {
-        return Err(std::io::Error::other(format!(
-            "qemu-img convert {} -> {}: {}",
-            src.display(),
-            dst.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(())
+    // The tmp file is created HERE and not by qemu-img. It is what the unit
+    // is given a bind mount of and what the converter is given ownership of
+    // for the length of the conversion, and neither can be done to a file
+    // that does not exist yet. `qemu-img convert` opens its destination with
+    // O_CREAT|O_TRUNC, so an empty file in front of it changes nothing about
+    // what it writes — and the file is made by the agent, with the agent's
+    // umask, so the volume keeps the mode it has always had.
+    std::fs::File::create(dst)?;
+    // Only for the sentence a person reads. The catalogue name is the file
+    // name in this pool's image directory.
+    let name = src
+        .file_name()
+        .unwrap_or(src.as_os_str())
+        .to_string_lossy()
+        .into_owned();
+    agent_api::base_image::convert_blocking(
+        sandbox,
+        qemu_img,
+        image,
+        src,
+        Destination::File(dst),
+        &name,
+    )
 }
 
 /// Reflink if the filesystem can, copy if it cannot.
@@ -216,7 +234,8 @@ pub(crate) fn clone_or_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
 /// volume that is finished, and an interrupted provision leaves a `.tmp`
 /// that `deprovision` removes with the volume.
 pub(crate) fn write_volume_file(
-    src: Option<(PathBuf, Option<agent_api::base_image::BaseImage>)>,
+    src: Option<(PathBuf, Option<BaseImage>)>,
+    sandbox: &Sandbox,
     qemu_img: &Path,
     tmp: &Path,
     final_path: &Path,
@@ -230,7 +249,7 @@ pub(crate) fn write_volume_file(
         Some((s, Some(image))) => {
             debug!(base = %s.display(), format = %image.format,
                    "converting base image to raw");
-            convert_to_raw(qemu_img, image, s, tmp)?;
+            convert_to_raw(sandbox, qemu_img, image, s, tmp)?;
         }
         None => {
             std::fs::File::create(tmp)?;

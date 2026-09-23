@@ -89,6 +89,8 @@ fn node(
                     image_dir: root.join("images"),
                     volume_dir: root.join("volumes"),
                     qemu_img: "qemu-img".into(),
+                    // No base image, so nothing is converted here.
+                    convert: agent_api::base_image::Sandbox::default(),
                 },
             )
             .expect("a filesystem pool"),
