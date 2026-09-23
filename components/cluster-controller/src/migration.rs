@@ -750,7 +750,8 @@ pub(crate) fn machines_that_fit<'a>(
 ///   * **a named node is a hard requirement.** Somebody who writes
 ///     `--to agent-3` is asking about agent-3; quietly using agent-4 would
 ///     answer a question they did not ask. So a named node is checked and
-///     never chosen from.
+///     never chosen from — and CHECKED means the same word it means for a
+///     node the scheduler would have picked, which is `feasible`.
 fn choose_target(
     scheduler: &dyn Scheduler,
     vm: &Vm,
@@ -762,19 +763,29 @@ fn choose_target(
     let elsewhere: Vec<Candidate> = all.iter().filter(|c| c.name != source).cloned().collect();
     match named {
         Some(named) => {
-            let Some(candidate) = elsewhere.iter().find(|c| {
-                c.name == named
-                    && c.connected
-                    && c.schedulable
-                    && common::capability::offers(
-                        &c.catalogue,
-                        common::capability::HYPERVISOR,
-                        None,
-                    )
-            }) else {
+            // `feasible` and not a list of its own. Astra finding S07,
+            // 2026-09-23: this branch used to ask four questions —
+            // connected, schedulable, offers a hypervisor, not the source —
+            // where the scheduler's own admission asks ten. So a node that
+            // was up and willing took a guest it had no room for, or that
+            // its labels did not select, or that a required anti-affinity
+            // term forbade, or that had said itself it was wedged. What the
+            // guest met on arrival was the agent refusing it, after the
+            // disks had been opened there and a VMM built. One predicate for
+            // both roads is what keeps "can this node take this vm" from
+            // meaning two things depending on who asked.
+            //
+            // The hypervisor is still in it: every VM's `DevicePolicy` asks
+            // for one, so `feasible` answers that question too, and a
+            // storage-only node is refused by name exactly as before.
+            let Some(candidate) = controller_api::feasible(vm, &elsewhere)
+                .into_iter()
+                .find(|c| c.name == named)
+            else {
                 return Err(format!(
                     "node {named} cannot take this vm: it must be connected, schedulable, \
-                     running a hypervisor, and not the node the vm is already on"
+                     healthy, running a hypervisor, with room for this vm and the labels it \
+                     selects, and not the node the vm is already on"
                 ));
             };
             // And the question no amount of capacity answers: can this
@@ -1671,6 +1682,57 @@ mod tests {
         let why = choose_target(&FirstFit, &vm("web-1"), "agent-1", Some("agent-1"), &fleet)
             .expect_err("the source");
         assert!(why.contains("agent-1"), "{why}");
+    }
+
+    /// Astra finding S07, 2026-09-23: "checked" means the same thing for a
+    /// node somebody named as for a node the scheduler would have picked.
+    ///
+    /// The branch above used to ask four questions where `feasible` asks ten,
+    /// so `--to agent-3` sent a guest to a machine with no room for it, or
+    /// one whose labels the vm does not select, or one that had said itself
+    /// it was wedged. Each of those was found out on ARRIVAL — after the
+    /// disks were opened at the destination and a VMM was built there — and
+    /// each is now a sentence about agent-3 before anything is built.
+    #[test]
+    fn a_named_node_must_also_be_feasible() {
+        let mut big = vm("web-1");
+        big.spec.vm = serde_json::json!({"vcpus": 4, "memory_mib": 4096});
+        let refused = |fleet: &[Candidate], vm: &Vm| {
+            choose_target(&FirstFit, vm, "agent-1", Some("agent-3"), fleet)
+                .expect_err("agent-3 cannot take this guest")
+        };
+
+        // Feasible, and the named node is answered with.
+        let fleet = vec![node("agent-1"), node("agent-2"), node("agent-3")];
+        assert_eq!(
+            choose_target(&FirstFit, &big, "agent-1", Some("agent-3"), &fleet),
+            Ok("agent-3".to_string())
+        );
+
+        // Too little room. agent-2 has plenty and is not quietly used.
+        let mut full = fleet.clone();
+        full[2].free = controller_api::Capacity {
+            vcpus: 1,
+            mem_mib: 512,
+        };
+        let why = refused(&full, &big);
+        assert!(why.contains("agent-3") && !why.contains("agent-2"), "{why}");
+
+        // The machine said itself something is wrong with it. A guest sent
+        // into that is a guest sent into a node that is about to be drained.
+        let mut wedged = fleet.clone();
+        wedged[2].unhealthy = vec!["StoreUnhealthy".to_string()];
+        let why = refused(&wedged, &big);
+        assert!(why.contains("agent-3") && !why.contains("agent-2"), "{why}");
+
+        // And the labels this vm selects, which agent-3 does not carry.
+        let mut picky = big.clone();
+        picky
+            .spec
+            .node_selector
+            .insert("rack".to_string(), "b".to_string());
+        let why = refused(&fleet, &picky);
+        assert!(why.contains("agent-3") && !why.contains("agent-2"), "{why}");
     }
 
     /// A node with no hypervisor is storage and nothing else, and a guest
