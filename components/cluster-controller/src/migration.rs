@@ -562,6 +562,11 @@ async fn prepare(
     store
         .mutate::<VmMigration, _>(&name, |m| {
             let phase = m.status.phase().kind();
+            // The field and the sentence in one write, so that no pass can
+            // ever see one without the other. The sentence is what a person
+            // reads; the field is what `send` reads — see `peer_of`, and
+            // Astra finding S05 on `status.peer`.
+            m.status.peer = Some(peer.clone());
             m.status.reported = Some(controller_api::VmMigrationReported::here(
                 phase,
                 controller_api::VmMigrationReason::Dispatched,
@@ -765,32 +770,35 @@ async fn send(
     ) else {
         return fail(store, migration, "this migration has no ends".to_string()).await;
     };
-    let Some(peer) = migration
-        .status
-        .phase()
-        .message()
-        .and_then(|m| m.rsplit_once(" at ").map(|(_, peer)| peer.to_string()))
-    else {
-        // The address is written down in the sentence the prepare step left,
-        // and a Preparing migration without one is a controller that died
-        // between the command and the write. Nothing has been done to the
-        // source, so tearing the destination down and failing is safe and
-        // says more than waiting would.
-        return abandon(
-            store,
-            dispatch,
-            migration,
-            vm,
-            &target,
-            "the destination's address was lost before the source was told".to_string(),
-        )
-        .await;
-    };
+    let peer = peer_of(&migration.status);
 
+    // The budget first, and the missing address only after it. Astra finding
+    // S05, 2026-09-23: this was the other way round, and there is no leader
+    // here — `prepare` writes `Preparing` by CAS BEFORE it opens the disks at
+    // the destination and blocks on `PrepareMigration`, and the address
+    // reaches the record seconds later. Every other replica passes through
+    // this function once per TICK (5 s) meanwhile, read "no address" as "the
+    // controller died between the command and the write", and tore down a
+    // destination that was being built correctly. A prepare that still has
+    // time is a prepare in progress, whatever it has managed to write down.
     if let Some(over) = overdue(migration, timeouts.prepare) {
-        let why = format!("the destination was not ready after {over}s");
+        let why = match &peer {
+            Some(_) => format!("the destination was not ready after {over}s"),
+            // Past the budget and still no address: now the old sentence is
+            // the true one. Nothing has been done to the source, so tearing
+            // the destination down is safe.
+            None => format!(
+                "the destination's address never reached this record, and {target} was not \
+                 ready after {over}s"
+            ),
+        };
         return abandon(store, dispatch, migration, vm, &target, why).await;
     }
+    let Some(peer) = peer else {
+        debug!(migration = %name, node = %target,
+               "the destination has not said where to send yet; it still has time");
+        return Ok(());
+    };
 
     let mut claimed = migration.clone();
     claimed.status.reported = Some(controller_api::VmMigrationReported::here(
@@ -1337,6 +1345,32 @@ fn peer_from(payload: &[u8]) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("the destination named no address to send to"))
 }
 
+/// The address to send to, off the migration's own status — or `None` while
+/// the destination has not named one.
+///
+/// Pure, because it is what `send` decides on and `send` needs a store.
+///
+/// Two readings, and the field wins. Astra finding S05, 2026-09-23: the
+/// address used to exist only inside the `Preparing` sentence, scraped back
+/// out with `rsplit_once(" at ")` — so a reader depended on the wording of a
+/// message written for a person, and "preparing agent-2" (the sentence
+/// `prepare` writes at its CAS, before the destination has been asked
+/// anything) read as an address of "agent-2" for any target whose name
+/// happened to contain " at ". `status.peer` is the field; the sentence stays
+/// as the fallback for records written before it existed, and for nothing
+/// else.
+fn peer_of(status: &VmMigrationStatus) -> Option<String> {
+    if let Some(peer) = status.peer.as_deref().filter(|p| !p.is_empty()) {
+        return Some(peer.to_string());
+    }
+    status
+        .phase()
+        .message()
+        .and_then(|m| m.rsplit_once(" is listening at "))
+        .map(|(_, peer)| peer.to_string())
+        .filter(|p| !p.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1700,5 +1734,110 @@ mod tests {
             panic!("a destination that may hold the guest is not torn down");
         };
         assert!(why.contains("may hold the guest"), "{why}");
+    }
+
+    /// Astra finding S05, 2026-09-23: the address to send to is a FIELD, and
+    /// the sentence is only what records written before the field have.
+    ///
+    /// The sentence `prepare` writes at its claim — "preparing agent-2" —
+    /// names no address at all, and reading one out of it is what made a
+    /// replica that saw a prepare in progress believe the address had been
+    /// lost.
+    #[test]
+    fn the_address_to_send_to_is_a_field_and_the_sentence_is_only_a_fallback() {
+        // Through `settle`, because `status.phase` is derived and private
+        // since struktur 4: a `reported` written by hand is not a phase until
+        // the object has been settled, which is what a read off the store
+        // does.
+        let said = |message: &str| {
+            let mut m = migration("web-1", VmMigrationPhaseKind::Preparing);
+            m.status.reported = Some(controller_api::VmMigrationReported::here(
+                VmMigrationPhaseKind::Preparing,
+                controller_api::VmMigrationReason::Dispatched,
+                Some(message.to_string()),
+                Utc::now(),
+            ));
+            m.settle(Utc::now());
+            m.status
+        };
+
+        // The claim's own sentence, which is every prepare's first word: no
+        // address has been named yet, and none is invented.
+        assert_eq!(peer_of(&said("preparing agent-2")), None);
+        assert_eq!(peer_of(&VmMigrationStatus::default()), None);
+
+        // An old record, from before the field: the sentence is all there is.
+        assert_eq!(
+            peer_of(&said("agent-2 is listening at tcp:10.0.0.5:49000")),
+            Some("tcp:10.0.0.5:49000".to_string())
+        );
+
+        // And with both, the field wins — it is what the destination
+        // answered, rather than what was written about it.
+        let mut both = said("agent-2 is listening at tcp:10.0.0.5:49000");
+        both.peer = Some("tcp:10.0.0.9:49000".to_string());
+        assert_eq!(peer_of(&both), Some("tcp:10.0.0.9:49000".to_string()));
+    }
+
+    /// Astra finding S05, 2026-09-23: a prepare that is still inside its
+    /// budget is left alone, whatever it has managed to write down.
+    ///
+    /// There is no leader in this tier (`dispatch.rs`) and TICK is 5 s, so
+    /// every replica reaches `send` for this migration while the prepare it
+    /// did not start is still opening disks at the destination and blocking
+    /// on `PrepareMigration`. Reading "no address" as "the address was lost"
+    /// made each of those passes tear down a destination that was being
+    /// built correctly — and the vm here is two seconds old against a thirty
+    /// second budget.
+    #[tokio::test]
+    async fn a_prepare_that_has_not_named_its_address_yet_is_given_its_budget() {
+        // The source is dialled into this replica, so a command for it would
+        // land in `rx` rather than going anywhere. The store is never asked
+        // anything if this pass does what it should — which is the other half
+        // of what is asserted, since every write below would fail against it.
+        let registry = std::sync::Arc::new(crate::session::SessionRegistry::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        registry.attach("agent-1", &tx);
+        let store = EtcdStore::connect(&["http://127.0.0.1:1".to_string()], "/migration-test")
+            .await
+            .expect("the etcd client is built lazily");
+        let dispatch = Dispatch::new(
+            registry,
+            std::sync::Arc::new(
+                EtcdStore::connect(&["http://127.0.0.1:1".to_string()], "/migration-test")
+                    .await
+                    .expect("the etcd client is built lazily"),
+            ),
+            std::sync::Arc::new(crate::logs::Forward {
+                cluster: "cluster-1".into(),
+                sibling: controller_api::forward::Sibling {
+                    serves_tls: false,
+                    tls: None,
+                },
+            }),
+        );
+
+        let mut m = migration("web-1", VmMigrationPhaseKind::Preparing);
+        m.status.source_node = Some("agent-1".to_string());
+        m.status.target_node = Some("agent-2".to_string());
+        m.status.started_at = Some(Utc::now() - chrono::Duration::seconds(2));
+        m.status.reported = Some(controller_api::VmMigrationReported::here(
+            VmMigrationPhaseKind::Preparing,
+            controller_api::VmMigrationReason::Dispatched,
+            Some("preparing agent-2".to_string()),
+            Utc::now(),
+        ));
+        m.settle(Utc::now());
+
+        send(&store, &dispatch, Timeouts::default(), &m, &vm("web-1"))
+            .await
+            .expect("a prepare with time left is not this pass's to end");
+
+        // Nothing went to the source, and nothing went to the destination
+        // either — no `MigrateOut`, and above all no `Destroy`.
+        assert!(
+            rx.try_recv().is_err(),
+            "a prepare inside its budget is left alone"
+        );
     }
 }

@@ -167,6 +167,24 @@ pub struct VmMigrationStatus {
     /// migration with `spec.targetNode` is immediately.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_node: Option<String>,
+    /// The address the DESTINATION is listening at for the stream, in the
+    /// node's own spelling (`tcp:10.0.0.5:49000`). Written when the
+    /// destination answered `PrepareMigration`, and the one thing the source
+    /// has to be told.
+    ///
+    /// Astra finding S05, 2026-09-23: it used to live only inside the
+    /// `Preparing` message — "{target} is listening at {peer}" — and the send
+    /// step scraped it back out with `rsplit_once(" at ")`. A sentence is for
+    /// a person to read; a field is what another step reads. Scraping made
+    /// the address depend on the wording, and it gave a replica that saw the
+    /// migration one write earlier no way to tell "no address yet" from "no
+    /// address ever".
+    ///
+    /// `None` on a migration whose destination has not answered yet, and on
+    /// every record written before this field existed — `peer_of` falls back
+    /// to the sentence for those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
