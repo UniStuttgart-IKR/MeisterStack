@@ -754,6 +754,9 @@ fn a_target_that_names_substituters_is_allowed_to_fetch_what_it_can() {
             .expect(cli("drain", "n1"), Output::stdout(""))
             .expect(helper("n1", &["activate"]), ok())
             .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            // Giving a host back is two commands since the integration lane:
+            // the drain and the cordon (see the tests above).
+            .expect(cli("undrain", "n1"), Output::stdout(""))
             .expect(cli("uncordon", "n1"), Output::stdout(""))
             .expect(helper("n1", &["txn", "retire"]), ok())
             .expect(helper("n1", &["lock", "release"]), ok())
@@ -812,6 +815,9 @@ fn a_plain_copy_is_what_happens(fx: Fixture, id: &str, address: &str) {
             .expect(cli("drain", id), Output::stdout(""))
             .expect(helper(id, &["activate"]), ok())
             .expect(helper(id, &["confirm", "--txn", "run-1"]), ok())
+            // Giving a host back is two commands since the integration lane:
+            // the drain and the cordon (see the tests above).
+            .expect(cli("undrain", id), Output::stdout(""))
             .expect(cli("uncordon", id), Output::stdout(""))
             .expect(helper(id, &["txn", "retire"]), ok())
             .expect(helper(id, &["lock", "release"]), ok())
