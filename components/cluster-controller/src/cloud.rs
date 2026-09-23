@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::dispatch::{Dispatch, NodeCommand};
 use crate::logs::{self, Logs};
 use crate::session::SessionRegistry;
 
@@ -104,10 +105,17 @@ async fn better_endpoint(
 /// `registry` is this cluster's own agent sessions. The cloud can ask for a
 /// VM's console and the only party that has one is the node, so the answer to
 /// a command arriving on THIS session is fetched over one of those.
+///
+/// `fanout` is the same `Dispatch` the migration and router reconcilers use,
+/// threaded in here for one command: `DropImage` reaches every node in the
+/// cluster, which on a multi-replica cluster-controller can mean nodes whose
+/// session this replica does not hold. See `dispatch::NodeCommand::DropImage`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     store: Arc<EtcdStore>,
     registry: Arc<SessionRegistry>,
     forward: Arc<logs::Forward>,
+    fanout: Arc<Dispatch>,
     cloud_addrs: Vec<String>,
     cluster_name: String,
     tls: Option<tonic::transport::ClientTlsConfig>,
@@ -129,6 +137,7 @@ pub async fn run(
             &store,
             &registry,
             &forward,
+            &fanout,
             &addr,
             &cluster_name,
             redial.ahead(),
@@ -178,6 +187,7 @@ async fn session(
     store: &Arc<EtcdStore>,
     registry: &SessionRegistry,
     forward: &logs::Forward,
+    fanout: &Dispatch,
     cloud_addr: &str,
     cluster_name: &str,
     ahead: &[String],
@@ -254,7 +264,7 @@ async fn session(
                 let batch = relay_consoles(batch, store, registry).await;
                 let mut acted = false;
                 for cmd in commands(batch) {
-                    let result = dispatch(store, registry, forward, cmd).await;
+                    let result = dispatch(store, registry, forward, fanout, cmd).await;
                     if tx
                         .send(ClusterMessage { kind: Some(cluster_message::Kind::Result(result)) })
                         .await
@@ -650,6 +660,7 @@ async fn dispatch(
     store: &EtcdStore,
     registry: &SessionRegistry,
     forward: &logs::Forward,
+    fanout: &Dispatch,
     cmd: proto::CloudCommand,
 ) -> CommandResult {
     let context = telemetry::TraceParent::parse(&cmd.traceparent)
@@ -662,7 +673,7 @@ async fn dispatch(
     telemetry::in_trace(
         span,
         &context,
-        dispatch_traced(store, registry, forward, cmd, context),
+        dispatch_traced(store, registry, forward, fanout, cmd, context),
     )
     .await
 }
@@ -671,6 +682,7 @@ async fn dispatch_traced(
     store: &EtcdStore,
     registry: &SessionRegistry,
     forward: &logs::Forward,
+    fanout: &Dispatch,
     cmd: proto::CloudCommand,
     context: telemetry::TraceParent,
 ) -> CommandResult {
@@ -703,6 +715,7 @@ async fn dispatch_traced(
         Some(cloud_command::Op::DeleteSecret(d)) => done(handle_delete_secret(store, d).await),
         Some(cloud_command::Op::CreateRouter(r)) => done(handle_create_router(store, r).await),
         Some(cloud_command::Op::DeleteRouter(r)) => done(handle_delete_router(store, r).await),
+        Some(cloud_command::Op::DropImage(d)) => done(handle_drop_image(store, fanout, d).await),
         None => Err(anyhow!("command without op")),
     };
     let outcome = match outcome {
@@ -1263,6 +1276,47 @@ async fn handle_delete_router(store: &EtcdStore, d: proto::DeleteRouter) -> anyh
     }
     store.delete::<Router>(&d.name).await?;
     info!(router = %d.name, node = %current.status.active_node, "router deleted for the cloud");
+    Ok(())
+}
+
+/// The cloud told this cluster an image was deleted; every node hears it.
+///
+/// Astra finding S02, 2026-09-23 (rest b). This tier keeps no `Image`
+/// objects and no record of which of its nodes fetched what — the whole
+/// reason `DropImage` is answered by fanning out rather than by looking
+/// anything up first. `Cache::drop_uid` at each node is where the real
+/// decision is: this function's only job is to reach every node, including
+/// the ones a sibling replica's session holds.
+///
+/// Best-effort per node and never a failure of the command as a whole: a
+/// node that is offline right now keeps its stale cache until it next
+/// reconnects and is told again on the NEXT delete of a *different* image
+/// that happens to fan out while it is up — which is not a repeat of this
+/// one. An offline node's cache staying stale for a while is the accepted
+/// cost of this design; see the module doc on `DropImage` for the
+/// broadcast-over-target reasoning.
+async fn handle_drop_image(
+    store: &EtcdStore,
+    fanout: &Dispatch,
+    d: proto::DropImage,
+) -> anyhow::Result<()> {
+    let nodes = store.list::<Node>().await?;
+    for node in nodes {
+        let name = node.metadata.name.clone();
+        if let Err(e) = fanout
+            .send(
+                &name,
+                NodeCommand::DropImage {
+                    name: d.name.clone(),
+                    uid: d.uid.clone(),
+                },
+            )
+            .await
+        {
+            debug!(image = %d.name, node = %name, error = format!("{e:#}"),
+                   "could not tell this node to drop the image; it keeps whatever it cached");
+        }
+    }
     Ok(())
 }
 

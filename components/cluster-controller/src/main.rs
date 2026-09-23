@@ -594,24 +594,31 @@ async fn run(args: Args) -> anyhow::Result<()> {
         None
     };
 
+    // A live migration is about two machines and their sessions can hang off
+    // two replicas, so its commands travel the way a console read does.
+    // Everything else a reconcile pass sends is about one machine and is sent
+    // through the registry directly, because the replica that holds the
+    // object is the replica that holds the session. See `dispatch`.
+    //
+    // Built once, here, and cloned into both the reconcile loop below and the
+    // cloud session: `DropImage` is the one CLOUD command that needs it too
+    // (Astra finding S02, 2026-09-23, rest b) — it reaches every node in the
+    // cluster, not the one object a session-owning replica already holds.
+    let dispatch = Arc::new(dispatch::Dispatch::new(
+        registry.clone(),
+        store.clone(),
+        forward.clone(),
+    ));
+
     {
         let store = store.clone();
         let registry = registry.clone();
+        let dispatch = dispatch.clone();
         let requeue = cfg.requeue.clone();
         let scheduler = cfg.scheduler.clone();
         let network = cfg.network.clone();
         let overcommit = cfg.admission;
         let migration_timeouts = cfg.migration;
-        // A live migration is about two machines and their sessions can hang
-        // off two replicas, so its commands travel the way a console read
-        // does. Everything else a pass sends is about one machine and is sent
-        // through the registry directly, because the replica that holds the
-        // object is the replica that holds the session. See `dispatch`.
-        let dispatch = Arc::new(dispatch::Dispatch::new(
-            registry.clone(),
-            store.clone(),
-            forward.clone(),
-        ));
         tokio::spawn(async move {
             reconcile::run(
                 store,
@@ -638,8 +645,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         let tls = cloud_tls.clone();
         let registry = registry.clone();
         let forward = forward.clone();
+        let dispatch = dispatch.clone();
         tokio::spawn(async move {
-            cloud::run(store, registry, forward, addrs, cluster_name, tls).await
+            cloud::run(store, registry, forward, dispatch, addrs, cluster_name, tls).await
         });
     }
 

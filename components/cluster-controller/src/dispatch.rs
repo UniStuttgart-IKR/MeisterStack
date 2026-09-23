@@ -66,8 +66,8 @@ pub const COMMAND_PATH: &str = "/apis/meister.io/v1/nodes/{name}/commands";
 /// A type of its own rather than `proto::command::Op`: the protobuf types
 /// carry no serde derives, the hop is JSON, and — the actual reason — this
 /// enum is the whole of what a sibling may be talked into doing. Every
-/// variant here is something the migration reconciler sends today; nothing
-/// here is reachable by a client.
+/// variant here is something the migration reconciler, the router reconciler
+/// or a cloud command sends today; nothing here is reachable by a client.
 ///
 /// Two fields the protobuf messages have are deliberately absent.
 /// `PrepareMigration.listen` is always empty (the destination picks the
@@ -86,6 +86,15 @@ pub const COMMAND_PATH: &str = "/apis/meister.io/v1/nodes/{name}/commands";
 /// registry would build the half of the list it can reach and call the rest
 /// unreachable, which is D-P2 one object over. So they travel this road, and
 /// the enum stays closed around them.
+///
+/// **`DropImage` is the same widening for a different reason.** It is not
+/// about several machines this cluster's ownership rule already hands to one
+/// replica — it is about EVERY node in the cluster at once, on purpose (Astra
+/// finding S02, 2026-09-23, rest b): a deleted image's bytes may be cached
+/// anywhere, this tier keeps no record of which nodes have fetched what, and
+/// a broadcast confined to whichever nodes happen to hold a session on the
+/// replica that received the cloud's command would silently skip every node
+/// a sibling replica is talking to — the exact D-P2 shape, one fan-out wider.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "command", rename_all = "camelCase")]
 pub enum NodeCommand {
@@ -131,6 +140,10 @@ pub enum NodeCommand {
     /// a deprovision.
     #[serde(rename_all = "camelCase")]
     ForgetVolume { id: String },
+    /// An image was deleted at the cloud; let go of whatever this node
+    /// fetched for it. See `DropImage` in control.proto.
+    #[serde(rename_all = "camelCase")]
+    DropImage { name: String, uid: String },
 }
 
 impl NodeCommand {
@@ -185,6 +198,7 @@ impl NodeCommand {
             }),
             Self::DestroyRouter { id } => command::Op::DestroyRouter(proto::DestroyRouter { id }),
             Self::ForgetVolume { id } => command::Op::ForgetVolume(proto::ForgetVolume { id }),
+            Self::DropImage { name, uid } => command::Op::DropImage(proto::DropImage { name, uid }),
         }
     }
 
@@ -200,6 +214,7 @@ impl NodeCommand {
             Self::EnsureRouter { .. } => "ensure-router",
             Self::DestroyRouter { .. } => "destroy-router",
             Self::ForgetVolume { .. } => "forget-volume",
+            Self::DropImage { .. } => "drop-image",
         }
     }
 }
@@ -582,6 +597,27 @@ mod tests {
             panic!("a forget, and nothing that touches bytes");
         };
         assert_eq!(op.id, "uid-3");
+
+        // The sixth, and the one whose reach is every node in the cluster
+        // rather than one VM's two ends — see the type's own doc for why
+        // that earns it this door too. Astra finding S02, 2026-09-23 (rest
+        // b).
+        let dropped = NodeCommand::DropImage {
+            name: "ubuntu.raw".into(),
+            uid: "uid-4".into(),
+        };
+        let wire = serde_json::to_string(&dropped).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"command":"dropImage","name":"ubuntu.raw","uid":"uid-4"}"#
+        );
+        assert_eq!(serde_json::from_str::<NodeCommand>(&wire).unwrap(), dropped);
+        assert_eq!(dropped.name(), "drop-image");
+        let command::Op::DropImage(op) = dropped.into_op() else {
+            panic!("a drop-image");
+        };
+        assert_eq!(op.name, "ubuntu.raw");
+        assert_eq!(op.uid, "uid-4");
 
         // And nothing else can be talked in: the enum is the door.
         assert!(

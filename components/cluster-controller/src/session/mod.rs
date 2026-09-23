@@ -105,6 +105,10 @@ struct ImageWord {
     phase: String,
     reason: String,
     message: String,
+    /// The sha256 a node bound a PATH image's bytes to, or empty. Relayed
+    /// unchanged, the same rule `reason` follows — see
+    /// `ImageStateReport.digest`. Astra finding S02, 2026-09-23 (rest a).
+    digest: String,
 }
 
 impl ImageView {
@@ -129,6 +133,7 @@ impl ImageView {
                     phase: report.phase.clone(),
                     reason: report.reason.clone(),
                     message: report.message.clone(),
+                    digest: report.digest.clone(),
                 },
             );
         }
@@ -163,6 +168,7 @@ impl ImageView {
                 reason: word.reason.clone(),
                 message: word.message.clone(),
                 node: node.clone(),
+                digest: word.digest.clone(),
             })
             .collect();
         // Sorted, so two consecutive reports of the same facts are the same

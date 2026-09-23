@@ -79,8 +79,8 @@ pub use resources::{
     VmReason, VmSilence, VmSpec, VmStatus, Volume, VolumeAttachmentStatus, VolumeMode, VolumePhase,
     VolumePhaseKind, VolumeReason, VolumeSnapshot, VolumeSnapshotPhase, VolumeSnapshotPhaseKind,
     VolumeSnapshotReason, VolumeSnapshotSpec, VolumeSnapshotStatus, VolumeSpec, VolumeStatus,
-    accepts_class, cluster_accepts, frozen_vm_shape, grows_only, live_migration_refusal,
-    new_volume, new_volume_snapshot, orphaned_reservations, same_tenancy,
+    accepts_class, cluster_accepts, first_bound_digest, frozen_vm_shape, grows_only,
+    live_migration_refusal, new_volume, new_volume_snapshot, orphaned_reservations, same_tenancy,
     second_open_is_a_migration, settle_image, settle_storage_pool, unbind_only, vm_shape_unchanged,
 };
 pub use resources::{

@@ -66,8 +66,9 @@ reasons! {
     /// Why an image is what it is.
     ///
     /// One list out of two vocabularies, the shape `VmReason` explains. This
-    /// tier has one word of its own — `AwaitingNode`, the wait before anybody
-    /// has looked — and the four after it are the NODE's
+    /// tier has two words of its own — `AwaitingNode`, the wait before
+    /// anybody has looked, and `DigestMismatch`, this tier's own comparison
+    /// against `status.digest` — and the four after them are the NODE's
     /// (`proto::reasons::IMAGE`). They are the whole of F16 in a closed set:
     /// `NotFound` is a catalogue entry pointing at bytes that are not there,
     /// `NotAFile` is a directory under the name, `ChecksumMismatch` is bytes
@@ -75,7 +76,7 @@ reasons! {
     /// did not arrive. All four used to be one word — `Reported` — with the
     /// node's prose beside it, so "roll-out still running" and "this will
     /// never work" were the same value.
-    ImageReason [6] {
+    ImageReason [7] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
         Unrecorded => "Unrecorded",
@@ -105,6 +106,24 @@ reasons! {
         ChecksumMismatch => "ChecksumMismatch",
         /// The bytes did not arrive at all, or could not be put in place.
         FetchFailed => "FetchFailed",
+
+        // --------------------------------------------------------------
+        // This tier's own second word. Never sent by a node — no field on
+        // `ImageStateReport` carries it — because comparing every `Ready`
+        // line's digest to the one this catalogue entry is bound to is a
+        // fact only the tier that HOLDS `status.digest` can state.
+        // --------------------------------------------------------------
+
+        /// A `Ready` node's digest disagrees with `status.digest`, the first
+        /// one this catalogue entry was bound to.
+        ///
+        /// Astra finding S02, 2026-09-23 (rest a). `check_source_kind` keeps
+        /// a member from adopting a file that is already on the nodes, but an
+        /// operator's own path registration had no checksum to bind it to
+        /// bytes at all — so a swap of the file after the fact, or two
+        /// registrations that were never the same file to begin with, went
+        /// unnoticed. See `settle_image` and `first_bound_digest`.
+        DigestMismatch => "DigestMismatch",
     }
 }
 
@@ -177,6 +196,17 @@ pub struct ImageNodeState {
     pub reason: ImageReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The sha256 this node bound a PATH image's bytes to, if it is a `Ready`
+    /// line and the node has one.
+    ///
+    /// Astra finding S02, 2026-09-23 (rest a). `None` for every `Failed` line
+    /// (nothing to hash), for a url image (its checksum is `spec.sha256` and
+    /// this field would only repeat it), and for a node or a cluster older
+    /// than the field. `first_bound_digest` reads the first one of these that
+    /// shows up as `ImageStatus.digest`, and `settle_image` holds every later
+    /// `Ready` line to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
 }
 
 fn is_unrecorded_image_reason(reason: &ImageReason) -> bool {
@@ -216,6 +246,21 @@ pub struct ImageStatus {
     /// older than the field — not "no nodes have it".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<ImageNodeState>,
+    /// The sha256 this catalogue entry is bound to, once a node's report
+    /// binds it.
+    ///
+    /// Astra finding S02, 2026-09-23 (rest a). A path registration has no
+    /// checksum by construction — that is `check_source_kind`'s TODO, closed
+    /// here — so nothing bound the catalogue name to particular bytes until
+    /// this existed. Set once, from `first_bound_digest`, and never moved:
+    /// `settle_image` fails the image the moment a LATER `Ready` line
+    /// disagrees with it, which is the whole point of pinning it rather than
+    /// tracking whatever the newest report says.
+    ///
+    /// `None` for a url image (bound by `spec.sha256` from creation, which
+    /// this would only repeat) and for one nobody has looked at yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     /// `status.availableOn`, which is gone — declared here so that it can go
     /// on being REFUSED rather than silently dropped.
     ///
@@ -260,9 +305,9 @@ pub type Image = Object<ImageSpec, ImageStatus>;
 /// What the fleet's words about an image ADD UP TO. The whole of F16's
 /// controller half, and the first derivation of this round.
 ///
-/// A pure function of the spec and `status.nodes[]`, which is the only fact
-/// there is about an image: no node has ever been asked a question about one,
-/// they simply say what is on their disks. Four rules, in this order:
+/// A pure function of the spec and `status`, which is the only fact there is
+/// about an image: no node has ever been asked a question about one, they
+/// simply say what is on their disks. Five rules, in this order:
 ///
 /// 1. **Nobody has said anything → `Pending { AwaitingNode }`.** This is F16.
 ///    A path image used to be `Ready` the moment it was registered — a
@@ -274,7 +319,13 @@ pub type Image = Object<ImageSpec, ImageStatus>;
 ///    `NotAFile` are true wherever the bytes are: a checksum that did not
 ///    match will not start matching, and a directory under the catalogue name
 ///    is a path no storage driver can open. One node saying either is the
-///    image's answer.
+///    image's answer. **A digest that disagrees with `status.digest` is the
+///    same kind of fact, for the image kind that had no checksum at all:**
+///    Astra finding S02, 2026-09-23 (rest a). A path registration's bytes
+///    were never bound to anything until a node hashed them, so a later
+///    report of different bytes under the same name is exactly what this
+///    rule is for — it is just read off a different field, because there was
+///    no `spec.sha256` to compare against.
 /// 3. **Otherwise one `Ready` is enough.** A fact about a NODE — `NotFound`,
 ///    `FetchFailed` — is not a fact about the image, and this is the rule
 ///    that CHANGED: the union used to let any `Failed` win, so a four-node
@@ -301,6 +352,24 @@ pub fn settle_image(spec: &ImageSpec, status: &ImageStatus) -> ImagePhase {
             ImagePhaseKind::Failed,
             bytes.reason,
             Some(said(bytes)),
+            UNSTAMPED,
+        );
+    }
+    // Rule 2b. Only once this catalogue entry is bound to a digest at all —
+    // `first_bound_digest` is what binds `status.digest`, and until then
+    // there is nothing here to disagree with.
+    if let Some(pinned) = &status.digest
+        && let Some(bad) = status.nodes.iter().find(|n| {
+            n.phase == ImagePhaseKind::Ready && n.digest.as_deref().is_some_and(|d| d != pinned)
+        })
+    {
+        return ImagePhase::new(
+            ImagePhaseKind::Failed,
+            ImageReason::DigestMismatch,
+            Some(format!(
+                "the file under {} on {} is not the one this image was bound to",
+                spec.source, bad.name
+            )),
             UNSTAMPED,
         );
     }
@@ -336,6 +405,26 @@ pub fn settle_image(spec: &ImageSpec, status: &ImageStatus) -> ImagePhase {
     )
 }
 
+/// The digest a catalogue entry binds to, the first time any `Ready` line
+/// carries one.
+///
+/// Astra finding S02, 2026-09-23 (rest a). Pure, and read once — the ingest
+/// that mirrors a cluster's report calls this only while `status.digest` is
+/// still `None`, so ONE report from ONE node decides it and nothing after
+/// that reopens the question; see `settle_image`'s rule 2b for what happens
+/// once it is set.
+///
+/// `nodes` is read in order and the first match wins, which is deterministic
+/// because the ingest sorts it by `(cluster, name)` before this runs — two
+/// clusters racing to report first pick the same answer wherever the choice
+/// is actually made.
+pub fn first_bound_digest(nodes: &[ImageNodeState]) -> Option<String> {
+    nodes
+        .iter()
+        .find(|n| n.phase == ImagePhaseKind::Ready && n.digest.is_some())
+        .and_then(|n| n.digest.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +440,7 @@ mod tests {
             phase,
             reason,
             message: None,
+            digest: None,
         }
     }
 
@@ -441,6 +531,100 @@ mod tests {
             assert_eq!(settled.kind(), *phase, "{about}");
             assert_eq!(settled.reason().unwrap_or_default(), *reason, "{about}");
         }
+    }
+
+    /// A digest line carries into the table above too, once pinned: agreeing
+    /// digests settle exactly as bare `Ready` does, and a disagreeing one
+    /// fails the image — Astra finding S02, 2026-09-23 (rest a).
+    #[test]
+    fn a_digest_that_disagrees_with_the_pinned_one_fails_the_image() {
+        let digest_line = |node: &str, digest: &str| ImageNodeState {
+            digest: Some(digest.to_string()),
+            ..line(node, ImagePhaseKind::Ready, ImageReason::Unrecorded)
+        };
+
+        // Nothing pinned yet: a lone digest settles as an ordinary `Ready`,
+        // exactly as it did before this field existed.
+        let settled = settle_image(
+            &image(None, vec![]).spec,
+            &ImageStatus {
+                nodes: vec![digest_line("a", "1111")],
+                digest: None,
+                ..Default::default()
+            },
+        );
+        assert_eq!(settled.kind(), ImagePhaseKind::Ready);
+
+        // Pinned, and every node agrees: still `Ready`.
+        let settled = settle_image(
+            &image(None, vec![]).spec,
+            &ImageStatus {
+                nodes: vec![digest_line("a", "1111"), digest_line("b", "1111")],
+                digest: Some("1111".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(settled.kind(), ImagePhaseKind::Ready);
+
+        // Pinned, and a second node's bytes are not the ones this catalogue
+        // entry was bound to.
+        let settled = settle_image(
+            &image(None, vec![]).spec,
+            &ImageStatus {
+                nodes: vec![digest_line("a", "1111"), digest_line("b", "2222")],
+                digest: Some("1111".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(settled.kind(), ImagePhaseKind::Failed);
+        assert_eq!(settled.reason(), Some(ImageReason::DigestMismatch));
+        let message = settled.message().expect("a sentence");
+        assert!(message.contains("debian.raw"), "{message}");
+        assert!(message.contains('b'), "names the node: {message}");
+
+        // A `Failed` line's own (absent) digest is not a disagreement — only
+        // a `Ready` line that actively claims different bytes is one.
+        let settled = settle_image(
+            &image(None, vec![]).spec,
+            &ImageStatus {
+                nodes: vec![
+                    digest_line("a", "1111"),
+                    line("b", ImagePhaseKind::Failed, ImageReason::NotFound),
+                ],
+                digest: Some("1111".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(settled.kind(), ImagePhaseKind::Ready);
+    }
+
+    /// Which digest a catalogue entry binds to: the first `Ready` line that
+    /// has one, in the order the ingest already sorts by — never the newest,
+    /// which would let a later report move a binding that is supposed to be
+    /// fixed once made.
+    #[test]
+    fn the_first_digest_a_ready_node_reports_is_the_one_that_is_bound() {
+        assert_eq!(first_bound_digest(&[]), None, "nobody has said anything");
+
+        assert_eq!(
+            first_bound_digest(&[line("a", ImagePhaseKind::Ready, ImageReason::Unrecorded)]),
+            None,
+            "ready, but no digest — a url image, or a path image from before this field"
+        );
+
+        let with_digest = |node: &str, digest: &str| ImageNodeState {
+            digest: Some(digest.to_string()),
+            ..line(node, ImagePhaseKind::Ready, ImageReason::Unrecorded)
+        };
+        assert_eq!(
+            first_bound_digest(&[
+                line("a", ImagePhaseKind::Failed, ImageReason::NotFound),
+                with_digest("b", "aaaa"),
+                with_digest("c", "bbbb"),
+            ]),
+            Some("aaaa".to_string()),
+            "the first READY line with a digest, not the first line of any kind"
+        );
     }
 
     /// F16 at the create edge: a path image is not `Ready` because it was

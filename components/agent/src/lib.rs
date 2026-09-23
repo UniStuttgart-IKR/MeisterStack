@@ -540,12 +540,14 @@ impl Agent {
             // image per report, and `Cache::report` below is a read of what
             // it found. `verify_path_images` is what bounds the cost: the
             // names are a set, so forty VMs off three images is three
-            // `stat`s, and nothing is fetched or hashed on this path.
+            // `stat`s — and a hash only on the report where a path image's
+            // digest was not already bound (Astra finding S02, 2026-09-23,
+            // rest a; see `Cache::verify_path`).
             images: self
                 .images
                 .report()
                 .into_iter()
-                .map(|(name, state)| proto::ImageStateReport {
+                .map(|(name, state, digest)| proto::ImageStateReport {
                     name,
                     phase: state.phase().to_string(),
                     // Which of the four ways an image is unusable this is —
@@ -561,6 +563,7 @@ impl Agent {
                     // and knows which one it is. It fills the field in on the
                     // way up, where the cloud does not.
                     node: String::new(),
+                    digest: digest.unwrap_or_default(),
                 })
                 .collect(),
             // Whether the list above is EVERY image under this node's image

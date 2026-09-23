@@ -104,12 +104,14 @@ pub(super) fn check_source_kind(spec: &ImageSpec, confined: Option<&str>) -> Res
         return Ok(());
     }
     let Some(tenant) = confined else {
-        // TODO(S02): bind an operator's path registration to the digest the
-        // first node computes of the file, so that the object says which
-        // bytes it stood for and a later swap of the file is visible. The
-        // node would have to report that digest, which is a field on
-        // `ImageStateReport` and a hop through the cluster this change does
-        // not make.
+        // An operator's path registration is bound to the digest the first
+        // node computes of the file (Astra finding S02, 2026-09-23, rest a):
+        // `ImageStateReport.digest`, mirrored unchanged through
+        // `ImageNodeState.digest`, pinned onto `status.digest` by
+        // `first_bound_digest` the first time a node's report carries one,
+        // and held to for ever after by `settle_image`'s rule 2b — a later
+        // report of different bytes under this name fails the image with
+        // `DigestMismatch` rather than going on being `Ready`.
         return Ok(());
     };
     Err(invalid(format!(
@@ -279,16 +281,33 @@ pub(super) async fn delete_image(
         return Err(conflict(format!("image {name} is still used by: {detail}")));
     }
 
-    // TODO(S02): the nodes are not told. Deleting the object leaves whatever
-    // a node fetched for it lying in that node's image directory, under the
-    // catalogue name, and there is no command in the session that says "drop
-    // this image" — `SyncState` carries VMs and nothing else. What carries
-    // the weight until there is one is the pair this milestone did land: a
-    // node's cache entry is keyed on the image's UID as well as its digest
-    // (`agent::images::Source::cache_key`), so a re-registration of the same
-    // name never reaches the old bytes, and a path-based registration — the
-    // one shape that could adopt them — is an operator's to make
-    // (`check_source_kind`).
+    // The nodes are told next, exactly the way a deleted secret's mirrored
+    // copies are (`delete_secret`): every cluster this replica is talking to,
+    // one command each, and a cluster that does not answer is logged and
+    // left. Astra finding S02, 2026-09-23 (rest b).
+    //
+    // `status.nodes[]` would name fewer clusters — only the ones this image
+    // has been SEEN on — but that list is only ever as fresh as the last
+    // heartbeat that changed it, and a cluster whose report is running behind
+    // is exactly the one this must not skip. A cluster the image was never on
+    // gets a command its nodes answer with nothing to do.
+    //
+    // Before the store delete and not after: what this loses on a crash
+    // between the two is a broadcast the object is still there to retry (an
+    // operator can delete again, or a retry loop can). The other order would
+    // lose the ability to tell the nodes at all, which is the defect this
+    // closes.
+    for cluster in st.sessions.connected() {
+        let op = cloud_command::Op::DropImage(proto::DropImage {
+            name: name.clone(),
+            uid: image.metadata.uid.clone(),
+        });
+        if let Err(e) = st.sessions.send_command(&cluster, "", op).await {
+            warn!(image = %name, %cluster, error = format!("{e:#}"),
+                  "could not tell this cluster to drop the image; its nodes keep their cached \
+                   copies until they next hear otherwise");
+        }
+    }
     st.store.delete::<Image>(&name).await?;
     Ok(controller_api::removed(
         Image::KIND,
