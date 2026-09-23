@@ -4417,6 +4417,21 @@ pub fn validate_against_next(
             continue;
         };
         // --- lane L4 ---
+        // A group that is HEALTHIER than the plan assumed has not moved under
+        // it — it moved the way the plan meant it to. This guard exists to
+        // catch a NEW outage, and `blocked` is a derived word: during the
+        // bootstrap of a three-member raft it flips from "not blocked" (no
+        // member was up, nothing to protect) to "blocked" (two are up and the
+        // third is not) purely because the rollout is working. Measured in the
+        // lab on 2026-09-23: the run stopped after its second member came up,
+        // every time, with "group cp is at 2 of 3 … It could when this plan
+        // was made."
+        //
+        // So the comparison is over the NUMBER of members that are down, and
+        // only an increase is the fleet moving under the plan.
+        if current.unhealthy_now <= planned.unhealthy_now {
+            continue;
+        }
         let its_own_absence = next.is_some_and(|host| {
             current.kind == GroupKind::Raft
                 && release
@@ -6832,6 +6847,53 @@ mod tests {
         let (release, observation) = three_member_cloud(1);
         let plan = planned(&release, "group=cloud", &observation);
         assert!(plan.groups["cloud"].blocked.is_some());
+    }
+
+    #[test]
+    fn a_group_that_got_healthier_has_not_moved_under_the_plan() {
+        // --- lane L4 ---
+        // `blocked` is a derived word. During the bootstrap of a three-member
+        // raft it flips from "not blocked" (nothing was up, nothing to
+        // protect) to "blocked" (two are up, the third is not) BECAUSE the
+        // rollout is working. The guard that exists to catch a new outage
+        // stopped the run at that moment, every time. Measured in the lab on
+        // 2026-09-23.
+        let (release, planned_obs) = three_member_cloud(3);
+        let plan = planned(&release, "group=cloud", &planned_obs);
+        assert_eq!(plan.groups["cloud"].unhealthy_now, 3);
+
+        // Now two of the three are up: better than the plan assumed, and the
+        // derived verdict is `blocked`.
+        let (_, better) = three_member_cloud(1);
+        let (views, _) = group_views(
+            &release.resolved_fleet,
+            &better,
+            &plan.selection.targets.iter().cloned().collect(),
+        );
+        assert!(
+            views["cloud"].blocked.is_some(),
+            "two of three is a degraded quorum, and it says so"
+        );
+        assert!(
+            matches!(
+                validate_against(&plan, &release, &better, at(NOW)),
+                Verdict::Proceed
+            ),
+            "a group with FEWER members down than the plan assumed has not moved under it"
+        );
+
+        // And the other direction is unchanged: a group that got worse stops
+        // the run.
+        let (release, planned_obs) = three_member_cloud(0);
+        let plan = planned(&release, "group=cloud", &planned_obs);
+        let (_, worse) = three_member_cloud(1);
+        assert!(
+            matches!(
+                validate_against(&plan, &release, &worse, at(NOW)),
+                Verdict::Stop { .. }
+            ),
+            "a member that went down after the plan was made is the fleet moving under it"
+        );
     }
 
     #[test]
