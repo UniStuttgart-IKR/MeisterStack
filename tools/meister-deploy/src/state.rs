@@ -69,6 +69,35 @@ pub const STATE_DIR: &str = ".meister-deploy";
 
 pub const LOCK_SCHEMA: &str = "meister-deploy/operator-lock/1";
 
+// --- lane 5B: the record of a retirement ---------------------------------
+
+pub const RETIRED_SCHEMA: &str = "meister-deploy/retired/1";
+
+/// What `retire` leaves behind about a host, and all of it.
+///
+/// Deliberately small, and deliberately not a receipt: the run that carried
+/// the revocation to the fleet wrote one of those, and this file is the one
+/// fact that outlives it — that this host was taken out of service on
+/// purpose, on a day, for a reason somebody typed. `last_system` and
+/// `identity_serial` are what a later question needs ("which closure was it
+/// running", "which serial did we take back") and neither is a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Retired {
+    pub schema: String,
+    pub host: String,
+    pub retired_at: DateTime<Utc>,
+    /// The system it was running when it was retired, as the last
+    /// observation saw it. `None` when nobody could ask it.
+    pub last_system: Option<String>,
+    /// The serials this repository took back for it. Empty when it held no
+    /// certificate of its own.
+    pub identity_serials: Vec<String>,
+    pub reason: Option<String>,
+}
+
+// --- end lane 5B ---------------------------------------------------------
+
 /// The state directory of one operator repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDir {
@@ -154,6 +183,54 @@ impl StateDir {
     pub fn gcroots_dir(&self) -> PathBuf {
         self.root.join("gcroots")
     }
+
+    // --- lane 5B: what is left of a host that left -----------------------
+
+    /// `retired/`: one small file per host that was taken out of service.
+    ///
+    /// It is in the state directory and not in the inventory because the
+    /// inventory is the operator's list of what the fleet IS, and a retired
+    /// host is not on it any more. What this directory answers is the
+    /// question `status` asks about a host that is in a release but not in
+    /// the inventory: was that a retirement, or did somebody delete a line.
+    pub fn retired_dir(&self) -> PathBuf {
+        self.root.join("retired")
+    }
+
+    pub fn retired_path(&self, host_id: &str) -> PathBuf {
+        self.retired_dir().join(format!("{host_id}.json"))
+    }
+
+    /// The record of one retirement, or `None` for a host that has none.
+    ///
+    /// A file that cannot be read is `None` and not an error: `status` is a
+    /// read-only verb and a broken record is a missing sentence, not a
+    /// reason to refuse to look at the fleet.
+    pub fn read_retired(&self, files: &dyn Files, host_id: &str) -> Option<Retired> {
+        let path = self.retired_path(host_id);
+        if !files.exists(&path) {
+            return None;
+        }
+        let text = files.read_to_string(&path).ok()?;
+        crate::manifest::parse_checked::<Retired>(
+            &text,
+            &path.display().to_string(),
+            RETIRED_SCHEMA,
+        )
+        .ok()
+    }
+
+    pub fn write_retired(&self, files: &dyn Files, record: &Retired) -> Result<PathBuf> {
+        let path = self.retired_path(&record.host);
+        files.create_dir_all(&self.retired_dir())?;
+        let mut bytes = serde_json::to_vec_pretty(record)
+            .map_err(|e| anyhow::anyhow!("writing the retirement record failed: {e}"))?;
+        bytes.push(b'\n');
+        files.write_atomic(&path, &bytes, 0o644)?;
+        Ok(path)
+    }
+
+    // --- end lane 5B -----------------------------------------------------
 
     pub fn gcroot_dir(&self, release_id: &str) -> PathBuf {
         self.gcroots_dir().join(release_id)

@@ -957,3 +957,161 @@ fn a_fleet_that_moved_is_planned_and_the_plan_is_read_back() {
         stdout(&out)
     );
 }
+
+// --- lane 5B: a host that left the inventory (V25) -------------------------
+
+/// The inventory of the fixture fleet, with `n2` left out — what an operator
+/// has after deleting a host's lines and before resolving again.
+const INVENTORY_WITHOUT_N2: &str = r#"
+schema = 2
+[fleet]
+name = "one-box"
+domain = "lab"
+[[host]]
+id = "box"
+name = "box"
+deployment = "nixos"
+roles = ["cloud", "cluster"]
+networks.management = { address = "10.0.0.10", prefix = 24 }
+[[host]]
+id = "n1"
+name = "n1"
+deployment = "nixos"
+roles = ["agent"]
+networks.management = { address = "10.0.0.11", prefix = 24 }
+"#;
+
+#[test]
+fn a_host_that_is_no_longer_in_the_inventory_is_unmanaged_and_is_not_asked() {
+    let sandbox = Sandbox::new();
+    std::fs::write(
+        sandbox.cwd.path().join("current.toml"),
+        INVENTORY_WITHOUT_N2,
+    )
+    .unwrap();
+    let out = sandbox.run(&[
+        "status",
+        "--release",
+        "release.json",
+        "--repo",
+        ".",
+        "--inventory",
+        "current.toml",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    // It is in the table, and it is the third word rather than "no": a
+    // machine nobody asked is not a machine that did not answer.
+    assert!(stdout(&out).contains("n2"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("unmanaged"), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("n2 is in this release and not in"),
+        "{}",
+        stderr(&out)
+    );
+
+    // And nothing was asked of it. The other two were.
+    let calls = sandbox.calls();
+    let n2 = &sandbox.fleet.hosts["n2"].address;
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("ssh ") && c.contains(n2)),
+        "n2 was asked something: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.starts_with("ssh ")
+                && c.contains(&sandbox.fleet.hosts["n1"].address.to_string())),
+        "n1 was not asked: {calls:?}"
+    );
+}
+
+#[test]
+fn an_unmanaged_host_blocks_nothing_and_says_whether_it_was_retired() {
+    let sandbox = Sandbox::new();
+    std::fs::write(
+        sandbox.cwd.path().join("current.toml"),
+        INVENTORY_WITHOUT_N2,
+    )
+    .unwrap();
+
+    // No record: the sentence has to say that, because "somebody deleted a
+    // line" and "somebody retired a machine" are not the same event and only
+    // one of them took the certificates back.
+    let out = sandbox.run(&[
+        "check",
+        "--release",
+        "release.json",
+        "--repo",
+        ".",
+        "--inventory",
+        "current.toml",
+    ]);
+    assert_eq!(
+        code(&out),
+        0,
+        "an unmanaged host may not block: {}",
+        stderr(&out)
+    );
+    assert!(
+        stdout(&out).contains("`retire` was never run for it")
+            || stderr(&out).contains("`retire` was never run for it"),
+        "{}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+
+    // With one, the same host is named with the day it left.
+    let dir = sandbox.state().join("retired");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("n2.json"),
+        r#"{"schema":"meister-deploy/retired/1","host":"n2",
+            "retired_at":"2026-09-23T10:00:00Z","last_system":null,
+            "identity_serials":["64:35:C9"],"reason":"decommissioned"}"#,
+    )
+    .unwrap();
+    let out = sandbox.run(&[
+        "status",
+        "--release",
+        "release.json",
+        "--repo",
+        ".",
+        "--inventory",
+        "current.toml",
+        "--json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("`retire` was 2026-09-23"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(stdout(&out).contains("decommissioned"), "{}", stdout(&out));
+}
+
+#[test]
+fn an_inventory_of_another_fleet_is_not_read_as_this_ones() {
+    let sandbox = Sandbox::new();
+    // The fixture inventory beside the release is `uni-lab`; the release is
+    // of `one-box`. Reading it would declare every host of this release
+    // unmanaged on the strength of a file about something else.
+    let out = sandbox.run(&[
+        "status",
+        "--release",
+        "release.json",
+        "--repo",
+        ".",
+        "--inventory",
+        "fleet.toml",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("is the inventory of the fleet \"uni-lab\""),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("unmanaged"), "{}", stdout(&out));
+}

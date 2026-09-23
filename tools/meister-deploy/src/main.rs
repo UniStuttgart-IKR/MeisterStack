@@ -235,6 +235,54 @@ enum Verb {
         cmd: KeysCmd,
     },
     // --- end lane 3B ---------------------------------------------------
+
+    // --- lane 5B: taking a host out of service --------------------------
+    /// Take a host out of service: take its certificates back, tell the
+    /// fleet, and write down that it happened.
+    ///
+    /// What it does NOT do is as much the point as what it does. No data is
+    /// deleted, no file on the machine is touched, no disk is wiped and the
+    /// `known_hosts` line stays where it is — a retirement is a statement
+    /// this fleet makes about a machine, not something it does to one. The
+    /// machine may be off, may be stolen, may be on somebody's desk; none of
+    /// that changes what has to be true here, which is that nothing it
+    /// presents is believed any more.
+    ///
+    /// The host leaves the inventory when the OPERATOR deletes its lines.
+    /// This verb never edits `fleet.toml`: an inventory a tool rewrites is
+    /// an inventory whose diff says nothing.
+    Retire {
+        /// The host id, as the inventory and the release spell it
+        host: String,
+        /// The release the delivery plan is made from
+        #[arg(long)]
+        release: PathBuf,
+        /// Why — it lands in the record and above the `known_hosts` line
+        #[arg(long)]
+        reason: Option<String>,
+        /// The operator's repository
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// The inventory the `[operator] ca_dir` reference is read from
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+        /// `tools/meister-ca`. Looked up on PATH when it is a bare name.
+        #[arg(long, default_value = "meister-ca")]
+        meister_ca: PathBuf,
+        /// The ssh key to offer while the remaining hosts are asked
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Where the delivery plan goes
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+        /// Say what would be taken back and take nothing back
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as json
+        #[arg(long)]
+        json: bool,
+    },
+    // --- end lane 5B ----------------------------------------------------
 }
 
 // --- lane 3B: the `keys` verbs ------------------------------------------
@@ -523,6 +571,14 @@ struct LookArgs {
     #[arg(long, default_value_t = observe::DEFAULT_CONCURRENCY)]
     at_once: usize,
 
+    // --- lane 5B ---
+    /// The inventory, for the one question a release cannot answer: which
+    /// of its hosts the fleet still has. A host that is in the release and
+    /// not in the inventory is `unmanaged`. Defaults to the file the
+    /// manifest was resolved from.
+    #[arg(long)]
+    inventory: Option<PathBuf>,
+    // --- end lane 5B ---
     /// Do not ask anybody: answer from the last snapshot in the state
     /// directory
     #[arg(long)]
@@ -1030,6 +1086,31 @@ fn run() -> Result<Answer> {
         // --- lane 3B ---------------------------------------------------
         Verb::Keys { cmd } => keys(cmd),
         // --- end lane 3B -----------------------------------------------
+        // --- lane 5B ---------------------------------------------------
+        Verb::Retire {
+            host,
+            release,
+            reason,
+            repo,
+            inventory,
+            meister_ca,
+            identity,
+            out,
+            dry_run,
+            json,
+        } => retire(RetireArgs {
+            host,
+            release,
+            reason: reason.as_deref(),
+            repo,
+            inventory: inventory.as_deref(),
+            meister_ca,
+            identity: identity.clone(),
+            out: out.clone(),
+            dry_run: *dry_run,
+            json: *json,
+        }),
+        // --- end lane 5B -----------------------------------------------
     }
 }
 
@@ -1224,6 +1305,11 @@ struct Looked {
     checks: Vec<meister_deploy::checks::CheckResult>,
     /// Where the snapshot was written, for a run that asked.
     written: Option<PathBuf>,
+    // --- lane 5B ---
+    /// Selected hosts that the inventory does not have any more. They are
+    /// listed, not probed and not judged (V25).
+    unmanaged: BTreeSet<String>,
+    // --- end lane 5B ---
 }
 
 /// Look at the fleet: one round trip per host, or the last snapshot on disk.
@@ -1263,6 +1349,66 @@ fn look(args: &LookArgs) -> Result<Looked> {
         .unwrap_or_else(|| PathBuf::from(&fleet.source.repo_path));
     let state = StateDir::in_repo(&repo);
 
+    // --- lane 5B: which of these hosts the fleet still has --------------
+    //
+    // A release is a photograph of an inventory at a moment. When a host
+    // leaves the inventory, every release that was built before the edit
+    // still names it — so `status --release r.json` would go on asking a
+    // machine that is nobody's any more, and a `check` would go on
+    // requiring it. Reading the inventory beside the release is what closes
+    // that gap, and it is READ-ONLY: what the release says about a host
+    // stays what it says.
+    let inventory_file = match &args.inventory {
+        Some(path) => inventory_path(&repo, path),
+        None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
+    };
+    let unmanaged: BTreeSet<String> = match Inventory::load(&files, &inventory_file) {
+        // The name first, and it is not a formality. The default path comes
+        // out of the manifest (`source.repo_path`), which is where `resolve`
+        // RAN — on another machine, or after somebody moved a directory,
+        // that path can point at a different fleet's inventory, and reading
+        // one would declare every host of this release `unmanaged` on the
+        // strength of a file about something else. So: same fleet, or no
+        // answer.
+        Ok(inventory) if inventory.fleet.name != fleet.fleet.name => {
+            eprintln!(
+                "note: {} is the inventory of the fleet {:?} and this release is of {:?}, so                  it says nothing about which of these hosts are still managed. Pass                  --inventory <file> to point at the right one.",
+                inventory_file.display(),
+                inventory.fleet.name,
+                fleet.fleet.name
+            );
+            BTreeSet::new()
+        }
+        Ok(inventory) => selected
+            .iter()
+            .filter(|id| !inventory.hosts.contains_key(*id))
+            .cloned()
+            .collect(),
+        Err(e) => {
+            // Not a failure: a status of a fleet whose inventory is not
+            // here (a release handed to somebody else, a build machine) is
+            // still a status. What it cannot say is which hosts left.
+            eprintln!(
+                "note: {} could not be read ({e}), so nobody can say which of these hosts                  the inventory still has. Pass --inventory <file> for that half.",
+                inventory_file.display()
+            );
+            BTreeSet::new()
+        }
+    };
+    let asked: Vec<String> = selected
+        .iter()
+        .filter(|id| !unmanaged.contains(*id))
+        .cloned()
+        .collect();
+    if !unmanaged.is_empty() {
+        eprintln!(
+            "note: {} is in this release and not in {}; nothing was asked of it.",
+            unmanaged.iter().cloned().collect::<Vec<_>>().join(", "),
+            inventory_file.display()
+        );
+    }
+    // --- end lane 5B ----------------------------------------------------
+
     let (observation, written) = if args.offline {
         let snapshot = state.load_latest_observation(&files)?;
         eprintln!(
@@ -1276,15 +1422,15 @@ fn look(args: &LookArgs) -> Result<Looked> {
             Some(path) => {
                 let text = files.read_to_string(path)?;
                 let targets = observation::Targets::from_json(&text, &path.display().to_string())?;
-                observation::bind_targets(&fleet, &targets, &selected)?
+                observation::bind_targets(&fleet, &targets, &asked)?
             }
-            None => observation::manifest_endpoints(&fleet, &selected)?,
+            None => observation::manifest_endpoints(&fleet, &asked)?,
         };
         Cancel::on_sigint()?;
         let runner = Real::new(policy);
         let ssh = transport::Ssh::for_repo(&repo).with_identity(args.identity.clone());
         let prober = observe::SshProber::new(&runner, &ssh);
-        let probes: Vec<observe::HostProbe> = selected
+        let probes: Vec<observe::HostProbe> = asked
             .iter()
             .map(|id| {
                 observe::HostProbe::new(
@@ -1298,7 +1444,16 @@ fn look(args: &LookArgs) -> Result<Looked> {
         (snapshot, Some(path))
     };
 
-    let checks = readiness::readiness_of(&fleet, &selected, &observation, release.as_ref());
+    let mut checks = readiness::readiness_of(&fleet, &asked, &observation, release.as_ref());
+    // --- lane 5B ---
+    for id in &unmanaged {
+        checks.push(readiness::unmanaged(
+            id,
+            state.read_retired(&files, id).as_ref(),
+        ));
+    }
+    checks.extend(service_checks(&Real::new(policy), &fleet, args.offline));
+    // --- end lane 5B ---
     Ok(Looked {
         fleet,
         release,
@@ -1306,8 +1461,95 @@ fn look(args: &LookArgs) -> Result<Looked> {
         observation,
         checks,
         written,
+        unmanaged,
     })
 }
+
+// --- lane 5B: the services this fleet does not deploy ---------------------
+
+/// How long one service endpoint has to answer.
+const SERVICE_DEADLINE_SECS: u64 = 5;
+
+/// Ask every unmanaged service of the inventory whether it is there.
+///
+/// One `curl` per declared endpoint, effect `read`, five seconds each. Not
+/// an HTTP client in this crate: a tool that only ever has to know "did
+/// something answer at this address" does not need to learn HTTP, and the
+/// one command it shells out to is on every machine that can reach the
+/// fleet anyway. When it is not, or when the run is offline, the verdict is
+/// `unknown` and says which of the two it was.
+fn service_checks(
+    runner: &dyn meister_deploy::run::Runner,
+    fleet: &manifest::ResolvedFleet,
+    offline: bool,
+) -> Vec<meister_deploy::checks::CheckResult> {
+    let mut out = Vec::new();
+    for (id, service) in &fleet.services {
+        if service.managed {
+            out.push(readiness::service(id, service, None));
+            continue;
+        }
+        let endpoints: Vec<(&String, &String)> = service
+            .endpoint
+            .as_ref()
+            .map(|e| e.iter().collect())
+            .unwrap_or_default();
+        if endpoints.is_empty() || offline {
+            out.push(readiness::service(id, service, None));
+            continue;
+        }
+        // Every declared endpoint, and the first silence wins: a service
+        // whose push address answers and whose query address does not is
+        // not a service that is there.
+        let mut verdict: Option<readiness::Reached> = None;
+        for (name, url) in endpoints {
+            let cmd = meister_deploy::run::Cmd::new(
+                meister_deploy::run::Effect::Read,
+                "curl",
+                std::time::Duration::from_secs(SERVICE_DEADLINE_SECS),
+            )
+            .args([
+                "--silent",
+                "--show-error",
+                "--output",
+                "/dev/null",
+                "--max-time",
+                &SERVICE_DEADLINE_SECS.to_string(),
+                "--write-out",
+                "%{http_code}",
+                url,
+            ]);
+            match runner.run(&cmd) {
+                // Any status code is an answer: a Loki push endpoint says
+                // 405 to a GET, and 405 means somebody is there. What this
+                // check is about is reachability, and claiming to know what
+                // a foreign service's 200 would mean would be a claim about
+                // somebody else's software.
+                Ok(done) => {
+                    verdict = Some(readiness::Reached::Answered {
+                        endpoint: format!("{name}={url}"),
+                        detail: format!("http {}", done.stdout.trim()),
+                    });
+                }
+                Err(e) => {
+                    verdict = Some(readiness::Reached::Silent {
+                        endpoint: format!("{name}={url}"),
+                        detail: first_line(&e.to_string()),
+                    });
+                    break;
+                }
+            }
+        }
+        out.push(readiness::service(id, service, verdict));
+    }
+    out
+}
+
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or("").trim().to_string()
+}
+
+// --- end lane 5B ----------------------------------------------------------
 
 fn status(args: &LookArgs) -> Result<Answer> {
     let looked = look(args)?;
@@ -1410,7 +1652,9 @@ fn status_table(looked: &Looked) -> String {
         );
         out.push_str(&format!(
             "    {id:<14} {:<9} {:<6} {:>4}  {:<28} {}\n",
+            // --- lane 5B: three answers, not two ---
             match obs {
+                _ if looked.unmanaged.contains(id) => "unmanaged",
                 Some(obs) if obs.reachable => "yes",
                 Some(_) => "no",
                 None => "-",
@@ -1431,13 +1675,23 @@ fn status_table(looked: &Looked) -> String {
     }
     // Then the ones that matter, once each, with what they expected.
     for check in &looked.checks {
-        if matches!(check.status, Status::Pass | Status::NotApplicable) {
+        // --- lane 5B ---
+        // `managed` is the one `not_applicable` that is printed: it does not
+        // block anything (that is the point of the class) and its sentence
+        // is the only place a reader learns why a host in this release is
+        // not being asked anything.
+        if check.status == Status::Pass
+            || (check.status == Status::NotApplicable && check.id != "managed")
+        {
             continue;
         }
+        // --- end lane 5B ---
         out.push_str(&format!(
             "    {} {} on {}: {}\n",
             if check.required {
                 "REQUIRED"
+            } else if check.id == "managed" {
+                "note    "
             } else {
                 "optional"
             },
@@ -2110,14 +2364,20 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
         // fleet that has to be told.
         "keys-revoke" => PlanKind::KeysRevoke,
         // --- end lane 5A ---
-        other @ ("keys-rotate" | "retire") => anyhow::bail!(
-            "the plan kind {other:?} is not built here. A rotation is made by `keys rotate`, \
-             which prepares the key on the host and issues the certificate before there is \
-             anything to plan; `retire` arrives with M5B."
+        // --- lane 5B ---
+        // The delivery half of a retirement, for the same reason
+        // `keys-revoke` has a door here: `retire <host>` builds one after it
+        // has taken the certificates back, and this is the other order.
+        "retire" => PlanKind::Retire,
+        // --- end lane 5B ---
+        "keys-rotate" => anyhow::bail!(
+            "the plan kind \"keys-rotate\" is not built here. A rotation is made by \
+             `keys rotate`, which prepares the key on the host and issues the certificate \
+             before there is anything to plan."
         ),
         other => anyhow::bail!(
             "{other:?} is not a plan kind. This tool builds `upgrade`, `bootstrap`, \
-             `install` and `keys-revoke`."
+             `install`, `keys-revoke` and `retire`."
         ),
     };
     // --- lane 3A ---
@@ -3252,6 +3512,224 @@ fn keys(cmd: &KeysCmd) -> Result<Answer> {
         // --- end lane 5A ---
     }
 }
+
+// --- lane 5B: retiring a host ---------------------------------------------
+
+/// Everything `retire` was told.
+struct RetireArgs<'a> {
+    host: &'a str,
+    release: &'a Path,
+    reason: Option<&'a str>,
+    repo: &'a Path,
+    inventory: Option<&'a Path>,
+    meister_ca: &'a Path,
+    identity: Option<PathBuf>,
+    out: Option<PathBuf>,
+    dry_run: bool,
+    json: bool,
+}
+
+/// Take a host out of service.
+///
+/// Three things happen here and they are in this order on purpose:
+///
+/// 1. the certificates this repository holds for the host are taken back and
+///    a new list is written and published (offline, on this machine);
+/// 2. the record and the `known_hosts` mark are written, so that the
+///    retirement survives everything else;
+/// 3. a plan is made that carries the new list to the REST of the fleet.
+///
+/// The host itself is not in that plan (`all,!host=<id>`) and nothing is
+/// sent to it. A machine that is being retired may be off, may be broken,
+/// may be somebody else's problem already — and a verb that needed it to
+/// answer would be a verb that cannot retire the one host you most want to.
+///
+/// Nothing is deleted: not a partition, not a data directory, not the
+/// certificate files on the machine, not the `known_hosts` line, not the
+/// lines in `fleet.toml`. The last of those is the operator's edit, and
+/// `status` says `unmanaged` about the gap until it is made.
+fn retire(args: RetireArgs<'_>) -> Result<Answer> {
+    use meister_deploy::pki;
+
+    let policy = if args.dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+    let runner = Real::new(policy);
+
+    let repo = &std::path::absolute(args.repo)
+        .with_context(|| format!("{} could not be made absolute", args.repo.display()))?;
+    let text = files.read_to_string(args.release)?;
+    let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
+    let fleet = &release.resolved_fleet;
+
+    if !fleet.hosts.contains_key(args.host) {
+        anyhow::bail!(
+            "{} names no host {:?}; it covers {}. A host that is already out of the \
+             inventory AND out of the last release has nothing left here to retire — the \
+             record under `.meister-deploy/retired/` is what says one was.",
+            args.release.display(),
+            args.host,
+            fleet.evaluated_hosts.join(", ")
+        );
+    }
+
+    let inventory_file = match args.inventory {
+        Some(path) => inventory_path(repo, path),
+        None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
+    };
+
+    // --- 1. the certificates ------------------------------------------
+    let certs = pki::issued_certs(&files, repo, args.host);
+    let mut serials: Vec<String> = Vec::new();
+    let mut ran: Vec<String> = Vec::new();
+    if certs.is_empty() {
+        eprintln!(
+            "note: {} holds no certificate for {}, so there is nothing of its to take back \
+             here. If it had one, revoke it by serial — the serial is in the receipt of the \
+             run that delivered it (`report --run <id>`).",
+            repo.join(pki::ISSUED_DIR).join(args.host).display(),
+            args.host
+        );
+    } else {
+        let parsed = Inventory::load(&files, &inventory_file)?;
+        let named = parsed
+            .operator
+            .as_ref()
+            .and_then(|o| o.ca_dir.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} has no `[operator] ca_dir`, so this tool does not know which CA \
+                     holds the index a revocation is written into.",
+                    inventory_file.display()
+                )
+            })?;
+        let ca = pki::ca_dir(&inventory_file, &named);
+        pki::refuse_ca_in_repo(repo, &ca)?;
+        for cert in &certs {
+            let what = cert.display().to_string();
+            // The serial before the revocation, because afterwards the file
+            // is still there and the record has to name what was taken back.
+            if let Ok(out) = runner.run(&pki::describe_cmd("openssl", cert))
+                && let Some(serial) = pki::parse_describe(&out.stdout, &what).serial
+            {
+                serials.push(serial);
+            }
+            let cmd = pki::revoke_cmd(args.meister_ca, &ca, &what, args.reason);
+            ran.push(cmd.line());
+            if args.dry_run {
+                println!("{}", cmd.described());
+            } else {
+                runner.run(&cmd)?;
+            }
+        }
+        let gencrl = pki::gencrl_cmd(args.meister_ca, &ca);
+        ran.push(gencrl.line());
+        if args.dry_run {
+            println!("{}", gencrl.described());
+        } else {
+            runner.run(&gencrl)?;
+            let bytes = files.read(&ca.join("crl.pem"))?;
+            let here = pki::crl_path(repo);
+            files.create_dir_all(here.parent().unwrap_or(repo))?;
+            files.write_atomic(&here, &bytes, 0o644)?;
+            eprintln!(
+                "==> {} ({} certificate(s) taken back)",
+                here.display(),
+                certs.len()
+            );
+        }
+    }
+
+    // --- 2. the record, and the mark ----------------------------------
+    let state = StateDir::in_repo(repo);
+    let now = RealClock.now();
+    let last_system = state
+        .load_latest_observation(&files)
+        .ok()
+        .and_then(|o| o.host(args.host).and_then(|h| h.current_system.clone()));
+    let record = state::Retired {
+        schema: state::RETIRED_SCHEMA.to_string(),
+        host: args.host.to_string(),
+        retired_at: now,
+        last_system,
+        identity_serials: serials.clone(),
+        reason: args.reason.map(str::to_string),
+    };
+    let ssh = transport::Ssh::for_repo(repo);
+    let marked = if args.dry_run {
+        eprintln!(
+            "note: nothing was written. {} and the `# retired` line above {}'s entry in {} \
+             are what a real run would add.",
+            state.retired_path(args.host).display(),
+            args.host,
+            ssh.known_hosts.display()
+        );
+        false
+    } else {
+        let path = state.write_retired(&files, &record)?;
+        eprintln!("==> {}", path.display());
+        let name = pki::target_from_host(args.host, &fleet.hosts[args.host]).known_hosts_name();
+        pki::mark_retired(&files, &ssh.known_hosts, &name, args.reason, now)?
+    };
+
+    // --- 3. the rest of the fleet -------------------------------------
+    let select = format!("all,!host={}", args.host);
+    let answer = if fleet.hosts.len() < 2 {
+        eprintln!(
+            "note: {} was the only host of this fleet, so there is nobody left to hand the \
+             list to and no plan was made. The revocation is in the CA and in {}.",
+            args.host,
+            pki::crl_path(repo).display()
+        );
+        Answer::Yes
+    } else if args.dry_run {
+        eprintln!("note: a real run would plan the delivery of the new list to `{select}`.");
+        Answer::Yes
+    } else {
+        make_plan(&PlanArgs {
+            release: args.release.to_path_buf(),
+            select: select.clone(),
+            kind: "retire".to_string(),
+            reinstall: false,
+            targets: None,
+            observation: None,
+            offline: false,
+            dry_run: false,
+            repo: Some(repo.clone()),
+            identity: args.identity.clone(),
+            at_once: observe::DEFAULT_CONCURRENCY,
+            inventory: Some(inventory_file.clone()),
+            out: args.out.clone(),
+        })?
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "host": args.host,
+                "retired_at": now,
+                "revoked": serials,
+                "known_hosts_marked": marked,
+                "commands": ran,
+                "record": state.retired_path(args.host).display().to_string(),
+            }))?
+        );
+    }
+    eprintln!(
+        "note: nothing on {} was changed or deleted — not its data, not its keys, not its \
+         line in {}. Take the host out of the inventory yourself when you are ready; until \
+         you do, `status` calls it `unmanaged` and names this retirement.",
+        args.host,
+        inventory_file.display()
+    );
+    Ok(answer)
+}
+
+// --- end lane 5B ----------------------------------------------------------
 
 /// The manifest, read through the same parser `validate --manifest` uses.
 fn read_manifest(files: &dyn Files, path: &Path) -> Result<manifest::ResolvedFleet> {

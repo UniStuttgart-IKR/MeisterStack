@@ -761,6 +761,144 @@ pub fn declares_identity(host: &ResolvedHost) -> bool {
         .any(|s| s.kind == SecretKind::IdentityKey)
 }
 
+// --- lane 5B: what is not (or no longer) this fleet's --------------------
+
+/// The verdict about a host that is in a release but not in the inventory
+/// any more.
+///
+/// `not_applicable` and not `unknown`: nobody failed to look at this
+/// machine, and nobody is going to. The inventory is the list of what this
+/// fleet IS, and a host that has left it is outside the question `check`
+/// asks — so it may not block a run, whatever the inventory's `required`
+/// list says about hosts that are still on it.
+///
+/// What the sentence has to carry is WHY the gap is there, because there are
+/// two reasons and they are very different: somebody retired the machine, or
+/// somebody deleted a line. The retirement record is the only thing that can
+/// tell them apart.
+pub fn unmanaged(id: &str, retired: Option<&crate::state::Retired>) -> CheckResult {
+    let reason = match retired {
+        Some(record) => format!(
+            "{id} is not in the inventory any more; `retire` was {}{}. It is still in this \
+             release because the release is older than the edit — resolve again and it is \
+             gone from both.",
+            record.retired_at.format("%Y-%m-%d"),
+            match &record.reason {
+                Some(why) if !why.trim().is_empty() => format!(" ({})", why.trim()),
+                _ => String::new(),
+            }
+        ),
+        None => format!(
+            "{id} is not in the inventory any more; `retire` was never run for it. Either \
+             the line was deleted without retiring the machine — then its certificates are \
+             still valid and `retire {id} --release <r>` is the verb — or it never belonged \
+             here at all."
+        ),
+    };
+    CheckResult {
+        id: "managed".to_string(),
+        subject: Subject::host(id),
+        required: false,
+        status: Status::NotApplicable,
+        expected: "a host of this inventory".to_string(),
+        observed: "unmanaged".to_string(),
+        reason,
+        duration_ms: 0,
+        evidence: Vec::new(),
+        release_id: None,
+        config_id: None,
+    }
+}
+
+/// What a service of the inventory that this fleet does NOT deploy answers,
+/// given what an attempt to reach it found.
+///
+/// `reached` is `None` for a service nobody asked (offline, no endpoint, no
+/// curl) and `Some(sentence)` for one that was asked — the sentence being
+/// what the attempt said. A service this fleet DOES deploy is
+/// `not_applicable` here on purpose: its units are on a host of this fleet
+/// and the host's own checks are the answer; a second verdict over the same
+/// fact would be a second answer to one question.
+///
+/// A `required = false` service that does not answer is a note. A
+/// `required = true` one is `unknown`, and `checks::acceptance` blocks on
+/// it — which is the whole of V25's second half: an external observability
+/// stack that is down stops a run only if the operator said it must be
+/// there.
+pub fn service(
+    id: &str,
+    service: &crate::manifest::Service,
+    reached: Option<Reached>,
+) -> CheckResult {
+    let (status, observed, reason) = if service.managed {
+        (
+            Status::NotApplicable,
+            "deployed by this fleet".to_string(),
+            format!(
+                "{id} is this fleet's own service; what it is doing is its host's units, and \
+                 those are checked on the host."
+            ),
+        )
+    } else {
+        match reached {
+            Some(Reached::Answered { endpoint, detail }) => (
+                Status::Pass,
+                detail,
+                format!("{id} answered at {endpoint}."),
+            ),
+            Some(Reached::Silent { endpoint, detail }) => (
+                Status::Unknown,
+                "no answer".to_string(),
+                format!(
+                    "{id} could not be confirmed at {endpoint}: {detail}. This fleet does \
+                     not deploy it, so there is nothing here to repair — the verdict is \
+                     `unknown` because nobody knows, and it {} a run.",
+                    if service.required {
+                        "blocks"
+                    } else {
+                        "does not block"
+                    }
+                ),
+            ),
+            None => (
+                Status::Unknown,
+                "not asked".to_string(),
+                format!(
+                    "{id} was not asked. Either it declares no endpoint, or this run was \
+                     offline, or there is no `curl` on this machine — in each case nobody \
+                     knows, and `unknown` is the only honest word."
+                ),
+            ),
+        }
+    };
+    CheckResult {
+        id: format!("service:{id}"),
+        subject: Subject::resource(id),
+        required: service.required && !service.managed,
+        status,
+        expected: if service.managed {
+            "its host's units".to_string()
+        } else {
+            "an answer at the declared endpoint".to_string()
+        },
+        observed,
+        reason,
+        duration_ms: 0,
+        evidence: Vec::new(),
+        release_id: None,
+        config_id: None,
+    }
+}
+
+/// What an attempt to reach an unmanaged service found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reached {
+    Answered { endpoint: String, detail: String },
+    Silent { endpoint: String, detail: String },
+}
+
+// --- end lane 5B ---------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;

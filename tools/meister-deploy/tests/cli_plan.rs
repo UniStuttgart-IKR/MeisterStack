@@ -372,10 +372,10 @@ fn a_plan_kind_that_does_not_exist_yet_says_which_milestone_it_arrives_in() {
     // `install` is no longer one of these: lane 3A built it, and
     // tests/cli_install.rs is where it is argued about. Nor is
     // `keys-revoke`, which lane 5A built — `keys revoke` makes one after it
-    // has written the list, and this door is for the other order.
+    // has written the list, and this door is for the other order. Nor is
+    // `retire`, which lane 5B built and which works the same way round.
     for (kind, needle) in [
         ("keys-rotate", "made by `keys rotate`"),
-        ("retire", "M5B"),
         ("nonsense", "is not a plan kind"),
     ] {
         let out = sandbox.run(&[

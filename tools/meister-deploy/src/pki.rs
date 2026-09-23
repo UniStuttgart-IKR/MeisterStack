@@ -303,6 +303,62 @@ pub fn enroll(
     })
 }
 
+// --- lane 5B: a host that left ------------------------------------------
+
+/// Mark a host's `known_hosts` entry as retired, and keep the entry.
+///
+/// A comment goes in ABOVE the line and the line stays. Deleting it would
+/// be the obvious thing and it is the wrong one: the entry is the record
+/// that this fleet, on some day, decided that this key belongs to this
+/// machine, and a reinstall on the same address has to collide with it
+/// (`keys enroll` refuses, and `--replace --reason` is how somebody says
+/// what happened). A deleted line would make the next machine on that
+/// address enrollable without anybody noticing that there was one before.
+///
+/// Returns false when the file has no entry for this host, which is not an
+/// error: a host that was never enrolled can still be retired.
+pub fn mark_retired(
+    files: &dyn Files,
+    known_hosts: &Path,
+    name: &str,
+    reason: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if !files.exists(known_hosts) {
+        return Ok(false);
+    }
+    let existing = files.read_to_string(known_hosts)?;
+    if !existing
+        .lines()
+        .any(|l| host_field(l).is_some_and(|h| h == name))
+    {
+        return Ok(false);
+    }
+    let marker = match reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(reason) => format!("# retired {} {reason}", now.format("%Y-%m-%dT%H:%M:%SZ")),
+        None => format!("# retired {}", now.format("%Y-%m-%dT%H:%M:%SZ")),
+    };
+    // Twice is not twice: a host retired again gets one marker, because the
+    // file is committed and a diff full of identical comments says nothing.
+    let mut out: Vec<String> = Vec::new();
+    let lines: Vec<&str> = existing.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if host_field(line).is_some_and(|h| h == name) {
+            let marked = i > 0 && lines[i - 1].trim_start().starts_with("# retired ");
+            if !marked {
+                out.push(marker.clone());
+            }
+        }
+        out.push((*line).to_string());
+    }
+    let mut text = out.join("\n");
+    text.push('\n');
+    files.write_atomic(known_hosts, text.as_bytes(), 0o644)?;
+    Ok(true)
+}
+
+// --- end lane 5B --------------------------------------------------------
+
 /// The host a `known_hosts` line is about, past a `@cert-authority` or
 /// `@revoked` marker. `None` for a comment or an empty line.
 fn host_field(line: &str) -> Option<&str> {
