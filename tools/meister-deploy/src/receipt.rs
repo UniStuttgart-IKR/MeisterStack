@@ -769,6 +769,16 @@ pub enum TxnView {
     Pending {
         deadline: Option<DateTime<Utc>>,
     },
+    // --- Astra finding F07, 2026-09-23 ---
+    /// A confirmation began on the target and did not finish. The machine
+    /// runs the new system and somebody meant to keep it; what is left is
+    /// to say so, which is a `confirm` and never a repair.
+    Confirming,
+    /// A revert began on the target and did not finish. Which system the
+    /// machine runs is not something this record can say, so nothing here
+    /// decides it.
+    Reverting,
+    // --- end Astra finding F07 ---
     Confirmed,
     Reverted,
     /// There is a record and it does not say a coherent thing.
@@ -799,6 +809,9 @@ impl TxnView {
                 TxnState::Pending => TxnView::Pending {
                     deadline: one.deadline,
                 },
+                // Astra finding F07, 2026-09-23.
+                TxnState::Confirming => TxnView::Confirming,
+                TxnState::Reverting => TxnView::Reverting,
                 TxnState::Confirmed => TxnView::Confirmed,
                 TxnState::Reverted => TxnView::Reverted,
                 TxnState::Inconsistent => TxnView::Inconsistent,
@@ -1024,7 +1037,27 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
             }
         }
         TxnView::Pending { .. } => Step::VerifyAndConfirm,
+        // Astra finding F07, 2026-09-23: a confirmation that began on the
+        // target and did not finish is NOT a recovery case. The host is on
+        // the new system, a confirm was already the decision, and
+        // `meister-activate confirm` finishes the record idempotently — so
+        // the resume does what it would have done anyway, one step earlier
+        // in the sentence: verify, then confirm. Reading it as a case for a
+        // person would strand every host whose operator process died in a
+        // window of two commands.
+        TxnView::Confirming => Step::VerifyAndConfirm,
         TxnView::Reverted => Step::RolledBack,
+        // A revert that did not finish is a different thing: the record
+        // cannot say which system the machine is on, so nothing here calls
+        // it rolled back and nothing activates on top of it. The way out is
+        // on the host, where repeating the revert is safe.
+        TxnView::Reverting => Step::RecoveryRequired(format!(
+            "a revert began on {} and did not finish, so the record cannot say which system \
+             that machine is on. Finish it there — `meister-activate revert --txn <id>` \
+             repeats the way back — and read `meister-activate txn show` before you plan \
+             again.",
+            host.id
+        )),
         // Astra, alongside finding F19, 2026-09-23: a host that only had to
         // BOOT never opened a transaction. Its plan has no `activate` and no
         // `confirm` — the way back from a boot that does not come up is the
@@ -1840,6 +1873,40 @@ mod tests {
     }
 
     // --- end lane 5C ---
+
+    // Astra finding F07, 2026-09-23.
+    #[test]
+    fn a_confirmation_that_did_not_finish_resumes_into_the_confirm() {
+        // The host carries a `confirming` record: a confirm began there and
+        // the process that began it is gone. That is not a case for a
+        // person — the machine is on the new system and the decision was
+        // taken — so the resume does what it was going to do anyway, and
+        // the confirm it runs finishes the record.
+        let mut obs = crate::observation::HostObservation::empty();
+        obs.open_txns = vec![Txn {
+            id: "txn-1".to_string(),
+            state: TxnState::Confirming,
+            target_system: None,
+            deadline: Some(at("2026-09-21T12:16:00Z")),
+            run_id: None,
+        }];
+        let view = TxnView::of(&obs, Some("txn-1"));
+        assert_eq!(view, TxnView::Confirming);
+        assert_eq!(next_step(&mid_activation(), &view), Step::VerifyAndConfirm);
+
+        // A way back that did not finish is the other answer: which system
+        // that machine is on is not something the record can say.
+        obs.open_txns[0].state = TxnState::Reverting;
+        let view = TxnView::of(&obs, Some("txn-1"));
+        assert_eq!(view, TxnView::Reverting);
+        match next_step(&mid_activation(), &view) {
+            Step::RecoveryRequired(why) => {
+                assert!(why.contains("did not finish"), "{why}");
+                assert!(why.contains("repeats the way back"), "{why}");
+            }
+            other => panic!("{other:?} — a half-finished revert is nobody's guess"),
+        }
+    }
 
     #[test]
     fn what_the_target_says_comes_from_its_own_transaction_records() {

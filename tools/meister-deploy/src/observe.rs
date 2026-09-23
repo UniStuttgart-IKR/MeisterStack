@@ -1695,6 +1695,40 @@ mod tests {
         assert_eq!(obs.unknown_reason, None);
     }
 
+    // Astra finding F07, 2026-09-23.
+    #[test]
+    fn a_decision_in_flight_comes_across_the_wire_as_the_word_it_is() {
+        // The target writes `confirming` and `reverting`, and the fleet
+        // reads them here. A word this side could not parse would drop the
+        // record out of `open_txns` altogether — a host with a decision in
+        // flight would look like a host with nothing open, which is the one
+        // reading that lets the next plan start over on top of it.
+        for word in ["confirming", "reverting"] {
+            let spec = spec_for("box");
+            let txn = serde_json::json!({
+                "id": "txn-8", "state": word,
+                "target_system": "/nix/store/newnewnew-nixos-system-box-25.11",
+                "deadline": "2026-09-21T12:05:00Z", "run_id": null
+            });
+            let answer = format!(
+                "{}txn_file={}\nprobe=end\n",
+                healthy_answer(&spec).trim_end_matches("probe=end\n"),
+                serde_json::to_string(&txn).unwrap()
+            );
+            let obs = parse_probe(&answer, &spec, None);
+            assert_eq!(obs.open_txns.len(), 1, "{word}");
+            assert_eq!(obs.open_txns[0].id, "txn-8", "{word}");
+            // And back out again in the same spelling: this is the type
+            // `meister-activate status --json` serialises on the other
+            // side, so the round trip is the contract.
+            assert_eq!(
+                serde_json::to_value(obs.open_txns[0].state).unwrap(),
+                serde_json::Value::String(word.to_string()),
+                "{word}"
+            );
+        }
+    }
+
     #[test]
     fn a_helper_answer_this_tool_does_not_speak_is_ignored_not_guessed() {
         let spec = spec_for("box");

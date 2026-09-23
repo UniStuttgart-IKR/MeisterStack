@@ -31,6 +31,14 @@
 //!   activation, and the target takes itself back") is only true this way
 //!   round. The cost is that a failure between arming and switching has to
 //!   disarm it again, which [`Helper::activate`] does.
+//! * **A decision is written before it is carried out.** Astra finding F07,
+//!   2026-09-23: `confirm` writes `confirming` and `revert` writes
+//!   `reverting` BEFORE the step that cannot be undone — the stop of the
+//!   revert timer in the one case, the move of the profile in the other. A
+//!   process that dies in that window used to leave a record saying
+//!   `pending` beside a machine that had already been decided about, and a
+//!   record that says less than what happened is the one thing a resume
+//!   cannot recover from. The cost is one more fsynced write per decision.
 //! * **Nothing decides by itself what is open.** A record is retired by the
 //!   run that owns it (`txn retire`), not by reaching a state. So a run that
 //!   was interrupted leaves its record behind, which is exactly what makes
@@ -241,10 +249,21 @@ impl TxnRecord {
 
     /// Whether this transaction is still in flight: something was done and
     /// nobody has said how it ended.
+    ///
+    /// Astra finding F07, 2026-09-23: a decision that began and did not
+    /// finish is the most open a transaction can be. `confirming` and
+    /// `reverting` are therefore counted here, which is what makes them
+    /// block the next plan, keep the record out of `txn retire` and show up
+    /// in `status --json` — a decision nobody can see is the thing this
+    /// state exists to stop.
     pub fn is_open(&self) -> bool {
         matches!(
             self.state,
-            TxnState::Staged | TxnState::Pending | TxnState::Inconsistent
+            TxnState::Staged
+                | TxnState::Pending
+                | TxnState::Confirming
+                | TxnState::Reverting
+                | TxnState::Inconsistent
         )
     }
 
@@ -311,6 +330,29 @@ fn is_running(pid: u32) -> bool {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
         Ok(()) | Err(nix::errno::Errno::EPERM)
     )
+}
+
+/// Who asked for a revert.
+///
+/// Astra finding F07, 2026-09-23: the three differ in exactly one thing —
+/// what a record that says `confirming` means to them. Everything else a
+/// revert does is the same work for all three, so this is a word about the
+/// CALLER and not a mode of the operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevertAsker {
+    /// An operator at a console, `apply` taking a host back after a failed
+    /// check, or this program putting back an activation of its own that
+    /// did not finish. A confirmation in flight stops it, because the
+    /// machine is then carrying a decision somebody else began.
+    Operator,
+    /// The transient revert timer, firing because nobody spoke. A
+    /// confirmation in flight means somebody DID speak, and the deadline
+    /// then has nothing to say: the unit leaves the machine alone.
+    Deadline,
+    /// An operator who has read the record and says this machine goes back
+    /// anyway (`revert --force --because "<why>"`). The only way out of a
+    /// `confirming` record that no confirmation will ever finish.
+    Force,
 }
 
 // --- end Astra finding F07 -------------------------------------------------
@@ -762,7 +804,7 @@ impl<'a> Helper<'a> {
                 // which is what makes a resume stop and ask for a person
                 // ([`crate::receipt::next_step`]).
                 let because = format!("the activation itself failed: {e:#}");
-                match self.revert(id, Some(&because)) {
+                match self.revert(id, Some(&because), RevertAsker::Operator) {
                     Ok(_) => Err(e.context(format!(
                         "{id} was taken back to {}",
                         record
@@ -887,6 +929,12 @@ impl<'a> Helper<'a> {
             .arg(self.deploy_dir.display().to_string())
             .arg("--profile")
             .arg(self.profile.display().to_string())
+            // Astra finding F07, 2026-09-23: this revert is the DEADLINE,
+            // and the deadline is the one caller that reads a `confirming`
+            // record as "somebody spoke after all". An operator's revert
+            // carries no such word and is stopped by that record instead
+            // ([`RevertAsker`]).
+            .arg("--by-timer")
             .arg("--because")
             .arg("nobody confirmed this activation before its deadline");
         self.runner.run(&cmd).with_context(|| {
@@ -990,7 +1038,8 @@ impl<'a> Helper<'a> {
         out
     }
 
-    /// Keep it. The timer goes first, then the record says so.
+    /// Keep it. The intent goes down, then the timer goes, then the record
+    /// says so.
     pub fn confirm(&self, id: &str) -> Result<TxnRecord> {
         check_id(id)?;
         self.deciding(id, "confirm", || self.confirm_held(id))
@@ -1005,11 +1054,43 @@ impl<'a> Helper<'a> {
                  is not confirmed afterwards; plan again.",
                 record.reason.as_deref().unwrap_or("no reason recorded")
             ),
+            // Astra finding F07, 2026-09-23: a revert that wrote its intent
+            // and did not finish may have moved the profile back already,
+            // and no reader of this record can tell how far it got. A
+            // confirmation on top of it would be this program asserting the
+            // new system on a machine that may be running the old one —
+            // exactly the lie the two in-flight states exist to prevent.
+            TxnState::Reverting => bail!(
+                "a revert of {id} began at {} and did not finish, so this record cannot say \
+                 which system this machine is on and nothing here will confirm one. Finish \
+                 the way back with `meister-activate revert --txn {id}` — repeating it is \
+                 safe, it is the same profile and the same switch — and plan again.",
+                record.changed_at
+            ),
             TxnState::Inconsistent => bail!(
                 "the record of {id} does not say a coherent thing, so there is nothing here \
                  to confirm. Read it with `meister-activate txn show --txn {id}`."
             ),
-            TxnState::Staged | TxnState::Pending => {}
+            // `confirming` is a confirmation this program began and did not
+            // finish, and finishing it is the whole of what this verb does.
+            // It needs no separate repair path: the work below is the same
+            // work, and all of it may be done twice — `stop_timer` tolerates
+            // a unit that is already gone, `bootctl set-default` names the
+            // generation that is already the default, and the record is
+            // written whole.
+            TxnState::Staged | TxnState::Pending | TxnState::Confirming => {}
+        }
+        // Astra finding F07, 2026-09-23: the intent is on the disk BEFORE
+        // the timer is stopped. A process that died between the stop and
+        // the `confirmed` below used to leave a record saying `pending`
+        // beside a revert timer that no longer existed: the host ran the new
+        // system with no way back, and nothing on it said that a decision
+        // had been in flight. `confirming` is that sentence, it is fsynced,
+        // and it is what `confirm` and a resume come back to.
+        if record.state != TxnState::Confirming {
+            record.state = TxnState::Confirming;
+            record.changed_at = self.clock.now();
+            self.write_record(&record)?;
         }
         if record.deadline.is_some() {
             self.stop_timer(id)?;
@@ -1040,12 +1121,20 @@ impl<'a> Helper<'a> {
 
     /// Take it back. Called by an operator, by `apply` when a check fails,
     /// and by the timer when nobody says anything at all.
-    pub fn revert(&self, id: &str, because: Option<&str>) -> Result<TxnRecord> {
+    ///
+    /// Who asks decides one thing and only one: what a record that says
+    /// `confirming` means ([`RevertAsker`]).
+    pub fn revert(&self, id: &str, because: Option<&str>, asked: RevertAsker) -> Result<TxnRecord> {
         check_id(id)?;
-        self.deciding(id, "revert", || self.revert_held(id, because))
+        self.deciding(id, "revert", || self.revert_held(id, because, asked))
     }
 
-    fn revert_held(&self, id: &str, because: Option<&str>) -> Result<TxnRecord> {
+    fn revert_held(
+        &self,
+        id: &str,
+        because: Option<&str>,
+        asked: RevertAsker,
+    ) -> Result<TxnRecord> {
         let mut record = self.record(id)?;
         match record.state {
             TxnState::Confirmed => bail!(
@@ -1056,7 +1145,48 @@ impl<'a> Helper<'a> {
             // Idempotent on purpose: the timer and an operator can both
             // arrive here, and the second one must not fail a rollout.
             TxnState::Reverted => return Ok(record),
-            TxnState::Staged | TxnState::Pending | TxnState::Inconsistent => {}
+            // Astra finding F07, 2026-09-23: a confirmation was in flight.
+            // The record was written before the timer was told to stop, so
+            // whoever wrote it had decided to keep this system — and the
+            // three callers of a revert read that differently.
+            TxnState::Confirming => match asked {
+                // The deadline says "nobody spoke". Somebody did, and the
+                // record is the evidence, so this unit takes nothing back
+                // and changes nothing: not the profile, not the boot menu,
+                // not the record. The decision is finished by `confirm`,
+                // which a resume calls and an operator can call by hand —
+                // and until then the record is open, so no plan starts over
+                // on top of it. Ok rather than an error, because a
+                // transient unit that fails is noise about a machine that
+                // is doing exactly the right thing.
+                RevertAsker::Deadline => return Ok(record),
+                RevertAsker::Operator => bail!(
+                    "a confirmation of {id} was in flight since {} and this revert did \
+                     nothing: something decided to keep this system and did not live long \
+                     enough to write it down. Finish that decision with `meister-activate \
+                     confirm --txn {id}`, which is what a resume does — or, if this machine \
+                     has to go back anyway, say `meister-activate revert --txn {id} --force \
+                     --because \"<what you found>\"`.",
+                    record.changed_at
+                ),
+                RevertAsker::Force => {}
+            },
+            // `reverting` is a way back that began and did not finish, and
+            // the way back is the one thing in this program that may simply
+            // be done again: the same profile, the same switch, the same
+            // boot entries.
+            TxnState::Staged | TxnState::Pending | TxnState::Reverting | TxnState::Inconsistent => {
+            }
+        }
+        // Astra finding F07, 2026-09-23: a force overrules a decision
+        // somebody else began, and the record is the only account of that
+        // there will ever be — the same rule `txn retire --force` follows.
+        if asked == RevertAsker::Force && because.map(str::trim).unwrap_or_default().is_empty() {
+            bail!(
+                "`revert --force` needs `--because <sentence>`: it takes a machine back over \
+                 a confirmation somebody began, and the record is the only place that \
+                 decision is written down."
+            );
         }
         let previous = record.previous.toplevel.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -1065,7 +1195,21 @@ impl<'a> Helper<'a> {
             )
         })?;
 
-        // The timer first, so that a revert that takes a while is not
+        // Astra finding F07, 2026-09-23: the intent first, and before the
+        // timer as much as before the profile. A revert that died after
+        // `nix-env --set` used to leave a record saying `pending` on a
+        // machine that was already back on its previous system — and the
+        // next `confirm` would have written `confirmed` over it, which is
+        // the record claiming the one system while the machine runs the
+        // other. The reason goes down with it: a record of a decision
+        // nobody finished is worth much less without the why.
+        if record.state != TxnState::Reverting {
+            record.state = TxnState::Reverting;
+            record.changed_at = self.clock.now();
+            record.reason = Some(because.unwrap_or("no reason was given").to_string());
+            self.write_record(&record)?;
+        }
+        // The timer next, so that a revert that takes a while is not
         // started twice.
         if record.deadline.is_some() {
             let _ = self.stop_timer(id);
@@ -2165,12 +2309,17 @@ pub fn timer_unit(id: &str) -> String {
 
 impl TxnState {
     /// The state in the spelling a sentence uses. On the observation type
-    /// rather than beside it, because there is one spelling of these five
+    /// rather than beside it, because there is one spelling of these seven
     /// words and the json is the other half of it.
     pub(crate) fn as_str_lower(self) -> &'static str {
         match self {
             TxnState::Staged => "staged",
             TxnState::Pending => "pending",
+            // Astra finding F07, 2026-09-23: the two in-flight words. The
+            // json spelling is the same one, so a sentence at a console and
+            // `status --json` say the same thing about the same record.
+            TxnState::Confirming => "confirming",
+            TxnState::Reverting => "reverting",
             TxnState::Confirmed => "confirmed",
             TxnState::Reverted => "reverted",
             TxnState::Inconsistent => "inconsistent",
@@ -2645,7 +2794,7 @@ mod tests {
     }
 
     #[test]
-    fn a_confirm_whose_timer_will_not_stop_changes_nothing() {
+    fn a_confirm_whose_timer_will_not_stop_moves_no_machine() {
         let files = host();
         let runner = StrictFake::new()
             .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
@@ -2658,7 +2807,13 @@ mod tests {
         helper.write_record(&pending("c2", Mode::Switch)).unwrap();
         let err = helper.confirm("c2").unwrap_err().to_string();
         assert!(err.contains("still active"), "{err}");
-        assert_eq!(helper.record("c2").unwrap().state, TxnState::Pending);
+        // Astra finding F07, 2026-09-23: the machine is untouched — nothing
+        // ran but the two systemctl words, which `verify` below is the
+        // proof of — and the record says a confirmation was in flight,
+        // because it was. It is NOT put back to `pending`: that would be
+        // this program forgetting a decision it had already made durable,
+        // which is the whole of what this state is for.
+        assert_eq!(helper.record("c2").unwrap().state, TxnState::Confirming);
         runner.verify().unwrap();
     }
 
@@ -2686,7 +2841,11 @@ mod tests {
         let helper = helper(&runner, &files, &clock);
         helper.write_record(&pending("r1", Mode::Switch)).unwrap();
         let record = helper
-            .revert("r1", Some("a readiness check failed"))
+            .revert(
+                "r1",
+                Some("a readiness check failed"),
+                RevertAsker::Operator,
+            )
             .unwrap();
         assert_eq!(record.state, TxnState::Reverted);
         assert_eq!(record.reason.as_deref(), Some("a readiness check failed"));
@@ -2762,6 +2921,235 @@ mod tests {
         runner.verify().unwrap();
     }
 
+    // --- Astra finding F07, 2026-09-23: the decision that did not finish ---
+
+    /// A record in the state a crash between the two steps leaves behind.
+    fn confirming(id: &str) -> TxnRecord {
+        let mut record = pending(id, Mode::Switch);
+        record.state = TxnState::Confirming;
+        record
+    }
+
+    #[test]
+    fn a_crash_between_the_timer_stop_and_the_record_leaves_confirming() {
+        // The window: `confirm` wrote its intent, the timer was stopped,
+        // and the process died before `confirmed` reached the disk. What
+        // the machine is left holding is this record and no timer — which
+        // used to read `pending`, a sentence that says the host is waiting
+        // for a word it has in fact already been given.
+        let files = host();
+        let runner = StrictFake::new()
+            // What `status` reads on its way past, before anything here
+            // decides anything.
+            .expect(Matcher::exact("uname", ["-r"]), Output::stdout("6.12.41\n"))
+            .expect(
+                Matcher::exact("systemctl", ["stop", "meister-revert-f1.timer"]),
+                // What systemd answers for a unit that is not there any
+                // more. `stop_timer` reads the ANSWER of `is-active`, not
+                // this exit code, and that is what makes finishing a
+                // confirmation whose timer is already gone the same work as
+                // finishing one whose timer is not.
+                Output::failing(5, "Failed to stop meister-revert-f1.timer: not loaded."),
+            )
+            .expect(
+                Matcher::exact("systemctl", ["is-active", "meister-revert-f1.timer"]),
+                Output::failing(3, "inactive"),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&confirming("f1")).unwrap();
+
+        // Before anything repairs it, the host SAYS so: the record is open,
+        // so no plan starts over on top of it, and `status --json` carries
+        // the word.
+        let status = helper.status().unwrap();
+        assert_eq!(status.open_txns.len(), 1, "{status:?}");
+        assert_eq!(status.open_txns[0].state, TxnState::Confirming);
+        assert!(helper.record("f1").unwrap().is_open());
+        assert_eq!(helper.record("f1").unwrap().state_word(), "confirming");
+
+        // And the confirmation is finished rather than repaired: the same
+        // verb, the same work, a record that now says what happened.
+        let record = helper.confirm("f1").unwrap();
+        assert_eq!(record.state, TxnState::Confirmed);
+        assert!(!record.is_open());
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_confirmation_in_flight_is_finished_not_reverted() {
+        // The timer fires into the window: the record says a confirmation
+        // began, the deadline says nobody spoke. Somebody did, so the unit
+        // takes nothing back — and the StrictFake with no expectation in it
+        // is the proof that not one command ran.
+        let files = host();
+        let timer = StrictFake::new();
+        let clock = clock();
+        let left_alone = {
+            let helper = helper(&timer, &files, &clock);
+            helper.write_record(&confirming("f2")).unwrap();
+            helper
+                .revert(
+                    "f2",
+                    Some("nobody confirmed this activation before its deadline"),
+                    RevertAsker::Deadline,
+                )
+                .expect("the deadline has nothing to say about a decision that was taken")
+        };
+        assert_eq!(left_alone.state, TxnState::Confirming);
+        assert_eq!(
+            helper(&timer, &files, &clock).record("f2").unwrap().state,
+            TxnState::Confirming,
+            "the record is not rewritten either"
+        );
+        timer.verify().unwrap();
+
+        // What finishes it is the confirmation itself, whenever it comes:
+        // from a resume, or from a person.
+        let after = StrictFake::new()
+            .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemctl", ["is-active"]),
+                Output::failing(3, "inactive"),
+            );
+        let record = helper(&after, &files, &clock).confirm("f2").unwrap();
+        assert_eq!(record.state, TxnState::Confirmed);
+        after.verify().unwrap();
+    }
+
+    #[test]
+    fn a_second_confirm_completes_a_confirming_record() {
+        // The timer is still armed — the first confirm died BEFORE it got
+        // to stop it — so this one stops it and finishes, which is the
+        // ordinary path and not a repair.
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(
+                Matcher::exact("systemctl", ["stop", "meister-revert-f3.timer"]),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact("systemctl", ["is-active", "meister-revert-f3.timer"]),
+                Output::failing(3, "inactive"),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&confirming("f3")).unwrap();
+        let record = helper.confirm("f3").unwrap();
+        assert_eq!(record.state, TxnState::Confirmed);
+        runner.verify().unwrap();
+
+        // And a third one is the answer again and runs nothing at all.
+        let quiet = StrictFake::new();
+        assert_eq!(
+            helper_with(&quiet, &files, &clock)
+                .confirm("f3")
+                .unwrap()
+                .state,
+            TxnState::Confirmed
+        );
+        quiet.verify().unwrap();
+    }
+
+    #[test]
+    fn a_revert_of_a_confirmation_in_flight_needs_a_person() {
+        let files = host();
+        let quiet = StrictFake::new();
+        let clock = clock();
+        {
+            let helper = helper(&quiet, &files, &clock);
+            helper.write_record(&confirming("f4")).unwrap();
+            let err = helper
+                .revert("f4", Some("a check failed"), RevertAsker::Operator)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("was in flight"), "{err}");
+            assert!(err.contains("confirm --txn f4"), "{err}");
+            assert!(err.contains("--force"), "{err}");
+            // A force still has to say why: the record is the only account
+            // of a decision overruled.
+            let err = helper
+                .revert("f4", None, RevertAsker::Force)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("needs `--because"), "{err}");
+            assert_eq!(helper.record("f4").unwrap().state, TxnState::Confirming);
+        }
+        quiet.verify().unwrap();
+
+        // And with the sentence, the machine goes back.
+        let runner = StrictFake::new()
+            .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemctl", ["is-active"]),
+                Output::failing(3, "inactive"),
+            )
+            .expect(
+                Matcher::exact(
+                    "nix-env",
+                    ["-p", "/nix/var/nix/profiles/system", "--set", PREV],
+                ),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(&format!("{PREV}/bin/switch-to-configuration"), ["switch"]),
+                Output::stdout(""),
+            );
+        let record = helper(&runner, &files, &clock)
+            .revert(
+                "f4",
+                Some("the confirming process is gone and this host must not keep the release"),
+                RevertAsker::Force,
+            )
+            .unwrap();
+        assert_eq!(record.state, TxnState::Reverted);
+        assert!(record.reason.as_deref().unwrap().contains("must not keep"));
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_crash_in_the_middle_of_a_revert_leaves_reverting() {
+        // The other half of the same window: the intent is on the disk
+        // before `nix-env --set`, so a revert that dies at the profile
+        // leaves a record that says a way back began — and not `pending`,
+        // which the next confirm would have turned into `confirmed` on a
+        // machine that is already somewhere else.
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemctl", ["is-active"]),
+                Output::failing(3, "inactive"),
+            )
+            .expect(
+                Matcher::prefix("nix-env", ["-p"]),
+                Output::failing(1, "no space left on device"),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&pending("f5", Mode::Switch)).unwrap();
+        let err = helper
+            .revert(
+                "f5",
+                Some("a readiness check failed"),
+                RevertAsker::Operator,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no space left"), "{err}");
+        let record = helper.record("f5").unwrap();
+        assert_eq!(record.state, TxnState::Reverting);
+        assert_eq!(record.reason.as_deref(), Some("a readiness check failed"));
+        assert!(record.is_open(), "a way back that stopped is open");
+        // Nothing confirms a machine whose way back did not finish.
+        let err = helper.confirm("f5").unwrap_err().to_string();
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(err.contains("revert --txn f5"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    // --- end Astra finding F07 --------------------------------------------
+
     #[test]
     fn a_second_revert_is_the_same_answer_and_runs_nothing() {
         let files = host();
@@ -2772,7 +3160,9 @@ mod tests {
         record.state = TxnState::Reverted;
         record.reason = Some("the timer fired".to_string());
         helper.write_record(&record).unwrap();
-        let again = helper.revert("r3", Some("and then a person")).unwrap();
+        let again = helper
+            .revert("r3", Some("and then a person"), RevertAsker::Operator)
+            .unwrap();
         assert_eq!(again.reason.as_deref(), Some("the timer fired"));
         runner.verify().unwrap();
     }
@@ -2786,7 +3176,9 @@ mod tests {
         let mut record = pending("r4", Mode::Switch);
         record.state = TxnState::Confirmed;
         helper.write_record(&record).unwrap();
-        let err = helper.revert("r4", Some("the timer fired")).unwrap_err();
+        let err = helper
+            .revert("r4", Some("the timer fired"), RevertAsker::Deadline)
+            .unwrap_err();
         assert!(
             err.to_string().contains("was confirmed"),
             "{}",

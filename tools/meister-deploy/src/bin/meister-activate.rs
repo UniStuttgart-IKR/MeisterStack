@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use meister_deploy::activate::{
-    DEFAULT_PKI_DIR, Helper, KeyKind, Mode, SYSTEM_PROFILE, TxnRecord, ok_reply,
+    DEFAULT_PKI_DIR, Helper, KeyKind, Mode, RevertAsker, SYSTEM_PROFILE, TxnRecord, ok_reply,
 };
 use meister_deploy::effects::{RealClock, RealFiles};
 use meister_deploy::observe::DEPLOY_DIR;
@@ -111,6 +111,20 @@ enum Verb {
         /// afterwards
         #[arg(long)]
         because: Option<String>,
+        // --- Astra finding F07, 2026-09-23 ---
+        /// Take this machine back although the record says a confirmation
+        /// was in flight. Needs `--because`: it overrules a decision
+        /// somebody else began, and the record is the only account of it.
+        #[arg(long)]
+        force: bool,
+        /// What the revert timer's own unit passes, and nothing else
+        /// should: this revert IS the deadline. A record that says a
+        /// confirmation was in flight stops it — somebody spoke, so the
+        /// deadline has nothing left to say — and the machine is left
+        /// alone.
+        #[arg(long)]
+        by_timer: bool,
+        // --- end Astra finding F07 ---
     },
 
     /// The transaction records this host holds.
@@ -362,8 +376,26 @@ fn run() -> Result<()> {
                 &describe(&record),
             )?;
         }
-        Verb::Revert { txn, because } => {
-            let record = helper.revert(txn, because.as_deref())?;
+        Verb::Revert {
+            txn,
+            because,
+            force,
+            by_timer,
+        } => {
+            // Astra finding F07, 2026-09-23: who is asking. The two words
+            // are exclusive on purpose — a transient unit that could
+            // overrule a person would be a person's decision undone by a
+            // clock.
+            let asked = match (by_timer, force) {
+                (true, true) => anyhow::bail!(
+                    "`--by-timer` and `--force` are not said together: the deadline does not \
+                     overrule anybody, and a person who does is not a timer."
+                ),
+                (true, false) => RevertAsker::Deadline,
+                (false, true) => RevertAsker::Force,
+                (false, false) => RevertAsker::Operator,
+            };
+            let record = helper.revert(txn, because.as_deref(), asked)?;
             answer(
                 &cli,
                 "revert",
@@ -628,6 +660,11 @@ fn show_lines(record: &TxnRecord) -> String {
     ));
     out.push_str(&format!("desired  {}\n", record.desired));
     out.push_str(&format!("started  {}\n", record.started_at));
+    // Astra finding F07, 2026-09-23: when the state last moved. On a
+    // `confirming` or a `reverting` record this is the moment the decision
+    // began, and it is the first thing a person at a console asks about a
+    // decision that did not finish.
+    out.push_str(&format!("changed  {}\n", record.changed_at));
     out.push_str(&format!(
         "deadline {}\n",
         record

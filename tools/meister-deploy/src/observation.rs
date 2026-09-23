@@ -86,11 +86,26 @@ pub enum TxnState {
     Staged,
     /// Activated, waiting for a `confirm` before the revert timer fires.
     Pending,
+    // --- Astra finding F07, 2026-09-23 ---
+    /// A decision is in flight: a `confirm` has begun and has not finished.
+    ///
+    /// It is written BEFORE the revert timer is stopped, so that a process
+    /// which dies in between leaves a record saying that a decision was
+    /// being made rather than one saying `pending` beside a timer that is
+    /// gone. Every reader is told the same thing by it: this machine runs
+    /// the new system and somebody meant to keep it.
+    Confirming,
+    /// The same window on the other side: a `revert` has begun and has not
+    /// finished. It is written before the profile moves back, so a machine
+    /// in this state may be on either system — which is why nothing
+    /// confirms it and only another `revert` finishes it.
+    Reverting,
+    // --- end Astra finding F07 ---
     Confirmed,
     Reverted,
     /// The record is there and does not say a coherent thing — a half-written
     /// file, a state this tool does not know. Never treated as any of the
-    /// four above.
+    /// six above.
     Inconsistent,
 }
 

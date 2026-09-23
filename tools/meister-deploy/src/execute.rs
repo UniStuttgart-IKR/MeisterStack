@@ -2340,7 +2340,16 @@ impl<'a> Executor<'a> {
         let answered = observed.as_ref().map(|o| o.reachable).unwrap_or(false);
         let state = match view {
             TxnView::Reverted => HostState::RolledBack,
-            TxnView::Pending { .. } | TxnView::Inconsistent => HostState::RecoveryRequired,
+            // Astra finding F07, 2026-09-23: `confirming` and `reverting`
+            // belong here for the same reason `pending` does. This is an
+            // activation whose OWN command came back with an error, so a
+            // decision in flight on that host is one nothing in this run
+            // began — and a run does not confirm or revert on top of
+            // something it cannot account for.
+            TxnView::Pending { .. }
+            | TxnView::Confirming
+            | TxnView::Reverting
+            | TxnView::Inconsistent => HostState::RecoveryRequired,
             TxnView::Confirmed => HostState::Committed,
             // It answered and holds no record: nothing was activated, and
             // that is a fact rather than a silence.
