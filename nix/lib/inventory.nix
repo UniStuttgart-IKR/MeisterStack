@@ -98,28 +98,55 @@ let
       planDir = builtins.dirOf file;
 
       # The schema first and on its own: a schema 1 file is the pre-v1 plan,
-      # and it belongs to `meister-deploy legacy` — not to a sentence about
-      # thirty missing keys.
+      # and saying so is one sentence — not a sentence about thirty missing
+      # keys.
       schema =
         if !(raw ? schema) then
-          throw ("${where}: no `schema` key. A v1 inventory of this tool says `schema = 2` "
-            + "on its first line; a file without one is the pre-v1 plan, which "
-            + "`meister-deploy legacy` still reads.")
+          throw ("${where}: no `schema` key. An inventory of this tool says `schema = 2` "
+            + "on its first line; a file without one is the pre-v1 plan, which nothing "
+            + "reads any more (M5B removed the reader).")
         else if raw.schema != 2 then
           throw ("${where}: schema ${toString raw.schema}, and this flake reads schema 2. "
             + "Schema 1 is the pre-v1 plan (nodes, not hosts; no groups, no install, no "
-            + "persistence): `meister-deploy legacy` reads it, and migrating means naming "
-            + "an id, a deployment and the groups of every host.")
+            + "persistence) and nothing reads it any more; migrating means naming an id, "
+            + "a deployment and the groups of every host.")
         else 2;
 
-      header = raw.fleet or (throw "${where}: no [fleet] table; a fleet says what it is called");
-      domain = header.domain or null;
-      defaults = raw.defaults or { };
-      operator = raw.operator or null;
+      # --- lane 5B: a table nobody declared ---------------------------------
+      #
+      # `deny_unknown_fields` on the Rust side has refused an unknown table
+      # since 1C (`inventory.rs`), and this is its twin: two readers of one
+      # file that disagree about what is IN the file are two readers, and
+      # `checks.inventory-parity` exists to keep them one.
+      #
+      # `[opennebula]` gets its own sentence because it is the one that was
+      # really there: the pre-v1 plan carried `frontend` and `image`, Nix
+      # and Rust both parsed them, and NOTHING read them. The provider lives
+      # in the lab repository now, and so does that table.
+      knownTop = [ "schema" "fleet" "defaults" "operator" "group" "host" "service" ];
+      unknownTop = lib.filter (k: !(lib.elem k knownTop)) (builtins.attrNames raw);
+      checkedRaw =
+        if unknownTop == [ ] then raw
+        else if lib.elem "opennebula" unknownTop then
+          throw ("${where}: the table [opennebula] is not part of a schema 2 inventory. It "
+            + "was parsed and exported by the pre-v1 plan and read by nothing; the "
+            + "OpenNebula adapter moved to the lab repository "
+            + "(~/git/meisterstack-lab/providers/opennebula/). Delete the table.")
+        else
+          throw ("${where}: the inventory has the table(s) "
+            + lib.concatStringsSep ", " (map (k: "[${k}]") unknownTop)
+            + ", and a schema 2 inventory knows "
+            + lib.concatStringsSep ", " (map (k: "[${k}]") knownTop)
+            + ". A key nobody declared is a typo and not a feature.");
 
-      groupList = raw.group or [ ];
-      hostList = raw.host or [ ];
-      serviceList = raw.service or [ ];
+      header = checkedRaw.fleet or (throw "${where}: no [fleet] table; a fleet says what it is called");
+      domain = header.domain or null;
+      defaults = checkedRaw.defaults or { };
+      operator = checkedRaw.operator or null;
+
+      groupList = checkedRaw.group or [ ];
+      hostList = checkedRaw.host or [ ];
+      serviceList = checkedRaw.service or [ ];
 
       groupIds = map (g: g.id or (throw "${where}: a [[group]] without an id")) groupList;
       hostIds' = map (h: h.id or (throw "${where}: a [[host]] without an id")) hostList;
@@ -230,7 +257,8 @@ let
           deployment = h.deployment or (throw
             ("${where}: host ${h.id} has no `deployment`. It is `nixos` (this flake builds its "
               + "system and meister-deploy takes it forward closure by closure) or `context` "
-              + "(a VM somebody else instantiated, served by the pre-v1 push until L3)."));
+              + "(a VM somebody else instantiated, served by the push in the lab "
+              + "repository, ~/git/meisterstack-lab/legacy/push.sh)."));
           inherit roles networks management;
           groups = h.groups or [ ];
           controllerGroup = h.controller_group or null;
@@ -712,8 +740,8 @@ let
 
       # The manifest describes the hosts this flake BUILDS A SYSTEM FOR, and
       # a `context` host is not one of them: it has no closure, no toplevel
-      # and no `build` — it is a VM somebody else instantiated, and
-      # `meister-deploy legacy` serves it from the pre-v1 plan until L3. So
+      # and no `build` — it is a VM somebody else instantiated, and the push
+      # in the lab repository serves it. So
       # it is left out of both halves, of the group memberships and of the
       # services that name it, exactly as `resolve --hosts` narrows a
       # manifest to a sub-fleet. `meister-deploy inventory` still lists it

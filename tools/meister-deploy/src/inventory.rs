@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::effects::Files;
 
 /// The schema this module reads. Schema 1 is the pre-v1 file and belongs to
-/// `meister-deploy legacy`.
+/// nothing at all: the verbs that read it went with M5B.
 pub const SCHEMA: u32 = 2;
 
 /// Ssh defaults when nobody said otherwise. Not policy, a floor: an
@@ -522,6 +522,13 @@ struct Raw {
 struct SchemaProbe {
     #[serde(default)]
     schema: Option<u32>,
+    // --- lane 5B ---
+    /// The one table that was really in the lab's inventory. It is probed
+    /// for by name because `deny_unknown_fields` would only say "unknown
+    /// field", and this one has an answer: the provider moved.
+    #[serde(default)]
+    opennebula: Option<toml::Value>,
+    // --- end lane 5B ---
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,13 +1016,25 @@ fn one_of<T: PartialEq + std::fmt::Debug>(
 fn check_schema(text: &str, origin: &str) -> Result<()> {
     let probe: SchemaProbe =
         toml::from_str(text).map_err(|e| anyhow::anyhow!("{origin} is not valid toml: {e}"))?;
+    // --- lane 5B ---
+    if probe.opennebula.is_some() {
+        bail!(
+            "{origin} has an `[opennebula]` table. It is not part of a schema {SCHEMA} \
+             inventory: it was parsed and exported by the pre-v1 plan and read by nothing, \
+             and the OpenNebula adapter moved to the lab repository \
+             (~/git/meisterstack-lab/providers/opennebula/). Delete the table. Where a \
+             machine IS instantiated is the provider's business and not this fleet's; what \
+             this inventory says about such a host is `deployment = \"context\"`."
+        );
+    }
+    // --- end lane 5B ---
     match probe.schema {
         Some(SCHEMA) => Ok(()),
         Some(1) | None => bail!(
             "{origin} has no `schema = {SCHEMA}` line, so it is the pre-v1 inventory. \
-             The old verbs read it as `meister-deploy legacy <verb>`; migrating it means \
-             writing the hosts as `[[host]]` with an `id`, a `deployment` and their \
-             groups, and letting Nix derive the addresses."
+             Nothing reads that one any more — the verbs that did went with M5B. \
+             Migrating it means writing the hosts as `[[host]]` with an `id`, a \
+             `deployment` and their groups, and letting Nix derive the addresses."
         ),
         Some(other) => {
             bail!("{origin} says `schema = {other}`, and this tool reads schema {SCHEMA}.")
@@ -1365,11 +1384,11 @@ managed = { substituters = ["http://gpu-01-local/cache"] }"#,
     }
 
     #[test]
-    fn the_old_schema_points_at_the_old_verbs() {
+    fn the_old_schema_says_what_to_do_with_it() {
         let err = parse("[fleet]\nname = \"one-box\"\n")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("meister-deploy legacy"), "{err}");
+        assert!(err.contains("pre-v1 inventory"), "{err}");
         assert!(err.contains("schema = 2"), "{err}");
 
         let err = parse("schema = 1\n[fleet]\nname = \"one-box\"\n")
@@ -1385,10 +1404,24 @@ managed = { substituters = ["http://gpu-01-local/cache"] }"#,
 
     #[test]
     fn a_key_nobody_declared_is_refused() {
+        let text = fixture().replace("[defaults]", "[nonsense]\nfrontend = \"x\"\n\n[defaults]");
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("nonsense"), "{err}");
+    }
+
+    // --- lane 5B ---
+    /// The table that was really there gets a sentence rather than "unknown
+    /// field", because there is something to say about it: the provider it
+    /// named lives somewhere else now.
+    #[test]
+    fn the_opennebula_table_is_refused_by_name_and_says_where_it_went() {
         let text = fixture().replace("[operator]", "[opennebula]\nfrontend = \"x\"\n\n[operator]");
         let err = parse(&text).unwrap_err().to_string();
-        assert!(err.contains("opennebula"), "{err}");
+        assert!(err.contains("[opennebula]"), "{err}");
+        assert!(err.contains("meisterstack-lab"), "{err}");
+        assert!(err.contains("deployment = \"context\""), "{err}");
     }
+    // --- end lane 5B ---
 
     #[test]
     fn a_group_that_is_not_declared_is_refused() {

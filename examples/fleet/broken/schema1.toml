@@ -3,8 +3,8 @@
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
 # The pre-v1 plan. It has nodes instead of hosts, no groups, no deployment and
-# no install — `meister-deploy legacy` reads it, and this flake says so
-# instead of listing thirty missing keys.
+# no install. Nothing reads it any more (the verbs that did went with M5B),
+# and this flake says so instead of listing thirty missing keys.
 [fleet]
 name = "old"
 
