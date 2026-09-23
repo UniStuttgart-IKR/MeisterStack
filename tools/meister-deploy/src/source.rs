@@ -327,6 +327,21 @@ fn scan(
     let mut entries = Vec::new();
     for path in &paths {
         let full = repo.join(path);
+        // Astra finding F16, 2026-09-23: `git ls-files -co --exclude-standard`
+        // reads the index, and still lists a file deleted in the working
+        // tree but not staged — `entry` would then fail with a bare "looking
+        // at ... failed", which is git's own answer read back as if this
+        // program had never asked it. Naming the exact, common cause first
+        // is worth a check `entry` cannot make for itself.
+        if !files.is_present(&full) {
+            bail!(
+                "{path} is tracked by git but not in the working tree — most likely deleted \
+                 there and not yet staged; `git ls-files -co --exclude-standard` lists the \
+                 index, not the working tree. `git add {path}` (or `git rm {path}`) if the \
+                 deletion is meant, or restore the file if it is not, then resolve --dev \
+                 again."
+            );
+        }
         let entry = files.entry(&full)?;
         match &entry {
             Entry::File { .. } => {
@@ -1033,6 +1048,22 @@ mod tests {
         .unwrap()
         .source;
         assert_ne!(a.fingerprint, b.fingerprint, "the path is part of the hash");
+    }
+
+    /// Astra finding F16, 2026-09-23: `git ls-files -co --exclude-standard`
+    /// reads the index, and still lists a file that was deleted in the
+    /// working tree but not staged. `scan` must name that rather than let
+    /// `entry`'s bare "looking at ... failed" stand in for it.
+    #[test]
+    fn a_tracked_file_deleted_but_not_staged_is_a_named_refusal() {
+        // "gone.nix" is in the `ls-files` listing but was never `given` to
+        // this test filesystem — the same shape a real deletion leaves.
+        let files = base_files();
+        let err = dirty_dev(files, "fleet.toml\0gone.nix\0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gone.nix"), "{err}");
+        assert!(err.contains("not in the working tree"), "{err}");
     }
 
     #[test]
