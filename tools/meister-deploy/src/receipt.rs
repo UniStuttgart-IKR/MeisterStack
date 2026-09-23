@@ -861,17 +861,28 @@ pub enum Step {
 /// | `prepared` | the certificate, the switch, the verify, the removal |
 /// | `overlap` | the switch, the verify, the removal |
 /// | `switched` | the verify and the removal |
-/// | `confirmed` | nothing |
+/// | `confirmed`, published here | nothing |
+/// | `confirmed`, not published here | the removal, for its local half |
 /// | `reverted` | nothing; the forward attempt stays failed |
 /// | `none`, nothing in the journal | the prepared pair is gone: plan again |
 /// | `none`, a switch in the journal | a person looks |
 /// | `inconsistent` | a person looks |
-pub fn next_keys_step(host: &HostRun, state: crate::activate::KeysState) -> Step {
+///
+/// Astra finding F09, 2026-09-23: `published` is the one thing the HOST
+/// cannot answer. The last phase has two halves — the old pair goes on the
+/// target, and the certificate the rotation issued becomes the repository's
+/// own `<kind>.crt` — and a host that is `confirmed` says only that the
+/// first half happened. Read without the second, `confirmed` meant `done`,
+/// the repository kept the certificate the host used to hold, and the next
+/// ordinary plan delivered it back over the new one. The step is idempotent
+/// in both halves, so naming it again is safe and is the whole repair.
+pub fn next_keys_step(host: &HostRun, state: crate::activate::KeysState, published: bool) -> Step {
     use crate::activate::KeysState;
     match state {
         KeysState::Prepared => Step::AtKeysPhase(ActionKind::KeysOverlap),
         KeysState::Overlap => Step::AtKeysPhase(ActionKind::KeysSwitch),
         KeysState::Switched => Step::AtKeysPhase(ActionKind::KeysVerify),
+        KeysState::Confirmed if !published => Step::AtKeysPhase(ActionKind::KeysRemove),
         KeysState::Confirmed => Step::Done,
         KeysState::Reverted => Step::RolledBack,
         KeysState::None => {
@@ -1570,8 +1581,28 @@ mod tests {
             (KeysState::Confirmed, Step::Done),
             (KeysState::Reverted, Step::RolledBack),
         ] {
-            assert_eq!(next_keys_step(&fresh, state), want, "{state:?}");
+            // Astra finding F09, 2026-09-23: `true` is "the certificate
+            // this rotation issued is already the repository's own", which
+            // the host cannot answer and which the case below is about.
+            assert_eq!(next_keys_step(&fresh, state, true), want, "{state:?}");
         }
+    }
+
+    // Astra finding F09, 2026-09-23.
+    #[test]
+    fn a_rotation_the_host_has_finished_is_not_finished_here_until_it_is_published() {
+        use crate::activate::KeysState;
+        // The remote half of the last phase is done — the old pair is gone
+        // from the host, so `keys status` says `confirmed` — and the local
+        // half is not: the repository still holds the certificate the host
+        // USED to have, and the planner compares every host against it. A
+        // resume that read this as `done` left it there, and the next
+        // ordinary plan delivered the old certificate back over the new
+        // one. Both halves of the step are idempotent, so it is named again.
+        assert_eq!(
+            next_keys_step(&HostRun::new("box"), KeysState::Confirmed, false),
+            Step::AtKeysPhase(ActionKind::KeysRemove)
+        );
     }
 
     /// Nothing on the disk means two different things, and the journal is
@@ -1581,7 +1612,7 @@ mod tests {
         use crate::activate::KeysState;
         // Nothing happened yet: the prepared key is gone, and the
         // certificate in the plan is for a key nobody has.
-        let step = next_keys_step(&HostRun::new("box"), KeysState::None);
+        let step = next_keys_step(&HostRun::new("box"), KeysState::None, false);
         let Step::RecoveryRequired(why) = step else {
             panic!("a plan whose key is gone is not something to carry on with");
         };
@@ -1599,7 +1630,7 @@ mod tests {
             evidence: Vec::new(),
             cmd_refs: Vec::new(),
         });
-        let Step::RecoveryRequired(why) = next_keys_step(&switched, KeysState::None) else {
+        let Step::RecoveryRequired(why) = next_keys_step(&switched, KeysState::None, false) else {
             panic!("a switched host with no pair needs a person");
         };
         assert!(why.contains("keys status"), "{why}");

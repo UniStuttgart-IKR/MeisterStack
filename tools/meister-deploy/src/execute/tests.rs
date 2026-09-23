@@ -3503,6 +3503,21 @@ fn a_resume_carries_a_rotation_on_from_the_phase_the_host_is_at() {
 #[test]
 fn a_resume_of_a_finished_rotation_does_nothing_at_all() {
     let (fx, _) = rotating();
+    // Astra finding F09, 2026-09-23: the run being resumed here ran its
+    // whole `keys remove` step, and the LOCAL half of that step is what
+    // makes the certificate this rotation issued the repository's own. A
+    // resume asks for that half now — the host cannot answer it — so the
+    // fixture says what a finished run leaves behind.
+    fx.files
+        .write_atomic(
+            &PathBuf::from("/repo/pki/issued/box/identity.crt"),
+            NEW_CERT.as_bytes(),
+            0o644,
+        )
+        .expect("the published certificate");
+    fx.files
+        .remove_file(&PathBuf::from("/repo/pki/issued/box/identity.next.crt"))
+        .expect("and the source it was published from is gone");
     write_rotation_journal(&fx, "run-1", ActionKind::KeysRemove);
     let look = TableLook::new(&fx);
     let runner = World::new(
@@ -3543,6 +3558,86 @@ fn a_resume_of_a_finished_rotation_does_nothing_at_all() {
         runner.calls()
     );
     assert_eq!(applied.receipt.outcome, Outcome::Success);
+}
+
+// Astra finding F09, 2026-09-23.
+#[test]
+fn a_resume_after_the_remote_removal_still_publishes_the_new_cert() {
+    // The last phase has two halves: the old pair goes on the host, and the
+    // certificate this rotation issued becomes the repository's own — which
+    // is what the planner compares every host against. The host answers
+    // `confirmed` for the first half alone, and that was read as `done`, so
+    // a run that died between the two left the OLD certificate in the
+    // repository and the next ordinary plan delivered it back over the new
+    // one, undoing the rotation in a plan nobody read as one.
+    let (fx, digest) = rotating();
+    write_rotation_journal(&fx, "run-1", ActionKind::KeysRemove);
+    let look = TableLook::new(&fx);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(
+                helper("box", &["keys", "status", "--kind", "identity"]),
+                Output::stdout(
+                    serde_json::json!({
+                        "ok": true,
+                        "what": "keys status",
+                        "result": {
+                            "kind": "identity",
+                            "state": "confirmed",
+                            "key_next": false,
+                            "crt_next": false,
+                            "prev": false,
+                            "reason": null,
+                            "record": null,
+                        },
+                    })
+                    .to_string(),
+                ),
+            )
+            // The plan's own `lock` step, which a resume with work left to
+            // do runs: the anchor above took the same lock, and the same run
+            // asking twice is asking whether it may act.
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            // Named again, and both halves of it are idempotent.
+            .expect(
+                helper("box", &["keys", "remove", "--kind", "identity"]),
+                ok(),
+            )
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = rotate_options(&fx);
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("exactly those commands");
+    assert_eq!(applied.receipt.outcome, Outcome::Success);
+    // The repository now holds what the host holds.
+    let published = fx
+        .files
+        .content(PathBuf::from("/repo/pki/issued/box/identity.crt"))
+        .expect("the certificate is published");
+    assert_eq!(
+        format!("sha256:{}", crate::ids::sha256_hex(&published)),
+        digest
+    );
+    assert!(
+        !fx.files
+            .exists(&PathBuf::from("/repo/pki/issued/box/identity.next.crt")),
+        "the source it was published from is gone"
+    );
+    // And nothing before the last phase was repeated: a second `prepare`
+    // would be a second key.
+    for repeated in ["keys switch", "keygen", "keys revert"] {
+        assert!(
+            !runner.calls().iter().any(|c| c.contains(repeated)),
+            "{repeated} was repeated: {:?}",
+            runner.calls()
+        );
+    }
 }
 
 // --- lane 5B: what `scripts/check-push-pki.sh` asked ----------------------
