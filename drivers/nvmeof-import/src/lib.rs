@@ -401,6 +401,38 @@ impl VolumeProvider for NvmeofImportDriver {
         }
     }
 
+    /// Which namespace this node is holding for `id`, if any.
+    ///
+    /// The first branch of `provision`, asked on its own: the claim files
+    /// under the state directory ARE this driver's record of what it holds,
+    /// so it can always be asked for a volume whose handle was never written
+    /// down. Astra finding S13, 2026-09-23.
+    #[instrument(skip_all, fields(volume = %id))]
+    async fn probe(
+        &self,
+        id: &VolumeId,
+        spec: &VolumeSpec,
+    ) -> agent_api::storage::Result<Option<VolumeHandle>> {
+        let params = params_of(spec)?;
+        let Some(held) = self.held_by(id, &params)? else {
+            return Ok(None);
+        };
+        // The claim outlived the pool entry that justified it. `Some` with a
+        // handle this pool cannot name is not available, and `None` would
+        // tell the caller to write a tombstone over a namespace this node is
+        // still holding — so the operator is told instead.
+        let ns = params
+            .namespaces
+            .iter()
+            .find(|n| n.nqn == held)
+            .ok_or_else(|| {
+                StorageError::InvalidSpec(format!(
+                    "volume {id} holds {held}, which this pool no longer lists"
+                ))
+            })?;
+        Ok(Some(handle_for(id, &params, ns)))
+    }
+
     fn locality(&self) -> Locality {
         Locality::Networked
     }

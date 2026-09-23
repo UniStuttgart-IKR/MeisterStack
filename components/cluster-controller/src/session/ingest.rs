@@ -938,6 +938,31 @@ pub(super) async fn ingest_snapshots(
     Ok(())
 }
 
+/// Which VMs this report says the node has let go of — the whole decision
+/// [`forget_unbound`] acts on, as a value.
+///
+/// Pure, and apart from the write for that reason: what it decides is that a
+/// VM may be placed on another machine, and the two inputs that make that
+/// safe are worth being able to test without a store. Both of them are Astra
+/// finding S12, 2026-09-23:
+///
+/// * `vms_complete` false is a report making NO statement about VMs — the
+///   heartbeat-only beat an agent sends when its per-VM half could not be
+///   read carries empty lists — and an empty list that means "not saying"
+///   used to be read here as "naming none".
+/// * a VM the node is still tearing down is NAMED by a current agent
+///   (`Provisioning`/`Stopping`), so absence really is the end of the
+///   teardown rather than the beginning of it.
+pub(super) fn letting_go<'a>(vms: &'a [Vm], node_id: &str, report: &StatusReport) -> Vec<&'a Vm> {
+    if !report.vms_complete {
+        return Vec::new();
+    }
+    vms.iter()
+        .filter(|vm| vm.spec.node_name.is_none() && vm.status.node_name.as_deref() == Some(node_id))
+        .filter(|vm| !report.vms.iter().any(|r| r.id == vm.metadata.uid))
+        .collect()
+}
+
 /// Clear the old node off a VM whose binding was let go, once that node has
 /// stopped naming it.
 ///
@@ -953,8 +978,8 @@ pub(super) async fn ingest_snapshots(
 /// not KNOW it, and a restart before the first report would otherwise be read
 /// as "gone". The question asked here is narrower, and it is exactly the one
 /// absence answers: **does this node still name this VM?** A node lists every
-/// record it has, minus the ones it is tearing down, so a report that does
-/// not carry the uid is a node that is no longer serving it.
+/// record it has, so a report that does not carry the uid is a node that is
+/// no longer serving it.
 ///
 /// It applies to nothing else. A VM whose `spec.nodeName` is still set is
 /// untouched however silent its node is — that is the heartbeat's business —
@@ -962,6 +987,23 @@ pub(super) async fn ingest_snapshots(
 /// A false positive costs a placement that may land on the same node again
 /// and is idempotent there; the alternative — waiting for a proof this road
 /// cannot carry — costs a VM that never moves.
+///
+/// # And only when the node SAID the list is whole
+///
+/// Astra finding S12, 2026-09-23. The paragraph above was true of the report
+/// a healthy node builds and of nothing else: a beat whose per-VM half could
+/// not be read sends the node's facts and empty lists (`heartbeat_only` in
+/// the agent), and an empty `vms` there means "not saying", not "none". Every
+/// unbound VM on that node was then declared let-go on one bad beat, while
+/// its VMM went on serving the guest and holding the disks. The node says
+/// which of the two it is now, and this reads a false as no statement at all.
+///
+/// The other half of the same finding is in the agent: a record whose intent
+/// is `Absent` used to drop out of the report as soon as the intent was
+/// written, so "the node no longer names it" arrived long before the teardown
+/// had happened. It is reported as `Provisioning` with `Stopping` until the
+/// teardown takes the record away, which is what makes the absence below mean
+/// what this function reads it as.
 pub(super) async fn forget_unbound(
     store: &EtcdStore,
     vms: &[Vm],
@@ -969,11 +1011,13 @@ pub(super) async fn forget_unbound(
     report: &StatusReport,
     at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let leaving: Vec<&Vm> = vms
-        .iter()
-        .filter(|vm| vm.spec.node_name.is_none() && vm.status.node_name.as_deref() == Some(node_id))
-        .filter(|vm| !report.vms.iter().any(|r| r.id == vm.metadata.uid))
-        .collect();
+    let leaving = letting_go(vms, node_id, report);
+    if leaving.is_empty() && !report.vms_complete {
+        debug!(
+            node = node_id,
+            "the report does not claim a complete vm list; letting go of nothing"
+        );
+    }
     for vm in leaving {
         let name = vm.metadata.name.clone();
         store

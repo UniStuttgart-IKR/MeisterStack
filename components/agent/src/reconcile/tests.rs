@@ -1112,10 +1112,24 @@ async fn a_disk_stays_open_until_the_teardown_has_really_detached_it() {
             .expect("a line for this node's own volume")
     };
 
-    // The premise: the VM half says nothing about this VM at all.
-    assert!(
-        reconciler.report().await.expect("a report").is_empty(),
-        "a vm on its way out is not in the vm half of the report"
+    // The premise: the VM half NAMES this VM, and says which disk it still
+    // has open.
+    //
+    // This assertion used to be the opposite — "a vm on its way out is not in
+    // the vm half of the report" — and that was Astra finding S12,
+    // 2026-09-23: one tier up, a uid a node does not name is read as a node
+    // that has let it go, so a record that dropped out of the report the
+    // moment the intent was written let the VM be placed on another machine
+    // while this VMM still held the disk. That is the same window the rest of
+    // this test measures, seen from the other half of the report.
+    let said = reconciler.report().await.expect("a report");
+    assert_eq!(said.len(), 1, "a vm on its way out is still this node's");
+    assert_eq!(said[0].phase, ReportedPhase::Provisioning);
+    assert_eq!(said[0].reason, Some(VmReason::Stopping));
+    assert_eq!(
+        said[0].volumes,
+        vec![disk],
+        "and it names the disk it is still holding"
     );
     // And the disk is open, because it is.
     assert!(line().open, "the vmm is still holding it");

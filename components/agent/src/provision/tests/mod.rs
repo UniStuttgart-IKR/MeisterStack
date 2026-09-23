@@ -172,3 +172,70 @@ fn plain_vm_gets_vmm_overhead_only() {
     assert_eq!(l.memory_max, Some((2048 + 112) * 1024 * 1024));
     assert_eq!(l.cpu_quota, Some(250));
 }
+
+/// Neither entrance of the chain builds over a row this node cannot read.
+///
+/// Astra finding S11, 2026-09-23. Both admission checks asked `Store::get`,
+/// which answers "unknown" for bytes it cannot deserialise — so a torn record
+/// read exactly like an absent one, and the node would build a second VMM and
+/// a second set of disks on top of whatever the row described, with nothing
+/// left naming the first. The row is present or it is not; whether this build
+/// can read it is a different question, and only one of the two belongs in
+/// front of somebody's guest.
+#[tokio::test]
+async fn a_corrupt_vm_record_refuses_a_create_and_a_receive() {
+    let temp = tempfile::Builder::new()
+        .prefix("meister-admit-")
+        .tempdir()
+        .expect("a temp dir");
+    let root = temp.path().to_path_buf();
+    let store = Arc::new(crate::store::Store::open(&root.join("a.redb")).expect("a store"));
+    let provisioner = Provisioner::new(
+        store.clone(),
+        Drivers {
+            confiner: Arc::new(cgroup_driver::CgroupV2::new(root.join("cgroup"))),
+            hypervisor: None,
+            hypervisor_name: None,
+            storage: HashMap::new(),
+            networking: None,
+            bridge: None,
+            announcer: None,
+            devices: HashMap::new(),
+        },
+        Arc::new(crate::images::Cache::new(root.join("images"))),
+        root.join("images"),
+        root.join("run"),
+        "br0".to_string(),
+        None,
+        None,
+    );
+
+    let id = VmId::new_v4();
+    let bytes = b"not a record at all";
+    store.put_raw(&id.to_string(), bytes).expect("a raw row");
+
+    let created = provisioner
+        .provision(id, spec(1, 256, vec![]), Desired::Running, true)
+        .await
+        .expect_err("a create may not land on a row nobody can read");
+    assert!(
+        format!("{created:#}").contains("cannot read"),
+        "the refusal says what is wrong with the row: {created:#}"
+    );
+
+    let received = provisioner
+        .prepare_migration(id, spec(1, 256, vec![]), "127.0.0.1:0", true)
+        .await
+        .expect_err("and neither may a reception");
+    assert!(
+        format!("{received:#}").contains("cannot read"),
+        "{received:#}"
+    );
+
+    // Untouched, both times. A refusal that had rewritten the row would have
+    // destroyed the one thing an operator still has to look at.
+    assert_eq!(
+        store.get_raw(&id).expect("a read").as_deref(),
+        Some(&bytes[..])
+    );
+}

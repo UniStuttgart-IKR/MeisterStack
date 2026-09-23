@@ -581,6 +581,14 @@ impl Agent {
             // False on every report but the last one. See `Shutdown`.
             stopping: self.shutdown.stopping(),
             migrations,
+            // True, and it is the whole of this report's claim about the VM
+            // list: `reconciler.report()` walked every row of the store and
+            // this call only exists because it succeeded. The tier above may
+            // therefore read a uid's absence as "this node is not serving
+            // it", which is what `forget_unbound` needs and what the
+            // heartbeat-only report below may never license. Astra finding
+            // S12, 2026-09-23.
+            vms_complete: true,
         })
     }
 }
@@ -1511,6 +1519,11 @@ fn heartbeat_only(node: NodeStatus, stopping: bool) -> StatusReport {
         snapshots: Vec::new(),
         stopping,
         migrations: Vec::new(),
+        // And the same about the VMs, which is the one that cost something:
+        // absence from `vms` is what `forget_unbound` reads as "this node has
+        // let the guest go", and this beat did not look at a single record.
+        // Astra finding S12, 2026-09-23.
+        vms_complete: false,
     }
 }
 

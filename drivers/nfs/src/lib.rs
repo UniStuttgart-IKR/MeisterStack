@@ -604,6 +604,38 @@ impl VolumeProvider for NfsDriver {
         }
         self.files.describe(handle).await
     }
+
+    /// Both candidates, in the order `deprovision` removes them and for the
+    /// same reason: what is on the export is the answer, not what `params`
+    /// says. Astra finding S13, 2026-09-23.
+    #[instrument(level = "trace", skip_all, fields(volume_id = %id))]
+    async fn probe(
+        &self,
+        id: &VolumeId,
+        spec: &VolumeSpec,
+    ) -> storage::Result<Option<VolumeHandle>> {
+        let dir = self.share_dir(id);
+        if tokio::fs::metadata(&dir).await.is_ok() {
+            return Ok(Some(VolumeHandle {
+                id: *id,
+                backend: dir.to_string_lossy().into_owned(),
+                size_bytes: 0,
+                params: spec.params.clone(),
+            }));
+        }
+        self.files.probe(id, spec).await
+    }
+
+    /// A share cannot be snapshotted, so every snapshot this driver ever took
+    /// is a file the inner backend made. Delegated whole.
+    #[instrument(level = "trace", skip_all, fields(snapshot_id = %id))]
+    async fn probe_snapshot(
+        &self,
+        volume: Option<&VolumeHandle>,
+        id: &SnapshotId,
+    ) -> storage::Result<Option<VolumeHandle>> {
+        self.files.probe_snapshot(volume, id).await
+    }
 }
 
 #[async_trait::async_trait]

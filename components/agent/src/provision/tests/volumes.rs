@@ -124,6 +124,14 @@ async fn a_referenced_volume_is_attached_and_never_provisioned() {
                 size_bytes: h.size_bytes,
             })
         }
+        /// A fake that keeps no bytes holds none under any id.
+        async fn probe(
+            &self,
+            _: &VolumeId,
+            _: &agent_api::storage::VolumeSpec,
+        ) -> agent_api::storage::Result<Option<VolumeHandle>> {
+            Ok(None)
+        }
     }
 
     #[async_trait::async_trait]
@@ -291,6 +299,14 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
             Ok(VolumeState {
                 size_bytes: h.size_bytes,
             })
+        }
+        /// A fake that keeps no bytes holds none under any id.
+        async fn probe(
+            &self,
+            _: &VolumeId,
+            _: &agent_api::storage::VolumeSpec,
+        ) -> agent_api::storage::Result<Option<VolumeHandle>> {
+            Ok(None)
         }
     }
 
@@ -723,6 +739,14 @@ impl agent_api::storage::VolumeProvider for CountingVolume {
             size_bytes: h.size_bytes,
         })
     }
+    /// A fake that keeps no bytes holds none under any id.
+    async fn probe(
+        &self,
+        _: &VolumeId,
+        _: &agent_api::storage::VolumeSpec,
+    ) -> agent_api::storage::Result<Option<agent_api::storage::VolumeHandle>> {
+        Ok(None)
+    }
 }
 
 #[async_trait::async_trait]
@@ -920,6 +944,14 @@ async fn a_failed_detach_is_not_marked_and_is_tried_again() {
             _: &agent_api::storage::VolumeHandle,
         ) -> agent_api::storage::Result<agent_api::storage::VolumeState> {
             Ok(agent_api::storage::VolumeState { size_bytes: 0 })
+        }
+        /// A fake that keeps no bytes holds none under any id.
+        async fn probe(
+            &self,
+            _: &VolumeId,
+            _: &agent_api::storage::VolumeSpec,
+        ) -> agent_api::storage::Result<Option<agent_api::storage::VolumeHandle>> {
+            Ok(None)
         }
     }
 

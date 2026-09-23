@@ -251,18 +251,33 @@ impl BackendKind {
             Some(user) => BackendError::Died(format!("{} {}", self.label, user.cannot_switch(&e))),
             None => BackendError::Failed(e.into()),
         })?;
-        let pid = child.id().ok_or_else(|| {
-            BackendError::Died(format!("{} exited before pid could be read", self.label))
-        })?;
+        // Every exit from here to the `Ok` below goes through `abandon`, and
+        // nothing between them may use `?`. Astra finding S16, 2026-09-23:
+        // the cgroup attach did, and a `tokio::process::Child` that is
+        // DROPPED sends no signal and reaps nothing — there is no
+        // `kill_on_drop` anywhere in this tree — so a backend whose slice
+        // could not be written went on running, holding the socket path the
+        // next attempt binds, with nobody left who knew its pid.
+        let Some(pid) = child.id() else {
+            // Already gone, so there is nothing to signal; `abandon` still
+            // runs, because "exited" and "reaped" are not the same thing.
+            self.abandon(&mut child).await;
+            return Err(BackendError::Died(format!(
+                "{} exited before pid could be read",
+                self.label
+            )));
+        };
         debug!(
             pid,
             backend = self.label,
             "backend spawned, waiting for socket"
         );
 
-        if let Some(cg) = cgroup {
-            cg.attach_pid(pid)
-                .map_err(|e| BackendError::Failed(anyhow::anyhow!("cgroup attach: {e}")))?;
+        if let Some(cg) = cgroup
+            && let Err(e) = cg.attach_pid(pid)
+        {
+            self.abandon(&mut child).await;
+            return Err(BackendError::Failed(anyhow::anyhow!("cgroup attach: {e}")));
         }
 
         // Waiting for the socket is where a backend spawn actually spends its
@@ -270,7 +285,7 @@ impl BackendKind {
         // than disappearing into the create it is 90% of. The span comes from
         // the caller because only the driver knows what its id is called.
         let label = self.label;
-        async {
+        let waited = async {
             let deadline = tokio::time::Instant::now() + timeout;
             loop {
                 if socket.exists() {
@@ -283,9 +298,6 @@ impl BackendKind {
                     )));
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    // A backend that missed its deadline must not be left
-                    // running: nothing would ever collect it again.
-                    let _ = child.start_kill();
                     return Err(BackendError::Died(format!(
                         "{label} socket did not appear within {timeout:?}; log tail:\n{}",
                         tail_log(log)
@@ -296,9 +308,43 @@ impl BackendKind {
             Ok(())
         }
         .instrument(span)
-        .await?;
+        .await;
+        // The deadline arm used to `start_kill` here and go; the reap was
+        // nobody's. Both arms come through the one guard now — the exited one
+        // too, because `try_wait` collecting a status is exactly what makes
+        // the second kill a no-op and costs nothing.
+        if let Err(e) = waited {
+            self.abandon(&mut child).await;
+            return Err(e);
+        }
 
         Ok((pid, Backend { child }))
+    }
+
+    /// SIGKILL and reap a child this spawn is giving up on.
+    ///
+    /// The whole of the guard S16 asked for, and it is a function rather than
+    /// a `Drop` because the kill has to be AWAITED: `Child::kill` is a signal
+    /// followed by a `wait`, and a destructor cannot wait. So every early
+    /// return between `Command::spawn` and the `Backend` the caller gets
+    /// calls this by hand, and the rule is written down where they are.
+    ///
+    /// Idempotent and quiet about a child that is already gone: `start_kill`
+    /// on a reaped process is an error this deliberately ignores, because
+    /// "already dead" is the outcome being asked for.
+    async fn abandon(&self, child: &mut tokio::process::Child) {
+        if let Some(pid) = child.id() {
+            warn!(
+                pid,
+                backend = self.label,
+                "giving up on a spawned backend; killing it"
+            );
+        }
+        // SIGKILL and not SIGTERM: this backend never began serving, so
+        // there is nothing for it to shut down gracefully, and `stop`'s
+        // two-second grace would be two seconds added to a create that has
+        // already failed.
+        let _ = child.kill().await;
     }
 
     /// Stop a backend that is still our child: SIGTERM, then SIGKILL if it is
@@ -570,6 +616,89 @@ mod tests {
     #[test]
     fn a_missing_log_reads_as_no_log_rather_than_an_empty_tail() {
         assert_eq!(tail_log(Path::new("/nonexistent/backend.log")), "<no log>");
+    }
+
+    /// A spawn that gives up takes its process with it, dead AND reaped.
+    ///
+    /// Astra finding S16, 2026-09-23. The cgroup attach failed with a `?`
+    /// after `Command::spawn` and before the `Backend` the caller owns, so
+    /// the `tokio::process::Child` was dropped — which sends no signal and
+    /// collects no status, there being no `kill_on_drop` anywhere in this
+    /// tree. What was left was a live backend holding the socket path the
+    /// next attempt binds, with nobody who knew its pid: not the driver,
+    /// which never got a handle, and not the VM's record, which is written
+    /// from the attachment this call never returned.
+    ///
+    /// `sleep` stands in for the backend because what is under test is the
+    /// process hygiene and not the program: it is harmless, it outlives the
+    /// test by minutes if nothing kills it, and it never creates the socket —
+    /// so a spawn that reached the wait would sit there until the deadline
+    /// instead of failing at the attach.
+    #[tokio::test]
+    async fn a_backend_whose_slice_cannot_be_written_is_killed_and_reaped() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let log = temp.path().join("backend.log");
+        let socket = temp.path().join("backend.sock");
+
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("600");
+
+        // A slice whose directory nothing made: the write into
+        // `<path>/cgroup.procs` is ENOENT, which is what a cgroup2 root that
+        // was unmounted under a running agent looks like from here.
+        let cgroup = CgroupHandle {
+            path: temp.path().join("no-such-slice"),
+        };
+
+        let kind = BackendKind::child("sleep", "sleep");
+        let err = kind
+            .spawn(
+                cmd,
+                BackendIo {
+                    socket: &socket,
+                    log: &log,
+                    timeout: Duration::from_secs(30),
+                    cgroup: Some(&cgroup),
+                    span: tracing::Span::none(),
+                },
+            )
+            .await
+            .map(|(pid, _)| pid)
+            .expect_err("a backend that cannot enter its slice is not a backend");
+        assert!(
+            format!("{err}").contains("cgroup attach"),
+            "the error names what failed: {err}"
+        );
+
+        // The process is gone AND collected. `kill` is SIGKILL followed by
+        // `wait`, so by the time the error came back there is no `/proc`
+        // entry left — a zombie would still have one, and a zombie is what a
+        // bare `start_kill` leaves.
+        let mut left = Vec::new();
+        for line in std::fs::read_dir("/proc").expect("linux") {
+            let Ok(entry) = line else { continue };
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            // Our own `sleep 600` and nobody else's: the argument is exact
+            // and a stranger's `sleep` would have to have been started with
+            // the same one to be caught here, which a NUL-separated match
+            // makes an equality rather than a substring.
+            if cmdline
+                .split(|b| *b == 0)
+                .eq([&b"sleep"[..], &b"600"[..], &b""[..]])
+            {
+                left.push(pid);
+            }
+        }
+        assert!(
+            left.is_empty(),
+            "the spawned backend is still around: {left:?}"
+        );
     }
 
     /// Only the tail is quoted: a backend that logged a megabyte before dying

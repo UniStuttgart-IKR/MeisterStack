@@ -612,6 +612,55 @@ impl VolumeProvider for LvmThinDriver {
             None => Err(StorageError::NotFound(handle.id)),
         }
     }
+
+    /// The LV this pool would have made for `id`, if it is in the group.
+    ///
+    /// The same `lvs` that makes `provision` idempotent, asked on its own: the
+    /// LV's name is derived from the id, so this backend can be asked what it
+    /// holds for a record whose handle was never written. Astra finding S13,
+    /// 2026-09-23.
+    #[instrument(level = "trace", skip_all, fields(volume_id = %id))]
+    async fn probe(
+        &self,
+        id: &VolumeId,
+        spec: &VolumeSpec,
+    ) -> storage::Result<Option<VolumeHandle>> {
+        let params = Self::params(spec)?;
+        let (vg, _) = resolve_pool(&params, &self.config.vg, &self.config.thin_pool)?;
+        let lv = lv_name(id);
+        let dev = Self::device_path(&vg, &lv);
+        Ok(self
+            .lv_size_bytes(&vg, &lv)
+            .await?
+            .map(|size| Self::handle(id, &dev, size, spec)))
+    }
+
+    /// And the snapshot's LV, which needs the volume it came from.
+    ///
+    /// The volume group is on the VOLUME's handle and nowhere else — a
+    /// snapshot record carries a driver name and an id — so a probe with no
+    /// volume in hand is refused rather than guessed at against the
+    /// configured group: guessing would answer "nothing here" for a snapshot
+    /// in another group, and a tombstone is what follows that answer.
+    #[instrument(level = "trace", skip_all, fields(snapshot_id = %id))]
+    async fn probe_snapshot(
+        &self,
+        volume: Option<&VolumeHandle>,
+        id: &SnapshotId,
+    ) -> storage::Result<Option<VolumeHandle>> {
+        let Some(volume) = volume else {
+            return Err(StorageError::InvalidSpec(format!(
+                "lvm-thin cannot look for snapshot {id} without the volume it was taken from:                  the volume group is on that volume's handle"
+            )));
+        };
+        let vg = self.vg_of(volume);
+        let snap = snapshot_lv_name(id);
+        let dev = Self::device_path(&vg, &snap);
+        Ok(self
+            .lv_size_bytes(&vg, &snap)
+            .await?
+            .map(|size| Self::snapshot_handle(id, &dev, size)))
+    }
 }
 
 /// The second degenerate case, and the plainest: a thin LV is a block device

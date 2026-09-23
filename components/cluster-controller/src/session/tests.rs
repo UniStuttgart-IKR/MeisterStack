@@ -43,6 +43,71 @@ fn line(uid: &str) -> proto::VmStatusReport {
     }
 }
 
+/// A report that makes no statement about VMs lets go of nothing.
+///
+/// Astra finding S12, 2026-09-23. `forget_unbound` reads a uid's absence from
+/// `report.vms` as "the node has stopped serving it", and clears the binding
+/// so the scheduler may place the guest again. That reading was only ever
+/// true of the report a healthy agent builds: a beat whose per-VM half could
+/// not be read sends the node's facts and EMPTY LISTS (`heartbeat_only`), and
+/// on that beat every unbound VM on the node was declared let-go — while its
+/// VMM went on serving the guest and holding its disks. One bad read was
+/// enough to place a running guest on a second machine.
+///
+/// So the node says which of the two an empty list is, and the decision is
+/// asked as a value here rather than through the store: what it decides is
+/// that somebody's guest may be started somewhere else.
+#[test]
+fn an_incomplete_report_lets_go_of_nothing() {
+    // The shape `forget_unbound` is for: a client cleared `spec.nodeName`,
+    // and `status.nodeName` still says where the guest is.
+    let mut web = vm("u-web");
+    web.spec.node_name = None;
+    web.status.node_name = Some("n1".into());
+    let vms = vec![web];
+
+    // A heartbeat-only beat: no VMs and no claim that the list is whole.
+    let silent = StatusReport {
+        vms: Vec::new(),
+        vms_complete: false,
+        ..Default::default()
+    };
+    assert!(
+        letting_go(&vms, "n1", &silent).is_empty(),
+        "an empty list that means `not saying` may not become `naming none`"
+    );
+
+    // The same empty list from a node that DID look: this is the statement,
+    // and it is the one the reschedule waits for.
+    let complete = StatusReport {
+        vms: Vec::new(),
+        vms_complete: true,
+        ..Default::default()
+    };
+    let leaving = letting_go(&vms, "n1", &complete);
+    assert_eq!(leaving.len(), 1);
+    assert_eq!(leaving[0].metadata.uid, "u-web");
+
+    // And a node that still names it keeps it, complete or not — which is
+    // what a record on its way out now does for the whole of its teardown.
+    let naming = StatusReport {
+        vms: vec![proto::VmStatusReport {
+            phase: "Provisioning".into(),
+            reason: "Stopping".into(),
+            ..line("u-web")
+        }],
+        vms_complete: true,
+        ..Default::default()
+    };
+    assert!(
+        letting_go(&vms, "n1", &naming).is_empty(),
+        "a vm the node is still taking apart has not been let go of"
+    );
+
+    // Another node's report is not about this binding at all.
+    assert!(letting_go(&vms, "n2", &complete).is_empty());
+}
+
 /// The N+1 this exists to stop: every agent reports every ten seconds and
 /// every report needs the same list, so the reports that overlap share
 /// one read of it — and a read older than the window is not reused.

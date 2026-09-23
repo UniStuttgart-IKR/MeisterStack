@@ -1310,6 +1310,13 @@ mod tests {
         async fn describe(&self, _: &VolumeHandle) -> agent_api::storage::Result<VolumeState> {
             unreachable!()
         }
+        async fn probe(
+            &self,
+            _: &agent_api::VolumeId,
+            _: &VolumeSpec,
+        ) -> agent_api::storage::Result<Option<VolumeHandle>> {
+            unreachable!("the catalogue never looks at any bytes")
+        }
     }
 
     #[async_trait::async_trait]

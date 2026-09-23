@@ -656,6 +656,55 @@ impl VolumeProvider for FilesystemBlockDriver {
     async fn describe(&self, handle: &VolumeHandle) -> storage::Result<VolumeState> {
         self.measure(&handle.id).await
     }
+
+    /// The file this pool would have made for `id`, if it is there.
+    ///
+    /// The same lookup `provision` opens with — the name is derived from the
+    /// id, so this backend can always be asked what it holds without being
+    /// told. The half-written `.tmp` counts, because `deprovision` removes
+    /// both and a tombstone written while one was lying there would leave it
+    /// on the pool for ever; the handle names the finished path either way,
+    /// which is what `deprovision` reads the id off. Astra finding S13,
+    /// 2026-09-23.
+    #[instrument(level = "trace", skip_all, fields(volume_id = %id))]
+    async fn probe(
+        &self,
+        id: &VolumeId,
+        spec: &VolumeSpec,
+    ) -> storage::Result<Option<VolumeHandle>> {
+        let path = layout::volume_path(&self.config.volume_dir, id);
+        let size = match Self::size_if_already_there(&path).await? {
+            Some(size) => Some(size),
+            None => Self::size_if_already_there(&layout::tmp_path(&self.config.volume_dir, id))
+                .await?
+                .map(|_| 0),
+        };
+        Ok(size.map(|size_bytes| VolumeHandle {
+            id: *id,
+            backend: path.to_string_lossy().into_owned(),
+            size_bytes,
+            params: spec.params.clone(),
+        }))
+    }
+
+    /// And the snapshot beside it, named after the snapshot's own id. See
+    /// `layout::snapshot_path`.
+    #[instrument(level = "trace", skip_all, fields(snapshot_id = %id))]
+    async fn probe_snapshot(
+        &self,
+        _volume: Option<&VolumeHandle>,
+        id: &SnapshotId,
+    ) -> storage::Result<Option<VolumeHandle>> {
+        let path = self.snapshot_path(id);
+        Ok(Self::size_if_already_there(&path)
+            .await?
+            .map(|size_bytes| VolumeHandle {
+                id: *id,
+                backend: path.to_string_lossy().into_owned(),
+                size_bytes,
+                params: None,
+            }))
+    }
 }
 
 /// The connection half, and the degenerate case the whole split has to keep
