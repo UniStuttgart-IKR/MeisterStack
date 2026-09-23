@@ -1656,11 +1656,24 @@ impl<'a> Helper<'a> {
     /// what is on the disk, and the record is what says whose rotation it
     /// was and why it ended. The two states the files cannot show
     /// (`confirmed`, `reverted`) are the record's alone.
+    ///
+    /// Astra finding F08, 2026-09-23: the switch is FOUR renames, and this
+    /// read the presence of any `.prev` as "switched" — so all three of the
+    /// half-switched shapes a crash leaves behind were read as the finished
+    /// one. The resume then skipped to `verify`, the verify found the wrong
+    /// certificate (or none), and `keys revert` refused because it needs
+    /// BOTH `.prev` files: the host was left without an active certificate
+    /// and in `recovery-required`, with no way for this tool to finish what
+    /// it started. So the four files are read as four, and only the one
+    /// tuple that is a finished switch is `switched`. Every other shape with
+    /// a `.prev` in it is `inconsistent`, which sends the resume to a person
+    /// instead of to a verify it cannot undo.
     pub fn keys_status(&self, kind: KeyKind) -> Result<KeysView> {
         let key_next = self.files.exists(&self.key_path_with(kind, Some("next")));
         let crt_next = self.files.exists(&self.cert_path_with(kind, Some("next")));
-        let prev = self.files.exists(&self.key_path_with(kind, Some("prev")))
-            || self.files.exists(&self.cert_path_with(kind, Some("prev")));
+        let key_prev = self.files.exists(&self.key_path_with(kind, Some("prev")));
+        let crt_prev = self.files.exists(&self.cert_path_with(kind, Some("prev")));
+        let prev = key_prev || crt_prev;
         let record = match self.files.read_to_string(&self.keys_record_path(kind)) {
             Ok(text) => match KeysRecord::from_json(
                 &text,
@@ -1690,20 +1703,47 @@ impl<'a> Helper<'a> {
             .as_ref()
             .filter(|r| matches!(r.state, KeysState::Confirmed | KeysState::Reverted))
             .map(|r| r.state);
-        let state = match (key_next, crt_next, prev) {
-            (_, _, true) => KeysState::Switched,
-            (true, true, false) => KeysState::Overlap,
-            (true, false, false) => KeysState::Prepared,
-            (false, true, false) => KeysState::Inconsistent,
-            (false, false, false) => finished.unwrap_or(KeysState::None),
+        let (state, reason) = match (key_next, crt_next, key_prev, crt_prev) {
+            // The switch, whole: the prepared pair is in and the pair it
+            // replaced is beside it.
+            (false, false, true, true) => (KeysState::Switched, None),
+            (true, true, false, false) => (KeysState::Overlap, None),
+            (true, false, false, false) => (KeysState::Prepared, None),
+            (false, true, false, false) => (
+                KeysState::Inconsistent,
+                Some(format!(
+                    "{} is there and {} is not: a certificate without the key it belongs to.",
+                    self.cert_path_with(kind, Some("next")).display(),
+                    self.key_path_with(kind, Some("next")).display()
+                )),
+            ),
+            (false, false, false, false) => (finished.unwrap_or(KeysState::None), None),
+            // A switch that stopped between two of its renames. Which files
+            // are there says where it stopped, and that is what a person
+            // needs; this tool will not finish a switch it can only see half
+            // of, and it will not call one done either.
+            _ => (
+                KeysState::Inconsistent,
+                Some(format!(
+                    "the {kind} key files on this host are a switch that stopped in the \
+                     middle: {}. The pair that was in use is what `.prev` holds; finish it or \
+                     put it back by hand, and this tool will not do either on its own.",
+                    [
+                        self.key_path_with(kind, None),
+                        self.cert_path_with(kind, None),
+                        self.key_path_with(kind, Some("next")),
+                        self.cert_path_with(kind, Some("next")),
+                        self.key_path_with(kind, Some("prev")),
+                        self.cert_path_with(kind, Some("prev")),
+                    ]
+                    .iter()
+                    .filter(|path| self.files.exists(path))
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+                )),
+            ),
         };
-        let reason = (state == KeysState::Inconsistent).then(|| {
-            format!(
-                "{} is there and {} is not: a certificate without the key it belongs to.",
-                self.cert_path_with(kind, Some("next")).display(),
-                self.key_path_with(kind, Some("next")).display()
-            )
-        });
         Ok(KeysView {
             kind: kind.as_str().to_string(),
             state,
@@ -3603,6 +3643,78 @@ mod tests {
             .unwrap();
         assert_eq!(view.state, KeysState::Inconsistent);
         assert!(view.reason.unwrap().contains("without the key"));
+    }
+
+    // Astra finding F08, 2026-09-23.
+    #[test]
+    fn keys_status_names_every_half_switch() {
+        // `keys_switch` is four renames in this order: the certificate in
+        // use goes aside, then the key in use, then the prepared key comes
+        // in, then the prepared certificate. A machine that stops between
+        // any two of them leaves one of the first three shapes below. All
+        // three used to read as `switched`, because any `.prev` was the
+        // whole question — so the resume skipped to `verify`, the verify
+        // found no certificate, and `keys revert` refused because it needs
+        // BOTH `.prev` files. The host was left with no active certificate
+        // and no way forward.
+        let runner = StrictFake::new();
+        let clock = clock();
+        let key = format!("{PKI}/identity.key");
+        let crt = format!("{PKI}/identity.crt");
+        let key_next = format!("{PKI}/identity.key.next");
+        let crt_next = format!("{PKI}/identity.crt.next");
+        let key_prev = format!("{PKI}/identity.key.prev");
+        let crt_prev = format!("{PKI}/identity.crt.prev");
+
+        for (after, there) in [
+            (
+                "the certificate went aside",
+                vec![&key, &key_next, &crt_next, &crt_prev],
+            ),
+            (
+                "the key went aside too",
+                vec![&key_next, &crt_next, &key_prev, &crt_prev],
+            ),
+            (
+                "the new key came in",
+                vec![&key, &crt_next, &key_prev, &crt_prev],
+            ),
+        ] {
+            let files = there.iter().fold(MemFiles::new(), |files, path| {
+                files.given((*path).clone(), "x\n")
+            });
+            let view = helper(&runner, &files, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap();
+            assert_eq!(
+                view.state,
+                KeysState::Inconsistent,
+                "after {after} the switch is not finished"
+            );
+            let reason = view.reason.unwrap_or_default();
+            assert!(
+                reason.contains("stopped in the middle"),
+                "{after}: {reason}"
+            );
+            // And it says what is on the disk, which is what a person needs.
+            for path in &there {
+                assert!(reason.contains(path.as_str()), "{after}: {reason}");
+            }
+        }
+
+        // The one tuple that IS a finished switch still is one.
+        let whole = [&key, &crt, &key_prev, &crt_prev]
+            .iter()
+            .fold(MemFiles::new(), |files, path| {
+                files.given((*path).clone(), "x\n")
+            });
+        assert_eq!(
+            helper(&runner, &whole, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap()
+                .state,
+            KeysState::Switched
+        );
     }
 
     /// The switch: four renames, and the record says what was replaced.
