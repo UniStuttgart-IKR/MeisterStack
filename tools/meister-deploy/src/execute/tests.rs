@@ -2210,6 +2210,31 @@ fn a_raft_member_is_not_back_until_its_database_is() {
         !executor.is_raft_member("n1"),
         "n1 is compute, and its etcd is nobody's business"
     );
+    // And a host that sits in a raft group without a database of its own
+    // is not waited for either — there would be nothing to wait for.
+    let mut without = fx.release.resolved_fleet.clone();
+    without
+        .hosts
+        .get_mut("box")
+        .unwrap()
+        .effective_settings
+        .etcd = None;
+    let mut release = fx.release.clone();
+    release.resolved_fleet = without;
+    let other = Fixture {
+        release,
+        plan: fx.plan.clone(),
+        files: MemFiles::new(),
+        clock: FakeClock::at(at(NOW)),
+        state: StateDir::at("/repo/.meister-deploy"),
+        ssh: Ssh::with_known_hosts("/repo/known_hosts"),
+    };
+    assert!(
+        !other
+            .executor(&runner, &look, other.options())
+            .is_raft_member("box"),
+        "a raft member without a database has none to wait for"
+    );
 
     // The machine has booted the release from the very first look; its
     // database has not.

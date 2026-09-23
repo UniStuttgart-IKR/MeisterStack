@@ -1520,9 +1520,20 @@ impl<'a> Executor<'a> {
     /// therefore a host whose etcd is part of what "back" means.
     fn is_raft_member(&self, id: &str) -> bool {
         let fleet = &self.release.resolved_fleet;
-        fleet.groups.values().any(|group| {
-            group.kind == crate::manifest::GroupKind::Raft && group.members.iter().any(|m| m == id)
-        })
+        // Both halves, and the second one matters: a host can sit in a raft
+        // group without running a database of its own (the group is the
+        // unit of ROLLOUT, and a fleet may put a host in one for that
+        // reason alone). Waiting for an etcd such a host does not have
+        // would be waiting until the reboot deadline for nothing.
+        let has_etcd = fleet
+            .hosts
+            .get(id)
+            .is_some_and(|host| host.effective_settings.etcd.is_some());
+        has_etcd
+            && fleet.groups.values().any(|group| {
+                group.kind == crate::manifest::GroupKind::Raft
+                    && group.members.iter().any(|m| m == id)
+            })
     }
     // --- end lane 4A ---
 
