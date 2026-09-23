@@ -4429,38 +4429,84 @@ pub fn validate_against_next(
         let Some(current) = now_groups.get(id) else {
             continue;
         };
-        // --- lane L4 ---
-        // A group that is HEALTHIER than the plan assumed has not moved under
-        // it — it moved the way the plan meant it to. This guard exists to
-        // catch a NEW outage, and `blocked` is a derived word: during the
-        // bootstrap of a three-member raft it flips from "not blocked" (no
-        // member was up, nothing to protect) to "blocked" (two are up and the
-        // third is not) purely because the rollout is working. Measured in the
-        // lab on 2026-09-23: the run stopped after its second member came up,
-        // every time, with "group cp is at 2 of 3 … It could when this plan
-        // was made."
+        // --- lane L4, reworked for Astra finding F01, 2026-09-23 ---
+        // Astra finding F01, 2026-09-23: the question this re-check has to
+        // answer is not "are more members down than the plan assumed" but
+        // "can this group still afford what is about to be done to it", and
+        // a count made those two one question when they are two. Take a raft
+        // a, b, c planned while a was down: the plan is FOR a, because the
+        // one host a degraded group needs a plan for is the one that is down
+        // (see `already_unavailable`). If a comes back and b falls over
+        // before the run, exactly as many members are down as the plan wrote
+        // down and none of the safety is left -- the step would interrupt a,
+        // which is now one of the two that serve, and leave c alone with
+        // itself. The old guard read the equal count and skipped the whole
+        // group, `current.blocked` included.
         //
-        // So the comparison is over the NUMBER of members that are down, and
-        // only an increase is the fleet moving under the plan.
-        if current.unhealthy_now <= planned.unhealthy_now {
+        // So the verdict is about the members this run may still disrupt. A
+        // member that is unavailable right now does not become more so by
+        // being worked on, and that exemption is also what keeps a bootstrap
+        // running: once two of three are up the group reads `blocked`, and
+        // the third member -- the one the wave is for -- is still allowed.
+        // Measured in the lab on 2026-09-23 (lane L4): without it every
+        // three-member bootstrap stopped after its second member came up,
+        // with "group cp is at 2 of 3 ... It could when this plan was made."
+        let members: &[String] = release
+            .resolved_fleet
+            .groups
+            .get(id)
+            .map(|g| g.members.as_slice())
+            .unwrap_or_default();
+        // Does working on this host cost the group an available member?
+        let costs_a_member =
+            |host: &str| !(current.kind == GroupKind::Raft && already_unavailable(fresh, host));
+        // The executor names the host that is next, and then that step is
+        // the only disruption in flight. `validate_against` is told no such
+        // host, so it asks the same of every member this plan takes forward
+        // -- a member it blocked, or one it found settled, disrupts nobody.
+        let imminent: Option<&str> =
+            next.filter(|host| members.iter().any(|m| m.as_str() == *host));
+        let disrupts_a_serving_member = match imminent {
+            Some(host) => costs_a_member(host),
+            None => members.iter().any(|m| {
+                plan.selection.targets.iter().any(|t| t == m)
+                    && plan.hosts.get(m).map(|h| h.verdict) == Some(HostVerdict::Change)
+                    && costs_a_member(m.as_str())
+            }),
+        };
+        if !disrupts_a_serving_member {
             continue;
         }
-        let its_own_absence = next.is_some_and(|host| {
-            current.kind == GroupKind::Raft
-                && release
-                    .resolved_fleet
-                    .groups
-                    .get(id)
-                    .is_some_and(|g| g.members.iter().any(|m| m == host))
-                && already_unavailable(fresh, host)
-        });
-        if its_own_absence {
-            continue;
-        }
-        if planned.blocked.is_none()
-            && let Some(why) = &current.blocked
-        {
-            stop.push(format!("{why} It could when this plan was made."));
+        let group_moved = match &current.blocked {
+            // The plan was made over a group that could afford this.
+            Some(why) if planned.blocked.is_none() => {
+                Some(format!("{why} It could when this plan was made."))
+            }
+            // It could not, and in a raft group that was blocked already the
+            // only reason this plan may act at all is that the host it is
+            // for was the member that was down (`blocked_by`). That is not
+            // true any more -- and "it could when this plan was made" would
+            // be a sentence that is not true either.
+            Some(why) if current.kind == GroupKind::Raft => Some(match imminent {
+                Some(host) => format!(
+                    "{why} This plan may work on {host} only because {host} was itself the \
+                     member that was down when it was made, and {host} is serving now."
+                ),
+                None => format!(
+                    "{why} It was blocked when this plan was made as well, and the member(s) \
+                     it may still take forward are serving now rather than down."
+                ),
+            }),
+            // Anything else is a group that was blocked when the plan was
+            // made and is blocked now for a reason that cannot have moved --
+            // a `rollout.max_unavailable` of 0 is the whole of it outside a
+            // raft. The plan wrote that down and blocked the steps it
+            // forbids; stopping the rest of the run over it again is what
+            // makes a fleet unrollable.
+            _ => None,
+        };
+        if let Some(line) = group_moved {
+            stop.push(line);
         } else if current.allowed_unavailable < planned.allowed_unavailable {
             stop.push(format!(
                 "group {id} could afford to lose {} member(s) when this plan was made and can \
@@ -6974,12 +7020,31 @@ mod tests {
             views["cloud"].blocked.is_some(),
             "two of three is a degraded quorum, and it says so"
         );
+        // Astra finding F01, 2026-09-23: this used to be asked of the whole
+        // plan, because the exemption was "fewer members are down than the
+        // plan assumed" -- a count. A count cannot tell an outage that moved
+        // from one that healed, so the exemption is now the host that is
+        // NEXT, which is what the lab measured: the third member of the
+        // bootstrap, the one the wave is for, is the one that must get
+        // through.
+        assert!(
+            matches!(
+                validate_against_next(&plan, &release, &better, at(NOW), Some("cloud-c")),
+                Verdict::Proceed
+            ),
+            "the member this wave is for is the member that is down; working on it costs \
+             the group nothing"
+        );
+        // And asked WITHOUT a next host the same snapshot stops, which is
+        // the honest answer: this plan also means to activate cloud-a and
+        // cloud-b, and those two are what the quorum now protects.
         assert!(
             matches!(
                 validate_against(&plan, &release, &better, at(NOW)),
-                Verdict::Proceed
+                Verdict::Stop { .. }
             ),
-            "a group with FEWER members down than the plan assumed has not moved under it"
+            "a plan that still means to interrupt the two members that serve is not the \
+             truth about this fleet any more"
         );
 
         // And the other direction is unchanged: a group that got worse stops
@@ -7671,6 +7736,116 @@ mod tests {
                 .any(|r| r.contains("It could when this plan was made")),
             "{:?}",
             verdict.reasons()
+        );
+    }
+
+    /// Move an outage inside a raft group: one member stops answering etcd
+    /// or starts again, in the snapshot and in what the others report.
+    fn etcd_health(observation: &mut Observations, id: &str, healthy: bool) {
+        observation
+            .hosts
+            .get_mut(id)
+            .expect("a member")
+            .etcd
+            .as_mut()
+            .expect("a raft member")
+            .healthy = healthy;
+        for other in observation.hosts.values_mut() {
+            if let Some(etcd) = other.etcd.as_mut() {
+                for m in &mut etcd.members {
+                    if m.name == id {
+                        m.healthy = healthy;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_outage_that_moved_to_another_member_stops_the_run() {
+        // Astra finding F01, 2026-09-23: the plan is made while cloud-c is
+        // down, so cloud-c is the host it is FOR (W8). Before it runs,
+        // cloud-c comes back and cloud-a falls over. The NUMBER of members
+        // that are down has not changed, and everything the plan relied on
+        // has: its one step would now interrupt cloud-c, which is serving,
+        // and leave cloud-a and cloud-b to hold a quorum of two that is
+        // already one short.
+        let (release, planned_obs) = three_member_cloud(1);
+        let plan = planned(&release, "group=cloud", &planned_obs);
+        assert_eq!(plan.groups["cloud"].unhealthy_now, 1);
+        assert!(plan.groups["cloud"].blocked.is_some());
+        assert_eq!(plan.hosts["cloud-c"].verdict, HostVerdict::Change);
+        assert_eq!(plan.hosts["cloud-a"].verdict, HostVerdict::Blocked);
+
+        let mut fresh = planned_obs.clone();
+        etcd_health(&mut fresh, "cloud-c", true);
+        etcd_health(&mut fresh, "cloud-a", false);
+        let (views, _) = group_views(
+            &release.resolved_fleet,
+            &fresh,
+            &plan.selection.targets.iter().cloned().collect(),
+        );
+        assert_eq!(
+            views["cloud"].unhealthy_now, 1,
+            "exactly as many members are down as when the plan was made"
+        );
+
+        let verdict = validate_against_next(&plan, &release, &fresh, later(), Some("cloud-c"));
+        assert!(matches!(verdict, Verdict::Stop { .. }), "{verdict:?}");
+        let said = verdict.reasons().join(" ");
+        assert!(said.contains("group cloud"), "{said}");
+        assert!(said.contains("cloud-c is serving now"), "{said}");
+    }
+
+    #[test]
+    fn the_member_that_is_down_now_is_still_worked_on() {
+        // Astra finding F01, 2026-09-23, the other half: the same moved
+        // outage, asked about the member that is down NOW. Working on a host
+        // that is already unavailable costs the group nothing, so this is
+        // the one step the fleet can still afford -- and refusing it is the
+        // deadlock W8 is about.
+        let (release, planned_obs) = three_member_cloud(1);
+        let plan = planned(&release, "group=cloud", &planned_obs);
+        let mut fresh = planned_obs.clone();
+        etcd_health(&mut fresh, "cloud-c", true);
+        etcd_health(&mut fresh, "cloud-a", false);
+        let verdict = validate_against_next(&plan, &release, &fresh, later(), Some("cloud-a"));
+        assert_eq!(verdict, Verdict::Proceed, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_bootstrap_still_gets_to_its_third_member() {
+        // Astra finding F01, 2026-09-23, against lane L4: the guard that
+        // catches the moved outage must not catch this. Three fresh members
+        // are planned while none of them serves; by the time the third wave
+        // comes round two are up, the group reads `blocked`, and the third
+        // member -- the one that wave is for -- is still unavailable and
+        // must go through. This is the lab measurement of 2026-09-23.
+        let (release, planned_obs) = three_member_cloud(3);
+        let plan = planned(&release, "group=cloud", &planned_obs);
+        assert!(plan.groups["cloud"].blocked.is_none());
+        let (_, two_up) = three_member_cloud(1);
+        let verdict = validate_against_next(&plan, &release, &two_up, later(), Some("cloud-c"));
+        assert_eq!(verdict, Verdict::Proceed, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_group_that_got_healthier_stops_nothing() {
+        // Astra finding F01, 2026-09-23: the check is about what the group
+        // can afford now, so a group that can afford MORE than the plan
+        // assumed is not the fleet moving under the plan -- not even when
+        // the host that is next is one of the members that came back.
+        let (release, planned_obs) = three_member_cloud(1);
+        let plan = planned(&release, "group=cloud", &planned_obs);
+        assert_eq!(plan.groups["cloud"].allowed_unavailable, 0);
+        let (_, healthy) = three_member_cloud(0);
+        for next in ["cloud-a", "cloud-c"] {
+            let verdict = validate_against_next(&plan, &release, &healthy, later(), Some(next));
+            assert_eq!(verdict, Verdict::Proceed, "{next}: {verdict:?}");
+        }
+        assert_eq!(
+            validate_against(&plan, &release, &healthy, later()),
+            Verdict::Proceed
         );
     }
 
