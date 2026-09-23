@@ -396,12 +396,22 @@ fn run() -> Result<()> {
                 (false, false) => RevertAsker::Operator,
             };
             let record = helper.revert(txn, because.as_deref(), asked)?;
-            answer(
-                &cli,
-                "revert",
-                serde_json::to_value(&record)?,
-                &describe(&record),
-            )?;
+            // Astra finding F07, 2026-09-23: a deadline that found a
+            // decision in flight took nothing back, and the journal of the
+            // machine is the only place anybody will ever read that. The
+            // ordinary line says what the record now is; this one says why
+            // it is still what it was.
+            let sentence = if record.state_word() == "confirming" {
+                format!(
+                    "{}: a confirmation was in flight, so nothing was taken back — the \
+                     deadline means nobody spoke, and somebody did. `meister-activate \
+                     confirm --txn {}` finishes it.",
+                    record.id, record.id
+                )
+            } else {
+                describe(&record)
+            };
+            answer(&cli, "revert", serde_json::to_value(&record)?, &sentence)?;
         }
         Verb::Txn { cmd } => match cmd {
             TxnVerb::List => {

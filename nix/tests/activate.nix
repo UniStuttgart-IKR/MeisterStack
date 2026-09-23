@@ -250,6 +250,50 @@ pkgs.testers.runNixOSTest {
       refused = machine.fail("meister-activate gc --keep 1 2>&1")
       assert "must not be collected" in refused, refused
       machine.succeed("meister-activate confirm --txn t6")
+      machine.succeed("meister-activate txn retire --txn t6 --run run-a")
+
+      # --- a decision that did not finish (Astra finding F07, 2026-09-23) --
+      #
+      # `confirm` writes `confirming` BEFORE it stops the revert timer, so a
+      # process that dies between the two leaves a record which says that a
+      # decision was in flight instead of one which says `pending` beside a
+      # timer that is gone. The dying cannot be staged in a VM, so the record
+      # is put into that state by hand — that is exactly what the crash
+      # leaves behind — and everything after it is the real machine: a real
+      # timer fires into the window and must take nothing back, because the
+      # deadline means "nobody spoke" and somebody did.
+      machine.succeed(
+          "meister-activate activate --txn t7 --toplevel ${systemB} "
+          "--mode switch --confirm-within 20 --run run-a"
+      )
+      machine.succeed(
+          "sed -i 's/\"pending\"/\"confirming\"/' "
+          "/var/lib/meisterstack/deploy/txn/t7.json"
+      )
+      in_flight = json.loads(machine.succeed("meister-activate --json txn show --txn t7"))
+      assert in_flight["state"] == "confirming", in_flight
+      # It is open, so no plan starts over on top of it and nobody retires it.
+      assert [t["id"] for t in status()["open_txns"]] == ["t7"], status()
+
+      machine.wait_until_fails("systemctl is-active meister-revert-t7.timer", timeout=90)
+      machine.wait_until_succeeds(
+          "journalctl -u meister-revert-t7.service --no-pager | "
+          "grep -q 'a confirmation was in flight'", timeout=60
+      )
+      assert generation_file() == "B", "a decision that was taken was taken back anyway"
+      after_timer = json.loads(machine.succeed("meister-activate --json txn show --txn t7"))
+      assert after_timer["state"] == "confirming", after_timer
+
+      # An operator's revert says the same thing and does nothing either.
+      refused = machine.fail("meister-activate revert --txn t7 2>&1")
+      assert "was in flight" in refused, refused
+      # What finishes it is the confirmation itself — the same verb, no
+      # repair command — and then the record is closed like any other.
+      machine.succeed("meister-activate confirm --txn t7")
+      finished = json.loads(machine.succeed("meister-activate --json txn show --txn t7"))
+      assert finished["state"] == "confirmed", finished
+      assert status()["open_txns"] == [], "a confirmed transaction is not open"
+      machine.succeed("meister-activate txn retire --txn t7 --run run-a")
 
       print("meister-activate: the semantics hold on a real machine")
     '';
