@@ -328,6 +328,16 @@ pkgs.testers.runNixOSTest {
     # the counter-probe; `alice` is the one that gets taken back.
     operator.succeed("meister-ca --dir /root/ca --admin root --admin alice")
 
+    # And into the repository, where it is a committed, public file like
+    # `known_hosts`. `resolve` refuses a working tree with untracked files
+    # in it (a manifest resolved from one could not be resolved again), so
+    # this is the moment it is committed.
+    operator.succeed("git -C /root/fleet add -A")
+    operator.succeed(
+        "git -C /root/fleet -c user.name=test -c user.email=test@example "
+        "commit -qm 'the revocation list'"
+    )
+
     # And the cloud's key-encryption key, which is an OPERATOR FILE: this
     # tool never makes one and never replaces one.
     # 64 hex characters and no newline: the cloud reads 32 raw bytes or 64
