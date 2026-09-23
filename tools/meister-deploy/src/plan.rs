@@ -2068,9 +2068,10 @@ fn decide_host(
     if host.deployment == crate::manifest::Deployment::Context {
         d.stop_all.push(format!(
             "{id} is deployed as `context`: its image comes from somewhere else and its \
-             binaries are pushed, so a closure is not how it is taken forward. \
-             `meister-deploy legacy context-push` carries it until the context fleet is \
-             migrated."
+             binaries are pushed, so a closure is not how it is taken forward. The push \
+             that serves such a host lives in the lab repository now \
+             (`~/git/meisterstack-lab/legacy/push.sh`), and it is not this tool: migrate \
+             the host to `deployment = \"nixos\"` to have it planned here."
         ));
         return settle(d, HostVerdict::Blocked);
     }
@@ -2765,8 +2766,8 @@ fn decide_revoke_host(
 
     if host.deployment == crate::manifest::Deployment::Context {
         d.stop_all.push(format!(
-            "{id} is deployed as `context`: its files are pushed by the legacy adapter, not by \
-             this plan."
+            "{id} is deployed as `context`: its files are pushed by the adapter in the lab \
+             repository (`legacy/push.sh`), not by this plan."
         ));
         return settle(d, HostVerdict::Blocked);
     }
@@ -6505,7 +6506,12 @@ mod tests {
         let plan = planned(&release, "host=n2", &observation);
         let why = &plan.hosts["n2"].reasons[0];
         assert!(why.contains("deployed as `context`"), "{why}");
-        assert!(why.contains("legacy context-push"), "{why}");
+        // The sentence has to name where the push lives NOW. `src/legacy/`
+        // and the verb `legacy push` went with M5B; a host of the context
+        // fleet is served from the lab repository, and a refusal that
+        // pointed at a verb this binary no longer has would send an
+        // operator looking for it.
+        assert!(why.contains("meisterstack-lab/legacy/push.sh"), "{why}");
     }
 
     #[test]
