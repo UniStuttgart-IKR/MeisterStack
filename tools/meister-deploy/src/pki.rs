@@ -417,6 +417,116 @@ pub fn crl_path(repo: &Path) -> PathBuf {
     repo.join(CRL_FILE)
 }
 
+/// Where the certificate of a rotation waits: beside the one in use, under
+/// the same name with `.next` in it.
+///
+/// A name of its own and not the name the active certificate has, because
+/// the ACTIVE one is what `plan` compares a host against — writing the new
+/// certificate over it would make the next ordinary upgrade deliver it
+/// straight to the host, with no overlap, no verify and no way back. That
+/// is precisely what `keys rotate` exists to avoid.
+pub fn next_issued_path(repo: &Path, host_id: &str, kind: &str) -> PathBuf {
+    issued_path(repo, host_id, &format!("{kind}.next.crt"))
+}
+
+pub fn next_csr_path(repo: &Path, host_id: &str, kind: &str) -> PathBuf {
+    csr_path(repo, host_id, &format!("{kind}.next"))
+}
+
+/// `meister-activate keygen --suffix <suffix>`, over ssh.
+pub fn keygen_beside_cmd(
+    ssh: &Ssh,
+    target: &Target,
+    subject: &str,
+    file: &str,
+    replace: bool,
+    suffix: &str,
+) -> Cmd {
+    let mut argv = vec![
+        "meister-activate".to_string(),
+        "--json".to_string(),
+        "keygen".to_string(),
+        "--subject".to_string(),
+        subject.to_string(),
+        "--kind".to_string(),
+        file.to_string(),
+        "--suffix".to_string(),
+        suffix.to_string(),
+    ];
+    if replace {
+        argv.push("--replace".to_string());
+    }
+    ssh.exec(target, argv, Effect::TargetWrite, KEYGEN_DEADLINE)
+}
+
+/// Everything the plan has to say about one rotation, out of what the fleet
+/// renders for that host.
+///
+/// The paths, the owner and the mode are the `secret_refs` of the
+/// certificate this rotation replaces — the same entries `deliver-secret`
+/// reads — and the units are every unit that reads that file. So a rotation
+/// pokes exactly what a delivery would poke, and neither of them knows the
+/// names of any units of its own.
+pub struct Prepared<'a> {
+    pub host_id: &'a str,
+    pub kind: &'a str,
+    pub subject: &'a str,
+    /// What the host answered `keygen` with.
+    pub public_key_sha256: &'a str,
+    /// `sha256:<hex>` of the certificate that was just issued for it.
+    pub cert_sha256: &'a str,
+    pub serial: Option<String>,
+    /// Where that certificate is, relative to the operator's repository.
+    pub source: &'a Path,
+}
+
+pub fn rotation_of(
+    host: &ResolvedHost,
+    prepared: Prepared<'_>,
+) -> Result<crate::plan::KeyRotation> {
+    let Prepared {
+        host_id,
+        kind,
+        subject,
+        public_key_sha256,
+        cert_sha256,
+        serial,
+        source,
+    } = prepared;
+    let wanted = format!("/{kind}.crt");
+    let refs: Vec<&crate::manifest::SecretRef> = host
+        .secret_refs
+        .iter()
+        .filter(|s| s.target_path.ends_with(&wanted))
+        .collect();
+    let Some(first) = refs.first() else {
+        bail!(
+            "the fleet renders no {kind} certificate for {host_id}: no `secret_refs` entry of              its names a file called {kind}.crt. A key that no configuration reads is a key              there is no point rotating."
+        );
+    };
+    let cert_path = first.target_path.clone();
+    let key_path = cert_path.replace(&format!("{kind}.crt"), &format!("{kind}.key"));
+    let mut units: Vec<String> = refs
+        .iter()
+        .filter_map(|s| s.reload.as_ref().map(|r| r.unit.clone()))
+        .collect();
+    units.sort();
+    units.dedup();
+    Ok(crate::plan::KeyRotation {
+        kind: kind.to_string(),
+        subject: subject.to_string(),
+        key_path,
+        cert_path,
+        source: source.display().to_string(),
+        public_key_sha256: public_key_sha256.to_string(),
+        cert_sha256: cert_sha256.to_string(),
+        serial,
+        owner: first.owner.clone(),
+        mode: first.mode.clone(),
+        units,
+    })
+}
+
 /// How long `meister-ca` may take over a revocation. openssl on two small
 /// files.
 pub const CA_DEADLINE: Duration = Duration::from_secs(120);

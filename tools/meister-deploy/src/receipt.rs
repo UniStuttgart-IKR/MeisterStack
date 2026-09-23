@@ -793,6 +793,11 @@ pub enum Step {
     /// There is nothing left to do here.
     Done,
     // --- lane 3-integration ---
+    // --- lane 5A ---
+    /// A key rotation is open on this host and this is the phase it is at.
+    /// Everything before it happened; nothing after it did.
+    AtKeysPhase(ActionKind),
+    // --- end lane 5A ---
     /// The run stopped in front of a `provider-reboot`. The preparation is
     /// behind us — staged, delivered, switched and confirmed — and the step
     /// itself is the question "has the provider been here", which the step
@@ -800,6 +805,79 @@ pub enum Step {
     AtTheProviderReboot,
     // --- end lane 3-integration ---
 }
+
+// --- lane 5A: the resume table of a rotation --------------------------------
+
+/// Where a resume picks a rotation up, asked of the TARGET's own record.
+///
+/// The five phases leave five different things on a host's disk, and that
+/// is what this reads — not the journal. A journal can stop in the middle
+/// of a line; a pair of files cannot be half renamed. The journal is only
+/// asked one thing, and only in the one case the disk cannot answer: a host
+/// with nothing prepared and nothing replaced either never started or had
+/// its prepared pair taken away, and a run that has already switched is the
+/// difference.
+///
+/// | on the host | what is left to do |
+/// |---|---|
+/// | `prepared` | the certificate, the switch, the verify, the removal |
+/// | `overlap` | the switch, the verify, the removal |
+/// | `switched` | the verify and the removal |
+/// | `confirmed` | nothing |
+/// | `reverted` | nothing; the forward attempt stays failed |
+/// | `none`, nothing in the journal | the prepared pair is gone: plan again |
+/// | `none`, a switch in the journal | a person looks |
+/// | `inconsistent` | a person looks |
+pub fn next_keys_step(host: &HostRun, state: crate::activate::KeysState) -> Step {
+    use crate::activate::KeysState;
+    match state {
+        KeysState::Prepared => Step::AtKeysPhase(ActionKind::KeysOverlap),
+        KeysState::Overlap => Step::AtKeysPhase(ActionKind::KeysSwitch),
+        KeysState::Switched => Step::AtKeysPhase(ActionKind::KeysVerify),
+        KeysState::Confirmed => Step::Done,
+        KeysState::Reverted => Step::RolledBack,
+        KeysState::None => {
+            let switched = host
+                .actions
+                .iter()
+                .any(|a| a.kind == ActionKind::KeysSwitch);
+            if switched {
+                Step::RecoveryRequired(format!(
+                    "this run switched a key on {} and the host now holds neither a prepared \
+                     pair nor a replaced one. Read `meister-activate keys status` on it and \
+                     decide there; this tool will not put a key in on top of that.",
+                    host.id
+                ))
+            } else {
+                Step::RecoveryRequired(format!(
+                    "the key {} had prepared is not on it any more, so the certificate this \
+                     plan carries is for a key nobody has. Make the plan again with \
+                     `keys rotate` — it prepares the key and has the certificate issued in \
+                     one go.",
+                    host.id
+                ))
+            }
+        }
+        KeysState::Inconsistent => Step::RecoveryRequired(format!(
+            "the key files on {} do not add up: read `meister-activate keys status` on it and \
+             decide there.",
+            host.id
+        )),
+    }
+}
+
+/// The order the five phases happen in, for the skip set of a resume.
+pub fn keys_phase_order(kind: ActionKind) -> Option<u8> {
+    match kind {
+        ActionKind::KeysPrepare => Some(0),
+        ActionKind::KeysOverlap => Some(1),
+        ActionKind::KeysSwitch => Some(2),
+        ActionKind::KeysVerify => Some(3),
+        ActionKind::KeysRemove => Some(4),
+        _ => None,
+    }
+}
+// --- end lane 5A ------------------------------------------------------------
 
 /// The V17 table.
 ///
@@ -1367,6 +1445,86 @@ mod tests {
         });
         run.txn_id = Some("txn-1".to_string());
         run
+    }
+
+    // --- lane 5A: the rotation table -----------------------------------
+
+    /// The five phases leave five different things on a host's disk, and
+    /// that is what a resume reads. The journal is asked one thing only:
+    /// did THIS run already switch.
+    #[test]
+    fn a_resume_picks_a_rotation_up_where_the_host_is() {
+        use crate::activate::KeysState;
+        let fresh = HostRun::new("box");
+        for (state, want) in [
+            (
+                KeysState::Prepared,
+                Step::AtKeysPhase(ActionKind::KeysOverlap),
+            ),
+            (
+                KeysState::Overlap,
+                Step::AtKeysPhase(ActionKind::KeysSwitch),
+            ),
+            (
+                KeysState::Switched,
+                Step::AtKeysPhase(ActionKind::KeysVerify),
+            ),
+            (KeysState::Confirmed, Step::Done),
+            (KeysState::Reverted, Step::RolledBack),
+        ] {
+            assert_eq!(next_keys_step(&fresh, state), want, "{state:?}");
+        }
+    }
+
+    /// Nothing on the disk means two different things, and the journal is
+    /// what tells them apart.
+    #[test]
+    fn a_host_with_nothing_prepared_is_read_by_what_this_run_did() {
+        use crate::activate::KeysState;
+        // Nothing happened yet: the prepared key is gone, and the
+        // certificate in the plan is for a key nobody has.
+        let step = next_keys_step(&HostRun::new("box"), KeysState::None);
+        let Step::RecoveryRequired(why) = step else {
+            panic!("a plan whose key is gone is not something to carry on with");
+        };
+        assert!(why.contains("keys rotate"), "{why}");
+
+        // This run switched, and the host has neither pair. Nobody puts a
+        // key in on top of that.
+        let mut switched = HostRun::new("box");
+        switched.actions.push(ActionRun {
+            seq: 5,
+            kind: ActionKind::KeysSwitch,
+            started: at("2026-09-23T10:00:00Z"),
+            ended: Some(at("2026-09-23T10:00:01Z")),
+            result: Some(ActionResult::Ok),
+            evidence: Vec::new(),
+            cmd_refs: Vec::new(),
+        });
+        let Step::RecoveryRequired(why) = next_keys_step(&switched, KeysState::None) else {
+            panic!("a switched host with no pair needs a person");
+        };
+        assert!(why.contains("keys status"), "{why}");
+    }
+
+    /// And the order the skip set is built from.
+    #[test]
+    fn the_five_phases_have_an_order() {
+        let order: Vec<Option<u8>> = [
+            ActionKind::KeysPrepare,
+            ActionKind::KeysOverlap,
+            ActionKind::KeysSwitch,
+            ActionKind::KeysVerify,
+            ActionKind::KeysRemove,
+            ActionKind::Activate,
+        ]
+        .into_iter()
+        .map(keys_phase_order)
+        .collect();
+        assert_eq!(
+            order,
+            vec![Some(0), Some(1), Some(2), Some(3), Some(4), None]
+        );
     }
 
     #[test]
