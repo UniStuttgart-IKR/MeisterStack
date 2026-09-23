@@ -6,10 +6,12 @@ config/token
 ctx.sh
 /tmp
 
-# local dev environments
+# local dev environments. `deploy/env` was read by deploy/push.sh and
+# deploy/check.sh; both went to the lab repository with M5B, and the file is
+# still ignored here because a checkout may carry one with real addresses in
+# it (L3 finding B5).
 deploy/env
 deploy/env.*
-!deploy/env.example
 
 # Nix-Build-Ausgaben
 /result
