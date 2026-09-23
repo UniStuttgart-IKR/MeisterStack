@@ -9,7 +9,10 @@
 # there is nothing a rollback cannot take back — the config files, the etcd
 # membership and the [auth] table of the cloud are all written by Nix, out of
 # the same `meisterstack.context.defaults` the boot renderer would have read,
-# through nix/lib/render.nix. `checks.render-parity` runs both over the same
+# through nix/lib/render.nix. Until M5B there was a second renderer that did
+# it at BOOT, and `checks.render-parity` held the two to each other; that one
+# went to the lab repository with the appliance image it belonged to. What is
+# left is the one that runs at build time. It used to be that both ran over the same
 # input and compares the parsed TOML, because two renderers is one too many.
 #
 # What this profile does NOT decide, on purpose: dhcp, firewall, resolvconf,
@@ -176,11 +179,13 @@ in
       {
         assertion = !ms.context.enable;
         message =
-          "this host imports both nix/managed.nix and the boot renderer "
-          + "(nix/context.nix, usually through nix/appliance.nix). They are two "
-          + "authors of the same config files: one writes them into the system "
+          "this host imports nix/managed.nix AND something that renders its "
+          + "config files at boot (`meisterstack.context.enable`). They are two "
+          + "authors of the same files: one writes them into the system "
           + "generation, the other overwrites them at boot, and a rollback would "
-          + "take back only half of it. Pick one profile.";
+          + "take back only half of it. Pick one. This flake ships no such "
+          + "renderer any more — the one the lab's context VMs boot lives in "
+          + "~/git/meisterstack-lab/legacy/nix/context.nix.";
       }
     ];
 

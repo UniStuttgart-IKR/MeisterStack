@@ -7,9 +7,10 @@
 # It exists for one reason, and lane 1A named it (§8, open point 6): on a
 # one-box fleet the raft group has one member, so `MEISTER_ETCD_PEERS`,
 # `MEISTER_ETCD_MEMBER` and `MEISTER_ETCD_TOKEN` are empty and
-# `checks.render-parity` never compares them. Here they are not empty, so
-# the build-time renderer (nix/lib/render.nix) and the boot-time one
-# (nix/context.nix) are held to each other on the etcd road as well.
+# nothing derived them. Here they are not empty, so the renderer
+# (nix/lib/render.nix) is exercised on the etcd road as well. (Until M5B
+# there was a second, boot-time renderer and `checks.render-parity` held
+# the two to each other; it went with the appliance image.)
 #
 # No addons role and therefore no OIDC issuer: that half is covered by
 # examples/fleet/one-box.toml, and a second copy of it here would only make

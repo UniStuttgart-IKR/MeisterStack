@@ -61,12 +61,6 @@
       example = fleetOf ./examples/fleet/one-box.toml exampleProfiles;
       exampleHa = fleetOf ./examples/fleet/ha.toml exampleProfiles;
 
-      # The role-agnostic image for OpenNebula: every unit ships, and the
-      # CONTEXT decides at boot which of them starts. `appliance` and not
-      # `default`, because `default` is the SERVICES and they decide nothing
-      # about the machine — no stateVersion, no firewall, no console, and no
-      # units at all without a role.
-      applianceModules = [ self.nixosModules.appliance ];
     in
     {
       # What a host that is not ours imports.
@@ -81,22 +75,23 @@
       # Somebody else's NixOS host has answers to all of those already, and
       # `checks.services-are-pure` holds this export to it.
       #
-      # Beside it are the three PROFILES, which are allowed to decide such
-      # things because each of them is a whole machine:
+      # Beside it is the one PROFILE, which is allowed to decide such things
+      # because it is a whole machine:
       #
-      #   appliance  today's image: the services, the boot renderer, the
-      #              OpenNebula provider, and base.nix' host-global set.
       #   managed    a host meister-deploy deploys to: nix on, config files
       #              complete at build time, no renderer. `lib.mkFleet` gives
       #              it to every host the inventory calls `nixos`.
-      #   context    the boot renderer on its own, for a host that wants one
-      #              without the rest of the appliance.
+      #
+      # There used to be two more, `appliance` and `context`, and with them
+      # `provider-opennebula`: the image the twelve OpenNebula VMs of the lab
+      # boot, which renders its configuration files AT BOOT out of a context
+      # its provider hands it. They went with M5B (lane L3 has the parity
+      # evidence) and live in `~/git/meisterstack-lab/legacy/nix/`, which is
+      # where the fleet that boots them lives. A machine of THIS flake is a
+      # machine whose configuration was decided when it was built.
       nixosModules = {
         services = ./nix/services.nix;
         managed = ./nix/managed.nix;
-        appliance = ./nix/appliance.nix;
-        context = ./nix/context.nix;
-        provider-opennebula = ./nix/provider-opennebula.nix;
         default = self.nixosModules.services;
       };
 
@@ -154,12 +149,11 @@
         module-options =
           let
             evaluated = nixpkgs.lib.nixosSystem {
-              # The appliance plus `managed`: the table documents every
-              # option this flake exports, and the two profiles are mutually
-              # exclusive only in their `enable`, not in their declarations.
-              # Without this line the managed half of the stack would have no
-              # documentation at all.
-              modules = applianceModules ++ [ self.nixosModules.managed ] ++ [{
+              # The services plus `managed`: the table documents every option
+              # this flake exports. (It used to be the appliance plus
+              # `managed`, because the appliance declared the renderer's
+              # options; the renderer went with M5B and so did they.)
+              modules = [ self.nixosModules.services self.nixosModules.managed ] ++ [{
                 nixpkgs.hostPlatform = system;
                 nixpkgs.overlays = [ self.overlays.default ];
                 fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
@@ -192,52 +186,12 @@
         #   nix build .#example-direct-boot && cat result/cmdline
         example-direct-boot = example.packages.${system}.n2-direct-boot;
 
-        # The generic appliance image, unchanged: the twelve context VMs of
-        # the lab boot this, and they will until their migration is done
-        # (L3). It is the one image that is NOT a fleet host — no hostname,
-        # no roles, no addresses — because the context decides all of that
-        # at boot.
-        control-plane-image = nixos-generators.nixosGenerate {
-          inherit system;
-          modules = applianceModules;
-          format = "qcow";
-        };
-
-        # The same image from the native builder, for the parity measurement
-        # the brief of this lane asks for (M0 probe S4 did it for the
-        # installer; these two are qemu/qcow and raw-efi). Both are built and
-        # compared in the report; until they are equal for a format, that
-        # format keeps its nixos-generators road.
-        control-plane-image-native =
-          (nixpkgs.lib.nixosSystem {
-            modules = applianceModules ++ [{
-              nixpkgs.hostPlatform = system;
-              nixpkgs.overlays = [ self.overlays.default ];
-            }];
-          }).config.system.build.images.qemu;
       };
 
       # One system per host of the EXAMPLE fleet, so that `nix flake check`
       # evaluates them — which is also what makes every assertion of every
       # host fire here rather than in a deployment.
-      nixosConfigurations = example.nixosConfigurations // {
-        # The appliance as a plain NixOS system: how the rendered role
-        # templates can be read without booting anything.
-        #
-        #   nix build --no-link --print-out-paths \
-        #     '.#nixosConfigurations.control-plane.config.environment.etc."meisterstack/cloud.toml".source'
-        control-plane = nixpkgs.lib.nixosSystem {
-          modules = applianceModules ++ [{
-            nixpkgs.hostPlatform = system;
-            nixpkgs.overlays = [ self.overlays.default ];
-            # Only so that this configuration evaluates to the END: a system
-            # without a root filesystem is an assertion rather than a value.
-            # The two lines are what the qcow format sets anyway.
-            fileSystems."/" = { device = "/dev/disk/by-label/nixos"; fsType = "ext4"; };
-            boot.loader.grub.device = "nodev";
-          }];
-        };
-      };
+      nixosConfigurations = example.nixosConfigurations;
 
       # The one shell this repository needs, and it exists because a musl
       # build needed hand-typed store paths without it.
@@ -387,22 +341,6 @@
           };
           # --- end lane 4A ---
 
-          # The boot renderer and the build-time renderer, on the same input.
-          # Both fleets: one-box has a raft group of ONE (no etcd variables),
-          # ha has three (1A §8, open point 6).
-          render-parity = import ./nix/tests/render-parity.nix {
-            inherit nixpkgs lib pkgs system self disko;
-            inv = example.inventory;
-            hostIds = [ "box" "n1" ];
-            profiles = exampleProfiles;
-          };
-          render-parity-ha = import ./nix/tests/render-parity.nix {
-            inherit nixpkgs lib pkgs system self disko;
-            inv = exampleHa.inventory;
-            hostIds = [ "cp-a" "cp-b" "a1" ];
-            profiles = exampleProfiles;
-          };
-
           # An installer medium carries no secret (D9).
           #
           # The cheap half of the claim, and the one `nix flake check` can
@@ -550,10 +488,11 @@
               grep -q metrics_listen ${cfg.environment.etc."meisterstack/cloud.toml".source}
 
               # And the two the host decides and we must not. The example
-              # sets 24.11 and a firewall ON; ours would be 25.11 and a
-              # firewall off (nix/appliance.nix). If either of these lines
-              # ever reads like our answer, a module of ours has started
-              # deciding something that belongs to somebody else's machine.
+              # sets 24.11 and a firewall ON; a module of ours sets neither,
+              # and `services-are-pure` is the check that says so. If either
+              # of these lines ever reads like an answer of ours, a module
+              # has started deciding something that belongs to somebody
+              # else's machine.
               test '${cfg.system.stateVersion}' = '24.11' \
                 || { echo "the foreign host's stateVersion is ${cfg.system.stateVersion}, not its own 24.11"; exit 1; }
               ${lib.optionalString (!cfg.networking.firewall.enable)
