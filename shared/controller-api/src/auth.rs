@@ -500,8 +500,11 @@ pub enum Reload {
         serials: usize,
         crl_number: Option<u64>,
     },
-    /// It moved and it could not be read. The list this process holds is
-    /// the OLD one, deliberately — see [`Revocations::refresh_at`].
+    /// It moved and it could not be read, or it was read but refused: an
+    /// older CRL number than the one already in force (Astra finding F14,
+    /// 2026-09-23), or the same number with different content. The list
+    /// this process holds is the OLD one, deliberately — see
+    /// [`Revocations::refresh_at`].
     Failed(String),
 }
 
@@ -636,6 +639,58 @@ impl Revocations {
         }
         match Self::read(&self.path, now) {
             Ok(fresh) => {
+                let (held_number, held_serials) = {
+                    let list = self.list.read().expect("revocation list");
+                    (list.crl_number, list.serials.clone())
+                };
+                // Astra finding F14, 2026-09-23: this reload is the only
+                // place a live process re-checks revocation (the TLS
+                // handshake's own CRL is read once, at startup, and never
+                // replaced — see `pki::tls::server_config`), and until here
+                // it accepted whatever mtime/size said had changed, with no
+                // check that the new list is actually newer. Restoring an
+                // earlier CRL — same file path, older or equal number —
+                // used to be accepted outright, forgetting every serial
+                // that a later list alone had revoked. A CRL number that
+                // goes backwards is refused outright; a CRL number that
+                // stays the same but the content differs is not "the same
+                // list twice" and is refused too, in either case keeping
+                // the list already in force.
+                if let (Some(held_n), Some(fresh_n)) = (held_number, fresh.crl_number)
+                    && fresh_n < held_n
+                {
+                    let why = format!(
+                        "{} carries crl number {fresh_n}, older than the {held_n} already \
+                         enforced; a revocation list that goes backwards is refused",
+                        self.path.display()
+                    );
+                    warn!(
+                        crl = %self.path.display(),
+                        error = %why,
+                        "an older revocation list was offered; the one this process already \
+                         holds stays in force"
+                    );
+                    return Reload::Failed(why);
+                }
+                if held_number.is_some()
+                    && held_number == fresh.crl_number
+                    && held_serials != fresh.serials
+                {
+                    let why = format!(
+                        "{} carries crl number {}, the same as the list already enforced, but \
+                         different content; a crl number is refused as a distinguisher once it \
+                         repeats",
+                        self.path.display(),
+                        held_number.expect("checked above")
+                    );
+                    warn!(
+                        crl = %self.path.display(),
+                        error = %why,
+                        "a revocation list with a repeated crl number and different content \
+                         was offered; the one this process already holds stays in force"
+                    );
+                    return Reload::Failed(why);
+                }
                 let answer = Reload::Loaded {
                     serials: fresh.serials.len(),
                     crl_number: fresh.crl_number,
@@ -2534,6 +2589,74 @@ mod tests {
         let refused = auth.authenticate_at(&alice, later).unwrap_err().to_string();
         assert!(refused.contains("CRL 3"), "{refused}");
         assert_eq!(revocations.list().crl_number, Some(3));
+    }
+
+    /// Astra finding F14, 2026-09-23: this reload used to trust whatever
+    /// mtime/size said had changed, with no check that the new list is
+    /// actually newer. Restoring an earlier CRL over the same path --
+    /// lower crl number, and it does not revoke the serial the later one
+    /// did -- used to be accepted outright, un-revoking it.
+    #[test]
+    fn restoring_an_older_crl_does_not_forget_a_later_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, leaves, empty) = ca_leaves_and_crl(&[], 1);
+        let path = crl_file(&dir, &empty);
+        let revocations = Revocations::load(&path).unwrap();
+        let auth = MtlsAuthenticator::new(cas).with_revocations(Some(revocations.clone()));
+        let bob = AuthRequest::with_certs(vec![leaves[1].clone()]);
+        let now = Utc::now();
+        assert!(auth.authenticate_at(&bob, now).unwrap().is_some());
+
+        let (_, _, with_bob) = ca_leaves_and_crl(&[2], 8);
+        std::fs::write(&path, with_bob).unwrap();
+        let later = now + TimeDelta::seconds(REVOCATION_RELOAD_SECS + 1);
+        assert!(matches!(
+            revocations.refresh_at(later),
+            Reload::Loaded { .. }
+        ));
+        assert!(auth.authenticate_at(&bob, later).is_err());
+        assert_eq!(revocations.list().crl_number, Some(8));
+
+        // The original list, written back where the new one was: same
+        // path, an older number, bob not on it.
+        let (_, _, original) = ca_leaves_and_crl(&[], 1);
+        std::fs::write(&path, original).unwrap();
+        let even_later = later + TimeDelta::seconds(REVOCATION_RELOAD_SECS + 1);
+        assert!(matches!(
+            revocations.refresh_at(even_later),
+            Reload::Failed(_)
+        ));
+        // Bob is still refused, and the list this process enforces is
+        // still number 8.
+        let refused = auth
+            .authenticate_at(&bob, even_later)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("is revoked"), "{refused}");
+        assert_eq!(revocations.list().crl_number, Some(8));
+    }
+
+    /// Astra finding F14, 2026-09-23: a crl number is supposed to be unique
+    /// per list, so two files that carry the SAME number but disagree on
+    /// content are not "the same list twice" -- one of them is wrong, and
+    /// neither is trusted over what is already enforced.
+    #[test]
+    fn a_repeated_crl_number_with_different_content_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, leaves, with_bob) = ca_leaves_and_crl(&[2], 8);
+        let path = crl_file(&dir, &with_bob);
+        let revocations = Revocations::load(&path).unwrap();
+        let auth = MtlsAuthenticator::new(cas).with_revocations(Some(revocations.clone()));
+        let bob = AuthRequest::with_certs(vec![leaves[1].clone()]);
+        let now = Utc::now();
+        assert!(auth.authenticate_at(&bob, now).is_err());
+
+        let (_, _, same_number_different_content) = ca_leaves_and_crl(&[], 8);
+        std::fs::write(&path, same_number_different_content).unwrap();
+        let later = now + TimeDelta::seconds(REVOCATION_RELOAD_SECS + 1);
+        assert!(matches!(revocations.refresh_at(later), Reload::Failed(_)));
+        assert!(auth.authenticate_at(&bob, later).is_err());
+        assert_eq!(revocations.list().crl_number, Some(8));
     }
 
     /// The order the check runs in. A serial is a number somebody else can
