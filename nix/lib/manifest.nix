@@ -53,7 +53,18 @@ let
     let cfg = configs.${id}; in
     if !cfg.meisterstack.etcd.enable then null else {
       name = cfg.services.etcd.name;
-      initial_cluster = cfg.services.etcd.initialCluster;
+      # --- lane 4A ---
+      # A STRING and not the list the NixOS option holds, because the
+      # string is what etcd is given: the module writes
+      # `ETCD_INITIAL_CLUSTER = concatStringsSep "," initialCluster`, and
+      # the topology check of D8 compares the membership etcd REPORTS
+      # against the membership this fleet CONFIGURED. Written as a list it
+      # was a json array, the planner asked it for a string, got nothing,
+      # and fell back to comparing member names — half the check, quietly,
+      # on every real manifest. (The hand-written fixture had it as a
+      # string all along, which is why no test saw it.)
+      initial_cluster = lib.concatStringsSep "," cfg.services.etcd.initialCluster;
+      # --- end lane 4A ---
       initial_cluster_token = cfg.services.etcd.initialClusterToken;
       data_dir = cfg.services.etcd.dataDir;
     };
