@@ -925,6 +925,68 @@ enum Verdict {
     TouchNothing(String),
 }
 
+/// What is to be done when the transfer budget is spent and the destination
+/// has still not reported the guest.
+///
+/// The sibling of `still_here` and pure for the same reason: it decides
+/// whether a VMM on another machine is torn down, and a decision that can
+/// only be reached through a store is a decision nobody checks.
+///
+/// Two answers, and the line between them is the one `abandon` draws — a
+/// destination that CANNOT hold the guest may be tidied up, and one that
+/// might hold the only copy may not. Three readings go into it:
+///
+///   * **the source said `Gone`.** It dropped the vmm pid and detached the
+///     volumes when its send finished; no guest is being served there. So
+///     whatever the destination has or has not said yet, the destination is
+///     the only machine that can hold this guest, and nothing here is
+///     touched.
+///   * **the destination has said nothing, or `Provisioning`.** It holds no
+///     guest. That word can be trusted because the agent reports it off the
+///     GUEST rather than off its own bookkeeping: a destination whose VMM
+///     says Running reports Running, whatever its record still says. Tear it
+///     down; the source is serving the guest as it was throughout.
+///   * **anything else.** Both ends may claim the vm. A VMM left standing on
+///     the destination is a leak; a guest destroyed is not something you get
+///     back.
+///
+/// Astra finding S04, 2026-09-23: only the second and third readings were
+/// here, so `SEND_GONE` — written by the source and carried to
+/// `status.sourceReported` by `ingest_departures` — was read nowhere in this
+/// tier. A send that completed while the destination's first report was
+/// still in flight therefore ended in `abandon`: the destination was
+/// destroyed by the VM's uid, and the record said "{source} is running the vm
+/// as before" about a machine that had just let the guest go. That sentence
+/// was true of no machine at all.
+fn verdict_on_timeout(
+    source: &str,
+    target: &str,
+    over: i64,
+    source_reported: Option<&str>,
+    target_reported: Option<&str>,
+) -> Verdict {
+    let said = target_reported.unwrap_or("nothing at all");
+    if source_reported == Some(controller_api::resources::SEND_GONE) {
+        return Verdict::TouchNothing(format!(
+            "the guest had not arrived on {target} after {over}s, and {source} says it let the \
+             guest go; the destination last said {said}. {source} is not serving this vm any \
+             more, so {target} may hold the only copy and nothing here has been torn down — \
+             look at both before deleting anything"
+        ));
+    }
+    if matches!(target_reported, None | Some("Provisioning")) {
+        return Verdict::TearDownTheDestination(format!(
+            "the guest had not arrived on {target} after {over}s; it said {said} and holds no \
+             guest, so it has been torn down and {source} is running the vm as before"
+        ));
+    }
+    Verdict::TouchNothing(format!(
+        "the guest had not arrived on {target} after {over}s; the destination last said {said}, \
+         so it may hold the guest and nothing here has been torn down — look at {source} and \
+         {target} before deleting anything"
+    ))
+}
+
 /// `Running` -> `Succeeded`: the destination says it has the guest, so the
 /// binding moves and the source's record goes.
 ///
@@ -967,37 +1029,20 @@ async fn settle(
         };
         // Out of time, and now the one question that decides what may be
         // done about it: **can the destination possibly have this guest?**
-        //
-        // Two answers are safe to tear down. Silence means the destination
-        // never even got a record. `Provisioning` means it has a record and
-        // no guest — and that word can be trusted because the agent reports
-        // it off the GUEST and not off its own phase: a destination whose
-        // VMM says Running reports Running, whatever its bookkeeping still
-        // says. Both are the same tidy-up every failure before the send
-        // takes.
-        //
-        // Every other answer is one where the destination may hold the only
-        // copy, and then nothing here may touch it: the source gave the guest
-        // up when it sent. The migration fails with a sentence naming both
-        // machines and a person looks. A VMM left standing on the destination
-        // is a leak; a guest destroyed is not something you get back.
-        let said = migration.status.target_reported.as_deref();
-        let empty = matches!(said, None | Some("Provisioning"));
-        if empty {
-            let why = format!(
-                "the guest had not arrived on {target} after {over}s; it said {} and holds no \
-                 guest, so it has been torn down and {source} is running the vm as before",
-                said.unwrap_or("nothing at all")
-            );
-            return abandon(store, dispatch, migration, vm, &target, why).await;
-        }
-        let why = format!(
-            "the guest had not arrived on {target} after {over}s; the destination last said \
-             {}, so it may hold the guest and nothing here has been torn down — look at \
-             {source} and {target} before deleting anything",
-            said.unwrap_or("nothing at all")
-        );
-        return fail(store, migration, why).await;
+        // The answer is `verdict_on_timeout`, where it can be checked
+        // without a store.
+        return match verdict_on_timeout(
+            &source,
+            &target,
+            over,
+            migration.status.source_reported.as_deref(),
+            migration.status.target_reported.as_deref(),
+        ) {
+            Verdict::TearDownTheDestination(why) => {
+                abandon(store, dispatch, migration, vm, &target, why).await
+            }
+            Verdict::TouchNothing(why) => fail(store, migration, why).await,
+        };
     }
 
     // The binding, by CAS onto the object this pass read. A conflict is
@@ -1565,6 +1610,13 @@ mod tests {
 
         // Nothing said, and the two words that are not a failure: this
         // function has no opinion and the timeout below it is still the rule.
+        //
+        // `Gone` stays in this list after Astra finding S04, 2026-09-23, and
+        // for the reason it was always here: `still_here` answers ONE
+        // question — did the source keep the guest — and a source that let it
+        // go did not. What changed is that "the timeout below it" no longer
+        // ignores the word: `verdict_on_timeout` reads it, and the test below
+        // is where `Gone` is now argued.
         for said in [None, Some("Sending"), Some("Gone")] {
             assert_eq!(still_here("agent-1", "agent-2", &status(said, None)), None);
         }
@@ -1597,5 +1649,56 @@ mod tests {
         assert!(why.contains("two machines claim one vm"), "{why}");
         assert!(why.contains("nothing here has been torn down"), "{why}");
         assert!(why.contains("Running"), "and what each of them said: {why}");
+    }
+
+    /// Astra finding S04, 2026-09-23: a source that said `Gone` has let the
+    /// guest go, so the destination is the only machine that can still hold
+    /// it — whatever it has managed to report by the time the budget runs
+    /// out.
+    ///
+    /// The word travelled this far already: the agent writes it after
+    /// `finish_migrate_out` has dropped the vmm pid and detached the volumes,
+    /// and `ingest_departures` puts it on `status.sourceReported`. Nothing
+    /// read it. So a send that completed while the destination's first report
+    /// was still in flight was tidied up by uid — and the record said
+    /// "agent-1 is running the vm as before" about a machine that was not
+    /// running it.
+    #[test]
+    fn a_source_that_let_the_guest_go_leaves_the_destination_alone() {
+        let verdict = |source_said: Option<&str>, target_said: Option<&str>| {
+            verdict_on_timeout("agent-1", "agent-2", 150, source_said, target_said)
+        };
+
+        // The source is gone. Neither silence nor `Provisioning` from the
+        // destination makes it safe to destroy anything.
+        for target_said in [None, Some("Provisioning")] {
+            let Verdict::TouchNothing(why) = verdict(Some("Gone"), target_said) else {
+                panic!("a destination is not torn down when the source let the guest go");
+            };
+            assert!(why.contains("agent-1") && why.contains("agent-2"), "{why}");
+            assert!(why.contains("let the guest go"), "{why}");
+            assert!(
+                !why.contains("running the vm as before"),
+                "and it does not claim the source still serves it: {why}"
+            );
+        }
+
+        // The source never said it was gone: silence, or a send still under
+        // way. Then the destination holding no guest is the old reading and
+        // the old tidy-up.
+        for source_said in [None, Some("Sending")] {
+            let Verdict::TearDownTheDestination(why) = verdict(source_said, None) else {
+                panic!("a destination with no guest is tidied up");
+            };
+            assert!(why.contains("nothing at all"), "{why}");
+            assert!(why.contains("agent-1 is running the vm as before"), "{why}");
+        }
+
+        // And the third reading, unchanged: the destination said something
+        // that is not `Provisioning`, so both ends may claim the vm.
+        let Verdict::TouchNothing(why) = verdict(None, Some("Running")) else {
+            panic!("a destination that may hold the guest is not torn down");
+        };
+        assert!(why.contains("may hold the guest"), "{why}");
     }
 }
