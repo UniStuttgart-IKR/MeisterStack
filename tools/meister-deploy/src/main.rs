@@ -2795,6 +2795,10 @@ fn verify(args: &VerifyArgs) -> Result<Answer> {
     options.pairs = parse_pairs(&args.pairs)?;
 
     let clock = RealClock;
+    // The one runner an interrupt does not reach, for the one piece of work
+    // an interrupt ASKS for: taking the guests back. Everything else in this
+    // verb goes through `runner` and stops when the operator says stop.
+    let cleanup_runner = Real::new(policy).unstoppable();
     // The rdma suite is the one that reaches the hosts themselves: it runs a
     // server on one end and a client on the other. The guest suites talk to
     // a control plane and to nothing else, and are given no transport at all
@@ -2809,7 +2813,8 @@ fn verify(args: &VerifyArgs) -> Result<Answer> {
         &observation,
         selected.clone(),
         options,
-    );
+    )
+    .with_cleanup_runner(&cleanup_runner);
     if suite == Suite::Rdma {
         let endpoints = observation::manifest_endpoints(&release.resolved_fleet, &selected)?;
         verifier = verifier.over_ssh(&ssh, endpoints);

@@ -1136,6 +1136,13 @@ fn the_guest_spec_is_the_one_the_package_builds() {
             .contains("console=ttyS0")
     );
     assert!(value.get("nics").is_none(), "a lifecycle guest has no nic");
+    // The two the cluster tier refused when this was first run for real:
+    // `desired` is controller-owned, and a vm needs a boot disk.
+    assert!(
+        value.get("desired").is_none(),
+        "spec.vm.desired is controller-owned (422 from the cluster tier)"
+    );
+    assert_eq!(value["volumes"][0]["size_bytes"], GUEST_DISK_BYTES);
 
     let gpu = gpu_spec(
         &GuestTiny {
@@ -1719,4 +1726,107 @@ fn what_the_three_tools_say_is_read_off_the_row_and_not_guessed() {
     // A tool that printed only its banner is not a measurement.
     assert_eq!(latency_of("---- Send Latency Test ----"), None);
     assert_eq!(bandwidth_of(""), None);
+}
+
+#[test]
+fn a_console_record_that_stops_mid_line_is_unknown_and_not_a_failure() {
+    // The one this is for, measured on manacor: the node's serial recorder
+    // attaches on a reconcile pass, and by then cloud-hypervisor has
+    // replayed only the first 278 bytes of a boot that was over in half a
+    // second. The record ends in the middle of "[Firmware Bug]: TSC doesn't
+    // count with P" — a guest does not write half a line, so what is
+    // missing is the recording.
+    assert_eq!(
+        record_of(
+            "[    0.000000] Linux version 6.12.93\n[    0.000000] [Firmware Bug]: TSC doesn't count with P"
+        ),
+        Record::Truncated
+    );
+    assert_eq!(record_of(""), Record::Empty);
+    assert_eq!(record_of("   \n "), Record::Empty);
+    assert_eq!(record_of("the guest said something else\n"), Record::Whole);
+}
+
+#[test]
+fn a_guest_whose_record_is_incomplete_blocks_without_calling_the_guest_broken() {
+    let world = world();
+    let files = MemFiles::new();
+    let clock = FakeClock::at(at("2026-09-22T19:00:00Z"));
+    let name = guest(1);
+    let mut rm = head();
+    rm.extend(["--yes", "vm", "rm"].iter().map(|a| a.to_string()));
+    rm.push(name.clone());
+    let mut options = options(Suite::VmLifecycle);
+    options.budget = 0;
+    options.settle = Duration::from_secs(4);
+
+    let mut fake = StrictFake::new()
+        .expect(
+            Matcher::prefix("meister", cli_args(&["vm", "create", &name, "-f"])),
+            created(&name, "n1"),
+        )
+        .expect(
+            Matcher::exact("meister", cli_args(&["vm", "get", &name])),
+            phase(&name, "n1", "Running"),
+        );
+    // Three polls of a console that is there and not whole.
+    for _ in 0..3 {
+        fake = fake.expect(
+            Matcher::exact(
+                "meister",
+                cli_args(&["vm", "logs", &name, "--lines", "200"]),
+            ),
+            console("[    0.000000] Linux version 6.12.93\\n[    0.000000] [Firmware Bug]: TSC"),
+        );
+    }
+    fake = fake
+        .expect(Matcher::exact("meister", rm), Output::stdout(""))
+        .expect(
+            Matcher::exact("meister", cli_args(&["vm", "ls"])),
+            listing(&[]),
+        );
+    // The second guest of the host (1 + budget.max(1)).
+    fake = a_good_guest(fake, &guest(2), "n1");
+
+    let mut verifier = Verifier::new(
+        &fake,
+        &files,
+        &clock,
+        state(),
+        &world.release,
+        &world.observation,
+        vec!["n1".to_string()],
+        options,
+    )
+    .as_mock();
+    let run = verifier.run().expect("the suite runs");
+    fake.verify().expect("every expectation was used");
+
+    let console = run
+        .checks
+        .iter()
+        .find(|c| c.id == "vm.console" && c.subject.resource.as_deref() == Some(name.as_str()))
+        .expect("the console was checked");
+    assert_eq!(console.status, Status::Unknown);
+    assert!(
+        console.observed.contains("middle of a line"),
+        "{}",
+        console.observed
+    );
+    assert!(
+        console
+            .reason
+            .contains("Not a pass, and not a failure of the guest"),
+        "{}",
+        console.reason
+    );
+    // Whatever the console said, the guests still went.
+    assert!(
+        run.ledger
+            .resources
+            .iter()
+            .all(|r| r.state == ResourceState::Deleted),
+        "{:?}",
+        run.ledger.resources
+    );
 }

@@ -393,6 +393,13 @@ pub struct Verifier<'a> {
     files: &'a dyn Files,
     clock: &'a dyn Clock,
     cancel: Cancel,
+    /// The runner the cleanup uses. `None` falls back to the one above,
+    /// which is right for a test and wrong for an interrupted run: see
+    /// [`crate::run::Real::stoppable`].
+    cleanup_runner: Option<&'a dyn Runner>,
+    /// Whether the cleanup is what is running. It decides which runner the
+    /// next command goes through and nothing else.
+    cleaning_up: bool,
     state: StateDir,
     release: &'a ReleaseManifest,
     observation: &'a Observations,
@@ -437,6 +444,8 @@ impl<'a> Verifier<'a> {
             files,
             clock,
             cancel: Cancel::new(),
+            cleanup_runner: None,
+            cleaning_up: false,
             state,
             release,
             observation,
@@ -457,6 +466,23 @@ impl<'a> Verifier<'a> {
     pub fn with_cancel(mut self, cancel: Cancel) -> Verifier<'a> {
         self.cancel = cancel;
         self
+    }
+
+    /// The runner the cleanup is to use, which is the one the operator's
+    /// interrupt does not reach: taking the guests back is the work an
+    /// interrupt ASKS for, and a runner that honoured it would kill the
+    /// delete it had just started.
+    pub fn with_cleanup_runner(mut self, runner: &'a dyn Runner) -> Verifier<'a> {
+        self.cleanup_runner = Some(runner);
+        self
+    }
+
+    /// Whichever runner this phase of the run goes through.
+    fn exec(&self, cmd: &Cmd) -> Result<crate::run::Output> {
+        match (self.cleaning_up, self.cleanup_runner) {
+            (true, Some(runner)) => runner.run(cmd),
+            _ => self.runner.run(cmd),
+        }
     }
 
     /// Say that every answer in this run came from a fake, so no evidence may
@@ -738,14 +764,24 @@ impl<'a> Verifier<'a> {
 
     /// The evidence kind a guest on this node earns.
     ///
-    /// `hardware` only when the SNAPSHOT of that machine says the capability
-    /// was there — not the inventory, which is a declaration, and not the
-    /// fact that a guest booted, which on a machine without `/dev/kvm` would
-    /// mean a hypervisor fell back to emulation and the guest is evidence of
-    /// emulation.
-    fn evidence_kind(&self, node: &str, capability: &str) -> EvidenceKind {
+    /// Three conditions, and all three have to hold:
+    ///
+    /// * the answer came from a real program and not from a fake;
+    /// * the SNAPSHOT of the machine the guest RAN ON says the capability
+    ///   was there — not the inventory, which is a declaration;
+    /// * the step actually happened. A `vm create` the control plane refused
+    ///   produced no guest, so it is evidence about a control plane and not
+    ///   about hardware, and printing it under "hardware evidence" would put
+    ///   a failure nobody measured on a machine beside the ones somebody
+    ///   did. Measured: the first real run of this suite refused every
+    ///   create (a 422 from the cluster tier) and the report still listed
+    ///   six checks as hardware evidence.
+    fn evidence_kind(&self, node: &str, capability: &str, happened: bool) -> EvidenceKind {
         if self.mock {
             return EvidenceKind::Mock;
+        }
+        if !happened {
+            return EvidenceKind::Command;
         }
         match self.observation.host(node) {
             Some(obs) if obs.has_capability(capability) => EvidenceKind::Hardware,
@@ -925,7 +961,7 @@ impl<'a> Verifier<'a> {
             .arg("-f")
             .arg(spec_path.display().to_string());
         let started = self.clock.now();
-        let answer = self.runner.run(&cmd);
+        let answer = self.exec(&cmd);
         let mut check = self.check("vm.create", id, Subject::resource(name), Status::Pass);
         check.duration_ms = self.since(started);
         check.expected = format!("the control plane records {name} for {id}");
@@ -984,7 +1020,7 @@ impl<'a> Verifier<'a> {
                 .arg("get")
                 .arg(name)
                 .expect(Expect::AnyExit);
-            match self.runner.run(&cmd) {
+            match self.exec(&cmd) {
                 Ok(out) if out.ok() => {
                     let (placed, _) = placement_of(&out.stdout);
                     if placed.is_some() {
@@ -1038,7 +1074,7 @@ impl<'a> Verifier<'a> {
             )
         };
         check.evidence.push(Evidence {
-            kind: self.evidence_kind(&ran_on, "kvm"),
+            kind: self.evidence_kind(&ran_on, "kvm", status == Status::Pass),
             reference: format!("vm {name} on node {ran_on}"),
         });
         let pass = status == Status::Pass;
@@ -1048,6 +1084,15 @@ impl<'a> Verifier<'a> {
 
     /// Read what the guest printed, and look for the one line only a booted
     /// guest-tiny prints.
+    ///
+    /// Polled and not asked once, and the reason is a measurement: the
+    /// node's serial line is a SOCKET, and the file `vm logs` reads exists
+    /// only once the agent's reconcile pass has attached a recorder to it.
+    /// That pass runs every thirty seconds, so a guest that booted in 0.8 s
+    /// has an empty console for up to half a minute — and cloud-hypervisor
+    /// holds a 1 MiB ring in the meantime and replays it, so nothing is
+    /// lost, it is only late. Asking once would have called every healthy
+    /// guest a guest that never booted.
     fn read_console(&mut self, id: &str, name: &str) -> Result<bool> {
         let started = self.clock.now();
         let cmd = self
@@ -1057,45 +1102,100 @@ impl<'a> Verifier<'a> {
             .arg(name)
             .arg("--lines")
             .arg("200");
-        let answer = self.runner.run(&cmd);
+        // The verdict a run that was interrupted before it could ask even
+        // once ends up with: nobody looked, so nobody knows.
+        let mut status = Status::Unknown;
+        let mut observed = "nothing was recorded".to_string();
+        let mut reason = String::new();
+        loop {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+            match self.exec(&cmd) {
+                Ok(out) if console_says(&out.stdout, TINY_MARKER) => {
+                    status = Status::Pass;
+                    break;
+                }
+                Ok(out) => {
+                    let text = console_text(&out.stdout);
+                    match record_of(&text) {
+                        Record::Empty => {
+                            status = Status::Unknown;
+                            observed = "nothing was recorded".to_string();
+                        }
+                        Record::Truncated => {
+                            status = Status::Unknown;
+                            observed = format!(
+                                "the record ends in the middle of a line: {}",
+                                last_lines(&text)
+                            );
+                        }
+                        Record::Whole => {
+                            status = Status::Fail;
+                            observed =
+                                format!("the console had no such line: {}", last_lines(&text));
+                        }
+                    }
+                }
+                Err(e) => {
+                    status = Status::Unknown;
+                    observed = "the console could not be read".to_string();
+                    reason = format!("{e:#}");
+                    break;
+                }
+            }
+            if self.waited_out(started) {
+                break;
+            }
+            self.clock.sleep(self.options.poll);
+        }
+
         let ran_on = self.node_of(name).unwrap_or_else(|| id.to_string());
-        let mut check = self.check("vm.console", id, Subject::resource(name), Status::Fail);
+        let mut check = self.check("vm.console", id, Subject::resource(name), status);
         check.duration_ms = self.since(started);
         check.expected = format!("{TINY_MARKER} on the guest's serial console");
         check.evidence.push(Evidence {
-            kind: self.evidence_kind(&ran_on, "kvm"),
+            kind: self.evidence_kind(&ran_on, "kvm", status == Status::Pass),
             reference: cmd.line(),
         });
-        match answer {
-            Ok(out) if console_says(&out.stdout, TINY_MARKER) => {
-                check.status = Status::Pass;
+        match status {
+            Status::Pass => {
                 check.observed = TINY_MARKER.to_string();
                 check.reason = format!(
                     "a kernel started, an init ran and wrote to the serial line on \
                      {ran_on}: the guest booted, and nothing short of a boot prints this"
                 );
-                self.record(check);
-                Ok(true)
             }
-            Ok(out) => {
-                check.observed = format!(
-                    "the console had no such line: {}",
-                    last_lines(&console_text(&out.stdout))
+            Status::Unknown => {
+                check.observed = observed;
+                check.reason = if reason.is_empty() {
+                    format!(
+                        "this cannot tell whether the guest booted, because the record of \
+                         what it said is not whole. The node's serial line is a socket and \
+                         the agent attaches its recorder on a reconcile pass, so a guest \
+                         that says everything it has to say in its first second can be \
+                         recorded from the middle. Measured against this node: the whole \
+                         boot is on the wire (a client connected at 0.2 s reads 20 750 \
+                         bytes ending in {TINY_MARKER}) and the recorded file holds 278 \
+                         bytes. Not a pass, and not a failure of the guest."
+                    )
+                } else {
+                    reason
+                };
+            }
+            _ => {
+                check.observed = observed;
+                check.reason = format!(
+                    "the object may be Running while the guest never booted; that is the \
+                     difference this check exists for. The node attaches its serial \
+                     recorder on a reconcile pass, so this waited {:?} for one.",
+                    self.options.settle
                 );
-                check.reason = "the object may be Running while the guest never booted; \
-                                that is the difference this check exists for"
-                    .to_string();
-                self.record(check);
-                Ok(false)
-            }
-            Err(e) => {
-                check.status = Status::Unknown;
-                check.observed = "the console could not be read".to_string();
-                check.reason = format!("{e:#}");
-                self.record(check);
-                Ok(false)
             }
         }
+        let pass = status == Status::Pass;
+        self.record(check);
+        Ok(pass)
     }
 
     fn delete_guest(&mut self, id: &str, name: &str) -> Result<bool> {
@@ -1274,7 +1374,7 @@ impl<'a> Verifier<'a> {
             .arg("-f")
             .arg(spec_path.display().to_string());
         let started = self.clock.now();
-        let answer = self.runner.run(&cmd);
+        let answer = self.exec(&cmd);
         let mut check = self.check("gpu.create", id, Subject::resource(name), Status::Pass);
         check.duration_ms = self.since(started);
         check.expected = format!("a guest on {id} holding {pci}");
@@ -1323,7 +1423,7 @@ impl<'a> Verifier<'a> {
              build. This is not a pass."
                 .to_string();
         check.evidence.push(Evidence {
-            kind: self.evidence_kind(&ran_on, "vfio"),
+            kind: self.evidence_kind(&ran_on, "vfio", true),
             reference: format!("vm {name} on node {ran_on}"),
         });
         self.record(check);
@@ -1348,7 +1448,7 @@ impl<'a> Verifier<'a> {
             .arg(spec_path.display().to_string())
             .expect(Expect::AnyExit);
         let started = self.clock.now();
-        let answer = self.runner.run(&cmd);
+        let answer = self.exec(&cmd);
         let mut check = self.check("gpu.refusal", id, Subject::resource(&name), Status::Fail);
         check.duration_ms = self.since(started);
         check.expected = format!("{NO_SUCH_PCI} is refused, because no such device exists");
@@ -1571,7 +1671,7 @@ impl<'a> Verifier<'a> {
             Effect::TargetWrite,
             self.options.cli_deadline,
         );
-        let out = self.runner.run(&cmd)?;
+        let out = self.exec(&cmd)?;
         Ok((cmd, out.trimmed().to_string()))
     }
 
@@ -1587,7 +1687,7 @@ impl<'a> Verifier<'a> {
             Effect::TargetWrite,
             self.options.cli_deadline,
         );
-        Ok(self.runner.run(&cmd)?.stdout)
+        Ok(self.exec(&cmd)?.stdout)
     }
 
     fn client(&self, host: &str, argv: &[String]) -> Result<(Cmd, Result<crate::run::Output>)> {
@@ -1596,7 +1696,7 @@ impl<'a> Verifier<'a> {
             .ssh()?
             .exec(&target, argv, Effect::TargetWrite, self.options.fabric)
             .expect(Expect::AnyExit);
-        let out = self.runner.run(&cmd);
+        let out = self.exec(&cmd);
         Ok((cmd, out))
     }
 
@@ -1824,7 +1924,7 @@ impl<'a> Verifier<'a> {
     /// `hardware` only where the SNAPSHOT of that machine found a fabric
     /// device — the same rule the guest suites follow, for the same reason.
     fn fabric_evidence(&self, id: &str) -> EvidenceKind {
-        self.evidence_kind(id, "rdma")
+        self.evidence_kind(id, "rdma", true)
     }
 
     // --- cleanup ----------------------------------------------------------
@@ -1837,6 +1937,7 @@ impl<'a> Verifier<'a> {
     /// else's ledger is added later, so it is enforced now, with a sentence
     /// and a check when it fires.
     pub fn cleanup(&mut self) -> Result<()> {
+        self.cleaning_up = true;
         if self.options.keep {
             let outstanding: Vec<String> = self
                 .ledger
@@ -1965,7 +2066,7 @@ impl<'a> Verifier<'a> {
             .arg("rm")
             .arg(name)
             .expect(Expect::AnyExit);
-        let deleted = self.runner.run(&cmd);
+        let deleted = self.exec(&cmd);
         let refusal = match &deleted {
             Ok(out) if out.ok() => None,
             Ok(out) => Some(last_lines(&out.stderr).to_string()),
@@ -2008,7 +2109,7 @@ impl<'a> Verifier<'a> {
             .arg("vm")
             .arg("ls")
             .expect(Expect::ExitZero);
-        let out = self.runner.run(&cmd)?;
+        let out = self.exec(&cmd)?;
         Ok(lists_name(&out.stdout, name))
     }
 
@@ -2342,14 +2443,33 @@ pub fn bandwidth_of(text: &str) -> Option<Bandwidth> {
 // the guest, and what the control plane answers
 // ---------------------------------------------------------------------------
 
+/// How big the one ephemeral disk of a verification guest is.
+///
+/// Sixteen mebibytes: the guest never writes to it. It exists because the
+/// cluster tier refuses a VM without one — "a vm needs at least one volume
+/// as boot disk", measured against the throwaway control plane of
+/// deploy/chaos/selftest.sh — and a disk that is made and unmade with every
+/// guest of every round is a disk worth keeping small.
+pub const GUEST_DISK_BYTES: u64 = 16 * 1024 * 1024;
+
 /// The `NewVmSpec` for one guest-tiny.
 ///
-/// The serial console and nothing else: `nix/packages/guest-tiny.nix`
-/// explains why (8250 is built into the pinned kernel and virtio_console is
-/// a module), and the marker line this suite reads is the first thing that
-/// guest prints. No nic and no volume — a lifecycle suite that needed a
-/// bridge would be testing the network driver, and that is somebody else's
-/// suite.
+/// Three decisions, each of them measured rather than reasoned about:
+///
+/// * **The serial console and nothing else.** `nix/packages/guest-tiny.nix`
+///   explains why: 8250 is built into the pinned kernel and virtio_console
+///   is a module, so a guest that talked over virtio would have to insmod
+///   before it could say anything — and the marker line this suite reads is
+///   the first thing that guest prints.
+/// * **No nic.** A lifecycle suite that needed a bridge would be testing
+///   the network driver, which is somebody else's suite — and it would make
+///   this one unrunnable on a node without `CAP_NET_ADMIN`.
+/// * **One ephemeral disk, and no `desired`.** The cluster tier refuses a
+///   VM with neither: `spec.vm.desired is controller-owned; use
+///   spec.runStrategy` (422) and `a vm needs at least one volume as boot
+///   disk` (422). Both were found by running this against a real control
+///   plane and not by reading the type, which is what this whole suite is
+///   for.
 pub fn tiny_spec(kernel: &GuestTiny) -> Result<Vec<u8>> {
     let spec = serde_json::json!({
         "vcpus": 1,
@@ -2360,7 +2480,7 @@ pub fn tiny_spec(kernel: &GuestTiny) -> Result<Vec<u8>> {
             "initramfs": kernel.initrd,
             "cmdline": "console=ttyS0 reboot=k panic=1",
         },
-        "desired": "Running",
+        "volumes": [ { "size_bytes": GUEST_DISK_BYTES } ],
     });
     let mut bytes = serde_json::to_vec_pretty(&spec)
         .map_err(|e| anyhow::anyhow!("writing the guest spec as json failed: {e}"))?;
@@ -2379,7 +2499,7 @@ pub fn gpu_spec(kernel: &GuestTiny, pci: &str) -> Result<Vec<u8>> {
             "initramfs": kernel.initrd,
             "cmdline": "console=ttyS0 reboot=k panic=1",
         },
-        "desired": "Running",
+        "volumes": [ { "size_bytes": GUEST_DISK_BYTES } ],
         "devices": [
             { "driver": "vfio", "partition": "exclusive", "params": { "pci_address": pci } }
         ],
@@ -2459,6 +2579,36 @@ pub fn console_text(text: &str) -> String {
 /// Whether the console carries this line.
 pub fn console_says(text: &str, marker: &str) -> bool {
     console_text(text).contains(marker)
+}
+
+/// What a console record looks like, when it does not hold the line that was
+/// being looked for.
+///
+/// The distinction is the difference between `fail` and `unknown`, and it is
+/// the whole reason [`crate::checks::Status`] has five values: a guest that
+/// printed something else did not boot the way it was supposed to, and a
+/// record that stops in the middle of a line says nothing about the guest at
+/// all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Record {
+    /// Nobody recorded anything.
+    Empty,
+    /// It ends mid-line, so what is missing is the recording and not the
+    /// output: a guest writes whole lines.
+    Truncated,
+    /// Whole, as far as anything here can tell.
+    Whole,
+}
+
+pub fn record_of(text: &str) -> Record {
+    if text.trim().is_empty() {
+        return Record::Empty;
+    }
+    if text.ends_with('\n') || text.ends_with("\r\n") {
+        Record::Whole
+    } else {
+        Record::Truncated
+    }
 }
 
 /// Every host of the fleet a suite would look at, in the fleet's own order.
