@@ -74,6 +74,17 @@ let
     # certificate that a bootstrap would deliver (M3), so it is inactive
     # here on purpose and must not block a rollout this test is not about.
     checks = { required = [ ] }
+    # --- lane 5C ---
+    # The cache this fleet's hosts may FETCH from. It belongs HERE and not
+    # only in the host module beside it: `nix/lib/manifest.nix` renders
+    # `hosts.<id>.substituters` out of the INVENTORY, and `stage` decides
+    # whether to pass `--substitute-on-destination` by reading the
+    # manifest. Without this line the release named a cache, the target's
+    # nix.conf named a substituter, and the copy still fetched nothing —
+    # which is what the first real run of this test found (lane 4C wrote
+    # the assertion and never ran it).
+    managed = { substituters = [ "http://192.168.1.1:8080" ] }
+    # --- end lane 5C ---
 
     # One host that is the whole control plane, which is the only shape a
     # fleet of one can have: a cloud places guests on clusters, a cluster
