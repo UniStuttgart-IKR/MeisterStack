@@ -1243,21 +1243,22 @@ fn resolve(
             return Ok(true);
         }
         // A dev run evaluates a snapshot directory named after its own
-        // content, and that name cannot be known without reading the tree —
-        // which a dry run does not do. So the line is printed with the one
-        // segment that is not yet decided spelled out as what it is.
-        let eval_dir = if dev {
+        // content, and a clean run pins the flake ref to the rev it read —
+        // neither can be known without reading the tree, which a dry run
+        // does not do. So the line is printed with the one segment that is
+        // not yet decided spelled out as what it is.
+        let (eval_dir, rev) = if dev {
             println!(
                 "# would then copy exactly those files to {}",
                 source::snapshot_dir(&repo, "<content-hash>").display()
             );
-            source::snapshot_dir(&repo, "<content-hash>")
+            (source::snapshot_dir(&repo, "<content-hash>"), None)
         } else {
-            repo.clone()
+            (repo.clone(), Some("<rev>"))
         };
         println!(
             "{}",
-            nix::eval_manifest_cmd(&nix::flake_ref(&eval_dir, dev), selection).line()
+            nix::eval_manifest_cmd(&nix::flake_ref(&eval_dir, dev, rev), selection).line()
         );
         println!("# would write {}", out.display());
         return Ok(true);
@@ -1303,7 +1304,13 @@ fn resolve(
             (evaluated, origin)
         }
         None => {
-            let flake_ref = nix::flake_ref(&tree.eval_dir, dev);
+            // Astra finding F15, 2026-09-23: a clean tree used to be
+            // addressed as `git+file://{path}` with no `?rev=`, so nix read
+            // whatever HEAD happened to be at the moment it ran rather than
+            // the rev `describe` had just captured — a commit or a checkout
+            // landing in that gap would be evaluated silently, under the
+            // OLDER rev's name. Pinning to the captured rev closes the gap.
+            let flake_ref = nix::flake_ref(&tree.eval_dir, dev, tree.source.git_rev.as_deref());
             let text = nix::eval_manifest(&runner, &flake_ref, selection)?;
             let origin = format!("{flake_ref}#{}", nix::MANIFEST_ATTR);
             (NixManifest::from_json(&text, &origin)?, origin)
@@ -5315,7 +5322,11 @@ fn validate_with_nix(fleet: &Path) -> Result<bool> {
     // what git tracks, so this verb cannot copy an ignored `keys/` into the
     // store on the way (the fix N1 of lane 1C). The price is that
     // uncommitted changes are not in the answer, and the note below says so.
-    let flake_ref = nix::flake_ref(repo, false);
+    // No rev to pin here (Astra finding F15 pinned `resolve`'s clean-tree
+    // read; this verb reads no rev at all, by the same design the comment
+    // above already names — it always compares against whatever HEAD is
+    // now).
+    let flake_ref = nix::flake_ref(repo, false, None);
     let text = nix::eval_inventory(&runner, &flake_ref)?;
 
     let evaluated: manifest::NixInventory = serde_json::from_str(&text).with_context(|| {
