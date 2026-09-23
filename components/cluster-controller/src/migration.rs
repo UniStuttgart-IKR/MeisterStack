@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use controller_api::{
-    Candidate, EtcdStore, Node, Resource, Scheduler, StoreError, Vm, VmMigration,
-    VmMigrationPhaseKind, VmMigrationStatus, VmPhaseKind, Volume,
+    Candidate, CapacityReservation, EtcdStore, Node, Overcommit, Resource, Scheduler, StoreError,
+    Vm, VmMigration, VmMigrationPhaseKind, VmMigrationStatus, VmPhaseKind, Volume,
 };
 use proto::StatusReport;
 use tracing::{debug, info, warn};
@@ -392,18 +392,26 @@ pub async fn start_from_the_cloud(
 /// machine, and a loop that ran two of them would have no place to record
 /// what it had already done if the process died between them. The object IS
 /// the progress.
+#[allow(clippy::too_many_arguments)]
 pub async fn reconcile_migrations(
     store: &EtcdStore,
     dispatch: &Dispatch,
     scheduler: &dyn Scheduler,
     nodes: &Mutex<Vec<Candidate>>,
     timeouts: Timeouts,
+    held: &[CapacityReservation],
+    overcommit: Overcommit,
 ) -> anyhow::Result<()> {
     let migrations: Vec<VmMigration> = match store.list().await {
         Ok(m) => m,
-        Err(StoreError::NotFound(_)) => return Ok(()),
+        Err(StoreError::NotFound(_)) => Vec::new(),
         Err(e) => return Err(e.into()),
     };
+    // BEFORE the early return below, and that is the whole point of it: an
+    // orphaned promise is exactly the one whose migration is gone, so a
+    // reaper that only ran when there were migrations could never reap the
+    // last one.
+    reap_reservations(store, held, &migrations).await;
     if migrations.is_empty() {
         return Ok(());
     }
@@ -418,20 +426,216 @@ pub async fn reconcile_migrations(
         if migration.metadata.deletion_timestamp.is_some() {
             continue;
         }
-        if let Err(e) = step(store, dispatch, scheduler, nodes, timeouts, migration).await {
+        if let Err(e) = step(
+            store, dispatch, scheduler, nodes, timeouts, held, overcommit, migration,
+        )
+        .await
+        {
             warn!(migration = %name, error = %format!("{e:#}"), "migration step failed");
         }
     }
     Ok(())
 }
 
+/// **A reservation outlives nothing.** Every promise whose migration is
+/// final, deleted or gone is given back, once per pass.
+///
+/// Astra finding S07, 2026-09-23: this is what makes the reservation safe to
+/// have at all. `fail` and `settle` give a promise back on the two roads a
+/// migration can leave by, and neither of them runs in the process that was
+/// killed between the reservation and the next phase — so without a sweep, a
+/// controller that died mid-move would hold a machine's room for ever, and
+/// nothing in the fleet could say why the node was full. The decision is
+/// `controller_api::orphaned_reservations`, where it can be checked without a
+/// store.
+///
+/// `held` is the pass's own reading and `migrations` is a fresh one, which is
+/// the conservative pairing: a promise written after the pass began is not in
+/// `held` and is therefore not touched, and a migration that ended after the
+/// pass began IS seen. Wrong in the direction of reaping a tick later rather
+/// than a tick too early.
+///
+/// The delete is guarded by the promise's own resourceVersion, for the reason
+/// S19 gave the secrets: the name is the migration's, migrations are named
+/// for a vm and a moment, and a record can be made again under a name that
+/// was used before. A conflict here means somebody wrote that key between the
+/// listing and now; the next pass looks again.
+async fn reap_reservations(
+    store: &EtcdStore,
+    held: &[CapacityReservation],
+    migrations: &[VmMigration],
+) {
+    for orphan in controller_api::orphaned_reservations(held, migrations) {
+        let name = &orphan.metadata.name;
+        match store
+            .delete_if::<CapacityReservation>(name, &orphan.metadata.resource_version)
+            .await
+        {
+            Ok(()) => info!(reservation = %name, node = %orphan.spec.node, vm = %orphan.spec.vm,
+                            "a reservation whose migration is over was given back"),
+            Err(StoreError::NotFound(_)) => {}
+            Err(e) => debug!(reservation = %name, error = %format!("{e:#}"),
+                             "the reservation was not given back this pass"),
+        }
+    }
+}
+
+/// Every promise this cluster is holding, with an empty directory read as
+/// none — which is the ordinary state of a fleet that is not migrating.
+async fn reservations(store: &EtcdStore) -> anyhow::Result<Vec<CapacityReservation>> {
+    match store.list().await {
+        Ok(held) => Ok(held),
+        Err(StoreError::NotFound(_)) => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// What `reserve` found at the key this migration writes its promise to.
+enum Reserved {
+    /// This pass wrote it. Unique as a KEY, which is not yet the same as
+    /// fitting — see `confirm`.
+    Fresh(CapacityReservation),
+    /// A promise for this very migration was already standing: an earlier
+    /// attempt of this record wrote it and the process died before the phase
+    /// moved, or a sibling replica is in `prepare` for it right now. Its node
+    /// IS the destination — the promise is where the choice is written down,
+    /// and a second answer to "where is this guest going" is how a guest gets
+    /// two destinations.
+    Standing(CapacityReservation),
+    /// The key is held by a promise belonging to a DIFFERENT record of the
+    /// same name. Nothing to do: the reaper takes it, and the next pass
+    /// reserves.
+    Foreign,
+}
+
+/// Write down, before anything is built at the destination, that this guest
+/// is coming — with a create-only write, so the room is promised once.
+async fn reserve(
+    store: &EtcdStore,
+    migration: &VmMigration,
+    vm: &Vm,
+    target: &str,
+) -> anyhow::Result<Reserved> {
+    let want = CapacityReservation::of(migration, vm, target);
+    match store.create(&want).await {
+        Ok(held) => Ok(Reserved::Fresh(held)),
+        Err(StoreError::AlreadyExists(_)) | Err(StoreError::Terminating(_)) => {
+            let standing: CapacityReservation = match store.get(&want.metadata.name).await {
+                Ok(standing) => standing,
+                // Given back between the two round trips. Nothing is held,
+                // and the next pass writes it again.
+                Err(StoreError::NotFound(_)) => return Ok(Reserved::Foreign),
+                Err(e) => return Err(e.into()),
+            };
+            Ok(match standing.belongs_to(migration) {
+                true => Reserved::Standing(standing),
+                false => Reserved::Foreign,
+            })
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Put back, in this pass's own picture of the fleet, the room THIS record
+/// has already promised.
+///
+/// A promise is somebody ELSE's claim on a machine; a record's own promise is
+/// not a reason to refuse that record's own move. An earlier attempt that
+/// wrote one and then died would otherwise make the destination look exactly
+/// this guest too full, and the move would be failed by its own bookkeeping —
+/// for ever, since every pass would write the same promise down again.
+///
+/// Only where the promise really was taken off, which is where the pass knew
+/// about it: `held` is what `free` was built with, and adding back a number
+/// nobody subtracted would invent room.
+fn give_back(all: &mut [Candidate], held: &[CapacityReservation], mine: &CapacityReservation) {
+    if !held.iter().any(|h| h.metadata.name == mine.metadata.name) {
+        return;
+    }
+    if let Some(c) = all.iter_mut().find(|c| c.name == mine.spec.node) {
+        c.free = c.free.plus(mine.spec.size());
+    }
+}
+
+/// Give back the room this migration was holding.
+///
+/// Guarded by the promise's own resourceVersion and by whose it is, because
+/// the key is named after the migration and a record can be made again under
+/// a name that was used before: a late release that deleted by name alone
+/// would take a LATER move's promise, and the node would then be offered to
+/// an ordinary create while a guest was still flying into it. The same ABA
+/// S19 closed for secrets.
+///
+/// Best effort on purpose, and it may be: it is called on the two roads a
+/// migration leaves by, where the thing that must be recorded is the ENDING.
+/// A release that did not go through is a promise the reaper takes on the
+/// next pass, which is what the reaper is for.
+async fn release(store: &EtcdStore, migration: &VmMigration) {
+    let name = migration.metadata.name.clone();
+    let held: CapacityReservation = match store.get(&name).await {
+        Ok(held) => held,
+        Err(StoreError::NotFound(_)) => return,
+        Err(e) => {
+            warn!(migration = %name, error = %format!("{e:#}"),
+                  "the reservation could not be read back to give it away");
+            return;
+        }
+    };
+    if !held.belongs_to(migration) {
+        debug!(migration = %name, "that reservation belongs to a later record of this name");
+        return;
+    }
+    match store
+        .delete_if::<CapacityReservation>(&name, &held.metadata.resource_version)
+        .await
+    {
+        Ok(()) => debug!(migration = %name, node = %held.spec.node, "the room was given back"),
+        Err(e) => warn!(migration = %name, error = %format!("{e:#}"),
+                        "the reservation was not given back; the reaper will take it"),
+    }
+}
+
+/// Is this promise one the destination can still carry, counting every
+/// promise written BEFORE it?
+///
+/// The confirmation a create-only write cannot give. A unique key says
+/// nothing about a sum: two replicas preparing two migrations onto one node
+/// in the same millisecond each read the reservations, each saw room, and
+/// each then wrote a key of its own — both creates succeed, and the node is
+/// overcommitted by exactly the guest the second one is sending. So the
+/// writer looks again and asks where in the queue it stands, in etcd's own
+/// revision order, which every replica derives the same way. See
+/// `controller_api::reservation_holds`.
+///
+/// `None` is "could not be established" and NEVER "does not fit": a store
+/// that did not answer must not be the reason a migration is refused, and the
+/// promise standing is the safe side of that — it makes the node look fuller
+/// than it is until the move is over.
+async fn confirm(
+    store: &EtcdStore,
+    mine: &CapacityReservation,
+    overcommit: Overcommit,
+) -> Option<bool> {
+    let node: Node = store.get(&mine.spec.node).await.ok()?;
+    let vms: Vec<Vm> = store.list().await.ok()?;
+    let held = reservations(store).await.ok()?;
+    // The room BEFORE any promise, which is what the queue is measured
+    // against — read through the same function the candidate list is built
+    // with, so the two cannot drift apart.
+    let room = crate::reconcile::free_on(&mine.spec.node, &node.status.capacity, &vms, overcommit);
+    Some(controller_api::reservation_holds(room, mine, &held))
+}
+
 /// One migration, one step.
+#[allow(clippy::too_many_arguments)]
 async fn step(
     store: &EtcdStore,
     dispatch: &Dispatch,
     scheduler: &dyn Scheduler,
     nodes: &Mutex<Vec<Candidate>>,
     timeouts: Timeouts,
+    held: &[CapacityReservation],
+    overcommit: Overcommit,
     migration: VmMigration,
 ) -> anyhow::Result<()> {
     let vm: Vm = match store.get(&migration.spec.vm).await {
@@ -452,7 +656,10 @@ async fn step(
 
     match migration.status.phase().kind() {
         VmMigrationPhaseKind::Pending => {
-            prepare(store, dispatch, scheduler, nodes, &migration, &vm).await
+            prepare(
+                store, dispatch, scheduler, nodes, held, overcommit, &migration, &vm,
+            )
+            .await
         }
         VmMigrationPhaseKind::Preparing => send(store, dispatch, timeouts, &migration, &vm).await,
         VmMigrationPhaseKind::Running => settle(store, dispatch, timeouts, &migration, &vm).await,
@@ -466,11 +673,14 @@ async fn step(
 /// Everything this does is on the DESTINATION. The source is not addressed
 /// once, and at the end of it the source is still serving the guest — which
 /// is what makes every failure below a matter of tidying up one machine.
+#[allow(clippy::too_many_arguments)]
 async fn prepare(
     store: &EtcdStore,
     dispatch: &Dispatch,
     scheduler: &dyn Scheduler,
     nodes: &Mutex<Vec<Candidate>>,
+    held: &[CapacityReservation],
+    overcommit: Overcommit,
     migration: &VmMigration,
     vm: &Vm,
 ) -> anyhow::Result<()> {
@@ -510,14 +720,44 @@ async fn prepare(
     // question they did not ask.
     let mut all = nodes.lock().unwrap().clone();
     reachable_anywhere(store, &mut all).await?;
-    let target = choose_target(
-        scheduler,
-        vm,
-        &source,
-        migration.spec.target_node.as_deref(),
-        &all,
-    );
-    let target = match target {
+    // What the fleet has promised to guests that are on their way and are
+    // bound nowhere yet. Astra finding S07, 2026-09-23: the migrations of one
+    // pass are stepped one after the other out of ONE snapshot, so without a
+    // fresh reading the second migration to a node with room for one guest
+    // would be measured against the room the first has already taken — and
+    // both would pass.
+    let standing = reservations(store).await?;
+    // This record's own promise, if an earlier attempt wrote one and the
+    // process died before the phase moved, or if a sibling replica wrote one
+    // a moment ago.
+    let ours = standing.iter().find(|r| r.belongs_to(migration)).cloned();
+    // Everybody ELSE's, and only the ones the pass did not already know
+    // about: `free` has the pass's own promises taken off it, the
+    // subtraction saturates, and a number taken off twice cannot be added
+    // back. A promise given back since the snapshot stays subtracted for this
+    // pass — a node that looks fuller than it is for five seconds, which is
+    // the safe direction.
+    let theirs: Vec<CapacityReservation> = standing
+        .iter()
+        .filter(|r| !r.belongs_to(migration))
+        .filter(|r| !held.iter().any(|h| h.metadata.name == r.metadata.name))
+        .cloned()
+        .collect();
+    controller_api::hold(&mut all, &theirs);
+    if let Some(ours) = &ours {
+        give_back(&mut all, held, ours);
+    }
+
+    // Where to. A promise that already stands IS the destination — it is
+    // where the choice was written down, and deciding again would give one
+    // guest two of them — and it is checked again all the same, because a
+    // machine that was feasible when it was promised may have been drained,
+    // filled or wedged since.
+    let named = ours
+        .as_ref()
+        .map(|r| r.spec.node.clone())
+        .or_else(|| migration.spec.target_node.clone());
+    let mut target = match choose_target(scheduler, vm, &source, named.as_deref(), &all) {
         Ok(target) => target,
         Err(why) => return fail(store, migration, why).await,
     };
@@ -551,6 +791,75 @@ async fn prepare(
                 "another migration record for vm {} has not finished; one guest moves once, so \
                  this record ends here and the other one carries the move",
                 migration.spec.vm
+            ),
+        )
+        .await;
+    }
+
+    // The room at the destination, written down before ANYTHING is built
+    // there — before the disks are opened, before the VMM, before the claim
+    // that says this replica is carrying the move.
+    //
+    // Astra finding S07, 2026-09-23: a guest in flight is bound to the
+    // machine it is LEAVING until `settle` moves the binding, so for the
+    // whole length of a migration the destination is carrying a guest that no
+    // sum over the VM objects can see. N migrations aimed at one node all
+    // measured themselves against the same numbers and all passed, and so did
+    // an ordinary create in the same window. This is that guest, written
+    // where every replica can read it.
+    //
+    // Before the claim and not after, because the claim is what the next pass
+    // reads as "this move is being carried": a crash in between would
+    // otherwise leave a `Preparing` migration whose room nobody is holding,
+    // which is the very gap this closes. In the other order the crash leaves
+    // a promise for a migration that is still Pending — and the next pass
+    // finds it, adopts it, and carries on.
+    //
+    // Both roads through the same write: a node somebody NAMED and a node the
+    // scheduler picked are one `target` by the time this runs, so there is
+    // one place where a destination is promised and one place where it is
+    // given back.
+    let mine = match reserve(store, migration, vm, &target).await? {
+        Reserved::Fresh(mine) => mine,
+        Reserved::Standing(mine) if mine.spec.node == target => mine,
+        // A sibling replica wrote the promise between the reading above and
+        // the write, and named another machine. Its choice is the one that
+        // stands — one promise, one destination — and it is checked on a list
+        // this guest's own promise is not counted against.
+        Reserved::Standing(mine) => {
+            let elsewhere = mine.spec.node.clone();
+            debug!(migration = %name, reserved = %elsewhere, chose = %target,
+                   "another replica promised this guest a different machine");
+            give_back(&mut all, held, &mine);
+            match choose_target(scheduler, vm, &source, Some(&elsewhere), &all) {
+                Ok(chosen) => {
+                    target = chosen;
+                    mine
+                }
+                // It was promised and it no longer holds. `fail` gives the
+                // room back — it is the one funnel every ending goes through.
+                Err(why) => return fail(store, migration, why).await,
+            }
+        }
+        Reserved::Foreign => {
+            debug!(migration = %name,
+                   "the reservation key is held by another record of this name; waiting");
+            return Ok(());
+        }
+    };
+
+    // A unique KEY is not a sum. Two replicas writing two promises onto one
+    // node in the same millisecond both succeed, so the writer looks again
+    // and asks where in the queue it stands — see `confirm`, and
+    // `reservation_holds` for the order, which is etcd's own and therefore
+    // the same on every replica.
+    if confirm(store, &mine, overcommit).await == Some(false) {
+        return fail(
+            store,
+            migration,
+            format!(
+                "another migration promised the last of {target}'s room first; this record \
+                 ends here and the move can be asked for again"
             ),
         )
         .await;
@@ -1142,6 +1451,15 @@ async fn settle(
         Err(e) => return Err(e.into()),
     }
 
+    // The room is given back HERE, in the arm where the binding took, and not
+    // a line earlier. From this write on the guest is counted on the
+    // destination by `free_on` like any other VM bound there, and a promise
+    // beside it would be the same guest counted twice; before it, the promise
+    // is the only thing holding the room at all. Astra finding S07,
+    // 2026-09-23: whichever of the two comes first, the machine's room is
+    // claimed by exactly one of them at every instant.
+    release(store, migration).await;
+
     // And now, and only now, the source. A failure here is not a failed
     // migration: the guest is at the destination and the object says so. What
     // is left behind is a record on a machine that no longer serves it, and
@@ -1231,6 +1549,16 @@ async fn abandon(
 /// Write the ending. `Failed` always carries a sentence — it is the only
 /// thing the object exists to say on the day somebody asks why a machine is
 /// still full.
+///
+/// And the one funnel every failure goes through, which is why the room is
+/// given back here: `abandon` ends in this, every refusal in `prepare` ends
+/// in this, and a release written into each of them separately is a release
+/// somebody forgets. Astra finding S07, 2026-09-23 — a reservation outlives
+/// nothing, and a failed move is the commonest nothing.
+///
+/// Unconditional, including on the paths that ran before anything was ever
+/// promised: giving back a promise that was never made is a read that finds
+/// no key, which costs one round trip and cannot be wrong.
 async fn fail(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow::Result<()> {
     let name = migration.metadata.name.clone();
     warn!(migration = %name, vm = %migration.spec.vm, reason = %why, "migration failed");
@@ -1246,6 +1574,13 @@ async fn fail(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow
             ));
         })
         .await?;
+    // After the ending and not before it, and the order is the invariant's:
+    // a process killed between the two leaves a promise whose migration is
+    // FINAL, which is exactly what the reaper takes. The other order would
+    // leave a non-final migration with no room held, and the gap this whole
+    // object exists to close would be open again for the length of one
+    // destination's teardown.
+    release(store, migration).await;
     Ok(())
 }
 
@@ -2025,5 +2360,302 @@ mod tests {
             rx.try_recv().is_err(),
             "a prepare inside its budget is left alone"
         );
+    }
+
+    /// A guest of exactly `node()`'s size, so that one of them fills a
+    /// machine and the second has to be told no.
+    fn whole_machine(name: &str) -> Vm {
+        let mut guest = vm(name);
+        guest.spec.vm = serde_json::json!({"vcpus": 8, "memory_mib": 8192});
+        guest
+    }
+
+    /// Astra finding S07, second half, 2026-09-23: two migrations aimed at
+    /// one node with room for one used to BOTH pass.
+    ///
+    /// Nothing held the room between `prepare` and the guest's arrival:
+    /// `Candidate::free` is a sum over the VMs BOUND to a node, and a guest
+    /// in flight stays bound to the machine it is leaving until `settle`
+    /// moves it. So the second migration of a pass measured itself against a
+    /// node the first had already filled, found it empty, opened the disks
+    /// there and built a second VMM — and what the guest met on arrival was
+    /// the machine carrying twice its memory.
+    ///
+    /// Both roads, because both go through the same promise: the node the
+    /// scheduler picks and the node somebody NAMED with `--to`.
+    #[test]
+    fn two_migrations_to_a_node_with_room_for_one_do_not_both_pass() {
+        let first = whole_machine("web-1");
+        let second = whole_machine("web-2");
+        // agent-2 is the only machine that is not the source.
+        let fleet = vec![node("agent-1"), node("agent-2")];
+        assert_eq!(
+            choose_target(&FirstFit, &first, "agent-1", None, &fleet),
+            Ok("agent-2".to_string()),
+            "there is room for the first"
+        );
+        assert_eq!(
+            choose_target(&FirstFit, &second, "agent-1", Some("agent-2"), &fleet),
+            Ok("agent-2".to_string()),
+            "and, measured alone, for the second"
+        );
+
+        // The first move writes its promise down. Nothing is bound yet — the
+        // guest is still on agent-1, and will be until the transfer finishes
+        // — so this object is the only thing in the cluster that knows.
+        let promise = CapacityReservation::of(
+            &migration("web-1", VmMigrationPhaseKind::Pending),
+            &first,
+            "agent-2",
+        );
+        let mut after = fleet.clone();
+        controller_api::hold(&mut after, std::slice::from_ref(&promise));
+
+        let why = choose_target(&FirstFit, &second, "agent-1", None, &after)
+            .expect_err("the second move has nowhere to go");
+        assert!(why.contains("web-2"), "it is about the guest: {why}");
+        let why = choose_target(&FirstFit, &second, "agent-1", Some("agent-2"), &after)
+            .expect_err("and naming the node does not buy the room back");
+        assert!(why.contains("agent-2"), "it is about the machine: {why}");
+
+        // Given back, the machine is a candidate again — the promise is a
+        // size and a moment, not a veto.
+        assert_eq!(
+            choose_target(&FirstFit, &second, "agent-1", None, &fleet),
+            Ok("agent-2".to_string())
+        );
+    }
+
+    /// A record's own promise is not a reason to refuse that record's own
+    /// move — and it would be, without `give_back`.
+    ///
+    /// The case is a real one: `prepare` writes the promise BEFORE the claim
+    /// that says this replica is carrying the move, so a process killed
+    /// between the two leaves a promise for a migration that is still
+    /// Pending. The next pass builds its candidate list with that promise
+    /// taken off, finds the destination exactly this guest too full, and
+    /// would fail the move by its own bookkeeping — every pass, for ever,
+    /// since every pass writes the same promise down again.
+    #[test]
+    fn a_records_own_reservation_does_not_refuse_its_own_move() {
+        let guest = whole_machine("web-1");
+        let moving = migration("web-1", VmMigrationPhaseKind::Pending);
+        let promise = CapacityReservation::of(&moving, &guest, "agent-2");
+        let taken = std::slice::from_ref(&promise);
+
+        let mut fleet = vec![node("agent-1"), node("agent-2")];
+        controller_api::hold(&mut fleet, taken);
+        assert!(
+            choose_target(&FirstFit, &guest, "agent-1", Some("agent-2"), &fleet).is_err(),
+            "taken off, the machine is exactly this guest too full"
+        );
+
+        give_back(&mut fleet, taken, &promise);
+        assert_eq!(
+            choose_target(&FirstFit, &guest, "agent-1", Some("agent-2"), &fleet),
+            Ok("agent-2".to_string()),
+            "and put back, it is the machine this very record promised"
+        );
+
+        // Somebody else's promise is not given back, and the guard is the
+        // name: adding back a number nobody subtracted would invent room.
+        let theirs = CapacityReservation::of(
+            &migration("web-2", VmMigrationPhaseKind::Pending),
+            &whole_machine("web-2"),
+            "agent-2",
+        );
+        let mut other = vec![node("agent-1"), node("agent-2")];
+        controller_api::hold(&mut other, std::slice::from_ref(&theirs));
+        give_back(&mut other, std::slice::from_ref(&theirs), &promise);
+        assert!(
+            choose_target(&FirstFit, &guest, "agent-1", Some("agent-2"), &other).is_err(),
+            "another move's promise stays where it is"
+        );
+    }
+
+    /// **A reservation outlives nothing**, as the sweep sees it: a promise is
+    /// live exactly while a migration of its own name AND uid is still being
+    /// carried.
+    ///
+    /// The four ways to become an orphan are the four ways that comparison
+    /// fails, and the fourth is why the uid is on the object at all: a
+    /// migration is named for a vm and a moment, and a record can be removed
+    /// and one made again under the same name.
+    #[test]
+    fn a_reservation_whose_migration_is_over_is_an_orphan() {
+        let guest = whole_machine("web-1");
+        let live = migration("web-1", VmMigrationPhaseKind::Preparing);
+        let held = CapacityReservation::of(&live, &guest, "agent-2");
+        let name_of = |rs: Vec<&CapacityReservation>| -> Vec<String> {
+            rs.into_iter().map(|r| r.metadata.name.clone()).collect()
+        };
+
+        assert!(
+            controller_api::orphaned_reservations(
+                std::slice::from_ref(&held),
+                std::slice::from_ref(&live)
+            )
+            .is_empty(),
+            "a move that is still being carried keeps its room"
+        );
+
+        // Finished, failed, deleted, and gone.
+        for phase in [
+            VmMigrationPhaseKind::Succeeded,
+            VmMigrationPhaseKind::Failed,
+        ] {
+            let mut over = live.clone();
+            over.status.reported = Some(controller_api::VmMigrationReported::by(
+                "target",
+                phase,
+                controller_api::VmMigrationReason::Abandoned,
+                Some("over".to_string()),
+                Utc::now(),
+            ));
+            over.settle(Utc::now());
+            assert_eq!(over.status.phase().kind(), phase);
+            assert_eq!(
+                name_of(controller_api::orphaned_reservations(
+                    std::slice::from_ref(&held),
+                    std::slice::from_ref(&over)
+                )),
+                vec![held.metadata.name.clone()],
+                "{phase:?}"
+            );
+        }
+        let mut removed = live.clone();
+        removed.metadata.deletion_timestamp = Some(Utc::now());
+        assert_eq!(
+            name_of(controller_api::orphaned_reservations(
+                std::slice::from_ref(&held),
+                std::slice::from_ref(&removed)
+            )),
+            vec![held.metadata.name.clone()],
+            "a record on its way out carries nothing"
+        );
+        assert_eq!(
+            name_of(controller_api::orphaned_reservations(
+                std::slice::from_ref(&held),
+                &[]
+            )),
+            vec![held.metadata.name.clone()],
+            "and a record that is gone carries nothing either"
+        );
+
+        // The one a name alone would get wrong: same name, later record.
+        let mut again = live.clone();
+        again.metadata.uid = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            name_of(controller_api::orphaned_reservations(
+                std::slice::from_ref(&held),
+                std::slice::from_ref(&again)
+            )),
+            vec![held.metadata.name.clone()],
+            "a later record of the same name is not this promise's migration"
+        );
+    }
+
+    /// An etcd of one's own, the way `reconcile::tests` takes one.
+    ///
+    /// `#[ignore]`: it needs an etcd. Start one and name it:
+    ///
+    /// ```text
+    /// MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
+    ///   cargo test -p meister-cluster-controller -- --ignored reservation
+    /// ```
+    async fn test_store() -> EtcdStore {
+        let endpoint = std::env::var("MEISTER_TEST_ETCD")
+            .unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+        let prefix = format!("/migration-reservation-test/{}", uuid::Uuid::new_v4());
+        EtcdStore::connect(&[endpoint], &prefix)
+            .await
+            .expect("an etcd to talk to; see the function's note")
+    }
+
+    /// The room goes back when the move ends — through `fail`, which is the
+    /// one funnel every failure in this file reaches, `abandon` included.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see test_store"]
+    async fn a_failed_migration_gives_its_room_back() {
+        let store = test_store().await;
+        let guest = store
+            .create(&whole_machine("web-1"))
+            .await
+            .expect("the guest");
+        let moving = store
+            .create(&migration("web-1", VmMigrationPhaseKind::Pending))
+            .await
+            .expect("the record");
+        let promise = store
+            .create(&CapacityReservation::of(&moving, &guest, "agent-2"))
+            .await
+            .expect("the promise");
+        assert_eq!(promise.spec.mem_mib, 8192, "the guest's size travelled");
+
+        fail(&store, &moving, "the destination said no".to_string())
+            .await
+            .expect("the ending is written");
+
+        let ended: VmMigration = store.get(&moving.metadata.name).await.expect("the record");
+        assert_eq!(ended.status.phase().kind(), VmMigrationPhaseKind::Failed);
+        let left: Vec<CapacityReservation> = store.list().await.expect("the listing");
+        assert!(
+            left.is_empty(),
+            "a failed move holds no room: {:?}",
+            left.iter().map(|r| &r.metadata.name).collect::<Vec<_>>()
+        );
+
+        // And failing again — a second replica, a re-read — is not an error
+        // and takes nothing that is not there.
+        fail(&store, &moving, "and again".to_string())
+            .await
+            .expect("releasing what was already released is a no-op");
+    }
+
+    /// The backstop for the process that was killed between the promise and
+    /// the migration's last phase: one sweep per pass, and a promise nobody
+    /// is coming for is given back.
+    #[tokio::test]
+    #[ignore = "needs an etcd; see test_store"]
+    async fn the_reaper_takes_a_reservation_whose_migration_is_over() {
+        let store = test_store().await;
+        let guest = store
+            .create(&whole_machine("web-1"))
+            .await
+            .expect("the guest");
+
+        // One move that is still being carried, and one whose record is gone
+        // — the crashed controller's leftover.
+        let live = store
+            .create(&migration("web-1", VmMigrationPhaseKind::Preparing))
+            .await
+            .expect("the live record");
+        store
+            .create(&CapacityReservation::of(&live, &guest, "agent-2"))
+            .await
+            .expect("its promise");
+        let mut gone = migration("web-2", VmMigrationPhaseKind::Pending);
+        gone.metadata.name = "web-2-20260923t193811".to_string();
+        store
+            .create(&CapacityReservation::of(&gone, &guest, "agent-2"))
+            .await
+            .expect("the orphan");
+
+        let held: Vec<CapacityReservation> = store.list().await.expect("the listing");
+        assert_eq!(held.len(), 2);
+        let migrations: Vec<VmMigration> = store.list().await.expect("the records");
+        reap_reservations(&store, &held, &migrations).await;
+
+        let left: Vec<CapacityReservation> = store.list().await.expect("the listing");
+        assert_eq!(
+            left.iter().map(|r| &r.spec.migration).collect::<Vec<_>>(),
+            vec![&live.metadata.name],
+            "the orphan went and the live one stayed"
+        );
+
+        // And it is idempotent: a second pass finds nothing to take.
+        reap_reservations(&store, &left, &migrations).await;
+        let after: Vec<CapacityReservation> = store.list().await.expect("the listing");
+        assert_eq!(after.len(), 1);
     }
 }

@@ -18,7 +18,16 @@ use super::*;
 /// Every phase counts, a Pending one included. A VM that has been bound and
 /// not yet started is a claim on this node, and leaving it out is how a node
 /// takes on twice its memory in one burst of creates.
-pub(super) fn free_on(
+///
+/// What it does NOT count is a guest on its way here that is still bound to
+/// the machine it is leaving — a live migration's, for the length of the
+/// move. That claim is an object of its own and is taken off by
+/// `controller_api::hold`; see `CapacityReservationSpec` and Astra finding
+/// S07, 2026-09-23. `pub(crate)` for that reason: `migration::confirm` needs
+/// the room a node has BEFORE any promise, which is exactly this number, and
+/// a second function computing it beside this one is two answers to one
+/// question.
+pub(crate) fn free_on(
     node: &str,
     capacity: &controller_api::NodeCapacity,
     vms: &[Vm],
@@ -90,6 +99,12 @@ pub(crate) async fn candidates_for_preview(
 ) -> anyhow::Result<Vec<Candidate>> {
     let now = Utc::now();
     let vms = store.list::<Vm>().await?;
+    // What is promised to a guest a live migration is moving, which a sum
+    // over the VM objects cannot see: the guest is still bound to the machine
+    // it is LEAVING. A preview that left it out would answer "would place on
+    // agent-2" about a machine whose last slot a migration is already flying
+    // into. See Astra finding S07, 2026-09-23.
+    let held = store.list::<CapacityReservation>().await?;
     // One read for the whole fleet's liveness: the heartbeat lives in its own
     // key since D-C7, and a LIST of ten nodes must not become eleven round
     // trips.
@@ -119,6 +134,7 @@ pub(crate) async fn candidates_for_preview(
             name,
         });
     }
+    controller_api::hold(&mut out, &held);
     Ok(out)
 }
 
@@ -132,10 +148,17 @@ pub(crate) async fn candidates_for_preview(
 /// two replicas reaching it at once cost one redundant write and nothing else.
 /// `connected` stays strictly local, though: a node with a live session
 /// *somewhere* is still not a node this replica can send anything to.
+///
+/// `held` is what the fleet has promised to guests that are on their way but
+/// not yet bound — a live migration's destination, and nothing else. It is
+/// read by the caller rather than here, because the same listing is what the
+/// reaper walks one step later in the same pass, and two readings of it could
+/// disagree about which promises are standing.
 pub(super) async fn expire_and_collect_nodes(
     store: &EtcdStore,
     sessions: &HashSet<String>,
     vms: &[Vm],
+    held: &[CapacityReservation],
     overcommit: Overcommit,
 ) -> anyhow::Result<(Vec<Candidate>, NodeLocalities)> {
     let now = Utc::now();
@@ -246,6 +269,11 @@ pub(super) async fn expire_and_collect_nodes(
             name,
         });
     }
+    // The second subtraction, and the one `free_on` cannot make: room already
+    // promised to a guest in flight. Applied here, where the list is built,
+    // so that every reader of it — the VM loop, the migrations, a preview —
+    // is measured against one number. See Astra finding S07, 2026-09-23.
+    controller_api::hold(&mut out, held);
     Ok((out, localities))
 }
 

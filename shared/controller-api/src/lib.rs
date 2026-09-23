@@ -58,20 +58,20 @@ pub use object::{
 pub use oidc::{GROUP_OIDC, GROUP_OIDC_TENANT_PREFIX, OidcAuthenticator, claimed_tenant};
 pub use requeue::{RequeueConfig, RequeuePolicy};
 pub use resources::{
-    API_VERSION, AccessMode, CLASS_ROUTER, CLASS_VM, CertificateSigningRequest, Cluster,
-    ClusterCapacity, ClusterSpec, ClusterStatus, Counter, CounterSpec, CsrCondition,
-    CsrConditionType, CsrSpec, CsrStatus, DEFAULT_QUOTA_PRIVATE, DEFAULT_QUOTA_PUBLIC,
-    DEFAULT_QUOTA_STORAGE_GIB, DEFAULT_ROUTED_PREFIX_LEN, Draining, Evacuating, Evacuation,
-    EvacuationStep, Event, EventSpec, EventType, FloatingIp, FloatingIpSpec, FloatingIpStatus,
-    FloatingPool, FloatingPoolSpec, FloatingPoolStatus, Image, ImageFormat, ImageNodeState,
-    ImagePhase, ImagePhaseKind, ImageReason, ImageSpec, ImageStatus, IssuedCertificate,
-    LABEL_CLOUD_UID, LABEL_MANAGED_BY, Locality, MANAGED_BY_CLOUD, MachineProfile, NatKind,
-    NatRule, Node, NodeCapacity, NodeCondition, NodeConditionType, NodeSpec, NodeStatus,
-    NodeSummary, PoolAtCluster, PoolDisagreement, PoolPointer, ProviderNetwork,
-    ProviderNetworkSpec, ProviderNetworkStatus, Refusal as VmRefusal, RoutedSubnet,
-    RoutedSubnetSpec, RoutedSubnetStatus, Router, RouterPhase, RouterPhaseKind, RouterReason,
-    RouterSpec, RouterStatus, RunStrategy, SIGNER_USER_CLIENT, Secret, SecretSpec, StayReason,
-    StayingVm, StoragePool, StoragePoolPhase, StoragePoolPhaseKind, StoragePoolReason,
+    API_VERSION, AccessMode, CLASS_ROUTER, CLASS_VM, CapacityReservation, CapacityReservationSpec,
+    CertificateSigningRequest, Cluster, ClusterCapacity, ClusterSpec, ClusterStatus, Counter,
+    CounterSpec, CsrCondition, CsrConditionType, CsrSpec, CsrStatus, DEFAULT_QUOTA_PRIVATE,
+    DEFAULT_QUOTA_PUBLIC, DEFAULT_QUOTA_STORAGE_GIB, DEFAULT_ROUTED_PREFIX_LEN, Draining,
+    Evacuating, Evacuation, EvacuationStep, Event, EventSpec, EventType, FloatingIp,
+    FloatingIpSpec, FloatingIpStatus, FloatingPool, FloatingPoolSpec, FloatingPoolStatus, Image,
+    ImageFormat, ImageNodeState, ImagePhase, ImagePhaseKind, ImageReason, ImageSpec, ImageStatus,
+    IssuedCertificate, LABEL_CLOUD_UID, LABEL_MANAGED_BY, Locality, MANAGED_BY_CLOUD,
+    MachineProfile, NatKind, NatRule, Node, NodeCapacity, NodeCondition, NodeConditionType,
+    NodeSpec, NodeStatus, NodeSummary, PoolAtCluster, PoolDisagreement, PoolPointer,
+    ProviderNetwork, ProviderNetworkSpec, ProviderNetworkStatus, Refusal as VmRefusal,
+    RoutedSubnet, RoutedSubnetSpec, RoutedSubnetStatus, Router, RouterPhase, RouterPhaseKind,
+    RouterReason, RouterSpec, RouterStatus, RunStrategy, SIGNER_USER_CLIENT, Secret, SecretSpec,
+    StayReason, StayingVm, StoragePool, StoragePoolPhase, StoragePoolPhaseKind, StoragePoolReason,
     StoragePoolSpec, StoragePoolStatus, Tenant, TenantQuota, TenantSpec, TenantStatus, TenantUsage,
     Ticket, TicketBearer, TicketSpec, User, UserSpec, UserStatus, VOLUME_RELEASE_FINALIZER, Vm,
     VmAddress, VmAddressKind, VmMigration, VmMigrationPhase, VmMigrationPhaseKind,
@@ -80,8 +80,8 @@ pub use resources::{
     VolumePhaseKind, VolumeReason, VolumeSnapshot, VolumeSnapshotPhase, VolumeSnapshotPhaseKind,
     VolumeSnapshotReason, VolumeSnapshotSpec, VolumeSnapshotStatus, VolumeSpec, VolumeStatus,
     accepts_class, cluster_accepts, frozen_vm_shape, grows_only, live_migration_refusal,
-    new_volume, new_volume_snapshot, same_tenancy, second_open_is_a_migration, settle_image,
-    settle_storage_pool, unbind_only, vm_shape_unchanged,
+    new_volume, new_volume_snapshot, orphaned_reservations, same_tenancy,
+    second_open_is_a_migration, settle_image, settle_storage_pool, unbind_only, vm_shape_unchanged,
 };
 pub use resources::{
     ImagePhaseWire, ImageReported, RouterPhaseWire, RouterReported, StoragePoolPhaseWire,
@@ -99,9 +99,9 @@ pub use rest::{
 pub use scheduler::{
     Candidate, CandidateKind, Capacity, DevicePolicy, FirstFit, NodeDemand, Overcommit,
     PendingReason, PendingTally, Scheduler, SchedulerConfig, Spread, VolumeBinding, feasible,
-    feasible_for_volumes, narrow_allowed, pending_reason, pending_reason_of, preferred,
-    preferred_for_volumes, selector_for, selects, spend, volume_nodes_unusable,
-    volume_pending_reason,
+    feasible_for_volumes, hold, narrow_allowed, pending_reason, pending_reason_of, preferred,
+    preferred_for_volumes, reservation_holds, reserved_on, selector_for, selects, spend,
+    volume_nodes_unusable, volume_pending_reason,
 };
 pub use store::{EtcdStore, Fence, PassTrigger, StoreError};
 pub use stuck::{

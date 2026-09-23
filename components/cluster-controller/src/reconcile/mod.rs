@@ -24,9 +24,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use controller_api::{
-    Candidate, CandidateKind, Capacity, EtcdStore, Lifecycle, Locality, Node, Overcommit,
-    PassTrigger, PendingReason, PendingTally, RequeuePolicy, Resource, RunStrategy, Scheduler,
-    StoragePool, StoreError, Vm, VmPhaseKind, Volume, VolumeBinding, VolumePhaseKind,
+    Candidate, CandidateKind, Capacity, CapacityReservation, EtcdStore, Lifecycle, Locality, Node,
+    Overcommit, PassTrigger, PendingReason, PendingTally, RequeuePolicy, Resource, RunStrategy,
+    Scheduler, StoragePool, StoreError, Vm, VmPhaseKind, Volume, VolumeBinding, VolumePhaseKind,
     VolumeSnapshot, VolumeSnapshotPhaseKind, heartbeat_expired, lifecycle_command,
     scheduler::{StoragePolicy, feasible_for_storage, storage_pending_reason},
 };
@@ -314,7 +314,21 @@ async fn pass(
     // rather than read a second time: one picture of the fleet per pass, and
     // two readings could disagree about which node a VM is on.
     let vms_for_drain = vms.clone();
-    let (nodes, localities) = expire_and_collect_nodes(store, &sessions, &vms, overcommit).await?;
+    // What the fleet has promised to guests that are on their way and are not
+    // bound anywhere yet — a live migration's destination. One reading for
+    // the whole pass: the candidate list is built with it taken off, and the
+    // reaper below walks the same list, so the two cannot disagree about
+    // which promises were standing when this pass began. Astra finding S07,
+    // 2026-09-23.
+    let held: Vec<CapacityReservation> = match store.list().await {
+        Ok(held) => held,
+        // Nothing has ever reserved in this cluster, which is the ordinary
+        // state of a fleet that is not migrating anything.
+        Err(StoreError::NotFound(_)) => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let (nodes, localities) =
+        expire_and_collect_nodes(store, &sessions, &vms, &held, overcommit).await?;
     telemetry::metrics::objects().set_count(Node::KIND, nodes.len() as i64);
     let pass = Pass {
         store,
@@ -363,9 +377,16 @@ async fn pass(
     // because a drain that finds a live-capable VM CREATES a migration, and
     // the one it made should be picked up by the next pass rather than by
     // this one, half-decided.
-    if let Err(e) =
-        crate::migration::reconcile_migrations(store, dispatch, scheduler, &pass.nodes, migration)
-            .await
+    if let Err(e) = crate::migration::reconcile_migrations(
+        store,
+        dispatch,
+        scheduler,
+        &pass.nodes,
+        migration,
+        &held,
+        overcommit,
+    )
+    .await
     {
         warn!(error = format!("{e:#}"), "vm migration pass failed");
     }
