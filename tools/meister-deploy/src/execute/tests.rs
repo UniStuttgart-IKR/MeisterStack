@@ -2730,15 +2730,21 @@ fn a_resume_carries_a_rotation_on_from_the_phase_the_host_is_at() {
         .expect(helper("box", &["lock", "acquire"]), ok())
         .expect(
             helper("box", &["keys", "status", "--kind", "identity"]),
+            // The helper's own envelope, exactly as `meister-activate
+            // --json keys status` prints it.
             Output::stdout(
                 serde_json::json!({
-                    "kind": "identity",
-                    "state": "overlap",
-                    "key_next": true,
-                    "crt_next": true,
-                    "prev": false,
-                    "reason": null,
-                    "record": null,
+                    "ok": true,
+                    "what": "keys status",
+                    "result": {
+                        "kind": "identity",
+                        "state": "overlap",
+                        "key_next": true,
+                        "crt_next": true,
+                        "prev": false,
+                        "reason": null,
+                        "record": null,
+                    },
                 })
                 .to_string(),
             ),
@@ -2805,13 +2811,17 @@ fn a_resume_of_a_finished_rotation_does_nothing_at_all() {
                 helper("box", &["keys", "status", "--kind", "identity"]),
                 Output::stdout(
                     serde_json::json!({
-                        "kind": "identity",
-                        "state": "confirmed",
-                        "key_next": false,
-                        "crt_next": false,
-                        "prev": false,
-                        "reason": null,
-                        "record": null,
+                        "ok": true,
+                        "what": "keys status",
+                        "result": {
+                            "kind": "identity",
+                            "state": "confirmed",
+                            "key_next": false,
+                            "crt_next": false,
+                            "prev": false,
+                            "reason": null,
+                            "record": null,
+                        },
                     })
                     .to_string(),
                 ),

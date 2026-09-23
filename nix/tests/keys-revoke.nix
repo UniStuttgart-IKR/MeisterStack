@@ -127,6 +127,11 @@ let
 
     services.openssh.enable = true;
     users.users.root.openssh.authorizedKeys.keys = [ keys.snakeOilPublicKey ];
+    # The operator's own line, and it belongs here rather than in the
+    # fleet's modules: `nixosModules.services` sets nothing host-global
+    # (D1), so which ports a host opens is the owner's decision. Without it
+    # the REST edge of this test would be a port nobody can reach.
+    networking.firewall.allowedTCPPorts = [ 3000 ];
 
     system.switch.enable = true;
     boot.loader.grub.enable = false;
@@ -660,12 +665,17 @@ pkgs.testers.runNixOSTest {
     # The list lives under `pki.dir`, not in the system generation, so going
     # back to the system that was running before the revocation changes
     # nothing about it.
+    system_b = box.succeed("readlink -f /run/current-system").strip()
+    system_a = box.succeed(
+        "readlink -f /nix/var/nix/profiles/system-1-link"
+    ).strip()
+    assert system_a != system_b, (system_a, system_b)
     box.succeed(
-        "meister-activate activate --txn rollback --toplevel "
-        "$(readlink -f /nix/var/nix/profiles/system-1-link 2>/dev/null || "
-        "readlink -f /run/booted-system) --mode switch --confirm-within 0"
+        f"meister-activate activate --txn rollback --toplevel {system_a} "
+        "--mode switch --confirm-within 0"
     )
     box.succeed("meister-activate confirm --txn rollback")
+    box.succeed("meister-activate txn retire --txn rollback")
     box.wait_for_unit("meister-cloud-controller.service")
     ok = False
     for _ in range(40):
@@ -677,6 +687,19 @@ pkgs.testers.runNixOSTest {
     assert ok, ("a rollback revived a revoked certificate", code, body)
     status, code, body, _ = ask("root")
     assert code == "200", (code, body)
+
+    # And forward again, so that the host runs what the release builds: the
+    # steps below are rollouts like any other, and a host that runs the
+    # system BEFORE the one in the release is a host whose `system` check
+    # fails — which would take the rotation below back for a reason that
+    # has nothing to do with keys.
+    box.succeed(
+        f"meister-activate activate --txn forward --toplevel {system_b} "
+        "--mode switch --confirm-within 0"
+    )
+    box.succeed("meister-activate confirm --txn forward")
+    box.succeed("meister-activate txn retire --txn forward")
+    assert box.succeed("readlink -f /run/current-system").strip() == system_b
 
     # --- step 12: and rustls' half, which needs the restart --------------
     #
@@ -768,9 +791,14 @@ pkgs.testers.runNixOSTest {
         box.succeed("meister-activate --json keys status --kind identity")
     )
     print(json.dumps(state, indent=2))
-    where = state.get("keys status", state).get("state")
+    where = state.get("result", state).get("state")
     assert where in ("overlap", "switched"), state
-    first_run = operator.succeed("head -1 /root/out/rot.log").strip()
+    # The run id, and not "the first line": stdout and stderr are in one
+    # file here, and the notes on stderr come and go.
+    first_run = operator.succeed(
+        "grep -oE '^[0-9a-f-]{36}$' /root/out/rot.log | head -1"
+    ).strip()
+    assert first_run, operator.succeed("cat /root/out/rot.log")
     print("the interrupted run was " + first_run)
 
     # The resume asks the host where it is and carries on from there.

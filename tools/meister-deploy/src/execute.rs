@@ -1495,14 +1495,14 @@ impl<'a> Executor<'a> {
         let cmd = self.helper_cmd(id, &["keys", "status", "--kind", &kind])?;
         let answer = self.runner.run(&cmd)?;
         let text = answer.trimmed();
-        // The helper prints its usual envelope (`{ok, what, <what>: …}`)
-        // with `--json`; a bare view is accepted too, so that a test can
-        // hand one over without building the envelope around it.
+        // The helper prints its usual envelope (`{ok, what, result}`) with
+        // `--json`; a bare view is accepted too, so that a test can hand
+        // one over without building the envelope around it.
         let view: crate::activate::KeysView = match serde_json::from_str(text) {
             Ok(view) => view,
             Err(_) => serde_json::from_str::<serde_json::Value>(text)
                 .ok()
-                .and_then(|v| v.get("keys status").cloned())
+                .and_then(|v| v.get("result").cloned())
                 .and_then(|v| serde_json::from_value(v).ok())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
