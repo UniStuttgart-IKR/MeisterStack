@@ -501,9 +501,11 @@ pkgs.testers.runNixOSTest {
     # assertion below went red. An input-addressed output of a one-line
     # derivation is what a real unsigned closure looks like. The builder is
     # `runtimeShell`, the bash every NixOS closure already carries — the
-    # operator has no network and cannot fetch another.
+    # operator has no network and cannot fetch another. `sandbox false`, because
+    # a builder named as a plain string is not an input of the derivation and
+    # the sandbox would not bind it (measured: "No such file or directory").
     unsigned = operator.succeed(
-        "nix-build --no-out-link -E 'derivation { name = \"unsigned\"; "
+        "nix-build --no-out-link --option sandbox false -E 'derivation { name = \"unsigned\"; "
         "system = \"x86_64-linux\"; builder = \"${pkgs.runtimeShell}\"; "
         "args = [ \"-c\" \"echo not-signed > $out\" ]; }'"
     ).strip()
