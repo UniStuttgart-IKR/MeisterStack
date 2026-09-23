@@ -48,7 +48,9 @@
 //!   -p CapabilityBoundingSet=          and there is nothing to widen to
 //!   -p AmbientCapabilities=
 //!   -p PrivateNetwork=yes              a converter has nobody to talk to
-//!   -p RestrictAddressFamilies=none    not even over a unix socket
+//!   -p RestrictAddressFamilies=        not even over a unix socket (an
+//!                                      empty allow-list denies every
+//!                                      family; see `argv`)
 //!   -p ProtectSystem=strict            the hierarchy read-only
 //!   -p ProtectHome=yes
 //!   -p PrivateTmp=yes
@@ -468,10 +470,23 @@ impl Sandbox {
         prop(text("RestrictNamespaces", "yes"));
         prop(text("RestrictRealtime", "yes"));
         // A converter has nobody to talk to. `PrivateNetwork` takes the
-        // stack away and `RestrictAddressFamilies=none` takes the socket
-        // syscalls with it, unix sockets included.
+        // stack away and the line below takes the socket syscalls with it,
+        // unix sockets included.
+        //
+        // And it is EMPTY on purpose, where a unit file would say `none`.
+        // The two are not the same word for the same thing: `none` is
+        // understood by the unit-file parser and refused by the transient
+        // one, so `systemd-run -p RestrictAddressFamilies=none` fails with
+        // "Failed to set unit properties: Invalid argument" and the
+        // conversion never runs at all. Over the bus the property is a
+        // (allow-list?, families) pair, and an EMPTY allow-list is what
+        // denies everything — measured on systemd 261: a probe under
+        // `RestrictAddressFamilies=` got EAFNOSUPPORT for AF_INET and for
+        // AF_UNIX, and the same probe with no property at all got neither.
+        // Changing this line to the word that reads better breaks every
+        // conversion on every node.
         prop(text("PrivateNetwork", "yes"));
-        prop(text("RestrictAddressFamilies", "none"));
+        prop(text("RestrictAddressFamilies", ""));
         // The filesystem: read-only everywhere, with the two exceptions
         // below, and no home directories at all.
         prop(text("ProtectSystem", "strict"));
@@ -1073,7 +1088,9 @@ mod tests {
             "CapabilityBoundingSet=",
             "AmbientCapabilities=",
             "PrivateNetwork=yes",
-            "RestrictAddressFamilies=none",
+            // Empty, and not the word `none` a unit file would use: see
+            // `argv`. `systemd-run` refuses `none` outright.
+            "RestrictAddressFamilies=",
             "ProtectSystem=strict",
             "ProtectHome=yes",
             "PrivateTmp=yes",

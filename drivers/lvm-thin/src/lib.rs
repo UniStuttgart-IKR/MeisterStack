@@ -1215,7 +1215,10 @@ mod tests {
                 "NoNewPrivileges=yes",
                 "CapabilityBoundingSet=",
                 "PrivateNetwork=yes",
-                "RestrictAddressFamilies=none",
+                // Empty, not `none`: `systemd-run` refuses the word a
+                // unit file would use. The trailing space is what makes
+                // this an assertion about the empty value.
+                "RestrictAddressFamilies= ",
                 "ProtectSystem=strict",
                 "ProtectHome=yes",
                 "PrivateTmp=yes",
