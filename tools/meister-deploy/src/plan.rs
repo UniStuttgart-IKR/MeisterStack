@@ -1604,7 +1604,7 @@ pub fn hardware_verdict(
     id: &str,
     host: &crate::manifest::ResolvedHost,
     obs: &crate::observation::HostObservation,
-    closure_size: u64,
+    closure_size: Option<u64>,
 ) -> HardwareVerdict {
     let mut v = HardwareVerdict::default();
 
@@ -1617,21 +1617,26 @@ pub fn hardware_verdict(
     // target which paths it is missing — is a second round trip per host
     // before the one `nix copy` that would tell us anyway, and it would
     // tell us at the moment the disk is already filling up.
-    match obs.disk_free_nix_bytes {
-        Some(free) if free < closure_size => v.blocked.push(format!(
+    // `None` means nothing is going to be copied onto this host — it runs
+    // what the release says, or it only needs a file — and then its free
+    // space is nobody's business. A host that needs no closure must not be
+    // blocked by a disk nothing is going to be written to.
+    match (closure_size, obs.disk_free_nix_bytes) {
+        (Some(closure_size), Some(free)) if free < closure_size => v.blocked.push(format!(
             "{id} has {free} byte(s) free on the filesystem that carries /nix and the closure \
              this release builds for it is {closure_size} byte(s). That is the whole closure, \
              and a host already holds most of it — but this tool will not start a copy it \
              cannot finish. Free space on {id} (`meister-activate gc --keep 3`) or take it out \
              of the selection."
         )),
-        Some(free) => v.met.push(format!(
+        (Some(closure_size), Some(free)) => v.met.push(format!(
             "{id} has {free} byte(s) free for a closure of {closure_size}"
         )),
-        None => v.unknown.push(format!(
+        (Some(_), None) => v.unknown.push(format!(
             "nobody could read how much room the store of {id} has, so whether this release \
              fits on it is not known; the copy is the first thing that would find out."
         )),
+        (None, _) => {}
     }
 
     // --- a node that is supposed to run guests ------------------------------
@@ -2104,26 +2109,6 @@ fn decide_host(
             ));
         }
     }
-    // --- lane 4A: the machine under the closure ---------------------------
-    //
-    // Room, /dev/kvm, the cards, the interfaces and the declared
-    // capabilities (V19), all from the one function `execute`'s preflight
-    // asks again with a fresh snapshot. `stop_all` and not
-    // `stop_disruptive`: a machine that is not the machine the fleet
-    // describes is not a machine to stage a closure onto either, and the
-    // preflight step itself stays free so that the finding is REPORTED
-    // rather than only refused.
-    let hardware = hardware_verdict(id, host, obs, artifacts.toplevel.closure_size);
-    d.preconditions.extend(hardware.met);
-    d.stop_all.extend(hardware.blocked);
-    for reason in hardware.unknown {
-        d.unknowns.push(Unknown {
-            host: Some(id.to_string()),
-            reason,
-        });
-    }
-    // --- end lane 4A ---
-
     // --- what runs, what should run, and what booted ----------------------
     d.current_system = obs.current_system.clone();
     let Some(current) = obs.current_system.as_ref() else {
@@ -2152,6 +2137,38 @@ fn decide_host(
             ),
         });
     }
+    // --- lane 4A: the machine under the closure ---------------------------
+    //
+    // Room, /dev/kvm, the cards, the interfaces and the declared
+    // capabilities (V19), all from the one function `execute`'s preflight
+    // asks again with a fresh snapshot. `stop_all` and not
+    // `stop_disruptive`: a machine that is not the machine the fleet
+    // describes is not a machine to stage a closure onto either — and the
+    // preflight step itself stays free, so the finding is REPORTED rather
+    // than only refused.
+    //
+    // Here and not further up, because the ROOM question needs to know
+    // whether anything is going to be copied at all: a host that already
+    // runs the release is not blocked by a full disk nothing would be
+    // written to. Everything else about the machine is asked either way —
+    // a card that is gone is worth saying even about a host that needs
+    // nothing.
+    let hardware = hardware_verdict(
+        id,
+        host,
+        obs,
+        (!unchanged).then_some(artifacts.toplevel.closure_size),
+    );
+    d.preconditions.extend(hardware.met);
+    d.stop_all.extend(hardware.blocked);
+    for reason in hardware.unknown {
+        d.unknowns.push(Unknown {
+            host: Some(id.to_string()),
+            reason,
+        });
+    }
+    // --- end lane 4A ---
+
     d.reboot_only = !unchanged && current_is_desired && next_is_desired && !booted_is_desired;
     if d.reboot_only {
         d.preconditions.push(format!(
@@ -5178,6 +5195,27 @@ mod tests {
         observation.hosts.get_mut("n1").unwrap().disk_free_nix_bytes = Some(closure);
         let plan = planned(&release, "host=n1", &observation);
         assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Change);
+    }
+
+    #[test]
+    fn a_host_that_needs_no_closure_is_not_blocked_by_a_disk_nobody_writes_to() {
+        // The room question is about a COPY. A host that already runs the
+        // release has nothing copied onto it, so a full disk on it is a
+        // thing for its operator and not a reason to refuse to look at it.
+        let release = release_of(onebox_enrolled());
+        let mut observation = observed(&release, at(TAKEN));
+        observation.hosts.get_mut("n1").unwrap().disk_free_nix_bytes = Some(1);
+        let plan = planned(&release, "host=n1", &observation);
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Unchanged);
+        // And it is not claimed either: nothing was measured against
+        // nothing.
+        let said = action(&plan, "n1", ActionKind::Preflight)
+            .preconditions
+            .join(" ");
+        assert!(!said.contains("free for a closure of"), "{said}");
+        // The rest of the machine is still checked, because a card that is
+        // gone is worth saying about a host that needs nothing.
+        assert!(said.contains("has /dev/kvm"), "{said}");
     }
 
     #[test]

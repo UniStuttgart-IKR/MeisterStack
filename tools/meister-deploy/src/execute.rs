@@ -701,7 +701,7 @@ impl<'a> Executor<'a> {
                         id,
                         host,
                         obs,
-                        self.release.artifacts[id].toplevel.closure_size,
+                        Some(self.release.artifacts[id].toplevel.closure_size),
                     );
                     if !verdict.is_clear() {
                         let why = verdict.blocked.join(" ");
