@@ -403,6 +403,232 @@ pub fn issued_path(repo: &Path, host_id: &str, file: &str) -> PathBuf {
     repo.join(ISSUED_DIR).join(host_id).join(file)
 }
 
+// --- lane 5A ---------------------------------------------------------------
+
+/// The fleet's revocation list, in the operator's repository.
+///
+/// Public and committed, like `known_hosts` and like every issued
+/// certificate: a list of serials is a statement about what is no longer
+/// valid, and keeping it secret would only keep it from the people who have
+/// to check it.
+pub const CRL_FILE: &str = "pki/crl.pem";
+
+pub fn crl_path(repo: &Path) -> PathBuf {
+    repo.join(CRL_FILE)
+}
+
+/// Where the certificate of a rotation waits: beside the one in use, under
+/// the same name with `.next` in it.
+///
+/// A name of its own and not the name the active certificate has, because
+/// the ACTIVE one is what `plan` compares a host against — writing the new
+/// certificate over it would make the next ordinary upgrade deliver it
+/// straight to the host, with no overlap, no verify and no way back. That
+/// is precisely what `keys rotate` exists to avoid.
+pub fn next_issued_path(repo: &Path, host_id: &str, kind: &str) -> PathBuf {
+    issued_path(repo, host_id, &format!("{kind}.next.crt"))
+}
+
+pub fn next_csr_path(repo: &Path, host_id: &str, kind: &str) -> PathBuf {
+    csr_path(repo, host_id, &format!("{kind}.next"))
+}
+
+/// `meister-activate keygen --suffix <suffix>`, over ssh.
+pub fn keygen_beside_cmd(
+    ssh: &Ssh,
+    target: &Target,
+    subject: &str,
+    file: &str,
+    replace: bool,
+    suffix: &str,
+) -> Cmd {
+    let mut argv = vec![
+        "meister-activate".to_string(),
+        "--json".to_string(),
+        "keygen".to_string(),
+        "--subject".to_string(),
+        subject.to_string(),
+        "--kind".to_string(),
+        file.to_string(),
+        "--suffix".to_string(),
+        suffix.to_string(),
+    ];
+    if replace {
+        argv.push("--replace".to_string());
+    }
+    ssh.exec(target, argv, Effect::TargetWrite, KEYGEN_DEADLINE)
+}
+
+/// Everything the plan has to say about one rotation, out of what the fleet
+/// renders for that host.
+///
+/// The paths, the owner and the mode are the `secret_refs` of the
+/// certificate this rotation replaces — the same entries `deliver-secret`
+/// reads — and the units are every unit that reads that file. So a rotation
+/// pokes exactly what a delivery would poke, and neither of them knows the
+/// names of any units of its own.
+pub struct Prepared<'a> {
+    pub host_id: &'a str,
+    pub kind: &'a str,
+    pub subject: &'a str,
+    /// What the host answered `keygen` with.
+    pub public_key_sha256: &'a str,
+    /// `sha256:<hex>` of the certificate that was just issued for it.
+    pub cert_sha256: &'a str,
+    pub serial: Option<String>,
+    /// Where that certificate is, relative to the operator's repository.
+    pub source: &'a Path,
+}
+
+pub fn rotation_of(
+    host: &ResolvedHost,
+    prepared: Prepared<'_>,
+) -> Result<crate::plan::KeyRotation> {
+    let Prepared {
+        host_id,
+        kind,
+        subject,
+        public_key_sha256,
+        cert_sha256,
+        serial,
+        source,
+    } = prepared;
+    let wanted = format!("/{kind}.crt");
+    let refs: Vec<&crate::manifest::SecretRef> = host
+        .secret_refs
+        .iter()
+        .filter(|s| s.target_path.ends_with(&wanted))
+        .collect();
+    let Some(first) = refs.first() else {
+        bail!(
+            "the fleet renders no {kind} certificate for {host_id}: no `secret_refs` entry of              its names a file called {kind}.crt. A key that no configuration reads is a key              there is no point rotating."
+        );
+    };
+    let cert_path = first.target_path.clone();
+    let key_path = cert_path.replace(&format!("{kind}.crt"), &format!("{kind}.key"));
+    let mut units: Vec<String> = refs
+        .iter()
+        .filter_map(|s| s.reload.as_ref().map(|r| r.unit.clone()))
+        .collect();
+    units.sort();
+    units.dedup();
+    Ok(crate::plan::KeyRotation {
+        kind: kind.to_string(),
+        subject: subject.to_string(),
+        key_path,
+        cert_path,
+        source: source.display().to_string(),
+        public_key_sha256: public_key_sha256.to_string(),
+        cert_sha256: cert_sha256.to_string(),
+        serial,
+        owner: first.owner.clone(),
+        mode: first.mode.clone(),
+        units,
+    })
+}
+
+/// How long `meister-ca` may take over a revocation. openssl on two small
+/// files.
+pub const CA_DEADLINE: Duration = Duration::from_secs(120);
+
+/// `meister-ca --dir <ca> --index-rebuild --revoke <what> [--reason <r>]`.
+///
+/// The rebuild travels with every revocation on purpose: it is additive and
+/// cheap, and a revocation against a certificate that has no row in the
+/// index would otherwise be a refusal an operator has to translate.
+pub fn revoke_cmd(meister_ca: &Path, ca_dir: &Path, what: &str, reason: Option<&str>) -> Cmd {
+    let mut cmd = Cmd::new(
+        // It uses the CA key to say something and makes no key: the `key`
+        // class, the same as signing.
+        Effect::Key,
+        meister_ca.display().to_string(),
+        CA_DEADLINE,
+    )
+    .arg("--dir")
+    .arg(ca_dir.display().to_string())
+    .arg("--index-rebuild")
+    .arg("--revoke")
+    .arg(what);
+    if let Some(reason) = reason {
+        cmd = cmd.arg("--reason").arg(reason);
+    }
+    cmd
+}
+
+/// `meister-ca --dir <ca> --index-rebuild --gencrl`.
+pub fn gencrl_cmd(meister_ca: &Path, ca_dir: &Path) -> Cmd {
+    Cmd::new(Effect::Key, meister_ca.display().to_string(), CA_DEADLINE)
+        .arg("--dir")
+        .arg(ca_dir.display().to_string())
+        .arg("--index-rebuild")
+        .arg("--gencrl")
+}
+
+/// `openssl crl -in <file> -noout -crlnumber -lastupdate -nextupdate`, for
+/// the sentence a revocation prints.
+pub fn crl_describe_cmd(openssl: &str, crl: &Path) -> Cmd {
+    Cmd::new(Effect::Offline, openssl, Duration::from_secs(30))
+        .arg("crl")
+        .arg("-in")
+        .arg(crl.display().to_string())
+        .arg("-noout")
+        .arg("-crlnumber")
+        .arg("-lastupdate")
+        .arg("-nextupdate")
+}
+
+/// Is this serial on the list this repository holds?
+///
+/// `None` when there is no list at all, which is a different answer from
+/// "not on it": a fleet that publishes no revocation list has taken nothing
+/// back, and a fleet whose list cannot be read is a fleet nobody should be
+/// issuing second certificates in.
+pub fn revoked_here(files: &dyn Files, repo: &Path, serial: &str) -> Result<Option<bool>> {
+    let path = crl_path(repo);
+    if !files.exists(&path) {
+        return Ok(None);
+    }
+    let crl = ::pki::tls::read_crl(&path)?;
+    let wanted = ::pki::tls::normalise_serial(serial);
+    Ok(Some(
+        crl.serials
+            .iter()
+            .any(|s| ::pki::tls::normalise_serial(s) == wanted),
+    ))
+}
+
+/// What a certificate this fleet issued for `host` is called on disk.
+///
+/// `keys issue` writes `<repo>/pki/issued/<host>/<file>.crt`, one per kind.
+/// A revocation of a HOST is a revocation of all of them: an identity and a
+/// serving certificate are the same machine's two credentials.
+pub fn issued_certs(files: &dyn Files, repo: &Path, host_id: &str) -> Vec<PathBuf> {
+    let dir = repo.join(ISSUED_DIR).join(host_id);
+    let mut out: Vec<PathBuf> = files
+        .list_dir(&dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "crt"))
+        // The ACTIVE ones. A rotation leaves two more behind — the one it
+        // is about (`<kind>.next.crt`) and the one it replaced
+        // (`<kind>.prev.crt`) — and neither of them is what this host is
+        // holding. The replaced one is usually worth taking back as well,
+        // and it is taken back by its serial, deliberately and one at a
+        // time.
+        .filter(|p| {
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            !name.contains(".next.") && !name.contains(".prev.")
+        })
+        .collect();
+    out.sort();
+    out
+}
+// --- end lane 5A -----------------------------------------------------------
+
 /// The directory `tools/meister-ca` keeps the CA in, as the inventory names
 /// it.
 ///
@@ -876,6 +1102,15 @@ pub fn local_source(
                 }
             })
         }
+        // --- lane 5A ---
+        // One list for the whole fleet, and it is not about this host: a
+        // revocation list names certificates, not machines, and a copy per
+        // host would be a directory of files that have to be equal and a
+        // day when one of them is not.
+        SecretSourceKind::MeisterCa if secret.kind == crate::manifest::SecretKind::Crl => {
+            Some(crl_path(repo))
+        }
+        // --- end lane 5A ---
         SecretSourceKind::MeisterCa => Some(issued_path(
             repo,
             host_id,

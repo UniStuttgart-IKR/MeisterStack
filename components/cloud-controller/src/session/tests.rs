@@ -234,7 +234,7 @@ fn dial(reg: &SessionRegistry, cluster: &str, at: DateTime<Utc>) -> u64 {
     // The receiver has to outlive the test or the sender reports closed;
     // leaking it is cheaper than threading it through every assertion.
     Box::leak(Box::new(rx));
-    reg.open(None, cluster, &tx, at)
+    reg.open(None, cluster, &tx, at, None)
 }
 
 /// The blocker this whole re-keying exists for: three replicas of one
@@ -545,4 +545,66 @@ fn a_complete_inventory_that_does_not_name_an_image_says_the_file_is_not_there()
         super::inventory::lines_of("cluster-1", "debian.raw", &[], &names).is_empty(),
         "an incomplete inventory is silence, not absence"
     );
+}
+
+// --- lane 5A: the session that was already talking -------------------------
+
+/// A live session on a certificate that has just been taken back is ended,
+/// and the one beside it is not.
+///
+/// What it must NOT do is take the entry out of the map: the stream's own
+/// unwinding is what calls `closed`, and `closed` is what says the cluster
+/// is gone. This test holds that line as well, because the day somebody
+/// "tidies up" by removing the entry here, the cloud starts listing clusters
+/// nobody can reach.
+#[tokio::test]
+async fn a_session_whose_certificate_was_revoked_is_ended() {
+    let reg = SessionRegistry::new();
+    let (tx_a, mut rx_a) = mpsc::channel(4);
+    let (tx_b, mut rx_b) = mpsc::channel(4);
+    reg.open(None, "c1", &tx_a, at(0), Some("aa:bb:01".to_string()));
+    reg.open(None, "c2", &tx_b, at(1), Some("cc:dd:02".to_string()));
+
+    // The list is in the spelling `meister-ca` writes and the session in the
+    // spelling a certificate parses to. One of them is normalised, and it is
+    // the whole point of doing that in one function.
+    let list = controller_api::auth::RevocationList {
+        serials: ["AABB01".to_string()]
+            .into_iter()
+            .map(|s| controller_api::auth::normalise_serial(&s))
+            .collect(),
+        crl_number: Some(4),
+        ..Default::default()
+    };
+    let ended = reg.drop_revoked(&list).await;
+    assert_eq!(ended, vec![("c1".to_string(), "aa:bb:01".to_string())]);
+
+    let said = rx_a
+        .try_recv()
+        .expect("the revoked session was told")
+        .expect_err("and told with an error");
+    assert!(said.to_string().contains("revoked"), "{said}");
+    assert!(
+        rx_b.try_recv().is_err(),
+        "a session nobody revoked was sent something"
+    );
+    assert_eq!(
+        reg.sessions.lock().unwrap().len(),
+        2,
+        "the entries belong to the streams; only their unwinding takes them away"
+    );
+}
+
+/// An anonymous session carries no certificate, so no list can name it.
+#[tokio::test]
+async fn a_session_without_a_certificate_is_not_revoked_by_an_empty_serial() {
+    let reg = SessionRegistry::new();
+    let (tx, mut rx) = mpsc::channel(4);
+    reg.open(None, "c1", &tx, at(0), None);
+    let list = controller_api::auth::RevocationList {
+        serials: ["".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    assert!(reg.drop_revoked(&list).await.is_empty());
+    assert!(rx.try_recv().is_err());
 }

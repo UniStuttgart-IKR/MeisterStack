@@ -153,9 +153,62 @@ enum Verb {
         /// that was reinstalled — never a repair.
         #[arg(long)]
         replace: bool,
+        // --- lane 5A ---
+        /// Write the key BESIDE the one in use: `<kind>.key.<suffix>`.
+        /// `next` is what a rotation prepares with — nothing reads it until
+        /// `keys switch` puts it in.
+        #[arg(long)]
+        suffix: Option<String>,
+        // --- end lane 5A ---
     },
     // --- end lane 3B --------------------------------------------------
+
+    // --- lane 5A: rotating a key in phases ----------------------------
+    /// The steps of a key rotation, one at a time.
+    ///
+    /// Each of them is its own command because each of them is a point a
+    /// run can be interrupted at and picked up from: the new key is made,
+    /// the certificate for it arrives, the pair goes in, the session is
+    /// checked, the old pair goes away. Nothing here decides WHETHER to
+    /// rotate — a plan does that — and nothing here talks to a CA.
+    Keys {
+        #[command(subcommand)]
+        cmd: KeysVerb,
+    },
+    // --- end lane 5A --------------------------------------------------
 }
+
+// --- lane 5A ---------------------------------------------------------------
+#[derive(Subcommand)]
+enum KeysVerb {
+    /// Where a rotation of this key has got to, read off the disk
+    Status {
+        #[arg(long, default_value = "identity")]
+        kind: String,
+    },
+    /// Put the prepared pair in and the one in use aside, in one move
+    Switch {
+        #[arg(long, default_value = "identity")]
+        kind: String,
+        /// The run that owns this rotation
+        #[arg(long)]
+        run: Option<String>,
+    },
+    /// Put the pair that was in use back, and drop the one that failed
+    Revert {
+        #[arg(long, default_value = "identity")]
+        kind: String,
+        /// Why, for the record
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Drop the pair the switch replaced. The rotation is over.
+    Remove {
+        #[arg(long, default_value = "identity")]
+        kind: String,
+    },
+}
+// --- end lane 5A -----------------------------------------------------------
 
 #[derive(Subcommand)]
 enum TxnVerb {
@@ -410,8 +463,10 @@ fn run() -> Result<()> {
             subject,
             kind,
             replace,
+            suffix,
         } => {
-            let outcome = helper.keygen(subject, KeyKind::parse(kind)?, *replace)?;
+            let outcome =
+                helper.keygen_into(subject, KeyKind::parse(kind)?, *replace, suffix.as_deref())?;
             // NOT through `answer`: this one has a shape the workstation
             // parses (`meister_deploy::pki::KeygenReply`), and wrapping it
             // in the helper's usual `{ok, …}` envelope would make the
@@ -428,13 +483,61 @@ fn run() -> Result<()> {
                     } else {
                         "kept the key that was here and made another request"
                     },
-                    helper.key_path(KeyKind::parse(kind)?).display(),
+                    helper
+                        .key_path_with(KeyKind::parse(kind)?, suffix.as_deref())
+                        .display(),
                     outcome.subject,
                     outcome.public_key_sha256
                 );
                 print!("{}", outcome.csr_pem);
             }
         } // --- end lane 3B ----------------------------------------------
+        // --- lane 5A ------------------------------------------------------
+        Verb::Keys { cmd } => match cmd {
+            KeysVerb::Status { kind } => {
+                let view = helper.keys_status(KeyKind::parse(kind)?)?;
+                let said = format!(
+                    "{}: {}{}",
+                    view.kind,
+                    view.state,
+                    view.reason
+                        .as_deref()
+                        .map(|r| format!(" ({r})"))
+                        .unwrap_or_default()
+                );
+                answer(&cli, "keys status", serde_json::to_value(&view)?, &said)?;
+            }
+            KeysVerb::Switch { kind, run } => {
+                let record = helper.keys_switch(KeyKind::parse(kind)?, run.as_deref())?;
+                answer(
+                    &cli,
+                    "keys switch",
+                    serde_json::to_value(&record)?,
+                    &format!(
+                        "{kind}: the prepared pair is in use, the one it replaced is beside it"
+                    ),
+                )?;
+            }
+            KeysVerb::Revert { kind, reason } => {
+                let record = helper.keys_revert(KeyKind::parse(kind)?, reason.as_deref())?;
+                answer(
+                    &cli,
+                    "keys revert",
+                    serde_json::to_value(&record)?,
+                    &format!("{kind}: the pair that was in use is back"),
+                )?;
+            }
+            KeysVerb::Remove { kind } => {
+                let record = helper.keys_remove(KeyKind::parse(kind)?)?;
+                answer(
+                    &cli,
+                    "keys remove",
+                    serde_json::to_value(&record)?,
+                    &format!("{kind}: the pair the switch replaced is gone"),
+                )?;
+            }
+        },
+        // --- end lane 5A --------------------------------------------------
     }
     Ok(())
 }

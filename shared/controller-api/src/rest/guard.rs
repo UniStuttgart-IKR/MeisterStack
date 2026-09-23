@@ -564,6 +564,19 @@ pub struct AuthConfig {
     pub bearer_groups: Option<Vec<String>>,
     /// The identity provider, when this tier has one. See `OidcConfig`.
     pub oidc: Option<OidcConfig>,
+    // --- lane 5A: revocation -------------------------------------------
+    /// The certificate revocation list this controller enforces, as
+    /// `tools/meister-ca --gencrl` writes it. A PATH like every other file
+    /// in this table, and a public file: a list of serials is not a secret.
+    ///
+    /// Absent = no revocation is enforced, which is what every deployment up
+    /// to M5 did. Set and unreadable = a start-up error, because a
+    /// deployment that names a list believes it enforces one.
+    ///
+    /// It is reloaded while the process runs: `meister-deploy keys revoke`
+    /// delivers a new file and nothing is restarted (D11).
+    pub crl: Option<std::path::PathBuf>,
+    // --- end lane 5A ---------------------------------------------------
 }
 
 /// The `[auth.oidc]` table.
@@ -766,6 +779,52 @@ pub fn build_chain(
     tier: Tier,
     serves_sessions: bool,
 ) -> Result<AuthChain> {
+    Ok(build_chain_with_revocations(cfg, client_ca, base, tier, serves_sessions)?.0)
+}
+
+// --- lane 5A ---------------------------------------------------------------
+/// The same, and it hands back the revocation list it built the chain with.
+///
+/// Two functions rather than a second parameter on one, because the list is
+/// wanted by somebody ELSE as well: the session registries close a running
+/// session whose certificate is revoked, and a periodic task reloads the
+/// file. There has to be exactly one `Revocations` in a process — two would
+/// be two answers to one question, half a minute apart — so it is built here
+/// and handed out.
+pub fn build_chain_with_revocations(
+    cfg: &AuthConfig,
+    client_ca: Option<&std::path::Path>,
+    base: Option<&std::path::Path>,
+    tier: Tier,
+    serves_sessions: bool,
+) -> Result<(AuthChain, Option<std::sync::Arc<crate::auth::Revocations>>)> {
+    let revocations = match &cfg.crl {
+        Some(path) => {
+            let path = pki::pem::resolve(base, path);
+            Some(crate::auth::Revocations::load(&path).with_context(|| {
+                format!(
+                    "the revocation list {} could not be read. `auth.crl` is set, so this \
+                     controller is configured to enforce revocation and will not start \
+                     without it; `meister-ca --index-rebuild --gencrl` writes one.",
+                    path.display()
+                )
+            })?)
+        }
+        None => None,
+    };
+    let chain = build_links(cfg, client_ca, base, tier, serves_sessions, &revocations)?;
+    Ok((chain, revocations))
+}
+// --- end lane 5A -----------------------------------------------------------
+
+fn build_links(
+    cfg: &AuthConfig,
+    client_ca: Option<&std::path::Path>,
+    base: Option<&std::path::Path>,
+    tier: Tier,
+    serves_sessions: bool,
+    revocations: &Option<std::sync::Arc<crate::auth::Revocations>>,
+) -> Result<AuthChain> {
     let built = check_chain(cfg, client_ca.is_some(), tier, serves_sessions)?;
     let mut links: Vec<Box<dyn crate::auth::Authenticator>> = Vec::new();
     for name in &built {
@@ -776,10 +835,16 @@ pub fn build_chain(
             }
             "mtls" => {
                 let ca = pki::pem::resolve(base, client_ca.expect("check_chain named it"));
-                links.push(Box::new(crate::auth::MtlsAuthenticator::from_pem_file(
-                    &ca,
-                )?));
-                info!(ca = %ca.display(), "mtls authenticator");
+                links.push(Box::new(
+                    crate::auth::MtlsAuthenticator::from_pem_file(&ca)?
+                        // --- lane 5A: the one place both ports pass ---
+                        .with_revocations(revocations.clone()),
+                ));
+                info!(
+                    ca = %ca.display(),
+                    crl = revocations.as_ref().map(|r| r.path().display().to_string()),
+                    "mtls authenticator"
+                );
             }
             "bearer" => {
                 let path = pki::pem::resolve(

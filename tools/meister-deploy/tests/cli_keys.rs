@@ -776,3 +776,160 @@ fn a_host_that_was_never_resolved_is_read_out_of_the_inventory() {
         stderr(&out)
     );
 }
+
+// --- lane 5A: taking one back ------------------------------------------------
+
+/// The refusals of `keys revoke` come before the CA is touched at all, and
+/// the log is what proves it: nothing ran.
+#[test]
+fn a_revocation_says_what_is_being_taken_back_before_it_touches_the_ca() {
+    let sandbox = Sandbox::new();
+    let release = support::release_of(sandbox.fleet.clone());
+    std::fs::write(
+        sandbox.cwd.path().join("release.json"),
+        release.to_json().unwrap(),
+    )
+    .unwrap();
+
+    // Nothing named.
+    let out = sandbox.run(&["keys", "revoke", "--release", "release.json"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("--serial"), "{}", stderr(&out));
+
+    // Two of the three named.
+    let out = sandbox.run(&[
+        "keys",
+        "revoke",
+        "--release",
+        "release.json",
+        "--serial",
+        "0A0B",
+        "--host",
+        "box",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("Exactly one of the three"),
+        "{}",
+        stderr(&out)
+    );
+
+    // A host this repository has issued nothing for: the sentence names the
+    // other way in (a serial off a receipt), because the machine may be gone.
+    let out = sandbox.run(&[
+        "keys",
+        "revoke",
+        "--release",
+        "release.json",
+        "--host",
+        "box",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("report --run"), "{}", stderr(&out));
+
+    // A host that is not in the fleet at all.
+    let out = sandbox.run(&[
+        "keys",
+        "revoke",
+        "--release",
+        "release.json",
+        "--host",
+        "nobody",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("nobody"), "{}", stderr(&out));
+
+    assert!(
+        !sandbox.calls().iter().any(|l| l.starts_with("meister-ca")),
+        "the CA was called by a refusal: {:?}",
+        sandbox.calls()
+    );
+}
+
+/// `--dry-run` prints the two commands and runs neither.
+#[test]
+fn a_dry_run_shows_the_ca_the_commands_it_would_get() {
+    let sandbox = Sandbox::new();
+    let release = support::release_of(sandbox.fleet.clone());
+    std::fs::write(
+        sandbox.cwd.path().join("release.json"),
+        release.to_json().unwrap(),
+    )
+    .unwrap();
+    let out = sandbox.run(&[
+        "keys",
+        "revoke",
+        "--release",
+        "release.json",
+        "--serial",
+        "64:35:c9:c4",
+        "--reason",
+        "keyCompromise",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let said = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(said.contains("--index-rebuild"), "{said}");
+    assert!(said.contains("--revoke"), "{said}");
+    assert!(said.contains("64:35:c9:c4"), "{said}");
+    assert!(said.contains("--gencrl"), "{said}");
+    assert!(
+        sandbox.calls().is_empty(),
+        "a dry run ran something: {:?}",
+        sandbox.calls()
+    );
+    assert!(
+        !sandbox.cwd.path().join("pki/crl.pem").exists(),
+        "a dry run wrote the list"
+    );
+}
+
+/// V24, the half that is an ORDER: a machine that was reinstalled asks for a
+/// certificate under the name its predecessor still holds one for. The old
+/// one has to be taken back first, or the fleet would accept either.
+#[test]
+fn a_second_certificate_for_one_name_needs_the_first_one_taken_back() {
+    let sandbox = Sandbox::new();
+    sandbox.enrolled(true);
+    // A real request, so that the signature check has something true to
+    // check.
+    let made = pki::generate_key_and_csr("system:node:n1").unwrap();
+    std::fs::create_dir_all(sandbox.path("pki/csr")).unwrap();
+    std::fs::write(sandbox.path("pki/csr/n1-identity.csr"), &made.csr_pem).unwrap();
+    let out = sandbox.run(&[
+        "keys",
+        "issue",
+        "--host",
+        "n1",
+        "--kind",
+        "node",
+        "--manifest",
+        "manifest.json",
+        "--inventory",
+        "fleet.toml",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    // And now the machine was reinstalled: a new key, a new request, and a
+    // certificate this repository will not sign until the old one is gone.
+    let out = sandbox.run(&[
+        "keys",
+        "issue",
+        "--host",
+        "n1",
+        "--kind",
+        "node",
+        "--manifest",
+        "manifest.json",
+        "--inventory",
+        "fleet.toml",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let said = stderr(&out);
+    assert!(said.contains("keys revoke --host n1"), "{said}");
+    assert!(said.contains("0A0B"), "the serial of the old one: {said}");
+    assert!(
+        said.contains("no revocation list"),
+        "it says which of the two reasons it is: {said}"
+    );
+}

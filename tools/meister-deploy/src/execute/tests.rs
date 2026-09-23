@@ -2425,3 +2425,613 @@ fn a_raft_member_is_not_back_until_its_database_is() {
         "a bounded wait that never sleeps is a spin"
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// lane 5A: the revocation list
+// ---------------------------------------------------------------------------
+
+const CRL_PUT: &str = "set -e; d=$(dirname /var/lib/meisterstack/pki/crl.pem); mkdir -p \"$d\"; \
+                       t=$(mktemp \"$d/.meister.XXXXXX\"); cat > \"$t\"; chown root:root \"$t\"; \
+                       chmod 0644 \"$t\"; mv \"$t\" /var/lib/meisterstack/pki/crl.pem";
+
+const CRL_SHA: &str = "sha256sum /var/lib/meisterstack/pki/crl.pem 2>/dev/null | cut -d' ' -f1";
+
+/// A revocation, ready to be carried out: one host that reads a list, a new
+/// list on the operator's disk, and the old one on the host.
+fn revoking() -> (Fixture, String) {
+    let release = release_of(crate::fixtures::with_crl(onebox_enrolled(), &["box"]));
+    let observation = observed(&release, at(NOW));
+    let contents = "-----BEGIN X509 CRL-----\nthe new list\n-----END X509 CRL-----\n".to_string();
+    let digest = crate::ids::sha256_hex(contents.as_bytes());
+    let mut expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
+    for secrets in expected.values_mut() {
+        for (id, value) in secrets.iter_mut() {
+            if id.starts_with("crl-") {
+                *value = format!("sha256:{digest}");
+            }
+        }
+    }
+    let plan = plan(
+        &release,
+        "host=box",
+        &observation,
+        None,
+        &crate::fixtures::plan_policy(PlanKind::KeysRevoke).with_expected_credentials(expected),
+        at(NOW),
+    )
+    .expect("the fixture plans");
+    let fx = Fixture {
+        release,
+        plan,
+        files: MemFiles::new().given("/repo/pki/crl.pem", contents.clone()),
+        clock: FakeClock::at(at(NOW)),
+        state: StateDir::at("/repo/.meister-deploy"),
+        ssh: Ssh::with_known_hosts("/repo/known_hosts"),
+    };
+    (fx, contents)
+}
+
+/// The whole step, and the one thing that must NOT be in it: a restart.
+///
+/// A controller re-reads its revocation list within half a minute. Poking
+/// the unit would be the single avoidable outage in this design — on every
+/// host of the fleet, for every revocation — so the list is written, the
+/// host is asked what it now has, and nothing else happens.
+#[test]
+fn a_revocation_list_is_delivered_and_no_unit_is_restarted() {
+    let (fx, contents) = revoking();
+    let digest = crate::ids::sha256_hex(contents.as_bytes());
+    let look = TableLook::new(&fx);
+    // Two references to ONE file (a cloud and a cluster on one host), which
+    // is what the one derivation writes.
+    let runner = World::new(
+        StrictFake::new()
+            // Twice: the fleet anchor holds every control-plane host of the
+            // inventory (D6), and this host is one — and it is also the
+            // host of this plan, so its own `lock` step takes it as well.
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(shell_on("box", CRL_PUT), ok())
+            .expect(
+                shell_on("box", CRL_SHA),
+                Output::stdout(format!("{digest}\n")),
+            )
+            .expect(shell_on("box", CRL_PUT), ok())
+            .expect(
+                shell_on("box", CRL_SHA),
+                Output::stdout(format!("{digest}\n")),
+            )
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.repo = PathBuf::from("/repo");
+    options.ca_dir = Some(PathBuf::from("/ca"));
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("a revocation applies");
+    // `verify()` is the assertion that matters here: a `systemctl restart`
+    // would have been an unexpected command and the run would have failed.
+    runner.verify().expect("exactly those commands");
+
+    assert_eq!(applied.receipt.outcome, Outcome::Success);
+    let steps: Vec<ActionKind> = applied.receipt.hosts["box"]
+        .actions
+        .iter()
+        .map(|a| a.kind)
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ActionKind::Preflight,
+            ActionKind::Lock,
+            ActionKind::DeliverSecret,
+            ActionKind::DeliverSecret,
+            ActionKind::Verify,
+            ActionKind::Unlock
+        ]
+    );
+    let evidence = applied.receipt.hosts["box"]
+        .actions
+        .iter()
+        .filter(|a| a.kind == ActionKind::DeliverSecret)
+        .flat_map(|a| a.evidence.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        evidence.contains("re-reads its revocation list"),
+        "{evidence}"
+    );
+    assert!(evidence.contains(&format!("sha256:{digest}")), "{evidence}");
+}
+
+// ---------------------------------------------------------------------------
+// lane 5A: the rotation
+// ---------------------------------------------------------------------------
+
+const NEW_CERT: &str = "-----BEGIN CERTIFICATE-----\nthe new one\n-----END CERTIFICATE-----\n";
+
+const ROT_PUT: &str = "set -e; d=$(dirname /var/lib/meisterstack/pki/identity.crt.next); \
+                       mkdir -p \"$d\"; t=$(mktemp \"$d/.meister.XXXXXX\"); cat > \"$t\"; \
+                       chown meister:meister \"$t\"; chmod 0644 \"$t\"; \
+                       mv \"$t\" /var/lib/meisterstack/pki/identity.crt.next";
+
+const ROT_SHA_NEXT: &str =
+    "sha256sum /var/lib/meisterstack/pki/identity.crt.next 2>/dev/null | cut -d' ' -f1";
+const ROT_SHA: &str =
+    "sha256sum /var/lib/meisterstack/pki/identity.crt 2>/dev/null | cut -d' ' -f1";
+
+/// The units of the fixture's four-role host, in the order the plan sorts
+/// them.
+const ROT_UNITS: [&str; 3] = [
+    "meister-agent.service",
+    "meister-cloud-controller.service",
+    "meister-cluster-controller.service",
+];
+
+fn is_active(id: &str, unit: &str) -> Matcher {
+    shell_on(id, &format!("systemctl is-active {unit}"))
+}
+
+fn restart(id: &str, unit: &str) -> Matcher {
+    let address = match id {
+        "box" => "10.0.0.10",
+        "n1" => "10.0.0.11",
+        _ => "10.0.0.12",
+    };
+    let mut out = Ssh::with_known_hosts("/repo/known_hosts").opts(22);
+    out.push(format!("root@{address}"));
+    out.push("systemctl".to_string());
+    out.push("restart".to_string());
+    out.push(unit.to_string());
+    Matcher::exact("ssh", out)
+}
+
+/// A rotation of `box`'s identity key, prepared and planned.
+fn rotating() -> (Fixture, String) {
+    let release = release_of(crate::fixtures::with_cert(
+        onebox_enrolled(),
+        &["box"],
+        "identity",
+    ));
+    let observation = observed(&release, at(NOW));
+    let digest = format!("sha256:{}", crate::ids::sha256_hex(NEW_CERT.as_bytes()));
+    let rotation = crate::fixtures::rotation_for(&release.resolved_fleet, "box", &digest);
+    let plan = plan(
+        &release,
+        "host=box",
+        &observation,
+        None,
+        &crate::fixtures::plan_policy(PlanKind::KeysRotate)
+            .with_rotations([("box".to_string(), rotation)].into_iter().collect()),
+        at(NOW),
+    )
+    .expect("the fixture plans");
+    let fx = Fixture {
+        release,
+        plan,
+        files: MemFiles::new().given("/repo/pki/issued/box/identity.next.crt", NEW_CERT),
+        clock: FakeClock::at(at(NOW)),
+        state: StateDir::at("/repo/.meister-deploy"),
+        ssh: Ssh::with_known_hosts("/repo/known_hosts"),
+    };
+    (fx, digest)
+}
+
+fn keygen_answer() -> Output {
+    Output::stdout(
+        serde_json::json!({
+            "subject": "system:node:box",
+            "kind": "identity",
+            "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nAAAA\n-----END CERTIFICATE REQUEST-----\n",
+            "public_key_sha256": "cd".repeat(32),
+            "created": false,
+        })
+        .to_string(),
+    )
+}
+
+fn rotate_options(fx: &Fixture) -> ApplyOptions {
+    let mut options = fx.options();
+    options.repo = PathBuf::from("/repo");
+    options.ca_dir = Some(PathBuf::from("/ca"));
+    options.approvals = vec![
+        (ApprovalClass::Disruptive, fx.plan.plan_id.clone()),
+        (ApprovalClass::Singleton, fx.plan.plan_id.clone()),
+    ];
+    options
+}
+
+/// The whole rotation, command for command.
+#[test]
+fn a_rotation_is_prepared_overlapped_switched_verified_and_finished() {
+    let (fx, digest) = rotating();
+    let bare = digest.trim_start_matches("sha256:").to_string();
+    let look = TableLook::new(&fx);
+    let mut fake = StrictFake::new()
+        .expect(helper("box", &["lock", "acquire"]), ok())
+        .expect(helper("box", &["lock", "acquire"]), ok())
+        .expect(
+            helper(
+                "box",
+                &[
+                    "keygen",
+                    "--subject",
+                    "system:node:box",
+                    "--kind",
+                    "identity",
+                    "--suffix",
+                    "next",
+                ],
+            ),
+            keygen_answer(),
+        )
+        .expect(shell_on("box", ROT_PUT), ok())
+        .expect(
+            shell_on("box", ROT_SHA_NEXT),
+            Output::stdout(format!("{bare}\n")),
+        )
+        .expect(
+            helper("box", &["keys", "switch", "--kind", "identity", "--run"]),
+            ok(),
+        );
+    for unit in ROT_UNITS {
+        fake = fake
+            .expect(is_active("box", unit), Output::stdout("active\n"))
+            .expect(restart("box", unit), ok());
+    }
+    let runner = World::new(
+        fake.expect(
+            shell_on("box", ROT_SHA),
+            Output::stdout(format!("{bare}\n")),
+        )
+        .expect(
+            helper("box", &["keys", "remove", "--kind", "identity"]),
+            ok(),
+        )
+        .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+
+    let applied = fx
+        .executor(&runner, &look, rotate_options(&fx))
+        .run()
+        .expect("a rotation applies");
+    runner.verify().expect("exactly those commands");
+
+    assert_eq!(applied.receipt.outcome, Outcome::Success);
+    assert_eq!(applied.receipt.hosts["box"].outcome, HostOutcome::Success);
+    let steps: Vec<ActionKind> = applied.receipt.hosts["box"]
+        .actions
+        .iter()
+        .map(|a| a.kind)
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ActionKind::Preflight,
+            ActionKind::Lock,
+            ActionKind::KeysPrepare,
+            ActionKind::KeysOverlap,
+            ActionKind::KeysSwitch,
+            ActionKind::KeysVerify,
+            ActionKind::KeysRemove,
+            ActionKind::Unlock,
+        ]
+    );
+    // Nothing of the certificate is in the journal beyond its digest, and
+    // nothing of the key at all.
+    let journal = String::from_utf8(
+        fx.files
+            .content("/repo/.meister-deploy/runs/run-1/journal.jsonl")
+            .expect("a journal"),
+    )
+    .unwrap();
+    assert!(!journal.contains("BEGIN CERTIFICATE"), "{journal}");
+    assert!(!journal.contains("PRIVATE KEY"), "{journal}");
+    assert!(journal.contains(&digest), "the digest is the evidence");
+
+    // And the repository caught up with the host: what the planner compares
+    // every host against is now the certificate the host actually holds.
+    // Without this the next ordinary plan would deliver the old one back.
+    assert_eq!(
+        fx.files.content("/repo/pki/issued/box/identity.crt"),
+        Some(NEW_CERT.as_bytes().to_vec())
+    );
+    assert!(
+        fx.files
+            .content("/repo/pki/issued/box/identity.next.crt")
+            .is_none(),
+        "the rotation's file is still lying about"
+    );
+}
+
+/// A key that is not the one the plan was made for stops the run before
+/// anything is put anywhere.
+#[test]
+fn a_host_that_prepared_a_different_key_stops_the_rotation() {
+    let (fx, _) = rotating();
+    let look = TableLook::new(&fx);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(
+                helper("box", &["keygen"]),
+                Output::stdout(
+                    serde_json::json!({
+                        "subject": "system:node:box",
+                        "kind": "identity",
+                        "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\nAAAA\n-----END CERTIFICATE REQUEST-----\n",
+                        "public_key_sha256": "ee".repeat(32),
+                        "created": true,
+                    })
+                    .to_string(),
+                ),
+            )
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let applied = fx
+        .executor(&runner, &look, rotate_options(&fx))
+        .run()
+        .expect("the run ends with a receipt");
+    runner.verify().expect("exactly those commands");
+    // `aborted` and not `failed`: the host never reached a state of its
+    // own, because the run stopped at the first step — which is the point.
+    // Nothing was put anywhere.
+    assert_eq!(applied.receipt.outcome, Outcome::Aborted);
+    let why = applied.stopped.unwrap_or_default();
+    assert!(why.contains("Somebody rotated this key"), "{why}");
+}
+
+/// A rotation that did not verify goes back, and the run says so.
+#[test]
+fn a_rotation_that_does_not_verify_is_taken_back() {
+    let (fx, digest) = rotating();
+    let bare = digest.trim_start_matches("sha256:").to_string();
+    let look = TableLook::new(&fx);
+    let mut fake = StrictFake::new()
+        .expect(helper("box", &["lock", "acquire"]), ok())
+        .expect(helper("box", &["lock", "acquire"]), ok())
+        .expect(helper("box", &["keygen"]), keygen_answer())
+        .expect(shell_on("box", ROT_PUT), ok())
+        .expect(
+            shell_on("box", ROT_SHA_NEXT),
+            Output::stdout(format!("{bare}\n")),
+        )
+        .expect(helper("box", &["keys", "switch"]), ok());
+    for unit in ROT_UNITS {
+        fake = fake
+            .expect(is_active("box", unit), Output::stdout("active\n"))
+            .expect(restart("box", unit), ok());
+    }
+    // The host answers with the certificate it had BEFORE the switch: the
+    // pair did not go in, whatever the helper said.
+    let runner = World::new(
+        fake.expect(
+            shell_on("box", ROT_SHA),
+            Output::stdout("0000000000000000000000000000000000000000000000000000000000000000\n"),
+        )
+        .expect(
+            helper("box", &["keys", "revert", "--kind", "identity"]),
+            ok(),
+        )
+        .expect(is_active("box", ROT_UNITS[0]), Output::stdout("active\n"))
+        .expect(restart("box", ROT_UNITS[0]), ok())
+        .expect(is_active("box", ROT_UNITS[1]), Output::stdout("active\n"))
+        .expect(restart("box", ROT_UNITS[1]), ok())
+        .expect(is_active("box", ROT_UNITS[2]), Output::stdout("active\n"))
+        .expect(restart("box", ROT_UNITS[2]), ok())
+        .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let applied = fx
+        .executor(&runner, &look, rotate_options(&fx))
+        .run()
+        .expect("the run ends with a receipt");
+    runner.verify().expect("exactly those commands");
+    assert_eq!(
+        applied.receipt.hosts["box"].outcome,
+        HostOutcome::RolledBack
+    );
+    assert_eq!(applied.receipt.outcome, Outcome::Failed);
+    // And the removal never ran: what the switch replaced is still there.
+    assert!(
+        !applied.receipt.hosts["box"]
+            .actions
+            .iter()
+            .any(|a| a.kind == ActionKind::KeysRemove)
+    );
+}
+
+/// A journal of a rotation that got as far as `through` and then stopped.
+fn write_rotation_journal(fx: &Fixture, run: &str, through: ActionKind) {
+    fx.state
+        .begin_run(&fx.files, run)
+        .expect("the run directory");
+    fx.files
+        .write_atomic(
+            &fx.state.plan_copy_path(run),
+            &fx.plan.to_json().expect("the plan"),
+            0o644,
+        )
+        .expect("the plan copy");
+    let journal = Journal::new(fx.state.journal_path(run), run, &fx.plan.plan_id);
+    let put = |event: JournalEvent| {
+        journal.append(&fx.files, event).expect("a line");
+    };
+    put(journal
+        .event(EventKind::RunStart, at(NOW))
+        .payload(serde_json::json!({"operator": {"user": "silas", "workstation": "manacor"}})));
+    put(journal
+        .event(EventKind::HostState, at(NOW))
+        .host("box")
+        .transition(HostState::Planned, HostState::Preflight)
+        .payload(serde_json::json!({})));
+    let reached = crate::receipt::keys_phase_order(through).expect("a phase");
+    for kind in [
+        ActionKind::KeysPrepare,
+        ActionKind::KeysOverlap,
+        ActionKind::KeysSwitch,
+        ActionKind::KeysVerify,
+        ActionKind::KeysRemove,
+    ] {
+        if crate::receipt::keys_phase_order(kind) > Some(reached) {
+            break;
+        }
+        let seq = fx
+            .plan
+            .actions_for("box")
+            .into_iter()
+            .find(|a| a.kind == kind)
+            .expect("the plan has it")
+            .seq;
+        put(journal
+            .event(EventKind::ActionBegin, at(NOW))
+            .host("box")
+            .payload(serde_json::json!({"action": seq, "kind": kind})));
+        put(journal
+            .event(EventKind::ActionEnd, at(NOW))
+            .host("box")
+            .payload(serde_json::json!({"action": seq, "kind": kind, "result": "ok"})));
+    }
+    if through == ActionKind::KeysRemove {
+        put(journal
+            .event(EventKind::HostState, at(NOW))
+            .host("box")
+            .transition(HostState::Preflight, HostState::Committed)
+            .payload(serde_json::json!({})));
+    }
+}
+
+/// V17 for a rotation: the run died after the certificate was put beside
+/// the one in use. A resume asks the HOST where it is and carries on from
+/// there — and never prepares a second key.
+#[test]
+fn a_resume_carries_a_rotation_on_from_the_phase_the_host_is_at() {
+    let (fx, digest) = rotating();
+    let bare = digest.trim_start_matches("sha256:").to_string();
+    write_rotation_journal(&fx, "run-1", ActionKind::KeysOverlap);
+    let look = TableLook::new(&fx);
+    let mut fake = StrictFake::new()
+        // The fleet anchor first, as in every run (D6), and then the
+        // question this resume turns on: where is the host.
+        .expect(helper("box", &["lock", "acquire"]), ok())
+        .expect(
+            helper("box", &["keys", "status", "--kind", "identity"]),
+            // The helper's own envelope, exactly as `meister-activate
+            // --json keys status` prints it.
+            Output::stdout(
+                serde_json::json!({
+                    "ok": true,
+                    "what": "keys status",
+                    "result": {
+                        "kind": "identity",
+                        "state": "overlap",
+                        "key_next": true,
+                        "crt_next": true,
+                        "prev": false,
+                        "reason": null,
+                        "record": null,
+                    },
+                })
+                .to_string(),
+            ),
+        )
+        .expect(helper("box", &["lock", "acquire"]), ok())
+        .expect(
+            helper("box", &["keys", "switch", "--kind", "identity"]),
+            ok(),
+        );
+    for unit in ROT_UNITS {
+        fake = fake
+            .expect(is_active("box", unit), Output::stdout("active\n"))
+            .expect(restart("box", unit), ok());
+    }
+    let runner = World::new(
+        fake.expect(
+            shell_on("box", ROT_SHA),
+            Output::stdout(format!("{bare}\n")),
+        )
+        .expect(
+            helper("box", &["keys", "remove", "--kind", "identity"]),
+            ok(),
+        )
+        .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+
+    let mut options = rotate_options(&fx);
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("exactly those commands");
+    assert_eq!(applied.stopped, None);
+    assert_eq!(applied.receipt.hosts["box"].outcome, HostOutcome::Success);
+    // The two things a resume must never do.
+    assert!(
+        !runner.calls().iter().any(|c| c.contains("keygen")),
+        "a second key was prepared: {:?}",
+        runner.calls()
+    );
+    assert!(
+        !runner
+            .calls()
+            .iter()
+            .any(|c| c.contains("identity.crt.next")),
+        "the certificate was delivered twice: {:?}",
+        runner.calls()
+    );
+}
+
+/// And the two answers that are not a phase: the rotation is over, or the
+/// host has nothing and a person has to look.
+#[test]
+fn a_resume_of_a_finished_rotation_does_nothing_at_all() {
+    let (fx, _) = rotating();
+    write_rotation_journal(&fx, "run-1", ActionKind::KeysRemove);
+    let look = TableLook::new(&fx);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(
+                helper("box", &["keys", "status", "--kind", "identity"]),
+                Output::stdout(
+                    serde_json::json!({
+                        "ok": true,
+                        "what": "keys status",
+                        "result": {
+                            "kind": "identity",
+                            "state": "confirmed",
+                            "key_next": false,
+                            "crt_next": false,
+                            "prev": false,
+                            "reason": null,
+                            "record": null,
+                        },
+                    })
+                    .to_string(),
+                ),
+            )
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = rotate_options(&fx);
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("exactly those commands");
+    assert!(
+        !runner.calls().iter().any(|c| c.contains("keys switch")),
+        "{:?}",
+        runner.calls()
+    );
+    assert_eq!(applied.receipt.outcome, Outcome::Success);
+}

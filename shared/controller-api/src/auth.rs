@@ -17,12 +17,15 @@
 //! chain: it is the anonymous mode this stack ran in for its first four
 //! milestones, and it stays the default.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use pki::CertInfo;
 use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 use crate::object::Resource;
 use crate::resources::{CertificateSigningRequest, FloatingIp, Image, Tenant, User, Vm, Volume};
@@ -156,6 +159,18 @@ impl PartialOrd for Role {
 pub struct Identity {
     pub name: String,
     pub groups: Vec<String>,
+    // --- lane 5A: which certificate this was ---------------------------
+    /// The serial of the certificate this identity came out of, exactly as
+    /// `pki::CertInfo::serial` spells it (lowercase hex, colon separated).
+    ///
+    /// `None` for every identity that is not a certificate — a bearer token,
+    /// a token from the identity provider, a test. It is not part of WHO
+    /// somebody is (two certificates for one name are one identity, which is
+    /// what a rotation is), and it is what a revocation names: a session
+    /// that is running when its certificate is revoked has to be findable,
+    /// and the only handle on it is this.
+    pub serial: Option<String>,
+    // --- end lane 5A ---------------------------------------------------
 }
 
 impl Identity {
@@ -163,8 +178,17 @@ impl Identity {
         Self {
             name: name.into(),
             groups,
+            serial: None,
         }
     }
+
+    // --- lane 5A ---
+    /// The same identity, with the certificate it came out of named.
+    pub fn with_serial(mut self, serial: impl Into<String>) -> Self {
+        self.serial = Some(serial.into());
+        self
+    }
+    // --- end lane 5A ---
 
     pub fn has_group(&self, group: &str) -> bool {
         self.groups.iter().any(|g| g == group)
@@ -398,6 +422,242 @@ impl AuthChain {
     }
 }
 
+// --- lane 5A: revocation ---------------------------------------------------
+//
+// D11, and the one sentence it rests on: a certificate that has been taken
+// back has to stop working WITHOUT restarting anything. rustls can check a
+// list at the handshake, but only one it was handed when the `ServerConfig`
+// was built (M0 probe S10 measured that), and the session port does not go
+// through rustls at all — tonic has no CRL api. So the check that matters
+// sits here, at the one point both ports pass through, and it reloads.
+
+/// How often the file is looked at again. Not how often it is READ: the
+/// mtime is looked at, and the file is read when the mtime moved.
+pub const REVOCATION_RELOAD_SECS: i64 = 30;
+
+/// What the list said, when it was read, and what it was read from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RevocationList {
+    /// Normalised serials — lowercase hex, no separators, no leading zero
+    /// bytes. See [`normalise_serial`].
+    pub serials: BTreeSet<String>,
+    pub crl_number: Option<u64>,
+    pub loaded_at: Option<DateTime<Utc>>,
+    pub path: PathBuf,
+    /// The modification time this list was read at. `None` when the file
+    /// system would not say — and then every check re-reads, which is the
+    /// safe direction.
+    pub mtime: Option<std::time::SystemTime>,
+    /// And its size, because a modification time is only as fine as the
+    /// filesystem that keeps it: two writes within one tick of it are two
+    /// different lists with one timestamp, and the second would never be
+    /// read.
+    pub size: Option<u64>,
+}
+
+impl RevocationList {
+    pub fn is_revoked(&self, serial: &str) -> bool {
+        self.serials.contains(&normalise_serial(serial))
+    }
+
+    pub fn len(&self) -> usize {
+        self.serials.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.serials.is_empty()
+    }
+}
+
+/// One spelling for a serial number, because this stack has three.
+///
+/// `x509-parser` prints `64:35:c9:…` (lowercase, colon separated) and it is
+/// what both a certificate and a CRL entry come out of here. openssl's
+/// `index.txt` and `x509 -serial` print `6435C9…` (upper case, no
+/// separators), and that is the one an operator reads off a receipt and
+/// retypes. A leading zero byte is DER's sign padding and says nothing about
+/// the number.
+///
+/// Comparing serials is the whole of revocation, so the comparison is made
+/// in exactly one function and both sides go through it.
+pub fn normalise_serial(serial: &str) -> String {
+    // In `pki` and not here, because the deployment tool compares serials
+    // too (`keys issue` refuses to hand out a second certificate for a name
+    // whose first one nobody took back) and it does not depend on this
+    // crate. One function, three callers, one meaning.
+    pki::tls::normalise_serial(serial)
+}
+
+/// What one look at the file came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reload {
+    /// Less than [`REVOCATION_RELOAD_SECS`] since the last look.
+    TooSoon,
+    /// The file has not moved.
+    Unchanged,
+    /// It moved and it was read: this many serials, this crl number.
+    Loaded {
+        serials: usize,
+        crl_number: Option<u64>,
+    },
+    /// It moved and it could not be read. The list this process holds is
+    /// the OLD one, deliberately — see [`Revocations::refresh_at`].
+    Failed(String),
+}
+
+/// The revocation list this process enforces, and the file it comes from.
+///
+/// Shared by the authenticator (which asks about every certificate) and by
+/// the session registries (which ask about the certificates that are already
+/// talking), because there must be exactly one answer to "is this serial
+/// revoked" in a process.
+#[derive(Debug)]
+pub struct Revocations {
+    path: PathBuf,
+    list: RwLock<RevocationList>,
+    /// When the mtime was last looked at. Its own lock so that a check
+    /// never waits on a reader of the list.
+    checked: Mutex<Option<DateTime<Utc>>>,
+}
+
+impl Revocations {
+    /// Read the list now, or fail.
+    ///
+    /// A configured `crl` that cannot be read is a start-up error and not a
+    /// warning: a deployment that names one believes it enforces revocation,
+    /// and the failure mode of "carry on with an empty list" is precisely a
+    /// revoked certificate that keeps working while a log line nobody reads
+    /// says why.
+    pub fn load(path: &Path) -> anyhow::Result<Arc<Revocations>> {
+        Self::load_at(path, Utc::now())
+    }
+
+    pub fn load_at(path: &Path, now: DateTime<Utc>) -> anyhow::Result<Arc<Revocations>> {
+        let list = Self::read(path, now)?;
+        info!(
+            crl = %path.display(),
+            revoked = list.serials.len(),
+            number = list.crl_number.unwrap_or_default(),
+            "revocation list loaded"
+        );
+        Ok(Arc::new(Revocations {
+            path: path.to_path_buf(),
+            list: RwLock::new(list),
+            checked: Mutex::new(Some(now)),
+        }))
+    }
+
+    fn read(path: &Path, now: DateTime<Utc>) -> anyhow::Result<RevocationList> {
+        let crl = pki::tls::read_crl(path)?;
+        let (mtime, size) = Self::stamp(path);
+        Ok(RevocationList {
+            serials: crl.serials.iter().map(|s| normalise_serial(s)).collect(),
+            crl_number: crl.number,
+            loaded_at: Some(now),
+            path: path.to_path_buf(),
+            mtime,
+            size,
+        })
+    }
+
+    fn stamp(path: &Path) -> (Option<std::time::SystemTime>, Option<u64>) {
+        match std::fs::metadata(path) {
+            Ok(meta) => (meta.modified().ok(), Some(meta.len())),
+            Err(_) => (None, None),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Read the list and say what it holds, without keeping it.
+    ///
+    /// What `--check-config` needs: the file a running controller would
+    /// refuse to start without is read by the same code, so that the answer
+    /// is the same answer. A summary and not a bool, because "12 revoked
+    /// serials, crl number 4" is what tells an operator whether the file
+    /// they are looking at is the one they just wrote.
+    pub fn check(path: &Path) -> anyhow::Result<String> {
+        let list = Self::read(path, Utc::now())?;
+        Ok(format!(
+            "{}: {} revoked serial(s), crl number {}",
+            path.display(),
+            list.serials.len(),
+            list.crl_number
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ))
+    }
+
+    /// A copy of what is currently enforced.
+    pub fn list(&self) -> RevocationList {
+        self.list.read().expect("revocation list").clone()
+    }
+
+    /// Is this serial on the list? The crl number comes back with the
+    /// answer, because a refusal that cannot say which list it came from is
+    /// a refusal nobody can check.
+    pub fn revoked(&self, serial: &str) -> Option<Option<u64>> {
+        let list = self.list.read().expect("revocation list");
+        list.is_revoked(serial).then_some(list.crl_number)
+    }
+
+    /// Look at the file again, at most every [`REVOCATION_RELOAD_SECS`].
+    ///
+    /// Cheap on purpose: one `stat` per half minute, not a parse per
+    /// request. What it must never do is turn an unreadable file into an
+    /// empty list — a CRL that cannot be read is not "nothing is revoked" —
+    /// so a failed read keeps the list this process already has and says so
+    /// once per attempt.
+    pub fn refresh(&self) -> Reload {
+        self.refresh_at(Utc::now())
+    }
+
+    pub fn refresh_at(&self, now: DateTime<Utc>) -> Reload {
+        {
+            let mut checked = self.checked.lock().expect("revocation clock");
+            if let Some(last) = *checked
+                && now.signed_duration_since(last) < TimeDelta::seconds(REVOCATION_RELOAD_SECS)
+            {
+                return Reload::TooSoon;
+            }
+            *checked = Some(now);
+        }
+        let seen = Self::stamp(&self.path);
+        let held = {
+            let list = self.list.read().expect("revocation list");
+            (list.mtime, list.size)
+        };
+        // `None` on either side means the file system would not say, and
+        // then the file is read rather than believed unchanged.
+        if seen.0.is_some() && held.0.is_some() && seen == held {
+            return Reload::Unchanged;
+        }
+        match Self::read(&self.path, now) {
+            Ok(fresh) => {
+                let answer = Reload::Loaded {
+                    serials: fresh.serials.len(),
+                    crl_number: fresh.crl_number,
+                };
+                *self.list.write().expect("revocation list") = fresh;
+                answer
+            }
+            Err(e) => {
+                let why = format!("{e:#}");
+                warn!(
+                    crl = %self.path.display(),
+                    error = %why,
+                    "the revocation list could not be read; the one this process already \
+                     holds stays in force"
+                );
+                Reload::Failed(why)
+            }
+        }
+    }
+}
+// --- end lane 5A -----------------------------------------------------------
+
 /// Identity out of a client certificate: CN is the name, every O is a group.
 ///
 /// rustls has already checked the chain by the time a REST handler runs, so
@@ -407,12 +667,29 @@ impl AuthChain {
 /// answers.
 pub struct MtlsAuthenticator {
     cas: Vec<CertificateDer<'static>>,
+    // --- lane 5A ---
+    /// The list this authenticator refuses against, when the deployment
+    /// configured one. Shared with whoever else in the process has to know
+    /// (the session registries), and reloadable — which is the difference
+    /// between this check and rustls'.
+    revocations: Option<Arc<Revocations>>,
+    // --- end lane 5A ---
 }
 
 impl MtlsAuthenticator {
     pub fn new(cas: Vec<CertificateDer<'static>>) -> Self {
-        Self { cas }
+        Self {
+            cas,
+            revocations: None,
+        }
     }
+
+    // --- lane 5A ---
+    pub fn with_revocations(mut self, revocations: Option<Arc<Revocations>>) -> Self {
+        self.revocations = revocations;
+        self
+    }
+    // --- end lane 5A ---
 
     pub fn from_pem_file(path: &Path) -> anyhow::Result<Self> {
         Ok(Self::new(pki::load_certs(path)?))
@@ -432,6 +709,28 @@ impl MtlsAuthenticator {
             return Ok(None);
         };
         let info = CertInfo::verified_by(leaf, &self.cas, now)?;
+        // --- lane 5A: after the chain, before the identity ---------------
+        //
+        // AFTER `verified_by` and not before it, because a serial means
+        // nothing until it is known which CA issued it: two CAs can issue
+        // the same number, and refusing on a serial alone would let anybody
+        // with a self-signed certificate pick a number that locks a node
+        // out. The order is: this CA signed it, it is in date, and it has
+        // not been taken back.
+        if let Some(revocations) = &self.revocations {
+            revocations.refresh_at(now);
+            if let Some(number) = revocations.revoked(&info.serial) {
+                anyhow::bail!(
+                    "certificate {} for {:?} is revoked (CRL {})",
+                    info.serial,
+                    info.common_name,
+                    number
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "unnumbered".to_string())
+                );
+            }
+        }
+        // --- end lane 5A -------------------------------------------------
         Ok(Some(identity_of(&info)))
     }
 }
@@ -442,6 +741,9 @@ pub fn identity_of(info: &CertInfo) -> Identity {
     Identity {
         name: info.common_name.clone(),
         groups: info.organizations.clone(),
+        // --- lane 5A ---
+        serial: Some(info.serial.clone()),
+        // --- end lane 5A ---
     }
 }
 
@@ -1997,6 +2299,396 @@ mod tests {
         (vec![ca_cert.der().clone()], leaf.der().to_vec())
     }
 
+    // --- lane 5A: revocation ------------------------------------------
+
+    /// A CA, two leaves with serials this test chose, and a signed CRL over
+    /// whichever of them the caller names. Real DER and real signatures, for
+    /// the same reason `ca_and_leaf` is real: what is being tested is that a
+    /// revocation is READ, and a hand-built fixture would prove the parser
+    /// runs.
+    fn ca_leaves_and_crl(
+        revoke: &[u64],
+        crl_number: u64,
+    ) -> (Vec<CertificateDer<'static>>, Vec<Vec<u8>>, String) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, CertificateRevocationListParams, DnType, IsCa,
+            Issuer, KeyPair, KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
+        };
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "meister-ca");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let epoch = Utc::now().timestamp();
+        let mut leaves = Vec::new();
+        for (index, cn) in ["alice", "bob"].iter().enumerate() {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(Vec::new()).unwrap();
+            params.distinguished_name.push(DnType::CommonName, *cn);
+            params
+                .distinguished_name
+                .push(DnType::OrganizationName, GROUP_MEMBERS);
+            params.serial_number = Some(SerialNumber::from(index as u64 + 1));
+            params.not_before = time::OffsetDateTime::from_unix_timestamp(epoch - 60).unwrap();
+            params.not_after =
+                time::OffsetDateTime::from_unix_timestamp(epoch + 90 * 86_400).unwrap();
+            leaves.push(params.signed_by(&key, &issuer).unwrap().der().to_vec());
+        }
+
+        let now = time::OffsetDateTime::from_unix_timestamp(epoch).unwrap();
+        let crl = CertificateRevocationListParams {
+            this_update: now,
+            next_update: now + time::Duration::days(30),
+            crl_number: SerialNumber::from(crl_number),
+            issuing_distribution_point: None,
+            revoked_certs: revoke
+                .iter()
+                .map(|serial| RevokedCertParams {
+                    serial_number: SerialNumber::from(*serial),
+                    revocation_time: now,
+                    reason_code: Some(RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                })
+                .collect(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&issuer)
+        .unwrap();
+
+        (vec![ca_cert.der().clone()], leaves, crl.pem().unwrap())
+    }
+
+    fn crl_file(dir: &tempfile::TempDir, pem: &str) -> std::path::PathBuf {
+        let path = dir.path().join("crl.pem");
+        std::fs::write(&path, pem).unwrap();
+        path
+    }
+
+    /// The three spellings of one number in this stack, and the one this
+    /// process compares in.
+    #[test]
+    fn a_serial_has_one_spelling_here() {
+        // x509-parser's (a certificate, a crl entry) and openssl's (an
+        // index, a receipt, what an operator retypes).
+        assert_eq!(normalise_serial("64:35:C9:c4"), "6435c9c4");
+        assert_eq!(normalise_serial("6435c9c4"), "6435c9c4");
+        // DER's sign padding says nothing about the number.
+        assert_eq!(normalise_serial("00:64:35"), "6435");
+        assert_eq!(normalise_serial("0x6435"), "6435");
+        // and a number somebody wrote without its leading zero
+        assert_eq!(normalise_serial("5"), "05");
+        // zero stays a number rather than becoming the empty string
+        assert_eq!(normalise_serial("00"), "00");
+    }
+
+    /// The whole of D11 in one assertion: the certificate is still valid,
+    /// still signed by this CA, still in date — and it is refused, with the
+    /// number of the list that refused it.
+    #[test]
+    fn a_revoked_certificate_is_refused_where_both_ports_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, leaves, pem) = ca_leaves_and_crl(&[1], 7);
+        let path = crl_file(&dir, &pem);
+        let auth = MtlsAuthenticator::new(cas).with_revocations(Some(
+            Revocations::load(&path).expect("a list this test just wrote"),
+        ));
+
+        let refused = auth
+            .authenticate_at(
+                &AuthRequest::with_certs(vec![leaves[0].clone()]),
+                Utc::now(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("is revoked"), "{refused}");
+        assert!(refused.contains("alice"), "{refused}");
+        assert!(refused.contains("CRL 7"), "{refused}");
+
+        // And the one nobody revoked is untouched.
+        let who = auth
+            .authenticate_at(
+                &AuthRequest::with_certs(vec![leaves[1].clone()]),
+                Utc::now(),
+            )
+            .unwrap()
+            .expect("recognised");
+        assert_eq!(who.name, "bob");
+        assert_eq!(who.serial.as_deref(), Some("02"));
+    }
+
+    /// An identity that came out of a certificate says which certificate.
+    /// It is what a session registry has to hold to be able to drop itself.
+    #[test]
+    fn an_identity_out_of_a_certificate_carries_its_serial() {
+        let (cas, leaves, _) = ca_leaves_and_crl(&[], 1);
+        let who = MtlsAuthenticator::new(cas)
+            .authenticate_at(
+                &AuthRequest::with_certs(vec![leaves[0].clone()]),
+                Utc::now(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(who.serial.as_deref(), Some("01"));
+        // A token is not a certificate and has no serial to carry.
+        let token = BearerAuthenticator::new("t", Identity::new("dev", vec![]))
+            .authenticate(&AuthRequest {
+                peer_certs: Vec::new(),
+                authorization: Some("Bearer t".into()),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.serial, None);
+    }
+
+    /// An empty list is a list. Nothing is revoked, and every certificate
+    /// goes through — which is the state a fleet is in the day it starts
+    /// publishing one.
+    #[test]
+    fn an_empty_list_revokes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, leaves, pem) = ca_leaves_and_crl(&[], 1);
+        let path = crl_file(&dir, &pem);
+        let auth =
+            MtlsAuthenticator::new(cas).with_revocations(Some(Revocations::load(&path).unwrap()));
+        for leaf in leaves {
+            assert!(
+                auth.authenticate_at(&AuthRequest::with_certs(vec![leaf]), Utc::now())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    /// "Nothing is revoked" and "the list could not be read" are the two
+    /// answers that must never be confused, because one of them is the one
+    /// an attacker wants. So a file that is not a list is a start-up error.
+    #[test]
+    fn a_list_that_cannot_be_read_is_not_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nowhere.pem");
+        assert!(Revocations::load(&missing).is_err());
+
+        let junk = dir.path().join("junk.pem");
+        std::fs::write(&junk, b"this is not a crl\n").unwrap();
+        let err = Revocations::load(&junk).unwrap_err().to_string();
+        assert!(err.contains("revocation list"), "{err}");
+    }
+
+    /// The point of the whole design: a certificate stops working without
+    /// anything being restarted.
+    #[test]
+    fn a_new_list_takes_effect_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, leaves, empty) = ca_leaves_and_crl(&[], 1);
+        let path = crl_file(&dir, &empty);
+        let revocations = Revocations::load(&path).unwrap();
+        let auth = MtlsAuthenticator::new(cas).with_revocations(Some(revocations.clone()));
+        let bob = AuthRequest::with_certs(vec![leaves[1].clone()]);
+        let now = Utc::now();
+        assert!(auth.authenticate_at(&bob, now).unwrap().is_some());
+
+        // The same CA, a new list. This is what `apply` delivers: one file,
+        // written where the old one was.
+        let (_, _, with_bob) = ca_leaves_and_crl(&[2], 8);
+        std::fs::write(&path, with_bob).unwrap();
+
+        // Within the half minute nothing is even looked at…
+        assert_eq!(revocations.refresh_at(now), Reload::TooSoon);
+        // …and after it, the new list is in force without anything having
+        // been restarted.
+        let later = now + TimeDelta::seconds(REVOCATION_RELOAD_SECS + 1);
+        let refused = auth.authenticate_at(&bob, later).unwrap_err().to_string();
+        assert!(refused.contains("is revoked"), "{refused}");
+        assert_eq!(revocations.list().crl_number, Some(8));
+
+        // A second look at a file that has not moved reads nothing.
+        assert_eq!(
+            revocations.refresh_at(later + TimeDelta::seconds(REVOCATION_RELOAD_SECS + 1)),
+            Reload::Unchanged
+        );
+    }
+
+    /// And the failure direction of the same thing: a list that becomes
+    /// unreadable does not become an empty one.
+    #[test]
+    fn a_list_that_becomes_unreadable_keeps_the_one_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, leaves, pem) = ca_leaves_and_crl(&[1], 3);
+        let path = crl_file(&dir, &pem);
+        let revocations = Revocations::load(&path).unwrap();
+        let auth = MtlsAuthenticator::new(cas).with_revocations(Some(revocations.clone()));
+        let alice = AuthRequest::with_certs(vec![leaves[0].clone()]);
+        let now = Utc::now();
+        assert!(auth.authenticate_at(&alice, now).is_err());
+
+        std::fs::write(&path, b"half a file").unwrap();
+        let later = now + TimeDelta::seconds(REVOCATION_RELOAD_SECS + 1);
+        assert!(matches!(revocations.refresh_at(later), Reload::Failed(_)));
+        // Still refused, and still by list 3.
+        let refused = auth.authenticate_at(&alice, later).unwrap_err().to_string();
+        assert!(refused.contains("CRL 3"), "{refused}");
+        assert_eq!(revocations.list().crl_number, Some(3));
+    }
+
+    /// The order the check runs in. A serial is a number somebody else can
+    /// choose, so it means nothing until it is known which CA issued it:
+    /// refusing on the serial alone would let anybody with a self-signed
+    /// certificate pick a number and lock a node out.
+    #[test]
+    fn a_foreign_certificate_with_a_revoked_serial_is_refused_as_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cas, _, pem) = ca_leaves_and_crl(&[1], 1);
+        let path = crl_file(&dir, &pem);
+        // Somebody else's CA, and their leaf carries serial 1 as well.
+        let (_, theirs, _) = ca_leaves_and_crl(&[], 1);
+        let auth =
+            MtlsAuthenticator::new(cas).with_revocations(Some(Revocations::load(&path).unwrap()));
+        let err = auth
+            .authenticate_at(
+                &AuthRequest::with_certs(vec![theirs[0].clone()]),
+                Utc::now(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no configured CA"), "{err}");
+    }
+
+    /// And the OTHER half of D11, one layer down: rustls itself refuses the
+    /// handshake of a revoked client.
+    ///
+    /// The test lives here and not beside `pki::tls`, because minting a CA,
+    /// a serving certificate and a signed CRL is what `rcgen` is for and
+    /// this is the crate that has it. What it proves is the belt to the
+    /// application check's braces: a certificate on the list at start-up
+    /// does not reach an authenticator at all.
+    #[tokio::test]
+    async fn rustls_refuses_the_handshake_of_a_revoked_client() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, CertificateRevocationListParams, DnType, IsCa,
+            Issuer, KeyPair, KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "meister-ca");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let leaf = |cn: &str, sans: Vec<String>, serial: u64| {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(sans).unwrap();
+            params.distinguished_name.push(DnType::CommonName, cn);
+            params.serial_number = Some(SerialNumber::from(serial));
+            let cert = params.signed_by(&key, &issuer).unwrap();
+            (cert.pem(), key.serialize_pem())
+        };
+        let (server_pem, server_key) = leaf("localhost", vec!["localhost".to_string()], 10);
+        let (client_pem, client_key) = leaf("system:node:n1", Vec::new(), 11);
+
+        let crl = CertificateRevocationListParams {
+            this_update: time::OffsetDateTime::now_utc(),
+            next_update: time::OffsetDateTime::now_utc() + time::Duration::days(30),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from(11u64),
+                revocation_time: time::OffsetDateTime::now_utc(),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&issuer)
+        .unwrap();
+
+        let write = |name: &str, text: &str, mode: u32| {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let ca_path = write("ca.crt", &ca_cert.pem(), 0o644);
+        let cert_path = write("serving.crt", &server_pem, 0o644);
+        let key_path = write("serving.key", &server_key, 0o600);
+        let crl_path = write("crl.pem", &crl.pem().unwrap(), 0o644);
+        let client_cert = write("client.crt", &client_pem, 0o644);
+        let client_key_path = write("client.key", &client_key, 0o600);
+
+        let config =
+            pki::tls::server_config(&cert_path, &key_path, Some(&ca_path), Some(&crl_path))
+                .expect("a server config with a list in it");
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Two connections: the revoked one and the good one.
+            for _ in 0..2 {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acceptor.accept(stream).await {
+                        let _ = tls.write_all(b"hello").await;
+                        // A clean close, so that the good case is told
+                        // apart from a peer that went away.
+                        let _ = tls.shutdown().await;
+                    }
+                });
+            }
+        });
+
+        // The whole exchange and not only the connect: under TLS 1.3 the
+        // client is finished before the server has looked at its
+        // certificate, so the refusal arrives as an alert on the first read.
+        // What is asserted is therefore what a client actually gets — no
+        // bytes — which is also what the REST edge would turn into a failed
+        // request.
+        let dial = |cert: std::path::PathBuf, key: std::path::PathBuf| {
+            let ca_path = ca_path.clone();
+            async move {
+                let client = pki::tls::client_config(Some(&ca_path), Some((&cert, &key))).unwrap();
+                let connector = tokio_rustls::TlsConnector::from(client);
+                let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+                let mut tls = connector.connect(name, tcp).await?;
+                let mut said = Vec::new();
+                tls.read_to_end(&mut said).await?;
+                Ok::<Vec<u8>, std::io::Error>(said)
+            }
+        };
+
+        let refused = dial(client_cert, client_key_path).await;
+        assert!(
+            refused.is_err(),
+            "rustls let a revoked client certificate through the handshake: {refused:?}"
+        );
+
+        // The counter-probe, on the same listener: a certificate from the
+        // same CA that is NOT on the list gets in.
+        let (ok_pem, ok_key) = leaf("system:node:n2", Vec::new(), 12);
+        let ok_cert = write("ok.crt", &ok_pem, 0o644);
+        let ok_key_path = write("ok.key", &ok_key, 0o600);
+        assert_eq!(
+            dial(ok_cert, ok_key_path).await.expect("not revoked"),
+            b"hello".to_vec(),
+            "a certificate nobody revoked was refused"
+        );
+    }
+
     #[test]
     fn a_certificate_from_our_ca_is_a_name_and_its_groups() {
         let (cas, leaf) = ca_and_leaf("alice", Some(GROUP_MEMBERS), 90);
@@ -2066,10 +2758,15 @@ mod tests {
             peer_certs: vec![leaf.clone()],
             authorization: Some("Bearer devtoken".into()),
         };
-        assert_eq!(
-            chain.authenticate(&with_cert).unwrap(),
-            Authenticated::As(Identity::new("alice", vec![GROUP_MEMBERS.into()]))
-        );
+        // Name and groups, not the whole value: an identity out of a
+        // certificate carries the serial of that certificate now (lane 5A),
+        // and it is a fresh one every time this test mints a CA.
+        let Authenticated::As(who) = chain.authenticate(&with_cert).unwrap() else {
+            panic!("the certificate should have been recognised");
+        };
+        assert_eq!(who.name, "alice");
+        assert_eq!(who.groups, vec![GROUP_MEMBERS.to_string()]);
+        assert!(who.serial.is_some(), "it came out of a certificate");
 
         // No certificate: the token is the bootstrap path.
         let token_only = AuthRequest {

@@ -650,11 +650,15 @@ async fn cors_layer(
 /// error rather than a silent downgrade to plain: that is precisely the
 /// mistake that would leave an API server open while its operator believes
 /// otherwise.
+/// `crl` (lane 5A) is the revocation list rustls checks a client certificate
+/// against during the handshake. It is read here, once: what reloads while
+/// the process runs is `auth::Revocations`, which both ports consult.
 pub fn server_tls(
     cert: Option<&std::path::Path>,
     key: Option<&std::path::Path>,
     client_ca: Option<&std::path::Path>,
     base: Option<&std::path::Path>,
+    crl: Option<&std::path::Path>,
 ) -> Result<Option<Arc<ServerConfig>>> {
     match (cert, key) {
         (None, None) => {
@@ -670,8 +674,14 @@ pub fn server_tls(
             let cert = pki::pem::resolve(base, cert);
             let key = pki::pem::resolve(base, key);
             let ca = client_ca.map(|p| pki::pem::resolve(base, p));
-            let config = pki::tls::server_config(&cert, &key, ca.as_deref())?;
-            info!(cert = %cert.display(), mtls = ca.is_some(), "tls enabled");
+            let crl = crl.map(|p| pki::pem::resolve(base, p));
+            let config = pki::tls::server_config(&cert, &key, ca.as_deref(), crl.as_deref())?;
+            info!(
+                cert = %cert.display(),
+                mtls = ca.is_some(),
+                crl = crl.as_ref().map(|p| p.display().to_string()),
+                "tls enabled"
+            );
             Ok(Some(config))
         }
         _ => anyhow::bail!("tls_cert and tls_key go together; set both or neither"),

@@ -122,3 +122,71 @@ fn checking_a_config_binds_nothing_dials_nothing_and_writes_nothing() {
     // in milliseconds rather than waiting for a connection that never comes.
     assert!(TcpListener::bind("127.0.0.1:1").is_err());
 }
+
+// --- lane 5A ---------------------------------------------------------------
+
+/// `auth.crl` is the one key in that table whose FILE the check opens, and
+/// on purpose: a controller that names a list refuses to start without it,
+/// so a check that said "ok" to an unreadable one would be a check that
+/// promises a start-up it cannot have.
+#[test]
+fn a_revocation_list_is_read_by_the_check_and_named_when_it_cannot_be() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.toml");
+
+    // Named and not there.
+    std::fs::write(&path, "[auth]\ncrl = \"crl.pem\"\n").unwrap();
+    let out = check(&path, None);
+    assert_eq!(out.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("crl.pem"), "{said}");
+
+    // Named and not a list.
+    std::fs::write(dir.path().join("crl.pem"), "not a crl\n").unwrap();
+    let out = check(&path, None);
+    assert_eq!(out.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("revocation list"), "{said}");
+
+    // And a real one, written by the script an operator runs. The path is
+    // relative to the CONFIG, like every other file in that table.
+    let ca = dir.path().join("ca");
+    let meister_ca = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/meister-ca");
+    let made = Command::new("bash")
+        .arg(&meister_ca)
+        .args(["--dir", ca.to_str().unwrap(), "--node", "n1"])
+        .output()
+        .expect("bash");
+    if !made.status.success() {
+        // No openssl on this machine: the two refusals above are the half
+        // of this test that needs nothing, and they have run.
+        eprintln!("skipping the accepted half: meister-ca did not run here");
+        return;
+    }
+    let out = Command::new("bash")
+        .arg(&meister_ca)
+        .args([
+            "--dir",
+            ca.to_str().unwrap(),
+            "--revoke",
+            ca.join("system-node-n1.crt").to_str().unwrap(),
+            "--gencrl",
+        ])
+        .output()
+        .expect("bash");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::copy(ca.join("crl.pem"), dir.path().join("crl.pem")).unwrap();
+
+    let out = check(&path, None);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("1 revoked serial(s)"), "{said}");
+}

@@ -575,6 +575,26 @@ impl<'a> Executor<'a> {
                     ]);
                 }
                 // --- end lane 3-integration ---
+                // --- lane 5A ---
+                Resume::AtKeysPhase(phase) => {
+                    // Everything before this phase is on the host's disk
+                    // already. `prepare` above all: a second one would make
+                    // a second key, and the certificate this plan carries
+                    // is for the first.
+                    let reached = crate::receipt::keys_phase_order(phase);
+                    for kind in [
+                        ActionKind::KeysPrepare,
+                        ActionKind::KeysOverlap,
+                        ActionKind::KeysSwitch,
+                        ActionKind::KeysVerify,
+                        ActionKind::KeysRemove,
+                    ] {
+                        if crate::receipt::keys_phase_order(kind) < reached {
+                            skip.insert(kind);
+                        }
+                    }
+                }
+                // --- end lane 5A ---
                 Resume::AfterTheActivation { confirmed } => {
                     // Everything up to and including the activation happened
                     // on the machine, and the target is what said so. The
@@ -1012,6 +1032,226 @@ impl<'a> Executor<'a> {
                 self.end(journal, id, action, ActionResult::Ok, evidence, Vec::new())?;
             }
             // --- end lane 3B ------------------------------------------
+            // --- lane 5A: the five phases of a rotation ------------------
+            ActionKind::KeysPrepare => {
+                let rotation = self.rotation(id, action)?;
+                self.begin(journal, id, action)?;
+                // WITHOUT `--replace`: the key was made when the plan was
+                // made, and a second one here would be a second identity —
+                // the certificate in this plan is for the first. So the
+                // host is asked, and what it answers with has to be the key
+                // this plan was made for.
+                let cmd = self.helper_cmd(
+                    id,
+                    &[
+                        "keygen",
+                        "--subject",
+                        &rotation.subject,
+                        "--kind",
+                        &rotation.kind,
+                        "--suffix",
+                        "next",
+                    ],
+                )?;
+                let line = cmd.line();
+                let answer = self.runner.run(&cmd)?;
+                let reply = crate::pki::parse_keygen(&answer.stdout, id)?;
+                if reply.public_key_sha256 != rotation.public_key_sha256 {
+                    bail!(
+                        "{id} holds the prepared {} key {} and this plan was made for {}. \
+                         Somebody rotated this key between the plan and this run; make the \
+                         plan again with `keys rotate`.",
+                        rotation.kind,
+                        reply.public_key_sha256,
+                        rotation.public_key_sha256
+                    );
+                }
+                self.end(
+                    journal,
+                    id,
+                    action,
+                    ActionResult::Ok,
+                    vec![format!(
+                        "{id} holds the prepared {} key {}",
+                        rotation.kind, reply.public_key_sha256
+                    )],
+                    vec![line],
+                )?;
+            }
+            ActionKind::KeysOverlap => {
+                let rotation = self.rotation(id, action)?;
+                self.begin(journal, id, action)?;
+                let evidence = self.overlap(id, &rotation)?;
+                self.end(journal, id, action, ActionResult::Ok, evidence, Vec::new())?;
+            }
+            ActionKind::KeysSwitch => {
+                let rotation = self.rotation(id, action)?;
+                self.begin(journal, id, action)?;
+                // NOT `action.irreversible`: the helper can put the pair
+                // that worked back (`keys revert`), and the record on the
+                // target says which state it is in. What makes a switch
+                // survivable is that record, not a line in this journal —
+                // and the line means exactly as much as the number of times
+                // it is true.
+                let cmd = self.helper_cmd(
+                    id,
+                    &[
+                        "keys",
+                        "switch",
+                        "--kind",
+                        &rotation.kind,
+                        "--run",
+                        &self.options.run_id,
+                    ],
+                )?;
+                let mut refs = vec![cmd.line()];
+                self.runner.run(&cmd)?;
+                self.entry(hosts, id).moved = true;
+                let mut evidence = vec![format!(
+                    "{} is now {}",
+                    rotation.cert_path, rotation.cert_sha256
+                )];
+                evidence.extend(self.poke(id, &rotation.units, &mut refs)?);
+                self.end(journal, id, action, ActionResult::Ok, evidence, refs)?;
+            }
+            ActionKind::KeysVerify => {
+                let rotation = self.rotation(id, action)?;
+                self.begin(journal, id, action)?;
+                // What the HOST says it holds, first: a check that passed
+                // while the old certificate was still in place would be a
+                // check about the wrong thing.
+                let target = self.target(id)?;
+                let seen = self.runner.run(&self.ssh.ask(
+                    &target,
+                    &format!(
+                        "sha256sum {} 2>/dev/null | cut -d' ' -f1",
+                        crate::run::shell_quote(&rotation.cert_path)
+                    ),
+                    REMOTE_DEADLINE,
+                ))?;
+                let seen = format!("sha256:{}", seen.trimmed());
+                let fresh = self.observe(&self.affected(id))?;
+                let results = self.verify(id, &fresh);
+                let verdict = checks::acceptance(&results);
+                let holds = seen == rotation.cert_sha256;
+                if holds && verdict.is_accepted() {
+                    self.end_with_checks(
+                        journal,
+                        id,
+                        action,
+                        ActionResult::Ok,
+                        results,
+                        Vec::new(),
+                    )?;
+                } else {
+                    let why = if holds {
+                        match verdict {
+                            checks::Acceptance::Blocked { reasons } => reasons.join("; "),
+                            checks::Acceptance::Accepted => unreachable!("it was accepted"),
+                        }
+                    } else {
+                        format!(
+                            "{id} answered {seen} for {} and this rotation put {} there",
+                            rotation.cert_path, rotation.cert_sha256
+                        )
+                    };
+                    self.end_with_checks(
+                        journal,
+                        id,
+                        action,
+                        ActionResult::Failed,
+                        results,
+                        Vec::new(),
+                    )?;
+                    // The way back, and it is the point of the overlap: the
+                    // pair that was working is still on the disk.
+                    let back = self.helper_cmd(
+                        id,
+                        &["keys", "revert", "--kind", &rotation.kind, "--reason", &why],
+                    )?;
+                    let line = back.line();
+                    match self.runner.run(&back) {
+                        Ok(_) => {
+                            let mut refs = vec![line];
+                            let _ = self.poke(id, &rotation.units, &mut refs);
+                            self.move_to(
+                                journal,
+                                id,
+                                hosts,
+                                HostState::RolledBack,
+                                fresh.host(id),
+                            )?;
+                            bail!(
+                                "the rotation of the {} key of {id} did not verify and was \
+                                 taken back: {why}",
+                                rotation.kind
+                            );
+                        }
+                        Err(e) => {
+                            self.move_to(
+                                journal,
+                                id,
+                                hosts,
+                                HostState::RecoveryRequired,
+                                fresh.host(id),
+                            )?;
+                            bail!(
+                                "the rotation of the {} key of {id} did not verify ({why}) and \
+                                 the way back failed too ({e:#}). The pair that was working is \
+                                 on the host as `{}.prev`; `meister-activate keys revert --kind \
+                                 {}` is what puts it back.",
+                                rotation.kind,
+                                rotation.cert_path,
+                                rotation.kind
+                            );
+                        }
+                    }
+                }
+            }
+            ActionKind::KeysRemove => {
+                let rotation = self.rotation(id, action)?;
+                self.begin(journal, id, action)?;
+                let cmd = self.helper_cmd(id, &["keys", "remove", "--kind", &rotation.kind])?;
+                let line = cmd.line();
+                self.runner.run(&cmd)?;
+                // And the repository catches up with the host.
+                //
+                // Until this moment `<kind>.crt` in the repository is the
+                // certificate the host USED to hold, and it is what the
+                // planner compares every host against. Leaving it there
+                // would make the next ordinary plan deliver the old
+                // certificate back over the new one — undoing the rotation,
+                // quietly, in a plan nobody read as a rotation. So the
+                // rotation ends where it began: on this workstation.
+                let mut evidence = vec![format!(
+                    "the {} pair {id} used before this rotation is gone",
+                    rotation.kind
+                )];
+                let active = self
+                    .options
+                    .repo
+                    .join(crate::pki::ISSUED_DIR)
+                    .join(id)
+                    .join(format!("{}.crt", rotation.kind));
+                let source = self.options.repo.join(&rotation.source);
+                if self.files.exists(&source) {
+                    if self.files.exists(&active) {
+                        let previous = active.with_file_name(format!("{}.prev.crt", rotation.kind));
+                        self.files.rename(&active, &previous)?;
+                        evidence.push(format!(
+                            "{} is what {id} held before this rotation; it is still valid \
+                             until somebody takes it back (`keys revoke --serial …`)",
+                            previous.display()
+                        ));
+                    }
+                    self.files.rename(&source, &active)?;
+                    evidence.push(format!("{} is now what {id} holds", active.display()));
+                }
+                self.end(journal, id, action, ActionResult::Ok, evidence, vec![line])?;
+                let fresh = fresh.unwrap_or_else(|| self.plan.observation.clone());
+                self.move_to(journal, id, hosts, HostState::Committed, fresh.host(id))?;
+            }
+            // --- end lane 5A ---------------------------------------------
             ActionKind::Install | ActionKind::Revoke | ActionKind::Gc => {
                 bail!(
                     "the step {} on {id} is a {} and this tool cannot do it yet: \
@@ -1214,6 +1454,22 @@ impl<'a> Executor<'a> {
             }
         }
 
+        // --- lane 5A ---
+        // A revocation list is not poked. The process that reads one looks
+        // at it again on its own clock, within half a minute
+        // (`controller_api::auth::Revocations`), and restarting a controller
+        // to deliver a list it re-reads by itself would be the one avoidable
+        // outage in this design — on every host of the fleet, for every
+        // revocation.
+        if secret.kind == crate::manifest::SecretKind::Crl {
+            evidence.push(
+                "no unit was restarted: a controller re-reads its revocation list within 30 s"
+                    .to_string(),
+            );
+            return Ok(evidence);
+        }
+        // --- end lane 5A ---
+
         // And the unit that reads it, if it is running.
         if let Some(reload) = &secret.reload {
             // `Codes([0, 1, 3, 4])` and not the `ask` default: `systemctl
@@ -1260,6 +1516,146 @@ impl<'a> Executor<'a> {
         }
         Ok(evidence)
     }
+
+    // --- lane 5A ---------------------------------------------------------
+
+    /// Where the rotation on this host has got to, asked of the host.
+    fn keys_state(&self, id: &str) -> Result<crate::activate::KeysState> {
+        let kind = self
+            .plan
+            .rotations
+            .get(id)
+            .map(|r| r.kind.clone())
+            .unwrap_or_else(|| "identity".to_string());
+        let cmd = self.helper_cmd(id, &["keys", "status", "--kind", &kind])?;
+        let answer = self.runner.run(&cmd)?;
+        let text = answer.trimmed();
+        // The helper prints its usual envelope (`{ok, what, result}`) with
+        // `--json`; a bare view is accepted too, so that a test can hand
+        // one over without building the envelope around it.
+        let view: crate::activate::KeysView = match serde_json::from_str(text) {
+            Ok(view) => view,
+            Err(_) => serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .and_then(|v| v.get("result").cloned())
+                .and_then(|v| serde_json::from_value(v).ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "meister-activate keys status on {id} did not answer with the json \
+                         this tool reads"
+                    )
+                })?,
+        };
+        Ok(view.state)
+    }
+
+    /// What this plan says it is rotating on this host.
+    fn rotation(&self, id: &str, action: &Action) -> Result<crate::plan::KeyRotation> {
+        self.plan.rotations.get(id).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "the step {} on {id} is a {} and this plan carries no rotation for {id}. A \
+                 rotation plan is made by `keys rotate`, which prepares the key on the host \
+                 first; a plan without that is a plan about nothing.",
+                action.seq,
+                action.kind
+            )
+        })
+    }
+
+    /// Put the new certificate beside the one in use.
+    ///
+    /// The same three steps a delivery is — write, ask, compare — against
+    /// `<cert_path>.next`, which nothing reads. A run that stops here has
+    /// changed nothing that is running.
+    fn overlap(&self, id: &str, rotation: &crate::plan::KeyRotation) -> Result<Vec<String>> {
+        let target = self.target(id)?;
+        let source = self.options.repo.join(&rotation.source);
+        if !self.files.exists(&source) {
+            bail!(
+                "{} is not there, and it is the certificate this rotation is about. Make the \
+                 plan again with `keys rotate --host {id} --kind {}`.",
+                source.display(),
+                rotation.kind
+            );
+        }
+        let bytes = self.files.read(&source)?;
+        let here = format!("sha256:{}", crate::ids::sha256_hex(&bytes));
+        if here != rotation.cert_sha256 {
+            bail!(
+                "{} hashes to {here} and this plan was made for {}. The file changed after \
+                 the plan was written; make it again.",
+                source.display(),
+                rotation.cert_sha256
+            );
+        }
+        let next = format!("{}.next", rotation.cert_path);
+        let put = self.ssh.put(
+            &target,
+            &next,
+            &bytes,
+            &rotation.mode,
+            &format!("{}:{}", rotation.owner, rotation.owner),
+            REMOTE_DEADLINE,
+        );
+        self.runner.run(&put)?;
+        let answer = self.runner.run(&self.ssh.ask(
+            &target,
+            &format!(
+                "sha256sum {} 2>/dev/null | cut -d' ' -f1",
+                crate::run::shell_quote(&next)
+            ),
+            REMOTE_DEADLINE,
+        ))?;
+        let seen = format!("sha256:{}", answer.trimmed());
+        if seen != rotation.cert_sha256 {
+            bail!(
+                "{id} answered {seen} for {next} and this workstation sent {}. Something is \
+                 between the two.",
+                rotation.cert_sha256
+            );
+        }
+        Ok(vec![format!("{next}: {seen}")])
+    }
+
+    /// Restart the units that read a pair, the ones that are running.
+    ///
+    /// The same question and the same answer as a delivery's: `systemctl
+    /// is-active` says 3 for a unit that is not running, and 3 is the
+    /// answer this question is asked for.
+    fn poke(&self, id: &str, units: &[String], refs: &mut Vec<String>) -> Result<Vec<String>> {
+        let target = self.target(id)?;
+        let mut evidence = Vec::new();
+        for unit in units {
+            let active = self.runner.run(
+                &self
+                    .ssh
+                    .ask(
+                        &target,
+                        &format!("systemctl is-active {}", crate::run::shell_quote(unit)),
+                        REMOTE_DEADLINE,
+                    )
+                    .expect(Expect::Codes(vec![0, 1, 3])),
+            )?;
+            if active.trimmed() == "active" {
+                let cmd = self.ssh.exec(
+                    &target,
+                    ["systemctl", "restart", unit],
+                    Effect::TargetWrite,
+                    REMOTE_DEADLINE,
+                );
+                refs.push(cmd.line());
+                self.runner.run(&cmd)?;
+                evidence.push(format!("restart {unit}"));
+            } else {
+                evidence.push(format!(
+                    "{unit} was {} and was left alone",
+                    active.trimmed()
+                ));
+            }
+        }
+        Ok(evidence)
+    }
+    // --- end lane 5A -------------------------------------------------------
 
     /// Carry the closure, then check at the TARGET that what arrived is what
     /// the release names (V12), then let the helper say it is whole.
@@ -1825,6 +2221,46 @@ impl<'a> Executor<'a> {
             return Ok(Resume::Carry);
         };
         let observed = self.observe_one(id)?;
+        // --- lane 5A: a rotation asks the host a different question ------
+        //
+        // Not the transaction record — a rotation opens none — but the key
+        // files themselves, which is where the five phases leave their
+        // marks. The table is `receipt::next_keys_step`.
+        if self.plan.kind == crate::plan::PlanKind::KeysRotate {
+            let state = self.keys_state(id)?;
+            return match crate::receipt::next_keys_step(run, state) {
+                Step::Done => Ok(Resume::Done),
+                Step::AtKeysPhase(phase) => {
+                    if crate::receipt::keys_phase_order(phase)
+                        > crate::receipt::keys_phase_order(ActionKind::KeysSwitch)
+                    {
+                        // The pair is in. Whatever else this run does, it
+                        // has already moved this host.
+                        self.entry(hosts, id).moved = true;
+                    }
+                    Ok(Resume::AtKeysPhase(phase))
+                }
+                Step::RolledBack => {
+                    self.move_to(journal, id, hosts, HostState::RolledBack, Some(&observed))?;
+                    Ok(Resume::Done)
+                }
+                Step::RecoveryRequired(why) => {
+                    self.move_to(
+                        journal,
+                        id,
+                        hosts,
+                        HostState::RecoveryRequired,
+                        Some(&observed),
+                    )?;
+                    bail!("{why}")
+                }
+                other => bail!(
+                    "the resume table answered {other:?} for the rotation on {id}, which is \
+                     not an answer about a rotation."
+                ),
+            };
+        }
+        // --- end lane 5A -------------------------------------------------
         let view = TxnView::of(&observed, run.txn_id.as_deref());
         match next_step(run, &view) {
             Step::Done => Ok(Resume::Done),
@@ -1868,6 +2304,16 @@ impl<'a> Executor<'a> {
                 )?;
                 bail!("{why}");
             }
+            // --- lane 5A ---
+            // The rotation table is asked above, and only for a rotation
+            // plan. Reaching this with a keys phase would mean the two
+            // tables were crossed.
+            Step::AtKeysPhase(phase) => bail!(
+                "the resume table answered {phase} for {id}, which is a phase of a key \
+                 rotation and this plan is a {}.",
+                self.plan.kind
+            ),
+            // --- end lane 5A ---
         }
     }
 
@@ -2380,6 +2826,12 @@ enum Resume {
     /// it happened; the step itself asks the machine again.
     AtTheProviderReboot,
     // --- end lane 3-integration ---
+    // --- lane 5A ---
+    /// A rotation is open on this host, at this phase. Everything before it
+    /// is on the disk already and is not done again — a second `prepare`
+    /// would be a second key.
+    AtKeysPhase(ActionKind),
+    // --- end lane 5A ---
 }
 
 /// Whether a step changes something and therefore has to be preceded by a
@@ -2392,6 +2844,12 @@ fn needs_validation(kind: ActionKind) -> bool {
     matches!(
         kind,
         ActionKind::Stage
+            // --- lane 5A: every phase that touches the host ---
+            | ActionKind::KeysPrepare
+            | ActionKind::KeysOverlap
+            | ActionKind::KeysSwitch
+            | ActionKind::KeysRemove
+            // --- end lane 5A ---
             | ActionKind::DeliverSecret
             | ActionKind::Cordon
             | ActionKind::Drain

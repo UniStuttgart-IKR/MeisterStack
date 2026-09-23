@@ -92,10 +92,15 @@ impl Connection {
             },
         )
         .await;
-        live.id = Some(
-            self.registry
-                .open(live.id, &hello.cluster_name, &self.tx, Utc::now()),
-        );
+        live.id = Some(self.registry.open(
+            live.id,
+            &hello.cluster_name,
+            &self.tx,
+            Utc::now(),
+            // --- lane 5A: which certificate this session is ---
+            self.serial(),
+            // --- end lane 5A ---
+        ));
         live.cluster = Some(hello.cluster_name);
         Step::Continue
     }

@@ -1778,12 +1778,12 @@ fn a_term_that_is_not_a_pair_is_refused_with_the_shape_it_should_have_had() {
 /// silently stayed plain while its operator believed it was not.
 #[test]
 fn half_a_tls_config_is_refused_rather_than_downgraded() {
-    assert!(server_tls(None, None, None, None).unwrap().is_none());
+    assert!(server_tls(None, None, None, None, None).unwrap().is_none());
     let some = std::path::Path::new("x.pem");
-    assert!(server_tls(Some(some), None, None, None).is_err());
-    assert!(server_tls(None, Some(some), None, None).is_err());
+    assert!(server_tls(Some(some), None, None, None, None).is_err());
+    assert!(server_tls(None, Some(some), None, None, None).is_err());
     // and a client CA with no TLS session to arrive on
-    assert!(server_tls(None, None, Some(some), None).is_err());
+    assert!(server_tls(None, None, Some(some), None, None).is_err());
 }
 
 /// The route that saves every client the probe run. Before it, a console

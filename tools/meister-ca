@@ -42,6 +42,12 @@ SERVINGS=(); CLOUD_IDS=(); CLUSTER_IDS=()
 # The CSR path: a request somebody else made, signed here. No key is
 # generated for it and none is wanted -- that is the point of a request.
 SIGN_CSR=""; SIGN_KIND=""; SIGN_NAME=""; SIGN_SAN=""; SIGN_OUT=""
+# --- lane 5A: the index, the revocations and the list ----------------------
+# A CA that cannot say what it signed cannot take it back: `openssl ca
+# -revoke` writes into index.txt and nowhere else, and this script has never
+# had one (it signs with `openssl x509 -req -CAcreateserial`). So the index is
+# rebuilt from the certificates themselves, ADDITIVELY.
+INDEX_REBUILD=0; REVOKE=""; REVOKE_REASON=""; GENCRL=0; CRL_DAYS=30
 
 usage() {
 	cat <<'USAGE'
@@ -90,6 +96,24 @@ usage: meister-ca [options]
   --out FILE                 where the certificate goes
                              (default: <dir>/issued/<name>-<kind>.crt)
 
+  Taking one back. A certificate is revoked in the CA's own index and
+  published in a list; `meister-deploy keys revoke` drives both and then
+  delivers the list to every host that reads one.
+
+  --index-rebuild            write <dir>/{index.txt,crlnumber,serial,openssl.cnf}
+                             and add a row for every certificate under <dir>
+                             and <dir>/issued that has none. ADDITIVE: a
+                             serial already in the index keeps the row it has,
+                             so no rebuild can lose a revocation.
+  --revoke CRT|SERIAL        mark one certificate revoked. A path is revoked
+                             by openssl itself; a bare serial is looked up in
+                             the index, which is what a certificate nobody
+                             kept a copy of leaves behind.
+  --reason NAME              keyCompromise | superseded | cessationOfOperation |
+                             affiliationChanged | privilegeWithdrawn | unspecified
+  --gencrl                   write <dir>/crl.pem from the index
+  --crl-days N               how long that list is current (default: 30)
+
 SANs are the addresses clients will use: bare names become DNS entries,
 anything that parses as an address becomes an IP entry. "localhost" and
 "127.0.0.1" are always added, because that is how the local recipes reach it.
@@ -128,6 +152,11 @@ while [ $# -gt 0 ]; do
 		--name)     SIGN_NAME="$2"; shift 2 ;;
 		--san)      SIGN_SAN="$2"; shift 2 ;;
 		--out)      SIGN_OUT="$2"; shift 2 ;;
+		--index-rebuild) INDEX_REBUILD=1; shift ;;
+		--revoke)   REVOKE="$2"; shift 2 ;;
+		--reason)   REVOKE_REASON="$2"; shift 2 ;;
+		--gencrl)   GENCRL=1; shift ;;
+		--crl-days) CRL_DAYS="$2"; shift 2 ;;
 		-h|--help) usage; exit 0 ;;
 		*) die "unknown option $1 (try --help)" ;;
 	esac
@@ -258,11 +287,189 @@ subjectAltName=$(sans_of "$SIGN_SAN")" ;;
 		-out "$out" -days "$DAYS" -sha256 -extfile "$ext" -subj "$subj" 2>/dev/null \
 		|| { rm -f "$ext"; die "openssl refused to sign $SIGN_CSR"; }
 	rm -f "$ext"
+	# The CA keeps its own copy, wherever --out sent the certificate. A CA
+	# that cannot say what it signed cannot take it back: `--index-rebuild`
+	# reads exactly these two directories, and `meister-deploy keys issue`
+	# passes an --out under the operator's REPOSITORY — so without this copy
+	# every certificate of the fleet would be outside the index and outside
+	# every revocation.
+	kept="$DIR/issued/$SIGN_NAME-$SIGN_KIND.crt"
+	mkdir -p "$DIR/issued"
+	[ "$out" -ef "$kept" ] 2>/dev/null || cp "$out" "$kept"
 	serial="$(openssl x509 -in "$out" -noout -serial | cut -d= -f2)"
 	note "signed: $subj"
 	note "serial: $serial"
 	note "        $out"
 	printf '%s\n' "$out"
+	exit 0
+fi
+
+# --- lane 5A: the index, the revocations and the list ----------------------
+#
+# Three verbs over one file. `openssl ca` is the only openssl subcommand that
+# revokes and the only one that writes a CRL, and it insists on a database:
+# `index.txt`, one row per certificate this CA has ever signed. This script
+# never had one, because it signs with `openssl x509 -req` — so the index is
+# reconstructed from the certificates themselves.
+#
+# The rebuild is ADDITIVE and that is the whole safety property: an `R` row is
+# the ONLY record that something was revoked (the certificate on disk looks
+# exactly as it did before), so a rebuild that rewrote the file from the
+# `*.crt` would quietly un-revoke every one of them. Measured in M0 probe S9,
+# and `scripts/check-ca-revoke.sh` holds it.
+
+INDEX="$DIR/index.txt"
+CNF="$DIR/openssl.cnf"
+
+# openssl resolves the paths in a config against the CURRENT DIRECTORY, and
+# this script is run from wherever an operator happens to stand. So the
+# config carries absolute paths and nothing in it depends on the caller's cwd.
+ca_abs() { (cd "$DIR" && pwd); }
+
+write_cnf() {
+	local abs; abs="$(ca_abs)"
+	cat > "$CNF" <<CNF
+# Written by meister-ca --index-rebuild. Only 'openssl ca -revoke' and
+# 'openssl ca -gencrl' read it; nothing here issues certificates.
+[ ca ]
+default_ca = meister
+
+[ meister ]
+database         = $abs/index.txt
+crlnumber        = $abs/crlnumber
+serial           = $abs/serial
+new_certs_dir    = $abs/newcerts
+certificate      = $abs/ca.crt
+private_key      = $abs/ca.key
+default_md       = sha256
+default_days     = $DAYS
+default_crl_days = $CRL_DAYS
+policy           = policy_any
+email_in_dn      = no
+unique_subject   = no
+
+# The subjects this CA writes carry a CN and an O and nothing else, and a
+# policy that demanded more would refuse to record its own certificates.
+[ policy_any ]
+commonName             = supplied
+organizationName       = optional
+organizationalUnitName = optional
+countryName            = optional
+stateOrProvinceName    = optional
+localityName           = optional
+CNF
+}
+
+# The five tab-separated fields openssl's own index writer uses:
+#   V <notAfter YYMMDDHHMMSSZ> <revocation date> <serial> unknown <subject>
+index_add() {
+	local crt="$1" serial notafter stamp subject
+	serial="$(openssl x509 -in "$crt" -noout -serial 2>/dev/null | cut -d= -f2)" || return 0
+	[ -n "$serial" ] || return 0
+	if cut -f4 "$INDEX" | grep -qx "$serial"; then
+		return 0
+	fi
+	notafter="$(openssl x509 -in "$crt" -noout -enddate | cut -d= -f2-)"
+	stamp="$(date -u -d "$notafter" +%y%m%d%H%M%SZ)"
+	# `compat` is the slash form openssl's index writer produces.
+	subject="$(openssl x509 -in "$crt" -noout -subject -nameopt compat | sed 's/^subject=//')"
+	printf 'V\t%s\t\t%s\tunknown\t%s\n' "$stamp" "$serial" "$subject" >> "$INDEX"
+	note "index: + $serial $subject"
+}
+
+index_rebuild() {
+	mkdir -p "$DIR/newcerts" "$DIR/issued"
+	[ -f "$INDEX" ] || : > "$INDEX"
+	printf 'unique_subject = no\n' > "$DIR/index.txt.attr"
+	[ -f "$DIR/crlnumber" ] || printf '01\n' > "$DIR/crlnumber"
+	[ -f "$DIR/serial" ] || printf '01\n' > "$DIR/serial"
+	write_cnf
+	local crt
+	# Both layouts: the hand-typed one writes <dir>/<stem>.crt, --sign-csr
+	# keeps its copy under <dir>/issued/ (3B finding N3/G4). A nested
+	# directory under issued/ is read too, so a copy of an operator's
+	# repository can be dropped in whole.
+	for crt in "$DIR"/*.crt; do
+		[ -f "$crt" ] || continue
+		case "$(basename "$crt")" in ca.crt) continue ;; esac
+		index_add "$crt"
+	done
+	if [ -d "$DIR/issued" ]; then
+		while IFS= read -r crt; do
+			[ -n "$crt" ] || continue
+			index_add "$crt"
+		done < <(find "$DIR/issued" -type f -name '*.crt' | sort)
+	fi
+}
+
+# A serial rather than a file. `openssl ca` has no way to revoke one — it
+# wants the certificate — and a certificate whose host was reinstalled is
+# exactly the one nobody kept. The row is already in the index (that is what
+# the rebuild is for), so this is the same edit openssl would make: V -> R,
+# with the date and the reason in the third field.
+#
+# The comparison ignores case, colons and leading zeros, because the three
+# spellings of one serial in this stack are openssl's (upper, no separator),
+# x509-parser's (lower, colons -- what a receipt from a controller carries)
+# and whatever an operator retypes.
+revoke_serial() {
+	local want="$1" reason="$2" now rc=0
+	now="$(date -u +%y%m%d%H%M%SZ)"
+	awk -F'\t' -v OFS='\t' -v want="$want" -v now="$now" -v reason="$reason" '
+		function norm(s) { gsub(/[: ]/, "", s); s = toupper(s); sub(/^0+/, "", s); return s }
+		norm($4) == norm(want) {
+			if ($1 == "R") { found = 2; print; next }
+			$1 = "R"; $3 = (reason == "" ? now : now "," reason)
+			found = 1; print; next
+		}
+		{ print }
+		END { exit (found == 1 ? 0 : (found == 2 ? 3 : 4)) }
+	' "$INDEX" > "$INDEX.tmp" || rc=$?
+	case "$rc" in
+		0) mv "$INDEX.tmp" "$INDEX"; note "revoked: $want" ;;
+		3) rm -f "$INDEX.tmp"; note "already revoked: $want" ;;
+		4) rm -f "$INDEX.tmp"
+		   die "no certificate with serial $want is in $INDEX. This CA can only revoke what it knows it signed: put the certificate under $DIR/issued/ and run --index-rebuild first." ;;
+		*) rm -f "$INDEX.tmp"; die "rewriting $INDEX failed" ;;
+	esac
+}
+
+if [ "$INDEX_REBUILD" -eq 1 ] || [ -n "$REVOKE" ] || [ "$GENCRL" -eq 1 ]; then
+	# Always, even when only --revoke was asked for: the index is the thing
+	# a revocation is written into, and a revocation against a missing row is
+	# a revocation that silently does nothing.
+	index_rebuild
+	if [ -n "$REVOKE" ]; then
+		case "$REVOKE_REASON" in
+			""|unspecified|keyCompromise|CACompromise|affiliationChanged|superseded|cessationOfOperation|certificateHold|removeFromCRL|privilegeWithdrawn|AACompromise) ;;
+			*) die "unknown --reason $REVOKE_REASON (unspecified|keyCompromise|CACompromise|affiliationChanged|superseded|cessationOfOperation|certificateHold|privilegeWithdrawn|AACompromise)" ;;
+		esac
+		if [ -f "$REVOKE" ]; then
+			# openssl's own path: it reads the certificate, finds its row and
+			# writes the reason the way it reads it back.
+			if [ -n "$REVOKE_REASON" ]; then
+				openssl ca -config "$CNF" -revoke "$REVOKE" -crl_reason "$REVOKE_REASON" -batch 2>&1 \
+					| sed 's/^/  /' >&2 || die "openssl refused to revoke $REVOKE"
+			else
+				openssl ca -config "$CNF" -revoke "$REVOKE" -batch 2>&1 \
+					| sed 's/^/  /' >&2 || die "openssl refused to revoke $REVOKE"
+			fi
+			note "revoked: $(openssl x509 -in "$REVOKE" -noout -serial | cut -d= -f2)"
+		else
+			case "$REVOKE" in
+				*/*|*.crt|*.pem) die "no such certificate: $REVOKE" ;;
+			esac
+			revoke_serial "$REVOKE" "$REVOKE_REASON"
+		fi
+	fi
+	if [ "$GENCRL" -eq 1 ]; then
+		openssl ca -config "$CNF" -gencrl -out "$DIR/crl.pem" -batch 2>&1 \
+			| sed 's/^/  /' >&2 || die "openssl refused to write $DIR/crl.pem"
+		number="$(openssl crl -in "$DIR/crl.pem" -noout -crlnumber 2>/dev/null | cut -d= -f2)"
+		count="$(grep -c '^R' "$INDEX" || true)"
+		note "crl:    $DIR/crl.pem (number ${number:-?}, $count revoked, $CRL_DAYS days)"
+		printf '%s\n' "$DIR/crl.pem"
+	fi
 	exit 0
 fi
 

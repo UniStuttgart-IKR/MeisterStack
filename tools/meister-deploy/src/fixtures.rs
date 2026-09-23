@@ -473,3 +473,139 @@ pub fn plan_policy(kind: PlanKind) -> PlanPolicy {
 pub fn plan_policy_with_certificates(kind: PlanKind, fleet: &ResolvedFleet) -> PlanPolicy {
     plan_policy(kind).with_expected_credentials(expected_credentials(fleet))
 }
+
+// --- lane 5A ---------------------------------------------------------------
+
+/// The same fleet, with the hosts that carry a controller reading a
+/// revocation list.
+///
+/// A separate helper rather than a line in the fixture file, for the reason
+/// `with_direct_host` is one: `auth.crl` is not rendered by the one
+/// derivation today (a controller refuses to start without a file it names,
+/// and no fleet has been delivered one yet), so a fixture that carried it
+/// everywhere would describe a fleet that does not exist. The manifest id is
+/// recomputed, because a fleet whose content was edited and whose id was not
+/// is a fleet `validate` refuses.
+pub fn with_crl(mut fleet: ResolvedFleet, hosts: &[&str]) -> ResolvedFleet {
+    for id in hosts {
+        let host = fleet
+            .hosts
+            .get_mut(*id)
+            .unwrap_or_else(|| panic!("{id} is in the fixture"));
+        let dir = host
+            .secret_refs
+            .iter()
+            .find(|s| s.target_path.ends_with("/ca.crt"))
+            .map(|s| s.target_path.trim_end_matches("/ca.crt").to_string())
+            .unwrap_or_else(|| "/var/lib/meisterstack/pki".to_string());
+        // One per role that reads one, exactly as `nix/lib/manifest.nix`
+        // writes a reference per file AND unit.
+        for role in ["cloud", "cluster"] {
+            if !host.roles.iter().any(|r| r == role) {
+                continue;
+            }
+            host.secret_refs.push(crate::manifest::SecretRef {
+                id: format!("crl-pem-{role}"),
+                kind: crate::manifest::SecretKind::Crl,
+                source: crate::manifest::SecretSource {
+                    kind: crate::manifest::SecretSourceKind::MeisterCa,
+                    reference: "crl".to_string(),
+                },
+                target_path: format!("{dir}/crl.pem"),
+                owner: "root".to_string(),
+                mode: "0644".to_string(),
+                delivery: crate::manifest::Delivery::File,
+                // What the one derivation renders: a unit per file. The
+                // planner and the executor are what decide that a list is
+                // not poked, and a test that left this out would be a test
+                // of a manifest nobody writes.
+                reload: Some(crate::manifest::Reload {
+                    unit: format!("meister-{role}-controller.service"),
+                    action: "restart".to_string(),
+                }),
+            });
+        }
+    }
+    fleet.manifest_id =
+        crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
+    fleet
+}
+
+/// The same fleet, with a certificate beside the key a host makes itself.
+///
+/// The checked-in manifest is older than the shape `nix/lib/manifest.nix`
+/// renders today: it carries `identity.key` but no `identity.crt`, and a
+/// rotation is about the pair. Rather than rewrite a fixture every other
+/// test's ids are computed from, this adds the reference the way the one
+/// derivation writes it — one per file AND unit.
+pub fn with_cert(mut fleet: ResolvedFleet, hosts: &[&str], kind: &str) -> ResolvedFleet {
+    for id in hosts {
+        let host = fleet
+            .hosts
+            .get_mut(*id)
+            .unwrap_or_else(|| panic!("{id} is in the fixture"));
+        let dir = host
+            .secret_refs
+            .iter()
+            .find(|s| s.target_path.ends_with("/ca.crt"))
+            .map(|s| s.target_path.trim_end_matches("/ca.crt").to_string())
+            .unwrap_or_else(|| "/var/lib/meisterstack/pki".to_string());
+        let roles: Vec<String> = ["cloud", "cluster", "agent"]
+            .iter()
+            .filter(|role| host.roles.iter().any(|r| r == *role))
+            .map(|r| r.to_string())
+            .collect();
+        for role in roles {
+            let unit = if role == "agent" {
+                "meister-agent.service".to_string()
+            } else {
+                format!("meister-{role}-controller.service")
+            };
+            host.secret_refs.push(crate::manifest::SecretRef {
+                id: format!("{kind}-crt-{role}"),
+                kind: if kind == "serving" {
+                    crate::manifest::SecretKind::ServingKey
+                } else {
+                    crate::manifest::SecretKind::IdentityKey
+                },
+                source: crate::manifest::SecretSource {
+                    kind: crate::manifest::SecretSourceKind::MeisterCa,
+                    reference: format!("system:node:{id}"),
+                },
+                target_path: format!("{dir}/{kind}.crt"),
+                owner: "meister".to_string(),
+                mode: "0644".to_string(),
+                delivery: crate::manifest::Delivery::File,
+                reload: Some(crate::manifest::Reload {
+                    unit,
+                    action: "restart".to_string(),
+                }),
+            });
+        }
+    }
+    fleet.manifest_id =
+        crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
+    fleet
+}
+
+/// A rotation of the identity key of `id`, as `keys rotate` would have
+/// prepared it.
+pub fn rotation_for(
+    fleet: &ResolvedFleet,
+    id: &str,
+    cert_sha256: &str,
+) -> crate::plan::KeyRotation {
+    crate::pki::rotation_of(
+        &fleet.hosts[id],
+        crate::pki::Prepared {
+            host_id: id,
+            kind: "identity",
+            subject: &format!("system:node:{id}"),
+            public_key_sha256: "cd".repeat(32).as_str(),
+            cert_sha256,
+            serial: Some("0A0B0C".to_string()),
+            source: &std::path::PathBuf::from(format!("pki/issued/{id}/identity.next.crt")),
+        },
+    )
+    .expect("the fixture renders a certificate for that host")
+}

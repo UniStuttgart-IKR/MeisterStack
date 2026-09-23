@@ -9,12 +9,14 @@
 //! and because the one thing that must agree between them (which crypto
 //! provider, which ALPN) is easier to keep true in one file than in two.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, CertificateRevocationListDer};
 
 use crate::pem::{load_certs, load_private_key};
 
@@ -30,10 +32,18 @@ const ALPN_HTTP11: &[u8] = b"http/1.1";
 /// no certificate has to reach the authenticator chain to be told 401 in
 /// words, and a handshake that fails instead would leave `meister login` — a
 /// client that by definition has no certificate yet — with nothing to talk to.
+/// `crl` is the revocation list this port checks a client certificate
+/// against at the HANDSHAKE. It is read once, here, and lives in the
+/// `ServerConfig` — rustls has no way to replace it in a config a listener
+/// already holds, so what reloads is the application-level check in
+/// `controller_api::auth` (D11, measured in M0 probe S10). This half is the
+/// belt: a certificate that is on the list when this process starts does not
+/// get as far as an authenticator.
 pub fn server_config(
     cert: &Path,
     key: &Path,
     client_ca: Option<&Path>,
+    crl: Option<&Path>,
 ) -> Result<Arc<ServerConfig>> {
     let chain = load_certs(cert)?;
     let key = load_private_key(key)?;
@@ -44,13 +54,32 @@ pub fn server_config(
 
     let mut config = match client_ca {
         Some(ca) => {
-            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            let mut verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
                 Arc::new(roots(ca)?),
                 crate::provider(),
             )
-            .allow_unauthenticated()
-            .build()
-            .context("building the client certificate verifier")?;
+            .allow_unauthenticated();
+            if let Some(path) = crl {
+                verifier = verifier
+                    .with_crls(read_crl(path)?.der)
+                    // The end entity and not the whole chain: the list this
+                    // CA publishes is about the certificates it issued, and
+                    // its own trust anchor is excluded from a revocation
+                    // check anyway.
+                    .only_check_end_entity_revocation()
+                    // A certificate no list mentions is not a certificate
+                    // this port refuses. rustls' default is the other way
+                    // round, and it would turn a bundle holding a second CA
+                    // — one this fleet verifies against and does not publish
+                    // a list for — into a lockout. What is authoritative
+                    // about revocation here is the reloadable check in
+                    // `controller_api::auth`, which reads the same file and
+                    // answers the same way about a serial that is on it.
+                    .allow_unknown_revocation_status();
+            }
+            let verifier = verifier
+                .build()
+                .context("building the client certificate verifier")?;
             builder.with_client_cert_verifier(verifier)
         }
         None => builder.with_no_client_auth(),
@@ -99,6 +128,103 @@ pub fn roots(path: &Path) -> Result<RootCertStore> {
             .with_context(|| format!("{} is not usable as a trust root", path.display()))?;
     }
     Ok(store)
+}
+
+/// A certificate revocation list, read once for both of the places that
+/// need it.
+///
+/// The same "one parse, both answers" as [`crate::cert::CertInfo`]: rustls
+/// wants DER for its handshake-time check, and the application-level check
+/// wants the serials to compare an authenticated certificate against. Two
+/// readers would be two chances to disagree about what the file says.
+///
+/// The serials are exactly what `x509-parser` prints for them — lowercase
+/// hex, colon separated, over the raw DER integer — which is the SAME
+/// function `CertInfo::serial` comes out of, so the two are comparable
+/// without a conversion. Callers that have to compare with openssl's
+/// spelling (upper case, no separators) normalise both sides; see
+/// `controller_api::auth::normalise_serial`.
+#[derive(Debug, Default)]
+pub struct Crl {
+    pub der: Vec<CertificateRevocationListDer<'static>>,
+    pub serials: BTreeSet<String>,
+    /// The `X509v3 CRL Number` extension: a list that goes backwards is a
+    /// list somebody restored from a backup, and an operator wants to see
+    /// the number rather than guess.
+    pub number: Option<u64>,
+}
+
+/// One spelling for a serial number, because this stack has three.
+///
+/// `x509-parser` prints `64:35:c9:…` (lowercase, colon separated) and it is
+/// what both a certificate and a CRL entry come out of here. openssl's
+/// `index.txt` and `x509 -serial` print `6435C9…` (upper case, no
+/// separators), and that is the one an operator reads off a receipt and
+/// retypes. A leading zero byte is DER's sign padding and says nothing about
+/// the number.
+///
+/// Comparing serials is the whole of revocation, so the comparison is made
+/// in exactly one function and every caller goes through it — the
+/// controllers' authenticator, the session registries, and the deployment
+/// tool, which all have to mean the same certificate by the same number.
+pub fn normalise_serial(serial: &str) -> String {
+    let mut out: String = serial
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if out.len() % 2 == 1 {
+        out.insert(0, '0');
+    }
+    while out.len() > 2 && out.starts_with("00") {
+        out.drain(..2);
+    }
+    out
+}
+
+/// Read a CRL file (PEM, as `openssl ca -gencrl` writes it).
+///
+/// A file with no list in it is an error and not an empty list: "nothing is
+/// revoked" and "the list could not be read" are the two answers that must
+/// never be confused, because one of them is the one an attacker wants.
+pub fn read_crl(path: &Path) -> Result<Crl> {
+    let der: Vec<CertificateRevocationListDer<'static>> =
+        CertificateRevocationListDer::pem_file_iter(path)
+            .with_context(|| format!("reading the revocation list {}", path.display()))?
+            .collect::<std::result::Result<_, _>>()
+            .with_context(|| format!("parsing the revocation list {}", path.display()))?;
+    if der.is_empty() {
+        anyhow::bail!(
+            "{} contains no certificate revocation list. An empty file is not an empty \
+             list: it is a file this process cannot tell anything from.",
+            path.display()
+        );
+    }
+    let mut serials = BTreeSet::new();
+    let mut number: Option<u64> = None;
+    for one in &der {
+        let (_, crl) = x509_parser::prelude::parse_x509_crl(one.as_ref())
+            .map_err(|e| anyhow::anyhow!("{} is not a usable crl: {e}", path.display()))?;
+        for revoked in crl.iter_revoked_certificates() {
+            serials.insert(revoked.raw_serial_as_string());
+        }
+        // The highest of them, for a bundle holding more than one list.
+        // `BigUint` because that is what a CRL number is; a number this
+        // stack cannot hold in a u64 is reported as none rather than
+        // truncated.
+        if let Some(n) = crl
+            .crl_number()
+            .and_then(|n| n.to_string().parse::<u64>().ok())
+            && number.is_none_or(|have| n > have)
+        {
+            number = Some(n);
+        }
+    }
+    Ok(Crl {
+        der,
+        serials,
+        number,
+    })
 }
 
 /// The peer's certificate chain as plain DER, leaf first.

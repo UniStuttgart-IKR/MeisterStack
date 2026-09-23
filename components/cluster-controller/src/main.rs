@@ -351,6 +351,14 @@ fn check_config(args: &Args) -> ! {
             controller_api::rest::Tier::Cluster,
             serves_sessions,
         )?;
+        // --- lane 5A: the list this controller would refuse to start
+        // without. Read and parsed by the same code the start-up uses, so
+        // that a check and a start say the same thing about the same file.
+        if let Some(crl) = &cfg.auth.crl {
+            let path = pki::pem::resolve(cfg.config_dir.as_deref(), crl);
+            eprintln!("{}", controller_api::auth::Revocations::check(&path)?);
+        }
+        // --- end lane 5A ---
         Ok(())
     });
     match verdict {
@@ -407,6 +415,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         cfg.tls_key.as_deref(),
         cfg.client_ca.as_deref(),
         base,
+        // --- lane 5A: the belt at the handshake; the braces are the chain ---
+        cfg.auth.crl.as_deref(),
+        // --- end lane 5A ---
     )?;
     let session_tls = controller_api::grpc::server_tls(
         cfg.tls_cert.as_deref(),
@@ -428,13 +439,20 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // the one configuration in which a chain without mtls is not a lockout —
     // see `build_chain`.
     let serves_sessions = !cfg.listen_session.trim().is_empty();
-    let chain = Arc::new(controller_api::rest::build_chain(
+    // --- lane 5A: one revocation list per process ---------------------
+    // The chain enforces it on every authentication; the periodic task below
+    // reloads it and ends the sessions that are already running on a
+    // certificate that has been taken back. Two lists would be two answers
+    // to one question, half a minute apart.
+    let (chain, revocations) = controller_api::rest::build_chain_with_revocations(
         &cfg.auth,
         cfg.client_ca.as_deref(),
         base,
         controller_api::rest::Tier::Cluster,
         serves_sessions,
-    )?);
+    )?;
+    let chain = Arc::new(chain);
+    // --- end lane 5A ---------------------------------------------------
     if chain.is_empty() {
         // Warn, as `csr_auto_approve` and the static bearer token are: a
         // deliberate configuration that leaves the API wide open should not
@@ -465,6 +483,45 @@ async fn run(args: Args) -> anyhow::Result<()> {
     info!(endpoints = %cfg.etcd_endpoints, prefix = %cfg.etcd_prefix, "etcd store ready");
 
     let registry = Arc::new(session::SessionRegistry::new());
+
+    // --- lane 5A: the list, while the process runs ----------------------
+    //
+    // The authenticator reloads on its own, but only when somebody
+    // authenticates — and a controller whose peers are all connected
+    // authenticates nobody for hours. So one task looks at the file on its
+    // own clock, and hands what it finds to the registry: a session that is
+    // already talking on a certificate that has just been taken back is
+    // exactly the case a revocation is for, and nothing else would notice
+    // it until the peer reconnected.
+    if let Some(revocations) = revocations.clone() {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let every =
+                Duration::from_secs(controller_api::auth::REVOCATION_RELOAD_SECS.unsigned_abs());
+            loop {
+                tokio::time::sleep(every).await;
+                // `Failed` has already been logged by the reload, with the
+                // reason; `TooSoon` and `Unchanged` are the quiet answers
+                // this task is supposed to have most of the time.
+                if let controller_api::auth::Reload::Loaded {
+                    serials,
+                    crl_number,
+                } = revocations.refresh()
+                {
+                    info!(
+                        revoked = serials,
+                        number = crl_number.unwrap_or_default(),
+                        "revocation list reloaded"
+                    );
+                }
+                let ended = registry.drop_revoked(&revocations.list()).await;
+                for (who, serial) in ended {
+                    info!(peer = %who, serial = %serial, "session ended: certificate revoked");
+                }
+            }
+        });
+    }
+    // --- end lane 5A ----------------------------------------------------
 
     // What a console read needs when it lands on the replica that does NOT
     // hold the node's session: this cluster's own name, which is what the

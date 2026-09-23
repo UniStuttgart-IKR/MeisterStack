@@ -172,8 +172,34 @@ impl ImageView {
     }
 }
 
+// --- lane 5A ---------------------------------------------------------------
+/// The serial of the certificate this session authenticated with, or `None`
+/// when nothing did (anonymous mode, a bearer token).
+///
+/// Read once, at the Hello: `who` is settled before the first message and
+/// never re-read, which is what makes a session an identity rather than a
+/// sequence of them.
+pub(super) fn serial_of(who: &Authenticated) -> Option<String> {
+    match who {
+        Authenticated::As(identity) => identity.serial.clone(),
+        Authenticated::Anonymous => None,
+    }
+}
+
+/// One node's live session: the channel commands go down, and which
+/// certificate opened it.
+///
+/// The serial is the only handle there is on a session that is already
+/// running. The node id is not one: a rotation gives one node two
+/// certificates, and a revocation is about ONE of them.
+struct NodeSession {
+    tx: CommandTx,
+    serial: Option<String>,
+}
+// --- end lane 5A -----------------------------------------------------------
+
 pub struct SessionRegistry {
-    nodes: Mutex<HashMap<String, CommandTx>>,
+    nodes: Mutex<HashMap<String, NodeSession>>,
     pending: Pending,
     /// Console frames on their way between the cloud and a node.
     ///
@@ -216,11 +242,14 @@ impl SessionRegistry {
     /// speaking through the new stream, and commands sent down the old one
     /// would go to a channel nobody reads. The old session's own unwinding
     /// cannot undo this — see `disconnect`.
-    fn register(&self, node_id: &str, tx: &CommandTx) {
-        self.nodes
-            .lock()
-            .unwrap()
-            .insert(node_id.to_string(), tx.clone());
+    fn register(&self, node_id: &str, tx: &CommandTx, serial: Option<String>) {
+        self.nodes.lock().unwrap().insert(
+            node_id.to_string(),
+            NodeSession {
+                tx: tx.clone(),
+                serial,
+            },
+        );
     }
 
     /// Drop this session's entry — but only if it is still the current one. A
@@ -229,13 +258,55 @@ impl SessionRegistry {
     fn disconnect(&self, node_id: &str, tx: &CommandTx) -> bool {
         let mut nodes = self.nodes.lock().unwrap();
         match nodes.get(node_id) {
-            Some(current) if current.same_channel(tx) => {
+            Some(current) if current.tx.same_channel(tx) => {
                 nodes.remove(node_id);
                 true
             }
             _ => false,
         }
     }
+
+    // --- lane 5A: a certificate that was taken back while it talked -------
+    /// End every session whose certificate is on this list.
+    ///
+    /// An error down the stream, and the registry entry is left where it is:
+    /// the stream unwinding is what calls `on_disconnect`, and that is what
+    /// marks the node not ready and takes its console endpoint off the
+    /// object. Removing the entry here would take the teardown away from the
+    /// path that owns it — `disconnect` would then find nothing, decide the
+    /// session was superseded, and leave a revoked node listed as ready.
+    pub async fn drop_revoked(
+        &self,
+        list: &controller_api::auth::RevocationList,
+    ) -> Vec<(String, String)> {
+        let doomed: Vec<(String, String, CommandTx)> = {
+            let nodes = self.nodes.lock().unwrap();
+            nodes
+                .iter()
+                .filter_map(|(id, node)| {
+                    let serial = node.serial.as_ref()?;
+                    list.is_revoked(serial)
+                        .then(|| (id.clone(), serial.clone(), node.tx.clone()))
+                })
+                .collect()
+        };
+        let mut ended = Vec::new();
+        for (id, serial, tx) in doomed {
+            warn!(
+                node = %id,
+                serial = %serial,
+                "the certificate of a live session is revoked; ending it"
+            );
+            let _ = tx
+                .send(Err(Status::permission_denied(format!(
+                    "the certificate {serial} this session opened with is revoked"
+                ))))
+                .await;
+            ended.push((id, serial));
+        }
+        ended
+    }
+    // --- end lane 5A ------------------------------------------------------
 
     /// Is this session still the one the node speaks through?
     ///
@@ -249,7 +320,7 @@ impl SessionRegistry {
             .lock()
             .unwrap()
             .get(node_id)
-            .is_some_and(|current| current.same_channel(tx))
+            .is_some_and(|current| current.tx.same_channel(tx))
     }
 
     /// A session for a node without a stream behind it.
@@ -260,7 +331,7 @@ impl SessionRegistry {
     /// made by a Hello and by nothing else.
     #[cfg(test)]
     pub(crate) fn attach(&self, node_id: &str, tx: &CommandTx) {
-        self.register(node_id, tx);
+        self.register(node_id, tx, None);
     }
 
     /// The answer a real agent's `CommandResult` would carry, for the same
@@ -285,7 +356,12 @@ impl SessionRegistry {
     /// one. `false` means the node has no session, which the caller turns
     /// into the end of that console session.
     pub async fn send_to(&self, node_id: &str, msg: ControllerMessage) -> bool {
-        let tx = self.nodes.lock().unwrap().get(node_id).cloned();
+        let tx = self
+            .nodes
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .map(|node| node.tx.clone());
         match tx {
             Some(tx) => tx.send(Ok(msg)).await.is_ok(),
             None => false,
@@ -305,7 +381,7 @@ impl SessionRegistry {
             .lock()
             .unwrap()
             .get(node_id)
-            .cloned()
+            .map(|node| node.tx.clone())
             .ok_or_else(|| anyhow!("node {node_id} has no active session"))?;
 
         let peer = Peer {
