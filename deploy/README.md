@@ -15,7 +15,7 @@ Maschine sagt, was sie ist.
 | **Prozesse** | Entwicklung auf dem eigenen Rechner, drei Binaries nebeneinander | `config/*.dev.toml`, `scripts/smoke.sh`. Ein eigener kleiner Brief folgt. |
 | **Eine VM** | einen Knoten einmal wirklich booten sehen, ohne Blech | `nixos-rebuild build-vm --flake .#box`, dann `./result/bin/run-*-vm` |
 | **Kiste plus Knoten** | der Normalfall: 1-5 Maschinen im Labor | `fleet.toml`, `meister-deploy` — siehe `config/examples/one-box/README.md` |
-| **Die Kontext-Flotte** | OpenNebula, zwoelf VMs, drei Tiers | dasselbe generische Image fuer alle, `MEISTER_ROLE` im Kontext — siehe unten |
+| **Eine Flotte** | 1-70 Maschinen, gemischte Hardware, aus dem eigenen Repo | `meister-deploy init`, dann `resolve` -> `build` -> `plan` -> `apply` — das Runbook ist `docs/DEPLOYMENT.md` |
 
 ## Der Plan
 
@@ -55,12 +55,16 @@ etwas nicht anfassen will; ein Lauf, der auf einen Provider wartet).
 | `apply --plan p.json --release r.json [--resume <run>] [--takeover <run>]` | target-write | schaut, prueft, nennt die Schritte — keine Sperre, kein Journal | – | 0/1/2 |
 | `status` / `check --release r.json [--suite readiness]` | read | – | antwortet aus dem letzten Schnappschuss | 0/2 |
 | `report --run <id>` | offline (liest das Zustandsverzeichnis) | – | – | 0/1 |
+| `verify --release r.json --suite vm-lifecycle\|gpu\|rdma --approve verify=<plan_id>` | target-write (Ledger, echte Gaeste, Cleanup) | listet die Schritte | verweigert | 0/1/2 |
 | `keys enroll <host> --fingerprint SHA256:…` | read + local-write | zeigt den Schluessel, schreibt nicht | verweigert | 0/1 |
 | `keys csr --host <id> --kind identity\|serving [--as <tier>]` | target-write (der Schluessel entsteht am Ziel) | zeigt das Subjekt | – | 0/1 |
 | `keys issue --host <id> --kind node\|cluster\|cloud\|serving` | key (offline, nur diese Maschine) | zeigt das Subjekt | – | 0/1 |
-| `gc --keep N` | local-write (nur GC-Wurzeln) | nennt die Releases | – | 0/1 |
+| `keys revoke --serial <s>\|--host <id>\|--refresh --release r.json` | key + read + local-write, danach ein Plan | zeigt die zwei CA-Kommandos | – | 0/1/2 |
+| `keys rotate --host <id> --kind identity\|serving --release r.json` | key + target-write (der neue Schluessel entsteht am Ziel), danach ein Plan | zeigt, was vorbereitet wuerde | – | 0/1/2 |
+| `keys import --from <dir> --map <host>=<stem> --manifest m.json` | key + local-write (offline) | zeigt, was wohin ginge | – | 0/1 |
+| `retire <host> --release r.json` | key + local-write, danach ein Plan an die uebrigen Hosts | zeigt die CA-Kommandos, schreibt nichts | – | 0/1/2 |
+| `gc --keep N [--older-than 14] [--observations N] [--runs]` | local-write (nur GC-Wurzeln) | nennt die Releases | – | 0/1 |
 | `schema <art>` | offline | – | – | 0/1 |
-| `legacy plan\|image\|push\|check\|keys\|render` | wie vor v1 | wie vor v1 | – | 0/1 |
 
 Genehmigt wird ausschliesslich mit `--approve <klasse>=<plan_id>`; ein
 globales `--force` gibt es nicht, und eine Freigabe nennt den Plan, fuer den
@@ -107,16 +111,13 @@ er die Module und sagt, was er ist:
 
 `examples/fleet/foreign-flake/` ist genau das, und `nix flake check`
 evaluiert es — der Export kann also nicht unbemerkt aufhoeren, allein zu
-stehen. Statt die Rollen von Hand zu setzen, kann der Host auch die Datei
-importieren, die `meister-deploy render <knoten>` schreibt: dieselben
-Optionswerte, die `mkNode` fuer diesen Knoten setzen wuerde, als reine
-Funktion des Plans und byteidentisch bei gleichem Plan. Sie enthaelt keine
-Hardware, keinen Bootloader, kein Dateisystem und keine Adresse — das
-gehoert dem Host.
+stehen. Ein Host, der in einem Inventar steht, braucht das nicht von Hand:
+`meisterstack.lib.mkFleet` baut sein Modul aus dem `[[host]]`-Eintrag, und
+`(mkFleet {…}).hostModules.<id>` ist genau diese Datei als Wert.
 
-Die Zertifikate kommen in keinem Fall aus dem Nix-Store: `keys push` legt
-sie nach `/opt/meisterstack/pki`, und bis dahin bleiben die Units sichtbar
-uebersprungen.
+Die Zertifikate kommen in keinem Fall aus dem Nix-Store: sie werden von der
+Plan-Aktion `deliver-secret` nach `meisterstack.pki.dir` gelegt (`apply`
+fuehrt sie aus), und bis dahin bleiben die Units sichtbar uebersprungen.
 
 ## Von der leeren Platte zur laufenden Flotte
 
@@ -178,43 +179,35 @@ Fuer eine Kiste, die ohnehin schon erreichbar ist und deren Platte niemand
 anders beansprucht, ist nixos-anywhere der kuerzere Weg. Fuer eine leere
 Maschine, an der jemand steht, ist es das Medium.
 
-## Die Kontext-Flotte (OpenNebula)
+## Die Kontext-Flotte (OpenNebula) — nicht mehr hier
 
-Zwoelf VMs, ein generisches Image, `MEISTER_ROLE` im Kontext. Der Plan
-dafuer ist `examples/fleet/lab.toml`; die Knoten haben dort **kein**
-`disk`, weil ihre Platte aus einem registrierten Image kam und der
-VM-Lebenszyklus OpenNebula gehoert (Tofu, spaeter). Fuer solche Knoten
-heisst `push`: rsync der Binaries nach `/opt/meisterstack/bin` und ein
-Unit-Restart — genau das, was `deploy/push.sh` seit M1 tut.
+Zwoelf VMs des Labs booten ein generisches Image und rendern ihre
+Konfigurationsdateien beim Boot aus einem Kontext. Dieses Repo hat davon
+seit M5B nichts mehr: `nix/appliance.nix`, `nix/context.nix`,
+`nix/provider-opennebula.nix`, `deploy/push.sh`, `deploy/check.sh`,
+`deploy/one-template.example` und `examples/fleet/lab.toml` liegen in
 
-**`push.sh` und `check.sh` bleiben**, bis `meister-deploy` sie im Lab
-einmal wirklich ersetzt hat. Sie koennen zwei Dinge, die das Werkzeug
-heute nicht kann: die Gast-Assets mitschieben (`MEISTER_GUEST_ASSETS`) und
-den musl-Build anstossen. Bis dahin sind sie die Wahrheit fuer die
-Kontext-Flotte, und `meister-deploy` ist es fuer alles andere.
+    ~/git/meisterstack-lab/legacy/
+
+zusammen mit ihrem Rendertest (`check-context.sh`, 140 Pruefungen) und dem
+Paritaetsbeleg, dass das Bild dort **dieselbe Ableitung** ist wie das, das
+hier gebaut wurde (72 Units, je derselbe Store-Pfad). Der Weg von dort
+hierher ist eine Migration und steht in `docs/DEPLOYMENT.md`, Abschnitt
+"Migrating the context fleet".
+
+Was hier bleibt: `deployment = "context"` im Inventar ist weiter ein
+gueltiger Wert. Ein solcher Host steht in `inventory`, hat aber kein
+Toplevel im Manifest, und ein Plan weist ihn mit einem Satz ab, der auf den
+Push im Lab-Repo zeigt. Das ist die ehrliche Antwort: dieses Werkzeug
+bedient ihn nicht.
 
 Der musl-Build braucht einen musl-Cross-GCC (`ring` uebersetzt C fuer das
-Ziel), und den gibt es hier als Shell: `nix develop .#musl` — oder gar nichts
-tun, `push.sh` betritt sie selbst, wenn der Compiler nicht schon auf dem PATH
-liegt. Die Shell setzt genau die drei Variablen, die `cc` und cargo lesen
-(`CC_`, `AR_`, `CARGO_TARGET_..._LINKER`, je mit dem Ziel im Namen); sie bringt
-kein Rust mit, denn das ist das der Maschine. Ein nativer Bau in ihr ist
-derselbe Bau wie ausserhalb.
+Ziel), und den gibt es hier als Shell: `nix develop .#musl`. Die statischen
+Binaries selbst kommen aber aus Nix und nicht mehr aus dieser Shell:
+`nix build .#meisterstack-static` (sieben Binaries) und
+`nix build .#cloud-hypervisor-meister-static` (cloud-hypervisor + ch-remote,
+static-pie) — das ist, was der Push im Lab-Repo nimmt.
 
-Beide lesen `deploy/env`; `meister-deploy` liest dieselben Variablen
-(`MEISTER_SSH_KEY`, `MEISTER_SSH_PORT`, `MEISTER_SSH_STRICT`), also
-bedeutet `. deploy/env` vor dem einen dasselbe wie vor dem anderen.
-
-Was eine Maschine ueber sich selbst sagt und nicht ueber ihre Rolle, geht
-denselben Weg — per Kontext, weil dieselbe qcow2 zwoelfmal instanziiert
-wird und die Maschinen sich unterscheiden:
-
-| Kontextschluessel | Beispiel | Wirkung |
-|---|---|---|
-| `MEISTER_VXLAN_UPLINK` / `MEISTER_VXLAN_MTU` | `eth0`, `1450` | `[network.vxlan]` im `agent.toml` |
-| `MEISTER_PHYSNETS` | `ext=eth1` oder `"ext=eth1, dmz=eth2"` | `[network.provider] physnets` — die Interfaces, die diese Maschine abgibt, mit dem Namen des Provider-Netzes davor. Das Interface darf KEINE Adresse tragen, sonst startet der Agent nicht. Kein Wert heisst kein Abschnitt und damit kein Gateway-Slot; die Nix-Option daneben ist `meisterstack.agent.physnets` und ist die Antwort fuer eine Flotte, die ihre Maschinen im Plan stehen hat. |
-| `MEISTER_BGP_ASN` / `MEISTER_BGP_ROUTER_ID` | `65001`, `10.128.1.10` | `[network.bgp]` — dieser Knoten spricht BGP und kuendigt an, was er traegt (`/32` je Floating IP eines Gastes hier, und die Praefixe seiner Router). Beide oder keiner: ein halber Abschnitt ist ein Startfehler. Die `router_id` wird gesetzt und nicht FRR ueberlassen, das sonst die hoechste Adresse der Kiste nimmt — auf einem Knoten voller Bruecken und Taps die des zuletzt gebauten Gastes. |
-| `MEISTER_BGP_NEIGHBORS` | `10.128.0.1=65000` oder `"10.128.0.1=65000, 10.128.0.2=65000"` | Die Peers, `<adresse>=<asn>`. Leer ist erlaubt: der Abschnitt steht, `frr` laeuft, angekuendigt wird an niemanden. Ohne `MEISTER_BGP_ASN` wirkungslos. |
 
 ## Ohne root
 
