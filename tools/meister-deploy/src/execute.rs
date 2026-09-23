@@ -672,23 +672,53 @@ impl<'a> Executor<'a> {
                 self.guard(&fresh, id, hosts)?;
                 self.begin(journal, id, action)?;
                 let seen = fresh.host(id).cloned();
-                self.end(
-                    journal,
-                    id,
-                    action,
-                    ActionResult::Ok,
-                    vec![format!(
-                        "identity {}, generation {}",
-                        seen.as_ref()
-                            .and_then(|o| o.identity.host_key_fingerprint.clone())
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        seen.as_ref()
-                            .and_then(|o| o.generation)
-                            .map(|g| g.to_string())
-                            .unwrap_or_else(|| "unknown".to_string())
-                    )],
-                    Vec::new(),
-                )?;
+                let mut evidence = vec![format!(
+                    "identity {}, generation {}",
+                    seen.as_ref()
+                        .and_then(|o| o.identity.host_key_fingerprint.clone())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    seen.as_ref()
+                        .and_then(|o| o.generation)
+                        .map(|g| g.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                )];
+                // --- lane 4A: the hardware preflight ---
+                //
+                // The same function the plan was made with, asked again
+                // against the snapshot of THIS minute and before anything
+                // is copied. The plan's answer is a document; this one is
+                // the one that stands between a release and a machine that
+                // stopped being the machine the inventory describes —
+                // a disk that filled up, a card that was pulled, a NIC that
+                // was swapped, a `/dev/kvm` that is not there.
+                //
+                // It fails the step rather than only recording it: this is
+                // the last look before `stage`, and the whole point of a
+                // preflight is that what it finds does not get copied over.
+                if let Some(obs) = seen.as_ref() {
+                    let host = &self.release.resolved_fleet.hosts[id];
+                    let verdict = crate::plan::hardware_verdict(
+                        id,
+                        host,
+                        obs,
+                        Some(self.release.artifacts[id].toplevel.closure_size),
+                    );
+                    if !verdict.is_clear() {
+                        let why = verdict.blocked.join(" ");
+                        self.end(
+                            journal,
+                            id,
+                            action,
+                            ActionResult::Failed,
+                            verdict.blocked.clone(),
+                            Vec::new(),
+                        )?;
+                        bail!("the preflight of {id} found the machine changed: {why}");
+                    }
+                    evidence.extend(verdict.met);
+                }
+                // --- end lane 4A ---
+                self.end(journal, id, action, ActionResult::Ok, evidence, Vec::new())?;
                 self.move_to(journal, id, hosts, HostState::Preflight, fresh.host(id))?;
             }
             ActionKind::Lock => {
@@ -1532,6 +1562,28 @@ impl<'a> Executor<'a> {
     /// `known_hosts` (D10), so a machine with another key does not answer at
     /// all — and the `identity` comparison in
     /// [`crate::plan::validate_against`] catches the rest.
+    // --- lane 4A ---
+    /// Whether this host is a member of a raft group of this fleet — and
+    /// therefore a host whose etcd is part of what "back" means.
+    fn is_raft_member(&self, id: &str) -> bool {
+        let fleet = &self.release.resolved_fleet;
+        // Both halves, and the second one matters: a host can sit in a raft
+        // group without running a database of its own (the group is the
+        // unit of ROLLOUT, and a fleet may put a host in one for that
+        // reason alone). Waiting for an etcd such a host does not have
+        // would be waiting until the reboot deadline for nothing.
+        let has_etcd = fleet
+            .hosts
+            .get(id)
+            .is_some_and(|host| host.effective_settings.etcd.is_some());
+        has_etcd
+            && fleet.groups.values().any(|group| {
+                group.kind == crate::manifest::GroupKind::Raft
+                    && group.members.iter().any(|m| m == id)
+            })
+    }
+    // --- end lane 4A ---
+
     fn wait_for_boot(&self, id: &str, desired: &str) -> Result<String> {
         let started = self.clock.now();
         // What the last look said, for the sentence a person reads when the
@@ -1540,6 +1592,25 @@ impl<'a> Executor<'a> {
         loop {
             match self.observe_one(id) {
                 Ok(obs) if obs.reachable => match obs.booted_system.as_deref() {
+                    // --- lane 4A ---
+                    // A controller that has rebooted is not back until its
+                    // database is back. sshd answers seconds before etcd
+                    // does (measured in `vm-kernel-change`: sshd at five
+                    // seconds into the boot, etcd at thirteen), and in that
+                    // window the host's own member list is EMPTY — which
+                    // the quorum arithmetic reads as a member that is down
+                    // and the topology check read as a fleet that has
+                    // changed. Waiting here is cheaper and truer than
+                    // teaching two later rules about a machine that is
+                    // merely still starting.
+                    Some(booted)
+                        if booted == desired
+                            && self.is_raft_member(id)
+                            && !obs.etcd.as_ref().is_some_and(|e| e.healthy) =>
+                    {
+                        last = "it booted the release and its etcd has not answered yet".to_string()
+                    }
+                    // --- end lane 4A ---
                     Some(booted) if booted == desired => return Ok(booted.to_string()),
                     Some(other) => last = format!("it booted {other}"),
                     None => last = "it answered and could not say what it booted".to_string(),

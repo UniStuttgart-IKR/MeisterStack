@@ -60,6 +60,9 @@ struct TableLook {
     txns: RefCell<BTreeMap<String, Txn>>,
     /// Hosts that never come back from their reboot.
     lost: RefCell<BTreeSet<String>>,
+    /// How many more looks this host's etcd needs before it answers, the
+    /// way a real one does after a reboot (lane 4A).
+    etcd_late: RefCell<BTreeMap<String, u32>>,
     /// Hosts whose activation leaves the record a real one leaves: pending,
     /// waiting for a word.
     keeps_the_record: RefCell<BTreeSet<String>>,
@@ -86,6 +89,7 @@ impl TableLook {
             broken: RefCell::new(BTreeSet::new()),
             txns: RefCell::new(BTreeMap::new()),
             lost: RefCell::new(BTreeSet::new()),
+            etcd_late: RefCell::new(BTreeMap::new()),
             keeps_the_record: RefCell::new(BTreeSet::new()),
             from_outside: RefCell::new(BTreeSet::new()),
             asked: RefCell::new(Vec::new()),
@@ -112,6 +116,20 @@ impl TableLook {
         self
     }
 
+    // --- lane 4A ---
+    /// Between the plan and the run, this host's store filled up. The plan
+    /// was made when there was room; the preflight is the look that finds
+    /// out there is none.
+    fn ran_out_of_room(mut self, id: &str) -> TableLook {
+        for map in [&mut self.before, &mut self.after] {
+            if let Some(obs) = map.get_mut(id) {
+                obs.disk_free_nix_bytes = Some(1);
+            }
+        }
+        self
+    }
+    // --- end lane 4A ---
+
     /// This host's activation leaves a pending transaction behind, as a
     /// real one does until somebody confirms it.
     fn keeps_the_record(self, id: &str, txn: &str, top: &str) -> TableLook {
@@ -128,6 +146,16 @@ impl TableLook {
         );
         self
     }
+
+    // --- lane 4A ---
+    /// This host's etcd answers only after `looks` more looks — which is
+    /// what a controller does after a reboot: sshd is up seconds before
+    /// the database is.
+    fn etcd_late(self, id: &str, looks: u32) -> TableLook {
+        self.etcd_late.borrow_mut().insert(id.to_string(), looks);
+        self
+    }
+    // --- end lane 4A ---
 
     /// This host is told to reboot and never comes back.
     fn never_returns(self, id: &str) -> TableLook {
@@ -199,6 +227,21 @@ impl Look for TableLook {
             obs.units
                 .insert("meister-agent.service".to_string(), "failed".to_string());
         }
+        // --- lane 4A ---
+        // A member that has not answered yet reports no members at all,
+        // which is what `observe::etcd_view` makes of a unit that is not
+        // active.
+        if let Some(left) = self.etcd_late.borrow_mut().get_mut(&id)
+            && *left > 0
+        {
+            *left -= 1;
+            obs.etcd = Some(crate::observation::EtcdView {
+                member_id: None,
+                healthy: false,
+                members: Vec::new(),
+            });
+        }
+        // --- end lane 4A ---
         if let Some(txn) = self.txns.borrow().get(&id) {
             obs.open_txns = vec![txn.clone()];
         }
@@ -701,6 +744,20 @@ fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
     };
     assert!(at_of("ActionBegin:activate") < at_of("ActionIrreversible:activate"));
     assert!(at_of("ActionIrreversible:activate") < at_of("ActionEnd:activate"));
+
+    // --- lane 4A ---
+    // And the preflight wrote down WHAT it checked, so that a receipt read
+    // a week later says which machine this release went onto and not only
+    // that somebody looked.
+    let preflight = applied.receipt.hosts["n1"]
+        .actions
+        .iter()
+        .find(|a| a.kind == ActionKind::Preflight)
+        .expect("n1 has a preflight");
+    let evidence = preflight.evidence.join(" ");
+    assert!(evidence.contains("free for a closure of"), "{evidence}");
+    assert!(evidence.contains("has /dev/kvm"), "{evidence}");
+    // --- end lane 4A ---
 }
 
 // --- lane 4C: the cache is a shortcut inside the copy --------------------
@@ -2247,4 +2304,124 @@ fn a_halt_and_a_resume_are_the_v17_table_and_not_a_recovery() {
     run.actions[0].result = Some(ActionResult::Ok);
     run.state = HostState::Verifying;
     assert_eq!(next_step(&run, &TxnView::Confirmed), Step::VerifyOnly);
+}
+
+// --- lane 4A: the preflight at the run ------------------------------------
+
+#[test]
+fn a_store_that_filled_up_between_the_plan_and_the_run_stops_before_the_copy() {
+    // The plan was made when there was room. The preflight is the last look
+    // before the first copy, and what it finds there is not a note in a
+    // receipt — it is the reason nothing is copied.
+    let fx = Fixture::changing(&["n1"], false);
+    let look = TableLook::new(&fx).ran_out_of_room("n1");
+    let runner = World::new(
+        StrictFake::new()
+            // The fleet anchor is taken before any host is looked at, and
+            // given back when the run ends.
+            .expect(helper("box", &["lock", "acquire", "--run", "run-1"]), ok())
+            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok()),
+        &look,
+    );
+    let applied = fx
+        .executor(&runner, &look, fx.options())
+        .run()
+        .expect("a stopped wave is an answer and not a crash");
+    let stopped = applied.stopped.clone().unwrap_or_default();
+    assert!(
+        stopped.contains("free on the filesystem that carries /nix"),
+        "{stopped}"
+    );
+
+    // Nothing was copied, nothing was locked on the host itself, nothing
+    // was activated: the only commands were the anchor's.
+    for call in runner.calls() {
+        assert!(
+            call.contains("lock acquire") || call.contains("lock release"),
+            "the run ran {call} after a preflight that failed"
+        );
+    }
+    runner.verify().expect("the anchor and nothing else");
+
+    // The receipt says the host was not reached and names the step that
+    // said so, with the sentence as its evidence.
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Unreached);
+    assert_eq!(applied.receipt.untouched, ["n1"]);
+    let preflight = applied.receipt.hosts["n1"]
+        .actions
+        .iter()
+        .find(|a| a.kind == ActionKind::Preflight)
+        .expect("n1 has a preflight");
+    assert_eq!(preflight.result, Some(ActionResult::Failed));
+    assert!(
+        preflight.evidence.join(" ").contains("2000000000"),
+        "{:?}",
+        preflight.evidence
+    );
+}
+
+#[test]
+fn a_raft_member_is_not_back_until_its_database_is() {
+    // What `vm-kernel-change` found on a machine that had just rebooted:
+    // sshd answered at five seconds into the boot and etcd at thirteen,
+    // and in that window the host's own member list is EMPTY. The quorum
+    // arithmetic reads that as a member that is down and the topology
+    // check read it as a fleet that had changed — so the rollout stopped
+    // in the middle of the reboot it had asked for. `wait_for_boot` now
+    // waits for the database of a raft member, not only for the machine.
+    let fx = Fixture::changing(&["box"], true);
+    let look = TableLook::new(&fx).etcd_late("box", 2);
+    let runner = World::new(StrictFake::new(), &look);
+    let executor = fx.executor(&runner, &look, fx.options());
+
+    assert!(
+        executor.is_raft_member("box"),
+        "box is the raft group of this fixture"
+    );
+    assert!(
+        !executor.is_raft_member("n1"),
+        "n1 is compute, and its etcd is nobody's business"
+    );
+    // And a host that sits in a raft group without a database of its own
+    // is not waited for either — there would be nothing to wait for.
+    let mut without = fx.release.resolved_fleet.clone();
+    without
+        .hosts
+        .get_mut("box")
+        .unwrap()
+        .effective_settings
+        .etcd = None;
+    let mut release = fx.release.clone();
+    release.resolved_fleet = without;
+    let other = Fixture {
+        release,
+        plan: fx.plan.clone(),
+        files: MemFiles::new(),
+        clock: FakeClock::at(at(NOW)),
+        state: StateDir::at("/repo/.meister-deploy"),
+        ssh: Ssh::with_known_hosts("/repo/known_hosts"),
+    };
+    assert!(
+        !other
+            .executor(&runner, &look, other.options())
+            .is_raft_member("box"),
+        "a raft member without a database has none to wait for"
+    );
+
+    // The machine has booted the release from the very first look; its
+    // database has not.
+    look.set("box", Phase::After);
+    let back = executor
+        .wait_for_boot("box", &fx.top("box"))
+        .expect("it does come back");
+    assert_eq!(back, fx.top("box"));
+    assert_eq!(
+        look.etcd_late.borrow()["box"],
+        0,
+        "it returned before the database had answered"
+    );
+    assert!(
+        !fx.clock.slept().is_empty(),
+        "a bounded wait that never sleeps is a spin"
+    );
 }

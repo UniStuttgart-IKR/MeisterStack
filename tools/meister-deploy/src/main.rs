@@ -2470,6 +2470,36 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
         return dry_run(&the_plan, &release, &look, &state);
     }
 
+    // --- lane 4A: an approval nobody granted is blocked, not broken ------
+    //
+    // `Executor::run` refuses the same thing and goes on refusing it; this
+    // is the door in front of it and it exists only for the EXIT CODE. §5
+    // says 2 is "blocked", and a rollout waiting for a person to say yes is
+    // the plainest case of it there is. Read as 1 it cannot be told from
+    // "this tool fell over", which is the distinction the third exit code
+    // was introduced for (2B). Nothing is taken and nothing is written on
+    // this path: the lock below is not reached.
+    let missing = plan::approvals_missing(&the_plan, &approvals);
+    if !missing.is_empty() {
+        eprintln!(
+            "==> this plan needs {}, and nothing was granted for it. Read the plan, then \
+             pass {}. An approval names the plan it is for, so it cannot be carried over \
+             from another one.",
+            missing
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(" and "),
+            missing
+                .iter()
+                .map(|c| format!("--approve {c}={}", the_plan.plan_id))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        return Ok(Answer::Blocked);
+    }
+    // --- end lane 4A -----------------------------------------------------
+
     // The workstation's door. Taken before anything is looked at, given back
     // whatever happens below.
     let held = match &args.takeover {

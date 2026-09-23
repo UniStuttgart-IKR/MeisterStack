@@ -359,6 +359,22 @@
             inherit nixpkgs lib pkgs system self disko;
           };
 
+          # --- lane 4A ---
+          # Three etcd members, one of them stopped, and a rollout that
+          # refuses to take a second one down — D8's arithmetic against a
+          # raft that really bootstrapped (V14), plus its topology half.
+          vm-quorum-degraded = import ./nix/tests/quorum.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
+          # A release whose kernel command line is different: the class is
+          # a reboot, the reboot needs an approval, and without one nothing
+          # reboots — measured on the machine and not in a plan (V15).
+          vm-kernel-change = import ./nix/tests/kernel.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+          # --- end lane 4A ---
+
           # The boot renderer and the build-time renderer, on the same input.
           # Both fleets: one-box has a raft group of ONE (no etcd variables),
           # ha has three (1A §8, open point 6).

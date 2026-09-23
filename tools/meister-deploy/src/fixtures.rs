@@ -351,6 +351,35 @@ pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observati
                 lock: None,
                 capabilities: host.hardware.capabilities.clone(),
                 enrolled: true,
+                // --- lane 4A: a machine that is what the fleet says ---
+                // Forty gigabytes against a two-gigabyte closure: a healthy
+                // fixture is one where the preflight has nothing to say, so
+                // every test about a hardware finding has to put the
+                // finding there itself.
+                disk_free_nix_bytes: Some(40_000_000_000),
+                pci: host
+                    .hardware
+                    .gpus
+                    .iter()
+                    .map(|gpu| crate::observation::PciDevice {
+                        address: gpu.pci.clone(),
+                        vendor_device: "10de:2684".to_string(),
+                    })
+                    .collect(),
+                nics: host
+                    .hardware
+                    .nics
+                    .iter()
+                    .map(|nic| crate::observation::NetworkInterface {
+                        name: nic.name.clone(),
+                        mac: nic.mac.clone(),
+                    })
+                    .collect(),
+                // What the host runs is what the release builds, so its
+                // units are the release's units and the planner has nothing
+                // to call new.
+                generation_units: host.units.clone(),
+                // --- end lane 4A ---
                 unknown_reason: None,
             },
         );

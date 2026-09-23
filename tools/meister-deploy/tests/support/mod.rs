@@ -22,8 +22,8 @@ use serde_json::{Value, json};
 
 use meister_deploy::manifest::{self, NixManifest, ResolvedFleet, Source, Tool};
 use meister_deploy::observation::{
-    BootedKernel, EtcdMember, EtcdView, HostObservation, Identity, Mount, OBSERVATION_SCHEMA,
-    Observations,
+    BootedKernel, EtcdMember, EtcdView, HostObservation, Identity, Mount, NetworkInterface,
+    OBSERVATION_SCHEMA, Observations, PciDevice,
 };
 use meister_deploy::release::{
     BootArtifacts, BuildEnv, ConfigArtifact, HostArtifacts, ReleaseManifest, Reproducibility,
@@ -376,6 +376,28 @@ pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observati
                 lock: None,
                 capabilities: host.hardware.capabilities.clone(),
                 enrolled: true,
+                // --- lane 4A: a machine that is what the fleet says ---
+                disk_free_nix_bytes: Some(40_000_000_000),
+                pci: host
+                    .hardware
+                    .gpus
+                    .iter()
+                    .map(|gpu| PciDevice {
+                        address: gpu.pci.clone(),
+                        vendor_device: "10de:2684".to_string(),
+                    })
+                    .collect(),
+                nics: host
+                    .hardware
+                    .nics
+                    .iter()
+                    .map(|nic| NetworkInterface {
+                        name: nic.name.clone(),
+                        mac: nic.mac.clone(),
+                    })
+                    .collect(),
+                generation_units: host.units.clone(),
+                // --- end lane 4A ---
                 unknown_reason: None,
             },
         );
@@ -668,6 +690,27 @@ pub fn probe_answer(fleet: &ResolvedFleet, release: &ReleaseManifest, id: &str) 
     for cap in &host.hardware.capabilities {
         s.push_str(&format!("cap={cap}\n"));
     }
+    // --- lane 4A: the machine under the closure ---
+    // A healthy host has room, has the cards the fleet names, has the
+    // interfaces the fleet names, and runs the units of the generation the
+    // release builds — so a test about anything else finds nothing here.
+    s.push_str(&format!(
+        "disk_free_nix={}\n",
+        artifacts.toplevel.closure_size * 20
+    ));
+    for gpu in &host.hardware.gpus {
+        s.push_str(&format!("pci={}\t10de:2684\n", gpu.pci));
+    }
+    // One device that is nobody's business, so that the list is never empty
+    // on a host without a declared card: an empty list means "nobody could
+    // ask" and would block a host that is perfectly fine.
+    s.push_str("pci=0000:00:01.0\t8086:1237\n");
+    for nic in &host.hardware.nics {
+        s.push_str(&format!("nic={}\t{}\n", nic.name, nic.mac));
+    }
+    s.push_str("nic=lo\t00:00:00:00:00:00\n");
+    s.push_str(&format!("gen_units={}\n", host.units.join(" ")));
+    // --- end lane 4A ---
     if let Some(etcd) = &spec.etcd {
         let name = etcd.member_name.clone().unwrap_or_else(|| id.to_string());
         s.push_str(&format!(
