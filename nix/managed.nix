@@ -12,12 +12,17 @@
 # through nix/lib/render.nix. `checks.render-parity` runs both over the same
 # input and compares the parsed TOML, because two renderers is one too many.
 #
-# What this profile does NOT decide, on purpose: dhcp, firewall, resolvconf,
+# What this profile does NOT decide, on purpose: dhcp, firewall,
 # `system.stateVersion`, the bootloader, the filesystems. A managed host is
 # somebody's own NixOS host with a plan attached, and those are the lines
 # their repository owns. What it does decide is what deploying REQUIRES: nix
 # stays on and takes signed closures only, the keys live outside the store,
 # and there are directories for the transaction records the helper writes.
+#
+# resolvconf used to be on that first list and is now the one exception,
+# under a condition: see the lane 5C block below. A file with two authors is
+# a file that breaks an activation AND its rollback, and the lab measured
+# exactly that.
 { lib, config, ... }:
 let
   cfg = config.meisterstack.managed;
@@ -238,6 +243,35 @@ in
     # context. Merged with what NixOS puts there anyway (localhost), never
     # replacing it.
     networking.hosts = hostEntries;
+
+    # --- lane 5C: one author for /etc/resolv.conf -------------------------
+    #
+    # Measured in the lab on 2026-09-23, on a managed host that reads an
+    # OpenNebula CONTEXT cd: the strict reader writes ETH0_DNS straight into
+    # /etc/resolv.conf, NixOS' resolvconf owns that file, and it refuses one
+    # it did not sign —
+    #
+    #   network-setup-start: .resolvconf-wrapped: signature mismatch:
+    #   /etc/resolv.conf
+    #   network-setup.service: Failed with result 'exit-code'
+    #
+    # In the middle of `switch-to-configuration` that is exit 4, so the
+    # ACTIVATION failed; and because the way back is the same command, the
+    # ROLLBACK failed with the same sentence and the host ended in
+    # `recovery-required`. nix/appliance.nix has carried
+    # `resolvconf.enable = false` since 2026-09-08 for exactly this reason,
+    # and the managed profile did not.
+    #
+    # Conditional, not flat, because the condition IS the finding: two
+    # authors for one file. Where a provider script writes the resolver, it
+    # is the author and resolvconf steps aside. Where there is none — the
+    # ordinary managed host, with a static address or a dhcp lease — this
+    # profile decides nothing, which is the promise at the top of this file.
+    # `mkDefault` on top of that: an operator who runs a resolver of their
+    # own says so and wins.
+    networking.resolvconf.enable =
+      lib.mkIf (ms.context.providerScript != "") (lib.mkDefault false);
+    # --- end lane 5C ------------------------------------------------------
 
     # The collector stays off, and this is a gap rather than a decision: its
     # config is not TOML, the boot renderer writes it from MEISTER_LOKI_URL,

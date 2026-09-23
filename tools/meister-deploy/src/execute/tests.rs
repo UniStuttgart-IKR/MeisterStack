@@ -758,6 +758,38 @@ fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
     assert!(evidence.contains("free for a closure of"), "{evidence}");
     assert!(evidence.contains("has /dev/kvm"), "{evidence}");
     // --- end lane 4A ---
+
+    // --- lane 5C ---
+    // And the journal replays into itself. Every run of lab lane L2 ended
+    // with "entry N says box left the state activating and the journal had
+    // it in staged; a line is missing", because `activating` only ever
+    // reached this process's memory. A journal that cannot be folded
+    // without a break is a journal a resume cannot trust.
+    let states: Vec<String> = fx
+        .journal_lines("run-1")
+        .into_iter()
+        .filter(|e| e.event == EventKind::HostState && e.host.as_deref() == Some("n1"))
+        .map(|e| e.to.unwrap_or_default())
+        .collect();
+    assert_eq!(
+        states,
+        [
+            "preflight",
+            "staged",
+            "maintenance-ready",
+            "activating",
+            "verifying",
+            "committed"
+        ],
+        "the machine of §6, line by line"
+    );
+    let folded = crate::receipt::fold(&fx.journal_lines("run-1")).expect("it folds");
+    assert!(
+        folded.breaks.is_empty(),
+        "a finished rollout left a hole in its own journal: {:?}",
+        folded.breaks
+    );
+    // --- end lane 5C ---
 }
 
 // --- lane 4C: the cache is a shortcut inside the copy --------------------
@@ -1296,6 +1328,159 @@ fn a_resume_whose_target_knows_nothing_repeats_nothing_and_asks_for_a_person() {
     let stopped = applied.stopped.expect("it stopped");
     assert!(stopped.contains("no transaction record"), "{stopped}");
 }
+
+// --- lane 5C ---
+
+/// A journal of a run in which `n1` went all the way through and gave its
+/// lock and its transaction record back — which is what the `unlock` step
+/// does, and therefore what a resume finds on the target: nothing.
+fn write_finished_host_journal(fx: &Fixture, run: &str) {
+    fx.state
+        .begin_run(&fx.files, run)
+        .expect("the run directory");
+    fx.files
+        .write_atomic(
+            &fx.state.plan_copy_path(run),
+            &fx.plan.to_json().expect("the plan"),
+            0o644,
+        )
+        .expect("the plan copy");
+    let journal = Journal::new(fx.state.journal_path(run), run, &fx.plan.plan_id);
+    let put = |event: JournalEvent| {
+        journal.append(&fx.files, event).expect("a line");
+    };
+    put(journal
+        .event(EventKind::RunStart, at(NOW))
+        .payload(serde_json::json!({"operator": {"user": "silas", "workstation": "manacor"}})));
+    put(journal
+        .event(EventKind::LockAcquire, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"run_id": run})));
+    let activate = fx
+        .plan
+        .actions_for("n1")
+        .into_iter()
+        .find(|a| a.kind == ActionKind::Activate)
+        .expect("there is one")
+        .seq;
+    for (from, to) in [
+        (HostState::Planned, HostState::Preflight),
+        (HostState::Preflight, HostState::Staged),
+        (HostState::Staged, HostState::MaintenanceReady),
+        (HostState::MaintenanceReady, HostState::Activating),
+    ] {
+        put(journal
+            .event(EventKind::HostState, at(NOW))
+            .host("n1")
+            .transition(from, to)
+            .payload(serde_json::json!({})));
+    }
+    put(journal
+        .event(EventKind::ActionBegin, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate"})));
+    put(journal
+        .event(EventKind::ActionIrreversible, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate", "txn": run})));
+    put(journal
+        .event(EventKind::ActionEnd, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate", "result": "ok"})));
+    for (from, to) in [
+        (HostState::Activating, HostState::Verifying),
+        (HostState::Verifying, HostState::Committed),
+    ] {
+        put(journal
+            .event(EventKind::HostState, at(NOW))
+            .host("n1")
+            .transition(from, to)
+            .payload(serde_json::json!({})));
+    }
+    // The `unlock` step: the record is retired on the target and the lock
+    // goes back. After this the target has NO transaction for this run.
+    put(journal
+        .event(EventKind::LockRelease, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"run_id": run})));
+    // And here the run stopped, before its `run.end` — a halt in front of
+    // another host's provider reboot, which is how lab lane L2 got here.
+}
+
+#[test]
+fn a_resume_reads_a_host_this_run_already_finished_as_finished() {
+    // L2 finding N7, second half. A run over two hosts that boot through
+    // their provider halts once per host. At the second resume `n1` was
+    // `committed` and its record was gone, and the table read that as "an
+    // irreversible step began and the target has no transaction record for
+    // it" — so the second resume refused the whole run and there was no
+    // supported way to finish it.
+    let fx = Fixture::changing(&["n1"], false);
+    write_finished_host_journal(&fx, "run-1");
+    let look = TableLook::new(&fx);
+    // The machine is where the journal says it is.
+    look.set("n1", Phase::After);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("nothing was done to n1");
+    assert_eq!(applied.stopped, None, "the resume stopped: {applied:?}");
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+    assert_eq!(applied.receipt.hosts["n1"].state, HostState::Committed);
+    assert!(
+        !runner.calls().iter().any(|c| c.contains("activate --txn")),
+        "an activation was repeated: {:?}",
+        runner.calls()
+    );
+}
+
+#[test]
+fn a_takeover_reaches_the_anchor_host_twice_and_that_is_the_point() {
+    // The shape behind L2 finding N8, pinned where it is decided rather
+    // than by walking a whole rollout: `box` is a control-plane host, so
+    // it is the fleet anchor (D6) AND — when the release changes it — a
+    // host with a `lock` step of its own. Both go through `lock_cmd`, so
+    // under `--takeover` the SAME `lock take-over --of-run <old>` reaches
+    // that host twice.
+    //
+    // The second call finds the host held by the run that is doing the
+    // taking. In the lab that was the end of the rollout: "this host is
+    // held by the run <new>, not by <old>. Nothing was taken over."
+    // tools/meister-deploy/src/activate.rs answers yes to it now.
+    let fx = Fixture::changing(&["box"], false);
+    let look = TableLook::new(&fx);
+    let runner = World::new(StrictFake::new(), &look);
+    let mut options = fx.options();
+    options.takeover = Some("run-0".to_string());
+    let executor = fx.executor(&runner, &look, options);
+    assert!(
+        executor.anchor_hosts().contains(&"box".to_string()),
+        "box is a cloud and a cluster, so it is the fleet anchor"
+    );
+    assert!(
+        kinds(&fx.plan, "box").contains(&ActionKind::Lock),
+        "and the release changes it, so it has a lock step of its own"
+    );
+    let anchor = executor.lock_cmd("box").expect("the anchor's command");
+    let step = executor.lock_cmd("box").expect("the step's command");
+    assert_eq!(anchor.line(), step.line(), "one command, taken twice");
+    assert!(
+        anchor.line().contains("lock take-over --of-run run-0"),
+        "{}",
+        anchor.line()
+    );
+}
+
+// --- end lane 5C ---
 
 #[test]
 fn a_resume_of_another_plan_is_refused_by_name() {

@@ -252,5 +252,53 @@ in
       description = "MeisterStack control plane";
       shell = "${pkgs.shadow}/bin/nologin";
     };
+
+    # --- lane 5C: the provider, on a host that has no renderer -------------
+    #
+    # A managed NixOS host on somebody's hypervisor: its config files are a
+    # system generation (nix/managed.nix), so it must NOT have the boot
+    # renderer — that module asserts against exactly this combination. But
+    # there is still one thing only the provider knows, and it is the thing
+    # the machine cannot be reached without: where it was booted. Address,
+    # route, resolver, hostname, the operator's key.
+    #
+    # Until this unit existed, `meisterstack.context.providerScript` was
+    # declared by the renderer, so `nixosModules.provider-opennebula` could
+    # only be imported together with it — and the lab paid for that with
+    # thirty hand-written lines of unit in the operator's own repository
+    # (L2 finding N5, 2026-09-23).
+    #
+    # It does ONLY the provider's part. No template is copied, no config
+    # file is rendered, no unit is started by role: on this road all of
+    # that is Nix's, at build time. `mkIf` on the script being non-empty AND
+    # on there being no renderer, so a host with neither has no unit at all
+    # and an appliance keeps exactly the one it had — two authors for one
+    # medium is the mistake this whole split exists to avoid.
+    #
+    # `checks.services-are-pure` is unaffected: it compares what this module
+    # decides about the MACHINE (dhcp, firewall, resolvconf, bootloader,
+    # stateVersion), and a unit that only exists when somebody sets an
+    # option is not one of those.
+    systemd.services.meister-provider-context =
+      lib.mkIf (cfg.context.providerScript != "" && !cfg.context.enable) {
+        description = "Read this machine's context from its provider";
+        wantedBy = [ "multi-user.target" ];
+        # Before anything that needs an address or a name: the whole point
+        # of this unit is that the machine can be reached at all.
+        before = [ "network-online.target" "sshd.service" ];
+        after = [ "local-fs.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          # A context that goes wrong has to be readable from a serial
+          # console, because a machine whose address is wrong is a machine
+          # nothing else reaches.
+          StandardOutput = "journal+console";
+          StandardError = "journal+console";
+        };
+        path = with pkgs; [ iproute2 util-linux coreutils gnugrep gawk systemd ];
+        script = cfg.context.providerScript;
+      };
+    # --- end lane 5C -------------------------------------------------------
   };
 }

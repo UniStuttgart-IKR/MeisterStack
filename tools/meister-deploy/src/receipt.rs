@@ -925,6 +925,31 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
         };
     }
 
+    // --- lane 5C ---
+    // A host this very run already finished is finished, whatever the
+    // target still has — and what it has is nothing, because the `unlock`
+    // step of a successful host RETIRES its transaction record.
+    //
+    // Measured in lab lane L2 (2026-09-23): a run over two direct-boot
+    // hosts stops twice, once in front of each provider reboot. The second
+    // resume folded the journal, read `committed` for the host that was
+    // already through, fell into the `TxnView::None` arm below — because
+    // `committed` is past the point of no return — and refused the whole
+    // run with "an irreversible step began on box and the target has no
+    // transaction record for it". The run was not continuable at all.
+    //
+    // The arm below is for a journal whose lines are MISSING: something
+    // irreversible began and nothing says how it ended. That is not this.
+    // Here the journal says how it ended, in the state the machine reached
+    // and in the `action.end` that closed the step, and both are lines this
+    // run wrote itself. (The `!began` branch above already spells
+    // `HostState::Committed => Step::Done`; it could never fire, because
+    // `committed` makes `began` true.)
+    if host.open_irreversible.is_none() && host.state == HostState::Committed {
+        return Step::Done;
+    }
+    // --- end lane 5C ---
+
     match target {
         TxnView::Confirmed => {
             if host.state == HostState::Committed {
@@ -1612,6 +1637,41 @@ mod tests {
             Step::Done
         );
     }
+
+    // --- lane 5C ---
+
+    #[test]
+    fn a_host_this_run_already_finished_stays_finished_after_its_record_is_gone() {
+        // The measured shape (lab lane L2, 2026-09-23): a run over two
+        // direct-boot hosts halts twice. By the second halt the first host
+        // is `committed` AND its transaction record has been retired by the
+        // `unlock` step of this very run, so the target has nothing. Before
+        // this arm existed the resume refused the whole run.
+        assert_eq!(
+            next_step(&host_in(HostState::Committed), &TxnView::None),
+            Step::Done
+        );
+    }
+
+    #[test]
+    fn a_committed_host_with_a_step_that_never_ended_still_needs_a_person() {
+        // The guard is `open_irreversible`, not the state alone: a journal
+        // that reached `committed` and then began something it never
+        // finished is still a journal with a missing line.
+        let mut run = host_in(HostState::Committed);
+        run.open_irreversible = Some(OpenAction {
+            seq: 9,
+            kind: ActionKind::Activate,
+            started: at("2026-09-21T12:09:00Z"),
+            txn: Some("txn-2".to_string()),
+        });
+        assert!(matches!(
+            next_step(&run, &TxnView::None),
+            Step::RecoveryRequired(_)
+        ));
+    }
+
+    // --- end lane 5C ---
 
     #[test]
     fn what_the_target_says_comes_from_its_own_transaction_records() {

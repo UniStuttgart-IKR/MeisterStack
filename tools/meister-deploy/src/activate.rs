@@ -171,6 +171,27 @@ pub struct SystemPoint {
     pub generation: Option<u64>,
 }
 
+// --- lane 5C ---
+/// Why a record that was still open was put aside anyway.
+///
+/// Only an `inconsistent` record can get one of these, and only because a
+/// person typed a sentence. It travels INTO the archive rather than beside
+/// it: an archive that does not say why it exists is a file somebody finds
+/// in a year and cannot read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForcedRetirement {
+    /// What the operator typed. A whole sentence, because it is the only
+    /// account of a decision nothing else records.
+    pub reason: String,
+    /// The run that asked, where there was one.
+    pub run_id: Option<String>,
+    pub at: DateTime<Utc>,
+    /// The state the record was in when it was put aside.
+    pub was: TxnState,
+}
+// --- end lane 5C ---
+
 /// One transaction, on disk, on the target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -195,6 +216,15 @@ pub struct TxnRecord {
     /// When the state last moved. The record is the evidence, and evidence
     /// without a time on it is half of one.
     pub changed_at: DateTime<Utc>,
+    // --- lane 5C ---
+    /// Set only by `txn retire --force`, and only on a record the machine
+    /// could no longer say anything coherent about. Absent everywhere
+    /// else, which is why it is skipped rather than written as null: a
+    /// record this program wrote before this field existed has to keep
+    /// reading back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_by_force: Option<ForcedRetirement>,
+    // --- end lane 5C ---
 }
 
 impl TxnRecord {
@@ -507,6 +537,7 @@ impl<'a> Helper<'a> {
                         path.display()
                     )),
                     changed_at: self.clock.now(),
+                    retired_by_force: None,
                 }),
             }
         }
@@ -674,6 +705,7 @@ impl<'a> Helper<'a> {
             state: TxnState::Pending,
             reason: None,
             changed_at: now,
+            retired_by_force: None,
         };
         self.write_record(&record)?;
 
@@ -984,7 +1016,45 @@ impl<'a> Helper<'a> {
     /// both — and both-present is read as still open, which is the
     /// conservative half of the two.
     pub fn retire(&self, id: &str, run_id: Option<&str>) -> Result<TxnRecord> {
-        let record = self.record(id)?;
+        self.retire_inner(id, run_id, None)
+    }
+
+    // --- lane 5C ---
+    /// Put an `inconsistent` record aside because a person says so.
+    ///
+    /// There was no way back out of `inconsistent` (L2 finding N13). The
+    /// record refuses to retire, because a record is the only thing that
+    /// says a machine may still have to go back; `apply --resume` refuses
+    /// too, because the run it was continuing is not the plan in front of
+    /// the operator any more. What the lab did was move the file by hand
+    /// into /root — a defensible decision, and no way for a tool to leave
+    /// it.
+    ///
+    /// Three things make this narrow rather than a `--force` that means
+    /// "stop complaining":
+    ///
+    /// * Only `inconsistent`. A `staged` or `pending` record says exactly
+    ///   what the machine may still do, and taking it away is taking away
+    ///   the rollback. Those two are still refused, by name.
+    /// * A reason, as a sentence, and the command refuses an empty one.
+    /// * The archive says it was forced, who asked, when, and out of which
+    ///   state ([`ForcedRetirement`]). The file is the record of the
+    ///   decision.
+    ///
+    /// The machine itself is not touched: no profile is moved, no unit is
+    /// started. What this does is stop a dead record from blocking the
+    /// next plan.
+    pub fn retire_forced(&self, id: &str, run_id: Option<&str>, reason: &str) -> Result<TxnRecord> {
+        self.retire_inner(id, run_id, Some(reason))
+    }
+
+    fn retire_inner(
+        &self,
+        id: &str,
+        run_id: Option<&str>,
+        forced: Option<&str>,
+    ) -> Result<TxnRecord> {
+        let mut record = self.record(id)?;
         if let (Some(asked), Some(owner)) = (run_id, record.run_id.as_deref())
             && asked != owner
         {
@@ -994,12 +1064,47 @@ impl<'a> Helper<'a> {
             );
         }
         if record.is_open() {
-            bail!(
-                "the transaction {id} is {} and is not retired: a record is the only thing \
-                 that says a machine may still have to go back.",
-                record.state.as_str_lower()
-            );
+            match (forced, record.state) {
+                (Some(reason), TxnState::Inconsistent) => {
+                    let reason = reason.trim();
+                    if reason.is_empty() {
+                        bail!(
+                            "`txn retire --force` needs `--reason <sentence>`: the archive is \
+                             the only account of this decision there will ever be."
+                        );
+                    }
+                    record.retired_by_force = Some(ForcedRetirement {
+                        reason: reason.to_string(),
+                        run_id: run_id.map(str::to_string),
+                        at: self.clock.now(),
+                        was: record.state,
+                    });
+                }
+                (Some(_), state) => bail!(
+                    "the transaction {id} is {} and `--force` does not take that away: the \
+                     record is what says this machine may still have to go back. Finish it — \
+                     `meister-activate confirm --txn {id}` or `meister-activate revert --txn \
+                     {id}` — and retire it afterwards. Only an `inconsistent` record can be \
+                     forced aside.",
+                    state.as_str_lower()
+                ),
+                (None, TxnState::Inconsistent) => bail!(
+                    "the transaction {id} is inconsistent and is not retired: a record is the \
+                     only thing that says a machine may still have to go back. Read it with \
+                     `meister-activate txn show --txn {id}`, compare the profile with \
+                     /run/current-system and /run/booted-system, and if this record cannot \
+                     say anything about the machine any more, put it aside with \
+                     `meister-activate txn retire --txn {id} --force --reason \"<what you \
+                     found>\"`."
+                ),
+                (None, state) => bail!(
+                    "the transaction {id} is {} and is not retired: a record is the only thing \
+                     that says a machine may still have to go back.",
+                    state.as_str_lower()
+                ),
+            }
         }
+        // --- end lane 5C ---
         self.files
             .write_atomic(&self.txn_archive(id), &record.to_json()?, 0o600)?;
         self.files.remove_file(&self.txn_path(id))?;
@@ -1103,6 +1208,21 @@ impl<'a> Helper<'a> {
                 self.files.remove_file(&self.lock_path())?;
                 self.lock_acquire(run_id, operator, pid)
             }
+            // --- lane 5C ---
+            // The taking run already has it, so there is nothing to take
+            // and the answer is yes — the same answer `lock_acquire` gives
+            // a run that asks twice.
+            //
+            // Measured in lab lane L2 (2026-09-23): `apply --takeover <old>`
+            // on a host the abandoned run had never locked. The fleet
+            // anchor (D6) reaches every control-plane host FIRST, finds no
+            // lock, and the takeover falls through to an acquire — so by
+            // the time the plan's own `lock` step runs on that same host,
+            // it is held by the NEW run, and the helper answered "this host
+            // is held by the run <new>, not by <old>. Nothing was taken
+            // over." The run took over from itself and the rollout stopped.
+            Some(held) if held.run_id == run_id => Ok(held),
+            // --- end lane 5C ---
             Some(held) => bail!(
                 "this host is held by the run {}, not by {of_run}. Nothing was taken over.",
                 held.run_id
@@ -2536,6 +2656,110 @@ mod tests {
         runner.verify().unwrap();
     }
 
+    // --- lane 5C ---
+
+    #[test]
+    fn an_inconsistent_record_can_be_put_aside_by_a_person_with_a_sentence() {
+        // L2 finding N13. `inconsistent` had no way out: retire refused,
+        // `apply --resume` refused (another plan had been built since), and
+        // what the lab did was move the file into /root by hand.
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let mut record = pending("stuck", Mode::Switch);
+        record.state = TxnState::Inconsistent;
+        record.reason = Some("the timer fired and the profile did not move".to_string());
+        record.run_id = Some("run-1".to_string());
+        helper.write_record(&record).unwrap();
+
+        // Without `--force` the refusal now says the way out.
+        let err = helper
+            .retire("stuck", Some("run-1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--force --reason"), "{err}");
+
+        // And an empty sentence is not one.
+        let err = helper
+            .retire_forced("stuck", Some("run-1"), "   ")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs `--reason"), "{err}");
+
+        let archived = helper
+            .retire_forced(
+                "stuck",
+                Some("run-1"),
+                "the profile, current-system and booted-system all name the old system.",
+            )
+            .expect("a person may put it aside");
+        let forced = archived.retired_by_force.expect("the archive says why");
+        assert_eq!(forced.was, TxnState::Inconsistent);
+        assert_eq!(forced.run_id.as_deref(), Some("run-1"));
+        assert!(forced.reason.starts_with("the profile"), "{forced:?}");
+        // It is out of the way of the next plan, and it is still readable.
+        assert!(helper.records().unwrap().is_empty());
+        assert!(files.exists(&helper.txn_archive("stuck")));
+        let text = String::from_utf8(files.content(helper.txn_archive("stuck")).unwrap()).unwrap();
+        assert!(text.contains("retired_by_force"), "{text}");
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn force_does_not_take_away_a_record_that_still_says_what_may_happen() {
+        // The narrow half: `staged` and `pending` are the two states in
+        // which the record IS the rollback, and no sentence buys them.
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        for state in [TxnState::Staged, TxnState::Pending] {
+            let mut record = pending("open", Mode::Switch);
+            record.state = state;
+            helper.write_record(&record).unwrap();
+            let err = helper
+                .retire_forced("open", None, "I would like this to go away.")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("does not take that away"), "{state:?}: {err}");
+            assert!(err.contains("Only an `inconsistent` record"), "{err}");
+        }
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_record_written_before_this_field_existed_still_reads_back() {
+        // `retired_by_force` is skipped when it is absent, so a record on
+        // a machine that was deployed to last week parses unchanged — and
+        // `deny_unknown_fields` means the other direction is a sentence
+        // rather than a silent drop.
+        let record = TxnRecord::from_json(
+            &serde_json::json!({
+                "schema": TXN_SCHEMA,
+                "id": "old",
+                "run_id": null,
+                "previous": {"toplevel": "/nix/store/aaa", "generation": 3},
+                "desired": "/nix/store/bbb",
+                "mode": "switch",
+                "started_at": "2026-09-20T10:00:00Z",
+                "deadline": null,
+                "state": "confirmed",
+                "reason": null,
+                "changed_at": "2026-09-20T10:01:00Z"
+            })
+            .to_string(),
+            "a record from before",
+        )
+        .expect("it reads back");
+        assert_eq!(record.retired_by_force, None);
+        // And writing it again does not invent the field.
+        let text = String::from_utf8(record.to_json().unwrap()).unwrap();
+        assert!(!text.contains("retired_by_force"), "{text}");
+    }
+
+    // --- end lane 5C ---
+
     #[test]
     fn a_transaction_id_is_a_file_name_and_nothing_more() {
         let files = host();
@@ -2617,6 +2841,40 @@ mod tests {
         assert_eq!(taken.run_id, "run-b");
         runner.verify().unwrap();
     }
+
+    // --- lane 5C ---
+
+    #[test]
+    fn a_takeover_of_a_host_the_taking_run_already_holds_is_the_answer_yes() {
+        // L2 finding N8. A takeover reaches a host twice: the fleet anchor
+        // takes every control-plane host before the walk, and the plan's
+        // own `lock` step takes the host again. When the abandoned run
+        // never held this host, the first call finds nothing and acquires,
+        // and the second one used to answer "this host is held by the run
+        // run-b, not by run-a" — the run refused to take over from itself.
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let first = helper
+            .lock_take_over("run-a", "run-b", "silas@manacor", 2)
+            .expect("nobody holds it, so it is taken");
+        assert_eq!(first.run_id, "run-b");
+        let again = helper
+            .lock_take_over("run-a", "run-b", "silas@manacor", 2)
+            .expect("the same run asking twice is asking whether it may act");
+        assert_eq!(again.run_id, "run-b");
+        assert_eq!(again.acquired_at, first.acquired_at, "it was not retaken");
+        // And a third run still cannot take it from run-b by naming run-a.
+        let err = helper
+            .lock_take_over("run-a", "run-c", "silas@manacor", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("held by the run run-b, not by run-a"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    // --- end lane 5C ---
 
     #[test]
     fn gc_keeps_the_current_the_booted_and_n_others() {
@@ -2923,6 +3181,7 @@ mod tests {
             state: TxnState::Pending,
             reason: None,
             changed_at: now,
+            retired_by_force: None,
         }
     }
 

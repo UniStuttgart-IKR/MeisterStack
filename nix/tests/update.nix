@@ -31,6 +31,27 @@ let
   keys = import "${nixpkgs}/nixos/tests/ssh-keys.nix" pkgs;
   inventoryLib = import ../lib/inventory.nix { inherit lib; };
 
+  # --- lane 5C ---
+  # A path nobody signed, for the half of the cache claim that is about
+  # refusal.
+  #
+  # It has to be INPUT-addressed. `nix-store --add`, which this test used
+  # until 2026-09-23, makes a CONTENT-addressed path, and nix takes one of
+  # those out of any cache without a signature — it can check the hash
+  # itself, so there is nothing for a signature to add. The test therefore
+  # asserted a refusal that nix has no reason to make, and the first real
+  # run of it said so ("unexpectedly succeeded").
+  #
+  # A bare `derivation` and not `runCommand`: the whole build input is one
+  # bash, which the operator's own system closure already carries.
+  notSigned = derivation {
+    name = "not-signed";
+    inherit system;
+    builder = "${pkgs.bash}/bin/bash";
+    args = [ "-c" "echo not-signed > $out" ];
+  };
+  # --- end lane 5C ---
+
   # The inventory of this two-host fleet. One host, `target`, at the address
   # the test framework gives the second node.
   # `builtins.toFile` and not `pkgs.writeText`: the inventory is READ during
@@ -53,6 +74,17 @@ let
     # certificate that a bootstrap would deliver (M3), so it is inactive
     # here on purpose and must not block a rollout this test is not about.
     checks = { required = [ ] }
+    # --- lane 5C ---
+    # The cache this fleet's hosts may FETCH from. It belongs HERE and not
+    # only in the host module beside it: `nix/lib/manifest.nix` renders
+    # `hosts.<id>.substituters` out of the INVENTORY, and `stage` decides
+    # whether to pass `--substitute-on-destination` by reading the
+    # manifest. Without this line the release named a cache, the target's
+    # nix.conf named a substituter, and the copy still fetched nothing —
+    # which is what the first real run of this test found (lane 4C wrote
+    # the assertion and never ran it).
+    managed = { substituters = [ "http://192.168.1.1:8080" ] }
+    # --- end lane 5C ---
 
     # One host that is the whole control plane, which is the only shape a
     # fleet of one can have: a cloud places guests on clusters, a cluster
@@ -193,6 +225,12 @@ pkgs.testers.runNixOSTest {
         pkgs.cloud-hypervisor-meister.drvPath
         pkgs.guest-tiny
         pkgs.guest-tiny.drvPath
+        # --- lane 5C: the unsigned path, on the OPERATOR only ---
+        # Declared here and nowhere else: `additionalPaths` registers a
+        # path in the node that names it, so the target's database does
+        # not have it and the only road into that database is the cache.
+        notSigned
+        # --- end lane 5C ---
       ];
       environment.etc."vm-fleet/fleet.toml".source = fleetToml;
       # A manifest says what its inputs were locked to. This repository has
@@ -459,14 +497,19 @@ pkgs.testers.runNixOSTest {
     assert the_release["build_env"]["cache_url"] == CACHE, the_release["build_env"]
     assert the_release["build_env"]["signing_key_name"] == "vm-update", the_release["build_env"]
     top_b = the_release["artifacts"]["target"]["toplevel"]["store_path"]
-    # No "the target has never seen B" assertion here: the test frame
-    # mounts the BUILD HOST's store into every node (writableStore is an
-    # overlay on top of it), so every closure this test built is visible on
-    # the target before anybody copied anything. Measured at gate M4: the
-    # assertion was the one red line of the whole check. What the cache
-    # proves is therefore (2) and the unsigned refusal below — the
-    # SIGNATURE travels and the far store enforces it — not the transfer
-    # of bytes the shared store makes unobservable here.
+    # --- lane 5C ---
+    # `nix path-info` and not `test -e`, and the difference is what a VM
+    # test's /nix/store is. Both machines mount the SAME store — the one
+    # the build sandbox holds — and the operator declares system B in its
+    # `additionalPaths`, so the bytes are under that path on the target too
+    # and `test -e` was always true. What the target does not have is the
+    # path in its own database, which is the only sense in which a store
+    # has something: nothing may be substituted from it, copied out of it
+    # or activated off it. Measured 2026-09-23 (lane 4C wrote this line and
+    # never ran the test; the first run of it failed here).
+    not_yet = target.fail(f"nix path-info {top_b} 2>&1")
+    assert "not valid" in not_yet or "No such file" in not_yet, not_yet
+    # --- end lane 5C ---
 
     # (2) The cache really holds that closure, and the SIGNATURE travelled
     #     with it — which is the whole reason the push happens after the
@@ -485,6 +528,8 @@ pkgs.testers.runNixOSTest {
     #     fleet's own cache is usable exactly because the closures in it
     #     carry the signature the fleet already trusts.
     target.succeed(f"nix copy --from http://192.168.1.1:8080 {top_b}")
+    # --- lane 5C: the same probe as above, the other way round ---
+    target.succeed(f"nix path-info {top_b}")
     target.succeed(f"test -e {top_b}/init")
     print("the target took " + top_b + " through the operator's cache with its signature "
           "(the bytes were already in the shared test store; the signature check is the proof)")
@@ -493,22 +538,9 @@ pkgs.testers.runNixOSTest {
     # an UNSIGNED path out of the same cache is refused by the same store.
     # `nix store sign` writes into the local store only, so a path the
     # release never signed and that was pushed anyway is exactly that case.
-    #
-    # The path has to be a BUILD OUTPUT and not something `nix-store --add`
-    # made: an added file is content-addressed, and a content-addressed
-    # path needs no signature by design — its name is its proof. Measured
-    # at gate M4: the `--add` version was accepted by the far store and the
-    # assertion below went red. An input-addressed output of a one-line
-    # derivation is what a real unsigned closure looks like. The builder is
-    # `runtimeShell`, the bash every NixOS closure already carries — the
-    # operator has no network and cannot fetch another. `sandbox false`, because
-    # a builder named as a plain string is not an input of the derivation and
-    # the sandbox would not bind it (measured: "No such file or directory").
-    unsigned = operator.succeed(
-        "nix-build --no-out-link --option sandbox false -E 'derivation { name = \"unsigned\"; "
-        "system = \"x86_64-linux\"; builder = \"${pkgs.runtimeShell}\"; "
-        "args = [ \"-c\" \"echo not-signed > $out\" ]; }'"
-    ).strip()
+    # The path is input-addressed on purpose — see `notSigned` above, and
+    # the measurement that put it there (lane 5C).
+    unsigned = "${notSigned}"
     operator.succeed(f"nix copy --to '{CACHE}' {unsigned}")
     refused = target.fail(f"nix copy --from http://192.168.1.1:8080 {unsigned} 2>&1")
     assert "signature" in refused, refused

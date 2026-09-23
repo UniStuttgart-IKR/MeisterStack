@@ -227,6 +227,17 @@ enum TxnVerb {
         /// The run that owns it
         #[arg(long)]
         run: Option<String>,
+        // --- lane 5C ---
+        /// Put an INCONSISTENT record aside although it is still open.
+        /// Needs `--reason`. A `staged` or `pending` record is refused:
+        /// that one still says what the machine may do.
+        #[arg(long)]
+        force: bool,
+        /// Why, as a sentence. It goes into the archive, which is the only
+        /// account of this decision there will be.
+        #[arg(long)]
+        reason: Option<String>,
+        // --- end lane 5C ---
     },
 }
 
@@ -379,15 +390,38 @@ fn run() -> Result<()> {
                     print!("{}", show_lines(&record));
                 }
             }
-            TxnVerb::Retire { txn, run } => {
-                let record = helper.retire(txn, run.as_deref())?;
-                answer(
-                    &cli,
-                    "retire",
-                    serde_json::to_value(&record)?,
-                    &format!("the record of {} is retired.", record.id),
-                )?;
-            }
+            // --- lane 5C ---
+            TxnVerb::Retire {
+                txn,
+                run,
+                force,
+                reason,
+            } => {
+                let record = match (force, reason) {
+                    (false, None) => helper.retire(txn, run.as_deref())?,
+                    (true, Some(reason)) => helper.retire_forced(txn, run.as_deref(), reason)?,
+                    (true, None) => anyhow::bail!(
+                        "`txn retire --force` needs `--reason <sentence>`: the archive it \
+                         writes is the only account of this decision there will ever be."
+                    ),
+                    (false, Some(_)) => anyhow::bail!(
+                        "`--reason` belongs to `--force`. An ordinary retire is a run saying \
+                         it is done with a finished record, and that needs no explaining."
+                    ),
+                };
+                let sentence = match &record.retired_by_force {
+                    Some(forced) => format!(
+                        "the record of {} was {} and is archived at {}: {} Nothing on this \
+                         machine was changed.",
+                        record.id,
+                        record.state_word(),
+                        helper.txn_archive(&record.id).display(),
+                        forced.reason
+                    ),
+                    None => format!("the record of {} is retired.", record.id),
+                };
+                answer(&cli, "retire", serde_json::to_value(&record)?, &sentence)?;
+            } // --- end lane 5C ---
         },
         Verb::Lock { cmd } => match cmd {
             LockVerb::Acquire { run, operator, pid } => {

@@ -79,6 +79,8 @@ let
 
       one_ip=""; one_mask=""; one_gateway=""; one_dns=""
       one_hostname=""; one_sshkey=""
+      # --- lane 5C: how many keys were skipped without a word (see below)
+      one_quiet=0
 
       # dotted netmask -> prefix length
       one_mask2prefix() {
@@ -139,11 +141,31 @@ let
             ETH0_DNS)       one_dns=$one_value ;;
             SET_HOSTNAME)   one_hostname=$one_value ;;
             SSH_PUBLIC_KEY) one_sshkey=$one_value ;;
+            # --- lane 5C: the block this reader already understands ------
+            #
+            # OpenNebula writes a whole interface block — ETH0_MAC,
+            # ETH0_NETWORK, ETH0_ALIAS0_*, ETH0_SEARCH_DOMAIN, ETH0_MTU and
+            # a dozen more — plus NETWORK, TARGET and DISK_ID, which are
+            # about the medium and not about this machine. None of them is
+            # a surprise, and naming each one made twenty-one lines on
+            # every boot (L2 §10, finding 9). They are counted and named
+            # ONCE, after the loop; what stays loud is what is genuinely
+            # unexpected, such as an ONEAPP_* key somebody added to the
+            # template.
+            ETH[0-9]*_*|NETWORK|TARGET|DISK_ID)
+              one_quiet=$((one_quiet + 1))
+              continue ;;
+            # --- end lane 5C ---
             *)
               echo "context: ignored, $one_key is not one of the six keys this provider reads"
               continue ;;
           esac
         done < "$one_mnt/context.sh"
+        # --- lane 5C ---
+        if [ "$one_quiet" -gt 0 ]; then
+          echo "context: $one_quiet key(s) of the medium's own interface and disk block were skipped"
+        fi
+        # --- end lane 5C ---
       else
         echo "context: $meister_one_device carries no context.sh"
       fi

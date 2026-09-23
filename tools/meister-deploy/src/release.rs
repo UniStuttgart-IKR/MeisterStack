@@ -414,12 +414,14 @@ pub fn bind(
                  command line, and a release that names none of them is a release nobody can \
                  boot that host from."
             ),
-            (Some(_), crate::manifest::BootMode::Uefi) => bail!(
-                "a direct-boot bundle was built for {id} and its manifest says it boots uefi. \
-                 A uefi host reads its own boot menu; the bundle would be a directory nothing \
-                 ever loads."
+            // --- lane 5C: and the same for grub, which also reads its own
+            // menu — somebody else's menu, on the machine's own disk.
+            (Some(_), mode) => bail!(
+                "a direct-boot bundle was built for {id} and its manifest says it boots \
+                 {mode}. Such a host reads a boot menu of its own; the bundle would be a \
+                 directory nothing ever loads."
             ),
-            (None, crate::manifest::BootMode::Uefi) => {}
+            (None, _) => {} // --- end lane 5C ---
         }
 
         // An image only exists where the evaluation said there would be one.
@@ -552,6 +554,90 @@ mod tests {
             "the same fleet built to different bytes is a different release"
         );
     }
+
+    // --- lane 5C ---
+
+    /// One required check, as `build` writes it: a derivation that built.
+    fn a_check(duration_ms: u64) -> CheckResult {
+        CheckResult {
+            id: "config-n1".to_string(),
+            subject: crate::checks::Subject::host("n1"),
+            required: true,
+            status: crate::checks::Status::Pass,
+            expected: "the derivation builds".to_string(),
+            observed: "/nix/store/cccc-config-n1".to_string(),
+            reason: "/nix/store/dddd-config-n1.drv built".to_string(),
+            duration_ms,
+            evidence: Vec::new(),
+            release_id: None,
+            config_id: None,
+        }
+    }
+
+    fn release_with(checks: Vec<CheckResult>, now: &str) -> ReleaseManifest {
+        let resolved = onebox();
+        let artifacts = artifacts_for(&resolved);
+        bind(
+            resolved,
+            artifacts,
+            BTreeMap::new(),
+            Vec::new(),
+            build_env(),
+            checks,
+            reproducibility(),
+            at(now),
+        )
+        .expect("the fixture binds")
+    }
+
+    #[test]
+    fn two_builds_of_one_manifest_are_one_release() {
+        // L2 finding N12, measured. Two `build` runs over the same manifest
+        // in the lab gave `release-76b31c11…` and `release-e375e654…`, and
+        // a plan names the release it was made for — so a freshly built
+        // plan was unusable against the release beside it.
+        //
+        // The field that moved is the one below, and it is the only one
+        // that can: everything else in a release is a store path, a nar
+        // hash, a signature or a flag. `created_at` and `build_env` were
+        // already out.
+        let first = release_with(vec![a_check(1_204)], "2026-09-21T11:00:00Z");
+        let second = release_with(vec![a_check(973)], "2026-09-23T06:31:00Z");
+        assert_eq!(
+            first.release_id, second.release_id,
+            "how long a check took is not what a release IS"
+        );
+        // And both still read back as themselves: the id is over the
+        // content that is left, and the file is not edited afterwards.
+        let text = String::from_utf8(second.to_json().expect("json")).expect("utf-8");
+        ReleaseManifest::from_json(&text, "the second build").expect("it reads back");
+    }
+
+    #[test]
+    fn which_checks_ran_and_what_they_said_is_still_part_of_the_release() {
+        // The other half of the same decision: only the duration left the
+        // id. A check that FAILED, or a check that is not there at all, is
+        // a different release.
+        let green = release_with(vec![a_check(500)], "2026-09-21T11:00:00Z");
+        let mut failed = a_check(500);
+        failed.status = crate::checks::Status::Fail;
+        assert_ne!(
+            green.release_id,
+            release_with(vec![failed], "2026-09-21T11:00:00Z").release_id
+        );
+        let mut renamed = a_check(500);
+        renamed.id = "config-n2".to_string();
+        assert_ne!(
+            green.release_id,
+            release_with(vec![renamed], "2026-09-21T11:00:00Z").release_id
+        );
+        assert_ne!(
+            green.release_id,
+            release_with(Vec::new(), "2026-09-21T11:00:00Z").release_id
+        );
+    }
+
+    // --- end lane 5C ---
 
     // ---------------------------------------------------------------
     // The bundle of a direct-boot host (M3A position 3)

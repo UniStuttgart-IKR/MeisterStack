@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+#
+# A host that says `boot = "grub"` and also asks to be installed. The two do
+# not go together: this flake installs systemd-boot or no loader at all, and
+# `grub` is the word for a machine that already brings its own. Refused at
+# evaluation.
+schema = 2
+
+[fleet]
+name = "grub"
+
+[[group]]
+id = "cp"
+kind = "raft"
+
+[[host]]
+id = "cp-a"
+name = "cp-a"
+deployment = "nixos"
+roles = ["cloud", "cluster"]
+groups = ["cp"]
+boot = "grub"
+networks.management = { address = "10.4.0.11", prefix = 24 }
+install = { disk = { serial = "S6PENX0T000001", size_gb = 480 }, layout = "disko/single-nvme.nix" }

@@ -544,6 +544,61 @@ fn check_is_exit_two_when_the_fleet_is_not_ready_and_says_why() {
     );
 }
 
+// --- lane 5C ---
+
+#[test]
+fn check_takes_the_same_inventory_flag_as_plan_and_apply() {
+    // L2 §10, findings 4 and 14. `check --inventory fleet.toml` was
+    // `error: unexpected argument`, and `check` says nothing about D7: a
+    // fleet that is green here can still be one no rollout may drain,
+    // because the `[operator] cli_config` reference is what a cordon goes
+    // through and `check` never read it.
+    let sandbox = Sandbox::new();
+    let out = sandbox.run(&[
+        "check",
+        "--release",
+        "release.json",
+        "--repo",
+        ".",
+        "--inventory",
+        "fleet.toml",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("unexpected argument"),
+        "{}",
+        stderr(&out)
+    );
+    // The fixture HAS `[operator] cli_config`, so there is nothing to warn
+    // about and this verb stays quiet.
+    assert!(!stderr(&out).contains("D7"), "{}", stderr(&out));
+
+    // And the case the lab was in: an inventory without that reference.
+    // The checks still pass — they are about the machines — and the note
+    // says what they do not cover.
+    let quiet = std::fs::read_to_string(sandbox.cwd.path().join("fleet.toml"))
+        .unwrap()
+        .replace("cli_config = \"cli.toml\"\n", "")
+        .replace("cli_profile = \"cloud-mtls\"\n", "");
+    std::fs::write(sandbox.cwd.path().join("no-operator.toml"), quiet).unwrap();
+    let out = sandbox.run(&[
+        "check",
+        "--release",
+        "release.json",
+        "--repo",
+        ".",
+        "--inventory",
+        "no-operator.toml",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let why = stderr(&out);
+    assert!(why.contains("say nothing about D7"), "{why}");
+    assert!(why.contains("cli_config"), "{why}");
+    assert!(why.contains("n1"), "{why}");
+}
+
+// --- end lane 5C ---
+
 #[test]
 fn a_suite_that_does_work_on_the_fleet_is_not_something_check_does() {
     let sandbox = Sandbox::new();

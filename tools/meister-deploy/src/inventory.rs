@@ -105,6 +105,20 @@ pub enum BootMode {
     Uefi,
     /// Kernel, initrd and command line come from outside the machine.
     Direct,
+    // --- lane 5C ---
+    /// The machine boots itself out of a loader this flake does not
+    /// install and cannot drive: grub on an MBR disk, which is what
+    /// `packages.managed-disk-image` makes and what every VM started from
+    /// such an image is.
+    ///
+    /// It keeps the switch rollback, which is userland and works
+    /// unchanged, and it has no boot rollback: `bootctl set-oneshot` is
+    /// what a boot rollback is made of, and grub has no equivalent. So a
+    /// release that changes the boot half is moved with `--mode switch`
+    /// and then rebooted, and if the machine does not come up the way back
+    /// is grub's own menu and a person at a console.
+    Grub,
+    // --- end lane 5C ---
 }
 
 impl BootMode {
@@ -112,6 +126,7 @@ impl BootMode {
         match self {
             BootMode::Uefi => "uefi",
             BootMode::Direct => "direct",
+            BootMode::Grub => "grub",
         }
     }
 
@@ -121,15 +136,24 @@ impl BootMode {
         match text {
             "uefi" => Ok(BootMode::Uefi),
             "direct" => Ok(BootMode::Direct),
+            "grub" => Ok(BootMode::Grub),
+            // --- lane 5C ---
+            // The word somebody will try, and it is not the value: this
+            // flake does not install a BIOS machine, it only deploys to
+            // one that already boots. `grub` says that out loud.
             "bios" => bail!(
-                "boot = \"bios\": v1 installs uefi or direct; a BIOS host keeps grub through \
-                 its own host module and has no boot fallback, because `bootctl set-oneshot` \
-                 is what a boot fallback is made of and grub has no equivalent."
+                "boot = \"bios\": this flake installs uefi or direct, and it deploys to a \
+                 machine that already has grub — that value is `grub`. The difference is who \
+                 made the loader: `meister-install` writes systemd-boot or nothing at all, \
+                 and a grub host brings its own (its image, or its host module). A grub host \
+                 has no boot fallback either way, because `bootctl set-oneshot` is what a \
+                 boot fallback is made of."
             ),
+            // --- end lane 5C ---
             other => bail!(
                 "boot = {other:?}: a host of this fleet boots uefi (it has an ESP and a boot \
-                 menu of its own) or direct (a hypervisor hands it kernel, initrd and command \
-                 line)."
+                 menu of its own), direct (a hypervisor hands it kernel, initrd and command \
+                 line) or grub (it boots itself out of a loader this flake did not install)."
             ),
         }
     }
@@ -725,6 +749,45 @@ impl Inventory {
             self.effective(id)?;
         }
 
+        // --- lane 5C ---
+        // One cloud per fleet, which is the one cross-host rule `nix eval`
+        // enforces and this parser did not (L2 finding N11): two `[[host]]`
+        // entries with the cloud role in two different raft groups made
+        // `validate` say `ok` and `nix eval` say no. A syntax check that
+        // passes a file the evaluation refuses is a check somebody stops
+        // reading.
+        //
+        // The comparison is the same one nix/lib/inventory.nix makes: the
+        // raft group of each cloud host, where a host's raft group is the
+        // FIRST group it is in whose kind is `raft` (a host in two rafts is
+        // refused there on its own). `null` — a cloud in no raft group at
+        // all — counts as a value, because two clouds outside any group are
+        // still two clouds.
+        let mut clouds: BTreeSet<Option<&String>> = BTreeSet::new();
+        for host in self.hosts.values() {
+            if !host.roles.iter().any(|r| r == "cloud") {
+                continue;
+            }
+            clouds.insert(host.groups.iter().find(|g| {
+                self.groups
+                    .get(*g)
+                    .map(|group| group.kind == GroupKind::Raft)
+                    .unwrap_or(false)
+            }));
+        }
+        if clouds.len() > 1 {
+            let named: Vec<&str> = clouds
+                .iter()
+                .map(|g| g.map(String::as_str).unwrap_or("no raft group"))
+                .collect();
+            bail!(
+                "{origin}: this fleet has two clouds ({}); a fleet has one, and a cluster told \
+                 two addresses does not know which is its own.",
+                named.join(", ")
+            );
+        }
+        // --- end lane 5C ---
+
         for (id, service) in &self.services {
             if let Some(host) = &service.host
                 && !self.hosts.contains_key(host)
@@ -1158,6 +1221,105 @@ mod tests {
     fn parse(text: &str) -> Result<Inventory> {
         Inventory::parse(text, "fleet.toml")
     }
+
+    // --- lane 5C ---
+
+    #[test]
+    fn two_clouds_are_refused_by_the_parser_and_not_only_by_nix() {
+        // L2 finding N11: `validate` said ok to an inventory `nix eval`
+        // refuses, and the operator found out one build later.
+        let text = format!(
+            "{}\n{}",
+            fixture(),
+            r#"
+[[group]]
+id = "cloud_b"
+kind = "raft"
+
+[[host]]
+id = "cloud-b"
+name = "meister-cloud-b"
+deployment = "nixos"
+roles = ["cloud"]
+groups = ["cloud_b"]
+site = "ikr-lab"
+failure_domain = "rack2"
+networks.management = { address = "10.128.1.104", prefix = 24, interface = "eno1" }
+"#
+        );
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("two clouds"), "{err}");
+        assert!(err.contains("cloud_b"), "{err}");
+        // The same words nix/lib/inventory.nix uses, so that an operator
+        // who has seen one of the two recognises the other.
+        assert!(err.contains("does not know which is its own"), "{err}");
+    }
+
+    #[test]
+    fn two_cloud_hosts_in_one_group_are_a_cloud_and_not_two() {
+        // The shape a real fleet has: a cloud of three replicas in one
+        // raft group. The rule is about GROUPS, not about hosts.
+        let text = fixture().replace(
+            r#"[[host]]
+id = "gpu-01"
+name = "agent-2b"
+deployment = "nixos"
+roles = ["agent"]"#,
+            r#"[[host]]
+id = "cloud-b"
+name = "meister-cloud-b"
+deployment = "nixos"
+roles = ["cloud"]
+groups = ["cloud"]
+site = "ikr-lab"
+failure_domain = "rack2"
+networks.management = { address = "10.128.1.104", prefix = 24, interface = "eno1" }
+
+[[host]]
+id = "gpu-01"
+name = "agent-2b"
+deployment = "nixos"
+roles = ["agent"]"#,
+        );
+        parse(&text).expect("one cloud, two of its hosts");
+    }
+
+    #[test]
+    fn a_host_that_brings_its_own_loader_has_a_word_for_it() {
+        // L2 finding N4: `packages.managed-disk-image` makes a legacy-MBR
+        // grub guest, the inventory knew `uefi` and `direct` and nothing
+        // else, and calling such a host `uefi` made `apply` ask the helper
+        // for a boot fallback it has not got.
+        assert_eq!(BootMode::parse("grub").unwrap(), BootMode::Grub);
+        assert_eq!(BootMode::Grub.as_str(), "grub");
+
+        let text = fixture().replace(
+            r#"roles = ["cloud", "addons"]"#,
+            "boot = \"grub\"\nroles = [\"cloud\", \"addons\"]",
+        );
+        let inventory = parse(&text).unwrap();
+        assert_eq!(
+            inventory.effective("cloud-a").unwrap().boot,
+            BootMode::Grub,
+            "precedence carries it like every other setting"
+        );
+        // And the round trip through the contract's own spelling.
+        let json = serde_json::to_string(&BootMode::Grub).unwrap();
+        assert_eq!(json, "\"grub\"");
+        assert_eq!(
+            serde_json::from_str::<crate::manifest::BootMode>(&json).unwrap(),
+            crate::manifest::BootMode::Grub
+        );
+    }
+
+    #[test]
+    fn bios_is_still_refused_and_now_names_the_value_that_exists() {
+        let err = BootMode::parse("bios").unwrap_err().to_string();
+        assert!(err.contains("that value is `grub`"), "{err}");
+        assert!(err.contains("no boot fallback"), "{err}");
+    }
+
+    // --- end lane 5C ---
 
     #[test]
     fn a_network_belongs_to_the_host_unless_the_plan_says_static() {

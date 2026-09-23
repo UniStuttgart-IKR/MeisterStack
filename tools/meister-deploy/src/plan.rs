@@ -1130,6 +1130,26 @@ struct HostDecision {
     /// of the activation before it (`switch`, never `boot` — the helper
     /// refuses boot mode on a machine with no boot menu, measured in 3A).
     provider_reboot: bool,
+    // --- lane 5C ---
+    /// This host boots itself out of a loader this flake did not install
+    /// (`boot = "grub"`), so it has the switch rollback and no other.
+    ///
+    /// Separate from `provider_reboot`, because the two differ in who does
+    /// the rebooting: a grub host reboots itself (`systemctl reboot`), a
+    /// direct host waits for its provider. What they share is the ONE
+    /// consequence below — the activation runs `--mode switch`, because
+    /// `bootctl set-oneshot` is what a boot-mode rollback is made of and
+    /// neither machine has it.
+    ///
+    /// Found in the lab (L2, 2026-09-23): every VM from
+    /// `packages.managed-disk-image` is a legacy-MBR grub guest, the
+    /// inventory had no word for one, calling it `uefi` made `apply` pass
+    /// `--mode boot`, and the helper refused — "there is no boot fallback
+    /// on this host: bootctl says systemd-boot is not installed". Such a
+    /// host was not deployable at all as soon as a release touched its
+    /// kernel.
+    switch_only: bool,
+    // --- end lane 5C ---
     /// The system is what the release says and a file on it is not: nothing
     /// to stage, nothing to activate, and putting the file there is the
     /// whole job (lane 3B).
@@ -2053,6 +2073,7 @@ fn decide_host(
         reboot_required: false,
         reboot_only: false,
         provider_reboot: false,
+        switch_only: false,
         secrets_only: false,
         needs_maintenance: false,
         class: class_of(host),
@@ -2460,6 +2481,14 @@ fn decide_host(
         && !d.secrets_only
         && (d.reboot_required || d.reboot_only)
         && host.build.boot.mode == crate::manifest::BootMode::Direct;
+    // --- lane 5C ---
+    // A grub host reboots itself, so the STEP is an ordinary `reboot`. What
+    // it cannot do is take a boot back, so the activation in front of that
+    // reboot runs in switch mode (`rollback_for` below). Unconditional on
+    // the boot mode and not on whether this release reboots: the way back
+    // of an activation is a property of the machine.
+    d.switch_only = host.build.boot.mode == crate::manifest::BootMode::Grub;
+    // --- end lane 5C ---
     if d.provider_reboot && artifacts.direct_boot.is_none() {
         // `release::bind` will not make such a release — it refuses a direct
         // host without a bundle in both directions (3A). This is the second
@@ -2555,6 +2584,9 @@ fn decide_rotate_host(
         stop_disruptive: Vec::new(),
         current_system: None,
         reboot_required: false,
+        // A grub host has no boot-mode rollback (lane 5C, N4); a key plan
+        // activates nothing, so the flag only has to be the truth about the host.
+        switch_only: host.build.boot.mode == crate::manifest::BootMode::Grub,
         reboot_only: false,
         provider_reboot: false,
         // Nothing is staged and nothing is activated: a rotation replaces a
@@ -2734,6 +2766,9 @@ fn decide_revoke_host(
         stop_disruptive: Vec::new(),
         current_system: None,
         reboot_required: false,
+        // A grub host has no boot-mode rollback (lane 5C, N4); a key plan
+        // activates nothing, so the flag only has to be the truth about the host.
+        switch_only: host.build.boot.mode == crate::manifest::BootMode::Grub,
         reboot_only: false,
         provider_reboot: false,
         // A revocation is only ever this shape: preflight, the lock, the
@@ -2915,6 +2950,7 @@ fn decide_install_host(
         // either: the machine is not running, and what starts it afterwards
         // is the medium's own business (3A prints the sentence).
         provider_reboot: false,
+        switch_only: false,
         needs_maintenance: false,
         class: class_of(host),
         canary_rank: u8::from(host.rollout.canary_class.is_none()),
@@ -3704,21 +3740,39 @@ fn steps_for(
                 step(ActionKind::Activate, Disruption::Service)
                     .maybe_from(decision.current_system.clone())
                     .to(desired.clone())
-                    .because(match (decision.reboot_required, decision.provider_reboot) {
+                    .because(match (
+                        decision.reboot_required,
+                        decision.provider_reboot,
+                        decision.switch_only,
+                    ) {
                         // Direct boot: the activation is the USERLAND half
                         // and runs in switch mode, because the way back a
                         // boot-mode activation needs is a boot menu and this
                         // machine has none (3A: the helper refuses it).
-                        (_, true) => {
+                        (_, true, _) => {
                             "this host boots through its provider, so the activation moves the \
                              userland at once (--mode switch) and the kernel follows when the \
                              provider loads the new bundle"
                         }
-                        (true, false) => {
+                        // --- lane 5C ---
+                        // And a grub host, which reboots itself but cannot
+                        // take a boot back: no `bootctl set-oneshot`, so
+                        // the machine is switched now and rebooted after,
+                        // and a boot that does not come up is grub's own
+                        // menu and a person at a console (D5's documented
+                        // limit, L2 finding N4).
+                        (true, false, true) => {
+                            "the boot half of this release changed and this host boots itself \
+                             out of grub, which has no one-shot entry: the profile is moved at \
+                             once (--mode switch) and the reboot below starts it. There is no \
+                             way back from a boot that does not come up except grub's own menu"
+                        }
+                        // --- end lane 5C ---
+                        (true, false, false) => {
                             "the boot half of this release changed, so the profile is moved and \
                              the new system takes over at the next boot (--mode boot)"
                         }
-                        (false, false) => {
+                        (false, false, _) => {
                             "nothing in the boot half changed, so this takes effect at once \
                              (--mode switch)"
                         }
@@ -3994,7 +4048,8 @@ fn rollback_for(kind: ActionKind, decision: &HostDecision, policy: &PlanPolicy) 
     // no ESP to write it into (3A measured the helper refusing it). What is
     // left is the userland half, and that is exactly what a switch takes
     // back.
-    if decision.provider_reboot {
+    // --- lane 5C: and a grub host, for the same reason and its own ---
+    if decision.provider_reboot || decision.switch_only {
         return Rollback {
             mode: RollbackMode::Switch,
             confirm_within_secs: policy.confirm_within_switch_secs,
@@ -5591,6 +5646,77 @@ mod tests {
         ));
         (release, observation)
     }
+
+    // --- lane 5C ---
+
+    fn upgrade_grub(new_kernel: bool) -> (ReleaseManifest, Observations) {
+        let base = crate::fixtures::with_grub_host(onebox_enrolled(), "n1");
+        let running = release_of(base.clone());
+        let observation = observed(&running, at(TAKEN));
+        let release = release_of(crate::fixtures::with_new_toplevels(
+            base,
+            &["n1"],
+            new_kernel,
+        ));
+        (release, observation)
+    }
+
+    #[test]
+    fn a_kernel_change_on_a_grub_host_is_switched_and_rebooted_by_the_machine_itself() {
+        // L2 finding N4. Every guest built from
+        // `packages.managed-disk-image` is a legacy-MBR grub machine. The
+        // inventory had no word for one, so the lab called it `uefi`,
+        // `apply` passed `--mode boot`, and the helper refused: "there is
+        // no boot fallback on this host: bootctl says systemd-boot is not
+        // installed". Such a host was not deployable at all as soon as a
+        // release touched its kernel.
+        let (release, observation) = upgrade_grub(true);
+        let plan = planned(&release, "host=n1", &observation);
+
+        assert!(plan.hosts["n1"].reboot_required);
+        let steps = kinds(&plan, "n1");
+        // It reboots ITSELF: the loader is on its own disk, so this is an
+        // ordinary reboot and never the provider's.
+        assert!(steps.contains(&ActionKind::Reboot), "{steps:?}");
+        assert!(!steps.contains(&ActionKind::ProviderReboot), "{steps:?}");
+
+        // And the one thing that makes `grub` a value of its own: the
+        // activation in front of that reboot is a switch, because
+        // `bootctl set-oneshot` is what a boot rollback is made of.
+        let activate = action(&plan, "n1", ActionKind::Activate);
+        assert_eq!(activate.rollback.mode, RollbackMode::Switch);
+        assert_eq!(
+            activate.rollback.confirm_within_secs,
+            CONFIRM_WITHIN_SWITCH_SECS
+        );
+        assert!(
+            activate.preconditions.iter().any(|p| p.contains("grub"))
+                || activate
+                    .preconditions
+                    .iter()
+                    .any(|p| p.contains("--mode switch")),
+            "the plan says why, in a sentence an operator reads: {:?}",
+            activate.preconditions
+        );
+    }
+
+    #[test]
+    fn a_grub_host_that_changes_only_its_userland_is_an_ordinary_switch() {
+        // The other half: nothing about `grub` makes an ordinary release
+        // special. There is no reboot, and the way back is the same one
+        // every switch has.
+        let (release, observation) = upgrade_grub(false);
+        let plan = planned(&release, "host=n1", &observation);
+        assert!(!plan.hosts["n1"].reboot_required);
+        let steps = kinds(&plan, "n1");
+        assert!(!steps.contains(&ActionKind::Reboot), "{steps:?}");
+        assert_eq!(
+            action(&plan, "n1", ActionKind::Activate).rollback.mode,
+            RollbackMode::Switch
+        );
+    }
+
+    // --- end lane 5C ---
 
     #[test]
     fn a_kernel_change_on_a_direct_host_is_a_provider_reboot_with_the_bundle() {

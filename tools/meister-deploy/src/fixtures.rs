@@ -193,6 +193,27 @@ pub fn with_direct_host(mut fleet: ResolvedFleet, id: &str) -> ResolvedFleet {
     fleet
 }
 
+// --- lane 5C ---
+/// The same for a host that boots itself out of grub: no ESP, no bundle,
+/// and no way back from a boot (L2 finding N4).
+pub fn with_grub_host(mut fleet: ResolvedFleet, id: &str) -> ResolvedFleet {
+    {
+        let host = fleet
+            .hosts
+            .get_mut(id)
+            .unwrap_or_else(|| panic!("{id} is in the fixture"));
+        host.build.boot.mode = crate::manifest::BootMode::Grub;
+        // It brings its own loader, so this flake installs none: such a
+        // host has no install table, and therefore no installer.
+        host.install = None;
+        host.build.installer_drv = None;
+    }
+    fleet.manifest_id =
+        crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
+    fleet
+}
+// --- end lane 5C ---
+
 /// The bundle that belongs to such a host: the paths its own manifest
 /// promised, plus the directory that holds them.
 pub fn bundle_for(fleet: &ResolvedFleet, id: &str) -> crate::release::DirectBoot {

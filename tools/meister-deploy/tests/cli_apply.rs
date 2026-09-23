@@ -406,6 +406,79 @@ fn a_run_that_changes_nothing_still_takes_the_anchor_and_writes_its_receipt() {
     );
 }
 
+// --- lane 5C ---
+
+#[test]
+fn a_resume_finds_the_plan_and_the_release_in_the_run_s_own_directory() {
+    // L2 finding N10. `runs/<id>/` held the plan and not the release, so a
+    // resume needed the operator's own `--out` file — and the next `build`
+    // over the same path took it away. In the lab there was then no
+    // supported way to continue an interrupted run at all.
+    let mut sandbox = Sandbox::new();
+    sandbox.ssh_exit = 0;
+    let out = sandbox.run(&[
+        "apply",
+        "--plan",
+        "plan.json",
+        "--release",
+        "release.json",
+        "--repo",
+        ".",
+        "--inventory",
+        "fleet.toml",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let run_id = stdout(&out).lines().next().unwrap_or_default().to_string();
+
+    let run_dir = sandbox.state().join("runs").join(&run_id);
+    let kept = run_dir.join("release.json");
+    assert!(kept.exists(), "no release at {}", kept.display());
+    let release: ReleaseManifest =
+        serde_json::from_slice(&std::fs::read(&kept).unwrap()).expect("it reads back");
+    assert_eq!(release.release_id, sandbox.release.release_id);
+
+    // And now the operator builds again over the same file, which is what
+    // happened in the lab. Both documents are gone from the working
+    // directory.
+    std::fs::remove_file(sandbox.cwd.path().join("release.json")).unwrap();
+    std::fs::remove_file(sandbox.cwd.path().join("plan.json")).unwrap();
+    sandbox.forget_calls();
+
+    let again = sandbox.run(&["apply", "--resume", &run_id, "--repo", "."]);
+    assert_eq!(code(&again), 0, "{}", stderr(&again));
+    assert!(
+        stderr(&again).contains("resuming from"),
+        "{}",
+        stderr(&again)
+    );
+    assert!(
+        stderr(&again).contains("release.json"),
+        "{}",
+        stderr(&again)
+    );
+}
+
+#[test]
+fn apply_without_a_plan_and_without_a_resume_says_which_one_is_missing() {
+    let sandbox = Sandbox::new();
+    let out = sandbox.run(&["apply", "--release", "release.json", "--repo", "."]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--plan is missing"),
+        "{}",
+        stderr(&out)
+    );
+    let out = sandbox.run(&["apply", "--repo", "."]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("Neither was named"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+// --- end lane 5C ---
+
 #[test]
 fn a_second_operator_is_refused_by_the_state_directory() {
     // V18 on the workstation: the fleet's own anchor is the per-host lock,

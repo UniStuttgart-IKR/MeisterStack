@@ -301,6 +301,27 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # --- lane 5C ---
+          # /etc/resolv.conf has one author. Two of them failed an
+          # activation and its rollback in the lab (L2 finding N6).
+          one-resolver-author = import ./nix/tests/one-resolver-author.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
+          # A managed host reads its provider without becoming an
+          # appliance (L2 finding N5).
+          managed-may-read-its-provider =
+            import ./nix/tests/managed-may-read-its-provider.nix {
+              inherit nixpkgs lib pkgs system self;
+            };
+
+          # A node that says it has no NVMe fabric does not claim one
+          # (L2 finding N9).
+          no-fabric-no-claim = import ./nix/tests/no-fabric-no-claim.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+          # --- end lane 5C ---
+
           # What the target-side helper does to a REAL machine: the profile
           # moves, the timer fires, and a host nobody confirms comes back by
           # itself (M2C).
