@@ -63,6 +63,27 @@ fn lv_name(id: &VolumeId) -> String {
     format!("vm-{id}")
 }
 
+/// The name an LV is built under before it is the volume.
+///
+/// Astra finding S14, 2026-09-23: `provision` read "the LV exists" as "the
+/// volume is ready", and it created the LV under its FINAL name before
+/// `qemu-img convert` had written a byte into it. A node that died in the
+/// middle of the convert — a reboot, an OOM kill, a power cut — left an LV
+/// under the name the next call looks for, and that call said "thin volume
+/// already exists" and handed a guest a disk with half an image on it.
+///
+/// So the bytes are written under a name nothing looks for, and the LAST
+/// thing that happens is the rename. An LV rename is one atomic change of the
+/// VG's metadata, so the final name appears when the image is whole and never
+/// before it — the same shape `write_volume_file` has in the filesystem
+/// driver, where it is a tmp file and a `rename`.
+///
+/// Derived from the id like every other name here, so a leftover from a run
+/// that died is found by the next call rather than leaked.
+fn staging_lv_name(id: &VolumeId) -> String {
+    format!("{}.staging", lv_name(id))
+}
+
 /// The LV a snapshot is. A prefix of its own so that `lvs` on a node reads
 /// as what it is, and so that a snapshot can never collide with a volume:
 /// both are derived from a uuid, and two different uuids is not a promise
@@ -364,6 +385,23 @@ impl LvmThinDriver {
         let target = format!("{vg}/{lv}");
         self.lvm("lvremove", &["-f", &target]).await.map(|_| ())
     }
+
+    /// Give the finished LV its real name. See [`staging_lv_name`].
+    ///
+    /// `Ok(None)` from `lvm` means LVM could not find the name to rename,
+    /// which here is not "nothing to do": the LV was created one call ago and
+    /// the bytes were just written into it, so its absence is a failure and
+    /// has to read as one.
+    async fn rename_lv(&self, vg: &str, from: &str, to: &str) -> storage::Result<()> {
+        self.lvm("lvrename", &[vg, from, to])
+            .await?
+            .ok_or_else(|| {
+                StorageError::Backend(anyhow::anyhow!(
+                    "{vg}/{from} was gone before it could be renamed to {to}"
+                ))
+            })
+            .map(|_| ())
+    }
 }
 
 #[async_trait::async_trait]
@@ -373,13 +411,26 @@ impl VolumeProvider for LvmThinDriver {
         let params = Self::params(spec)?;
         let (vg, pool) = resolve_pool(&params, &self.config.vg, &self.config.thin_pool)?;
         let lv = lv_name(id);
+        let staging = staging_lv_name(id);
         let dev = Self::device_path(&vg, &lv);
 
         // Idempotent like every other create in this tree: a re-provision of
-        // the same volume finds its LV and is done.
+        // the same volume finds its LV and is done. Only the FINAL name
+        // counts, and that is the whole of S14: the name exists because the
+        // image was written, not merely because an `lvcreate` once returned.
         if let Some(size) = self.lv_size_bytes(&vg, &lv).await? {
             debug!(size_bytes = size, "thin volume already exists");
             return Ok(Self::handle(id, &dev, size, spec));
+        }
+
+        // A staging LV without a volume beside it is what a run that died
+        // mid-convert leaves: half an image under a name nothing looks for.
+        // It is dropped and the work is done again, because the one thing
+        // that must not happen is a guest booting off it.
+        if self.lv_size_bytes(&vg, &staging).await?.is_some() {
+            warn!(vg = %vg, lv = %staging,
+                  "a half-written lv from an earlier attempt is here, removing it");
+            self.remove_lv(&vg, &staging).await?;
         }
 
         let fill = self.pool_data_percent(&vg, &pool).await?;
@@ -406,9 +457,17 @@ impl VolumeProvider for LvmThinDriver {
 
         let target_pool = format!("{vg}/{pool}");
         let size_arg = format!("{}b", spec.size_bytes);
+        // A volume with a base image is built under the staging name and
+        // renamed when the image is whole; a volume WITHOUT one is finished
+        // the moment `lvcreate` returns, so it is created under its own name
+        // and there is no window to protect. See [`staging_lv_name`].
+        let building = match &src {
+            Some(_) => staging.as_str(),
+            None => lv.as_str(),
+        };
         self.lvm(
             "lvcreate",
-            &["-T", &target_pool, "-V", &size_arg, "-n", &lv],
+            &["-T", &target_pool, "-V", &size_arg, "-n", building],
         )
         .await?
         .ok_or_else(|| {
@@ -419,20 +478,28 @@ impl VolumeProvider for LvmThinDriver {
         // — a half-written volume that survives would be handed to the next
         // boot as if it were ready.
         if let Some((path, name)) = src {
-            info!(base = %path.display(), dev = %dev.display(), "writing base image onto lv");
-            if let Err(e) = self.write_base_image(&path, &dev, &name).await {
+            let staging_dev = Self::device_path(&vg, &staging);
+            info!(base = %path.display(), dev = %staging_dev.display(),
+                  "writing base image onto lv");
+            if let Err(e) = self.write_base_image(&path, &staging_dev, &name).await {
                 warn!(error = %format!("{e:#}"),
                       "base image failed, removing the lv again");
-                if let Err(rm) = self.remove_lv(&vg, &lv).await {
+                if let Err(rm) = self.remove_lv(&vg, &staging).await {
                     // Error and not warn: the rollback is what keeps a
-                    // half-written volume from being handed to the next boot,
-                    // and no later pass comes back for this lv. It stays in
-                    // the vg until somebody removes it.
-                    error!(vg = %vg, lv = %lv, error = %format!("{rm:#}"),
-                           "rollback failed, the lv is orphaned");
+                    // half-written volume from being handed to the next boot.
+                    // Since S14 a leftover under the staging name is found and
+                    // dropped by the next provision of this volume, so it is
+                    // no longer forever — but it still costs the pool its data
+                    // until then, and nobody is told unless this line is.
+                    error!(vg = %vg, lv = %staging, error = %format!("{rm:#}"),
+                           "rollback failed, the half-written lv is orphaned");
                 }
                 return Err(e);
             }
+            // And only now does the volume have the name the next call looks
+            // for. One atomic change of the VG metadata; there is no state
+            // between the two names.
+            self.rename_lv(&vg, &staging, &lv).await?;
         }
 
         let size_bytes = self
@@ -591,6 +658,11 @@ impl VolumeProvider for LvmThinDriver {
         let vg = self.vg_of(handle);
         self.remove_lv(&vg, &lv).await?;
         debug!(vg = %vg, lv = %lv, "thin volume removed");
+        // And whatever an attempt that died mid-image left under the staging
+        // name (S14). `lvremove` of a name that is not there is `Ok(None)`
+        // here, so the common case costs one command and says nothing.
+        let staging = staging_lv_name(&handle.id);
+        self.remove_lv(&vg, &staging).await?;
         Ok(())
     }
 
@@ -670,6 +742,309 @@ mod tests {
             driver: Some("lvm-thin".into()),
             params: None,
         }
+    }
+
+    /// LVM and `qemu-img` as shell scripts, and a volume group as a
+    /// directory of files.
+    ///
+    /// This driver IS its command line — LVM has no library worth linking —
+    /// so the only way to test what it does to a volume group is to give it
+    /// commands it can run. Each script keeps the group in `state/` (one file
+    /// per LV, holding its size) and appends what it was asked to do to
+    /// `log`, which is what the tests then read: the ORDER of those lines is
+    /// the property S14 is about.
+    ///
+    /// Nothing here talks to a disk, a pool or a real `qemu-img`, and none of
+    /// the scripts starts a process of its own.
+    struct FakeLvm {
+        temp: tempfile::TempDir,
+    }
+
+    impl FakeLvm {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = tempfile::Builder::new()
+                .prefix("meister-lvm-thin-")
+                .tempdir()
+                .expect("a temp dir");
+            let root = temp.path();
+            for dir in ["bin", "state", "images"] {
+                std::fs::create_dir_all(root.join(dir)).expect("the fake's directories");
+            }
+            let state = root.join("state").display().to_string();
+            let log = root.join("log").display().to_string();
+
+            let scripts = [
+                (
+                    "lvs",
+                    format!(
+                        "field=\ntarget=\n\
+                         while [ $# -gt 0 ]; do\n\
+                         case \"$1\" in\n\
+                         -o) field=\"$2\"; shift 2;;\n\
+                         --units) shift 2;;\n\
+                         --noheadings|--nosuffix) shift;;\n\
+                         *) target=\"$1\"; shift;;\n\
+                         esac\n\
+                         done\n\
+                         name=${{target#*/}}\n\
+                         if [ \"$field\" = data_percent ]; then echo \"  10.00\"; exit 0; fi\n\
+                         if [ -f \"{state}/$name\" ]; then\n\
+                         echo \"  $(cat \"{state}/$name\")\"; exit 0\n\
+                         fi\n\
+                         echo \"  Failed to find logical volume \\\"$target\\\"\" >&2\n\
+                         exit 5\n"
+                    ),
+                ),
+                (
+                    "lvcreate",
+                    format!(
+                        "echo \"lvcreate $*\" >> \"{log}\"\n\
+                         size=0\nname=\n\
+                         while [ $# -gt 0 ]; do\n\
+                         case \"$1\" in\n\
+                         -V) size=${{2%b}}; shift 2;;\n\
+                         -n) name=\"$2\"; shift 2;;\n\
+                         -T) shift 2;;\n\
+                         *) shift;;\n\
+                         esac\n\
+                         done\n\
+                         printf '%s\\n' \"$size\" > \"{state}/$name\"\n"
+                    ),
+                ),
+                (
+                    "lvrename",
+                    format!(
+                        "echo \"lvrename $*\" >> \"{log}\"\n\
+                         if [ -f \"{state}/$2\" ]; then mv \"{state}/$2\" \"{state}/$3\"; exit 0; fi\n\
+                         echo \"  Failed to find logical volume \\\"$2\\\"\" >&2\n\
+                         exit 5\n"
+                    ),
+                ),
+                (
+                    "lvremove",
+                    format!(
+                        "echo \"lvremove $*\" >> \"{log}\"\n\
+                         name=${{2#*/}}\n\
+                         rm -f \"{state}/$name\"\n"
+                    ),
+                ),
+                (
+                    "qemu-img",
+                    format!(
+                        "echo \"qemu-img $*\" >> \"{log}\"\n\
+                         if [ \"$1\" = info ]; then\n\
+                         echo '{{\"virtual-size\": 1024, \"format\": \"raw\"}}'\n\
+                         exit 0\n\
+                         fi\n\
+                         if [ -f \"{state}/../convert-fails\" ]; then\n\
+                         echo \"  the convert was interrupted\" >&2; exit 1\n\
+                         fi\n"
+                    ),
+                ),
+            ];
+            for (name, body) in scripts {
+                let path = root.join("bin").join(name);
+                std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("the script");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("runnable");
+            }
+            Self { temp }
+        }
+
+        fn driver(&self) -> LvmThinDriver {
+            LvmThinDriver {
+                config: LvmThinDriverConfig {
+                    vg: "vg0".into(),
+                    thin_pool: "thin".into(),
+                    max_data_percent: DEFAULT_MAX_DATA_PERCENT,
+                    image_dir: self.temp.path().join("images"),
+                    bin_dir: Some(self.temp.path().join("bin")),
+                    qemu_img: self.temp.path().join("bin").join("qemu-img"),
+                },
+            }
+        }
+
+        /// A base image the driver will find under its image_dir.
+        fn image(&self, name: &str) -> String {
+            std::fs::write(self.temp.path().join("images").join(name), b"an image")
+                .expect("the bytes");
+            name.to_string()
+        }
+
+        /// Put an LV into the group by hand: what a run that died halfway
+        /// leaves behind.
+        fn lv(&self, name: &str, size: u64) {
+            std::fs::write(
+                self.temp.path().join("state").join(name),
+                format!("{size}\n"),
+            )
+            .expect("the lv");
+        }
+
+        fn has_lv(&self, name: &str) -> bool {
+            self.temp.path().join("state").join(name).exists()
+        }
+
+        /// Make the next `qemu-img convert` fail, the way a killed one does.
+        fn break_convert(&self) {
+            std::fs::write(self.temp.path().join("convert-fails"), b"").expect("the marker");
+        }
+
+        /// Every command the driver ran, in order.
+        fn log(&self) -> Vec<String> {
+            std::fs::read_to_string(self.temp.path().join("log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    fn from_image(name: &str) -> VolumeSpec {
+        VolumeSpec {
+            base_image: Some(name.to_string()),
+            size_bytes: 1 << 30,
+            driver: Some("lvm-thin".into()),
+            params: None,
+        }
+    }
+
+    /// The image is written under a name nothing looks for, and the volume's
+    /// own name appears only when it is whole.
+    ///
+    /// Astra finding S14, 2026-09-23: the LV used to be created under its
+    /// final name and the image written into it afterwards, so a node that
+    /// died between the two left an LV that the next provision read as
+    /// "already exists" and handed to a guest with half an image on it. The
+    /// order of the commands IS the fix, which is why the test reads the
+    /// order.
+    #[tokio::test]
+    async fn the_image_is_written_under_a_staging_name_and_renamed_when_it_is_whole() {
+        let fake = FakeLvm::new();
+        let driver = fake.driver();
+        let id: VolumeId = Uuid::new_v4();
+        let spec = from_image(&fake.image("base.raw"));
+
+        let handle = driver.provision(&id, &spec).await.expect("provisioned");
+
+        let staging = staging_lv_name(&id);
+        let final_name = lv_name(&id);
+        let log = fake.log();
+        let at = |needle: &str| {
+            log.iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is not in {log:?}"))
+        };
+        assert!(
+            at(&format!("-n {staging}")) < at("qemu-img convert"),
+            "the lv is made under the staging name first: {log:?}"
+        );
+        assert!(
+            at("qemu-img convert") < at(&format!("lvrename vg0 {staging} {final_name}")),
+            "and renamed only after the image is whole: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .all(|l| !l.ends_with(&format!("-n {final_name}"))),
+            "nothing is ever created under the volume's own name: {log:?}"
+        );
+        assert!(fake.has_lv(&final_name), "the volume is there");
+        assert!(!fake.has_lv(&staging), "and the staging name is not");
+        assert_eq!(
+            handle.backend,
+            format!("/dev/vg0/{final_name}"),
+            "the handle names the volume and not the name it was built under"
+        );
+    }
+
+    /// A node that died mid-convert: the leftover is dropped and the work is
+    /// done again, and what the guest gets is a whole image.
+    ///
+    /// Astra finding S14, 2026-09-23. This is the case the old code got
+    /// wrong in the one direction that cannot be recovered from — it handed
+    /// the half-written disk on — and the staging name is what turns it into
+    /// a case at all: an LV under a name nothing looks for is evidence of a
+    /// run that did not finish.
+    #[tokio::test]
+    async fn a_run_that_died_mid_image_is_redone_rather_than_handed_on() {
+        let fake = FakeLvm::new();
+        let driver = fake.driver();
+        let id: VolumeId = Uuid::new_v4();
+        let spec = from_image(&fake.image("base.raw"));
+        let staging = staging_lv_name(&id);
+        let final_name = lv_name(&id);
+
+        // What the crash left: the staging LV, no volume.
+        fake.lv(&staging, 1 << 30);
+
+        driver.provision(&id, &spec).await.expect("provisioned");
+
+        let log = fake.log();
+        assert!(
+            log.iter()
+                .any(|l| l.contains(&format!("lvremove -f vg0/{staging}"))),
+            "the half-written lv is removed: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.contains("qemu-img convert")),
+            "and the image is written again: {log:?}"
+        );
+        assert!(fake.has_lv(&final_name));
+        assert!(!fake.has_lv(&staging));
+    }
+
+    /// A volume that is already there is not written again — the idempotence
+    /// every create in this tree has, now resting on the one name that means
+    /// the image is whole.
+    #[tokio::test]
+    async fn a_volume_that_is_already_there_is_not_written_again() {
+        let fake = FakeLvm::new();
+        let driver = fake.driver();
+        let id: VolumeId = Uuid::new_v4();
+        let spec = from_image(&fake.image("base.raw"));
+        fake.lv(&lv_name(&id), 1 << 30);
+
+        let handle = driver.provision(&id, &spec).await.expect("already there");
+
+        assert_eq!(handle.size_bytes, 1 << 30, "measured, not echoed");
+        let log = fake.log();
+        assert!(
+            log.iter().all(|l| !l.contains("qemu-img convert")),
+            "no image is written over a volume that has one: {log:?}"
+        );
+        assert!(
+            log.iter().all(|l| !l.contains("lvcreate")),
+            "and nothing is created: {log:?}"
+        );
+    }
+
+    /// A convert that fails leaves nothing under either name.
+    ///
+    /// Astra finding S14, 2026-09-23: the rollback was always here, and what
+    /// it could not cover was the failure that takes the whole node with it.
+    /// What it covers now is the same failure under a name that was never the
+    /// volume's, so even a rollback that does not run leaves nothing the next
+    /// provision can mistake for a finished disk.
+    #[tokio::test]
+    async fn a_convert_that_fails_leaves_no_volume_behind() {
+        let fake = FakeLvm::new();
+        let driver = fake.driver();
+        let id: VolumeId = Uuid::new_v4();
+        let spec = from_image(&fake.image("base.raw"));
+        fake.break_convert();
+
+        let err = driver
+            .provision(&id, &spec)
+            .await
+            .expect_err("the convert failed");
+        assert!(
+            format!("{err}").contains("interrupted"),
+            "the failure carries qemu-img's own words: {err}"
+        );
+        assert!(!fake.has_lv(&lv_name(&id)), "no volume");
+        assert!(!fake.has_lv(&staging_lv_name(&id)), "and no leftover");
     }
 
     /// The degeneration probe for this backend, and it is the plainest of the

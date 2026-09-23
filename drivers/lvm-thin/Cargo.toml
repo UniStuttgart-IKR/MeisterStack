@@ -15,4 +15,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The fake LVM: a bin_dir of shell scripts and a volume group in a directory,
+# both of which have to be somewhere that goes away with the test.
+tempfile = { workspace = true }
 uuid = { workspace = true }
