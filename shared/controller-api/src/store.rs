@@ -824,6 +824,43 @@ impl EtcdStore {
         Ok(())
     }
 
+    /// `delete`, and only if `resource_version` still names the object as it
+    /// was when the caller last read it — the same CAS `update_fenced` (see
+    /// above) guards a write with, applied to a delete.
+    ///
+    /// Astra finding S19, 2026-09-23: a delete by NAME alone is an ABA hole
+    /// wherever names are reused — `delete_secret` reads and authorises one
+    /// object, then AWAITS an Ack from every connected cluster before it
+    /// deletes, and a delete that resumes after the old object was removed
+    /// and a new one created under the same name would remove the wrong
+    /// object. A failed compare means the name no longer names what the
+    /// caller authorised against, and the caller sees `Conflict` — a 409 —
+    /// rather than a silent wrong delete.
+    pub async fn delete_if<T: Resource>(&self, name: &str, resource_version: &str) -> Result<()> {
+        let rev: i64 = resource_version.parse().map_err(|_| {
+            StoreError::Invalid(
+                "invalid object: metadata.resourceVersion must be set for a guarded delete".into(),
+            )
+        })?;
+        let key = self.key(T::RESOURCE, name);
+        let txn = Txn::new()
+            .when(vec![Compare::mod_revision(
+                key.clone(),
+                CompareOp::Equal,
+                rev,
+            )])
+            .and_then(vec![TxnOp::delete(key.clone(), None)]);
+        let resp = timed("delete_if", self.handle().txn(txn)).await?;
+        if !resp.succeeded() {
+            return Err(StoreError::Conflict(format!(
+                "resource version conflict on {resource}/{name} (concurrent write)",
+                resource = T::RESOURCE
+            )));
+        }
+        observe_revision(resp.header());
+        Ok(())
+    }
+
     /// Take an object: delete it and hand back what was there, or `None` if
     /// nothing was.
     ///
