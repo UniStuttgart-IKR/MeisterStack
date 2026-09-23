@@ -1134,6 +1134,46 @@ else
     bad "ein echter ed25519-Key wird eingetragen" "authorized_keys fehlt"
 fi
 
+# Und ein Kommentar mit Leerzeichen, weil `ssh-keygen -C` einen Satz nimmt
+# und OpenSSH alles hinter dem base64 als EINEN Kommentar liest. Lane L4 hat
+# genau das im Lab gebaut ("meister-lab-l4a operator"), und vier frische VMs
+# waren danach nicht erreichbar -- die Absage steht auf der seriellen
+# Konsole einer VM, die keinen Schluessel hat.
+render_strict friendly_comment \
+    'MEISTER_ROLE=agent' \
+    -- \
+    "SET_HOSTNAME='agent-9y'" \
+    "SSH_PUBLIC_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForTheTestOnly meister-lab-l4a operator'"
+
+if [ -f "$T/root/.ssh/authorized_keys" ]; then
+    grepfor "ein Kommentar mit Leerzeichen macht den Key nicht ungueltig" \
+        'meister-lab-l4a operator' "$T/root/.ssh/authorized_keys" \
+        "$(cat "$T/root/.ssh/authorized_keys")"
+else
+    bad "ein Kommentar mit Leerzeichen macht den Key nicht ungueltig" \
+        "authorized_keys fehlt"
+fi
+
+# Die Gegenprobe zur Gegenprobe: was der Allowlist wirklich gilt, ist das
+# OPTIONS-Feld VOR dem Typ -- `command=` waere ein Medium, das entscheidet,
+# was ein Login tut. Die Zeile muss mit einem Schluesseltyp anfangen.
+render_strict options_field \
+    'MEISTER_ROLE=agent' \
+    -- \
+    "SET_HOSTNAME='agent-9x'" \
+    "SSH_PUBLIC_KEY='command=\"/bin/sh\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForTheTestOnly x'"
+
+if [ -f "$T/root/.ssh/authorized_keys" ]; then
+    if grep -q 'command=' "$T/root/.ssh/authorized_keys"; then
+        bad "ein options-Feld vor dem Typ wird weiter abgewiesen" \
+            "$(cat "$T/root/.ssh/authorized_keys")"
+    else
+        ok "ein options-Feld vor dem Typ wird weiter abgewiesen"
+    fi
+else
+    ok "ein options-Feld vor dem Typ wird weiter abgewiesen"
+fi
+
 echo
 echo "O. ohne Medium und ohne Provider: die gebackene Datei ist der ganze Kontext"
 

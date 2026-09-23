@@ -230,7 +230,18 @@ let
       # for its name: `command=` and the other options would be a medium
       # deciding what a login does, and they are not on the allowlist.
       if [ -n "$one_sshkey" ]; then
-        if printf '%s' "$one_sshkey" | grep -qE "^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+=*( [^ ]*)?$"; then
+        # The comment field may contain spaces, because ssh-keygen -C takes
+        # a sentence and OpenSSH reads everything after the base64 as one
+        # comment. `( [^ ]*)?$` refused such a line, and the refusal is
+        # invisible where it matters: it goes to the serial console of a VM
+        # that then has no key on it, which in a lab with no console is the
+        # same as a machine that is gone. Measured 2026-09-23 (lane L4): four
+        # fresh VMs, `Permission denied (publickey)`, and the only way back
+        # was a new key and a new context. What the allowlist is ACTUALLY
+        # about is the options field in FRONT of the type, which is where
+        # `command=` would be — and that is still refused, because the line
+        # has to START with a key type.
+        if printf '%s' "$one_sshkey" | grep -qE "^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+=*( .*)?$"; then
           mkdir -p /root/.ssh
           chmod 700 /root/.ssh
           if ! grep -qxF "$one_sshkey" /root/.ssh/authorized_keys 2>/dev/null; then
