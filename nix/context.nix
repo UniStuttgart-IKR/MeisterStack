@@ -57,24 +57,15 @@ in
       '';
     };
 
-    providerScript = lib.mkOption {
-      type = lib.types.lines;
-      default = "";
-      description = ''
-        Shell run after the files above and before anything is rendered:
-        a provider's chance to say where this machine was booted.
-
-        Empty (the default) is a machine whose whole context is its baked
-        files. `nixosModules.provider-opennebula` is the one implementation
-        today, and it is deliberately NOT part of `nixosModules.default`: a
-        renderer that knows how to mount a CONTEXT cd is a renderer that
-        cannot be used anywhere else.
-
-        What it may do is set MEISTER_* variables and configure the interface
-        it owns. What it must not do is render a config file — that is this
-        module's job, once, for every road into it.
-      '';
-    };
+    # --- lane 5C ---
+    # `providerScript` is NOT declared here any more. It is declared in
+    # nix/roles.nix, which nix/services.nix imports and nix/managed.nix
+    # therefore has: a managed host on a provider's VM has to be able to
+    # take the strict reader (nix/provider-opennebula.nix) WITHOUT taking
+    # this renderer, and an option that only exists where the renderer is
+    # made that combination fail to evaluate (L2 finding N5). This module
+    # still reads it, unchanged.
+    # --- end lane 5C ---
   };
 
   config = {

@@ -66,6 +66,51 @@ in
       '';
     };
 
+    # --- lane 5C ---
+    # Declared HERE and not in nix/context.nix, which is where it used to
+    # live and where it is still read.
+    #
+    # The reason is a host the lab built: a managed NixOS host on an
+    # OpenNebula VM. It needs the strict reader
+    # (`nixosModules.provider-opennebula`) to learn its address, its
+    # hostname and its resolver off the CONTEXT cd, and it must NOT have
+    # the boot renderer, because nix/managed.nix asserts against it — a
+    # machine whose config files are a system generation may not have a
+    # second author for them at boot. The reader sets this option, the
+    # renderer declared it, and nix/managed.nix forbids the renderer: the
+    # combination did not evaluate at all, and the lab paid for it with
+    # thirty hand-written lines of unit in the operator's own repository
+    # (L2 finding N5, 2026-09-23).
+    #
+    # A declaration decides nothing, so moving it into the module every
+    # host imports costs nothing either: `checks.services-are-pure` is
+    # about what nix/services.nix SETS, and this sets nothing.
+    context.providerScript = lib.mkOption {
+      type = lib.types.lines;
+      default = "";
+      description = ''
+        Shell run before anything else reads this machine's context: a
+        provider's chance to say where the machine was actually booted.
+
+        Empty (the default) is a machine whose whole context is what its
+        configuration bakes. `nixosModules.provider-opennebula` is the one
+        implementation today, and it is deliberately NOT part of
+        `nixosModules.default`: a reader that knows how to mount a CONTEXT
+        cd is a reader nobody else can use.
+
+        On an appliance the boot renderer (nix/context.nix) runs it in the
+        middle of rendering, because there the provider's values are an
+        INPUT to the config files. A managed host has no renderer — its
+        config files are part of the system generation — and what is left
+        for a provider to say there is the machine's address, its route,
+        its resolver, its hostname and the operator's key.
+
+        What it may do is set MEISTER_* variables and configure the
+        interface it owns. What it must not do is render a config file.
+      '';
+    };
+    # --- end lane 5C ---
+
     context.defaults = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = { };

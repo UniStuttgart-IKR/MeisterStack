@@ -301,6 +301,14 @@
             inherit nixpkgs lib pkgs system self;
           };
 
+          # --- lane 5C ---
+          # /etc/resolv.conf has one author. Two of them failed an
+          # activation and its rollback in the lab (L2 finding N6).
+          one-resolver-author = import ./nix/tests/one-resolver-author.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+          # --- end lane 5C ---
+
           # What the target-side helper does to a REAL machine: the profile
           # moves, the timer fires, and a host nobody confirms comes back by
           # itself (M2C).
