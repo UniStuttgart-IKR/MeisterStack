@@ -223,6 +223,16 @@ pkgs.testers.runNixOSTest {
 
     first_boot = boot_id()
 
+    # Lane 4A position 5, measured here because it costs one line and
+    # decides whether a drain with a REAL guest is provable in a VM at all:
+    # is there a hypervisor inside a test guest? Nothing loads a kvm module
+    # in this configuration, so a `yes` means udev autoloaded one, which is
+    # what makes nix/tests/fleet/bootstrap/hosts/n1.nix work on a machine
+    # whose `boot.kernelModules = [ "kvm-intel" ]` line cannot apply.
+    print("[nested] /dev/kvm inside a test guest: " + target.succeed(
+        "test -c /dev/kvm && echo yes || echo no"
+    ).strip())
+
     # --- the operator's repository ----------------------------------------
     operator.succeed("mkdir -p /root/.ssh /root/fleet /root/keys /root/out")
     operator.copy_from_host("${keys.snakeOilPrivateKey}", "/root/.ssh/id_ed25519")

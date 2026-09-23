@@ -232,31 +232,34 @@ pkgs.testers.runNixOSTest {
     import json
 
     MEMBERS = ["r1", "r2", "r3"]
-    machines = {"r1": r1, "r2": r2, "r3": r3}
+    # NOT `machines`: the driver has a global of that name (the list of
+    # every node), and mypy type-checks this whole script — shadowing it
+    # cost one build.
+    raft = {"r1": r1, "r2": r2, "r3": r3}
 
     operator.start()
-    for m in machines.values():
+    for m in raft.values():
         m.start()
     operator.wait_for_unit("multi-user.target")
-    for m in machines.values():
+    for m in raft.values():
         m.wait_for_unit("sshd.service")
 
     for name, address in [("r1", "192.168.1.2"), ("r2", "192.168.1.3"), ("r3", "192.168.1.4")]:
-        machines[name].succeed(f"ip -4 addr show eth1 | grep -q 'inet {address}/24'")
+        raft[name].succeed(f"ip -4 addr show eth1 | grep -q 'inet {address}/24'")
 
     # --- a raft of three, really bootstrapped -----------------------------
-    for name, m in machines.items():
+    for name, m in raft.items():
         m.wait_for_unit("etcd.service")
     # Not "the unit is up": the cluster has to have AGREED, which is what a
     # member list of three from every member means.
     def members_of(name):
-        out = machines[name].succeed(
+        out = raft[name].succeed(
             "etcdctl --endpoints=http://127.0.0.1:2379 member list -w json"
         )
         return sorted(m["name"] for m in json.loads(out)["members"])
 
     for name in MEMBERS:
-        machines[name].wait_until_succeeds(
+        raft[name].wait_until_succeeds(
             "etcdctl --endpoints=http://127.0.0.1:2379 endpoint health", timeout=120
         )
     for name in MEMBERS:
@@ -279,13 +282,16 @@ pkgs.testers.runNixOSTest {
     # into the operator's known_hosts AND into the inventory and both
     # manifests, because a host key is what every connection of this tool
     # checks (D10).
-    known = ""
+    operator.succeed("true > /root/fleet/known_hosts")
     for name, address in [("r1", "192.168.1.2"), ("r2", "192.168.1.3"), ("r3", "192.168.1.4")]:
-        host_key = machines[name].succeed("cat /etc/ssh/ssh_host_ed25519_key.pub").strip()
-        fingerprint = machines[name].succeed(
+        host_key = raft[name].succeed("cat /etc/ssh/ssh_host_ed25519_key.pub").strip()
+        fingerprint = raft[name].succeed(
             "ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | cut -d' ' -f2"
         ).strip()
-        known += f"{address} {' '.join(host_key.split()[:2])}\n"
+        key = " ".join(host_key.split()[:2])
+        operator.succeed(
+            f"printf '%s %s\\n' '{address}' '{key}' >> /root/fleet/known_hosts"
+        )
         placeholder = "SHA256:PLACEHOLDER-" + name.upper()
         for path in [
             "/root/fleet/fleet.toml",
@@ -293,7 +299,6 @@ pkgs.testers.runNixOSTest {
             "/root/out/m-nix-b.json",
         ]:
             operator.succeed(f"sed -i 's|{placeholder}|{fingerprint}|' {path}")
-    operator.succeed(f"cat > /root/fleet/known_hosts <<'EOF'\n{known}EOF")
 
     operator.succeed("git -C /root/fleet init -q")
     operator.succeed("git -C /root/fleet add -A")
@@ -306,7 +311,7 @@ pkgs.testers.runNixOSTest {
         "nix-store --generate-binary-cache-key vm-quorum /root/keys/signing.sec /root/keys/signing.pub"
     )
     public = operator.succeed("cat /root/keys/signing.pub").strip()
-    for name, m in machines.items():
+    for name, m in raft.items():
         m.succeed(f"echo 'extra-trusted-public-keys = {public}' > /etc/nix/extra-keys.conf")
         m.succeed("systemctl restart nix-daemon.service")
         m.wait_until_succeeds("nix config show | grep -q vm-quorum", timeout=30)
@@ -408,7 +413,7 @@ pkgs.testers.runNixOSTest {
     print("stopped before the first lock: " + out.strip().splitlines()[-1])
     # Nothing moved: no host holds a transaction, and every one of them
     # still runs generation A.
-    for name, m in machines.items():
+    for name, m in raft.items():
         assert json.loads(m.succeed("meister-activate --json txn list")) == [], name
         assert m.succeed("cat /etc/meister-generation").strip() == "A", name
     # The receipt of that run names the hosts nothing was done to.
@@ -439,7 +444,7 @@ pkgs.testers.runNixOSTest {
     )
     for name in ["r2", "r3"]:
         health = json.loads(
-            machines[name].succeed(
+            raft[name].succeed(
                 "etcdctl --endpoints=http://127.0.0.1:2379 endpoint health -w json"
             )
         )
@@ -447,18 +452,16 @@ pkgs.testers.runNixOSTest {
         print(f"while r1 was activating, {name} answered healthy")
 
     operator.wait_until_fails("systemctl is-active apply-cp.service", timeout=900)
-    run = operator.succeed(
-        "grep -l run.end /root/fleet/.meister-deploy/runs/*/journal.jsonl | tail -1"
-    ).strip().split("/")[-2]
+    run = operator.succeed("ls -1t /root/fleet/.meister-deploy/runs").split()[0]
     receipt = read(f"/root/fleet/.meister-deploy/runs/{run}/receipt.json")
     assert receipt["outcome"] == "success", receipt
     for name in MEMBERS:
         assert receipt["hosts"][name]["outcome"] == "success", receipt["hosts"][name]
-        assert machines[name].succeed("cat /etc/meister-generation").strip() == "B", name
+        assert raft[name].succeed("cat /etc/meister-generation").strip() == "B", name
     # And the member that went first is a member again, with the cluster
     # still at three.
     for name in MEMBERS:
-        machines[name].wait_until_succeeds(
+        raft[name].wait_until_succeeds(
             "etcdctl --endpoints=http://127.0.0.1:2379 endpoint health", timeout=120
         )
         assert members_of(name) == MEMBERS, (name, members_of(name))
@@ -469,10 +472,15 @@ pkgs.testers.runNixOSTest {
     # The manifest says the fleet configured a member this etcd has never
     # heard of. That is not a rollout problem, it is a different cluster,
     # and the group is blocked rather than rolled.
+    # Manifest A and not B, and that is the point: these hosts run B now, so
+    # a plan over A is a plan that would MOVE them. A group verdict only
+    # reaches a host that was going to be interrupted — an unchanged host is
+    # not blocked by a quorum it is not spending (2B), and a test that used
+    # B here would have asserted nothing.
     operator.succeed(
         "jq '.hosts |= with_entries(.value.effective_settings.etcd.initial_cluster = "
         "\"r1=http://192.168.1.2:2380,r2=http://192.168.1.3:2380,r9=http://192.168.1.9:2380\")' "
-        "/root/out/m-nix-b.json > /root/out/m-nix-moved.json"
+        "/root/out/m-nix-a.json > /root/out/m-nix-moved.json"
     )
     deploy("moved", "/root/out/m-nix-moved.json")
     plan_moved = make_plan("/root/out/r-moved.json", "moved", expect=2)
