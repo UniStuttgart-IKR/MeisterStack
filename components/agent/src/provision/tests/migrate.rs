@@ -1314,16 +1314,22 @@ async fn a_vmm_with_no_record_is_named_and_a_corrupt_row_still_counts_as_one() {
         .expect("a running vm");
     // A second guest whose record cannot be read. The row exists, so this vm
     // is somebody's — this build simply cannot say whose.
+    //
+    // Built first and broken afterwards, where this used to write the garbage
+    // over an empty table and provision on top of it. That order stopped
+    // being possible with Astra finding S11, 2026-09-23: a create over a row
+    // this build cannot read is refused now, because reading a torn record as
+    // an absence is what let a second VMM land on the first one's disks. The
+    // state under test is unchanged — a live guest with an unreadable row —
+    // and keeping the old order would test the admission check instead of the
+    // sweep.
     let unreadable = VmId::new_v4();
-    store
-        .put_raw(&unreadable.to_string(), b"{\"not\":\"a record\"}")
-        .expect("a raw row");
     p.provision(unreadable, migratable_spec(&store), Desired::Running, true)
         .await
         .expect("a second running vm");
     store
         .put_raw(&unreadable.to_string(), b"{\"not\":\"a record\"}")
-        .expect("and its row is broken again");
+        .expect("and its row is broken");
 
     // Every row this table has, readable or not — which is what the sweep
     // uses and the point of the test.

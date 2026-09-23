@@ -97,6 +97,65 @@ impl std::fmt::Display for HeldByVm {
 
 impl std::error::Error for HeldByVm {}
 
+/// The same refusal about a VM record this build cannot read.
+///
+/// Astra finding S11, 2026-09-23: `holder` asked `Store::list`, which passes
+/// over a row it cannot deserialise, so one corrupt record was the difference
+/// between "a vm is holding this disk" and "nobody is" — and at the end of
+/// that answer the driver destroys bytes a live VMM has open. The guard now
+/// counts an unreadable row as a holder, and this is what it says.
+///
+/// Its own type beside [`HeldByVm`] rather than a variant of it, because the
+/// two need opposite treatment one tier up: a held volume is a CORRECT answer
+/// the control plane acts on by itself (`heals_without_an_operator`), and a
+/// record nobody can read is a node somebody has to look at.
+#[derive(Debug)]
+pub struct HeldByUnreadable {
+    pub volume: VolumeId,
+    /// The key of the row, verbatim. See `store::VmRow::Unreadable`.
+    pub key: String,
+}
+
+impl std::fmt::Display for HeldByUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this node has an unreadable record of vm {}, which may be holding this volume",
+            self.key
+        )
+    }
+}
+
+impl std::error::Error for HeldByUnreadable {}
+
+/// What stands between a volume on this node and its deletion.
+///
+/// Three answers and not two, which is the whole of S11: a VM has it open, a
+/// row here cannot be read and therefore nobody can say it has not, or
+/// nobody.
+enum Holder {
+    Vm(agent_api::VmId),
+    Unreadable(String),
+}
+
+impl Holder {
+    /// The refusal this holder is, about `volume`.
+    fn refusal(self, volume: VolumeId) -> anyhow::Error {
+        match self {
+            Holder::Vm(vm) => HeldByVm { volume, vm }.into(),
+            Holder::Unreadable(key) => HeldByUnreadable { volume, key }.into(),
+        }
+    }
+
+    /// What goes in the log line beside the refusal.
+    fn said(&self) -> String {
+        match self {
+            Holder::Vm(vm) => vm.to_string(),
+            Holder::Unreadable(key) => format!("{key} (unreadable record)"),
+        }
+    }
+}
+
 /// The node's volume half: a store, the one driver registry, and four verbs.
 pub struct Volumes {
     store: Arc<Store>,
@@ -313,12 +372,12 @@ impl Volumes {
     /// [`VolumeRecordPhase::Gone`].
     #[instrument(skip_all, fields(volume_id = %id))]
     pub async fn deprovision(&self, id: VolumeId) -> anyhow::Result<()> {
-        if let Some(vm) = self.holder(&id)? {
+        if let Some(holder) = self.holder(&id)? {
             // The last defence. The controller clears `attachedTo` before it
             // sends this, so reaching here means the controller is wrong, and
             // at the end of obeying it anyway is somebody's data.
-            warn!(vm = %vm, "refusing to deprovision a volume a vm is holding");
-            return Err(HeldByVm { volume: id, vm }.into());
+            warn!(vm = %holder.said(), "refusing to deprovision a volume a vm is holding");
+            return Err(holder.refusal(id));
         }
 
         let Some(record) = self.store.get_volume(&id)? else {
@@ -386,9 +445,10 @@ impl Volumes {
     /// has, and reaching it means the tier above is wrong.
     #[instrument(skip_all, fields(volume_id = %id))]
     pub async fn forget(&self, id: VolumeId) -> anyhow::Result<()> {
-        if let Some(vm) = self.holder(&id)? {
-            warn!(vm = %vm, "refusing to forget a volume a vm on this node is holding");
-            return Err(HeldByVm { volume: id, vm }.into());
+        if let Some(holder) = self.holder(&id)? {
+            warn!(vm = %holder.said(),
+                  "refusing to forget a volume a vm on this node is holding");
+            return Err(holder.refusal(id));
         }
         let Some(record) = self.store.get_volume(&id)? else {
             debug!("no record; this node had already forgotten it");
@@ -708,10 +768,27 @@ impl Volumes {
     /// attachment belongs to the consumer: a VM's record is what names the
     /// volumes it has open, and that stays true whether the volume was made
     /// inline or handed over as an object.
-    fn holder(&self, id: &VolumeId) -> anyhow::Result<Option<agent_api::VmId>> {
-        for (vm, record) in self.store.list()? {
-            if record.volumes.iter().any(|v| v.id() == *id) {
-                return Ok(Some(vm));
+    ///
+    /// **A row this build cannot read counts as a holder.** `Store::rows` and
+    /// not `Store::list`, for the reason `provision::network::overlay_users`
+    /// gives one file over and that this guard needed at least as badly:
+    /// `list` passes over a damaged record, and the caller here is the last
+    /// thing between a mistake one tier up and somebody's data. An unreadable
+    /// row may name this volume — nothing can say it does not — so the
+    /// deprovision is refused, the node leaks a disk instead of destroying a
+    /// live one, and an operator is told which key to look at. Astra finding
+    /// S11, 2026-09-23.
+    fn holder(&self, id: &VolumeId) -> anyhow::Result<Option<Holder>> {
+        for row in self.store.rows()? {
+            match row {
+                crate::store::VmRow::Record(vm, record) => {
+                    if record.volumes.iter().any(|v| v.id() == *id) {
+                        return Ok(Some(Holder::Vm(vm)));
+                    }
+                }
+                crate::store::VmRow::Unreadable(key) => {
+                    return Ok(Some(Holder::Unreadable(key)));
+                }
             }
         }
         Ok(None)
@@ -1550,5 +1627,196 @@ mod tests {
             volumes.get(&held).expect("a read").is_some(),
             "and the record is still there"
         );
+    }
+
+    /// Every destructive call of the `filesystem` backend, counted.
+    ///
+    /// A guard that refuses is only half of what has to be proven; the other
+    /// half is that the driver was never reached, and a real backend cannot
+    /// say that about itself. Everything else is delegated, so a volume made
+    /// through this one is a volume on the disk.
+    struct Counting {
+        inner: Arc<dyn agent_api::storage::VolumeDriver>,
+        deprovisions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Counting {
+        fn deprovisions(&self) -> usize {
+            self.deprovisions.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl agent_api::storage::VolumeProvider for Counting {
+        fn locality(&self) -> agent_api::storage::Locality {
+            self.inner.locality()
+        }
+        async fn provision(
+            &self,
+            id: &VolumeId,
+            spec: &VolumeSpec,
+        ) -> agent_api::storage::Result<VolumeHandle> {
+            self.inner.provision(id, spec).await
+        }
+        async fn deprovision(&self, handle: &VolumeHandle) -> agent_api::storage::Result<()> {
+            self.deprovisions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.deprovision(handle).await
+        }
+        async fn describe(
+            &self,
+            handle: &VolumeHandle,
+        ) -> agent_api::storage::Result<agent_api::storage::VolumeState> {
+            self.inner.describe(handle).await
+        }
+        async fn resize(
+            &self,
+            handle: &VolumeHandle,
+            size_bytes: u64,
+        ) -> agent_api::storage::Result<VolumeHandle> {
+            self.inner.resize(handle, size_bytes).await
+        }
+        fn snapshot_support(&self) -> Option<agent_api::storage::SnapshotConsistency> {
+            self.inner.snapshot_support()
+        }
+        async fn snapshot(
+            &self,
+            handle: &VolumeHandle,
+            id: &SnapshotId,
+        ) -> agent_api::storage::Result<VolumeHandle> {
+            self.inner.snapshot(handle, id).await
+        }
+        async fn drop_snapshot(&self, handle: &VolumeHandle) -> agent_api::storage::Result<()> {
+            self.inner.drop_snapshot(handle).await
+        }
+        async fn provision_from(
+            &self,
+            id: &VolumeId,
+            snapshot: &VolumeHandle,
+            spec: &VolumeSpec,
+        ) -> agent_api::storage::Result<VolumeHandle> {
+            self.inner.provision_from(id, snapshot, spec).await
+        }
+        async fn forget(&self, handle: &VolumeHandle) -> agent_api::storage::Result<()> {
+            self.inner.forget(handle).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl agent_api::storage::VolumeAttacher for Counting {
+        async fn attach(
+            &self,
+            handle: &VolumeHandle,
+            cgroup: Option<&agent_api::CgroupHandle>,
+        ) -> agent_api::storage::Result<VolumeAttachment> {
+            self.inner.attach(handle, cgroup).await
+        }
+        async fn detach(
+            &self,
+            handle: &VolumeHandle,
+            attachment: &VolumeAttachment,
+        ) -> agent_api::storage::Result<()> {
+            self.inner.detach(handle, attachment).await
+        }
+        async fn stat(
+            &self,
+            handle: &VolumeHandle,
+            attachment: &VolumeAttachment,
+        ) -> agent_api::storage::Result<agent_api::storage::VolumeState> {
+            self.inner.stat(handle, attachment).await
+        }
+    }
+
+    /// `node`, with the one backend wrapped in [`Counting`].
+    fn counted_node(
+        tag: &str,
+    ) -> (
+        tempfile::TempDir,
+        Volumes,
+        Arc<Store>,
+        std::path::PathBuf,
+        Arc<Counting>,
+    ) {
+        let (temp, volumes, store, dir) = node(tag);
+        let inner = volumes
+            .drivers
+            .storage
+            .get("filesystem")
+            .cloned()
+            .expect("the filesystem backend");
+        let counting = Arc::new(Counting {
+            inner,
+            deprovisions: Default::default(),
+        });
+        let mut drivers = volumes.drivers.clone();
+        drivers
+            .storage
+            .insert("filesystem".to_string(), counting.clone());
+        (
+            temp,
+            Volumes::new(store.clone(), drivers),
+            store,
+            dir,
+            counting,
+        )
+    }
+
+    /// A VM record nobody can read is a VM that may be holding the disk, and
+    /// the node answers accordingly.
+    ///
+    /// Astra finding S11, 2026-09-23. `holder` walked `Store::list`, which
+    /// logs a row it cannot deserialise and passes over it — so one torn
+    /// write turned "a live VMM has this disk open" into "nobody is holding
+    /// it", and the backend was then told to destroy the bytes. The guard
+    /// counts the unreadable row, and the proof that it did is a fake backend
+    /// that saw no call at all: the real one would make the same file either
+    /// way and this test would stay green while the rule was broken.
+    #[tokio::test]
+    async fn a_corrupt_vm_record_still_blocks_a_deprovision() {
+        let (_temp, volumes, store, dir, driver) = counted_node("corrupt-holder");
+        let id = VolumeId::new_v4();
+        volumes.provision(id, spec(4096)).await.expect("made");
+        let path = dir.join(format!("{id}.raw"));
+        assert!(path.exists());
+
+        // Garbage under a VM key: a torn write, or a record from a build
+        // whose struct this one cannot read. It is the VM that holds the
+        // disk, and nothing here can find that out.
+        let vm = agent_api::VmId::new_v4();
+        store
+            .put_raw(&vm.to_string(), b"{\"spec\":")
+            .expect("a raw row");
+
+        let err = volumes
+            .deprovision(id)
+            .await
+            .expect_err("an unreadable record is not an absent one");
+        assert!(
+            err.chain().any(|c| c.is::<HeldByUnreadable>()),
+            "the refusal has to be recognisable and apart from HeldByVm: {err:#}"
+        );
+        assert!(
+            !err.chain().any(|c| c.is::<HeldByVm>()),
+            "and it is NOT the answer the controller heals by itself: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains(&vm.to_string()),
+            "it names the key an operator has to look at: {err:#}"
+        );
+        assert_eq!(driver.deprovisions(), 0, "the backend was never asked");
+        assert!(path.exists(), "the bytes are still there");
+        assert_eq!(
+            volumes.get(&id).unwrap().unwrap().phase,
+            VolumeRecordPhase::Ready,
+            "and the record did not move"
+        );
+
+        // The same row stops a `forget`, which is the other verb that walks
+        // past a holder.
+        let refused = volumes
+            .forget(id)
+            .await
+            .expect_err("forget has the same guard");
+        assert!(refused.chain().any(|c| c.is::<HeldByUnreadable>()));
     }
 }

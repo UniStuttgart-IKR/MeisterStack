@@ -48,6 +48,12 @@ impl Provisioner {
     /// **A VM this node already has is refused.** A migration into a record
     /// that exists is either the same guest twice or a name collision, and
     /// both are worse than not moving.
+    ///
+    /// A ROW that exists is refused too, whether or not this build can read
+    /// it: `Store::get` answers "unknown" for bytes it cannot deserialise,
+    /// which is right for a reader describing the node and wrong for the
+    /// admission check that stands in front of a guest's disks. Astra finding
+    /// S11, 2026-09-23.
     #[instrument(skip(self, spec), fields(vm_id = %id, listen))]
     pub async fn prepare_migration(
         &self,
@@ -56,8 +62,19 @@ impl Provisioner {
         listen: &str,
         managed_by_controller: bool,
     ) -> Result<()> {
-        if self.store.get(&id)?.is_some() {
-            bail!("this node already has a record of vm {id}; it cannot receive it as well");
+        match self.store.row(&id)? {
+            None => {}
+            Some(crate::store::VmRow::Record(..)) => {
+                bail!("this node already has a record of vm {id}; it cannot receive it as well");
+            }
+            Some(crate::store::VmRow::Unreadable(key)) => {
+                bail!(
+                    "this node has a record of vm {key} that it cannot read; it cannot receive \
+                     the vm as well. The row has to be looked at before this node takes the \
+                     guest: receiving over it would build a second vmm on top of whatever it \
+                     describes."
+                );
+            }
         }
         // An inline disk is an instance store: it was MADE with the vm, on
         // the machine the vm was made on, and it has no `Volume` object

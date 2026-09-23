@@ -267,6 +267,13 @@ impl Provisioner {
     /// `managed_by_controller` marks the record as the controller's, which is
     /// what a desired-state snapshot is later allowed to reap. Only the
     /// session path passes true.
+    ///
+    /// A row this build cannot READ is neither of the two cases below. It is
+    /// not a record to apply a diff to and it is emphatically not an absence
+    /// to build over: `Store::get` used to call it absent, so a create landed
+    /// on top of whatever the bytes described — a second VMM, a second set of
+    /// disks, and no record left naming the first. Astra finding S11,
+    /// 2026-09-23.
     #[instrument(skip(self, spec), fields(vm_id = %id))]
     pub async fn provision(
         &self,
@@ -275,6 +282,13 @@ impl Provisioner {
         desired: Desired,
         managed_by_controller: bool,
     ) -> Result<()> {
+        if let Some(crate::store::VmRow::Unreadable(key)) = self.store.row(&id)? {
+            bail!(
+                "this node has a record of vm {key} that it cannot read; it will not create a vm \
+                 over it. The row has to be looked at first: building here would leave whatever \
+                 it describes running with nothing naming it."
+            );
+        }
         if let Some(mut existing) = self.store.get(&id)? {
             info!(desired = ?desired, "vm record exists, applying the volume diff");
             existing.desired = desired;

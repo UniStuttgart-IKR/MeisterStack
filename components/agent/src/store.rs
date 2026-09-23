@@ -124,6 +124,34 @@ impl std::fmt::Display for Closed {
 
 impl std::error::Error for Closed {}
 
+/// One row of the VM table as a GUARD has to take it.
+///
+/// `Store::get` and `Store::list` both answer "unknown, not gone" for a row
+/// they cannot deserialise, and for every reader that describes this node
+/// that is the right answer: a record nothing can read cannot be planned for,
+/// reported or torn down, so the node behaves as though it were not there.
+///
+/// It is the wrong answer for the three callers that are about to DESTROY
+/// something, and that was Astra finding S11, 2026-09-23. `volumes::holder`
+/// walked `list` to ask "is a VM on this node holding this disk", so one
+/// unreadable record turned a `deprovision` of a disk a live VMM had open
+/// into a driver call; the two admission checks read a corrupt row as absent
+/// and let a create or a migration land on top of it. Those three ask the
+/// question this type answers instead: not "what is on this node" but "is
+/// there anything here at all, readable or not".
+pub enum VmRow {
+    /// A row whose key is a uid and whose bytes decode into the record this
+    /// build knows.
+    /// Boxed only to keep the two variants the same size: a `VmRecord` is
+    /// half a kilobyte and the key of a broken row is a string.
+    Record(VmId, Box<VmRecord>),
+    /// A row that is THERE and that this build cannot read — corrupt bytes,
+    /// or a key that is not a uid at all. Carries the key verbatim, because
+    /// an operator has to be told which bytes to look at and a key that does
+    /// not parse has no `VmId` to name it by.
+    Unreadable(String),
+}
+
 pub struct Store {
     /// Behind a lock because it is REPLACED, not because it is shared: redb's
     /// own handle is `Sync` and every operation here took `&self` before. What
@@ -466,6 +494,13 @@ impl Store {
     /// for what the tier above has to act on, and a record only this node can
     /// see is not that. This is the line somebody greps for with `list_raw`
     /// in their other hand.
+    ///
+    /// **A guard may not use this.** "Unknown, not gone" is the right answer
+    /// for a reader that describes the node and the wrong one for a caller
+    /// that is about to destroy something on the strength of it — see
+    /// [`Store::row`] and [`Store::rows`], which are the same two reads with
+    /// the unreadable row kept as an answer of its own. Astra finding S11,
+    /// 2026-09-23.
     pub fn get(&self, id: &VmId) -> anyhow::Result<Option<VmRecord>> {
         self.reading(|db| {
             let id_str = id.to_string();
@@ -518,6 +553,57 @@ impl Store {
             }
             Ok(out)
         })
+    }
+
+    /// What is under this key, with "there is a row and it cannot be read" as
+    /// an answer of its own. See [`VmRow`].
+    ///
+    /// `get` with the one case it folds away kept apart, for the callers that
+    /// may not fold it: an admission check that reads a damaged row as absent
+    /// admits a second guest onto the first one's disks.
+    pub fn row(&self, id: &VmId) -> anyhow::Result<Option<VmRow>> {
+        let id_str = id.to_string();
+        Ok(self
+            .get_raw(id)?
+            .map(|bytes| match serde_json::from_slice::<VmRecord>(&bytes) {
+                Ok(record) => VmRow::Record(*id, Box::new(record)),
+                Err(e) => {
+                    error!(vm_id = %id_str, error = %format!("{e:#}"),
+                           "corrupt record; this vm counts as present, not as absent");
+                    VmRow::Unreadable(id_str.clone())
+                }
+            }))
+    }
+
+    /// Every row of the VM table, decoded where it can be and NAMED where it
+    /// cannot. See [`VmRow`].
+    ///
+    /// `list` with the same case kept apart, and the same argument:
+    /// `volumes::holder` decides whether somebody's disk may be destroyed,
+    /// and a row it passed over is a row that could have been holding it.
+    pub fn rows(&self) -> anyhow::Result<Vec<VmRow>> {
+        Ok(self
+            .list_raw()?
+            .into_iter()
+            .map(|(key, bytes)| {
+                let decoded = key
+                    .parse::<VmId>()
+                    .map_err(|e| format!("{e:#}"))
+                    .and_then(|id| {
+                        serde_json::from_slice::<VmRecord>(&bytes)
+                            .map(|record| VmRow::Record(id, Box::new(record)))
+                            .map_err(|e| format!("{e:#}"))
+                    });
+                match decoded {
+                    Ok(row) => row,
+                    Err(e) => {
+                        error!(key = %key, error = %e,
+                               "corrupt row; it counts as present, not as absent");
+                        VmRow::Unreadable(key)
+                    }
+                }
+            })
+            .collect())
     }
 
     pub fn delete(&self, id: &VmId) -> anyhow::Result<()> {
