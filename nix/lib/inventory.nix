@@ -830,6 +830,13 @@ let
     in
     {
       inherit schema where planDir ports;
+      # The digest of the FILE this evaluation read. `meister-deploy resolve`
+      # compares it with the file `-f` names: a flake that evaluates
+      # `other.toml` while the workstation reads `fleet.toml` would otherwise
+      # write a manifest whose `source.inventory_path` points at a file nobody
+      # evaluated — measured in the lab (L4 finding W3: `keys issue` fell back
+      # to that path and created a CA under the wrong `ca_dir`).
+      sha256 = builtins.hashFile "sha256" file;
       fleet = { name = header.name; inherit domain schema; };
       inherit operator hosts defaults;
       groups = groupsRaw;

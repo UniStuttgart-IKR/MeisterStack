@@ -1,5 +1,6 @@
 {
   "schema": "meister-deploy/nix-manifest/1",
+  "inventory_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "inventory": {
     "fleet": {
       "name": "one-box",

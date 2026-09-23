@@ -240,6 +240,28 @@ fn an_evaluation_that_was_handed_over_is_read_and_nothing_is_evaluated() {
     assert!(sandbox.calls().is_empty(), "{:?}", sandbox.calls());
 }
 
+/// Lab finding W3: the evaluation says which inventory it read, by content.
+/// Handed over, an older evaluation is a warning that names both digests.
+#[test]
+fn an_evaluation_of_another_inventory_is_said_out_loud() {
+    let sandbox = Sandbox::new();
+    // The fixture's digest is all zeros, which is not the sandbox's fleet.toml.
+    let out = sandbox.run(&[
+        "resolve",
+        "--from",
+        "evaluation.json",
+        "--repo",
+        ".",
+        "--out",
+        &sandbox.out("m.json"),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("not the same file"), "{err}");
+    assert!(err.contains("only a warning"), "{err}");
+    assert!(err.contains("fleet.toml"), "{err}");
+}
+
 #[test]
 fn a_manifest_that_was_already_resolved_is_not_an_evaluation() {
     let sandbox = Sandbox::new();

@@ -552,6 +552,9 @@ pub struct NixHost {
 pub struct NixManifest {
     pub schema: String,
     pub inventory: NixInventory,
+    /// sha256 (hex) of the inventory FILE the flake evaluated. `resolve`
+    /// holds the file `-f` names against it (lab finding W3).
+    pub inventory_sha256: String,
     /// Keyed by host id, the same ids as `inventory.hosts`. Two maps rather
     /// than one because the inventory half is cheap and the evaluated half
     /// is not: `resolve --hosts a,b` asks Nix for a subset of this one.
@@ -761,6 +764,10 @@ pub fn resolve(
     }
     let NixManifest {
         schema: _,
+        // Held against the file `-f` names by the caller (main.rs), which is
+        // the one that knows whether the evaluation was made here or handed
+        // over.
+        inventory_sha256: _,
         inventory,
         hosts: evaluated,
         packages,

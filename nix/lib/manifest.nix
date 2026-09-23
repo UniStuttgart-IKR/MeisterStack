@@ -267,6 +267,8 @@ in
   schema = "meister-deploy/nix-manifest/1";
 
   inventory = inventory.manifestInventory;
+  # Which FILE the inventory half came from, by content (nix/lib/inventory.nix).
+  inventory_sha256 = inventory.sha256;
 
   hosts = builtins.listToAttrs (map (id: lib.nameValuePair id (manifestHost id)) ids);
 

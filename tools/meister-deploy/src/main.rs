@@ -1309,6 +1309,38 @@ fn resolve(
             (NixManifest::from_json(&text, &origin)?, origin)
         }
     };
+    // --- lab finding W3 ---
+    // The evaluation names the inventory it read by content; this command
+    // read the file `-f` names. If they differ, `source.inventory_path` would
+    // point at a file nobody evaluated, and everything that reads the
+    // inventory back through the manifest (`keys issue` and its `[operator]
+    // ca_dir`, `plan`'s cli_config, `apply`) would read the wrong one.
+    // Measured in the lab on 2026-09-23: the flake evaluated `lab.toml`, the
+    // default `fleet.toml` went into the manifest, and `keys issue` created a
+    // CA under that file's `ca_dir`. An evaluation that was handed over
+    // (`--from`) is allowed to be older than the file — the placeholder host
+    // keys of a VM test are exactly that — so there it is a warning.
+    if evaluated.inventory_sha256 != tree.source.inventory_sha256 {
+        let what = format!(
+            "the evaluation read an inventory with sha256 {} and this command read {} \
+             (sha256 {}); they are not the same file. The manifest would name a file \
+             nobody evaluated.",
+            evaluated.inventory_sha256, tree.source.inventory_path, tree.source.inventory_sha256
+        );
+        if from.is_some() {
+            eprintln!(
+                "warning: {what} The evaluation was handed over, so this is only a warning: \
+                 whatever changed in {} since it was made is not in this manifest.",
+                tree.source.inventory_path
+            );
+        } else {
+            anyhow::bail!(
+                "{what} Name the inventory the flake evaluates with `-f`, or point the \
+                 flake at this one. Nothing was written."
+            );
+        }
+    }
+    // --- end lab finding W3 ---
     let resolved = manifest::resolve(evaluated, tree.source, tool(), RealClock.now(), selection)?;
 
     files.write_atomic(out, &resolved.to_json()?, 0o644)?;
