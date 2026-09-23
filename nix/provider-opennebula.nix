@@ -385,7 +385,7 @@ in
       # had to carry a module to set a default nobody disagrees with.
       default = !hostOwnsInterface;
       defaultText = lib.literalMD
-        "`false` if this host names a static address for the interface, `true` otherwise";
+        "false if this host names a static address for the interface, true otherwise";
       description = ''
         Whether the provider configures that interface at all.
 
