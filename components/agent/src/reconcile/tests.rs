@@ -984,7 +984,7 @@ async fn a_pass_says_again_whether_the_path_images_of_its_records_are_here() {
         .reconcile_all(Trigger::Periodic)
         .await
         .expect("a pass");
-    let (name, state) = images.report().pop().expect("the pass has an opinion");
+    let (name, state, _digest) = images.report().pop().expect("the pass has an opinion");
     assert_eq!(name, "nixos.raw");
     assert_eq!(state.phase(), "Failed", "the file is not there");
     assert!(
@@ -1247,7 +1247,7 @@ async fn a_volume_record_is_the_other_way_this_node_hears_of_a_path_image() {
     assert!(images.report().is_empty());
 
     provisioner.verify_path_images().await;
-    let (name, state) = images.report().pop().expect("an opinion");
+    let (name, state, _digest) = images.report().pop().expect("an opinion");
     assert_eq!(name, "chaos-img-bad.raw");
     assert_eq!(state.phase(), "Failed", "the file is not in that directory");
     assert_eq!(
@@ -1298,7 +1298,7 @@ async fn a_volume_record_is_the_other_way_this_node_hears_of_a_path_image() {
         !images
             .report()
             .iter()
-            .any(|(name, _)| name == "only-the-tombstone-names-it.raw"),
+            .any(|(name, _, _)| name == "only-the-tombstone-names-it.raw"),
         "a tombstone's base image is nobody's evidence"
     );
 }

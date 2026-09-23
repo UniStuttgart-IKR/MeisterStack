@@ -566,6 +566,31 @@ mod tests {
         assert_eq!(back.routers, vec![report]);
         assert!(back.routers_complete);
     }
+
+    /// A url image reports no digest — its checksum is `spec.sha256`, already
+    /// checked at fetch — and a node older than the field decodes the same
+    /// way: empty, never a claim about the bytes. Astra finding S02,
+    /// 2026-09-23 (rest a).
+    #[test]
+    fn an_images_digest_is_empty_unless_a_node_bound_one() {
+        let image = ImageStateReport {
+            name: "nixos.raw".into(),
+            phase: "Ready".into(),
+            digest: "a".repeat(64),
+            ..Default::default()
+        };
+        let back = ImageStateReport::decode(image.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(back.digest, "a".repeat(64));
+
+        let from_before_the_field = ImageStateReport {
+            digest: String::new(),
+            ..image
+        };
+        let back =
+            ImageStateReport::decode(from_before_the_field.encode_to_vec().as_slice()).unwrap();
+        assert!(back.digest.is_empty());
+    }
+
     /// `reason` on all five reports, both directions, and what a reporter
     /// from before the field looks like.
     ///

@@ -502,6 +502,7 @@ fn a_complete_inventory_that_does_not_name_an_image_says_the_file_is_not_there()
         reason: reason.into(),
         message: String::new(),
         node: node.into(),
+        digest: String::new(),
     };
 
     // Nobody said anything about the image, and both nodes listed everything
@@ -545,6 +546,35 @@ fn a_complete_inventory_that_does_not_name_an_image_says_the_file_is_not_there()
         super::inventory::lines_of("cluster-1", "debian.raw", &[], &names).is_empty(),
         "an incomplete inventory is silence, not absence"
     );
+}
+
+/// A node's reported digest reaches `ImageNodeState` unchanged, and an empty
+/// one — a url image, or a node older than the field — arrives as `None`
+/// rather than as an empty claim.
+///
+/// Astra finding S02, 2026-09-23 (rest a). `first_bound_digest` and
+/// `settle_image`'s rule 2b are what DO something with this value; this is
+/// only the relay that has to hand them one.
+#[test]
+fn a_reported_digest_relays_as_some_and_silence_relays_as_none() {
+    let said = proto::ImageStateReport {
+        name: "nixos.raw".into(),
+        phase: "Ready".into(),
+        reason: String::new(),
+        message: String::new(),
+        node: "agent-1a".into(),
+        digest: "a".repeat(64),
+    };
+    let lines = super::inventory::lines_of("cluster-1", "nixos.raw", &[&said], &[]);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].digest.as_deref(), Some("a".repeat(64).as_str()));
+
+    let quiet_on_digest = proto::ImageStateReport {
+        digest: String::new(),
+        ..said
+    };
+    let lines = super::inventory::lines_of("cluster-1", "nixos.raw", &[&quiet_on_digest], &[]);
+    assert_eq!(lines[0].digest, None, "empty is not a digest of anything");
 }
 
 // --- lane 5A: the session that was already talking -------------------------

@@ -104,12 +104,14 @@ pub(super) fn check_source_kind(spec: &ImageSpec, confined: Option<&str>) -> Res
         return Ok(());
     }
     let Some(tenant) = confined else {
-        // TODO(S02): bind an operator's path registration to the digest the
-        // first node computes of the file, so that the object says which
-        // bytes it stood for and a later swap of the file is visible. The
-        // node would have to report that digest, which is a field on
-        // `ImageStateReport` and a hop through the cluster this change does
-        // not make.
+        // An operator's path registration is bound to the digest the first
+        // node computes of the file (Astra finding S02, 2026-09-23, rest a):
+        // `ImageStateReport.digest`, mirrored unchanged through
+        // `ImageNodeState.digest`, pinned onto `status.digest` by
+        // `first_bound_digest` the first time a node's report carries one,
+        // and held to for ever after by `settle_image`'s rule 2b — a later
+        // report of different bytes under this name fails the image with
+        // `DigestMismatch` rather than going on being `Ready`.
         return Ok(());
     };
     Err(invalid(format!(

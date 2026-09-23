@@ -201,6 +201,23 @@ struct Entry {
     /// nothing here fetches it", which is the one sentence that is certainly
     /// wrong about it.
     fetched: bool,
+    /// The sha256 of a PATH image's bytes, hashed the first time this entry
+    /// went Ready and remembered from then on.
+    ///
+    /// Astra finding S02, 2026-09-23 (rest a). `None` for a fetched entry
+    /// (its digest is `Source::sha256`, already checked at fetch time and not
+    /// worth a second statement) and for a path entry this process has not
+    /// successfully looked at yet.
+    ///
+    /// Computed ONCE per process lifetime and never again while the entry
+    /// stays Ready: `verify_path` runs on every status report and every
+    /// reconcile pass, and hashing a multi-gigabyte image on that schedule
+    /// would turn a `stat` into the cost `take_inventory`'s own doc comment
+    /// goes out of its way to avoid. The trade this makes is the same one the
+    /// fetch cache already makes for its own digest — trusted between looks,
+    /// re-earned on a restart — so a file swapped on shared storage is caught
+    /// at the next agent restart rather than within one report interval.
+    digest: Option<String>,
 }
 
 /// Where the content-addressed copies live, under the image directory so that
@@ -383,18 +400,24 @@ impl Cache {
     /// did not match, a directory under the name, a path with nothing at it.
     /// The inventory adds `Ready` for every file nobody asked about, which is
     /// the half F16 needed.
-    pub fn report(&self) -> Vec<(String, State)> {
+    ///
+    /// The third element is the digest `verify_path` bound, when it has one
+    /// (Astra finding S02, 2026-09-23, rest a). `None` for everything the
+    /// inventory adds on its own: a file nobody's record names is a file this
+    /// node has never been asked to hash, and inventing a look here would
+    /// undo the bound `take_inventory` exists to hold.
+    pub fn report(&self) -> Vec<(String, State, Option<String>)> {
         let known = self.known.lock().unwrap();
-        let mut out: Vec<(String, State)> = known
+        let mut out: Vec<(String, State, Option<String>)> = known
             .iter()
-            .map(|(name, entry)| (name.clone(), entry.state.clone()))
+            .map(|(name, entry)| (name.clone(), entry.state.clone(), entry.digest.clone()))
             .collect();
         if let Some(held) = self.inventory.lock().unwrap().as_ref() {
             out.extend(
                 held.names
                     .iter()
                     .filter(|name| !known.contains_key(*name))
-                    .map(|name| (name.clone(), State::Ready)),
+                    .map(|name| (name.clone(), State::Ready, None)),
             );
         }
         // Sorted so two consecutive reports of the same facts are the same
@@ -413,7 +436,20 @@ impl Cache {
             .is_some_and(|entry| entry.fetched)
     }
 
-    fn remember(&self, name: &str, state: State, fetched: bool) {
+    /// The digest already remembered for `name`, if this process has one.
+    ///
+    /// Read before [`remember`] overwrites the entry, so a path image's
+    /// digest survives every look after the first that found one. See
+    /// [`Entry::digest`].
+    fn known_digest(&self, name: &str) -> Option<String> {
+        self.known
+            .lock()
+            .unwrap()
+            .get(name)
+            .and_then(|entry| entry.digest.clone())
+    }
+
+    fn remember(&self, name: &str, state: State, fetched: bool, digest: Option<String>) {
         let previous = self
             .known
             .lock()
@@ -423,6 +459,7 @@ impl Cache {
                 Entry {
                     state: state.clone(),
                     fetched,
+                    digest,
                 },
             )
             .map(|entry| entry.state);
@@ -463,16 +500,31 @@ impl Cache {
     /// that is not there. Measured on the fleet, unchanged since 2026-08-29:
     /// `image with a nonexistent source sits in phase 'Ready', not Failed`.
     ///
-    /// A `stat`, and deliberately no more. Whether the bytes are the RIGHT
-    /// bytes is a question only a checksum answers, and a path image has none
-    /// by construction — that is what distinguishes it from a URL image. What
-    /// this can say is the half that was missing and is worth everything: the
-    /// file is there, or it is not and here is the path that was looked at.
+    /// A `stat`, on every look but the first that finds the bytes there. What
+    /// this can say without more is the half that was missing and is worth
+    /// everything: the file is there, or it is not and here is the path that
+    /// was looked at.
     ///
     /// Level-triggered like everything else this node reports: called on every
     /// provision that names the image AND once per reconcile pass over the
     /// records that name it, so an image restored on shared storage goes back
     /// to `Ready` without anybody creating a VM to prove it.
+    ///
+    /// ## The digest, and why it is not a `stat`'s cost
+    ///
+    /// Astra finding S02, 2026-09-23 (rest a). A path image has no checksum
+    /// by construction — that is what distinguishes it from a URL image —
+    /// so nothing bound the catalogue name to particular bytes until this
+    /// existed. The FIRST look that finds the file hashes it and remembers
+    /// the digest on the entry; every look after that, on the same entry,
+    /// reuses the remembered value rather than hashing again. Re-hashing on
+    /// this schedule — every report and every reconcile pass — would turn a
+    /// `stat` into exactly the cost `take_inventory`'s own doc comment goes
+    /// out of its way to avoid, for a multi-gigabyte image. The cost this
+    /// keeps instead: a file swapped on shared storage after this node's
+    /// first look is not caught until the agent restarts and looks again,
+    /// exactly the trust the content-addressed fetch cache already extends
+    /// between uses of its own.
     pub async fn verify_path(&self, name: &str) {
         // An image this node FETCHED is not a path image, whatever a record
         // calls it. See `Entry::fetched`: the digest is what verified those
@@ -500,7 +552,26 @@ impl Cache {
                 ),
             },
         };
-        self.remember(name, state, false);
+        let digest = match &state {
+            State::Ready => match self.known_digest(name) {
+                Some(digest) => Some(digest),
+                None => match hash_local_file(&path, self.bounds.deadline).await {
+                    Ok(digest) => Some(digest),
+                    Err(e) => {
+                        // Not fatal to the look: the file is there, which is
+                        // what F16 needed, and an unhashable file is worth a
+                        // debug line rather than turning a present image into
+                        // a failed one over a statement nothing requires yet.
+                        debug!(image = %name, error = %e,
+                               "the base image could not be hashed; reporting it present \
+                                without a digest");
+                        None
+                    }
+                },
+            },
+            State::Failed { .. } => None,
+        };
+        self.remember(name, state, false, digest);
     }
 
     /// Make sure this image is on the node, fetching it if it is not.
@@ -512,7 +583,11 @@ impl Cache {
     pub async fn ensure(&self, source: &Source) -> Result<()> {
         match self.ensure_inner(source).await {
             Ok(()) => {
-                self.remember(&source.name, State::Ready, true);
+                // No digest here: `source.sha256` already IS the checked
+                // digest of these bytes, so `Image.status.digest` — which
+                // exists to bind a PATH image nothing else checks — has
+                // nothing to add for one that arrived with its own checksum.
+                self.remember(&source.name, State::Ready, true, None);
                 Ok(())
             }
             Err(failure) => {
@@ -524,6 +599,7 @@ impl Cache {
                         message: format!("{e:#}"),
                     },
                     true,
+                    None,
                 );
                 Err(e)
             }
@@ -751,6 +827,51 @@ fn check_uid(uid: &str) -> Result<()> {
         bail!("image uid {uid:?} is not a uid");
     }
     Ok(())
+}
+
+/// Hash a file already on this node's disk, for a path image's first look.
+///
+/// Astra finding S02, 2026-09-23 (rest a). Streamed in fixed-size chunks
+/// exactly like [`drain`] hashes a download, so the whole file is never held
+/// in memory at once.
+///
+/// Under a deadline for the same reason [`fetch`]'s read loop is (Astra
+/// finding S15): a path image is, by its own definition, somebody else's
+/// file on SHARED storage, and a mount that has wedged would otherwise park
+/// this call on a `read` that never returns. `bounds.deadline` is reused
+/// rather than given a config key of its own — it is already the "how long
+/// may this node wait on bytes it did not ask a server for" number, and a
+/// second one next to it would be a second knob nobody has a reason to set
+/// differently.
+async fn hash_local_file(path: &Path, deadline: Duration) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let work = async {
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("opening {}", path.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .await
+                .with_context(|| format!("reading {}", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok::<String, anyhow::Error>(format!("{:x}", hasher.finalize()))
+    };
+    match tokio::time::timeout(deadline.saturating_add(BOUND_GRACE), work).await {
+        Ok(result) => result,
+        Err(_) => bail!(
+            "hashing {} did not finish within {}s and was stopped",
+            path.display(),
+            deadline.as_secs()
+        ),
+    }
 }
 
 /// Read the URL into `into`, hashing as it goes; the digest comes back.
@@ -1165,7 +1286,7 @@ mod tests {
         assert!(images.join(CACHE_DIR).join(&source.sha256).exists());
         assert_eq!(
             cache.report(),
-            vec![("ubuntu.raw".to_string(), State::Ready)]
+            vec![("ubuntu.raw".to_string(), State::Ready, None)]
         );
 
         // A second use with the origin GONE: nothing is fetched, because
@@ -1296,7 +1417,7 @@ mod tests {
 
         // And the node says so, with the reason, for the status report.
         match &cache.report()[..] {
-            [(name, State::Failed { reason, message })] => {
+            [(name, State::Failed { reason, message }, _digest)] => {
                 assert_eq!(name, "ubuntu.raw");
                 assert!(message.contains("checksum mismatch"), "{message}");
                 // And in the word, so the catalogue can tell this apart from
@@ -1416,15 +1537,16 @@ mod tests {
         std::fs::create_dir(images.join("not-an-image")).expect("a directory");
 
         assert!(cache.take_inventory().await, "the directory can be read");
-        let mut said: Vec<(String, State)> = cache.report();
+        let mut said: Vec<(String, State, Option<String>)> = cache.report();
         said.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             said,
             vec![
-                ("nixos.raw".to_string(), State::Ready),
-                ("ubuntu.raw".to_string(), State::Ready),
+                ("nixos.raw".to_string(), State::Ready, None),
+                ("ubuntu.raw".to_string(), State::Ready, None),
             ],
-            "two files, and nothing that is not one of them"
+            "two files, and nothing that is not one of them — and no digest for either: the \
+             inventory only reads the directory, it never looks at a file's bytes"
         );
 
         // A LOOK at one of them, and it disagrees with the file being there:
@@ -1438,8 +1560,9 @@ mod tests {
                 message: "checksum mismatch for ubuntu.raw".into(),
             },
             true,
+            None,
         );
-        let mut said: Vec<(String, State)> = cache.report();
+        let mut said: Vec<(String, State, Option<String>)> = cache.report();
         said.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(said[0].0, "nixos.raw");
         assert_eq!(said[0].1, State::Ready);
@@ -1454,7 +1577,7 @@ mod tests {
         let said = cache.report();
         let bad = said
             .iter()
-            .find(|(name, _)| name == "chaos-img-bad.raw")
+            .find(|(name, _, _)| name == "chaos-img-bad.raw")
             .expect("a line");
         assert_eq!(bad.1.reason(), Some(ImageReason::NotFound));
 
@@ -1494,8 +1617,9 @@ mod tests {
         assert!(cache.report().is_empty());
 
         cache.verify_path("nixos.raw").await;
-        let (name, state) = cache.report().pop().expect("one opinion");
+        let (name, state, digest) = cache.report().pop().expect("one opinion");
         assert_eq!(name, "nixos.raw");
+        assert_eq!(digest, None, "nothing was there to hash");
         let State::Failed {
             reason,
             message: why,
@@ -1514,13 +1638,19 @@ mod tests {
         );
 
         // Somebody puts the bytes there. The next look says so — no create,
-        // no restart, no second command.
+        // no restart, no second command — and Astra finding S02, 2026-09-23
+        // (rest a): this same first look is what binds the catalogue name to
+        // a digest for the first time.
         std::fs::write(images.join("nixos.raw"), b"an image").expect("the bytes");
         cache.verify_path("nixos.raw").await;
         assert_eq!(
             cache.report(),
-            vec![("nixos.raw".to_string(), State::Ready)],
-            "the registry follows the file"
+            vec![(
+                "nixos.raw".to_string(),
+                State::Ready,
+                Some(digest_of(b"an image"))
+            )],
+            "the registry follows the file, and now hashes it"
         );
 
         // A directory under the name is not an image, and saying `Ready`
@@ -1537,5 +1667,42 @@ mod tests {
         };
         assert!(why.contains("is a directory"), "{why}");
         assert_eq!(reason, ImageReason::NotAFile);
+    }
+
+    /// A path image's digest is hashed once and trusted afterwards — even
+    /// past a swap this process never re-reads for.
+    ///
+    /// Astra finding S02, 2026-09-23 (rest a). The cost this avoids is real:
+    /// `verify_path` runs on every status report and every reconcile pass,
+    /// and re-hashing a multi-gigabyte image on that schedule would be worse
+    /// than the problem it closes. The trade that buys is stated here rather
+    /// than left implicit — a file swapped on shared storage keeps the OLD
+    /// digest until this process restarts.
+    #[tokio::test]
+    async fn a_path_images_digest_is_bound_once_and_trusted_after_that() {
+        let (_temp, images) = scratch("digest-once");
+        let cache = Cache::new(images.clone());
+
+        std::fs::write(images.join("nixos.raw"), b"the original bytes").expect("the bytes");
+        cache.verify_path("nixos.raw").await;
+        let (_, _, first) = cache.report().pop().expect("one opinion");
+        assert_eq!(first, Some(digest_of(b"the original bytes")));
+
+        // The bytes change underneath the same path, without a restart.
+        std::fs::write(images.join("nixos.raw"), b"different bytes now").expect("swapped");
+        cache.verify_path("nixos.raw").await;
+        let (_, state, second) = cache.report().pop().expect("still one opinion");
+        assert_eq!(state, State::Ready, "the file is still there");
+        assert_eq!(
+            second, first,
+            "the remembered digest, not a re-hash of the new bytes"
+        );
+
+        // A fresh `Cache` — this process's stand-in for a restart — has no
+        // memory of the first look and binds to what is actually there now.
+        let restarted = Cache::new(images.clone());
+        restarted.verify_path("nixos.raw").await;
+        let (_, _, after_restart) = restarted.report().pop().expect("one opinion");
+        assert_eq!(after_restart, Some(digest_of(b"different bytes now")));
     }
 }

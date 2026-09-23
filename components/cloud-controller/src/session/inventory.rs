@@ -79,6 +79,14 @@ pub(super) async fn ingest_images(
                 // so there is exactly one rule for "is this image usable" and
                 // it cannot be written down in two places again.
                 i.status.nodes = merged.clone();
+                // Pinned once, inside the same read-modify-write `mutate`
+                // already is: a second cluster reporting the same image at
+                // the same moment re-reads `i.status.digest` fresh on every
+                // retry, so the first write to land is the one that decides
+                // it. Astra finding S02, 2026-09-23 (rest a).
+                if i.status.digest.is_none() {
+                    i.status.digest = controller_api::first_bound_digest(&merged);
+                }
             })
             .await;
         match result {
@@ -122,6 +130,8 @@ pub(super) fn lines_of(
             phase: ImagePhaseKind::Failed,
             reason: controller_api::ImageReason::NotFound,
             message: Some(format!("{node} has no file named {name}")),
+            // Nothing was hashed: this line is a silence, not a look.
+            digest: None,
         });
     }
     mine.sort_by(|a, b| (&a.cluster, &a.name).cmp(&(&b.cluster, &b.name)));
@@ -190,6 +200,9 @@ fn node_states(
             phase,
             reason,
             message,
+            // Relayed and not re-derived, the same rule `reason` follows.
+            // Astra finding S02, 2026-09-23 (rest a).
+            digest: (!line.digest.is_empty()).then(|| line.digest.clone()),
         });
     }
     nodes
@@ -220,6 +233,12 @@ fn merged_lines(
 /// else needs. Every cluster reports every ten seconds and almost every
 /// report says what the last one said; a write per report would churn etcd
 /// revisions while nothing about the image happened.
+///
+/// `digest` is compared for the same reason every other field is: an agent
+/// that upgrades mid-fleet starts reporting one for a name that was already
+/// `Ready` under the old binary, and that IS a change — the one `ingest_images`
+/// has to write for `first_bound_digest` ever to see it. Astra finding S02,
+/// 2026-09-23 (rest a).
 pub(super) fn same_node_states(
     a: &[controller_api::ImageNodeState],
     b: &[controller_api::ImageNodeState],
@@ -231,6 +250,7 @@ pub(super) fn same_node_states(
                 && x.phase == y.phase
                 && x.reason == y.reason
                 && x.message == y.message
+                && x.digest == y.digest
         })
 }
 

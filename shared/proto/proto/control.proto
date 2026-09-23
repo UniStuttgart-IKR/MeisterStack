@@ -459,6 +459,21 @@ message ImageStateReport {
   //
   // Empty for `Ready` and from every node that predates the field.
   string reason = 5;
+  // The sha256 this node computed for a PATH image's bytes, the first time
+  // it found them present and Ready.
+  //
+  // Astra finding S02, 2026-09-23 (rest a). A path registration names a file
+  // nobody had ever hashed — that is what distinguishes it from a url image,
+  // which carries `spec.sha256` from the moment it is created — so nothing
+  // bound the catalogue name to particular bytes. The cloud pins the first
+  // one it sees onto `Image.status.digest` and holds every later report to
+  // it; see `settle_image`.
+  //
+  // Empty for a url image (already bound by its own checksum, which this
+  // field would only repeat), for a node that has not looked yet, and for a
+  // node older than this field. None of those may be read as a claim about
+  // the bytes — only a non-empty value is one.
+  string digest = 6;
 }
 
 message NodeStatus {
