@@ -228,6 +228,13 @@ pub enum BootMode {
     /// inside, no boot menu, and the next boot is the provider's fact and
     /// not the guest's.
     Direct,
+    // --- lane 5C ---
+    /// The machine boots itself out of a loader this flake did not
+    /// install: grub on an MBR disk. The switch rollback works; there is
+    /// no boot rollback, because `bootctl set-oneshot` is what one is made
+    /// of. Every VM built from `packages.managed-disk-image` is this.
+    Grub,
+    // --- end lane 5C ---
 }
 
 impl BootMode {
@@ -235,6 +242,7 @@ impl BootMode {
         match self {
             BootMode::Uefi => "uefi",
             BootMode::Direct => "direct",
+            BootMode::Grub => "grub",
         }
     }
 }

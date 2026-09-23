@@ -105,6 +105,20 @@ pub enum BootMode {
     Uefi,
     /// Kernel, initrd and command line come from outside the machine.
     Direct,
+    // --- lane 5C ---
+    /// The machine boots itself out of a loader this flake does not
+    /// install and cannot drive: grub on an MBR disk, which is what
+    /// `packages.managed-disk-image` makes and what every VM started from
+    /// such an image is.
+    ///
+    /// It keeps the switch rollback, which is userland and works
+    /// unchanged, and it has no boot rollback: `bootctl set-oneshot` is
+    /// what a boot rollback is made of, and grub has no equivalent. So a
+    /// release that changes the boot half is moved with `--mode switch`
+    /// and then rebooted, and if the machine does not come up the way back
+    /// is grub's own menu and a person at a console.
+    Grub,
+    // --- end lane 5C ---
 }
 
 impl BootMode {
@@ -112,6 +126,7 @@ impl BootMode {
         match self {
             BootMode::Uefi => "uefi",
             BootMode::Direct => "direct",
+            BootMode::Grub => "grub",
         }
     }
 
@@ -121,15 +136,24 @@ impl BootMode {
         match text {
             "uefi" => Ok(BootMode::Uefi),
             "direct" => Ok(BootMode::Direct),
+            "grub" => Ok(BootMode::Grub),
+            // --- lane 5C ---
+            // The word somebody will try, and it is not the value: this
+            // flake does not install a BIOS machine, it only deploys to
+            // one that already boots. `grub` says that out loud.
             "bios" => bail!(
-                "boot = \"bios\": v1 installs uefi or direct; a BIOS host keeps grub through \
-                 its own host module and has no boot fallback, because `bootctl set-oneshot` \
-                 is what a boot fallback is made of and grub has no equivalent."
+                "boot = \"bios\": this flake installs uefi or direct, and it deploys to a \
+                 machine that already has grub — that value is `grub`. The difference is who \
+                 made the loader: `meister-install` writes systemd-boot or nothing at all, \
+                 and a grub host brings its own (its image, or its host module). A grub host \
+                 has no boot fallback either way, because `bootctl set-oneshot` is what a \
+                 boot fallback is made of."
             ),
+            // --- end lane 5C ---
             other => bail!(
                 "boot = {other:?}: a host of this fleet boots uefi (it has an ESP and a boot \
-                 menu of its own) or direct (a hypervisor hands it kernel, initrd and command \
-                 line)."
+                 menu of its own), direct (a hypervisor hands it kernel, initrd and command \
+                 line) or grub (it boots itself out of a loader this flake did not install)."
             ),
         }
     }
@@ -1258,6 +1282,41 @@ deployment = "nixos"
 roles = ["agent"]"#,
         );
         parse(&text).expect("one cloud, two of its hosts");
+    }
+
+    #[test]
+    fn a_host_that_brings_its_own_loader_has_a_word_for_it() {
+        // L2 finding N4: `packages.managed-disk-image` makes a legacy-MBR
+        // grub guest, the inventory knew `uefi` and `direct` and nothing
+        // else, and calling such a host `uefi` made `apply` ask the helper
+        // for a boot fallback it has not got.
+        assert_eq!(BootMode::parse("grub").unwrap(), BootMode::Grub);
+        assert_eq!(BootMode::Grub.as_str(), "grub");
+
+        let text = fixture().replace(
+            r#"roles = ["cloud", "addons"]"#,
+            "boot = \"grub\"\nroles = [\"cloud\", \"addons\"]",
+        );
+        let inventory = parse(&text).unwrap();
+        assert_eq!(
+            inventory.effective("cloud-a").unwrap().boot,
+            BootMode::Grub,
+            "precedence carries it like every other setting"
+        );
+        // And the round trip through the contract's own spelling.
+        let json = serde_json::to_string(&BootMode::Grub).unwrap();
+        assert_eq!(json, "\"grub\"");
+        assert_eq!(
+            serde_json::from_str::<crate::manifest::BootMode>(&json).unwrap(),
+            crate::manifest::BootMode::Grub
+        );
+    }
+
+    #[test]
+    fn bios_is_still_refused_and_now_names_the_value_that_exists() {
+        let err = BootMode::parse("bios").unwrap_err().to_string();
+        assert!(err.contains("that value is `grub`"), "{err}");
+        assert!(err.contains("no boot fallback"), "{err}");
     }
 
     // --- end lane 5C ---

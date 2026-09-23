@@ -786,6 +786,21 @@ impl<'a> Installer<'a> {
                  Then enrol it with `meister-deploy keys enroll {} --fingerprint {}`.",
                 target.host, target.host, installed.host_key_fingerprint
             ),
+            // --- lane 5C ---
+            // Unreachable in practice and written out all the same: a grub
+            // host is one this tool deploys TO and never installs, and the
+            // plan refuses `--kind install` for it before anything gets
+            // here (nix/lib/inventory.nix says the same thing to the other
+            // half). A `_ =>` would make the next boot mode somebody adds
+            // silently print a uefi sentence.
+            BootMode::Grub => format!(
+                "power off and remove the medium. This host is declared `boot = \"grub\"`, \
+                 which is a machine that brings its own loader — `meister-install` installed \
+                 none. Make it bootable by hand, then enrol it with `meister-deploy keys \
+                 enroll {} --fingerprint {}`.",
+                target.host, installed.host_key_fingerprint
+            ),
+            // --- end lane 5C ---
         };
         outcome.installed = Some(installed);
         Ok((outcome, summary))
@@ -984,6 +999,13 @@ pub fn sheet(record: &MediaRecord, target: &SheetFacts) -> String {
              … \n--host {} --kind direct-boot`).\n",
             record.host, record.host
         ),
+        // --- lane 5C ---
+        BootMode::Grub => format!(
+            "Afterwards {} has no boot loader from this installer: `boot = \"grub\"` is a\n\
+             machine that brings its own, and this flake installs none for it.\n",
+            record.host
+        ),
+        // --- end lane 5C ---
     });
     if !target.preserve.is_empty() {
         out.push_str(&format!(

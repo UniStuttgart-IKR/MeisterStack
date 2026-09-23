@@ -39,13 +39,27 @@ let
   # boot loader at all and has no boot-mode rollback; what it keeps is the
   # switch rollback, which is userland and works unchanged.
   #
-  # `bios` is deliberately not one of them: a grub host has no `bootctl` and
-  # therefore no way back from a boot that does not come up, and installing a
-  # boot loader whose rollback this tool cannot arrange would be a guarantee
-  # it cannot keep. A BIOS machine can still be a host of this fleet — it
-  # keeps grub through its own host module — it is just not one this flake
-  # installs.
-  knownBootModes = [ "uefi" "direct" ];
+  # --- lane 5C ---
+  # `grub` is the third: a machine that boots ITSELF out of a loader this
+  # flake did not install and cannot drive. Every VM made from
+  # `packages.managed-disk-image` is one — legacy MBR, grub, no ESP — and
+  # the lab found (L2, 2026-09-23) that there was no word for it: calling
+  # such a host `uefi` made `apply` hand the helper `--mode boot`, and the
+  # helper refused, correctly, with "bootctl says systemd-boot is not
+  # installed". Every release that changed the kernel then stopped there,
+  # so such a host was not deployable at all.
+  #
+  # What `grub` keeps is the switch rollback, which is userland; what it
+  # does not have is the boot rollback, because `bootctl set-oneshot` is
+  # what one is made of. D5 called that a documented limit and this is the
+  # word that documents it. It is NOT a mode this flake installs — the
+  # assertion below says so — because installing a loader whose rollback
+  # this tool cannot arrange would be a guarantee it cannot keep.
+  #
+  # `bios` is deliberately not a value: it describes firmware, and the
+  # question here is who wrote the boot menu.
+  knownBootModes = [ "uefi" "direct" "grub" ];
+  # --- end lane 5C ---
 
   # The order roles are DEPLOYED in, and therefore the order they are written
   # in: the bottom tier first, so that a controller never issues a command the
@@ -340,13 +354,33 @@ let
             # somebody will try and the reason it is refused is not obvious
             # from a list of two words.
             ++ (lib.optional (h.boot == "bios")
-              ("${where}: host ${h.id} asks for boot = \"bios\". v1 installs uefi or direct; "
-                + "a BIOS host keeps grub through its own host module and has no boot "
-                + "fallback, because `bootctl set-oneshot` is what a boot fallback is made "
+              ("${where}: host ${h.id} asks for boot = \"bios\". This flake installs uefi or "
+                + "direct, and it deploys to a machine that already has grub — that value is "
+                + "\"grub\". A grub host has no boot "
+                + "fallback either way, because `bootctl set-oneshot` is what a boot fallback is made "
                 + "of and grub has no equivalent."))
             ++ (lib.optional (h.boot != "bios" && !(builtins.elem h.boot knownBootModes))
               ("${where}: host ${h.id} has boot = ${builtins.toJSON h.boot}; a host of this "
                 + "fleet boots " + lib.concatStringsSep " or " knownBootModes))
+            # --- lane 5C ---
+            # A grub host is one this flake DEPLOYS TO and never installs:
+            # `meister-install` writes systemd-boot (uefi) or no loader at
+            # all (direct), and installing a loader whose rollback this tool
+            # cannot arrange would be a guarantee it cannot keep. `grub` is
+            # for a machine that is already bootable — a guest from
+            # packages.managed-disk-image, or a box somebody installed by
+            # hand — and such a machine has no install table.
+            #
+            # Here and not in `assertions` below, because this is a fact
+            # about the inventory and needs no host to be evaluated: the
+            # sentence has to reach somebody running `validate`, not
+            # somebody building a system.
+            ++ (lib.optional (h.boot == "grub" && h.install != null)
+              ("${where}: host ${h.id} has boot = \"grub\" AND an install table. This flake "
+                + "installs uefi (systemd-boot) or direct (no loader at all); a grub host "
+                + "brings its own loader, which is why it has no boot fallback. Drop the "
+                + "install table, or set boot = \"uefi\" and give the layout an ESP."))
+            # --- end lane 5C ---
             ++ (lib.optional (h.install != null && !(h.install ? layout))
               ("${where}: host ${h.id} has an install table without a layout. The layout is "
                 + "the disko module that decides the partition table, named relative to this "
@@ -594,6 +628,16 @@ let
           # mkDefault throughout: a host module may say something else and
           # answer for it — a BIOS box keeps grub that way, and then it has
           # no boot-mode rollback either.
+          #
+          # --- lane 5C ---
+          # `grub`: nothing, and that is the whole value. The loader is
+          # already on the machine — a legacy-MBR guest image, or a box
+          # somebody installed by hand — and this flake neither writes it
+          # nor drives it. `boot.loader.grub.enable` stays at the mkDefault
+          # below so that the image module or the host module that OWNS
+          # that loader is the one that says so, with a `grub.device` this
+          # inventory cannot know.
+          # --- end lane 5C ---
           boot.loader.systemd-boot.enable = lib.mkDefault (h.boot == "uefi");
           boot.loader.efi.canTouchEfiVariables = lib.mkDefault (h.boot == "uefi");
           boot.loader.grub.enable = lib.mkDefault false;

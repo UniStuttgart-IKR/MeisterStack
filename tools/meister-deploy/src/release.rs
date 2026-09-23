@@ -414,12 +414,14 @@ pub fn bind(
                  command line, and a release that names none of them is a release nobody can \
                  boot that host from."
             ),
-            (Some(_), crate::manifest::BootMode::Uefi) => bail!(
-                "a direct-boot bundle was built for {id} and its manifest says it boots uefi. \
-                 A uefi host reads its own boot menu; the bundle would be a directory nothing \
-                 ever loads."
+            // --- lane 5C: and the same for grub, which also reads its own
+            // menu — somebody else's menu, on the machine's own disk.
+            (Some(_), mode) => bail!(
+                "a direct-boot bundle was built for {id} and its manifest says it boots \
+                 {mode}. Such a host reads a boot menu of its own; the bundle would be a \
+                 directory nothing ever loads."
             ),
-            (None, crate::manifest::BootMode::Uefi) => {}
+            (None, _) => {} // --- end lane 5C ---
         }
 
         // An image only exists where the evaluation said there would be one.
