@@ -817,6 +817,45 @@ impl EtcdStore {
         )))
     }
 
+    /// `mutate`, for a caller whose `name` came off a listing that may
+    /// already be stale.
+    ///
+    /// Astra finding S20, 2026-09-23: `mutate` re-reads BY NAME on every
+    /// retry and reapplies the closure without asking whether the name still
+    /// names the object the caller resolved `uid` from. A cached listing
+    /// (`VmIndex` and its like) can be seconds old, so between the read that
+    /// produced `uid` and the write that finally lands, the name may have
+    /// been freed and taken by an unrelated object — same shape as the
+    /// ABA `delete_if` guards against, one level up: a write instead of a
+    /// delete. `uid` is checked after EVERY get, including retries, because
+    /// a recreation can happen between any two of them.
+    pub async fn mutate_if<T, F>(&self, name: &str, uid: &str, mut f: F) -> Result<T>
+    where
+        T: Resource,
+        F: FnMut(&mut T),
+    {
+        for _ in 0..8 {
+            let mut obj: T = self.get(name).await?;
+            if obj.metadata().uid != uid {
+                return Err(StoreError::Conflict(format!(
+                    "resource version conflict on {resource}/{name} (recreated under the same \
+                     name)",
+                    resource = T::RESOURCE
+                )));
+            }
+            f(&mut obj);
+            match self.update(&obj).await {
+                Ok(o) => return Ok(o),
+                Err(StoreError::Conflict(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(StoreError::Conflict(format!(
+            "resource version conflict on {resource}/{name} (retries exhausted)",
+            resource = T::RESOURCE
+        )))
+    }
+
     /// Hard delete — the finalizer flow soft-deletes via update first.
     pub async fn delete<T: Resource>(&self, name: &str) -> Result<()> {
         let key = self.key(T::RESOURCE, name);

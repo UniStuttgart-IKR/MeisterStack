@@ -689,6 +689,77 @@ async fn a_report_on_a_superseded_session_changes_nothing() {
     assert_eq!(now.status.capacity.vcpus, 32);
 }
 
+/// Astra finding S20, 2026-09-23: `ingest_phases` is handed a VM listing that
+/// can be seconds stale (`VmIndex`), and it checks the binding — whether the
+/// reporting node still speaks for the vm — against THAT snapshot. Between
+/// the snapshot and the write, the vm can be rebound to a different node, and
+/// a delayed report from the old one must not land on it: `mutate_if`'s
+/// closure re-checks the binding against the object it just re-read, not
+/// against the stale snapshot `changed()` matched the report to.
+///
+/// `#[ignore]`: the ingest writes the store, and the workspace's ordinary run
+/// has no etcd. See `two_replicas_assigning_at_once_hand_out_two_namespaces`.
+#[tokio::test]
+#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+async fn a_report_from_the_old_node_does_not_land_after_the_vm_was_rebound() {
+    let endpoint =
+        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+    let prefix = format!("/rebind-test/{}", uuid::Uuid::new_v4());
+    let store = EtcdStore::connect(&[endpoint], &prefix)
+        .await
+        .expect("an etcd to talk to");
+
+    // Bound to n1, and the snapshot `ingest_phases` is handed below is taken
+    // HERE — before the rebind, exactly the staleness a cached `VmIndex` can
+    // have in production.
+    let mut web = vm("u-web");
+    web.spec.node_name = Some("n1".into());
+    let created = store.create(&web).await.expect("the vm");
+    let stale_snapshot = vec![created];
+
+    // Rebound to n2 before n1's delayed report is ingested. The listing
+    // above still says n1 — that is the staleness this finding is about.
+    store
+        .mutate::<Vm, _>("u-web", |v| v.spec.node_name = Some("n2".into()))
+        .await
+        .expect("rebound to n2");
+
+    let report = StatusReport {
+        vms: vec![proto::VmStatusReport {
+            phase: "Failed".into(),
+            ..line("u-web")
+        }],
+        ..Default::default()
+    };
+    let ours = |v: &Vm| {
+        v.spec
+            .node_name
+            .as_deref()
+            .is_none_or(|bound| bound == "n1")
+    };
+    ingest_phases(
+        &store,
+        "n1",
+        &stale_snapshot,
+        &report,
+        ours,
+        chrono::Utc::now(),
+    )
+    .await;
+
+    let after: Vm = store.get("u-web").await.expect("the vm");
+    assert!(
+        after.status.reported.is_none(),
+        "n1's report must not land on a vm now bound to n2: {:?}",
+        after.status.reported
+    );
+    assert_eq!(
+        after.spec.node_name.as_deref(),
+        Some("n2"),
+        "and the rebind itself stands"
+    );
+}
+
 // --- lane 5A: the session that was already talking -------------------------
 
 /// A live agent session on a certificate that has just been taken back is
