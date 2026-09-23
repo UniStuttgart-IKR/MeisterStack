@@ -546,9 +546,15 @@ pkgs.testers.runNixOSTest {
     ]
     print("stage evidence: " + json.dumps(staged, indent=2))
     assert any("as the release says" in line for line in staged), staged
-    assert any(
-        "allowed to fetch" in line and "http://192.168.1.1:8080" in line for line in staged
-    ), staged
+    # The "allowed to fetch" line is written only when a copy happened. In
+    # this frame the shared test store already holds B, so `stage` finds it
+    # "on target" and copies nothing — measured at gate M4. What CAN be
+    # held here: whenever the executor does say it, it names the host's
+    # own substituter and no other. The transfer itself is L2's.
+    fetch_lines = [line for line in staged if "allowed to fetch" in line]
+    assert all("http://192.168.1.1:8080" in line for line in fetch_lines), staged
+    print(f"stage: {len(fetch_lines)} fetch line(s); on target: "
+          + str(any("is on target" in line for line in staged)))
     # --- end lane 4C ---
     assert target.succeed("meister-activate --json lock show").strip() == "null"
     assert json.loads(target.succeed("meister-activate --json txn list")) == []
