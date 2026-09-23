@@ -1214,6 +1214,69 @@ fn sending_observation() -> crate::reconcile::Observed {
     }
 }
 
+/// Astra finding S06, 2026-09-23: a guest that is already being sent is not
+/// sent again.
+///
+/// Two migration RECORDS for one vm reach the cluster's `prepare` —
+/// `create_vm_migration` mints one per name and refuses nothing — so the
+/// second one dispatches `MigrateOut` for a guest whose transfer is already
+/// in the air. The marker was written over whatever was there, so the record
+/// then named the SECOND address while the first transfer was still running
+/// to the first: `finish_migrate_out` would have written its outcome against
+/// an address the guest never went to, and cloud-hypervisor would have been
+/// asked to send one guest to two machines at once.
+#[tokio::test]
+async fn a_second_migrate_out_for_a_vm_already_sending_is_refused() {
+    let (_temp, root) = migration_root("mig-twice");
+    let store = Arc::new(crate::store::Store::open(&root.join("src.redb")).expect("a store"));
+    // Accepts the send and never lets the process go, so the transfer is
+    // still under way when the second command arrives.
+    let hv = Arc::new(MigratingVmm::that_fails_mid_send());
+    let p = Arc::new(migrating_provisioner(&root, store.clone(), hv.clone()));
+    let id = VmId::new_v4();
+    p.provision(id, migratable_spec(&store), Desired::Running, true)
+        .await
+        .expect("a running vm");
+
+    let ops = tokio::sync::Mutex::new(());
+    p.begin_migrate_out(&id, "tcp:10.0.0.9:49000", &ops)
+        .await
+        .expect("the stream is open");
+
+    let refused = p
+        .begin_migrate_out(&id, "tcp:10.0.0.11:49000", &ops)
+        .await
+        .expect_err("a guest is sent to one machine at a time");
+    let why = format!("{refused:#}");
+    assert!(
+        why.contains("tcp:10.0.0.9:49000"),
+        "and the refusal names the transfer that is running: {why}"
+    );
+
+    // The peer is unchanged. It is what the watcher of the first send writes
+    // its outcome against, and what the tier above reads off the heartbeat.
+    let record = store.get(&id).expect("a lookup").expect("a record");
+    assert!(
+        matches!(
+            &record.operation,
+            Some(crate::types::Operation::MigratingOut { peer }) if peer == "tcp:10.0.0.9:49000"
+        ),
+        "{:?}",
+        record.operation
+    );
+
+    // And the VMM was asked to send exactly once.
+    assert_eq!(
+        hv.said()
+            .iter()
+            .filter(|said| said.starts_with("migrate_out"))
+            .count(),
+        1,
+        "{:?}",
+        hv.said()
+    );
+}
+
 /// D18, the shutdown half: a stopping agent gives back a VMM that is waiting
 /// for a guest — and keeps the ones that are running one.
 ///

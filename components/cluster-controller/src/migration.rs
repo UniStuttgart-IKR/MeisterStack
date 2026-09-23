@@ -116,6 +116,36 @@ pub fn phase_for(migrations: &[VmMigration], vm: &Vm) -> Option<VmMigrationPhase
         .find(|p| controller_api::second_open_is_a_migration(Some(*p)))
 }
 
+/// Does another record already name this VM and not be finished with it?
+///
+/// The rule `start_for_drain` has always kept for the road it owns — "at most
+/// one in flight per VM" — as a value, so that the other road can keep it
+/// too and so that it can be checked without a store.
+///
+/// Astra finding S06, 2026-09-23: `create_vm_migration` is idempotent by
+/// NAME and refuses nothing else, so two operators, or one operator and a
+/// retry under a fresh name, file two records for one guest. Both reach
+/// `prepare`, both choose a destination, and the second one's destination
+/// refuses the VM it already has a record of — a refusal this tier reads as
+/// "the destination could not open the disks" and answers with `abandon`,
+/// which destroys by the VM's uid on the node that is holding the FIRST
+/// migration's receiving VMM.
+///
+/// Every non-final record counts, `Pending` included, which is deliberate: a
+/// record that has not been acted on yet is one that will be acted on within
+/// the tick, and this is a question asked one line before a claim. So two
+/// records filed for one guest end with at most one of them building a
+/// destination, and in the worst case — two replicas asking in the same
+/// instant — with both failed and saying why. That is a pair of records an
+/// operator can act on, which the alternative was not.
+fn another_attempt_in_flight(all: &[VmMigration], mine: &VmMigration) -> bool {
+    all.iter().any(|m| {
+        m.metadata.name != mine.metadata.name
+            && m.spec.vm == mine.spec.vm
+            && !m.status.phase().kind().is_final()
+    })
+}
+
 /// What the DESTINATION says about a guest that is moving to it.
 ///
 /// Its own ingest, in its own file, and it exists because `ingest_status`'s
@@ -492,6 +522,40 @@ async fn prepare(
         Err(why) => return fail(store, migration, why).await,
     };
 
+    // One guest is moved once. Astra finding S06, 2026-09-23: the claim CAS
+    // below is per MIGRATION, and two migration OBJECTS for one VM each win
+    // their own — `create_vm_migration` mints a record per name and refuses
+    // nothing, and the "at most one in flight" rule existed only inside
+    // `start_for_drain`. What the second attempt then did was not a second
+    // wasted preparation: the destination's agent refuses a VM it already has
+    // a record of (`prepare_migration`), this tier reads that refusal as "the
+    // destination could not open the disks", and `abandon` sends `Destroy`
+    // BY THE VM's UID — to the node that is holding the first migration's
+    // receiving VMM. The first move loses its destination to the second
+    // attempt's tidy-up.
+    //
+    // Read immediately before the claim, so that the window between the
+    // question and the answer is as short as this tier can make it, and
+    // `fail` rather than a quiet return: an operator who asked twice is owed
+    // a record saying which record is carrying the move.
+    let siblings: Vec<VmMigration> = match store.list().await {
+        Ok(m) => m,
+        Err(StoreError::NotFound(_)) => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    if another_attempt_in_flight(&siblings, migration) {
+        return fail(
+            store,
+            migration,
+            format!(
+                "another migration record for vm {} has not finished; one guest moves once, so \
+                 this record ends here and the other one carries the move",
+                migration.spec.vm
+            ),
+        )
+        .await;
+    }
+
     // The claim before the command, exactly as every other dispatch in this
     // tree: a CAS that loses means another replica is already preparing this
     // migration, and two replicas preparing one migration would build two
@@ -562,6 +626,11 @@ async fn prepare(
     store
         .mutate::<VmMigration, _>(&name, |m| {
             let phase = m.status.phase().kind();
+            // The field and the sentence in one write, so that no pass can
+            // ever see one without the other. The sentence is what a person
+            // reads; the field is what `send` reads — see `peer_of`, and
+            // Astra finding S05 on `status.peer`.
+            m.status.peer = Some(peer.clone());
             m.status.reported = Some(controller_api::VmMigrationReported::here(
                 phase,
                 controller_api::VmMigrationReason::Dispatched,
@@ -681,7 +750,8 @@ pub(crate) fn machines_that_fit<'a>(
 ///   * **a named node is a hard requirement.** Somebody who writes
 ///     `--to agent-3` is asking about agent-3; quietly using agent-4 would
 ///     answer a question they did not ask. So a named node is checked and
-///     never chosen from.
+///     never chosen from — and CHECKED means the same word it means for a
+///     node the scheduler would have picked, which is `feasible`.
 fn choose_target(
     scheduler: &dyn Scheduler,
     vm: &Vm,
@@ -693,19 +763,29 @@ fn choose_target(
     let elsewhere: Vec<Candidate> = all.iter().filter(|c| c.name != source).cloned().collect();
     match named {
         Some(named) => {
-            let Some(candidate) = elsewhere.iter().find(|c| {
-                c.name == named
-                    && c.connected
-                    && c.schedulable
-                    && common::capability::offers(
-                        &c.catalogue,
-                        common::capability::HYPERVISOR,
-                        None,
-                    )
-            }) else {
+            // `feasible` and not a list of its own. Astra finding S07,
+            // 2026-09-23: this branch used to ask four questions —
+            // connected, schedulable, offers a hypervisor, not the source —
+            // where the scheduler's own admission asks ten. So a node that
+            // was up and willing took a guest it had no room for, or that
+            // its labels did not select, or that a required anti-affinity
+            // term forbade, or that had said itself it was wedged. What the
+            // guest met on arrival was the agent refusing it, after the
+            // disks had been opened there and a VMM built. One predicate for
+            // both roads is what keeps "can this node take this vm" from
+            // meaning two things depending on who asked.
+            //
+            // The hypervisor is still in it: every VM's `DevicePolicy` asks
+            // for one, so `feasible` answers that question too, and a
+            // storage-only node is refused by name exactly as before.
+            let Some(candidate) = controller_api::feasible(vm, &elsewhere)
+                .into_iter()
+                .find(|c| c.name == named)
+            else {
                 return Err(format!(
                     "node {named} cannot take this vm: it must be connected, schedulable, \
-                     running a hypervisor, and not the node the vm is already on"
+                     healthy, running a hypervisor, with room for this vm and the labels it \
+                     selects, and not the node the vm is already on"
                 ));
             };
             // And the question no amount of capacity answers: can this
@@ -765,32 +845,35 @@ async fn send(
     ) else {
         return fail(store, migration, "this migration has no ends".to_string()).await;
     };
-    let Some(peer) = migration
-        .status
-        .phase()
-        .message()
-        .and_then(|m| m.rsplit_once(" at ").map(|(_, peer)| peer.to_string()))
-    else {
-        // The address is written down in the sentence the prepare step left,
-        // and a Preparing migration without one is a controller that died
-        // between the command and the write. Nothing has been done to the
-        // source, so tearing the destination down and failing is safe and
-        // says more than waiting would.
-        return abandon(
-            store,
-            dispatch,
-            migration,
-            vm,
-            &target,
-            "the destination's address was lost before the source was told".to_string(),
-        )
-        .await;
-    };
+    let peer = peer_of(&migration.status);
 
+    // The budget first, and the missing address only after it. Astra finding
+    // S05, 2026-09-23: this was the other way round, and there is no leader
+    // here — `prepare` writes `Preparing` by CAS BEFORE it opens the disks at
+    // the destination and blocks on `PrepareMigration`, and the address
+    // reaches the record seconds later. Every other replica passes through
+    // this function once per TICK (5 s) meanwhile, read "no address" as "the
+    // controller died between the command and the write", and tore down a
+    // destination that was being built correctly. A prepare that still has
+    // time is a prepare in progress, whatever it has managed to write down.
     if let Some(over) = overdue(migration, timeouts.prepare) {
-        let why = format!("the destination was not ready after {over}s");
+        let why = match &peer {
+            Some(_) => format!("the destination was not ready after {over}s"),
+            // Past the budget and still no address: now the old sentence is
+            // the true one. Nothing has been done to the source, so tearing
+            // the destination down is safe.
+            None => format!(
+                "the destination's address never reached this record, and {target} was not \
+                 ready after {over}s"
+            ),
+        };
         return abandon(store, dispatch, migration, vm, &target, why).await;
     }
+    let Some(peer) = peer else {
+        debug!(migration = %name, node = %target,
+               "the destination has not said where to send yet; it still has time");
+        return Ok(());
+    };
 
     let mut claimed = migration.clone();
     claimed.status.reported = Some(controller_api::VmMigrationReported::here(
@@ -925,6 +1008,68 @@ enum Verdict {
     TouchNothing(String),
 }
 
+/// What is to be done when the transfer budget is spent and the destination
+/// has still not reported the guest.
+///
+/// The sibling of `still_here` and pure for the same reason: it decides
+/// whether a VMM on another machine is torn down, and a decision that can
+/// only be reached through a store is a decision nobody checks.
+///
+/// Two answers, and the line between them is the one `abandon` draws — a
+/// destination that CANNOT hold the guest may be tidied up, and one that
+/// might hold the only copy may not. Three readings go into it:
+///
+///   * **the source said `Gone`.** It dropped the vmm pid and detached the
+///     volumes when its send finished; no guest is being served there. So
+///     whatever the destination has or has not said yet, the destination is
+///     the only machine that can hold this guest, and nothing here is
+///     touched.
+///   * **the destination has said nothing, or `Provisioning`.** It holds no
+///     guest. That word can be trusted because the agent reports it off the
+///     GUEST rather than off its own bookkeeping: a destination whose VMM
+///     says Running reports Running, whatever its record still says. Tear it
+///     down; the source is serving the guest as it was throughout.
+///   * **anything else.** Both ends may claim the vm. A VMM left standing on
+///     the destination is a leak; a guest destroyed is not something you get
+///     back.
+///
+/// Astra finding S04, 2026-09-23: only the second and third readings were
+/// here, so `SEND_GONE` — written by the source and carried to
+/// `status.sourceReported` by `ingest_departures` — was read nowhere in this
+/// tier. A send that completed while the destination's first report was
+/// still in flight therefore ended in `abandon`: the destination was
+/// destroyed by the VM's uid, and the record said "{source} is running the vm
+/// as before" about a machine that had just let the guest go. That sentence
+/// was true of no machine at all.
+fn verdict_on_timeout(
+    source: &str,
+    target: &str,
+    over: i64,
+    source_reported: Option<&str>,
+    target_reported: Option<&str>,
+) -> Verdict {
+    let said = target_reported.unwrap_or("nothing at all");
+    if source_reported == Some(controller_api::resources::SEND_GONE) {
+        return Verdict::TouchNothing(format!(
+            "the guest had not arrived on {target} after {over}s, and {source} says it let the \
+             guest go; the destination last said {said}. {source} is not serving this vm any \
+             more, so {target} may hold the only copy and nothing here has been torn down — \
+             look at both before deleting anything"
+        ));
+    }
+    if matches!(target_reported, None | Some("Provisioning")) {
+        return Verdict::TearDownTheDestination(format!(
+            "the guest had not arrived on {target} after {over}s; it said {said} and holds no \
+             guest, so it has been torn down and {source} is running the vm as before"
+        ));
+    }
+    Verdict::TouchNothing(format!(
+        "the guest had not arrived on {target} after {over}s; the destination last said {said}, \
+         so it may hold the guest and nothing here has been torn down — look at {source} and \
+         {target} before deleting anything"
+    ))
+}
+
 /// `Running` -> `Succeeded`: the destination says it has the guest, so the
 /// binding moves and the source's record goes.
 ///
@@ -967,37 +1112,20 @@ async fn settle(
         };
         // Out of time, and now the one question that decides what may be
         // done about it: **can the destination possibly have this guest?**
-        //
-        // Two answers are safe to tear down. Silence means the destination
-        // never even got a record. `Provisioning` means it has a record and
-        // no guest — and that word can be trusted because the agent reports
-        // it off the GUEST and not off its own phase: a destination whose
-        // VMM says Running reports Running, whatever its bookkeeping still
-        // says. Both are the same tidy-up every failure before the send
-        // takes.
-        //
-        // Every other answer is one where the destination may hold the only
-        // copy, and then nothing here may touch it: the source gave the guest
-        // up when it sent. The migration fails with a sentence naming both
-        // machines and a person looks. A VMM left standing on the destination
-        // is a leak; a guest destroyed is not something you get back.
-        let said = migration.status.target_reported.as_deref();
-        let empty = matches!(said, None | Some("Provisioning"));
-        if empty {
-            let why = format!(
-                "the guest had not arrived on {target} after {over}s; it said {} and holds no \
-                 guest, so it has been torn down and {source} is running the vm as before",
-                said.unwrap_or("nothing at all")
-            );
-            return abandon(store, dispatch, migration, vm, &target, why).await;
-        }
-        let why = format!(
-            "the guest had not arrived on {target} after {over}s; the destination last said \
-             {}, so it may hold the guest and nothing here has been torn down — look at \
-             {source} and {target} before deleting anything",
-            said.unwrap_or("nothing at all")
-        );
-        return fail(store, migration, why).await;
+        // The answer is `verdict_on_timeout`, where it can be checked
+        // without a store.
+        return match verdict_on_timeout(
+            &source,
+            &target,
+            over,
+            migration.status.source_reported.as_deref(),
+            migration.status.target_reported.as_deref(),
+        ) {
+            Verdict::TearDownTheDestination(why) => {
+                abandon(store, dispatch, migration, vm, &target, why).await
+            }
+            Verdict::TouchNothing(why) => fail(store, migration, why).await,
+        };
     }
 
     // The binding, by CAS onto the object this pass read. A conflict is
@@ -1292,6 +1420,32 @@ fn peer_from(payload: &[u8]) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("the destination named no address to send to"))
 }
 
+/// The address to send to, off the migration's own status — or `None` while
+/// the destination has not named one.
+///
+/// Pure, because it is what `send` decides on and `send` needs a store.
+///
+/// Two readings, and the field wins. Astra finding S05, 2026-09-23: the
+/// address used to exist only inside the `Preparing` sentence, scraped back
+/// out with `rsplit_once(" at ")` — so a reader depended on the wording of a
+/// message written for a person, and "preparing agent-2" (the sentence
+/// `prepare` writes at its CAS, before the destination has been asked
+/// anything) read as an address of "agent-2" for any target whose name
+/// happened to contain " at ". `status.peer` is the field; the sentence stays
+/// as the fallback for records written before it existed, and for nothing
+/// else.
+fn peer_of(status: &VmMigrationStatus) -> Option<String> {
+    if let Some(peer) = status.peer.as_deref().filter(|p| !p.is_empty()) {
+        return Some(peer.to_string());
+    }
+    status
+        .phase()
+        .message()
+        .and_then(|m| m.rsplit_once(" is listening at "))
+        .map(|(_, peer)| peer.to_string())
+        .filter(|p| !p.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1356,6 +1510,66 @@ mod tests {
                 phase.as_str()
             );
         }
+    }
+
+    /// Astra finding S06, 2026-09-23: a second record for one guest is
+    /// refused before it claims a destination.
+    ///
+    /// `create_vm_migration` mints a record per NAME and says nothing about
+    /// how many name one vm, so two of them reach `prepare`. The second one's
+    /// destination refuses the vm it already has a record of, this tier reads
+    /// that as "the destination could not open the disks", and `abandon`
+    /// destroys BY THE VM's UID — on the node that is holding the first
+    /// migration's receiving VMM.
+    #[test]
+    fn a_second_record_for_one_guest_never_reaches_a_destination() {
+        let mine = migration("web-1", VmMigrationPhaseKind::Pending);
+        let sibling = |vm: &str, phase| {
+            let mut m = migration(vm, phase);
+            m.metadata.name = format!("{vm}-y");
+            m
+        };
+
+        // Nothing else on file, and the record's own entry in the list: this
+        // migration is the one carrying the move.
+        assert!(!another_attempt_in_flight(&[], &mine));
+        assert!(
+            !another_attempt_in_flight(std::slice::from_ref(&mine), &mine),
+            "a record is not another attempt at itself"
+        );
+
+        // Every phase that is not an ending, `Pending` included: a record
+        // nothing has acted on yet is one that will be acted on inside the
+        // tick, and this is asked one line before a claim.
+        for phase in [
+            VmMigrationPhaseKind::Pending,
+            VmMigrationPhaseKind::Preparing,
+            VmMigrationPhaseKind::Running,
+        ] {
+            assert!(
+                another_attempt_in_flight(&[sibling("web-1", phase)], &mine),
+                "{}",
+                phase.as_str()
+            );
+        }
+
+        // And the two endings, which have let go of both machines.
+        for phase in [
+            VmMigrationPhaseKind::Succeeded,
+            VmMigrationPhaseKind::Failed,
+        ] {
+            assert!(
+                !another_attempt_in_flight(&[sibling("web-1", phase)], &mine),
+                "{}",
+                phase.as_str()
+            );
+        }
+
+        // Another guest's move is not this guest's business.
+        assert!(!another_attempt_in_flight(
+            &[sibling("web-2", VmMigrationPhaseKind::Running)],
+            &mine
+        ));
     }
 
     /// Somebody else's migration is not this vm's permission — neither
@@ -1470,6 +1684,57 @@ mod tests {
         assert!(why.contains("agent-1"), "{why}");
     }
 
+    /// Astra finding S07, 2026-09-23: "checked" means the same thing for a
+    /// node somebody named as for a node the scheduler would have picked.
+    ///
+    /// The branch above used to ask four questions where `feasible` asks ten,
+    /// so `--to agent-3` sent a guest to a machine with no room for it, or
+    /// one whose labels the vm does not select, or one that had said itself
+    /// it was wedged. Each of those was found out on ARRIVAL — after the
+    /// disks were opened at the destination and a VMM was built there — and
+    /// each is now a sentence about agent-3 before anything is built.
+    #[test]
+    fn a_named_node_must_also_be_feasible() {
+        let mut big = vm("web-1");
+        big.spec.vm = serde_json::json!({"vcpus": 4, "memory_mib": 4096});
+        let refused = |fleet: &[Candidate], vm: &Vm| {
+            choose_target(&FirstFit, vm, "agent-1", Some("agent-3"), fleet)
+                .expect_err("agent-3 cannot take this guest")
+        };
+
+        // Feasible, and the named node is answered with.
+        let fleet = vec![node("agent-1"), node("agent-2"), node("agent-3")];
+        assert_eq!(
+            choose_target(&FirstFit, &big, "agent-1", Some("agent-3"), &fleet),
+            Ok("agent-3".to_string())
+        );
+
+        // Too little room. agent-2 has plenty and is not quietly used.
+        let mut full = fleet.clone();
+        full[2].free = controller_api::Capacity {
+            vcpus: 1,
+            mem_mib: 512,
+        };
+        let why = refused(&full, &big);
+        assert!(why.contains("agent-3") && !why.contains("agent-2"), "{why}");
+
+        // The machine said itself something is wrong with it. A guest sent
+        // into that is a guest sent into a node that is about to be drained.
+        let mut wedged = fleet.clone();
+        wedged[2].unhealthy = vec!["StoreUnhealthy".to_string()];
+        let why = refused(&wedged, &big);
+        assert!(why.contains("agent-3") && !why.contains("agent-2"), "{why}");
+
+        // And the labels this vm selects, which agent-3 does not carry.
+        let mut picky = big.clone();
+        picky
+            .spec
+            .node_selector
+            .insert("rack".to_string(), "b".to_string());
+        let why = refused(&fleet, &picky);
+        assert!(why.contains("agent-3") && !why.contains("agent-2"), "{why}");
+    }
+
     /// A node with no hypervisor is storage and nothing else, and a guest
     /// cannot be sent to it however much room it has.
     #[test]
@@ -1565,6 +1830,13 @@ mod tests {
 
         // Nothing said, and the two words that are not a failure: this
         // function has no opinion and the timeout below it is still the rule.
+        //
+        // `Gone` stays in this list after Astra finding S04, 2026-09-23, and
+        // for the reason it was always here: `still_here` answers ONE
+        // question — did the source keep the guest — and a source that let it
+        // go did not. What changed is that "the timeout below it" no longer
+        // ignores the word: `verdict_on_timeout` reads it, and the test below
+        // is where `Gone` is now argued.
         for said in [None, Some("Sending"), Some("Gone")] {
             assert_eq!(still_here("agent-1", "agent-2", &status(said, None)), None);
         }
@@ -1597,5 +1869,161 @@ mod tests {
         assert!(why.contains("two machines claim one vm"), "{why}");
         assert!(why.contains("nothing here has been torn down"), "{why}");
         assert!(why.contains("Running"), "and what each of them said: {why}");
+    }
+
+    /// Astra finding S04, 2026-09-23: a source that said `Gone` has let the
+    /// guest go, so the destination is the only machine that can still hold
+    /// it — whatever it has managed to report by the time the budget runs
+    /// out.
+    ///
+    /// The word travelled this far already: the agent writes it after
+    /// `finish_migrate_out` has dropped the vmm pid and detached the volumes,
+    /// and `ingest_departures` puts it on `status.sourceReported`. Nothing
+    /// read it. So a send that completed while the destination's first report
+    /// was still in flight was tidied up by uid — and the record said
+    /// "agent-1 is running the vm as before" about a machine that was not
+    /// running it.
+    #[test]
+    fn a_source_that_let_the_guest_go_leaves_the_destination_alone() {
+        let verdict = |source_said: Option<&str>, target_said: Option<&str>| {
+            verdict_on_timeout("agent-1", "agent-2", 150, source_said, target_said)
+        };
+
+        // The source is gone. Neither silence nor `Provisioning` from the
+        // destination makes it safe to destroy anything.
+        for target_said in [None, Some("Provisioning")] {
+            let Verdict::TouchNothing(why) = verdict(Some("Gone"), target_said) else {
+                panic!("a destination is not torn down when the source let the guest go");
+            };
+            assert!(why.contains("agent-1") && why.contains("agent-2"), "{why}");
+            assert!(why.contains("let the guest go"), "{why}");
+            assert!(
+                !why.contains("running the vm as before"),
+                "and it does not claim the source still serves it: {why}"
+            );
+        }
+
+        // The source never said it was gone: silence, or a send still under
+        // way. Then the destination holding no guest is the old reading and
+        // the old tidy-up.
+        for source_said in [None, Some("Sending")] {
+            let Verdict::TearDownTheDestination(why) = verdict(source_said, None) else {
+                panic!("a destination with no guest is tidied up");
+            };
+            assert!(why.contains("nothing at all"), "{why}");
+            assert!(why.contains("agent-1 is running the vm as before"), "{why}");
+        }
+
+        // And the third reading, unchanged: the destination said something
+        // that is not `Provisioning`, so both ends may claim the vm.
+        let Verdict::TouchNothing(why) = verdict(None, Some("Running")) else {
+            panic!("a destination that may hold the guest is not torn down");
+        };
+        assert!(why.contains("may hold the guest"), "{why}");
+    }
+
+    /// Astra finding S05, 2026-09-23: the address to send to is a FIELD, and
+    /// the sentence is only what records written before the field have.
+    ///
+    /// The sentence `prepare` writes at its claim — "preparing agent-2" —
+    /// names no address at all, and reading one out of it is what made a
+    /// replica that saw a prepare in progress believe the address had been
+    /// lost.
+    #[test]
+    fn the_address_to_send_to_is_a_field_and_the_sentence_is_only_a_fallback() {
+        // Through `settle`, because `status.phase` is derived and private
+        // since struktur 4: a `reported` written by hand is not a phase until
+        // the object has been settled, which is what a read off the store
+        // does.
+        let said = |message: &str| {
+            let mut m = migration("web-1", VmMigrationPhaseKind::Preparing);
+            m.status.reported = Some(controller_api::VmMigrationReported::here(
+                VmMigrationPhaseKind::Preparing,
+                controller_api::VmMigrationReason::Dispatched,
+                Some(message.to_string()),
+                Utc::now(),
+            ));
+            m.settle(Utc::now());
+            m.status
+        };
+
+        // The claim's own sentence, which is every prepare's first word: no
+        // address has been named yet, and none is invented.
+        assert_eq!(peer_of(&said("preparing agent-2")), None);
+        assert_eq!(peer_of(&VmMigrationStatus::default()), None);
+
+        // An old record, from before the field: the sentence is all there is.
+        assert_eq!(
+            peer_of(&said("agent-2 is listening at tcp:10.0.0.5:49000")),
+            Some("tcp:10.0.0.5:49000".to_string())
+        );
+
+        // And with both, the field wins — it is what the destination
+        // answered, rather than what was written about it.
+        let mut both = said("agent-2 is listening at tcp:10.0.0.5:49000");
+        both.peer = Some("tcp:10.0.0.9:49000".to_string());
+        assert_eq!(peer_of(&both), Some("tcp:10.0.0.9:49000".to_string()));
+    }
+
+    /// Astra finding S05, 2026-09-23: a prepare that is still inside its
+    /// budget is left alone, whatever it has managed to write down.
+    ///
+    /// There is no leader in this tier (`dispatch.rs`) and TICK is 5 s, so
+    /// every replica reaches `send` for this migration while the prepare it
+    /// did not start is still opening disks at the destination and blocking
+    /// on `PrepareMigration`. Reading "no address" as "the address was lost"
+    /// made each of those passes tear down a destination that was being
+    /// built correctly — and the vm here is two seconds old against a thirty
+    /// second budget.
+    #[tokio::test]
+    async fn a_prepare_that_has_not_named_its_address_yet_is_given_its_budget() {
+        // The source is dialled into this replica, so a command for it would
+        // land in `rx` rather than going anywhere. The store is never asked
+        // anything if this pass does what it should — which is the other half
+        // of what is asserted, since every write below would fail against it.
+        let registry = std::sync::Arc::new(crate::session::SessionRegistry::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        registry.attach("agent-1", &tx);
+        let store = EtcdStore::connect(&["http://127.0.0.1:1".to_string()], "/migration-test")
+            .await
+            .expect("the etcd client is built lazily");
+        let dispatch = Dispatch::new(
+            registry,
+            std::sync::Arc::new(
+                EtcdStore::connect(&["http://127.0.0.1:1".to_string()], "/migration-test")
+                    .await
+                    .expect("the etcd client is built lazily"),
+            ),
+            std::sync::Arc::new(crate::logs::Forward {
+                cluster: "cluster-1".into(),
+                sibling: controller_api::forward::Sibling {
+                    serves_tls: false,
+                    tls: None,
+                },
+            }),
+        );
+
+        let mut m = migration("web-1", VmMigrationPhaseKind::Preparing);
+        m.status.source_node = Some("agent-1".to_string());
+        m.status.target_node = Some("agent-2".to_string());
+        m.status.started_at = Some(Utc::now() - chrono::Duration::seconds(2));
+        m.status.reported = Some(controller_api::VmMigrationReported::here(
+            VmMigrationPhaseKind::Preparing,
+            controller_api::VmMigrationReason::Dispatched,
+            Some("preparing agent-2".to_string()),
+            Utc::now(),
+        ));
+        m.settle(Utc::now());
+
+        send(&store, &dispatch, Timeouts::default(), &m, &vm("web-1"))
+            .await
+            .expect("a prepare with time left is not this pass's to end");
+
+        // Nothing went to the source, and nothing went to the destination
+        // either — no `MigrateOut`, and above all no `Destroy`.
+        assert!(
+            rx.try_recv().is_err(),
+            "a prepare inside its budget is left alone"
+        );
     }
 }
