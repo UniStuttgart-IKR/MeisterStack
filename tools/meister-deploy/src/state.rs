@@ -486,6 +486,17 @@ pub fn current_operator() -> Operator {
 /// A lock this run already holds is not an error: a verb that acquires
 /// twice inside one run — `plan` then `apply --resume` — is asking whether
 /// it may write, and the answer is yes.
+///
+/// Astra finding F04, 2026-09-23: it was the answer to a second LIVE process
+/// of the same run as well, and that is the one reading of it that is wrong.
+/// Two `apply --resume <run>` at once both came through this door, and the
+/// journal is what paid for it: each writer seeds its sequence counter from
+/// the file it read when it started, so both hand out the same numbers and
+/// the next `fold` refuses the whole journal with "this journal goes
+/// backwards". The run is then neither readable nor resumable. So the
+/// shortcut now asks WHICH process is meant — this one, or one that is
+/// demonstrably not on this machine any more, which is what a resume after
+/// a kill is.
 pub fn acquire_lock(
     files: &dyn Files,
     state: &StateDir,
@@ -502,7 +513,32 @@ pub fn acquire_lock(
             // Somebody was faster, or a run is in progress. Which of the two
             // it is, the file says.
             match read_lock(files, state)? {
-                Some(held) if held.run_id == run_id => Ok(held),
+                // This very process asking again, or a run whose process is
+                // gone — the shape `apply --resume` has after a kill. A run
+                // id that is the same and a process that is still running is
+                // a SECOND writer, and it is refused like any other.
+                Some(held)
+                    if held.run_id == run_id
+                        && (held.pid == std::process::id()
+                            || held.liveness(operator) != Liveness::Running) =>
+                {
+                    Ok(held)
+                }
+                // The same run, and somebody else is running it right now.
+                // The refusal below would tell this operator to resume the
+                // run they are already resuming, so it gets a sentence of
+                // its own.
+                Some(held) if held.run_id == run_id => bail!(
+                    "the run {run_id} is already being carried on by the process {} on {} \
+                     (operator {}, since {}). Two processes writing one run write one journal \
+                     twice and make it unreadable, so this one did nothing. Wait for that \
+                     process, or take the run over with `--takeover {run_id}` once you know \
+                     it is gone.",
+                    held.pid,
+                    held.workstation,
+                    held.operator,
+                    held.acquired_at.to_rfc3339()
+                ),
                 Some(held) => bail!("{}", held.refusal(operator, run_id)),
                 // The file is there and cannot be read as a lock record.
                 // Nothing here rewrites it: a file in this place that this
@@ -551,6 +587,21 @@ pub fn release_lock(files: &dyn Files, state: &StateDir, run_id: &str) -> Result
 /// out of it is how they say which run they mean. A takeover that accepted
 /// "whatever is in the file" would take over a run that started in the
 /// meantime.
+///
+/// Astra finding F04, 2026-09-23: reading the owner, removing it and
+/// creating a new one is three steps, and two takeovers that both read the
+/// old owner could both go through them. The loser's `remove_file` then took
+/// away the WINNER'S fresh lock — after which both processes believed they
+/// held the repository, which is the state this file exists to make
+/// impossible.
+///
+/// So the claim is a rename and no longer a remove. Every taker renames the
+/// lock to a name of its own (`lock.taken-by-<run>`), and a rename of a file
+/// that is not there fails: of two takers, exactly one carries the old
+/// record away. Only then is it read, and a taker that finds it was not the
+/// run it named puts it back with `create_new` — which cannot overwrite
+/// anything, so a third lock that appeared meanwhile survives and is
+/// reported.
 pub fn take_over_lock(
     files: &dyn Files,
     state: &StateDir,
@@ -559,18 +610,53 @@ pub fn take_over_lock(
     operator: &Operator,
     now: DateTime<Utc>,
 ) -> Result<LockRecord> {
-    match read_lock(files, state)? {
-        None => acquire_lock(files, state, run_id, operator, now),
+    let path = state.lock_path();
+    if !files.exists(&path) {
+        return acquire_lock(files, state, run_id, operator, now);
+    }
+    let claim = path.with_file_name(format!("lock.taken-by-{run_id}"));
+    files.rename(&path, &claim).with_context(|| {
+        format!(
+            "the lock on {} could not be taken over; another takeover was here first, or the \
+             run gave it back while you were reading.",
+            path.display()
+        )
+    })?;
+    let bytes = files.read(&claim)?;
+    let taken = serde_json::from_slice::<LockRecord>(&bytes).ok();
+    match taken {
         Some(held) if held.run_id == of_run => {
-            files.remove_file(&state.lock_path())?;
+            files.remove_file(&claim)?;
             acquire_lock(files, state, run_id, operator, now)
         }
-        Some(held) => bail!(
-            "this repository is held by run {}, not by {of_run}. Nothing was taken over: \
-             --takeover names the run it takes over so that it cannot take over one that \
-             started while you were reading.",
-            held.run_id
-        ),
+        // Not the run that was named. It goes back exactly as it was, and
+        // `create_new` is what puts it there: it refuses to overwrite, so a
+        // lock that somebody took in this window is not lost either.
+        other => {
+            let restored = files.create_new(&path, &bytes, 0o644);
+            let whose = match &other {
+                Some(held) => format!("by run {}", held.run_id),
+                None => "by a file this tool did not write".to_string(),
+            };
+            match restored {
+                Ok(()) => {
+                    // It is back where it was, so the claim is rubbish.
+                    files.remove_file(&claim)?;
+                    bail!(
+                        "this repository is held {whose}, not by {of_run}. Nothing was taken \
+                         over: --takeover names the run it takes over so that it cannot take \
+                         over one that started while you were reading."
+                    )
+                }
+                Err(e) => bail!(
+                    "this repository is held {whose}, not by {of_run}, and the lock could not \
+                     be put back ({e:#}) because something else took {} in the meantime. \
+                     Nothing was taken over; the record that was there is in {}.",
+                    path.display(),
+                    claim.display()
+                ),
+            }
+        }
     }
 }
 
@@ -1368,7 +1454,123 @@ mod tests {
             at("2026-09-21T12:05:00Z"),
         )
         .unwrap();
-        assert_eq!(first, again, "a resume of the same run holds the same lock");
+        // This process asking twice, which is what `plan` then `apply` is.
+        // A resume after a kill is a DIFFERENT process and is the case
+        // `two_processes_of_one_run_do_not_both_hold_the_lock` below draws.
+        assert_eq!(first, again, "one process of one run holds one lock");
+    }
+
+    // Astra finding F04, 2026-09-23.
+    #[test]
+    fn two_processes_of_one_run_do_not_both_hold_the_lock() {
+        let files = MemFiles::new();
+        let state = state();
+        // A record of this run, held by a process that is demonstrably
+        // running and is not this one: pid 1 is init and is always there.
+        let other = LockRecord {
+            schema: LOCK_SCHEMA.to_string(),
+            run_id: run_id(),
+            operator: "silas".to_string(),
+            workstation: operator().workstation.clone(),
+            pid: 1,
+            acquired_at: at("2026-09-21T12:00:00Z"),
+        };
+        files
+            .write_atomic(&state.lock_path(), &other.to_json().unwrap(), 0o644)
+            .unwrap();
+        let err = acquire_lock(
+            &files,
+            &state,
+            &run_id(),
+            &operator(),
+            at("2026-09-21T12:05:00Z"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already being carried on"), "{err}");
+        assert!(err.contains("unreadable"), "{err}");
+        assert!(err.contains("--takeover"), "{err}");
+        // And the holder's record is untouched.
+        assert_eq!(read_lock(&files, &state).unwrap().unwrap(), other);
+    }
+
+    // Astra finding F04, 2026-09-23.
+    #[test]
+    fn a_resume_after_a_kill_still_takes_the_lock_of_its_own_run() {
+        let files = MemFiles::new();
+        let state = state();
+        // The same shape as above, with the one difference that decides it:
+        // the process that took the lock is not on this machine any more.
+        let dead = LockRecord {
+            schema: LOCK_SCHEMA.to_string(),
+            run_id: run_id(),
+            operator: "silas".to_string(),
+            workstation: operator().workstation.clone(),
+            // Positive, and above every `pid_max` a Linux kernel hands out.
+            pid: 2_147_483_646,
+            acquired_at: at("2026-09-21T12:00:00Z"),
+        };
+        files
+            .write_atomic(&state.lock_path(), &dead.to_json().unwrap(), 0o644)
+            .unwrap();
+        let held = acquire_lock(
+            &files,
+            &state,
+            &run_id(),
+            &operator(),
+            at("2026-09-21T12:05:00Z"),
+        )
+        .expect("a resume of a run whose process is gone may write");
+        assert_eq!(held.run_id, run_id());
+    }
+
+    // Astra finding F04, 2026-09-23.
+    #[test]
+    fn two_takeovers_of_one_run_leave_exactly_one_holder() {
+        let files = MemFiles::new();
+        let state = state();
+        let abandoned = acquire_lock(
+            &files,
+            &state,
+            &run_id(),
+            &operator(),
+            at("2026-09-21T12:00:00Z"),
+        )
+        .unwrap();
+        // The first takeover comes all the way through: it claims the old
+        // record, drops it and puts its own lock there.
+        let winner = take_over_lock(
+            &files,
+            &state,
+            &abandoned.run_id,
+            "run-second",
+            &operator(),
+            at("2026-09-21T12:01:00Z"),
+        )
+        .unwrap();
+        assert_eq!(winner.run_id, "run-second");
+        // The second one read the SAME old owner before any of that and
+        // arrives now. It used to remove the winner's fresh lock and take
+        // the repository as well; now it carries that lock away, sees it is
+        // not the run it named, and puts it back.
+        let err = take_over_lock(
+            &files,
+            &state,
+            &abandoned.run_id,
+            "run-third",
+            &operator(),
+            at("2026-09-21T12:02:00Z"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("run-second"), "{err}");
+        assert!(err.contains("Nothing was taken over"), "{err}");
+        let after = read_lock(&files, &state).unwrap().unwrap();
+        assert_eq!(after, winner, "the winner still holds the repository");
+        assert!(
+            !files.exists(&state.lock_path().with_file_name("lock.taken-by-run-third")),
+            "the claim of a takeover that failed is not left lying about"
+        );
     }
 
     #[test]

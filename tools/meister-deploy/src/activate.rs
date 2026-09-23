@@ -1152,7 +1152,28 @@ impl<'a> Helper<'a> {
             Err(e) => match self.read_lock()? {
                 // The same run asking twice is asking whether it may act,
                 // and the answer is yes.
-                Some(held) if held.run_id == run_id => Ok(held),
+                //
+                // Astra finding F04, 2026-09-23: the run id alone was the
+                // whole question, so two operator processes carrying one run
+                // both got a yes here. This host cannot judge a pid — the
+                // number in the record is a process on a WORKSTATION and
+                // `kill(0)` here would ask about a stranger — so what it can
+                // ask is who is carrying the run, and it does. The other
+                // half of the door is `state::acquire_lock`, which refuses a
+                // second live process of one run on the workstation itself;
+                // the two together are what makes one run one writer. A pid
+                // that differs and an operator that does not is a resume
+                // after a kill, and that is the flow this shortcut exists
+                // for.
+                Some(held) if held.run_id == run_id && held.operator == operator => Ok(held),
+                Some(held) if held.run_id == run_id => bail!(
+                    "this host is held by the run {} as it is carried by {}, and this is {}. \
+                     One run is one writer: two operators carrying it write one journal twice \
+                     and make it unreadable. Nothing was changed.",
+                    held.run_id,
+                    held.operator,
+                    operator
+                ),
                 Some(held) => bail!(
                     "this host is held by the run {} since {} (operator {}, pid {}). \
                      Continue that run with `apply --resume {}`, or take it over with \
@@ -1195,6 +1216,13 @@ impl<'a> Helper<'a> {
     /// Take a named run's lock, deliberately. The id has to match what is
     /// there, so that a takeover cannot take over a run that started while
     /// somebody was reading the refusal.
+    ///
+    /// Astra finding F04, 2026-09-23: read, remove, create is three steps,
+    /// and two takeovers that both read the old owner went through all
+    /// three — the loser's `remove_file` taking away the winner's fresh
+    /// lock. The claim is a rename to a name of the taker's own, exactly as
+    /// in `state::take_over_lock`: a rename of a file that is gone fails, so
+    /// of two takers exactly one carries the record away.
     pub fn lock_take_over(
         &self,
         of_run: &str,
@@ -1202,31 +1230,67 @@ impl<'a> Helper<'a> {
         operator: &str,
         pid: u32,
     ) -> Result<Lock> {
-        match self.read_lock()? {
-            None => self.lock_acquire(run_id, operator, pid),
+        let path = self.lock_path();
+        if !self.files.exists(&path) {
+            return self.lock_acquire(run_id, operator, pid);
+        }
+        // --- lane 5C ---
+        // The taking run already has it, so there is nothing to take and the
+        // answer is yes — the same answer `lock_acquire` gives a run that
+        // asks twice. Asked BEFORE the claim below, because a run that
+        // already holds the host must not carry its own lock away.
+        //
+        // Measured in lab lane L2 (2026-09-23): `apply --takeover <old>` on
+        // a host the abandoned run had never locked. The fleet anchor (D6)
+        // reaches every control-plane host FIRST, finds no lock, and the
+        // takeover falls through to an acquire — so by the time the plan's
+        // own `lock` step runs on that same host, it is held by the NEW run,
+        // and the helper answered "this host is held by the run <new>, not
+        // by <old>. Nothing was taken over." The run took over from itself
+        // and the rollout stopped.
+        if let Some(held) = self.read_lock()?
+            && held.run_id == run_id
+        {
+            return Ok(held);
+        }
+        // --- end lane 5C ---
+        let claim = path.with_file_name(format!("owner.taken-by-{run_id}.json"));
+        self.files.rename(&path, &claim).with_context(|| {
+            format!(
+                "the lock on this host could not be taken over; another takeover was here \
+                 first, or the run gave {} back while you were reading.",
+                path.display()
+            )
+        })?;
+        let bytes = self.files.read(&claim)?;
+        match serde_json::from_slice::<Lock>(&bytes).ok() {
             Some(held) if held.run_id == of_run => {
-                self.files.remove_file(&self.lock_path())?;
+                self.files.remove_file(&claim)?;
                 self.lock_acquire(run_id, operator, pid)
             }
-            // --- lane 5C ---
-            // The taking run already has it, so there is nothing to take
-            // and the answer is yes — the same answer `lock_acquire` gives
-            // a run that asks twice.
-            //
-            // Measured in lab lane L2 (2026-09-23): `apply --takeover <old>`
-            // on a host the abandoned run had never locked. The fleet
-            // anchor (D6) reaches every control-plane host FIRST, finds no
-            // lock, and the takeover falls through to an acquire — so by
-            // the time the plan's own `lock` step runs on that same host,
-            // it is held by the NEW run, and the helper answered "this host
-            // is held by the run <new>, not by <old>. Nothing was taken
-            // over." The run took over from itself and the rollout stopped.
-            Some(held) if held.run_id == run_id => Ok(held),
-            // --- end lane 5C ---
-            Some(held) => bail!(
-                "this host is held by the run {}, not by {of_run}. Nothing was taken over.",
-                held.run_id
-            ),
+            // Not the run that was named, so it goes back exactly as it was.
+            // `create_new` and not `write_atomic`: it refuses to overwrite,
+            // so a lock somebody took in this window is not lost either.
+            other => {
+                let restored = self.files.create_new(&path, &bytes, 0o600);
+                let whose = match &other {
+                    Some(held) => format!("by the run {}", held.run_id),
+                    None => "by a file this program did not write".to_string(),
+                };
+                match restored {
+                    Ok(()) => {
+                        self.files.remove_file(&claim)?;
+                        bail!("this host is held {whose}, not by {of_run}. Nothing was taken over.")
+                    }
+                    Err(e) => bail!(
+                        "this host is held {whose}, not by {of_run}, and the lock could not be \
+                         put back ({e:#}) because something else took {} meanwhile. Nothing was \
+                         taken over; the record that was there is in {}.",
+                        path.display(),
+                        claim.display()
+                    ),
+                }
+            }
         }
     }
 
@@ -2839,6 +2903,67 @@ mod tests {
             .lock_take_over("run-a", "run-b", "silas@manacor", 2)
             .unwrap();
         assert_eq!(taken.run_id, "run-b");
+        runner.verify().unwrap();
+    }
+
+    // Astra finding F04, 2026-09-23.
+    #[test]
+    fn two_operators_carrying_one_run_do_not_both_hold_the_host() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let first = helper.lock_acquire("run-a", "silas@manacor", 42).unwrap();
+        // The same run from the same workstation is a resume after a kill,
+        // whatever the pid says: the process is gone and the lock it left is
+        // the lock of this run.
+        assert_eq!(
+            helper.lock_acquire("run-a", "silas@manacor", 99).unwrap(),
+            first
+        );
+        // The same run from somewhere else is a second writer, and this host
+        // cannot ask a workstation whether a pid is still there — so it asks
+        // the only question it can answer.
+        let err = helper
+            .lock_acquire("run-a", "leandro@calvia", 7)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("as it is carried by silas@manacor"), "{err}");
+        assert!(err.contains("one writer"), "{err}");
+        assert_eq!(helper.read_lock().unwrap().unwrap(), first);
+        runner.verify().unwrap();
+    }
+
+    // Astra finding F04, 2026-09-23.
+    #[test]
+    fn two_takeovers_of_one_run_leave_exactly_one_holder_of_the_host() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.lock_acquire("run-a", "silas@manacor", 1).unwrap();
+        let winner = helper
+            .lock_take_over("run-a", "run-b", "silas@manacor", 2)
+            .unwrap();
+        assert_eq!(winner.run_id, "run-b");
+        // The second takeover read run-a before any of that. It used to
+        // remove run-b's fresh lock and take the host as well; now it
+        // carries that lock away, sees it is not run-a, and puts it back.
+        let err = helper
+            .lock_take_over("run-a", "run-c", "silas@manacor", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("held by the run run-b"), "{err}");
+        assert!(err.contains("Nothing was taken over"), "{err}");
+        assert_eq!(helper.read_lock().unwrap().unwrap(), winner);
+        assert!(
+            !files.exists(
+                &helper
+                    .lock_path()
+                    .with_file_name("owner.taken-by-run-c.json")
+            ),
+            "the claim of a takeover that failed is not left lying about"
+        );
         runner.verify().unwrap();
     }
 
