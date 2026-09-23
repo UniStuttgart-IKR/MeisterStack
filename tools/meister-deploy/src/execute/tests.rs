@@ -1386,6 +1386,43 @@ fn a_resume_reads_a_host_this_run_already_finished_as_finished() {
     );
 }
 
+#[test]
+fn a_takeover_reaches_the_anchor_host_twice_and_that_is_the_point() {
+    // The shape behind L2 finding N8, pinned where it is decided rather
+    // than by walking a whole rollout: `box` is a control-plane host, so
+    // it is the fleet anchor (D6) AND — when the release changes it — a
+    // host with a `lock` step of its own. Both go through `lock_cmd`, so
+    // under `--takeover` the SAME `lock take-over --of-run <old>` reaches
+    // that host twice.
+    //
+    // The second call finds the host held by the run that is doing the
+    // taking. In the lab that was the end of the rollout: "this host is
+    // held by the run <new>, not by <old>. Nothing was taken over."
+    // tools/meister-deploy/src/activate.rs answers yes to it now.
+    let fx = Fixture::changing(&["box"], false);
+    let look = TableLook::new(&fx);
+    let runner = World::new(StrictFake::new(), &look);
+    let mut options = fx.options();
+    options.takeover = Some("run-0".to_string());
+    let executor = fx.executor(&runner, &look, options);
+    assert!(
+        executor.anchor_hosts().contains(&"box".to_string()),
+        "box is a cloud and a cluster, so it is the fleet anchor"
+    );
+    assert!(
+        kinds(&fx.plan, "box").contains(&ActionKind::Lock),
+        "and the release changes it, so it has a lock step of its own"
+    );
+    let anchor = executor.lock_cmd("box").expect("the anchor's command");
+    let step = executor.lock_cmd("box").expect("the step's command");
+    assert_eq!(anchor.line(), step.line(), "one command, taken twice");
+    assert!(
+        anchor.line().contains("lock take-over --of-run run-0"),
+        "{}",
+        anchor.line()
+    );
+}
+
 // --- end lane 5C ---
 
 #[test]

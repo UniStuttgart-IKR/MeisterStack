@@ -1093,6 +1093,21 @@ impl<'a> Helper<'a> {
                 self.files.remove_file(&self.lock_path())?;
                 self.lock_acquire(run_id, operator, pid)
             }
+            // --- lane 5C ---
+            // The taking run already has it, so there is nothing to take
+            // and the answer is yes — the same answer `lock_acquire` gives
+            // a run that asks twice.
+            //
+            // Measured in lab lane L2 (2026-09-23): `apply --takeover <old>`
+            // on a host the abandoned run had never locked. The fleet
+            // anchor (D6) reaches every control-plane host FIRST, finds no
+            // lock, and the takeover falls through to an acquire — so by
+            // the time the plan's own `lock` step runs on that same host,
+            // it is held by the NEW run, and the helper answered "this host
+            // is held by the run <new>, not by <old>. Nothing was taken
+            // over." The run took over from itself and the rollout stopped.
+            Some(held) if held.run_id == run_id => Ok(held),
+            // --- end lane 5C ---
             Some(held) => bail!(
                 "this host is held by the run {}, not by {of_run}. Nothing was taken over.",
                 held.run_id
@@ -2233,6 +2248,40 @@ mod tests {
         assert_eq!(taken.run_id, "run-b");
         runner.verify().unwrap();
     }
+
+    // --- lane 5C ---
+
+    #[test]
+    fn a_takeover_of_a_host_the_taking_run_already_holds_is_the_answer_yes() {
+        // L2 finding N8. A takeover reaches a host twice: the fleet anchor
+        // takes every control-plane host before the walk, and the plan's
+        // own `lock` step takes the host again. When the abandoned run
+        // never held this host, the first call finds nothing and acquires,
+        // and the second one used to answer "this host is held by the run
+        // run-b, not by run-a" — the run refused to take over from itself.
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let first = helper
+            .lock_take_over("run-a", "run-b", "silas@manacor", 2)
+            .expect("nobody holds it, so it is taken");
+        assert_eq!(first.run_id, "run-b");
+        let again = helper
+            .lock_take_over("run-a", "run-b", "silas@manacor", 2)
+            .expect("the same run asking twice is asking whether it may act");
+        assert_eq!(again.run_id, "run-b");
+        assert_eq!(again.acquired_at, first.acquired_at, "it was not retaken");
+        // And a third run still cannot take it from run-b by naming run-a.
+        let err = helper
+            .lock_take_over("run-a", "run-c", "silas@manacor", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("held by the run run-b, not by run-a"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    // --- end lane 5C ---
 
     #[test]
     fn gc_keeps_the_current_the_booted_and_n_others() {

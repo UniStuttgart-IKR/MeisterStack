@@ -459,7 +459,19 @@ pkgs.testers.runNixOSTest {
     assert the_release["build_env"]["cache_url"] == CACHE, the_release["build_env"]
     assert the_release["build_env"]["signing_key_name"] == "vm-update", the_release["build_env"]
     top_b = the_release["artifacts"]["target"]["toplevel"]["store_path"]
-    target.fail(f"test -e {top_b}/init")
+    # --- lane 5C ---
+    # `nix path-info` and not `test -e`, and the difference is what a VM
+    # test's /nix/store is. Both machines mount the SAME store — the one
+    # the build sandbox holds — and the operator declares system B in its
+    # `additionalPaths`, so the bytes are under that path on the target too
+    # and `test -e` was always true. What the target does not have is the
+    # path in its own database, which is the only sense in which a store
+    # has something: nothing may be substituted from it, copied out of it
+    # or activated off it. Measured 2026-09-23 (lane 4C wrote this line and
+    # never ran the test; the first run of it failed here).
+    not_yet = target.fail(f"nix path-info {top_b} 2>&1")
+    assert "not valid" in not_yet or "No such file" in not_yet, not_yet
+    # --- end lane 5C ---
 
     # (2) The cache really holds that closure, and the SIGNATURE travelled
     #     with it — which is the whole reason the push happens after the
@@ -478,6 +490,8 @@ pkgs.testers.runNixOSTest {
     #     fleet's own cache is usable exactly because the closures in it
     #     carry the signature the fleet already trusts.
     target.succeed(f"nix copy --from http://192.168.1.1:8080 {top_b}")
+    # --- lane 5C: the same probe as above, the other way round ---
+    target.succeed(f"nix path-info {top_b}")
     target.succeed(f"test -e {top_b}/init")
     print("the target fetched " + top_b + " out of the operator's cache, signature and all")
 
