@@ -470,6 +470,30 @@ pub struct Action {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_boot: Option<crate::release::DirectBoot>,
     // --- end lane 3-integration -------------------------------------------
+
+    // --- lane 3B: what a delivery is made of ------------------------------
+    /// The digest of the file a `deliver-secret` step was planned with.
+    ///
+    /// Astra finding F10, 2026-09-23: the step used to say only
+    /// `<id> at <path>`, and the executor re-read the operator's file and
+    /// then checked the host's copy against whatever that file now held. So
+    /// a plan made with the certificate C1 delivered C2, or a plan made with
+    /// one revocation list delivered an older one, under its own `plan_id` --
+    /// and the approval bound to that id, the journal and the receipt all
+    /// named bytes nobody had looked at. A rotation has been bound to its
+    /// file this way from the start (`KeyRotation::cert_sha256`); this is
+    /// the ordinary delivery catching up with it.
+    ///
+    /// PUBLIC files only: a certificate, a CA bundle, a revocation list. A
+    /// private file is compared by existence and nothing else
+    /// (`crate::pki::needs_delivery`), so no digest of a key is written into
+    /// a plan that goes on disk.
+    ///
+    /// Absent -- not null -- on every other step, so a plan without deliveries
+    /// hashes to exactly what it hashed to before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sha256: Option<String>,
+    // --- end lane 3B ------------------------------------------------------
 }
 
 impl Action {
@@ -3540,6 +3564,7 @@ struct StepSpec {
     desired: Option<String>,
     disruption: Disruption,
     preconditions: Vec<String>,
+    expected_sha256: Option<String>,
 }
 
 fn step(kind: ActionKind, disruption: Disruption) -> StepSpec {
@@ -3549,6 +3574,7 @@ fn step(kind: ActionKind, disruption: Disruption) -> StepSpec {
         desired: None,
         disruption,
         preconditions: Vec::new(),
+        expected_sha256: None,
     }
 }
 
@@ -3570,6 +3596,13 @@ impl StepSpec {
 
     fn because(mut self, why: impl Into<String>) -> StepSpec {
         self.preconditions.push(why.into());
+        self
+    }
+
+    /// Astra finding F10, 2026-09-23: bind this step to the bytes it was
+    /// planned with, for the steps that have a digest to be bound to.
+    fn of_bytes(mut self, digest: Option<String>) -> StepSpec {
+        self.expected_sha256 = digest;
         self
     }
 }
@@ -3726,6 +3759,19 @@ fn steps_for(
                         .flatten(),
                 )
                 .to(format!("{} at {}", secret.id, secret.target_path))
+                // --- lane 3B: Astra finding F10, 2026-09-23 ---
+                // The planner already read this file to decide the step, so
+                // the digest it decided on travels with the step. `want` is
+                // the word `crate::pki::expected_for_host` wrote down: a
+                // `sha256:...` for a public file, `present` for a private one,
+                // `unreadable` for a file that is there and cannot be read.
+                // Only the first of those three is a binding, which is also
+                // how a private key stays out of a plan on disk.
+                .of_bytes(
+                    want.filter(|w| w.starts_with("sha256:"))
+                        .map(|w| w.to_string()),
+                )
+                // --- end lane 3B ---
                 .because(match seen.flatten() {
                     Some(None) | None => format!(
                         "{id} has no {} and the fleet says it needs one",
@@ -4021,6 +4067,15 @@ fn steps_for(
                 None
             },
             // --- end lane 3-integration ---
+            // --- lane 3B: Astra finding F10, 2026-09-23 ---
+            // Only a delivery carries one, and only when the planner had a
+            // digest of its own to write down.
+            expected_sha256: if spec.kind == ActionKind::DeliverSecret {
+                spec.expected_sha256
+            } else {
+                None
+            },
+            // --- end lane 3B ---
         });
     }
     (actions, needed)
@@ -4801,6 +4856,89 @@ mod tests {
         // Tier order: the thing that is talked TO comes first in a
         // bootstrap.
         assert!(plan.hosts["box"].wave < plan.hosts["n1"].wave);
+    }
+
+    /// A delivery says WHICH bytes, and a private file still says nothing.
+    ///
+    /// Astra finding F10, 2026-09-23: the step used to carry only
+    /// `<id> at <path>`, and the executor then checked the host's copy
+    /// against a file it had just re-read -- which always agreed. The digest
+    /// the planner decided the step from travels with the step now, so the
+    /// executor can refuse a file that changed underneath it. Only public
+    /// files have one: a digest of a private key is not something this tool
+    /// writes into a plan that goes on disk.
+    #[test]
+    fn a_delivery_names_the_bytes_it_was_planned_with_and_round_trips() {
+        let base = onebox_enrolled();
+        let running = release_of(base.clone());
+        let mut observation = observed(&running, at(TAKEN));
+        for host in observation.hosts.values_mut() {
+            host.credentials.values_mut().for_each(|v| *v = None);
+        }
+        let release = with_new_systems(base, &["n1"], false);
+        let mut expected = expected_credentials(&release.resolved_fleet);
+        let digest = format!("sha256:{}", crate::ids::sha256_hex(b"a new authority\n"));
+        for secrets in expected.values_mut() {
+            if let Some(value) = secrets.get_mut("ca-bundle") {
+                *value = digest.clone();
+            }
+        }
+        let policy = plan_policy(PlanKind::Upgrade).with_expected_credentials(expected);
+        let plan = plan(&release, "all", &observation, None, &policy, at(NOW)).unwrap();
+
+        let mut public = 0;
+        let mut private = 0;
+        for action in &plan.actions {
+            if action.kind != ActionKind::DeliverSecret {
+                // And no other step gains the field.
+                assert!(action.expected_sha256.is_none(), "{:?}", action.kind);
+                continue;
+            }
+            let what = action.desired.clone().unwrap_or_default();
+            if what.starts_with("ca-bundle ") {
+                assert_eq!(action.expected_sha256.as_deref(), Some(digest.as_str()));
+                public += 1;
+            } else {
+                // `box` is handed `serving.key`, which is not a certificate
+                // and is compared by existence alone.
+                assert!(
+                    action.expected_sha256.is_none(),
+                    "a private file carries no digest: {what} {action:?}"
+                );
+                private += 1;
+            }
+        }
+        assert_eq!(
+            public, 3,
+            "every host of the fixture gets the new CA bundle"
+        );
+        assert!(private > 0, "and one of them a private file as well");
+
+        // It survives the file the plan is written to, and the id covers it.
+        let text = String::from_utf8(plan.to_json().unwrap()).unwrap();
+        assert!(text.contains(&digest), "{text}");
+        let back = DeploymentPlan::from_json(&text, "the round trip").expect("it parses back");
+        assert_eq!(back, plan);
+        assert!(back.id_matches().unwrap());
+    }
+
+    /// A plan that delivers nothing gains no field and keeps its id.
+    ///
+    /// Astra finding F10, 2026-09-23: the digest is absent rather than null
+    /// everywhere else, so adding it did not rename every plan in every
+    /// operator's repository.
+    #[test]
+    fn a_plan_without_a_delivery_hashes_to_what_it_always_did() {
+        let (release, observation) = upgrade(&["n1"], false);
+        let plan = planned(&release, "host=n1", &observation);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| a.kind == ActionKind::DeliverSecret)
+        );
+        let text = String::from_utf8(plan.to_json().unwrap()).unwrap();
+        assert!(!text.contains("expected_sha256"), "{text}");
     }
 
     /// The same fleet, already running: the wanted state and the seen state
