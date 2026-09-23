@@ -95,6 +95,7 @@ pub mod reasons {
         "VmmGone",
         "BackendGone",
         "ResumeIneffective",
+        "Stopping",
         "Unrecorded",
     ];
 

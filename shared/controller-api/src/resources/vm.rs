@@ -102,7 +102,7 @@ reasons! {
     /// is `CannotServe` and the cloud's refusal of a create; `Silent` is
     /// `unheard_of` and its counterpart at the cloud.
     ///
-    /// The eight after them are the NODE's, verbatim — `proto::reasons::VM`,
+    /// The nine after them are the NODE's, verbatim — `proto::reasons::VM`,
     /// the list the agent writes on the wire. There is no `Reported` here any
     /// more, and that absence is the decision: a phase that came up from
     /// below used to arrive as "Reported" with the node's word buried in the
@@ -122,7 +122,7 @@ reasons! {
     /// counts candidates and names capabilities, which is what an operator
     /// reads. This is the closed set behind it, so that "how many VMs are
     /// waiting, and why" is a time series rather than a string.
-    VmReason [17] {
+    VmReason [18] {
         /// Nobody recorded one.
         ///
         /// Not a failure of this enum but the honest value in two cases: a
@@ -217,6 +217,17 @@ reasons! {
         /// `Quarantined`: the guest did not come back from a pause however
         /// often it was resumed.
         ResumeIneffective => "ResumeIneffective",
+        /// `Provisioning`: the node was told the VM is to be `Absent` and has
+        /// not finished taking it apart. Its VMM may still be running and its
+        /// disks may still be open.
+        ///
+        /// The one word here that says "do NOT act yet". A node used to stop
+        /// naming such a VM the moment the intent was written, and absence
+        /// from a node's report is what `session::ingest::forget_unbound`
+        /// reads as "that node has let go" — so a VM could be placed
+        /// elsewhere while the first node's VMM still held its volumes.
+        /// Astra finding S12, 2026-09-23.
+        Stopping => "Stopping",
     }
 }
 

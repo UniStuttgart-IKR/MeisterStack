@@ -297,6 +297,22 @@ message StatusReport {
   // cloud refuses anything else), so no translation happens on either side.
   // Nothing is fetched and nothing is hashed for it.
   bool images_complete = 9;
+  // The `vms` list above is EVERY vm this node has a record of.
+  //
+  // The same word as `images_complete`, for the list the control plane acts
+  // on hardest. `vms` is empty in two entirely different situations and they
+  // used to look identical on the wire: a node that has no guests, and a node
+  // whose per-vm half could not be read at all (`heartbeat_only`, which sends
+  // the node's facts and empty lists). `session::ingest::forget_unbound`
+  // treats absence from this list as proof that the node has let a vm go, and
+  // clears the binding a client released — so one unreadable beat from a
+  // healthy node was enough to declare its guests unplaced while their VMMs
+  // went on serving them. Astra finding S12, 2026-09-23.
+  //
+  // False means "not saying", exactly as an empty list does, and every agent
+  // from before this field says false. A reader may turn a false into no
+  // statement at all; only a true licenses "this vm is not on that node".
+  bool vms_complete = 10;
 }
 
 // What one node has to say about a guest it was told to send away.

@@ -1556,6 +1556,7 @@ mod tests {
             routers: Vec::new(),
             images: Vec::new(),
             images_complete: false,
+            vms_complete: false,
             volumes: vec![proto::VolumeStateReport {
                 size_bytes: 0,
                 id: id.to_string(),
@@ -1586,6 +1587,7 @@ mod tests {
             routers: Vec::new(),
             images: Vec::new(),
             images_complete: false,
+            vms_complete: false,
             volumes: Vec::new(),
             stopping: false,
             migrations: Vec::new(),

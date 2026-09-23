@@ -214,6 +214,19 @@ pub enum VmReason {
     /// `Quarantined`: the guest did not come back from a pause however often
     /// it was resumed. See `act::RESUME_INEFFECTIVE_REASON`.
     ResumeIneffective,
+    /// `Provisioning`: the intent for this VM is `Absent` and this node has
+    /// not finished taking it apart. Its VMM may still be running and its
+    /// disks may still be open.
+    ///
+    /// The word exists because the report used to LEAVE such a record out —
+    /// `report` skipped every `Desired::Absent` row, so the guest vanished
+    /// from this node's report the moment the intent was written, hours
+    /// before the last driver call. One tier up that absence is read as "the
+    /// node has let go" (`session::ingest::forget_unbound`), and a VM can be
+    /// placed on another machine while this one's VMM still holds the
+    /// volumes. `volumes.rs` documents the same hazard from the disk's side.
+    /// Astra finding S12, 2026-09-23.
+    Stopping,
     /// A marker this build does not recognise — a record written by another
     /// version of this agent. The sentence it carries travels on unchanged,
     /// because an agent that has drifted has to be visible rather than
@@ -223,7 +236,7 @@ pub enum VmReason {
 
 impl VmReason {
     /// Every variant, in declaration order — see `ReportedPhase::ALL`.
-    pub const ALL: [VmReason; 9] = [
+    pub const ALL: [VmReason; 10] = [
         VmReason::Working,
         VmReason::Backoff,
         VmReason::AwaitingGuest,
@@ -232,6 +245,7 @@ impl VmReason {
         VmReason::VmmGone,
         VmReason::BackendGone,
         VmReason::ResumeIneffective,
+        VmReason::Stopping,
         VmReason::Unrecorded,
     ];
 
@@ -245,6 +259,7 @@ impl VmReason {
             VmReason::VmmGone => "VmmGone",
             VmReason::BackendGone => "BackendGone",
             VmReason::ResumeIneffective => "ResumeIneffective",
+            VmReason::Stopping => "Stopping",
             VmReason::Unrecorded => "Unrecorded",
         }
     }
@@ -572,6 +587,12 @@ pub struct ReportedNic {
 pub const RECEIVE_FAILED_REASON: &str = "the guest did not arrive; this node is giving back the vmm, the disks and the taps it \
      made for it, and the vm is still running where it was";
 
+/// What a node says about a VM it has been told to take apart and has not
+/// finished taking apart. One string for the report and the log, for the
+/// reason the two above are one.
+pub const STOPPING_REASON: &str = "the intent for this vm is gone and this node has not finished taking it apart; its \
+     vmm and its disks may still be here";
+
 pub fn report_status(
     record: &VmRecord,
     obs: &Observed,
@@ -839,8 +860,39 @@ impl Reconciler {
     pub async fn report(&self) -> Result<Vec<VmReport>> {
         let mut out = Vec::new();
         for (id, mut record) in self.store.list()? {
+            // A record whose intent is `Absent` is still NAMED, and that is
+            // Astra finding S12, 2026-09-23. This used to `continue`: the
+            // guest vanished from this node's report the moment the intent
+            // was written, which is hours before the last driver call on a
+            // node that is busy or wedged. One tier up, a uid this node does
+            // not name is read as a node that has let it go
+            // (`session::ingest::forget_unbound`), so the binding was
+            // released and the VM could be placed on another machine while
+            // this VMM still had the volumes open — the hazard
+            // `volumes::open_here` documents from the disk's side.
+            //
+            // The record IS the proof: `teardown` removes it last and only
+            // when everything before it succeeded, so a row that is still
+            // here is a teardown that has not finished.
+            //
+            // `Provisioning` and not a word of its own, because the control
+            // plane's phases are a closed set with no `Stopping` in it and
+            // `Provisioning` is its word for "in flight, nothing here to act
+            // on" — see the migration arms below, which report the same thing
+            // for the same reason. The REASON is what distinguishes this one,
+            // and `attached_volumes` travels with it so the tier above can
+            // see which disks are still open.
             if record.desired == Desired::Absent {
-                continue; // being torn down; the controller drives the delete
+                out.push(VmReport {
+                    id,
+                    phase: ReportedPhase::Provisioning,
+                    reason: Some(VmReason::Stopping),
+                    message: Some(STOPPING_REASON.to_string()),
+                    volumes: attached_volumes(&record),
+                    nics: reported_nics(&record),
+                    departure: departure(&record),
+                });
+                continue;
             }
             let observed = self.observe(&id, &record).await;
             // The periodic pass may not have marked the record yet; report

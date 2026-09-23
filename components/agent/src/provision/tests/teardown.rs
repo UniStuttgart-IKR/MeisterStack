@@ -290,6 +290,112 @@ async fn the_teardown_kill_asks_whose_process_it_is_before_signalling() {
     }
 }
 
+/// A VM on its way out is still this node's, and the report says so for the
+/// whole of the teardown.
+///
+/// Astra finding S12, 2026-09-23. `Reconciler::report` skipped every record
+/// whose intent is `Absent`, so a guest dropped out of this node's report the
+/// moment the intent was WRITTEN — which on a busy or wedged node is a long
+/// way before the last driver call. One tier up, a uid a node does not name
+/// is read as a node that has let it go (`session::ingest::forget_unbound`),
+/// and the VM may then be placed on another machine while this VMM is still
+/// executing the guest and holding its disks.
+///
+/// A real process stands in for the VMM, because "the teardown has not
+/// happened yet" is the premise and a record alone cannot show it.
+#[tokio::test]
+async fn a_vm_on_its_way_out_is_still_named_while_its_vmm_runs() {
+    let temp = tempfile::tempdir().expect("a temp dir");
+    let root = temp.path().to_path_buf();
+    let store = Arc::new(crate::store::Store::open(&root.join("a.redb")).expect("a store"));
+    let drivers = Drivers {
+        confiner: Arc::new(cgroup_driver::CgroupV2::new(root.join("cgroup"))),
+        hypervisor: Some(Arc::new(EmptyHypervisor)),
+        hypervisor_name: Some("empty".into()),
+        storage: HashMap::new(),
+        networking: None,
+        bridge: None,
+        announcer: None,
+        devices: HashMap::new(),
+    };
+    let provisioner = Arc::new(Provisioner::new(
+        store.clone(),
+        drivers.clone(),
+        Arc::new(crate::images::Cache::new(root.join("images"))),
+        root.join("images"),
+        root.join("run"),
+        "br0".to_string(),
+        None,
+        None,
+    ));
+    let reconciler = crate::reconcile::Reconciler::new(
+        store.clone(),
+        drivers,
+        provisioner,
+        Arc::new(tokio::sync::Mutex::new(())),
+    );
+
+    let vm = VmId::new_v4();
+    let mut vmm = a_process_carrying(&vm.to_string());
+    let disk = VolumeId::new_v4();
+    let handle = agent_api::storage::VolumeHandle {
+        id: disk,
+        backend: format!("/fake/{disk}.raw"),
+        size_bytes: 4096,
+        params: None,
+    };
+    let mut record = spec_record();
+    // The intent is written and nothing else has happened yet: the VMM is
+    // running and the disk is open.
+    record.desired = Desired::Absent;
+    record.vmm_pid = Some(vmm.id());
+    // Referenced, because that is the entry whose bytes outlive the VM and
+    // therefore the one the tier above has to know is still open.
+    record.spec.volumes = vec![crate::types::VolumeWithId {
+        id: disk,
+        spec: agent_api::storage::VolumeSpec {
+            base_image: None,
+            size_bytes: 4096,
+            driver: Some("filesystem".into()),
+            params: None,
+        },
+        referenced: true,
+    }];
+    record.volumes = vec![agent_api::storage::Volume::attached(
+        handle.clone(),
+        agent_api::storage::VolumeAttachment::Path(handle.path()),
+    )];
+    store.put(&vm, &record).expect("a record");
+
+    let said = reconciler.report().await.expect("a report");
+    assert_eq!(said.len(), 1, "the node still has this vm");
+    assert_eq!(said[0].id, vm);
+    assert_eq!(said[0].phase, crate::reconcile::ReportedPhase::Provisioning);
+    assert_eq!(
+        said[0].reason,
+        Some(crate::reconcile::VmReason::Stopping),
+        "and the word says why, because `Provisioning` alone would read as \
+         a vm being built"
+    );
+    assert_eq!(
+        said[0].volumes,
+        vec![disk],
+        "with the disk it has not let go of yet"
+    );
+    assert!(
+        still_alive(&mut vmm),
+        "the premise: the vmm is still serving the guest"
+    );
+
+    // And once the teardown has taken the record away, the node says nothing
+    // about it — which is the absence one tier up is allowed to act on.
+    store.delete(&vm).expect("the record goes");
+    assert!(reconciler.report().await.expect("a report").is_empty());
+
+    let _ = vmm.kill();
+    let _ = vmm.wait();
+}
+
 /// The default `Hypervisor::owns_pid` reads the VM's uuid off the
 /// process's command line, which is the contract every driver in this
 /// tree meets: one process per VM, given a socket named after that VM.
