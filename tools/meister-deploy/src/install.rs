@@ -505,25 +505,47 @@ impl<'a> Installer<'a> {
                 target.layout
             );
         }
-        let mut resolved = Vec::new();
+        // Astra finding F02, 2026-09-23: this used to return as soon as ONE
+        // resolved device equalled the consented disk. `install()` then runs
+        // the whole `disko_script`, which disko builds from every disk the
+        // layout names — so a layout naming two disks would destroy the
+        // second one on consent for the first. Every device the layout names
+        // now has to resolve to the one disk that was consented to, or this
+        // refuses instead of reaching disks nobody typed a serial for.
+        let mut matched = None;
+        let mut other: Vec<String> = Vec::new();
         for device in &target.layout_devices {
             let real = self.real_path(device)?;
             if real == disk {
-                return Ok(device.clone());
+                matched = Some(device.clone());
+            } else {
+                other.push(format!("{device} -> {real}"));
             }
-            resolved.push(format!("{device} -> {real}"));
         }
-        bail!(
-            "the disk with the serial {} is {} ({}), and the layout {} writes its partition \
-             table to {}. Those are different disks. Either the host module binds the wrong \
-             device or the serial in the inventory belongs to another machine. Nothing was \
-             changed.",
-            target.disk.serial,
-            chosen.device.path,
-            disk,
-            target.layout,
-            resolved.join(", ")
-        );
+        match matched {
+            Some(device) if other.is_empty() => Ok(device),
+            Some(device) => bail!(
+                "the layout {} names {} block devices and only {device} is the disk with the \
+                 serial {} ({disk}); the others are {}. This installer consents to the one \
+                 disk whose serial was typed and refuses a layout that reaches beyond it. \
+                 Nothing was changed.",
+                target.layout,
+                target.layout_devices.len(),
+                target.disk.serial,
+                other.join(", ")
+            ),
+            None => bail!(
+                "the disk with the serial {} is {} ({}), and the layout {} writes its \
+                 partition table to {}. Those are different disks. Either the host module \
+                 binds the wrong device or the serial in the inventory belongs to another \
+                 machine. Nothing was changed.",
+                target.disk.serial,
+                chosen.device.path,
+                disk,
+                target.layout,
+                other.join(", ")
+            ),
+        }
     }
 
     fn real_path(&self, path: &str) -> Result<String> {
@@ -1351,6 +1373,37 @@ mod tests {
             .to_string();
         assert!(err.contains("different disks"), "{err}");
         assert!(err.contains("/dev/vdc"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    /// Astra finding F02, 2026-09-23: one resolved match used to be the
+    /// whole layout's consent, and `install()` runs the WHOLE `disko_script`
+    /// — every disk the layout names, not just the one that was checked. A
+    /// layout naming a second disk must refuse rather than silently reach
+    /// it.
+    #[test]
+    fn layout_device_refuses_a_layout_that_reaches_a_second_disk() {
+        let runner = StrictFake::new().expect(lsblk_matcher(), Output::stdout(lsblk(&[], SIZE)));
+        let files = files_with(&target());
+        let clock = FakeClock::fixed();
+        let chosen = installer(&runner, &files, &clock)
+            .disk(&target(), "MEISTERTEST01", None)
+            .unwrap();
+        runner.verify().unwrap();
+
+        let mut two_disks = target();
+        let second = "/dev/disk/by-id/virtio-OTHERDISK99";
+        two_disks.layout_devices = vec![BY_ID.to_string(), second.to_string()];
+
+        let runner = StrictFake::new()
+            .expect(realpath(BY_ID), Output::stdout("/dev/vdb\n"))
+            .expect(realpath(second), Output::stdout("/dev/vdc\n"));
+        let err = installer(&runner, &files, &clock)
+            .layout_device(&two_disks, &chosen, "/dev/vdb")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("consents to the one disk"), "{err}");
+        assert!(err.contains(second), "{err}");
         runner.verify().unwrap();
     }
 
