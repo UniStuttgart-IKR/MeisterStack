@@ -293,6 +293,11 @@
           no-fabric-no-claim = import ./nix/tests/no-fabric-no-claim.nix {
             inherit nixpkgs lib pkgs system self;
           };
+
+          # --- lane L4 ---
+          raft-member-starts-alone = import ./nix/tests/raft-member-starts-alone.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
           # --- end lane 5C ---
 
           # What the target-side helper does to a REAL machine: the profile

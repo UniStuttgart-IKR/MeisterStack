@@ -2611,6 +2611,61 @@ fn a_raft_member_is_not_back_until_its_database_is() {
     );
 }
 
+#[test]
+fn a_member_of_a_group_that_was_not_serving_is_back_when_the_machine_is() {
+    // --- lane L4 ---
+    // The wait above is for a window of SECONDS. A group that is coming
+    // into existence has no such window: the first member of a fresh
+    // three-member cluster has no majority to elect a leader with, so
+    // `etcdctl endpoint health` cannot answer until the SECOND member is
+    // activated — which is the next wave, which does not start until this
+    // one finishes. Measured in the lab on 2026-09-23: the first bootstrap
+    // of a three-member control plane sat in this loop with "it booted the
+    // release and its etcd has not answered yet" until the reboot deadline,
+    // and the run failed.
+    let fx = Fixture::changing(&["box"], true);
+    // What the plan says about the group is what decides it. `box` is the
+    // raft group of this fixture; make it a group that was NOT serving when
+    // the plan was made.
+    let mut plan = fx.plan.clone();
+    for view in plan.groups.values_mut() {
+        view.unhealthy_now = view.size;
+    }
+    let fx = Fixture {
+        release: fx.release.clone(),
+        plan,
+        files: MemFiles::new(),
+        clock: FakeClock::at(at(NOW)),
+        state: StateDir::at("/repo/.meister-deploy"),
+        ssh: Ssh::with_known_hosts("/repo/known_hosts"),
+    };
+    // etcd would answer only after two more looks — and is never asked.
+    let look = TableLook::new(&fx).etcd_late("box", 2);
+    let runner = World::new(StrictFake::new(), &look);
+    let executor = fx.executor(&runner, &look, fx.options());
+    assert!(
+        executor.is_raft_member("box"),
+        "box is still a member of a raft group"
+    );
+    assert!(
+        !executor.group_was_serving("box"),
+        "every member of that group was unhealthy when the plan was made"
+    );
+
+    look.set("box", Phase::After);
+    let back = executor
+        .wait_for_boot("box", &fx.top("box"))
+        .expect("the machine is back, and that is all there is to wait for");
+    assert_eq!(back, fx.top("box"));
+    // One look, and it was enough: the counter went down by the one
+    // observation this call made, and nothing ever slept.
+    assert_eq!(look.etcd_late.borrow()["box"], 1);
+    assert!(
+        fx.clock.slept().is_empty(),
+        "it waited for a database that had nothing to come back to"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // lane 5A: the revocation list
 // ---------------------------------------------------------------------------
