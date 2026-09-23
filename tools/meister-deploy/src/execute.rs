@@ -2003,6 +2003,40 @@ impl<'a> Executor<'a> {
                     && group.members.iter().any(|m| m == id)
             })
     }
+
+    // --- lane L4 ---
+    /// Whether the raft group this host belongs to was SERVING when the plan
+    /// was made.
+    ///
+    /// The wait above exists for a window of seconds: sshd answers before
+    /// etcd does, and a member that is merely still starting must not be
+    /// read as one that is down. That is true of a group that HAS a quorum
+    /// to rejoin. It is not true of a group that is coming into existence:
+    /// the first member of a fresh three-member cluster has no majority to
+    /// elect a leader with, so `etcdctl endpoint health` cannot answer until
+    /// the SECOND member is activated — which is the next wave, which does
+    /// not start until this one finishes. Measured in the lab on 2026-09-23
+    /// (lane L4): the first bootstrap of a three-member control plane sat in
+    /// this loop with "it booted the release and its etcd has not answered
+    /// yet" until the reboot deadline, and the run then failed.
+    ///
+    /// So the question the wait really asks is "is there a database for this
+    /// member to come back to", and the plan already answered it: a group
+    /// whose members were ALL unhealthy when the plan was made is not
+    /// serving, and there is nothing to wait for.
+    fn group_was_serving(&self, id: &str) -> bool {
+        let fleet = self.fleet();
+        fleet
+            .groups
+            .iter()
+            .filter(|(_, group)| {
+                group.kind == crate::manifest::GroupKind::Raft
+                    && group.members.iter().any(|m| m == id)
+            })
+            .filter_map(|(gid, _)| self.plan.groups.get(gid))
+            .any(|view| view.unhealthy_now < view.size)
+    }
+    // --- end lane L4 ---
     // --- end lane 4A ---
 
     fn wait_for_boot(&self, id: &str, desired: &str) -> Result<String> {
@@ -2027,6 +2061,9 @@ impl<'a> Executor<'a> {
                     Some(booted)
                         if booted == desired
                             && self.is_raft_member(id)
+                            // --- lane L4: only where there is a database to
+                            // come back to; see `group_was_serving`.
+                            && self.group_was_serving(id)
                             && !obs.etcd.as_ref().is_some_and(|e| e.healthy) =>
                     {
                         last = "it booted the release and its etcd has not answered yet".to_string()
