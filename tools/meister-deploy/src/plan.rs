@@ -1403,6 +1403,34 @@ fn canaries_of(order: &[String], decisions: &BTreeMap<String, HostDecision>) -> 
 // Groups: what the OBSERVATION says a group can afford
 // ---------------------------------------------------------------------------
 
+// --- lane L4 ---
+/// Is this host already counted among the unavailable members of its raft
+/// group — by exactly the arithmetic `group_views` uses?
+///
+/// The quorum rule asks "how many MORE members may become unavailable". A
+/// member that is already unavailable does not become more so by being acted
+/// on: the group is at the same number before and after. Blocking it is
+/// therefore not a protection, it is a deadlock — and it is the sharp end of
+/// it, because the one host a degraded group most needs a plan for is the one
+/// that is down.
+///
+/// Measured in the lab on 2026-09-23 (lane L4), bootstrapping a three-member
+/// control plane: as soon as the first two members were up and formed a
+/// quorum, the third — which had never been touched — was refused with
+/// "group cp is at 2 of 3; no further member may go down. It could when this
+/// plan was made." A raft group could be started and never finished.
+fn already_unavailable(observation: &Observations, id: &str) -> bool {
+    match observation.host(id) {
+        None => true,
+        Some(obs) if !obs.reachable => true,
+        Some(obs) => match &obs.etcd {
+            None => true,
+            Some(etcd) => !etcd.healthy,
+        },
+    }
+}
+// --- end lane L4 ---
+
 fn group_views(
     fleet: &ResolvedFleet,
     observation: &Observations,
@@ -2452,6 +2480,11 @@ fn decide_host(
         if let Some(view) = groups.get(group)
             && let Some(why) = &view.blocked
         {
+            // --- lane L4: not for a member that is already down; see
+            // `already_unavailable`.
+            if view.kind == GroupKind::Raft && already_unavailable(observation, id) {
+                continue;
+            }
             d.stop_disruptive.push(why.clone());
         }
     }
@@ -4215,6 +4248,23 @@ pub fn validate_against(
     fresh: &Observations,
     now: DateTime<Utc>,
 ) -> Verdict {
+    validate_against_next(plan, release, fresh, now, None)
+}
+
+/// The same check, told which host is about to be acted on.
+///
+/// --- lane L4 --- A group's quorum verdict is about how many MORE members
+/// may become unavailable, and a member that is already unavailable does not
+/// become more so. `next` is that member when the caller knows it — the
+/// executor always does — and then a group block that names only this host's
+/// own absence does not stop the run. See `already_unavailable`.
+pub fn validate_against_next(
+    plan: &DeploymentPlan,
+    release: &ReleaseManifest,
+    fresh: &Observations,
+    now: DateTime<Utc>,
+    next: Option<&str>,
+) -> Verdict {
     let mut stop: Vec<String> = Vec::new();
     let mut replan: Vec<String> = Vec::new();
 
@@ -4366,6 +4416,19 @@ pub fn validate_against(
         let Some(current) = now_groups.get(id) else {
             continue;
         };
+        // --- lane L4 ---
+        let its_own_absence = next.is_some_and(|host| {
+            current.kind == GroupKind::Raft
+                && release
+                    .resolved_fleet
+                    .groups
+                    .get(id)
+                    .is_some_and(|g| g.members.iter().any(|m| m == host))
+                && already_unavailable(fresh, host)
+        });
+        if its_own_absence {
+            continue;
+        }
         if planned.blocked.is_none()
             && let Some(why) = &current.blocked
         {
@@ -6769,6 +6832,39 @@ mod tests {
         let (release, observation) = three_member_cloud(1);
         let plan = planned(&release, "group=cloud", &observation);
         assert!(plan.groups["cloud"].blocked.is_some());
+    }
+
+    #[test]
+    fn a_member_that_is_already_down_is_not_blocked_by_its_own_absence() {
+        // --- lane L4 ---
+        // The rule asks "how many MORE members may become unavailable", and a
+        // member that is already unavailable does not become more so. Measured
+        // in the lab while a three-member control plane was being bootstrapped:
+        // as soon as two members were up and had a quorum, the THIRD — which
+        // had never been touched — was refused with "group cloud is at 2 of 3;
+        // no further member may go down." A raft group could be started and
+        // never finished; a degraded one could never be repaired, because the
+        // one host it needs a plan for is the one that is down.
+        let (release, observation) = three_member_cloud(1);
+        // `raft_cloud` makes the LAST member the unhealthy one.
+        let down = "cloud-c";
+        let plan = planned(&release, "group=cloud", &observation);
+        assert!(
+            plan.groups["cloud"].blocked.is_some(),
+            "the group is still degraded, and says so"
+        );
+        assert!(
+            !action(&plan, down, ActionKind::Activate).is_blocked(),
+            "{down} is the member that is already down; acting on it costs the group nothing"
+        );
+        // And the two that are UP are still protected, which is the whole
+        // point of the rule.
+        for host in ["cloud-a", "cloud-b"] {
+            assert!(
+                action(&plan, host, ActionKind::Activate).is_blocked(),
+                "{host} is healthy and taking it down would be the second outage"
+            );
+        }
     }
 
     #[test]

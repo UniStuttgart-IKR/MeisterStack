@@ -59,7 +59,7 @@ use crate::observation::{Endpoint, HostObservation, Observations};
 use crate::observe::{self, HostProbe, ProbeSpec, Prober};
 use crate::plan::{
     Action, ActionKind, ApprovalClass, DeploymentPlan, HostVerdict, RollbackMode, Verdict,
-    WorkloadControl, approvals_missing, validate_against,
+    WorkloadControl, approvals_missing, validate_against_next,
 };
 use crate::readiness;
 use crate::receipt::{
@@ -2666,7 +2666,10 @@ impl<'a> Executor<'a> {
         hosts: &BTreeMap<String, HostRunState>,
     ) -> Result<()> {
         let fresh = self.own_footprints_removed(fresh, hosts);
-        match validate_against(self.plan, self.release, &fresh, self.clock.now()) {
+        // --- lane L4: `id` is the host this wave is about to act on, and a
+        // group block that says only "this one is down" must not stop the
+        // run that is bringing it up.
+        match validate_against_next(self.plan, self.release, &fresh, self.clock.now(), Some(id)) {
             Verdict::Proceed => Ok(()),
             Verdict::Stop { reasons } => bail!(
                 "this plan is not the truth about the fleet any more, so nothing more was done \
