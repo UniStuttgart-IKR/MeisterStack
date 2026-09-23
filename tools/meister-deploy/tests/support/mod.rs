@@ -161,6 +161,31 @@ pub fn release_of(resolved: ResolvedFleet) -> ReleaseManifest {
     .expect("the fixture binds")
 }
 
+// --- lane 4B: the guest a verification boots ------------------------------
+
+/// The same release with the `guest-tiny` package in it.
+///
+/// `release_of` binds no packages, and `verify --suite vm-lifecycle` reads
+/// exactly one: the kernel and the initramfs
+/// `nix/packages/guest-tiny.nix` builds. The id is recomputed, because a
+/// release whose content changed and whose id did not is one `validate`
+/// refuses.
+pub fn with_guest_tiny(mut release: ReleaseManifest, store_path: &str) -> ReleaseManifest {
+    release.packages.insert(
+        "guest-tiny".to_string(),
+        meister_deploy::release::PackageArtifact {
+            store_path: store_path.to_string(),
+            nar_hash: "sha256:guest-tiny".to_string(),
+        },
+    );
+    release.release_id =
+        meister_deploy::ids::content_id(meister_deploy::ids::IdKind::Release, &release)
+            .expect("a release hashes");
+    release
+}
+
+// --- end lane 4B ----------------------------------------------------------
+
 /// A release in which the named hosts got a new system.
 pub fn with_new_systems(
     mut fleet: ResolvedFleet,

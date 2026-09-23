@@ -222,6 +222,13 @@ enum Verb {
         json: bool,
     },
 
+    // --- lane 4B: verification ------------------------------------------
+    /// Make the fleet do the thing it exists for: create guests through the
+    /// operator's own control plane, read what they printed, and delete
+    /// them again. Writes a ledger before every create, and takes back only
+    /// what it made.
+    Verify(VerifyArgs),
+    // --- end lane 4B ----------------------------------------------------
     // --- lane 3B: enrolment and certificates (one block, one verb) -----
     /// Host keys and certificates: enrol a machine against a fingerprint
     /// somebody read off its console, ask it for a certificate request, and
@@ -424,6 +431,112 @@ struct LookArgs {
     #[arg(long)]
     json: bool,
 }
+
+// --- lane 4B: verification ------------------------------------------------
+
+#[derive(Args)]
+struct VerifyArgs {
+    /// The release to verify, from `build`
+    #[arg(long)]
+    release: PathBuf,
+
+    /// `vm-lifecycle`, `gpu` or `rdma`
+    #[arg(long)]
+    suite: String,
+
+    /// Which hosts: `all`, `host=<id>`, `group=<g>`, `role=<r>`,
+    /// `profile=<p>`, `site=<s>`
+    #[arg(long, default_value = "all")]
+    select: String,
+
+    /// One host, as shorthand for `--select host=<id>`. Repeatable.
+    #[arg(long)]
+    host: Vec<String>,
+
+    /// `<a>:<b>`, for the rdma suite: measure between exactly these two,
+    /// with the server end first. Repeatable. Without it, every pair the
+    /// inventory declares among the selected hosts is measured.
+    #[arg(long)]
+    pairs: Vec<String>,
+
+    /// How long ONE fabric measurement may take, in seconds.
+    #[arg(long, default_value_t = meister_deploy::verify::FABRIC_DEADLINE.as_secs())]
+    fabric_deadline: u64,
+
+    /// `verify=<release_id>`. The approval names the RELEASE and not a
+    /// plan: this verb rolls nothing out, so there is no plan for an
+    /// approval to hang on, and what somebody is saying yes to is guests
+    /// being created against the fleet running THIS release.
+    #[arg(long)]
+    approve: Vec<String>,
+
+    /// The most guests that may be alive at once. One is created on its own
+    /// first, so a host sees `1 + budget` of them.
+    #[arg(long, default_value_t = meister_deploy::verify::BUDGET)]
+    budget: usize,
+
+    /// The whole run, in seconds. When it passes, the guests are deleted
+    /// and the outcome is `aborted`.
+    #[arg(long, default_value_t = meister_deploy::verify::DEADLINE.as_secs())]
+    deadline: u64,
+
+    /// How long ONE guest gets to reach a phase, in seconds. A guest that
+    /// boots in a second still needs a control plane that answers, so this
+    /// is a wait on the answer rather than on the guest.
+    #[arg(long, default_value_t = meister_deploy::verify::SETTLE.as_secs())]
+    settle: u64,
+
+    /// How often to ask, in seconds, while waiting.
+    #[arg(long, default_value_t = meister_deploy::verify::POLL.as_secs())]
+    poll: u64,
+
+    /// Leave the guests standing instead of deleting them, and say which.
+    /// A suite that deleted nothing has not shown a lifecycle, so every
+    /// delete is then `skipped` and a required suite is blocked.
+    #[arg(long)]
+    keep: bool,
+
+    /// A `targets/1` file from a provider adapter: where each host answers
+    #[arg(long)]
+    targets: Option<PathBuf>,
+
+    /// A snapshot from `status`, instead of asking the hosts again
+    #[arg(long)]
+    observation: Option<PathBuf>,
+
+    /// The operator's repository: its `known_hosts` is what every
+    /// connection is checked against, and its state directory is where the
+    /// ledger goes. Defaults to the one the manifest was resolved from.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+
+    /// The inventory the `[operator] cli_config` reference is read from.
+    /// Defaults to the one the manifest was resolved from.
+    #[arg(long)]
+    inventory: Option<PathBuf>,
+
+    /// The ssh key to offer when the hosts are asked what they are.
+    #[arg(long)]
+    identity: Option<PathBuf>,
+
+    /// How many hosts to ask at once
+    #[arg(long, default_value_t = observe::DEFAULT_CONCURRENCY)]
+    at_once: usize,
+
+    /// List the steps and create nothing
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Refused: a verification is work on the fleet
+    #[arg(long)]
+    offline: bool,
+
+    /// Print the verification as json instead of as a table
+    #[arg(long)]
+    json: bool,
+}
+
+// --- end lane 4B ----------------------------------------------------------
 
 #[derive(Args)]
 struct BuildArgs {
@@ -905,7 +1018,10 @@ fn run() -> Result<Answer> {
         )
         .map(Answer::from),
         Verb::Apply(args) => apply(args),
-        Verb::Report { run, repo, json } => report(run, repo, *json).map(Answer::from),
+        Verb::Report { run, repo, json } => report(run, repo, *json),
+        // --- lane 4B ---------------------------------------------------
+        Verb::Verify(args) => verify(args),
+        // --- end lane 4B -----------------------------------------------
         // --- lane 3B ---------------------------------------------------
         Verb::Keys { cmd } => keys(cmd).map(Answer::from),
         // --- end lane 3B -----------------------------------------------
@@ -931,10 +1047,14 @@ fn print_schema(kind: &str) -> Result<bool> {
         // The contract lane 2C's `meister-activate status --json` answers
         // with, and the second source `observe` merges into an observation.
         "activate-status" => schemars::schema_for!(observe::ActivateStatus),
+        // --- lane 4B ---
+        "verify-ledger" => schemars::schema_for!(meister_deploy::verify::Ledger),
+        "verify" => schemars::schema_for!(meister_deploy::verify::VerifyRun),
+        // --- end lane 4B ---
         other => anyhow::bail!(
             "there is no schema called {other:?}; this tool knows nix-manifest, \
              resolved-fleet, release, observation, activate-status, targets, plan, \
-             status, receipt, journal-event and check-result."
+             status, receipt, journal-event, check-result, verify and verify-ledger."
         ),
     };
     println!("{}", serde_json::to_string_pretty(&schema)?);
@@ -1204,10 +1324,11 @@ fn status(args: &LookArgs) -> Result<Answer> {
 fn check(args: &LookArgs, suite: &str) -> Result<Answer> {
     if suite != "readiness" {
         anyhow::bail!(
+            // --- lane 4B: the verb it points at now exists ---
             "the suite {suite:?} does work on the fleet — it starts guests, it uses \
              hardware — so it is not something `check` does. `check --suite readiness` is \
-             what reads; `verify --suite {suite}` arrives with M4 and takes a budget, a \
-             deadline and an approval."
+             what reads; `verify --suite {suite}` is the one that does the work, and it \
+             takes a budget, a deadline and an approval." // --- end lane 4B ---"
         );
     }
     let looked = look(args)?;
@@ -2543,7 +2664,7 @@ fn parse_approvals(given: &[String]) -> Result<Vec<(plan::ApprovalClass, String)
 /// Exit 0 means a report was produced, whatever it says: a rollout that
 /// failed is not this verb failing. Exit 1 means there is nothing here to
 /// report.
-fn report(run: &str, repo: &Path, json: bool) -> Result<bool> {
+fn report(run: &str, repo: &Path, json: bool) -> Result<Answer> {
     let files = RealFiles::new(Policy::real());
     let state = StateDir::in_repo(repo);
 
@@ -2568,6 +2689,48 @@ fn report(run: &str, repo: &Path, json: bool) -> Result<bool> {
             }
         );
     }
+
+    // --- lane 4B: a run may be a verification rather than a rollout ---
+    //
+    // The two write into the same run directory and are read by the same
+    // verb, because they are the same question — what did this run do and
+    // what did it find. A verification has no journal and no receipt; it has
+    // a ledger and a set of checks, and its report draws the one line that
+    // matters: what came off hardware, and what did not.
+    if files.exists(&state.verify_path(run)) {
+        let text = files.read_to_string(&state.verify_path(run))?;
+        let verification = meister_deploy::verify::VerifyRun::from_json(
+            &text,
+            &state.verify_path(run).display().to_string(),
+        )?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&meister_deploy::verify::report_json(&verification))?
+            );
+        } else {
+            print!("{}", meister_deploy::verify::report_text(&verification));
+        }
+        let blocked = meister_deploy::verify::blocking(&verification);
+        if blocked.is_empty() {
+            eprintln!(
+                "==> the {} suite passed every required check over {} host(s).",
+                verification.suite,
+                verification.hosts.len()
+            );
+            return Ok(Answer::Yes);
+        }
+        for reason in &blocked {
+            eprintln!("    blocked: {reason}");
+        }
+        eprintln!(
+            "==> {} required check(s) of the {} suite did not pass.",
+            blocked.len(),
+            verification.suite
+        );
+        return Ok(Answer::Blocked);
+    }
+    // --- end lane 4B --------------------------------------------------
 
     let journal_path = state.journal_path(run);
     let read = if files.exists(&journal_path) {
@@ -2644,8 +2807,270 @@ fn report(run: &str, repo: &Path, json: bool) -> Result<bool> {
     {
         eprintln!("note: {torn}");
     }
-    Ok(true)
+    Ok(Answer::Yes)
 }
+
+// ---------------------------------------------------------------------------
+// lane 4B: verification
+// ---------------------------------------------------------------------------
+
+/// `verify --release r.json --suite <s> --approve verify=<release_id>`.
+///
+/// The one verb of this tool that makes something on the fleet which is not
+/// part of the fleet: guests, so that the answer to "does this work" is a
+/// guest that booted rather than a unit that is active. Everything it makes
+/// it writes down first and takes back afterwards, and what it could not take
+/// back is a check rather than a silence.
+fn verify(args: &VerifyArgs) -> Result<Answer> {
+    use meister_deploy::verify::{self, Options, Suite, Verifier};
+
+    if args.offline {
+        anyhow::bail!(
+            "a verification creates guests on the fleet and deletes them again, so there is \
+             nothing it can do without reaching a control plane. `check --suite readiness` \
+             is the verb that only reads, and it takes --offline."
+        );
+    }
+    let suite = Suite::parse(&args.suite)?;
+    let policy = if args.dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+
+    let text = files.read_to_string(&args.release)?;
+    let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
+
+    // The approval names the release, because that is what is being verified.
+    // A dry run creates nothing, so it needs none — and saying so is more
+    // use than making somebody paste an id to read a listing.
+    if !args.dry_run {
+        match verify_approval(&args.approve)? {
+            Some(id) if id == release.release_id => {}
+            Some(id) => anyhow::bail!(
+                "the approval names {id} and this release is {}. An approval is for the \
+                 bytes it was given, not for whatever is in the file today.",
+                release.release_id
+            ),
+            None => anyhow::bail!(
+                "this creates guests on the fleet. Say so: --approve verify={}",
+                release.release_id
+            ),
+        }
+    }
+
+    let select = if args.host.is_empty() {
+        args.select.clone()
+    } else {
+        args.host
+            .iter()
+            .map(|id| format!("host={id}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let selected = plan::select(&release.resolved_fleet, &select)?;
+    let repo = args
+        .repo
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(&release.resolved_fleet.source.repo_path));
+    let state = StateDir::in_repo(&repo);
+
+    Cancel::on_sigint()?;
+    let runner = Real::new(policy);
+
+    // What the machines ARE, as opposed to what the inventory says they are.
+    // It decides three things: whether a host can be asked anything at all,
+    // whether a declared capability is actually there, and — the one that
+    // keeps a report honest — whether a guest that ran counts as hardware
+    // evidence.
+    let observation = match &args.observation {
+        Some(path) => {
+            let text = files.read_to_string(path)?;
+            let snapshot =
+                observation::Observations::from_json(&text, &path.display().to_string())?;
+            eprintln!(
+                "note: nothing was asked of any host. This is the snapshot of {}, and a \
+                 fleet moves.",
+                snapshot.taken_at.to_rfc3339()
+            );
+            snapshot
+        }
+        None => {
+            let endpoints = match &args.targets {
+                Some(path) => {
+                    let text = files.read_to_string(path)?;
+                    let targets =
+                        observation::Targets::from_json(&text, &path.display().to_string())?;
+                    observation::bind_targets(&release.resolved_fleet, &targets, &selected)?
+                }
+                None => observation::manifest_endpoints(&release.resolved_fleet, &selected)?,
+            };
+            let ssh = transport::Ssh::for_repo(&repo).with_identity(args.identity.clone());
+            let prober = observe::SshProber::new(&runner, &ssh);
+            let probes: Vec<observe::HostProbe> = selected
+                .iter()
+                .map(|id| {
+                    observe::HostProbe::new(
+                        transport::Target::from_endpoint(id, &endpoints[id]),
+                        observe::ProbeSpec::for_host(&release.resolved_fleet.hosts[id]),
+                    )
+                })
+                .collect();
+            let snapshot = observe::observe_fleet(&prober, &probes, RealClock.now(), args.at_once)?;
+            if !args.dry_run {
+                state.create(&files)?;
+                state.save_observation(&files, &snapshot, None)?;
+            }
+            snapshot
+        }
+    };
+
+    let (control, note) = workload_control(&files, &release, args.inventory.as_deref());
+    if let Some(note) = &note {
+        eprintln!("note: {note}");
+    }
+
+    let run_id = meister_deploy::ids::run_id(RealClock.now()).to_string();
+    let mut options = Options::new(&run_id, suite);
+    options.budget = args.budget;
+    options.deadline = std::time::Duration::from_secs(args.deadline);
+    options.keep = args.keep;
+    options.control = control;
+    options.settle = std::time::Duration::from_secs(args.settle);
+    options.poll = std::time::Duration::from_secs(args.poll.max(1));
+    options.fabric = std::time::Duration::from_secs(args.fabric_deadline);
+    options.pairs = parse_pairs(&args.pairs)?;
+
+    let clock = RealClock;
+    // The one runner an interrupt does not reach, for the one piece of work
+    // an interrupt ASKS for: taking the guests back. Everything else in this
+    // verb goes through `runner` and stops when the operator says stop.
+    let cleanup_runner = Real::new(policy).unstoppable();
+    // The rdma suite is the one that reaches the hosts themselves: it runs a
+    // server on one end and a client on the other. The guest suites talk to
+    // a control plane and to nothing else, and are given no transport at all
+    // so that they cannot.
+    let ssh = transport::Ssh::for_repo(&repo).with_identity(args.identity.clone());
+    let mut verifier = Verifier::new(
+        &runner,
+        &files,
+        &clock,
+        state,
+        &release,
+        &observation,
+        selected.clone(),
+        options,
+    )
+    .with_cleanup_runner(&cleanup_runner);
+    if suite == Suite::Rdma {
+        let endpoints = observation::manifest_endpoints(&release.resolved_fleet, &selected)?;
+        verifier = verifier.over_ssh(&ssh, endpoints);
+    }
+
+    if args.dry_run {
+        print!("{}", verify::listing(&verifier.steps()));
+        eprintln!(
+            "==> this is what `verify --suite {suite}` would do. Nothing was created and \
+             nothing was written."
+        );
+        return Ok(Answer::Yes);
+    }
+
+    // The run id first and on its own line, like `apply`: a script that has
+    // to read the ledger afterwards needs it even when the run went badly.
+    println!("{run_id}");
+    let run = verifier.run()?;
+
+    if args.json {
+        println!("{}", String::from_utf8(run.to_json()?)?);
+    } else {
+        print!("{}", verify::summary(&run));
+    }
+    eprintln!("==> {}", run.ledger_path);
+
+    match meister_deploy::checks::acceptance(&run.checks) {
+        meister_deploy::checks::Acceptance::Blocked { reasons } => {
+            for reason in &reasons {
+                eprintln!("    blocked: {reason}");
+            }
+            eprintln!(
+                "==> {} required check(s) of the {suite} suite did not pass.",
+                reasons.len()
+            );
+            Ok(Answer::Blocked)
+        }
+        meister_deploy::checks::Acceptance::Accepted
+            if run.outcome == meister_deploy::receipt::Outcome::Aborted =>
+        {
+            eprintln!(
+                "==> the {suite} suite did not finish, so it answered nothing. What it had \
+                 made was deleted; the ledger says what it held."
+            );
+            Ok(Answer::Blocked)
+        }
+        meister_deploy::checks::Acceptance::Accepted => {
+            eprintln!(
+                "==> the {suite} suite passed every required check over {} host(s).",
+                run.hosts.len()
+            );
+            Ok(Answer::Yes)
+        }
+    }
+}
+
+/// `--pairs <a>:<b>`, as the operator typed it.
+fn parse_pairs(given: &[String]) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for text in given {
+        let Some((a, b)) = text.split_once(':') else {
+            anyhow::bail!(
+                "{text:?} is not a pair. The form is `--pairs <server>:<client>`, two host                  ids of this fleet."
+            );
+        };
+        if a.trim().is_empty() || b.trim().is_empty() {
+            anyhow::bail!("{text:?} names only one end, and a fabric measurement has two.");
+        }
+        if a == b {
+            anyhow::bail!(
+                "{text:?} names {a} at both ends. A loopback measurement says nothing about                  a fabric between two machines."
+            );
+        }
+        out.push((a.to_string(), b.to_string()));
+    }
+    Ok(out)
+}
+
+/// `--approve verify=<release_id>`, as the operator typed it.
+///
+/// Its own parser and not [`parse_approvals`]: the classes of that one are a
+/// plan's, and a `verify` approval names a release. Spelling it `verify=` on
+/// purpose, so that a person who has both commands in their shell history
+/// cannot paste one into the other and have it taken.
+fn verify_approval(given: &[String]) -> Result<Option<String>> {
+    let mut found = None;
+    for text in given {
+        let Some((class, id)) = text.split_once('=') else {
+            anyhow::bail!(
+                "{text:?} is not an approval. The form is `--approve verify=<release_id>`, \
+                 and the release id is the one `build` printed."
+            );
+        };
+        if class != "verify" {
+            anyhow::bail!(
+                "{class:?} is not a class this verb takes. A verification has one: \
+                 `--approve verify=<release_id>`."
+            );
+        }
+        if id.trim().is_empty() {
+            anyhow::bail!("{text:?} names no release id.");
+        }
+        found = Some(id.to_string());
+    }
+    Ok(found)
+}
+
+// --- end lane 4B ----------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // lane 3B: keys

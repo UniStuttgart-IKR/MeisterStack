@@ -38,6 +38,9 @@ in
     ./etcd.nix
     ./controllers.nix
     ./agent.nix
+    # --- lane 4B: the fabric tools of a host with an RDMA card ---
+    ./rdma.nix
+    # --- end lane 4B ---
     ./addons.nix
     ./data.nix
     ./observability.nix

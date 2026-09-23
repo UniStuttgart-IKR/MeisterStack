@@ -115,6 +115,26 @@ impl StateDir {
         self.run_dir(run_id).join("plan.json")
     }
 
+    // --- lane 4B: what a verification leaves behind -------------------
+    //
+    // Beside the journal and the receipt of a rollout, in the same run
+    // directory, because they are the same kind of thing: what this run did
+    // and what it found. `report --run <id>` reads whichever of them is
+    // there.
+
+    /// `runs/<run-id>/ledger.json`: what a verification made, written
+    /// before it was made.
+    pub fn verify_ledger_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("ledger.json")
+    }
+
+    /// `runs/<run-id>/verify.json`: what it found.
+    pub fn verify_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("verify.json")
+    }
+
+    // --- end lane 4B --------------------------------------------------
+
     pub fn observations_dir(&self) -> PathBuf {
         self.root.join("observations")
     }

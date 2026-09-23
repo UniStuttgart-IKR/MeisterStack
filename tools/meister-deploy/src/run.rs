@@ -455,6 +455,19 @@ pub struct Real {
     /// go there.
     pub verbose: bool,
     pub cancel: Cancel,
+    // --- lane 4B ---
+    /// Whether the operator's interrupt reaches the commands this runner
+    /// spawns.
+    ///
+    /// True for everything, with exactly one exception: the work that has to
+    /// happen BECAUSE the operator interrupted. `verify` takes its guests
+    /// back when it is stopped, and a runner that honoured the same Ctrl-C
+    /// would kill the `vm rm` it had just started — measured on manacor, the
+    /// first interrupted run left two guests standing, because the delete
+    /// and the listing after it were in the process group the interrupt had
+    /// killed. The deadline still applies, so this cannot hang.
+    pub stoppable: bool,
+    // --- end lane 4B ---
 }
 
 impl Real {
@@ -463,6 +476,7 @@ impl Real {
             policy,
             verbose: false,
             cancel: Cancel::new(),
+            stoppable: true,
         }
     }
 
@@ -470,6 +484,15 @@ impl Real {
         self.verbose = on;
         self
     }
+
+    // --- lane 4B ---
+    /// A runner whose commands the operator's interrupt does not reach. See
+    /// [`Real::stoppable`]; nothing but a cleanup may use it.
+    pub fn unstoppable(mut self) -> Real {
+        self.stoppable = false;
+        self
+    }
+    // --- end lane 4B ---
 }
 
 /// How often the wait loop looks at the child. Small enough that a 200 ms
@@ -553,7 +576,7 @@ impl Runner for Real {
                 break status;
             }
             if signalled.is_none() {
-                if self.cancel.is_cancelled() {
+                if self.stoppable && self.cancel.is_cancelled() {
                     cancelled = true;
                 } else if started.elapsed() >= cmd.deadline {
                     timed_out = true;
