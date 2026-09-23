@@ -218,6 +218,14 @@ and records `dirty: true` — a `dev:` fingerprint is never a `git:` one.
   (L2 §10.6). Write the commands on separate lines.
 * `validate --manifest manifest.json` checks a contract file against the
   types. `checks.manifest-json` does the same thing inside `nix flake check`.
+* **`-f` must be the inventory the flake evaluates.** The evaluation records
+  the sha256 of the file it read, and `resolve` compares it with the file
+  named by `-f` (default `fleet.toml`); another file is refused before
+  anything is written. In the lab (L4, W3) the flake read `lab.toml`, `-f`
+  was not given, and every later verb — `keys issue` first — read the
+  default `fleet.toml` out of the manifest and acted on its `[operator]`
+  section. With `--from` it is only a warning, because a handed-over
+  evaluation is allowed to be older than the file.
 
 ---
 
