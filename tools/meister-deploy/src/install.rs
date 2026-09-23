@@ -477,6 +477,27 @@ impl<'a> Installer<'a> {
             }
         };
 
+        // Astra finding F18, 2026-09-23: `target.disk.wwn` — what the
+        // INVENTORY declared, baked into this medium when it was built —
+        // used to be carried in the struct and never read again; only an
+        // operator-TYPED `--wwn` ever filtered a candidate. A serial alone
+        // is not always unique (the two-disks-one-serial case a few lines
+        // above is exactly that), so a declared wwn is enforced the same
+        // way the declared serial already is: it has to match the disk that
+        // was found, not sit unread in `target.json`.
+        if let Some(declared_wwn) = &target.disk.wwn
+            && chosen.wwn.as_deref() != Some(declared_wwn.as_str())
+        {
+            bail!(
+                "the disk with the serial {serial} is {} and its wwn is {}, but the inventory \
+                 declares the wwn {declared_wwn} for this host. Either this is a different \
+                 disk that happens to share the serial, or the inventory is stale. Nothing was \
+                 changed.",
+                chosen.path,
+                chosen.wwn.as_deref().unwrap_or("none")
+            );
+        }
+
         let Some(size) = chosen.size_bytes() else {
             bail!(
                 "lsblk did not say how big {} is, so its size cannot be compared with the {} \
@@ -1451,6 +1472,49 @@ mod tests {
             .disk(&target(), "MEISTERTEST01", Some("nvme.0000-2222"))
             .expect("one of the two");
         assert_eq!(chosen.device.path, "/dev/vdc");
+        runner.verify().unwrap();
+    }
+
+    /// Astra finding F18, 2026-09-23: a wwn the INVENTORY declares — baked
+    /// into the medium at build time — has to match the disk that was
+    /// found, exactly like the declared serial already must. It used to sit
+    /// in `target.disk.wwn` unread; only an operator-typed `--wwn` was ever
+    /// checked.
+    #[test]
+    fn a_declared_wwn_that_does_not_match_the_disk_is_refused() {
+        let mut target = target();
+        target.disk.wwn = Some("nvme.declared-0001".to_string());
+        let answer = lsblk(&[], SIZE).replace(
+            r#""serial":"MEISTERTEST01","wwn":null"#,
+            r#""serial":"MEISTERTEST01","wwn":"nvme.actual-9999""#,
+        );
+        let runner = StrictFake::new().expect(lsblk_matcher(), Output::stdout(answer));
+        let files = files_with(&target);
+        let clock = FakeClock::fixed();
+        let err = installer(&runner, &files, &clock)
+            .disk(&target, "MEISTERTEST01", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nvme.declared-0001"), "{err}");
+        assert!(err.contains("nvme.actual-9999"), "{err}");
+        runner.verify().unwrap();
+    }
+
+    #[test]
+    fn a_declared_wwn_that_matches_the_disk_is_not_a_refusal() {
+        let mut target = target();
+        target.disk.wwn = Some("nvme.actual-9999".to_string());
+        let answer = lsblk(&[], SIZE).replace(
+            r#""serial":"MEISTERTEST01","wwn":null"#,
+            r#""serial":"MEISTERTEST01","wwn":"nvme.actual-9999""#,
+        );
+        let runner = StrictFake::new().expect(lsblk_matcher(), Output::stdout(answer));
+        let files = files_with(&target);
+        let clock = FakeClock::fixed();
+        let chosen = installer(&runner, &files, &clock)
+            .disk(&target, "MEISTERTEST01", None)
+            .expect("the declared wwn matches");
+        assert_eq!(chosen.device.wwn.as_deref(), Some("nvme.actual-9999"));
         runner.verify().unwrap();
     }
 
