@@ -142,6 +142,7 @@
           meisterstack-static
           meisterstack-runtime
           cloud-hypervisor-meister
+          cloud-hypervisor-meister-static
           vhost-device-input
           guest-tiny
           # The CA an operator issues with: `nix run .#meister-ca`, or on
