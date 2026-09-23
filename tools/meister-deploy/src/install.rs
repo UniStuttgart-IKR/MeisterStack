@@ -22,7 +22,13 @@
 //!    `--reinstall` says so on purpose;
 //! 5. nothing this host preserves lives on it.
 //!
-//! Only then does anything happen, and what happens is printed first.
+//! Only then does anything happen, and what happens is printed first —
+//! [`Installer::prepare`] does the five refusals and returns the summary,
+//! [`Installer::execute`] is the only thing that may run a command that
+//! changes the machine, and a caller has to have the first before it can
+//! call the second (Astra finding F17, 2026-09-23: the two used to be one
+//! function that returned the summary only after already running those
+//! commands, which is the opposite of this sentence).
 //!
 //! **Preserve means "not touched", not "copied".** This program moves no
 //! data anywhere. A path in `install.preserve` that turns out to be on the
@@ -302,6 +308,25 @@ pub struct Chosen {
     pub device: BlockDevice,
     /// Its partitions, as lsblk listed them.
     pub partitions: Vec<BlockDevice>,
+}
+
+/// Everything decided before anything is allowed to change the machine, and
+/// the summary that has to reach the operator before it does.
+///
+/// Astra finding F17, 2026-09-23: `Installer::confirm` used to do the five
+/// refusals, build the summary, run the four destructive commands (unless
+/// `--dry-run`) and only THEN return one `(Outcome, String)` — so a caller
+/// could not print the summary until the disk was already gone, and never
+/// printed it at all when the install failed partway. `Prepared` is the
+/// boundary: everything up to [`Installer::prepare`] changes nothing, and a
+/// caller shows the summary it returns and flushes it before calling
+/// [`Installer::execute`].
+pub struct Prepared {
+    target: InstallTarget,
+    chosen: Chosen,
+    plan_id: Option<String>,
+    dry_run: bool,
+    outcome: Outcome,
 }
 
 pub struct Installer<'a> {
@@ -811,10 +836,10 @@ impl<'a> Installer<'a> {
         out
     }
 
-    /// The whole of it: five refusals, a summary, and then — only then —
-    /// the four commands that change the machine.
+    /// The five refusals, in order, and the summary of what would happen —
+    /// nothing here changes the machine.
     #[allow(clippy::too_many_arguments)]
-    pub fn confirm(
+    pub fn prepare(
         &self,
         host: &str,
         serial: &str,
@@ -822,7 +847,7 @@ impl<'a> Installer<'a> {
         reinstall: bool,
         plan_id: Option<&str>,
         dry_run: bool,
-    ) -> Result<(Outcome, String)> {
+    ) -> Result<(Prepared, String)> {
         let target = self.target(host)?;
         let chosen = self.disk(&target, serial, wwn)?;
         let disk = self.real_path(&chosen.device.path)?;
@@ -853,7 +878,7 @@ impl<'a> Installer<'a> {
             reinstall,
         );
 
-        let mut outcome = Outcome {
+        let outcome = Outcome {
             schema: OUTCOME_SCHEMA.to_string(),
             host: target.host.clone(),
             fleet: target.fleet.clone(),
@@ -871,16 +896,41 @@ impl<'a> Installer<'a> {
             next: String::new(),
         };
 
+        Ok((
+            Prepared {
+                target,
+                chosen,
+                plan_id: plan_id.map(str::to_string),
+                dry_run,
+                outcome,
+            },
+            summary,
+        ))
+    }
+
+    /// The four commands that change the machine — or, for a dry run,
+    /// nothing. Called only once the summary [`Installer::prepare`] returned
+    /// has reached the operator: nothing before this point may run before
+    /// that happens.
+    pub fn execute(&self, prepared: Prepared) -> Result<Outcome> {
+        let Prepared {
+            target,
+            chosen,
+            plan_id,
+            dry_run,
+            mut outcome,
+        } = prepared;
+
         if dry_run {
             outcome.next = format!(
                 "nothing was changed. A real run would destroy every partition of {}, install \
                  {} and generate this machine's first host key.",
                 chosen.device.path, target.toplevel
             );
-            return Ok((outcome, summary));
+            return Ok(outcome);
         }
 
-        let installed = self.install(&target, &chosen, plan_id)?;
+        let installed = self.install(&target, &chosen, plan_id.as_deref())?;
         outcome.next = match target.boot_mode {
             BootMode::Uefi => format!(
                 "power off, remove the medium and boot from {}. Then enrol this machine with \
@@ -911,6 +961,25 @@ impl<'a> Installer<'a> {
             // --- end lane 5C ---
         };
         outcome.installed = Some(installed);
+        Ok(outcome)
+    }
+
+    /// `prepare` then `execute`, with no summary shown in between — what
+    /// every test in this module wants, and the one thing a real caller
+    /// (Astra finding F17) must not do.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn confirm(
+        &self,
+        host: &str,
+        serial: &str,
+        wwn: Option<&str>,
+        reinstall: bool,
+        plan_id: Option<&str>,
+        dry_run: bool,
+    ) -> Result<(Outcome, String)> {
+        let (prepared, summary) = self.prepare(host, serial, wwn, reinstall, plan_id, dry_run)?;
+        let outcome = self.execute(prepared)?;
         Ok((outcome, summary))
     }
 
@@ -1841,6 +1910,91 @@ mod tests {
 
         assert!(outcome.next.contains("power off"), "{}", outcome.next);
         assert!(outcome.next.contains("keys enroll box"), "{}", outcome.next);
+    }
+
+    /// Astra finding F17, 2026-09-23: `prepare` returns the summary using
+    /// only the five refusals' own read-only commands — the runner here has
+    /// none of the four destructive ones to hand out, and verifying it right
+    /// after `prepare` alone still succeeds. `execute` is a second, separate
+    /// call, against a `Prepared` that carries no runner of its own: the one
+    /// used here belongs to a different `Installer`, proving that nothing
+    /// destructive can run before a caller has already seen the summary.
+    #[test]
+    fn prepare_hands_back_the_summary_before_execute_runs_anything() {
+        let runner = StrictFake::new()
+            .expect(lsblk_matcher(), Output::stdout(lsblk(&[], SIZE)))
+            .expect(realpath(DISK), Output::stdout("/dev/vdb\n"))
+            .expect(realpath(BY_ID), Output::stdout("/dev/vdb\n"));
+        let files = files_with(&target());
+        let clock = FakeClock::fixed();
+        let (prepared, summary) = installer(&runner, &files, &clock)
+            .prepare("box", "MEISTERTEST01", None, false, Some("plan-1"), false)
+            .expect("a blank disk prepares");
+        // Nothing but lsblk and two realpaths ran: no disko, no
+        // nixos-install, no ssh-keygen, no machine-id-setup.
+        runner.verify().unwrap();
+        assert!(summary.contains("this disk is blank"), "{summary}");
+        assert!(
+            summary.contains("DESTROY every partition of /dev/vdb"),
+            "{summary}"
+        );
+
+        // Only now, with the summary already in hand, does execute get a
+        // chance to run anything — on ITS OWN runner, expecting only the
+        // four commands `execute` itself runs and none of `prepare`'s, so
+        // the assertion below is about execute alone.
+        let runner = StrictFake::new()
+            .expect(
+                Matcher::exact(DISKO, Vec::<String>::new()),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(
+                    "nixos-install",
+                    [
+                        "--system",
+                        TOPLEVEL,
+                        "--root",
+                        ROOT,
+                        "--no-root-passwd",
+                        "--no-channel-copy",
+                    ],
+                ),
+                Output::stdout("installing"),
+            )
+            .expect(
+                Matcher::exact(
+                    "ssh-keygen",
+                    [
+                        "-t",
+                        "ed25519",
+                        "-N",
+                        "",
+                        "-f",
+                        "/mnt/etc/ssh/ssh_host_ed25519_key",
+                    ],
+                ),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(
+                    "ssh-keygen",
+                    ["-lf", "/mnt/etc/ssh/ssh_host_ed25519_key.pub"],
+                ),
+                Output::stdout("256 SHA256:aBcD1234 root@box (ED25519)\n"),
+            )
+            .expect(
+                Matcher::exact("systemd-machine-id-setup", ["--root=/mnt"]),
+                Output::stdout(""),
+            )
+            .expect(Matcher::exact("umount", ["-R", "/mnt"]), Output::stdout(""));
+        let files = files_with(&target())
+            .given("/mnt/etc/machine-id", "feedfacefeedfacefeedfacefeedface\n");
+        let outcome = installer(&runner, &files, &clock)
+            .execute(prepared)
+            .expect("execute finishes what prepare found");
+        runner.verify().unwrap();
+        assert!(outcome.installed.is_some());
     }
 
     #[test]

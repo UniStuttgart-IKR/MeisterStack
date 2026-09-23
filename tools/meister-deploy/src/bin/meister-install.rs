@@ -18,10 +18,11 @@
 //! one — an installer that formats a disk because a stick was left in a
 //! drive is the failure this verb exists to prevent.
 
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use meister_deploy::effects::{RealClock, RealFiles};
@@ -147,7 +148,7 @@ fn run() -> Result<()> {
             plan,
             dry_run,
         } => {
-            let (outcome, summary) = installer.confirm(
+            let (prepared, summary) = installer.prepare(
                 host,
                 disk,
                 wwn.as_deref(),
@@ -157,7 +158,18 @@ fn run() -> Result<()> {
             )?;
             // The summary on stderr and the answer on stdout, so that a
             // person reads the first and a script reads the second.
+            //
+            // Astra finding F17, 2026-09-23: printed and FLUSHED here, before
+            // `execute` runs a single command — `confirm` used to build this
+            // same summary and hand it back only after the disko script had
+            // already run (or, on a failure partway through, never hand it
+            // back at all). The operator now sees exactly what is about to
+            // happen before anything does.
             eprint!("{summary}");
+            io::stderr()
+                .flush()
+                .context("printing the summary failed")?;
+            let outcome = installer.execute(prepared)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
