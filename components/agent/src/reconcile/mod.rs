@@ -54,6 +54,15 @@ pub enum Trigger {
     Manual,
 }
 
+/// What an action was decided from: the record as the pass read it, what it
+/// saw, and the instant it decided at. Handed to `execute`, which asks `plan`
+/// the same question again under the node's lock — see there, and F07.
+pub(super) struct Planned<'a> {
+    pub(super) record: &'a VmRecord,
+    pub(super) observed: &'a Observed,
+    pub(super) at: SystemTime,
+}
+
 /// What a pass WOULD do, without doing it: the record's stated intent, where
 /// its resources got to, whether it is quarantined, what the world looks
 /// like, and the action those three add up to. A struct and not a tuple
@@ -531,7 +540,8 @@ impl Reconciler {
                 record = fresh;
             }
 
-            let action = plan(&record, &observed, SystemTime::now());
+            let at = SystemTime::now();
+            let action = plan(&record, &observed, at);
             log_decision(step, &record, &observed, action);
 
             if first_action.is_none() {
@@ -542,10 +552,12 @@ impl Reconciler {
                 break;
             }
 
-            if let Err(e) = self
-                .execute(&id, (record.phase, record.desired), action)
-                .await
-            {
+            let planned = Planned {
+                record: &record,
+                observed: &observed,
+                at,
+            };
+            if let Err(e) = self.execute(&id, planned, action).await {
                 let said = format!("{e:#}");
                 let retry_in = self.register_failure(&id, &said);
                 warn!(error = %said, ?retry_in, "reconcile failed");

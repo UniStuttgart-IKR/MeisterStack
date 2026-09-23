@@ -20,9 +20,9 @@ use controller_api::events;
 use controller_api::rest::Json;
 use controller_api::{
     API_VERSION, ApiError, ApiResource, Caller, CallerRole, CallerTenant, Capacity,
-    CertificateSigningRequest, Cluster, ClusterSpec, EtcdStore, Event, FloatingIp, FloatingPool,
-    Image, ImageSpec, Owned, ProviderNetwork, Resource, Role, RoutedSubnet, Scope, SpecUpdate,
-    StoragePool, StoreError, Tenant, User, Verb, Vm, VmSpec, Volume, VolumePhaseKind,
+    CertificateSigningRequest, Cluster, ClusterSpec, EtcdStore, Event, Fence, FloatingIp,
+    FloatingPool, Image, ImageSpec, Owned, ProviderNetwork, Resource, Role, RoutedSubnet, Scope,
+    SpecUpdate, StoragePool, StoreError, Tenant, User, Verb, Vm, VmSpec, Volume, VolumePhaseKind,
     VolumeSnapshot, apply_spec_update, check_envelope, check_owned, conflict, floating, forbidden,
     invalid, invalid_field, permits_object, quota,
     resources::{
@@ -33,7 +33,7 @@ use controller_api::{
 };
 use proto::cloud_command;
 use serde_json::json;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// The CA this API server signs with, and the two decisions that go with it.
 ///
@@ -635,6 +635,9 @@ macro_rules! patch_object {
 // this file says `use <child>::*` and sees the handlers the router names. So
 // a handler that moves between two of them needs no import changed at either
 // end, and the router below stays one line per route.
+mod admission;
+#[cfg(test)]
+mod admission_tests;
 mod clusters;
 mod csrs;
 #[path = "events.rs"]
@@ -655,6 +658,7 @@ mod tests;
 mod users;
 mod vms;
 
+use admission::*;
 use clusters::*;
 use csrs::*;
 use events_route::*;

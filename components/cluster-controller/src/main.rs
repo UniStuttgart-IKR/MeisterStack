@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use controller_api::EtcdStore;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "meister-cluster-controller")]
@@ -512,8 +512,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         );
     }
 
-    if serves_sessions {
-        let session_addr = cfg.listen_session.parse().context("listen_session")?;
+    // Bound here and supervised at the end of `run`: a replica told to take
+    // agent sessions that cannot is not a replica. See
+    // `controller_api::grpc::serve_beside`.
+    let sessions = if serves_sessions {
+        let incoming = controller_api::grpc::bind_sessions(&cfg.listen_session)?;
         let mut grpc_builder = tonic::transport::Server::builder();
         if let Some(tls) = session_tls {
             grpc_builder = grpc_builder.tls_config(tls).context("session tls")?;
@@ -526,16 +529,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 cfg.advertise_api.clone(),
                 kek.clone(),
             ))
-            .serve(session_addr);
-        tokio::spawn(async move {
-            if let Err(e) = grpc.await {
-                error!(error = format!("{e:#}"), "session server stopped");
-            }
-        });
+            .serve_with_incoming(incoming);
         info!(endpoint = %cfg.listen_session, "agent session server listening");
+        Some(tokio::spawn(grpc))
     } else {
         warn!("listen_session is empty; no node can dial this replica");
-    }
+        None
+    };
 
     {
         let store = store.clone();
@@ -620,7 +620,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
             tickets: None,
         },
     );
-    controller_api::rest::serve(listener, router, api_tls).await
+    controller_api::grpc::serve_beside(
+        controller_api::rest::serve(listener, router, api_tls),
+        sessions,
+    )
+    .await
 }
 
 #[cfg(test)]

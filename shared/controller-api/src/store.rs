@@ -49,6 +49,40 @@ fn lease_dir(prefix: &str, resource: &str) -> String {
     format!("{prefix}/leases/{resource}/")
 }
 
+/// A key whose only content is its revision: `<prefix>/fences/<name>`.
+///
+/// The one thing the store cannot do by itself is keep a promise about MANY
+/// objects. Its compare-and-swap is per key, so a rule over a set — "this
+/// tenant holds at most one VM" — was checked by listing the set and then
+/// writing a key of its own, and two writers that each listed before the
+/// other wrote each got a yes (F03). Two different keys, nothing for etcd to
+/// see as a collision.
+///
+/// A fence gives the rule a key. Everybody who would make the set bigger
+/// reads the fence first, looks at the set, and writes through
+/// `create_fenced`/`update_fenced`, which compares the fence in the same
+/// transaction and moves it. Of two writers that read the same fence, the
+/// second finds it moved and looks again, and what it sees then includes the
+/// first. Across replicas as much as within one: the fence is in etcd.
+///
+/// Deliberately NOT a counter. The value is only a note of what last went
+/// through — the answer to "how much is held" stays the objects themselves,
+/// counted where it is asked, because a second copy of a number is a number
+/// that can be wrong (`TenantUsage` makes the same argument).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fence {
+    key: String,
+    /// The key's mod_revision when it was read. Zero is a fence nobody has
+    /// passed yet, which etcd compares as a key that does not exist.
+    revision: i64,
+}
+
+/// What a fenced write leaves on the fence: which object went through last.
+/// Read by nobody but a person with `etcdctl`.
+fn fence_mark(resource: &str, name: &str) -> String {
+    format!("{resource}/{name}")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("object not found: {0}")]
@@ -277,6 +311,19 @@ impl EtcdStore {
     }
 
     pub async fn list<T: Resource>(&self) -> Result<Vec<T>> {
+        Ok(self.list_counted().await?.0)
+    }
+
+    /// `list`, and how many keys the SAME answer held.
+    ///
+    /// For the callers whose correctness rests on the list being all of them:
+    /// fewer objects than keys means something did not decode. They used to
+    /// ask `count` for the second number, which is a second read at a later
+    /// revision — so an object created between the two made a complete list
+    /// look short, and a quota check under concurrent creates refused with
+    /// "some vm objects did not decode" about objects that decoded fine.
+    /// Found by the F03 stress test; one response cannot disagree with itself.
+    pub async fn list_counted<T: Resource>(&self) -> Result<(Vec<T>, usize)> {
         let dir = self.dir(T::RESOURCE);
         let resp = timed(
             "list",
@@ -296,7 +343,7 @@ impl EtcdStore {
                                  error = format!("{e:#}"), "skipping undecodable object"),
             }
         }
-        Ok(out)
+        Ok((out, resp.kvs().len()))
     }
 
     /// Record that this peer has just spoken, in a key of its own.
@@ -631,6 +678,121 @@ impl EtcdStore {
             )));
         }
         self.written(&name, &value, &resp).await
+    }
+
+    /// Where the fence called `name` stands right now.
+    ///
+    /// Read BEFORE whatever the fence guards is looked at: the promise
+    /// `create_fenced` and `update_fenced` keep is that nothing guarded by it
+    /// was written between this read and their own write, so a decision made
+    /// from reads that came after this one is still a decision about the
+    /// store the write lands in. See [`Fence`].
+    pub async fn fence(&self, name: &str) -> Result<Fence> {
+        let key = format!("{}/fences/{}", self.prefix, name);
+        let resp = timed("fence", self.handle().get(key.clone(), None)).await?;
+        observe_revision(resp.header());
+        let revision = resp.kvs().first().map_or(0, |kv| kv.mod_revision());
+        Ok(Fence { key, revision })
+    }
+
+    /// `create`, and only if `fence` has not moved since it was read — in one
+    /// transaction that moves it.
+    ///
+    /// `Ok(None)` is "the fence moved": somebody else got through the same
+    /// door first, the decision this write rested on may be stale, and the
+    /// caller decides again. A name that is taken is the error `create`
+    /// gives, whichever of the two conditions failed first.
+    pub async fn create_fenced<T: Resource>(&self, obj: &T, fence: &Fence) -> Result<Option<T>> {
+        let name = obj.metadata().name.clone();
+        Self::check_name(&name, T::NAME_SHAPE)?;
+        // Generation 1 here too; see `create_inner`.
+        let mut obj = obj.clone();
+        obj.metadata_mut().generation = 1;
+        let key = self.key(T::RESOURCE, &name);
+        let value = Self::encode(&obj, chrono::Utc::now())?;
+        let txn = Txn::new()
+            .when(vec![
+                Compare::create_revision(key.clone(), CompareOp::Equal, 0),
+                Compare::mod_revision(fence.key.clone(), CompareOp::Equal, fence.revision),
+            ])
+            // One transaction is one revision, so the object's mod_revision is
+            // still the header's and `written` reads it the way it always has.
+            .and_then(vec![
+                TxnOp::put(key.clone(), value.clone(), None),
+                TxnOp::put(fence.key.clone(), fence_mark(T::RESOURCE, &name), None),
+            ])
+            .or_else(vec![TxnOp::get(key.clone(), None)]);
+        let resp = timed("create", self.handle().txn(txn)).await?;
+        if !resp.succeeded() {
+            let subject = format!("{resource}/{name}", resource = T::RESOURCE);
+            return match Self::held(resp.op_responses()) {
+                Some(true) => Err(StoreError::Terminating(subject)),
+                Some(false) => Err(StoreError::AlreadyExists(subject)),
+                None => Ok(None),
+            };
+        }
+        self.written(&name, &value, &resp).await.map(Some)
+    }
+
+    /// `update`, and only if `fence` has not moved since it was read — in one
+    /// transaction that moves it.
+    ///
+    /// `Ok(None)` is "the fence moved", as for `create_fenced`. An object that
+    /// moved is the conflict `update` gives: that is the CALLER's version
+    /// being stale, and deciding again would not make it any less so.
+    pub async fn update_fenced<T: Resource>(&self, obj: &T, fence: &Fence) -> Result<Option<T>> {
+        let name = obj.metadata().name.clone();
+        Self::check_name(&name, T::NAME_SHAPE)?;
+        let rev: i64 = obj.metadata().resource_version.parse().map_err(|_| {
+            StoreError::Invalid(
+                "invalid object: metadata.resourceVersion must be set for updates".into(),
+            )
+        })?;
+        let key = self.key(T::RESOURCE, &name);
+        let value = Self::encode(obj, chrono::Utc::now())?;
+        let txn = Txn::new()
+            .when(vec![
+                Compare::mod_revision(key.clone(), CompareOp::Equal, rev),
+                Compare::mod_revision(fence.key.clone(), CompareOp::Equal, fence.revision),
+            ])
+            .and_then(vec![
+                TxnOp::put(
+                    key.clone(),
+                    value.clone(),
+                    Some(PutOptions::new().with_ignore_lease()),
+                ),
+                TxnOp::put(fence.key.clone(), fence_mark(T::RESOURCE, &name), None),
+            ])
+            .or_else(vec![TxnOp::get(key.clone(), None)]);
+        let resp = timed("update", self.handle().txn(txn)).await?;
+        if !resp.succeeded() {
+            let stands = resp.op_responses().into_iter().any(|op| match op {
+                etcd_client::TxnOpResponse::Get(r) => {
+                    r.kvs().first().is_some_and(|kv| kv.mod_revision() == rev)
+                }
+                _ => false,
+            });
+            if stands {
+                return Ok(None);
+            }
+            return Err(StoreError::Conflict(format!(
+                "resource version conflict on {resource}/{name} (concurrent write)",
+                resource = T::RESOURCE
+            )));
+        }
+        self.written(&name, &value, &resp).await.map(Some)
+    }
+
+    /// Whether the key a failed fenced create read back is there, and if so
+    /// whether it is on its way out. `None` = it is not there, so what failed
+    /// was the fence.
+    fn held(ops: Vec<etcd_client::TxnOpResponse>) -> Option<bool> {
+        ops.into_iter().find_map(|op| match op {
+            etcd_client::TxnOpResponse::Get(r) => {
+                r.kvs().first().map(|kv| Self::is_deleting(kv.value()))
+            }
+            _ => None,
+        })
     }
 
     /// Read-modify-write with retry — for controller-owned fields (status,

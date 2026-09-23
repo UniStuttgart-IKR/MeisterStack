@@ -279,11 +279,51 @@ pub(super) async fn check_base_image(store: &EtcdStore, name: &str) -> Result<()
             )))
         }
         Ok(_) => Ok(()),
-        Err(StoreError::NotFound(_)) => Err(invalid(format!(
-            "unknown base_image {name:?}; register it first (meister image create)"
-        ))),
+        Err(StoreError::NotFound(_)) => Err(unknown_base_image(name)),
         Err(e) => Err(e.into()),
     }
+}
+
+/// That this caller may use that base image at all: the read rule `get_image`
+/// applies, asked again where the image is USED.
+///
+/// Naming an image in a disk is a way of reading it — its bytes end up on a
+/// disk the naming tenant can read every one of — so a reference must not
+/// reach further than `GET /images/<name>` does. Found by review: a member
+/// who knew the name of another tenant's private image could boot from it,
+/// because the reference was only asked whether the image exists.
+///
+/// The refusal is the one an unknown name gets, and this is asked BEFORE
+/// `check_base_image`: a caller who may not read an image must not learn from
+/// the answer that it exists, nor what a node said about it when it failed.
+///
+/// At the two create edges and only there — a VM's disks, a volume's seed.
+/// An update cannot name a new base image (the boot entry and every inline
+/// disk are frozen by `VM_OWNED`, `spec.baseImage` by `VOLUME_OWNED`), so what
+/// an update carries was asked about when it was bound, by whoever bound it;
+/// asking the updating caller again would lock a member out of a VM an admin
+/// built for them.
+pub(super) async fn check_image_readable(
+    store: &EtcdStore,
+    who: &Grant,
+    name: &str,
+) -> Result<(), ApiError> {
+    let image = match store.get::<Image>(name).await {
+        Ok(image) => image,
+        Err(StoreError::NotFound(_)) => return Err(unknown_base_image(name)),
+        Err(e) => return Err(e.into()),
+    };
+    who.allows(
+        Scope::image(image.spec.tenant.as_deref(), image.spec.public),
+        Verb::Read,
+    )
+    .map_err(|_| unknown_base_image(name))
+}
+
+fn unknown_base_image(name: &str) -> ApiError {
+    invalid(format!(
+        "unknown base_image {name:?}; register it first (meister image create)"
+    ))
 }
 
 /// Fields on a volume that the control plane owns, refused when a client
@@ -423,14 +463,23 @@ pub(super) async fn resolve_base_images(
 /// that size, and a control plane that only guards the create is a control
 /// plane whose quota is a suggestion.
 ///
-/// A tenant with no quota costs nothing at all — no listing, no arithmetic —
-/// which is what keeps every create in a fleet that has never set one exactly
-/// as cheap as it was. An unscoped VM (an admin's, belonging to nobody) has
-/// no tenant and therefore no ceiling; that is the shape every VM had before
-/// M5 and the one an admin still gets by naming none.
+/// A tenant with no quota costs no listing and no arithmetic, which is what
+/// keeps every create in a fleet that has never set one as cheap as it was —
+/// one read of the fence is all it adds. An unscoped VM (an admin's,
+/// belonging to nobody) has no tenant and therefore no ceiling and no fence;
+/// that is the shape every VM had before M5 and the one an admin still gets
+/// by naming none.
 ///
 /// `except` is the VM being changed, taken out of the sum so the caller can
 /// put it back at its new size. `None` on a create.
+///
+/// **The yes comes with the tenant's fence, read before anything else**, and
+/// the caller writes through it (`admission::create_under`). Without it this
+/// was a check-then-act: two creates that each listed before the other wrote
+/// each saw room for one, and the tenant held two (F03). Even a tenant with
+/// no quota goes through its fence — a quota set a moment ago must not meet a
+/// create that was waved through without one and a second that did not see
+/// it.
 ///
 /// The listing is guarded the way `delete_image`'s is: `list` drops what it
 /// cannot decode, and a VM not seen is usage not counted — which would let a
@@ -441,14 +490,17 @@ pub(super) async fn check_quota(
     tenant: Option<&str>,
     adding: Capacity,
     except: Option<&str>,
-) -> Result<(), ApiError> {
-    let Some(tenant) = tenant else { return Ok(()) };
+) -> Result<Option<Fence>, ApiError> {
+    let Some(tenant) = tenant else {
+        return Ok(None);
+    };
+    let fence = st.store.fence(&quota::fence(tenant)).await?;
     let object: Tenant = st.store.get(tenant).await?;
     if object.spec.quota.is_unset() {
-        return Ok(());
+        return Ok(Some(fence));
     }
-    let vms = st.store.list::<Vm>().await?;
-    if vms.len() != st.store.count::<Vm>().await? {
+    let (vms, keys) = st.store.list_counted::<Vm>().await?;
+    if vms.len() != keys {
         return Err(conflict(
             "cannot tell how much this tenant is holding (some vm objects did not decode); \
              refusing to let it grow",
@@ -456,7 +508,7 @@ pub(super) async fn check_quota(
     }
     let after = quota::Usage::of(tenant, &vms, except).plus(adding);
     let Err(why) = quota::check(&object.spec.quota, tenant, after) else {
-        return Ok(());
+        return Ok(Some(fence));
     };
     // On the TENANT and not on a VM: the VM this was about is being refused
     // and will not exist, so an event pointing at it would point at nothing.
@@ -541,6 +593,11 @@ pub(super) async fn create_vm_traced(
         return Err(invalid("metadata.name must be set"));
     }
     check_envelope(&body)?;
+    // Before `validate_vm_spec`, which describes an image it finds unusable:
+    // see `check_image_readable`.
+    for image in base_images(&body.spec.vm) {
+        check_image_readable(&st.store, &who, &image).await?;
+    }
     validate_vm_spec(&st.store, &body.spec).await?;
 
     // Whose it is, decided before anything is written: named by the client,
@@ -564,15 +621,6 @@ pub(super) async fn create_vm_traced(
     // After the owner is known and not in `validate_vm_spec`, because whose
     // volume it has to be is exactly the question the owner answers.
     check_volume_refs(&st, Some(owner.as_str()), &body.metadata.name, &body.spec).await?;
-    // Before the create and not after: a VM that was written and then found
-    // to be over the ceiling is a VM somebody has to go and delete.
-    check_quota(
-        &st,
-        Some(owner.as_str()),
-        Capacity::wanted_by_spec(&body.spec.vm),
-        None,
-    )
-    .await?;
 
     // Server-owned metadata; client keeps name + labels.
     let mut spec = body.spec;
@@ -584,7 +632,7 @@ pub(super) async fn create_vm_traced(
             // never the cloud's business at all.
             cluster_name: None,
             node_name: None,
-            tenant: Some(owner),
+            tenant: Some(owner.clone()),
             ..spec
         },
     );
@@ -618,10 +666,21 @@ pub(super) async fn create_vm_traced(
         });
         vm.settle(chrono::Utc::now());
     }
-    let created = match dry.preview(&vm) {
-        Some(preview) => preview,
-        None => st.store.create(&vm).await?,
-    };
+    // The quota, and the write, as one decision: see `admission`. Before the
+    // create and not after — a VM that was written and then found to be over
+    // the ceiling is a VM somebody has to go and delete.
+    let wanted = Capacity::wanted_by_spec(&vm.spec.vm);
+    let (st_, vm_, owner_) = (&st, &vm, owner.as_str());
+    let created = admit(owner_, move || async move {
+        let fence = check_quota(st_, Some(owner_), wanted, None).await?;
+        #[cfg(test)]
+        super::admission_tests::admission_gate(owner_).await;
+        match dry.preview(vm_) {
+            Some(preview) => Ok(Some(preview)),
+            None => create_under(st_, vm_, fence.as_ref()).await,
+        }
+    })
+    .await?;
     info!(vm = %created.metadata.name, vm_id = %created.metadata.uid,
           trace_id = %traceparent.trace_id_hex(), "vm created");
     Ok((StatusCode::CREATED, Json(created)))
@@ -1056,23 +1115,24 @@ pub(super) async fn update_vm(
     // The half that gets forgotten. A PUT that raises this VM's vcpus is the
     // same act as creating one that size, and it goes through the same
     // arithmetic: the object as it stands comes out of the sum (`except`),
-    // and its new size goes back in.
-    check_quota(
-        &st,
-        body.spec.tenant.as_deref(),
-        Capacity::wanted_by_spec(&body.spec.vm),
-        Some(&name),
-    )
-    .await?;
+    // and its new size goes back in — and through the same fence, see
+    // `admission`.
     controller_api::carry_generation(&current, &mut body)?;
-    match dry.preview(&body) {
-        Some(preview) => Ok(Json(preview)),
-        None => {
-            let stored = st.store.update(&body).await?;
-            note_unknown_release(&st, &current, &body).await;
-            Ok(Json(stored))
+    let wanted = Capacity::wanted_by_spec(&body.spec.vm);
+    let (st_, body_, name_) = (&st, &body, name.as_str());
+    let tenant = body.spec.tenant.as_deref();
+    let stored = admit(tenant.unwrap_or("-"), move || async move {
+        let fence = check_quota(st_, tenant, wanted, Some(name_)).await?;
+        match dry.preview(body_) {
+            Some(preview) => Ok(Some(preview)),
+            None => update_under(st_, body_, fence.as_ref()).await,
         }
+    })
+    .await?;
+    if !dry.requested() {
+        note_unknown_release(&st, &current, &body).await;
     }
+    Ok(Json(stored))
 }
 
 pub(super) async fn delete_vm(

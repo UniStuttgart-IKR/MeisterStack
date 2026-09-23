@@ -631,11 +631,17 @@ async fn a_resume_that_does_not_take_is_not_repeated_in_silence() {
         None,
     ));
     let reconciler = Reconciler::new(store.clone(), drivers, provisioner, ops);
-    let planned = (Phase::Provisioned, Desired::Running);
+    // What the pass decided from: this record, a paused guest, now.
+    let seen = obs(true, true, true, Some(VmState::Paused));
+    let planned = || Planned {
+        record: &r,
+        observed: &seen,
+        at: now(),
+    };
 
     for attempt in 1..RESUME_ATTEMPTS {
         let failed = reconciler
-            .execute(&id, planned, Action::Resume)
+            .execute(&id, planned(), Action::Resume)
             .await
             .expect_err("the guest is still paused");
         assert!(
@@ -656,7 +662,7 @@ async fn a_resume_that_does_not_take_is_not_repeated_in_silence() {
     // The third one is. Not a race any more, and the marker is what stops
     // the pass from issuing a fourth, a fifth and a five-hundredth.
     reconciler
-        .execute(&id, planned, Action::Resume)
+        .execute(&id, planned(), Action::Resume)
         .await
         .expect_err("still paused");
     let marked = store.get(&id).expect("the record").unwrap();
@@ -688,7 +694,7 @@ async fn a_resume_that_does_not_take_is_not_repeated_in_silence() {
         .mutate(&id, |r| r.unhealthy = None)
         .expect("the operator's repair");
     reconciler
-        .execute(&id, planned, Action::Resume)
+        .execute(&id, planned(), Action::Resume)
         .await
         .expect("the guest is running");
     assert_eq!(*vmm.resumes.lock().unwrap(), RESUME_ATTEMPTS + 1);

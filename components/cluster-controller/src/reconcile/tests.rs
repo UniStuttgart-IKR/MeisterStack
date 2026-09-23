@@ -2665,3 +2665,227 @@ fn a_destroy_that_has_been_quittanced_has_not_let_go_of_the_disk() {
         Release::WaitingForNode("agent-1a")
     );
 }
+
+/// F04, the cluster half: the cloud's larger size becomes this tier's desired
+/// size, and the ordinary resize becomes due.
+///
+/// `handle_create_volume` used to answer a create for a uid it already held
+/// with "nothing to change — a volume's spec is immutable", which stopped
+/// being true when `sizeGib` became growable. The stuck state was: cloud spec
+/// 20 GiB, cluster spec 10 GiB, backend 10 GiB, and no pass that would ever
+/// move any of them.
+#[test]
+fn a_cloud_volume_grown_after_it_was_seen_is_grown_here() {
+    // Fully observed at 10 GiB: made, reported, settled.
+    let mut v = controller_api::resources::new_volume(
+        "data",
+        controller_api::VolumeSpec {
+            pool: "fast".into(),
+            size_gib: 10,
+            ..Default::default()
+        },
+    );
+    v.metadata.generation = 1;
+    v.status.node = Some("agent-1".into());
+    v.status.size_gib = 10;
+    v.status.reported = Some(controller_api::VolumeReported::by(
+        "agent-1",
+        VolumePhaseKind::Ready,
+        controller_api::VolumeReason::Unrecorded,
+        None,
+        Utc::now(),
+    ));
+    v.settle(Utc::now());
+    assert_eq!(next_for(&v), Next::Settled);
+
+    let cloud = |gib: u64| controller_api::VolumeSpec {
+        pool: "fast".into(),
+        size_gib: gib,
+        ..Default::default()
+    };
+
+    assert!(crate::cloud::grow_to_cloud_size(&mut v, &cloud(20)));
+    assert_eq!(
+        v.spec.size_gib, 20,
+        "the cloud's size is this tier's intent"
+    );
+    assert_eq!(v.metadata.generation, 2, "and the spec moved, so did this");
+    assert_eq!(
+        next_for(&v),
+        Next::Resize("agent-1"),
+        "which is exactly what the ordinary resize is waiting for"
+    );
+
+    // The same create again is a no-op, and an older one arriving late —
+    // two cloud replicas around a speaker change — does not take the size
+    // back down.
+    assert!(!crate::cloud::grow_to_cloud_size(&mut v, &cloud(20)));
+    assert!(!crate::cloud::grow_to_cloud_size(&mut v, &cloud(10)));
+    assert_eq!(v.spec.size_gib, 20);
+    assert_eq!(v.metadata.generation, 2);
+}
+
+/// A node's session as a test holds it: every command it is sent is written
+/// down and acked, as an agent that did the work would ack it.
+fn scripted_node(
+    registry: &Arc<SessionRegistry>,
+    node: &str,
+) -> Arc<std::sync::Mutex<Vec<proto::command::Op>>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    registry.attach(node, &tx);
+    let heard: Arc<std::sync::Mutex<Vec<proto::command::Op>>> = Default::default();
+    let log = heard.clone();
+    let answering = registry.clone();
+    tokio::spawn(async move {
+        while let Some(Ok(message)) = rx.recv().await {
+            if let Some(proto::controller_message::Kind::Command(command)) = message.kind {
+                if let Some(op) = command.op {
+                    log.lock().unwrap().push(op);
+                }
+                answering.answer(&command.request_id, Vec::new());
+            }
+        }
+    });
+    heard
+}
+
+/// F05: the bytes grew and the guest was not told — and that stays a thing
+/// to do after the node has reported the bytes grown.
+///
+/// A resize is two steps on possibly two machines: the backend grows, then
+/// the guest holding the disk is told. The second failing was written down
+/// as a sentence, and `next_for` read `status.sizeGib` alone — so the node's
+/// next report, which says the bytes ARE 20 GiB, took the volume to Settled
+/// and overwrote the sentence with it. The guest kept its 10 GiB until
+/// somebody restarted it, and nothing anywhere said so any more.
+///
+/// What this checks is the retry itself: the second pass sends the
+/// notification, and nothing else.
+///
+/// `#[ignore]`: it needs an etcd, the way
+/// `two_replicas_assigning_at_once_hand_out_two_namespaces` does.
+#[tokio::test]
+#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+async fn a_guest_that_was_not_told_is_told_on_the_next_pass() {
+    let endpoint =
+        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+    let prefix = format!("/resize-test/{}", uuid::Uuid::new_v4());
+    let store = EtcdStore::connect(&[endpoint], &prefix)
+        .await
+        .expect("an etcd to talk to");
+
+    // `web` runs on agent-2 and holds `data`, whose bytes are on agent-1:
+    // the shared-pool shape, two machines, two halves.
+    let mut vm = controller_api::resources::new_vm(
+        "web",
+        controller_api::VmSpec {
+            node_name: Some("agent-2".into()),
+            vm: serde_json::json!({}),
+            ..serde_json::from_value(serde_json::json!({ "vm": {} })).unwrap()
+        },
+    );
+    reported_as(&mut vm, "agent-2", VmPhaseKind::Running);
+    let vm = store.create(&vm).await.expect("the vm");
+
+    let mut volume = controller_api::resources::new_volume(
+        "data",
+        controller_api::VolumeSpec {
+            pool: "shared".into(),
+            size_gib: 20,
+            ..Default::default()
+        },
+    );
+    volume.status.node = Some("agent-1".into());
+    volume.status.size_gib = 10;
+    volume.status.attached_to = Some("web".into());
+    volume.status.reported = Some(controller_api::VolumeReported::by(
+        "agent-1",
+        VolumePhaseKind::Ready,
+        controller_api::VolumeReason::Unrecorded,
+        None,
+        Utc::now(),
+    ));
+    store.create(&volume).await.expect("the volume");
+
+    let registry = Arc::new(SessionRegistry::new());
+    let backend = scripted_node(&registry, "agent-1");
+    // agent-2 has no session yet: the notification cannot be delivered.
+    let connected = sessions(&["agent-1"]);
+    let pass = Pass {
+        store: &store,
+        registry: &registry,
+        scheduler: &controller_api::FirstFit,
+        requeue: &controller_api::requeue::NoRequeue,
+        sessions: &connected,
+        nodes: std::sync::Mutex::new(Vec::new()),
+        pending: PendingTally::new(),
+        kek: None,
+    };
+
+    // First pass: the backend grows, the guest is not told.
+    let held: Volume = store.get("data").await.unwrap();
+    assert_eq!(next_for(&held), Next::Resize("agent-1"));
+    reconcile_volume(&pass, &[], held).await.expect("a pass");
+    assert!(
+        matches!(
+            backend.lock().unwrap().as_slice(),
+            [proto::command::Op::ResizeVolume(r)] if r.size_bytes == 20 << 30
+        ),
+        "the backend was grown once: {:?}",
+        backend.lock().unwrap()
+    );
+    let held: Volume = store.get("data").await.unwrap();
+    assert!(
+        held.status
+            .phase()
+            .message()
+            .is_some_and(|m| m.contains("the guest was not told")),
+        "and the object says the second half is missing"
+    );
+
+    // The node reports the bytes at their new size — exactly what the
+    // status ingest writes: the measurement, and the node's own word, which
+    // carries no sentence of this tier's.
+    store
+        .mutate::<Volume, _>("data", |v| {
+            v.status.size_gib = 20;
+            v.status.reported = Some(controller_api::VolumeReported::by(
+                "agent-1",
+                VolumePhaseKind::Ready,
+                controller_api::VolumeReason::Unrecorded,
+                None,
+                Utc::now(),
+            ));
+        })
+        .await
+        .unwrap();
+
+    // Second pass, with the guest's node reachable now.
+    let guest = scripted_node(&registry, "agent-2");
+    let held: Volume = store.get("data").await.unwrap();
+    assert_eq!(
+        next_for(&held),
+        Next::Resize("agent-1"),
+        "the bytes being there is not the guest having been told"
+    );
+    reconcile_volume(&pass, &[], held).await.expect("a pass");
+    assert!(
+        matches!(
+            guest.lock().unwrap().as_slice(),
+            [proto::command::Op::ResizeAttachment(r)]
+                if r.size_bytes == 20 << 30 && r.vm == vm.metadata.uid
+        ),
+        "the guest is told, on its own node: {:?}",
+        guest.lock().unwrap()
+    );
+    assert_eq!(
+        backend.lock().unwrap().len(),
+        1,
+        "and the bytes, which the node measured, are not grown a second time"
+    );
+
+    // Told: nothing left to do, and nothing left to say.
+    let held: Volume = store.get("data").await.unwrap();
+    assert_eq!(next_for(&held), Next::Settled);
+    assert!(held.status.phase().message().is_none());
+}

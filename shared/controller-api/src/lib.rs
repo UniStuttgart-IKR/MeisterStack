@@ -103,7 +103,7 @@ pub use scheduler::{
     preferred_for_volumes, selector_for, selects, spend, volume_nodes_unusable,
     volume_pending_reason,
 };
-pub use store::{EtcdStore, PassTrigger, StoreError};
+pub use store::{EtcdStore, Fence, PassTrigger, StoreError};
 pub use stuck::{
     STUCK_AFTER_PENDING, STUCK_AFTER_PROVISIONING, STUCK_AFTER_UNKNOWN, stuck, stuck_after,
 };

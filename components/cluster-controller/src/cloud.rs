@@ -1323,9 +1323,44 @@ async fn handle_create_volume(store: &EtcdStore, c: proto::CreateVolume) -> anyh
         );
     }
     // Ours, and already here: a lost ack, a reconnect, a repeat after the
-    // cloud lost sight of it. Nothing to change — a volume's spec is
-    // immutable, so there is no drift to reconcile, only the ack to repeat.
+    // cloud lost sight of it — or the cloud's spec moved on. The one field of
+    // a volume's spec that moves is its size, and only upwards (storage B);
+    // the cloud sends the create again when its generation passes the one it
+    // last sent, and this is where that lands. Everything else about the spec
+    // was decided once, at both tiers, and is left as it is.
+    let cloud = &volume.spec;
+    if cloud.size_gib > current.spec.size_gib {
+        store
+            .mutate::<Volume, _>(&c.name, |v| {
+                grow_to_cloud_size(v, cloud);
+            })
+            .await?;
+        info!(volume = %c.name, from = current.spec.size_gib, to = cloud.size_gib,
+              "the cloud grew the volume");
+    }
     Ok(())
+}
+
+/// Take the cloud's size for a volume this tier already holds, if it is
+/// larger; say whether anything changed.
+///
+/// A maximum and not an assignment, which is what makes the road safe to
+/// repeat and to reorder: two cloud replicas can each send a create for the
+/// same volume around a speaker change, and the older of the two arriving
+/// last must not take the size back down — the bytes past the old end would
+/// be data. The generation moves with the spec, as `carry_generation` moves
+/// it at a REST edge, so `observedGeneration` still means what it says.
+///
+/// Found by review: this used to be "nothing to change — a volume's spec is
+/// immutable", which stopped being true when `sizeGib` became growable, and
+/// a cloud volume grown after the cluster had seen it was never grown here.
+pub(crate) fn grow_to_cloud_size(volume: &mut Volume, cloud: &controller_api::VolumeSpec) -> bool {
+    if cloud.size_gib <= volume.spec.size_gib {
+        return false;
+    }
+    volume.spec.size_gib = cloud.size_gib;
+    volume.metadata.generation += 1;
+    true
 }
 
 /// The cloud asked for a copy. Idempotent by name with the same uid guard the
@@ -2954,5 +2989,56 @@ mod tests {
                 .expect_err("nothing to move")
         );
         assert!(why.contains("vm to move"), "{why}");
+    }
+
+    /// The road itself, against a real etcd: the same create, twice, the
+    /// second one with the size the cloud grew the volume to.
+    ///
+    /// `#[ignore]` for the reason `two_replicas_assigning_at_once_hand_out_two_namespaces`
+    /// is: it needs something to talk to.
+    ///
+    /// ```text
+    /// MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
+    ///   cargo test -p meister-cluster-controller grown -- --ignored
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs an etcd; see the note above"]
+    async fn a_create_for_a_volume_this_tier_holds_carries_the_grown_size() {
+        let endpoint = std::env::var("MEISTER_TEST_ETCD")
+            .unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+        let prefix = format!("/cloud-volume-test/{}", uuid::Uuid::new_v4());
+        let store = EtcdStore::connect(&[endpoint], &prefix)
+            .await
+            .expect("an etcd to talk to — see the note above");
+        let create = |gib: u64| proto::CreateVolume {
+            name: "data".into(),
+            spec_json: serde_json::to_string(&controller_api::VolumeSpec {
+                pool: "fast".into(),
+                size_gib: gib,
+                ..Default::default()
+            })
+            .unwrap(),
+            uid: "u-1".into(),
+            tenant: "acme".into(),
+        };
+
+        handle_create_volume(&store, create(10))
+            .await
+            .expect("made");
+        handle_create_volume(&store, create(20))
+            .await
+            .expect("the cloud grew it");
+        let held: Volume = store.get("data").await.expect("the volume");
+        assert_eq!(held.spec.size_gib, 20, "the cloud's intent is this tier's");
+        assert_eq!(held.metadata.generation, 2);
+        assert_eq!(held.metadata.uid, "u-1", "and it is still the same bytes");
+
+        // A late, older create does not shrink anything.
+        handle_create_volume(&store, create(10))
+            .await
+            .expect("a repeat is acked");
+        let held: Volume = store.get("data").await.expect("the volume");
+        assert_eq!(held.spec.size_gib, 20);
+        assert_eq!(held.metadata.generation, 2);
     }
 }

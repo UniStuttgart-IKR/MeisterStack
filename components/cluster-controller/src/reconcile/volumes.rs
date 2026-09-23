@@ -341,7 +341,8 @@ pub(super) enum Next<'a> {
     /// which is idempotent — so the repair path is the ordinary path and
     /// there is no second one to get wrong.
     Requeue(&'a str),
-    /// Ready, and the spec asks for more room than the node has measured.
+    /// Ready, and the spec asks for more room than the node has measured —
+    /// or the room is there and the guest holding it has not been told.
     Resize(&'a str),
     /// Nothing to do this pass.
     Settled,
@@ -354,7 +355,9 @@ pub(super) fn next_for(volume: &Volume) -> Next<'_> {
     match volume.status.phase().kind() {
         VolumePhaseKind::Pending => Next::Provision(node),
         VolumePhaseKind::Failed => Next::Requeue(node),
-        VolumePhaseKind::Ready if grew(volume) => Next::Resize(node),
+        VolumePhaseKind::Ready if grew(volume) || volume.status.untold_gib > 0 => {
+            Next::Resize(node)
+        }
         _ => Next::Settled,
     }
 }
@@ -401,58 +404,83 @@ pub(super) fn grew(volume: &Volume) -> bool {
 ///
 /// **The two halves fail differently, and the message says which.** The first
 /// failing means nothing happened, and the requeue curve tries again. The
-/// second failing means the backend GREW and the guest was not told: the
-/// object keeps `status.sizeGib` at the old value, because a guest that has
-/// not been told does not have the room, and the sentence says that a retry
-/// resizes only the notification. Both are honest states; neither is a
-/// rollback, because there is no shrinking back.
+/// second failing means the backend GREW and the guest was not told, and the
+/// sentence says that a retry resizes only the notification. Both are honest
+/// states; neither is a rollback, because there is no shrinking back.
+///
+/// **What keeps the second half due is `status.untoldGib`, and not the size.**
+/// This used to say the object kept `status.sizeGib` at the old value until
+/// the guest was told — but that field is the NODE's measurement of the
+/// bytes, and its next report said 20 whether anybody had told the guest or
+/// not. The volume read as settled and the notification was never tried again
+/// (F05). So the intent is written down first, before either half is asked
+/// for, and taken off only when the guest has heard; a pass that finds the
+/// bytes already measured at the new size does the second half and nothing
+/// else.
 ///
 /// The guest half is skipped where there is no guest — a volume nothing is
 /// holding still grows, which is the case `vm.resize-disk` could never cover.
 pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> anyhow::Result<()> {
     let name = volume.metadata.name.clone();
     let size_bytes = volume.spec.size_gib.saturating_mul(1024 * 1024 * 1024);
-    info!(volume = %name, node, from = volume.status.size_gib, to = volume.spec.size_gib,
-          "growing a volume");
 
-    // First half: the bytes, on the provisioning node. Always.
-    if let Err(e) = p
-        .registry
-        .send_command(
-            node,
-            "",
-            command::Op::ResizeVolume(proto::ResizeVolume {
-                id: volume.metadata.uid.clone(),
-                size_bytes,
-            }),
-        )
-        .await
-    {
-        let message = format!("{e:#}");
-        warn!(volume = %name, node, error = %message, "the backend did not grow");
+    // The intent, before anything is asked of anybody: whoever holds this
+    // volume has to hear about this size. First, so that losing this
+    // controller between the two halves loses nothing.
+    if volume.status.untold_gib < volume.spec.size_gib {
         p.store
             .mutate::<Volume, _>(&name, |v| {
-                // Not the node's word: the node never got the command. Two of
-                // the old assignments said "Reported" about a session
-                // failure, and this was one of them — the sentence is this
-                // tier's, about a wire, and the fix is on the network. Which
-                // is also why it names nobody.
-                v.status.reported = Some(controller_api::VolumeReported::here(
-                    VolumePhaseKind::Failed,
-                    controller_api::VolumeReason::Undeliverable,
-                    Some(message.clone()),
-                    Utc::now(),
-                ));
+                v.status.untold_gib = v.status.untold_gib.max(v.spec.size_gib);
             })
             .await?;
-        return Ok(());
+    }
+
+    // First half: the bytes, on the provisioning node — unless the node has
+    // measured them at this size already, which makes this pass the retry of
+    // the second half and of nothing else.
+    if grew(volume) {
+        info!(volume = %name, node, from = volume.status.size_gib, to = volume.spec.size_gib,
+              "growing a volume");
+        if let Err(e) = p
+            .registry
+            .send_command(
+                node,
+                "",
+                command::Op::ResizeVolume(proto::ResizeVolume {
+                    id: volume.metadata.uid.clone(),
+                    size_bytes,
+                }),
+            )
+            .await
+        {
+            let message = format!("{e:#}");
+            warn!(volume = %name, node, error = %message, "the backend did not grow");
+            p.store
+                .mutate::<Volume, _>(&name, |v| {
+                    // Not the node's word: the node never got the command.
+                    // Two of the old assignments said "Reported" about a
+                    // session failure, and this was one of them — the
+                    // sentence is this tier's, about a wire, and the fix is
+                    // on the network. Which is also why it names nobody.
+                    v.status.reported = Some(controller_api::VolumeReported::here(
+                        VolumePhaseKind::Failed,
+                        controller_api::VolumeReason::Undeliverable,
+                        Some(message.clone()),
+                        Utc::now(),
+                    ));
+                })
+                .await?;
+            return Ok(());
+        }
     }
 
     // Second half: the guest, on the node the VM runs on — a different
     // machine whenever the pool is shared.
     let Some((vm, vm_node)) = holder_of(p, volume).await? else {
+        // Nothing is running it, so nothing has a size to be wrong about: a
+        // guest that starts later opens the disk as big as it is.
         debug!(volume = %name, "nobody is holding it; there is no guest to tell");
-        return Ok(());
+        return told(p, volume).await;
     };
     if let Err(e) = p
         .registry
@@ -477,21 +505,36 @@ pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> 
                 // The sentence, onto the word that is already there. The
                 // bytes ARE what the node last said they are — the resize
                 // grew them — and what is missing is one notification, so the
-                // word must not move. Only the sentence does.
+                // word must not move. Only the sentence does; `untoldGib`,
+                // written above, is what makes the next pass try again.
                 note_on_volume(v, Some(message.clone()));
             })
             .await?;
         return Ok(());
     }
-    // The size on the object is the NODE's word and arrives with its next
-    // report; nothing is written here. What is cleared is the sentence a
-    // previous half-resize may have left, because it is answered now.
-    if volume.status.phase().message().is_some() {
-        p.store
-            .mutate::<Volume, _>(&name, |v| note_on_volume(v, None))
-            .await?;
-    }
+    told(p, volume).await?;
     info!(volume = %name, "the guest was told");
+    Ok(())
+}
+
+/// The second half is done: the guest has heard about this size, or there is
+/// no running guest to hear it.
+///
+/// The size on the object is the NODE's word and arrives with its next
+/// report; nothing about it is written here. What goes is the intent this
+/// pass answered — only up to the size it told, so a spec that grew again in
+/// between keeps its own — and the sentence a previous half-resize may have
+/// left, because it is answered now.
+async fn told(p: &Pass<'_>, volume: &Volume) -> anyhow::Result<()> {
+    let size = volume.spec.size_gib;
+    p.store
+        .mutate::<Volume, _>(&volume.metadata.name, |v| {
+            if v.status.untold_gib <= size {
+                v.status.untold_gib = 0;
+            }
+            note_on_volume(v, None);
+        })
+        .await?;
     Ok(())
 }
 

@@ -363,14 +363,44 @@ pub(super) fn pick_storage_pool<'a>(
 /// cost of undercounting is two tenants on one address, here it is a pool
 /// quietly overcommitted past the disk that is actually in the machine.
 pub(super) async fn all_volumes(st: &ApiState) -> Result<Vec<Volume>, ApiError> {
-    let volumes = st.store.list::<Volume>().await?;
-    if volumes.len() != st.store.count::<Volume>().await? {
+    let (volumes, keys) = st.store.list_counted::<Volume>().await?;
+    if volumes.len() != keys {
         return Err(conflict(
             "some volume objects did not decode, so how much storage is held cannot be \
              established; refusing rather than handing out room twice",
         ));
     }
     Ok(volumes)
+}
+
+/// Would this tenant still be inside its ceiling in `pool` with a volume of
+/// `gib` in it?
+///
+/// One rejection path, and it is the one in `controller_api::quota`. A
+/// second sum computed here would be a second answer to "is this tenant over
+/// its limit", and the wrong one is whichever an operator is not looking at.
+/// Asked by the create and by the resize, and `except` is the difference
+/// between them: the volume being resized comes out of the sum so that its
+/// new size can go back in. `None` on a create.
+///
+/// The yes comes with the tenant's fence, read before the volumes are, and
+/// the caller writes through it — the same door `check_quota` hands out, and
+/// for the same reason (F03): two volumes that each saw the room for one
+/// were two writes to two keys, and nothing arbitrated them.
+pub(super) async fn check_storage_quota(
+    st: &ApiState,
+    pool: &StoragePool,
+    tenant: &str,
+    gib: u64,
+    except: Option<&str>,
+) -> Result<Fence, ApiError> {
+    let fence = st.store.fence(&quota::fence(tenant)).await?;
+    let held =
+        quota::StorageUsage::of(tenant, &pool.metadata.name, &all_volumes(st).await?, except);
+    let Err(why) = quota::check_storage(pool, tenant, held.plus(gib)) else {
+        return Ok(fence);
+    };
+    Err(conflict(why))
 }
 
 pub(super) async fn list_volumes(
@@ -467,6 +497,7 @@ pub(super) async fn create_volume(
     }
     check_one_seed(&body)?;
     if let Some(image) = body.spec.base_image.as_deref().filter(|i| !i.is_empty()) {
+        check_image_readable(&st.store, &who, image).await?;
         check_base_image(&st.store, image).await?;
     }
     if let Some(named) = body.spec.from_snapshot.as_deref().filter(|s| !s.is_empty()) {
@@ -475,15 +506,6 @@ pub(super) async fn create_volume(
 
     let pools = st.store.list::<StoragePool>().await?;
     let pool = pick_storage_pool(&pools, Some(body.spec.pool.as_str()))?;
-
-    // One rejection path, and it is the one in `controller_api::quota`. A
-    // second sum computed here would be a second answer to "is this tenant
-    // over its limit", and the wrong one is whichever an operator is not
-    // looking at.
-    let held = quota::StorageUsage::of(&owner, &pool.metadata.name, &all_volumes(&st).await?, None);
-    if let Err(why) = quota::check_storage(pool, &owner, held.plus(body.spec.size_gib)) {
-        return Err(conflict(why));
-    }
 
     let mut spec = body.spec;
     spec.tenant = owner.clone();
@@ -494,10 +516,18 @@ pub(super) async fn create_volume(
     // ever uses, and until the first report the object then named a path that
     // was nowhere.
     let volume = new_volume(&body.metadata.name, spec);
-    let created = match dry.preview(&volume) {
-        Some(preview) => preview,
-        None => st.store.create(&volume).await?,
-    };
+    // The quota and the write as one decision: see `admission`.
+    let (st_, volume_, owner_) = (&st, &volume, owner.as_str());
+    let created = admit(owner_, move || async move {
+        let fence = check_storage_quota(st_, pool, owner_, volume_.spec.size_gib, None).await?;
+        #[cfg(test)]
+        super::admission_tests::admission_gate(owner_).await;
+        match dry.preview(volume_) {
+            Some(preview) => Ok(Some(preview)),
+            None => create_under(st_, volume_, Some(&fence)).await,
+        }
+    })
+    .await?;
 
     info!(volume = %created.metadata.name, tenant = %owner, pool = %created.spec.pool,
           size_gib = created.spec.size_gib, "volume reserved");
@@ -608,12 +638,35 @@ pub(super) async fn update_volume(
 
     keep_server_owned(&mut body.metadata, &current.metadata);
     check_owned(&current, &body, VOLUME_OWNED)?;
+    // A resize is the same act as creating a volume that size, and it goes
+    // through the same arithmetic: this volume comes out of the sum and its
+    // new size goes back in. Only when it GROWS — an edit that holds no more
+    // than it did is not a storage question, even for a tenant an operator
+    // has since put under its own usage.
+    // And through the same fence, see `admission`.
     body.status = current.status.clone();
     controller_api::carry_generation(&current, &mut body)?;
-    match dry.preview(&body) {
-        Some(preview) => Ok(Json(preview)),
-        None => Ok(Json(st.store.update(&body).await?)),
+    if body.spec.size_gib <= current.spec.size_gib {
+        return match dry.preview(&body) {
+            Some(preview) => Ok(Json(preview)),
+            None => Ok(Json(st.store.update(&body).await?)),
+        };
     }
+    let pool: StoragePool = st.store.get(&current.spec.pool).await?;
+    let tenant = current.spec.tenant.as_str();
+    let (st_, body_, pool_, name_) = (&st, &body, &pool, name.as_str());
+    let stored = admit(tenant, move || async move {
+        let fence =
+            check_storage_quota(st_, pool_, tenant, body_.spec.size_gib, Some(name_)).await?;
+        #[cfg(test)]
+        super::admission_tests::admission_gate(tenant).await;
+        match dry.preview(body_) {
+            Some(preview) => Ok(Some(preview)),
+            None => update_under(st_, body_, Some(&fence)).await,
+        }
+    })
+    .await?;
+    Ok(Json(stored))
 }
 
 /// Give the storage back — or say so, and wait.

@@ -237,6 +237,21 @@ impl SessionRegistry {
         }
     }
 
+    /// Is this session still the one the node speaks through?
+    ///
+    /// The question `disconnect` has always asked before it takes anything
+    /// away, asked here of everything a session SAYS. A superseded stream can
+    /// still hold reports the node sent before it reconnected, and they arrive
+    /// after the new session's — read as current, they put the node back the
+    /// way it was. See `on_status`.
+    fn speaks_for(&self, node_id: &str, tx: &CommandTx) -> bool {
+        self.nodes
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .is_some_and(|current| current.same_channel(tx))
+    }
+
     /// A session for a node without a stream behind it.
     ///
     /// Test-only, and it is the door the migration forward is proved through:

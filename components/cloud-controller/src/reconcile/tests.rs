@@ -700,3 +700,57 @@ fn a_secret_travels_once_and_a_leftover_copy_is_collected() {
     let stale: Vec<&str> = leftovers(&held, &ours).map(|s| s.name.as_str()).collect();
     assert_eq!(stale, ["gone"]);
 }
+
+/// F04, the cloud half: a volume the cluster has already spoken about is sent
+/// again when its spec moves past what was last sent — and only then.
+///
+/// The dedup used to be `observed_at` alone, which is "the cluster has this
+/// volume" and not "the cluster has this SPEC". `spec.sizeGib` became growable
+/// at the cloud edge with storage B, so the resize was accepted, bumped the
+/// generation, and never left this tier: the object said 20 GiB and the
+/// cluster held 10 for ever.
+#[test]
+fn an_observed_volume_whose_spec_moved_is_handed_down_again() {
+    let mut volume = controller_api::resources::new_volume(
+        "data",
+        controller_api::VolumeSpec {
+            tenant: "acme".into(),
+            pool: "disks".into(),
+            size_gib: 10,
+            ..Default::default()
+        },
+    );
+    // What `create` stamps.
+    volume.metadata.generation = 1;
+    assert!(
+        needs_dispatch(&volume),
+        "never seen by the cluster: send it"
+    );
+
+    // Sent (the dispatch writes what it sent), then reported (the mirror
+    // writes that the cluster spoke). Fully observed at 10 GiB.
+    volume.status.observed_generation = 1;
+    volume.status.observed_at = Some(Utc::now());
+    assert!(
+        !needs_dispatch(&volume),
+        "observed and current: not a write per pass down there"
+    );
+
+    // A client grows it. The edge bumps the generation exactly as it does
+    // for any spec change.
+    let current = volume.clone();
+    volume.spec.size_gib = 20;
+    controller_api::carry_generation(&current, &mut volume).expect("serialisable");
+    assert_eq!(volume.metadata.generation, 2);
+    assert!(
+        needs_dispatch(&volume),
+        "a generation the cluster has never been sent goes down"
+    );
+    let sent: controller_api::VolumeSpec =
+        serde_json::from_str(&serde_json::to_string(&volume.spec).unwrap()).unwrap();
+    assert_eq!(sent.size_gib, 20, "and what goes down is the new size");
+
+    // Once it has gone, the dedup holds again.
+    volume.status.observed_generation = 2;
+    assert!(!needs_dispatch(&volume));
+}

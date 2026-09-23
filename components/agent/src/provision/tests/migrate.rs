@@ -41,6 +41,13 @@ struct MigratingVmm {
     /// What `send_failed` answers: `Some` is the VMM serving its guest
     /// again, which after a send has started can only mean it failed.
     send_broke: std::sync::Mutex<Option<String>>,
+    /// The pid `create` hands back. `None` is this test process, which never
+    /// carries a VM's uuid on its command line and so is never "that VMM" —
+    /// the right stand-in for every test that is not about the process.
+    vmm_pid: std::sync::Mutex<Option<u32>>,
+    /// How many times the api socket has been asked, for the tests that have
+    /// to know the watch has gone round without looking at a clock.
+    probes: std::sync::atomic::AtomicUsize,
 }
 
 impl MigratingVmm {
@@ -54,6 +61,8 @@ impl MigratingVmm {
             live: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             send_leaves: true,
             send_broke: std::sync::Mutex::new(None),
+            vmm_pid: std::sync::Mutex::new(None),
+            probes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     /// A hypervisor that ACCEPTS the send and then fails it, which is the
@@ -87,7 +96,7 @@ impl agent_api::hypervisor::Hypervisor for MigratingVmm {
     ) -> agent_api::hypervisor::Result<u32> {
         self.log.lock().unwrap().push("create".into());
         self.live.lock().unwrap().insert(*id);
-        Ok(std::process::id())
+        Ok(self.vmm_pid.lock().unwrap().unwrap_or(std::process::id()))
     }
     async fn destroy(&self, id: &VmId) -> agent_api::hypervisor::Result<()> {
         self.log.lock().unwrap().push("destroy".into());
@@ -135,6 +144,8 @@ impl agent_api::hypervisor::Hypervisor for MigratingVmm {
     /// the source VMM when a send succeeds, and the socket going quiet is
     /// how that is knowable from the outside.
     async fn probe(&self, _: &VmId) -> bool {
+        self.probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.still_here_after_send
             .load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -1436,5 +1447,261 @@ async fn tearing_down_a_guest_that_ran_here_keeps_the_volume_this_node_owns() {
     assert!(
         disk.deprovisioned.lock().unwrap().is_empty(),
         "and certainly does not delete a referenced volume's bytes"
+    );
+}
+
+/// A process that is, by every test the agent has, this VM's VMM: alive, and
+/// carrying the VM's uuid on its command line the way cloud-hypervisor
+/// carries `--api-socket <run_dir>/<uuid>.sock`. Killed when dropped.
+struct StandInVmm(std::process::Child);
+
+impl StandInVmm {
+    fn for_vm(id: &VmId) -> Self {
+        use std::os::unix::process::CommandExt as _;
+        // ONE process, carrying the uuid as its argv[0]. Not `sh -c`: a
+        // shell's `sleep` is a second process, which the kill below does not
+        // reach, and which held the test's stdout open for its whole ten
+        // minutes. Nothing inherited, for the same reason.
+        let child = std::process::Command::new("sleep")
+            .arg0(format!("stand-in-vmm --api-socket=/run/meister/{id}.sock"))
+            .arg("600")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a process");
+        Self(child)
+    }
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+    /// The VMM exits, which is what v53 does when a send took.
+    fn exit(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for StandInVmm {
+    fn drop(&mut self) {
+        self.exit();
+    }
+}
+
+/// F06: a source VMM that stops ANSWERING has not thereby LEFT.
+///
+/// The watch took a failed `vmm.ping` as proof that the guest had gone —
+/// "v53 exits the source VMM only when the send took" — and on that proof
+/// wrote `Migrated`, forgot the pid and let go of the disks. But a ping fails
+/// for more reasons than an exit: a VMM whose API thread is slow under a
+/// busy transfer, a socket the agent cannot open for a moment. An unreachable
+/// VMM with a live guest in it, told it has migrated, is a guest whose disks
+/// were just detached underneath it.
+///
+/// Here the socket is silent from the moment the send starts and the
+/// process is demonstrably alive: the watch goes round and round, and nothing
+/// about the source moves until the process really is gone.
+#[tokio::test]
+async fn a_vmm_that_stops_answering_has_not_left() {
+    let (_temp, root) = migration_root("mig-unreachable");
+    let store = Arc::new(crate::store::Store::open(&root.join("src.redb")).expect("a store"));
+    let id = VmId::new_v4();
+    let mut vmm = StandInVmm::for_vm(&id);
+    // Accepts the send and goes quiet on its socket at once — which is also
+    // what a successful send looks like from here, until the process is asked.
+    let hv = Arc::new(MigratingVmm::new(true));
+    *hv.vmm_pid.lock().unwrap() = Some(vmm.pid());
+    let disk = Arc::new(PlainDisk::default());
+    let source = Arc::new(migrating_provisioner_over(
+        &root,
+        store.clone(),
+        hv.clone(),
+        disk.clone(),
+    ));
+    source
+        .provision(id, migratable_spec(&store), Desired::Running, true)
+        .await
+        .expect("a running vm");
+    use agent_api::hypervisor::Hypervisor as _;
+    assert!(hv.owns_pid(&id, vmm.pid()), "the stand-in IS this vm's vmm");
+
+    let ops = Arc::new(tokio::sync::Mutex::new(()));
+    source
+        .begin_migrate_out(&id, "tcp:10.0.0.9:49000", &ops)
+        .await
+        .expect("the stream is open");
+    let asked_before = hv.probes.load(std::sync::atomic::Ordering::SeqCst);
+    let watching = tokio::spawn({
+        let source = source.clone();
+        let ops = ops.clone();
+        async move {
+            source
+                .finish_migrate_out(&id, "tcp:10.0.0.9:49000", std::time::Instant::now(), &ops)
+                .await
+        }
+    });
+
+    // Let the watch go round five times against a silent socket and a live
+    // process. Counted, not timed.
+    while hv.probes.load(std::sync::atomic::Ordering::SeqCst) < asked_before + 5 {
+        assert!(
+            !watching.is_finished(),
+            "the watch ended on a socket that did not answer"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let record = store.get(&id).expect("a lookup").expect("a record");
+    assert_eq!(record.phase, Phase::Provisioned, "not Migrated");
+    assert_eq!(record.vmm_pid, Some(vmm.pid()), "the pid is not forgotten");
+    assert_eq!(record.volumes.len(), 1, "and the disk is not let go of");
+    assert!(
+        disk.forgotten.lock().unwrap().is_empty(),
+        "nothing was detached at the backend"
+    );
+    assert!(matches!(
+        record.operation,
+        Some(crate::types::Operation::MigratingOut { .. })
+    ));
+
+    // Now the process goes, which is the evidence v53 gives of a send that
+    // took — and the watch reads it as that.
+    vmm.exit();
+    tokio::time::timeout(std::time::Duration::from_secs(10), watching)
+        .await
+        .expect("the watch ended once the process had")
+        .expect("the task");
+    let record = store.get(&id).expect("a lookup").expect("a record");
+    assert_eq!(record.phase, Phase::Migrated);
+    assert!(record.vmm_pid.is_none());
+}
+
+/// And one that never answers again and never exits is still here when the
+/// watch gives up: the guest, its pid and its disks stay, and the line the
+/// tier above reads says why.
+#[tokio::test]
+async fn a_vmm_that_never_answers_again_is_still_here_at_the_ceiling() {
+    let (_temp, root) = migration_root("mig-unreachable-ceiling");
+    let store = Arc::new(crate::store::Store::open(&root.join("src.redb")).expect("a store"));
+    let id = VmId::new_v4();
+    let vmm = StandInVmm::for_vm(&id);
+    let hv = Arc::new(MigratingVmm::new(true));
+    *hv.vmm_pid.lock().unwrap() = Some(vmm.pid());
+    let source = migrating_provisioner(&root, store.clone(), hv.clone()).with_ceilings(
+        crate::provision::Ceilings {
+            migrate_out: std::time::Duration::from_millis(300),
+            receive: std::time::Duration::from_secs(600),
+        },
+    );
+    source
+        .provision(id, migratable_spec(&store), Desired::Running, true)
+        .await
+        .expect("a running vm");
+    let ops = tokio::sync::Mutex::new(());
+    source
+        .begin_migrate_out(&id, "tcp:10.0.0.9:49000", &ops)
+        .await
+        .expect("the stream is open");
+    source
+        .finish_migrate_out(&id, "tcp:10.0.0.9:49000", std::time::Instant::now(), &ops)
+        .await;
+
+    let record = store.get(&id).expect("a lookup").expect("a record");
+    assert_eq!(record.phase, Phase::Provisioned, "the guest is still ours");
+    assert_eq!(record.vmm_pid, Some(vmm.pid()));
+    assert_eq!(record.volumes.len(), 1);
+    let line = crate::reconcile::departure(&record).expect("this node says so");
+    assert_eq!(line.outcome, crate::reconcile::DepartureOutcome::StillHere);
+    let said = line.message.expect("with a reason");
+    assert!(said.contains("not answering"), "{said}");
+}
+
+/// F07: a plan made before a migration began is not carried out during it.
+///
+/// A pass reads the record, looks at the VMM and decides — all without the
+/// node's lock — and only `execute` takes it. `begin_migrate_out` takes the
+/// same lock and writes `operation = MigratingOut` under it. So a pass can
+/// decide from a record with no operation, wait at the lock while the send
+/// begins, and then act: `execute` used to compare the phase and the intent
+/// and nothing else, and neither of those moves when a send starts. Here the
+/// pass has decided to stop the VM, and a stop carried out into a running
+/// send kills the source VMM in the middle of the transfer.
+///
+/// The interleaving is forced, not hoped for: the test holds the node's lock
+/// the way the send does, lets the pass read and look, writes the marker the
+/// way the send writes it, and only then lets go.
+#[tokio::test]
+async fn a_plan_made_before_a_migration_began_is_not_carried_out_during_it() {
+    let (_temp, root) = migration_root("stale-plan");
+    let store = Arc::new(crate::store::Store::open(&root.join("src.redb")).expect("a store"));
+    let hv = Arc::new(MigratingVmm::new(true));
+    let drivers = migrating_drivers(&root, hv.clone());
+    let provisioner = Arc::new(provisioner_over(&root, store.clone(), drivers.clone()));
+    let ops = Arc::new(tokio::sync::Mutex::new(()));
+    let reconciler = Arc::new(crate::reconcile::Reconciler::new(
+        store.clone(),
+        drivers,
+        provisioner.clone(),
+        ops.clone(),
+    ));
+    let id = VmId::new_v4();
+    provisioner
+        .provision(id, migratable_spec(&store), Desired::Running, true)
+        .await
+        .expect("a running vm");
+    // An operator's stop, written the way `set_desired` writes it — without
+    // the pass `set_desired` runs afterwards, which is the one under test.
+    store
+        .mutate(&id, |r| r.desired = Desired::Stopped)
+        .expect("the intent");
+
+    // The node's lock, held the way `begin_migrate_out` holds it.
+    let lock = ops.lock().await;
+    let asked = hv.probes.load(std::sync::atomic::Ordering::SeqCst);
+    let pass = tokio::spawn({
+        let reconciler = reconciler.clone();
+        async move {
+            reconciler
+                .reconcile(id, crate::reconcile::Trigger::Manual)
+                .await
+        }
+    });
+    // The pass has read the record and is looking at the VMM: whatever it
+    // decides, it decides from a record with no operation on it. From here
+    // to `execute` nothing is awaited but the lock.
+    while hv.probes.load(std::sync::atomic::Ordering::SeqCst) == asked {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    // What the send writes under the lock before it answers.
+    store
+        .mutate(&id, |r| {
+            r.operation = Some(crate::types::Operation::MigratingOut {
+                peer: "tcp:10.0.0.9:49000".into(),
+            })
+        })
+        .expect("the marker");
+    drop(lock);
+
+    let decided = pass.await.expect("the task").expect("a pass");
+    assert_eq!(
+        decided,
+        crate::reconcile::Action::Stop,
+        "the plan WAS a stop, made from the record as it was before the send"
+    );
+    assert!(
+        !hv.said().iter().any(|l| l == "destroy"),
+        "and it was not carried out into the send: {:?}",
+        hv.said()
+    );
+    let record = store.get(&id).expect("a lookup").expect("a record");
+    assert!(
+        record.vmm_pid.is_some(),
+        "the sending vmm is still recorded"
+    );
+    assert!(
+        matches!(
+            record.operation,
+            Some(crate::types::Operation::MigratingOut { .. })
+        ),
+        "and the send still owns the vm"
     );
 }

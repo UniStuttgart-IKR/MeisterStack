@@ -455,6 +455,23 @@ pub struct VolumeStatus {
     /// one no node has reported yet, which reads as "not measured".
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub size_gib: u64,
+    /// A size, in GiB, that the running guest holding this volume has not
+    /// been told about yet. Zero = nothing to tell.
+    ///
+    /// The second of a resize's two progress states, and it has to be written
+    /// down because the first cannot stand in for it. `sizeGib` above is what
+    /// the NODE measured, and it says 20 the moment the backend has grown —
+    /// whether or not the guest was told. Read alone, a failed notification
+    /// turned into a settled volume on the node's very next report, and the
+    /// guest went on with its old size until somebody restarted it (F05).
+    ///
+    /// Written by the cluster's resize BEFORE the backend is asked, so that
+    /// losing the controller between the two halves loses nothing; cleared
+    /// when the guest has been told, or when no running guest holds the
+    /// volume — a guest that starts later opens the disk at its new size.
+    /// Always zero at the cloud, which runs no resize.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub untold_gib: u64,
     /// The last `metadata.generation` this object's controller ACTED on —
     /// the same field, with the same meaning, that `Vm`, `FloatingIp` and
     /// `RoutedSubnet` carry.

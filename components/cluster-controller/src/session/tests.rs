@@ -581,3 +581,108 @@ fn a_second_heartbeat_that_says_the_same_thing_writes_no_node_revision() {
         "silence about health leaves the list alone and writes nothing"
     );
 }
+
+/// F08: once a node's session has been replaced, what arrives on the old one
+/// is no longer the node speaking.
+///
+/// `disconnect` always knew this — an old stream unwinding must not take the
+/// newer session's entry with it — and the status road did not: a report
+/// still buffered on the superseded stream was ingested after the new
+/// session's, stamped with the time it was READ, and the node's capacity,
+/// conditions, heartbeat and VM phases went back to what they had been.
+///
+/// `#[ignore]`: the ingest writes the store, and the workspace's ordinary run
+/// has no etcd. See `two_replicas_assigning_at_once_hand_out_two_namespaces`.
+#[tokio::test]
+#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+async fn a_report_on_a_superseded_session_changes_nothing() {
+    let endpoint =
+        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+    let prefix = format!("/superseded-test/{}", uuid::Uuid::new_v4());
+    let store = Arc::new(
+        EtcdStore::connect(&[endpoint], &prefix)
+            .await
+            .expect("an etcd to talk to"),
+    );
+    // What a Hello leaves behind: the node, and a VM bound to it.
+    store
+        .create(&Node::declare("n1", NodeSpec::default()))
+        .await
+        .expect("the node");
+    let mut web = vm("u-web");
+    web.spec.node_name = Some("n1".into());
+    store.create(&web).await.expect("the vm");
+
+    let registry = Arc::new(SessionRegistry::new());
+    let index = Arc::new(VmIndex::default());
+    let session = |tx: &CommandTx| Session {
+        registry: registry.clone(),
+        store: store.clone(),
+        vms: index.clone(),
+        who: Authenticated::Anonymous,
+        tx: tx.clone(),
+        advertise: None,
+        kek: None,
+    };
+    // A says Hello; B, the same node reconnecting, replaces it.
+    let (a_tx, _a_rx) = mpsc::channel(16);
+    let (b_tx, _b_rx) = mpsc::channel(16);
+    registry.register("n1", &a_tx);
+    let a = session(&a_tx);
+    registry.register("n1", &b_tx);
+    let b = session(&b_tx);
+
+    let report = |vcpus: u32, pressure: bool, phase: &str| StatusReport {
+        node: Some(proto::NodeStatus {
+            vcpus,
+            mem_mib: 4096,
+            conditions: if pressure {
+                vec![proto::NodeCondition {
+                    r#type: "DiskPressure".into(),
+                    message: "no room".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+        }),
+        vms: vec![proto::VmStatusReport {
+            phase: phase.into(),
+            ..line("u-web")
+        }],
+        ..Default::default()
+    };
+
+    // B, the node as it is now.
+    on_status(&b, Some("n1"), &report(16, false, "Running")).await;
+    let fresh: Node = store.get("n1").await.unwrap();
+    assert_eq!(fresh.status.capacity.vcpus, 16);
+    let beat = store.last_beat::<Node>("n1").await.unwrap();
+    assert!(beat.is_some());
+    let running: Vm = store.get("u-web").await.unwrap();
+    assert_eq!(running.status.phase().kind(), VmPhaseKind::Running);
+
+    // A's report, delayed on the superseded stream: the node as it WAS.
+    on_status(&a, Some("n1"), &report(8, true, "Stopped")).await;
+    let after: Node = store.get("n1").await.unwrap();
+    assert_eq!(after.status.capacity.vcpus, 16, "node facts are B's");
+    assert!(
+        after.status.conditions.is_empty(),
+        "and so are its conditions"
+    );
+    assert_eq!(
+        store.last_beat::<Node>("n1").await.unwrap(),
+        beat,
+        "a superseded session is not a heartbeat"
+    );
+    let still: Vm = store.get("u-web").await.unwrap();
+    assert_eq!(
+        still.status.phase().kind(),
+        VmPhaseKind::Running,
+        "nor a statement about the node's vms"
+    );
+
+    // And the node's voice is untouched: B is still heard.
+    on_status(&b, Some("n1"), &report(32, false, "Running")).await;
+    let now: Node = store.get("n1").await.unwrap();
+    assert_eq!(now.status.capacity.vcpus, 32);
+}
