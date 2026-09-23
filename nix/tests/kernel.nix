@@ -443,8 +443,13 @@ pkgs.testers.runNixOSTest {
     # one this machine does NOT run any more), and an inventory that says
     # this host is never rebooted. A plan, not a run: the refusal is the
     # document.
+    # `.hosts` and not `.inventory.hosts`: the rollout policy of a host is
+    # part of the EVALUATED half of a nix manifest (`nix/lib/manifest.nix`
+    # resolves defaults < group < host there), and the inventory half
+    # carries no `rollout` key at all — writing one in would be a field the
+    # parser refuses.
     operator.succeed(
-        "jq '.inventory.hosts.target.rollout.reboot = \"never\"' "
+        "jq '.hosts.target.rollout.reboot = \"never\"' "
         "/root/out/m-nix-a.json > /root/out/m-nix-never.json"
     )
     release_never = deploy("never", "/root/out/m-nix-never.json")
