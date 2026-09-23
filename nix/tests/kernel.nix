@@ -93,9 +93,23 @@ let
     boot.loader.systemd-boot.enable = true;
     boot.loader.efi.canTouchEfiVariables = true;
 
+    # Room, and why it has to be said here. The image the framework builds
+    # for a boot-loader VM is sized EXACTLY to the closure it contains
+    # (`diskSize = "auto"; additionalSpace = "0M"` in qemu-vm.nix), so a
+    # fresh machine of this kind has some two hundred megabytes free — and
+    # this lane's preflight compares the free space against the WHOLE
+    # closure of the release. That is the conservative comparison the lane
+    # brief asks for, and on a machine like this it refuses a copy that in
+    # truth needs a few megabytes. (Measured: the first run of this test
+    # stopped with "target has 213381120 byte(s) free … and the closure …
+    # is 1141721200 byte(s)".) So the machine gets room the way a real
+    # managed host has it: the partition grows into its disk at boot.
+    boot.growPartition = true;
+    virtualisation.fileSystems."/".autoResize = true;
+
     virtualisation.writableStore = true;
     virtualisation.memorySize = 2048;
-    virtualisation.diskSize = 8192;
+    virtualisation.diskSize = 12288;
   };
 
   # The spare systems, built and never started. Their MAC rule, their etcd
