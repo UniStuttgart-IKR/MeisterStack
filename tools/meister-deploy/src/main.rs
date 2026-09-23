@@ -418,6 +418,13 @@ struct LookArgs {
     #[arg(long)]
     identity: Option<PathBuf>,
 
+    // --- lane 5C ---
+    /// The inventory whose `[operator] cli_config` reference is read (D7).
+    /// Defaults to the one the manifest was resolved from. `plan` and
+    /// `apply` take the same flag and mean the same thing by it.
+    #[arg(long)]
+    inventory: Option<PathBuf>,
+    // --- end lane 5C ---
     /// How many hosts to ask at once
     #[arg(long, default_value_t = observe::DEFAULT_CONCURRENCY)]
     at_once: usize,
@@ -1323,6 +1330,57 @@ fn status(args: &LookArgs) -> Result<Answer> {
     Ok(Answer::Yes)
 }
 
+// --- lane 5C ---
+/// What `check` does NOT look at, said out loud.
+///
+/// Two lab findings in one sentence (L2 §10, 4 and 14). `check` did not
+/// take `--inventory` at all — `error: unexpected argument` — and it does
+/// not read `[operator] cli_config`, so a fleet that is green here may
+/// still be a fleet no rollout can drain: an agent with guests on it is
+/// `blocked` in every plan until that reference exists (D7). An operator
+/// who reads "every required check passed" after a bootstrap has not been
+/// told that.
+///
+/// A note on stderr and never a verdict: this verb reports readiness, and
+/// whether the operator's own cli is reachable is not a property of the
+/// fleet.
+fn note_about_the_workload_reference(args: &LookArgs, looked: &Looked) {
+    let Some(release) = &looked.release else {
+        return;
+    };
+    let files = RealFiles::new(Policy::real());
+    let (control, why) = workload_control(&files, release, args.inventory.as_deref());
+    if control.is_some() {
+        return;
+    }
+    let agents: Vec<&str> = looked
+        .selected
+        .iter()
+        .filter(|id| {
+            looked
+                .fleet
+                .hosts
+                .get(*id)
+                .map(|host| host.roles.iter().any(|r| r == "agent"))
+                .unwrap_or(false)
+        })
+        .map(|id| id.as_str())
+        .collect();
+    if agents.is_empty() {
+        return;
+    }
+    if let Some(why) = why {
+        eprintln!("note: {why}");
+    }
+    eprintln!(
+        "note: these checks say nothing about D7. {} carries guests, and without `[operator] \
+         cli_config` in the inventory no rollout can cordon or drain it — every interrupting \
+         step for it is blocked in the plan, not here.",
+        agents.join(", ")
+    );
+}
+// --- end lane 5C ---
+
 fn check(args: &LookArgs, suite: &str) -> Result<Answer> {
     if suite != "readiness" {
         anyhow::bail!(
@@ -1342,6 +1400,9 @@ fn check(args: &LookArgs, suite: &str) -> Result<Answer> {
     if let Some(path) = &looked.written {
         eprintln!("==> {}", path.display());
     }
+    // --- lane 5C ---
+    note_about_the_workload_reference(args, &looked);
+    // --- end lane 5C ---
     match meister_deploy::checks::acceptance(&looked.checks) {
         meister_deploy::checks::Acceptance::Accepted => {
             eprintln!(
@@ -2610,6 +2671,11 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
         return Ok(Answer::Blocked);
     }
     // --- end lane 3-integration -------------------------------------------
+    // --- lane 5C: what a run that did not come through leaves behind ------
+    if applied.receipt.outcome != receipt::Outcome::Success {
+        eprint!("{}", what_is_left(&applied.receipt, &state, &run_id));
+    }
+    // --- end lane 5C ------------------------------------------------------
     match (applied.receipt.outcome, applied.blocked.is_empty()) {
         (receipt::Outcome::Success, true) => Ok(Answer::Yes),
         // It worked, and the plan refused to touch something. Exit 2 is
@@ -2618,6 +2684,61 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
         _ => Ok(Answer::No),
     }
 }
+
+// --- lane 5C ---
+/// The three things a run that did not come through leaves in three
+/// places, and the one sentence that was missing: how to get out.
+///
+/// From the lab (L2 §10, finding 8): "Ein gescheiterter Lauf hinterlaesst
+/// drei Dinge an drei Orten: die Operator-Sperre im Repo, einen
+/// Txn-Record auf dem Ziel und eine halbe Zeile im Journal. Die Meldungen
+/// erklaeren jede einzeln gut; was fehlt, ist der eine Satz 'so kommst du
+/// hier raus'." Each of those messages arrives when somebody runs into the
+/// thing; none of them is printed by the run that made it.
+///
+/// Pure, so the wording is a test rather than a thing somebody reads once
+/// on a bad evening.
+fn what_is_left(receipt: &receipt::DeploymentReceipt, state: &StateDir, run_id: &str) -> String {
+    let mut out = String::new();
+    out.push_str("==> what this run left behind, and the way out:\n");
+    out.push_str(&format!(
+        "    1. the run itself, in {}: its journal, the plan it ran and the release it ran \
+         them from. Read it with `meister-deploy report --run {run_id}`, and continue it with \
+         `meister-deploy apply --resume {run_id}` — that needs no --plan and no --release, \
+         they are in there.\n",
+        state.run_dir(run_id).display()
+    ));
+    out.push_str(&format!(
+        "    2. the operator's lock, {}. This run gave it back; a run that was KILLED did \
+         not, and the next one then names this id and offers `--takeover {run_id}`.\n",
+        state.lock_path().display()
+    ));
+    let open: Vec<(&String, &String)> = receipt
+        .hosts
+        .iter()
+        .filter(|(_, host)| host.outcome != receipt::HostOutcome::Success)
+        .filter_map(|(id, host)| host.txn_id.as_ref().map(|txn| (id, txn)))
+        .collect();
+    if open.is_empty() {
+        out.push_str("    3. no transaction record: no host of this run was left holding one.\n");
+    } else {
+        out.push_str(
+            "    3. a transaction record on each of these hosts, which is what says the \
+             machine may still have to go back:\n",
+        );
+        for (id, txn) in open {
+            out.push_str(&format!(
+                "       {id}: `meister-activate txn show --txn {txn}` on that host. Finish it \
+                 with `confirm` or `revert`; only if it says `inconsistent` and the machine's \
+                 profile, /run/current-system and /run/booted-system all agree, put it aside \
+                 with `meister-activate txn retire --txn {txn} --force --reason \"<what you \
+                 found>\"`.\n"
+            ));
+        }
+    }
+    out
+}
+// --- end lane 5C ---
 
 /// Look, check, and say what would be done.
 ///
@@ -4101,3 +4222,79 @@ fn run_legacy(cli: &LegacyCli) -> Result<bool> {
         LegacyVerb::Render { .. } => unreachable!("answered above"),
     }
 }
+
+// --- lane 5C ---
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meister_deploy::receipt::{
+        DeploymentReceipt, HostOutcome, HostReceipt, Outcome, RECEIPT_SCHEMA, SystemView,
+    };
+
+    fn a_failed_receipt(txn: Option<&str>) -> DeploymentReceipt {
+        let mut hosts = BTreeMap::new();
+        hosts.insert(
+            "box".to_string(),
+            HostReceipt {
+                outcome: HostOutcome::RecoveryRequired,
+                state: meister_deploy::receipt::HostState::RecoveryRequired,
+                before: SystemView::default(),
+                after: SystemView::default(),
+                actions: Vec::new(),
+                credential_versions: None,
+                txn_id: txn.map(str::to_string),
+            },
+        );
+        DeploymentReceipt {
+            schema: RECEIPT_SCHEMA.to_string(),
+            run_id: "run-1".to_string(),
+            plan_id: "plan-1".to_string(),
+            release_id: "release-1".to_string(),
+            started_at: None,
+            ended_at: None,
+            operator: None,
+            outcome: Outcome::Failed,
+            hosts,
+            untouched: Vec::new(),
+            checks: Vec::new(),
+            breaks: Vec::new(),
+            journal_path: "journal.jsonl".to_string(),
+            journal_sha256: "0".repeat(64),
+        }
+    }
+
+    #[test]
+    fn a_failed_run_names_its_three_leftovers_and_the_way_out_of_each() {
+        // L2 §10, finding 8: the three messages each arrive when somebody
+        // runs into the thing, and no message names all three.
+        let state = StateDir::at("/repo/.meister-deploy");
+        let text = what_is_left(&a_failed_receipt(Some("txn-9")), &state, "run-1");
+        // 1: the run directory, and that a resume needs nothing else (N10).
+        assert!(text.contains("/repo/.meister-deploy/runs/run-1"), "{text}");
+        assert!(text.contains("apply --resume run-1"), "{text}");
+        assert!(text.contains("no --plan and no --release"), "{text}");
+        // 2: the operator's lock, and the word for taking it (N8).
+        assert!(text.contains("/repo/.meister-deploy/lock"), "{text}");
+        assert!(text.contains("--takeover run-1"), "{text}");
+        // 3: the transaction record, per host, and the forced way out (N13).
+        assert!(
+            text.contains("box: `meister-activate txn show --txn txn-9`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("txn retire --txn txn-9 --force --reason"),
+            "{text}"
+        );
+        assert!(text.contains("inconsistent"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_run_that_opened_no_transaction_says_that_too() {
+        // Silence would read as "there might be one somewhere".
+        let state = StateDir::at("/repo/.meister-deploy");
+        let text = what_is_left(&a_failed_receipt(None), &state, "run-1");
+        assert!(text.contains("no transaction record"), "{text}");
+        assert!(!text.contains("txn retire"), "{text}");
+    }
+}
+// --- end lane 5C ---

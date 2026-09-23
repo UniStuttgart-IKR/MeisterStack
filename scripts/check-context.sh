@@ -1071,7 +1071,11 @@ render_strict hostile \
     "ONEAPP_SECRET='geheim'" \
     "export FOO=1" \
     "ETH0_IP='10.128.1.77'" \
-    "ETH0_MASK='255.255.255.0'"
+    "ETH0_MASK='255.255.255.0'" \
+    "ETH0_MAC='02:00:0a:80:01:4d'" \
+    "ETH0_SEARCH_DOMAIN='lab.example'" \
+    "NETWORK='YES'" \
+    "TARGET='hda'"
 
 expect "die Rolle kommt aus dem Plan, nicht vom Medium" \
     "agent" "$(cat "$T/run/meister-role" 2>/dev/null)"
@@ -1085,6 +1089,16 @@ grepfor "MEISTER_ROLE vom Medium wird benannt und verworfen" \
 grepfor "ein fremder Schluessel wird benannt und verworfen" \
     'ignored, ONEAPP_SECRET is not one of the six keys' "$T/hostile.log" \
     "$(cat "$T/hostile.log")"
+# --- lane 5C: der eigene Block des Mediums wird EINMAL gezaehlt, nicht
+# einundzwanzigmal genannt (L2 §10, Befund 9).
+grepfor "der Interface-Block des Mediums wird einmal gezaehlt" \
+    'context: 4 key\(s\) of the medium.s own interface and disk block were skipped' \
+    "$T/hostile.log" "$(cat "$T/hostile.log")"
+if grep -q 'ETH0_MAC is not one of the six keys' "$T/hostile.log"; then
+    bad "der Interface-Block wird nicht Zeile fuer Zeile genannt" "$(cat "$T/hostile.log")"
+else
+    ok "der Interface-Block wird nicht Zeile fuer Zeile genannt"
+fi
 grepfor "eine Zeile, die keine KEY='value' ist, wird benannt und verworfen" \
     "ignored, not KEY='value': export FOO=1" "$T/hostile.log" \
     "$(cat "$T/hostile.log")"
