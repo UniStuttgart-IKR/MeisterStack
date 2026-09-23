@@ -703,7 +703,15 @@ pub(super) async fn ingest_attachments(
         .iter()
         .filter_map(|r| {
             let vm = vms.iter().find(|v| v.metadata.uid == r.id)?;
-            (ours(vm) && !vm.spec.referenced_volumes().is_empty()).then_some((vm, r))
+            // Astra finding S18, 2026-09-23: a spec that no longer
+            // references any disk still needs its LAST report, or a stale
+            // `status.volumes` entry from before the spec was cleared is
+            // never rewritten — `observed_attachments` returns `[]` for an
+            // empty spec, and that is what clears it, but only if the vm is
+            // still let through here to receive one.
+            let has_something_to_settle =
+                !vm.spec.referenced_volumes().is_empty() || !vm.status.volumes.is_empty();
+            (ours(vm) && has_something_to_settle).then_some((vm, r))
         })
         .collect();
     if relevant.is_empty() {
@@ -1087,8 +1095,29 @@ pub(super) async fn ingest_phases(
         // the spec and travels with the event, so a member sees its own VMs'
         // history and nobody else's.
         let vm_tenant = vm.spec.tenant.clone();
+        // Set fresh inside the closure on every call, including a retry: it
+        // must say whether the write that actually landed applied the
+        // report, not whether some earlier attempt would have.
+        let mut applied = false;
         let result = store
-            .mutate::<Vm, _>(&name, |v| {
+            // Astra finding S20, 2026-09-23: `vms` above is a listing that
+            // can be seconds stale (`VmIndex`), so the binding `observe`
+            // already checked may not hold any more by the time this write
+            // lands — a name that was recreated under the same uid, or (as
+            // here) a vm that was REBOUND to a different node in between.
+            // `mutate_if` re-checks the uid on every read; the binding check
+            // below re-checks the freshly read object rather than the stale
+            // snapshot `vm` came from.
+            .mutate_if::<Vm, _>(&name, &reported.id, |v| {
+                applied = false;
+                if v.spec
+                    .node_name
+                    .as_deref()
+                    .is_some_and(|bound| bound != node_id)
+                {
+                    return;
+                }
+                applied = true;
                 v.status.reported = Some(controller_api::VmReported::by(
                     node_id,
                     phase,
@@ -1113,10 +1142,12 @@ pub(super) async fn ingest_phases(
             })
             .await;
         match result {
-            Ok(_) => {
+            Ok(_) if applied => {
                 note_phase(store, &name, &reported.id, phase, &message, &vm_tenant).await;
                 info!(vm = %name, vm_id = %reported.id, ?phase, "phase observed")
             }
+            Ok(_) => debug!(vm = %name, node = node_id,
+                             "status landed between reads on a vm rebound out from under it, dropping it"),
             Err(e) => warn!(vm = %name, error = format!("{e:#}"), "writing vm status failed"),
         }
     }

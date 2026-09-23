@@ -595,7 +595,11 @@ pub(super) async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::
 /// this asks for a re-create every pass. Idempotent at the node and visible
 /// in the log, which is the honest failure mode for a version skew that has
 /// to end with a rollout anyway.
-pub(super) fn volume_drift(vm: &Vm) -> Option<Drift> {
+// `pub(crate)`, not `pub(super)`: the session ingest test for Astra finding
+// S18 (2026-09-23) asserts through this function, from `session` rather than
+// from `reconcile`, that a vm whose last volume left the spec settles with
+// nothing left to release.
+pub(crate) fn volume_drift(vm: &Vm) -> Option<Drift> {
     // Only where a node has a record to diff against. A Pending VM is handled
     // by the create path above; a Failed one is on the requeue curve, which
     // re-sends the current spec anyway and does it with a backoff — plugging
@@ -632,11 +636,13 @@ pub(super) fn volume_drift(vm: &Vm) -> Option<Drift> {
 }
 
 /// The difference between a VM's spec and the disks its node has open.
-pub(super) struct Drift {
+///
+/// `pub(crate)`, alongside `volume_drift` — see that function's note.
+pub(crate) struct Drift {
     /// Referenced volumes the spec names that the node does not report.
-    pub(super) attach: Vec<String>,
+    pub(crate) attach: Vec<String>,
     /// Volumes the node reports that the spec no longer names.
-    pub(super) release: Vec<String>,
+    pub(crate) release: Vec<String>,
 }
 
 /// Make the node's disks match the spec: hold the new ones, re-send the spec,

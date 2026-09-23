@@ -817,10 +817,86 @@ impl EtcdStore {
         )))
     }
 
+    /// `mutate`, for a caller whose `name` came off a listing that may
+    /// already be stale.
+    ///
+    /// Astra finding S20, 2026-09-23: `mutate` re-reads BY NAME on every
+    /// retry and reapplies the closure without asking whether the name still
+    /// names the object the caller resolved `uid` from. A cached listing
+    /// (`VmIndex` and its like) can be seconds old, so between the read that
+    /// produced `uid` and the write that finally lands, the name may have
+    /// been freed and taken by an unrelated object — same shape as the
+    /// ABA `delete_if` guards against, one level up: a write instead of a
+    /// delete. `uid` is checked after EVERY get, including retries, because
+    /// a recreation can happen between any two of them.
+    pub async fn mutate_if<T, F>(&self, name: &str, uid: &str, mut f: F) -> Result<T>
+    where
+        T: Resource,
+        F: FnMut(&mut T),
+    {
+        for _ in 0..8 {
+            let mut obj: T = self.get(name).await?;
+            if obj.metadata().uid != uid {
+                return Err(StoreError::Conflict(format!(
+                    "resource version conflict on {resource}/{name} (recreated under the same \
+                     name)",
+                    resource = T::RESOURCE
+                )));
+            }
+            f(&mut obj);
+            match self.update(&obj).await {
+                Ok(o) => return Ok(o),
+                Err(StoreError::Conflict(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(StoreError::Conflict(format!(
+            "resource version conflict on {resource}/{name} (retries exhausted)",
+            resource = T::RESOURCE
+        )))
+    }
+
     /// Hard delete — the finalizer flow soft-deletes via update first.
     pub async fn delete<T: Resource>(&self, name: &str) -> Result<()> {
         let key = self.key(T::RESOURCE, name);
         timed("delete", self.handle().delete(key, None)).await?;
+        Ok(())
+    }
+
+    /// `delete`, and only if `resource_version` still names the object as it
+    /// was when the caller last read it — the same CAS `update_fenced` (see
+    /// above) guards a write with, applied to a delete.
+    ///
+    /// Astra finding S19, 2026-09-23: a delete by NAME alone is an ABA hole
+    /// wherever names are reused — `delete_secret` reads and authorises one
+    /// object, then AWAITS an Ack from every connected cluster before it
+    /// deletes, and a delete that resumes after the old object was removed
+    /// and a new one created under the same name would remove the wrong
+    /// object. A failed compare means the name no longer names what the
+    /// caller authorised against, and the caller sees `Conflict` — a 409 —
+    /// rather than a silent wrong delete.
+    pub async fn delete_if<T: Resource>(&self, name: &str, resource_version: &str) -> Result<()> {
+        let rev: i64 = resource_version.parse().map_err(|_| {
+            StoreError::Invalid(
+                "invalid object: metadata.resourceVersion must be set for a guarded delete".into(),
+            )
+        })?;
+        let key = self.key(T::RESOURCE, name);
+        let txn = Txn::new()
+            .when(vec![Compare::mod_revision(
+                key.clone(),
+                CompareOp::Equal,
+                rev,
+            )])
+            .and_then(vec![TxnOp::delete(key.clone(), None)]);
+        let resp = timed("delete_if", self.handle().txn(txn)).await?;
+        if !resp.succeeded() {
+            return Err(StoreError::Conflict(format!(
+                "resource version conflict on {resource}/{name} (concurrent write)",
+                resource = T::RESOURCE
+            )));
+        }
+        observe_revision(resp.header());
         Ok(())
     }
 

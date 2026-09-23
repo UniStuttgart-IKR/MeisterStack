@@ -249,7 +249,17 @@ pub(super) async fn delete_secret(
                   "the mirrored copy could not be removed; it stays there sealed");
         }
     }
-    st.store.delete::<controller_api::Secret>(&name).await?;
+    // Astra finding S19, 2026-09-23: names are global (`create_secret` keys
+    // by `metadata.name`) and the Acks above are an unbounded pause — a
+    // delete that resumed after this pauses could land on an object that was
+    // removed and recreated under the same name while it waited, deleting
+    // whatever a DIFFERENT tenant now holds there. `delete_if` is the same
+    // compare-and-swap `update_fenced` guards a write with, so a name that no
+    // longer names the object read above answers with `Conflict` — 409 — and
+    // not a silent delete of the wrong thing.
+    st.store
+        .delete_if::<controller_api::Secret>(&name, &current.metadata.resource_version)
+        .await?;
     info!(secret = %name, tenant = %current.spec.tenant, "secret deleted");
     Ok(controller_api::removed(
         controller_api::Secret::KIND,

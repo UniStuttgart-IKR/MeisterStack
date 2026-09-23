@@ -1063,8 +1063,28 @@ pub fn settle_vm(spec: &VmSpec, status: &VmStatus) -> VmPhase {
             .unwrap_or((VmReason::AwaitingNode, Some("not placed yet".to_string())));
         return waiting(reason, message);
     }
-    // Rule 3.
-    if let Some(phase) = said.and_then(VmReported::phase) {
+    // Rule 3. A peer's word counts only while `spec` still names it as the
+    // holder — Astra finding S20, 2026-09-23. `status.reported` stays on the
+    // object until a fresh report replaces it, and a vm whose SPEC has since
+    // been rebound to somebody else must not go on reading that old word as
+    // current; the empty-`node` case (`here`) is this tier's own conclusion
+    // and carries no peer to compare. Checked against `spec` and not
+    // `status.nodeName`/`status.clusterName`: those two lag a rebind on
+    // purpose (`a_guest_a_node_still_holds_is_not_nowhere`) and are exactly
+    // the case this must NOT refuse — the old holder's word is still good
+    // until spec itself points elsewhere.
+    let stale_holder = said.is_some_and(|r| {
+        !r.node.is_empty()
+            && (spec
+                .node_name
+                .as_deref()
+                .is_some_and(|bound| bound != r.node)
+                || spec
+                    .cluster_name
+                    .as_deref()
+                    .is_some_and(|bound| bound != r.node))
+    });
+    if !stale_holder && let Some(phase) = said.and_then(VmReported::phase) {
         return phase;
     }
     // Rule 4.
