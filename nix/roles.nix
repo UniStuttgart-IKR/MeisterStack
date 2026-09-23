@@ -98,12 +98,15 @@ in
         `nixosModules.default`: a reader that knows how to mount a CONTEXT
         cd is a reader nobody else can use.
 
-        On an appliance the boot renderer (nix/context.nix) runs it in the
-        middle of rendering, because there the provider's values are an
-        INPUT to the config files. A managed host has no renderer — its
-        config files are part of the system generation — and what is left
-        for a provider to say there is the machine's address, its route,
-        its resolver, its hostname and the operator's key.
+        Two modules run it, and never both on one host. On an appliance the
+        boot renderer (nix/context.nix) runs it in the middle of rendering,
+        because there the provider's values are an INPUT to the config
+        files. On a managed host there is no renderer — the config files
+        are part of the system generation — and
+        `meister-provider-context.service` (nix/services.nix) runs the same
+        script for the one thing that is still the provider's to say: the
+        machine's address, its route, its resolver, its hostname and the
+        operator's key.
 
         What it may do is set MEISTER_* variables and configure the
         interface it owns. What it must not do is render a config file.
