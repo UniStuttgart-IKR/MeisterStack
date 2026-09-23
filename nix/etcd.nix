@@ -136,6 +136,42 @@ in
       initialClusterToken = cfg.clusterToken;
     };
 
+    # --- lane L4: a member of a cluster that does not exist yet is still up.
+    #
+    # nixpkgs' unit is `Type = "notify"`, and etcd notifies readiness only
+    # once the cluster has a LEADER. A three-member cluster with
+    # `initial-cluster-state = new` has no leader until a majority of its
+    # members is running, so the FIRST member to be activated can never
+    # become ready on its own: systemd's start timeout kills it, and with it
+    # `switch-to-configuration`.
+    #
+    # Measured in the lab on 2026-09-23 (lane L4), on the first activation of
+    # a three-member raft:
+    #
+    #   prober detected unhealthy status … dial tcp 10.128.1.120:2380:
+    #     connect: connection refused
+    #   etcd.service: start operation timed out. Terminating.
+    #   switch-to-configuration switch exited 4 … the following units
+    #     failed: etcd.service
+    #
+    # and `meister-deploy` — correctly — took the host back and stopped the
+    # rollout. It could not have been anything else: the rollout moves ONE
+    # member of a raft group per wave (D8, and that is right for a group that
+    # is SERVING), so the second member is by definition not there yet when
+    # the first one activates. A fresh raft could therefore not be
+    # bootstrapped at all.
+    #
+    # `exec` is the honest readiness for this unit: the claim it makes is
+    # "the process is up and listening", which is exactly as much as a single
+    # member of a forming cluster can claim. Whether the cluster FORMED is a
+    # different question, it is asked by a different thing
+    # (`etcdctl endpoint health`, which is `meister-deploy`'s `etcd` check
+    # and the D8 arithmetic), and answering it here would mean an activation
+    # that depends on a machine somebody else has not activated yet.
+    #
+    # `Restart = "always"` stays what nixpkgs sets, so a member that dies
+    # because it never found its peers comes back and keeps trying.
+
     # By label, not by device name: which slot the datablock lands in depends
     # on the OS image's DEV_PREFIX and the attach order — /dev/vdb silently
     # became sda+vda twice in the lab, and etcd silently lived on the root
@@ -163,9 +199,13 @@ in
     # `clusterToken` above — Nix knows them at build time — and a second
     # author of the same three values at boot is how two halves start
     # disagreeing about who is in the Raft.
-    systemd.services.etcd = lib.mkIf config.meisterstack.context.enable {
-      after = [ "meister-context.service" ];
-      serviceConfig.EnvironmentFile = "-${config.meisterstack.configDir}/etcd.env";
-    };
+    systemd.services.etcd = lib.mkMerge [
+      # --- lane L4: see the block above `services.etcd` ---
+      { serviceConfig.Type = lib.mkForce "exec"; }
+      (lib.mkIf config.meisterstack.context.enable {
+        after = [ "meister-context.service" ];
+        serviceConfig.EnvironmentFile = "-${config.meisterstack.configDir}/etcd.env";
+      })
+    ];
   };
 }
