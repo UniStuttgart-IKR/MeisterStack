@@ -347,6 +347,30 @@ async fn a_router_is_built_and_taken_down_again() {
         !d.list_routers().await.expect("still one router")[0].active,
         "and the RECORD says standby, so the node does not shout on its way back up"
     );
+    // Astra finding S08, 2026-09-23: this function has a second caller now.
+    // The agent's dead man (`ROUTER_DEAD_MAN`) calls it when the controller
+    // is merely LOST rather than when the unit is stopped, so what it leaves
+    // behind is what an operator gets on every control-plane outage, not only
+    // on a `systemctl stop`. Both halves of that are worth asserting here,
+    // because they are the two things the cluster is relying on when it
+    // promotes a standby on a timer.
+    let silent = d.list_routers().await.expect("still one router");
+    assert!(
+        silent[0].announce.is_empty(),
+        "the withdraw: a silent router asks the fabric for nothing, not even \
+         the floating address it was translating"
+    );
+    // The addresses are still ON the leg, and that is not a contradiction of
+    // the line above: with `arp_ignore = 8` nothing on either wire learns
+    // they are here, and keeping them configured is exactly what makes the
+    // way back a sysctl rather than a build. A namespace with no addresses
+    // would be a failover that has to build a router.
+    let on_ext = in_netns(&netns, &["ip", "-o", "addr", "show", "ext"]);
+    assert!(
+        on_ext.contains("203.0.113.10/24") && on_ext.contains("203.0.113.55/32"),
+        "the standby keeps its own address and the floating one it holds, and \
+         answers for neither: {on_ext}"
+    );
     assert!(
         d.fall_silent().await.expect("twice is once").is_empty(),
         "a second farewell has nothing left to silence"
