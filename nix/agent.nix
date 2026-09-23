@@ -723,6 +723,13 @@ in
           nfs-utils
           curl
           nvme-cli
+          # `systemd-run`: a base image is read and written in a transient
+          # unit of its own rather than in this process, which is root by
+          # default (Astra finding S01, 2026-09-23). The agent resolves
+          # `qemu-img` against THIS path itself and hands the unit an
+          # absolute path, because systemd would resolve a bare name against
+          # the manager's own PATH, which is not this one.
+          systemd
         ];
         unitConfig = {
           # All three must have been pushed before the agent can do anything.

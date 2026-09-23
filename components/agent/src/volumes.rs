@@ -1068,6 +1068,8 @@ mod tests {
                 image_dir: root.join("images"),
                 volume_dir: volumes.clone(),
                 qemu_img: std::path::PathBuf::from("qemu-img"),
+                // Nothing here converts anything: these pools are raw files.
+                convert: agent_api::base_image::Sandbox::default(),
             },
         )
         .expect("the filesystem driver builds");

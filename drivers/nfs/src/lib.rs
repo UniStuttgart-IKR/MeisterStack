@@ -204,6 +204,10 @@ impl NfsDriver {
             // raw; this backend names no path of its own for it, so PATH is
             // the answer here exactly as it is there.
             qemu_img: PathBuf::from("qemu-img"),
+            // And the same sandbox, for the same reason: a volume on a share
+            // is still written from an image this node did not make (Astra
+            // finding S01, 2026-09-23). See `agent_api::base_image`.
+            convert: agent_api::base_image::Sandbox::default(),
         })?;
 
         Ok(Self {

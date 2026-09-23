@@ -24,6 +24,15 @@ pub struct FilesystemDriverConfig {
     /// `nft` takes one module over. A node whose base images are all raw
     /// never runs it.
     pub qemu_img: PathBuf,
+    /// The unit `qemu-img` runs inside, for both the case above and the
+    /// probe that judges the image first.
+    ///
+    /// Astra finding S01, 2026-09-23: the converter used to be a subprocess
+    /// of the agent, and the agent is root on a node with
+    /// `unprivileged = false`. `agent_api::base_image` holds the whole of
+    /// the argument; this is the value that carries it to both calls, and a
+    /// node that cannot build the unit converts nothing.
+    pub convert: agent_api::base_image::Sandbox,
 }
 
 /// The qcow2 magic, and the whole of the format detection this driver does.
@@ -345,7 +354,15 @@ impl FilesystemBlockDriver {
                 // For a qcow2 the FILE is smaller than the disk it describes,
                 // so its length is the wrong number to compare against.
                 let judged = if qcow2 {
-                    Some(agent_api::base_image::probe(&self.config.qemu_img, &src, name).await?)
+                    Some(
+                        agent_api::base_image::probe(
+                            &self.config.convert,
+                            &self.config.qemu_img,
+                            &src,
+                            name,
+                        )
+                        .await?,
+                    )
                 } else {
                     None
                 };
@@ -422,10 +439,13 @@ impl VolumeProvider for FilesystemBlockDriver {
         let final_path = path.clone();
         let size = spec.size_bytes;
         let qemu_img = self.config.qemu_img.clone();
+        let sandbox = self.config.convert.clone();
 
         let span = Span::current();
         tokio::task::spawn_blocking(move || {
-            span.in_scope(|| layout::write_volume_file(src, &qemu_img, &tmp, &final_path, size))
+            span.in_scope(|| {
+                layout::write_volume_file(src, &sandbox, &qemu_img, &tmp, &final_path, size)
+            })
         })
         .await
         .map_err(|e| StorageError::Backend(anyhow::anyhow!("blocking task failed: {e}")))?
@@ -759,6 +779,59 @@ mod tests {
     use agent_api::storage::VolumeSpec;
     use uuid::Uuid;
 
+    /// Every destination this test's sandbox was asked to hand over or take
+    /// back, in order.
+    type HandedOver = std::sync::Arc<std::sync::Mutex<Vec<(PathBuf, u32, u32)>>>;
+
+    /// A sandbox whose `systemd-run` is a shell script, and the hand-overs
+    /// it would have made.
+    ///
+    /// A build host has no `meister-convert` account and a test is not root,
+    /// so the account is said to resolve to a uid of this test's choosing
+    /// and the chowns are recorded instead of performed. Everything else is
+    /// what a node runs: the argv is the argv, and unless `runs` is false
+    /// the script really starts what comes after `--`.
+    fn sandboxed(root: &Path, runs: bool) -> (agent_api::base_image::Sandbox, HandedOver) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("a bin dir");
+        let log = root.join("systemd-run.log").display().to_string();
+        let body = if runs {
+            format!(
+                "echo \"$@\" >> \"{log}\"\n\
+                 while [ $# -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\n\
+                 shift\n\
+                 exec \"$@\"\n"
+            )
+        } else {
+            format!(
+                "echo \"$@\" >> \"{log}\"\n\
+                 echo 'Failed to start transient service unit' >&2\n\
+                 exit 1\n"
+            )
+        };
+        let script = bin.join("systemd-run");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}")).expect("the script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("runnable");
+
+        let handed_over: HandedOver = Default::default();
+        let recorder = handed_over.clone();
+        let sandbox = agent_api::base_image::Sandbox::new(script).resolved_as(
+            4242,
+            4343,
+            std::sync::Arc::new(move |path: &Path, uid, gid| {
+                recorder.lock().expect("the recorded hand-overs").push((
+                    path.to_path_buf(),
+                    uid,
+                    gid,
+                ));
+                Ok(())
+            }),
+        );
+        (sandbox, handed_over)
+    }
+
     /// A driver over a directory of its own, and the directory's guard.
     ///
     /// The guard is FIRST in the tuple and is what every caller binds: it owns
@@ -766,6 +839,24 @@ mod tests {
     /// caller that dropped it would be running against a pool that is already
     /// gone.
     fn driver(tag: &str) -> (tempfile::TempDir, FilesystemBlockDriver, PathBuf, PathBuf) {
+        let (temp, driver, volumes, images, _) = sandboxed_driver(tag, "qemu-img", true);
+        (temp, driver, volumes, images)
+    }
+
+    /// The same, for the tests that are about the sandbox itself: they name
+    /// their own `qemu-img`, they say whether the unit starts, and they read
+    /// what was handed over.
+    fn sandboxed_driver(
+        tag: &str,
+        qemu_img: &str,
+        runs: bool,
+    ) -> (
+        tempfile::TempDir,
+        FilesystemBlockDriver,
+        PathBuf,
+        PathBuf,
+        HandedOver,
+    ) {
         let temp = tempfile::Builder::new()
             .prefix(&format!("meister-fs-{tag}-"))
             .tempdir()
@@ -775,13 +866,19 @@ mod tests {
         let volumes = root.join("volumes");
         std::fs::create_dir_all(&images).expect("a temp image dir");
         let _ = std::fs::remove_dir_all(&volumes);
+        let (sandbox, handed_over) = sandboxed(&root, runs);
+        let qemu_img = match qemu_img.contains('/') {
+            true => root.join(qemu_img),
+            false => PathBuf::from(qemu_img),
+        };
         let driver = FilesystemBlockDriver::new(FilesystemDriverConfig {
             image_dir: images.clone(),
             volume_dir: volumes.clone(),
-            qemu_img: PathBuf::from("qemu-img"),
+            qemu_img,
+            convert: sandbox,
         })
         .expect("the driver builds");
-        (temp, driver, volumes, images)
+        (temp, driver, volumes, images, handed_over)
     }
 
     fn spec(size_bytes: u64) -> VolumeSpec {
@@ -913,6 +1010,162 @@ mod tests {
         assert!(
             text.contains("once written out raw"),
             "and it says so: {text}"
+        );
+    }
+
+    /// A `qemu-img` that is a shell script: it answers `info` with the
+    /// document a 4 MiB qcow2 produces, writes nothing on `convert`, and
+    /// leaves a mark so that a test can say whether it ran at all.
+    fn fake_qemu_img(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("a bin dir");
+        let ran = root.join("qemu-ran").display().to_string();
+        let script = bin.join("qemu-img");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$@\" >> \"{ran}\"\n\
+                 if [ \"$1\" = info ]; then\n\
+                 echo '{{\"virtual-size\": 4194304, \"format\": \"qcow2\"}}'\n\
+                 fi\n"
+            ),
+        )
+        .expect("the script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("runnable");
+        root.join("qemu-ran")
+    }
+
+    /// A qcow2 by its first four bytes, which is all this driver looks at
+    /// before it asks the probe.
+    fn a_qcow2(at: &Path) {
+        std::fs::write(at, b"QFI\xfb\x00\x00\x00\x03and the rest").expect("the bytes");
+    }
+
+    /// Both qemu-img runs of a provision happen in the unit, and the unit
+    /// may write one file: the `.tmp` this volume is being built under.
+    ///
+    /// Astra finding S01, 2026-09-23, second half: the converter used to be
+    /// a subprocess of the agent, which is root on a node with
+    /// `unprivileged = false`. The command line IS the sandbox, so this test
+    /// reads the command line — every property, and the two paths that say
+    /// what may be read and what may be written.
+    #[tokio::test]
+    async fn the_image_is_read_and_written_inside_the_unit_and_nowhere_else() {
+        let (temp, driver, volumes, images, handed_over) =
+            sandboxed_driver("sandbox", "bin/qemu-img", true);
+        let root = temp.path().to_path_buf();
+        let ran = fake_qemu_img(&root);
+        let base = images.join("base.qcow2");
+        a_qcow2(&base);
+
+        let id = Uuid::new_v4();
+        let mut want = spec(8 * 1024 * 1024);
+        want.base_image = Some("base.qcow2".to_string());
+        driver.provision(&id, &want).await.expect("provisioned");
+
+        let tmp = volumes.join(format!("{id}.tmp"));
+        let log = std::fs::read_to_string(root.join("systemd-run.log")).expect("the two runs");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "the probe and the conversion: {log}");
+        for line in &lines {
+            for property in [
+                "User=meister-convert",
+                "NoNewPrivileges=yes",
+                "CapabilityBoundingSet=",
+                "PrivateNetwork=yes",
+                // Empty, not `none`: `systemd-run` refuses the word a
+                // unit file would use. The trailing space is what makes
+                // this an assertion about the empty value.
+                "RestrictAddressFamilies= ",
+                "ProtectSystem=strict",
+                "ProtectHome=yes",
+                "PrivateTmp=yes",
+                "SystemCallFilter=@system-service",
+                "MemoryMax=",
+                "CPUQuota=",
+                "RuntimeMaxSec=",
+                "--wait",
+                "--pipe",
+                "--collect",
+                "--quiet",
+            ] {
+                assert!(line.contains(property), "{property} is missing from {line}");
+            }
+            assert!(
+                line.contains(&format!("BindReadOnlyPaths={}", base.display())),
+                "the image is read-only: {line}"
+            );
+        }
+        assert!(
+            !lines[0].contains("BindPaths="),
+            "the probe writes nothing: {}",
+            lines[0]
+        );
+        // Exactly one writable bind, and it is the tmp file itself rather
+        // than the pool directory it is in: the other guests' volumes are in
+        // that directory.
+        let writable: Vec<&str> = lines[1]
+            .split_whitespace()
+            .filter(|word| word.starts_with("BindPaths="))
+            .collect();
+        assert_eq!(
+            writable,
+            vec![format!("BindPaths={}", tmp.display())],
+            "the conversion writes the tmp file and nothing else: {}",
+            lines[1]
+        );
+
+        // Given to the converter for the length of the conversion, taken
+        // back afterwards — and it is the tmp file that was handed over,
+        // never the volume the VMM will be given.
+        let handed_over = handed_over.lock().expect("the hand-overs").clone();
+        assert_eq!(handed_over.len(), 2, "{handed_over:?}");
+        assert!(
+            handed_over.iter().all(|(path, _, _)| *path == tmp),
+            "{handed_over:?}"
+        );
+        assert_eq!(handed_over[0].1, 4242, "to the converter first");
+        assert_ne!(handed_over[1].1, 4242, "and back to the agent after");
+
+        assert!(ran.exists(), "qemu-img did run — inside the unit");
+        assert!(
+            volumes.join(format!("{id}.raw")).exists(),
+            "and the volume is there"
+        );
+    }
+
+    /// A unit that does not start is a refusal. The agent does not read the
+    /// image itself instead, and the pool is left with nothing in it.
+    ///
+    /// Astra finding S01, 2026-09-23: a fallback would mean the most
+    /// privileged path is the one that runs when something is wrong.
+    #[tokio::test]
+    async fn a_unit_that_does_not_start_refuses_rather_than_converting_here() {
+        let (temp, driver, volumes, images, _) = sandboxed_driver("no-unit", "bin/qemu-img", false);
+        let root = temp.path().to_path_buf();
+        let ran = fake_qemu_img(&root);
+        a_qcow2(&images.join("base.qcow2"));
+
+        let id = Uuid::new_v4();
+        let mut want = spec(8 * 1024 * 1024);
+        want.base_image = Some("base.qcow2".to_string());
+        let err = driver
+            .provision(&id, &want)
+            .await
+            .expect_err("nothing is converted outside the unit");
+
+        let said = format!("{err:#}");
+        assert!(
+            said.contains("Failed to start transient service unit"),
+            "the refusal carries what systemd said: {said}"
+        );
+        assert!(!ran.exists(), "qemu-img was never started: {said}");
+        assert!(
+            !volumes.join(format!("{id}.raw")).exists(),
+            "and no volume was made"
         );
     }
 
@@ -1351,6 +1604,7 @@ mod tests {
             image_dir: images.clone(),
             volume_dir: volume_dir.clone(),
             qemu_img: PathBuf::from("qemu-img"),
+            convert: agent_api::base_image::Sandbox::default(),
         };
 
         let copying = FilesystemBlockDriver {
@@ -1493,6 +1747,7 @@ mod tests {
             image_dir: images,
             volume_dir: volumes.clone(),
             qemu_img: PathBuf::from("qemu-img"),
+            convert: agent_api::base_image::Sandbox::default(),
         })
         .expect("the driver builds");
 

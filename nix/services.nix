@@ -259,6 +259,38 @@ in
       shell = "${pkgs.shadow}/bin/nologin";
     };
 
+    # The account a base image is converted in, and the only thing it is for.
+    #
+    # Astra finding S01, 2026-09-23: `qemu-img` parses a file this node did
+    # not write -- a qcow2 is a tree of tables that name each other -- and it
+    # ran as the agent, which on a node with `meisterstack.agent.unprivileged
+    # = false` (the default) is root. It runs in a transient systemd unit now
+    # (`systemd-run`, built in shared/agent-api/src/base_image.rs), and this
+    # is the account that unit runs as: no shell, no home, no group but its
+    # own, in no other group, owning nothing on this machine. For the length
+    # of one conversion the agent hands it the ONE destination that
+    # conversion writes -- a `<id>.tmp` file, or an LV's device node -- and
+    # takes it back when the unit is gone.
+    #
+    # `DynamicUser = yes` would be the obvious answer and cannot work here:
+    # its uid is allocated when the unit starts, and the destination has to
+    # be given away before that. base_image.rs argues the rest of it.
+    #
+    # Behind the agent role, because only a node that provisions volumes
+    # converts an image. It is a system user with no shell and it decides
+    # nothing about the machine, so `checks.services-are-pure` is unaffected
+    # -- that check compares dhcp, firewall, resolvconf, bootloader and
+    # stateVersion, and an account is none of them.
+    users.groups.meister-convert =
+      lib.mkIf (builtins.elem "agent" cfg.unitsFor) { };
+    users.users.meister-convert =
+      lib.mkIf (builtins.elem "agent" cfg.unitsFor) {
+        isSystemUser = true;
+        group = "meister-convert";
+        description = "MeisterStack base image converter";
+        shell = "${pkgs.shadow}/bin/nologin";
+      };
+
     # --- lane 5C: the provider, on a host that has no renderer -------------
     #
     # A managed NixOS host on somebody's hypervisor: its config files are a
