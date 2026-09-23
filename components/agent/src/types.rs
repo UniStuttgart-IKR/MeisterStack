@@ -533,10 +533,15 @@ impl TryFrom<proto::DeviceSpec> for DeviceWithId {
             "mediated" => PartitionSpec::Mediated,
             other => bail!("unknown partition type {other:?}"),
         };
-        let params = non_empty(p.params_json)
+        let params: Option<serde_json::Value> = non_empty(p.params_json)
             .map(|s| serde_json::from_str(&s))
             .transpose()
             .context("device params_json")?;
+        let driver = non_empty(p.driver_name).unwrap_or_else(default_device_driver);
+        // The same split the REST document goes through. A controller is not
+        // a tenant, but what it forwards came from one, and this is the other
+        // door into the driver. See `refuse_operator_only_device_params`.
+        refuse_operator_only_device_params(&driver, params.as_ref())?;
         Ok(Self {
             id: parse_uuid(&p.id).context("device id")?,
             // `driver_name` IS in the proto and is honoured here: routing a
@@ -549,7 +554,7 @@ impl TryFrom<proto::DeviceSpec> for DeviceWithId {
             // TODO(proto): `profile` still has no field; extend control.proto
             // when the controller learns to pick one.
             spec: DeviceSpec {
-                driver: non_empty(p.driver_name).unwrap_or_else(default_device_driver),
+                driver,
                 partition,
                 profile: None,
                 params,
@@ -663,6 +668,11 @@ fn images_to_fetch(volumes: &[NewVolume]) -> Vec<crate::images::Source> {
                 name: name.to_string(),
                 url: url.to_string(),
                 sha256: sha256.to_string(),
+                // Whose registration these bytes are. Written into the spec
+                // by the cloud beside the url and the checksum, and empty on
+                // a standalone cluster that has no catalogue to mint one.
+                // See `images::Source::uid` for what the node does with it.
+                uid: v.base_image_uid.clone().unwrap_or_default(),
             });
         }
     }
@@ -749,6 +759,40 @@ fn nics_with_ids(nics: Vec<NewNic>, default_bridge: &str) -> anyhow::Result<Vec<
         .collect::<anyhow::Result<Vec<_>>>()
 }
 
+/// The device params a SPEC may carry, as opposed to the ones only the node's
+/// own configuration may.
+///
+/// Astra finding S03, 2026-09-23: `params` is a free JSON map and it travelled
+/// from a VM document straight into the driver that reads it. For `nvrm` that
+/// map is the backend's whole configuration — `admin_priv` keeps
+/// `CAP_SYS_ADMIN` in the process, and `env` IS the process environment, over
+/// the top of the very values this node's admission had just counted. Neither
+/// is a tenant's to set, and both are already sayable in `[device.nvrm]` by
+/// whoever runs the node.
+///
+/// Asked here, where the document becomes this node's record, so the answer
+/// reaches the client as a refusal of the create rather than as a VM that
+/// fails to provision. The driver asks the same question again at the point
+/// of use — see `nvrm_driver::refuse_operator_only_params` — because this is
+/// not the only door into it.
+///
+/// One driver has a rule today. The shape is per driver deliberately: what
+/// counts as a tenant's business is a fact about the device the driver
+/// serves, and the driver is where that fact lives.
+fn refuse_operator_only_device_params(
+    driver: &str,
+    params: Option<&serde_json::Value>,
+) -> anyhow::Result<()> {
+    let Some(params) = params else {
+        return Ok(());
+    };
+    if driver == crate::drivers::DRIVER_NVRM {
+        nvrm_driver::refuse_operator_only_params(params)
+            .map_err(|said| anyhow::anyhow!("{said}"))?;
+    }
+    Ok(())
+}
+
 /// One id per device, and the one word of the document that is not free
 /// text: how the card is partitioned.
 fn devices_with_ids(devices: Vec<NewDevice>) -> anyhow::Result<Vec<DeviceWithId>> {
@@ -760,10 +804,12 @@ fn devices_with_ids(devices: Vec<NewDevice>) -> anyhow::Result<Vec<DeviceWithId>
                 "mediated" => PartitionSpec::Mediated,
                 other => anyhow::bail!("unknown partition type {other:?}"),
             };
+            let driver = d.driver.unwrap_or_else(default_device_driver);
+            refuse_operator_only_device_params(&driver, d.params.as_ref())?;
             Ok(DeviceWithId {
                 id: Uuid::new_v4(),
                 spec: DeviceSpec {
-                    driver: d.driver.unwrap_or_else(default_device_driver),
+                    driver,
                     partition,
                     profile: d.profile,
                     params: d.params,
@@ -784,6 +830,67 @@ fn non_empty(s: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A VM document may name the vGPU type it wants and nothing else about
+    /// the backend that serves it.
+    ///
+    /// Astra finding S03, 2026-09-23: `devices[].params` reached the nvrm
+    /// driver unfiltered, so a spec could ask for `admin_priv` — the backend
+    /// keeping `CAP_SYS_ADMIN` — and could set the process's environment,
+    /// including the `LEA_VRAM_*` values this node had just admitted the
+    /// device against. Both belong to `[device.nvrm]` on the node, and the
+    /// refusal is here so a person reads it while they still hold the
+    /// request.
+    #[test]
+    fn a_vm_document_may_not_configure_the_nvrm_backend() {
+        let device = |params: serde_json::Value| NewDevice {
+            driver: Some("nvrm".into()),
+            partition: "mediated".into(),
+            profile: Some("desktop".into()),
+            params: Some(params),
+        };
+
+        let ok = devices_with_ids(vec![device(serde_json::json!({
+            "vgpu_type": "RTX2070-4Q"
+        }))])
+        .expect("a vgpu type is a tenant's to ask for");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].spec.driver, "nvrm");
+
+        for refused in ["admin_priv", "env", "vram_profile_mib"] {
+            let err = devices_with_ids(vec![device(
+                serde_json::json!({ refused: serde_json::Value::Null }),
+            )])
+            .expect_err("not a spec's to set");
+            let said = format!("{err:#}");
+            assert!(said.contains(refused), "{said}");
+            assert!(
+                said.contains("device.nvrm"),
+                "and says where it belongs: {said}"
+            );
+        }
+
+        // Another driver's params are its own business and are untouched.
+        assert!(
+            devices_with_ids(vec![NewDevice {
+                driver: Some("crosvm-gpu".into()),
+                partition: "mediated".into(),
+                profile: None,
+                params: Some(serde_json::json!({ "anything": "at all" })),
+            }])
+            .is_ok()
+        );
+
+        // And the road a controller sends a device down is the same road.
+        let err = DeviceWithId::try_from(proto::DeviceSpec {
+            id: Uuid::new_v4().to_string(),
+            partition: "mediated".into(),
+            driver_name: "nvrm".into(),
+            params_json: r#"{"admin_priv": true}"#.into(),
+        })
+        .expect_err("the other door is the same door");
+        assert!(format!("{err:#}").contains("admin_priv"), "{err:#}");
+    }
 
     /// `DeviceSpec.driver_name` is a real proto field, so a device the
     /// controller routed to `nvrm` must not land on the node's default

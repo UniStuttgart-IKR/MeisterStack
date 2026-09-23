@@ -142,62 +142,22 @@ impl Room {
     }
 }
 
-/// What a base image will occupy once written out raw.
-///
-/// Only ever called for a qcow2: a qcow2 file is smaller than the disk it
-/// describes, so its own length is the wrong number to check `size_bytes`
-/// against. Same question, same tool and same reasoning as
-/// `lvm_thin::image_virtual_size`.
-pub(crate) async fn image_virtual_size(
-    qemu_img: &Path,
-    path: &Path,
-    name: &str,
-) -> storage::Result<u64> {
-    let out = tokio::process::Command::new(qemu_img)
-        .args(["info", "--output=json"])
-        .arg(path)
-        .output()
-        .await
-        .map_err(|e| {
-            StorageError::Backend(anyhow::anyhow!(
-                "running {}: {e} (a qcow2 base image needs it; is qemu-img on the agent's \
-                 PATH?)",
-                qemu_img.display()
-            ))
-        })?;
-    if !out.status.success() {
-        return Err(StorageError::ImageNotFound(format!(
-            "{name}: qemu-img info failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    // Parsed, not scanned. The document is not flat: `children[0].info`
-    // carries a `virtual-size` of its own for the FILE node — a few
-    // hundred kilobytes for a fresh qcow2 — before the top-level one that
-    // describes the disk. Taking the first match is how a 64M image
-    // passes a check meant to reject it, which is what a test caught here
-    // before this line was ever deployed.
-    let info: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
-        StorageError::Backend(anyhow::anyhow!("qemu-img info json for {name}: {e}"))
-    })?;
-    info.get("virtual-size")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            StorageError::Backend(anyhow::anyhow!(
-                "qemu-img info for {name} has no virtual-size"
-            ))
-        })
-}
-
 /// Write a non-raw base image out as raw. `qemu-img convert` and not a
 /// copy, because what this backend hands the VMM is a raw file and a
 /// copied qcow2 is not one.
-pub(crate) fn convert_to_raw(qemu_img: &Path, src: &Path, dst: &Path) -> std::io::Result<()> {
+///
+/// The format is passed in and not detected here: it is what
+/// `agent_api::base_image::probe` already judged, and a second detection at
+/// convert time would be a second decision about a file nothing checked
+/// again. Astra finding S01, 2026-09-23.
+pub(crate) fn convert_to_raw(
+    qemu_img: &Path,
+    image: &agent_api::base_image::BaseImage,
+    src: &Path,
+    dst: &Path,
+) -> std::io::Result<()> {
     let out = std::process::Command::new(qemu_img)
-        .arg("convert")
-        .args(["-O", "raw"])
-        .arg(src)
-        .arg(dst)
+        .args(agent_api::base_image::convert_argv(image, src, dst))
         .output()
         .map_err(|e| std::io::Error::other(format!("running {}: {e}", qemu_img.display())))?;
     if !out.status.success() {
@@ -256,20 +216,21 @@ pub(crate) fn clone_or_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
 /// volume that is finished, and an interrupted provision leaves a `.tmp`
 /// that `deprovision` removes with the volume.
 pub(crate) fn write_volume_file(
-    src: Option<(PathBuf, bool)>,
+    src: Option<(PathBuf, Option<agent_api::base_image::BaseImage>)>,
     qemu_img: &Path,
     tmp: &Path,
     final_path: &Path,
     size: u64,
 ) -> std::io::Result<()> {
     match &src {
-        Some((s, false)) => {
+        Some((s, None)) => {
             debug!(base = %s.display(), "cloning base image");
             clone_or_copy(s, tmp)?;
         }
-        Some((s, true)) => {
-            debug!(base = %s.display(), "converting qcow2 base image to raw");
-            convert_to_raw(qemu_img, s, tmp)?;
+        Some((s, Some(image))) => {
+            debug!(base = %s.display(), format = %image.format,
+                   "converting base image to raw");
+            convert_to_raw(qemu_img, image, s, tmp)?;
         }
         None => {
             std::fs::File::create(tmp)?;

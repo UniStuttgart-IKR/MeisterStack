@@ -78,6 +78,48 @@ pub(super) fn check_fetchable(spec: &ImageSpec) -> Result<(), ApiError> {
     }
 }
 
+/// Whose registration a PATH-based image may be, and why it is not
+/// everybody's.
+///
+/// Astra finding S02, 2026-09-23. A registration with no url and no checksum
+/// says: "the bytes are already on the node, under this name". It names a
+/// file this control plane has never seen and cannot check, in a namespace
+/// every tenant shares — the catalogue name IS the file name, on every node —
+/// and `delete_image` removes the catalogue entry without removing anything
+/// from any node. So a tenant could register the NAME of an image somebody
+/// else had fetched, take the bytes that are still lying there, and boot a
+/// VM off them. Nothing in the object would look wrong.
+///
+/// The line is `Operator`, the same line `Grant::confined_to` draws
+/// everywhere else, and it is the honest one: adopting a file that is already
+/// on a node is a statement about the node's disk, and whoever runs the
+/// estate can already put anything on that disk. A member has no such
+/// standing and now has to say where the bytes come from — a url and a
+/// checksum, which is a claim this control plane can hold them to.
+///
+/// Anonymous mode says yes, here as it does everywhere else; that is the mode
+/// the lab has run in since M1.
+pub(super) fn check_source_kind(spec: &ImageSpec, confined: Option<&str>) -> Result<(), ApiError> {
+    if spec.url.is_some() {
+        return Ok(());
+    }
+    let Some(tenant) = confined else {
+        // TODO(S02): bind an operator's path registration to the digest the
+        // first node computes of the file, so that the object says which
+        // bytes it stood for and a later swap of the file is visible. The
+        // node would have to report that digest, which is a field on
+        // `ImageStateReport` and a hop through the cluster this change does
+        // not make.
+        return Ok(());
+    };
+    Err(invalid(format!(
+        "an image without spec.url and spec.sha256 adopts a file that is already on the nodes, \
+         under a name every tenant shares; tenant {tenant:?} has to say where the bytes come \
+         from instead — a url and its checksum — and an operator registers the ones that are \
+         already there"
+    )))
+}
+
 /// A member's catalogue is its own images plus the public ones — which is
 /// what a shared base image is for, and why the list is not simply filtered
 /// to one tenant the way the VM list is.
@@ -119,6 +161,7 @@ pub(super) async fn create_image(
     check_fetchable(&body.spec)?;
 
     let who = Grant::new(caller, role, tenant);
+    check_source_kind(&body.spec, who.confined_to())?;
     let owner = who.tenant_for_create(body.spec.tenant.clone());
     // `public` is deliberately not gated beyond this: publishing an image
     // grants a read of a file every node can already open by path, and a
@@ -236,6 +279,16 @@ pub(super) async fn delete_image(
         return Err(conflict(format!("image {name} is still used by: {detail}")));
     }
 
+    // TODO(S02): the nodes are not told. Deleting the object leaves whatever
+    // a node fetched for it lying in that node's image directory, under the
+    // catalogue name, and there is no command in the session that says "drop
+    // this image" — `SyncState` carries VMs and nothing else. What carries
+    // the weight until there is one is the pair this milestone did land: a
+    // node's cache entry is keyed on the image's UID as well as its digest
+    // (`agent::images::Source::cache_key`), so a re-registration of the same
+    // name never reaches the old bytes, and a path-based registration — the
+    // one shape that could adopt them — is an operator's to make
+    // (`check_source_kind`).
     st.store.delete::<Image>(&name).await?;
     Ok(controller_api::removed(
         Image::KIND,
@@ -247,6 +300,43 @@ pub(super) async fn delete_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registration that adopts a file already on the nodes is an
+    /// operator's to make.
+    ///
+    /// Astra finding S02, 2026-09-23: the catalogue name is the file name on
+    /// every node, `delete_image` removes the object and nothing else, and a
+    /// path-based registration says "the bytes are already there". Put
+    /// together, a member could register the name of an image somebody else
+    /// had fetched and boot a VM off bytes nobody meant them to have.
+    #[test]
+    fn adopting_a_file_that_is_already_there_is_an_operators_to_do() {
+        let path_based = ImageSpec {
+            source: "/mnt/vmstore/images/nixos.raw".into(),
+            ..Default::default()
+        };
+        let fetchable = ImageSpec {
+            source: "nixos.raw".into(),
+            url: Some("https://images.example/nixos.raw".into()),
+            sha256: Some("a".repeat(64)),
+            ..Default::default()
+        };
+
+        // A member — anybody `confined_to` one tenant — has to say where the
+        // bytes come from.
+        let err = format!(
+            "{:?}",
+            check_source_kind(&path_based, Some("acme")).unwrap_err()
+        );
+        assert!(err.contains("acme"), "the refusal names the tenant: {err}");
+        assert!(err.contains("url"), "and what to do instead: {err}");
+        check_source_kind(&fetchable, Some("acme")).expect("a url and a checksum is a claim");
+
+        // An operator, an admin, a system identity and anonymous are not
+        // confined, and register what is already on the estate's disks.
+        check_source_kind(&path_based, None).expect("the estate is theirs");
+        check_source_kind(&fetchable, None).expect("and so is the other kind");
+    }
 
     /// The catalogue is only worth a 422 if its names are the names the node
     /// will look up. A path that disagrees with the object name is a

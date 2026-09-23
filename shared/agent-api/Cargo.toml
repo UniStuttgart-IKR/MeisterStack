@@ -21,10 +21,11 @@ common = { package = "meister-common", path = "../common" }
 # depend on a unit's PATH.
 nix = { workspace = true }
 libc = { workspace = true }
+# `base_image`: the probe that judges a base image before a driver converts
+# it runs `qemu-img info` and stats the file, and both happen on the async
+# path a create is already on. Every driver that calls it already builds
+# tokio, so this is a dependency the tree pays for once and not again.
+tokio = { workspace = true }
 
 [dev-dependencies]
-# One async test, and the trait it exercises is async: the snapshot verbs
-# default to a refusal, and a default that is never awaited is a default
-# nobody has read. `rt` and `macros` only -- this crate spawns nothing.
-tokio = { workspace = true }
 tempfile = { workspace = true }

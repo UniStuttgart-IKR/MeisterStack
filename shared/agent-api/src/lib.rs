@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
+/// What a base image has to be before a node converts it. See the module.
+pub mod base_image;
 pub mod device;
 pub mod hypervisor;
 pub mod networking;

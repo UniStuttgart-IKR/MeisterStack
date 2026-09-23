@@ -351,7 +351,7 @@ fn unknown_base_image(name: &str) -> ApiError {
 /// refused with the sentence it always had.
 pub(super) fn check_owned_volume_fields(
     vm: &serde_json::Value,
-    resolved: &std::collections::BTreeMap<String, (String, String)>,
+    resolved: &std::collections::BTreeMap<String, CatalogueSource>,
 ) -> Result<(), ApiError> {
     let volumes = vm
         .get("volumes")
@@ -364,8 +364,9 @@ pub(super) fn check_owned_volume_fields(
             .and_then(|b| b.as_str())
             .and_then(|name| resolved.get(name));
         for (field, catalogue) in [
-            ("base_image_url", ours.map(|(url, _)| url)),
-            ("base_image_sha256", ours.map(|(_, sha)| sha)),
+            ("base_image_url", ours.map(|s| &s.url)),
+            ("base_image_sha256", ours.map(|s| &s.sha256)),
+            ("base_image_uid", ours.map(|s| &s.uid)),
         ] {
             let Some(said) = volume.get(field).filter(|v| !v.is_null()) else {
                 continue;
@@ -406,17 +407,34 @@ pub(super) fn check_owned_volume_fields(
 pub(super) async fn catalogue_sources(
     store: &EtcdStore,
     vm: &serde_json::Value,
-) -> std::collections::BTreeMap<String, (String, String)> {
-    let mut sources: std::collections::BTreeMap<String, (String, String)> = Default::default();
+) -> std::collections::BTreeMap<String, CatalogueSource> {
+    let mut sources: std::collections::BTreeMap<String, CatalogueSource> = Default::default();
     for name in base_images(vm) {
         let Ok(image) = store.get::<Image>(&name).await else {
             continue;
         };
+        let uid = image.metadata.uid.clone();
         if let (Some(url), Some(sha256)) = (image.spec.url, image.spec.sha256) {
-            sources.insert(name, (url, sha256));
+            sources.insert(name, CatalogueSource { url, sha256, uid });
         }
     }
     sources
+}
+
+/// What the catalogue says about one base image, at the moment a VM was
+/// created against it.
+///
+/// A struct and not a tuple since S02 added the third field: two strings that
+/// are both hex and both come from the same object are exactly the pair a
+/// positional type gets swapped in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CatalogueSource {
+    pub(super) url: String,
+    pub(super) sha256: String,
+    /// The image OBJECT's uid, which is the only thing about an image that is
+    /// not shared with everybody who registers the same name. The node keys
+    /// its cache on it. Astra finding S02, 2026-09-23.
+    pub(super) uid: String,
 }
 
 /// Write the catalogue's answer into the spec: where each base image comes
@@ -444,14 +462,18 @@ pub(super) async fn resolve_base_images(
         let Some(name) = volume.get("base_image").and_then(|b| b.as_str()) else {
             continue;
         };
-        let Some((url, sha256)) = sources.get(name).cloned() else {
+        let Some(source) = sources.get(name).cloned() else {
             continue;
         };
         let Some(volume) = volume.as_object_mut() else {
             continue;
         };
-        volume.insert("base_image_url".into(), json!(url));
-        volume.insert("base_image_sha256".into(), json!(sha256));
+        volume.insert("base_image_url".into(), json!(source.url));
+        volume.insert("base_image_sha256".into(), json!(source.sha256));
+        // And WHOSE registration it was. The node's cache entry is keyed on
+        // this and the digest, so a name re-registered by somebody else never
+        // reaches these bytes. Astra finding S02, 2026-09-23.
+        volume.insert("base_image_uid".into(), json!(source.uid));
     }
     Ok(())
 }
@@ -2286,10 +2308,18 @@ mod tests {
         let catalogue = || {
             std::collections::BTreeMap::from([(
                 "noble".to_string(),
-                ("https://images/noble.img".to_string(), "abc123".to_string()),
+                CatalogueSource {
+                    url: "https://images/noble.img".to_string(),
+                    sha256: "abc123".to_string(),
+                    uid: "4f3c0000-0000-0000-0000-00000000000a".to_string(),
+                },
             )])
         };
-        for field in ["base_image_url", "base_image_sha256"] {
+        // `base_image_uid` joined the list with S02: whose registration the
+        // bytes came from is the cloud's answer for the same reason the url
+        // and the checksum are, and a client that could write it could point
+        // a node's cache entry at somebody else's image.
+        for field in ["base_image_url", "base_image_sha256", "base_image_uid"] {
             let spec = json!({ "volumes": [{}, { "base_image": "noble", field: "x" }] });
             let msg = format!(
                 "{:?}",
@@ -2331,13 +2361,18 @@ mod tests {
     fn the_document_the_cloud_wrote_may_be_handed_back_unchanged() {
         let catalogue = std::collections::BTreeMap::from([(
             "noble".to_string(),
-            ("https://images/noble.img".to_string(), "abc123".to_string()),
+            CatalogueSource {
+                url: "https://images/noble.img".to_string(),
+                sha256: "abc123".to_string(),
+                uid: "4f3c0000-0000-0000-0000-00000000000a".to_string(),
+            },
         )]);
         let stored = json!({
             "volumes": [{
                 "base_image": "noble",
                 "base_image_url": "https://images/noble.img",
                 "base_image_sha256": "abc123",
+                "base_image_uid": "4f3c0000-0000-0000-0000-00000000000a",
                 "size_bytes": 4294967296u64,
             }]
         });

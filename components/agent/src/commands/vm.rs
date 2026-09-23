@@ -76,6 +76,31 @@ impl Agent {
                 .validate(&spec.nics)
                 .context("invalid nic spec"),
         )?;
+
+        // Astra finding S15, 2026-09-23: the base images are fetched HERE,
+        // before the lock, and not where they are used.
+        //
+        // The lock is the node's one `ops` mutex and `pump` handles one
+        // controller command at a time, so everything held across a create is
+        // held across every other command the node has. `provision` reaches
+        // `images::Cache::ensure` several links down its chain, which meant
+        // one download — of a file measured in gigabytes, from a url this
+        // node does not control — sat between the controller and every other
+        // VM on the machine. The transfer is bounded now (`images::Bounds`),
+        // and that bound is a ceiling rather than an excuse: a node should
+        // not be deaf for it at all.
+        //
+        // The same call, the same errors and the same registry: `ensure` is
+        // idempotent and its second run inside the chain is one `stat`. It is
+        // after the four structural questions on purpose — a node that cannot
+        // run this VM at all must refuse it without fetching anything first.
+        for source in &spec.images {
+            self.images
+                .ensure(source)
+                .await
+                .with_context(|| format!("base image {}", source.name))?;
+        }
+
         let _guard = self.ops.lock().await;
         self.provisioner.provision(id, spec, desired, true).await
     }

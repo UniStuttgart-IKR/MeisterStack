@@ -47,6 +47,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -68,6 +69,41 @@ pub struct Source {
     pub url: String,
     /// Lowercase hex, 64 characters.
     pub sha256: String,
+    /// The uid of the `Image` object these bytes were registered as.
+    ///
+    /// Astra finding S02, 2026-09-23: the cache entry was addressed by the
+    /// digest alone and the catalogue NAME is global, so two images that are
+    /// the same file to this node are the same cache entry however many
+    /// tenants registered them and whatever happened to their objects. The
+    /// uid is what makes an entry belong to the registration it was fetched
+    /// for: it is minted once, at the cloud, and never reused.
+    ///
+    /// Empty for a record written before the field existed, and for a
+    /// standalone cluster with no cloud above it to mint one. Then the entry
+    /// is addressed by the digest exactly as it always was — a cache that
+    /// silently stopped matching would re-download every image on the fleet.
+    #[serde(default)]
+    pub uid: String,
+}
+
+impl Source {
+    /// What this image is called inside the node's cache.
+    ///
+    /// The uid and the digest, and neither of them alone: the digest is what
+    /// makes the presence of the file proof that these are the right bytes,
+    /// and the uid is what keeps one registration's bytes from answering for
+    /// another's. The NAME is deliberately not in it — that is the namespace
+    /// two tenants share, and sharing it was the finding.
+    ///
+    /// The whole digest and not a prefix of it, because this is a file name
+    /// nobody types: a prefix would buy shorter `ls` output and pay for it
+    /// with a collision nobody would ever debug.
+    fn cache_key(&self) -> String {
+        match self.uid.is_empty() {
+            true => self.sha256.clone(),
+            false => format!("{}-{}", self.uid, self.sha256),
+        }
+    }
 }
 
 /// What this node has learned about an image, and what it tells the
@@ -132,6 +168,8 @@ pub struct Cache {
     /// Everything that IS in the image directory, and when that directory
     /// last changed. See [`Cache::take_inventory`].
     inventory: Mutex<Option<Inventory>>,
+    /// What a download may cost before it is cut off. See [`Bounds`].
+    bounds: Bounds,
 }
 
 /// A reading of the image directory, and the mtime it was read at.
@@ -211,15 +249,26 @@ impl Cache {
             dir: image_dir,
             known: Mutex::default(),
             inventory: Mutex::default(),
+            bounds: Bounds::default(),
         }
+    }
+
+    /// The same cache with different download bounds.
+    ///
+    /// A builder call and not a second argument to `new`, for the reason
+    /// `Provisioner::with_ceilings` is one: `Bounds::default()` is what every
+    /// node runs with, and a caller that says nothing gets it.
+    pub fn with_bounds(mut self, bounds: Bounds) -> Self {
+        self.bounds = bounds;
+        self
     }
 
     fn cache_dir(&self) -> PathBuf {
         self.dir.join(CACHE_DIR)
     }
 
-    fn cached(&self, sha256: &str) -> PathBuf {
-        self.cache_dir().join(sha256)
+    fn cached(&self, key: &str) -> PathBuf {
+        self.cache_dir().join(key)
     }
 
     /// What the volume drivers will open: `<image_dir>/<name>`.
@@ -483,7 +532,8 @@ impl Cache {
 
     async fn ensure_inner(&self, source: &Source) -> std::result::Result<(), FetchFailure> {
         check_digest(&source.sha256)?;
-        let cached = self.cached(&source.sha256);
+        check_uid(&source.uid)?;
+        let cached = self.cached(&source.cache_key());
         if tokio::fs::metadata(&cached).await.is_ok() {
             // The presence of a file under its own digest IS the proof that
             // the right bytes are here: nothing writes into the cache except
@@ -498,10 +548,12 @@ impl Cache {
         // Named after the digest and this process, so two agents on one
         // shared directory — and two fetches of two images in one agent —
         // cannot write into each other's partial file.
-        let partial =
-            self.cache_dir()
-                .join(format!("{}.partial.{}", source.sha256, std::process::id()));
-        let fetched = fetch(&source.url, &partial).await;
+        let partial = self.cache_dir().join(format!(
+            "{}.partial.{}",
+            source.cache_key(),
+            std::process::id()
+        ));
+        let fetched = fetch(&source.url, &partial, &self.bounds).await;
         // Whatever happened, the partial file is this function's to clean up.
         // An abandoned one is exactly what "a cancelled download leaves
         // nothing usable" is about, and it is never usable in any case: the
@@ -567,9 +619,11 @@ impl Cache {
         // under the same name with a new checksum. The new content wins, and
         // the swap goes through a temporary name so that nothing ever opens a
         // half-replaced path.
-        let staged = self
-            .dir
-            .join(format!(".{}.linking.{}", source.sha256, std::process::id()));
+        let staged = self.dir.join(format!(
+            ".{}.linking.{}",
+            source.cache_key(),
+            std::process::id()
+        ));
         let _ = tokio::fs::remove_file(&staged).await;
         match tokio::fs::hard_link(cached, &staged).await {
             Ok(()) => {}
@@ -584,6 +638,86 @@ impl Cache {
             .await
             .with_context(|| format!("putting {} in place at {}", source.name, link.display()))
     }
+}
+
+/// What a download may cost before this node stops paying for it.
+///
+/// Astra finding S15, 2026-09-23: `fetch` ran `curl --fail --location
+/// --silent --show-error <url>` with no bound of any kind, and the node's
+/// whole command loop sits behind it — `pump` handles one controller command
+/// at a time, and the create that reaches here used to hold the global `ops`
+/// lock across the transfer. A url that answered its headers and then went
+/// quiet took the node with it for as long as the other end cared to hold the
+/// socket. These four numbers are what ends that wait.
+///
+/// Defaults rather than configuration: the cache is built from a directory
+/// and nothing else (`Cache::new`, called before the agent has a config to
+/// hand it), so the numbers live with the code that uses them and a caller
+/// that wants others says so with [`Cache::with_bounds`]. They are chosen to
+/// be far outside any honest download on this fleet — a 4 GiB cloud image
+/// over a 1 KiB/s link would still finish — and close enough to catch a dead
+/// one within a minute.
+#[derive(Clone, Copy, Debug)]
+pub struct Bounds {
+    /// Slower than this for [`Bounds::idle`], and the transfer is over. The
+    /// cut-off that actually matters: what a stalled download looks like from
+    /// here is a socket that is open and says nothing, and no timeout on the
+    /// WHOLE transfer can tell that apart from a big file in time to help.
+    pub floor_bytes_per_sec: u64,
+    /// How long the transfer may stay under the floor before it is cut.
+    pub idle: Duration,
+    /// The whole transfer, headers included.
+    pub deadline: Duration,
+    /// What the file may not grow past. A url that answers with a terabyte is
+    /// not a base image, and the node's disk is what pays for finding out —
+    /// the same disk the agent's database is on.
+    pub max_bytes: u64,
+}
+
+impl Default for Bounds {
+    fn default() -> Self {
+        Self {
+            floor_bytes_per_sec: 1024,
+            idle: Duration::from_secs(60),
+            deadline: Duration::from_secs(2 * 60 * 60),
+            max_bytes: 64 * (1 << 30),
+        }
+    }
+}
+
+/// How much longer than its own bound this side waits before it stops
+/// believing the bound is being kept. See the deadline in [`fetch`].
+const BOUND_GRACE: Duration = Duration::from_secs(30);
+
+/// The argv `fetch` runs, with every bound in it.
+///
+/// A function of its own so that the bounds can be read off a value in a test
+/// instead of off a process nobody can see. The four flags that were always
+/// there keep their reasons: `--fail` so a 404 is an error and not a file
+/// containing the words "not found", `--location` because cloud image urls
+/// redirect every time, `--silent --show-error` so nothing but the bytes goes
+/// to stdout and the reason goes to stderr.
+fn curl_argv(url: &str, bounds: &Bounds) -> Vec<String> {
+    vec![
+        "--fail".to_string(),
+        "--location".to_string(),
+        "--silent".to_string(),
+        "--show-error".to_string(),
+        // The idle cut-off, in curl's own two halves.
+        "--speed-limit".to_string(),
+        bounds.floor_bytes_per_sec.to_string(),
+        "--speed-time".to_string(),
+        bounds.idle.as_secs().to_string(),
+        // And the ceiling on the whole thing, connection included.
+        "--max-time".to_string(),
+        bounds.deadline.as_secs().to_string(),
+        // Only ever a first line of defence: curl decides this from the
+        // length the SERVER declared, so a server that declares none walks
+        // past it. `drain` counts what arrives.
+        "--max-filesize".to_string(),
+        bounds.max_bytes.to_string(),
+        url.to_string(),
+    ]
 }
 
 /// A sha256 that is not one is refused before anything is downloaded.
@@ -601,6 +735,24 @@ fn check_digest(sha256: &str) -> Result<()> {
     Ok(())
 }
 
+/// A uid that is not one is refused before anything is downloaded.
+///
+/// The same reason `check_digest` exists and the same danger: the uid names
+/// the cache entry, so a value with a slash or a `..` in it would write
+/// outside the cache directory. What the cloud mints is a uuid; what is
+/// accepted here is the shape of one and nothing looser.
+fn check_uid(uid: &str) -> Result<()> {
+    if uid.is_empty() {
+        // An image registered by a cluster with no cloud above it, or a
+        // record written before the field existed. See `Source::uid`.
+        return Ok(());
+    }
+    if uid.len() > 64 || !uid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        bail!("image uid {uid:?} is not a uid");
+    }
+    Ok(())
+}
+
 /// Read the URL into `into`, hashing as it goes; the digest comes back.
 ///
 /// Hashed while streaming rather than by reading the file back, because a
@@ -614,16 +766,12 @@ fn check_digest(sha256: &str) -> Result<()> {
 /// is running VMs. `curl` is in the agent's PATH list for the same reason
 /// those four are (nix/agent.nix), and its absence is a named error at the
 /// point of use.
-async fn fetch(url: &str, into: &Path) -> Result<String> {
+async fn fetch(url: &str, into: &Path, bounds: &Bounds) -> Result<String> {
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
     let mut child = Command::new("curl")
-        // --fail: a 404 is an error and not a file containing the words "not
-        // found". --location: cloud image URLs redirect, every time.
-        // --silent --show-error: nothing on stdout but the bytes, and the
-        // reason on stderr when it goes wrong.
-        .args(["--fail", "--location", "--silent", "--show-error", url])
+        .args(curl_argv(url, bounds))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -635,18 +783,34 @@ async fn fetch(url: &str, into: &Path) -> Result<String> {
     let mut file = tokio::fs::File::create(into)
         .await
         .with_context(|| format!("creating {}", into.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = stdout.read(&mut buf).await.context("reading from curl")?;
-        if n == 0 {
-            break;
+
+    // Astra finding S15, 2026-09-23: the read loop is under a deadline of its
+    // own and not only under curl's. The three curl bounds are the right
+    // first line — they are what can see a slow socket — but they are bounds
+    // a DIFFERENT process keeps, and the thing being protected here is this
+    // one: a curl that was replaced, wedged in uninterruptible I/O, or stopped
+    // would otherwise park the agent's whole command loop on a `read` that
+    // never returns.
+    let drained = tokio::time::timeout(
+        bounds.deadline.saturating_add(BOUND_GRACE),
+        drain(&mut stdout, &mut file, into, bounds.max_bytes),
+    )
+    .await;
+    let digest = match drained {
+        Ok(Ok(digest)) => digest,
+        Ok(Err(e)) => {
+            kill_and_reap(&mut child).await;
+            return Err(e);
         }
-        hasher.update(&buf[..n]);
-        file.write_all(&buf[..n])
-            .await
-            .with_context(|| format!("writing {}", into.display()))?;
-    }
+        Err(_) => {
+            kill_and_reap(&mut child).await;
+            bail!(
+                "fetching {url} did not finish within {}s and was stopped; nothing usable was \
+                 written",
+                bounds.deadline.as_secs()
+            );
+        }
+    };
     file.flush().await.ok();
     // Durable before it is renamed: the rename is what makes the bytes
     // usable, and a rename that lands before the data does would survive a
@@ -656,7 +820,16 @@ async fn fetch(url: &str, into: &Path) -> Result<String> {
         .with_context(|| format!("syncing {}", into.display()))?;
     drop(file);
 
-    let status = child.wait().await.context("waiting for curl")?;
+    // Curl has written its last byte by here, so this is a wait for an exit
+    // status and not for a transfer — and it is still bounded, because the
+    // one thing this function may not do is wait for ever on anything.
+    let status = match tokio::time::timeout(BOUND_GRACE, child.wait()).await {
+        Ok(status) => status.context("waiting for curl")?,
+        Err(_) => {
+            kill_and_reap(&mut child).await;
+            bail!("curl did not exit after fetching {url} and was stopped");
+        }
+    };
     if !status.success() {
         let mut said = String::new();
         if let Some(mut stderr) = child.stderr.take() {
@@ -672,7 +845,63 @@ async fn fetch(url: &str, into: &Path) -> Result<String> {
             }
         );
     }
+    Ok(digest)
+}
+
+/// Read curl's stdout into the file, hashing as it goes, and stop at the byte
+/// budget.
+///
+/// The budget is counted HERE as well as handed to curl, and the two are not
+/// the same check: `--max-filesize` is a decision made from the length the
+/// server declared, so a server that declares none — or declares a small one
+/// and sends a large one — walks straight past it. This one counts what
+/// actually arrived.
+async fn drain(
+    stdout: &mut tokio::process::ChildStdout,
+    file: &mut tokio::fs::File,
+    into: &Path,
+    max_bytes: u64,
+) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut written: u64 = 0;
+    loop {
+        let n = stdout.read(&mut buf).await.context("reading from curl")?;
+        if n == 0 {
+            break;
+        }
+        written += n as u64;
+        if written > max_bytes {
+            bail!(
+                "the bytes at this url are past the {max_bytes} byte budget this node fetches \
+                 within; the download was stopped"
+            );
+        }
+        hasher.update(&buf[..n]);
+        file.write_all(&buf[..n])
+            .await
+            .with_context(|| format!("writing {}", into.display()))?;
+    }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Signal the child and then WAIT for it, on every path out of a failed
+/// fetch.
+///
+/// Both halves, and the second is the one that gets forgotten: a killed
+/// process nobody waits for is a zombie until its parent exits, and this
+/// parent is an agent that runs for months. Neither error is worth more than
+/// a debug line — "the process is already gone" is exactly the outcome that
+/// was being asked for.
+async fn kill_and_reap(child: &mut tokio::process::Child) {
+    if let Err(e) = child.start_kill() {
+        debug!(error = %e, "curl was already gone when the fetch was stopped");
+    }
+    if let Err(e) = child.wait().await {
+        debug!(error = %e, "reaping the stopped curl");
+    }
 }
 
 #[cfg(test)]
@@ -717,6 +946,192 @@ mod tests {
         );
     }
 
+    /// Whether anything on this machine is still running a curl that names
+    /// this port. Only the fetch under test can have started one, so this is
+    /// exactly "did the fetch leave its download behind".
+    fn a_curl_still_runs_for(port: u16) -> bool {
+        let marker = format!("127.0.0.1:{port}");
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let said = String::from_utf8_lossy(&cmdline);
+            if said.contains("curl") && said.contains(&marker) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Every bound is on the command line, and the command line is what the
+    /// download actually runs with.
+    ///
+    /// Astra finding S15, 2026-09-23: this argv used to be `--fail
+    /// --location --silent --show-error <url>` and nothing else, so a url
+    /// that answered its headers and then went quiet held the node's command
+    /// loop for as long as the other end wanted. The test is on the argv
+    /// rather than on a transfer because that is where the bounds are: a
+    /// process nobody can see is not evidence.
+    #[test]
+    fn the_download_argv_carries_every_bound() {
+        let bounds = Bounds {
+            floor_bytes_per_sec: 1024,
+            idle: Duration::from_secs(60),
+            deadline: Duration::from_secs(7200),
+            max_bytes: 1 << 30,
+        };
+        let argv = curl_argv("https://images.example/noble.img", &bounds);
+
+        let after = |flag: &str| {
+            argv.iter()
+                .position(|a| a == flag)
+                .and_then(|i| argv.get(i + 1))
+                .map(String::as_str)
+        };
+        assert_eq!(after("--speed-limit"), Some("1024"), "the idle floor");
+        assert_eq!(after("--speed-time"), Some("60"), "how long under it");
+        assert_eq!(after("--max-time"), Some("7200"), "the whole transfer");
+        assert_eq!(after("--max-filesize"), Some("1073741824"), "the budget");
+
+        // And the four that were always there, for the reasons they were
+        // always there.
+        for flag in ["--fail", "--location", "--silent", "--show-error"] {
+            assert!(argv.iter().any(|a| a == flag), "{flag} is still passed");
+        }
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("https://images.example/noble.img"),
+            "the url is the last word, so no bound can be read as one"
+        );
+    }
+
+    /// A url that answers its headers and then says nothing: the fetch comes
+    /// back inside its bound, nothing usable is left, and the download it
+    /// started is not still running.
+    ///
+    /// Astra finding S15, 2026-09-23. The bound in the test is seconds rather
+    /// than the node's hours, which is the only difference between this and
+    /// the fleet: a stall is a stall at either scale, and a test that waited
+    /// for the real ceiling would be a test nobody runs.
+    #[tokio::test]
+    async fn a_url_that_stalls_after_its_headers_is_cut_off_and_leaves_no_child() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_temp, dir) = scratch("stall");
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let held = stop.clone();
+        let server = std::thread::spawn(move || {
+            // The headers, and then nothing at all. The stream is KEPT so the
+            // socket stays open: dropping it would end the transfer with an
+            // error curl reports at once, which is the easy case and not this
+            // one.
+            listener.set_nonblocking(true).ok();
+            let mut kept = Vec::new();
+            while !held.load(Ordering::Relaxed) {
+                if let Ok((stream, _)) = listener.accept() {
+                    use std::io::Write;
+                    stream.set_nonblocking(false).ok();
+                    let mut stream = stream;
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n");
+                    let _ = stream.flush();
+                    kept.push(stream);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let cache = Cache::new(images.clone()).with_bounds(Bounds {
+            floor_bytes_per_sec: 1,
+            idle: Duration::from_secs(1),
+            deadline: Duration::from_secs(5),
+            max_bytes: 1 << 20,
+        });
+        let source = Source {
+            name: "ubuntu.raw".into(),
+            url: format!("http://127.0.0.1:{port}/ubuntu.raw"),
+            sha256: digest_of(b"bytes that never arrive"),
+            uid: String::new(),
+        };
+
+        let started = std::time::Instant::now();
+        let err = cache.ensure(&source).await.expect_err("nothing arrived");
+        let waited = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        server.join().ok();
+
+        assert!(
+            waited < Duration::from_secs(30),
+            "the wait has an end: {waited:?} ({err:#})"
+        );
+        assert!(
+            !a_curl_still_runs_for(port),
+            "the download was killed and reaped, not abandoned"
+        );
+        assert!(
+            !images.join("ubuntu.raw").exists(),
+            "nothing under the catalogue name"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(images.join(CACHE_DIR))
+            .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "and no partial file: {leftovers:?}");
+        assert!(matches!(
+            cache.report()[0].1,
+            State::Failed {
+                reason: ImageReason::FetchFailed,
+                ..
+            }
+        ));
+    }
+
+    /// Bytes past the budget are not written out to the end and then judged.
+    ///
+    /// Astra finding S15, 2026-09-23. Two checks say this, and which of them
+    /// speaks depends on the other end: curl refuses a DECLARED length past
+    /// the ceiling before a byte moves, and `drain` refuses the bytes that
+    /// actually arrive when nobody declared a length. The same refusal either
+    /// way, and the second is the one that cannot be talked out of it.
+    #[tokio::test]
+    async fn a_body_past_the_byte_budget_is_refused() {
+        let (_temp, dir) = scratch("budget");
+        let payload = vec![7u8; 4096];
+        let origin = dir.join("origin.raw");
+        std::fs::write(&origin, &payload).unwrap();
+
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let cache = Cache::new(images.clone()).with_bounds(Bounds {
+            max_bytes: 512,
+            ..Bounds::default()
+        });
+        let source = Source {
+            name: "ubuntu.raw".into(),
+            url: format!("file://{}", origin.display()),
+            sha256: digest_of(&payload),
+            uid: String::new(),
+        };
+
+        let err = cache.ensure(&source).await.expect_err("past the budget");
+        let said = format!("{err:#}").to_lowercase();
+        assert!(
+            said.contains("budget") || said.contains("file size"),
+            "the refusal names the size: {said}"
+        );
+        assert!(!images.join("ubuntu.raw").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(images.join(CACHE_DIR))
+            .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
     /// A URL that answers, byte for byte, and a second use that does not
     /// fetch again. `file://` is a real fetch through the same code path a
     /// http one takes — curl reads it the same way — so this exercises the
@@ -735,6 +1150,7 @@ mod tests {
             name: "ubuntu.raw".into(),
             url: format!("file://{}", origin.display()),
             sha256: digest_of(&payload),
+            uid: String::new(),
         };
 
         cache.ensure(&source).await.expect("fetched");
@@ -742,7 +1158,10 @@ mod tests {
         let placed = images.join("ubuntu.raw");
         assert_eq!(std::fs::read(&placed).unwrap(), payload);
         // And in the cache under its own digest, which is what makes the
-        // second use free.
+        // second use free. The bare digest and not `<uid>-<digest>` because
+        // this source carries no uid: a cluster with no cloud above it mints
+        // none, and S02's key falls back to what it always was rather than
+        // making every node on such a fleet re-download everything.
         assert!(images.join(CACHE_DIR).join(&source.sha256).exists());
         assert_eq!(
             cache.report(),
@@ -762,6 +1181,83 @@ mod tests {
         assert_eq!((a.ino(), a.dev()), (b.ino(), b.dev()));
     }
 
+    /// Two registrations of one name are two images, and one node's cache
+    /// keeps them apart.
+    ///
+    /// Astra finding S02, 2026-09-23: the cache entry was the digest alone
+    /// and the catalogue name is global — one namespace for every tenant on
+    /// the fleet — while `delete_image` at the cloud removes the object and
+    /// nothing a node holds. So a name deregistered by one tenant and
+    /// registered by another was, on the node, the same entry. The uid is
+    /// what an image cannot share: it is minted once and never reused.
+    #[tokio::test]
+    async fn two_images_of_one_name_do_not_share_a_cache_entry() {
+        let (_temp, dir) = scratch("uid");
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let cache = Cache::new(images.clone());
+
+        let theirs = b"the image one tenant registered".to_vec();
+        let mine = b"what somebody else put under the same name".to_vec();
+        let origin = dir.join("origin.raw");
+
+        std::fs::write(&origin, &theirs).unwrap();
+        let first = Source {
+            name: "ubuntu.raw".into(),
+            url: format!("file://{}", origin.display()),
+            sha256: digest_of(&theirs),
+            uid: "4f3c0000-0000-0000-0000-00000000000a".into(),
+        };
+        cache.ensure(&first).await.expect("fetched");
+
+        std::fs::write(&origin, &mine).unwrap();
+        let second = Source {
+            name: "ubuntu.raw".into(),
+            url: format!("file://{}", origin.display()),
+            sha256: digest_of(&mine),
+            uid: "9b210000-0000-0000-0000-00000000000b".into(),
+        };
+        cache.ensure(&second).await.expect("fetched");
+
+        let entries = |source: &Source| {
+            images
+                .join(CACHE_DIR)
+                .join(format!("{}-{}", source.uid, source.sha256))
+        };
+        assert!(entries(&first).exists(), "one entry per registration");
+        assert!(entries(&second).exists());
+        assert_ne!(entries(&first), entries(&second));
+        assert!(
+            !images.join(CACHE_DIR).join(&first.sha256).exists(),
+            "and nothing under the bare digest, which is the namespace they shared"
+        );
+        // The name follows the newest bytes, as it always has.
+        assert_eq!(std::fs::read(images.join("ubuntu.raw")).unwrap(), mine);
+
+        // Same uid, same digest, same entry: asking twice is asking once.
+        cache.ensure(&second).await.expect("already here");
+        assert_eq!(
+            std::fs::read_dir(images.join(CACHE_DIR))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .count(),
+            2
+        );
+    }
+
+    /// A uid names a file in the cache directory, so a value that is not one
+    /// is refused before anything is downloaded — the same rule and the same
+    /// danger as `check_digest`.
+    #[test]
+    fn a_uid_that_is_not_one_is_refused_before_anything_is_fetched() {
+        assert!(check_uid("4f3c0000-0000-0000-0000-00000000000a").is_ok());
+        assert!(check_uid("").is_ok(), "no cloud above this cluster");
+        assert!(check_uid("../../etc/passwd").is_err());
+        assert!(check_uid("a/b").is_err());
+        assert!(check_uid("a.b").is_err(), "a dot is a path component");
+        assert!(check_uid(&"a".repeat(65)).is_err());
+    }
+
     /// The checksum is what makes a fetched image usable, so bytes that do
     /// not match it leave nothing behind at all — not in the cache, not under
     /// the catalogue name, not as a partial file.
@@ -779,6 +1275,7 @@ mod tests {
             name: "ubuntu.raw".into(),
             url: format!("file://{}", origin.display()),
             sha256: claimed.clone(),
+            uid: String::new(),
         };
 
         let err = cache.ensure(&source).await.expect_err("must not be usable");
@@ -822,6 +1319,7 @@ mod tests {
             name: "ubuntu.raw".into(),
             url: format!("file://{}", dir.join("nothing-here.raw").display()),
             sha256: digest_of(b"anything"),
+            uid: String::new(),
         };
 
         assert!(cache.ensure(&source).await.is_err());
@@ -867,6 +1365,7 @@ mod tests {
                 name: "ubuntu.raw".into(),
                 url: format!("file://{}", origin.display()),
                 sha256: digest_of(&first),
+                uid: String::new(),
             })
             .await
             .unwrap();
@@ -878,6 +1377,7 @@ mod tests {
                 name: "ubuntu.raw".into(),
                 url: format!("file://{}", origin.display()),
                 sha256: digest_of(&second),
+                uid: String::new(),
             })
             .await
             .unwrap();

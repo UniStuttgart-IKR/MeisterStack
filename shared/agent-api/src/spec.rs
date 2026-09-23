@@ -173,6 +173,21 @@ pub struct NewVolume {
     pub base_image_url: Option<String>,
     #[serde(default)]
     pub base_image_sha256: Option<String>,
+    /// The uid of the `Image` object the two fields above came from.
+    ///
+    /// Control-plane-owned exactly as they are, and written in beside them:
+    /// the catalogue name is global, so it is the one thing about an image
+    /// that cannot say WHICH registration a node fetched. Astra finding S02,
+    /// 2026-09-23: the node addresses its cache entry by this and the digest,
+    /// so one tenant's bytes can never answer for another tenant's image of
+    /// the same name.
+    ///
+    /// Absent on a standalone cluster with no cloud above it — there is no
+    /// catalogue there to mint a uid — and on every spec written before the
+    /// field existed. The node falls back to the digest alone, which is what
+    /// it always did.
+    #[serde(default)]
+    pub base_image_uid: Option<String>,
     /// How big, for a disk this node is to MAKE. Defaults so that a
     /// referenced entry need not name it — the size belongs to the volume
     /// that already exists — and an INLINE entry that names none is refused
@@ -223,8 +238,26 @@ pub struct NewDevice {
     #[serde(default, alias = "driver_name")]
     pub driver: Option<String>,
     pub partition: String,
+    /// The name of a section the NODE's configuration wrote. This is the
+    /// ordinary way to ask a device for more than its defaults, and it is the
+    /// safe one: what the name stands for was written by whoever runs the
+    /// node.
     #[serde(default)]
     pub profile: Option<String>,
+    /// What this device's driver is to make of the request, in the driver's
+    /// own vocabulary.
+    ///
+    /// Free-form here and NOT free-form at the node. Astra finding S03,
+    /// 2026-09-23: this map reached the nvrm driver as the whole of its
+    /// configuration — `admin_priv`, which keeps `CAP_SYS_ADMIN` in the
+    /// backend process, and `env`, which is that process's environment — so a
+    /// document could configure a backend the node was supposed to configure.
+    /// The node now refuses every key a driver has not declared a tenant's to
+    /// set (`agent::types::refuse_operator_only_device_params`), and the
+    /// refusal arrives while a person still holds the request.
+    ///
+    /// A schema cannot say this, because what is allowed depends on which
+    /// driver the device lands on and that is a fact about a node.
     #[serde(default)]
     pub params: Option<serde_json::Value>,
 }

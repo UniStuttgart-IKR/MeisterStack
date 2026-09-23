@@ -470,6 +470,7 @@ impl VmSpec {
             "base_image",
             "base_image_url",
             "base_image_sha256",
+            "base_image_uid",
             "driver",
         ];
         entries

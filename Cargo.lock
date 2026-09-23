@@ -1315,6 +1315,7 @@ dependencies = [
  "meister-agent-api",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
