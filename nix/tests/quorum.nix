@@ -230,6 +230,7 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import json
+    import time
 
     MEMBERS = ["r1", "r2", "r3"]
     # NOT `machines`: the driver has a global of that name (the list of
@@ -399,12 +400,20 @@ pkgs.testers.runNixOSTest {
     # a preflight is exactly the step that should report this.
     for name in MEMBERS:
         assert degraded["hosts"][name]["verdict"] == "blocked", degraded["hosts"][name]
-    free = {a["kind"] for a in degraded["actions"] if a["blocked"] is None}
-    assert free == {"preflight", "verify"}, free
-    for kind in ["stage", "activate", "confirm"]:
-        assert all(
-            a["blocked"] is not None for a in degraded["actions"] if a["kind"] == kind
-        ), kind
+    # A lost quorum blocks what INTERRUPTS and nothing else — 2B's rule,
+    # seen in a plan: taking a member's lock and copying a closure onto it
+    # disturbs nobody, so those stay allowed and the activation does not.
+    # (These hosts carry no agent role, so there is no cordon and no drain.)
+    def blocked_of(kind):
+        return [a["blocked"] for a in degraded["actions"] if a["kind"] == kind]
+
+    for kind in ["preflight", "verify", "lock", "stage", "unlock"]:
+        assert blocked_of(kind) and all(b is None for b in blocked_of(kind)), kind
+    for kind in ["activate", "confirm"]:
+        assert blocked_of(kind) and all(b is not None for b in blocked_of(kind)), kind
+    print("blocked in a degraded group: " + ", ".join(sorted(
+        {a["kind"] for a in degraded["actions"] if a["blocked"] is not None}
+    )))
 
     # --- and a plan made BEFORE the outage is stopped at the door ----------
     status, out = operator.execute(apply_cmd(plan_b, release_b) + " 2>&1")
@@ -431,6 +440,7 @@ pkgs.testers.runNixOSTest {
     assert read(plan_ok)["groups"]["cp"]["allowed_unavailable"] == 1
 
     # --- the rollout, with the other two watching --------------------------
+    rollout_started = time.monotonic()
     operator.succeed(
         "systemd-run --unit=apply-cp --collect --working-directory=/root/fleet "
         "--setenv=PATH=/run/current-system/sw/bin "
@@ -452,6 +462,10 @@ pkgs.testers.runNixOSTest {
         print(f"while r1 was activating, {name} answered healthy")
 
     operator.wait_until_fails("systemctl is-active apply-cp.service", timeout=900)
+    # The number Position 6 of the lane report does its arithmetic with:
+    # three raft members, one wave each, strictly one at a time.
+    print(f"[timing] apply over three members, serially: "
+          f"{time.monotonic() - rollout_started:.1f} s")
     run = operator.succeed("ls -1t /root/fleet/.meister-deploy/runs").split()[0]
     receipt = read(f"/root/fleet/.meister-deploy/runs/{run}/receipt.json")
     assert receipt["outcome"] == "success", receipt

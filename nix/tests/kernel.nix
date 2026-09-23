@@ -324,7 +324,9 @@ pkgs.testers.runNixOSTest {
     def receipt_of(run):
         return read(f"/root/fleet/.meister-deploy/runs/{run}/receipt.json")
 
-    release_a = deploy("a")
+    # A is built and never planned against on its own; its file is what the
+    # `reboot = never` case below is edited from.
+    deploy("a")
     release_b = deploy("b")
     release_c = deploy("c")
 
