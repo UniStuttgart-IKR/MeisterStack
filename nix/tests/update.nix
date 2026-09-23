@@ -499,10 +499,12 @@ pkgs.testers.runNixOSTest {
     # path needs no signature by design — its name is its proof. Measured
     # at gate M4: the `--add` version was accepted by the far store and the
     # assertion below went red. An input-addressed output of a one-line
-    # derivation is what a real unsigned closure looks like.
+    # derivation is what a real unsigned closure looks like. The builder is
+    # `runtimeShell`, the bash every NixOS closure already carries — the
+    # operator has no network and cannot fetch another.
     unsigned = operator.succeed(
         "nix-build --no-out-link -E 'derivation { name = \"unsigned\"; "
-        "system = \"x86_64-linux\"; builder = \"${pkgs.bash}/bin/bash\"; "
+        "system = \"x86_64-linux\"; builder = \"${pkgs.runtimeShell}\"; "
         "args = [ \"-c\" \"echo not-signed > $out\" ]; }'"
     ).strip()
     operator.succeed(f"nix copy --to '{CACHE}' {unsigned}")
