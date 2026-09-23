@@ -475,14 +475,30 @@ if [ "$INDEX_REBUILD" -eq 1 ] || [ -n "$REVOKE" ] || [ "$GENCRL" -eq 1 ]; then
 		if [ -f "$REVOKE" ]; then
 			# openssl's own path: it reads the certificate, finds its row and
 			# writes the reason the way it reads it back.
+			rc=0
 			if [ -n "$REVOKE_REASON" ]; then
-				openssl ca -config "$CNF" -revoke "$REVOKE" -crl_reason "$REVOKE_REASON" -batch 2>&1 \
-					| sed 's/^/  /' >&2 || die "openssl refused to revoke $REVOKE"
+				out="$(openssl ca -config "$CNF" -revoke "$REVOKE" -crl_reason "$REVOKE_REASON" \
+					-batch 2>&1)" || rc=$?
 			else
-				openssl ca -config "$CNF" -revoke "$REVOKE" -batch 2>&1 \
-					| sed 's/^/  /' >&2 || die "openssl refused to revoke $REVOKE"
+				out="$(openssl ca -config "$CNF" -revoke "$REVOKE" -batch 2>&1)" || rc=$?
 			fi
-			note "revoked: $(openssl x509 -in "$REVOKE" -noout -serial | cut -d= -f2)"
+			printf '%s\n' "$out" | sed 's/^/  /' >&2
+			revoked_serial="$(openssl x509 -in "$REVOKE" -noout -serial | cut -d= -f2)"
+			# Astra finding F13, 2026-09-23: `openssl ca -revoke` on a
+			# certificate that is already revoked is not a mistake, it is a
+			# retry -- `retire`/`keys revoke --host` revoke several
+			# certificates in sequence and this is the one that ran before
+			# and a second time is not a reason to abort before the rest
+			# are taken back and the list is written. `--revoke <serial>`
+			# already treats this the same way (see `revoke_serial`); the
+			# file path did not.
+			if [ "$rc" -eq 0 ]; then
+				note "revoked: $revoked_serial"
+			elif printf '%s' "$out" | grep -qi 'already revoked'; then
+				note "already revoked: $revoked_serial"
+			else
+				die "openssl refused to revoke $REVOKE"
+			fi
 		else
 			case "$REVOKE" in
 				*/*|*.crt|*.pem) die "no such certificate: $REVOKE" ;;

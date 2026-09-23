@@ -111,6 +111,26 @@ else
 fi
 if [ -f "$DIR/crl.pem" ]; then ok "--gencrl schreibt crl.pem"; else bad "crl.pem fehlt"; fi
 
+# --- ein zweiter Widerruf ueber dieselbe Datei (Astra-Befund F13) ----------
+#
+# `retire`/`keys revoke --host` widerrufen mehrere Zertifikate eines Hosts
+# der Reihe nach und schreiben die Liste erst am Ende; ein Neustart nach
+# einem Teillauf widerruft dasselbe Zertifikat ein zweites Mal, ueber
+# dieselbe Datei. Das war vorher ein toter Lauf: openssl meldet "Already
+# revoked" mit einem Fehlerstatus, und das Skript nahm das als fatal.
+out="$("$CA" --dir "$DIR" --revoke "$DIR/system-node-a.crt" --reason keyCompromise 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(state_of "$A_SERIAL")" = "R" ]; then
+	ok "ein zweiter Widerruf ueber dieselbe Datei ist kein Fehler"
+else
+	bad "der zweite Datei-Widerruf ist gescheitert" "rc=$rc" "$out"
+fi
+if printf '%s' "$out" | grep -qi 'already revoked'; then
+	ok "und sagt, dass das Zertifikat schon widerrufen war"
+else
+	bad "die Meldung fehlt" "$out"
+fi
+
 crl_text() { openssl crl -in "$DIR/crl.pem" -noout -text; }
 if crl_text | grep -q "$A_SERIAL"; then
 	ok "die CRL nennt das widerrufene Serial"
