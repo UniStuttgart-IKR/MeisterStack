@@ -714,6 +714,80 @@ impl Cache {
             .await
             .with_context(|| format!("putting {} in place at {}", source.name, link.display()))
     }
+
+    /// Remove this node's cache entry for a deleted image, addressed by uid
+    /// and never by name.
+    ///
+    /// Astra finding S02, 2026-09-23 (rest b). `delete_image` at the cloud
+    /// removes the catalogue OBJECT and tells no node anything, so whatever a
+    /// node had fetched for it used to sit in `.cache/` and under its name
+    /// forever — including across a NAME recycled for an unrelated later
+    /// registration, which is exactly the shape a name-keyed removal would
+    /// get wrong. `uid` is what makes a removal safe to run by command
+    /// instead of by inference: the cloud mints it once and never reuses it,
+    /// so a cache entry keyed on it (`Source::cache_key`) can only ever be
+    /// the bytes this one registration fetched.
+    ///
+    /// `name` is read once, before anything is removed, and spent on exactly
+    /// one question: does the CATALOGUE LINK under it still point at the uid
+    /// being dropped? Same-inode is the proof, the same test `link` runs the
+    /// other way to decide a second use needs no work — never a name
+    /// comparison, because the name may already belong to a different
+    /// registration's bytes by the time this command arrives.
+    ///
+    /// A path image has no entry here to begin with — see the module doc — so
+    /// this is a harmless no-op for one: nothing under `.cache/` is ever keyed
+    /// to a path image's uid, and the file its catalogue name points at is
+    /// shared storage this node never wrote to and this command does not
+    /// touch.
+    pub async fn drop_uid(&self, name: &str, uid: &str) {
+        if uid.is_empty() {
+            // Nothing to scope a removal to. Sweeping the whole cache on an
+            // empty uid would be exactly the name-keyed mistake this exists
+            // to avoid, just spelled differently.
+            return;
+        }
+        let linked = self.linked(name);
+        let link_place = place_of(&linked).await;
+        let prefix = format!("{uid}-");
+        let mut dropped_place = None;
+        if let Ok(mut entries) = tokio::fs::read_dir(self.cache_dir()).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                if !fname.starts_with(&prefix) {
+                    continue;
+                }
+                let path = self.cache_dir().join(&fname);
+                if dropped_place.is_none() {
+                    dropped_place = place_of(&path).await;
+                }
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    debug!(image = %name, file = %fname, error = %e,
+                           "could not remove a cache file for a dropped image");
+                }
+            }
+        }
+        // The catalogue link and this node's opinion of `name` both go only
+        // when the link provably pointed at the bytes just removed — a
+        // re-registration under this name that this node already fetched
+        // must not lose its link or its `Ready` state to a drop that arrived
+        // late for the OLD registration.
+        if link_place.is_some() && link_place == dropped_place {
+            let _ = tokio::fs::remove_file(&linked).await;
+            self.known.lock().unwrap().remove(name);
+        }
+    }
+}
+
+/// The `(dev, ino)` pair that proves two paths are the same file, or `None`
+/// if this one could not be looked at. See [`Cache::drop_uid`] and `link`,
+/// which runs the same test the other way.
+async fn place_of(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    tokio::fs::metadata(path)
+        .await
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
 }
 
 /// What a download may cost before this node stops paying for it.
@@ -1704,5 +1778,130 @@ mod tests {
         restarted.verify_path("nixos.raw").await;
         let (_, _, after_restart) = restarted.report().pop().expect("one opinion");
         assert_eq!(after_restart, Some(digest_of(b"different bytes now")));
+    }
+
+    /// A dropped uid loses its cache file and its catalogue link; a
+    /// DIFFERENT uid under the same recycled name keeps both.
+    ///
+    /// Astra finding S02, 2026-09-23 (rest b). `delete_image` at the cloud
+    /// only ever removes the catalogue object, so this is the other half:
+    /// told a uid, a node removes exactly the bytes it fetched for that uid.
+    /// The name is deliberately reused here for a SECOND, later registration
+    /// — the shape `Cache::drop_uid`'s own doc comment calls out as the one a
+    /// name-keyed removal would get wrong.
+    #[tokio::test]
+    async fn drop_uid_removes_the_right_registrations_bytes_and_not_a_same_named_others() {
+        let (_temp, dir) = scratch("drop-uid");
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let cache = Cache::new(images.clone());
+        let origin = dir.join("origin.raw");
+
+        let old = b"the image that gets deleted".to_vec();
+        std::fs::write(&origin, &old).unwrap();
+        let old_uid = "4f3c0000-0000-0000-0000-00000000000a";
+        let old_source = Source {
+            name: "ubuntu.raw".into(),
+            url: format!("file://{}", origin.display()),
+            sha256: digest_of(&old),
+            uid: old_uid.into(),
+        };
+        cache.ensure(&old_source).await.expect("fetched");
+        let old_cache_file = images.join(CACHE_DIR).join(old_source.cache_key());
+        assert!(old_cache_file.exists());
+
+        // The name is re-registered — a different tenant, or the same one
+        // registering again — before the drop for the OLD uid arrives. This
+        // node already fetched the new bytes too, so its link now points at
+        // them.
+        let new = b"a completely different image, same name".to_vec();
+        std::fs::write(&origin, &new).unwrap();
+        let new_uid = "9b210000-0000-0000-0000-00000000000b";
+        let new_source = Source {
+            name: "ubuntu.raw".into(),
+            url: format!("file://{}", origin.display()),
+            sha256: digest_of(&new),
+            uid: new_uid.into(),
+        };
+        cache.ensure(&new_source).await.expect("fetched");
+        let new_cache_file = images.join(CACHE_DIR).join(new_source.cache_key());
+        assert!(new_cache_file.exists());
+        assert_eq!(std::fs::read(images.join("ubuntu.raw")).unwrap(), new);
+
+        // The old uid is dropped. Its own cache file goes; the new
+        // registration's file, link and reported state are untouched.
+        cache.drop_uid("ubuntu.raw", old_uid).await;
+        assert!(!old_cache_file.exists(), "the dropped uid's bytes are gone");
+        assert!(
+            new_cache_file.exists(),
+            "a different uid under the same name is not this drop's to touch"
+        );
+        assert_eq!(
+            std::fs::read(images.join("ubuntu.raw")).unwrap(),
+            new,
+            "the catalogue link still names the current registration"
+        );
+        assert!(matches!(
+            cache.report().iter().find(|(n, _, _)| n == "ubuntu.raw"),
+            Some((_, State::Ready, _))
+        ));
+
+        // Dropping the uid that IS current removes the link too, and this
+        // node's opinion of the name along with it.
+        cache.drop_uid("ubuntu.raw", new_uid).await;
+        assert!(!new_cache_file.exists());
+        assert!(
+            !images.join("ubuntu.raw").exists(),
+            "the link followed its own bytes out"
+        );
+        assert!(cache.report().is_empty());
+    }
+
+    /// An empty uid removes nothing. `check_uid` refuses one everywhere else
+    /// a `Source` carries it; this is the same refusal for the road that
+    /// does not build one.
+    #[tokio::test]
+    async fn dropping_an_empty_uid_is_a_no_op() {
+        let (_temp, dir) = scratch("drop-uid-empty");
+        let images = dir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let cache = Cache::new(images.clone());
+        let origin = dir.join("origin.raw");
+        let payload = b"bytes".to_vec();
+        std::fs::write(&origin, &payload).unwrap();
+        let source = Source {
+            name: "ubuntu.raw".into(),
+            url: format!("file://{}", origin.display()),
+            sha256: digest_of(&payload),
+            uid: "4f3c0000-0000-0000-0000-00000000000a".into(),
+        };
+        cache.ensure(&source).await.expect("fetched");
+
+        cache.drop_uid("ubuntu.raw", "").await;
+        assert!(images.join("ubuntu.raw").exists());
+        assert!(images.join(CACHE_DIR).join(source.cache_key()).exists());
+    }
+
+    /// A path image has no cache entry, so dropping any uid for its name is a
+    /// harmless no-op: the file its catalogue name points at is shared
+    /// storage this node never wrote to.
+    #[tokio::test]
+    async fn dropping_a_path_images_uid_touches_nothing() {
+        let (_temp, images) = scratch("drop-uid-path");
+        std::fs::create_dir_all(&images).unwrap();
+        let cache = Cache::new(images.clone());
+        std::fs::write(images.join("nixos.raw"), b"somebody else's file").expect("the bytes");
+        cache.verify_path("nixos.raw").await;
+        assert_eq!(cache.report().len(), 1);
+
+        cache
+            .drop_uid("nixos.raw", "4f3c0000-0000-0000-0000-00000000000a")
+            .await;
+
+        assert!(
+            images.join("nixos.raw").exists(),
+            "shared storage, untouched"
+        );
+        assert_eq!(cache.report().len(), 1, "this node's opinion is unchanged");
     }
 }

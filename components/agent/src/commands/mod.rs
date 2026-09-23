@@ -12,6 +12,7 @@
 use super::*;
 
 mod console;
+mod image;
 mod migration;
 mod router;
 mod state;
@@ -69,6 +70,7 @@ impl Agent {
             Some(command::Op::MigrateOut(m)) => done(self.handle_migrate_out(m).await),
             Some(command::Op::EnsureRouter(r)) => done(self.handle_ensure_router(r).await),
             Some(command::Op::DestroyRouter(r)) => done(self.handle_destroy_router(r).await),
+            Some(command::Op::DropImage(d)) => done(self.handle_drop_image(d).await),
             None => Err(anyhow!("command without op")),
         };
         let outcome = match op_result {

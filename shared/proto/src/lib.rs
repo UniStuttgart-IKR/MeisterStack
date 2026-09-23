@@ -567,6 +567,36 @@ mod tests {
         assert!(back.routers_complete);
     }
 
+    /// `DropImage` travels both hops unchanged — cloud to cluster inside a
+    /// `CloudCommand`, cluster to agent inside a `Command` — carrying the
+    /// same `name` and `uid` either way. Astra finding S02, 2026-09-23 (rest
+    /// b): there is exactly one message for both hops because neither tier
+    /// keeps an id space of its own for an image; see the type's own doc in
+    /// control.proto.
+    #[test]
+    fn a_dropped_image_names_the_same_uid_on_both_hops() {
+        let drop = DropImage {
+            name: "ubuntu.raw".into(),
+            uid: "4f3c0000-0000-0000-0000-00000000000a".into(),
+        };
+
+        let cloud_command = CloudCommand {
+            request_id: "req-1".into(),
+            traceparent: String::new(),
+            op: Some(cloud_command::Op::DropImage(drop.clone())),
+        };
+        let back = CloudCommand::decode(cloud_command.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(back.op, Some(cloud_command::Op::DropImage(drop.clone())));
+
+        let command = Command {
+            request_id: "req-1".into(),
+            traceparent: String::new(),
+            op: Some(command::Op::DropImage(drop.clone())),
+        };
+        let back = Command::decode(command.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(back.op, Some(command::Op::DropImage(drop)));
+    }
+
     /// A url image reports no digest — its checksum is `spec.sha256`, already
     /// checked at fetch — and a node older than the field decodes the same
     /// way: empty, never a claim about the bytes. Astra finding S02,

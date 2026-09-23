@@ -693,6 +693,8 @@ message Command {
     // Let go of a volume's RECORD and keep the bytes. The one command in this
     // list that is a removal and destroys nothing; see ForgetVolume.
     ForgetVolume forget_volume = 20;
+    // Told once, from the cloud, that an image was deleted. See DropImage.
+    DropImage drop_image = 21;
   }
 }
 
@@ -726,6 +728,33 @@ message Command {
 message ForgetVolume {
   // The Volume object's metadata.uid, exactly as ProvisionVolume carries it.
   string id = 1;
+}
+
+// An image the cloud let go of. Told down both hops unchanged — cloud to
+// cluster as CloudCommand.drop_image, cluster to every node as
+// Command.drop_image — because neither tier keeps an id space of its own for
+// an image the way it does for a VM: the cloud mints `uid` once and it
+// travels verbatim all the way to `agent::images::Source::uid`.
+//
+// Astra finding S02, 2026-09-23 (rest b): deleting the Image object used to
+// tell nobody, so whatever a node had fetched for it sat in its cache
+// forever, including across a name recycled for a different registration.
+// `uid` is what makes this safe to broadcast rather than target: a node that
+// never fetched this uid does nothing, and a node holding a DIFFERENT
+// image's bytes under a re-registered `name` is untouched because the
+// removal is keyed on `uid`, never on `name` alone — see `Cache::drop_uid`.
+//
+// Sent to every connected cluster, and inside a cluster to every connected
+// node, rather than only the ones known to have it: that knowledge is only
+// ever as fresh as the last heartbeat, and a stale or incomplete inventory
+// must not be the reason bytes are never dropped. A node with nothing under
+// this uid answers with nothing to do.
+message DropImage {
+  // The catalogue name, so a node can tell whether ITS link under that name
+  // still points at the uid being dropped before it removes the link too.
+  string name = 1;
+  // The Image object's metadata.uid.
+  string uid = 2;
 }
 
 // A tenant router as the node builds it: one leg on the provider network
@@ -1438,6 +1467,9 @@ message CloudCommand {
     CreateVmMigration create_vm_migration = 14;
     CreateRouter create_router = 15;
     DeleteRouter delete_router = 16;
+    // An image was deleted; every connected cluster is told once. See
+    // DropImage.
+    DropImage drop_image = 17;
   }
 }
 
