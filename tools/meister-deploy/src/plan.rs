@@ -1561,6 +1561,199 @@ fn names(set: &BTreeSet<&String>) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The hardware preflight
+// ---------------------------------------------------------------------------
+
+// --- lane 4A ---
+
+/// What the preflight found out about the machine under the closure.
+///
+/// Three lists and not a bool, because the three are read by different
+/// people: `met` is evidence a reader wants in the plan, `blocked` is what
+/// stops the rollout, and `unknown` is the probe admitting it could not ask.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HardwareVerdict {
+    pub met: Vec<String>,
+    pub blocked: Vec<String>,
+    pub unknown: Vec<String>,
+}
+
+impl HardwareVerdict {
+    pub fn is_clear(&self) -> bool {
+        self.blocked.is_empty()
+    }
+}
+
+/// Is this machine the machine the fleet says it is, and will the release
+/// fit on it?
+///
+/// Pure, and deliberately called TWICE: [`decide_host`] asks it while the
+/// plan is made, so that the answer is part of the plan's contract (the
+/// `preconditions[]` of the `preflight` step, or the sentence that blocks
+/// the host), and `execute`'s preflight asks it again against a FRESH
+/// snapshot immediately before the first copy. One implementation, because
+/// a second one here would be a second answer somebody has to keep in step
+/// with the first.
+///
+/// What it does NOT do is guess. An empty `pci` list means the probe found
+/// no way to ask, not that the machine has no cards — so a declared GPU
+/// against an empty list blocks with a sentence that says which of the two
+/// happened, rather than reporting a card as missing that nobody looked
+/// for.
+pub fn hardware_verdict(
+    id: &str,
+    host: &crate::manifest::ResolvedHost,
+    obs: &crate::observation::HostObservation,
+    closure_size: u64,
+) -> HardwareVerdict {
+    let mut v = HardwareVerdict::default();
+
+    // --- will it fit -------------------------------------------------------
+    //
+    // The whole closure against the free space, which is the conservative
+    // comparison and says so in the sentence: most of a fleet's closure is
+    // shared with what the host already runs, so this number is an upper
+    // bound on what the copy really needs. The alternative — asking the
+    // target which paths it is missing — is a second round trip per host
+    // before the one `nix copy` that would tell us anyway, and it would
+    // tell us at the moment the disk is already filling up.
+    match obs.disk_free_nix_bytes {
+        Some(free) if free < closure_size => v.blocked.push(format!(
+            "{id} has {free} byte(s) free on the filesystem that carries /nix and the closure \
+             this release builds for it is {closure_size} byte(s). That is the whole closure, \
+             and a host already holds most of it — but this tool will not start a copy it \
+             cannot finish. Free space on {id} (`meister-activate gc --keep 3`) or take it out \
+             of the selection."
+        )),
+        Some(free) => v.met.push(format!(
+            "{id} has {free} byte(s) free for a closure of {closure_size}"
+        )),
+        None => v.unknown.push(format!(
+            "nobody could read how much room the store of {id} has, so whether this release \
+             fits on it is not known; the copy is the first thing that would find out."
+        )),
+    }
+
+    // --- a node that is supposed to run guests ------------------------------
+    //
+    // Not part of `capabilities`, and on purpose: `kvm` there is an
+    // operator's CLAIM about a machine, and a fleet is allowed not to make
+    // it. The agent's own code refuses to start without the device ("a node
+    // whose whole purpose is running guests would answer every create with
+    // the same error", drivers.rs), so for the agent role this is a fact
+    // about the role and not about the inventory.
+    if host.roles.iter().any(|r| r == "agent") {
+        if obs.has_capability("kvm") {
+            v.met
+                .push(format!("{id} carries the agent role and has /dev/kvm"));
+        } else {
+            v.blocked.push(format!(
+                "{id} carries the agent role and the snapshot found no /dev/kvm. The agent \
+                 refuses to start without it, so activating this release would take the node \
+                 out of the fleet rather than forward. Load the virtualisation module on {id}, \
+                 or take the agent role off it."
+            ));
+        }
+    }
+
+    // --- the cards the inventory names --------------------------------------
+    for gpu in &host.hardware.gpus {
+        if obs.pci.is_empty() {
+            v.blocked.push(format!(
+                "the fleet says {id} has a {} at {} and the snapshot carries no PCI list at \
+                 all, so nobody looked. A host whose cards cannot be read is not a host to \
+                 activate a release on that was built for those cards.",
+                gpu.model, gpu.pci
+            ));
+        } else if obs.has_pci(&gpu.pci) {
+            v.met
+                .push(format!("{} answers at {} on {id}", gpu.model, gpu.pci));
+        } else {
+            v.blocked.push(format!(
+                "the fleet says {id} has a {} at {} and nothing is at that address. The \
+                 machine lists {}. Either the card moved — then correct `hardware.gpus[].pci` \
+                 — or it is not in this machine.",
+                gpu.model,
+                gpu.pci,
+                addresses(&obs.pci)
+            ));
+        }
+    }
+
+    // --- the interfaces the inventory names ---------------------------------
+    //
+    // By MAC and never by name: `hardware.nics[].name` is what the operator
+    // calls it, and what the kernel calls it depends on where it is
+    // plugged in.
+    for nic in &host.hardware.nics {
+        if obs.nics.is_empty() {
+            v.blocked.push(format!(
+                "the fleet says {id} has the interface {} ({}) and the snapshot carries no \
+                 interface list at all, so nobody looked.",
+                nic.name, nic.mac
+            ));
+        } else if obs.has_mac(&nic.mac) {
+            v.met.push(format!(
+                "the interface {} ({}) of {id} answered",
+                nic.name, nic.mac
+            ));
+        } else {
+            v.blocked.push(format!(
+                "the fleet says {id} has the interface {} with the address {} and no \
+                 interface on the machine has it. The machine has {}. A card that was \
+                 replaced has a new address, and the inventory has to say so.",
+                nic.name,
+                nic.mac,
+                macs(&obs.nics)
+            ));
+        }
+    }
+
+    // --- what the fleet declared it can do ----------------------------------
+    //
+    // V19, and the sentence is the one the planner has had since 2B: a
+    // capability that is declared and not found is a machine that cannot
+    // run what was built for it. It moved here so that the preflight of
+    // `apply` asks it again with the same words.
+    for capability in &host.hardware.capabilities {
+        if obs.has_capability(capability) {
+            v.met.push(format!("{id} has {capability}"));
+        } else {
+            v.blocked.push(format!(
+                "the fleet declares that {id} has {capability} and the snapshot did not find \
+                 it. A host that is missing a declared capability cannot run what was built \
+                 for it."
+            ));
+        }
+    }
+
+    v
+}
+
+fn addresses(devices: &[crate::observation::PciDevice]) -> String {
+    if devices.is_empty() {
+        return "nothing".to_string();
+    }
+    devices
+        .iter()
+        .map(|d| format!("{} ({})", d.address, d.vendor_device))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn macs(nics: &[crate::observation::NetworkInterface]) -> String {
+    if nics.is_empty() {
+        return "nothing".to_string();
+    }
+    nics.iter()
+        .map(|n| format!("{} ({})", n.name, n.mac))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// --- end lane 4A ---
+
+// ---------------------------------------------------------------------------
 // One host
 // ---------------------------------------------------------------------------
 
@@ -1810,17 +2003,25 @@ fn decide_host(
             ));
         }
     }
-    for capability in &host.hardware.capabilities {
-        if obs.has_capability(capability) {
-            d.preconditions.push(format!("{id} has {capability}"));
-        } else {
-            d.stop_all.push(format!(
-                "the fleet declares that {id} has {capability} and the snapshot did not find \
-                 it. A host that is missing a declared capability cannot run what was built \
-                 for it."
-            ));
-        }
+    // --- lane 4A: the machine under the closure ---------------------------
+    //
+    // Room, /dev/kvm, the cards, the interfaces and the declared
+    // capabilities (V19), all from the one function `execute`'s preflight
+    // asks again with a fresh snapshot. `stop_all` and not
+    // `stop_disruptive`: a machine that is not the machine the fleet
+    // describes is not a machine to stage a closure onto either, and the
+    // preflight step itself stays free so that the finding is REPORTED
+    // rather than only refused.
+    let hardware = hardware_verdict(id, host, obs, artifacts.toplevel.closure_size);
+    d.preconditions.extend(hardware.met);
+    d.stop_all.extend(hardware.blocked);
+    for reason in hardware.unknown {
+        d.unknowns.push(Unknown {
+            host: Some(id.to_string()),
+            reason,
+        });
     }
+    // --- end lane 4A ---
 
     // --- what runs, what should run, and what booted ----------------------
     d.current_system = obs.current_system.clone();
@@ -4833,6 +5034,190 @@ mod tests {
             "{:?}",
             plan.hosts["n1"].reasons
         );
+    }
+
+    // --- lane 4A: the hardware preflight ------------------------------------
+
+    /// The one sentence a blocked host gives, joined, so that a test can
+    /// look for a number in it.
+    fn why(plan: &DeploymentPlan, id: &str) -> String {
+        plan.hosts[id].reasons.join(" ")
+    }
+
+    #[test]
+    fn a_closure_that_does_not_fit_blocks_with_both_numbers() {
+        let (release, observation) = upgrade(&["n1"], false);
+        let closure = release.artifacts["n1"].toplevel.closure_size;
+        let mut observation = observation;
+        observation.hosts.get_mut("n1").unwrap().disk_free_nix_bytes = Some(closure - 1);
+        let plan = planned(&release, "host=n1", &observation);
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Blocked);
+        let why = why(&plan, "n1");
+        // Both numbers, because "not enough room" without them is a
+        // sentence nobody can act on.
+        assert!(why.contains(&(closure - 1).to_string()), "{why}");
+        assert!(why.contains(&closure.to_string()), "{why}");
+        // And the preflight itself is never blocked: it is the step whose
+        // job is to report exactly this.
+        assert!(!action(&plan, "n1", ActionKind::Preflight).is_blocked());
+        assert!(action(&plan, "n1", ActionKind::Stage).is_blocked());
+    }
+
+    #[test]
+    fn room_that_is_exactly_enough_is_enough() {
+        // The boundary, because `<` and `<=` is the whole difference
+        // between a fleet that rolls and a fleet that does not.
+        let (release, observation) = upgrade(&["n1"], false);
+        let closure = release.artifacts["n1"].toplevel.closure_size;
+        let mut observation = observation;
+        observation.hosts.get_mut("n1").unwrap().disk_free_nix_bytes = Some(closure);
+        let plan = planned(&release, "host=n1", &observation);
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Change);
+    }
+
+    #[test]
+    fn a_store_whose_room_nobody_could_read_is_an_unknown_and_not_a_full_disk() {
+        let (release, observation) = upgrade(&["n1"], false);
+        let mut observation = observation;
+        observation.hosts.get_mut("n1").unwrap().disk_free_nix_bytes = None;
+        let plan = planned(&release, "host=n1", &observation);
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Change);
+        assert!(
+            plan.unknowns
+                .iter()
+                .any(|u| u.host.as_deref() == Some("n1") && u.reason.contains("how much room")),
+            "{:?}",
+            plan.unknowns
+        );
+    }
+
+    #[test]
+    fn an_agent_without_dev_kvm_blocks_even_when_the_fleet_declared_nothing() {
+        // Not a capability the inventory claims: the agent refuses to start
+        // without the device, so for that role it is a fact about the role.
+        let (release, observation) = upgrade(&["n1"], false);
+        let mut observation = observation;
+        let obs = observation.hosts.get_mut("n1").unwrap();
+        obs.capabilities.clear();
+        let mut fleet = release.resolved_fleet.clone();
+        fleet.hosts.get_mut("n1").unwrap().hardware.capabilities = Vec::new();
+        let mut release = release;
+        release.resolved_fleet = fleet;
+        let plan = planned(&release, "host=n1", &observation);
+        let why = why(&plan, "n1");
+        assert!(why.contains("/dev/kvm"), "{why}");
+        assert!(why.contains("agent role"), "{why}");
+    }
+
+    #[test]
+    fn a_declared_gpu_that_is_not_in_the_machine_blocks_with_its_address() {
+        let (release, observation) = upgrade(&["n1"], false);
+        let mut release = release;
+        release
+            .resolved_fleet
+            .hosts
+            .get_mut("n1")
+            .unwrap()
+            .hardware
+            .gpus = vec![crate::manifest::Gpu {
+            model: "NVIDIA RTX PRO 6000".to_string(),
+            pci: "0000:41:00.0".to_string(),
+            selected_for: Some("vfio".to_string()),
+        }];
+        let mut observation = observation;
+        observation.hosts.get_mut("n1").unwrap().pci = vec![crate::observation::PciDevice {
+            address: "0000:00:01.0".to_string(),
+            vendor_device: "8086:1237".to_string(),
+        }];
+        let plan = planned(&release, "host=n1", &observation);
+        let why = why(&plan, "n1");
+        assert!(why.contains("0000:41:00.0"), "{why}");
+        assert!(why.contains("NVIDIA RTX PRO 6000"), "{why}");
+        // And it says what the machine DOES have, so that an operator can
+        // correct the inventory without walking to the rack.
+        assert!(why.contains("0000:00:01.0 (8086:1237)"), "{why}");
+    }
+
+    #[test]
+    fn a_machine_whose_cards_nobody_could_list_blocks_and_says_so() {
+        // An empty list is "nobody looked", not "there is no card". The two
+        // read the same to a bool and not to a person.
+        let (release, observation) = upgrade(&["n1"], false);
+        let mut release = release;
+        release
+            .resolved_fleet
+            .hosts
+            .get_mut("n1")
+            .unwrap()
+            .hardware
+            .gpus = vec![crate::manifest::Gpu {
+            model: "NVIDIA RTX PRO 6000".to_string(),
+            pci: "0000:41:00.0".to_string(),
+            selected_for: None,
+        }];
+        let mut observation = observation;
+        observation.hosts.get_mut("n1").unwrap().pci.clear();
+        let plan = planned(&release, "host=n1", &observation);
+        let why = why(&plan, "n1");
+        assert!(why.contains("no PCI list at all"), "{why}");
+        assert!(why.contains("nobody looked"), "{why}");
+    }
+
+    #[test]
+    fn a_declared_mac_that_no_interface_has_blocks_and_names_the_ones_that_answered() {
+        let (release, observation) = upgrade(&["n1"], false);
+        let mut observation = observation;
+        observation.hosts.get_mut("n1").unwrap().nics =
+            vec![crate::observation::NetworkInterface {
+                name: "eth0".to_string(),
+                mac: "52:54:00:aa:bb:cc".to_string(),
+            }];
+        let declared = release.resolved_fleet.hosts["n1"].hardware.nics[0]
+            .mac
+            .clone();
+        let plan = planned(&release, "host=n1", &observation);
+        let why = why(&plan, "n1");
+        assert!(why.contains(&declared), "{why}");
+        assert!(why.contains("eth0 (52:54:00:aa:bb:cc)"), "{why}");
+    }
+
+    #[test]
+    fn a_nic_that_answers_under_a_different_name_is_the_same_nic() {
+        // The MAC is what the fleet enrolled; the name is what the kernel
+        // handed out this boot. A rename must not block a rollout.
+        let (release, observation) = upgrade(&["n1"], false);
+        let declared = release.resolved_fleet.hosts["n1"].hardware.nics[0].clone();
+        let mut observation = observation;
+        observation.hosts.get_mut("n1").unwrap().nics =
+            vec![crate::observation::NetworkInterface {
+                name: "enp3s0f0".to_string(),
+                mac: declared.mac.to_uppercase(),
+            }];
+        let plan = planned(&release, "host=n1", &observation);
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Change);
+        assert!(
+            action(&plan, "n1", ActionKind::Preflight)
+                .preconditions
+                .iter()
+                .any(|p| p.contains(&declared.mac)),
+            "{:?}",
+            action(&plan, "n1", ActionKind::Preflight).preconditions
+        );
+    }
+
+    #[test]
+    fn what_the_preflight_found_is_part_of_the_plan_and_not_only_of_the_run() {
+        // The lane brief's point: the verdict is a contract, so it is in
+        // `preconditions[]` of the `preflight` step where a reader and a
+        // reviewer both find it.
+        let (release, observation) = upgrade(&["n1"], false);
+        let plan = planned(&release, "host=n1", &observation);
+        let said = action(&plan, "n1", ActionKind::Preflight)
+            .preconditions
+            .join(" ");
+        assert!(said.contains("free for a closure of"), "{said}");
+        assert!(said.contains("has /dev/kvm"), "{said}");
+        assert!(said.contains("answered"), "{said}");
     }
 
     #[test]

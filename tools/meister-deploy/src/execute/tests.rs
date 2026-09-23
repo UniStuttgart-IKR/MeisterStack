@@ -112,6 +112,20 @@ impl TableLook {
         self
     }
 
+    // --- lane 4A ---
+    /// Between the plan and the run, this host's store filled up. The plan
+    /// was made when there was room; the preflight is the look that finds
+    /// out there is none.
+    fn ran_out_of_room(mut self, id: &str) -> TableLook {
+        for map in [&mut self.before, &mut self.after] {
+            if let Some(obs) = map.get_mut(id) {
+                obs.disk_free_nix_bytes = Some(1);
+            }
+        }
+        self
+    }
+    // --- end lane 4A ---
+
     /// This host's activation leaves a pending transaction behind, as a
     /// real one does until somebody confirms it.
     fn keeps_the_record(self, id: &str, txn: &str, top: &str) -> TableLook {
@@ -701,6 +715,20 @@ fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
     };
     assert!(at_of("ActionBegin:activate") < at_of("ActionIrreversible:activate"));
     assert!(at_of("ActionIrreversible:activate") < at_of("ActionEnd:activate"));
+
+    // --- lane 4A ---
+    // And the preflight wrote down WHAT it checked, so that a receipt read
+    // a week later says which machine this release went onto and not only
+    // that somebody looked.
+    let preflight = applied.receipt.hosts["n1"]
+        .actions
+        .iter()
+        .find(|a| a.kind == ActionKind::Preflight)
+        .expect("n1 has a preflight");
+    let evidence = preflight.evidence.join(" ");
+    assert!(evidence.contains("free for a closure of"), "{evidence}");
+    assert!(evidence.contains("has /dev/kvm"), "{evidence}");
+    // --- end lane 4A ---
 }
 
 #[test]
@@ -2075,4 +2103,58 @@ fn a_halt_and_a_resume_are_the_v17_table_and_not_a_recovery() {
     run.actions[0].result = Some(ActionResult::Ok);
     run.state = HostState::Verifying;
     assert_eq!(next_step(&run, &TxnView::Confirmed), Step::VerifyOnly);
+}
+
+// --- lane 4A: the preflight at the run ------------------------------------
+
+#[test]
+fn a_store_that_filled_up_between_the_plan_and_the_run_stops_before_the_copy() {
+    // The plan was made when there was room. The preflight is the last look
+    // before the first copy, and what it finds there is not a note in a
+    // receipt — it is the reason nothing is copied.
+    let fx = Fixture::changing(&["n1"], false);
+    let look = TableLook::new(&fx).ran_out_of_room("n1");
+    let runner = World::new(
+        StrictFake::new()
+            // The fleet anchor is taken before any host is looked at, and
+            // given back when the run ends.
+            .expect(helper("box", &["lock", "acquire", "--run", "run-1"]), ok())
+            .expect(helper("box", &["lock", "release", "--run", "run-1"]), ok()),
+        &look,
+    );
+    let applied = fx
+        .executor(&runner, &look, fx.options())
+        .run()
+        .expect("a stopped wave is an answer and not a crash");
+    let stopped = applied.stopped.clone().unwrap_or_default();
+    assert!(
+        stopped.contains("free on the filesystem that carries /nix"),
+        "{stopped}"
+    );
+
+    // Nothing was copied, nothing was locked on the host itself, nothing
+    // was activated: the only commands were the anchor's.
+    for call in runner.calls() {
+        assert!(
+            call.contains("lock acquire") || call.contains("lock release"),
+            "the run ran {call} after a preflight that failed"
+        );
+    }
+    runner.verify().expect("the anchor and nothing else");
+
+    // The receipt says the host was not reached and names the step that
+    // said so, with the sentence as its evidence.
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Unreached);
+    assert_eq!(applied.receipt.untouched, ["n1"]);
+    let preflight = applied.receipt.hosts["n1"]
+        .actions
+        .iter()
+        .find(|a| a.kind == ActionKind::Preflight)
+        .expect("n1 has a preflight");
+    assert_eq!(preflight.result, Some(ActionResult::Failed));
+    assert!(
+        preflight.evidence.join(" ").contains("2000000000"),
+        "{:?}",
+        preflight.evidence
+    );
 }

@@ -672,23 +672,53 @@ impl<'a> Executor<'a> {
                 self.guard(&fresh, id, hosts)?;
                 self.begin(journal, id, action)?;
                 let seen = fresh.host(id).cloned();
-                self.end(
-                    journal,
-                    id,
-                    action,
-                    ActionResult::Ok,
-                    vec![format!(
-                        "identity {}, generation {}",
-                        seen.as_ref()
-                            .and_then(|o| o.identity.host_key_fingerprint.clone())
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        seen.as_ref()
-                            .and_then(|o| o.generation)
-                            .map(|g| g.to_string())
-                            .unwrap_or_else(|| "unknown".to_string())
-                    )],
-                    Vec::new(),
-                )?;
+                let mut evidence = vec![format!(
+                    "identity {}, generation {}",
+                    seen.as_ref()
+                        .and_then(|o| o.identity.host_key_fingerprint.clone())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    seen.as_ref()
+                        .and_then(|o| o.generation)
+                        .map(|g| g.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                )];
+                // --- lane 4A: the hardware preflight ---
+                //
+                // The same function the plan was made with, asked again
+                // against the snapshot of THIS minute and before anything
+                // is copied. The plan's answer is a document; this one is
+                // the one that stands between a release and a machine that
+                // stopped being the machine the inventory describes —
+                // a disk that filled up, a card that was pulled, a NIC that
+                // was swapped, a `/dev/kvm` that is not there.
+                //
+                // It fails the step rather than only recording it: this is
+                // the last look before `stage`, and the whole point of a
+                // preflight is that what it finds does not get copied over.
+                if let Some(obs) = seen.as_ref() {
+                    let host = &self.release.resolved_fleet.hosts[id];
+                    let verdict = crate::plan::hardware_verdict(
+                        id,
+                        host,
+                        obs,
+                        self.release.artifacts[id].toplevel.closure_size,
+                    );
+                    if !verdict.is_clear() {
+                        let why = verdict.blocked.join(" ");
+                        self.end(
+                            journal,
+                            id,
+                            action,
+                            ActionResult::Failed,
+                            verdict.blocked.clone(),
+                            Vec::new(),
+                        )?;
+                        bail!("the preflight of {id} found the machine changed: {why}");
+                    }
+                    evidence.extend(verdict.met);
+                }
+                // --- end lane 4A ---
+                self.end(journal, id, action, ActionResult::Ok, evidence, Vec::new())?;
                 self.move_to(journal, id, hosts, HostState::Preflight, fresh.host(id))?;
             }
             ActionKind::Lock => {
