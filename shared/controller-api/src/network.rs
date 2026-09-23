@@ -183,6 +183,137 @@ pub fn cut_external_addr(network: &ProviderNetwork, routers: &[Router]) -> Optio
     Some(format!("{address}/{prefix}"))
 }
 
+/// The bare host part of a stored external address: `203.0.113.10/24` is the
+/// same claim on the wire as `203.0.113.10/32`, and the mask is a fact about
+/// the provider network rather than about who holds the address.
+fn bare_addr(stored: &str) -> &str {
+    stored.split('/').next().unwrap_or("")
+}
+
+/// What a pass has to do about the external address of ONE router.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AddressClaim {
+    /// Leave `status.external_addr` exactly as it is.
+    Keep,
+    /// Write this address: the router holds none and this one is free.
+    Take(String),
+    /// Clear the address this router is holding. Somebody with a lower name
+    /// holds it too, and only one of them may.
+    Yield,
+}
+
+/// The routers OTHER than `name` that hold the same address, by name.
+///
+/// Compared on the host part, because that is what is on the wire and what
+/// [`cut_external_addr`] counts as taken.
+pub fn other_holders<'a>(name: &str, address: &str, routers: &'a [Router]) -> Vec<&'a str> {
+    let wanted = bare_addr(address);
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let mut holders: Vec<&str> = routers
+        .iter()
+        .filter(|r| r.metadata.name != name)
+        .filter(|r| bare_addr(&r.status.external_addr) == wanted)
+        .map(|r| r.metadata.name.as_str())
+        .collect();
+    holders.sort_unstable();
+    holders
+}
+
+/// The whole of the external-address decision for one router, out of the
+/// listing as it stands.
+///
+/// Astra finding S09, 2026-09-23: this used to be two half-rules, one per
+/// tier. The cluster asked the question only while the address was still
+/// empty and, having written one, made only ITSELF give way and only to a
+/// lower name; the cloud asked nothing at all after writing. That leaves one
+/// interleaving in which a duplicate stands for ever: A and B both cut `.10`
+/// out of the same stale listing, B writes first and finds no conflict, A
+/// writes, sees B, and keeps `.10` because A sorts lower -- which is right --
+/// and B never looks again. Two routers then answer for one address on the
+/// provider wire, and the next `cut_external_addr` hands the next caller a
+/// third.
+///
+/// Two properties make the duplicate impossible instead of unlikely:
+///
+///   * the question is asked on EVERY pass, whether or not an address is
+///     already written, so the router that wrote first re-checks too, and
+///   * the rule is symmetric -- a router keeps the address only if its own
+///     name is the minimum of {itself} and everybody else holding it -- so
+///     out of any set of holders exactly one keeps it and every other one
+///     yields, at whatever pass each of them next runs.
+///
+/// Deterministic out of names alone, which is what lets leaderless replicas
+/// reach it without agreeing on anything, and level-triggered: a router that
+/// yielded simply has no address on the next pass and takes the next free
+/// one.
+pub fn claim_external_addr(
+    router: &Router,
+    network: &ProviderNetwork,
+    routers: &[Router],
+) -> AddressClaim {
+    let name = router.metadata.name.as_str();
+    let held = router.status.external_addr.as_str();
+    if bare_addr(held).is_empty() {
+        return match cut_external_addr(network, routers) {
+            Some(address) => AddressClaim::Take(address),
+            // Nothing held and nothing free: there is nothing to write, and
+            // the caller says so in its own words.
+            None => AddressClaim::Keep,
+        };
+    }
+    match other_holders(name, held, routers)
+        .into_iter()
+        .any(|other| other < name)
+    {
+        true => AddressClaim::Yield,
+        false => AddressClaim::Keep,
+    }
+}
+
+/// [`claim_external_addr`] against the store, applied: the helper both tiers
+/// call in place of an address rule of their own.
+///
+/// At most two rounds, and the second is the point. The first writes an
+/// address if the router had none; the second looks at the listing AFTER that
+/// write, which is the only way a replica finds out that somebody else wrote
+/// the same address in the same instant. A router that already had an address
+/// is answered by the first round alone -- `Keep` or `Yield` -- which is the
+/// re-check the cluster tier used to skip and the cloud tier never made.
+pub async fn settle_external_addr(
+    store: &crate::store::EtcdStore,
+    router: Router,
+    network: &ProviderNetwork,
+) -> crate::store::Result<Router> {
+    let name = router.metadata.name.clone();
+    let mut router = router;
+    for _ in 0..2 {
+        let routers = store.list::<Router>().await?;
+        match claim_external_addr(&router, network, &routers) {
+            AddressClaim::Keep => break,
+            AddressClaim::Take(address) => {
+                let taken = address.clone();
+                router = store
+                    .mutate::<Router, _>(&name, |r| r.status.external_addr = taken.clone())
+                    .await?;
+                tracing::info!(router = %name, address = %address, "external address cut");
+            }
+            AddressClaim::Yield => {
+                let lost = router.status.external_addr.clone();
+                let to = other_holders(&name, &lost, &routers).join(", ");
+                tracing::warn!(router = %name, address = %lost, lost_to = %to,
+                               "lost the claim on this external address, taking it back");
+                router = store
+                    .mutate::<Router, _>(&name, |r| r.status.external_addr.clear())
+                    .await?;
+                break;
+            }
+        }
+    }
+    Ok(router)
+}
+
 /// The rules this router really carries, derived from what is stored.
 ///
 /// Decision 5, and the derivation is the whole of it: an operator writes

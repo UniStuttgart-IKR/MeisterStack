@@ -252,17 +252,17 @@ async fn reconcile_router(
             .await?;
     }
 
-    // The address, cut once and kept for life.
-    let mut router = router;
-    if router.status.external_addr.is_empty()
-        && let Some(address) = network::cut_external_addr(network, estate.held)
-    {
-        let taken = address.clone();
-        router = store
-            .mutate::<Router, _>(&name, |r| r.status.external_addr = taken.clone())
-            .await?;
-        info!(router = %name, address = %address, "external address cut");
-    }
+    // The address: cut once and kept for life, and asked about on every pass.
+    //
+    // Astra finding S09, 2026-09-23: this tier cut out of `estate.held` -- a
+    // listing taken before the write -- and then never looked again. Two
+    // replicas reconciling two routers in the same instant both saw the same
+    // free address, both wrote it, and neither of them found out. The check
+    // and the rule are `network::settle_external_addr` now, the same function
+    // the cluster tier asks, so a duplicate resolves the same way in both
+    // tiers: the lowest name of the holders keeps the address and every other
+    // holder gives it back on its own next pass.
+    let mut router = network::settle_external_addr(store, router, network).await?;
 
     // The derived halves: the prefixes this router announces, and the rules
     // — which carry those prefixes as `routed` entries, because the contract
@@ -640,6 +640,98 @@ mod tests {
         let mut other_tenant = ip.clone();
         other_tenant.spec.tenant = "acme".into();
         assert!(!carried_down(&other_tenant, &router, &nats));
+    }
+
+    /// Astra finding S09, 2026-09-23, this tier's half: the cut is made out
+    /// of a snapshot, so it has to be checked against the listing afterwards.
+    ///
+    /// `reconcile_routers` lists the routers once per router and hands the
+    /// listing down as `estate.held`. Two replicas reconciling two routers in
+    /// the same instant therefore both read the same free address out of two
+    /// snapshots that are both already out of date, both write it, and -- this
+    /// being the tier that made no re-check at all -- both keep it. The
+    /// tenant's way out and somebody else's then answer for one address on
+    /// the provider wire.
+    ///
+    /// The rule is the cluster tier's, out of the same function, so that a
+    /// duplicate cannot be resolved one way up here and another way down
+    /// there: the lowest name of the holders keeps the address.
+    #[test]
+    fn two_routers_that_both_wrote_the_same_external_address_do_not_both_keep_it() {
+        use controller_api::network::{AddressClaim, claim_external_addr};
+
+        let net = ProviderNetwork::declare(
+            "ext",
+            controller_api::ProviderNetworkSpec {
+                physnet: "ext".into(),
+                cidr: "198.51.100.0/24".into(),
+                gateway: "198.51.100.1".into(),
+                allocation: vec!["198.51.100.10-198.51.100.20".into()],
+                description: String::new(),
+            },
+        );
+        let holding = |name: &str, address: &str| {
+            let mut r = Router::declare(
+                name,
+                controller_api::RouterSpec {
+                    provider_network: "ext".into(),
+                    ..Default::default()
+                },
+            );
+            r.status.external_addr = address.into();
+            r
+        };
+
+        // The stale snapshot both replicas cut out of: nobody holds anything.
+        let stale: Vec<Router> = vec![holding("acme-out", ""), holding("beta-out", "")];
+        assert_eq!(
+            claim_external_addr(&stale[0], &net, &stale),
+            AddressClaim::Take("198.51.100.10/24".to_string())
+        );
+        assert_eq!(
+            claim_external_addr(&stale[1], &net, &stale),
+            AddressClaim::Take("198.51.100.10/24".to_string()),
+            "out of the same snapshot, the same address -- which is the race"
+        );
+
+        // Both wrote it. The listing as it now stands is what decides.
+        let mut held = vec![
+            holding("acme-out", "198.51.100.10/24"),
+            holding("beta-out", "198.51.100.10/24"),
+        ];
+        assert_eq!(
+            claim_external_addr(&held[0], &net, &held),
+            AddressClaim::Keep
+        );
+        assert_eq!(
+            claim_external_addr(&held[1], &net, &held),
+            AddressClaim::Yield,
+            "the higher name gives the address back, on this tier too"
+        );
+        held[1].status.external_addr.clear();
+        assert_eq!(
+            held.iter()
+                .filter(|r| r.status.external_addr == "198.51.100.10/24")
+                .count(),
+            1,
+            "exactly one router answers for the address"
+        );
+
+        // And the loser is not left without one: the next pass takes the next
+        // free address and both are settled from then on.
+        assert_eq!(
+            claim_external_addr(&held[1], &net, &held),
+            AddressClaim::Take("198.51.100.11/24".to_string())
+        );
+        held[1].status.external_addr = "198.51.100.11/24".into();
+        assert_eq!(
+            claim_external_addr(&held[0], &net, &held),
+            AddressClaim::Keep
+        );
+        assert_eq!(
+            claim_external_addr(&held[1], &net, &held),
+            AddressClaim::Keep
+        );
     }
 
     /// Decision 4's first half: the cluster is the one whose nodes gave an

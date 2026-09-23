@@ -860,6 +860,21 @@ impl crate::LinuxNetworkDriver {
     pub(crate) async fn destroy_router_impl(&self, id: &RouterId) -> networking::Result<()> {
         let netns = router_netns(id);
         self.ip_again(&["netns", "del", &netns]).await;
+        // Astra finding S10, 2026-09-23: `ip_again` swallows every failure,
+        // so a `netns del` that did NOT happen -- a namespace something still
+        // holds open, an `ip` that is not on PATH -- used to run straight on
+        // into the record removal and report the router gone. The tier above
+        // then believes the external address is free and hands it to another
+        // node while this namespace is still answering for it. Ask the kernel
+        // instead of the exit code: the name has to be off `ip netns list`
+        // before anything here may claim the router was taken down, and the
+        // record stays on disk until it is, so the next pass retries.
+        if self.netns_present().await?.iter().any(|n| n == &netns) {
+            return Err(NetworkError::Backend(anyhow::anyhow!(
+                "the namespace {netns} is still listed after `ip netns del`, so this router was \
+                 not taken down; its record is kept and the teardown is retried"
+            )));
+        }
         for host in [veth_external(id), veth_internal(id)] {
             if self.link_index(&host).await?.is_some() {
                 self.ip_again(&["link", "del", &host]).await;
@@ -942,6 +957,17 @@ impl crate::LinuxNetworkDriver {
                 continue;
             }
             self.ip_again(&["netns", "del", &netns]).await;
+            // Astra finding S10, 2026-09-23: the same swallowed failure, and
+            // here it would become a sentence to the tier above -- the swept
+            // list travels to `session::ingest::sweep_routers`, which reads
+            // it as "these are gone". A namespace that would not go is named
+            // in the log and left out of that list.
+            if self.netns_present().await?.iter().any(|n| n == &netns) {
+                warn!(netns = %netns,
+                      "this orphaned namespace is still listed after `ip netns del`; \
+                       it is not reported as swept");
+                continue;
+            }
             info!(netns = %netns, "orphaned router removed: no record on this node names it");
             swept.push(netns);
         }
@@ -1042,6 +1068,42 @@ fn classify(
 mod tests {
     use super::*;
     use agent_api::networking::{NatKind, NatRule};
+
+    /// A shell script wearing a binary's name -- the pattern
+    /// `drivers/input/tests/backend.rs` uses, for the same reason: what is
+    /// being asserted here is how this driver reads an answer, and an answer
+    /// can be written down without the kernel that would otherwise give it.
+    fn fake_binary(dir: &Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("a fake binary");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("and it is executable");
+        path.display().to_string()
+    }
+
+    /// A driver whose `ip` and `nft` are the two scripts above.
+    fn fake_driver(dir: &Path, ip_body: &str) -> crate::LinuxNetworkDriver {
+        let ip = fake_binary(dir, "ip", ip_body);
+        // `Nft::new` proves at start-up that this process may write a table;
+        // the fake says yes and reads the script off stdin so that nothing
+        // here dies of a broken pipe.
+        let nft = fake_binary(dir, "nft", "cat > /dev/null\nexit 0\n");
+        crate::LinuxNetworkDriver::build(
+            None,
+            crate::nftables::NftConfig {
+                binary: nft,
+                guarded: common::net::Ipv4Ranges::default(),
+            },
+            Some(GatewayConfig {
+                physnets: BTreeMap::from([("ext".to_string(), "pxlink".to_string())]),
+                ip,
+                arping: "arping".to_string(),
+                state_dir: dir.to_path_buf(),
+            }),
+        )
+        .expect("the driver comes up against the fakes")
+    }
 
     fn spec(active: bool) -> RouterSpec {
         RouterSpec {
@@ -1220,6 +1282,67 @@ mod tests {
     /// tier above may fail a router over on the first and must not on the
     /// second. Until the word existed both arrived as the same phase with a
     /// different sentence.
+    /// Astra finding S10, 2026-09-23: a teardown reports what the kernel
+    /// says, not what `ip netns del` returned.
+    ///
+    /// `ip_again` swallows every failure on purpose -- a level-triggered
+    /// ensure must not trip over "File exists" -- and the teardown used to
+    /// borrow it for `netns del` as well. A namespace that something still
+    /// holds open therefore ended as `Ok(())` with the record deleted, and
+    /// the tier above handed the external address to another node while this
+    /// namespace was still answering for it on the wire. The fake `ip` below
+    /// is exactly that kernel: the delete is refused and the name goes on
+    /// being listed.
+    #[tokio::test]
+    async fn a_teardown_that_leaves_the_namespace_behind_is_not_ok() {
+        let temp = tempfile::Builder::new()
+            .prefix("ms-router-s10-")
+            .tempdir()
+            .expect("a state directory");
+        let dir = temp.path();
+        let s = spec(true);
+        let netns = router_netns(&s.id);
+        let record = crate::LinuxNetworkDriver::record_path(dir, &s.id);
+        std::fs::write(
+            &record,
+            serde_json::to_vec(&RouterRecord { spec: s.clone() }).expect("a record"),
+        )
+        .expect("the record this node wrote when it built the router");
+
+        let busy = fake_driver(
+            dir,
+            &format!(
+                r#"case "$1 $2" in
+"netns del") echo "Cannot remove namespace file: Device or resource busy" >&2; exit 1;;
+"netns list") echo "{netns} (id: 0)";;
+*) exit 0;;
+esac
+"#
+            ),
+        );
+        let err = busy
+            .destroy_router_impl(&s.id)
+            .await
+            .expect_err("a namespace that is still there is not a router that was taken down");
+        assert!(matches!(err, NetworkError::Backend(_)), "{err:#}");
+        let said = format!("{err:#}");
+        assert!(said.contains(&netns), "{said}");
+        assert!(
+            record.exists(),
+            "the record is this node's claim on the address, and it is kept until the \
+             namespace is actually gone"
+        );
+
+        // And the other half, so that the gate is a gate and not a wall: the
+        // same teardown against a kernel that DID let go removes the record
+        // and answers Ok.
+        let gone = fake_driver(dir, "exit 0\n");
+        gone.destroy_router_impl(&s.id)
+            .await
+            .expect("a namespace that is off the list is a router that is gone");
+        assert!(!record.exists(), "and then the record goes with it");
+    }
+
     #[test]
     fn a_router_says_which_of_the_three_things_is_wrong_with_it() {
         let netns = "meister-rt-1a2b3c4d-5e6f-0000-0000-000000000000";

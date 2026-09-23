@@ -23,7 +23,7 @@ pub mod volumes;
 
 use anyhow::{Context, anyhow, bail};
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tracing::{debug, error, info, instrument, warn};
@@ -144,6 +144,45 @@ fn heals_without_an_operator(e: &anyhow::Error) -> bool {
 /// be a unit systemd eventually kills, which is the very ambiguity the
 /// farewell exists to remove.
 const LAST_WORD: Duration = Duration::from_secs(2);
+
+/// How long this node goes on answering for its routers' addresses after it
+/// has lost every controller.
+///
+/// Astra finding S08, 2026-09-23: `fall_silent` was reachable from exactly
+/// one place, `say_goodbye`, so it ran when somebody stopped the unit and
+/// never when the machine merely lost the control plane. A gateway in that
+/// state keeps its namespace, its external address and its ARP answers while
+/// the cluster, hearing nothing, hands the address to the standby -- and two
+/// machines then answer for one address on the provider wire. The measured
+/// shape of it is in the farewell's own note: manacor answered ARP for
+/// 10.128.1.210 eight seconds after its standby took over.
+///
+/// This is the dead man, and the number is arithmetic rather than taste. The
+/// tier above declares a node gone `HEARTBEAT_TIMEOUT_SECS` = 30s after the
+/// last heartbeat it stamped -- spelled here and not imported, for the reason
+/// `proto::KEEPALIVE_TIMEOUT` gives one crate over: the agent does not depend
+/// on the controller -- and its next router pass then makes a standby active
+/// and shouts for the address. This node has to be silent before that, in
+/// both of the ways a controller can be lost:
+///
+///   * the session ENDS and says so (a replica restarting, a reset). The last
+///     report the controller stamped is at most `STATUS_INTERVAL` = 10s old,
+///     so the earliest promotion is `session end + 30 - 10` = +20s, and
+///     silence at +10s leaves ten seconds.
+///   * the wire goes BLACK and nothing says so. Finding out costs this end
+///     `proto::KEEPALIVE_INTERVAL` + `proto::KEEPALIVE_TIMEOUT` = 15s, and
+///     the controller's own clock started when the wire did, so the earliest
+///     promotion is `black + 30s` and this node is silent at `black + 15 +
+///     10` = +25s. Five seconds, and the check runs between dial attempts,
+///     each of which is bounded by `proto::DIAL_TIMEOUT` = 3s.
+///
+/// Ten seconds is also comfortably more than a redial that finds anybody at
+/// all -- half a second of backoff and a three-second dial -- so a controller
+/// that merely restarted does not cost a tenant its gateway. The other
+/// direction is cheap: `EnsureRouter` is level-triggered, so a node that fell
+/// silent and then got its controller back is told to speak again within one
+/// router pass.
+const ROUTER_DEAD_MAN: Duration = Duration::from_secs(10);
 
 /// Whether this agent is on its way out, and whether it has said so.
 ///
@@ -1061,6 +1100,12 @@ async fn dial_forever(
     tls: Option<&tonic::transport::ClientTlsConfig>,
     redial: &mut common::redial::Redial,
 ) {
+    // The dead man's clock: the last moment a controller was on the other
+    // end of this stream. It starts now, because a node that has not been
+    // reached since it came up is exactly as silent to the tier above as one
+    // that lost the controller an hour in. See `ROUTER_DEAD_MAN`.
+    let mut last_up = Instant::now();
+    let mut silenced = false;
     loop {
         let addr = redial.endpoint().to_string();
         let (position, of) = redial.position();
@@ -1072,10 +1117,79 @@ async fn dial_forever(
             Err(e) => warn!(endpoint = %addr, error = %format!("{e:#}"),
                             "controller session failed"),
         }
-        if let Some(wait) = redial.ended(established) {
-            warn!(?wait, endpoints = of, "no controller answered, waiting");
-            tokio::time::sleep(wait).await;
+        if established {
+            // A session that got as far as a Hello is a controller that has
+            // this node's report again, so the clock starts from the moment
+            // that session ENDED. Nothing is re-ensured from here on purpose:
+            // `EnsureRouter` is level-triggered, and the cluster's next
+            // router pass tells this node what it is -- active or standby --
+            // within a tick. A node that decided for itself to speak again
+            // would be deciding a failover.
+            last_up = Instant::now();
+            silenced = false;
         }
+        let wait = redial.ended(established);
+        if let Some(wait) = wait {
+            warn!(?wait, endpoints = of, "no controller answered, waiting");
+        }
+        wait_out_the_backoff(agent, last_up, &mut silenced, wait.unwrap_or_default()).await;
+    }
+}
+
+/// Has this node been out of touch long enough to stop answering for its
+/// routers?
+///
+/// Astra finding S08, 2026-09-23. Pure, and its own function for the reason
+/// `classify` is one in the network driver: it is the whole of the decision,
+/// what it decides is whether a tenant's gateway speaks, and it is worth
+/// asserting without a controller, a socket and a clock.
+///
+/// `>=` because a deadline is a deadline, and `saturating_duration_since`
+/// because `Instant` subtraction panics on a reversed order in a debug build
+/// -- a clock that appears to have gone backwards must not take a gateway
+/// down, the same rule `heartbeat::expired` follows one tier up.
+fn should_fall_silent(last_seen: Instant, now: Instant, threshold: Duration) -> bool {
+    now.saturating_duration_since(last_seen) >= threshold
+}
+
+/// Wait out the redial backoff, and let this node's routers fall silent if
+/// the controller has been gone longer than the dead man allows.
+///
+/// The waiting and the deadline are one function because the backoff climbs
+/// to thirty seconds (`common::redial`), which is longer than
+/// `ROUTER_DEAD_MAN` -- a dead man that is slept through is not one. So the
+/// sleep ends at whichever comes first, and once the routers are silent there
+/// is nothing left to wake up for and the rest of the backoff is slept in one
+/// piece.
+///
+/// It silences ONCE per outage. `dial_forever` clears the flag when a session
+/// says Hello again, which is the only thing that makes this node a candidate
+/// to speak for anything.
+async fn wait_out_the_backoff(
+    agent: &Arc<Agent>,
+    last_up: Instant,
+    silenced: &mut bool,
+    wait: Duration,
+) {
+    let until = Instant::now() + wait;
+    loop {
+        let now = Instant::now();
+        if !*silenced && should_fall_silent(last_up, now, ROUTER_DEAD_MAN) {
+            warn!(deadline = ?ROUTER_DEAD_MAN,
+                  "no controller has answered for longer than the dead man's deadline; this \
+                   node stops answering for its routers' addresses before the cluster can give \
+                   them to a standby");
+            stop_speaking_for_every_router(agent).await;
+            *silenced = true;
+        }
+        if now >= until {
+            return;
+        }
+        let next = match *silenced {
+            true => until,
+            false => until.min(last_up + ROUTER_DEAD_MAN),
+        };
+        tokio::time::sleep_until(tokio::time::Instant::from_std(next)).await;
     }
 }
 
@@ -1122,6 +1236,13 @@ async fn say_goodbye(agent: &Arc<Agent>) {
 /// It takes nothing down. A stopping agent's routers stay built for the same
 /// reason its guests stay running — `systemctl restart` is not an outage —
 /// and what is left behind is exactly a standby.
+///
+/// Astra finding S08, 2026-09-23: it has a second caller now. A farewell is
+/// only the orderly way to lose a controller; `wait_out_the_backoff` calls
+/// this for the other way, where nobody said anything and the tier above is
+/// about to promote a standby on a timer. Same call, same result, and
+/// deliberately the same function -- two definitions of "stop speaking" is
+/// how the two of them start disagreeing.
 async fn stop_speaking_for_every_router(agent: &Agent) {
     let Some(bridge) = agent.reconciler.drivers().bridge.as_ref() else {
         return;
@@ -1507,6 +1628,67 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Astra finding S08, 2026-09-23: when a node that has lost only the
+    /// control plane has to stop answering for its routers.
+    ///
+    /// The decision is a subtraction and a comparison, and everything that
+    /// makes it correct is in the three numbers it is compared against -- so
+    /// the arithmetic in `ROUTER_DEAD_MAN`'s note is asserted here rather
+    /// than only written down. A change to `STATUS_INTERVAL` or to either of
+    /// the keepalive constants moves the deadline this node needs, and
+    /// without this test it would move silently: the failure is two machines
+    /// answering for one address on a provider wire, which nothing in a
+    /// workspace test could otherwise see.
+    #[test]
+    fn a_node_that_lost_the_controller_falls_silent_before_a_standby_can_be_promoted() {
+        let lost = Instant::now();
+
+        assert!(
+            !should_fall_silent(lost, lost, ROUTER_DEAD_MAN),
+            "the moment the session ends is not yet an outage"
+        );
+        assert!(!should_fall_silent(
+            lost,
+            lost + ROUTER_DEAD_MAN - Duration::from_millis(1),
+            ROUTER_DEAD_MAN
+        ));
+        assert!(
+            should_fall_silent(lost, lost + ROUTER_DEAD_MAN, ROUTER_DEAD_MAN),
+            "a deadline is a deadline"
+        );
+        assert!(should_fall_silent(
+            lost,
+            lost + Duration::from_secs(600),
+            ROUTER_DEAD_MAN
+        ));
+        // A clock that appears to have gone backwards must not take a
+        // gateway down, which is what an unsaturated subtraction would do.
+        assert!(!should_fall_silent(
+            lost + Duration::from_secs(30),
+            lost,
+            ROUTER_DEAD_MAN
+        ));
+
+        // The arithmetic. `HEARTBEAT_TIMEOUT_SECS` is 30 in
+        // `controller_api::heartbeat`, and it is spelled out here because the
+        // agent does not depend on the controller -- the same seam
+        // `proto::KEEPALIVE_TIMEOUT` documents.
+        const CONTROLLER_CALLS_A_NODE_DEAD: Duration = Duration::from_secs(30);
+        assert!(
+            ROUTER_DEAD_MAN + STATUS_INTERVAL < CONTROLLER_CALLS_A_NODE_DEAD,
+            "a session that ended cleanly: the last heartbeat the controller \
+             stamped is at most one report old, so the promotion is at \
+             `end + 30 - 10` and this node has to be silent before it"
+        );
+        assert!(
+            ROUTER_DEAD_MAN + proto::KEEPALIVE_INTERVAL + proto::KEEPALIVE_TIMEOUT
+                < CONTROLLER_CALLS_A_NODE_DEAD,
+            "and a wire that went black without saying so: finding out costs \
+             this end one keepalive interval plus its timeout, and the \
+             controller's own clock started when the wire did"
+        );
+    }
 
     /// The two words a node puts in `RouterReport.phase`, held against the
     /// constants the tier above matches on.
