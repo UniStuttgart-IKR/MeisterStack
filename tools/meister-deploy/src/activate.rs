@@ -286,6 +286,35 @@ fn check_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+// --- Astra finding F07, 2026-09-23 -----------------------------------------
+
+/// The pid out of a `<id>.deciding` file, which reads `<verb> pid <n> at
+/// <time>`. `None` for anything this program did not write.
+fn deciding_pid(held: &str) -> Option<u32> {
+    let rest = held.split_once(" pid ")?.1;
+    let digits = rest.split_whitespace().next()?;
+    digits.parse().ok()
+}
+
+/// Whether that process is on this machine. The same question, and the same
+/// answer, as the operator's lock asks of its own holder: signal 0 is what
+/// `kill` answers without doing anything, and `EPERM` means it exists and
+/// belongs to somebody else, which is still "it exists".
+fn is_running(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Ok(()) | Err(nix::errno::Errno::EPERM)
+    )
+}
+
+// --- end Astra finding F07 -------------------------------------------------
+
 /// The state of the machine, and the tools to change it.
 pub struct Helper<'a> {
     pub runner: &'a dyn Runner,
@@ -902,8 +931,72 @@ impl<'a> Helper<'a> {
     // confirm and revert
     // -----------------------------------------------------------------
 
+    /// Hold one transaction for the length of one decision.
+    ///
+    /// Astra finding F07, 2026-09-23: `confirm` and `revert` were both a
+    /// read, a look at the state, work on the machine and a write, with
+    /// nothing between them. The two arrive from different directions —
+    /// an operator (or `apply`) over ssh, and the transient revert timer on
+    /// the host itself — and they meet exactly at the deadline, which is
+    /// the moment this whole mechanism exists for. Interleaved, both read
+    /// `pending`, the revert puts the old system back and the confirm then
+    /// writes `confirmed`: the machine runs one system and its record says
+    /// the other, which is the one thing no resume can recover from.
+    ///
+    /// `O_EXCL` on a file beside the record, for the same reason the host
+    /// lock uses it and in the same directory — `records()` reads only
+    /// `<id>.json`, so this name is invisible to every reader. A holder
+    /// whose process is gone is not a holder: a machine that lost power
+    /// while deciding must not be a machine whose timer can never fire
+    /// again.
+    fn deciding<T>(&self, id: &str, what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let path = self.txn_dir().join(format!("{id}.deciding"));
+        self.files.create_dir_all(&self.txn_dir())?;
+        let mine = format!("{what} pid {} at {}", std::process::id(), self.clock.now());
+        if let Err(e) = self.files.create_new(&path, mine.as_bytes(), 0o600) {
+            let held = self.files.read_to_string(&path).unwrap_or_default();
+            // No exception for this process's own pid: nothing here decides
+            // one transaction inside another, so a holder that is running is
+            // a holder whatever its number is.
+            if let Some(pid) = deciding_pid(&held)
+                && is_running(pid)
+            {
+                bail!(
+                    "the transaction {id} is being decided right now ({}). A confirm and a \
+                     revert at once leave the machine on one system and the record saying the \
+                     other, so this one did nothing.",
+                    held.trim()
+                );
+            }
+            // Nobody is behind it. It is taken over, and the takeover is
+            // the same exclusive create once the stale one is gone.
+            self.files.remove_file(&path)?;
+            self.files
+                .create_new(&path, mine.as_bytes(), 0o600)
+                .with_context(|| {
+                    format!(
+                        "the transaction {id} could not be held for this decision ({e:#}), and the \
+                     record that was there ({}) could not be replaced either.",
+                        held.trim()
+                    )
+                })?;
+        }
+        let out = f();
+        // Given back whatever happened: a decision that failed is a
+        // decision somebody has to be able to make again.
+        if let Err(e) = self.files.remove_file(&path) {
+            eprintln!("note: {} was not removed: {e:#}", path.display());
+        }
+        out
+    }
+
     /// Keep it. The timer goes first, then the record says so.
     pub fn confirm(&self, id: &str) -> Result<TxnRecord> {
+        check_id(id)?;
+        self.deciding(id, "confirm", || self.confirm_held(id))
+    }
+
+    fn confirm_held(&self, id: &str) -> Result<TxnRecord> {
         let mut record = self.record(id)?;
         match record.state {
             TxnState::Confirmed => return Ok(record),
@@ -948,6 +1041,11 @@ impl<'a> Helper<'a> {
     /// Take it back. Called by an operator, by `apply` when a check fails,
     /// and by the timer when nobody says anything at all.
     pub fn revert(&self, id: &str, because: Option<&str>) -> Result<TxnRecord> {
+        check_id(id)?;
+        self.deciding(id, "revert", || self.revert_held(id, because))
+    }
+
+    fn revert_held(&self, id: &str, because: Option<&str>) -> Result<TxnRecord> {
         let mut record = self.record(id)?;
         match record.state {
             TxnState::Confirmed => bail!(
@@ -1054,7 +1152,27 @@ impl<'a> Helper<'a> {
         run_id: Option<&str>,
         forced: Option<&str>,
     ) -> Result<TxnRecord> {
-        let mut record = self.record(id)?;
+        let mut record = match self.record(id) {
+            Ok(record) => record,
+            // Astra finding F06, 2026-09-23: a retire that has already
+            // happened is the outcome this asks for. A resume now repeats
+            // the `unlock` step of a host whose run stopped after the
+            // confirm, and that step retires a record the interrupted run
+            // may already have archived — which used to fail the whole
+            // resume with "there is no transaction on this host". The
+            // archive is the proof that it happened, and it is handed back
+            // unchanged.
+            Err(e) => {
+                let archive = self.txn_archive(id);
+                if !self.files.exists(&archive) {
+                    return Err(e);
+                }
+                return TxnRecord::from_json(
+                    &self.files.read_to_string(&archive)?,
+                    &archive.display().to_string(),
+                );
+            }
+        };
         if let (Some(asked), Some(owner)) = (run_id, record.run_id.as_deref())
             && asked != owner
         {
@@ -1152,7 +1270,28 @@ impl<'a> Helper<'a> {
             Err(e) => match self.read_lock()? {
                 // The same run asking twice is asking whether it may act,
                 // and the answer is yes.
-                Some(held) if held.run_id == run_id => Ok(held),
+                //
+                // Astra finding F04, 2026-09-23: the run id alone was the
+                // whole question, so two operator processes carrying one run
+                // both got a yes here. This host cannot judge a pid — the
+                // number in the record is a process on a WORKSTATION and
+                // `kill(0)` here would ask about a stranger — so what it can
+                // ask is who is carrying the run, and it does. The other
+                // half of the door is `state::acquire_lock`, which refuses a
+                // second live process of one run on the workstation itself;
+                // the two together are what makes one run one writer. A pid
+                // that differs and an operator that does not is a resume
+                // after a kill, and that is the flow this shortcut exists
+                // for.
+                Some(held) if held.run_id == run_id && held.operator == operator => Ok(held),
+                Some(held) if held.run_id == run_id => bail!(
+                    "this host is held by the run {} as it is carried by {}, and this is {}. \
+                     One run is one writer: two operators carrying it write one journal twice \
+                     and make it unreadable. Nothing was changed.",
+                    held.run_id,
+                    held.operator,
+                    operator
+                ),
                 Some(held) => bail!(
                     "this host is held by the run {} since {} (operator {}, pid {}). \
                      Continue that run with `apply --resume {}`, or take it over with \
@@ -1195,6 +1334,13 @@ impl<'a> Helper<'a> {
     /// Take a named run's lock, deliberately. The id has to match what is
     /// there, so that a takeover cannot take over a run that started while
     /// somebody was reading the refusal.
+    ///
+    /// Astra finding F04, 2026-09-23: read, remove, create is three steps,
+    /// and two takeovers that both read the old owner went through all
+    /// three — the loser's `remove_file` taking away the winner's fresh
+    /// lock. The claim is a rename to a name of the taker's own, exactly as
+    /// in `state::take_over_lock`: a rename of a file that is gone fails, so
+    /// of two takers exactly one carries the record away.
     pub fn lock_take_over(
         &self,
         of_run: &str,
@@ -1202,31 +1348,67 @@ impl<'a> Helper<'a> {
         operator: &str,
         pid: u32,
     ) -> Result<Lock> {
-        match self.read_lock()? {
-            None => self.lock_acquire(run_id, operator, pid),
+        let path = self.lock_path();
+        if !self.files.exists(&path) {
+            return self.lock_acquire(run_id, operator, pid);
+        }
+        // --- lane 5C ---
+        // The taking run already has it, so there is nothing to take and the
+        // answer is yes — the same answer `lock_acquire` gives a run that
+        // asks twice. Asked BEFORE the claim below, because a run that
+        // already holds the host must not carry its own lock away.
+        //
+        // Measured in lab lane L2 (2026-09-23): `apply --takeover <old>` on
+        // a host the abandoned run had never locked. The fleet anchor (D6)
+        // reaches every control-plane host FIRST, finds no lock, and the
+        // takeover falls through to an acquire — so by the time the plan's
+        // own `lock` step runs on that same host, it is held by the NEW run,
+        // and the helper answered "this host is held by the run <new>, not
+        // by <old>. Nothing was taken over." The run took over from itself
+        // and the rollout stopped.
+        if let Some(held) = self.read_lock()?
+            && held.run_id == run_id
+        {
+            return Ok(held);
+        }
+        // --- end lane 5C ---
+        let claim = path.with_file_name(format!("owner.taken-by-{run_id}.json"));
+        self.files.rename(&path, &claim).with_context(|| {
+            format!(
+                "the lock on this host could not be taken over; another takeover was here \
+                 first, or the run gave {} back while you were reading.",
+                path.display()
+            )
+        })?;
+        let bytes = self.files.read(&claim)?;
+        match serde_json::from_slice::<Lock>(&bytes).ok() {
             Some(held) if held.run_id == of_run => {
-                self.files.remove_file(&self.lock_path())?;
+                self.files.remove_file(&claim)?;
                 self.lock_acquire(run_id, operator, pid)
             }
-            // --- lane 5C ---
-            // The taking run already has it, so there is nothing to take
-            // and the answer is yes — the same answer `lock_acquire` gives
-            // a run that asks twice.
-            //
-            // Measured in lab lane L2 (2026-09-23): `apply --takeover <old>`
-            // on a host the abandoned run had never locked. The fleet
-            // anchor (D6) reaches every control-plane host FIRST, finds no
-            // lock, and the takeover falls through to an acquire — so by
-            // the time the plan's own `lock` step runs on that same host,
-            // it is held by the NEW run, and the helper answered "this host
-            // is held by the run <new>, not by <old>. Nothing was taken
-            // over." The run took over from itself and the rollout stopped.
-            Some(held) if held.run_id == run_id => Ok(held),
-            // --- end lane 5C ---
-            Some(held) => bail!(
-                "this host is held by the run {}, not by {of_run}. Nothing was taken over.",
-                held.run_id
-            ),
+            // Not the run that was named, so it goes back exactly as it was.
+            // `create_new` and not `write_atomic`: it refuses to overwrite,
+            // so a lock somebody took in this window is not lost either.
+            other => {
+                let restored = self.files.create_new(&path, &bytes, 0o600);
+                let whose = match &other {
+                    Some(held) => format!("by the run {}", held.run_id),
+                    None => "by a file this program did not write".to_string(),
+                };
+                match restored {
+                    Ok(()) => {
+                        self.files.remove_file(&claim)?;
+                        bail!("this host is held {whose}, not by {of_run}. Nothing was taken over.")
+                    }
+                    Err(e) => bail!(
+                        "this host is held {whose}, not by {of_run}, and the lock could not be \
+                         put back ({e:#}) because something else took {} meanwhile. Nothing was \
+                         taken over; the record that was there is in {}.",
+                        path.display(),
+                        claim.display()
+                    ),
+                }
+            }
         }
     }
 
@@ -1494,11 +1676,24 @@ impl<'a> Helper<'a> {
     /// what is on the disk, and the record is what says whose rotation it
     /// was and why it ended. The two states the files cannot show
     /// (`confirmed`, `reverted`) are the record's alone.
+    ///
+    /// Astra finding F08, 2026-09-23: the switch is FOUR renames, and this
+    /// read the presence of any `.prev` as "switched" — so all three of the
+    /// half-switched shapes a crash leaves behind were read as the finished
+    /// one. The resume then skipped to `verify`, the verify found the wrong
+    /// certificate (or none), and `keys revert` refused because it needs
+    /// BOTH `.prev` files: the host was left without an active certificate
+    /// and in `recovery-required`, with no way for this tool to finish what
+    /// it started. So the four files are read as four, and only the one
+    /// tuple that is a finished switch is `switched`. Every other shape with
+    /// a `.prev` in it is `inconsistent`, which sends the resume to a person
+    /// instead of to a verify it cannot undo.
     pub fn keys_status(&self, kind: KeyKind) -> Result<KeysView> {
         let key_next = self.files.exists(&self.key_path_with(kind, Some("next")));
         let crt_next = self.files.exists(&self.cert_path_with(kind, Some("next")));
-        let prev = self.files.exists(&self.key_path_with(kind, Some("prev")))
-            || self.files.exists(&self.cert_path_with(kind, Some("prev")));
+        let key_prev = self.files.exists(&self.key_path_with(kind, Some("prev")));
+        let crt_prev = self.files.exists(&self.cert_path_with(kind, Some("prev")));
+        let prev = key_prev || crt_prev;
         let record = match self.files.read_to_string(&self.keys_record_path(kind)) {
             Ok(text) => match KeysRecord::from_json(
                 &text,
@@ -1528,20 +1723,47 @@ impl<'a> Helper<'a> {
             .as_ref()
             .filter(|r| matches!(r.state, KeysState::Confirmed | KeysState::Reverted))
             .map(|r| r.state);
-        let state = match (key_next, crt_next, prev) {
-            (_, _, true) => KeysState::Switched,
-            (true, true, false) => KeysState::Overlap,
-            (true, false, false) => KeysState::Prepared,
-            (false, true, false) => KeysState::Inconsistent,
-            (false, false, false) => finished.unwrap_or(KeysState::None),
+        let (state, reason) = match (key_next, crt_next, key_prev, crt_prev) {
+            // The switch, whole: the prepared pair is in and the pair it
+            // replaced is beside it.
+            (false, false, true, true) => (KeysState::Switched, None),
+            (true, true, false, false) => (KeysState::Overlap, None),
+            (true, false, false, false) => (KeysState::Prepared, None),
+            (false, true, false, false) => (
+                KeysState::Inconsistent,
+                Some(format!(
+                    "{} is there and {} is not: a certificate without the key it belongs to.",
+                    self.cert_path_with(kind, Some("next")).display(),
+                    self.key_path_with(kind, Some("next")).display()
+                )),
+            ),
+            (false, false, false, false) => (finished.unwrap_or(KeysState::None), None),
+            // A switch that stopped between two of its renames. Which files
+            // are there says where it stopped, and that is what a person
+            // needs; this tool will not finish a switch it can only see half
+            // of, and it will not call one done either.
+            _ => (
+                KeysState::Inconsistent,
+                Some(format!(
+                    "the {kind} key files on this host are a switch that stopped in the \
+                     middle: {}. The pair that was in use is what `.prev` holds; finish it or \
+                     put it back by hand, and this tool will not do either on its own.",
+                    [
+                        self.key_path_with(kind, None),
+                        self.cert_path_with(kind, None),
+                        self.key_path_with(kind, Some("next")),
+                        self.cert_path_with(kind, Some("next")),
+                        self.key_path_with(kind, Some("prev")),
+                        self.cert_path_with(kind, Some("prev")),
+                    ]
+                    .iter()
+                    .filter(|path| self.files.exists(path))
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+                )),
+            ),
         };
-        let reason = (state == KeysState::Inconsistent).then(|| {
-            format!(
-                "{} is there and {} is not: a certificate without the key it belongs to.",
-                self.cert_path_with(kind, Some("next")).display(),
-                self.key_path_with(kind, Some("next")).display()
-            )
-        });
         Ok(KeysView {
             kind: kind.as_str().to_string(),
             state,
@@ -2471,6 +2693,75 @@ mod tests {
         runner.verify().unwrap();
     }
 
+    // Astra finding F07, 2026-09-23.
+    #[test]
+    fn a_confirm_and_a_timer_revert_do_not_both_win() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&pending("d1", Mode::Switch)).unwrap();
+        // The timer is inside its decision: it has read the record and is
+        // on its way to `nix-env --set`. This process is what holds it, so
+        // the holder is demonstrably alive.
+        let held = helper.txn_dir().join("d1.deciding");
+        files
+            .write_atomic(
+                &held,
+                format!("revert pid {} at 2026-09-22T12:05:00Z", std::process::id()).as_bytes(),
+                0o600,
+            )
+            .unwrap();
+        let err = helper.confirm("d1").unwrap_err().to_string();
+        assert!(err.contains("being decided right now"), "{err}");
+        assert!(err.contains("revert pid"), "{err}");
+        assert_eq!(
+            helper.record("d1").unwrap().state,
+            TxnState::Pending,
+            "nothing was decided"
+        );
+        // And nothing was run: the timer was never stopped, so the way back
+        // is still armed.
+        runner.verify().unwrap();
+    }
+
+    // Astra finding F07, 2026-09-23.
+    #[test]
+    fn a_decision_whose_process_is_gone_does_not_block_the_next_one() {
+        // The other half of the door. A machine that lost power while
+        // deciding must not be a machine whose timer can never fire again,
+        // so a holder that is not a process is not a holder.
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemctl", ["is-active"]),
+                Output::failing(3, ""),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.write_record(&pending("d2", Mode::Switch)).unwrap();
+        let held = helper.txn_dir().join("d2.deciding");
+        files
+            .write_atomic(
+                &held,
+                // Positive, and above every `pid_max` a Linux kernel hands
+                // out.
+                b"confirm pid 2147483646 at 2026-09-22T12:05:00Z",
+                0o600,
+            )
+            .unwrap();
+        let record = helper
+            .confirm("d2")
+            .expect("the stale holder is taken over");
+        assert_eq!(record.state, TxnState::Confirmed);
+        assert!(
+            !files.exists(&held),
+            "the decision gives the transaction back"
+        );
+        runner.verify().unwrap();
+    }
+
     #[test]
     fn a_second_revert_is_the_same_answer_and_runs_nothing() {
         let files = host();
@@ -2839,6 +3130,67 @@ mod tests {
             .lock_take_over("run-a", "run-b", "silas@manacor", 2)
             .unwrap();
         assert_eq!(taken.run_id, "run-b");
+        runner.verify().unwrap();
+    }
+
+    // Astra finding F04, 2026-09-23.
+    #[test]
+    fn two_operators_carrying_one_run_do_not_both_hold_the_host() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let first = helper.lock_acquire("run-a", "silas@manacor", 42).unwrap();
+        // The same run from the same workstation is a resume after a kill,
+        // whatever the pid says: the process is gone and the lock it left is
+        // the lock of this run.
+        assert_eq!(
+            helper.lock_acquire("run-a", "silas@manacor", 99).unwrap(),
+            first
+        );
+        // The same run from somewhere else is a second writer, and this host
+        // cannot ask a workstation whether a pid is still there — so it asks
+        // the only question it can answer.
+        let err = helper
+            .lock_acquire("run-a", "leandro@calvia", 7)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("as it is carried by silas@manacor"), "{err}");
+        assert!(err.contains("one writer"), "{err}");
+        assert_eq!(helper.read_lock().unwrap().unwrap(), first);
+        runner.verify().unwrap();
+    }
+
+    // Astra finding F04, 2026-09-23.
+    #[test]
+    fn two_takeovers_of_one_run_leave_exactly_one_holder_of_the_host() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper.lock_acquire("run-a", "silas@manacor", 1).unwrap();
+        let winner = helper
+            .lock_take_over("run-a", "run-b", "silas@manacor", 2)
+            .unwrap();
+        assert_eq!(winner.run_id, "run-b");
+        // The second takeover read run-a before any of that. It used to
+        // remove run-b's fresh lock and take the host as well; now it
+        // carries that lock away, sees it is not run-a, and puts it back.
+        let err = helper
+            .lock_take_over("run-a", "run-c", "silas@manacor", 3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("held by the run run-b"), "{err}");
+        assert!(err.contains("Nothing was taken over"), "{err}");
+        assert_eq!(helper.read_lock().unwrap().unwrap(), winner);
+        assert!(
+            !files.exists(
+                &helper
+                    .lock_path()
+                    .with_file_name("owner.taken-by-run-c.json")
+            ),
+            "the claim of a takeover that failed is not left lying about"
+        );
         runner.verify().unwrap();
     }
 
@@ -3311,6 +3663,78 @@ mod tests {
             .unwrap();
         assert_eq!(view.state, KeysState::Inconsistent);
         assert!(view.reason.unwrap().contains("without the key"));
+    }
+
+    // Astra finding F08, 2026-09-23.
+    #[test]
+    fn keys_status_names_every_half_switch() {
+        // `keys_switch` is four renames in this order: the certificate in
+        // use goes aside, then the key in use, then the prepared key comes
+        // in, then the prepared certificate. A machine that stops between
+        // any two of them leaves one of the first three shapes below. All
+        // three used to read as `switched`, because any `.prev` was the
+        // whole question — so the resume skipped to `verify`, the verify
+        // found no certificate, and `keys revert` refused because it needs
+        // BOTH `.prev` files. The host was left with no active certificate
+        // and no way forward.
+        let runner = StrictFake::new();
+        let clock = clock();
+        let key = format!("{PKI}/identity.key");
+        let crt = format!("{PKI}/identity.crt");
+        let key_next = format!("{PKI}/identity.key.next");
+        let crt_next = format!("{PKI}/identity.crt.next");
+        let key_prev = format!("{PKI}/identity.key.prev");
+        let crt_prev = format!("{PKI}/identity.crt.prev");
+
+        for (after, there) in [
+            (
+                "the certificate went aside",
+                vec![&key, &key_next, &crt_next, &crt_prev],
+            ),
+            (
+                "the key went aside too",
+                vec![&key_next, &crt_next, &key_prev, &crt_prev],
+            ),
+            (
+                "the new key came in",
+                vec![&key, &crt_next, &key_prev, &crt_prev],
+            ),
+        ] {
+            let files = there.iter().fold(MemFiles::new(), |files, path| {
+                files.given((*path).clone(), "x\n")
+            });
+            let view = helper(&runner, &files, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap();
+            assert_eq!(
+                view.state,
+                KeysState::Inconsistent,
+                "after {after} the switch is not finished"
+            );
+            let reason = view.reason.unwrap_or_default();
+            assert!(
+                reason.contains("stopped in the middle"),
+                "{after}: {reason}"
+            );
+            // And it says what is on the disk, which is what a person needs.
+            for path in &there {
+                assert!(reason.contains(path.as_str()), "{after}: {reason}");
+            }
+        }
+
+        // The one tuple that IS a finished switch still is one.
+        let whole = [&key, &crt, &key_prev, &crt_prev]
+            .iter()
+            .fold(MemFiles::new(), |files, path| {
+                files.given((*path).clone(), "x\n")
+            });
+        assert_eq!(
+            helper(&runner, &whole, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap()
+                .state,
+            KeysState::Switched
+        );
     }
 
     /// The switch: four renames, and the record says what was replaced.

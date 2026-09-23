@@ -486,6 +486,17 @@ pub fn current_operator() -> Operator {
 /// A lock this run already holds is not an error: a verb that acquires
 /// twice inside one run — `plan` then `apply --resume` — is asking whether
 /// it may write, and the answer is yes.
+///
+/// Astra finding F04, 2026-09-23: it was the answer to a second LIVE process
+/// of the same run as well, and that is the one reading of it that is wrong.
+/// Two `apply --resume <run>` at once both came through this door, and the
+/// journal is what paid for it: each writer seeds its sequence counter from
+/// the file it read when it started, so both hand out the same numbers and
+/// the next `fold` refuses the whole journal with "this journal goes
+/// backwards". The run is then neither readable nor resumable. So the
+/// shortcut now asks WHICH process is meant — this one, or one that is
+/// demonstrably not on this machine any more, which is what a resume after
+/// a kill is.
 pub fn acquire_lock(
     files: &dyn Files,
     state: &StateDir,
@@ -502,7 +513,32 @@ pub fn acquire_lock(
             // Somebody was faster, or a run is in progress. Which of the two
             // it is, the file says.
             match read_lock(files, state)? {
-                Some(held) if held.run_id == run_id => Ok(held),
+                // This very process asking again, or a run whose process is
+                // gone — the shape `apply --resume` has after a kill. A run
+                // id that is the same and a process that is still running is
+                // a SECOND writer, and it is refused like any other.
+                Some(held)
+                    if held.run_id == run_id
+                        && (held.pid == std::process::id()
+                            || held.liveness(operator) != Liveness::Running) =>
+                {
+                    Ok(held)
+                }
+                // The same run, and somebody else is running it right now.
+                // The refusal below would tell this operator to resume the
+                // run they are already resuming, so it gets a sentence of
+                // its own.
+                Some(held) if held.run_id == run_id => bail!(
+                    "the run {run_id} is already being carried on by the process {} on {} \
+                     (operator {}, since {}). Two processes writing one run write one journal \
+                     twice and make it unreadable, so this one did nothing. Wait for that \
+                     process, or take the run over with `--takeover {run_id}` once you know \
+                     it is gone.",
+                    held.pid,
+                    held.workstation,
+                    held.operator,
+                    held.acquired_at.to_rfc3339()
+                ),
                 Some(held) => bail!("{}", held.refusal(operator, run_id)),
                 // The file is there and cannot be read as a lock record.
                 // Nothing here rewrites it: a file in this place that this
@@ -551,6 +587,21 @@ pub fn release_lock(files: &dyn Files, state: &StateDir, run_id: &str) -> Result
 /// out of it is how they say which run they mean. A takeover that accepted
 /// "whatever is in the file" would take over a run that started in the
 /// meantime.
+///
+/// Astra finding F04, 2026-09-23: reading the owner, removing it and
+/// creating a new one is three steps, and two takeovers that both read the
+/// old owner could both go through them. The loser's `remove_file` then took
+/// away the WINNER'S fresh lock — after which both processes believed they
+/// held the repository, which is the state this file exists to make
+/// impossible.
+///
+/// So the claim is a rename and no longer a remove. Every taker renames the
+/// lock to a name of its own (`lock.taken-by-<run>`), and a rename of a file
+/// that is not there fails: of two takers, exactly one carries the old
+/// record away. Only then is it read, and a taker that finds it was not the
+/// run it named puts it back with `create_new` — which cannot overwrite
+/// anything, so a third lock that appeared meanwhile survives and is
+/// reported.
 pub fn take_over_lock(
     files: &dyn Files,
     state: &StateDir,
@@ -559,18 +610,53 @@ pub fn take_over_lock(
     operator: &Operator,
     now: DateTime<Utc>,
 ) -> Result<LockRecord> {
-    match read_lock(files, state)? {
-        None => acquire_lock(files, state, run_id, operator, now),
+    let path = state.lock_path();
+    if !files.exists(&path) {
+        return acquire_lock(files, state, run_id, operator, now);
+    }
+    let claim = path.with_file_name(format!("lock.taken-by-{run_id}"));
+    files.rename(&path, &claim).with_context(|| {
+        format!(
+            "the lock on {} could not be taken over; another takeover was here first, or the \
+             run gave it back while you were reading.",
+            path.display()
+        )
+    })?;
+    let bytes = files.read(&claim)?;
+    let taken = serde_json::from_slice::<LockRecord>(&bytes).ok();
+    match taken {
         Some(held) if held.run_id == of_run => {
-            files.remove_file(&state.lock_path())?;
+            files.remove_file(&claim)?;
             acquire_lock(files, state, run_id, operator, now)
         }
-        Some(held) => bail!(
-            "this repository is held by run {}, not by {of_run}. Nothing was taken over: \
-             --takeover names the run it takes over so that it cannot take over one that \
-             started while you were reading.",
-            held.run_id
-        ),
+        // Not the run that was named. It goes back exactly as it was, and
+        // `create_new` is what puts it there: it refuses to overwrite, so a
+        // lock that somebody took in this window is not lost either.
+        other => {
+            let restored = files.create_new(&path, &bytes, 0o644);
+            let whose = match &other {
+                Some(held) => format!("by run {}", held.run_id),
+                None => "by a file this tool did not write".to_string(),
+            };
+            match restored {
+                Ok(()) => {
+                    // It is back where it was, so the claim is rubbish.
+                    files.remove_file(&claim)?;
+                    bail!(
+                        "this repository is held {whose}, not by {of_run}. Nothing was taken \
+                         over: --takeover names the run it takes over so that it cannot take \
+                         over one that started while you were reading."
+                    )
+                }
+                Err(e) => bail!(
+                    "this repository is held {whose}, not by {of_run}, and the lock could not \
+                     be put back ({e:#}) because something else took {} in the meantime. \
+                     Nothing was taken over; the record that was there is in {}.",
+                    path.display(),
+                    claim.display()
+                ),
+            }
+        }
     }
 }
 
@@ -709,8 +795,16 @@ impl JournalRead {
 }
 
 /// Read a journal, tolerating exactly one torn line at the end.
+///
+/// Astra finding F05, 2026-09-23: the bytes are read and made into text
+/// here rather than by `read_to_string`, because a machine that lost power
+/// in the middle of a line can have cut it inside a multi-byte character,
+/// and `read_to_string` then fails with "stream did not contain valid
+/// UTF-8" before the tail handling below ever runs. A journal that cannot
+/// be read is a run that cannot be resumed, so the bad bytes become
+/// replacement characters and land in the fragment that is dropped anyway.
 pub fn read_journal(files: &dyn Files, path: &Path) -> Result<JournalRead> {
-    let text = files.read_to_string(path)?;
+    let text = String::from_utf8_lossy(&files.read(path)?).into_owned();
     let origin = path.display().to_string();
     // A line that is not followed by a newline was not finished: every line
     // this tool writes goes out as line plus newline in ONE write.
@@ -743,6 +837,55 @@ pub fn read_journal(files: &dyn Files, path: &Path) -> Result<JournalRead> {
     let whole = lines.join("\n");
     let events = parse_journal(&whole, &origin)?;
     Ok(JournalRead { events, torn })
+}
+
+/// Make the file end where its last whole line ends, and say what was
+/// found. `None` when there was nothing to repair.
+///
+/// Astra finding F05, 2026-09-23: [`read_journal`] tolerated a torn last
+/// line IN MEMORY and nothing ever touched the file. `Journal::resuming`
+/// only set the sequence counter, so the next `append_fsync` — O_APPEND —
+/// wrote its line directly behind the fragment. The result was a line that
+/// is two halves of two entries, and it is no longer the LAST line, so the
+/// tolerance above does not apply to it: the test
+/// `a_broken_line_that_is_not_the_last_one_is_not_a_power_cut` shows what
+/// happens then, which is that the whole journal is refused. One torn write
+/// made the run unreadable and unresumable from the second resume on.
+///
+/// The repair works on the raw text and never re-serialises an entry: the
+/// journal is evidence, and evidence that has been through this tool's
+/// serialiser a second time is a copy. Two shapes, exactly the two
+/// [`read_journal`] distinguishes — a fragment, which goes, and a whole
+/// line that lost only its newline, which gets the newline it is missing.
+pub fn repair_journal(files: &dyn Files, path: &Path) -> Result<Option<String>> {
+    if !files.exists(path) {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&files.read(path)?).into_owned();
+    if text.is_empty() || text.ends_with('\n') {
+        return Ok(None);
+    }
+    let origin = path.display().to_string();
+    let cut = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let (repaired, what) = match serde_json::from_str::<JournalEvent>(&text[cut..]) {
+        Ok(_) => (
+            format!("{text}\n"),
+            format!(
+                "the last line of {origin} was written without its newline; it parses, so it \
+                 is kept and the newline is now there. The run that wrote it did not get any \
+                 further."
+            ),
+        ),
+        Err(e) => (
+            text[..cut].to_string(),
+            format!(
+                "the last line of {origin} is not a whole entry ({e}); it was dropped and the \
+                 file now ends where the last whole line ends. Everything before it is intact."
+            ),
+        ),
+    };
+    files.write_atomic(path, repaired.as_bytes(), 0o600)?;
+    Ok(Some(what))
 }
 
 /// The journal and its digest, as a receipt names them.
@@ -1368,7 +1511,123 @@ mod tests {
             at("2026-09-21T12:05:00Z"),
         )
         .unwrap();
-        assert_eq!(first, again, "a resume of the same run holds the same lock");
+        // This process asking twice, which is what `plan` then `apply` is.
+        // A resume after a kill is a DIFFERENT process and is the case
+        // `two_processes_of_one_run_do_not_both_hold_the_lock` below draws.
+        assert_eq!(first, again, "one process of one run holds one lock");
+    }
+
+    // Astra finding F04, 2026-09-23.
+    #[test]
+    fn two_processes_of_one_run_do_not_both_hold_the_lock() {
+        let files = MemFiles::new();
+        let state = state();
+        // A record of this run, held by a process that is demonstrably
+        // running and is not this one: pid 1 is init and is always there.
+        let other = LockRecord {
+            schema: LOCK_SCHEMA.to_string(),
+            run_id: run_id(),
+            operator: "silas".to_string(),
+            workstation: operator().workstation.clone(),
+            pid: 1,
+            acquired_at: at("2026-09-21T12:00:00Z"),
+        };
+        files
+            .write_atomic(&state.lock_path(), &other.to_json().unwrap(), 0o644)
+            .unwrap();
+        let err = acquire_lock(
+            &files,
+            &state,
+            &run_id(),
+            &operator(),
+            at("2026-09-21T12:05:00Z"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already being carried on"), "{err}");
+        assert!(err.contains("unreadable"), "{err}");
+        assert!(err.contains("--takeover"), "{err}");
+        // And the holder's record is untouched.
+        assert_eq!(read_lock(&files, &state).unwrap().unwrap(), other);
+    }
+
+    // Astra finding F04, 2026-09-23.
+    #[test]
+    fn a_resume_after_a_kill_still_takes_the_lock_of_its_own_run() {
+        let files = MemFiles::new();
+        let state = state();
+        // The same shape as above, with the one difference that decides it:
+        // the process that took the lock is not on this machine any more.
+        let dead = LockRecord {
+            schema: LOCK_SCHEMA.to_string(),
+            run_id: run_id(),
+            operator: "silas".to_string(),
+            workstation: operator().workstation.clone(),
+            // Positive, and above every `pid_max` a Linux kernel hands out.
+            pid: 2_147_483_646,
+            acquired_at: at("2026-09-21T12:00:00Z"),
+        };
+        files
+            .write_atomic(&state.lock_path(), &dead.to_json().unwrap(), 0o644)
+            .unwrap();
+        let held = acquire_lock(
+            &files,
+            &state,
+            &run_id(),
+            &operator(),
+            at("2026-09-21T12:05:00Z"),
+        )
+        .expect("a resume of a run whose process is gone may write");
+        assert_eq!(held.run_id, run_id());
+    }
+
+    // Astra finding F04, 2026-09-23.
+    #[test]
+    fn two_takeovers_of_one_run_leave_exactly_one_holder() {
+        let files = MemFiles::new();
+        let state = state();
+        let abandoned = acquire_lock(
+            &files,
+            &state,
+            &run_id(),
+            &operator(),
+            at("2026-09-21T12:00:00Z"),
+        )
+        .unwrap();
+        // The first takeover comes all the way through: it claims the old
+        // record, drops it and puts its own lock there.
+        let winner = take_over_lock(
+            &files,
+            &state,
+            &abandoned.run_id,
+            "run-second",
+            &operator(),
+            at("2026-09-21T12:01:00Z"),
+        )
+        .unwrap();
+        assert_eq!(winner.run_id, "run-second");
+        // The second one read the SAME old owner before any of that and
+        // arrives now. It used to remove the winner's fresh lock and take
+        // the repository as well; now it carries that lock away, sees it is
+        // not the run it named, and puts it back.
+        let err = take_over_lock(
+            &files,
+            &state,
+            &abandoned.run_id,
+            "run-third",
+            &operator(),
+            at("2026-09-21T12:02:00Z"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("run-second"), "{err}");
+        assert!(err.contains("Nothing was taken over"), "{err}");
+        let after = read_lock(&files, &state).unwrap().unwrap();
+        assert_eq!(after, winner, "the winner still holds the repository");
+        assert!(
+            !files.exists(&state.lock_path().with_file_name("lock.taken-by-run-third")),
+            "the claim of a takeover that failed is not left lying about"
+        );
     }
 
     #[test]
@@ -1705,6 +1964,104 @@ mod tests {
             read.torn
         );
         fold(&read.events).expect("what is left is a journal");
+    }
+
+    // Astra finding F05, 2026-09-23.
+    #[test]
+    fn a_resume_after_a_torn_write_leaves_a_journal_that_folds() {
+        // Both shapes a machine that stopped in the middle leaves behind,
+        // and the same demand on each: after the repair and one more line,
+        // the file reads back whole. Before this it did not — the next
+        // append landed behind the fragment, and from the read after that
+        // on the journal was refused outright.
+        for (what, tail, kept) in [
+            ("a fragment", "{\"seq\":3,\"ts\":\"2026-09-2", 2usize),
+            ("no newline", "", 2usize),
+        ] {
+            let files = MemFiles::new();
+            let state = state();
+            let run = run_id();
+            let path = state.journal_path(&run);
+            let journal = Journal::new(&path, &run, "plan-abc");
+            for (seq, kind, host) in [
+                (1, EventKind::RunStart, None),
+                (2, EventKind::LockAcquire, Some("n1")),
+            ] {
+                let event = journal.event(kind, at("2026-09-21T12:00:00Z"));
+                let event = match host {
+                    Some(host) => event.host(host),
+                    None => event,
+                };
+                let written = journal.append(&files, event).unwrap();
+                assert_eq!(written.seq, seq);
+            }
+            let whole = String::from_utf8(files.content(&path).unwrap()).unwrap();
+            let broken = if tail.is_empty() {
+                // A whole line that lost only its newline.
+                whole.trim_end_matches('\n').to_string()
+            } else {
+                format!("{whole}{tail}")
+            };
+            let files = MemFiles::new().given(path.clone(), broken.into_bytes());
+
+            let note = repair_journal(&files, &path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{what} is something to repair"));
+            assert!(note.contains(&path.display().to_string()), "{note}");
+            // Nothing is left to report, because nothing is left torn.
+            let read = read_journal(&files, &path).unwrap();
+            assert_eq!(read.torn, None, "{what}: it was repaired");
+            assert_eq!(read.events.len(), kept, "{what}");
+
+            // And now the resume writes its next line, and the file still
+            // reads back as what it is.
+            let resumed = Journal::resuming(&path, &run, "plan-abc", read.last_seq());
+            let next = resumed
+                .append(
+                    &files,
+                    resumed.event(EventKind::RunEnd, at("2026-09-21T12:10:00Z")),
+                )
+                .unwrap();
+            assert_eq!(next.seq, kept as u64 + 1, "{what}");
+            let after = read_journal(&files, &path)
+                .unwrap_or_else(|e| panic!("{what}: the journal is unreadable: {e:#}"));
+            assert_eq!(after.torn, None, "{what}");
+            assert_eq!(after.events.len(), kept + 1, "{what}");
+            let folded = fold(&after.events).expect("it folds");
+            assert!(folded.breaks.is_empty(), "{what}: {:?}", folded.breaks);
+        }
+    }
+
+    // Astra finding F05, 2026-09-23.
+    #[test]
+    fn a_journal_cut_inside_a_character_is_still_a_journal() {
+        // `read_to_string` refused this file with "stream did not contain
+        // valid UTF-8" before any tail handling ran, so a power cut in the
+        // wrong byte made the run unresumable. The bad bytes are in the
+        // fragment, which is exactly what goes.
+        let files = MemFiles::new();
+        let state = state();
+        let run = run_id();
+        let path = state.journal_path(&run);
+        let journal = Journal::new(&path, &run, "plan-abc");
+        journal
+            .append(
+                &files,
+                journal.event(EventKind::RunStart, at("2026-09-21T12:00:00Z")),
+            )
+            .unwrap();
+        let mut bytes = files.content(&path).unwrap();
+        // The first two bytes of a three-byte character and nothing else.
+        bytes.extend_from_slice(b"{\"seq\":2,\"ts\":\"\xe2\x80");
+        let files = MemFiles::new().given(path.clone(), bytes);
+
+        let read = read_journal(&files, &path).expect("it is readable");
+        assert_eq!(read.events.len(), 1);
+        assert!(read.torn.is_some(), "and the fragment is reported");
+        assert!(repair_journal(&files, &path).unwrap().is_some());
+        let after = read_journal(&files, &path).unwrap();
+        assert_eq!(after.torn, None);
+        assert_eq!(after.events.len(), 1);
     }
 
     #[test]

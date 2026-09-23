@@ -1357,7 +1357,7 @@ fn a_resume_whose_target_knows_nothing_repeats_nothing_and_asks_for_a_person() {
 /// A journal of a run in which `n1` went all the way through and gave its
 /// lock and its transaction record back — which is what the `unlock` step
 /// does, and therefore what a resume finds on the target: nothing.
-fn write_finished_host_journal(fx: &Fixture, run: &str) {
+fn write_finished_host_journal(fx: &Fixture, run: &str, given_back: bool) {
     fx.state
         .begin_run(&fx.files, run)
         .expect("the run directory");
@@ -1422,10 +1422,35 @@ fn write_finished_host_journal(fx: &Fixture, run: &str) {
     }
     // The `unlock` step: the record is retired on the target and the lock
     // goes back. After this the target has NO transaction for this run.
-    put(journal
-        .event(EventKind::LockRelease, at(NOW))
-        .host("n1")
-        .payload(serde_json::json!({"run_id": run})));
+    //
+    // Astra finding F06, 2026-09-23: this used to be the `lock.release`
+    // line alone, which is not what the executor writes — every step
+    // carries an `action.begin` and an `action.end` around what it does.
+    // The difference matters now, because "did this run give the host back"
+    // is read off the `unlock` step's own end: the bare `lock.release` that
+    // the safety net `release_locks` writes at the end of EVERY run cannot
+    // tell a finished host from an abandoned one.
+    if given_back {
+        let unlock = fx
+            .plan
+            .actions_for("n1")
+            .into_iter()
+            .find(|a| a.kind == ActionKind::Unlock)
+            .expect("a host that is taken forward is given back")
+            .seq;
+        put(journal
+            .event(EventKind::ActionBegin, at(NOW))
+            .host("n1")
+            .payload(serde_json::json!({"action": unlock, "kind": "unlock"})));
+        put(journal
+            .event(EventKind::LockRelease, at(NOW))
+            .host("n1")
+            .payload(serde_json::json!({"run_id": run})));
+        put(journal
+            .event(EventKind::ActionEnd, at(NOW))
+            .host("n1")
+            .payload(serde_json::json!({"action": unlock, "kind": "unlock", "result": "ok"})));
+    }
     // And here the run stopped, before its `run.end` — a halt in front of
     // another host's provider reboot, which is how lab lane L2 got here.
 }
@@ -1439,7 +1464,7 @@ fn a_resume_reads_a_host_this_run_already_finished_as_finished() {
     // it" — so the second resume refused the whole run and there was no
     // supported way to finish it.
     let fx = Fixture::changing(&["n1"], false);
-    write_finished_host_journal(&fx, "run-1");
+    write_finished_host_journal(&fx, "run-1", true);
     let look = TableLook::new(&fx);
     // The machine is where the journal says it is.
     look.set("n1", Phase::After);
@@ -1464,6 +1489,163 @@ fn a_resume_reads_a_host_this_run_already_finished_as_finished() {
         "an activation was repeated: {:?}",
         runner.calls()
     );
+}
+
+// Astra finding F06, 2026-09-23.
+#[test]
+fn a_resume_of_a_confirmed_but_uncleaned_host_uncordons_and_retires() {
+    // The host is `committed` — the confirm put it there — and the run
+    // stopped before its `uncordon` and its `unlock`. That was read as a
+    // host with nothing left to do, so the resume walked past both: the
+    // machine stayed cordoned, so nothing was scheduled onto it, and its
+    // transaction record stayed open, which is what makes the NEXT plan
+    // refuse to start.
+    let fx = Fixture::changing(&["n1"], false);
+    write_finished_host_journal(&fx, "run-1", false);
+    let look = TableLook::new(&fx).carrying(
+        "n1",
+        Txn {
+            id: "run-1".to_string(),
+            state: TxnState::Confirmed,
+            target_system: Some(fx.top("n1")),
+            deadline: None,
+            run_id: Some("run-1".to_string()),
+        },
+    );
+    look.set("n1", Phase::After);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            // What was left, and only what was left.
+            .expect(cli("undrain", "n1"), Output::stdout(""))
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["txn", "retire", "--txn", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("every expectation was used");
+    assert_eq!(applied.stopped, None, "the resume stopped: {applied:?}");
+    assert_eq!(applied.receipt.hosts["n1"].state, HostState::Committed);
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+    // And nothing before the confirm was touched.
+    for repeated in ["activate --txn", "nix copy", "confirm --txn"] {
+        assert!(
+            !runner.calls().iter().any(|c| c.contains(repeated)),
+            "{repeated} was repeated: {:?}",
+            runner.calls()
+        );
+    }
+}
+
+// Astra finding F19, 2026-09-23.
+#[test]
+fn a_resume_after_a_completed_reboot_does_not_reboot_again() {
+    // The machine went round and came back as the system the plan wants,
+    // and the run stopped before the confirm. `reboot` was not in the set a
+    // resume skips, and `wait_for_boot` only asks whether the booted system
+    // is the wanted one — which it is — so the resume sent `systemctl
+    // reboot` again. In `mode boot` that boots the OLD generation, because
+    // the one-shot is spent and the confirm that makes the new one the
+    // default has not run: a rollout one step from done undeployed itself.
+    let fx = Fixture::changing(&["n1"], true);
+    assert!(
+        kinds(&fx.plan, "n1").contains(&ActionKind::Reboot),
+        "a changed kernel is a reboot class: {:?}",
+        kinds(&fx.plan, "n1")
+    );
+    write_rebooted_journal(&fx, "run-1");
+    let look = TableLook::new(&fx).carrying(
+        "n1",
+        Txn {
+            id: "run-1".to_string(),
+            state: TxnState::Pending,
+            target_system: Some(fx.top("n1")),
+            deadline: Some(at("2026-09-22T12:05:00Z")),
+            run_id: Some("run-1".to_string()),
+        },
+    );
+    // The machine is back on what it booted, which is what it had to boot.
+    look.set("n1", Phase::After);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            .expect(cli("undrain", "n1"), Output::stdout(""))
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["txn", "retire", "--txn", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("every expectation was used");
+    assert_eq!(applied.stopped, None, "the resume stopped: {applied:?}");
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+    assert!(
+        !runner
+            .calls()
+            .iter()
+            .any(|c| c.contains("systemctl reboot")),
+        "the machine was rebooted a second time: {:?}",
+        runner.calls()
+    );
+}
+
+// Astra finding F19, 2026-09-23.
+#[test]
+fn a_resume_of_a_host_that_was_switched_and_never_booted_still_boots_it() {
+    // The other side of the same condition, and the reason it is read off
+    // the journal rather than set for every resume: a host whose run died
+    // between the activation and the reboot still has to go round.
+    let fx = Fixture::changing(&["n1"], true);
+    write_interrupted_journal(&fx, "run-1");
+    let look = TableLook::new(&fx).carrying(
+        "n1",
+        Txn {
+            id: "run-1".to_string(),
+            state: TxnState::Pending,
+            target_system: Some(fx.top("n1")),
+            deadline: Some(at("2026-09-22T12:05:00Z")),
+            run_id: Some("run-1".to_string()),
+        },
+    );
+    look.set("n1", Phase::After);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(reboot_of("n1"), Output::stdout(""))
+            .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            .expect(cli("undrain", "n1"), Output::stdout(""))
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["txn", "retire", "--txn", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("the reboot was sent");
+    assert_eq!(applied.stopped, None, "the resume stopped: {applied:?}");
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
 }
 
 #[test]
@@ -1810,6 +1992,94 @@ fn write_interrupted_journal(fx: &Fixture, run: &str) {
         .host("n1")
         .payload(serde_json::json!({"action": activate, "kind": "activate", "txn": run})));
     // And here the workstation went away: no `action.end`, no `run.end`.
+}
+
+/// A reboot-class host that activated, went round, came back — and then the
+/// run stopped, before the verify and before the confirm.
+///
+/// Astra finding F19, 2026-09-23: this is the window in which a resume used
+/// to send `systemctl reboot` a second time.
+fn write_rebooted_journal(fx: &Fixture, run: &str) {
+    fx.state
+        .begin_run(&fx.files, run)
+        .expect("the run directory");
+    fx.files
+        .write_atomic(
+            &fx.state.plan_copy_path(run),
+            &fx.plan.to_json().expect("the plan"),
+            0o644,
+        )
+        .expect("the plan copy");
+    let journal = Journal::new(fx.state.journal_path(run), run, &fx.plan.plan_id);
+    let put = |event: JournalEvent| {
+        journal.append(&fx.files, event).expect("a line");
+    };
+    let seq_of = |kind: ActionKind| {
+        fx.plan
+            .actions_for("n1")
+            .into_iter()
+            .find(|a| a.kind == kind)
+            .unwrap_or_else(|| panic!("the plan has a {kind}"))
+            .seq
+    };
+    put(journal
+        .event(EventKind::RunStart, at(NOW))
+        .payload(serde_json::json!({"operator": {"user": "silas", "workstation": "manacor"}})));
+    put(journal
+        .event(EventKind::LockAcquire, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"run_id": run})));
+    for (from, to) in [
+        (HostState::Planned, HostState::Preflight),
+        (HostState::Preflight, HostState::Staged),
+        (HostState::Staged, HostState::MaintenanceReady),
+    ] {
+        put(journal
+            .event(EventKind::HostState, at(NOW))
+            .host("n1")
+            .transition(from, to)
+            .payload(serde_json::json!({})));
+    }
+    let activate = seq_of(ActionKind::Activate);
+    put(journal
+        .event(EventKind::ActionBegin, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate"})));
+    put(journal
+        .event(EventKind::ActionIrreversible, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate", "txn": run})));
+    put(journal
+        .event(EventKind::HostState, at(NOW))
+        .host("n1")
+        .transition(HostState::MaintenanceReady, HostState::Activating)
+        .payload(serde_json::json!({})));
+    put(journal
+        .event(EventKind::ActionEnd, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate", "result": "ok"})));
+    put(journal
+        .event(EventKind::HostState, at(NOW))
+        .host("n1")
+        .transition(HostState::Activating, HostState::AwaitingReboot)
+        .payload(serde_json::json!({})));
+    // The reboot, whole: the `action.end` is written only after
+    // `wait_for_boot` has seen the machine come back as what it had to be.
+    let reboot = seq_of(ActionKind::Reboot);
+    put(journal
+        .event(EventKind::ActionBegin, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": reboot, "kind": "reboot"})));
+    put(journal
+        .event(EventKind::ActionEnd, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": reboot, "kind": "reboot", "result": "ok"})));
+    put(journal
+        .event(EventKind::HostState, at(NOW))
+        .host("n1")
+        .transition(HostState::AwaitingReboot, HostState::Verifying)
+        .payload(serde_json::json!({})));
+    // And here the operator pressed ctrl-c: no verify, no confirm.
 }
 
 #[test]
@@ -3317,6 +3587,21 @@ fn a_resume_carries_a_rotation_on_from_the_phase_the_host_is_at() {
 #[test]
 fn a_resume_of_a_finished_rotation_does_nothing_at_all() {
     let (fx, _) = rotating();
+    // Astra finding F09, 2026-09-23: the run being resumed here ran its
+    // whole `keys remove` step, and the LOCAL half of that step is what
+    // makes the certificate this rotation issued the repository's own. A
+    // resume asks for that half now — the host cannot answer it — so the
+    // fixture says what a finished run leaves behind.
+    fx.files
+        .write_atomic(
+            &PathBuf::from("/repo/pki/issued/box/identity.crt"),
+            NEW_CERT.as_bytes(),
+            0o644,
+        )
+        .expect("the published certificate");
+    fx.files
+        .remove_file(&PathBuf::from("/repo/pki/issued/box/identity.next.crt"))
+        .expect("and the source it was published from is gone");
     write_rotation_journal(&fx, "run-1", ActionKind::KeysRemove);
     let look = TableLook::new(&fx);
     let runner = World::new(
@@ -3357,6 +3642,86 @@ fn a_resume_of_a_finished_rotation_does_nothing_at_all() {
         runner.calls()
     );
     assert_eq!(applied.receipt.outcome, Outcome::Success);
+}
+
+// Astra finding F09, 2026-09-23.
+#[test]
+fn a_resume_after_the_remote_removal_still_publishes_the_new_cert() {
+    // The last phase has two halves: the old pair goes on the host, and the
+    // certificate this rotation issued becomes the repository's own — which
+    // is what the planner compares every host against. The host answers
+    // `confirmed` for the first half alone, and that was read as `done`, so
+    // a run that died between the two left the OLD certificate in the
+    // repository and the next ordinary plan delivered it back over the new
+    // one, undoing the rotation in a plan nobody read as one.
+    let (fx, digest) = rotating();
+    write_rotation_journal(&fx, "run-1", ActionKind::KeysRemove);
+    let look = TableLook::new(&fx);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(
+                helper("box", &["keys", "status", "--kind", "identity"]),
+                Output::stdout(
+                    serde_json::json!({
+                        "ok": true,
+                        "what": "keys status",
+                        "result": {
+                            "kind": "identity",
+                            "state": "confirmed",
+                            "key_next": false,
+                            "crt_next": false,
+                            "prev": false,
+                            "reason": null,
+                            "record": null,
+                        },
+                    })
+                    .to_string(),
+                ),
+            )
+            // The plan's own `lock` step, which a resume with work left to
+            // do runs: the anchor above took the same lock, and the same run
+            // asking twice is asking whether it may act.
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            // Named again, and both halves of it are idempotent.
+            .expect(
+                helper("box", &["keys", "remove", "--kind", "identity"]),
+                ok(),
+            )
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = rotate_options(&fx);
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("exactly those commands");
+    assert_eq!(applied.receipt.outcome, Outcome::Success);
+    // The repository now holds what the host holds.
+    let published = fx
+        .files
+        .content(PathBuf::from("/repo/pki/issued/box/identity.crt"))
+        .expect("the certificate is published");
+    assert_eq!(
+        format!("sha256:{}", crate::ids::sha256_hex(&published)),
+        digest
+    );
+    assert!(
+        !fx.files
+            .exists(&PathBuf::from("/repo/pki/issued/box/identity.next.crt")),
+        "the source it was published from is gone"
+    );
+    // And nothing before the last phase was repeated: a second `prepare`
+    // would be a second key.
+    for repeated in ["keys switch", "keygen", "keys revert"] {
+        assert!(
+            !runner.calls().iter().any(|c| c.contains(repeated)),
+            "{repeated} was repeated: {:?}",
+            runner.calls()
+        );
+    }
 }
 
 // --- lane 5B: what `scripts/check-push-pki.sh` asked ----------------------

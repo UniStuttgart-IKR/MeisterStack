@@ -479,6 +479,44 @@ impl HostRun {
     }
     // --- end lane 3-integration ---
 
+    /// Whether the machine has already been round: a `reboot` step of this
+    /// run that came through.
+    ///
+    /// Astra finding F19, 2026-09-23. The reboot sits between the activation
+    /// and the confirmation, and a resume skipped neither of the two — so an
+    /// operator who stopped a run in that window sent `systemctl reboot` a
+    /// second time. The evidence was always in the journal: the step writes
+    /// its `action.end` only after `wait_for_boot` has seen the machine come
+    /// back as the system the plan wants.
+    ///
+    /// The LAST one, like `open_provider_reboot`: a resume that did have to
+    /// reboot writes a second pair of lines.
+    pub fn rebooted(&self) -> bool {
+        self.actions
+            .iter()
+            .rev()
+            .find(|a| a.kind == ActionKind::Reboot)
+            .is_some_and(|a| a.result == Some(ActionResult::Ok))
+    }
+
+    /// Whether this run gave the host back: the `unlock` step, which retires
+    /// the transaction record on the target and releases the host's lock.
+    ///
+    /// Astra finding F06, 2026-09-23. A host becomes `committed` at its
+    /// CONFIRM, and the plan puts `uncordon` and `unlock` after that. So
+    /// "committed" means the system is kept, not that the run has finished
+    /// with the machine — and reading it as finished is what made a resume
+    /// skip the uncordon and the retire. The host then stayed cordoned, so
+    /// nothing was scheduled onto it, and its record stayed open, which is
+    /// what makes the NEXT plan refuse to start. The journal says which of
+    /// the two it is, in the `action.end` of the step that does the giving
+    /// back, so it is asked.
+    pub fn was_given_back(&self) -> bool {
+        self.actions
+            .iter()
+            .any(|a| a.kind == ActionKind::Unlock && a.result == Some(ActionResult::Ok))
+    }
+
     /// A host the journal says nothing about. What a resume starts from when
     /// the run died before it reached this host.
     pub fn new(id: impl Into<String>) -> HostRun {
@@ -823,17 +861,28 @@ pub enum Step {
 /// | `prepared` | the certificate, the switch, the verify, the removal |
 /// | `overlap` | the switch, the verify, the removal |
 /// | `switched` | the verify and the removal |
-/// | `confirmed` | nothing |
+/// | `confirmed`, published here | nothing |
+/// | `confirmed`, not published here | the removal, for its local half |
 /// | `reverted` | nothing; the forward attempt stays failed |
 /// | `none`, nothing in the journal | the prepared pair is gone: plan again |
 /// | `none`, a switch in the journal | a person looks |
 /// | `inconsistent` | a person looks |
-pub fn next_keys_step(host: &HostRun, state: crate::activate::KeysState) -> Step {
+///
+/// Astra finding F09, 2026-09-23: `published` is the one thing the HOST
+/// cannot answer. The last phase has two halves — the old pair goes on the
+/// target, and the certificate the rotation issued becomes the repository's
+/// own `<kind>.crt` — and a host that is `confirmed` says only that the
+/// first half happened. Read without the second, `confirmed` meant `done`,
+/// the repository kept the certificate the host used to hold, and the next
+/// ordinary plan delivered it back over the new one. The step is idempotent
+/// in both halves, so naming it again is safe and is the whole repair.
+pub fn next_keys_step(host: &HostRun, state: crate::activate::KeysState, published: bool) -> Step {
     use crate::activate::KeysState;
     match state {
         KeysState::Prepared => Step::AtKeysPhase(ActionKind::KeysOverlap),
         KeysState::Overlap => Step::AtKeysPhase(ActionKind::KeysSwitch),
         KeysState::Switched => Step::AtKeysPhase(ActionKind::KeysVerify),
+        KeysState::Confirmed if !published => Step::AtKeysPhase(ActionKind::KeysRemove),
         KeysState::Confirmed => Step::Done,
         KeysState::Reverted => Step::RolledBack,
         KeysState::None => {
@@ -945,14 +994,30 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
     // run wrote itself. (The `!began` branch above already spells
     // `HostState::Committed => Step::Done`; it could never fire, because
     // `committed` makes `began` true.)
+    //
+    // Astra finding F06, 2026-09-23: "committed" is written at the CONFIRM,
+    // and `uncordon` and `unlock` come after it. A run that stopped between
+    // the two was read here as a host with nothing left to do, so the
+    // resume left the machine cordoned and its transaction record open —
+    // and an open record is what makes the next plan refuse to start. The
+    // question is therefore not "is it committed" but "did this run give it
+    // back", which is `was_given_back`. Whatever the target says is asked
+    // only when the answer is no: everything else about this host is
+    // finished, so `VerifyOnly` is the whole of what is left, and it is the
+    // arm that repeats the verify, the uncordon and the unlock and nothing
+    // before them.
     if host.open_irreversible.is_none() && host.state == HostState::Committed {
-        return Step::Done;
+        return if host.was_given_back() {
+            Step::Done
+        } else {
+            Step::VerifyOnly
+        };
     }
     // --- end lane 5C ---
 
     match target {
         TxnView::Confirmed => {
-            if host.state == HostState::Committed {
+            if host.state == HostState::Committed && host.was_given_back() {
                 Step::Done
             } else {
                 Step::VerifyOnly
@@ -960,6 +1025,27 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
         }
         TxnView::Pending { .. } => Step::VerifyAndConfirm,
         TxnView::Reverted => Step::RolledBack,
+        // Astra, alongside finding F19, 2026-09-23: a host that only had to
+        // BOOT never opened a transaction. Its plan has no `activate` and no
+        // `confirm` — the way back from a boot that does not come up is the
+        // boot menu, which is the documented limit of that class — so the
+        // journal records no `action.irreversible` and no txn id for it. A
+        // run that stopped between its `reboot` and its `verify` still
+        // reached `verifying`, which is past the point of no return, and
+        // fell into the arm below: "an irreversible step began and the
+        // target has no transaction record for it". It had not, and those
+        // hosts were not resumable at all.
+        //
+        // The guard is the JOURNAL's own txn id and two states, and it takes
+        // nothing away from the arm below: an activation writes its
+        // `action.irreversible`, with the txn in it, BEFORE the command that
+        // cannot be taken back, so a host that activated always has one.
+        TxnView::None
+            if host.txn_id.is_none()
+                && matches!(host.state, HostState::AwaitingReboot | HostState::Verifying) =>
+        {
+            Step::VerifyOnly
+        }
         TxnView::None => Step::RecoveryRequired(format!(
             "an irreversible step began on {} and the target has no transaction record for it. \
              The journal cannot say what happened after the line it managed to write, and \
@@ -1460,6 +1546,25 @@ mod tests {
         run
     }
 
+    /// The `unlock` step of a run that finished with this host: the record
+    /// retired on the target, the lock given back.
+    ///
+    /// Astra finding F06, 2026-09-23: `committed` alone is not that. It is
+    /// written at the CONFIRM, and the uncordon and the unlock come after
+    /// it, so the tests below say which of the two they mean.
+    fn given_back(mut run: HostRun) -> HostRun {
+        run.actions.push(ActionRun {
+            seq: 9,
+            kind: ActionKind::Unlock,
+            started: at("2026-09-21T12:09:00Z"),
+            ended: Some(at("2026-09-21T12:09:01Z")),
+            result: Some(ActionResult::Ok),
+            evidence: Vec::new(),
+            cmd_refs: Vec::new(),
+        });
+        run
+    }
+
     fn mid_activation() -> HostRun {
         let mut run = host_in(HostState::Activating);
         run.open_irreversible = Some(OpenAction {
@@ -1497,8 +1602,28 @@ mod tests {
             (KeysState::Confirmed, Step::Done),
             (KeysState::Reverted, Step::RolledBack),
         ] {
-            assert_eq!(next_keys_step(&fresh, state), want, "{state:?}");
+            // Astra finding F09, 2026-09-23: `true` is "the certificate
+            // this rotation issued is already the repository's own", which
+            // the host cannot answer and which the case below is about.
+            assert_eq!(next_keys_step(&fresh, state, true), want, "{state:?}");
         }
+    }
+
+    // Astra finding F09, 2026-09-23.
+    #[test]
+    fn a_rotation_the_host_has_finished_is_not_finished_here_until_it_is_published() {
+        use crate::activate::KeysState;
+        // The remote half of the last phase is done — the old pair is gone
+        // from the host, so `keys status` says `confirmed` — and the local
+        // half is not: the repository still holds the certificate the host
+        // USED to have, and the planner compares every host against it. A
+        // resume that read this as `done` left it there, and the next
+        // ordinary plan delivered the old certificate back over the new
+        // one. Both halves of the step are idempotent, so it is named again.
+        assert_eq!(
+            next_keys_step(&HostRun::new("box"), KeysState::Confirmed, false),
+            Step::AtKeysPhase(ActionKind::KeysRemove)
+        );
     }
 
     /// Nothing on the disk means two different things, and the journal is
@@ -1508,7 +1633,7 @@ mod tests {
         use crate::activate::KeysState;
         // Nothing happened yet: the prepared key is gone, and the
         // certificate in the plan is for a key nobody has.
-        let step = next_keys_step(&HostRun::new("box"), KeysState::None);
+        let step = next_keys_step(&HostRun::new("box"), KeysState::None, false);
         let Step::RecoveryRequired(why) = step else {
             panic!("a plan whose key is gone is not something to carry on with");
         };
@@ -1526,7 +1651,7 @@ mod tests {
             evidence: Vec::new(),
             cmd_refs: Vec::new(),
         });
-        let Step::RecoveryRequired(why) = next_keys_step(&switched, KeysState::None) else {
+        let Step::RecoveryRequired(why) = next_keys_step(&switched, KeysState::None, false) else {
             panic!("a switched host with no pair needs a person");
         };
         assert!(why.contains("keys status"), "{why}");
@@ -1612,6 +1737,34 @@ mod tests {
         assert!(matches!(step, Step::RecoveryRequired(_)));
     }
 
+    // Astra, alongside finding F19, 2026-09-23.
+    #[test]
+    fn a_host_that_only_had_to_boot_is_not_a_recovery_case() {
+        // A `reboot_only` host has no `activate` and no `confirm`, so it
+        // opens no transaction and the journal records no txn id for it. A
+        // run that stopped between its `reboot` and its `verify` left it in
+        // `verifying`, which is past the point of no return — and the table
+        // then said "an irreversible step began and the target has no
+        // transaction record for it". It had not, and the host could not be
+        // resumed at all. What is left for it is the verify.
+        for state in [HostState::AwaitingReboot, HostState::Verifying] {
+            assert_eq!(
+                next_step(&host_in(state), &TxnView::None),
+                Step::VerifyOnly,
+                "{state}"
+            );
+        }
+        // And the arm this passes through is untouched where it belongs: a
+        // host that DID activate carries the txn its `action.irreversible`
+        // wrote before the command that cannot be taken back.
+        let mut activated = host_in(HostState::Verifying);
+        activated.txn_id = Some("txn-1".to_string());
+        let Step::RecoveryRequired(why) = next_step(&activated, &TxnView::None) else {
+            panic!("an activation whose record is gone needs a person");
+        };
+        assert!(why.contains("no transaction record"), "{why}");
+    }
+
     #[test]
     fn an_empty_journal_and_a_target_with_a_transaction_needs_a_person() {
         // The half of V17 that is about a lost journal rather than a lost
@@ -1629,12 +1782,24 @@ mod tests {
     #[test]
     fn after_the_confirmation_there_is_nothing_left_to_do() {
         assert_eq!(
-            next_step(&host_in(HostState::Committed), &TxnView::Confirmed),
+            next_step(
+                &given_back(host_in(HostState::Committed)),
+                &TxnView::Confirmed
+            ),
             Step::Done
         );
         assert_eq!(
             next_step(&host_in(HostState::Unchanged), &TxnView::None),
             Step::Done
+        );
+        // Astra finding F06, 2026-09-23: and a host that is committed and
+        // was NOT given back has the rest of its own rollout left — the
+        // uncordon and the unlock, which `VerifyOnly` is the arm for. This
+        // used to answer `Done`, and the machine stayed cordoned with an
+        // open record on it.
+        assert_eq!(
+            next_step(&host_in(HostState::Committed), &TxnView::Confirmed),
+            Step::VerifyOnly
         );
     }
 
@@ -1647,8 +1812,11 @@ mod tests {
         // is `committed` AND its transaction record has been retired by the
         // `unlock` step of this very run, so the target has nothing. Before
         // this arm existed the resume refused the whole run.
+        //
+        // Astra finding F06, 2026-09-23: it is that `unlock` step that says
+        // the host is finished, so the journal is asked for it by name.
         assert_eq!(
-            next_step(&host_in(HostState::Committed), &TxnView::None),
+            next_step(&given_back(host_in(HostState::Committed)), &TxnView::None),
             Step::Done
         );
     }

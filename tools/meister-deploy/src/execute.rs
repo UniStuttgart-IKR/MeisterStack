@@ -68,7 +68,7 @@ use crate::receipt::{
 };
 use crate::release::ReleaseManifest;
 use crate::run::{Cancel, Cmd, Effect, Expect, Runner};
-use crate::state::{Journal, StateDir, journal_ref, read_journal};
+use crate::state::{Journal, StateDir, journal_ref, read_journal, repair_journal};
 use crate::transport::{Ssh, Target};
 
 /// How long a guest-drain may take before the step is refused.
@@ -328,10 +328,18 @@ impl<'a> Executor<'a> {
 
         let journal_path = self.state.journal_path(&self.options.run_id);
         let (journal, resumed) = if self.options.resume {
-            let read = read_journal(self.files, &journal_path)?;
-            if let Some(torn) = &read.torn {
+            // Astra finding F05, 2026-09-23: the torn tail is repaired on
+            // the DISK and not only in this process's memory. Reporting it
+            // and leaving it there meant the next `append_fsync` wrote its
+            // line behind the fragment, and the fragment was then no longer
+            // the last line — which is the one shape `read_journal` refuses
+            // outright. This is the only place that repairs: `report` reads
+            // a journal and says what it found, and a reader does not
+            // rewrite evidence.
+            if let Some(torn) = repair_journal(self.files, &journal_path)? {
                 eprintln!("note: {torn}");
             }
+            let read = read_journal(self.files, &journal_path)?;
             let folded = fold(&read.events)?;
             if folded.plan_id != self.plan.plan_id {
                 bail!(
@@ -606,7 +614,10 @@ impl<'a> Executor<'a> {
                     }
                 }
                 // --- end lane 5A ---
-                Resume::AfterTheActivation { confirmed } => {
+                Resume::AfterTheActivation {
+                    confirmed,
+                    rebooted,
+                } => {
                     // Everything up to and including the activation happened
                     // on the machine, and the target is what said so. The
                     // preparation is not repeated — a second `nix copy` would
@@ -621,6 +632,31 @@ impl<'a> Executor<'a> {
                     if confirmed {
                         skip.insert(ActionKind::Confirm);
                     }
+                    // --- Astra finding F19, 2026-09-23 ---
+                    //
+                    // The reboot stands between the activation and the
+                    // confirmation and was not in this set, so an operator
+                    // who interrupted a run after the machine had come back
+                    // and before the confirm sent `systemctl reboot` again.
+                    // `wait_for_boot` cannot catch it: it asks whether the
+                    // booted system is the wanted one, which it already is,
+                    // and never whether THIS boot is a new one.
+                    //
+                    // And it is worse than a wasted reboot. In `mode boot`
+                    // the way back is the one-shot boot entry, which the
+                    // first boot consumed, and `confirm` — which has not run
+                    // — is what makes the new generation the default. So the
+                    // second reboot boots the OLD system, `wait_for_boot`
+                    // sits there reading "it booted <other>" until the
+                    // deadline, and a rollout that was one step from done
+                    // has quietly undeployed itself.
+                    //
+                    // Conditioned on the journal and not on the plan: a host
+                    // that was switched and never booted still has to boot.
+                    if rebooted {
+                        skip.insert(ActionKind::Reboot);
+                    }
+                    // --- end Astra finding F19 ---
                 }
             }
         }
@@ -1045,6 +1081,23 @@ impl<'a> Executor<'a> {
                     )?;
                 }
                 self.end(journal, id, action, ActionResult::Ok, Vec::new(), refs)?;
+                // Astra finding F06, 2026-09-23: the host is where the run
+                // leaves it, and this is where a run leaves a host it took
+                // forward — every path that does not take it forward
+                // (`take_back`, a failed activation, a failed check) ends
+                // the host before this step. On an ordinary rollout it is
+                // already `committed`, because the confirm put it there, and
+                // then nothing is written.
+                //
+                // It matters on a RESUME of a host that was confirmed and
+                // not given back: the confirm is behind us and skipped, and
+                // the `preflight` this resume DOES repeat — it is a read —
+                // moves the host back to `preflight`. Without this line such
+                // a host ended the run there, and the receipt read a resume
+                // that did everything that was left as `skipped`.
+                if self.entry(hosts, id).state != HostState::Committed {
+                    self.move_to(journal, id, hosts, HostState::Committed, None)?;
+                }
             }
             // --- lane 3B ----------------------------------------------
             ActionKind::DeliverSecret => {
@@ -1236,22 +1289,33 @@ impl<'a> Executor<'a> {
             ActionKind::KeysRemove => {
                 let rotation = self.rotation(id, action)?;
                 self.begin(journal, id, action)?;
-                let cmd = self.helper_cmd(id, &["keys", "remove", "--kind", &rotation.kind])?;
-                let line = cmd.line();
-                self.runner.run(&cmd)?;
-                // And the repository catches up with the host.
+                // The repository catches up with the host FIRST.
                 //
-                // Until this moment `<kind>.crt` in the repository is the
+                // Until this happens `<kind>.crt` in the repository is the
                 // certificate the host USED to hold, and it is what the
                 // planner compares every host against. Leaving it there
                 // would make the next ordinary plan deliver the old
                 // certificate back over the new one — undoing the rotation,
                 // quietly, in a plan nobody read as a rotation. So the
                 // rotation ends where it began: on this workstation.
-                let mut evidence = vec![format!(
-                    "the {} pair {id} used before this rotation is gone",
-                    rotation.kind
-                )];
+                //
+                // Astra finding F09, 2026-09-23: it used to end there
+                // AFTER the remote step, and a run that died in between
+                // was unrecoverable by resume. The remote `keys remove`
+                // leaves a host with no `.next` and no `.prev`, which
+                // `keys_status` reads as `confirmed` and the resume table
+                // reads as `done` — so the resume returned before it ever
+                // reached this step, the repository kept the old
+                // certificate, and the next plan delivered it back over
+                // the new one.
+                //
+                // The order is the fix, and it is the right order anyway:
+                // what this writes became true at the SWITCH, not at the
+                // removal. Both renames are idempotent — the second run
+                // finds no `source` and does nothing — while the remote
+                // step is the one that cannot be taken back, so it goes
+                // last.
+                let mut evidence = Vec::new();
                 let active = self
                     .options
                     .repo
@@ -1272,6 +1336,13 @@ impl<'a> Executor<'a> {
                     self.files.rename(&source, &active)?;
                     evidence.push(format!("{} is now what {id} holds", active.display()));
                 }
+                let cmd = self.helper_cmd(id, &["keys", "remove", "--kind", &rotation.kind])?;
+                let line = cmd.line();
+                self.runner.run(&cmd)?;
+                evidence.push(format!(
+                    "the {} pair {id} used before this rotation is gone",
+                    rotation.kind
+                ));
                 self.end(journal, id, action, ActionResult::Ok, evidence, vec![line])?;
                 let fresh = fresh.unwrap_or_else(|| self.plan.observation.clone());
                 self.move_to(journal, id, hosts, HostState::Committed, fresh.host(id))?;
@@ -1564,6 +1635,37 @@ impl<'a> Executor<'a> {
     }
 
     // --- lane 5A ---------------------------------------------------------
+
+    /// Whether the certificate this rotation issued is already the
+    /// repository's own `<kind>.crt` for this host.
+    ///
+    /// Astra finding F09, 2026-09-23: the local half of the last phase, and
+    /// the one part of a rotation the target knows nothing about. By the
+    /// hash and not by the file name, because the question is whether THIS
+    /// rotation's certificate is the one that is published — a file of that
+    /// name was there before the rotation too.
+    ///
+    /// A plan without a rotation for this host, or a repository that cannot
+    /// be read, answers "not published": naming a step that does nothing
+    /// twice is cheap, and skipping the one that publishes is what this
+    /// finding is about.
+    fn rotation_published(&self, id: &str) -> bool {
+        let Some(rotation) = self.plan.rotations.get(id) else {
+            return false;
+        };
+        let active = self
+            .options
+            .repo
+            .join(crate::pki::ISSUED_DIR)
+            .join(id)
+            .join(format!("{}.crt", rotation.kind));
+        self.files
+            .read(&active)
+            .map(|bytes| {
+                format!("sha256:{}", crate::ids::sha256_hex(&bytes)) == rotation.cert_sha256
+            })
+            .unwrap_or(false)
+    }
 
     /// Where the rotation on this host has got to, asked of the host.
     fn keys_state(&self, id: &str) -> Result<crate::activate::KeysState> {
@@ -2319,7 +2421,14 @@ impl<'a> Executor<'a> {
         // marks. The table is `receipt::next_keys_step`.
         if self.plan.kind == crate::plan::PlanKind::KeysRotate {
             let state = self.keys_state(id)?;
-            return match crate::receipt::next_keys_step(run, state) {
+            // Astra finding F09, 2026-09-23: and the one question the host
+            // cannot answer — whether the certificate this rotation issued
+            // is the repository's own `<kind>.crt` yet. That is the local
+            // half of the last phase, and without it `confirmed` was read
+            // as `done` while the repository still held the certificate the
+            // host used to have.
+            let published = self.rotation_published(id);
+            return match crate::receipt::next_keys_step(run, state, published) {
                 Step::Done => Ok(Resume::Done),
                 Step::AtKeysPhase(phase) => {
                     if crate::receipt::keys_phase_order(phase)
@@ -2378,7 +2487,10 @@ impl<'a> Executor<'a> {
             Step::VerifyOnly => {
                 self.entry(hosts, id).txn = run.txn_id.clone();
                 self.move_to(journal, id, hosts, HostState::Verifying, Some(&observed))?;
-                Ok(Resume::AfterTheActivation { confirmed: true })
+                Ok(Resume::AfterTheActivation {
+                    confirmed: true,
+                    rebooted: run.rebooted(),
+                })
             }
             Step::VerifyAndConfirm => {
                 // The activation happened and the target is still waiting
@@ -2386,7 +2498,10 @@ impl<'a> Executor<'a> {
                 // never from a new one.
                 self.entry(hosts, id).txn = run.txn_id.clone();
                 self.move_to(journal, id, hosts, HostState::Verifying, Some(&observed))?;
-                Ok(Resume::AfterTheActivation { confirmed: false })
+                Ok(Resume::AfterTheActivation {
+                    confirmed: false,
+                    rebooted: run.rebooted(),
+                })
             }
             // --- end lane 5C ---
             Step::RolledBack => {
@@ -2922,7 +3037,11 @@ enum Resume {
     Carry,
     /// The activation is behind us. What is left is the verification and,
     /// unless somebody already confirmed, the confirmation.
-    AfterTheActivation { confirmed: bool },
+    ///
+    /// `rebooted` is Astra finding F19, 2026-09-23: on a host whose plan
+    /// holds a `reboot`, the reboot happens between the activation and the
+    /// confirmation, and the journal says whether it came through.
+    AfterTheActivation { confirmed: bool, rebooted: bool },
     // --- lane 3-integration ---
     /// The run stopped in front of the provider's reboot. Everything before
     /// it happened; the step itself asks the machine again.
