@@ -188,6 +188,12 @@ const NOT_SERVED: &[&str] = &[
     controller_api::FloatingPool::RESOURCE,
     controller_api::FloatingIp::RESOURCE,
     controller_api::RoutedSubnet::RESOURCE,
+    // Room held on a node while a live migration is in flight. Server-owned
+    // bookkeeping with a life of about a minute: it is written by `prepare`,
+    // taken away by the migration's last phase, and swept by the reaper on
+    // the reconcile tick. Nothing an operator creates, names or removes, and
+    // a client that could remove one could overfill a machine.
+    controller_api::CapacityReservation::RESOURCE,
     // A console ticket is a stored SECRET, not a document: a client that
     // could list these would read every other client's outstanding
     // credential. It is a resource only because it lives in the store, and

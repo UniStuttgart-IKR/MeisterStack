@@ -33,6 +33,7 @@ mod migration;
 mod network;
 mod node;
 mod pool;
+mod reservation;
 mod secret;
 mod tenant;
 mod ticket;
@@ -51,6 +52,7 @@ pub use network::*;
 pub use node::*;
 pub use phase::*;
 pub use pool::*;
+pub use reservation::*;
 pub use secret::*;
 pub use tenant::*;
 pub use ticket::*;
@@ -204,6 +206,10 @@ resources! {
             self.status.stamp(phase, now);
         }
     };
+    /// Room held on a node for a guest a live migration is moving there, for
+    /// the length of the window in which nothing else can see it coming. See
+    /// `CapacityReservationSpec`.
+    CapacityReservation => "capacityreservations", "CapacityReservation";
     /// One credential, for one URL, for thirty seconds — and the second
     /// resource that expires by itself. Served by nobody: a client that could
     /// list these could read every other client's outstanding credential. See

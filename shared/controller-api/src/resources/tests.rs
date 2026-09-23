@@ -1037,7 +1037,7 @@ fn a_typo_in_the_envelope_is_named_and_not_swallowed_for_any_kind() {
 
     // One line per row of `resources!`, in its order. The count is
     // asserted below, so a new resource has to be named here too.
-    let said: [(&str, String); 20] = [
+    let said: [(&str, String); 21] = [
         ("Vm", refusal::<Vm>("Vm")),
         ("Node", refusal::<Node>("Node")),
         ("Cluster", refusal::<Cluster>("Cluster")),
@@ -1064,6 +1064,10 @@ fn a_typo_in_the_envelope_is_named_and_not_swallowed_for_any_kind() {
             refusal::<VolumeSnapshot>("VolumeSnapshot"),
         ),
         ("VmMigration", refusal::<VmMigration>("VmMigration")),
+        (
+            "CapacityReservation",
+            refusal::<CapacityReservation>("CapacityReservation"),
+        ),
         ("Ticket", refusal::<Ticket>("Ticket")),
         ("Secret", refusal::<Secret>("Secret")),
         ("Event", refusal::<Event>("Event")),
@@ -1128,6 +1132,7 @@ fn only_a_kind_with_no_status_at_all_leaves_the_field_out() {
     let without_status = [
         ("Secret", status_of::<()>()),
         ("Ticket", status_of::<()>()),
+        ("CapacityReservation", status_of::<()>()),
         ("Event", status_of::<()>()),
     ];
     assert_eq!(

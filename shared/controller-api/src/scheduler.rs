@@ -16,7 +16,7 @@ use tracing::debug;
 
 use std::collections::BTreeMap;
 
-use crate::resources::{AntiAffinity, NodeSummary, StoragePool, Vm};
+use crate::resources::{AntiAffinity, CapacityReservation, NodeSummary, StoragePool, Vm};
 
 /// What a machine has, and what a VM wants of it. Two numbers, because those
 /// are the two a node can run out of.
@@ -223,7 +223,12 @@ pub struct Candidate {
     /// before this existed.
     pub unhealthy: Vec<String>,
     /// What is still free here: the allowance this candidate's capacity gives
-    /// under the configured overcommit, minus everything already bound to it.
+    /// under the configured overcommit, minus everything already bound to it
+    /// — and minus what is PROMISED to a guest on its way here, which is a
+    /// live migration's destination and nothing else. See [`hold`] and
+    /// `CapacityReservationSpec`: a guest in flight is bound to the machine
+    /// it is leaving, so without that second subtraction it is a claim on
+    /// this machine that no sum over the VM objects can see.
     ///
     /// On the Candidate and not behind a `Scheduler` parameter, so that the
     /// rule reaches every strategy that will ever be written. Whether a VM
@@ -1558,6 +1563,89 @@ pub fn spend(candidates: &mut [Candidate], name: &str, vm: &Vm) {
         c.free = c.free.minus(Capacity::wanted_by(vm));
         c.hosted.push(vm.metadata.labels.clone());
     }
+}
+
+/// What is promised on `node` by reservations that have not been delivered.
+///
+/// Astra finding S07, 2026-09-23: the other half of what a machine is
+/// carrying. `Candidate::free` counts the VMs BOUND to a node, and a guest a
+/// live migration is moving there is bound to the SOURCE until the transfer
+/// has finished — so for the length of a migration the destination is
+/// carrying a guest that no sum over the VM objects can see. This is that
+/// guest, counted where it is going.
+pub fn reserved_on(node: &str, held: &[CapacityReservation]) -> Capacity {
+    held.iter()
+        .filter(|r| r.spec.node == node)
+        .fold(Capacity::default(), |sum, r| sum.plus(r.spec.size()))
+}
+
+/// Take what is promised off the room each candidate has.
+///
+/// The sibling of [`spend`], and the argument for it is the same one: a
+/// decision measured against a machine that still looks empty is a decision
+/// that fills it twice. `spend` books what a pass has just DONE; this books
+/// what the fleet has already PROMISED, and it is applied where the candidate
+/// list is built, so that every reader of `free` — `feasible`, the pending
+/// sentence, every strategy that will ever be written — sees one number and
+/// not two.
+///
+/// It is what makes the fix cover ordinary placement as well as migration: a
+/// new VM must not be given a slot a guest is already on its way into, and a
+/// scheduler that only migrations consulted would have handed it out.
+///
+/// Saturating, through `Capacity::minus`: reservations that exceed what a
+/// node has left make it full and never negative, which is the same direction
+/// `free_on` is already wrong in when an operator shrinks a node under its
+/// guests.
+///
+/// **Apply it once.** Room taken off twice is a machine that looks fuller
+/// than it is, and because the subtraction saturates it cannot be undone by
+/// adding the same number back — see `prepare`, which holds only the
+/// reservations its pass did not already know about.
+pub fn hold(candidates: &mut [Candidate], held: &[CapacityReservation]) {
+    for candidate in candidates.iter_mut() {
+        candidate.free = candidate.free.minus(reserved_on(&candidate.name, held));
+    }
+}
+
+/// Does `mine` still fit on a machine with `room` for guests that have not
+/// arrived, once every reservation made BEFORE it is counted?
+///
+/// The confirmation after the fact, and it exists because a create-only write
+/// makes one key unique and says nothing about a SUM. Two replicas preparing
+/// two migrations onto one node in the same millisecond each read the
+/// reservations, each saw room, and each then wrote a key of its own: both
+/// creates succeed, and the node is overcommitted by exactly the guest the
+/// second one is sending. So after writing, the writer looks again and asks
+/// where in the queue it is standing.
+///
+/// The order is etcd's `mod_revision`, which for an object nothing ever
+/// updates is the revision it was created at: a total order over the writes,
+/// agreed by every replica because it is the store's own. So of two
+/// reservations against one slot both reach the same verdict about which of
+/// them keeps it, and the loser releases what it wrote and says so. A version
+/// that cannot be read sorts last, which makes it the one that yields.
+///
+/// `room` is what the machine has free BEFORE any reservation — capacity
+/// under overcommit, minus the guests bound to it — because the reservations
+/// are what this is counting.
+pub fn reservation_holds(
+    room: Capacity,
+    mine: &CapacityReservation,
+    held: &[CapacityReservation],
+) -> bool {
+    fn made_at(r: &CapacityReservation) -> (i64, &str) {
+        (
+            r.metadata.resource_version.parse().unwrap_or(i64::MAX),
+            r.metadata.name.as_str(),
+        )
+    }
+    let ahead = held
+        .iter()
+        .filter(|r| r.spec.node == mine.spec.node && r.metadata.name != mine.metadata.name)
+        .filter(|r| made_at(r) < made_at(mine))
+        .fold(Capacity::default(), |sum, r| sum.plus(r.spec.size()));
+    mine.spec.size().fits_in(room.minus(ahead))
 }
 
 pub struct FirstFit;
@@ -2913,6 +3001,125 @@ mod tests {
         let before = room[0].free;
         spend(&mut room, "agent-1a", &sized_vm);
         assert!(room[0].free.mem_mib < before.mem_mib, "room is spent too");
+    }
+
+    /// A reservation, as the arithmetic sees one: a node, a size and the
+    /// revision etcd stamped on it.
+    fn reservation(
+        name: &str,
+        node: &str,
+        vcpus: u32,
+        mem_mib: u64,
+        at: i64,
+    ) -> CapacityReservation {
+        let mut r = CapacityReservation::declare(
+            name,
+            crate::resources::CapacityReservationSpec {
+                node: node.to_string(),
+                vm: format!("{name}-vm"),
+                vm_uid: format!("vm-uid-{name}"),
+                migration: name.to_string(),
+                migration_uid: format!("migration-uid-{name}"),
+                vcpus,
+                mem_mib,
+            },
+        );
+        r.metadata.resource_version = at.to_string();
+        r
+    }
+
+    /// Astra finding S07, 2026-09-23: the arithmetic everything else rests
+    /// on. What a machine can take is what it has left MINUS what is already
+    /// promised to a guest on its way there, and a guest in flight is bound
+    /// to the machine it is LEAVING — so no sum over the VM objects can see
+    /// it.
+    ///
+    /// Asked through `feasible` rather than by reading the field, because the
+    /// whole point of booking it into `free` is that every reader of the
+    /// candidate list sees it without being told: the scheduler, the pending
+    /// sentence, and the ordinary create that must not be given a slot a
+    /// migration is already flying into.
+    #[test]
+    fn room_promised_to_a_guest_in_flight_is_not_room_a_scheduler_may_offer() {
+        let guest = sized(4, 4096);
+        let mut nodes = [room("agent-1a", 4, 4096)];
+        assert_eq!(
+            feasible(&guest, &nodes).len(),
+            1,
+            "the room is there to start with"
+        );
+
+        hold(&mut nodes, &[reservation("m-1", "agent-1a", 4, 4096, 10)]);
+        assert!(
+            feasible(&guest, &nodes).is_empty(),
+            "and it is spoken for by a guest that has not landed yet"
+        );
+        // The sentence an operator reads is the ordinary one: there is no
+        // room. Which is true — what is left is promised.
+        assert_eq!(
+            pending_reason_of(&guest, &nodes).0,
+            PendingReason::NoCapacity
+        );
+
+        // Half of it, and half is left: the subtraction is a size and not a
+        // veto.
+        let mut half = [room("agent-1a", 4, 4096)];
+        hold(&mut half, &[reservation("m-1", "agent-1a", 2, 2048, 10)]);
+        assert_eq!(feasible(&sized(2, 2048), &half).len(), 1);
+        assert!(feasible(&sized(3, 2048), &half).is_empty());
+
+        // And a promise made on another machine takes nothing off this one.
+        let mut elsewhere = [room("agent-1a", 4, 4096)];
+        hold(
+            &mut elsewhere,
+            &[reservation("m-1", "agent-1b", 4, 4096, 10)],
+        );
+        assert_eq!(feasible(&guest, &elsewhere).len(), 1);
+    }
+
+    /// The race a create-only write does not close, and the answer to it.
+    ///
+    /// Two replicas preparing two migrations onto one node in the same
+    /// millisecond each read the reservations, each saw room, and each then
+    /// wrote a key of ITS OWN: both creates succeed, because uniqueness of a
+    /// key says nothing about a sum. So after writing, a writer asks where in
+    /// the queue it is standing — and the queue is etcd's own revision order,
+    /// which is why both replicas reach the same verdict about which of them
+    /// keeps the slot.
+    #[test]
+    fn of_two_reservations_against_one_slot_the_earlier_one_keeps_it() {
+        let slot = Capacity {
+            vcpus: 4,
+            mem_mib: 4096,
+        };
+        let first = reservation("m-1", "agent-1a", 4, 4096, 10);
+        let second = reservation("m-2", "agent-1a", 4, 4096, 11);
+        let both = [first.clone(), second.clone()];
+        assert!(reservation_holds(slot, &first, &both), "the earlier write");
+        assert!(
+            !reservation_holds(slot, &second, &both),
+            "and the later one yields, on both replicas"
+        );
+
+        // A promise on another machine is not in this queue at all.
+        let far = reservation("m-3", "agent-1b", 4, 4096, 9);
+        assert!(reservation_holds(slot, &second, &[far, second.clone()]));
+
+        // A revision nobody can read sorts last, so it is the one that gives
+        // way — the conservative direction, and the only one that cannot turn
+        // an unreadable field into an overcommitted machine.
+        let mut unreadable = reservation("m-0", "agent-1a", 4, 4096, 1);
+        unreadable.metadata.resource_version = String::new();
+        assert!(reservation_holds(
+            slot,
+            &first,
+            &[unreadable.clone(), first.clone()]
+        ));
+        assert!(!reservation_holds(
+            slot,
+            &unreadable,
+            &[unreadable.clone(), first]
+        ));
     }
 
     /// The category behind the sentence: a closed set, because the sentence
