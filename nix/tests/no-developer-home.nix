@@ -6,9 +6,10 @@
 #
 # It used to: the units expected /opt/meisterstack/bin, filled by
 # `deploy/push.sh` from `$HOME/git/Leandro/target/release` and by
-# `get_patched_binaries.sh`, which clones two repositories into `bin/` and
-# — measured in M0 — writes a GLOBAL git identity while it is at it. A fleet
+# `get_patched_binaries.sh`, which cloned two repositories into `bin/` and
+# — measured in M0 — wrote a GLOBAL git identity while it was at it. A fleet
 # built that way cannot be rebuilt by anybody else, which is scenario V04.
+# Both went with M5B; this check is what says they cannot come back.
 #
 # Two halves, and the first one is the build itself: this derivation only
 # exists if the example fleet's systems, the rendered configuration files and

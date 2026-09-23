@@ -19,7 +19,9 @@
 # The THIRD road is `nix/managed.nix`: there the same variables are read by
 # `nix/lib/render.nix` at build time and the config files are complete before
 # the machine boots. Same input, same keys, no renderer — and
-# `checks.render-parity` holds the two to each other.
+# Until M5B a second, boot-time renderer read the same variables and
+# `checks.render-parity` held the two to each other; that renderer went to
+# `~/git/meisterstack-lab/legacy/nix/` with the appliance image.
 #
 #   imports = [ meisterstack.nixosModules.default ];
 #   meisterstack.roles = [ "cloud" "cluster" ];
@@ -56,8 +58,10 @@ in
       type = lib.types.bool;
       default = false;
       description = ''
-        Whether this machine renders its config files at BOOT, from a context
-        (nix/context.nix sets this, by being imported).
+        Whether this machine renders its config files at BOOT, from a
+        context. A renderer sets it by being imported; this flake ships none
+        any more (M5B), so on a host of this flake it is always false and
+        what reads it is the refusal in nix/managed.nix.
 
         It is read rather than set: the two auth fragments of the cloud exist
         only where something appends them, and `nix/managed.nix` refuses to

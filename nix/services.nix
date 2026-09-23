@@ -14,14 +14,18 @@
 # by evaluating a minimal host with and without these modules and comparing
 # exactly those attributes.
 #
-# What DOES decide host-global things are the two profiles beside this file:
+# What DOES decide host-global things is the profile beside this file:
 #
-#   nix/appliance.nix  the image the OpenNebula fleet boots — today's
-#                      base.nix, plus this file, plus the boot-time context
-#                      renderer.
 #   nix/managed.nix    a host `meister-deploy` deploys to: nix stays on, the
 #                      config files are complete at build time, and there is
 #                      no renderer at boot.
+#
+# There was a second one until M5B — `nix/appliance.nix`, the image the
+# twelve OpenNebula VMs of the lab boot, with a renderer that wrote the
+# config files AT BOOT out of a context (`nix/context.nix`,
+# `nix/provider-opennebula.nix`). It went to `~/git/meisterstack-lab/
+# legacy/nix/`, which is where the fleet that boots it lives. Comments in
+# these modules that name those three files mean the copies there.
 #
 # The gate every service hangs on is `meisterstack.unitsFor`, which is
 # `meisterstack.roles` for everybody except the appliance: that image ships
@@ -76,9 +80,9 @@ in
         The package the units of this stack take their binaries from.
 
         Read only where `meisterstack.binDir` is derived from it — which is
-        what nix/managed.nix does and what nix/appliance.nix does not: an
-        appliance gets its binaries pushed into /opt/meisterstack/bin and
-        this option is never forced there. That is also why the default may
+        what nix/managed.nix does. A host that is not managed by this flake
+        may get its binaries pushed into /opt/meisterstack/bin instead, and
+        then this option is never forced. That is also why the default may
         be a package that the operator's nixpkgs does not have: a foreign
         host importing `nixosModules.default` without the overlay is a
         perfectly good host, as long as it says where its binaries are.
@@ -140,9 +144,9 @@ in
         skipped until they are there, and the hypervisor path in the agent's
         config all read this one option.
 
-        The default is where `deploy/push.sh` and `meister-deploy keys push`
-        have always put them — outside the nix store, so that an image swap
-        does not touch them. A host whose binaries come from a package points
+        The default is where a push has always put them — outside the nix
+        store, so that an image swap does not touch them. A host whose
+        binaries come from a package points
         this at that package's `bin` instead; the condition is then satisfied
         by construction, which is the honest reading of "the binary is part
         of this system".
@@ -178,11 +182,13 @@ in
       description = ''
         The directory the units read their `--config` from.
 
-        The default is where the boot-time renderer (nix/context.nix) writes
-        the completed files: the image bakes a TEMPLATE under
-        /etc/meisterstack, and the per-machine values — node id, controller
-        addresses, the cloud's whole [auth] table — are only known once the
-        machine has booted somewhere.
+        The default is where a boot-time renderer writes the completed
+        files: such an image bakes a TEMPLATE under /etc/meisterstack, and
+        the per-machine values — node id, controller addresses, the cloud's
+        whole [auth] table — are only known once the machine has booted
+        somewhere. This flake has no such renderer any more (M5B); the one
+        the lab's twelve context VMs boot is in
+        `~/git/meisterstack-lab/legacy/nix/context.nix`.
 
         A managed host has no renderer and no context: Nix knows every one of
         those values at build time, writes the complete file into /etc and

@@ -2063,6 +2063,17 @@ fn decide_host(
         return decide_rotate_host(release, id, observation, policy);
     }
     // --- end lane 5A ---
+    // --- lane 5B: a host that leaves ---
+    // A retirement is a revocation seen from the other side. The host that
+    // is going is not in this selection at all (`retire` writes
+    // `all,!host=<id>`); what the plan does is carry the list that says so
+    // to everybody who reads one. Nothing is deleted anywhere, and the
+    // machine itself is never touched: it keeps its disk, its data and its
+    // files, and what it loses is the right to be believed.
+    if policy.kind == PlanKind::Retire {
+        return decide_revoke_host(release, id, observation, policy);
+    }
+    // --- end lane 5B ---
 
     let mut d = HostDecision {
         verdict: HostVerdict::Change,
@@ -2089,9 +2100,10 @@ fn decide_host(
     if host.deployment == crate::manifest::Deployment::Context {
         d.stop_all.push(format!(
             "{id} is deployed as `context`: its image comes from somewhere else and its \
-             binaries are pushed, so a closure is not how it is taken forward. \
-             `meister-deploy legacy context-push` carries it until the context fleet is \
-             migrated."
+             binaries are pushed, so a closure is not how it is taken forward. The push \
+             that serves such a host lives in the lab repository now \
+             (`~/git/meisterstack-lab/legacy/push.sh`), and it is not this tool: migrate \
+             the host to `deployment = \"nixos\"` to have it planned here."
         ));
         return settle(d, HostVerdict::Blocked);
     }
@@ -2800,8 +2812,8 @@ fn decide_revoke_host(
 
     if host.deployment == crate::manifest::Deployment::Context {
         d.stop_all.push(format!(
-            "{id} is deployed as `context`: its files are pushed by the legacy adapter, not by \
-             this plan."
+            "{id} is deployed as `context`: its files are pushed by the adapter in the lab \
+             repository (`legacy/push.sh`), not by this plan."
         ));
         return settle(d, HostVerdict::Blocked);
     }
@@ -3614,12 +3626,13 @@ fn steps_for(
             // A revocation plan carries ONE kind of file. A certificate that
             // happens to differ as well is a different decision, made by a
             // different verb, on a day somebody chose.
-            if policy.kind == PlanKind::KeysRevoke
+            // --- lane 5B: and a retirement is one of those plans ---
+            if matches!(policy.kind, PlanKind::KeysRevoke | PlanKind::Retire)
                 && secret.kind != crate::manifest::SecretKind::Crl
             {
                 continue;
             }
-            // --- end lane 5A ---
+            // --- end lane 5A/5B ---
             let seen = obs.map(|o| o.credentials.get(&secret.id));
             let want = expected_here.and_then(|e| e.get(&secret.id));
             if !crate::pki::needs_delivery(secret, want, seen.flatten()) {
@@ -5101,6 +5114,88 @@ mod tests {
             );
         }
     }
+
+    // --- lane 5B: retiring a host --------------------------------------
+
+    /// A retirement is a revocation that leaves the machine out.
+    ///
+    /// Two things have to be true and they are the whole of V25's first
+    /// half: the host that is going is not in the plan at all, and what the
+    /// rest of the fleet gets is the list and nothing else.
+    #[test]
+    fn a_retirement_carries_the_list_to_the_others_and_never_touches_the_host() {
+        let fleet = crate::fixtures::with_crl(onebox_enrolled(), &["box", "n1"]);
+        let release = release_of(fleet);
+        let observation = observed(&release, at(TAKEN));
+        let mut expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
+        for secrets in expected.values_mut() {
+            for (id, value) in secrets.iter_mut() {
+                if id.starts_with("crl-") {
+                    *value = "sha256:the-list-without-n2".to_string();
+                }
+            }
+        }
+        let policy = plan_policy(PlanKind::Retire).with_expected_credentials(expected);
+        // This is the selector `retire n2` writes.
+        let plan = plan(
+            &release,
+            "all,!host=n2",
+            &observation,
+            None,
+            &policy,
+            at(NOW),
+        )
+        .expect("plans");
+
+        assert_eq!(plan.kind, PlanKind::Retire);
+        assert!(
+            !plan.hosts.contains_key("n2"),
+            "the host being retired is not in its own retirement plan: {:?}",
+            plan.hosts.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            plan.actions.iter().all(|a| a.host != "n2"),
+            "nothing is done to n2"
+        );
+        assert_eq!(
+            kinds(&plan, "box"),
+            vec![
+                ActionKind::Preflight,
+                ActionKind::Lock,
+                ActionKind::DeliverSecret,
+                ActionKind::DeliverSecret,
+                ActionKind::Verify,
+                ActionKind::Unlock,
+            ],
+            "the same shape a revocation has: the list, and nothing else"
+        );
+        for action in plan
+            .actions
+            .iter()
+            .filter(|a| a.kind == ActionKind::DeliverSecret)
+        {
+            let said = action.desired.clone().unwrap_or_default();
+            assert!(said.contains("crl.pem"), "{said}");
+            assert_eq!(action.disruption, Disruption::None);
+        }
+        // Nothing of the rollout, and nothing that removes anything.
+        for action in &plan.actions {
+            assert!(
+                !matches!(
+                    action.kind,
+                    ActionKind::Stage
+                        | ActionKind::Activate
+                        | ActionKind::Reboot
+                        | ActionKind::Confirm
+                ),
+                "{:?} has no business in a retirement",
+                action.kind
+            );
+        }
+        assert!(plan.approvals.is_empty(), "{:?}", plan.approvals);
+    }
+
+    // --- end lane 5B ----------------------------------------------------
 
     /// A host that already holds this list is not written to twice.
     #[test]
@@ -6631,7 +6726,12 @@ mod tests {
         let plan = planned(&release, "host=n2", &observation);
         let why = &plan.hosts["n2"].reasons[0];
         assert!(why.contains("deployed as `context`"), "{why}");
-        assert!(why.contains("legacy context-push"), "{why}");
+        // The sentence has to name where the push lives NOW. `src/legacy/`
+        // and the verb `legacy push` went with M5B; a host of the context
+        // fleet is served from the lab repository, and a refusal that
+        // pointed at a verb this binary no longer has would send an
+        // operator looking for it.
+        assert!(why.contains("meisterstack-lab/legacy/push.sh"), "{why}");
     }
 
     #[test]

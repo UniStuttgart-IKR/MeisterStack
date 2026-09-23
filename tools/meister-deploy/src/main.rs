@@ -16,10 +16,6 @@ use meister_deploy::build;
 use meister_deploy::effects::{Clock, Files, RealClock, RealFiles};
 use meister_deploy::execute;
 use meister_deploy::inventory::{self, Inventory};
-use meister_deploy::legacy::fleet::Plan;
-use meister_deploy::legacy::ops::{self, Ctx};
-use meister_deploy::legacy::remote::Ssh;
-use meister_deploy::legacy::run::Real as LegacyRunner;
 use meister_deploy::manifest::{self, Contract, NixManifest, Tool};
 use meister_deploy::observation::{self, Observations, Targets};
 use meister_deploy::observe;
@@ -239,11 +235,54 @@ enum Verb {
         cmd: KeysCmd,
     },
     // --- end lane 3B ---------------------------------------------------
-    /// The tool as it was before v1: the `fleet.toml` of schema 1, the rsync
-    /// push to the context fleet, `nixos-rebuild --target-host` for metal.
-    /// Kept whole, with the same flags, because twelve VMs are served by it
-    /// today and `plan` means something else from v1 on.
-    Legacy(LegacyCli),
+
+    // --- lane 5B: taking a host out of service --------------------------
+    /// Take a host out of service: take its certificates back, tell the
+    /// fleet, and write down that it happened.
+    ///
+    /// What it does NOT do is as much the point as what it does. No data is
+    /// deleted, no file on the machine is touched, no disk is wiped and the
+    /// `known_hosts` line stays where it is — a retirement is a statement
+    /// this fleet makes about a machine, not something it does to one. The
+    /// machine may be off, may be stolen, may be on somebody's desk; none of
+    /// that changes what has to be true here, which is that nothing it
+    /// presents is believed any more.
+    ///
+    /// The host leaves the inventory when the OPERATOR deletes its lines.
+    /// This verb never edits `fleet.toml`: an inventory a tool rewrites is
+    /// an inventory whose diff says nothing.
+    Retire {
+        /// The host id, as the inventory and the release spell it
+        host: String,
+        /// The release the delivery plan is made from
+        #[arg(long)]
+        release: PathBuf,
+        /// Why — it lands in the record and above the `known_hosts` line
+        #[arg(long)]
+        reason: Option<String>,
+        /// The operator's repository
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// The inventory the `[operator] ca_dir` reference is read from
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+        /// `tools/meister-ca`. Looked up on PATH when it is a bare name.
+        #[arg(long, default_value = "meister-ca")]
+        meister_ca: PathBuf,
+        /// The ssh key to offer while the remaining hosts are asked
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Where the delivery plan goes
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+        /// Say what would be taken back and take nothing back
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as json
+        #[arg(long)]
+        json: bool,
+    },
+    // --- end lane 5B ----------------------------------------------------
 }
 
 // --- lane 3B: the `keys` verbs ------------------------------------------
@@ -492,6 +531,55 @@ enum KeysCmd {
         json: bool,
     },
     // --- end lane 5A ----------------------------------------------------
+
+    // --- lane 5B: certificates that are already there -------------------
+    /// Take certificates a CA of this fleet already issued into this
+    /// repository, so that they can be planned, compared and taken back.
+    ///
+    /// For a fleet that existed before this tool did. The certificates are
+    /// under whatever fixed names the old road gave them
+    /// (`system-node-<host>.crt`, `system-cluster-<group>.crt`), and this
+    /// verb is the mapping from those names to host ids — typed by a person,
+    /// because a file name is not an identity and guessing which machine a
+    /// certificate belongs to is exactly the mistake that ends in a host
+    /// presenting somebody else's name.
+    ///
+    /// The PRIVATE half is never copied, never read and never delivered. A
+    /// key that is already on a machine stays on that machine; what arrives
+    /// here is the public certificate, and `secret_refs` calls its source
+    /// `target-generated` — which is the truth: this workstation did not
+    /// make it and cannot make it again.
+    ///
+    /// No network, and therefore no `--offline`.
+    Import {
+        /// The directory the certificates are in
+        #[arg(long)]
+        from: PathBuf,
+        /// `<host id>=<file stem>`, once per certificate. The stem is the
+        /// file name without `.crt`.
+        #[arg(long = "map", value_name = "HOST=STEM")]
+        map: Vec<String>,
+        /// The manifest from `resolve`: it says what each host's subject
+        /// would be, which is what an imported certificate is held to
+        #[arg(long)]
+        manifest: PathBuf,
+        /// The operator's repository, where the certificates land
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// The inventory the `[operator] ca_dir` reference is read from
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+        /// `tools/meister-ca`. Looked up on PATH when it is a bare name.
+        #[arg(long, default_value = "meister-ca")]
+        meister_ca: PathBuf,
+        /// Say what would be imported and import nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as json
+        #[arg(long)]
+        json: bool,
+    },
+    // --- end lane 5B ----------------------------------------------------
 }
 
 /// What `status` and `check` both need: which fleet, which hosts, where
@@ -528,13 +616,16 @@ struct LookArgs {
     #[arg(long)]
     identity: Option<PathBuf>,
 
-    // --- lane 5C ---
-    /// The inventory whose `[operator] cli_config` reference is read (D7).
-    /// Defaults to the one the manifest was resolved from. `plan` and
-    /// `apply` take the same flag and mean the same thing by it.
+    // --- lanes 5B + 5C: one flag, two readers ---
+    /// The inventory. Two things are read out of it: the `[operator]
+    /// cli_config` reference (D7, lane 5C) and the list of hosts the fleet
+    /// still has, so that a host in the release but not in the inventory
+    /// is `unmanaged` (V25, lane 5B). Defaults to the file the manifest was
+    /// resolved from. `plan` and `apply` take the same flag and mean the
+    /// same thing by it.
     #[arg(long)]
     inventory: Option<PathBuf>,
-    // --- end lane 5C ---
+    // --- end lanes 5B + 5C ---
     /// How many hosts to ask at once
     #[arg(long, default_value_t = observe::DEFAULT_CONCURRENCY)]
     at_once: usize,
@@ -941,102 +1032,6 @@ struct PlanArgs {
     out: Option<PathBuf>,
 }
 
-#[derive(Args)]
-struct LegacyCli {
-    /// The plan
-    #[arg(short = 'f', long, default_value = "fleet.toml", global = true)]
-    fleet: PathBuf,
-
-    /// The flake the systems and images are built from
-    #[arg(long, default_value = ".", global = true)]
-    flake: String,
-
-    /// Where meister-ca keeps its directory. Overrides the plan's `ca`.
-    #[arg(long, global = true)]
-    ca: Option<String>,
-
-    /// Print every command, not only the ones that change something
-    #[arg(short, long, global = true)]
-    verbose: bool,
-
-    /// Say what would happen and read whatever is needed to say it, but
-    /// change nothing
-    #[arg(long, global = true)]
-    dry_run: bool,
-
-    #[command(subcommand)]
-    cmd: LegacyVerb,
-}
-
-#[derive(Subcommand)]
-enum LegacyVerb {
-    /// The table: what each node is, what it is running, and whether that is
-    /// what the plan says. Read-only.
-    Plan {
-        /// Ask no host anything — just read the plan back
-        #[arg(long)]
-        offline: bool,
-    },
-
-    /// Build an image: a node's name, `generic`, or `all`
-    Image {
-        #[arg(default_value = "all")]
-        target: String,
-        /// Put a copy here, named after the fleet, the node and the commit
-        #[arg(long)]
-        copy: Option<String>,
-    },
-
-    /// Roll the fleet forward: agents, then clusters, then clouds, then
-    /// addons, one node of a raft group at a time
-    Push {
-        /// A node name, a role, or `all`
-        #[arg(default_value = "all")]
-        only: String,
-        /// How long to wait for a replica to be healthy again before giving
-        /// up on its group, in seconds
-        #[arg(long, default_value_t = 120)]
-        wait: u64,
-    },
-
-    /// Certificates and the three secrets that are not certificates
-    Keys {
-        #[command(subcommand)]
-        cmd: KeysVerb,
-    },
-
-    /// Units, sessions, /dev/kvm, disks — and what the cloud says about its
-    /// clusters and nodes, because a unit being active is not the same as a
-    /// node that works
-    Check {
-        /// The cli to ask, and its arguments, e.g.
-        /// `--cli 'meister --config cli.toml -p cloud-mtls'`
-        #[arg(long)]
-        cli: Option<String>,
-    },
-
-    /// Write a node's MeisterStack options as an importable Nix module, so a
-    /// host with its own NixOS configuration can be a node of this fleet
-    Render {
-        node: String,
-        /// Where to write it (default: stdout)
-        #[arg(short = 'o', long)]
-        out: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand)]
-enum KeysVerb {
-    /// Issue everything the plan needs. Idempotent: run it again after adding
-    /// a node and it adds that node.
-    Init,
-    /// Put them on the hosts, under the fixed names the templates point at
-    Push {
-        #[arg(default_value = "all")]
-        only: String,
-    },
-}
-
 /// What a verb came to, and what the shell is told.
 ///
 /// Three codes and not two: a plan that refuses to interrupt a fleet did not
@@ -1144,7 +1139,31 @@ fn run() -> Result<Answer> {
         // --- lane 3B ---------------------------------------------------
         Verb::Keys { cmd } => keys(cmd),
         // --- end lane 3B -----------------------------------------------
-        Verb::Legacy(legacy) => run_legacy(legacy).map(Answer::from),
+        // --- lane 5B ---------------------------------------------------
+        Verb::Retire {
+            host,
+            release,
+            reason,
+            repo,
+            inventory,
+            meister_ca,
+            identity,
+            out,
+            dry_run,
+            json,
+        } => retire(RetireArgs {
+            host,
+            release,
+            reason: reason.as_deref(),
+            repo,
+            inventory: inventory.as_deref(),
+            meister_ca,
+            identity: identity.clone(),
+            out: out.clone(),
+            dry_run: *dry_run,
+            json: *json,
+        }),
+        // --- end lane 5B -----------------------------------------------
     }
 }
 
@@ -1339,6 +1358,11 @@ struct Looked {
     checks: Vec<meister_deploy::checks::CheckResult>,
     /// Where the snapshot was written, for a run that asked.
     written: Option<PathBuf>,
+    // --- lane 5B ---
+    /// Selected hosts that the inventory does not have any more. They are
+    /// listed, not probed and not judged (V25).
+    unmanaged: BTreeSet<String>,
+    // --- end lane 5B ---
 }
 
 /// Look at the fleet: one round trip per host, or the last snapshot on disk.
@@ -1378,6 +1402,66 @@ fn look(args: &LookArgs) -> Result<Looked> {
         .unwrap_or_else(|| PathBuf::from(&fleet.source.repo_path));
     let state = StateDir::in_repo(&repo);
 
+    // --- lane 5B: which of these hosts the fleet still has --------------
+    //
+    // A release is a photograph of an inventory at a moment. When a host
+    // leaves the inventory, every release that was built before the edit
+    // still names it — so `status --release r.json` would go on asking a
+    // machine that is nobody's any more, and a `check` would go on
+    // requiring it. Reading the inventory beside the release is what closes
+    // that gap, and it is READ-ONLY: what the release says about a host
+    // stays what it says.
+    let inventory_file = match &args.inventory {
+        Some(path) => inventory_path(&repo, path),
+        None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
+    };
+    let unmanaged: BTreeSet<String> = match Inventory::load(&files, &inventory_file) {
+        // The name first, and it is not a formality. The default path comes
+        // out of the manifest (`source.repo_path`), which is where `resolve`
+        // RAN — on another machine, or after somebody moved a directory,
+        // that path can point at a different fleet's inventory, and reading
+        // one would declare every host of this release `unmanaged` on the
+        // strength of a file about something else. So: same fleet, or no
+        // answer.
+        Ok(inventory) if inventory.fleet.name != fleet.fleet.name => {
+            eprintln!(
+                "note: {} is the inventory of the fleet {:?} and this release is of {:?}, so                  it says nothing about which of these hosts are still managed. Pass                  --inventory <file> to point at the right one.",
+                inventory_file.display(),
+                inventory.fleet.name,
+                fleet.fleet.name
+            );
+            BTreeSet::new()
+        }
+        Ok(inventory) => selected
+            .iter()
+            .filter(|id| !inventory.hosts.contains_key(*id))
+            .cloned()
+            .collect(),
+        Err(e) => {
+            // Not a failure: a status of a fleet whose inventory is not
+            // here (a release handed to somebody else, a build machine) is
+            // still a status. What it cannot say is which hosts left.
+            eprintln!(
+                "note: {} could not be read ({e}), so nobody can say which of these hosts                  the inventory still has. Pass --inventory <file> for that half.",
+                inventory_file.display()
+            );
+            BTreeSet::new()
+        }
+    };
+    let asked: Vec<String> = selected
+        .iter()
+        .filter(|id| !unmanaged.contains(*id))
+        .cloned()
+        .collect();
+    if !unmanaged.is_empty() {
+        eprintln!(
+            "note: {} is in this release and not in {}; nothing was asked of it.",
+            unmanaged.iter().cloned().collect::<Vec<_>>().join(", "),
+            inventory_file.display()
+        );
+    }
+    // --- end lane 5B ----------------------------------------------------
+
     let (observation, written) = if args.offline {
         let snapshot = state.load_latest_observation(&files)?;
         eprintln!(
@@ -1391,15 +1475,15 @@ fn look(args: &LookArgs) -> Result<Looked> {
             Some(path) => {
                 let text = files.read_to_string(path)?;
                 let targets = observation::Targets::from_json(&text, &path.display().to_string())?;
-                observation::bind_targets(&fleet, &targets, &selected)?
+                observation::bind_targets(&fleet, &targets, &asked)?
             }
-            None => observation::manifest_endpoints(&fleet, &selected)?,
+            None => observation::manifest_endpoints(&fleet, &asked)?,
         };
         Cancel::on_sigint()?;
         let runner = Real::new(policy);
         let ssh = transport::Ssh::for_repo(&repo).with_identity(args.identity.clone());
         let prober = observe::SshProber::new(&runner, &ssh);
-        let probes: Vec<observe::HostProbe> = selected
+        let probes: Vec<observe::HostProbe> = asked
             .iter()
             .map(|id| {
                 observe::HostProbe::new(
@@ -1413,7 +1497,16 @@ fn look(args: &LookArgs) -> Result<Looked> {
         (snapshot, Some(path))
     };
 
-    let checks = readiness::readiness_of(&fleet, &selected, &observation, release.as_ref());
+    let mut checks = readiness::readiness_of(&fleet, &asked, &observation, release.as_ref());
+    // --- lane 5B ---
+    for id in &unmanaged {
+        checks.push(readiness::unmanaged(
+            id,
+            state.read_retired(&files, id).as_ref(),
+        ));
+    }
+    checks.extend(service_checks(&Real::new(policy), &fleet, args.offline));
+    // --- end lane 5B ---
     Ok(Looked {
         fleet,
         release,
@@ -1421,8 +1514,95 @@ fn look(args: &LookArgs) -> Result<Looked> {
         observation,
         checks,
         written,
+        unmanaged,
     })
 }
+
+// --- lane 5B: the services this fleet does not deploy ---------------------
+
+/// How long one service endpoint has to answer.
+const SERVICE_DEADLINE_SECS: u64 = 5;
+
+/// Ask every unmanaged service of the inventory whether it is there.
+///
+/// One `curl` per declared endpoint, effect `read`, five seconds each. Not
+/// an HTTP client in this crate: a tool that only ever has to know "did
+/// something answer at this address" does not need to learn HTTP, and the
+/// one command it shells out to is on every machine that can reach the
+/// fleet anyway. When it is not, or when the run is offline, the verdict is
+/// `unknown` and says which of the two it was.
+fn service_checks(
+    runner: &dyn meister_deploy::run::Runner,
+    fleet: &manifest::ResolvedFleet,
+    offline: bool,
+) -> Vec<meister_deploy::checks::CheckResult> {
+    let mut out = Vec::new();
+    for (id, service) in &fleet.services {
+        if service.managed {
+            out.push(readiness::service(id, service, None));
+            continue;
+        }
+        let endpoints: Vec<(&String, &String)> = service
+            .endpoint
+            .as_ref()
+            .map(|e| e.iter().collect())
+            .unwrap_or_default();
+        if endpoints.is_empty() || offline {
+            out.push(readiness::service(id, service, None));
+            continue;
+        }
+        // Every declared endpoint, and the first silence wins: a service
+        // whose push address answers and whose query address does not is
+        // not a service that is there.
+        let mut verdict: Option<readiness::Reached> = None;
+        for (name, url) in endpoints {
+            let cmd = meister_deploy::run::Cmd::new(
+                meister_deploy::run::Effect::Read,
+                "curl",
+                std::time::Duration::from_secs(SERVICE_DEADLINE_SECS),
+            )
+            .args([
+                "--silent",
+                "--show-error",
+                "--output",
+                "/dev/null",
+                "--max-time",
+                &SERVICE_DEADLINE_SECS.to_string(),
+                "--write-out",
+                "%{http_code}",
+                url,
+            ]);
+            match runner.run(&cmd) {
+                // Any status code is an answer: a Loki push endpoint says
+                // 405 to a GET, and 405 means somebody is there. What this
+                // check is about is reachability, and claiming to know what
+                // a foreign service's 200 would mean would be a claim about
+                // somebody else's software.
+                Ok(done) => {
+                    verdict = Some(readiness::Reached::Answered {
+                        endpoint: format!("{name}={url}"),
+                        detail: format!("http {}", done.stdout.trim()),
+                    });
+                }
+                Err(e) => {
+                    verdict = Some(readiness::Reached::Silent {
+                        endpoint: format!("{name}={url}"),
+                        detail: first_line(&e.to_string()),
+                    });
+                    break;
+                }
+            }
+        }
+        out.push(readiness::service(id, service, verdict));
+    }
+    out
+}
+
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or("").trim().to_string()
+}
+
+// --- end lane 5B ----------------------------------------------------------
 
 fn status(args: &LookArgs) -> Result<Answer> {
     let looked = look(args)?;
@@ -1579,7 +1759,9 @@ fn status_table(looked: &Looked) -> String {
         );
         out.push_str(&format!(
             "    {id:<14} {:<9} {:<6} {:>4}  {:<28} {}\n",
+            // --- lane 5B: three answers, not two ---
             match obs {
+                _ if looked.unmanaged.contains(id) => "unmanaged",
                 Some(obs) if obs.reachable => "yes",
                 Some(_) => "no",
                 None => "-",
@@ -1600,13 +1782,23 @@ fn status_table(looked: &Looked) -> String {
     }
     // Then the ones that matter, once each, with what they expected.
     for check in &looked.checks {
-        if matches!(check.status, Status::Pass | Status::NotApplicable) {
+        // --- lane 5B ---
+        // `managed` is the one `not_applicable` that is printed: it does not
+        // block anything (that is the point of the class) and its sentence
+        // is the only place a reader learns why a host in this release is
+        // not being asked anything.
+        if check.status == Status::Pass
+            || (check.status == Status::NotApplicable && check.id != "managed")
+        {
             continue;
         }
+        // --- end lane 5B ---
         out.push_str(&format!(
             "    {} {} on {}: {}\n",
             if check.required {
                 "REQUIRED"
+            } else if check.id == "managed" {
+                "note    "
             } else {
                 "optional"
             },
@@ -2279,14 +2471,20 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
         // fleet that has to be told.
         "keys-revoke" => PlanKind::KeysRevoke,
         // --- end lane 5A ---
-        other @ ("keys-rotate" | "retire") => anyhow::bail!(
-            "the plan kind {other:?} is not built here. A rotation is made by `keys rotate`, \
-             which prepares the key on the host and issues the certificate before there is \
-             anything to plan; `retire` arrives with M5B."
+        // --- lane 5B ---
+        // The delivery half of a retirement, for the same reason
+        // `keys-revoke` has a door here: `retire <host>` builds one after it
+        // has taken the certificates back, and this is the other order.
+        "retire" => PlanKind::Retire,
+        // --- end lane 5B ---
+        "keys-rotate" => anyhow::bail!(
+            "the plan kind \"keys-rotate\" is not built here. A rotation is made by \
+             `keys rotate`, which prepares the key on the host and issues the certificate \
+             before there is anything to plan."
         ),
         other => anyhow::bail!(
             "{other:?} is not a plan kind. This tool builds `upgrade`, `bootstrap`, \
-             `install` and `keys-revoke`."
+             `install`, `keys-revoke` and `retire`."
         ),
     };
     // --- lane 3A ---
@@ -3523,8 +3721,516 @@ fn keys(cmd: &KeysCmd) -> Result<Answer> {
             json: *json,
         }),
         // --- end lane 5A ---
+        // --- lane 5B ---
+        KeysCmd::Import {
+            from,
+            map,
+            manifest,
+            repo,
+            inventory,
+            meister_ca,
+            dry_run,
+            json,
+        } => keys_import(KeysImportArgs {
+            from,
+            map,
+            manifest,
+            repo,
+            inventory: inventory.as_deref(),
+            meister_ca,
+            dry_run: *dry_run,
+            json: *json,
+        }),
+        // --- end lane 5B ---
     }
 }
+
+// --- lane 5B: certificates that are already there -------------------------
+
+/// Everything `keys import` was told.
+struct KeysImportArgs<'a> {
+    from: &'a Path,
+    map: &'a [String],
+    manifest: &'a Path,
+    repo: &'a Path,
+    inventory: Option<&'a Path>,
+    meister_ca: &'a Path,
+    dry_run: bool,
+    json: bool,
+}
+
+/// What one mapping turned out to be.
+#[derive(serde::Serialize)]
+struct Imported {
+    host: String,
+    stem: String,
+    kind: String,
+    cn: String,
+    serial: Option<String>,
+    not_after: Option<String>,
+    to: String,
+    /// What was found beside the certificate, and what was done about it —
+    /// which is nothing, in every case.
+    private_key: String,
+}
+
+/// Take certificates this fleet's CA already issued into the repository.
+///
+/// Every refusal happens before anything is written, and they are all the
+/// same refusal in different clothes: a certificate is an identity, and one
+/// that lands under the wrong host id is a machine that can speak as
+/// another. So the subject on the file has to be the subject this fleet
+/// would have issued for the host it is being mapped to, and if it is not,
+/// the mapping is wrong and nothing is copied.
+fn keys_import(args: KeysImportArgs<'_>) -> Result<Answer> {
+    use meister_deploy::effects::Entry;
+    use meister_deploy::pki;
+
+    let policy = if args.dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+    let runner = Real::new(policy);
+
+    if args.map.is_empty() {
+        anyhow::bail!(
+            "nothing to import: say which file belongs to which host, once per certificate, \
+             as `--map <host>=<stem>`. The stem is the file name without `.crt` — a lab that \
+             issued `system-node-manacor.crt` for the host `manacor` is \
+             `--map manacor=system-node-manacor`."
+        );
+    }
+    let repo = &std::path::absolute(args.repo)
+        .with_context(|| format!("{} could not be made absolute", args.repo.display()))?;
+    let fleet = read_manifest(&files, args.manifest)?;
+
+    // --- the mappings, before any file is touched ----------------------
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for entry in args.map {
+        let Some((host, stem)) = entry.split_once('=') else {
+            anyhow::bail!(
+                "{entry:?} is not a mapping. It is `<host id>=<file stem>`, for example \
+                 `--map cloud-a=system-cloud-meister`."
+            );
+        };
+        let (host, stem) = (host.trim(), stem.trim());
+        if host.is_empty() || stem.is_empty() {
+            anyhow::bail!("{entry:?} has an empty half.");
+        }
+        if !fleet.hosts.contains_key(host) {
+            anyhow::bail!(
+                "{} names no host {host:?}; it covers {}.",
+                args.manifest.display(),
+                fleet.evaluated_hosts.join(", ")
+            );
+        }
+        if let Some(first) = seen.insert(host.to_string(), stem.to_string()) {
+            anyhow::bail!(
+                "{host} is mapped twice, to {first:?} and to {stem:?}. A host of this fleet \
+                 holds ONE identity certificate and one serving certificate, and which is \
+                 which comes off the subject — so two client certificates for one host is a \
+                 question this tool cannot answer for you."
+            );
+        }
+    }
+
+    // --- read each one, and hold it to the fleet's own subject ---------
+    let mut plan: Vec<(Imported, Vec<u8>)> = Vec::new();
+    for (host, stem) in &seen {
+        let crt = args.from.join(format!("{stem}.crt"));
+        if !files.exists(&crt) {
+            anyhow::bail!(
+                "{} is not there. The directory holds: {}",
+                crt.display(),
+                match files.list_dir(args.from) {
+                    Ok(entries) if !entries.is_empty() => entries
+                        .iter()
+                        .filter_map(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    _ => "nothing this tool can read".to_string(),
+                }
+            );
+        }
+        let described = runner.run(&pki::describe_cmd("openssl", &crt))?;
+        let issued = pki::parse_describe(&described.stdout, &crt.display().to_string());
+        let subject = issued.subject.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "openssl read {} and printed no subject, so nobody can say whose certificate \
+                 it is. It is either not a certificate or not readable.",
+                crt.display()
+            )
+        })?;
+        let cn = pki::cn_of(&subject).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has the subject {subject:?} and no CN in it. Every certificate this \
+                 fleet checks is checked on its CN.",
+                crt.display()
+            )
+        })?;
+        let kind = pki::kind_from_cn(&cn);
+        let wanted = pki::subject_for(&fleet, host, kind, &[])?;
+        if wanted.cn != cn {
+            anyhow::bail!(
+                "{} carries CN={cn}, and a {kind} certificate of {host} in this fleet is \
+                 CN={}. Either the mapping is wrong — that file belongs to another machine — \
+                 or the fleet renamed something since it was issued. Nothing was copied.",
+                crt.display(),
+                wanted.cn
+            );
+        }
+
+        // The private half. It is LOOKED AT and nothing else: not read, not
+        // copied, not delivered. A key that is already on a machine belongs
+        // on that machine, and a key that travelled through a workstation
+        // is a key somebody has to assume is on the workstation.
+        let key = args.from.join(format!("{stem}.key"));
+        let private_key = match files.entry(&key) {
+            Ok(Entry::File { mode }) if mode & 0o077 == 0 => {
+                format!(
+                    "{} is beside it, {:o}, and stays there",
+                    key.display(),
+                    mode
+                )
+            }
+            Ok(Entry::File { mode }) => anyhow::bail!(
+                "{} is mode {:o}: it is readable by somebody who is not its owner. This tool \
+                 will not take the certificate of a key that is lying open — fix the mode \
+                 (`chmod 600`) and decide whether the key has to be replaced, because \
+                 anything that could read it may have.",
+                key.display(),
+                mode
+            ),
+            _ => format!(
+                "{} is not here, which is right when the key is on the target",
+                key.display()
+            ),
+        };
+
+        let to = pki::issued_path(repo, host, &format!("{}.crt", kind.file_stem()));
+        plan.push((
+            Imported {
+                host: host.clone(),
+                stem: stem.clone(),
+                kind: kind.as_str().to_string(),
+                cn,
+                serial: issued.serial.clone(),
+                not_after: issued.not_after.clone(),
+                to: to.display().to_string(),
+                private_key,
+            },
+            files.read(&crt)?,
+        ));
+    }
+
+    // --- and only now, the writes --------------------------------------
+    if args.dry_run {
+        for (what, _) in &plan {
+            println!(
+                "{} <- {}.crt  {} CN={} serial={}",
+                what.to,
+                what.stem,
+                what.kind,
+                what.cn,
+                what.serial.as_deref().unwrap_or("?")
+            );
+        }
+        eprintln!("note: nothing was written and the index was not rebuilt.");
+        return Ok(Answer::Yes);
+    }
+
+    for (what, bytes) in &plan {
+        let to = Path::new(&what.to);
+        files.create_dir_all(to.parent().unwrap_or(repo))?;
+        files.write_atomic(to, bytes, 0o644)?;
+        eprintln!("==> {}", what.to);
+    }
+
+    // The CA's own certificate, if this directory has one and the CA
+    // directory does not. Not overwritten: a CA that already has one is a
+    // CA whose trust anchor is not this import's business.
+    let inventory_file = match args.inventory {
+        Some(path) => inventory_path(repo, path),
+        None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
+    };
+    let parsed = Inventory::load(&files, &inventory_file)?;
+    let named = parsed
+        .operator
+        .as_ref()
+        .and_then(|o| o.ca_dir.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no `[operator] ca_dir`, so this tool does not know which CA these \
+                 certificates belong to — and the index that makes them revocable lives \
+                 there.",
+                inventory_file.display()
+            )
+        })?;
+    let ca = pki::ca_dir(&inventory_file, &named);
+    pki::refuse_ca_in_repo(repo, &ca)?;
+    let ca_crt = args.from.join("ca.crt");
+    if files.exists(&ca_crt) && !files.exists(&ca.join("ca.crt")) {
+        let bytes = files.read(&ca_crt)?;
+        files.create_dir_all(&ca)?;
+        files.write_atomic(&ca.join("ca.crt"), &bytes, 0o644)?;
+        eprintln!("==> {}", ca.join("ca.crt").display());
+    }
+
+    // And the index. Without it `meister-ca --revoke` has nothing to write
+    // into, so an imported certificate would be one this fleet can check
+    // and never take back. The rebuild is additive (M0 finding 7): a
+    // revocation that is already recorded stays recorded.
+    let rebuild = pki::index_rebuild_cmd(args.meister_ca, &ca);
+    runner.run(&rebuild)?;
+    eprintln!("==> {} (index rebuilt)", ca.display());
+
+    let taken: Vec<&Imported> = plan.iter().map(|(what, _)| what).collect();
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&taken)?);
+    } else {
+        for what in &taken {
+            println!(
+                "{:<14} {:<8} CN={} serial={} until {}",
+                what.host,
+                what.kind,
+                what.cn,
+                what.serial.as_deref().unwrap_or("?"),
+                what.not_after.as_deref().unwrap_or("?")
+            );
+        }
+    }
+    eprintln!(
+        "note: {} certificate(s) are in this repository and in the CA's index. No private \
+         key was read or copied: each one stays where it is, and the fleet's manifest calls \
+         its source `target-generated`. Commit `{}`.",
+        taken.len(),
+        pki::ISSUED_DIR
+    );
+    Ok(Answer::Yes)
+}
+
+// --- end lane 5B ----------------------------------------------------------
+
+// --- lane 5B: retiring a host ---------------------------------------------
+
+/// Everything `retire` was told.
+struct RetireArgs<'a> {
+    host: &'a str,
+    release: &'a Path,
+    reason: Option<&'a str>,
+    repo: &'a Path,
+    inventory: Option<&'a Path>,
+    meister_ca: &'a Path,
+    identity: Option<PathBuf>,
+    out: Option<PathBuf>,
+    dry_run: bool,
+    json: bool,
+}
+
+/// Take a host out of service.
+///
+/// Three things happen here and they are in this order on purpose:
+///
+/// 1. the certificates this repository holds for the host are taken back and
+///    a new list is written and published (offline, on this machine);
+/// 2. the record and the `known_hosts` mark are written, so that the
+///    retirement survives everything else;
+/// 3. a plan is made that carries the new list to the REST of the fleet.
+///
+/// The host itself is not in that plan (`all,!host=<id>`) and nothing is
+/// sent to it. A machine that is being retired may be off, may be broken,
+/// may be somebody else's problem already — and a verb that needed it to
+/// answer would be a verb that cannot retire the one host you most want to.
+///
+/// Nothing is deleted: not a partition, not a data directory, not the
+/// certificate files on the machine, not the `known_hosts` line, not the
+/// lines in `fleet.toml`. The last of those is the operator's edit, and
+/// `status` says `unmanaged` about the gap until it is made.
+fn retire(args: RetireArgs<'_>) -> Result<Answer> {
+    use meister_deploy::pki;
+
+    let policy = if args.dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+    let runner = Real::new(policy);
+
+    let repo = &std::path::absolute(args.repo)
+        .with_context(|| format!("{} could not be made absolute", args.repo.display()))?;
+    let text = files.read_to_string(args.release)?;
+    let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
+    let fleet = &release.resolved_fleet;
+
+    if !fleet.hosts.contains_key(args.host) {
+        anyhow::bail!(
+            "{} names no host {:?}; it covers {}. A host that is already out of the \
+             inventory AND out of the last release has nothing left here to retire — the \
+             record under `.meister-deploy/retired/` is what says one was.",
+            args.release.display(),
+            args.host,
+            fleet.evaluated_hosts.join(", ")
+        );
+    }
+
+    let inventory_file = match args.inventory {
+        Some(path) => inventory_path(repo, path),
+        None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
+    };
+
+    // --- 1. the certificates ------------------------------------------
+    let certs = pki::issued_certs(&files, repo, args.host);
+    let mut serials: Vec<String> = Vec::new();
+    let mut ran: Vec<String> = Vec::new();
+    if certs.is_empty() {
+        eprintln!(
+            "note: {} holds no certificate for {}, so there is nothing of its to take back \
+             here. If it had one, revoke it by serial — the serial is in the receipt of the \
+             run that delivered it (`report --run <id>`).",
+            repo.join(pki::ISSUED_DIR).join(args.host).display(),
+            args.host
+        );
+    } else {
+        let parsed = Inventory::load(&files, &inventory_file)?;
+        let named = parsed
+            .operator
+            .as_ref()
+            .and_then(|o| o.ca_dir.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} has no `[operator] ca_dir`, so this tool does not know which CA \
+                     holds the index a revocation is written into.",
+                    inventory_file.display()
+                )
+            })?;
+        let ca = pki::ca_dir(&inventory_file, &named);
+        pki::refuse_ca_in_repo(repo, &ca)?;
+        for cert in &certs {
+            let what = cert.display().to_string();
+            // The serial before the revocation, because afterwards the file
+            // is still there and the record has to name what was taken back.
+            if let Ok(out) = runner.run(&pki::describe_cmd("openssl", cert))
+                && let Some(serial) = pki::parse_describe(&out.stdout, &what).serial
+            {
+                serials.push(serial);
+            }
+            let cmd = pki::revoke_cmd(args.meister_ca, &ca, &what, args.reason);
+            ran.push(cmd.line());
+            if args.dry_run {
+                println!("{}", cmd.described());
+            } else {
+                runner.run(&cmd)?;
+            }
+        }
+        let gencrl = pki::gencrl_cmd(args.meister_ca, &ca);
+        ran.push(gencrl.line());
+        if args.dry_run {
+            println!("{}", gencrl.described());
+        } else {
+            runner.run(&gencrl)?;
+            let bytes = files.read(&ca.join("crl.pem"))?;
+            let here = pki::crl_path(repo);
+            files.create_dir_all(here.parent().unwrap_or(repo))?;
+            files.write_atomic(&here, &bytes, 0o644)?;
+            eprintln!(
+                "==> {} ({} certificate(s) taken back)",
+                here.display(),
+                certs.len()
+            );
+        }
+    }
+
+    // --- 2. the record, and the mark ----------------------------------
+    let state = StateDir::in_repo(repo);
+    let now = RealClock.now();
+    let last_system = state
+        .load_latest_observation(&files)
+        .ok()
+        .and_then(|o| o.host(args.host).and_then(|h| h.current_system.clone()));
+    let record = state::Retired {
+        schema: state::RETIRED_SCHEMA.to_string(),
+        host: args.host.to_string(),
+        retired_at: now,
+        last_system,
+        identity_serials: serials.clone(),
+        reason: args.reason.map(str::to_string),
+    };
+    let ssh = transport::Ssh::for_repo(repo);
+    let marked = if args.dry_run {
+        eprintln!(
+            "note: nothing was written. {} and the `# retired` line above {}'s entry in {} \
+             are what a real run would add.",
+            state.retired_path(args.host).display(),
+            args.host,
+            ssh.known_hosts.display()
+        );
+        false
+    } else {
+        let path = state.write_retired(&files, &record)?;
+        eprintln!("==> {}", path.display());
+        let name = pki::target_from_host(args.host, &fleet.hosts[args.host]).known_hosts_name();
+        pki::mark_retired(&files, &ssh.known_hosts, &name, args.reason, now)?
+    };
+
+    // --- 3. the rest of the fleet -------------------------------------
+    let select = format!("all,!host={}", args.host);
+    let answer = if fleet.hosts.len() < 2 {
+        eprintln!(
+            "note: {} was the only host of this fleet, so there is nobody left to hand the \
+             list to and no plan was made. The revocation is in the CA and in {}.",
+            args.host,
+            pki::crl_path(repo).display()
+        );
+        Answer::Yes
+    } else if args.dry_run {
+        eprintln!("note: a real run would plan the delivery of the new list to `{select}`.");
+        Answer::Yes
+    } else {
+        make_plan(&PlanArgs {
+            release: args.release.to_path_buf(),
+            select: select.clone(),
+            kind: "retire".to_string(),
+            reinstall: false,
+            targets: None,
+            observation: None,
+            offline: false,
+            dry_run: false,
+            repo: Some(repo.clone()),
+            identity: args.identity.clone(),
+            at_once: observe::DEFAULT_CONCURRENCY,
+            inventory: Some(inventory_file.clone()),
+            out: args.out.clone(),
+        })?
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "host": args.host,
+                "retired_at": now,
+                "revoked": serials,
+                "known_hosts_marked": marked,
+                "commands": ran,
+                "record": state.retired_path(args.host).display().to_string(),
+            }))?
+        );
+    }
+    eprintln!(
+        "note: nothing on {} was changed or deleted — not its data, not its keys, not its \
+         line in {}. Take the host out of the inventory yourself when you are ready; until \
+         you do, `status` calls it `unmanaged` and names this retirement.",
+        args.host,
+        inventory_file.display()
+    );
+    Ok(answer)
+}
+
+// --- end lane 5B ----------------------------------------------------------
 
 /// The manifest, read through the same parser `validate --manifest` uses.
 fn read_manifest(files: &dyn Files, path: &Path) -> Result<manifest::ResolvedFleet> {
@@ -4804,131 +5510,3 @@ fn validate_manifest(from: &str) -> Result<bool> {
         }
     }
 }
-
-fn run_legacy(cli: &LegacyCli) -> Result<bool> {
-    let plan = Plan::load(&cli.fleet)?;
-    let runner = LegacyRunner {
-        dry_run: cli.dry_run,
-        verbose: cli.verbose,
-    };
-    let ssh = Ssh::from_env();
-
-    // `render` is a pure function of the plan — no ssh, no nix, no host — so
-    // it is answered before anything that could need a network.
-    if let LegacyVerb::Render { node, out } = &cli.cmd {
-        let node = plan.node(node)?;
-        meister_deploy::legacy::render::write_module(&plan, node, out.as_deref())?;
-        return Ok(true);
-    }
-
-    let ctx = Ctx {
-        plan: &plan,
-        runner: &runner,
-        ssh: &ssh,
-        flake: cli.flake.clone(),
-        ca: cli.ca.clone().unwrap_or_else(|| plan.fleet.ca.clone()),
-        wait: match &cli.cmd {
-            LegacyVerb::Push { wait, .. } => *wait,
-            _ => 0,
-        },
-        offline: matches!(cli.cmd, LegacyVerb::Plan { offline: true }),
-    };
-
-    match &cli.cmd {
-        LegacyVerb::Plan { .. } => ops::plan(&ctx).map(|()| true),
-        LegacyVerb::Image { target, copy } => {
-            ops::image(&ctx, target, copy.as_deref()).map(|()| true)
-        }
-        LegacyVerb::Push { only, .. } => ops::push(&ctx, Some(only)).map(|()| true),
-        LegacyVerb::Keys { cmd } => match cmd {
-            KeysVerb::Init => ops::keys_init(&ctx).map(|()| true),
-            KeysVerb::Push { only } => ops::keys_push(&ctx, Some(only)).map(|()| true),
-        },
-        LegacyVerb::Check { cli: cli_argv } => {
-            // A whole command line in one argument, split on spaces: the cli
-            // takes a config path and a profile, and asking for four flags to
-            // pass three of its own would be worse than one string.
-            let argv: Option<Vec<String>> = cli_argv
-                .as_ref()
-                .map(|s| s.split_whitespace().map(str::to_string).collect());
-            ops::check(&ctx, argv.as_deref())
-        }
-        LegacyVerb::Render { .. } => unreachable!("answered above"),
-    }
-}
-
-// --- lane 5C ---
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use meister_deploy::receipt::{
-        DeploymentReceipt, HostOutcome, HostReceipt, Outcome, RECEIPT_SCHEMA, SystemView,
-    };
-
-    fn a_failed_receipt(txn: Option<&str>) -> DeploymentReceipt {
-        let mut hosts = BTreeMap::new();
-        hosts.insert(
-            "box".to_string(),
-            HostReceipt {
-                outcome: HostOutcome::RecoveryRequired,
-                state: meister_deploy::receipt::HostState::RecoveryRequired,
-                before: SystemView::default(),
-                after: SystemView::default(),
-                actions: Vec::new(),
-                credential_versions: None,
-                txn_id: txn.map(str::to_string),
-            },
-        );
-        DeploymentReceipt {
-            schema: RECEIPT_SCHEMA.to_string(),
-            run_id: "run-1".to_string(),
-            plan_id: "plan-1".to_string(),
-            release_id: "release-1".to_string(),
-            started_at: None,
-            ended_at: None,
-            operator: None,
-            outcome: Outcome::Failed,
-            hosts,
-            untouched: Vec::new(),
-            checks: Vec::new(),
-            breaks: Vec::new(),
-            journal_path: "journal.jsonl".to_string(),
-            journal_sha256: "0".repeat(64),
-        }
-    }
-
-    #[test]
-    fn a_failed_run_names_its_three_leftovers_and_the_way_out_of_each() {
-        // L2 §10, finding 8: the three messages each arrive when somebody
-        // runs into the thing, and no message names all three.
-        let state = StateDir::at("/repo/.meister-deploy");
-        let text = what_is_left(&a_failed_receipt(Some("txn-9")), &state, "run-1");
-        // 1: the run directory, and that a resume needs nothing else (N10).
-        assert!(text.contains("/repo/.meister-deploy/runs/run-1"), "{text}");
-        assert!(text.contains("apply --resume run-1"), "{text}");
-        assert!(text.contains("no --plan and no --release"), "{text}");
-        // 2: the operator's lock, and the word for taking it (N8).
-        assert!(text.contains("/repo/.meister-deploy/lock"), "{text}");
-        assert!(text.contains("--takeover run-1"), "{text}");
-        // 3: the transaction record, per host, and the forced way out (N13).
-        assert!(
-            text.contains("box: `meister-activate txn show --txn txn-9`"),
-            "{text}"
-        );
-        assert!(
-            text.contains("txn retire --txn txn-9 --force --reason"),
-            "{text}"
-        );
-        assert!(text.contains("inconsistent"), "{text}");
-    }
-
-    #[test]
-    fn a_failed_run_that_opened_no_transaction_says_that_too() {
-        // Silence would read as "there might be one somewhere".
-        let state = StateDir::at("/repo/.meister-deploy");
-        let text = what_is_left(&a_failed_receipt(None), &state, "run-1");
-        assert!(text.contains("no transaction record"), "{text}");
-        assert!(!text.contains("txn retire"), "{text}");
-    }
-}
-// --- end lane 5C ---

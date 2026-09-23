@@ -14,9 +14,6 @@
 //! goes through one narrow door, and the door knows the effect class of what
 //! passes it — which is what makes `--dry-run` and `--offline` a property of
 //! the program rather than a promise in its documentation.
-//!
-//! The pre-v1 tool is whole under [`legacy`] and reachable as
-//! `meister-deploy legacy <verb>`; it carries the context fleet until L3.
 
 pub mod activate;
 pub mod build;
@@ -29,7 +26,6 @@ pub mod fixtures;
 pub mod ids;
 pub mod install;
 pub mod inventory;
-pub mod legacy;
 pub mod manifest;
 pub mod nix;
 pub mod observation;

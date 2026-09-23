@@ -15,7 +15,7 @@ Maschine sagt, was sie ist.
 | **Prozesse** | Entwicklung auf dem eigenen Rechner, drei Binaries nebeneinander | `config/*.dev.toml`, `scripts/smoke.sh`. Ein eigener kleiner Brief folgt. |
 | **Eine VM** | einen Knoten einmal wirklich booten sehen, ohne Blech | `nixos-rebuild build-vm --flake .#box`, dann `./result/bin/run-*-vm` |
 | **Kiste plus Knoten** | der Normalfall: 1-5 Maschinen im Labor | `fleet.toml`, `meister-deploy` — siehe `config/examples/one-box/README.md` |
-| **Die Kontext-Flotte** | OpenNebula, zwoelf VMs, drei Tiers | dasselbe generische Image fuer alle, `MEISTER_ROLE` im Kontext — siehe unten |
+| **Eine Flotte** | 1-70 Maschinen, gemischte Hardware, aus dem eigenen Repo | `meister-deploy init`, dann `resolve` -> `build` -> `plan` -> `apply` — das Runbook ist `docs/DEPLOYMENT.md` |
 
 ## Der Plan
 
@@ -55,12 +55,16 @@ etwas nicht anfassen will; ein Lauf, der auf einen Provider wartet).
 | `apply --plan p.json --release r.json [--resume <run>] [--takeover <run>]` | target-write | schaut, prueft, nennt die Schritte — keine Sperre, kein Journal | – | 0/1/2 |
 | `status` / `check --release r.json [--suite readiness]` | read | – | antwortet aus dem letzten Schnappschuss | 0/2 |
 | `report --run <id>` | offline (liest das Zustandsverzeichnis) | – | – | 0/1 |
+| `verify --release r.json --suite vm-lifecycle\|gpu\|rdma --approve verify=<plan_id>` | target-write (Ledger, echte Gaeste, Cleanup) | listet die Schritte | verweigert | 0/1/2 |
 | `keys enroll <host> --fingerprint SHA256:…` | read + local-write | zeigt den Schluessel, schreibt nicht | verweigert | 0/1 |
 | `keys csr --host <id> --kind identity\|serving [--as <tier>]` | target-write (der Schluessel entsteht am Ziel) | zeigt das Subjekt | – | 0/1 |
 | `keys issue --host <id> --kind node\|cluster\|cloud\|serving` | key (offline, nur diese Maschine) | zeigt das Subjekt | – | 0/1 |
-| `gc --keep N` | local-write (nur GC-Wurzeln) | nennt die Releases | – | 0/1 |
+| `keys revoke --serial <s>\|--host <id>\|--refresh --release r.json` | key + read + local-write, danach ein Plan | zeigt die zwei CA-Kommandos | – | 0/1/2 |
+| `keys rotate --host <id> --kind identity\|serving --release r.json` | key + target-write (der neue Schluessel entsteht am Ziel), danach ein Plan | zeigt, was vorbereitet wuerde | – | 0/1/2 |
+| `keys import --from <dir> --map <host>=<stem> --manifest m.json` | key + local-write (offline) | zeigt, was wohin ginge | – | 0/1 |
+| `retire <host> --release r.json` | key + local-write, danach ein Plan an die uebrigen Hosts | zeigt die CA-Kommandos, schreibt nichts | – | 0/1/2 |
+| `gc --keep N [--older-than 14] [--observations N] [--runs]` | local-write (nur GC-Wurzeln) | nennt die Releases | – | 0/1 |
 | `schema <art>` | offline | – | – | 0/1 |
-| `legacy plan\|image\|push\|check\|keys\|render` | wie vor v1 | wie vor v1 | – | 0/1 |
 
 Genehmigt wird ausschliesslich mit `--approve <klasse>=<plan_id>`; ein
 globales `--force` gibt es nicht, und eine Freigabe nennt den Plan, fuer den
@@ -107,16 +111,13 @@ er die Module und sagt, was er ist:
 
 `examples/fleet/foreign-flake/` ist genau das, und `nix flake check`
 evaluiert es — der Export kann also nicht unbemerkt aufhoeren, allein zu
-stehen. Statt die Rollen von Hand zu setzen, kann der Host auch die Datei
-importieren, die `meister-deploy render <knoten>` schreibt: dieselben
-Optionswerte, die `mkNode` fuer diesen Knoten setzen wuerde, als reine
-Funktion des Plans und byteidentisch bei gleichem Plan. Sie enthaelt keine
-Hardware, keinen Bootloader, kein Dateisystem und keine Adresse — das
-gehoert dem Host.
+stehen. Ein Host, der in einem Inventar steht, braucht das nicht von Hand:
+`meisterstack.lib.mkFleet` baut sein Modul aus dem `[[host]]`-Eintrag, und
+`(mkFleet {…}).hostModules.<id>` ist genau diese Datei als Wert.
 
-Die Zertifikate kommen in keinem Fall aus dem Nix-Store: `keys push` legt
-sie nach `/opt/meisterstack/pki`, und bis dahin bleiben die Units sichtbar
-uebersprungen.
+Die Zertifikate kommen in keinem Fall aus dem Nix-Store: sie werden von der
+Plan-Aktion `deliver-secret` nach `meisterstack.pki.dir` gelegt (`apply`
+fuehrt sie aus), und bis dahin bleiben die Units sichtbar uebersprungen.
 
 ## Von der leeren Platte zur laufenden Flotte
 
@@ -178,43 +179,44 @@ Fuer eine Kiste, die ohnehin schon erreichbar ist und deren Platte niemand
 anders beansprucht, ist nixos-anywhere der kuerzere Weg. Fuer eine leere
 Maschine, an der jemand steht, ist es das Medium.
 
-## Die Kontext-Flotte (OpenNebula)
+## Die Kontext-Flotte (OpenNebula) — nicht mehr hier
 
-Zwoelf VMs, ein generisches Image, `MEISTER_ROLE` im Kontext. Der Plan
-dafuer ist `examples/fleet/lab.toml`; die Knoten haben dort **kein**
-`disk`, weil ihre Platte aus einem registrierten Image kam und der
-VM-Lebenszyklus OpenNebula gehoert (Tofu, spaeter). Fuer solche Knoten
-heisst `push`: rsync der Binaries nach `/opt/meisterstack/bin` und ein
-Unit-Restart — genau das, was `deploy/push.sh` seit M1 tut.
+Zwoelf VMs des Labs booten ein generisches Image und rendern ihre
+Konfigurationsdateien beim Boot aus einem Kontext. Dieses Repo hat davon
+seit M5B fast nichts mehr: `nix/appliance.nix`, `nix/context.nix`,
+`deploy/push.sh`, `deploy/check.sh`, `deploy/one-template.example` und
+`examples/fleet/lab.toml` liegen in
 
-**`push.sh` und `check.sh` bleiben**, bis `meister-deploy` sie im Lab
-einmal wirklich ersetzt hat. Sie koennen zwei Dinge, die das Werkzeug
-heute nicht kann: die Gast-Assets mitschieben (`MEISTER_GUEST_ASSETS`) und
-den musl-Build anstossen. Bis dahin sind sie die Wahrheit fuer die
-Kontext-Flotte, und `meister-deploy` ist es fuer alles andere.
+    ~/git/meisterstack-lab/legacy/
+
+zusammen mit ihrem Rendertest (`check-context.sh`, 140 Pruefungen) und dem
+Paritaetsbeleg, dass das Bild dort **dieselbe Ableitung** ist wie das, das
+hier gebaut wurde (72 Units, je derselbe Store-Pfad). Der Weg von dort
+hierher ist eine Migration und steht in `docs/DEPLOYMENT.md`, Abschnitt
+"Migrating the context fleet".
+
+Was hier bleibt, und mit Absicht: **`nixosModules.provider-opennebula`**.
+Das Medium eines Providers zu LESEN ist nicht dasselbe wie
+Konfigurationsdateien beim Boot zu rendern, und eine verwaltete Maschine
+kann das erste ohne das zweite wollen — sie wird auf OpenNebula
+instanziiert und bekommt ihre Adresse von dort. Der Leser parst
+`context.sh` mit einem `KEY='value'`-Grammar und einer Allowlist von sechs
+Schluesseln, sourct nie und nimmt kein `MEISTER_*` vom Medium: was eine
+Maschine IST, steht im Inventar.
+
+Ebenfalls hier: `deployment = "context"` im Inventar ist weiter ein
+gueltiger Wert. Ein solcher Host steht in `inventory`, hat aber kein
+Toplevel im Manifest, und ein Plan weist ihn mit einem Satz ab, der auf den
+Push im Lab-Repo zeigt. Das ist die ehrliche Antwort: dieses Werkzeug
+bedient ihn nicht.
 
 Der musl-Build braucht einen musl-Cross-GCC (`ring` uebersetzt C fuer das
-Ziel), und den gibt es hier als Shell: `nix develop .#musl` — oder gar nichts
-tun, `push.sh` betritt sie selbst, wenn der Compiler nicht schon auf dem PATH
-liegt. Die Shell setzt genau die drei Variablen, die `cc` und cargo lesen
-(`CC_`, `AR_`, `CARGO_TARGET_..._LINKER`, je mit dem Ziel im Namen); sie bringt
-kein Rust mit, denn das ist das der Maschine. Ein nativer Bau in ihr ist
-derselbe Bau wie ausserhalb.
+Ziel), und den gibt es hier als Shell: `nix develop .#musl`. Die statischen
+Binaries selbst kommen aber aus Nix und nicht mehr aus dieser Shell:
+`nix build .#meisterstack-static` (sieben Binaries) und
+`nix build .#cloud-hypervisor-meister-static` (cloud-hypervisor + ch-remote,
+static-pie) — das ist, was der Push im Lab-Repo nimmt.
 
-Beide lesen `deploy/env`; `meister-deploy` liest dieselben Variablen
-(`MEISTER_SSH_KEY`, `MEISTER_SSH_PORT`, `MEISTER_SSH_STRICT`), also
-bedeutet `. deploy/env` vor dem einen dasselbe wie vor dem anderen.
-
-Was eine Maschine ueber sich selbst sagt und nicht ueber ihre Rolle, geht
-denselben Weg — per Kontext, weil dieselbe qcow2 zwoelfmal instanziiert
-wird und die Maschinen sich unterscheiden:
-
-| Kontextschluessel | Beispiel | Wirkung |
-|---|---|---|
-| `MEISTER_VXLAN_UPLINK` / `MEISTER_VXLAN_MTU` | `eth0`, `1450` | `[network.vxlan]` im `agent.toml` |
-| `MEISTER_PHYSNETS` | `ext=eth1` oder `"ext=eth1, dmz=eth2"` | `[network.provider] physnets` — die Interfaces, die diese Maschine abgibt, mit dem Namen des Provider-Netzes davor. Das Interface darf KEINE Adresse tragen, sonst startet der Agent nicht. Kein Wert heisst kein Abschnitt und damit kein Gateway-Slot; die Nix-Option daneben ist `meisterstack.agent.physnets` und ist die Antwort fuer eine Flotte, die ihre Maschinen im Plan stehen hat. |
-| `MEISTER_BGP_ASN` / `MEISTER_BGP_ROUTER_ID` | `65001`, `10.128.1.10` | `[network.bgp]` — dieser Knoten spricht BGP und kuendigt an, was er traegt (`/32` je Floating IP eines Gastes hier, und die Praefixe seiner Router). Beide oder keiner: ein halber Abschnitt ist ein Startfehler. Die `router_id` wird gesetzt und nicht FRR ueberlassen, das sonst die hoechste Adresse der Kiste nimmt — auf einem Knoten voller Bruecken und Taps die des zuletzt gebauten Gastes. |
-| `MEISTER_BGP_NEIGHBORS` | `10.128.0.1=65000` oder `"10.128.0.1=65000, 10.128.0.2=65000"` | Die Peers, `<adresse>=<asn>`. Leer ist erlaubt: der Abschnitt steht, `frr` laeuft, angekuendigt wird an niemanden. Ohne `MEISTER_BGP_ASN` wirkungslos. |
 
 ## Ohne root
 
@@ -426,16 +428,13 @@ von Hand aendert, aendert sie am naechsten Lauf wieder zurueck.
 | `meisterstack.agent.vmm.package` | package | `pkgs.cloud-hypervisor-meister` | The hypervisor this node's agent starts guests with: cloud-hypervisor with this repository's patch series (nix/packages/cloud-hypervisor.nix says why it is not nixpkgs' own). Read only where `meisterstack.binDir` is derived from a package — an appliance has its hypervisor pushed into /opt/meisterstack/bin — and joined with `meisterstack.package` into one directory there, because the agent's unit names both programs in `binDir`. |
 | `meisterstack.agent.volumes.device` | null or string | `"/dev/disk/by-label/meister-volumes"` | The block this node keeps its guests' disks on, mounted at /var/lib/meisterstack/volumes. `null` keeps them on the root disk. A guest's disks are the one thing on an agent that is BIG and that must outlive an image swap — the root disk of these lab VMs is 3.4 GiB with a 2.2 GiB image on it, so a single provisioned volume fills it. By LABEL rather than by device name in the default, because which slot a disk lands in is not a promise anybody made: /dev/vdb quietly became sda+vda twice in the lab, and etcd lived on the root disk without saying so. |
 | `meisterstack.agent.volumes.required` | boolean | `false` | Whether the agent may run WITHOUT that block. False (the default) mounts it `nofail`: a node whose disk was not attached comes up and keeps its volumes on the root disk, which is the honest degraded state and not an emergency shell — and what the lab has done since the block existed. True is the other answer, for a node whose disks are its job: no `nofail`, and the agent unit REQUIRES the mount. A node that silently provisions onto its root disk fills it and then fails at the worst moment, and "the volume block is not here" is a sentence worth stopping for. |
-| `meisterstack.appliance.enable` | boolean | `true` | Whether this machine is the appliance image. Importing this module is normally the decision, so the default is true; the option exists for a configuration that imports the profile and then turns it off — and for `nix/managed.nix`, which asserts that the two profiles are not on the same machine. |
-| `meisterstack.appliance.legacyContext` | boolean | `true` | Whether the provider's context is SOURCED as a shell script, the way it has been since the first lab VM. `. "$mnt/context.sh"` runs whatever is on the medium, as root, before the network is up. That is a privileged entrance, and the only reason it is still here is that the twelve VMs of the context fleet boot through it today and a rollout is not the place to change two things at once. Everything it is used for it did in the lab: set MEISTER_ROLE, write a hostname, add an ssh key — and everything else it COULD do is why `nix/provider-opennebula.nix` has a second reader that parses instead of sourcing (`mode = "strict"`). The way out is documented rather than implied: a managed host never turns this on, a migrated VM is a managed host, and when the last one has moved, this option and the code behind it go out together (L3). |
-| `meisterstack.binDir` | string | `"/opt/meisterstack/bin"` | The directory every unit of this stack takes its binaries from: `ExecStart`, the `ConditionPathExists` that keeps a unit visibly skipped until they are there, and the hypervisor path in the agent's config all read this one option. The default is where `deploy/push.sh` and `meister-deploy keys push` have always put them — outside the nix store, so that an image swap does not touch them. A host whose binaries come from a package points this at that package's `bin` instead; the condition is then satisfied by construction, which is the honest reading of "the binary is part of this system". |
+| `meisterstack.binDir` | string | `"/opt/meisterstack/bin"` | The directory every unit of this stack takes its binaries from: `ExecStart`, the `ConditionPathExists` that keeps a unit visibly skipped until they are there, and the hypervisor path in the agent's config all read this one option. The default is where a push has always put them — outside the nix store, so that an image swap does not touch them. A host whose binaries come from a package points this at that package's `bin` instead; the condition is then satisfied by construction, which is the honest reading of "the binary is part of this system". |
 | `meisterstack.cloud.settings` | TOML value | `{ }` | cloud-controller config, same shape and same rules; see config/examples/cloud.toml. This is the one tier with a public port, so config/examples/hardened/cloud.toml is worth reading before any deployment that is reachable from outside the lab. NOT `auth`: this tier's whole [auth] table is appended by the context renderer (nix/context.nix) at boot (see cloudAuthMtls/cloudAuthOidc above and the reason it has to be one owner). A key here would be a duplicate [auth] table and a parse error on the VM. The values live in cloudAuthOidc; the issuer comes from MEISTER_OIDC_ISSUER — and on a managed host, where there is no renderer, by `meisterstack.cloud.generated` at build time. |
 | `meisterstack.cluster.settings` | TOML value | `{ }` | cluster-controller config, merged OVER the role defaults above (so a deployment that sets one key keeps the rest). Free-form TOML: nothing here validates a key, the binary does that at start-up with deny_unknown_fields. config/examples/cluster.toml is the reference for every key it takes, and config/examples/hardened/cluster.toml for a control plane that is not on a lab switch. Empty (the default) = the role defaults above and, for everything they do not name, the binary's own — which are the lab topology. cluster_name, cloud_addr and cloud_addrs are normally left out here and written by the context renderer from the context instead — a key in both places would be a duplicate TOML key. |
-| `meisterstack.configDir` | string | `"/run/meisterstack"` | The directory the units read their `--config` from. The default is where the boot-time renderer (nix/context.nix) writes the completed files: the image bakes a TEMPLATE under /etc/meisterstack, and the per-machine values — node id, controller addresses, the cloud's whole [auth] table — are only known once the machine has booted somewhere. A managed host has no renderer and no context: Nix knows every one of those values at build time, writes the complete file into /etc and points this option at it. Then the config a unit reads is part of the system generation, which is what makes a rollback a rollback. |
+| `meisterstack.configDir` | string | `"/run/meisterstack"` | The directory the units read their `--config` from. The default is where a boot-time renderer writes the completed files: such an image bakes a TEMPLATE under /etc/meisterstack, and the per-machine values — node id, controller addresses, the cloud's whole [auth] table — are only known once the machine has booted somewhere. This flake has no such renderer any more (M5B); the one the lab's twelve context VMs boot is in `~/git/meisterstack-lab/legacy/nix/context.nix`. A managed host has no renderer and no context: Nix knows every one of those values at build time, writes the complete file into /etc and points this option at it. Then the config a unit reads is part of the system generation, which is what makes a rollback a rollback. |
 | `meisterstack.context.defaults` | attribute set of string | `{ }` | MEISTER_* variables baked as defaults for the context renderer. Anything a provider's context can say, a configuration can say here instead — and the context, being the thing that knows where this machine was actually booted, wins over it. On a managed host this attrset is the WHOLE input: there is no provider and no cd, `nix/lib/render.nix` turns it into the complete config files at build time, and nothing overrides it afterwards. Secrets do not belong here: this file is in the nix store and the store is world-readable. Certificates and keys travel with `meister-deploy keys push`, as they always have. |
-| `meisterstack.context.enable` | boolean | `false` | Whether this machine renders its config files at BOOT, from a context (nix/context.nix sets this, by being imported). It is read rather than set: the two auth fragments of the cloud exist only where something appends them, and `nix/managed.nix` refuses to be combined with a renderer — a host whose config files are complete at build time must not have a second author for them at boot. |
-| `meisterstack.context.providerScript` | strings concatenated with "\n" | `""` | Shell run before anything else reads this machine's context: a provider's chance to say where the machine was actually booted. Empty (the default) is a machine whose whole context is what its configuration bakes. `nixosModules.provider-opennebula` is the one implementation today, and it is deliberately NOT part of `nixosModules.default`: a reader that knows how to mount a CONTEXT cd is a reader nobody else can use. Two modules run it, and never both on one host. On an appliance the boot renderer (nix/context.nix) runs it in the middle of rendering, because there the provider's values are an INPUT to the config files. On a managed host there is no renderer — the config files are part of the system generation — and `meister-provider-context.service` (nix/services.nix) runs the same script for the one thing that is still the provider's to say: the machine's address, its route, its resolver, its hostname and the operator's key. What it may do is set MEISTER_* variables and configure the interface it owns. What it must not do is render a config file. |
-| `meisterstack.context.sources` | list of string | `[ "/etc/meisterstack/context.env" ]` | The files this machine sources its MEISTER_* variables from, in order, before any provider speaks. A file that is not there is skipped without a word — the generic image, which is told everything at boot, carries none of them. The default is the one nix/roles.nix writes out of `meisterstack.context.defaults`. The order is the precedence: the last file to set a variable wins, and a provider wins over all of them, because it is the thing that knows where this machine was actually booted. |
+| `meisterstack.context.enable` | boolean | `false` | Whether this machine renders its config files at BOOT, from a context. A renderer sets it by being imported; this flake ships none any more (M5B), so on a host of this flake it is always false and what reads it is the refusal in nix/managed.nix. It is read rather than set: the two auth fragments of the cloud exist only where something appends them, and `nix/managed.nix` refuses to be combined with a renderer — a host whose config files are complete at build time must not have a second author for them at boot. |
+| `meisterstack.context.providerScript` | strings concatenated with "\n" | `""` | Shell run before anything else reads a context: a provider's chance to say where this machine was booted. Empty (the default) is a machine whose whole context is its baked files. `nixosModules.provider-opennebula` is the one implementation today, and it is deliberately NOT part of `nixosModules.default`: a reader that knows how to mount a CONTEXT cd is a reader that cannot be used anywhere else. What it may do is set MEISTER_* variables and configure the interface it owns. What it must not do is render a config file. |
 | `meisterstack.data.label` | string | `"etcd-data"` | The filesystem label of this box's data block. The default is the lab's historical one and mounts only /var/lib/etcd, exactly as before. Any other value mounts /var/lib/meister-data instead and puts etcd under `etcd/` and the addons under `addons/` there. The label is IN the filesystem (`mkfs.ext4 -L <label>`), so it survives an image swap and a bus surprise alike. |
 | `meisterstack.etcd.clusterToken` | string | `"meisterstack"` | Bootstrap token. Two tiers bootstrapping on one network must not share it — it is what keeps a cloud member from joining a cluster's Raft. |
 | `meisterstack.etcd.enable` | boolean | `a controller tier runs one` | Whether this machine runs the etcd its controller talks to. The default is "yes if it carries a controller role": each tier's etcd is private to its controller (Oakestra-style), so an agent-only node has no reason to run one — and a host that imports these modules without naming a role gets no database it did not ask for. The appliance image is every tier at once (`meisterstack.unitsFor`), so there this is on, exactly as it has always been. |
@@ -447,7 +446,7 @@ von Hand aendert, aendert sie am naechsten Lauf wieder zurueck.
 | `meisterstack.managed.substituters` | list of string | `[ ]` | Binary caches this host may fetch from. Empty (the default) is a host that is only ever pushed to: `nix copy --to ssh-ng://` carries the whole closure, and a target that fetches from nowhere cannot be surprised by what somebody else put in a cache. |
 | `meisterstack.managed.trustedPublicKeys` | list of string | `[ ]` | The signing keys whose closures this host accepts. REQUIRED when `enable` is on, and the assertion below says so. Measured, not assumed (M0 probe S12): with `require-sigs = true` a `nix copy --to ssh-ng://root@host` of an UNSIGNED closure is refused — "cannot add path … because it lacks a signature by a trusted key" — even though root is a trusted user. Being trusted is not being signed. The old `ssh://` store would take it, and that is exactly the guarantee `require-sigs` exists for, so the answer is to sign (`meister-deploy build --sign-key`) rather than to widen the target. |
 | `meisterstack.observability.enable` | boolean | `a machine that runs a role collects its journal` | Whether this machine runs the log collector beside its units. The default is "yes, if this machine runs any of our units at all": the interesting lines on these VMs are not ours — etcd losing a leader, the VMM refusing a disk, the kernel remounting read-only — and it is the WHOLE journal that gets shipped, which is the entire reason to run a collector rather than teach three binaries to push. It still costs nothing on a machine that names no Loki: without a rendered config the unit's ConditionPathExists is not met and Alloy stays skipped. A managed host turns this off by default, and that is a gap rather than a decision: its config file would have to be baked at build time the way its TOML files are, and that is not built yet. |
-| `meisterstack.package` | package | `pkgs.meisterstack` | The package the units of this stack take their binaries from. Read only where `meisterstack.binDir` is derived from it — which is what nix/managed.nix does and what nix/appliance.nix does not: an appliance gets its binaries pushed into /opt/meisterstack/bin and this option is never forced there. That is also why the default may be a package that the operator's nixpkgs does not have: a foreign host importing `nixosModules.default` without the overlay is a perfectly good host, as long as it says where its binaries are. |
+| `meisterstack.package` | package | `pkgs.meisterstack` | The package the units of this stack take their binaries from. Read only where `meisterstack.binDir` is derived from it — which is what nix/managed.nix does. A host that is not managed by this flake may get its binaries pushed into /opt/meisterstack/bin instead, and then this option is never forced. That is also why the default may be a package that the operator's nixpkgs does not have: a foreign host importing `nixosModules.default` without the overlay is a perfectly good host, as long as it says where its binaries are. |
 | `meisterstack.pki.dir` | string | `"/opt/meisterstack/pki"` | Where this machine's certificates and private keys live. The names in it are FIXED — `ca.crt`, `serving.crt`, `serving.key`, `identity.crt`, `identity.key` — because a serving certificate and an identity differ per host while one config template serves them all. Outside the nix store on purpose, in both profiles: a private key must never travel in an image, and the store is world-readable. The private keys belong to the user that reads them (`meister`, mode 0600). systemd credentials are NOT an option here: `LoadCredential` hands the unit a `root:root 0440` file with an ACL, and all three of this project's key loaders refuse a mode with group bits in it (`shared/pki/src/pem.rs`, `shared/proto/src/lib.rs`, `components/cli/src/config.rs`). Measured in a VM, M0 probe S11. |
 | `meisterstack.ports` | attribute set of attribute set of (signed integer or string) | `{ agent = { metrics = 9102; migration = "49000-49099"; }; cloud = { api = 3000; grpc = 50050; metrics = 9100; }; cluster = { api = 3001; grpc = 50051; metrics = 9101; }; etcd = { client = 2379; peer = 2380; }; }` | The ports this stack listens on, per role — to be READ, not set. No firewall rule is written by these modules, and that is the point: a host's firewall belongs to the host, and a service module that opens a port decides something host-global behind its owner's back. So the numbers are published here instead, and an operator's own `networking.firewall` can name them: networking.firewall.allowedTCPPorts = with config.meisterstack.ports; [ cloud.api cloud.grpc etcd.peer ]; Which of them this module actually sets: the three `metrics` listeners (controllers.nix, agent.nix), the agent's `migration` RANGE, and etcd's two (nix/etcd.nix — `client` is bound to loopback and is here for completeness, `peer` is the one that crosses the network). `api` and `grpc` are the binaries' own defaults, written down because a plan derives addresses from them (`MEISTER_CLOUD_ADDRS`, `MEISTER_CONTROLLER_ADDRS`) and an operator opening a hole needs the number in one place. The addons role is not in this list: its six services bring their own nixpkgs modules and their own listeners, and `meisterstack.addons` is where they are configured. |
 | `meisterstack.provider.opennebula.device` | string | `"/dev/disk/by-label/CONTEXT"` | The medium. OpenNebula labels its context iso CONTEXT, and the label is what makes it findable whatever bus it lands on — which slot a disk gets is not a promise anybody made. Read by the strict reader only. The legacy one has the path in it, because it is frozen. |

@@ -303,6 +303,62 @@ pub fn enroll(
     })
 }
 
+// --- lane 5B: a host that left ------------------------------------------
+
+/// Mark a host's `known_hosts` entry as retired, and keep the entry.
+///
+/// A comment goes in ABOVE the line and the line stays. Deleting it would
+/// be the obvious thing and it is the wrong one: the entry is the record
+/// that this fleet, on some day, decided that this key belongs to this
+/// machine, and a reinstall on the same address has to collide with it
+/// (`keys enroll` refuses, and `--replace --reason` is how somebody says
+/// what happened). A deleted line would make the next machine on that
+/// address enrollable without anybody noticing that there was one before.
+///
+/// Returns false when the file has no entry for this host, which is not an
+/// error: a host that was never enrolled can still be retired.
+pub fn mark_retired(
+    files: &dyn Files,
+    known_hosts: &Path,
+    name: &str,
+    reason: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if !files.exists(known_hosts) {
+        return Ok(false);
+    }
+    let existing = files.read_to_string(known_hosts)?;
+    if !existing
+        .lines()
+        .any(|l| host_field(l).is_some_and(|h| h == name))
+    {
+        return Ok(false);
+    }
+    let marker = match reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(reason) => format!("# retired {} {reason}", now.format("%Y-%m-%dT%H:%M:%SZ")),
+        None => format!("# retired {}", now.format("%Y-%m-%dT%H:%M:%SZ")),
+    };
+    // Twice is not twice: a host retired again gets one marker, because the
+    // file is committed and a diff full of identical comments says nothing.
+    let mut out: Vec<String> = Vec::new();
+    let lines: Vec<&str> = existing.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if host_field(line).is_some_and(|h| h == name) {
+            let marked = i > 0 && lines[i - 1].trim_start().starts_with("# retired ");
+            if !marked {
+                out.push(marker.clone());
+            }
+        }
+        out.push((*line).to_string());
+    }
+    let mut text = out.join("\n");
+    text.push('\n');
+    files.write_atomic(known_hosts, text.as_bytes(), 0o644)?;
+    Ok(true)
+}
+
+// --- end lane 5B --------------------------------------------------------
+
 /// The host a `known_hosts` line is about, past a `@cert-authority` or
 /// `@revoked` marker. `None` for a comment or an empty line.
 fn host_field(line: &str) -> Option<&str> {
@@ -555,6 +611,22 @@ pub fn revoke_cmd(meister_ca: &Path, ca_dir: &Path, what: &str, reason: Option<&
     cmd
 }
 
+// --- lane 5B ---
+/// `meister-ca --dir <ca> --index-rebuild`, on its own.
+///
+/// What `keys import` runs after it has put certificates into the
+/// repository: the index is what makes a certificate revocable, and a
+/// certificate this fleet can check but never take back is worse than no
+/// certificate. The rebuild is ADDITIVE — a revocation already in the index
+/// survives it (M0 finding 7) — so running it is never a way to lose one.
+pub fn index_rebuild_cmd(meister_ca: &Path, ca_dir: &Path) -> Cmd {
+    Cmd::new(Effect::Key, meister_ca.display().to_string(), CA_DEADLINE)
+        .arg("--dir")
+        .arg(ca_dir.display().to_string())
+        .arg("--index-rebuild")
+}
+// --- end lane 5B ---
+
 /// `meister-ca --dir <ca> --index-rebuild --gencrl`.
 pub fn gencrl_cmd(meister_ca: &Path, ca_dir: &Path) -> Cmd {
     Cmd::new(Effect::Key, meister_ca.display().to_string(), CA_DEADLINE)
@@ -761,6 +833,40 @@ pub struct Subject {
     /// The SANs a serving certificate gets. Empty for the client kinds.
     pub sans: Vec<String>,
 }
+
+// --- lane 5B: reading a certificate somebody else issued ----------------
+
+/// Which kind a certificate is, from the common name on it.
+///
+/// The three client kinds name themselves (`system:node:`, `system:cluster:`,
+/// `system:cloud:`) because this fleet's authenticator reads exactly those
+/// prefixes (`controller_api::Identity::may_speak_for`). Anything else is a
+/// SERVING certificate: a name a client typed and checked the address
+/// against, which is the only other thing this stack's CA issues.
+pub fn kind_from_cn(cn: &str) -> CaKind {
+    match cn {
+        _ if cn.starts_with("system:node:") => CaKind::Node,
+        _ if cn.starts_with("system:cluster:") => CaKind::Cluster,
+        _ if cn.starts_with("system:cloud:") => CaKind::Cloud,
+        _ => CaKind::Serving,
+    }
+}
+
+/// The common name out of what `openssl x509 -subject` printed.
+///
+/// `subject=CN=system:node:n1, O=system:nodes` — the field order is
+/// openssl's and the CN is not always first, so it is searched for rather
+/// than taken from a position.
+pub fn cn_of(subject: &str) -> Option<String> {
+    subject
+        .trim()
+        .trim_start_matches("subject=")
+        .split(',')
+        .map(str::trim)
+        .find_map(|field| field.strip_prefix("CN=").map(|cn| cn.trim().to_string()))
+}
+
+// --- end lane 5B --------------------------------------------------------
 
 /// Which identity a host's `identity.key` is for, from its roles.
 ///

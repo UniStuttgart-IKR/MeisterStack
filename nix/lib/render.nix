@@ -11,7 +11,8 @@
 # files are in /etc before the machine has started.
 #
 # Two renderers is one too many, which is why this one is a function with no
-# I/O in it and why `checks.render-parity` runs both over the same input and
+# I/O in it. Until M5B a boot-time renderer did the same job from a context,
+# and `checks.render-parity` ran both over the same input and
 # compares the parsed TOML. If they ever disagree, the check says so in the
 # key that differs rather than in the lab three weeks later.
 #

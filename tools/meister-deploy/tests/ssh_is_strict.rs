@@ -10,18 +10,18 @@
 //! it. The pre-v1 tool had three ways — `accept-new`, `no` plus
 //! `UserKnownHostsFile=/dev/null`, and `nixos-rebuild` with no options —
 //! and the one that changed machines was the one with no options. So the
-//! source is read: outside `legacy/`, the three spellings that turn host
-//! key verification off do not appear, and the one that turns it on appears
-//! in exactly one file.
+//! source is read: the three spellings that turn host key verification off
+//! do not appear anywhere, and the one that turns it on appears in exactly
+//! one file. There is no exempt directory any more — `legacy/` was the last
+//! one and M5B removed it.
 //!
 //! A source-reading test is blunt. It is chosen for the same reason
 //! `no_direct_effects.rs` is: the alternative is a promise in a comment.
 
 use std::path::{Path, PathBuf};
 
-/// The pre-v1 wing. It keeps its options until L3 retires it, and it is the
-/// only place they may be.
-const EXEMPT: &[&str] = &["legacy"];
+/// Nothing is exempt. The pre-v1 wing was, and it is gone (M5B).
+const EXEMPT: &[&str] = &[];
 
 /// What must not be in new code, and why each one is a refusal rather than a
 /// preference.
@@ -89,7 +89,7 @@ fn nothing_outside_the_old_wing_turns_host_key_checking_off() {
     );
     assert!(
         found.is_empty(),
-        "{} place(s) outside legacy/ weaken host key verification:\n{}",
+        "{} place(s) weaken host key verification:\n{}",
         found.len(),
         found.join("\n")
     );

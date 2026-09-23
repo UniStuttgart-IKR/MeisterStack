@@ -9,7 +9,7 @@
 # its own root any more — a deployment is an operator's own repository, and
 # `meister-deploy init <dir>` writes one. This file exists so that
 # `nix flake check` has a real fleet to check (`checks.example-cpu-host`,
-# `example-topology`, `render-parity`, `manifest-json`), and it is read
+# `example-topology`, `manifest-json`), and it is read
 # through `lib.mkFleet` exactly the way an operator's `fleet.toml` is.
 
 schema = 2

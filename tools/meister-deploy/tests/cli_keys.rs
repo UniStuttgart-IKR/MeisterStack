@@ -933,3 +933,182 @@ fn a_second_certificate_for_one_name_needs_the_first_one_taken_back() {
         "it says which of the two reasons it is: {said}"
     );
 }
+
+// --- lane 5B: retiring a host ------------------------------------------------
+
+/// A fleet of one host, so that `retire` has nobody left to hand the list to
+/// and the test is about the operator's side alone.
+fn one_host_release(sandbox: &Sandbox, keep: &str) -> PathBuf {
+    let mut fleet = sandbox.fleet.clone();
+    fleet.hosts.retain(|id, _| id == keep);
+    fleet.evaluated_hosts.retain(|id| id == keep);
+    fleet.groups.clear();
+    // The id is over the content, so a fleet that was cut down has a new
+    // one; a manifest whose id does not hash to itself is one `validate`
+    // refuses, and rightly.
+    fleet.manifest_id =
+        meister_deploy::ids::content_id(meister_deploy::ids::IdKind::Manifest, &fleet)
+            .expect("a manifest hashes");
+    let release = support::release_of(fleet);
+    let path = sandbox.path("release-one.json");
+    std::fs::write(&path, release.to_json().unwrap()).unwrap();
+    path
+}
+
+/// `--dry-run` says what would be taken back and takes nothing back.
+#[test]
+fn a_retirement_dry_run_touches_neither_the_ca_nor_the_repository() {
+    let sandbox = Sandbox::new();
+    one_host_release(&sandbox, "box");
+    std::fs::create_dir_all(sandbox.path("pki/issued/box")).unwrap();
+    std::fs::write(sandbox.path("pki/issued/box/identity.crt"), "x").unwrap();
+
+    let out = sandbox.run(&[
+        "retire",
+        "box",
+        "--release",
+        "release-one.json",
+        "--inventory",
+        "fleet.toml",
+        "--reason",
+        "decommissioned",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let said = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(said.contains("--revoke"), "{said}");
+    assert!(said.contains("--gencrl"), "{said}");
+    assert!(
+        !sandbox.path(".meister-deploy/retired/box.json").exists(),
+        "a dry run wrote the record"
+    );
+    assert!(
+        !sandbox.calls().iter().any(|l| l.starts_with("meister-ca")),
+        "a dry run called the CA: {:?}",
+        sandbox.calls()
+    );
+}
+
+/// The whole of what a retirement leaves behind, and what it leaves alone.
+#[test]
+fn retiring_takes_the_certificates_back_and_marks_the_line_without_removing_it() {
+    let sandbox = Sandbox::new();
+    one_host_release(&sandbox, "box");
+    std::fs::create_dir_all(sandbox.path("pki/issued/box")).unwrap();
+    std::fs::write(sandbox.path("pki/issued/box/identity.crt"), "x").unwrap();
+    // What the CA writes when it is asked for a list.
+    std::fs::write(
+        sandbox.ca.path().join("crl.pem"),
+        "-----BEGIN X509 CRL-----\n",
+    )
+    .unwrap();
+    // And the entry a real fleet has for the machine.
+    let address = &sandbox.fleet.hosts["box"].address;
+    std::fs::write(
+        sandbox.path("known_hosts"),
+        format!("{address} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample\n"),
+    )
+    .unwrap();
+
+    let out = sandbox.run(&[
+        "retire",
+        "box",
+        "--release",
+        "release-one.json",
+        "--inventory",
+        "fleet.toml",
+        "--reason",
+        "decommissioned",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    // The CA was asked for both halves, in that order.
+    let ca: Vec<String> = sandbox
+        .calls()
+        .into_iter()
+        .filter(|l| l.starts_with("meister-ca"))
+        .collect();
+    assert!(
+        ca.iter().any(|l| l.contains("--revoke")),
+        "the certificate was not taken back: {ca:?}"
+    );
+    assert!(
+        ca.iter().any(|l| l.contains("--gencrl")),
+        "no list was written: {ca:?}"
+    );
+    // And the list is in the repository, where the delivery reads it from.
+    assert!(sandbox.path("pki/crl.pem").exists(), "{ca:?}");
+
+    // The record says what happened, with the serial the CA's own answer
+    // named.
+    let record = std::fs::read_to_string(sandbox.path(".meister-deploy/retired/box.json")).unwrap();
+    assert!(record.contains("\"host\": \"box\""), "{record}");
+    assert!(record.contains("decommissioned"), "{record}");
+    assert!(record.contains("0A0B"), "{record}");
+
+    // The `known_hosts` line is still there, with the reason above it. A
+    // deleted line would let the next machine on that address be enrolled
+    // without anybody seeing that there had been one.
+    let known = sandbox.known_hosts();
+    assert!(known.contains(address.as_str()), "{known}");
+    assert!(known.contains("# retired "), "{known}");
+    assert!(known.contains("decommissioned"), "{known}");
+
+    // And the certificate file itself is untouched: `retire` takes a
+    // certificate back, it does not delete anybody's files.
+    assert!(sandbox.path("pki/issued/box/identity.crt").exists());
+    assert!(
+        stderr(&out).contains("nothing on box was changed or deleted"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// Running it twice adds one marker, not two.
+#[test]
+fn retiring_twice_does_not_fill_known_hosts_with_comments() {
+    let sandbox = Sandbox::new();
+    one_host_release(&sandbox, "box");
+    std::fs::write(sandbox.ca.path().join("crl.pem"), "x\n").unwrap();
+    let address = &sandbox.fleet.hosts["box"].address;
+    std::fs::write(
+        sandbox.path("known_hosts"),
+        format!("{address} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample\n"),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let out = sandbox.run(&[
+            "retire",
+            "box",
+            "--release",
+            "release-one.json",
+            "--inventory",
+            "fleet.toml",
+        ]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+    }
+    let known = sandbox.known_hosts();
+    assert_eq!(known.matches("# retired ").count(), 1, "{known}");
+}
+
+/// A host this release does not have is named, and nothing is written.
+#[test]
+fn retiring_a_host_the_release_does_not_have_is_a_sentence() {
+    let sandbox = Sandbox::new();
+    one_host_release(&sandbox, "box");
+    let out = sandbox.run(&[
+        "retire",
+        "nobody",
+        "--release",
+        "release-one.json",
+        "--inventory",
+        "fleet.toml",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("nobody"), "{}", stderr(&out));
+    assert!(
+        sandbox.calls().is_empty(),
+        "a refusal ran something: {:?}",
+        sandbox.calls()
+    );
+}

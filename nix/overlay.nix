@@ -45,6 +45,21 @@ final: prev: {
   # says so rather than a half-working package pretending otherwise.
   meisterstack-static = final.pkgsStatic.callPackage ./packages/meisterstack.nix { };
 
+  # And the hypervisor beside them, statically linked, for the same road.
+  #
+  # `get_patched_binaries.sh` used to build this one by hand (`nix shell` +
+  # `cargo build --target x86_64-unknown-linux-musl`) and drop it under
+  # `bin/`; the legacy push then took the file `MEISTER_CH_BIN` named. That
+  # script went with M5B, so the binary it produced has to come from
+  # somewhere a fleet can name — and an attribute is the only place that
+  # does not depend on whose machine ran what.
+  #
+  # The twelve context VMs are the only readers: a MANAGED host takes
+  # `pkgs.cloud-hypervisor-meister` out of its own closure and needs nothing
+  # static at all.
+  cloud-hypervisor-meister-static =
+    final.pkgsStatic.callPackage ./packages/cloud-hypervisor.nix { };
+
   meisterstack-runtime = final.symlinkJoin {
     name = "meisterstack-runtime-${final.meisterstack.version}";
     paths = [ final.meisterstack final.cloud-hypervisor-meister ];

@@ -8,16 +8,17 @@
 //! about EVERY path through this binary, and a unit test can only ever pin
 //! the paths it calls. So this test reads the source instead: new code spawns
 //! no process of its own, opens no file of its own, and asks no clock of its
-//! own. Three files are exempt, because they are the doors themselves, and
-//! `legacy/` is exempt because it predates them and goes away with L3.
+//! own. Two files are exempt, because they are the doors themselves.
+//! `legacy/` was exempt as well until M5B removed it; the exemption went
+//! with the directory.
 //!
 //! A source-reading test is a blunt instrument, and it is chosen on purpose:
 //! the alternative is a promise in a comment.
 
 use std::path::{Path, PathBuf};
 
-/// The doors, and the old wing.
-const EXEMPT: &[&str] = &["legacy", "effects.rs", "run.rs"];
+/// The doors.
+const EXEMPT: &[&str] = &["effects.rs", "run.rs"];
 
 /// What new code must not say, and what to say instead.
 ///

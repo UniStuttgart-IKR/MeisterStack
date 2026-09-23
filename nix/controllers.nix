@@ -88,9 +88,11 @@ let
   # cloud.toml. The values stay in this file, where the cloud's auth lives, and
   # TOML quoting stays Nix's problem rather than a shell's.
   #
-  # `[auth.oidc]` is LAST in the oidc fragment (toml.generate orders it so,
-  # and the check-context render test holds it there), which is what lets
-  # the renderer append the single `issuer` line into it.
+  # `[auth.oidc]` is LAST in the oidc fragment (toml.generate orders it so).
+  # Until M5B that mattered to a boot-time renderer, which appended the
+  # single `issuer` line into it; that renderer and its 140-check shell test
+  # went to `~/git/meisterstack-lab/legacy/`. The order is kept because the
+  # fragment is still assembled the same way.
   #
   # No ca_cert for the provider: the lab's Keycloak is plain http. That is
   # THE deviation from the hardened profile in this whole file, and it is
