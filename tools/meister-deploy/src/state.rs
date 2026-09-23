@@ -640,6 +640,441 @@ pub fn journal_ref(files: &dyn Files, path: &Path) -> Result<JournalRef> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// --- lane 4C: what a state directory keeps
+// ---------------------------------------------------------------------------
+//
+// Three kinds of thing pile up in here, and they are not the same kind of
+// thing at all:
+//
+// * `gcroots/<release-id>/` costs DISK — gigabytes of closure the collector
+//   may not take. Dropping a root removes no store path; it only stops this
+//   tool from insisting.
+// * `observations/<ts>.json` costs kilobytes and is a picture of a fleet at
+//   a moment. Old ones answer "when did this host last look healthy".
+// * `runs/<run-id>/` is the EVIDENCE: the journal that was fsynced line by
+//   line before every irreversible step, and the receipt that says what
+//   happened. Some of it is the only record of something that went wrong.
+//
+// So the rules differ, and the differences are the point:
+//
+// * a release loses its roots when it is neither among the newest N NOR
+//   younger than `--older-than` — two guards, both of which have to agree,
+//   because the conservative direction is the one that keeps a rollback
+//   possible;
+// * a directory with no `.created` stamp is never removed, because a
+//   directory this tool cannot date is one it does not know enough about;
+// * `observations/latest.json` is never removed — it is what `status
+//   --offline` answers from;
+// * `runs/` is touched only when `--runs` says so, and NEVER a run whose
+//   receipt is not `success` or that has no receipt at all: a run that
+//   failed, was aborted, ended partial or never ended is the one somebody
+//   has to read;
+// * nothing is deleted recursively. A run directory is emptied of the files
+//   this tool knows it writes, and anything else in it stops the removal
+//   with a sentence rather than a `rm -rf`.
+
+/// The recommended retention, as a sentence an operator can copy:
+/// `meister-deploy gc --keep 3 --older-than 14`.
+///
+/// Three, because that is what the target keeps as well
+/// (`meisterstack.managed.keepGenerations`, `meister-activate gc --keep 3`):
+/// the running system, the booted system and three generations back. A
+/// release whose roots are gone while the target still has the generation
+/// is a rollback that works and a rebuild that does not, which is the wrong
+/// way round.
+pub const DEFAULT_KEEP_RELEASES: usize = 3;
+
+/// Fourteen days, because that is how long "the release from before the
+/// holiday" stays a thing somebody goes back to. It is a SECOND guard and
+/// never the only one: a fleet that has not been rebuilt in a month must
+/// not lose the roots of the release it is running.
+pub const DEFAULT_OLDER_THAN_DAYS: i64 = 14;
+
+/// What `gc` was asked to keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retention {
+    /// How many releases keep their garbage-collector roots.
+    pub keep: usize,
+    /// Only releases (and runs) older than this many days may go at all.
+    /// `None` is "age does not protect anything", which is what makes
+    /// `--keep 0` mean what it says.
+    pub older_than_days: Option<i64>,
+    /// How many snapshots under `observations/` to keep. `None` leaves them
+    /// alone entirely.
+    pub observations: Option<usize>,
+    /// Whether run directories may be removed at all.
+    pub runs: bool,
+}
+
+impl Default for Retention {
+    fn default() -> Retention {
+        Retention {
+            keep: DEFAULT_KEEP_RELEASES,
+            older_than_days: None,
+            observations: None,
+            runs: false,
+        }
+    }
+}
+
+/// One thing that would be removed, in the form an operator reads and a
+/// carrying-out loop walks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removal {
+    /// What it is called: a release id, a snapshot's file name, a run id.
+    pub what: String,
+    /// What kind of thing: `release`, `observation`, `run`.
+    pub kind: &'static str,
+    /// The files to unlink, in order.
+    pub files: Vec<PathBuf>,
+    /// The directories to remove afterwards, deepest first. Empty for a
+    /// single file.
+    pub dirs: Vec<PathBuf>,
+}
+
+impl Removal {
+    /// How much it is: the number of files this would unlink.
+    pub fn entries(&self) -> usize {
+        self.files.len()
+    }
+}
+
+/// Something that stays, and the sentence that says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub what: String,
+    pub kind: &'static str,
+    pub why: String,
+}
+
+/// Everything one `gc` would do, decided before anything is done.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sweep {
+    pub remove: Vec<Removal>,
+    pub keep: Vec<Kept>,
+}
+
+impl Sweep {
+    pub fn removals_of(&self, kind: &str) -> Vec<&Removal> {
+        self.remove.iter().filter(|r| r.kind == kind).collect()
+    }
+
+    pub fn kept_of(&self, kind: &str) -> Vec<&Kept> {
+        self.keep.iter().filter(|k| k.kind == kind).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.remove.is_empty()
+    }
+}
+
+/// Decide what this state directory may stop keeping.
+///
+/// Reads the disk and writes nothing: `--dry-run` prints exactly this and a
+/// real run hands the same value to [`carry_out`]. One function, so that the
+/// listing and the doing can never be two different decisions.
+pub fn sweep(
+    files: &dyn Files,
+    state: &StateDir,
+    roots: &[crate::build::RootDir],
+    retention: &Retention,
+    now: DateTime<Utc>,
+) -> Result<Sweep> {
+    let mut out = Sweep::default();
+    sweep_releases(roots, retention, now, &mut out);
+    sweep_observations(files, state, retention, now, &mut out)?;
+    sweep_runs(files, state, retention, now, &mut out)?;
+    Ok(out)
+}
+
+/// Whether a thing made at `created` is old enough to be allowed to go.
+///
+/// `None` for `older_than_days` means age protects nothing, which is what
+/// keeps `--keep 0` a sentence about counting.
+fn old_enough(created: DateTime<Utc>, retention: &Retention, now: DateTime<Utc>) -> bool {
+    match retention.older_than_days {
+        None => true,
+        Some(days) => now.signed_duration_since(created) >= chrono::Duration::days(days),
+    }
+}
+
+fn sweep_releases(
+    roots: &[crate::build::RootDir],
+    retention: &Retention,
+    now: DateTime<Utc>,
+    out: &mut Sweep,
+) {
+    // `roots()` sorts oldest last-dated first and undated first, so the
+    // newest N are the tail of the dated ones.
+    let dated: Vec<&crate::build::RootDir> =
+        roots.iter().filter(|r| r.created_at.is_some()).collect();
+    let cut = dated.len().saturating_sub(retention.keep);
+    for (index, dir) in dated.iter().enumerate() {
+        let created = dir.created_at.expect("filtered above");
+        if index >= cut {
+            out.keep.push(Kept {
+                what: dir.release_id.clone(),
+                kind: "release",
+                why: format!("among the newest {}", retention.keep),
+            });
+        } else if !old_enough(created, retention, now) {
+            out.keep.push(Kept {
+                what: dir.release_id.clone(),
+                kind: "release",
+                why: format!(
+                    "made {}, which is inside the {} day(s) this sweep protects",
+                    created.to_rfc3339(),
+                    retention.older_than_days.unwrap_or(0)
+                ),
+            });
+        } else {
+            out.remove.push(Removal {
+                what: dir.release_id.clone(),
+                kind: "release",
+                files: dir
+                    .links
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(dir.path.join(crate::build::STAMP)))
+                    .collect(),
+                dirs: vec![dir.path.clone()],
+            });
+        }
+    }
+    for dir in roots.iter().filter(|r| r.created_at.is_none()) {
+        out.keep.push(Kept {
+            what: dir.release_id.clone(),
+            kind: "release",
+            // The reader knows WHY it could not date this one — no stamp at
+            // all, or a stamp it cannot read — and those are not the same
+            // thing to somebody deciding what to do about it.
+            why: dir
+                .undated_because
+                .clone()
+                .unwrap_or_else(|| "this tool cannot say how old it is".to_string()),
+        });
+    }
+}
+
+fn sweep_observations(
+    files: &dyn Files,
+    state: &StateDir,
+    retention: &Retention,
+    now: DateTime<Utc>,
+    out: &mut Sweep,
+) -> Result<()> {
+    let Some(keep) = retention.observations else {
+        return Ok(());
+    };
+    let latest = state.latest_observation_path();
+    // Named `<YYYYmmdd>T<HHMMSS>Z.json` by `save_observation`, so a lexical
+    // sort is a chronological one — the same property run ids have.
+    let mut snapshots: Vec<PathBuf> = files
+        .list_dir(&state.observations_dir())?
+        .into_iter()
+        .filter(|path| path != &latest)
+        .collect();
+    snapshots.sort();
+    let cut = snapshots.len().saturating_sub(keep);
+    for (index, path) in snapshots.iter().enumerate() {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if index >= cut {
+            out.keep.push(Kept {
+                what: name,
+                kind: "observation",
+                why: format!("among the newest {keep}"),
+            });
+            continue;
+        }
+        // The name carries the moment it was taken, and that is the only
+        // date this tool has for a snapshot; one it cannot read is one it
+        // leaves alone.
+        match observation_taken_at(&name) {
+            Some(taken) if !old_enough(taken, retention, now) => out.keep.push(Kept {
+                what: name,
+                kind: "observation",
+                why: format!(
+                    "taken {}, which is inside the {} day(s) this sweep protects",
+                    taken.to_rfc3339(),
+                    retention.older_than_days.unwrap_or(0)
+                ),
+            }),
+            None => out.keep.push(Kept {
+                what: name,
+                kind: "observation",
+                why: "its name does not say when it was taken".to_string(),
+            }),
+            Some(_) => out.remove.push(Removal {
+                what: name,
+                kind: "observation",
+                files: vec![path.clone()],
+                dirs: Vec::new(),
+            }),
+        }
+    }
+    Ok(())
+}
+
+/// `20260922T090000Z.json` -> the moment, or `None` for a name this tool did
+/// not write.
+fn observation_taken_at(name: &str) -> Option<DateTime<Utc>> {
+    let stem = name.strip_suffix(".json")?;
+    chrono::NaiveDateTime::parse_from_str(stem, "%Y%m%dT%H%M%SZ")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
+fn sweep_runs(
+    files: &dyn Files,
+    state: &StateDir,
+    retention: &Retention,
+    now: DateTime<Utc>,
+    out: &mut Sweep,
+) -> Result<()> {
+    if !retention.runs {
+        return Ok(());
+    }
+    // `runs()` is chronological because a run id is a uuid v7.
+    let runs = state.runs(files)?;
+    let cut = runs.len().saturating_sub(retention.keep);
+    for (index, run_id) in runs.iter().enumerate() {
+        let dir = state.run_dir(run_id);
+        if index >= cut {
+            out.keep.push(Kept {
+                what: run_id.clone(),
+                kind: "run",
+                why: format!("among the newest {}", retention.keep),
+            });
+            continue;
+        }
+        // The receipt decides. No receipt is a run that never ended, and a
+        // run that never ended is exactly the one somebody has to read.
+        let receipt = match state.read_receipt(files, run_id) {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                out.keep.push(Kept {
+                    what: run_id.clone(),
+                    kind: "run",
+                    why: "it wrote no receipt, so it never ended and its journal is the \
+                          only record of what it did"
+                        .to_string(),
+                });
+                continue;
+            }
+        };
+        if receipt.outcome != crate::receipt::Outcome::Success {
+            out.keep.push(Kept {
+                what: run_id.clone(),
+                kind: "run",
+                why: format!("it ended {}, which is evidence", receipt.outcome.as_str()),
+            });
+            continue;
+        }
+        // When it ENDED, because that is when its evidence stopped being
+        // about something happening now. A receipt that says `success` and
+        // names no end is a receipt this tool did not write, so it is kept.
+        let Some(ended) = receipt.ended_at else {
+            out.keep.push(Kept {
+                what: run_id.clone(),
+                kind: "run",
+                why: "its receipt names no end, so this tool cannot say how old it is".to_string(),
+            });
+            continue;
+        };
+        if !old_enough(ended, retention, now) {
+            out.keep.push(Kept {
+                what: run_id.clone(),
+                kind: "run",
+                why: format!(
+                    "it ended {}, which is inside the {} day(s) this sweep protects",
+                    ended.to_rfc3339(),
+                    retention.older_than_days.unwrap_or(0)
+                ),
+            });
+            continue;
+        }
+        match run_contents(files, &dir, state, run_id)? {
+            Ok(removal) => out.remove.push(removal),
+            Err(why) => out.keep.push(Kept {
+                what: run_id.clone(),
+                kind: "run",
+                why,
+            }),
+        }
+    }
+    Ok(())
+}
+
+/// Exactly what is in a run directory, or the sentence that says why this
+/// tool will not empty it.
+///
+/// Driven by NAMES and not by file types, and no recursive delete anywhere:
+/// a run directory holds the four things this module writes — `journal.jsonl`,
+/// `receipt.json`, `plan.json` and `observations/` — and anything else in
+/// there is something somebody else put beside their evidence. A `gc` that
+/// removed it would be a `gc` that removed a file on purpose left there.
+#[allow(clippy::type_complexity)]
+fn run_contents(
+    files: &dyn Files,
+    dir: &Path,
+    state: &StateDir,
+    run_id: &str,
+) -> Result<std::result::Result<Removal, String>> {
+    const KNOWN: [&str; 3] = ["journal.jsonl", "receipt.json", "plan.json"];
+    let observations = state.run_observations_dir(run_id);
+    let mut to_unlink = Vec::new();
+    let mut dirs = Vec::new();
+    for entry in files.list_dir(dir)? {
+        let name = entry
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if KNOWN.contains(&name.as_str()) {
+            to_unlink.push(entry);
+        } else if entry == observations {
+            // The snapshots this run took, which are files by construction
+            // (`save_observation` writes them and nothing else does).
+            to_unlink.extend(files.list_dir(&entry)?);
+            dirs.push(entry);
+        } else {
+            return Ok(Err(format!(
+                "{} is not one of the files a run writes (journal.jsonl, receipt.json, \
+                 plan.json, observations/), and this tool empties a run directory rather \
+                 than deleting it recursively",
+                entry.display()
+            )));
+        }
+    }
+    dirs.push(dir.to_path_buf());
+    Ok(Ok(Removal {
+        what: run_id.to_string(),
+        kind: "run",
+        files: to_unlink,
+        dirs,
+    }))
+}
+
+/// Do what [`sweep`] decided. Removes no store path — whether an
+/// unprotected closure goes is `nix store gc`'s decision, and this tool does
+/// not make it.
+pub fn carry_out(files: &dyn Files, sweep: &Sweep) -> Result<()> {
+    for removal in &sweep.remove {
+        for path in &removal.files {
+            files.remove_file(path)?;
+        }
+        for dir in &removal.dirs {
+            files.remove_dir(dir)?;
+        }
+    }
+    Ok(())
+}
+
+// --- end lane 4C -----------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1294,5 +1729,452 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // --- lane 4C: retention ---------------------------------------------
+
+    /// A release's roots on the disk: one link per host, plus the stamp.
+    fn with_release(files: MemFiles, id: &str, created: &str) -> MemFiles {
+        files
+            .given(
+                format!("/repo/.meister-deploy/gcroots/{id}/.created"),
+                format!("{created}\n").into_bytes(),
+            )
+            .given_symlink(
+                format!("/repo/.meister-deploy/gcroots/{id}/box"),
+                format!("/nix/store/{id}-system"),
+            )
+    }
+
+    fn a_receipt(run_id: &str, outcome: crate::receipt::Outcome, ended: Option<&str>) -> Vec<u8> {
+        let receipt = DeploymentReceipt {
+            schema: crate::receipt::RECEIPT_SCHEMA.to_string(),
+            run_id: run_id.to_string(),
+            plan_id: "plan-1".to_string(),
+            release_id: "release-1".to_string(),
+            started_at: Some(at("2026-09-01T00:00:00Z")),
+            ended_at: ended.map(at),
+            operator: None,
+            outcome,
+            hosts: BTreeMap::new(),
+            untouched: Vec::new(),
+            checks: Vec::new(),
+            breaks: Vec::new(),
+            journal_path: "journal.jsonl".to_string(),
+            journal_sha256: "0".repeat(64),
+        };
+        receipt.to_json().unwrap()
+    }
+
+    /// A finished run on the disk: the four things a run writes.
+    fn with_run(
+        files: MemFiles,
+        run_id: &str,
+        outcome: crate::receipt::Outcome,
+        ended: Option<&str>,
+    ) -> MemFiles {
+        files
+            .given(
+                format!("/repo/.meister-deploy/runs/{run_id}/journal.jsonl"),
+                b"{}\n".to_vec(),
+            )
+            .given(
+                format!("/repo/.meister-deploy/runs/{run_id}/plan.json"),
+                b"{}\n".to_vec(),
+            )
+            .given(
+                format!("/repo/.meister-deploy/runs/{run_id}/observations/20260901T000000Z.json"),
+                b"{}\n".to_vec(),
+            )
+            .given(
+                format!("/repo/.meister-deploy/runs/{run_id}/receipt.json"),
+                a_receipt(run_id, outcome, ended),
+            )
+    }
+
+    #[test]
+    fn a_release_goes_only_when_the_count_and_the_age_both_allow_it() {
+        let mut files = MemFiles::new();
+        files = with_release(files, "release-old", "2026-09-01T00:00:00Z");
+        files = with_release(files, "release-mid", "2026-09-20T00:00:00Z");
+        files = with_release(files, "release-new", "2026-09-21T00:00:00Z");
+        let state = state();
+        let roots = crate::build::roots(&files, &state).unwrap();
+        let now = at("2026-09-22T00:00:00Z");
+
+        // Count alone: the newest keeps its roots, the two behind it do not.
+        let swept = sweep(
+            &files,
+            &state,
+            &roots,
+            &Retention {
+                keep: 1,
+                ..Retention::default()
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            swept
+                .removals_of("release")
+                .iter()
+                .map(|r| r.what.as_str())
+                .collect::<Vec<_>>(),
+            vec!["release-old", "release-mid"]
+        );
+
+        // With an age guard the two guards have to AGREE: `release-mid` is
+        // two days old and stays, `release-old` is three weeks old and goes.
+        let swept = sweep(
+            &files,
+            &state,
+            &roots,
+            &Retention {
+                keep: 1,
+                older_than_days: Some(DEFAULT_OLDER_THAN_DAYS),
+                ..Retention::default()
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            swept
+                .removals_of("release")
+                .iter()
+                .map(|r| r.what.as_str())
+                .collect::<Vec<_>>(),
+            vec!["release-old"]
+        );
+        let kept: Vec<&str> = swept
+            .kept_of("release")
+            .iter()
+            .map(|k| k.what.as_str())
+            .collect();
+        assert!(kept.contains(&"release-mid"), "{kept:?}");
+        // And the sentence says which of the two guards kept it.
+        let why = &swept
+            .kept_of("release")
+            .iter()
+            .find(|k| k.what == "release-mid")
+            .unwrap()
+            .why;
+        assert!(why.contains("14 day(s)"), "{why}");
+    }
+
+    #[test]
+    fn a_directory_this_tool_cannot_date_is_never_removed() {
+        let files = MemFiles::new().given_symlink(
+            "/repo/.meister-deploy/gcroots/release-undated/box",
+            "/nix/store/xxx-system",
+        );
+        let state = state();
+        let roots = crate::build::roots(&files, &state).unwrap();
+        let swept = sweep(
+            &files,
+            &state,
+            &roots,
+            &Retention {
+                keep: 0,
+                ..Retention::default()
+            },
+            at("2030-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        assert!(swept.removals_of("release").is_empty());
+        assert!(
+            swept.kept_of("release")[0].why.contains(".created"),
+            "{:?}",
+            swept.kept_of("release")[0]
+        );
+    }
+
+    #[test]
+    fn a_stamp_this_tool_cannot_read_is_not_the_same_as_no_stamp() {
+        // Both are kept, and an operator has to be able to tell them
+        // apart: no stamp is a release from before this tool wrote them,
+        // an unreadable one is a file somebody edited. Found by running
+        // `gc` by hand against a stamp a shell had truncated.
+        let files = MemFiles::new()
+            .given(
+                "/repo/.meister-deploy/gcroots/release-edited/.created",
+                b"00Z\n".to_vec(),
+            )
+            .given_symlink(
+                "/repo/.meister-deploy/gcroots/release-edited/box",
+                "/nix/store/xxx-system",
+            )
+            .given_symlink(
+                "/repo/.meister-deploy/gcroots/release-stampless/box",
+                "/nix/store/yyy-system",
+            );
+        let state = state();
+        let roots = crate::build::roots(&files, &state).unwrap();
+        let swept = sweep(
+            &files,
+            &state,
+            &roots,
+            &Retention {
+                keep: 0,
+                ..Retention::default()
+            },
+            at("2030-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        assert!(swept.removals_of("release").is_empty(), "both are kept");
+        let why: BTreeMap<&str, &str> = swept
+            .kept_of("release")
+            .iter()
+            .map(|k| (k.what.as_str(), k.why.as_str()))
+            .collect();
+        assert!(
+            why["release-edited"].contains("\"00Z\"")
+                && why["release-edited"].contains("not a date"),
+            "{:?}",
+            why["release-edited"]
+        );
+        assert!(
+            why["release-stampless"].contains("has no .created stamp"),
+            "{:?}",
+            why["release-stampless"]
+        );
+    }
+
+    #[test]
+    fn carrying_out_a_sweep_drops_the_links_and_never_the_store_path() {
+        let files = with_release(MemFiles::new(), "release-old", "2026-09-01T00:00:00Z");
+        let state = state();
+        let roots = crate::build::roots(&files, &state).unwrap();
+        let swept = sweep(
+            &files,
+            &state,
+            &roots,
+            &Retention {
+                keep: 0,
+                ..Retention::default()
+            },
+            at("2026-09-22T00:00:00Z"),
+        )
+        .unwrap();
+        carry_out(&files, &swept).unwrap();
+        assert!(!files.exists(Path::new("/repo/.meister-deploy/gcroots/release-old/box")));
+        assert!(
+            !files
+                .attempts()
+                .iter()
+                .any(|a| a.contains("/nix/store/release-old-system")),
+            "{:?}",
+            files.attempts()
+        );
+    }
+
+    #[test]
+    fn snapshots_are_left_alone_unless_a_number_is_given_and_latest_never_goes() {
+        let files = MemFiles::new()
+            .given(
+                "/repo/.meister-deploy/observations/20260901T000000Z.json",
+                b"{}".to_vec(),
+            )
+            .given(
+                "/repo/.meister-deploy/observations/20260920T000000Z.json",
+                b"{}".to_vec(),
+            )
+            .given(
+                "/repo/.meister-deploy/observations/20260921T000000Z.json",
+                b"{}".to_vec(),
+            )
+            .given(
+                "/repo/.meister-deploy/observations/latest.json",
+                b"{}".to_vec(),
+            );
+        let state = state();
+        let now = at("2026-09-22T00:00:00Z");
+
+        // Nothing asked, nothing touched.
+        let swept = sweep(&files, &state, &[], &Retention::default(), now).unwrap();
+        assert!(swept.remove.is_empty());
+        assert!(swept.keep.is_empty());
+
+        // The newest one, and `latest.json` is not one of the candidates.
+        let swept = sweep(
+            &files,
+            &state,
+            &[],
+            &Retention {
+                observations: Some(1),
+                ..Retention::default()
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            swept
+                .removals_of("observation")
+                .iter()
+                .map(|r| r.what.as_str())
+                .collect::<Vec<_>>(),
+            vec!["20260901T000000Z.json", "20260920T000000Z.json"]
+        );
+
+        // The age guard protects a snapshot the count would have taken —
+        // asked before anything is carried out, because a sweep is a
+        // decision about what is on the disk right now.
+        let guarded = sweep(
+            &files,
+            &state,
+            &[],
+            &Retention {
+                observations: Some(1),
+                older_than_days: Some(14),
+                ..Retention::default()
+            },
+            now,
+        )
+        .unwrap();
+        assert!(
+            guarded
+                .kept_of("observation")
+                .iter()
+                .any(|k| k.what == "20260920T000000Z.json" && k.why.contains("14 day(s)")),
+            "{:?}",
+            guarded.kept_of("observation")
+        );
+
+        carry_out(&files, &swept).unwrap();
+        assert!(files.exists(Path::new("/repo/.meister-deploy/observations/latest.json")));
+        assert!(files.exists(Path::new(
+            "/repo/.meister-deploy/observations/20260921T000000Z.json"
+        )));
+    }
+
+    #[test]
+    fn a_run_that_is_evidence_is_never_removed() {
+        let mut files = MemFiles::new();
+        // Oldest first; uuid v7 sorts by time.
+        files = with_run(
+            files,
+            "0192f0c0-0000-7000-8000-000000000001",
+            crate::receipt::Outcome::Success,
+            Some("2026-09-01T00:00:00Z"),
+        );
+        files = with_run(
+            files,
+            "0192f0c0-0000-7000-8000-000000000002",
+            crate::receipt::Outcome::Failed,
+            Some("2026-09-02T00:00:00Z"),
+        );
+        files = with_run(
+            files,
+            "0192f0c0-0000-7000-8000-000000000003",
+            crate::receipt::Outcome::Partial,
+            Some("2026-09-03T00:00:00Z"),
+        );
+        // A run that never ended: journal, no receipt.
+        files = files.given(
+            "/repo/.meister-deploy/runs/0192f0c0-0000-7000-8000-000000000004/journal.jsonl",
+            b"{}\n".to_vec(),
+        );
+        files = with_run(
+            files,
+            "0192f0c0-0000-7000-8000-000000000005",
+            crate::receipt::Outcome::Success,
+            Some("2026-09-05T00:00:00Z"),
+        );
+        let state = state();
+        let now = at("2026-09-22T00:00:00Z");
+
+        // Without `--runs` nothing under runs/ is even considered.
+        let swept = sweep(
+            &files,
+            &state,
+            &[],
+            &Retention {
+                keep: 0,
+                ..Retention::default()
+            },
+            now,
+        )
+        .unwrap();
+        assert!(swept.remove.is_empty());
+
+        let swept = sweep(
+            &files,
+            &state,
+            &[],
+            &Retention {
+                keep: 0,
+                runs: true,
+                ..Retention::default()
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            swept
+                .removals_of("run")
+                .iter()
+                .map(|r| r.what.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "0192f0c0-0000-7000-8000-000000000001",
+                "0192f0c0-0000-7000-8000-000000000005"
+            ],
+            "only the two that ended success"
+        );
+        let why: BTreeMap<&str, &str> = swept
+            .kept_of("run")
+            .iter()
+            .map(|k| (k.what.as_str(), k.why.as_str()))
+            .collect();
+        assert!(why["0192f0c0-0000-7000-8000-000000000002"].contains("failed"));
+        assert!(why["0192f0c0-0000-7000-8000-000000000003"].contains("partial"));
+        assert!(why["0192f0c0-0000-7000-8000-000000000004"].contains("no receipt"));
+
+        // And what it removes is the four things a run writes, nothing else.
+        carry_out(&files, &swept).unwrap();
+        for leftover in [
+            "/repo/.meister-deploy/runs/0192f0c0-0000-7000-8000-000000000001/journal.jsonl",
+            "/repo/.meister-deploy/runs/0192f0c0-0000-7000-8000-000000000001/receipt.json",
+            "/repo/.meister-deploy/runs/0192f0c0-0000-7000-8000-000000000001/observations/20260901T000000Z.json",
+        ] {
+            assert!(
+                !files.exists(Path::new(leftover)),
+                "{leftover} is still there"
+            );
+        }
+        assert!(files.exists(Path::new(
+            "/repo/.meister-deploy/runs/0192f0c0-0000-7000-8000-000000000002/receipt.json"
+        )));
+    }
+
+    #[test]
+    fn a_run_with_a_file_nobody_here_wrote_stays_whole() {
+        let mut files = MemFiles::new();
+        files = with_run(
+            files,
+            "0192f0c0-0000-7000-8000-000000000001",
+            crate::receipt::Outcome::Success,
+            Some("2026-09-01T00:00:00Z"),
+        );
+        files = files.given(
+            "/repo/.meister-deploy/runs/0192f0c0-0000-7000-8000-000000000001/notes.txt",
+            b"why this went wrong\n".to_vec(),
+        );
+        let state = state();
+        let swept = sweep(
+            &files,
+            &state,
+            &[],
+            &Retention {
+                keep: 0,
+                runs: true,
+                ..Retention::default()
+            },
+            at("2026-09-22T00:00:00Z"),
+        )
+        .unwrap();
+        assert!(swept.removals_of("run").is_empty());
+        let why = &swept.kept_of("run")[0].why;
+        assert!(why.contains("notes.txt"), "{why}");
+        assert!(why.contains("recursively"), "{why}");
     }
 }

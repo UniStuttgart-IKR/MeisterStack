@@ -102,6 +102,22 @@ let
     meisterstack.managed.trustedPublicKeys = [
       "vm-update-placeholder:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     ];
+    # --- lane 4C: this host may FETCH, and only from the fleet's own cache.
+    #
+    # The operator serves `/root/cache` — where `build --cache` put the
+    # signed closures — over http on its own address. `require-sigs` stays
+    # `true`, so a path that comes out of there is held to exactly the rule
+    # a path pushed over ssh-ng is: signed by a key in
+    # `trustedPublicKeys`, which for this fleet is the one key the test
+    # makes. That is the whole claim, and it is what makes a fleet's own
+    # cache safe to name.
+    #
+    # In the inventory of a real fleet this line is
+    # `[defaults] managed.substituters` (nix/lib/inventory.nix); here the
+    # host module IS the inventory, because this test hands `resolve` a
+    # manifest rather than evaluating a flake.
+    meisterstack.managed.substituters = [ "http://192.168.1.1:8080" ];
+    # --- end lane 4C ---
     nix.extraOptions = ''
       !include /etc/nix/extra-keys.conf
     '';
@@ -146,7 +162,14 @@ pkgs.testers.runNixOSTest {
     # 192.168.1.1. The workstation: the tool, a git repository, a signing
     # key, and the closures of both target systems in its store.
     operator = { nodes, ... }: {
-      environment.systemPackages = [ pkgs.meisterstack pkgs.git pkgs.jq ];
+      # python3: the http server that puts `/root/cache` on the wire, which
+      # is what a real operator's cache is reached over (lane 4C).
+      environment.systemPackages = [ pkgs.meisterstack pkgs.git pkgs.jq pkgs.python3 ];
+      # The cache's port, and it has to be said out loud: a NixOS host has a
+      # firewall on by default, sshd opens its own port and nothing opens
+      # this one. Without this line the target's `nix copy --from http://…`
+      # hangs on a port that is filtered rather than closed.
+      networking.firewall.allowedTCPPorts = [ 8080 ];
       nix.settings.experimental-features = [ "nix-command" ];
       virtualisation.writableStore = true;
       virtualisation.memorySize = 3072;
@@ -340,6 +363,27 @@ pkgs.testers.runNixOSTest {
     target.succeed("chown meister:meister /var/lib/meisterstack/pki/identity.key")
     target.succeed("chmod 600 /var/lib/meisterstack/pki/identity.key")
 
+    # --- lane 4C: the fleet's own cache -------------------------------
+    #
+    # `file:///root/cache` is where `build --cache` puts the signed
+    # closures, and the operator serves that directory over http on the
+    # address the target's `managed.substituters` names.
+    #
+    # `compression=none`, and that is not a shortcut: the default for a
+    # `file://` store is xz, and xz-ing a NixOS system closure in a test VM
+    # is minutes of cpu for a property this test is not about. What it IS
+    # about — that the signature travels into the cache and that the far
+    # side accepts it — is the same either way.
+    CACHE = "file:///root/cache?compression=none"
+    operator.succeed("mkdir -p /root/cache")
+    operator.succeed(
+        "systemd-run --unit=cache-http --collect "
+        "--working-directory=/root/cache "
+        "/run/current-system/sw/bin/python3 -m http.server 8080"
+    )
+    operator.wait_for_open_port(8080)
+    # --- end lane 4C ---
+
     def deploy(name, manifest):
         """resolve -> build: the two verbs that turn an evaluation into a release."""
         operator.succeed(
@@ -348,7 +392,8 @@ pkgs.testers.runNixOSTest {
         )
         operator.succeed(
             f"cd /root/fleet && meister-deploy build --manifest /root/out/m-{name}.json "
-            f"--sign-key /root/keys/signing.sec --repo /root/fleet --out /root/out/r-{name}.json"
+            f"--sign-key /root/keys/signing.sec --repo /root/fleet "
+            f"--cache '{CACHE}' --out /root/out/r-{name}.json"
         )
         return f"/root/out/r-{name}.json"
 
@@ -382,6 +427,7 @@ pkgs.testers.runNixOSTest {
 
     # --- V10: a fleet that already runs the release ---------------------
     release_a = deploy("a", "nix-manifest-a.json")
+
     plan_a = make_plan(release_a, "a")
     the_plan = json.loads(operator.succeed(f"cat {plan_a}"))
     assert the_plan["hosts"]["target"]["verdict"] == "unchanged", the_plan["hosts"]
@@ -398,6 +444,57 @@ pkgs.testers.runNixOSTest {
 
     # --- the change -----------------------------------------------------
     release_b = deploy("b", "nix-manifest-b.json")
+
+    # --- lane 4C: what went into the cache, and who can take it out -----
+    #
+    # Here and not after release A on purpose: A is the system this target
+    # is RUNNING, so it is already in its store and fetching it would prove
+    # nothing. B is a system this machine has never seen.
+    #
+    # (1) The release says where its closures went, beside the name of the
+    #     key they were signed with. It is a statement about what happened
+    #     and instructs nobody: what a host may FETCH is decided by that
+    #     host's own configuration.
+    the_release = json.loads(operator.succeed(f"cat {release_b}"))
+    assert the_release["build_env"]["cache_url"] == CACHE, the_release["build_env"]
+    assert the_release["build_env"]["signing_key_name"] == "vm-update", the_release["build_env"]
+    top_b = the_release["artifacts"]["target"]["toplevel"]["store_path"]
+    target.fail(f"test -e {top_b}/init")
+
+    # (2) The cache really holds that closure, and the SIGNATURE travelled
+    #     with it — which is the whole reason the push happens after the
+    #     signing and not before.
+    in_cache = json.loads(
+        operator.succeed(f"nix path-info --json --sigs --store '{CACHE}' {top_b}")
+    )
+    entries = in_cache["info"] if "info" in in_cache else in_cache
+    sigs = list(entries.values())[0]["signatures"]
+    print("what the cache says about the toplevel: " + json.dumps(sigs))
+    assert any(s.startswith("vm-update:") for s in sigs), sigs
+
+    # (3) And the TARGET takes it out of there by itself, over http, into
+    #     its own store — the one with `require-sigs = true`. No
+    #     `--no-check-sigs` anywhere on that line, and that is the point: a
+    #     fleet's own cache is usable exactly because the closures in it
+    #     carry the signature the fleet already trusts.
+    target.succeed(f"nix copy --from http://192.168.1.1:8080 {top_b}")
+    target.succeed(f"test -e {top_b}/init")
+    print("the target fetched " + top_b + " out of the operator's cache, signature and all")
+
+    # And the other half, which is what makes that guarantee worth having:
+    # an UNSIGNED path out of the same cache is refused by the same store.
+    # `nix store sign` writes into the local store only, so a path the
+    # release never signed and that was pushed anyway is exactly that case.
+    # `nix-store --add` and not `nix store add-path`, which is a deprecated
+    # alias in 2.35 and prints a warning this test would have to filter.
+    operator.succeed("echo not-signed > /root/unsigned.txt")
+    unsigned = operator.succeed("nix-store --add /root/unsigned.txt").strip()
+    operator.succeed(f"nix copy --to '{CACHE}' {unsigned}")
+    refused = target.fail(f"nix copy --from http://192.168.1.1:8080 {unsigned} 2>&1")
+    assert "signature" in refused, refused
+    print("and an unsigned path out of the same cache is refused: "
+          + refused.strip().splitlines()[-1])
+    # --- end lane 4C ---
     plan_b = make_plan(release_b, "b")
     the_plan = json.loads(operator.succeed(f"cat {plan_b}"))
     assert the_plan["hosts"]["target"]["verdict"] == "change", the_plan["hosts"]
@@ -412,6 +509,27 @@ pkgs.testers.runNixOSTest {
     # The receipt says where it came from and where it went, and the run
     # gave the host back afterwards.
     assert receipt["hosts"]["target"]["before"]["system"] != receipt["hosts"]["target"]["after"]["system"]
+
+    # --- lane 4C: the stage was allowed to use the cache ----------------
+    #
+    # The copy is still ONE `nix copy --to ssh-ng://` and the nar hash at
+    # the target is still compared against the release — the cache is a
+    # shortcut inside the transfer and never an exception to it. What
+    # changed is that the far store was allowed to fetch what it can reach
+    # itself, and the receipt says so with the store the HOST's own
+    # configuration names.
+    staged = [
+        line
+        for action in receipt["hosts"]["target"]["actions"]
+        if action["kind"] == "stage"
+        for line in action["evidence"]
+    ]
+    print("stage evidence: " + json.dumps(staged, indent=2))
+    assert any("as the release says" in line for line in staged), staged
+    assert any(
+        "allowed to fetch" in line and "http://192.168.1.1:8080" in line for line in staged
+    ), staged
+    # --- end lane 4C ---
     assert target.succeed("meister-activate --json lock show").strip() == "null"
     assert json.loads(target.succeed("meister-activate --json txn list")) == []
 

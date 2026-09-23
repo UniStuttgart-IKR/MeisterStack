@@ -83,6 +83,14 @@ in
           # check about the RENDERER instead of reporting that difference
           # once per agent host.
           meisterstack.binDir = "/opt/meisterstack/bin";
+          # --- lane 4C ---
+          # And the image cache, which is the third difference of exactly
+          # that kind: a managed host keeps it under /var/lib because
+          # nothing pushes into its filesystem, an appliance keeps it where
+          # the push writes. Pinned here so that this check stays about the
+          # RENDERER instead of reporting that decision once per agent host.
+          meisterstack.agent.imageDir = "/opt/meisterstack/images";
+          # --- end lane 4C ---
         }
         (inv.hostModule id)
       ]

@@ -154,17 +154,34 @@ enum Verb {
     /// of the fleet; asks no host anything of its own.
     Plan(PlanArgs),
 
-    /// Drop the garbage-collector roots of all but the newest N releases.
-    /// Removes no store path: whether a closure goes is `nix store gc`'s
+    /// Drop the garbage-collector roots of all but the newest N releases,
+    /// and optionally trim the snapshots and the finished runs. Removes no
+    /// store path: whether an unprotected closure goes is `nix store gc`'s
     /// decision.
     Gc {
         /// How many releases keep their roots
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = state::DEFAULT_KEEP_RELEASES)]
         keep: usize,
+        // --- lane 4C: the other two things that pile up -----------------
+        /// A second guard: nothing younger than this many days is removed,
+        /// however far down the list it is. The recommended retention is
+        /// `--keep 3 --older-than 14`.
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<i64>,
+        /// Also keep only the newest N snapshots under `observations/`.
+        /// Without it they are left alone; `latest.json` is never removed.
+        #[arg(long, value_name = "N")]
+        observations: Option<usize>,
+        /// Also remove finished run directories. Never a run that did not
+        /// end `success`, and never one that wrote no receipt: those are
+        /// the ones somebody has to read.
+        #[arg(long)]
+        runs: bool,
+        // --- end lane 4C ------------------------------------------------
         /// The operator's repository, which is where the state directory is
         #[arg(long, default_value = ".")]
         repo: PathBuf,
-        /// Say which roots would go, and remove nothing
+        /// Say what would go, and remove nothing
         #[arg(long)]
         dry_run: bool,
     },
@@ -436,6 +453,31 @@ struct BuildArgs {
     #[arg(long)]
     substituters: Vec<String>,
 
+    // --- lane 4C: what nix is handed and where the result goes ----------
+    /// How many derivations nix may build at once: a number, or `auto`.
+    /// Passed on unread and recorded in the release.
+    #[arg(long)]
+    max_jobs: Option<String>,
+
+    /// A nix setting with no flag of its own: `--option <name> <value>`.
+    /// Repeatable, recorded in the release.
+    #[arg(long, num_args = 2, value_names = ["NAME", "VALUE"])]
+    option: Vec<String>,
+
+    /// Push the signed closures into this nix store once they are built:
+    /// `file:///srv/cache`, `s3://bucket`, `ssh-ng://host`. Recorded in the
+    /// release as `build_env.cache_url`. A host fetches from it only if its
+    /// own `meisterstack.managed.substituters` names it.
+    #[arg(long)]
+    cache: Option<String>,
+
+    /// Build every host's system a SECOND time and let nix compare, so that
+    /// the release's `bit_identical_verified` is a measurement. Expensive
+    /// by construction — it is the whole fleet, twice — and without it the
+    /// release says `false` with `method: null`, which is "nobody checked".
+    #[arg(long)]
+    verify_reproducible: bool,
+    // --- end lane 4C ----------------------------------------------------
     /// The inventory the `[operator] signing_key` reference is read from.
     /// Defaults to the one the manifest was resolved from.
     #[arg(long)]
@@ -844,9 +886,24 @@ fn run() -> Result<Answer> {
         Verb::Plan(args) => make_plan(args),
         Verb::Gc {
             keep,
+            // --- lane 4C ---
+            older_than,
+            observations,
+            runs,
+            // --- end lane 4C ---
             repo,
             dry_run,
-        } => gc(*keep, repo, *dry_run).map(Answer::from),
+        } => gc(
+            &state::Retention {
+                keep: *keep,
+                older_than_days: *older_than,
+                observations: *observations,
+                runs: *runs,
+            },
+            repo,
+            *dry_run,
+        )
+        .map(Answer::from),
         Verb::Apply(args) => apply(args),
         Verb::Report { run, repo, json } => report(run, repo, *json).map(Answer::from),
         // --- lane 3B ---------------------------------------------------
@@ -1302,7 +1359,12 @@ fn build(args: &BuildArgs) -> Result<bool> {
         }
         eprintln!(
             "note: nothing was built and no release was written. A real run realises these \
-             derivations, signs them and writes --out."
+             derivations in ONE `nix build`, signs them{} and writes --out.",
+            // --- lane 4C ---
+            match &args.cache {
+                Some(cache) => format!(", pushes them into {cache}"),
+                None => String::new(),
+            } // --- end lane 4C ---
         );
         return Ok(true);
     }
@@ -1332,6 +1394,12 @@ fn build(args: &BuildArgs) -> Result<bool> {
             sign_key,
             builders: args.builders.clone(),
             substituters: args.substituters.clone(),
+            // --- lane 4C ---
+            max_jobs: args.max_jobs.clone(),
+            options: nix_options(&args.option)?,
+            cache: args.cache.clone(),
+            verify_reproducible: args.verify_reproducible,
+            // --- end lane 4C ---
             hosts,
         },
         state: Some(state),
@@ -1368,6 +1436,25 @@ fn build(args: &BuildArgs) -> Result<bool> {
                 .unwrap_or_default()
         );
     }
+    // --- lane 4C ---
+    if let Some(cache) = &built.release.build_env.cache_url {
+        eprintln!(
+            "    {} path(s) pushed into {cache}, signed by {}",
+            built.release.artifacts.len() + built.release.packages.len(),
+            built
+                .release
+                .build_env
+                .signing_key_name
+                .as_deref()
+                .unwrap_or("nobody")
+        );
+        eprintln!(
+            "note: a host fetches from that store only if its own \
+             `meisterstack.managed.substituters` names it — the release records where the \
+             closures went and instructs nobody."
+        );
+    }
+    // --- end lane 4C ---
     Ok(true)
 }
 
@@ -1375,6 +1462,40 @@ fn build(args: &BuildArgs) -> Result<bool> {
 fn repo_of(resolved: &manifest::ResolvedFleet) -> PathBuf {
     PathBuf::from(&resolved.source.repo_path)
 }
+
+// --- lane 4C --------------------------------------------------------------
+
+/// `--option <name> <value>`, repeated, as the pairs nix is handed.
+///
+/// A map and not a list: nix takes the last value for a repeated setting,
+/// so two `--option cores` on one command line are one setting, and a
+/// release that recorded both would be recording a question rather than an
+/// answer. The same name twice with different values is therefore refused
+/// here rather than silently narrowed.
+fn nix_options(flat: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for pair in flat.chunks(2) {
+        // clap's `num_args = 2` guarantees the pairing; the match is here
+        // because a slice does not carry that guarantee into the types.
+        let [name, value] = pair else {
+            anyhow::bail!(
+                "--option takes a name and a value; {:?} is half of one.",
+                pair
+            );
+        };
+        if let Some(had) = out.insert(name.clone(), value.clone())
+            && &had != value
+        {
+            anyhow::bail!(
+                "--option {name} was given twice, as {had:?} and as {value:?}. nix would take \
+                 the last one and the release would record one of two answers, so say which."
+            );
+        }
+    }
+    Ok(out)
+}
+
+// --- end lane 4C ----------------------------------------------------------
 
 // --- lane 3A: media -------------------------------------------------------
 
@@ -1695,8 +1816,15 @@ fn signing_key(
     }
 }
 
-/// Drop the roots of all but the newest N releases.
-fn gc(keep: usize, repo: &Path, dry_run: bool) -> Result<bool> {
+// --- lane 4C --------------------------------------------------------------
+
+/// Stop keeping what this state directory no longer has a reason to keep.
+///
+/// Three kinds of thing and three rules — releases by count and age,
+/// snapshots by count and age, runs only when asked and never one that is
+/// evidence. The decision is made whole before anything is removed
+/// (`state::sweep`), so `--dry-run` prints exactly what a real run does.
+fn gc(retention: &state::Retention, repo: &Path, dry_run: bool) -> Result<bool> {
     let policy = if dry_run {
         Policy::dry_run()
     } else {
@@ -1704,47 +1832,67 @@ fn gc(keep: usize, repo: &Path, dry_run: bool) -> Result<bool> {
     };
     let files = RealFiles::new(policy);
     let state = StateDir::in_repo(repo);
-    let all = build::roots(&files, &state)?;
-    if all.is_empty() {
-        eprintln!(
-            "note: {} protects no release; there is nothing to remove.",
-            state.gcroots_dir().display()
-        );
-        return Ok(true);
-    }
-    let (remove, kept) = build::gc_plan(&all, keep);
-    for dir in &remove {
+    let roots = build::roots(&files, &state)?;
+    let sweep = state::sweep(&files, &state, &roots, retention, RealClock.now())?;
+
+    for removal in &sweep.remove {
         println!(
-            "{}\t{} root(s){}",
-            dir.release_id,
-            dir.links.len(),
+            "{}\t{}\t{} file(s){}",
+            removal.kind,
+            removal.what,
+            removal.entries(),
             if dry_run { "  (would remove)" } else { "" }
         );
-        if !dry_run {
-            build::remove_roots(&files, dir)?;
-        }
     }
-    eprintln!(
-        "==> {} release(s) {}, {} kept{}",
-        remove.len(),
-        if dry_run {
-            "would lose their roots"
-        } else {
-            "unprotected"
-        },
-        kept.len(),
-        if all.iter().any(|r| r.created_at.is_none()) {
-            " (a directory with no .created stamp is never removed)"
-        } else {
-            ""
+    if !dry_run {
+        state::carry_out(&files, &sweep)?;
+    }
+
+    for kind in ["release", "observation", "run"] {
+        let going = sweep.removals_of(kind).len();
+        let staying = sweep.kept_of(kind).len();
+        if going == 0 && staying == 0 {
+            continue;
         }
-    );
+        eprintln!(
+            "==> {kind}: {going} {}, {staying} kept",
+            if dry_run { "would go" } else { "removed" }
+        );
+    }
+    // Why each thing stayed, because "nothing happened" is the answer an
+    // operator most often has to act on — a run that is still there is a
+    // run that failed, and that is worth reading rather than guessing at.
+    for kept in &sweep.keep {
+        eprintln!("    kept {} {}: {}", kept.kind, kept.what, kept.why);
+    }
+    if roots.is_empty() {
+        eprintln!(
+            "note: {} protects no release.",
+            state.gcroots_dir().display()
+        );
+    }
+    if retention.observations.is_none() {
+        eprintln!(
+            "note: the snapshots under {} were not touched; `--observations N` is what \
+             trims them, and `latest.json` is never removed.",
+            state.observations_dir().display()
+        );
+    }
+    if !retention.runs {
+        eprintln!(
+            "note: the runs under {} were not touched; `--runs` is what removes the \
+             finished ones, and a run that did not end `success` is never one of them.",
+            state.runs_dir().display()
+        );
+    }
     eprintln!(
         "note: no store path was removed. Whether an unprotected closure goes is \
          `nix store gc`'s decision, and this tool does not make it."
     );
     Ok(true)
 }
+
+// --- end lane 4C ----------------------------------------------------------
 
 fn make_plan(args: &PlanArgs) -> Result<Answer> {
     if args.offline && args.out.is_some() {
@@ -3268,6 +3416,11 @@ fn validate_with_nix(fleet: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Where a fleet's signing key lives, relative to the operator's
+/// repository. In the template's `.gitignore`; the PUBLIC half
+/// (`signing.pub`) is beside it and is committed.
+const KEYS_DIR: &str = "keys";
+
 /// `init <dir>`: the repository a deployment starts from.
 ///
 /// Writes once, into an empty or absent directory, and never into a
@@ -3284,9 +3437,12 @@ fn init(dir: &Path, flake_ref: Option<&str>, dry_run: bool) -> Result<bool> {
             println!("{}", dir.join(file.path).display());
         }
         println!("{}", dir.join(".meister-deploy").display());
+        // --- lane 4C ---
+        println!("{}", dir.join(KEYS_DIR).display());
+        // --- end lane 4C ---
         eprintln!(
-            "note: --dry-run wrote nothing. {} file(s) and one directory would be created; \
-             `nix flake lock` would then be run in {}.",
+            "note: --dry-run wrote nothing. {} file(s) and two directories would be \
+             created; `nix flake lock` would then be run in {}.",
             template::FILES.len(),
             dir.display()
         );
@@ -3341,6 +3497,23 @@ fn init(dir: &Path, flake_ref: Option<&str>, dry_run: bool) -> Result<bool> {
     let state = dir.join(".meister-deploy");
     files.create_dir_all(&state)?;
     println!("{}", state.display());
+
+    // --- lane 4C: N6 --------------------------------------------------
+    //
+    // And `keys/`, because step 1 of the sentence below is
+    // `nix-store --generate-binary-cache-key <fleet> keys/signing.sec
+    // signing.pub` and nix does not make the directory: without this the
+    // very first thing an operator types fails with "No such file or
+    // directory" (gate M1, finding N6; lane L1 hit it again as B1).
+    //
+    // No `.gitkeep`: `keys/` is in the template's .gitignore, so a file in
+    // it to keep it in git would be a file git ignores. What this verb
+    // leaves behind is a directory on the disk, which is what the command
+    // needs.
+    // --- end lane 4C ---
+    let keys = dir.join(KEYS_DIR);
+    files.create_dir_all(&keys)?;
+    println!("{}", keys.display());
 
     // The lock file, and ONLY through nix. Writing one by hand would be
     // claiming a set of revisions nobody resolved.

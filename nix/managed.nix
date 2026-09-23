@@ -205,6 +205,17 @@ in
     # LoadCredential hands a unit instead).
     meisterstack.pki.dir = lib.mkDefault "/var/lib/meisterstack/pki";
 
+    # --- lane 4C ---
+    # And the guest images, for the same reason and into the same place.
+    # /opt/meisterstack is what `legacy context-push` writes into, and a
+    # managed host has no push; the volume records and the keys are already
+    # under /var/lib/meisterstack, so the image cache being somewhere else
+    # was inconsistent rather than wrong (lane 1B, open point 6). The
+    # appliance keeps its own answer, which is what `checks.render-parity`
+    # holds both sides to.
+    meisterstack.agent.imageDir = lib.mkDefault "/var/lib/meisterstack/images";
+    # --- end lane 4C ---
+
     # The three roles' per-machine keys, from the same context the renderer
     # would have read. This is the whole point of the profile: node_id, the
     # controller addresses, the advertise addresses, the telemetry keys and

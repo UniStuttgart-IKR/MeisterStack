@@ -91,7 +91,10 @@ pub fn build_env() -> BuildEnv {
         system: "x86_64-linux".to_string(),
         builders: Vec::new(),
         substituters: vec!["https://cache.nixos.org".to_string()],
+        max_jobs: None,
+        options: BTreeMap::new(),
         signing_key_name: Some("fleet-1".to_string()),
+        cache_url: None,
         sandbox: true,
     }
 }
@@ -151,6 +154,7 @@ pub fn release_of(resolved: ResolvedFleet) -> ReleaseManifest {
             inputs_pinned: true,
             bit_identical_verified: false,
             method: None,
+            differences: Vec::new(),
         },
         at("2026-09-21T11:00:00Z"),
     )
@@ -280,6 +284,7 @@ pub fn direct_release_of(resolved: ResolvedFleet) -> ReleaseManifest {
             inputs_pinned: true,
             bit_identical_verified: false,
             method: None,
+            differences: Vec::new(),
         },
         at("2026-09-21T11:00:00Z"),
     )

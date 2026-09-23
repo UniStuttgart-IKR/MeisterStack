@@ -94,8 +94,11 @@ let
     #               agent's sockets and per-VM scratch get their own
     #               subdirectory rather than sharing that one.
     #   image_dir   the example's /var/lib/… is the FHS answer for a
-    #               hand-installed node; here it is the push.sh target, which
-    #               is also the directory tmpfiles creates below.
+    #               hand-installed node, and it is what a MANAGED host takes
+    #               (nix/managed.nix); on the appliance it stays the push.sh
+    #               target. One option decides which
+    #               (`meisterstack.agent.imageDir`), and either way it is
+    #               the directory tmpfiles creates below.
     paths = {
       # ON the volume block and not beside it, because it is the RECORD of
       # what is on that block. The two were split — bytes on the labelled
@@ -109,7 +112,9 @@ let
       # swap need bookkeeping that outlives it too.
       db_path = "${volumeDir}/agent.redb";
       run_dir = "/run/meisterstack/agent";
-      image_dir = "/opt/meisterstack/images";
+      # The appliance's push target by default, /var/lib on a managed host:
+      # one option, two profiles (`meisterstack.agent.imageDir`, lane 4C).
+      image_dir = cfg.agent.imageDir;
       volume_dir = volumeDir;
       # Root's agent makes its own directory under the mount root and asks
       # systemd for nothing. An unprivileged one cannot: `/sys/fs/cgroup` is
@@ -292,6 +297,30 @@ in
       '';
     };
   };
+
+  # --- lane 4C ---
+  options.meisterstack.agent.imageDir = lib.mkOption {
+    type = lib.types.str;
+    default = "/opt/meisterstack/images";
+    example = "/var/lib/meisterstack/images";
+    description = ''
+      Where this node keeps the guest images it has been handed.
+
+      The default is the APPLIANCE's answer and is what it has always been:
+      on that road images arrive next to the binaries, both pushed into
+      /opt/meisterstack by `meister-deploy legacy context-push`, and moving
+      them would move a directory the push writes.
+
+      A MANAGED host has no push (nix/managed.nix sets
+      `/var/lib/meisterstack/images`): nothing writes into its filesystem by
+      hand any more, and the FHS answer for state a service owns is
+      /var/lib — which is where `meisterstack.pki.dir` and the volume
+      records already live. Named as an option rather than derived from the
+      profile so that a node with its images on a separate block can say so
+      in one line.
+    '';
+  };
+  # --- end lane 4C ---
 
   options.meisterstack.agent.effective = lib.mkOption {
     type = toml.type;
@@ -509,7 +538,7 @@ in
               cfg.agent.settings));
 
       systemd.tmpfiles.rules = [
-        "d /opt/meisterstack/images 0755 root root -"
+        "d ${cfg.agent.imageDir} 0755 root root -"
         "d /var/lib/meisterstack 0755 root root -"
       ] ++ lib.optionals unprivileged [
         # The three directories [paths] names, given to the user that now has

@@ -26,6 +26,14 @@ final: prev: {
 
   guest-tiny = final.callPackage ./packages/guest-tiny.nix { };
 
+  # The CA, for the OPERATOR's side. Deliberately not in
+  # `meisterstack-runtime` below: the runtime is what a fleet host's units
+  # exec, and a fleet host has no CA key on it (D10) — the key stays with the
+  # operator and a node sends a request. `meister-deploy keys issue` looks up
+  # a bare `meister-ca` on PATH, which is what this attribute makes possible
+  # without a `nix shell` around every invocation.
+  meister-ca = final.callPackage ./packages/meister-ca.nix { };
+
   # The same five binaries, statically linked. The legacy context fleet gets
   # its binaries pushed into /opt/meisterstack/bin on a host whose libc is
   # not ours (`meister-deploy legacy context-push`, M2C), so that push needs

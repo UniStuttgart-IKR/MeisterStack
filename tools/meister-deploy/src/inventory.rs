@@ -191,6 +191,20 @@ pub struct ChecksOverrides {
     pub functional: Vec<String>,
 }
 
+/// What a machine of this fleet is told about being deployed TO.
+///
+/// One key today, and it is a list: the binary caches a host may FETCH a
+/// closure from. It lives in the inventory rather than in an operator's own
+/// profile because the other half of that answer is a flag —
+/// `meister-deploy build --cache <store>` — and "does this fleet use a
+/// cache" should be a question one file answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedOverrides {
+    #[serde(default)]
+    pub substituters: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
@@ -205,6 +219,8 @@ pub struct Defaults {
     pub rollout: RolloutOverrides,
     #[serde(default)]
     pub checks: ChecksOverrides,
+    #[serde(default)]
+    pub managed: ManagedOverrides,
 }
 
 /// References to what the operator already has. No secret is named here, and
@@ -260,6 +276,8 @@ pub struct Group {
     pub rollout: RolloutOverrides,
     #[serde(default)]
     pub checks: ChecksOverrides,
+    #[serde(default)]
+    pub managed: ManagedOverrides,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,6 +475,8 @@ pub struct Host {
     #[serde(default)]
     pub checks: ChecksOverrides,
     #[serde(default)]
+    pub managed: ManagedOverrides,
+    #[serde(default)]
     pub deviations: Deviations,
 }
 
@@ -554,6 +574,11 @@ pub struct Settings {
     pub boot: BootMode,
     pub rollout: EffectiveRollout,
     pub checks: EffectiveChecks,
+    /// The binary caches this host may fetch from, accumulated in precedence
+    /// order like `profiles`: a list of substituters is the order nix tries
+    /// them in, and a group that adds a regional mirror is adding one rather
+    /// than replacing what the fleet already had.
+    pub substituters: Vec<String>,
 }
 
 /// A host plus what it inherited — what `inventory --json` prints.
@@ -813,6 +838,13 @@ impl Inventory {
         }
         push_new(&mut functional, &host.checks.functional);
 
+        let mut substituters = Vec::new();
+        push_new(&mut substituters, &self.defaults.managed.substituters);
+        for group in &groups {
+            push_new(&mut substituters, &group.managed.substituters);
+        }
+        push_new(&mut substituters, &host.managed.substituters);
+
         Ok(Settings {
             ssh: EffectiveSsh {
                 user,
@@ -830,6 +862,7 @@ impl Inventory {
                 required,
                 functional,
             },
+            substituters,
         })
     }
 
@@ -1176,6 +1209,53 @@ mod tests {
         assert_eq!(gpu.capabilities, vec!["kvm", "vfio", "rdma"]);
         assert!(gpu.deviations.settings.contains_key("agent"));
     }
+
+    // --- lane 4C ---
+    #[test]
+    fn substituters_accumulate_the_way_profiles_do() {
+        // Nothing said anywhere is a fleet that is only ever pushed to.
+        let inventory = parse(fixture()).unwrap();
+        assert_eq!(
+            inventory.effective("cloud-a").unwrap().substituters,
+            vec![] as Vec<String>
+        );
+
+        // A fleet-wide cache, a group that adds a regional mirror, a host
+        // that adds one of its own: the list is the ORDER nix tries them
+        // in, so it accumulates rather than overriding.
+        let text = fixture()
+            .replace(
+                "[defaults]",
+                "[defaults]\nmanaged = { substituters = [\"http://build/cache\"] }",
+            )
+            .replace(
+                r#"[[group]]
+id = "compute_pro6000""#,
+                r#"[[group]]
+managed = { substituters = ["http://rack1/cache"] }
+id = "compute_pro6000""#,
+            )
+            .replace(
+                r#"id = "gpu-01""#,
+                r#"id = "gpu-01"
+managed = { substituters = ["http://gpu-01-local/cache"] }"#,
+            );
+        let inventory = parse(&text).unwrap();
+        assert_eq!(
+            inventory.effective("gpu-01").unwrap().substituters,
+            vec![
+                "http://build/cache",
+                "http://rack1/cache",
+                "http://gpu-01-local/cache"
+            ]
+        );
+        // And a host that is in no such group gets the fleet's answer only.
+        assert_eq!(
+            inventory.effective("cloud-a").unwrap().substituters,
+            vec!["http://build/cache"]
+        );
+    }
+    // --- end lane 4C ---
 
     #[test]
     fn precedence_runs_defaults_then_group_then_host() {

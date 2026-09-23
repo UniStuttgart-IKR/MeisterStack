@@ -112,6 +112,23 @@ pub struct BuildOptions {
     /// `--builders`, offered to nix in the order they were given.
     pub builders: Vec<String>,
     pub substituters: Vec<String>,
+    /// `--max-jobs`, as a string because nix takes `auto` as well as a
+    /// number. Passed on unread: what a sensible parallelism is on the
+    /// machine that builds is that machine's question, not this tool's.
+    pub max_jobs: Option<String>,
+    /// `--option <name> <value>`, for the settings that have no flag of
+    /// their own. Sorted, so that the release records them in one order and
+    /// two runs with the same options produce the same `build_env`.
+    pub options: BTreeMap<String, String>,
+    /// Where this release's closures are pushed once they are signed:
+    /// `file:///srv/cache`, an `s3://` bucket, an `ssh-ng://` store. A nix
+    /// store url, handed to `nix copy --to` unread — which urls nix speaks
+    /// is nix's question and not a list this tool keeps in step with it.
+    pub cache: Option<String>,
+    /// Build every host's system a second time and let nix compare, so that
+    /// `reproducibility.bit_identical_verified` is a measurement rather than
+    /// a hope. Expensive by construction: it is the whole fleet, twice.
+    pub verify_reproducible: bool,
     /// Only these hosts. A build of part of a fleet is for looking at, not
     /// for releasing — see [`Builder::realise`].
     pub hosts: Option<Vec<String>>,
@@ -291,11 +308,38 @@ pub fn build_cmd(drv: &str, options: &BuildOptions) -> Cmd {
         "--no-link",
         "--print-out-paths",
     ]);
-    cmd = with_builders(cmd, options);
+    cmd = with_nix_options(cmd, options);
     cmd.arg(format!("{drv}^*"))
 }
 
-fn with_builders(cmd: Cmd, options: &BuildOptions) -> Cmd {
+/// `nix build --no-link --json <drv1>^* <drv2>^* …`: the whole fleet, once.
+///
+/// One invocation and not one per derivation, and the reason is nix's
+/// scheduler: seventy systems handed over separately are seventy build
+/// graphs built one after the other, where one graph is seventy roots nix
+/// schedules across `--max-jobs` and `--builders` at the same time and whose
+/// shared dependencies — one kernel, one nixpkgs, one meisterstack — are
+/// realised once by construction rather than found in the store seventy
+/// times.
+///
+/// `--json` and not `--print-out-paths`, which is what the per-derivation
+/// road used: with several installables the printed paths are a LIST, and
+/// deciding which of seventy systems a path belongs to by its position in
+/// that list would be a guess. The json answer names the `drvPath` beside
+/// every output, so the mapping is nix's own statement.
+pub fn build_many_cmd(drvs: &[String], options: &BuildOptions) -> Cmd {
+    let cmd = Cmd::new(Effect::Build, "nix", BUILD_DEADLINE).args(["build", "--no-link", "--json"]);
+    let cmd = with_nix_options(cmd, options);
+    cmd.args(drvs.iter().map(|drv| format!("{drv}^*")))
+}
+
+/// The flags this tool hands nix untouched: where it may build, what it may
+/// fetch from, how much at once, and whatever else the operator named.
+///
+/// Recorded in `build_env` as well, because a release built on a farm and a
+/// release built on a laptop are the same release and the question "where
+/// did this come from" still has an answer.
+fn with_nix_options(cmd: Cmd, options: &BuildOptions) -> Cmd {
     let mut cmd = cmd;
     if !options.builders.is_empty() {
         cmd = cmd.args(["--builders".to_string(), options.builders.join(" ; ")]);
@@ -303,7 +347,38 @@ fn with_builders(cmd: Cmd, options: &BuildOptions) -> Cmd {
     if !options.substituters.is_empty() {
         cmd = cmd.args(["--substituters".to_string(), options.substituters.join(" ")]);
     }
+    if let Some(jobs) = &options.max_jobs {
+        cmd = cmd.args(["--max-jobs".to_string(), jobs.clone()]);
+    }
+    for (name, value) in &options.options {
+        cmd = cmd.args(["--option".to_string(), name.clone(), value.clone()]);
+    }
     cmd
+}
+
+/// What one entry of `nix build --json` says.
+#[derive(Debug, Deserialize)]
+struct RawBuildResult {
+    #[serde(rename = "drvPath")]
+    drv_path: String,
+    #[serde(default)]
+    outputs: BTreeMap<String, String>,
+}
+
+/// Read `nix build --json`: derivation path -> the output paths it made.
+pub fn parse_build_json(text: &str, origin: &str) -> Result<BTreeMap<String, Vec<String>>> {
+    let results: Vec<RawBuildResult> = serde_json::from_str(text)
+        .map_err(|e| anyhow::anyhow!("{origin} did not answer with a build result: {e}."))?;
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for result in results {
+        // `outputs` is keyed by output NAME (`out`, `dev`, …) and the names
+        // are sorted here so that a derivation with two of them is refused
+        // with the same sentence twice rather than with whichever order nix
+        // happened to answer in.
+        let paths: Vec<String> = result.outputs.into_values().collect();
+        out.entry(result.drv_path).or_default().extend(paths);
+    }
+    Ok(out)
 }
 
 /// `nix path-info --json --closure-size <paths…>`, of the local store.
@@ -333,6 +408,59 @@ pub fn sign_cmd(key: &std::path::Path, paths: &[String]) -> Cmd {
         .arg(key.clone())
         .args(paths.iter().cloned())
         .redact(key)
+}
+
+/// `nix build --rebuild --no-link <drv>^*`: build it AGAIN, on top of the
+/// output that is already there, and let nix compare.
+///
+/// nix does the comparison itself and refuses with "may not be
+/// deterministic: output … differs", which is a better answer than hashing
+/// two nars here would be: nix knows which output of a multi-output
+/// derivation differed and it knows what to do with a fixed-output one.
+///
+/// One derivation per call and not the whole fleet in one, which is the
+/// opposite of [`build_many_cmd`] and deliberately so: what this produces is
+/// a per-host VERDICT, and a batch that exited 1 would say "something in the
+/// fleet differed" — the one thing an operator cannot act on.
+pub fn rebuild_cmd(drv: &str, options: &BuildOptions) -> Cmd {
+    let cmd =
+        Cmd::new(Effect::Build, "nix", BUILD_DEADLINE).args(["build", "--rebuild", "--no-link"]);
+    // `--builders` and `--substituters` on purpose, `--max-jobs` and the
+    // operator's `--option`s too: the question is whether THIS build
+    // environment produces the same bytes twice, so it has to be the same
+    // build environment.
+    let cmd = with_nix_options(cmd, options);
+    cmd.arg(format!("{drv}^*")).expect(Expect::AnyExit)
+}
+
+/// What nix says when a rebuild came out different. Matched rather than
+/// guessed at, because every other non-zero exit is a check that could not
+/// be MADE — a builder that went away, a disk that filled — and reporting
+/// that as "not reproducible" would be this tool inventing a finding.
+const NOT_DETERMINISTIC: &str = "may not be deterministic";
+
+/// How long pushing a fleet's closures into a cache may take. Seventy
+/// system closures are tens of gigabytes of nar over whatever link the cache
+/// is on.
+pub const CACHE_DEADLINE: Duration = Duration::from_secs(2 * 3600);
+
+/// `nix copy --to <cache> <paths…>`: the closures, into the store a fleet
+/// fetches from.
+///
+/// After signing, and that is the whole order: `nix copy` carries the
+/// signatures that are in the local store when it runs, and a cache full of
+/// unsigned paths is a cache a managed host refuses to fetch from —
+/// `require-sigs = true` is as true for a substituter as for an `ssh-ng://`
+/// push (M0 probe S12).
+///
+/// No `--no-check-sigs`, no `--all`, and nothing about the target hosts:
+/// this pushes exactly the paths this release names, and what a host is
+/// allowed to fetch is decided by that host's own configuration.
+pub fn cache_copy_cmd(cache: &str, paths: &[String]) -> Cmd {
+    Cmd::new(Effect::Build, "nix", CACHE_DEADLINE)
+        .args(["copy", "--to"])
+        .arg(cache.to_string())
+        .args(paths.iter().cloned())
 }
 
 /// `nix-store --realise --add-root <link> <path>`: an indirect root, so the
@@ -382,28 +510,36 @@ impl Builder<'_> {
             bail!("this manifest names no derivation to build.");
         }
         self.require_signing_key(&resolved, &hosts)?;
+        self.require_a_key_for_the_cache()?;
 
         self.ensure_present(&drvs)?;
-        let mut outputs: BTreeMap<String, String> = BTreeMap::new();
+
+        // The artifacts, in ONE nix invocation: every system, every bundle
+        // and every package of the fleet as one build graph.
+        //
+        // The check derivations are NOT in it, and that is the one thing
+        // this does not batch. A check is a data object — id, status,
+        // expected, observed, reason, duration — and a batch that failed
+        // would answer "nix exited 1" for all of them together. So each one
+        // is asked on its own, with `AnyExit`, and a required check that
+        // does not pass is a sentence that names it. In a real fleet these
+        // are few: `checks.required` is usually `units, session, mounts`,
+        // which are questions about a running host and belong to `check`.
+        let artifacts: Vec<&Derivation> =
+            drvs.iter().filter(|d| d.kind != DrvKind::Check).collect();
+        let outputs = self.build_artifacts(&artifacts)?;
+
         let mut checks: Vec<CheckResult> = Vec::new();
-        for drv in &drvs {
-            match drv.kind {
-                DrvKind::Check => {
-                    let result = self.build_check(drv, &resolved)?;
-                    if result.status != Status::Pass {
-                        bail!(
-                            "the required check {} did not pass, so there is no release: {}",
-                            result.id,
-                            result.reason
-                        );
-                    }
-                    checks.push(result);
-                }
-                _ => {
-                    let out = self.build_one(drv)?;
-                    outputs.insert(drv.what.clone(), out);
-                }
+        for drv in drvs.iter().filter(|d| d.kind == DrvKind::Check) {
+            let result = self.build_check(drv, &resolved)?;
+            if result.status != Status::Pass {
+                bail!(
+                    "the required check {} did not pass, so there is no release: {}",
+                    result.id,
+                    result.reason
+                );
             }
+            checks.push(result);
         }
 
         // A partial build is for looking at. It cannot be a release, because
@@ -429,6 +565,11 @@ impl Builder<'_> {
 
         self.check_promises(&resolved, &hosts, &outputs)?;
 
+        // Was it the same build twice? Asked here, next to the build it is
+        // a claim about, and only when the operator asked for it: this
+        // builds every host's system a SECOND time.
+        let reproducibility = self.verify_reproducible(&resolved, &hosts)?;
+
         let mut to_measure: Vec<String> = outputs.values().cloned().collect();
         // The configuration files are in the closure of the systems that
         // read them, so they exist once the toplevels are built; they are
@@ -445,6 +586,14 @@ impl Builder<'_> {
         let info = self.measure(&to_measure)?;
         self.require_signatures(&resolved, &hosts, &outputs, &info)?;
 
+        // Into the cache, after the signatures are on and after they have
+        // been checked: a cache is only worth having if what a host pulls
+        // out of it is what a host would have accepted over ssh. A push that
+        // fails is a build that fails — a release whose `cache_url` named a
+        // store the closures never reached would be a release that lies
+        // about where they are.
+        self.push_to_cache(&to_measure)?;
+
         let artifacts = self.host_artifacts(&resolved, &hosts, &outputs, &info, config_files)?;
         let packages = self.packages(&drvs, &outputs, &info)?;
         let build_env = self.build_env()?;
@@ -459,15 +608,7 @@ impl Builder<'_> {
             Vec::new(),
             build_env,
             checks,
-            Reproducibility {
-                // The manifest was resolved from a locked tree — `resolve`
-                // refuses one without a `flake.lock` — so the inputs are
-                // pinned. Whether the bytes come out the same twice is a
-                // different claim, and nobody has checked it here.
-                inputs_pinned: true,
-                bit_identical_verified: false,
-                method: None,
-            },
+            reproducibility,
             self.clock.now(),
         )?;
 
@@ -538,6 +679,23 @@ impl Builder<'_> {
         );
     }
 
+    /// A cache of unsigned closures is a cache no host of this fleet can
+    /// fetch from, and finding that out after an hour of copying is finding
+    /// it out too late.
+    fn require_a_key_for_the_cache(&self) -> Result<()> {
+        if self.options.cache.is_none() || self.options.sign_key.is_some() {
+            return Ok(());
+        }
+        bail!(
+            "this build would push into {} and has no signing key. A managed host fetches \
+             from a substituter under the same rule it takes an ssh-ng:// push under — \
+             `require-sigs = true` — so an unsigned cache is a cache every host of this \
+             fleet would refuse. Pass `--sign-key <file>`, or `[operator] signing_key` in \
+             the inventory.",
+            self.options.cache.as_deref().unwrap_or_default()
+        );
+    }
+
     /// Are the derivations still in the store?
     fn ensure_present(&self, drvs: &[Derivation]) -> Result<()> {
         let paths: Vec<String> = drvs.iter().map(|d| d.drv.clone()).collect();
@@ -578,35 +736,73 @@ impl Builder<'_> {
         );
     }
 
-    /// Build one derivation and hand back its output path.
-    fn build_one(&self, drv: &Derivation) -> Result<String> {
-        let out = self.runner.run(&build_cmd(&drv.drv, &self.options))?;
-        let mut paths: Vec<&str> = out
-            .stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect();
-        match paths.len() {
-            1 => Ok(paths.remove(0).to_string()),
-            0 => bail!(
-                "nix built {} and printed no output path. Nothing can be named in a release \
-                 that nobody can point at.",
-                drv.drv
-            ),
-            // A derivation with several outputs: the manifest names one out
-            // path per derivation, so which of them it meant is not this
-            // tool's to guess.
-            _ => bail!(
-                "the derivation {} for {} has {} outputs ({}), and the manifest names one. \
-                 The one derivation has to expose a single output per host, package and \
-                 check.",
-                drv.drv,
-                drv.what,
-                paths.len(),
-                paths.join(", ")
-            ),
+    /// Build these derivations in one nix invocation, and say which output
+    /// belongs to which of them.
+    ///
+    /// The mapping is nix's own (`drvPath` beside `outputs` in the json
+    /// answer) and not the order of the arguments: a release that named
+    /// seventy systems by the position of a line in a list would be a
+    /// release that is right until nix reorders its output.
+    ///
+    /// Two derivations of one manifest may be the same path — two hosts of a
+    /// fleet can be the same system — so the arguments are deduplicated and
+    /// the answer is read back per `what`.
+    fn build_artifacts(&self, drvs: &[&Derivation]) -> Result<BTreeMap<String, String>> {
+        if drvs.is_empty() {
+            return Ok(BTreeMap::new());
         }
+        let mut wanted: Vec<String> = drvs.iter().map(|d| d.drv.clone()).collect();
+        wanted.sort();
+        wanted.dedup();
+
+        let cmd = build_many_cmd(&wanted, &self.options);
+        let out = self.runner.run(&cmd)?;
+        let built = parse_build_json(&out.stdout, &cmd.line())?;
+
+        let mut outputs = BTreeMap::new();
+        for drv in drvs {
+            let paths = built.get(&drv.drv).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "nix built the fleet and said nothing about {} (for {}). Nothing can be \
+                     named in a release that nobody can point at.",
+                    drv.drv,
+                    drv.what
+                )
+            })?;
+            match paths.len() {
+                1 => {
+                    outputs.insert(drv.what.clone(), paths[0].clone());
+                }
+                0 => bail!(
+                    "nix built {} and printed no output path. Nothing can be named in a \
+                     release that nobody can point at.",
+                    drv.drv
+                ),
+                // A derivation with several outputs: the manifest names one
+                // out path per derivation, so which of them it meant is not
+                // this tool's to guess.
+                _ => bail!(
+                    "the derivation {} for {} has {} outputs ({}), and the manifest names \
+                     one. The one derivation has to expose a single output per host, \
+                     package and check.",
+                    drv.drv,
+                    drv.what,
+                    paths.len(),
+                    paths.join(", ")
+                ),
+            }
+        }
+        Ok(outputs)
+    }
+
+    /// One derivation, through the same road as seventy. Used by `image`,
+    /// which builds exactly one medium.
+    fn build_one(&self, drv: &Derivation) -> Result<String> {
+        let outputs = self.build_artifacts(&[drv])?;
+        outputs
+            .into_values()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("nix built {} and said nothing about it.", drv.drv))
     }
 
     /// A check that passes by building.
@@ -735,6 +931,88 @@ impl Builder<'_> {
             );
         }
         Ok(info)
+    }
+
+    /// Build every host's system a second time and say whether the bytes
+    /// came out the same.
+    ///
+    /// Without `--verify-reproducible` this runs nothing and answers
+    /// `bit_identical_verified: false, method: null` — which is the honest
+    /// shape of "nobody checked", and the reason the two fields are
+    /// separate from `inputs_pinned`. Pinned inputs are a reason to EXPECT
+    /// the same bytes and never evidence of them.
+    ///
+    /// A rebuild that could not be MADE — a builder that went away, a disk
+    /// that filled, a derivation nix refused for some other reason — stops
+    /// the build with what nix said. An operator who asked for a
+    /// verification and got `false` without one would have been told
+    /// something that is not true.
+    fn verify_reproducible(
+        &self,
+        resolved: &ResolvedFleet,
+        hosts: &[String],
+    ) -> Result<Reproducibility> {
+        // The manifest was resolved from a locked tree — `resolve` refuses
+        // one without a `flake.lock` — so the inputs are pinned either way.
+        let pinned = Reproducibility {
+            inputs_pinned: true,
+            bit_identical_verified: false,
+            method: None,
+            differences: Vec::new(),
+        };
+        if !self.options.verify_reproducible {
+            return Ok(pinned);
+        }
+        let mut differences = Vec::new();
+        for id in hosts {
+            let host = &resolved.hosts[id];
+            let drv = &host.build.toplevel_drv;
+            let cmd = rebuild_cmd(drv, &self.options);
+            let out = self.runner.run(&cmd)?;
+            if out.ok() {
+                continue;
+            }
+            let said = crate::run::last_lines(out.stderr.trim());
+            if !said.contains(NOT_DETERMINISTIC) {
+                bail!(
+                    "the rebuild of {id} could not be made, so this release cannot say \
+                     whether it is reproducible. `{}` exited {} and said: {said}",
+                    cmd.line(),
+                    out.status
+                );
+            }
+            differences.push(format!("{id} ({drv}): {said}"));
+        }
+        Ok(Reproducibility {
+            inputs_pinned: true,
+            bit_identical_verified: differences.is_empty(),
+            // Named even when the answer is `false`: what makes this field
+            // worth anything is that somebody can tell "checked and
+            // different" from "not checked".
+            method: Some("nix build --rebuild".to_string()),
+            differences,
+        })
+    }
+
+    /// Push the whole release into the cache the operator named.
+    ///
+    /// One `nix copy` over every path of the release, for the same reason
+    /// the build is one `nix build`: seventy closures that share a kernel,
+    /// a nixpkgs and one meisterstack are one graph to walk, and seventy
+    /// invocations would query the cache for the shared half seventy times.
+    ///
+    /// A build with no `--cache` runs no command here at all — not an empty
+    /// one, not a probe. That is what makes `cache_url: null` in a release a
+    /// statement rather than an absence.
+    fn push_to_cache(&self, paths: &[String]) -> Result<()> {
+        let Some(cache) = &self.options.cache else {
+            return Ok(());
+        };
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.runner.run(&cache_copy_cmd(cache, paths))?;
+        Ok(())
     }
 
     /// Every managed host's system carries a signature.
@@ -912,10 +1190,13 @@ impl Builder<'_> {
             system: system.trimmed().to_string(),
             builders: self.options.builders.clone(),
             substituters: self.options.substituters.clone(),
+            max_jobs: self.options.max_jobs.clone(),
+            options: self.options.options.clone(),
             signing_key_name: match &self.options.sign_key {
                 Some(key) => Some(self.key_name(key)?),
                 None => None,
             },
+            cache_url: self.options.cache.clone(),
             // "relaxed" is nix's third value and it is not a sandbox.
             sandbox: sandbox.trimmed() == "true",
         })
@@ -1259,6 +1540,12 @@ pub struct RootDir {
     /// that carries none — which is never removed, because a directory this
     /// tool cannot date is one it does not know enough about.
     pub created_at: Option<DateTime<Utc>>,
+    /// Why there is no date, for the sentence `gc` prints. A directory with
+    /// NO stamp and one whose stamp cannot be read are both kept, and they
+    /// are not the same thing to an operator: the first is a release from
+    /// before this tool wrote stamps, the second is a file somebody edited.
+    /// `None` when there IS a date.
+    pub undated_because: Option<String>,
     pub links: Vec<PathBuf>,
 }
 
@@ -1270,11 +1557,25 @@ pub fn roots(files: &dyn Files, state: &StateDir) -> Result<Vec<RootDir>> {
             continue;
         };
         let stamp = dir.join(STAMP);
-        let created_at = files
-            .read_to_string(&stamp)
-            .ok()
-            .and_then(|text| DateTime::parse_from_rfc3339(text.trim()).ok())
-            .map(|t| t.with_timezone(&Utc));
+        let (created_at, undated_because) = match files.read_to_string(&stamp) {
+            Err(_) => (
+                None,
+                Some(format!(
+                    "it has no {STAMP} stamp, so this tool cannot say how old it is"
+                )),
+            ),
+            Ok(text) => match DateTime::parse_from_rfc3339(text.trim()) {
+                Ok(when) => (Some(when.with_timezone(&Utc)), None),
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "its {STAMP} stamp says {:?}, which is not a date this tool can read \
+                         ({e}), so it cannot say how old it is",
+                        text.trim()
+                    )),
+                ),
+            },
+        };
         let links = files
             .list_dir(&dir)?
             .into_iter()
@@ -1284,6 +1585,7 @@ pub fn roots(files: &dyn Files, state: &StateDir) -> Result<Vec<RootDir>> {
             release_id,
             path: dir,
             created_at,
+            undated_because,
             links,
         });
     }
@@ -1294,28 +1596,6 @@ pub fn roots(files: &dyn Files, state: &StateDir) -> Result<Vec<RootDir>> {
             .then_with(|| a.release_id.cmp(&b.release_id))
     });
     Ok(out)
-}
-
-/// What `gc --keep N` would remove, and why it would leave the rest.
-pub fn gc_plan(all: &[RootDir], keep: usize) -> (Vec<&RootDir>, Vec<&RootDir>) {
-    let datable: Vec<&RootDir> = all.iter().filter(|r| r.created_at.is_some()).collect();
-    let undatable: Vec<&RootDir> = all.iter().filter(|r| r.created_at.is_none()).collect();
-    let cut = datable.len().saturating_sub(keep);
-    let (remove, kept) = datable.split_at(cut);
-    let mut keeping: Vec<&RootDir> = undatable;
-    keeping.extend(kept.iter().copied());
-    (remove.to_vec(), keeping)
-}
-
-/// Drop one release's roots. The store paths themselves are untouched:
-/// whether they go is `nix store gc`'s decision, not this tool's.
-pub fn remove_roots(files: &dyn Files, dir: &RootDir) -> Result<()> {
-    for link in &dir.links {
-        files.remove_file(link)?;
-    }
-    files.remove_file(&dir.path.join(STAMP))?;
-    files.remove_dir(&dir.path)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1365,35 +1645,90 @@ mod tests {
     /// whether the store reports a signature afterwards. They are two
     /// arguments and not one because the interesting failure is a sign that
     /// ran and left nothing behind.
-    fn expect_build(fleet: &ResolvedFleet, sign: bool, signed: bool) -> StrictFake {
-        let drvs: Vec<String> = derivations(fleet, &["box".to_string()])
-            .into_iter()
-            .map(|d| d.drv)
-            .collect();
-        let outs: Vec<String> = vec![
+    /// The four outputs of the one-host fixture, in the order
+    /// [`derivations`] lists their derivations: the host, then the packages.
+    fn outputs_in_derivation_order() -> Vec<String> {
+        vec![
             TOPLEVEL.to_string(),
             "/nix/store/pppppppppppppppppppppppppppppppp-meisterstack".to_string(),
             "/nix/store/cccccccccccccccccccccccccccccccc-cloud-hypervisor".to_string(),
             "/nix/store/gggggggggggggggggggggggggggggggg-guest-tiny".to_string(),
-        ];
+        ]
+    }
+
+    /// The same, sorted and deduplicated the way `realise` hands them to
+    /// `path-info`, `store sign` and the cache.
+    fn measured_paths(fleet: &ResolvedFleet) -> Vec<String> {
+        let _ = fleet;
+        let mut paths = outputs_in_derivation_order();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// What `nix build --json` answers for these derivation/output pairs.
+    fn build_json(pairs: &[(String, String)]) -> String {
+        let results: Vec<serde_json::Value> = pairs
+            .iter()
+            .map(|(drv, out)| serde_json::json!({ "drvPath": drv, "outputs": { "out": out } }))
+            .collect();
+        serde_json::to_string(&results).unwrap()
+    }
+
+    fn expect_build(fleet: &ResolvedFleet, sign: bool, signed: bool) -> StrictFake {
+        expect_build_into(fleet, sign, signed, None, None)
+    }
+
+    /// The same, for a build that verifies its own reproducibility and/or
+    /// pushes its release into a cache. Both steps sit at fixed points of
+    /// the order `realise` walks — the rebuild right after the build, the
+    /// push right after the measurement — and the strict fake is in that
+    /// order, which is what makes these tests statements about the order.
+    fn expect_build_into(
+        fleet: &ResolvedFleet,
+        sign: bool,
+        signed: bool,
+        cache: Option<&str>,
+        rebuild: Option<Output>,
+    ) -> StrictFake {
+        let drvs: Vec<String> = derivations(fleet, &["box".to_string()])
+            .into_iter()
+            .map(|d| d.drv)
+            .collect();
+        let outs: Vec<String> = outputs_in_derivation_order();
         let mut fake = StrictFake::new().expect(
             Matcher::prefix("nix", ["path-info", "--json"]),
             Output::stdout("{}"),
         );
-        for (drv, out) in drvs.iter().zip(outs.iter()) {
-            fake = fake.expect(
-                Matcher::exact(
-                    "nix",
-                    [
-                        "build".to_string(),
-                        "--no-link".to_string(),
-                        "--print-out-paths".to_string(),
-                        format!("{drv}^*"),
-                    ],
-                ),
-                Output::stdout(format!("{out}\n")),
-            );
+        // ONE build over the whole list, answered the way nix answers
+        // `--json`: an object per derivation, naming its own `drvPath`.
+        // Sorted, because `build_artifacts` sorts and deduplicates what it
+        // hands nix.
+        let mut sorted: Vec<(String, String)> = drvs
+            .iter()
+            .cloned()
+            .zip(outs.iter().cloned())
+            .collect::<Vec<_>>();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        fake = fake.expect(
+            Matcher::exact(
+                "nix",
+                [
+                    "build".to_string(),
+                    "--no-link".to_string(),
+                    "--json".to_string(),
+                ]
+                .into_iter()
+                .chain(sorted.iter().map(|(drv, _)| format!("{drv}^*")))
+                .collect::<Vec<_>>(),
+            ),
+            Output::stdout(build_json(&sorted)),
+        );
+        // --- lane 4C: the rebuild is next to the build it is about ---
+        if let Some(reply) = rebuild {
+            fake = fake.expect(Matcher::prefix("nix", ["build", "--rebuild"]), reply);
         }
+        // --- end lane 4C ---
         if sign {
             fake = fake.expect(
                 Matcher::prefix("nix", ["store", "sign", "--recursive", "--key-file"]),
@@ -1414,11 +1749,19 @@ mod tests {
                 )
             })
             .collect();
-        fake.expect(
+        fake = fake.expect(
             Matcher::prefix("nix", ["path-info", "--json", "--closure-size"]),
             Output::stdout(serde_json::to_string(&info).unwrap()),
-        )
-        .expect(
+        );
+        // --- lane 4C: after the measurement, before `build_env` ---
+        if let Some(cache) = cache {
+            fake = fake.expect(
+                Matcher::prefix("nix", ["copy", "--to", cache]),
+                Output::stdout(""),
+            );
+        }
+        // --- end lane 4C ---
+        fake.expect(
             Matcher::exact("nix", ["--version"]),
             Output::stdout("nix (Nix) 2.35.2\n"),
         )
@@ -1641,6 +1984,275 @@ mod tests {
         assert!(runner.calls().is_empty(), "{:?}", runner.calls());
     }
 
+    // --- lane 4C: the cache ---------------------------------------------
+
+    #[test]
+    fn a_cache_without_a_signing_key_is_refused_before_anything_is_built() {
+        let mut fleet = one_host();
+        // A context fleet, so that the MANAGED-host rule is not what
+        // refuses: what is under test is the cache's own rule.
+        fleet.hosts.get_mut("box").unwrap().deployment = Deployment::Context;
+        let runner = StrictFake::new();
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                cache: Some("file:///srv/cache".to_string()),
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let err = builder.realise(fleet).unwrap_err().to_string();
+        runner.verify().unwrap();
+        assert!(err.contains("file:///srv/cache"), "{err}");
+        assert!(err.contains("require-sigs"), "{err}");
+        assert!(err.contains("--sign-key"), "{err}");
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    }
+
+    #[test]
+    fn a_build_with_a_cache_pushes_once_after_signing_and_says_so_in_the_release() {
+        let fleet = one_host();
+        let fleet_paths = fleet.clone();
+        let runner = expect_build_into(&fleet, true, true, Some("file:///srv/cache"), None);
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                cache: Some("file:///srv/cache".to_string()),
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let built = builder.realise(fleet).expect("a green build with a cache");
+        runner.verify().unwrap();
+
+        let calls = runner.calls();
+        let copies: Vec<&String> = calls.iter().filter(|c| c.starts_with("nix copy")).collect();
+        assert_eq!(copies.len(), 1, "one push for the whole release: {calls:?}");
+        // And it names every path the release names — the systems AND the
+        // packages, because a host that fetches a system from a cache that
+        // lacks half its closure has fetched nothing.
+        for path in measured_paths(&fleet_paths) {
+            assert!(copies[0].contains(&path), "{path} is not in {}", copies[0]);
+        }
+        // After the signing, because a cache of unsigned paths is a cache
+        // every host refuses.
+        let signed_at = calls.iter().position(|c| c.contains("store sign")).unwrap();
+        let pushed_at = calls
+            .iter()
+            .position(|c| c.starts_with("nix copy"))
+            .unwrap();
+        assert!(signed_at < pushed_at, "{calls:?}");
+
+        assert_eq!(
+            built.release.build_env.cache_url.as_deref(),
+            Some("file:///srv/cache")
+        );
+        assert_eq!(
+            built.release.build_env.signing_key_name.as_deref(),
+            Some("fleet-1"),
+            "a target has to be told which key to trust"
+        );
+    }
+
+    #[test]
+    fn a_build_without_a_cache_runs_no_copy_at_all() {
+        let fleet = one_host();
+        // The strict fake has no `nix copy` expectation, so a probe, an
+        // empty push or a "does the cache exist" round trip would fail here.
+        let runner = expect_build(&fleet, true, true);
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let built = builder.realise(fleet).expect("a green build");
+        runner.verify().unwrap();
+        assert!(
+            !runner.calls().iter().any(|c| c.starts_with("nix copy")),
+            "{:?}",
+            runner.calls()
+        );
+        assert_eq!(built.release.build_env.cache_url, None);
+    }
+
+    #[test]
+    fn without_the_flag_a_release_says_nobody_checked() {
+        let fleet = one_host();
+        // The strict fake expects no `--rebuild`, so a probe would fail here.
+        let runner = expect_build(&fleet, true, true);
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let built = builder.realise(fleet).expect("a green build");
+        runner.verify().unwrap();
+        let repro = &built.release.reproducibility;
+        assert!(repro.inputs_pinned, "the tree was locked");
+        assert!(!repro.bit_identical_verified);
+        assert_eq!(
+            repro.method, None,
+            "null is what `nobody checked` looks like"
+        );
+        assert!(repro.differences.is_empty());
+    }
+
+    #[test]
+    fn a_rebuild_that_matched_is_the_only_thing_that_sets_the_flag() {
+        let fleet = one_host();
+        let runner = expect_build_into(&fleet, true, true, None, Some(Output::stdout("")));
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                verify_reproducible: true,
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let built = builder.realise(fleet).expect("a green build");
+        runner.verify().unwrap();
+        let repro = &built.release.reproducibility;
+        assert!(repro.bit_identical_verified);
+        assert_eq!(repro.method.as_deref(), Some("nix build --rebuild"));
+        assert!(repro.differences.is_empty());
+    }
+
+    #[test]
+    fn a_rebuild_that_differed_is_a_finding_and_not_a_failure() {
+        let fleet = one_host();
+        let runner = expect_build_into(
+            &fleet,
+            true,
+            true,
+            None,
+            Some(Output::failing(
+                1,
+                "error: derivation '/nix/store/dddd-nixos-system-box-25.11.drv' may not be \
+                 deterministic: output '/nix/store/oooo-nixos-system-box-25.11' differs",
+            )),
+        );
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                verify_reproducible: true,
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        // A release that is not bit-identical is still a release: what it
+        // says about itself is the finding.
+        let built = builder
+            .realise(fleet)
+            .expect("a build that is still a build");
+        runner.verify().unwrap();
+        let repro = &built.release.reproducibility;
+        assert!(!repro.bit_identical_verified);
+        assert_eq!(
+            repro.method.as_deref(),
+            Some("nix build --rebuild"),
+            "checked-and-different has to be tellable from not-checked"
+        );
+        assert_eq!(repro.differences.len(), 1);
+        assert!(
+            repro.differences[0].starts_with("box ("),
+            "{:?}",
+            repro.differences
+        );
+        assert!(
+            repro.differences[0].contains("may not be deterministic"),
+            "{:?}",
+            repro.differences
+        );
+    }
+
+    #[test]
+    fn a_rebuild_that_could_not_be_made_says_so_instead_of_answering_false() {
+        let fleet = one_host();
+        // Built by hand and not from `expect_build_into`: this build stops
+        // AT the rebuild, so a fake that expected the steps after it would
+        // fail on the unused expectations rather than on the finding.
+        let mut pairs: Vec<(String, String)> = derivations(&fleet, &["box".to_string()])
+            .into_iter()
+            .map(|d| d.drv)
+            .zip(outputs_in_derivation_order())
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let runner = StrictFake::new()
+            .expect(
+                Matcher::prefix("nix", ["path-info", "--json"]),
+                Output::stdout("{}"),
+            )
+            .expect(
+                Matcher::prefix("nix", ["build", "--no-link", "--json"]),
+                Output::stdout(build_json(&pairs)),
+            )
+            .expect(
+                Matcher::prefix("nix", ["build", "--rebuild"]),
+                Output::failing(
+                    1,
+                    "error: unable to start any build; either increase '--max-jobs' or \
+                     enable remote builds",
+                ),
+            );
+        let files = files_with_config(&fleet);
+        let clock = FakeClock::fixed();
+        let builder = Builder {
+            runner: &runner,
+            files: &files,
+            clock: &clock,
+            options: BuildOptions {
+                sign_key: Some(PathBuf::from("/keys/fleet.sec")),
+                verify_reproducible: true,
+                ..BuildOptions::default()
+            },
+            state: None,
+        };
+        let err = builder.realise(fleet).unwrap_err().to_string();
+        assert!(err.contains("could not be made"), "{err}");
+        assert!(err.contains("unable to start any build"), "{err}");
+        // And nothing was signed: the refusal came before the key was used.
+        assert!(
+            !runner.calls().iter().any(|c| c.contains("store sign")),
+            "{:?}",
+            runner.calls()
+        );
+    }
+
+    // --- end lane 4C ----------------------------------------------------
+
     #[test]
     fn a_green_build_binds_what_the_manifest_promised() {
         let fleet = one_host();
@@ -1839,24 +2451,35 @@ mod tests {
             Matcher::prefix("nix", ["path-info", "--json"]),
             Output::stdout("{}"),
         );
-        for (i, drv) in drvs.iter().enumerate() {
-            runner = runner.expect(
-                Matcher::exact(
-                    "nix",
-                    [
-                        "build".to_string(),
-                        "--no-link".to_string(),
-                        "--print-out-paths".to_string(),
-                        format!("{drv}^*"),
-                    ],
-                ),
-                Output::stdout(if i == 0 {
-                    "/nix/store/somethingelse-nixos-system-box-25.11\n".to_string()
-                } else {
-                    format!("/nix/store/pkg{i}-package\n")
-                }),
-            );
-        }
+        let mut pairs: Vec<(String, String)> = drvs
+            .iter()
+            .enumerate()
+            .map(|(i, drv)| {
+                (
+                    drv.clone(),
+                    if i == 0 {
+                        "/nix/store/somethingelse-nixos-system-box-25.11".to_string()
+                    } else {
+                        format!("/nix/store/pkg{i}-package")
+                    },
+                )
+            })
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        runner = runner.expect(
+            Matcher::exact(
+                "nix",
+                [
+                    "build".to_string(),
+                    "--no-link".to_string(),
+                    "--json".to_string(),
+                ]
+                .into_iter()
+                .chain(pairs.iter().map(|(drv, _)| format!("{drv}^*")))
+                .collect::<Vec<_>>(),
+            ),
+            Output::stdout(build_json(&pairs)),
+        );
         let files = files_with_config(&fleet);
         let clock = FakeClock::fixed();
         let builder = Builder {
@@ -1890,37 +2513,30 @@ mod tests {
             Matcher::prefix("nix", ["path-info", "--json"]),
             Output::stdout("{}"),
         );
-        runner = runner.expect(
-            Matcher::exact(
-                "nix",
-                [
-                    "build".to_string(),
-                    "--no-link".to_string(),
-                    "--print-out-paths".to_string(),
-                    format!("{drv}^*"),
-                ],
-            ),
-            Output::stdout(format!("{out}\n")),
-        );
+        let mut pairs: Vec<(String, String)> = vec![(drv.clone(), out.clone())];
         for name in ["meisterstack", "cloud_hypervisor", "guest_tiny"] {
             let drv = match name {
                 "meisterstack" => fleet.packages.meisterstack.drv.clone(),
                 "cloud_hypervisor" => fleet.packages.cloud_hypervisor.drv.clone(),
                 _ => fleet.packages.guest_tiny.drv.clone(),
             };
-            runner = runner.expect(
-                Matcher::exact(
-                    "nix",
-                    [
-                        "build".to_string(),
-                        "--no-link".to_string(),
-                        "--print-out-paths".to_string(),
-                        format!("{drv}^*"),
-                    ],
-                ),
-                Output::stdout(format!("/nix/store/{name}-out\n")),
-            );
+            pairs.push((drv, format!("/nix/store/{name}-out")));
         }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        runner = runner.expect(
+            Matcher::exact(
+                "nix",
+                [
+                    "build".to_string(),
+                    "--no-link".to_string(),
+                    "--json".to_string(),
+                ]
+                .into_iter()
+                .chain(pairs.iter().map(|(d, _)| format!("{d}^*")))
+                .collect::<Vec<_>>(),
+            ),
+            Output::stdout(build_json(&pairs)),
+        );
         let files = files_with_config(&fleet);
         let clock = FakeClock::fixed();
         let builder = Builder {
@@ -2096,51 +2712,6 @@ mod tests {
     }
 
     #[test]
-    fn gc_keeps_the_newest_and_never_removes_what_it_cannot_date() {
-        let dirs = vec![
-            RootDir {
-                release_id: "release-old".to_string(),
-                path: PathBuf::from("/repo/.meister-deploy/gcroots/release-old"),
-                created_at: Some(crate::fixtures::at("2026-09-01T00:00:00Z")),
-                links: vec![PathBuf::from(
-                    "/repo/.meister-deploy/gcroots/release-old/box",
-                )],
-            },
-            RootDir {
-                release_id: "release-new".to_string(),
-                path: PathBuf::from("/repo/.meister-deploy/gcroots/release-new"),
-                created_at: Some(crate::fixtures::at("2026-09-21T00:00:00Z")),
-                links: vec![PathBuf::from(
-                    "/repo/.meister-deploy/gcroots/release-new/box",
-                )],
-            },
-            RootDir {
-                release_id: "release-undated".to_string(),
-                path: PathBuf::from("/repo/.meister-deploy/gcroots/release-undated"),
-                created_at: None,
-                links: vec![],
-            },
-        ];
-        let (remove, keep) = gc_plan(&dirs, 1);
-        assert_eq!(
-            remove
-                .iter()
-                .map(|r| r.release_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["release-old"]
-        );
-        assert!(
-            keep.iter().any(|r| r.release_id == "release-undated"),
-            "a directory this tool cannot date is one it does not remove"
-        );
-        assert!(keep.iter().any(|r| r.release_id == "release-new"));
-        // Keeping more than there are removes nothing.
-        let (remove, keep) = gc_plan(&dirs, 10);
-        assert!(remove.is_empty());
-        assert_eq!(keep.len(), 3);
-    }
-
-    #[test]
     fn the_roots_of_a_directory_are_read_back_newest_last() {
         let files = MemFiles::new()
             .given(
@@ -2170,9 +2741,22 @@ mod tests {
         assert_eq!(all[0].links.len(), 1, "the stamp is not a root");
         assert!(all[0].links[0].ends_with("box"));
 
-        let (remove, _) = gc_plan(&all, 1);
-        assert_eq!(remove.len(), 1);
-        remove_roots(&files, remove[0]).unwrap();
+        // What is DONE with them is `state::sweep` / `state::carry_out`,
+        // which is where the whole retention decision lives; here it is
+        // driven directly so that this test stays about the reader.
+        let sweep = crate::state::sweep(
+            &files,
+            &state,
+            &all,
+            &crate::state::Retention {
+                keep: 1,
+                ..crate::state::Retention::default()
+            },
+            crate::fixtures::at("2026-09-22T00:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(sweep.removals_of("release").len(), 1);
+        crate::state::carry_out(&files, &sweep).unwrap();
         assert!(
             !files.exists(std::path::Path::new(
                 "/repo/.meister-deploy/gcroots/release-a/box"

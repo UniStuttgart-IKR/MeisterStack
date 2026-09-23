@@ -50,6 +50,15 @@
     # the binary in it.
     test -x ${runtime}/cloud-hypervisor               || { echo "the hypervisor is not in ${runtime}"; exit 1; }
     grep -q '${runtime}/cloud-hypervisor'               ${probe.environment.etc."meisterstack/agent.toml".source}               || { echo "agent.toml does not name the hypervisor in binDir"; exit 1; }
+    # --- lane 4C ---
+    # And the one program that talks to a RUNNING VMM from outside it.
+    # The agent reaches its guests over the per-VM http socket and needs
+    # neither, but a verification suite that has to stop a guest it
+    # started, and an operator on a node looking at why one will not die,
+    # both reach for this one (lane 1B, open point 5).
+    test -x ${runtime}/ch-remote \
+      || { echo "ch-remote is not in ${runtime}; nothing outside a VMM can talk to it"; exit 1; }
+    # --- end lane 4C ---
     # And what the conditions say now: the keys, which are pushed on
     # both roads, and never a binary, which on this road cannot be
     # missing.

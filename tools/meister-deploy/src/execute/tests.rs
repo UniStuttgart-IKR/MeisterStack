@@ -703,6 +703,158 @@ fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
     assert!(at_of("ActionIrreversible:activate") < at_of("ActionEnd:activate"));
 }
 
+// --- lane 4C: the cache is a shortcut inside the copy --------------------
+
+/// The fleet, changed on `n1`, with a release that was pushed into a cache.
+///
+/// `build_env` is NOT part of `release_id` (a release built on a laptop and
+/// one built on a farm are the same release), so saying where the closures
+/// went afterwards is a statement about this release and not a different
+/// one — which is what makes this two lines instead of a second fixture.
+fn changing_with_a_cache(cache: Option<&str>) -> Fixture {
+    let mut fx = Fixture::changing(&["n1"], false);
+    fx.release.build_env.cache_url = cache.map(str::to_string);
+    fx
+}
+
+#[test]
+fn a_target_that_names_substituters_is_allowed_to_fetch_what_it_can() {
+    let fx = changing_with_a_cache(Some("file:///srv/cache"));
+    // The fixture's `n1` names a cache and the other two do not, which is
+    // what makes this a property of the HOST and not of the release.
+    assert_eq!(
+        fx.release.resolved_fleet.hosts["n1"].substituters,
+        vec!["http://box.lab:8080/cache".to_string()]
+    );
+    let top = fx.top("n1");
+    let look = TableLook::new(&fx);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(
+                Matcher::exact(
+                    "nix",
+                    [
+                        "copy",
+                        "--substitute-on-destination",
+                        "--to",
+                        "ssh-ng://root@10.0.0.11",
+                        &top,
+                    ],
+                ),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::prefix("nix", ["path-info"]),
+                Output::stdout(fx.path_info("n1")),
+            )
+            .expect(helper("n1", &["stage"]), ok())
+            .expect(cli("cordon", "n1"), Output::stdout(""))
+            .expect(cli("drain", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["activate"]), ok())
+            .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["txn", "retire"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let applied = fx
+        .executor(&runner, &look, fx.options())
+        .run()
+        .expect("the rollout runs");
+    runner.verify().expect("every expectation was used");
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+
+    // What arrived is still compared against the release: the cache is a
+    // road and never an exception.
+    let evidence: Vec<String> = applied.receipt.hosts["n1"]
+        .actions
+        .iter()
+        .flat_map(|a| a.evidence.clone())
+        .collect();
+    assert!(
+        evidence.iter().any(|e| e.contains("as the release says")),
+        "{evidence:?}"
+    );
+    // And the receipt says the target was allowed to fetch, with the store
+    // its own configuration names.
+    assert!(
+        evidence
+            .iter()
+            .any(|e| e.contains("allowed to fetch") && e.contains("http://box.lab:8080/cache")),
+        "{evidence:?}"
+    );
+}
+
+/// One changed host, one plain `nix copy`, asserted exactly.
+fn a_plain_copy_is_what_happens(fx: Fixture, id: &str, address: &str) {
+    let top = fx.top(id);
+    let look = TableLook::new(&fx);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper(id, &["lock", "acquire"]), ok())
+            .expect(
+                Matcher::exact(
+                    "nix",
+                    ["copy", "--to", &format!("ssh-ng://root@{address}"), &top],
+                ),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::prefix("nix", ["path-info"]),
+                Output::stdout(fx.path_info(id)),
+            )
+            .expect(helper(id, &["stage"]), ok())
+            .expect(cli("cordon", id), Output::stdout(""))
+            .expect(cli("drain", id), Output::stdout(""))
+            .expect(helper(id, &["activate"]), ok())
+            .expect(helper(id, &["confirm", "--txn", "run-1"]), ok())
+            .expect(cli("uncordon", id), Output::stdout(""))
+            .expect(helper(id, &["txn", "retire"]), ok())
+            .expect(helper(id, &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    fx.executor(&runner, &look, fx.options())
+        .run()
+        .expect("the rollout runs");
+    runner.verify().expect("every expectation was used");
+}
+
+#[test]
+fn a_release_that_went_into_no_cache_asks_the_target_to_fetch_nothing() {
+    // `n1` names a substituter and the release names no cache: there is
+    // nothing out there to fetch, so asking the far store to try would be a
+    // round trip for nothing.
+    let fx = changing_with_a_cache(None);
+    assert!(
+        !fx.release.resolved_fleet.hosts["n1"]
+            .substituters
+            .is_empty()
+    );
+    a_plain_copy_is_what_happens(fx, "n1", "10.0.0.11");
+}
+
+#[test]
+fn a_target_that_names_no_substituter_is_pushed_to_even_when_there_is_a_cache() {
+    // The other half: a cache exists and THIS host fetches from nowhere, so
+    // the whole closure comes over ssh — which is the default and the
+    // smaller attack surface.
+    let mut fx = Fixture::changing(&["n2"], false);
+    fx.release.build_env.cache_url = Some("file:///srv/cache".to_string());
+    assert!(
+        fx.release.resolved_fleet.hosts["n2"]
+            .substituters
+            .is_empty()
+    );
+    a_plain_copy_is_what_happens(fx, "n2", "10.0.0.12");
+}
+
+// --- end lane 4C ---------------------------------------------------------
+
 #[test]
 fn an_activation_whose_connection_died_is_decided_by_the_host_and_not_by_ssh() {
     // The case the VM test found: `switch-to-configuration` restarts sshd

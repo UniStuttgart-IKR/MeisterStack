@@ -505,6 +505,15 @@ pub struct InventoryHost {
     pub hardware: Hardware,
     /// Null for a host that is never installed by this tool.
     pub install: Option<Install>,
+    /// The binary caches this host is configured to FETCH from
+    /// (`meisterstack.managed.substituters`), in the order nix tries them.
+    ///
+    /// Here because a stage has to know it: `nix copy --to ssh-ng://` can
+    /// let the far store pull what it can reach itself, and whether that is
+    /// worth asking for is a fact about the target's configuration. Empty is
+    /// a host that fetches from nowhere and is only ever pushed to, which is
+    /// the smaller attack surface and the default.
+    pub substituters: Vec<String>,
 }
 
 /// A host as Nix evaluated it: what it will run, and what has to be true.
@@ -516,6 +525,13 @@ pub struct NixHost {
     /// `{"agent_toml_out": "/nix/store/…-agent.toml"}`: the rendered
     /// configuration files, by role.
     pub config_artifacts: BTreeMap<String, String>,
+    /// Every systemd unit this host's system generation carries, by name.
+    ///
+    /// Names and not units: what a plan does with them is tell this stack's
+    /// units from the operator's own. A unit nobody here declared is a unit
+    /// whose disruption this tool cannot predict, which is what an
+    /// `unknowns[]` entry says out loud instead of guessing.
+    pub units: Vec<String>,
     pub secret_refs: Vec<SecretRef>,
     pub persistence: Vec<Persistence>,
     pub checks: HostChecks,
@@ -650,11 +666,15 @@ pub struct ResolvedHost {
     pub effective_settings: EffectiveSettings,
     pub build: Build,
     pub config_artifacts: BTreeMap<String, String>,
+    /// Every systemd unit this host's system generation carries, by name.
+    pub units: Vec<String>,
     pub secret_refs: Vec<SecretRef>,
     pub persistence: Vec<Persistence>,
     pub install: Option<Install>,
     pub checks: HostChecks,
     pub rollout: Rollout,
+    /// The binary caches this host fetches from, in nix's order.
+    pub substituters: Vec<String>,
 }
 
 /// `manifest.json`: one fleet, one tree, one id.
@@ -794,11 +814,13 @@ pub fn resolve(
                 effective_settings: built.effective_settings,
                 build: built.build,
                 config_artifacts: built.config_artifacts,
+                units: built.units,
                 secret_refs: built.secret_refs,
                 persistence: built.persistence,
                 install: host.install,
                 checks: built.checks,
                 rollout: built.rollout,
+                substituters: host.substituters,
             },
         );
     }
@@ -841,6 +863,31 @@ pub fn resolve(
             );
         }
     }
+    // --- lane 4C: B2 -------------------------------------------------
+    //
+    // A manifest with no host in it is not a small manifest, it is a
+    // manifest about nothing: every verb after this one would work and do
+    // nothing — `build` would build the packages, `plan` would produce a
+    // plan with no actions, `apply` would report success — and the operator
+    // would be looking at a green run over an empty fleet.
+    //
+    // nix/lib/inventory.nix already refuses a file with no `[[host]]` at
+    // all, so the only way to get here is a fleet whose hosts are all
+    // `deployment = "context"`: those have no closure, no toplevel and no
+    // `build`, and the pre-v1 push serves them until L3. Found in lane L1,
+    // where a lab inventory of twelve context VMs resolved to a silent
+    // manifest of zero hosts (finding B2).
+    if hosts.is_empty() {
+        bail!(
+            "the fleet {:?} has no host this flake builds a system for, so there is nothing \
+             to resolve. Every host of it is `deployment = \"context\"` — a VM somebody else \
+             instantiated, with no closure of its own — and those are served by \
+             `meister-deploy legacy context-push` until they are migrated. Give a host \
+             `deployment = \"nixos\"` to deploy it with this tool.",
+            inventory.fleet.name
+        );
+    }
+    // --- end lane 4C ---------------------------------------------------
     let evaluated_hosts: Vec<String> = hosts.keys().cloned().collect();
 
     let mut resolved = ResolvedFleet {
@@ -1068,6 +1115,91 @@ mod tests {
         assert_eq!(host.rollout.reboot, RebootPolicy::Approve);
         assert_eq!(host.checks.required, vec!["units", "session", "mounts"]);
         assert_eq!(resolved.schema, RESOLVED_FLEET_SCHEMA);
+    }
+
+    #[test]
+    fn a_host_carries_the_units_of_its_generation() {
+        let manifest = NixManifest::from_json(&fixture(), "the fixture").unwrap();
+        let resolved = resolve(manifest.clone(), source(), tool(), now(), None).unwrap();
+        // The list travels from the evaluated half to the resolved host
+        // whole and in order: a plan that reordered it would change the
+        // manifest id for nothing.
+        assert_eq!(resolved.hosts["box"].units, manifest.hosts["box"].units);
+        assert!(
+            resolved.hosts["box"]
+                .units
+                .contains(&"meister-cloud-controller.service".to_string()),
+            "{:?}",
+            resolved.hosts["box"].units
+        );
+        // And it is a per-host fact and not a fleet-wide one: an agent has
+        // no controller unit, which is exactly the difference a plan reads.
+        assert!(
+            !resolved.hosts["n1"]
+                .units
+                .contains(&"meister-cloud-controller.service".to_string()),
+            "{:?}",
+            resolved.hosts["n1"].units
+        );
+        assert!(
+            resolved.hosts["n1"]
+                .units
+                .contains(&"meister-agent.service".to_string())
+        );
+    }
+
+    // --- lane 4C: B2 -------------------------------------------------
+    #[test]
+    fn a_fleet_of_context_hosts_only_is_a_sentence_and_not_an_empty_manifest() {
+        let mut manifest = NixManifest::from_json(&fixture(), "the fixture").unwrap();
+        // What nix/lib/inventory.nix produces for a fleet whose hosts are
+        // all `deployment = "context"`: the inventory half keeps the
+        // groups and the fleet's name, and both host maps are empty.
+        manifest.inventory.hosts.clear();
+        manifest.hosts.clear();
+        for group in manifest.inventory.groups.values_mut() {
+            group.members.clear();
+        }
+        manifest.inventory.services.clear();
+
+        let err = resolve(manifest, source(), tool(), now(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one-box"), "it names the fleet: {err}");
+        assert!(
+            err.contains("no host this flake builds a system for"),
+            "{err}"
+        );
+        assert!(err.contains("context"), "{err}");
+        assert!(
+            err.contains("legacy context-push"),
+            "it says the way: {err}"
+        );
+    }
+    // --- end lane 4C ---------------------------------------------------
+
+    #[test]
+    fn a_changed_unit_list_is_a_different_manifest_id() {
+        let before = resolve(
+            NixManifest::from_json(&fixture(), "a").unwrap(),
+            source(),
+            tool(),
+            now(),
+            None,
+        )
+        .unwrap();
+        let mut manifest = NixManifest::from_json(&fixture(), "b").unwrap();
+        manifest
+            .hosts
+            .get_mut("n1")
+            .unwrap()
+            .units
+            .push("somebody-elses.service".to_string());
+        let after = resolve(manifest, source(), tool(), now(), None).unwrap();
+        assert_ne!(
+            before.manifest_id, after.manifest_id,
+            "a unit an operator's own module brought onto a host is part of what that host is"
+        );
     }
 
     #[test]

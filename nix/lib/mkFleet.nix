@@ -133,6 +133,22 @@ let
         # closure is copied in, staged, activated and confirmed from the
         # outside, and that is what this profile means.
         meisterstack.managed.enable = true;
+
+        # And where it may FETCH a closure from, as the inventory said it.
+        # One list, one place: `meister-deploy build --cache <store>` pushes
+        # a release into a store and this is what lets a host pull out of
+        # one, and having the second half live in an operator's profile
+        # while the first is a flag would make "does this fleet use its
+        # cache" a question no single file answers.
+        #
+        # HERE and not in `inv.hostModule`, which is the module a host of
+        # this fleet is expressed as through the options a FOREIGN host has
+        # too: `meisterstack.managed.*` only exists where nix/managed.nix is
+        # imported, and that is exactly this list.
+        #
+        # mkDefault, so a host module that knows better — a machine behind a
+        # slow link, a machine that must never fetch — keeps its own answer.
+        meisterstack.managed.substituters = lib.mkDefault inv.hosts.${id}.substituters;
       }
       (inv.hostModule id)
       # The installer MEDIUM of this host, which is a medium and not this
@@ -350,7 +366,7 @@ let
       nixSide = pkgs.writeText "inventory-nix.json" (builtins.toJSON
         (lib.mapAttrs
           (_: h: {
-            inherit (h) profiles boot;
+            inherit (h) profiles boot substituters;
             ssh = h.ssh;
             rollout = h.rollout;
             checks = h.checks;
