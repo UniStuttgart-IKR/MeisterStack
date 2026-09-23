@@ -380,9 +380,20 @@ fn a_degraded_raft_group_blocks_only_its_own_members() {
     let plan = planned(&release, "all", &observation);
     assert!(plan.groups["cluster-2"].blocked.is_some());
     assert!(plan.groups["cluster-1"].blocked.is_none());
-    for id in ["cluster-2-a", "cluster-2-b", "cluster-2-c"] {
+    // The two HEALTHY members are what the quorum rule protects. The member
+    // that is already down does not go down again by being worked on — it
+    // is the one host a degraded group most needs a plan for (lab finding
+    // W8, 2026-09-23: a bootstrap of three could be started and never
+    // finished, because the third member was refused once the first two
+    // formed a quorum).
+    for id in ["cluster-2-b", "cluster-2-c"] {
         assert_eq!(plan.hosts[id].verdict, HostVerdict::Blocked, "{id}");
     }
+    assert_eq!(
+        plan.hosts["cluster-2-a"].verdict,
+        HostVerdict::Change,
+        "the member that is down is the one the plan is for"
+    );
     for id in ["cluster-1-a", "agent-01", "cloud-a"] {
         assert_eq!(plan.hosts[id].verdict, HostVerdict::Change, "{id}");
     }
