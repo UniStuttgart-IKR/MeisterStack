@@ -318,7 +318,10 @@ impl FilesystemBlockDriver {
     /// The refusal in the middle is the space check of a create: a disk
     /// asked for smaller than the image it is made from is a disk nobody can
     /// write, and it is said before a byte is copied.
-    async fn base_image_for(&self, spec: &VolumeSpec) -> storage::Result<Option<(PathBuf, bool)>> {
+    async fn base_image_for(
+        &self,
+        spec: &VolumeSpec,
+    ) -> storage::Result<Option<(PathBuf, Option<agent_api::base_image::BaseImage>)>> {
         match &spec.base_image {
             Some(name) => {
                 let src = self.config.image_dir.join(name);
@@ -326,12 +329,29 @@ impl FilesystemBlockDriver {
                     .await
                     .map_err(|_| StorageError::ImageNotFound(name.clone()))?;
                 let qcow2 = is_qcow2(&src).map_err(|e| StorageError::Backend(e.into()))?;
+                // A qcow2 is the one image this backend converts, and since
+                // S01 it is also the one it JUDGES: a qcow2 can name a second
+                // file of its own — a backing file, an external data file —
+                // and `qemu-img convert` would read it, as the agent, which
+                // on a node with `unprivileged = false` is root. The probe
+                // refuses that and hands back the format the convert is then
+                // told (`agent_api::base_image`).
+                //
+                // A file that is not a qcow2 is copied and no qemu-img is
+                // started at all, which is what keeps a node without one
+                // working exactly as it did — and a copy reads nothing but
+                // the bytes in front of it, so there is nothing to refuse.
+                //
                 // For a qcow2 the FILE is smaller than the disk it describes,
                 // so its length is the wrong number to compare against.
-                let needed = if qcow2 {
-                    layout::image_virtual_size(&self.config.qemu_img, &src, name).await?
+                let judged = if qcow2 {
+                    Some(agent_api::base_image::probe(&self.config.qemu_img, &src, name).await?)
                 } else {
-                    meta.len()
+                    None
+                };
+                let needed = match &judged {
+                    Some(image) => image.virtual_size,
+                    None => meta.len(),
                 };
                 if needed > spec.size_bytes {
                     return Err(StorageError::InvalidSpec(format!(
@@ -342,7 +362,7 @@ impl FilesystemBlockDriver {
                         if qcow2 { " once written out raw" } else { "" }
                     )));
                 }
-                Ok(Some((src, qcow2)))
+                Ok(Some((src, judged)))
             }
             None => Ok(None),
         }

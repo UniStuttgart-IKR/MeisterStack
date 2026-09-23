@@ -326,48 +326,25 @@ impl LvmThinDriver {
         Ok(Some(parse_number(&out, "lv_size")? as u64))
     }
 
-    /// What the base image will occupy once written out raw. qcow2 files are
-    /// smaller on disk than the disk they describe, so the file's own length
-    /// is the wrong number to compare against — this is the right one.
-    async fn image_virtual_size(&self, path: &PathBuf, name: &str) -> storage::Result<u64> {
-        let out = tokio::process::Command::new(&self.config.qemu_img)
-            .args(["info", "--output=json"])
-            .arg(path)
-            .output()
-            .await
-            .map_err(|e| StorageError::Backend(anyhow::anyhow!("running qemu-img info: {e}")))?;
-        if !out.status.success() {
-            return Err(StorageError::ImageNotFound(format!(
-                "{name}: qemu-img info failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        let info: serde_json::Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| StorageError::Backend(anyhow::anyhow!("qemu-img info json: {e}")))?;
-        info.get("virtual-size")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| {
-                StorageError::Backend(anyhow::anyhow!(
-                    "qemu-img info for {name} has no virtual-size"
-                ))
-            })
-    }
-
     /// Write the base image onto the LV. `qemu-img convert` and not `dd`
     /// because it reads qcow2 as well as raw, and the images this lab boots
     /// are both.
+    ///
+    /// The format is the one `agent_api::base_image::probe` judged and is
+    /// passed with `-f`. Astra finding S01, 2026-09-23: this ran `convert -O
+    /// raw` with no `-f` and refused nothing, so the source format was
+    /// decided again here — and an image naming a backing file or an external
+    /// data file had that second file read into the guest's disk, by a
+    /// converter that on a node with `unprivileged = false` is root.
     async fn write_base_image(
         &self,
-        src: &PathBuf,
-        dev: &PathBuf,
+        image: &agent_api::base_image::BaseImage,
+        src: &Path,
+        dev: &Path,
         name: &str,
     ) -> storage::Result<()> {
         let out = tokio::process::Command::new(&self.config.qemu_img)
-            .arg("convert")
-            .arg("-O")
-            .arg("raw")
-            .arg(src)
-            .arg(dev)
+            .args(agent_api::base_image::convert_argv(image, src, dev))
             .output()
             .await
             .map_err(|e| StorageError::Backend(anyhow::anyhow!("running qemu-img convert: {e}")))?;
@@ -443,14 +420,20 @@ impl VolumeProvider for LvmThinDriver {
                 if !path.is_file() {
                     return Err(StorageError::ImageNotFound(name.clone()));
                 }
-                let virtual_size = self.image_virtual_size(&path, name).await?;
-                if virtual_size > spec.size_bytes {
+                // One probe, and it answers both questions: how big the image
+                // is once written out raw — a qcow2 file is smaller than the
+                // disk it describes, so the file's own length is the wrong
+                // number — and whether this node will convert it at all. See
+                // `agent_api::base_image` for what it refuses and why.
+                let image =
+                    agent_api::base_image::probe(&self.config.qemu_img, &path, name).await?;
+                if image.virtual_size > spec.size_bytes {
                     return Err(StorageError::InvalidSpec(format!(
-                        "size_bytes {} smaller than base image {name} ({virtual_size} bytes raw)",
-                        spec.size_bytes
+                        "size_bytes {} smaller than base image {name} ({} bytes raw)",
+                        spec.size_bytes, image.virtual_size
                     )));
                 }
-                Some((path, name.clone()))
+                Some((path, name.clone(), image))
             }
             None => None,
         };
@@ -477,11 +460,14 @@ impl VolumeProvider for LvmThinDriver {
         // From here on the LV exists, so every failure has to take it with it
         // — a half-written volume that survives would be handed to the next
         // boot as if it were ready.
-        if let Some((path, name)) = src {
+        if let Some((path, name, image)) = src {
             let staging_dev = Self::device_path(&vg, &staging);
             info!(base = %path.display(), dev = %staging_dev.display(),
-                  "writing base image onto lv");
-            if let Err(e) = self.write_base_image(&path, &staging_dev, &name).await {
+                  format = %image.format, "writing base image onto lv");
+            if let Err(e) = self
+                .write_base_image(&image, &path, &staging_dev, &name)
+                .await
+            {
                 warn!(error = %format!("{e:#}"),
                       "base image failed, removing the lv again");
                 if let Err(rm) = self.remove_lv(&vg, &staging).await {
