@@ -1152,7 +1152,27 @@ impl<'a> Helper<'a> {
         run_id: Option<&str>,
         forced: Option<&str>,
     ) -> Result<TxnRecord> {
-        let mut record = self.record(id)?;
+        let mut record = match self.record(id) {
+            Ok(record) => record,
+            // Astra finding F06, 2026-09-23: a retire that has already
+            // happened is the outcome this asks for. A resume now repeats
+            // the `unlock` step of a host whose run stopped after the
+            // confirm, and that step retires a record the interrupted run
+            // may already have archived — which used to fail the whole
+            // resume with "there is no transaction on this host". The
+            // archive is the proof that it happened, and it is handed back
+            // unchanged.
+            Err(e) => {
+                let archive = self.txn_archive(id);
+                if !self.files.exists(&archive) {
+                    return Err(e);
+                }
+                return TxnRecord::from_json(
+                    &self.files.read_to_string(&archive)?,
+                    &archive.display().to_string(),
+                );
+            }
+        };
         if let (Some(asked), Some(owner)) = (run_id, record.run_id.as_deref())
             && asked != owner
         {

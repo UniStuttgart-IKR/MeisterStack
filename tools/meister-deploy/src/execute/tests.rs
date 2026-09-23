@@ -1334,7 +1334,7 @@ fn a_resume_whose_target_knows_nothing_repeats_nothing_and_asks_for_a_person() {
 /// A journal of a run in which `n1` went all the way through and gave its
 /// lock and its transaction record back — which is what the `unlock` step
 /// does, and therefore what a resume finds on the target: nothing.
-fn write_finished_host_journal(fx: &Fixture, run: &str) {
+fn write_finished_host_journal(fx: &Fixture, run: &str, given_back: bool) {
     fx.state
         .begin_run(&fx.files, run)
         .expect("the run directory");
@@ -1399,10 +1399,35 @@ fn write_finished_host_journal(fx: &Fixture, run: &str) {
     }
     // The `unlock` step: the record is retired on the target and the lock
     // goes back. After this the target has NO transaction for this run.
-    put(journal
-        .event(EventKind::LockRelease, at(NOW))
-        .host("n1")
-        .payload(serde_json::json!({"run_id": run})));
+    //
+    // Astra finding F06, 2026-09-23: this used to be the `lock.release`
+    // line alone, which is not what the executor writes — every step
+    // carries an `action.begin` and an `action.end` around what it does.
+    // The difference matters now, because "did this run give the host back"
+    // is read off the `unlock` step's own end: the bare `lock.release` that
+    // the safety net `release_locks` writes at the end of EVERY run cannot
+    // tell a finished host from an abandoned one.
+    if given_back {
+        let unlock = fx
+            .plan
+            .actions_for("n1")
+            .into_iter()
+            .find(|a| a.kind == ActionKind::Unlock)
+            .expect("a host that is taken forward is given back")
+            .seq;
+        put(journal
+            .event(EventKind::ActionBegin, at(NOW))
+            .host("n1")
+            .payload(serde_json::json!({"action": unlock, "kind": "unlock"})));
+        put(journal
+            .event(EventKind::LockRelease, at(NOW))
+            .host("n1")
+            .payload(serde_json::json!({"run_id": run})));
+        put(journal
+            .event(EventKind::ActionEnd, at(NOW))
+            .host("n1")
+            .payload(serde_json::json!({"action": unlock, "kind": "unlock", "result": "ok"})));
+    }
     // And here the run stopped, before its `run.end` — a halt in front of
     // another host's provider reboot, which is how lab lane L2 got here.
 }
@@ -1416,7 +1441,7 @@ fn a_resume_reads_a_host_this_run_already_finished_as_finished() {
     // it" — so the second resume refused the whole run and there was no
     // supported way to finish it.
     let fx = Fixture::changing(&["n1"], false);
-    write_finished_host_journal(&fx, "run-1");
+    write_finished_host_journal(&fx, "run-1", true);
     let look = TableLook::new(&fx);
     // The machine is where the journal says it is.
     look.set("n1", Phase::After);
@@ -1441,6 +1466,60 @@ fn a_resume_reads_a_host_this_run_already_finished_as_finished() {
         "an activation was repeated: {:?}",
         runner.calls()
     );
+}
+
+// Astra finding F06, 2026-09-23.
+#[test]
+fn a_resume_of_a_confirmed_but_uncleaned_host_uncordons_and_retires() {
+    // The host is `committed` — the confirm put it there — and the run
+    // stopped before its `uncordon` and its `unlock`. That was read as a
+    // host with nothing left to do, so the resume walked past both: the
+    // machine stayed cordoned, so nothing was scheduled onto it, and its
+    // transaction record stayed open, which is what makes the NEXT plan
+    // refuse to start.
+    let fx = Fixture::changing(&["n1"], false);
+    write_finished_host_journal(&fx, "run-1", false);
+    let look = TableLook::new(&fx).carrying(
+        "n1",
+        Txn {
+            id: "run-1".to_string(),
+            state: TxnState::Confirmed,
+            target_system: Some(fx.top("n1")),
+            deadline: None,
+            run_id: Some("run-1".to_string()),
+        },
+    );
+    look.set("n1", Phase::After);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            // What was left, and only what was left.
+            .expect(cli("undrain", "n1"), Output::stdout(""))
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["txn", "retire", "--txn", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("every expectation was used");
+    assert_eq!(applied.stopped, None, "the resume stopped: {applied:?}");
+    assert_eq!(applied.receipt.hosts["n1"].state, HostState::Committed);
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+    // And nothing before the confirm was touched.
+    for repeated in ["activate --txn", "nix copy", "confirm --txn"] {
+        assert!(
+            !runner.calls().iter().any(|c| c.contains(repeated)),
+            "{repeated} was repeated: {:?}",
+            runner.calls()
+        );
+    }
 }
 
 #[test]

@@ -1053,6 +1053,23 @@ impl<'a> Executor<'a> {
                     )?;
                 }
                 self.end(journal, id, action, ActionResult::Ok, Vec::new(), refs)?;
+                // Astra finding F06, 2026-09-23: the host is where the run
+                // leaves it, and this is where a run leaves a host it took
+                // forward — every path that does not take it forward
+                // (`take_back`, a failed activation, a failed check) ends
+                // the host before this step. On an ordinary rollout it is
+                // already `committed`, because the confirm put it there, and
+                // then nothing is written.
+                //
+                // It matters on a RESUME of a host that was confirmed and
+                // not given back: the confirm is behind us and skipped, and
+                // the `preflight` this resume DOES repeat — it is a read —
+                // moves the host back to `preflight`. Without this line such
+                // a host ended the run there, and the receipt read a resume
+                // that did everything that was left as `skipped`.
+                if self.entry(hosts, id).state != HostState::Committed {
+                    self.move_to(journal, id, hosts, HostState::Committed, None)?;
+                }
             }
             // --- lane 3B ----------------------------------------------
             ActionKind::DeliverSecret => {

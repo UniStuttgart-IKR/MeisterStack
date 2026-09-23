@@ -479,6 +479,24 @@ impl HostRun {
     }
     // --- end lane 3-integration ---
 
+    /// Whether this run gave the host back: the `unlock` step, which retires
+    /// the transaction record on the target and releases the host's lock.
+    ///
+    /// Astra finding F06, 2026-09-23. A host becomes `committed` at its
+    /// CONFIRM, and the plan puts `uncordon` and `unlock` after that. So
+    /// "committed" means the system is kept, not that the run has finished
+    /// with the machine — and reading it as finished is what made a resume
+    /// skip the uncordon and the retire. The host then stayed cordoned, so
+    /// nothing was scheduled onto it, and its record stayed open, which is
+    /// what makes the NEXT plan refuse to start. The journal says which of
+    /// the two it is, in the `action.end` of the step that does the giving
+    /// back, so it is asked.
+    pub fn was_given_back(&self) -> bool {
+        self.actions
+            .iter()
+            .any(|a| a.kind == ActionKind::Unlock && a.result == Some(ActionResult::Ok))
+    }
+
     /// A host the journal says nothing about. What a resume starts from when
     /// the run died before it reached this host.
     pub fn new(id: impl Into<String>) -> HostRun {
@@ -945,14 +963,30 @@ pub fn next_step(host: &HostRun, target: &TxnView) -> Step {
     // run wrote itself. (The `!began` branch above already spells
     // `HostState::Committed => Step::Done`; it could never fire, because
     // `committed` makes `began` true.)
+    //
+    // Astra finding F06, 2026-09-23: "committed" is written at the CONFIRM,
+    // and `uncordon` and `unlock` come after it. A run that stopped between
+    // the two was read here as a host with nothing left to do, so the
+    // resume left the machine cordoned and its transaction record open —
+    // and an open record is what makes the next plan refuse to start. The
+    // question is therefore not "is it committed" but "did this run give it
+    // back", which is `was_given_back`. Whatever the target says is asked
+    // only when the answer is no: everything else about this host is
+    // finished, so `VerifyOnly` is the whole of what is left, and it is the
+    // arm that repeats the verify, the uncordon and the unlock and nothing
+    // before them.
     if host.open_irreversible.is_none() && host.state == HostState::Committed {
-        return Step::Done;
+        return if host.was_given_back() {
+            Step::Done
+        } else {
+            Step::VerifyOnly
+        };
     }
     // --- end lane 5C ---
 
     match target {
         TxnView::Confirmed => {
-            if host.state == HostState::Committed {
+            if host.state == HostState::Committed && host.was_given_back() {
                 Step::Done
             } else {
                 Step::VerifyOnly
@@ -1460,6 +1494,25 @@ mod tests {
         run
     }
 
+    /// The `unlock` step of a run that finished with this host: the record
+    /// retired on the target, the lock given back.
+    ///
+    /// Astra finding F06, 2026-09-23: `committed` alone is not that. It is
+    /// written at the CONFIRM, and the uncordon and the unlock come after
+    /// it, so the tests below say which of the two they mean.
+    fn given_back(mut run: HostRun) -> HostRun {
+        run.actions.push(ActionRun {
+            seq: 9,
+            kind: ActionKind::Unlock,
+            started: at("2026-09-21T12:09:00Z"),
+            ended: Some(at("2026-09-21T12:09:01Z")),
+            result: Some(ActionResult::Ok),
+            evidence: Vec::new(),
+            cmd_refs: Vec::new(),
+        });
+        run
+    }
+
     fn mid_activation() -> HostRun {
         let mut run = host_in(HostState::Activating);
         run.open_irreversible = Some(OpenAction {
@@ -1629,12 +1682,24 @@ mod tests {
     #[test]
     fn after_the_confirmation_there_is_nothing_left_to_do() {
         assert_eq!(
-            next_step(&host_in(HostState::Committed), &TxnView::Confirmed),
+            next_step(
+                &given_back(host_in(HostState::Committed)),
+                &TxnView::Confirmed
+            ),
             Step::Done
         );
         assert_eq!(
             next_step(&host_in(HostState::Unchanged), &TxnView::None),
             Step::Done
+        );
+        // Astra finding F06, 2026-09-23: and a host that is committed and
+        // was NOT given back has the rest of its own rollout left — the
+        // uncordon and the unlock, which `VerifyOnly` is the arm for. This
+        // used to answer `Done`, and the machine stayed cordoned with an
+        // open record on it.
+        assert_eq!(
+            next_step(&host_in(HostState::Committed), &TxnView::Confirmed),
+            Step::VerifyOnly
         );
     }
 
@@ -1647,8 +1712,11 @@ mod tests {
         // is `committed` AND its transaction record has been retired by the
         // `unlock` step of this very run, so the target has nothing. Before
         // this arm existed the resume refused the whole run.
+        //
+        // Astra finding F06, 2026-09-23: it is that `unlock` step that says
+        // the host is finished, so the journal is asked for it by name.
         assert_eq!(
-            next_step(&host_in(HostState::Committed), &TxnView::None),
+            next_step(&given_back(host_in(HostState::Committed)), &TxnView::None),
             Step::Done
         );
     }
