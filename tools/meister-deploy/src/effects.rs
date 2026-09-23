@@ -105,6 +105,19 @@ pub trait Files {
     /// (a release's garbage-collector roots), and a recursive delete in a
     /// deployment tool is a foot-gun waiting for a wrong path.
     fn remove_dir(&self, path: &Path) -> Result<()>;
+
+    // --- lane 5A ---
+    /// Move a file that is ALREADY THERE, replacing whatever is at `to`.
+    ///
+    /// Its own door rather than a read and a write, because what is wanted
+    /// is the one thing a rename gives and a copy does not: a reader either
+    /// sees the old file or the new one, never a half of either. That is
+    /// what makes a key rotation survivable — the pair a service opens is
+    /// always a pair somebody wrote whole. The directory is made durable
+    /// afterwards for the reason `write_atomic` does it: a rename that is
+    /// not on the disk is a rename that did not happen.
+    fn rename(&self, from: &Path, to: &Path) -> Result<()>;
+    // --- end lane 5A ---
 }
 
 /// The directory a file lives in, as something that can be opened.
@@ -305,6 +318,18 @@ impl Files for RealFiles {
             .and_then(|d| d.sync_all())
             .with_context(|| format!("making the removal of {} durable failed", path.display()))
     }
+
+    // --- lane 5A ---
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.may_write(from)?;
+        self.may_write(to)?;
+        std::fs::rename(from, to)
+            .with_context(|| format!("moving {} to {} failed", from.display(), to.display()))?;
+        std::fs::File::open(parent_of(to))
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("making the move to {} durable failed", to.display()))
+    }
+    // --- end lane 5A ---
 
     fn remove_dir(&self, path: &Path) -> Result<()> {
         self.may_write(path)?;
@@ -512,6 +537,25 @@ impl Files for MemFiles {
         self.links.borrow_mut().remove(path);
         Ok(())
     }
+
+    // --- lane 5A ---
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.may_write("rename", from)?;
+        self.may_write("rename", to)?;
+        let bytes =
+            self.files.borrow().get(from).cloned().ok_or_else(|| {
+                anyhow::anyhow!("moving {} failed: it is not there", from.display())
+            })?;
+        let mode = self.modes.borrow().get(from).copied();
+        self.files.borrow_mut().remove(from);
+        self.modes.borrow_mut().remove(from);
+        self.files.borrow_mut().insert(to.to_path_buf(), bytes);
+        if let Some(mode) = mode {
+            self.modes.borrow_mut().insert(to.to_path_buf(), mode);
+        }
+        Ok(())
+    }
+    // --- end lane 5A ---
 
     fn remove_dir(&self, path: &Path) -> Result<()> {
         self.may_write("rmdir", path)?;

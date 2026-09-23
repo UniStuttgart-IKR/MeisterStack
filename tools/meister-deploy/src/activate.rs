@@ -473,6 +473,16 @@ impl<'a> Helper<'a> {
             let Some(id) = name.strip_suffix(".json") else {
                 continue;
             };
+            // --- lane 5A ---
+            // A key rotation lives in the same directory and is not a
+            // system transaction. Reading one here would turn it into an
+            // `inconsistent` record — and an inconsistent record blocks
+            // every plan for that host, for ever. `keys status` is what
+            // reads these.
+            if id.starts_with("keys-") {
+                continue;
+            }
+            // --- end lane 5A ---
             let text = match self.files.read_to_string(&path) {
                 Ok(text) => text,
                 Err(_) => continue,
@@ -1254,7 +1264,23 @@ impl<'a> Helper<'a> {
     /// reinstalled host needs; it is a flag rather than the default for the
     /// same reason.
     pub fn keygen(&self, subject: &str, kind: KeyKind, replace: bool) -> Result<KeygenOutcome> {
-        let path = self.key_path(kind);
+        self.keygen_into(subject, kind, replace, None)
+    }
+
+    /// The same, beside the key that is in use rather than over it.
+    ///
+    /// `suffix = Some("next")` writes `<kind>.key.next`, which is how a
+    /// rotation begins (lane 5A): the new key lives next to the old one
+    /// until somebody has a certificate for it, and nothing that is running
+    /// notices it is there.
+    pub fn keygen_into(
+        &self,
+        subject: &str,
+        kind: KeyKind,
+        replace: bool,
+        suffix: Option<&str>,
+    ) -> Result<KeygenOutcome> {
+        let path = self.key_path_with(kind, suffix);
         let had = self.files.exists(&path);
 
         let (key_pem, created) = if had && !replace {
@@ -1316,7 +1342,365 @@ impl<'a> Helper<'a> {
     pub fn key_path(&self, kind: KeyKind) -> PathBuf {
         self.pki_dir.join(format!("{}.key", kind.as_str()))
     }
+
+    // --- lane 5A: a key beside the one in use ---------------------------
+
+    /// `<pki.dir>/<kind>.key`, `.key.next` or `.key.prev`.
+    pub fn key_path_with(&self, kind: KeyKind, suffix: Option<&str>) -> PathBuf {
+        self.pki_dir.join(match suffix {
+            Some(suffix) => format!("{}.key.{suffix}", kind.as_str()),
+            None => format!("{}.key", kind.as_str()),
+        })
+    }
+
+    /// `<pki.dir>/<kind>.crt`, `.crt.next` or `.crt.prev`.
+    pub fn cert_path_with(&self, kind: KeyKind, suffix: Option<&str>) -> PathBuf {
+        self.pki_dir.join(match suffix {
+            Some(suffix) => format!("{}.crt.{suffix}", kind.as_str()),
+            None => format!("{}.crt", kind.as_str()),
+        })
+    }
+
+    pub fn keys_record_path(&self, kind: KeyKind) -> PathBuf {
+        self.txn_dir().join(format!("keys-{}.json", kind.as_str()))
+    }
+
+    /// Where a rotation of this key has got to.
+    ///
+    /// The FILES are the truth and the record is the story. A machine that
+    /// lost power between the rename and the record would otherwise be a
+    /// machine whose record says one thing and whose disk says another, and
+    /// the resume would believe the record — so the state is derived from
+    /// what is on the disk, and the record is what says whose rotation it
+    /// was and why it ended. The two states the files cannot show
+    /// (`confirmed`, `reverted`) are the record's alone.
+    pub fn keys_status(&self, kind: KeyKind) -> Result<KeysView> {
+        let key_next = self.files.exists(&self.key_path_with(kind, Some("next")));
+        let crt_next = self.files.exists(&self.cert_path_with(kind, Some("next")));
+        let prev = self.files.exists(&self.key_path_with(kind, Some("prev")))
+            || self.files.exists(&self.cert_path_with(kind, Some("prev")));
+        let record = match self.files.read_to_string(&self.keys_record_path(kind)) {
+            Ok(text) => match KeysRecord::from_json(
+                &text,
+                &self.keys_record_path(kind).display().to_string(),
+            ) {
+                Ok(record) => Some(record),
+                Err(e) => {
+                    return Ok(KeysView {
+                        kind: kind.as_str().to_string(),
+                        state: KeysState::Inconsistent,
+                        key_next,
+                        crt_next,
+                        prev,
+                        reason: Some(format!(
+                            "{} could not be read as a key transaction: {e:#}",
+                            self.keys_record_path(kind).display()
+                        )),
+                        record: None,
+                    });
+                }
+            },
+            Err(_) => None,
+        };
+        // The record wins only where the disk cannot speak: a rotation that
+        // was finished or taken back leaves nothing behind either way.
+        let finished = record
+            .as_ref()
+            .filter(|r| matches!(r.state, KeysState::Confirmed | KeysState::Reverted))
+            .map(|r| r.state);
+        let state = match (key_next, crt_next, prev) {
+            (_, _, true) => KeysState::Switched,
+            (true, true, false) => KeysState::Overlap,
+            (true, false, false) => KeysState::Prepared,
+            (false, true, false) => KeysState::Inconsistent,
+            (false, false, false) => finished.unwrap_or(KeysState::None),
+        };
+        let reason = (state == KeysState::Inconsistent).then(|| {
+            format!(
+                "{} is there and {} is not: a certificate without the key it belongs to.",
+                self.cert_path_with(kind, Some("next")).display(),
+                self.key_path_with(kind, Some("next")).display()
+            )
+        });
+        Ok(KeysView {
+            kind: kind.as_str().to_string(),
+            state,
+            key_next,
+            crt_next,
+            prev,
+            reason,
+            record,
+        })
+    }
+
+    fn write_keys_record(&self, record: &KeysRecord) -> Result<()> {
+        self.files.create_dir_all(&self.txn_dir())?;
+        let kind = KeyKind::parse(&record.kind)?;
+        self.files
+            .write_atomic(&self.keys_record_path(kind), &record.to_json()?, 0o600)
+    }
+
+    /// Put the prepared pair in and the one in use aside, in one move.
+    ///
+    /// Four renames and an order that matters: the CERTIFICATE goes last on
+    /// the way in, because a process that reads the pair between the two
+    /// renames must never find a new key under an old certificate. The
+    /// loaders of this stack read both files at once and refuse a pair that
+    /// does not belong together, so the window is a refusal rather than a
+    /// wrong identity — but it is still the shorter window that is wanted.
+    pub fn keys_switch(&self, kind: KeyKind, run_id: Option<&str>) -> Result<KeysRecord> {
+        let key_next = self.key_path_with(kind, Some("next"));
+        let crt_next = self.cert_path_with(kind, Some("next"));
+        if !self.files.exists(&key_next) || !self.files.exists(&crt_next) {
+            bail!(
+                "there is no prepared {} pair on this host: {} and {} both have to be there. \
+                 `keygen --suffix next` makes the key and the rotation's `overlap` step \
+                 delivers the certificate.",
+                kind,
+                key_next.display(),
+                crt_next.display()
+            );
+        }
+        let key = self.key_path_with(kind, None);
+        let crt = self.cert_path_with(kind, None);
+        let key_prev = self.key_path_with(kind, Some("prev"));
+        let crt_prev = self.cert_path_with(kind, Some("prev"));
+        let previous = self.digest_of(&crt);
+
+        // What is in use goes aside first: a pair that is half replaced is
+        // worse than one that is briefly absent, and absent is what a
+        // restart of the unit would survive.
+        if self.files.exists(&crt) {
+            self.files.rename(&crt, &crt_prev)?;
+        }
+        if self.files.exists(&key) {
+            self.files.rename(&key, &key_prev)?;
+        }
+        self.files.rename(&key_next, &key)?;
+        self.files.rename(&crt_next, &crt)?;
+        // The owner travels with the file, so nothing is chowned here; the
+        // key was written 0600 `meister:meister` when it was made.
+
+        let now = self.clock.now();
+        let record = KeysRecord {
+            schema: KEYS_SCHEMA.to_string(),
+            kind: kind.as_str().to_string(),
+            state: KeysState::Switched,
+            run_id: run_id.map(str::to_string),
+            previous_sha256: previous,
+            sha256: self.digest_of(&crt),
+            started_at: now,
+            changed_at: now,
+            reason: None,
+        };
+        self.write_keys_record(&record)?;
+        Ok(record)
+    }
+
+    /// Put the pair that was in use back, and drop the one that failed.
+    ///
+    /// The failed pair is not kept: its certificate is in the operator's
+    /// repository (that is where it was issued), and its private half is a
+    /// key that never served a connection. What IS kept is the record,
+    /// which says that a rotation was taken back and why.
+    pub fn keys_revert(&self, kind: KeyKind, because: Option<&str>) -> Result<KeysRecord> {
+        let key_prev = self.key_path_with(kind, Some("prev"));
+        let crt_prev = self.cert_path_with(kind, Some("prev"));
+        if !self.files.exists(&key_prev) || !self.files.exists(&crt_prev) {
+            bail!(
+                "there is nothing to go back to for {kind}: {} and {} are not both here. A \
+                 rotation that has not switched is taken back by deleting the `.next` pair, \
+                 and one that has been confirmed cannot be taken back at all.",
+                key_prev.display(),
+                crt_prev.display()
+            );
+        }
+        let key = self.key_path_with(kind, None);
+        let crt = self.cert_path_with(kind, None);
+        self.files.remove_file(&crt)?;
+        self.files.remove_file(&key)?;
+        self.files.rename(&key_prev, &key)?;
+        self.files.rename(&crt_prev, &crt)?;
+
+        let now = self.clock.now();
+        let mut record = match self.files.read_to_string(&self.keys_record_path(kind)) {
+            Ok(text) => KeysRecord::from_json(&text, "the key transaction")
+                .unwrap_or_else(|_| KeysRecord::new(kind, None, now)),
+            Err(_) => KeysRecord::new(kind, None, now),
+        };
+        record.state = KeysState::Reverted;
+        record.reason = Some(because.unwrap_or("the rotation was taken back").to_string());
+        record.sha256 = self.digest_of(&crt);
+        record.changed_at = now;
+        self.write_keys_record(&record)?;
+        Ok(record)
+    }
+
+    /// The last step: the pair that was replaced is dropped and the record
+    /// says the rotation is over.
+    pub fn keys_remove(&self, kind: KeyKind) -> Result<KeysRecord> {
+        let key_prev = self.key_path_with(kind, Some("prev"));
+        let crt_prev = self.cert_path_with(kind, Some("prev"));
+        if !self.files.exists(&key_prev) && !self.files.exists(&crt_prev) {
+            bail!(
+                "there is no replaced {kind} pair on this host, so this rotation has either \
+                 not switched yet or has already been finished."
+            );
+        }
+        self.files.remove_file(&key_prev)?;
+        self.files.remove_file(&crt_prev)?;
+        let now = self.clock.now();
+        let mut record = match self.files.read_to_string(&self.keys_record_path(kind)) {
+            Ok(text) => KeysRecord::from_json(&text, "the key transaction")
+                .unwrap_or_else(|_| KeysRecord::new(kind, None, now)),
+            Err(_) => KeysRecord::new(kind, None, now),
+        };
+        record.state = KeysState::Confirmed;
+        record.changed_at = now;
+        record.sha256 = self.digest_of(&self.cert_path_with(kind, None));
+        self.write_keys_record(&record)?;
+        Ok(record)
+    }
+
+    /// `sha256:<hex>` of a file, or `None` when it is not there.
+    ///
+    /// The same shape the read-only probe reports for a public file, so
+    /// that a record and a snapshot say the same thing about one
+    /// certificate.
+    fn digest_of(&self, path: &Path) -> Option<String> {
+        self.files
+            .read(path)
+            .ok()
+            .map(|bytes| format!("sha256:{}", crate::ids::sha256_hex(&bytes)))
+    }
+    // --- end lane 5A ----------------------------------------------------
 }
+
+// --- lane 5A: the key transaction ------------------------------------------
+
+pub const KEYS_SCHEMA: &str = "meister-deploy/activate-keys/1";
+
+/// Where a rotation of one key has got to.
+///
+/// Five states and a sixth for "this does not add up", which is the same
+/// shape [`TxnState`] has and for the same reason: a resume decides what to
+/// do next from this word, and a word that could mean two things is a word
+/// that decides wrongly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum KeysState {
+    /// No rotation is open on this host for this key.
+    None,
+    /// A new key lies beside the one in use. Nothing reads it yet.
+    Prepared,
+    /// And a certificate for it lies beside the one in use. Still nothing
+    /// reads either.
+    Overlap,
+    /// The new pair is the pair in use, and the old one is still here.
+    Switched,
+    /// The old pair is gone. The rotation is over.
+    Confirmed,
+    /// The old pair is back in use and the new one is gone.
+    Reverted,
+    /// The disk says something this tool has no rule for.
+    Inconsistent,
+}
+
+impl KeysState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeysState::None => "none",
+            KeysState::Prepared => "prepared",
+            KeysState::Overlap => "overlap",
+            KeysState::Switched => "switched",
+            KeysState::Confirmed => "confirmed",
+            KeysState::Reverted => "reverted",
+            KeysState::Inconsistent => "inconsistent",
+        }
+    }
+}
+
+impl std::fmt::Display for KeysState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+/// One key rotation, on disk, on the target.
+///
+/// Beside the system transactions and NOT among them: `records()` skips
+/// `keys-*.json` on purpose, because an open key rotation is not a reason to
+/// refuse to roll a system forward — and a file in `txn/` that the system's
+/// own parser cannot read would otherwise make every plan see an
+/// `inconsistent` transaction and block the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeysRecord {
+    pub schema: String,
+    /// `identity` or `serving`.
+    pub kind: String,
+    pub state: KeysState,
+    /// The run that opened it, so that a second operator can see whose it is.
+    pub run_id: Option<String>,
+    /// `sha256:<hex>` of the certificate that was in use before the switch.
+    pub previous_sha256: Option<String>,
+    /// And of the one that is in use now. The same shape the read-only probe
+    /// reports for a public file, so a record and a snapshot say the same
+    /// thing about one certificate.
+    pub sha256: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub changed_at: DateTime<Utc>,
+    /// Why, for the two states that have a reason.
+    pub reason: Option<String>,
+}
+
+impl KeysRecord {
+    pub fn new(kind: KeyKind, run_id: Option<&str>, now: DateTime<Utc>) -> KeysRecord {
+        KeysRecord {
+            schema: KEYS_SCHEMA.to_string(),
+            kind: kind.as_str().to_string(),
+            state: KeysState::None,
+            run_id: run_id.map(str::to_string),
+            previous_sha256: None,
+            sha256: None,
+            started_at: now,
+            changed_at: now,
+            reason: None,
+        }
+    }
+
+    pub fn to_json(&self) -> Result<Vec<u8>> {
+        let mut bytes = serde_json::to_vec_pretty(self)
+            .map_err(|e| anyhow::anyhow!("writing the key transaction failed: {e}"))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    pub fn from_json(text: &str, origin: &str) -> Result<KeysRecord> {
+        crate::manifest::parse_checked(text, origin, KEYS_SCHEMA)
+    }
+}
+
+/// What `keys status --json` answers with: where the rotation is, and what
+/// is on the disk that says so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KeysView {
+    pub kind: String,
+    pub state: KeysState,
+    /// `<kind>.key.next` is there.
+    pub key_next: bool,
+    /// `<kind>.crt.next` is there.
+    pub crt_next: bool,
+    /// A `.prev` pair is there: the switch happened and nobody has removed
+    /// what it replaced.
+    pub prev: bool,
+    /// What makes this inconsistent, when it is.
+    pub reason: Option<String>,
+    pub record: Option<KeysRecord>,
+}
+
+// --- end lane 5A -----------------------------------------------------------
 
 /// Which of the two keys a managed host holds.
 ///
@@ -2540,5 +2924,310 @@ mod tests {
             reason: None,
             changed_at: now,
         }
+    }
+
+    // --- lane 5A: rotating a key in phases -----------------------------
+
+    /// A prepared key lies BESIDE the one in use, and nothing that is
+    /// running notices it is there.
+    #[test]
+    fn a_prepared_key_is_written_next_to_the_one_in_use() {
+        let runner = StrictFake::new().expect(
+            chown(&format!("{PKI}/identity.key.next")),
+            Output::default(),
+        );
+        let files = MemFiles::new().given(format!("{PKI}/identity.key"), "the key in use\n");
+        let clock = clock();
+        let made = helper(&runner, &files, &clock)
+            .keygen_into("system:node:n1", KeyKind::Identity, true, Some("next"))
+            .unwrap();
+        runner.verify().unwrap();
+        assert!(made.created);
+        assert_eq!(
+            files.content(format!("{PKI}/identity.key")).unwrap(),
+            b"the key in use\n".to_vec(),
+            "the key in use was replaced"
+        );
+        let next = files
+            .content(format!("{PKI}/identity.key.next"))
+            .expect("the prepared key");
+        assert!(String::from_utf8(next).unwrap().contains("PRIVATE KEY"));
+        assert!(!made.csr_pem.contains("PRIVATE KEY"));
+        // 0600 from the start, like every other key this helper makes: the
+        // attempt says with which mode it was created.
+        assert!(
+            files
+                .attempts()
+                .iter()
+                .any(|a| a == &format!("write(0600) {PKI}/identity.key.next")),
+            "{:?}",
+            files.attempts()
+        );
+    }
+
+    /// Asking twice prepares one key: a second one would be a second
+    /// identity, and the certificate issued over the first would be a
+    /// certificate for a key nobody has.
+    #[test]
+    fn preparing_twice_prepares_one_key() {
+        let first = StrictFake::new().expect(
+            chown(&format!("{PKI}/identity.key.next")),
+            Output::default(),
+        );
+        let files = MemFiles::new();
+        let clock = clock();
+        let one = helper(&first, &files, &clock)
+            .keygen_into("system:node:n1", KeyKind::Identity, false, Some("next"))
+            .unwrap();
+        let runner = StrictFake::new();
+        let two = helper(&runner, &files, &clock)
+            .keygen_into("system:node:n1", KeyKind::Identity, false, Some("next"))
+            .unwrap();
+        assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+        assert!(!two.created);
+        assert_eq!(one.public_key_sha256, two.public_key_sha256);
+    }
+
+    /// A rotation with a prepared pair, ready to switch.
+    fn rotating() -> MemFiles {
+        MemFiles::new()
+            .given(format!("{PKI}/identity.key"), "old key\n")
+            .given(format!("{PKI}/identity.crt"), "old certificate\n")
+            .given(format!("{PKI}/identity.key.next"), "new key\n")
+            .given(format!("{PKI}/identity.crt.next"), "new certificate\n")
+    }
+
+    /// The five states, read off the DISK. The record is the story of a
+    /// rotation; the files are what it actually did.
+    #[test]
+    fn where_a_rotation_got_to_is_read_off_the_disk() {
+        let runner = StrictFake::new();
+        let clock = clock();
+
+        let nothing = MemFiles::new();
+        assert_eq!(
+            helper(&runner, &nothing, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap()
+                .state,
+            KeysState::None
+        );
+
+        let prepared = MemFiles::new().given(format!("{PKI}/identity.key.next"), "k\n");
+        assert_eq!(
+            helper(&runner, &prepared, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap()
+                .state,
+            KeysState::Prepared
+        );
+
+        let overlap = rotating();
+        assert_eq!(
+            helper(&runner, &overlap, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap()
+                .state,
+            KeysState::Overlap
+        );
+
+        let switched = MemFiles::new()
+            .given(format!("{PKI}/identity.key"), "new key\n")
+            .given(format!("{PKI}/identity.crt"), "new certificate\n")
+            .given(format!("{PKI}/identity.key.prev"), "old key\n")
+            .given(format!("{PKI}/identity.crt.prev"), "old certificate\n");
+        assert_eq!(
+            helper(&runner, &switched, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap()
+                .state,
+            KeysState::Switched
+        );
+
+        // A certificate with no key beside it is a state this tool has no
+        // rule for, and it says so rather than guessing.
+        let half = MemFiles::new().given(format!("{PKI}/identity.crt.next"), "c\n");
+        let view = helper(&runner, &half, &clock)
+            .keys_status(KeyKind::Identity)
+            .unwrap();
+        assert_eq!(view.state, KeysState::Inconsistent);
+        assert!(view.reason.unwrap().contains("without the key"));
+    }
+
+    /// The switch: four renames, and the record says what was replaced.
+    #[test]
+    fn the_switch_puts_the_prepared_pair_in_and_the_old_one_aside() {
+        let runner = StrictFake::new();
+        let files = rotating();
+        let clock = clock();
+        let record = helper(&runner, &files, &clock)
+            .keys_switch(KeyKind::Identity, Some("run-7"))
+            .unwrap();
+        assert!(runner.calls().is_empty(), "a switch runs no command");
+
+        assert_eq!(
+            files.content(format!("{PKI}/identity.key")).unwrap(),
+            b"new key\n".to_vec()
+        );
+        assert_eq!(
+            files.content(format!("{PKI}/identity.crt")).unwrap(),
+            b"new certificate\n".to_vec()
+        );
+        assert_eq!(
+            files.content(format!("{PKI}/identity.key.prev")).unwrap(),
+            b"old key\n".to_vec()
+        );
+        assert!(files.content(format!("{PKI}/identity.key.next")).is_none());
+        assert_eq!(record.state, KeysState::Switched);
+        assert_eq!(record.run_id.as_deref(), Some("run-7"));
+        assert_eq!(
+            record.previous_sha256,
+            Some(format!(
+                "sha256:{}",
+                crate::ids::sha256_hex(b"old certificate\n")
+            ))
+        );
+        assert_eq!(
+            record.sha256,
+            Some(format!(
+                "sha256:{}",
+                crate::ids::sha256_hex(b"new certificate\n")
+            ))
+        );
+        // And it is on the disk, where a resume reads it.
+        assert_eq!(
+            helper(&runner, &files, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap()
+                .record
+                .unwrap(),
+            record
+        );
+    }
+
+    /// Half a prepared pair is not a switch.
+    #[test]
+    fn a_switch_without_a_certificate_is_a_sentence() {
+        let runner = StrictFake::new();
+        let files = MemFiles::new()
+            .given(format!("{PKI}/identity.key"), "old key\n")
+            .given(format!("{PKI}/identity.key.next"), "new key\n");
+        let clock = clock();
+        let err = helper(&runner, &files, &clock)
+            .keys_switch(KeyKind::Identity, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prepared"), "{err}");
+        assert_eq!(
+            files.content(format!("{PKI}/identity.key")).unwrap(),
+            b"old key\n".to_vec(),
+            "nothing was moved"
+        );
+    }
+
+    /// The way back, and what it leaves: the pair that worked, and a record
+    /// that says why the other one did not.
+    #[test]
+    fn a_revert_puts_the_pair_that_worked_back() {
+        let runner = StrictFake::new();
+        let files = rotating();
+        let clock = clock();
+        helper(&runner, &files, &clock)
+            .keys_switch(KeyKind::Identity, Some("run-7"))
+            .unwrap();
+        let record = helper(&runner, &files, &clock)
+            .keys_revert(KeyKind::Identity, Some("the session did not come back"))
+            .unwrap();
+
+        assert_eq!(
+            files.content(format!("{PKI}/identity.key")).unwrap(),
+            b"old key\n".to_vec()
+        );
+        assert_eq!(
+            files.content(format!("{PKI}/identity.crt")).unwrap(),
+            b"old certificate\n".to_vec()
+        );
+        assert!(files.content(format!("{PKI}/identity.key.prev")).is_none());
+        assert!(files.content(format!("{PKI}/identity.key.next")).is_none());
+        assert_eq!(record.state, KeysState::Reverted);
+        assert!(record.reason.unwrap().contains("did not come back"));
+        assert_eq!(
+            helper(&runner, &files, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap()
+                .state,
+            KeysState::Reverted,
+            "the disk is clean again, and the record is what remembers"
+        );
+    }
+
+    /// And the last step: what the switch replaced goes away.
+    #[test]
+    fn remove_drops_the_pair_the_switch_replaced() {
+        let runner = StrictFake::new();
+        let files = rotating();
+        let clock = clock();
+        helper(&runner, &files, &clock)
+            .keys_switch(KeyKind::Identity, Some("run-7"))
+            .unwrap();
+        let record = helper(&runner, &files, &clock)
+            .keys_remove(KeyKind::Identity)
+            .unwrap();
+        assert_eq!(record.state, KeysState::Confirmed);
+        assert!(files.content(format!("{PKI}/identity.key.prev")).is_none());
+        assert!(files.content(format!("{PKI}/identity.crt.prev")).is_none());
+        assert_eq!(
+            files.content(format!("{PKI}/identity.key")).unwrap(),
+            b"new key\n".to_vec()
+        );
+        assert_eq!(
+            helper(&runner, &files, &clock)
+                .keys_status(KeyKind::Identity)
+                .unwrap()
+                .state,
+            KeysState::Confirmed
+        );
+        // Twice is a sentence, not a second removal.
+        assert!(
+            helper(&runner, &files, &clock)
+                .keys_remove(KeyKind::Identity)
+                .is_err()
+        );
+    }
+
+    /// A key rotation is not a system transaction, and a plan that read it
+    /// as one would block the host for ever.
+    #[test]
+    fn a_key_rotation_is_not_an_open_transaction() {
+        let runner = StrictFake::new();
+        let files = rotating();
+        let clock = clock();
+        helper(&runner, &files, &clock)
+            .keys_switch(KeyKind::Identity, Some("run-7"))
+            .unwrap();
+        assert!(
+            files
+                .content("/var/lib/meisterstack/deploy/txn/keys-identity.json")
+                .is_some(),
+            "the record is in the transaction directory"
+        );
+        assert!(
+            helper(&runner, &files, &clock)
+                .records()
+                .unwrap()
+                .is_empty(),
+            "a key record was read as a system transaction"
+        );
+        // And through the door a snapshot comes in by. `uname -r` is the
+        // one command a status runs.
+        let asking =
+            StrictFake::new().expect(Matcher::exact("uname", ["-r"]), Output::stdout("6.12.48\n"));
+        assert!(
+            helper(&asking, &files, &clock)
+                .status()
+                .unwrap()
+                .open_txns
+                .is_empty()
+        );
     }
 }
