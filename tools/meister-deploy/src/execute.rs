@@ -756,7 +756,21 @@ impl<'a> Executor<'a> {
                 )?;
                 self.entry(hosts, id).txn = Some(txn.clone());
                 self.entry(hosts, id).moved = true;
-                self.set_state(hosts, id, HostState::Activating);
+                // --- lane 5C ---
+                // `move_to` and not `set_state`: the state has to reach the
+                // JOURNAL here, not only this process's memory.
+                //
+                // Measured in every run of lab lane L2 (2026-09-23). The
+                // next `move_to` writes `from: activating`, the replay had
+                // the host in `staged`, and every receipt of that lane ended
+                // with "entry N says box left the state activating and the
+                // journal had it in staged; a line is missing." The §6 table
+                // names this transition and its evidence — `action.
+                // irreversible` written, transaction record on the target —
+                // and both are on the disk one line above this one, so there
+                // is nothing left to wait for.
+                self.move_to(journal, id, hosts, HostState::Activating, None)?;
+                // --- end lane 5C ---
                 let cmd = self.activate_cmd(id, action, &txn)?;
                 let line = cmd.line();
                 let next = if action.rollback.mode == RollbackMode::Boot {
@@ -1770,9 +1784,16 @@ impl<'a> Executor<'a> {
                 Ok(Resume::AtTheProviderReboot)
             }
             // --- end lane 3-integration ---
+            // --- lane 5C ---
+            // `move_to` and not `set_state` in both arms below: a resume
+            // that only remembers where it put a host writes the NEXT line
+            // as a transition out of a state the journal never mentions,
+            // and `fold` reports that as a lost line (L2 finding N7). The
+            // move is real — the target was asked, and its answer is what
+            // decided it — so it belongs in the journal like every other.
             Step::VerifyOnly => {
                 self.entry(hosts, id).txn = run.txn_id.clone();
-                self.set_state(hosts, id, HostState::Verifying);
+                self.move_to(journal, id, hosts, HostState::Verifying, Some(&observed))?;
                 Ok(Resume::AfterTheActivation { confirmed: true })
             }
             Step::VerifyAndConfirm => {
@@ -1780,9 +1801,10 @@ impl<'a> Executor<'a> {
                 // for a word. The transaction id comes from the journal,
                 // never from a new one.
                 self.entry(hosts, id).txn = run.txn_id.clone();
-                self.set_state(hosts, id, HostState::Verifying);
+                self.move_to(journal, id, hosts, HostState::Verifying, Some(&observed))?;
                 Ok(Resume::AfterTheActivation { confirmed: false })
             }
+            // --- end lane 5C ---
             Step::RolledBack => {
                 self.move_to(journal, id, hosts, HostState::RolledBack, Some(&observed))?;
                 Ok(Resume::Done)
