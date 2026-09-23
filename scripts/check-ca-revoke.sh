@@ -236,6 +236,56 @@ case "$said" in
 	*) bad "das CSR-Zertifikat gilt trotz Widerruf" "$said" ;;
 esac
 
+# --- ein zweites --sign-csr fuer denselben Namen+Kind (Astra-Befund F12) ---
+#
+# `--out` ist nicht gesetzt, also IST `$out` `$kept` -- openssl's `-out`
+# ueberschreibt die Datei, bevor das Skript ueberhaupt zum `cp` kommt. Vor
+# dem Fix verlor die zweite Ausstellung damit die einzige Kopie der ersten,
+# und mit ihr das Einzige, an dem `--index-rebuild` sie spaeter noch finden
+# konnte.
+openssl genpkey -quiet -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 \
+	-out "$T/re1.key" 2>/dev/null
+openssl req -new -key "$T/re1.key" -out "$T/re1.csr" -subj "/CN=egal" 2>/dev/null
+"$CA" --dir "$DIR" --sign-csr "$T/re1.csr" --kind cloud --name reissue >/dev/null 2>&1
+FIRST_SERIAL="$(serial_of "$DIR/issued/reissue-cloud.crt")"
+sleep 1
+openssl genpkey -quiet -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 \
+	-out "$T/re2.key" 2>/dev/null
+openssl req -new -key "$T/re2.key" -out "$T/re2.csr" -subj "/CN=auch-egal" 2>/dev/null
+"$CA" --dir "$DIR" --sign-csr "$T/re2.csr" --kind cloud --name reissue >/dev/null 2>&1
+SECOND_SERIAL="$(serial_of "$DIR/issued/reissue-cloud.crt")"
+ARCHIVED="$DIR/issued/reissue-cloud-$FIRST_SERIAL.crt"
+if [ -f "$ARCHIVED" ]; then
+	ok "die erste Ausstellung wird beiseitegelegt statt ueberschrieben"
+else
+	bad "die erste Ausstellung ist verschwunden" "$(ls "$DIR/issued/" | grep reissue)"
+fi
+if [ "$(serial_of "$ARCHIVED")" = "$FIRST_SERIAL" ]; then
+	ok "und traegt weiter ihr eigenes Serial"
+else
+	bad "die beiseitegelegte Datei traegt das falsche Serial"
+fi
+"$CA" --dir "$DIR" --index-rebuild >/dev/null 2>&1
+if [ -n "$(state_of "$FIRST_SERIAL")" ] && [ -n "$(state_of "$SECOND_SERIAL")" ]; then
+	ok "--index-rebuild kennt beide Serials der doppelten Ausstellung"
+else
+	bad "eines der beiden Serials fehlt im Index" "$(cat "$DIR/index.txt")"
+fi
+out="$("$CA" --dir "$DIR" --revoke "$FIRST_SERIAL" --reason superseded 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(state_of "$FIRST_SERIAL")" = "R" ]; then
+	ok "das erste, beiseitegelegte Serial ist widerrufbar"
+else
+	bad "das erste Serial ist nicht widerrufbar" "rc=$rc" "$out"
+fi
+out="$("$CA" --dir "$DIR" --revoke "$SECOND_SERIAL" --reason superseded 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(state_of "$SECOND_SERIAL")" = "R" ]; then
+	ok "und das zweite, aktuelle Serial ebenso"
+else
+	bad "das zweite Serial ist nicht widerrufbar" "rc=$rc" "$out"
+fi
+
 # --- der alte Weg lebt ------------------------------------------------------
 "$CA" --dir "$DIR" --node d >/dev/null 2>&1
 if [ -f "$DIR/system-node-d.crt" ] && [ -f "$DIR/bundle/system-node-d.md" ]; then

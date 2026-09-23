@@ -276,7 +276,37 @@ subjectAltName=$(sans_of "$SIGN_SAN")" ;;
 		|| die "$SIGN_CSR is not signed by the key it carries"
 
 	out="${SIGN_OUT:-$DIR/issued/$SIGN_NAME-$SIGN_KIND.crt}"
-	mkdir -p "$(dirname "$out")"
+	kept="$DIR/issued/$SIGN_NAME-$SIGN_KIND.crt"
+	mkdir -p "$(dirname "$out")" "$DIR/issued"
+
+	# Astra finding F12, 2026-09-23: both paths below are keyed on
+	# name+kind, not on the certificate -- when `--out` is not given `$out`
+	# IS `$kept`, and openssl's `-out` truncates whatever is already there
+	# before this function ever reaches the `cp` a few lines down. A
+	# re-issue for a name+kind already on disk used to destroy the only
+	# copy this CA had of the earlier certificate, silently, and with it
+	# the one thing `--index-rebuild` could later find to revoke by. Each
+	# side that might already hold an earlier certificate is moved aside
+	# under ITS OWN serial before anything is written, so no certificate
+	# this CA once signed is ever overwritten.
+	archive_aside() {
+		local f="$1" old_serial aside
+		[ -f "$f" ] || return 0
+		old_serial="$(openssl x509 -in "$f" -noout -serial 2>/dev/null | cut -d= -f2)"
+		[ -n "$old_serial" ] || return 0
+		aside="$DIR/issued/$SIGN_NAME-$SIGN_KIND-$old_serial.crt"
+		[ "$f" = "$aside" ] && return 0
+		# `$out` and `$kept` can hold an identical copy of the same
+		# superseded certificate (an earlier run's `cp` made them byte for
+		# byte the same); once one side has archived it, the other side has
+		# nothing left to preserve, and is about to be overwritten anyway.
+		[ -e "$aside" ] && return 0
+		mv "$f" "$aside"
+		note "archived: $aside (superseded)"
+	}
+	archive_aside "$out"
+	[ "$out" -ef "$kept" ] 2>/dev/null || archive_aside "$kept"
+
 	ext="$(mktemp)"
 	printf '%s\n' "$exts" > "$ext"
 	# ADDITIVE: every issued certificate stays where it was written, because
@@ -287,16 +317,14 @@ subjectAltName=$(sans_of "$SIGN_SAN")" ;;
 		-out "$out" -days "$DAYS" -sha256 -extfile "$ext" -subj "$subj" 2>/dev/null \
 		|| { rm -f "$ext"; die "openssl refused to sign $SIGN_CSR"; }
 	rm -f "$ext"
+	serial="$(openssl x509 -in "$out" -noout -serial | cut -d= -f2)"
 	# The CA keeps its own copy, wherever --out sent the certificate. A CA
 	# that cannot say what it signed cannot take it back: `--index-rebuild`
 	# reads exactly these two directories, and `meister-deploy keys issue`
 	# passes an --out under the operator's REPOSITORY — so without this copy
 	# every certificate of the fleet would be outside the index and outside
 	# every revocation.
-	kept="$DIR/issued/$SIGN_NAME-$SIGN_KIND.crt"
-	mkdir -p "$DIR/issued"
 	[ "$out" -ef "$kept" ] 2>/dev/null || cp "$out" "$kept"
-	serial="$(openssl x509 -in "$out" -noout -serial | cut -d= -f2)"
 	note "signed: $subj"
 	note "serial: $serial"
 	note "        $out"
