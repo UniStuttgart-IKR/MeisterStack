@@ -2234,3 +2234,123 @@ fn a_halt_and_a_resume_are_the_v17_table_and_not_a_recovery() {
     run.state = HostState::Verifying;
     assert_eq!(next_step(&run, &TxnView::Confirmed), Step::VerifyOnly);
 }
+
+// ---------------------------------------------------------------------------
+// lane 5A: the revocation list
+// ---------------------------------------------------------------------------
+
+const CRL_PUT: &str = "set -e; d=$(dirname /var/lib/meisterstack/pki/crl.pem); mkdir -p \"$d\"; \
+                       t=$(mktemp \"$d/.meister.XXXXXX\"); cat > \"$t\"; chown root:root \"$t\"; \
+                       chmod 0644 \"$t\"; mv \"$t\" /var/lib/meisterstack/pki/crl.pem";
+
+const CRL_SHA: &str = "sha256sum /var/lib/meisterstack/pki/crl.pem 2>/dev/null | cut -d' ' -f1";
+
+/// A revocation, ready to be carried out: one host that reads a list, a new
+/// list on the operator's disk, and the old one on the host.
+fn revoking() -> (Fixture, String) {
+    let release = release_of(crate::fixtures::with_crl(onebox_enrolled(), &["box"]));
+    let observation = observed(&release, at(NOW));
+    let contents = "-----BEGIN X509 CRL-----\nthe new list\n-----END X509 CRL-----\n".to_string();
+    let digest = crate::ids::sha256_hex(contents.as_bytes());
+    let mut expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
+    for secrets in expected.values_mut() {
+        for (id, value) in secrets.iter_mut() {
+            if id.starts_with("crl-") {
+                *value = format!("sha256:{digest}");
+            }
+        }
+    }
+    let plan = plan(
+        &release,
+        "host=box",
+        &observation,
+        None,
+        &crate::fixtures::plan_policy(PlanKind::KeysRevoke).with_expected_credentials(expected),
+        at(NOW),
+    )
+    .expect("the fixture plans");
+    let fx = Fixture {
+        release,
+        plan,
+        files: MemFiles::new().given("/repo/pki/crl.pem", contents.clone()),
+        clock: FakeClock::at(at(NOW)),
+        state: StateDir::at("/repo/.meister-deploy"),
+        ssh: Ssh::with_known_hosts("/repo/known_hosts"),
+    };
+    (fx, contents)
+}
+
+/// The whole step, and the one thing that must NOT be in it: a restart.
+///
+/// A controller re-reads its revocation list within half a minute. Poking
+/// the unit would be the single avoidable outage in this design — on every
+/// host of the fleet, for every revocation — so the list is written, the
+/// host is asked what it now has, and nothing else happens.
+#[test]
+fn a_revocation_list_is_delivered_and_no_unit_is_restarted() {
+    let (fx, contents) = revoking();
+    let digest = crate::ids::sha256_hex(contents.as_bytes());
+    let look = TableLook::new(&fx);
+    // Two references to ONE file (a cloud and a cluster on one host), which
+    // is what the one derivation writes.
+    let runner = World::new(
+        StrictFake::new()
+            // Twice: the fleet anchor holds every control-plane host of the
+            // inventory (D6), and this host is one — and it is also the
+            // host of this plan, so its own `lock` step takes it as well.
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(shell_on("box", CRL_PUT), ok())
+            .expect(
+                shell_on("box", CRL_SHA),
+                Output::stdout(format!("{digest}\n")),
+            )
+            .expect(shell_on("box", CRL_PUT), ok())
+            .expect(
+                shell_on("box", CRL_SHA),
+                Output::stdout(format!("{digest}\n")),
+            )
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.repo = PathBuf::from("/repo");
+    options.ca_dir = Some(PathBuf::from("/ca"));
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("a revocation applies");
+    // `verify()` is the assertion that matters here: a `systemctl restart`
+    // would have been an unexpected command and the run would have failed.
+    runner.verify().expect("exactly those commands");
+
+    assert_eq!(applied.receipt.outcome, Outcome::Success);
+    let steps: Vec<ActionKind> = applied.receipt.hosts["box"]
+        .actions
+        .iter()
+        .map(|a| a.kind)
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ActionKind::Preflight,
+            ActionKind::Lock,
+            ActionKind::DeliverSecret,
+            ActionKind::DeliverSecret,
+            ActionKind::Verify,
+            ActionKind::Unlock
+        ]
+    );
+    let evidence = applied.receipt.hosts["box"]
+        .actions
+        .iter()
+        .filter(|a| a.kind == ActionKind::DeliverSecret)
+        .flat_map(|a| a.evidence.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        evidence.contains("re-reads its revocation list"),
+        "{evidence}"
+    );
+    assert!(evidence.contains(&format!("sha256:{digest}")), "{evidence}");
+}

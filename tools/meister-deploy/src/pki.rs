@@ -403,6 +403,88 @@ pub fn issued_path(repo: &Path, host_id: &str, file: &str) -> PathBuf {
     repo.join(ISSUED_DIR).join(host_id).join(file)
 }
 
+// --- lane 5A ---------------------------------------------------------------
+
+/// The fleet's revocation list, in the operator's repository.
+///
+/// Public and committed, like `known_hosts` and like every issued
+/// certificate: a list of serials is a statement about what is no longer
+/// valid, and keeping it secret would only keep it from the people who have
+/// to check it.
+pub const CRL_FILE: &str = "pki/crl.pem";
+
+pub fn crl_path(repo: &Path) -> PathBuf {
+    repo.join(CRL_FILE)
+}
+
+/// How long `meister-ca` may take over a revocation. openssl on two small
+/// files.
+pub const CA_DEADLINE: Duration = Duration::from_secs(120);
+
+/// `meister-ca --dir <ca> --index-rebuild --revoke <what> [--reason <r>]`.
+///
+/// The rebuild travels with every revocation on purpose: it is additive and
+/// cheap, and a revocation against a certificate that has no row in the
+/// index would otherwise be a refusal an operator has to translate.
+pub fn revoke_cmd(meister_ca: &Path, ca_dir: &Path, what: &str, reason: Option<&str>) -> Cmd {
+    let mut cmd = Cmd::new(
+        // It uses the CA key to say something and makes no key: the `key`
+        // class, the same as signing.
+        Effect::Key,
+        meister_ca.display().to_string(),
+        CA_DEADLINE,
+    )
+    .arg("--dir")
+    .arg(ca_dir.display().to_string())
+    .arg("--index-rebuild")
+    .arg("--revoke")
+    .arg(what);
+    if let Some(reason) = reason {
+        cmd = cmd.arg("--reason").arg(reason);
+    }
+    cmd
+}
+
+/// `meister-ca --dir <ca> --index-rebuild --gencrl`.
+pub fn gencrl_cmd(meister_ca: &Path, ca_dir: &Path) -> Cmd {
+    Cmd::new(Effect::Key, meister_ca.display().to_string(), CA_DEADLINE)
+        .arg("--dir")
+        .arg(ca_dir.display().to_string())
+        .arg("--index-rebuild")
+        .arg("--gencrl")
+}
+
+/// `openssl crl -in <file> -noout -crlnumber -lastupdate -nextupdate`, for
+/// the sentence a revocation prints.
+pub fn crl_describe_cmd(openssl: &str, crl: &Path) -> Cmd {
+    Cmd::new(Effect::Offline, openssl, Duration::from_secs(30))
+        .arg("crl")
+        .arg("-in")
+        .arg(crl.display().to_string())
+        .arg("-noout")
+        .arg("-crlnumber")
+        .arg("-lastupdate")
+        .arg("-nextupdate")
+}
+
+/// What a certificate this fleet issued for `host` is called on disk.
+///
+/// `keys issue` writes `<repo>/pki/issued/<host>/<file>.crt`, one per kind.
+/// A revocation of a HOST is a revocation of all of them: an identity and a
+/// serving certificate are the same machine's two credentials.
+pub fn issued_certs(files: &dyn Files, repo: &Path, host_id: &str) -> Vec<PathBuf> {
+    let dir = repo.join(ISSUED_DIR).join(host_id);
+    let mut out: Vec<PathBuf> = files
+        .list_dir(&dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "crt"))
+        .collect();
+    out.sort();
+    out
+}
+// --- end lane 5A -----------------------------------------------------------
+
 /// The directory `tools/meister-ca` keeps the CA in, as the inventory names
 /// it.
 ///
@@ -876,6 +958,15 @@ pub fn local_source(
                 }
             })
         }
+        // --- lane 5A ---
+        // One list for the whole fleet, and it is not about this host: a
+        // revocation list names certificates, not machines, and a copy per
+        // host would be a directory of files that have to be equal and a
+        // day when one of them is not.
+        SecretSourceKind::MeisterCa if secret.kind == crate::manifest::SecretKind::Crl => {
+            Some(crl_path(repo))
+        }
+        // --- end lane 5A ---
         SecretSourceKind::MeisterCa => Some(issued_path(
             repo,
             host_id,

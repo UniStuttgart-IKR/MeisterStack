@@ -444,3 +444,60 @@ pub fn plan_policy(kind: PlanKind) -> PlanPolicy {
 pub fn plan_policy_with_certificates(kind: PlanKind, fleet: &ResolvedFleet) -> PlanPolicy {
     plan_policy(kind).with_expected_credentials(expected_credentials(fleet))
 }
+
+// --- lane 5A ---------------------------------------------------------------
+
+/// The same fleet, with the hosts that carry a controller reading a
+/// revocation list.
+///
+/// A separate helper rather than a line in the fixture file, for the reason
+/// `with_direct_host` is one: `auth.crl` is not rendered by the one
+/// derivation today (a controller refuses to start without a file it names,
+/// and no fleet has been delivered one yet), so a fixture that carried it
+/// everywhere would describe a fleet that does not exist. The manifest id is
+/// recomputed, because a fleet whose content was edited and whose id was not
+/// is a fleet `validate` refuses.
+pub fn with_crl(mut fleet: ResolvedFleet, hosts: &[&str]) -> ResolvedFleet {
+    for id in hosts {
+        let host = fleet
+            .hosts
+            .get_mut(*id)
+            .unwrap_or_else(|| panic!("{id} is in the fixture"));
+        let dir = host
+            .secret_refs
+            .iter()
+            .find(|s| s.target_path.ends_with("/ca.crt"))
+            .map(|s| s.target_path.trim_end_matches("/ca.crt").to_string())
+            .unwrap_or_else(|| "/var/lib/meisterstack/pki".to_string());
+        // One per role that reads one, exactly as `nix/lib/manifest.nix`
+        // writes a reference per file AND unit.
+        for role in ["cloud", "cluster"] {
+            if !host.roles.iter().any(|r| r == role) {
+                continue;
+            }
+            host.secret_refs.push(crate::manifest::SecretRef {
+                id: format!("crl-pem-{role}"),
+                kind: crate::manifest::SecretKind::Crl,
+                source: crate::manifest::SecretSource {
+                    kind: crate::manifest::SecretSourceKind::MeisterCa,
+                    reference: "crl".to_string(),
+                },
+                target_path: format!("{dir}/crl.pem"),
+                owner: "root".to_string(),
+                mode: "0644".to_string(),
+                delivery: crate::manifest::Delivery::File,
+                // What the one derivation renders: a unit per file. The
+                // planner and the executor are what decide that a list is
+                // not poked, and a test that left this out would be a test
+                // of a manifest nobody writes.
+                reload: Some(crate::manifest::Reload {
+                    unit: format!("meister-{role}-controller.service"),
+                    action: "restart".to_string(),
+                }),
+            });
+        }
+    }
+    fleet.manifest_id =
+        crate::ids::content_id(crate::ids::IdKind::Manifest, &fleet).expect("a manifest hashes");
+    fleet
+}

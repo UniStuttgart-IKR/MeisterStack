@@ -776,3 +776,110 @@ fn a_host_that_was_never_resolved_is_read_out_of_the_inventory() {
         stderr(&out)
     );
 }
+
+// --- lane 5A: taking one back ------------------------------------------------
+
+/// The refusals of `keys revoke` come before the CA is touched at all, and
+/// the log is what proves it: nothing ran.
+#[test]
+fn a_revocation_says_what_is_being_taken_back_before_it_touches_the_ca() {
+    let sandbox = Sandbox::new();
+    let release = support::release_of(sandbox.fleet.clone());
+    std::fs::write(
+        sandbox.cwd.path().join("release.json"),
+        release.to_json().unwrap(),
+    )
+    .unwrap();
+
+    // Nothing named.
+    let out = sandbox.run(&["keys", "revoke", "--release", "release.json"]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("--serial"), "{}", stderr(&out));
+
+    // Two of the three named.
+    let out = sandbox.run(&[
+        "keys",
+        "revoke",
+        "--release",
+        "release.json",
+        "--serial",
+        "0A0B",
+        "--host",
+        "box",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("Exactly one of the three"),
+        "{}",
+        stderr(&out)
+    );
+
+    // A host this repository has issued nothing for: the sentence names the
+    // other way in (a serial off a receipt), because the machine may be gone.
+    let out = sandbox.run(&[
+        "keys",
+        "revoke",
+        "--release",
+        "release.json",
+        "--host",
+        "box",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("report --run"), "{}", stderr(&out));
+
+    // A host that is not in the fleet at all.
+    let out = sandbox.run(&[
+        "keys",
+        "revoke",
+        "--release",
+        "release.json",
+        "--host",
+        "nobody",
+    ]);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("nobody"), "{}", stderr(&out));
+
+    assert!(
+        !sandbox.calls().iter().any(|l| l.starts_with("meister-ca")),
+        "the CA was called by a refusal: {:?}",
+        sandbox.calls()
+    );
+}
+
+/// `--dry-run` prints the two commands and runs neither.
+#[test]
+fn a_dry_run_shows_the_ca_the_commands_it_would_get() {
+    let sandbox = Sandbox::new();
+    let release = support::release_of(sandbox.fleet.clone());
+    std::fs::write(
+        sandbox.cwd.path().join("release.json"),
+        release.to_json().unwrap(),
+    )
+    .unwrap();
+    let out = sandbox.run(&[
+        "keys",
+        "revoke",
+        "--release",
+        "release.json",
+        "--serial",
+        "64:35:c9:c4",
+        "--reason",
+        "keyCompromise",
+        "--dry-run",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let said = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(said.contains("--index-rebuild"), "{said}");
+    assert!(said.contains("--revoke"), "{said}");
+    assert!(said.contains("64:35:c9:c4"), "{said}");
+    assert!(said.contains("--gencrl"), "{said}");
+    assert!(
+        sandbox.calls().is_empty(),
+        "a dry run ran something: {:?}",
+        sandbox.calls()
+    );
+    assert!(
+        !sandbox.cwd.path().join("pki/crl.pem").exists(),
+        "a dry run wrote the list"
+    );
+}

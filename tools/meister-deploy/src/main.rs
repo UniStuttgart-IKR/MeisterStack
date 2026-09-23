@@ -380,9 +380,70 @@ enum KeysCmd {
         #[arg(long)]
         json: bool,
     },
-}
+    // --- end lane 3B ----------------------------------------------------
 
-// --- end lane 3B --------------------------------------------------------
+    // --- lane 5A: taking one back ---------------------------------------
+    /// Take a certificate back, and plan the delivery of the list that says
+    /// so.
+    ///
+    /// Two halves, and they are separate on purpose. The CA writes the
+    /// revocation into its own index and publishes a list — that happens
+    /// here, offline, on this machine. Getting the list to the hosts is a
+    /// PLAN, like every other thing this tool does to a machine, so it goes
+    /// through `apply`, the locks and the journal.
+    ///
+    /// The list takes effect without restarting anything: a controller looks
+    /// at its file again within half a minute, refuses the serials on it,
+    /// and ends the sessions that are already running on one.
+    Revoke {
+        /// The serial to take back, in any of its spellings: `6435C9…` as
+        /// openssl prints it, `64:35:c9:…` as a controller's log does.
+        #[arg(long)]
+        serial: Option<String>,
+        /// Every certificate this repository holds for that host — its
+        /// identity and its serving certificate are the same machine's two
+        /// credentials. This is what a reinstall needs.
+        #[arg(long)]
+        host: Option<String>,
+        /// Take nothing back: write the list again. A CRL has a lifetime
+        /// (30 days), and one that has run out is a list a verifier may
+        /// refuse; this is how it is renewed.
+        #[arg(long)]
+        refresh: bool,
+        /// keyCompromise | superseded | cessationOfOperation | …
+        #[arg(long)]
+        reason: Option<String>,
+        /// The release the delivery plan is made from
+        #[arg(long)]
+        release: PathBuf,
+        /// Which hosts the list goes to. Every host that reads one, by
+        /// default — a revocation nobody was told about is not one.
+        #[arg(long, default_value = "all")]
+        select: String,
+        /// The operator's repository
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// The inventory the `[operator] ca_dir` reference is read from
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+        /// `tools/meister-ca`. Looked up on PATH when it is a bare name.
+        #[arg(long, default_value = "meister-ca")]
+        meister_ca: PathBuf,
+        /// The ssh key to offer while the hosts are asked
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Where the delivery plan goes
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+        /// Print what would be revoked and revoke nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as json
+        #[arg(long)]
+        json: bool,
+    },
+    // --- end lane 5A ----------------------------------------------------
+}
 
 /// What `status` and `check` both need: which fleet, which hosts, where
 /// they answer, and whether to ask at all.
@@ -1023,7 +1084,7 @@ fn run() -> Result<Answer> {
         Verb::Verify(args) => verify(args),
         // --- end lane 4B -----------------------------------------------
         // --- lane 3B ---------------------------------------------------
-        Verb::Keys { cmd } => keys(cmd).map(Answer::from),
+        Verb::Keys { cmd } => keys(cmd),
         // --- end lane 3B -----------------------------------------------
         Verb::Legacy(legacy) => run_legacy(legacy).map(Answer::from),
     }
@@ -2099,13 +2160,21 @@ fn make_plan(args: &PlanArgs) -> Result<Answer> {
         // --- lane 3A: first installation ---
         "install" => PlanKind::Install,
         // --- end lane 3A ---
-        other @ ("keys-rotate" | "keys-revoke" | "retire") => anyhow::bail!(
-            "the plan kind {other:?} is a contract this tool already speaks and a plan it \
-             cannot build yet: `keys-rotate`, `keys-revoke` and `retire` arrive with M5."
+        // --- lane 5A ---
+        // The delivery half of a revocation. `keys revoke` builds one after
+        // it has written the list; this door is for the other order — a
+        // certificate somebody took back with `meister-ca` by hand, and a
+        // fleet that has to be told.
+        "keys-revoke" => PlanKind::KeysRevoke,
+        // --- end lane 5A ---
+        other @ ("keys-rotate" | "retire") => anyhow::bail!(
+            "the plan kind {other:?} is not built here. A rotation is made by `keys rotate`, \
+             which prepares the key on the host and issues the certificate before there is \
+             anything to plan; `retire` arrives with M5B."
         ),
         other => anyhow::bail!(
-            "{other:?} is not a plan kind. This tool builds `upgrade`, `bootstrap` and \
-             `install`."
+            "{other:?} is not a plan kind. This tool builds `upgrade`, `bootstrap`, \
+             `install` and `keys-revoke`."
         ),
     };
     // --- lane 3A ---
@@ -3076,7 +3145,7 @@ fn verify_approval(given: &[String]) -> Result<Option<String>> {
 // lane 3B: keys
 // ---------------------------------------------------------------------------
 
-fn keys(cmd: &KeysCmd) -> Result<bool> {
+fn keys(cmd: &KeysCmd) -> Result<Answer> {
     match cmd {
         KeysCmd::Enroll {
             host,
@@ -3100,7 +3169,8 @@ fn keys(cmd: &KeysCmd) -> Result<bool> {
             *dry_run,
             *offline,
             *json,
-        ),
+        )
+        .map(Answer::from),
         KeysCmd::Csr {
             host,
             kind,
@@ -3121,7 +3191,8 @@ fn keys(cmd: &KeysCmd) -> Result<bool> {
             identity.as_deref(),
             *dry_run,
             *json,
-        ),
+        )
+        .map(Answer::from),
         KeysCmd::Issue {
             host,
             kind,
@@ -3146,7 +3217,39 @@ fn keys(cmd: &KeysCmd) -> Result<bool> {
             meister_ca,
             *dry_run,
             *json,
-        ),
+        )
+        .map(Answer::from),
+        // --- lane 5A ---
+        KeysCmd::Revoke {
+            serial,
+            host,
+            refresh,
+            reason,
+            release,
+            select,
+            repo,
+            inventory,
+            meister_ca,
+            identity,
+            out,
+            dry_run,
+            json,
+        } => keys_revoke(KeysRevokeArgs {
+            serial: serial.as_deref(),
+            host: host.as_deref(),
+            refresh: *refresh,
+            reason: reason.as_deref(),
+            release,
+            select,
+            repo,
+            inventory: inventory.as_deref(),
+            meister_ca,
+            identity: identity.clone(),
+            out: out.clone(),
+            dry_run: *dry_run,
+            json: *json,
+        }),
+        // --- end lane 5A ---
     }
 }
 
@@ -3591,6 +3694,198 @@ fn keys_enroll(
 }
 
 // --- end lane 3B ------------------------------------------------------------
+
+// --- lane 5A: taking a certificate back --------------------------------------
+
+/// Everything `keys revoke` was told. A struct because it is twelve things
+/// and a function of twelve arguments is a function nobody calls correctly.
+struct KeysRevokeArgs<'a> {
+    serial: Option<&'a str>,
+    host: Option<&'a str>,
+    refresh: bool,
+    reason: Option<&'a str>,
+    release: &'a Path,
+    select: &'a str,
+    repo: &'a Path,
+    inventory: Option<&'a Path>,
+    meister_ca: &'a Path,
+    identity: Option<PathBuf>,
+    out: Option<PathBuf>,
+    dry_run: bool,
+    json: bool,
+}
+
+/// Revoke, publish, and plan the delivery.
+///
+/// The order is the whole of it: the CA first, on this machine and offline,
+/// and the fleet second, through a plan. A verb that put the file on the
+/// hosts itself would be a second road past the locks and the journal — the
+/// same reason there is no `keys deliver` (3B).
+fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
+    use meister_deploy::pki;
+
+    let policy = if args.dry_run {
+        Policy::dry_run()
+    } else {
+        Policy::real()
+    };
+    let files = RealFiles::new(policy);
+    let runner = Real::new(policy);
+
+    let asked = [args.serial.is_some(), args.host.is_some(), args.refresh]
+        .iter()
+        .filter(|x| **x)
+        .count();
+    if asked != 1 {
+        anyhow::bail!(
+            "say what is being taken back: `--serial <s>` (one certificate), `--host <id>` \
+             (every certificate this repository holds for that host) or `--refresh` (take \
+             nothing back and write the list again). Exactly one of the three."
+        );
+    }
+
+    let repo = &std::path::absolute(args.repo)
+        .with_context(|| format!("{} could not be made absolute", args.repo.display()))?;
+    let text = files.read_to_string(args.release)?;
+    let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
+    let fleet = &release.resolved_fleet;
+
+    // The CA directory, from the inventory the manifest names — the same
+    // rule `keys issue` follows, and the same refusal if it is inside the
+    // committed tree.
+    let inventory_file = match args.inventory {
+        Some(path) => inventory_path(repo, path),
+        None => Path::new(&fleet.source.repo_path).join(&fleet.source.inventory_path),
+    };
+    let parsed = Inventory::load(&files, &inventory_file)?;
+    let named = parsed
+        .operator
+        .as_ref()
+        .and_then(|o| o.ca_dir.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} has no `[operator] ca_dir`, so this tool does not know which CA holds the \
+                 index a revocation is written into.",
+                inventory_file.display()
+            )
+        })?;
+    let ca = pki::ca_dir(&inventory_file, &named);
+    pki::refuse_ca_in_repo(repo, &ca)?;
+
+    // What is being taken back, in the CA's own terms: a file where this
+    // repository has one, a serial where it does not.
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(serial) = args.serial {
+        targets.push(serial.to_string());
+    }
+    if let Some(host_id) = args.host {
+        if !fleet.hosts.contains_key(host_id) {
+            anyhow::bail!(
+                "{} names no host {host_id:?}; it covers {}.",
+                args.release.display(),
+                fleet.evaluated_hosts.join(", ")
+            );
+        }
+        let certs = pki::issued_certs(&files, repo, host_id);
+        if certs.is_empty() {
+            anyhow::bail!(
+                "{} holds no certificate for {host_id}, so there is nothing of its to take \
+                 back. If the machine was reinstalled and its old certificate is gone from \
+                 here too, revoke it by serial: it is in the receipt of the run that \
+                 delivered it (`report --run <id>`), and in the log of whatever it dialled.",
+                repo.join(pki::ISSUED_DIR).join(host_id).display()
+            );
+        }
+        targets.extend(certs.iter().map(|p| p.display().to_string()));
+    }
+
+    let mut ran: Vec<String> = Vec::new();
+    for what in &targets {
+        let cmd = pki::revoke_cmd(args.meister_ca, &ca, what, args.reason);
+        ran.push(cmd.line());
+        if args.dry_run {
+            println!("{}", cmd.described());
+        } else {
+            runner.run(&cmd)?;
+        }
+    }
+    let gencrl = pki::gencrl_cmd(args.meister_ca, &ca);
+    ran.push(gencrl.line());
+    if args.dry_run {
+        println!("{}", gencrl.described());
+        eprintln!(
+            "note: nothing was revoked and no plan was made. {} would be written and copied \
+             to {}.",
+            ca.join("crl.pem").display(),
+            pki::crl_path(repo).display()
+        );
+        return Ok(Answer::Yes);
+    }
+    runner.run(&gencrl)?;
+
+    // Into the repository, where the delivery reads it from. Public and
+    // committed: a list of serials is what everybody has to be able to check.
+    let published = ca.join("crl.pem");
+    let bytes = files.read(&published)?;
+    let here = pki::crl_path(repo);
+    files.create_dir_all(here.parent().unwrap_or(repo))?;
+    files.write_atomic(&here, &bytes, 0o644)?;
+    let described = runner.run(&pki::crl_describe_cmd("openssl", &here))?;
+    let summary: BTreeMap<String, String> = described
+        .stdout
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+
+    eprintln!(
+        "==> {}\n    crl number {}  next update {}\n    {} certificate(s) taken back in this run",
+        here.display(),
+        summary.get("crlNumber").map(String::as_str).unwrap_or("?"),
+        summary.get("nextUpdate").map(String::as_str).unwrap_or("?"),
+        targets.len()
+    );
+
+    // And now the fleet. The same planner, the same observation, the same
+    // locks: a revocation is a plan like any other, and `apply` is what
+    // carries it out.
+    let answer = make_plan(&PlanArgs {
+        release: args.release.to_path_buf(),
+        select: args.select.to_string(),
+        kind: "keys-revoke".to_string(),
+        reinstall: false,
+        targets: None,
+        observation: None,
+        offline: false,
+        dry_run: false,
+        repo: Some(repo.clone()),
+        identity: args.identity.clone(),
+        at_once: observe::DEFAULT_CONCURRENCY,
+        inventory: Some(inventory_file.clone()),
+        out: args.out.clone(),
+    })?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "crl": here.display().to_string(),
+                "crl_number": summary.get("crlNumber"),
+                "next_update": summary.get("nextUpdate"),
+                "revoked": targets,
+                "commands": ran,
+            }))?
+        );
+    }
+    eprintln!(
+        "note: the list is in the repository and in the CA. It reaches the hosts with \
+         `apply --plan <the plan above>`; until it has, the certificates are taken back \
+         here and nowhere else. Commit `{}`.",
+        pki::CRL_FILE
+    );
+    Ok(answer)
+}
+// --- end lane 5A -------------------------------------------------------------
 
 /// The receipt as a person reads it.
 fn receipt_table(receipt: &receipt::DeploymentReceipt) -> String {

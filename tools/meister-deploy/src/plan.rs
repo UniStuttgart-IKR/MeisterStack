@@ -1585,6 +1585,15 @@ fn decide_host(
         return decide_install_host(release, id, observation, policy);
     }
     // --- end lane 3A ---
+    // --- lane 5A: a list, and nothing else ---
+    // A revocation is not a rollout. What this plan may do to a host is put
+    // one public file on it; whether that host also owes a kernel is not
+    // this plan's business, and answering it here would turn "take a
+    // certificate back" into "roll the fleet forward".
+    if policy.kind == PlanKind::KeysRevoke {
+        return decide_revoke_host(release, id, observation, policy);
+    }
+    // --- end lane 5A ---
 
     let mut d = HostDecision {
         verdict: HostVerdict::Change,
@@ -2049,6 +2058,180 @@ fn pending_deliveries(
         })
         .count()
 }
+
+// --- lane 5A: the revocation plan ------------------------------------------
+
+/// Every `crl` reference of this host. Empty for a host that reads no list —
+/// which is every host of a fleet that has not named `auth.crl`, and is a
+/// statement about the fleet rather than about this host.
+fn crl_refs(host: &crate::manifest::ResolvedHost) -> Vec<&crate::manifest::SecretRef> {
+    host.secret_refs
+        .iter()
+        .filter(|s| s.kind == crate::manifest::SecretKind::Crl)
+        .collect()
+}
+
+/// What a `keys-revoke` plan says about one host.
+///
+/// The same facts as an upgrade's, read for one question: has this host got
+/// the list that is on this workstation. Everything else it might owe —
+/// a system, a kernel, a certificate — is another plan's business, and
+/// mixing them would make a revocation the most dangerous verb in the tool.
+fn decide_revoke_host(
+    release: &ReleaseManifest,
+    id: &str,
+    observation: &Observations,
+    policy: &PlanPolicy,
+) -> HostDecision {
+    let fleet = &release.resolved_fleet;
+    let host = &fleet.hosts[id];
+    let mut d = HostDecision {
+        verdict: HostVerdict::Change,
+        reasons: Vec::new(),
+        stop_all: Vec::new(),
+        stop_disruptive: Vec::new(),
+        current_system: None,
+        reboot_required: false,
+        reboot_only: false,
+        provider_reboot: false,
+        // A revocation is only ever this shape: preflight, the lock, the
+        // file, a verify, the lock back.
+        secrets_only: true,
+        needs_maintenance: false,
+        class: class_of(host),
+        canary_rank: u8::from(host.rollout.canary_class.is_none()),
+        tier_rank: tier_rank(host, policy.kind),
+        preconditions: Vec::new(),
+        unknowns: Vec::new(),
+    };
+
+    if crl_refs(host).is_empty() {
+        // Not a failure and not a gap in this plan: this host's rendered
+        // configuration names no revocation list, so there is no file to
+        // put anywhere and nothing on it would read one.
+        // A precondition and not a `reason`: `settle` keeps the reasons for
+        // what STOPS a host, and this host is not stopped — it simply has
+        // nothing to read a list with. The sentence travels on its preflight.
+        d.preconditions.push(format!(
+            "{id} reads no revocation list: its configuration names no `auth.crl`, so a list \
+             delivered to it would be a file nobody opens. Name it in the inventory (the \
+             fleet renders the path under `meisterstack.pki.dir`) and resolve again."
+        ));
+        d.secrets_only = false;
+        return settle(d, HostVerdict::Unchanged);
+    }
+
+    if host.deployment == crate::manifest::Deployment::Context {
+        d.stop_all.push(format!(
+            "{id} is deployed as `context`: its files are pushed by the legacy adapter, not by \
+             this plan."
+        ));
+        return settle(d, HostVerdict::Blocked);
+    }
+    if observation.provisional {
+        d.stop_all.push(
+            "this plan was made without an observation, so nobody knows which list any host \
+             is holding. A revocation that is not delivered is not a revocation."
+                .to_string(),
+        );
+        return settle(d, HostVerdict::Blocked);
+    }
+    let Some(obs) = observation.host(id) else {
+        d.stop_all.push(format!(
+            "the snapshot taken at {} has no entry for {id}, so nobody can say whether it has \
+             the new list.",
+            observation.taken_at
+        ));
+        return settle(d, HostVerdict::Unreachable);
+    };
+    if !obs.reachable {
+        // The receipt's job, and V24's honest half: a revocation is in force
+        // where it arrived, and the plan names who did not answer.
+        d.stop_all.push(format!(
+            "{id} did not answer when the snapshot was taken, so it is still serving whatever \
+             list it had. Run this plan again when it is back — until then the revocation is \
+             in force everywhere else and not there."
+        ));
+        return settle(d, HostVerdict::Unreachable);
+    }
+    match (
+        &host.ssh.host_key_fingerprint,
+        &obs.identity.host_key_fingerprint,
+    ) {
+        (Some(declared), Some(seen)) if declared != seen => d.stop_all.push(format!(
+            "identity changed: the fleet has {id} enrolled with the host key {declared} and \
+             {seen} answered."
+        )),
+        (Some(declared), Some(_)) => d.preconditions.push(format!(
+            "{id} answered with the enrolled host key {declared}"
+        )),
+        (Some(_), None) => d.stop_all.push(format!(
+            "the snapshot does not say which host key answered for {id}."
+        )),
+        (None, _) => {
+            d.stop_all.push(format!(
+                "the fleet has no host key for {id}, so nothing can connect to it. Run \
+                 `keys enroll {id} --fingerprint SHA256:…` first."
+            ));
+            return settle(d, HostVerdict::Unenrolled);
+        }
+    }
+    if let Some(lock) = &obs.lock {
+        d.stop_all.push(format!(
+            "the run {} has held {id} since {} (operator {}, pid {}).",
+            lock.run_id, lock.acquired_at, lock.operator, lock.pid
+        ));
+    }
+    if !obs.open_txns.is_empty() {
+        let ids: Vec<&str> = obs.open_txns.iter().map(|t| t.id.as_str()).collect();
+        d.stop_all.push(format!(
+            "{id} still has the transaction(s) {} open; finish that run with `apply --resume \
+             <run-id>` before a file is written under it.",
+            ids.join(", ")
+        ));
+    }
+
+    let expected = policy.expected_credentials.get(id);
+    // Before the comparison and not after it: a workstation with no list has
+    // nothing that DIFFERS from what the host holds, so the comparison would
+    // come out "nothing to do" — which is the one answer a revocation must
+    // never give by accident.
+    if expected.is_none_or(|e| crl_refs(host).iter().all(|s| !e.contains_key(&s.id))) {
+        d.stop_all.push(format!(
+            "{id} reads a revocation list and this workstation has none to deliver. \
+             `keys revoke` writes it to `pki/crl.pem` in the repository; run that rather \
+             than this plan."
+        ));
+        return settle(d, HostVerdict::Blocked);
+    }
+    let pending = crl_refs(host)
+        .into_iter()
+        .filter(|secret| {
+            crate::pki::needs_delivery(
+                secret,
+                expected.and_then(|e| e.get(&secret.id)),
+                obs.credentials.get(&secret.id),
+            )
+        })
+        .count();
+    if pending == 0 {
+        d.secrets_only = false;
+        d.preconditions
+            .push(format!("{id} already holds the list this repository has."));
+        return settle(d, HostVerdict::Unchanged);
+    }
+    d.preconditions.push(format!(
+        "{id} holds a revocation list that is not the one in this repository"
+    ));
+
+    let verdict = if d.stop_all.is_empty() {
+        HostVerdict::Change
+    } else {
+        HostVerdict::Blocked
+    };
+    settle(d, verdict)
+}
+// --- end lane 5A -----------------------------------------------------------
 
 // --- lane 3A: first installation ------------------------------------------
 
@@ -2723,6 +2906,16 @@ fn steps_for(
         // (M5) and it is a plan of its own.
         let expected_here = policy.expected_credentials.get(id);
         for secret in &host.secret_refs {
+            // --- lane 5A ---
+            // A revocation plan carries ONE kind of file. A certificate that
+            // happens to differ as well is a different decision, made by a
+            // different verb, on a day somebody chose.
+            if policy.kind == PlanKind::KeysRevoke
+                && secret.kind != crate::manifest::SecretKind::Crl
+            {
+                continue;
+            }
+            // --- end lane 5A ---
             let seen = obs.map(|o| o.credentials.get(&secret.id));
             let want = expected_here.and_then(|e| e.get(&secret.id));
             if !crate::pki::needs_delivery(secret, want, seen.flatten()) {
@@ -2732,10 +2925,19 @@ fn steps_for(
             // running. In a bootstrap the units are off — they wait on a CA
             // certificate that has not arrived — and calling that step
             // disruptive would ask for an approval to interrupt nothing.
-            let restarts = secret
-                .reload
-                .as_ref()
-                .is_some_and(|r| r.action == "restart");
+            // --- lane 5A ---
+            // A revocation list is the one file in this fleet that is
+            // re-read by the process that uses it, on its own clock and
+            // within half a minute (`controller_api::auth::Revocations`).
+            // Restarting a controller to hand it one would be the single
+            // avoidable outage in the whole design, so this step interrupts
+            // nothing and the executor pokes nothing.
+            let restarts = secret.kind != crate::manifest::SecretKind::Crl
+                && secret
+                    .reload
+                    .as_ref()
+                    .is_some_and(|r| r.action == "restart");
+            // --- end lane 5A ---
             let unit_running = secret.reload.as_ref().is_some_and(|r| {
                 obs.is_some_and(|o| o.units.get(&r.unit).map(String::as_str) == Some("active"))
             });
@@ -3941,6 +4143,195 @@ mod tests {
     // -----------------------------------------------------------------
     // lane 3A: first installation
     // -----------------------------------------------------------------
+
+    // --- lane 5A: the revocation plan ---------------------------------
+
+    /// A fleet whose controller host reads a revocation list, and a snapshot
+    /// in which it holds the one it was given.
+    fn revoking() -> (ReleaseManifest, Observations) {
+        let fleet = crate::fixtures::with_crl(onebox_enrolled(), &["box"]);
+        let release = release_of(fleet);
+        let observation = observed(&release, at(TAKEN));
+        (release, observation)
+    }
+
+    /// What a new list does to a fleet: one file, on the hosts that read
+    /// one, and nothing else happens to any of them.
+    #[test]
+    fn a_revocation_carries_one_file_and_interrupts_nothing() {
+        let (release, observation) = revoking();
+        let fleet = &release.resolved_fleet;
+        // The operator has a NEW list; everything else is as the hosts have
+        // it.
+        let mut expected = crate::fixtures::expected_credentials(fleet);
+        for secrets in expected.values_mut() {
+            for (id, value) in secrets.iter_mut() {
+                if id.starts_with("crl-") {
+                    *value = "sha256:the-new-list".to_string();
+                }
+            }
+        }
+        let policy = plan_policy(PlanKind::KeysRevoke).with_expected_credentials(expected);
+        let plan = plan(&release, "all", &observation, None, &policy, at(NOW)).expect("plans");
+
+        assert_eq!(
+            kinds(&plan, "box"),
+            vec![
+                ActionKind::Preflight,
+                ActionKind::Lock,
+                ActionKind::DeliverSecret,
+                ActionKind::DeliverSecret,
+                ActionKind::Verify,
+                ActionKind::Unlock,
+            ],
+            "a revocation is preflight, the lock, the file(s), a verify and the lock back"
+        );
+        // Two references to ONE file (a cloud and a cluster on one host),
+        // which is what the one derivation writes — and both of them the
+        // list.
+        for action in plan
+            .actions
+            .iter()
+            .filter(|a| a.kind == ActionKind::DeliverSecret)
+        {
+            let said = action.desired.clone().unwrap_or_default();
+            assert!(said.contains("crl.pem"), "{said}");
+            assert_eq!(
+                action.disruption,
+                Disruption::None,
+                "a list is re-read by the process that uses it; nothing is restarted"
+            );
+            assert_eq!(action.approval_class, ApprovalClass::None);
+        }
+        assert!(
+            plan.approvals.is_empty(),
+            "nothing about a revocation needs a person to be asked: {:?}",
+            plan.approvals
+        );
+        // And the hosts that read no list are left entirely alone. The
+        // sentence travels on the one step such a host has.
+        for id in ["n1", "n2"] {
+            assert_eq!(plan.hosts[id].verdict, HostVerdict::Unchanged, "{id}");
+            let why = action(&plan, id, ActionKind::Preflight)
+                .preconditions
+                .join(" ");
+            assert!(why.contains("reads no revocation list"), "{id}: {why}");
+        }
+        // Nothing of the rollout: no stage, no activation, no reboot,
+        // anywhere in the plan.
+        for action in &plan.actions {
+            assert!(
+                !matches!(
+                    action.kind,
+                    ActionKind::Stage
+                        | ActionKind::Activate
+                        | ActionKind::Reboot
+                        | ActionKind::Confirm
+                ),
+                "{:?} has no business in a revocation",
+                action.kind
+            );
+        }
+    }
+
+    /// A host that already holds this list is not written to twice.
+    #[test]
+    fn a_host_that_already_holds_the_list_is_unchanged() {
+        let (release, observation) = revoking();
+        let policy = plan_policy_with_certificates(PlanKind::KeysRevoke, &release.resolved_fleet);
+        let plan = plan(&release, "all", &observation, None, &policy, at(NOW)).expect("plans");
+        assert_eq!(plan.hosts["box"].verdict, HostVerdict::Unchanged);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| a.kind == ActionKind::DeliverSecret),
+            "nothing to deliver"
+        );
+    }
+
+    /// The honest half of V24: a revocation is in force where it arrived,
+    /// and the plan says who has not got it.
+    #[test]
+    fn a_host_that_did_not_answer_stays_in_the_plan_and_is_named() {
+        let (release, mut observation) = revoking();
+        observation
+            .hosts
+            .get_mut("box")
+            .expect("in the fixture")
+            .reachable = false;
+        let mut expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
+        for secrets in expected.values_mut() {
+            for (id, value) in secrets.iter_mut() {
+                if id.starts_with("crl-") {
+                    *value = "sha256:the-new-list".to_string();
+                }
+            }
+        }
+        let policy = plan_policy(PlanKind::KeysRevoke).with_expected_credentials(expected);
+        let plan = plan(&release, "all", &observation, None, &policy, at(NOW)).expect("plans");
+        assert_eq!(plan.hosts["box"].verdict, HostVerdict::Unreachable);
+        assert!(
+            plan.selection
+                .required_unreachable
+                .contains(&"box".to_string()),
+            "{:?}",
+            plan.selection.required_unreachable
+        );
+        let why = plan.hosts["box"].reasons.join(" ");
+        assert!(why.contains("still serving whatever list it had"), "{why}");
+    }
+
+    /// A list this workstation does not have is not a plan that pretends to
+    /// deliver one.
+    #[test]
+    fn a_revocation_without_a_list_on_this_workstation_is_blocked() {
+        let (release, observation) = revoking();
+        let mut expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
+        for secrets in expected.values_mut() {
+            secrets.retain(|id, _| !id.starts_with("crl-"));
+        }
+        let policy = plan_policy(PlanKind::KeysRevoke).with_expected_credentials(expected);
+        let plan = plan(&release, "all", &observation, None, &policy, at(NOW)).expect("plans");
+        assert_eq!(plan.hosts["box"].verdict, HostVerdict::Blocked);
+        let why = plan.hosts["box"].reasons.join(" ");
+        assert!(why.contains("keys revoke"), "{why}");
+    }
+
+    /// And a revocation never turns into a rollout: the same fleet with a
+    /// system to take forward still only gets the file.
+    #[test]
+    fn a_host_that_also_owes_a_system_still_only_gets_the_list() {
+        let base = crate::fixtures::with_crl(onebox_enrolled(), &["box"]);
+        let running = release_of(base.clone());
+        let observation = observed(&running, at(TAKEN));
+        // A new system for the same host, which an upgrade would act on.
+        let release = with_new_systems(base, &["box"], true);
+        let mut expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
+        for secrets in expected.values_mut() {
+            for (id, value) in secrets.iter_mut() {
+                if id.starts_with("crl-") {
+                    *value = "sha256:the-new-list".to_string();
+                }
+            }
+        }
+        let policy = plan_policy(PlanKind::KeysRevoke).with_expected_credentials(expected);
+        let plan = plan(&release, "all", &observation, None, &policy, at(NOW)).expect("plans");
+        assert_eq!(
+            kinds(&plan, "box"),
+            vec![
+                ActionKind::Preflight,
+                ActionKind::Lock,
+                ActionKind::DeliverSecret,
+                ActionKind::DeliverSecret,
+                ActionKind::Verify,
+                ActionKind::Unlock,
+            ]
+        );
+        assert!(!plan.hosts["box"].reboot_required);
+    }
+
+    // --- end lane 5A ---------------------------------------------------
 
     /// A fleet nobody has ever reached: no host answered when the snapshot
     /// was taken, which is what a rack of new machines looks like.

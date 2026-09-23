@@ -1184,6 +1184,22 @@ impl<'a> Executor<'a> {
             }
         }
 
+        // --- lane 5A ---
+        // A revocation list is not poked. The process that reads one looks
+        // at it again on its own clock, within half a minute
+        // (`controller_api::auth::Revocations`), and restarting a controller
+        // to deliver a list it re-reads by itself would be the one avoidable
+        // outage in this design — on every host of the fleet, for every
+        // revocation.
+        if secret.kind == crate::manifest::SecretKind::Crl {
+            evidence.push(
+                "no unit was restarted: a controller re-reads its revocation list within 30 s"
+                    .to_string(),
+            );
+            return Ok(evidence);
+        }
+        // --- end lane 5A ---
+
         // And the unit that reads it, if it is running.
         if let Some(reload) = &secret.reload {
             // `Codes([0, 1, 3])` and not the `ask` default: `systemctl
