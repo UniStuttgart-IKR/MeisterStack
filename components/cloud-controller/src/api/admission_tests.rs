@@ -607,3 +607,138 @@ async fn two_slots_are_two_vms_under_any_interleaving() {
     }
     assert_eq!((admitted, refused), (2, 14));
 }
+
+/// A VM for `tenant` whose cloud-init block is exactly `cloud_init` — the
+/// counterpart to `vm` above, for the cases that turn on the block's shape
+/// rather than on its disk.
+fn vm_with_cloud_init(name: &str, tenant: &str, cloud_init: serde_json::Value) -> Vm {
+    let spec: VmSpec = serde_json::from_value(json!({
+        "tenant": tenant,
+        "vm": {
+            "vcpus": 1,
+            "memory_mib": 512,
+            "boot": {"kind": "firmware", "firmware": "fw"},
+            "volumes": [{ "size_bytes": 1073741824u64 }],
+            "cloud_init": cloud_init,
+        },
+    }))
+    .expect("a vm spec");
+    new_vm(name, spec)
+}
+
+/// Astra finding S21, 2026-09-23: `cloud_init.user_data_from` used to be
+/// refused at the door with "unknown field", before the checks right below —
+/// which already knew how to read it — ever got a look at it. The node-side
+/// schema (`agent_api::spec::CloudInit`) stays strict; this is the edge that
+/// has to accept the reference itself, so `check_volume_refs` can validate it
+/// here, where a person is still holding the request, and the cluster tier
+/// can resolve it later.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_cloud_init_secret_reference_is_accepted_and_checked() {
+    let st = cloud("f21").await;
+    st.store
+        .create(&controller_api::Secret::declare(
+            "db",
+            controller_api::SecretSpec {
+                tenant: "a".into(),
+                data: [("password".to_string(), "s3kr3t".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a secret");
+
+    // The reference alone, with no literal beside it — exactly the shape
+    // that used to be "unknown field `user_data_from`".
+    let created = create_vm_as(
+        &st,
+        member("a"),
+        vm_with_cloud_init(
+            "web",
+            "a",
+            json!({ "user_data_from": { "secret": "db", "key": "password" } }),
+        ),
+    )
+    .await
+    .expect("a reference to this tenant's own secret is not malformed");
+    assert_eq!(
+        created.spec.vm["cloud_init"]["user_data_from"]["secret"], "db",
+        "the reference travels unresolved out of the cloud — that is the cluster's job"
+    );
+
+    // A key the secret does not have is refused HERE, where a person is
+    // still holding the request, and not three tiers down as a Failed VM.
+    let bad_key = create_vm_as(
+        &st,
+        member("a"),
+        vm_with_cloud_init(
+            "web2",
+            "a",
+            json!({ "user_data_from": { "secret": "db", "key": "nope" } }),
+        ),
+    )
+    .await
+    .expect_err("db has no key \"nope\"");
+    assert_eq!(bad_key.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(bad_key.message().contains("nope"), "{}", bad_key.message());
+
+    // Somebody else's secret is the 404 an unknown volume gets, for the same
+    // reason: a 403 would confirm that a secret of that name exists.
+    let unknown = create_vm_as(
+        &st,
+        member("b"),
+        vm_with_cloud_init(
+            "web3",
+            "b",
+            json!({ "user_data_from": { "secret": "db", "key": "password" } }),
+        ),
+    )
+    .await
+    .expect_err("b has no secret named db");
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+}
+
+/// The structural half of the same rule, both directions: `cloud_init` needs
+/// exactly one starting point. "Both" was already refused before this
+/// finding — `user_data_said_twice` — but only once the block could be
+/// parsed at all; "neither" is new, because `user_data` stopped being the
+/// one required field that made an empty block impossible to write.
+#[tokio::test]
+#[ignore = "needs an etcd; see the module note"]
+async fn a_cloud_init_naming_neither_or_both_a_literal_and_a_reference_is_refused() {
+    let st = cloud("f21-shape").await;
+
+    let neither = create_vm_as(&st, member("a"), vm_with_cloud_init("web", "a", json!({})))
+        .await
+        .expect_err("a cloud_init with no starting point");
+    assert_eq!(neither.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        neither.message().contains("needs a starting point"),
+        "{}",
+        neither.message()
+    );
+
+    let both = create_vm_as(
+        &st,
+        member("a"),
+        vm_with_cloud_init(
+            "web2",
+            "a",
+            json!({
+                "user_data": "#cloud-config\n",
+                "user_data_from": { "secret": "db", "key": "password" },
+            }),
+        ),
+    )
+    .await
+    .expect_err("a cloud_init naming both a literal and a reference");
+    assert_eq!(both.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        both.message().contains("two starting points"),
+        "{}",
+        both.message()
+    );
+}
