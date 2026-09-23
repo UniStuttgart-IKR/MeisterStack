@@ -439,9 +439,12 @@ enum KeysCmd {
         /// openssl prints it, `64:35:c9:…` as a controller's log does.
         #[arg(long)]
         serial: Option<String>,
-        /// Every certificate this repository holds for that host — its
-        /// identity and its serving certificate are the same machine's two
-        /// credentials. This is what a reinstall needs.
+        /// Every ACTIVE certificate this repository holds for that host --
+        /// its identity and its serving certificate are the same machine's
+        /// two credentials. This is what a reinstall needs. A `.prev` or
+        /// `.next` certificate left over from an in-progress rotation is
+        /// not included; take that one back by `--serial` (Astra finding
+        /// F11, 2026-09-23).
         #[arg(long)]
         host: Option<String>,
         /// Take nothing back: write the list again. A CRL has a lifetime
@@ -4066,8 +4069,10 @@ struct RetireArgs<'a> {
 ///
 /// Three things happen here and they are in this order on purpose:
 ///
-/// 1. the certificates this repository holds for the host are taken back and
-///    a new list is written and published (offline, on this machine);
+/// 1. the active certificates this repository holds for the host are taken
+///    back and a new list is written and published (offline, on this
+///    machine) -- a `.prev`/`.next` certificate mid-rotation is not one of
+///    them; see `issued_certs` (Astra finding F11, 2026-09-23);
 /// 2. the record and the `known_hosts` mark are written, so that the
 ///    retirement survives everything else;
 /// 3. a plan is made that carries the new list to the REST of the fleet.
@@ -4115,7 +4120,11 @@ fn retire(args: RetireArgs<'_>) -> Result<Answer> {
     };
 
     // --- 1. the certificates ------------------------------------------
-    let certs = pki::issued_certs(&files, repo, args.host);
+    // Astra finding F11, 2026-09-23: this used to swallow a real listing
+    // failure into "no certificates", which let a retirement proceed and
+    // report success while nothing was revoked. `?` here means a directory
+    // that cannot be read is an error, not an empty answer.
+    let certs = pki::issued_certs(&files, repo, args.host)?;
     let mut serials: Vec<String> = Vec::new();
     let mut ran: Vec<String> = Vec::new();
     if certs.is_empty() {
@@ -4785,7 +4794,8 @@ fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
     if asked != 1 {
         anyhow::bail!(
             "say what is being taken back: `--serial <s>` (one certificate), `--host <id>` \
-             (every certificate this repository holds for that host) or `--refresh` (take \
+             (every active certificate this repository holds for that host; a `.prev`/`.next` \
+             certificate mid-rotation is revoked separately, by serial) or `--refresh` (take \
              nothing back and write the list again). Exactly one of the three."
         );
     }
@@ -4832,7 +4842,9 @@ fn keys_revoke(args: KeysRevokeArgs<'_>) -> Result<Answer> {
                 fleet.evaluated_hosts.join(", ")
             );
         }
-        let certs = pki::issued_certs(&files, repo, host_id);
+        // Astra finding F11, 2026-09-23: propagated rather than swallowed --
+        // see the matching comment in `retire`.
+        let certs = pki::issued_certs(&files, repo, host_id)?;
         if certs.is_empty() {
             anyhow::bail!(
                 "{} holds no certificate for {host_id}, so there is nothing of its to take \

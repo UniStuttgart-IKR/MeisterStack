@@ -1112,3 +1112,52 @@ fn retiring_a_host_the_release_does_not_have_is_a_sentence() {
         sandbox.calls()
     );
 }
+
+/// Astra finding F11, 2026-09-23: a directory `retire` cannot even list used
+/// to look exactly like a host with no certificates -- the CA was never
+/// asked, no record was written, and the run still exited 0. It has to
+/// refuse instead.
+#[test]
+fn retiring_refuses_rather_than_pretend_an_unreadable_directory_is_empty() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Root ignores a directory's own permission bits, so this test cannot
+    // say anything under it.
+    if std::env::var("USER").as_deref() == Ok("root") {
+        eprintln!("skipping: running as root, a chmod 000 directory stays readable");
+        return;
+    }
+
+    let sandbox = Sandbox::new();
+    one_host_release(&sandbox, "box");
+    let dir = sandbox.path("pki/issued/box");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("identity.crt"), "x").unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = sandbox.run(&[
+        "retire",
+        "box",
+        "--release",
+        "release-one.json",
+        "--inventory",
+        "fleet.toml",
+        "--reason",
+        "decommissioned",
+    ]);
+
+    // Restored before any assertion can early-return and leave an
+    // unreadable directory behind for the sandbox's own cleanup.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_ne!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        sandbox.calls().is_empty(),
+        "the CA was asked despite the listing failure: {:?}",
+        sandbox.calls()
+    );
+    assert!(
+        !sandbox.path(".meister-deploy/retired/box.json").exists(),
+        "a run that could not even list the certificates wrote a retirement record"
+    );
+}

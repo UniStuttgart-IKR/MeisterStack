@@ -674,19 +674,28 @@ pub fn revoked_here(files: &dyn Files, repo: &Path, serial: &str) -> Result<Opti
 /// `keys issue` writes `<repo>/pki/issued/<host>/<file>.crt`, one per kind.
 /// A revocation of a HOST is a revocation of all of them: an identity and a
 /// serving certificate are the same machine's two credentials.
-pub fn issued_certs(files: &dyn Files, repo: &Path, host_id: &str) -> Vec<PathBuf> {
+///
+/// This is the ACTIVE set, not every certificate under the directory: a
+/// rotation leaves two more files behind -- the one it is about
+/// (`<kind>.next.crt`) and the one it replaced (`<kind>.prev.crt`) -- and
+/// neither is what this host is holding right now. The replaced one is
+/// usually worth taking back as well, and it is taken back by its serial,
+/// deliberately and one at a time. A caller that tells an operator every
+/// certificate was taken back has to say so with that caveat.
+///
+/// Astra finding F11, 2026-09-23: a directory that cannot be listed is not
+/// the same as a host that holds no certificates. `Files::list_dir` already
+/// turns "the directory is not there" into an empty list, so an `Err`
+/// reaching here is a real I/O failure (permissions, a stale mount), and
+/// swallowing it used to make `retire`/`keys revoke --host` report "nothing
+/// to take back" and exit 0. It is propagated instead.
+pub fn issued_certs(files: &dyn Files, repo: &Path, host_id: &str) -> Result<Vec<PathBuf>> {
     let dir = repo.join(ISSUED_DIR).join(host_id);
     let mut out: Vec<PathBuf> = files
         .list_dir(&dir)
-        .unwrap_or_default()
+        .with_context(|| format!("listing the certificates {} holds failed", dir.display()))?
         .into_iter()
         .filter(|p| p.extension().is_some_and(|e| e == "crt"))
-        // The ACTIVE ones. A rotation leaves two more behind — the one it
-        // is about (`<kind>.next.crt`) and the one it replaced
-        // (`<kind>.prev.crt`) — and neither of them is what this host is
-        // holding. The replaced one is usually worth taking back as well,
-        // and it is taken back by its serial, deliberately and one at a
-        // time.
         .filter(|p| {
             let name = p
                 .file_name()
@@ -697,7 +706,7 @@ pub fn issued_certs(files: &dyn Files, repo: &Path, host_id: &str) -> Vec<PathBu
         })
         .collect();
     out.sort();
-    out
+    Ok(out)
 }
 // --- end lane 5A -----------------------------------------------------------
 
