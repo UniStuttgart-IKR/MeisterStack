@@ -1426,6 +1426,27 @@ impl<'a> Executor<'a> {
             );
         }
         let bytes = self.files.read(&source)?;
+        // --- lane 3B: Astra finding F10, 2026-09-23 ---
+        // The step is bound to the bytes it was planned with, exactly as a
+        // rotation's overlap is (`Executor::overlap`), and with the same
+        // sentence. Without this the executor re-read the operator's file
+        // and then checked the host's copy against whatever that file now
+        // held, so a plan made with one certificate -- or one revocation
+        // list -- delivered another under its own plan_id, with the
+        // approval, the journal and the receipt all naming the wrong bytes.
+        // The comparison is BEFORE the put: a run that stops here has
+        // changed nothing on the host.
+        if let Some(expected) = &action.expected_sha256 {
+            let here = format!("sha256:{}", crate::ids::sha256_hex(&bytes));
+            if &here != expected {
+                bail!(
+                    "{} hashes to {here} and this plan was made for {expected}. The file \
+                     changed after the plan was written; make it again.",
+                    source.display()
+                );
+            }
+        }
+        // --- end lane 3B ---
 
         let put = self.ssh.put(
             &target,

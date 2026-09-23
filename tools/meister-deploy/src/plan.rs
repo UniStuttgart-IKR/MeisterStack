@@ -470,6 +470,30 @@ pub struct Action {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_boot: Option<crate::release::DirectBoot>,
     // --- end lane 3-integration -------------------------------------------
+
+    // --- lane 3B: what a delivery is made of ------------------------------
+    /// The digest of the file a `deliver-secret` step was planned with.
+    ///
+    /// Astra finding F10, 2026-09-23: the step used to say only
+    /// `<id> at <path>`, and the executor re-read the operator's file and
+    /// then checked the host's copy against whatever that file now held. So
+    /// a plan made with the certificate C1 delivered C2, or a plan made with
+    /// one revocation list delivered an older one, under its own `plan_id` --
+    /// and the approval bound to that id, the journal and the receipt all
+    /// named bytes nobody had looked at. A rotation has been bound to its
+    /// file this way from the start (`KeyRotation::cert_sha256`); this is
+    /// the ordinary delivery catching up with it.
+    ///
+    /// PUBLIC files only: a certificate, a CA bundle, a revocation list. A
+    /// private file is compared by existence and nothing else
+    /// (`crate::pki::needs_delivery`), so no digest of a key is written into
+    /// a plan that goes on disk.
+    ///
+    /// Absent -- not null -- on every other step, so a plan without deliveries
+    /// hashes to exactly what it hashed to before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sha256: Option<String>,
+    // --- end lane 3B ------------------------------------------------------
 }
 
 impl Action {
@@ -3540,6 +3564,7 @@ struct StepSpec {
     desired: Option<String>,
     disruption: Disruption,
     preconditions: Vec<String>,
+    expected_sha256: Option<String>,
 }
 
 fn step(kind: ActionKind, disruption: Disruption) -> StepSpec {
@@ -3549,6 +3574,7 @@ fn step(kind: ActionKind, disruption: Disruption) -> StepSpec {
         desired: None,
         disruption,
         preconditions: Vec::new(),
+        expected_sha256: None,
     }
 }
 
@@ -3570,6 +3596,13 @@ impl StepSpec {
 
     fn because(mut self, why: impl Into<String>) -> StepSpec {
         self.preconditions.push(why.into());
+        self
+    }
+
+    /// Astra finding F10, 2026-09-23: bind this step to the bytes it was
+    /// planned with, for the steps that have a digest to be bound to.
+    fn of_bytes(mut self, digest: Option<String>) -> StepSpec {
+        self.expected_sha256 = digest;
         self
     }
 }
@@ -3726,6 +3759,19 @@ fn steps_for(
                         .flatten(),
                 )
                 .to(format!("{} at {}", secret.id, secret.target_path))
+                // --- lane 3B: Astra finding F10, 2026-09-23 ---
+                // The planner already read this file to decide the step, so
+                // the digest it decided on travels with the step. `want` is
+                // the word `crate::pki::expected_for_host` wrote down: a
+                // `sha256:...` for a public file, `present` for a private one,
+                // `unreadable` for a file that is there and cannot be read.
+                // Only the first of those three is a binding, which is also
+                // how a private key stays out of a plan on disk.
+                .of_bytes(
+                    want.filter(|w| w.starts_with("sha256:"))
+                        .map(|w| w.to_string()),
+                )
+                // --- end lane 3B ---
                 .because(match seen.flatten() {
                     Some(None) | None => format!(
                         "{id} has no {} and the fleet says it needs one",
@@ -4021,6 +4067,15 @@ fn steps_for(
                 None
             },
             // --- end lane 3-integration ---
+            // --- lane 3B: Astra finding F10, 2026-09-23 ---
+            // Only a delivery carries one, and only when the planner had a
+            // digest of its own to write down.
+            expected_sha256: if spec.kind == ActionKind::DeliverSecret {
+                spec.expected_sha256
+            } else {
+                None
+            },
+            // --- end lane 3B ---
         });
     }
     (actions, needed)
@@ -4429,38 +4484,84 @@ pub fn validate_against_next(
         let Some(current) = now_groups.get(id) else {
             continue;
         };
-        // --- lane L4 ---
-        // A group that is HEALTHIER than the plan assumed has not moved under
-        // it — it moved the way the plan meant it to. This guard exists to
-        // catch a NEW outage, and `blocked` is a derived word: during the
-        // bootstrap of a three-member raft it flips from "not blocked" (no
-        // member was up, nothing to protect) to "blocked" (two are up and the
-        // third is not) purely because the rollout is working. Measured in the
-        // lab on 2026-09-23: the run stopped after its second member came up,
-        // every time, with "group cp is at 2 of 3 … It could when this plan
-        // was made."
+        // --- lane L4, reworked for Astra finding F01, 2026-09-23 ---
+        // Astra finding F01, 2026-09-23: the question this re-check has to
+        // answer is not "are more members down than the plan assumed" but
+        // "can this group still afford what is about to be done to it", and
+        // a count made those two one question when they are two. Take a raft
+        // a, b, c planned while a was down: the plan is FOR a, because the
+        // one host a degraded group needs a plan for is the one that is down
+        // (see `already_unavailable`). If a comes back and b falls over
+        // before the run, exactly as many members are down as the plan wrote
+        // down and none of the safety is left -- the step would interrupt a,
+        // which is now one of the two that serve, and leave c alone with
+        // itself. The old guard read the equal count and skipped the whole
+        // group, `current.blocked` included.
         //
-        // So the comparison is over the NUMBER of members that are down, and
-        // only an increase is the fleet moving under the plan.
-        if current.unhealthy_now <= planned.unhealthy_now {
+        // So the verdict is about the members this run may still disrupt. A
+        // member that is unavailable right now does not become more so by
+        // being worked on, and that exemption is also what keeps a bootstrap
+        // running: once two of three are up the group reads `blocked`, and
+        // the third member -- the one the wave is for -- is still allowed.
+        // Measured in the lab on 2026-09-23 (lane L4): without it every
+        // three-member bootstrap stopped after its second member came up,
+        // with "group cp is at 2 of 3 ... It could when this plan was made."
+        let members: &[String] = release
+            .resolved_fleet
+            .groups
+            .get(id)
+            .map(|g| g.members.as_slice())
+            .unwrap_or_default();
+        // Does working on this host cost the group an available member?
+        let costs_a_member =
+            |host: &str| !(current.kind == GroupKind::Raft && already_unavailable(fresh, host));
+        // The executor names the host that is next, and then that step is
+        // the only disruption in flight. `validate_against` is told no such
+        // host, so it asks the same of every member this plan takes forward
+        // -- a member it blocked, or one it found settled, disrupts nobody.
+        let imminent: Option<&str> =
+            next.filter(|host| members.iter().any(|m| m.as_str() == *host));
+        let disrupts_a_serving_member = match imminent {
+            Some(host) => costs_a_member(host),
+            None => members.iter().any(|m| {
+                plan.selection.targets.iter().any(|t| t == m)
+                    && plan.hosts.get(m).map(|h| h.verdict) == Some(HostVerdict::Change)
+                    && costs_a_member(m.as_str())
+            }),
+        };
+        if !disrupts_a_serving_member {
             continue;
         }
-        let its_own_absence = next.is_some_and(|host| {
-            current.kind == GroupKind::Raft
-                && release
-                    .resolved_fleet
-                    .groups
-                    .get(id)
-                    .is_some_and(|g| g.members.iter().any(|m| m == host))
-                && already_unavailable(fresh, host)
-        });
-        if its_own_absence {
-            continue;
-        }
-        if planned.blocked.is_none()
-            && let Some(why) = &current.blocked
-        {
-            stop.push(format!("{why} It could when this plan was made."));
+        let group_moved = match &current.blocked {
+            // The plan was made over a group that could afford this.
+            Some(why) if planned.blocked.is_none() => {
+                Some(format!("{why} It could when this plan was made."))
+            }
+            // It could not, and in a raft group that was blocked already the
+            // only reason this plan may act at all is that the host it is
+            // for was the member that was down (`blocked_by`). That is not
+            // true any more -- and "it could when this plan was made" would
+            // be a sentence that is not true either.
+            Some(why) if current.kind == GroupKind::Raft => Some(match imminent {
+                Some(host) => format!(
+                    "{why} This plan may work on {host} only because {host} was itself the \
+                     member that was down when it was made, and {host} is serving now."
+                ),
+                None => format!(
+                    "{why} It was blocked when this plan was made as well, and the member(s) \
+                     it may still take forward are serving now rather than down."
+                ),
+            }),
+            // Anything else is a group that was blocked when the plan was
+            // made and is blocked now for a reason that cannot have moved --
+            // a `rollout.max_unavailable` of 0 is the whole of it outside a
+            // raft. The plan wrote that down and blocked the steps it
+            // forbids; stopping the rest of the run over it again is what
+            // makes a fleet unrollable.
+            _ => None,
+        };
+        if let Some(line) = group_moved {
+            stop.push(line);
         } else if current.allowed_unavailable < planned.allowed_unavailable {
             stop.push(format!(
                 "group {id} could afford to lose {} member(s) when this plan was made and can \
@@ -4755,6 +4856,89 @@ mod tests {
         // Tier order: the thing that is talked TO comes first in a
         // bootstrap.
         assert!(plan.hosts["box"].wave < plan.hosts["n1"].wave);
+    }
+
+    /// A delivery says WHICH bytes, and a private file still says nothing.
+    ///
+    /// Astra finding F10, 2026-09-23: the step used to carry only
+    /// `<id> at <path>`, and the executor then checked the host's copy
+    /// against a file it had just re-read -- which always agreed. The digest
+    /// the planner decided the step from travels with the step now, so the
+    /// executor can refuse a file that changed underneath it. Only public
+    /// files have one: a digest of a private key is not something this tool
+    /// writes into a plan that goes on disk.
+    #[test]
+    fn a_delivery_names_the_bytes_it_was_planned_with_and_round_trips() {
+        let base = onebox_enrolled();
+        let running = release_of(base.clone());
+        let mut observation = observed(&running, at(TAKEN));
+        for host in observation.hosts.values_mut() {
+            host.credentials.values_mut().for_each(|v| *v = None);
+        }
+        let release = with_new_systems(base, &["n1"], false);
+        let mut expected = expected_credentials(&release.resolved_fleet);
+        let digest = format!("sha256:{}", crate::ids::sha256_hex(b"a new authority\n"));
+        for secrets in expected.values_mut() {
+            if let Some(value) = secrets.get_mut("ca-bundle") {
+                *value = digest.clone();
+            }
+        }
+        let policy = plan_policy(PlanKind::Upgrade).with_expected_credentials(expected);
+        let plan = plan(&release, "all", &observation, None, &policy, at(NOW)).unwrap();
+
+        let mut public = 0;
+        let mut private = 0;
+        for action in &plan.actions {
+            if action.kind != ActionKind::DeliverSecret {
+                // And no other step gains the field.
+                assert!(action.expected_sha256.is_none(), "{:?}", action.kind);
+                continue;
+            }
+            let what = action.desired.clone().unwrap_or_default();
+            if what.starts_with("ca-bundle ") {
+                assert_eq!(action.expected_sha256.as_deref(), Some(digest.as_str()));
+                public += 1;
+            } else {
+                // `box` is handed `serving.key`, which is not a certificate
+                // and is compared by existence alone.
+                assert!(
+                    action.expected_sha256.is_none(),
+                    "a private file carries no digest: {what} {action:?}"
+                );
+                private += 1;
+            }
+        }
+        assert_eq!(
+            public, 3,
+            "every host of the fixture gets the new CA bundle"
+        );
+        assert!(private > 0, "and one of them a private file as well");
+
+        // It survives the file the plan is written to, and the id covers it.
+        let text = String::from_utf8(plan.to_json().unwrap()).unwrap();
+        assert!(text.contains(&digest), "{text}");
+        let back = DeploymentPlan::from_json(&text, "the round trip").expect("it parses back");
+        assert_eq!(back, plan);
+        assert!(back.id_matches().unwrap());
+    }
+
+    /// A plan that delivers nothing gains no field and keeps its id.
+    ///
+    /// Astra finding F10, 2026-09-23: the digest is absent rather than null
+    /// everywhere else, so adding it did not rename every plan in every
+    /// operator's repository.
+    #[test]
+    fn a_plan_without_a_delivery_hashes_to_what_it_always_did() {
+        let (release, observation) = upgrade(&["n1"], false);
+        let plan = planned(&release, "host=n1", &observation);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| a.kind == ActionKind::DeliverSecret)
+        );
+        let text = String::from_utf8(plan.to_json().unwrap()).unwrap();
+        assert!(!text.contains("expected_sha256"), "{text}");
     }
 
     /// The same fleet, already running: the wanted state and the seen state
@@ -6974,12 +7158,31 @@ mod tests {
             views["cloud"].blocked.is_some(),
             "two of three is a degraded quorum, and it says so"
         );
+        // Astra finding F01, 2026-09-23: this used to be asked of the whole
+        // plan, because the exemption was "fewer members are down than the
+        // plan assumed" -- a count. A count cannot tell an outage that moved
+        // from one that healed, so the exemption is now the host that is
+        // NEXT, which is what the lab measured: the third member of the
+        // bootstrap, the one the wave is for, is the one that must get
+        // through.
+        assert!(
+            matches!(
+                validate_against_next(&plan, &release, &better, at(NOW), Some("cloud-c")),
+                Verdict::Proceed
+            ),
+            "the member this wave is for is the member that is down; working on it costs \
+             the group nothing"
+        );
+        // And asked WITHOUT a next host the same snapshot stops, which is
+        // the honest answer: this plan also means to activate cloud-a and
+        // cloud-b, and those two are what the quorum now protects.
         assert!(
             matches!(
                 validate_against(&plan, &release, &better, at(NOW)),
-                Verdict::Proceed
+                Verdict::Stop { .. }
             ),
-            "a group with FEWER members down than the plan assumed has not moved under it"
+            "a plan that still means to interrupt the two members that serve is not the \
+             truth about this fleet any more"
         );
 
         // And the other direction is unchanged: a group that got worse stops
@@ -7671,6 +7874,116 @@ mod tests {
                 .any(|r| r.contains("It could when this plan was made")),
             "{:?}",
             verdict.reasons()
+        );
+    }
+
+    /// Move an outage inside a raft group: one member stops answering etcd
+    /// or starts again, in the snapshot and in what the others report.
+    fn etcd_health(observation: &mut Observations, id: &str, healthy: bool) {
+        observation
+            .hosts
+            .get_mut(id)
+            .expect("a member")
+            .etcd
+            .as_mut()
+            .expect("a raft member")
+            .healthy = healthy;
+        for other in observation.hosts.values_mut() {
+            if let Some(etcd) = other.etcd.as_mut() {
+                for m in &mut etcd.members {
+                    if m.name == id {
+                        m.healthy = healthy;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_outage_that_moved_to_another_member_stops_the_run() {
+        // Astra finding F01, 2026-09-23: the plan is made while cloud-c is
+        // down, so cloud-c is the host it is FOR (W8). Before it runs,
+        // cloud-c comes back and cloud-a falls over. The NUMBER of members
+        // that are down has not changed, and everything the plan relied on
+        // has: its one step would now interrupt cloud-c, which is serving,
+        // and leave cloud-a and cloud-b to hold a quorum of two that is
+        // already one short.
+        let (release, planned_obs) = three_member_cloud(1);
+        let plan = planned(&release, "group=cloud", &planned_obs);
+        assert_eq!(plan.groups["cloud"].unhealthy_now, 1);
+        assert!(plan.groups["cloud"].blocked.is_some());
+        assert_eq!(plan.hosts["cloud-c"].verdict, HostVerdict::Change);
+        assert_eq!(plan.hosts["cloud-a"].verdict, HostVerdict::Blocked);
+
+        let mut fresh = planned_obs.clone();
+        etcd_health(&mut fresh, "cloud-c", true);
+        etcd_health(&mut fresh, "cloud-a", false);
+        let (views, _) = group_views(
+            &release.resolved_fleet,
+            &fresh,
+            &plan.selection.targets.iter().cloned().collect(),
+        );
+        assert_eq!(
+            views["cloud"].unhealthy_now, 1,
+            "exactly as many members are down as when the plan was made"
+        );
+
+        let verdict = validate_against_next(&plan, &release, &fresh, later(), Some("cloud-c"));
+        assert!(matches!(verdict, Verdict::Stop { .. }), "{verdict:?}");
+        let said = verdict.reasons().join(" ");
+        assert!(said.contains("group cloud"), "{said}");
+        assert!(said.contains("cloud-c is serving now"), "{said}");
+    }
+
+    #[test]
+    fn the_member_that_is_down_now_is_still_worked_on() {
+        // Astra finding F01, 2026-09-23, the other half: the same moved
+        // outage, asked about the member that is down NOW. Working on a host
+        // that is already unavailable costs the group nothing, so this is
+        // the one step the fleet can still afford -- and refusing it is the
+        // deadlock W8 is about.
+        let (release, planned_obs) = three_member_cloud(1);
+        let plan = planned(&release, "group=cloud", &planned_obs);
+        let mut fresh = planned_obs.clone();
+        etcd_health(&mut fresh, "cloud-c", true);
+        etcd_health(&mut fresh, "cloud-a", false);
+        let verdict = validate_against_next(&plan, &release, &fresh, later(), Some("cloud-a"));
+        assert_eq!(verdict, Verdict::Proceed, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_bootstrap_still_gets_to_its_third_member() {
+        // Astra finding F01, 2026-09-23, against lane L4: the guard that
+        // catches the moved outage must not catch this. Three fresh members
+        // are planned while none of them serves; by the time the third wave
+        // comes round two are up, the group reads `blocked`, and the third
+        // member -- the one that wave is for -- is still unavailable and
+        // must go through. This is the lab measurement of 2026-09-23.
+        let (release, planned_obs) = three_member_cloud(3);
+        let plan = planned(&release, "group=cloud", &planned_obs);
+        assert!(plan.groups["cloud"].blocked.is_none());
+        let (_, two_up) = three_member_cloud(1);
+        let verdict = validate_against_next(&plan, &release, &two_up, later(), Some("cloud-c"));
+        assert_eq!(verdict, Verdict::Proceed, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_group_that_got_healthier_stops_nothing() {
+        // Astra finding F01, 2026-09-23: the check is about what the group
+        // can afford now, so a group that can afford MORE than the plan
+        // assumed is not the fleet moving under the plan -- not even when
+        // the host that is next is one of the members that came back.
+        let (release, planned_obs) = three_member_cloud(1);
+        let plan = planned(&release, "group=cloud", &planned_obs);
+        assert_eq!(plan.groups["cloud"].allowed_unavailable, 0);
+        let (_, healthy) = three_member_cloud(0);
+        for next in ["cloud-a", "cloud-c"] {
+            let verdict = validate_against_next(&plan, &release, &healthy, later(), Some(next));
+            assert_eq!(verdict, Verdict::Proceed, "{next}: {verdict:?}");
+        }
+        assert_eq!(
+            validate_against(&plan, &release, &healthy, later()),
+            Verdict::Proceed
         );
     }
 

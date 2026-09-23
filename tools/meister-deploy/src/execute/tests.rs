@@ -1837,7 +1837,17 @@ fn delivering() -> (Fixture, String) {
         .get_mut("n1")
         .expect("n1 is in the fixture");
     n1.credentials.insert("ca-bundle".to_string(), None);
-    let expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
+    let contents = "a certificate authority\n".to_string();
+    let mut expected = crate::fixtures::expected_credentials(&release.resolved_fleet);
+    // Astra finding F10, 2026-09-23: the planner writes down the digest of
+    // the file it decided the step from, and the step carries it. The shared
+    // fixture uses the word `fingerprint-of-<id>` for a public file, which is
+    // not a digest and binds nothing, so this one host's CA bundle gets the
+    // real one -- what an operator's plan holds.
+    expected.entry("n1".to_string()).or_default().insert(
+        "ca-bundle".to_string(),
+        format!("sha256:{}", crate::ids::sha256_hex(contents.as_bytes())),
+    );
     let plan = plan(
         &release,
         "host=n1",
@@ -1847,7 +1857,6 @@ fn delivering() -> (Fixture, String) {
         at(NOW),
     )
     .expect("the fixture plans");
-    let contents = "a certificate authority\n".to_string();
     let fx = Fixture {
         release,
         plan,
@@ -2030,6 +2039,58 @@ fn a_digest_the_host_does_not_agree_with_fails_the_step() {
     assert_ne!(applied.receipt.outcome, Outcome::Success);
     let why = applied.stopped.unwrap_or_default();
     assert!(why.contains("Something is between the two"), "{why}");
+}
+
+/// The plan named the bytes, and the file on the workstation is not those
+/// bytes any more.
+///
+/// Astra finding F10, 2026-09-23: a `deliver-secret` step used to say only
+/// "<id> at <path>", so the executor re-read the operator's file and checked
+/// the host's copy against whatever it had just read -- which always agreed.
+/// A certificate re-issued, or a revocation list rolled back, between the
+/// plan and the run was therefore delivered under the plan_id of a plan that
+/// was about a different file. A rotation has refused this from the start;
+/// so does an ordinary delivery now, with the same sentence and before
+/// anything is sent.
+#[test]
+fn a_deliver_of_a_file_that_changed_after_the_plan_is_refused() {
+    let (fx, planned_contents) = delivering();
+    let swapped = "a DIFFERENT certificate authority\n";
+    let fx = Fixture {
+        files: MemFiles::new().given("/ca/ca.crt", swapped),
+        ..fx
+    };
+    let look = TableLook::new(&fx);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok()),
+        &look,
+    );
+    let applied = fx
+        .executor(&runner, &look, deliver_options(&fx))
+        .run()
+        .expect("the run ends with a receipt");
+    runner.verify().expect("nothing was put anywhere");
+    assert_ne!(applied.receipt.outcome, Outcome::Success);
+    let why = applied.stopped.unwrap_or_default();
+    assert!(why.contains("/ca/ca.crt"), "{why}");
+    assert!(why.contains("changed after the plan was written"), "{why}");
+    // Both digests stand in the sentence: what is there and what was planned.
+    assert!(
+        why.contains(&format!(
+            "sha256:{}",
+            crate::ids::sha256_hex(swapped.as_bytes())
+        )),
+        "{why}"
+    );
+    assert!(
+        why.contains(&format!(
+            "sha256:{}",
+            crate::ids::sha256_hex(planned_contents.as_bytes())
+        )),
+        "{why}"
+    );
 }
 
 /// A key the target made itself is never sent, whatever a plan says. The
