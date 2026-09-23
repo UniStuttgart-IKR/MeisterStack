@@ -697,14 +697,16 @@ struct InstallArgs {
 
 #[derive(Args)]
 struct ApplyArgs {
-    /// The plan from `plan`
+    /// The plan from `plan`. Optional with `--resume`, which reads the
+    /// copy the run itself wrote.
     #[arg(long)]
-    plan: PathBuf,
+    plan: Option<PathBuf>,
 
-    /// The release the plan was made for. Required and checked: a plan
-    /// names the bytes it is about, and another build is another plan.
+    /// The release the plan was made for. Checked: a plan names the bytes
+    /// it is about, and another build is another plan. Optional with
+    /// `--resume`, for the same reason as `--plan`.
     #[arg(long)]
-    release: PathBuf,
+    release: Option<PathBuf>,
 
     /// `--approve <class>=<plan_id>`, once per class the plan asks for.
     /// The id is the plan's own, so an approval cannot be carried over
@@ -2428,17 +2430,61 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
     };
     let files = RealFiles::new(policy);
 
-    let text = files.read_to_string(&args.plan)?;
-    let the_plan = plan::DeploymentPlan::from_json(&text, &args.plan.display().to_string())?;
-    let text = files.read_to_string(&args.release)?;
-    let release = ReleaseManifest::from_json(&text, &args.release.display().to_string())?;
+    // --- lane 5C ---
+    // Where the two documents come from. Named on the command line, or —
+    // with `--resume` and nothing named — out of the run's own directory,
+    // where `apply` put them when the run began.
+    //
+    // The lab needed this (finding N10): a run stopped, the operator built
+    // again over the same `--out` file, and the release the run had acted
+    // on was gone. There was no supported way to continue it.
+    let (plan_path, release_path) = match (&args.plan, &args.release, &args.resume) {
+        (Some(plan), Some(release), _) => (plan.clone(), release.clone()),
+        (None, None, Some(run)) => {
+            let repo = args.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+            let state = StateDir::in_repo(&repo);
+            let plan = state.plan_copy_path(run);
+            let release = state.release_copy_path(run);
+            for (what, path) in [("plan", &plan), ("release", &release)] {
+                if !files.exists(path) {
+                    anyhow::bail!(
+                        "the run {run} has no copy of its {what} in {}. Name the file with \
+                         --{what}; a run that began before this tool kept the release beside \
+                         the plan has only the one the operator still holds.",
+                        path.display()
+                    );
+                }
+            }
+            eprintln!(
+                "==> resuming from {} and {}",
+                plan.display(),
+                release.display()
+            );
+            (plan, release)
+        }
+        (plan, release, _) => anyhow::bail!(
+            "apply needs a plan and the release it was made for. {} Pass both, or pass \
+             `--resume <run-id>` alone and let the run's own directory answer.",
+            match (plan.is_some(), release.is_some()) {
+                (true, false) => "--release is missing.",
+                (false, true) => "--plan is missing.",
+                _ => "Neither was named and this is not a resume.",
+            }
+        ),
+    };
+    // --- end lane 5C ---
+
+    let text = files.read_to_string(&plan_path)?;
+    let the_plan = plan::DeploymentPlan::from_json(&text, &plan_path.display().to_string())?;
+    let text = files.read_to_string(&release_path)?;
+    let release = ReleaseManifest::from_json(&text, &release_path.display().to_string())?;
     if release.release_id != the_plan.release_id {
         anyhow::bail!(
             "{} was made for the release {} and {} is {}. A plan names the bytes it was made \
              for; another build is another plan.",
-            args.plan.display(),
+            plan_path.display(),
             the_plan.release_id,
-            args.release.display(),
+            release_path.display(),
             release.release_id
         );
     }

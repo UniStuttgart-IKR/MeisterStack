@@ -115,6 +115,23 @@ impl StateDir {
         self.run_dir(run_id).join("plan.json")
     }
 
+    // --- lane 5C ---
+    /// The release the plan was made for, copied in beside it.
+    ///
+    /// A plan names a `release_id` and `apply --resume` needs the release
+    /// itself: the store paths, the nar hashes, the direct-boot bundles.
+    /// Until this existed, the only copy was wherever the operator had put
+    /// `--out`, and a second `build` over the same file took it away — so
+    /// an interrupted run could not be continued at all, and `--resume`
+    /// answered "A resume continues the run it was, not a different
+    /// rollout with the same id." (lab lane L2, 2026-09-23). The run
+    /// directory is the evidence of a run, and the bytes it acted on are
+    /// part of that evidence.
+    pub fn release_copy_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("release.json")
+    }
+    // --- end lane 5C ---
+
     // --- lane 4B: what a verification leaves behind -------------------
     //
     // Beside the journal and the receipt of a rollout, in the same run

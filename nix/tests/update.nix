@@ -31,6 +31,27 @@ let
   keys = import "${nixpkgs}/nixos/tests/ssh-keys.nix" pkgs;
   inventoryLib = import ../lib/inventory.nix { inherit lib; };
 
+  # --- lane 5C ---
+  # A path nobody signed, for the half of the cache claim that is about
+  # refusal.
+  #
+  # It has to be INPUT-addressed. `nix-store --add`, which this test used
+  # until 2026-09-23, makes a CONTENT-addressed path, and nix takes one of
+  # those out of any cache without a signature — it can check the hash
+  # itself, so there is nothing for a signature to add. The test therefore
+  # asserted a refusal that nix has no reason to make, and the first real
+  # run of it said so ("unexpectedly succeeded").
+  #
+  # A bare `derivation` and not `runCommand`: the whole build input is one
+  # bash, which the operator's own system closure already carries.
+  notSigned = derivation {
+    name = "not-signed";
+    inherit system;
+    builder = "${pkgs.bash}/bin/bash";
+    args = [ "-c" "echo not-signed > $out" ];
+  };
+  # --- end lane 5C ---
+
   # The inventory of this two-host fleet. One host, `target`, at the address
   # the test framework gives the second node.
   # `builtins.toFile` and not `pkgs.writeText`: the inventory is READ during
@@ -193,6 +214,12 @@ pkgs.testers.runNixOSTest {
         pkgs.cloud-hypervisor-meister.drvPath
         pkgs.guest-tiny
         pkgs.guest-tiny.drvPath
+        # --- lane 5C: the unsigned path, on the OPERATOR only ---
+        # Declared here and nowhere else: `additionalPaths` registers a
+        # path in the node that names it, so the target's database does
+        # not have it and the only road into that database is the cache.
+        notSigned
+        # --- end lane 5C ---
       ];
       environment.etc."vm-fleet/fleet.toml".source = fleetToml;
       # A manifest says what its inputs were locked to. This repository has
@@ -499,10 +526,9 @@ pkgs.testers.runNixOSTest {
     # an UNSIGNED path out of the same cache is refused by the same store.
     # `nix store sign` writes into the local store only, so a path the
     # release never signed and that was pushed anyway is exactly that case.
-    # `nix-store --add` and not `nix store add-path`, which is a deprecated
-    # alias in 2.35 and prints a warning this test would have to filter.
-    operator.succeed("echo not-signed > /root/unsigned.txt")
-    unsigned = operator.succeed("nix-store --add /root/unsigned.txt").strip()
+    # The path is input-addressed on purpose — see `notSigned` above, and
+    # the measurement that put it there (lane 5C).
+    unsigned = "${notSigned}"
     operator.succeed(f"nix copy --to '{CACHE}' {unsigned}")
     refused = target.fail(f"nix copy --from http://192.168.1.1:8080 {unsigned} 2>&1")
     assert "signature" in refused, refused

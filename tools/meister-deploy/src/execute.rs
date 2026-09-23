@@ -362,6 +362,17 @@ impl<'a> Executor<'a> {
                 &self.plan.to_json()?,
                 0o644,
             )?;
+            // --- lane 5C ---
+            // And the release with it. A resume needs the store paths and
+            // the nar hashes the plan only names by id, and the operator's
+            // own `--out` file is a file the next `build` overwrites (L2
+            // finding N10).
+            self.files.write_atomic(
+                &self.state.release_copy_path(&self.options.run_id),
+                &self.release.to_json()?,
+                0o644,
+            )?;
+            // --- end lane 5C ---
             (
                 Journal::new(
                     journal_path.clone(),
