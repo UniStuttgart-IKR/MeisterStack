@@ -1730,6 +1730,107 @@ pub fn hardware_verdict(
     v
 }
 
+/// Every systemd unit a MeisterStack module declares, by name.
+///
+/// The list is a constant and not a prefix rule, because half of these are
+/// not called `meister-*`: `etcd`, `alloy` and the six addons are upstream
+/// NixOS services that `nix/{etcd,observability,addons}.nix` configure, and
+/// an operator's own `etcd.service` would be a different thing with the
+/// same name (which is exactly why the test below holds the constant
+/// against a real manifest instead of trusting this comment).
+///
+/// Sorted, so that a reader of the file and a reader of the diff see the
+/// same order.
+pub const STACK_UNITS: &[&str] = &[
+    "alloy.service",
+    "etcd.service",
+    "garage.service",
+    "grafana.service",
+    "kanidm-provision.service",
+    "kanidm.service",
+    "loki.service",
+    "meister-addons-dirs.service",
+    "meister-agent.service",
+    "meister-cloud-controller.service",
+    "meister-cluster-controller.service",
+    "meister-context.service",
+    "prometheus.service",
+    "tempo.service",
+];
+
+/// What this release brings to a host that this tool cannot model.
+///
+/// The useful question is the DIFF BETWEEN TWO GENERATIONS and not a diff
+/// against an allowlist (lane 4C measured why: of the seventy-five units an
+/// agent's generation carries, exactly one is ours — the other
+/// seventy-four are NixOS' own, and "everything that is not meister" would
+/// be seventy-four unknowns per host, every run, for ever).
+///
+/// So: the units the release builds, minus the units the running
+/// generation already has, minus the ones this stack declares itself. What
+/// is left is a unit an operator's own module brings with this release, and
+/// what it does when it starts or restarts is not something a plan can
+/// predict.
+///
+/// Two limits, both deliberate and both in the report:
+///
+/// * A unit BOTH generations have can still have changed its contents. The
+///   manifest carries names and not texts (4C: the texts would be a
+///   megabyte of shell in a file that is committed and diffed), so this
+///   sees what appears and not what changed.
+/// * A unit the previous generation had and this one drops cannot be named.
+///   The probe lists the whole unit directory of the running system, which
+///   also holds the units systemd's own package ships, while the manifest
+///   lists only what NixOS was configured with — so a name in the first and
+///   not in the second is usually an upstream unit and not a removal. One
+///   side of the diff is sound; the other would be a guess.
+fn operator_unit_unknowns(
+    id: &str,
+    host: &crate::manifest::ResolvedHost,
+    obs: &crate::observation::HostObservation,
+) -> Vec<Unknown> {
+    if host.units.is_empty() {
+        // A manifest from before this field existed, or a host nothing was
+        // evaluated for. Silence is right: there is nothing to diff.
+        return Vec::new();
+    }
+    if obs.generation_units.is_empty() {
+        // Not "everything is new". A probe that could not list the
+        // directory has said nothing about it, and turning that into one
+        // unknown per unit would bury the plan.
+        return vec![Unknown {
+            host: Some(id.to_string()),
+            reason: format!(
+                "nobody could list the units {id} is running, so which of the {} unit(s) of \
+                 this release are new on it is not known.",
+                host.units.len()
+            ),
+        }];
+    }
+    let running: BTreeSet<&str> = obs.generation_units.iter().map(String::as_str).collect();
+    let arriving: Vec<&str> = host
+        .units
+        .iter()
+        .map(String::as_str)
+        .filter(|unit| !running.contains(unit))
+        .filter(|unit| !STACK_UNITS.contains(unit))
+        .collect();
+    if arriving.is_empty() {
+        return Vec::new();
+    }
+    // One entry per HOST and not per unit: ten new units on one machine is
+    // one thing to look at, and ten sentences that differ in one word is a
+    // plan nobody reads to the end.
+    vec![Unknown {
+        host: Some(id.to_string()),
+        reason: format!(
+            "operator-owned unit(s) {} change with this release on {id}; their effect is not \
+             modelled.",
+            arriving.join(", ")
+        ),
+    }]
+}
+
 fn addresses(devices: &[crate::observation::PciDevice]) -> String {
     if devices.is_empty() {
         return "nothing".to_string();
@@ -2148,6 +2249,10 @@ fn decide_host(
             ),
         });
     }
+
+    // --- lane 4A: the units the operator owns -----------------------------
+    d.unknowns.extend(operator_unit_unknowns(id, host, obs));
+    // --- end lane 4A ---
 
     // --- lane 3B: a file that is not what it should be ------------------
     //
@@ -5202,6 +5307,154 @@ mod tests {
                 .any(|p| p.contains(&declared.mac)),
             "{:?}",
             action(&plan, "n1", ActionKind::Preflight).preconditions
+        );
+    }
+
+    // --- lane 4A: the units the operator owns -------------------------------
+
+    #[test]
+    fn the_units_this_stack_owns_are_the_ones_a_role_adds() {
+        // The constant, held against a real manifest rather than against
+        // this file: `box` carries four roles and `n1` one, so every unit
+        // `box` has and `n1` has not is a unit some MeisterStack module
+        // brought. If a module ever grows a unit and nobody adds it here,
+        // this test names it.
+        let fleet = crate::fixtures::onebox();
+        let box_units: BTreeSet<&str> = fleet.hosts["box"]
+            .units
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let agent_units: BTreeSet<&str> =
+            fleet.hosts["n1"].units.iter().map(String::as_str).collect();
+        let added: Vec<&str> = box_units.difference(&agent_units).copied().collect();
+        assert!(!added.is_empty(), "the fixture has two host shapes");
+        for unit in &added {
+            assert!(
+                STACK_UNITS.contains(unit),
+                "{unit} is what a MeisterStack role adds and STACK_UNITS does not name it"
+            );
+        }
+        // And the one unit both shapes share from this stack is named too.
+        assert!(STACK_UNITS.contains(&"meister-agent.service"));
+    }
+
+    #[test]
+    fn a_unit_this_tool_does_not_know_is_an_unknown_once_per_host() {
+        let (release, observation) = upgrade(&["n1"], false);
+        let mut release = release;
+        let host = release.resolved_fleet.hosts.get_mut("n1").unwrap();
+        host.units.push("node-exporter.service".to_string());
+        host.units.push("operator-backup.timer".to_string());
+        host.units.sort();
+        let plan = planned(&release, "host=n1", &observation);
+        let ours: Vec<&Unknown> = plan
+            .unknowns
+            .iter()
+            .filter(|u| u.reason.contains("operator-owned unit"))
+            .collect();
+        assert_eq!(ours.len(), 1, "one entry per host, not per unit: {ours:?}");
+        assert_eq!(ours[0].host.as_deref(), Some("n1"));
+        assert!(ours[0].reason.contains("node-exporter.service"), "{ours:?}");
+        assert!(ours[0].reason.contains("operator-backup.timer"), "{ours:?}");
+        assert!(ours[0].reason.contains("is not modelled"), "{ours:?}");
+        // An unknown is not a refusal: the plan still rolls.
+        assert_eq!(plan.hosts["n1"].verdict, HostVerdict::Change);
+    }
+
+    #[test]
+    fn a_unit_the_host_already_runs_is_not_new_and_a_unit_of_ours_is_never_an_unknown() {
+        let (release, observation) = upgrade(&["n1"], false);
+        let mut release = release;
+        let host = release.resolved_fleet.hosts.get_mut("n1").unwrap();
+        // One the machine already has, one of ours that it has not.
+        host.units.push("node-exporter.service".to_string());
+        host.units.push("alloy.service".to_string());
+        host.units.sort();
+        let mut observation = observation;
+        observation
+            .hosts
+            .get_mut("n1")
+            .unwrap()
+            .generation_units
+            .push("node-exporter.service".to_string());
+        let plan = planned(&release, "host=n1", &observation);
+        assert!(
+            !plan
+                .unknowns
+                .iter()
+                .any(|u| u.reason.contains("operator-owned unit")),
+            "{:?}",
+            plan.unknowns
+        );
+    }
+
+    #[test]
+    fn a_generation_whose_units_nobody_could_list_is_one_unknown_and_not_seventy() {
+        // 4C's warning made into a test: "everything that is not meister"
+        // over an empty list would be one unknown per unit, every run.
+        let (release, observation) = upgrade(&["n1"], false);
+        let mut observation = observation;
+        observation
+            .hosts
+            .get_mut("n1")
+            .unwrap()
+            .generation_units
+            .clear();
+        let plan = planned(&release, "host=n1", &observation);
+        let ours: Vec<&Unknown> = plan
+            .unknowns
+            .iter()
+            .filter(|u| u.reason.contains("units"))
+            .collect();
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        assert!(ours[0].reason.contains("nobody could list"), "{ours:?}");
+    }
+
+    #[test]
+    fn a_multi_role_host_is_one_interruption_and_not_two() {
+        // 2B has the rule; this is the evidence at the waves and at the
+        // approvals, which is where an operator meets it. `box` carries
+        // cloud, cluster, agent and addons on one machine.
+        let (release, observation) = upgrade(&["box"], false);
+        let plan = planned(&release, "all", &observation);
+        let acting: Vec<&Action> = plan
+            .actions
+            .iter()
+            .filter(|a| a.host == "box" && !a.is_blocked())
+            .collect();
+        // One activation, one lock, one drain, one confirm. Four roles do
+        // not make four interruptions of one machine.
+        for kind in [
+            ActionKind::Activate,
+            ActionKind::Lock,
+            ActionKind::Drain,
+            ActionKind::Confirm,
+            ActionKind::Unlock,
+        ] {
+            assert_eq!(
+                acting.iter().filter(|a| a.kind == kind).count(),
+                1,
+                "{kind} on a four-role host: {:?}",
+                acting.iter().map(|a| a.kind).collect::<Vec<_>>()
+            );
+        }
+        // It sits in ONE wave and in one parallel group, so no other host
+        // of its raft group can move at the same time.
+        let waves: BTreeSet<u32> = acting.iter().map(|a| a.wave).collect();
+        assert_eq!(waves.len(), 1, "{waves:?}");
+        let groups: BTreeSet<&str> = acting.iter().map(|a| a.parallel_group.as_str()).collect();
+        assert_eq!(groups, BTreeSet::from(["box"]));
+        // And the approvals it needs are the union of the classes of that
+        // one interruption, not one set per role.
+        assert!(
+            plan.approvals
+                .iter()
+                .filter(|a| a.class == ApprovalClass::Singleton)
+                .count()
+                <= 1,
+            "{:?}",
+            plan.approvals
         );
     }
 
