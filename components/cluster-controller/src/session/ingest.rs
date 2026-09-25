@@ -709,8 +709,14 @@ pub(super) async fn ingest_attachments(
             // never rewritten — `observed_attachments` returns `[]` for an
             // empty spec, and that is what clears it, but only if the vm is
             // still let through here to receive one.
-            let has_something_to_settle =
-                !vm.spec.referenced_volumes().is_empty() || !vm.status.volumes.is_empty();
+            //
+            // Astra round 3, finding R3-F01: a node that still reports a disk
+            // is a reason on its own. A spec and a status that are both empty
+            // while the node holds a disk is exactly the hot-detach this pass
+            // must make visible, or nothing ever releases it.
+            let has_something_to_settle = !vm.spec.referenced_volumes().is_empty()
+                || !vm.status.volumes.is_empty()
+                || !r.attached_volumes.is_empty();
             (ours(vm) && has_something_to_settle).then_some((vm, r))
         })
         .collect();
@@ -724,10 +730,9 @@ pub(super) async fn ingest_attachments(
         .collect();
 
     for (vm, reported) in relevant {
-        // Spec order, one entry per referenced disk, so the list reads like
-        // the spec it answers. A uid the node named that this tier cannot
-        // resolve to a name is simply not among the spec's volumes and
-        // therefore not in the answer — the spec is the question.
+        // A uid the node named that this tier cannot resolve to a name is a
+        // volume object that no longer exists; there is no claim on it to
+        // release and no name to show, so it is not in the answer.
         let held: Vec<&str> = reported
             .attached_volumes
             .iter()
@@ -742,8 +747,10 @@ pub(super) async fn ingest_attachments(
         // (`VolumeStateReport.open`, see `note_open`).
         //
         // What this pass still answers is the question it was made for: which
-        // of the SPEC's disks this VM has. That is a statement about the VM
-        // and not about the machine, and it is the evidence half of hot-plug.
+        // disks this VM has, read against its spec. That is a statement about
+        // the VM and not about the machine, and it is the evidence half of
+        // hot-plug. The comparison here is against the listing and only saves
+        // a write; the write itself derives the answer again (see below).
         let observed = observed_attachments(vm, &held);
         if vm.status.volumes == observed {
             continue;
@@ -756,17 +763,47 @@ pub(super) async fn ingest_attachments(
         // command long since acked. Every other spec change is a document the
         // node takes whole, and for those "told" really is all this tier can
         // honestly claim.
-        let settled = observed.iter().all(|v| v.attached);
-        let generation = vm.metadata.generation;
-        store
-            .mutate::<Vm, _>(&name, |v| {
-                v.status.volumes = observed.clone();
+        //
+        // Astra round 3, finding R3-F01: the answer, the settled verdict and
+        // the generation are all derived again from the object as it is read
+        // inside the write, never from the listing `vm` came out of. A spec
+        // that dropped a disk after that listing would otherwise be judged
+        // against the spec from before, and the generation that closed would
+        // be one the node was never measured against. `mutate_if` pins the
+        // uid and `ours` is asked again for the same reason as in
+        // `ingest_phases`: the name may have been recreated or the vm rebound
+        // between the listing and this write.
+        let mut settled = false;
+        let mut applied = false;
+        let result = store
+            .mutate_if::<Vm, _>(&name, &reported.id, |v| {
+                settled = false;
+                applied = false;
+                if !ours(v) {
+                    return;
+                }
+                applied = true;
+                let observed = observed_attachments(v, &held);
+                settled = attachments_settled(v, &observed);
+                v.status.volumes = observed;
                 if settled {
-                    v.status.observed_generation = v.status.observed_generation.max(generation);
+                    v.status.observed_generation =
+                        v.status.observed_generation.max(v.metadata.generation);
                 }
                 v.status.observed_at = Some(at);
             })
-            .await?;
+            .await;
+        // One vm's write failing (gone, recreated under the same name, or
+        // contended past the retries) says nothing about the others in this
+        // report, so it is logged and the pass goes on.
+        if let Err(e) = result {
+            warn!(vm = %name, error = format!("{e:#}"), "writing vm attachments failed");
+            continue;
+        }
+        if !applied {
+            debug!(vm = %name, "vm rebound between the listing and the write, attachments dropped");
+            continue;
+        }
         debug!(vm = %name, attached = held.len(), settled, "vm attachments observed");
     }
     Ok(())
@@ -1054,26 +1091,64 @@ pub(super) async fn forget_unbound(
     Ok(())
 }
 
-/// One entry per referenced disk of the spec, in spec order, saying whether
-/// the node reports having it.
+/// What the node reports this VM as holding, read against the spec.
 ///
-/// Spec order and not report order, because the spec is the question: a list
-/// that reordered itself as disks arrived would be a list an operator cannot
-/// read against what they wrote. A uid the node named that is not among the
-/// spec's volumes is simply not in the answer — it is a disk this VM is not
-/// asking for, and the drift that follows is the reconciler's.
+/// First one entry per referenced disk of the spec, in spec order, saying
+/// whether the node reports having it. Spec order and not report order,
+/// because the spec is the question: a list that reordered itself as disks
+/// arrived would be a list an operator cannot read against what they wrote.
+///
+/// Then, in report order, every disk the node reports that the spec no longer
+/// names, marked attached. Astra round 3, finding R3-F01: this list used to
+/// stop at the spec, so a disk the spec had just dropped fell out of
+/// `status.volumes` the moment the next report was ingested — while the node
+/// still held it. `reconcile::vms::volume_drift` reads this field and nothing
+/// else, so it saw no release to make, and the hot-detach never happened.
+/// The observed set is the whole of what the node says it holds; the drift is
+/// the difference in both directions, and that is the reconciler's to act on.
 pub(super) fn observed_attachments(
     vm: &Vm,
     held: &[&str],
 ) -> Vec<controller_api::VolumeAttachmentStatus> {
-    vm.spec
-        .referenced_volumes()
-        .into_iter()
+    let wanted = vm.spec.referenced_volumes();
+    let mut observed: Vec<controller_api::VolumeAttachmentStatus> = wanted
+        .iter()
         .map(|name| controller_api::VolumeAttachmentStatus {
             attached: held.contains(&name.as_str()),
-            name,
+            name: name.clone(),
         })
-        .collect()
+        .collect();
+    for name in held {
+        if wanted.iter().any(|w| w == name) || observed.iter().any(|o| o.name == *name) {
+            continue;
+        }
+        observed.push(controller_api::VolumeAttachmentStatus {
+            name: (*name).to_string(),
+            attached: true,
+        });
+    }
+    observed
+}
+
+/// Whether the node holds exactly the disks the spec names: none missing and
+/// none left over.
+///
+/// Astra round 3, finding R3-F01: "every entry attached" is not the test any
+/// more, because the observed list now carries disks the spec dropped, and
+/// those are attached precisely because the detach has not happened. A
+/// generation that dropped a disk closes when the node stops reporting it,
+/// not when the rest of the list looks complete.
+pub(super) fn attachments_settled(
+    vm: &Vm,
+    observed: &[controller_api::VolumeAttachmentStatus],
+) -> bool {
+    let wanted = vm.spec.referenced_volumes();
+    wanted
+        .iter()
+        .all(|w| observed.iter().any(|o| o.attached && o.name == *w))
+        && observed
+            .iter()
+            .all(|o| !o.attached || wanted.contains(&o.name))
 }
 
 /// The phase half: what the node says each of its VMs is doing, written onto
