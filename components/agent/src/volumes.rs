@@ -160,11 +160,16 @@ impl Holder {
 pub struct Volumes {
     store: Arc<Store>,
     drivers: Drivers,
+    ops: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Volumes {
-    pub fn new(store: Arc<Store>, drivers: Drivers) -> Self {
-        Self { store, drivers }
+    pub fn new(store: Arc<Store>, drivers: Drivers, ops: Arc<tokio::sync::Mutex<()>>) -> Self {
+        Self {
+            store,
+            drivers,
+            ops,
+        }
     }
 
     /// Make the volume, or hand back the one that is already there.
@@ -372,6 +377,9 @@ impl Volumes {
     /// [`VolumeRecordPhase::Gone`].
     #[instrument(skip_all, fields(volume_id = %id))]
     pub async fn deprovision(&self, id: VolumeId) -> anyhow::Result<()> {
+        // Hold the VM operations lock through the holder check and backend call.
+        // A local create must not attach after the check but before deletion.
+        let _guard = self.ops.lock().await;
         if let Some(holder) = self.holder(&id)? {
             // The last defence. The controller clears `attachedTo` before it
             // sends this, so reaching here means the controller is wrong, and
@@ -471,6 +479,7 @@ impl Volumes {
     /// has, and reaching it means the tier above is wrong.
     #[instrument(skip_all, fields(volume_id = %id))]
     pub async fn forget(&self, id: VolumeId) -> anyhow::Result<()> {
+        let _guard = self.ops.lock().await;
         if let Some(holder) = self.holder(&id)? {
             warn!(vm = %holder.said(),
                   "refusing to forget a volume a vm on this node is holding");
@@ -845,7 +854,9 @@ impl Volumes {
         for row in self.store.rows()? {
             match row {
                 crate::store::VmRow::Record(vm, record) => {
-                    if record.volumes.iter().any(|v| v.id() == *id) {
+                    if record.volumes.iter().any(|v| v.id() == *id)
+                        || record.unattached_volumes.iter().any(|v| v.id == *id)
+                    {
                         return Ok(Some(Holder::Vm(vm)));
                     }
                 }
@@ -1087,7 +1098,16 @@ mod tests {
             announcer: None,
             devices: HashMap::new(),
         };
-        (temp, Volumes::new(store.clone(), drivers), store, volumes)
+        (
+            temp,
+            Volumes::new(
+                store.clone(),
+                drivers,
+                Arc::new(tokio::sync::Mutex::new(())),
+            ),
+            store,
+            volumes,
+        )
     }
 
     fn spec(size_bytes: u64) -> VolumeSpec {
@@ -1327,34 +1347,7 @@ mod tests {
 
         // A VM record holding it, exactly as `run_chain` would have left one.
         let vm = agent_api::VmId::new_v4();
-        let mut record = crate::types::VmRecord {
-            spec: crate::types::AgentVmSpec {
-                vcpus: 1,
-                memory_mib: 64,
-                boot: crate::types::BootSourceSpec::Firmware {
-                    firmware: "fw".into(),
-                },
-                volumes: vec![],
-                nics: vec![],
-                devices: vec![],
-                images: Vec::new(),
-                cloud_init: None,
-            },
-            desired: Default::default(),
-            phase: crate::types::Phase::Provisioned,
-            operation: None,
-            stop_deadline: None,
-            receive_deadline: None,
-            send_failed: None,
-            migration: None,
-            unhealthy: None,
-            managed_by_controller: true,
-            volumes: vec![],
-            nics: vec![],
-            devices: vec![],
-            vmm_pid: None,
-            overlay_bridges: Default::default(),
-        };
+        let mut record = empty_vm_record();
         let handle = volumes.get(&id).unwrap().unwrap().handle.unwrap();
         record.volumes.push(agent_api::storage::Volume::attached(
             handle.clone(),
@@ -1377,6 +1370,87 @@ mod tests {
             VolumeRecordPhase::Ready,
             "and the record did not move"
         );
+    }
+
+    fn empty_vm_record() -> crate::types::VmRecord {
+        let record = crate::types::VmRecord {
+            spec: crate::types::AgentVmSpec {
+                vcpus: 1,
+                memory_mib: 64,
+                boot: crate::types::BootSourceSpec::Firmware {
+                    firmware: "fw".into(),
+                },
+                volumes: vec![],
+                nics: vec![],
+                devices: vec![],
+                images: Vec::new(),
+                cloud_init: None,
+            },
+            desired: Default::default(),
+            phase: crate::types::Phase::Provisioned,
+            operation: None,
+            stop_deadline: None,
+            receive_deadline: None,
+            send_failed: None,
+            migration: None,
+            unhealthy: None,
+            managed_by_controller: true,
+            unattached_volumes: Vec::new(),
+            volumes: vec![],
+            nics: vec![],
+            devices: vec![],
+            vmm_pid: None,
+            overlay_bridges: Default::default(),
+        };
+        record
+    }
+
+    #[tokio::test]
+    async fn deletion_rechecks_holders_after_waiting_for_vm_creation() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        for forget in [false, true] {
+            let (_temp, volumes, store, dir) = node("concurrent-holder");
+            let id = VolumeId::new_v4();
+            volumes.provision(id, spec(4096)).await.unwrap();
+            let vm = agent_api::VmId::new_v4();
+            let mut record = empty_vm_record();
+            let handle = volumes.get(&id).unwrap().unwrap().handle.unwrap();
+            record.volumes.push(agent_api::storage::Volume::attached(
+                handle.clone(),
+                VolumeAttachment::Path(handle.path()),
+            ));
+
+            // Local VM creation owns this lock before it starts attaching.
+            let guard = volumes.ops.lock().await;
+            let deletion = async {
+                if forget {
+                    volumes.forget(id).await
+                } else {
+                    volumes.deprovision(id).await
+                }
+            };
+            tokio::pin!(deletion);
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(
+                deletion.as_mut().poll(&mut context),
+                Poll::Pending
+            ));
+            store.put(&vm, &record).unwrap();
+            drop(guard);
+
+            let error = deletion.await.expect_err("the newly attached holder wins");
+            assert!(
+                error.chain().any(|cause| cause.is::<HeldByVm>()),
+                "{error:#}"
+            );
+            assert!(dir.join(format!("{id}.raw")).exists());
+            assert_eq!(
+                volumes.get(&id).unwrap().unwrap().phase,
+                VolumeRecordPhase::Ready
+            );
+        }
     }
 
     /// Deprovision removes the data and leaves a tombstone, because absence
@@ -1836,7 +1910,11 @@ mod tests {
             .insert("filesystem".to_string(), counting.clone());
         (
             temp,
-            Volumes::new(store.clone(), drivers),
+            Volumes::new(
+                store.clone(),
+                drivers,
+                Arc::new(tokio::sync::Mutex::new(())),
+            ),
             store,
             dir,
             counting,

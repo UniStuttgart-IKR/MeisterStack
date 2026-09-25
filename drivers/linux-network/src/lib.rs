@@ -83,6 +83,16 @@ use rtnetlink::packet_route::link::LinkAttribute;
 use rtnetlink::{LinkBridge, LinkUnspec, LinkVxlan};
 use tracing::{debug, info, instrument, warn};
 
+/// A port other than this overlay's own tunnel is still a bridge consumer.
+fn is_overlay_consumer(attributes: &[LinkAttribute], bridge: u32, tunnel: &str) -> bool {
+    attributes
+        .iter()
+        .any(|a| matches!(a, LinkAttribute::Controller(index) if *index == bridge))
+        && !attributes
+            .iter()
+            .any(|a| matches!(a, LinkAttribute::IfName(name) if name == tunnel))
+}
+
 /// The IANA-assigned VXLAN port (RFC 7348 §5).
 ///
 /// Not configurable, and the reason is hardware rather than convention: a NIC
@@ -407,6 +417,35 @@ impl LinuxNetworkDriver {
         found.sort_unstable();
         found.dedup();
         Ok(found)
+    }
+
+    /// Shared by last-VM teardown and startup sweeping. Router records and live
+    /// ports both count; a failed inventory read authorizes no link deletion.
+    async fn remove_unused_overlay(&self, vni: u32) -> networking::Result<bool> {
+        if let Some(gateway) = &self.gateway
+            && router::overlay_vnis(&gateway.state_dir)
+                .await?
+                .contains(&vni)
+        {
+            return Ok(false);
+        }
+        let bridge = overlay_bridge(vni);
+        let device = overlay_device(vni);
+        if let Some(index) = self.link_index(&bridge).await? {
+            let mut links = self.handle.link().get().execute();
+            while let Some(link) = links
+                .try_next()
+                .await
+                .map_err(|e| NetworkError::Backend(e.into()))?
+            {
+                if is_overlay_consumer(&link.attributes, index, &device) {
+                    return Ok(false);
+                }
+            }
+        }
+        BridgeDriver::destroy(self, &device).await?;
+        BridgeDriver::destroy(self, &bridge).await?;
+        Ok(true)
     }
 
     /// The first IPv4 address on a link, which for the uplink is this node's
@@ -746,11 +785,9 @@ impl BridgeDriver for LinuxNetworkDriver {
         if let Some(said) = not_this_drivers_overlay(vni, recorded) {
             return Err(NetworkError::InvalidSpec(said));
         }
-        let device = overlay_device(vni);
-        let bridge = overlay_bridge(vni);
-        BridgeDriver::destroy(self, &device).await?;
-        BridgeDriver::destroy(self, &bridge).await?;
-        info!(bridge = %bridge, device = %device, "overlay removed, nothing on this node uses it");
+        if self.remove_unused_overlay(vni).await? {
+            info!(vni, "overlay removed, no VM, router or live port owns it");
+        }
         Ok(())
     }
 
@@ -781,21 +818,13 @@ impl BridgeDriver for LinuxNetworkDriver {
                 continue;
             }
             let bridge = overlay_bridge(vni);
-            let device = overlay_device(vni);
-            match BridgeDriver::destroy(self, &device).await {
-                Ok(()) => {}
-                Err(e) => {
-                    warn!(vni, device = %device, error = %format!("{e:#}"),
-                          "an orphaned overlay device would not come down");
-                    continue;
-                }
-            }
-            match BridgeDriver::destroy(self, &bridge).await {
-                Ok(()) => {
-                    info!(vni, bridge = %bridge, device = %device,
+            match self.remove_unused_overlay(vni).await {
+                Ok(true) => {
+                    info!(vni, bridge = %bridge,
                           "orphaned overlay removed: no record on this node names it");
                     swept.push(bridge);
                 }
+                Ok(false) => {}
                 Err(e) => warn!(vni, bridge = %bridge, error = %format!("{e:#}"),
                                 "an orphaned overlay bridge would not come down"),
             }

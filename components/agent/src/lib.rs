@@ -710,13 +710,10 @@ async fn sweep_what_no_record_names(
     networking: Option<&Arc<dyn agent_api::networking::NicDriver>>,
     bridge: Option<&Arc<dyn agent_api::networking::BridgeDriver>>,
 ) -> anyhow::Result<()> {
-    let live_taps: Vec<String> = store
-        .list()?
-        .iter()
-        .flat_map(|(_, record)| record.nics.iter().map(|n| n.tap_name.clone()))
-        .collect();
     // Nothing to reap on a node that makes no taps, and nobody to ask.
-    if let Some(driver) = networking {
+    if let Some(driver) = networking
+        && let Some(live_taps) = live_taps_for_sweep(store)?
+    {
         driver.reap(&live_taps).await;
     }
 
@@ -743,6 +740,22 @@ async fn sweep_what_no_record_names(
         }
     }
     Ok(())
+}
+
+/// None means the inventory cannot authorize removal of any guest's filters.
+fn live_taps_for_sweep(store: &Store) -> anyhow::Result<Option<Vec<String>>> {
+    let mut taps = Vec::new();
+    for (key, bytes) in store.list_raw()? {
+        let record: types::VmRecord = match serde_json::from_slice(&bytes) {
+            Ok(record) => record,
+            Err(e) => {
+                warn!(vm = %key, error = %e, "VM inventory is incomplete; preserving all anti-spoofing filters");
+                return Ok(None);
+            }
+        };
+        taps.extend(record.nics.into_iter().map(|nic| nic.tap_name));
+    }
+    Ok(Some(taps))
 }
 
 /// Festlegung 1: every provider network this node names gets its bridge, with
@@ -837,7 +850,11 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
     // Built before the reconciler takes ownership of `drivers`, because both
     // halves route on the same map and a second one would be a second answer
     // to "which backend owns these bytes".
-    let volumes_owned = Arc::new(crate::volumes::Volumes::new(store.clone(), drivers.clone()));
+    let volumes_owned = Arc::new(crate::volumes::Volumes::new(
+        store.clone(),
+        drivers.clone(),
+        ops.clone(),
+    ));
     let reconciler = Arc::new(Reconciler::new(
         store.clone(),
         drivers,
@@ -1919,6 +1936,15 @@ mod tests {
 #[cfg(test)]
 mod sweep_tests {
     use super::*;
+
+    #[test]
+    fn a_corrupt_vm_record_cannot_remove_its_anti_spoofing_rules() {
+        let (_temp, store) = a_store("corrupt-filter-owner");
+        store
+            .put_raw(&VmId::new_v4().to_string(), b"not a vm record")
+            .unwrap();
+        assert!(live_taps_for_sweep(&store).unwrap().is_none());
+    }
 
     /// A bridge driver that builds nothing and remembers what it was asked to
     /// keep.

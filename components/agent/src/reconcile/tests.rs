@@ -1052,7 +1052,11 @@ async fn a_disk_stays_open_until_the_teardown_has_really_detached_it() {
         announcer: None,
         devices: HashMap::new(),
     };
-    let volumes = crate::volumes::Volumes::new(store.clone(), drivers.clone());
+    let volumes = crate::volumes::Volumes::new(
+        store.clone(),
+        drivers.clone(),
+        Arc::new(tokio::sync::Mutex::new(())),
+    );
 
     // A volume this node owns, and a VM holding it as a REFERENCED disk: the
     // shape that outlives its VM, and the one `openOn` is kept for.

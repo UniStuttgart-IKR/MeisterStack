@@ -131,6 +131,7 @@ fn overlay_vm(vni: u32) -> (VmId, VmRecord) {
             migration: None,
             unhealthy: None,
             managed_by_controller: true,
+            unattached_volumes: Vec::new(),
             volumes: Vec::new(),
             nics: vec![agent_api::networking::Nic {
                 id: nic_id,
@@ -159,6 +160,7 @@ fn spec_record() -> VmRecord {
         migration: None,
         unhealthy: None,
         managed_by_controller: true,
+        unattached_volumes: Vec::new(),
         volumes: Vec::new(),
         nics: Vec::new(),
         devices: Vec::new(),

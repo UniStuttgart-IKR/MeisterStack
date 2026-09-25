@@ -311,6 +311,7 @@ impl Provisioner {
             migration: None,
             unhealthy: None,
             managed_by_controller,
+            unattached_volumes: Vec::new(),
             volumes: vec![],
             nics: vec![],
             devices: vec![],

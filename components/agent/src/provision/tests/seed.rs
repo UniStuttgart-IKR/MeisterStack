@@ -88,6 +88,7 @@ async fn a_vm_is_built_from_the_same_attachments_two_calls_now_produce() {
         migration: None,
         unhealthy: None,
         managed_by_controller: false,
+        unattached_volumes: Vec::new(),
         volumes: vec![Volume::attached(handle.clone(), attachment.clone())],
         nics: vec![],
         devices: vec![],

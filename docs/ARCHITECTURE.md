@@ -66,6 +66,11 @@ Storage and networking are also abstracted on the control plane by Rust traits t
 The implemented ownership, timeout, restart and upgrade contract is documented in
 [Live migration: ownership, evidence and recovery](MIGRATION.md).
 
+### Resource cleanup
+
+The local ownership checks, incomplete provisioning recovery and their limits are
+documented in [Resource cleanup: ownership and incomplete work](RESOURCE_LIFECYCLE.md).
+
 ## Miscellaneous
 
 ## Future Work

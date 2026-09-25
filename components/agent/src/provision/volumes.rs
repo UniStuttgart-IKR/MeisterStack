@@ -209,16 +209,25 @@ impl Provisioner {
                 true => self.reference(&v.id, v.spec.params.clone())?,
                 false => {
                     let driver_name = v.spec.driver.clone().unwrap_or_else(default_volume_driver);
-                    debug!(volume_id = %v.id, driver = %driver_name,
+                    if let Some(handle) = record.unattached_volumes.iter().find(|h| h.id == v.id) {
+                        (driver_name, handle.clone())
+                    } else {
+                        debug!(volume_id = %v.id, driver = %driver_name,
                                base_image = ?v.spec.base_image, "creating volume");
-                    let driver = self.storage(&driver_name)?;
-                    let handle =
-                        timed_driver(&driver_name, "provision", driver.provision(&v.id, &v.spec))
-                            .await
-                            .with_context(|| {
-                                format!("provisioning volume {} via {driver_name}", v.id)
-                            })?;
-                    (driver_name, handle)
+                        let driver = self.storage(&driver_name)?;
+                        let handle = timed_driver(
+                            &driver_name,
+                            "provision",
+                            driver.provision(&v.id, &v.spec),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("provisioning volume {} via {driver_name}", v.id)
+                        })?;
+                        record.unattached_volumes.push(handle.clone());
+                        self.store.put(id, record)?;
+                        (driver_name, handle)
+                    }
                 }
             };
             let driver = self.storage(&driver_name)?;
@@ -227,11 +236,54 @@ impl Provisioner {
                     .await
                     .with_context(|| format!("attaching volume {} via {driver_name}", v.id))?;
             record.volumes.push(Volume::attached(handle, attachment));
+            record.unattached_volumes.retain(|h| h.id != v.id);
+            self.store.put(id, record)?;
         }
         record.phase = Phase::VolumesDone;
         self.store.put(id, record)?;
         info!(count = record.volumes.len(), "volumes ready");
         Ok(())
+    }
+
+    /// Reclaim inline disks for which attach never returned a durable attachment.
+    /// The persisted spec is also intent: probe covers a crash after provision but
+    /// before its returned handle was written. A failed probe must retain the row.
+    pub(super) async fn reclaim_unattached_volumes(
+        &self,
+        id: &VmId,
+        record: &VmRecord,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        for v in record.spec.volumes.iter().filter(|v| !v.referenced) {
+            if record.volumes.iter().any(|held| held.id() == v.id) {
+                continue;
+            }
+            let name = v.spec.driver.clone().unwrap_or_else(default_volume_driver);
+            let result: Result<()> = async {
+                let driver = self.storage(&name)?;
+                let handle = match record.unattached_volumes.iter().find(|h| h.id == v.id) {
+                    Some(handle) => handle.clone(),
+                    None => match timed_driver(&name, "probe", driver.probe(&v.id, &v.spec)).await?
+                    {
+                        Some(handle) => {
+                            self.store
+                                .mutate(id, |r| r.unattached_volumes.push(handle.clone()))?;
+                            handle
+                        }
+                        None => return Ok(()),
+                    },
+                };
+                timed_driver(&name, "deprovision", driver.deprovision(&handle)).await?;
+                self.store
+                    .mutate(id, |r| r.unattached_volumes.retain(|h| h.id != v.id))?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                failures.push(format!("unattached volume {}: {error:#}", v.id));
+            }
+        }
+        failures
     }
 
     /// Give the volume backends back without touching the data.

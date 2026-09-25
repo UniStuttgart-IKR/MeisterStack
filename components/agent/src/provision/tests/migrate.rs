@@ -2120,7 +2120,9 @@ fn legacy_records_load_without_inventing_attempt_evidence() {
     });
     let mut json = serde_json::to_value(&record).unwrap();
     json.as_object_mut().unwrap().remove("migration");
+    json.as_object_mut().unwrap().remove("unattached_volumes");
     let loaded: VmRecord = serde_json::from_value(json).unwrap();
+    assert!(loaded.unattached_volumes.is_empty());
     assert!(crate::reconcile::departure(&loaded).is_none());
     assert_eq!(
         crate::reconcile::plan(

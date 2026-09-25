@@ -162,6 +162,7 @@ impl Provisioner {
         // is collected rather than acted on per volume is that `record` is
         // borrowed for the length of this loop.
         let mut closed: Vec<VolumeId> = Vec::new();
+        failures.extend(self.reclaim_unattached_volumes(id, &record).await);
         for v in &record.volumes {
             let id = v.id();
             let name = volume_driver_name(&self.store, &record, &id);

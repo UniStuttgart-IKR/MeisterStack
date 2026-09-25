@@ -516,6 +516,7 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
         migration: None,
         unhealthy: None,
         managed_by_controller: true,
+        unattached_volumes: Vec::new(),
         volumes: vec![boot, going]
             .into_iter()
             .map(|id| {
@@ -703,6 +704,11 @@ fn the_diff_never_touches_the_boot_entry_or_an_inline_disk() {
 /// defect through.
 #[derive(Default)]
 struct CountingVolume {
+    probe_has_bytes: std::sync::atomic::AtomicBool,
+    fail_probe: std::sync::atomic::AtomicBool,
+    fail_attach: std::sync::atomic::AtomicBool,
+    fail_deprovision: std::sync::atomic::AtomicBool,
+    provisions: std::sync::atomic::AtomicUsize,
     detaches: std::sync::atomic::AtomicUsize,
     deprovisions: std::sync::atomic::AtomicUsize,
 }
@@ -717,6 +723,8 @@ impl agent_api::storage::VolumeProvider for CountingVolume {
         id: &VolumeId,
         spec: &agent_api::storage::VolumeSpec,
     ) -> agent_api::storage::Result<agent_api::storage::VolumeHandle> {
+        self.provisions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(agent_api::storage::VolumeHandle {
             id: *id,
             backend: format!("/fake/{id}.raw"),
@@ -730,6 +738,14 @@ impl agent_api::storage::VolumeProvider for CountingVolume {
     ) -> agent_api::storage::Result<()> {
         self.deprovisions
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .fail_deprovision
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(agent_api::storage::StorageError::Backend(anyhow!(
+                "injected delete error"
+            )));
+        }
         Ok(())
     }
     async fn describe(
@@ -740,13 +756,26 @@ impl agent_api::storage::VolumeProvider for CountingVolume {
             size_bytes: h.size_bytes,
         })
     }
-    /// A fake that keeps no bytes holds none under any id.
     async fn probe(
         &self,
-        _: &VolumeId,
-        _: &agent_api::storage::VolumeSpec,
+        id: &VolumeId,
+        spec: &agent_api::storage::VolumeSpec,
     ) -> agent_api::storage::Result<Option<agent_api::storage::VolumeHandle>> {
-        Ok(None)
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.fail_probe.load(SeqCst) {
+            return Err(agent_api::storage::StorageError::Backend(anyhow!(
+                "injected probe error"
+            )));
+        }
+        Ok(self
+            .probe_has_bytes
+            .load(SeqCst)
+            .then(|| agent_api::storage::VolumeHandle {
+                id: *id,
+                backend: format!("/fake/{id}.raw"),
+                size_bytes: spec.size_bytes,
+                params: None,
+            }))
     }
 }
 
@@ -757,6 +786,11 @@ impl agent_api::storage::VolumeAttacher for CountingVolume {
         handle: &agent_api::storage::VolumeHandle,
         _: Option<&agent_api::CgroupHandle>,
     ) -> agent_api::storage::Result<VolumeAttachment> {
+        if self.fail_attach.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(agent_api::storage::StorageError::Backend(anyhow!(
+                "injected attach error"
+            )));
+        }
         Ok(VolumeAttachment::FsShare {
             socket: PathBuf::from(format!("/run/fake/{}.sock", handle.id)),
             tag: "data".into(),
@@ -854,6 +888,7 @@ async fn a_stop_and_then_a_destroy_detach_the_volume_once() {
         migration: None,
         unhealthy: None,
         managed_by_controller: true,
+        unattached_volumes: Vec::new(),
         volumes: vec![Volume::attached(
             handle,
             VolumeAttachment::FsShare {
@@ -1038,6 +1073,7 @@ async fn a_failed_detach_is_not_marked_and_is_tried_again() {
         migration: None,
         unhealthy: None,
         managed_by_controller: true,
+        unattached_volumes: Vec::new(),
         volumes: vec![Volume::attached(
             agent_api::storage::VolumeHandle {
                 id: volume_id,
@@ -1067,5 +1103,176 @@ async fn a_failed_detach_is_not_marked_and_is_tried_again() {
         refusing.attempts.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "so the teardown asked again"
+    );
+}
+
+#[tokio::test]
+async fn an_inline_attach_failure_remains_reclaimable_after_restart() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let db = root.join("agent.redb");
+    let driver = Arc::new(CountingVolume::default());
+    driver.fail_attach.store(true, SeqCst);
+    driver.fail_deprovision.store(true, SeqCst);
+    let build = |store| counting_provisioner(root, store, driver.clone());
+    let vm = VmId::new_v4();
+    let disk = VolumeId::new_v4();
+    {
+        let store = Arc::new(crate::store::Store::open(&db).unwrap());
+        let provisioner = build(store.clone());
+        let mut record = inline_record(disk);
+        store.put(&vm, &record).unwrap();
+        let spec = record.spec.clone();
+        let cgroup = provisioner.drivers.confiner.open_slice(&vm.to_string());
+        provisioner
+            .attach_volumes(&vm, &mut record, &spec, &cgroup)
+            .await
+            .expect_err("attach failed");
+        assert!(record.volumes.is_empty());
+        // This is the error path in provision: preserve the latest record, then teardown.
+        store.put(&vm, &record).unwrap();
+    }
+    {
+        let store = Arc::new(crate::store::Store::open(&db).unwrap());
+        build(store.clone())
+            .teardown(&vm)
+            .await
+            .expect_err("failed deletion must retain its handle");
+        assert!(store.get(&vm).unwrap().is_some());
+        assert_eq!(driver.deprovisions.load(SeqCst), 1);
+    }
+    driver.fail_deprovision.store(false, SeqCst);
+    {
+        let store = Arc::new(crate::store::Store::open(&db).unwrap());
+        build(store.clone()).teardown(&vm).await.unwrap();
+        assert!(store.get(&vm).unwrap().is_none());
+    }
+    assert_eq!(driver.provisions.load(SeqCst), 1);
+    assert_eq!(driver.deprovisions.load(SeqCst), 2);
+    assert_eq!(
+        driver.detaches.load(SeqCst),
+        0,
+        "no attachment was returned"
+    );
+}
+
+fn counting_provisioner(
+    root: &std::path::Path,
+    store: Arc<crate::store::Store>,
+    driver: Arc<CountingVolume>,
+) -> Provisioner {
+    let mut storage: HashMap<String, Arc<dyn agent_api::storage::VolumeDriver>> = HashMap::new();
+    storage.insert("filesystem".into(), driver);
+    Provisioner::new(
+        store,
+        Drivers {
+            confiner: Arc::new(cgroup_driver::CgroupV2::new(root.join("cgroup"))),
+            hypervisor: Some(Arc::new(EmptyHypervisor)),
+            hypervisor_name: Some("empty".into()),
+            storage,
+            networking: None,
+            bridge: None,
+            announcer: None,
+            devices: HashMap::new(),
+        },
+        Arc::new(crate::images::Cache::new(root.join("images"))),
+        root.join("images"),
+        root.join("run"),
+        "br0".into(),
+        None,
+        None,
+    )
+}
+
+fn inline_record(disk: VolumeId) -> VmRecord {
+    let mut record = spec_record();
+    record.spec.volumes.push(crate::types::VolumeWithId {
+        id: disk,
+        spec: agent_api::storage::VolumeSpec {
+            base_image: None,
+            size_bytes: 4096,
+            driver: Some("filesystem".into()),
+            params: None,
+        },
+        referenced: false,
+    });
+    record
+}
+
+#[tokio::test]
+async fn a_crash_before_inline_handle_commit_is_recovered_by_probe() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("agent.redb");
+    let vm = VmId::new_v4();
+    let disk = VolumeId::new_v4();
+    let driver = Arc::new(CountingVolume::default());
+    driver.probe_has_bytes.store(true, SeqCst);
+    driver.fail_probe.store(true, SeqCst);
+    driver.fail_deprovision.store(true, SeqCst);
+    {
+        let store = crate::store::Store::open(&db).unwrap();
+        store.put(&vm, &inline_record(disk)).unwrap();
+    }
+    for probe_fails in [true, false] {
+        driver.fail_probe.store(probe_fails, SeqCst);
+        let store = Arc::new(crate::store::Store::open(&db).unwrap());
+        let provisioner = counting_provisioner(temp.path(), store.clone(), driver.clone());
+        provisioner
+            .teardown(&vm)
+            .await
+            .expect_err("uncertain cleanup retains ownership");
+        let record = store.get(&vm).unwrap().unwrap();
+        assert_eq!(record.unattached_volumes.len(), usize::from(!probe_fails));
+        assert_eq!(driver.deprovisions.load(SeqCst), usize::from(!probe_fails));
+    }
+    driver.fail_deprovision.store(false, SeqCst);
+    {
+        let store = Arc::new(crate::store::Store::open(&db).unwrap());
+        counting_provisioner(temp.path(), store.clone(), driver.clone())
+            .teardown(&vm)
+            .await
+            .unwrap();
+        assert!(store.get(&vm).unwrap().is_none());
+    }
+    assert_eq!(driver.provisions.load(SeqCst), 0);
+    assert_eq!(driver.deprovisions.load(SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_restarted_attach_reuses_the_persisted_inline_handle() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("agent.redb");
+    let vm = VmId::new_v4();
+    let disk = VolumeId::new_v4();
+    let driver = Arc::new(CountingVolume::default());
+    for attach_fails in [true, false] {
+        driver.fail_attach.store(attach_fails, SeqCst);
+        let store = Arc::new(crate::store::Store::open(&db).unwrap());
+        let provisioner = counting_provisioner(temp.path(), store.clone(), driver.clone());
+        let mut record = store
+            .get(&vm)
+            .unwrap()
+            .unwrap_or_else(|| inline_record(disk));
+        store.put(&vm, &record).unwrap();
+        let spec = record.spec.clone();
+        let cgroup = provisioner.drivers.confiner.open_slice(&vm.to_string());
+        let result = provisioner
+            .attach_volumes(&vm, &mut record, &spec, &cgroup)
+            .await;
+        assert_eq!(result.is_err(), attach_fails);
+        let persisted = store.get(&vm).unwrap().unwrap();
+        assert_eq!(
+            persisted.unattached_volumes.len(),
+            usize::from(attach_fails)
+        );
+        assert_eq!(persisted.volumes.len(), usize::from(!attach_fails));
+    }
+    assert_eq!(
+        driver.provisions.load(SeqCst),
+        1,
+        "retry attaches the original disk"
     );
 }

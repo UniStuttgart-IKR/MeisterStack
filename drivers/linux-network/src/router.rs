@@ -169,6 +169,37 @@ struct RouterRecord {
     spec: RouterSpec,
 }
 
+/// Overlay ownership must include unreadable router inventory as uncertainty.
+pub(crate) async fn overlay_vnis(dir: &Path) -> networking::Result<Vec<u32>> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(NetworkError::Backend(e.into())),
+    };
+    let mut vnis = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| NetworkError::Backend(e.into()))?
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| NetworkError::Backend(e.into()))?;
+        let record: RouterRecord = serde_json::from_slice(&bytes).map_err(|e| {
+            NetworkError::Backend(anyhow::anyhow!(
+                "cannot establish router ownership from {}: {e}",
+                path.display()
+            ))
+        })?;
+        vnis.push(record.spec.vxlan_id);
+    }
+    Ok(vnis)
+}
+
 /// The prefixes an ACTIVE router asks the fabric to send it.
 ///
 /// Its own function and not a loop inside the caller, for the reason
@@ -1117,6 +1148,57 @@ mod tests {
             routed_subnets: Vec::new(),
             active,
         }
+    }
+
+    #[tokio::test]
+    async fn router_ownership_preserves_an_overlay_across_driver_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = spec(true);
+        let path = dir.path().join(format!("{}.json", router.id));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&RouterRecord {
+                spec: router.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // No local VM is present. Both a fresh driver and its replacement must
+        // refuse deletion before issuing any netlink mutation.
+        for _ in 0..2 {
+            let driver = fake_driver(dir.path(), "exit 0\n");
+            assert!(!driver.remove_unused_overlay(router.vxlan_id).await.unwrap());
+        }
+        std::fs::write(&path, b"unreadable router").unwrap();
+        let driver = fake_driver(dir.path(), "exit 0\n");
+        assert!(driver.remove_unused_overlay(router.vxlan_id).await.is_err());
+    }
+
+    #[test]
+    fn any_remaining_router_or_vm_port_blocks_overlay_removal() {
+        use rtnetlink::packet_route::link::LinkAttribute as A;
+        for port in ["router-inside", "guest-tap"] {
+            assert!(crate::is_overlay_consumer(
+                &[A::Controller(7), A::IfName(port.into())],
+                7,
+                "vx10000"
+            ));
+        }
+        assert!(!crate::is_overlay_consumer(
+            &[A::Controller(7), A::IfName("vx10000".into())],
+            7,
+            "vx10000"
+        ));
+        assert!(!crate::is_overlay_consumer(
+            &[A::Controller(8), A::IfName("router-inside".into())],
+            7,
+            "vx10000"
+        ));
+        assert!(crate::is_overlay_consumer(
+            &[A::Controller(7)],
+            7,
+            "vx10000"
+        ));
     }
 
     /// The three names an operator greps for, and the one that has to fit in

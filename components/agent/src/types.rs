@@ -154,28 +154,9 @@ pub struct VmRecord {
     /// Expiry does not prove that a receive ended and never authorizes teardown.
     #[serde(default)]
     pub receive_deadline: Option<std::time::SystemTime>,
-    /// Why the last send this node was told to make did NOT take the guest
-    /// away, if one did not.
-    ///
-    /// The third of the three things a source can say about a migration, and
-    /// the only one the record could not express. `operation =
-    /// MigratingOut` is "sending" and `phase = Migrated` is "gone"; a send
-    /// that failed leaves the record exactly as it was — `Provisioned`, no
-    /// marker, guest running — which is indistinguishable from a VM nobody
-    /// ever asked to move. So the sentence lives here, and
-    /// `MigrationReport.outcome` reads all three off this record.
-    ///
-    /// It matters because of what v53 does: a failed `vm.send-migration`
-    /// RESUMES the guest and goes on serving it. That is the good outcome of
-    /// a bad transfer, and until this field the tier above learned of it only
-    /// by a command that never answered — after which it waited out its whole
-    /// transfer timeout to work out which machine had the guest.
-    ///
-    /// Written by the task that watched the send, cleared by the next
-    /// `MigrateOut`. It therefore outlives the migration that set it, on
-    /// purpose: it is the last true thing about this VM's last attempt, and
-    /// there is no moment at which forgetting it would be more honest than
-    /// keeping it.
+    /// Explicit terminal evidence that the acknowledged send returned ownership
+    /// to this source. Deadlines and ambiguous errors never populate this field.
+    /// It belongs to `migration.id` and is cleared before the next attempt.
     #[serde(default)]
     pub send_failed: Option<String>,
     /// Set by the reconciler when it detects a condition it must not repair
@@ -203,6 +184,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub managed_by_controller: bool,
     pub volumes: Vec<Volume>,
+    /// Inline disks created before an attachment could be committed. Kept across
+    /// restart so failed attach/cleanup cannot discard ownership of their bytes.
+    #[serde(default)]
+    pub unattached_volumes: Vec<agent_api::storage::VolumeHandle>,
     pub nics: Vec<Nic>,
     pub devices: Vec<Device>,
     #[serde(default)]
@@ -262,6 +247,7 @@ impl VmRecord {
             unhealthy: None,
             managed_by_controller: false,
             volumes: vec![],
+            unattached_volumes: vec![],
             nics: vec![],
             devices: vec![],
             vmm_pid: None,
