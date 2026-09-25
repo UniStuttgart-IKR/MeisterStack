@@ -682,6 +682,47 @@ impl<'a> Executor<'a> {
             self.guard(&fresh, id, hosts)?;
             for action in &actions {
                 self.begin(journal, id, action)?;
+                // Astra finding MD07, 2026-09-25: the plan's `verify` names
+                // the host's required checks, and this branch skipped it
+                // along with everything else, so "runs the release" stood in
+                // for "is right". A host whose required unit died after the
+                // plan was made passed the identity and plan checks above
+                // and ended the run green. Unchanged means nothing is
+                // installed, activated or delivered; the read-only checks
+                // are still made, and a host that fails them fails.
+                if action.kind == ActionKind::Verify {
+                    let results = self.verify(id, &fresh);
+                    let verdict = checks::acceptance(&results);
+                    if verdict.is_accepted() {
+                        self.end_with_checks(
+                            journal,
+                            id,
+                            action,
+                            ActionResult::Ok,
+                            results,
+                            Vec::new(),
+                        )?;
+                    } else {
+                        self.end_with_checks(
+                            journal,
+                            id,
+                            action,
+                            ActionResult::Failed,
+                            results,
+                            Vec::new(),
+                        )?;
+                        let why = match verdict {
+                            checks::Acceptance::Blocked { reasons } => reasons.join("; "),
+                            checks::Acceptance::Accepted => unreachable!("it was not accepted"),
+                        };
+                        self.move_to(journal, id, hosts, HostState::Failed, fresh.host(id))?;
+                        bail!(
+                            "{id} already runs the release and is not right: the readiness \
+                             checks did not pass: {why}"
+                        );
+                    }
+                    continue;
+                }
                 self.end(
                     journal,
                     id,

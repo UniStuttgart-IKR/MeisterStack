@@ -24,6 +24,7 @@ use super::*;
 
 use std::cell::RefCell;
 
+use crate::checks::Status;
 use crate::effects::{FakeClock, MemFiles};
 use crate::fixtures::{at, observed, onebox_enrolled, release_of, with_new_systems};
 use crate::manifest::ResolvedHost;
@@ -55,6 +56,10 @@ struct TableLook {
     phase: RefCell<BTreeMap<String, Phase>>,
     /// Hosts whose new system has a unit that did not come up.
     broken: RefCell<BTreeSet<String>>,
+    /// Hosts whose required unit is down NOW, before anything is done to
+    /// them (Astra finding MD07): what an unchanged host looks like when a
+    /// service died after the plan was made.
+    broken_now: RefCell<BTreeSet<String>>,
     /// The transaction each host holds, as `meister-activate status` would
     /// report it.
     txns: RefCell<BTreeMap<String, Txn>>,
@@ -87,6 +92,7 @@ impl TableLook {
             after,
             phase: RefCell::new(BTreeMap::new()),
             broken: RefCell::new(BTreeSet::new()),
+            broken_now: RefCell::new(BTreeSet::new()),
             txns: RefCell::new(BTreeMap::new()),
             lost: RefCell::new(BTreeSet::new()),
             etcd_late: RefCell::new(BTreeMap::new()),
@@ -113,6 +119,12 @@ impl TableLook {
     /// The new system of this host comes up with a unit that failed.
     fn breaks(self, id: &str) -> TableLook {
         self.broken.borrow_mut().insert(id.to_string());
+        self
+    }
+
+    /// This host's agent is down already, whatever phase it is in.
+    fn broken_now(self, id: &str) -> TableLook {
+        self.broken_now.borrow_mut().insert(id.to_string());
         self
     }
 
@@ -224,6 +236,10 @@ impl Look for TableLook {
             obs.kernel_booted = self.before[&id].kernel_booted.clone();
         }
         if phase == Phase::After && self.broken.borrow().contains(&id) {
+            obs.units
+                .insert("meister-agent.service".to_string(), "failed".to_string());
+        }
+        if self.broken_now.borrow().contains(&id) {
             obs.units
                 .insert("meister-agent.service".to_string(), "failed".to_string());
         }
@@ -645,7 +661,74 @@ fn a_host_that_already_runs_the_release_is_journalled_and_not_touched() {
         })
         .collect();
     assert_eq!(states, ["box:unchanged", "n1:unchanged", "n2:unchanged"]);
+    // Astra finding MD07, 2026-09-25: "unchanged" still made its required
+    // checks, and the journal carries their results.
+    for id in ["n1", "n2"] {
+        let verify = applied.receipt.hosts[id]
+            .actions
+            .iter()
+            .find(|a| a.kind == ActionKind::Verify)
+            .unwrap_or_else(|| panic!("{id} has a verify step"));
+        assert_eq!(verify.result, Some(ActionResult::Ok), "{id}");
+    }
+    assert!(
+        applied
+            .receipt
+            .checks
+            .iter()
+            .any(|c| c.subject.host.as_deref() == Some("n1")),
+        "the receipt carries n1's checks: {:?}",
+        applied.receipt.checks
+    );
 }
+
+// Astra finding MD07, 2026-09-25: a host that runs the release and whose
+// required service is down is not "unchanged" — it is wrong, and the run
+// says so instead of ending green.
+#[test]
+fn an_unchanged_host_whose_required_unit_is_down_fails_its_checks() {
+    let fx = Fixture::unchanged();
+    let look = TableLook::new(&fx).broken_now("n1");
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let applied = fx
+        .executor(&runner, &look, fx.options())
+        .run()
+        .expect("the run ends with a receipt");
+    runner.verify().expect("the anchor and nothing else");
+    // Nothing was activated: no activate, no revert, no reboot.
+    for call in runner.calls() {
+        assert!(
+            call.contains("lock acquire") || call.contains("lock release"),
+            "an unchanged host ran {call}"
+        );
+    }
+    let stopped = applied.stopped.clone().expect("the run stopped");
+    assert!(stopped.contains("n1"), "{stopped}");
+    assert!(stopped.contains("did not pass"), "{stopped}");
+    assert_ne!(applied.receipt.outcome, Outcome::Success);
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Failed);
+    let verify = applied.receipt.hosts["n1"]
+        .actions
+        .iter()
+        .find(|a| a.kind == ActionKind::Verify)
+        .expect("n1 has a verify step");
+    assert_eq!(verify.result, Some(ActionResult::Failed));
+    assert!(
+        applied
+            .receipt
+            .checks
+            .iter()
+            .any(|c| c.subject.host.as_deref() == Some("n1") && c.status == Status::Fail),
+        "{:?}",
+        applied.receipt.checks
+    );
+}
+
 
 #[test]
 fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
