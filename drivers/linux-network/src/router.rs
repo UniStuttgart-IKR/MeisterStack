@@ -58,6 +58,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use agent_api::networking::{
     self, NatKind, NetworkError, RouterId, RouterPhase, RouterReason, RouterSpec, RouterState,
@@ -291,6 +292,61 @@ fn arp_ignore(active: bool) -> &'static str {
     }
 }
 
+/// How long an external command (`ip`, `nft`) may run before this driver
+/// gives up on it and kills it.
+///
+/// Astra finding R3-F08, 2026-09-25. Generous for a command that is normally
+/// milliseconds — `components/agent/src/images.rs` bounds its own curl fetch
+/// probes at the same five seconds for the same reason: long enough that an
+/// ordinarily slow node is never the cause of a false timeout, short enough
+/// that a wedged `ip` is a log line and a retried command rather than every
+/// command behind it in the agent's serial pump (`lib.rs`'s `pump`) waiting
+/// for ever.
+const COMMAND_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Drain a child's stdout and stderr and wait for it to exit.
+///
+/// Takes `&mut Child` rather than consuming it the way `Child::wait_with_
+/// output` does, so that a caller whose deadline fires while this is still
+/// running still holds the handle needed to kill and reap it: a future
+/// dropped by `tokio::time::timeout` drops everything it owns, and a `Child`
+/// owned by the dropped future would be gone with it, unsignalled.
+async fn drain_and_wait(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::Output> {
+    use tokio::io::AsyncReadExt;
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let (a, b) = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+    a?;
+    b?;
+    let status = child.wait().await?;
+    Ok(std::process::Output {
+        status,
+        stdout: out,
+        stderr: err,
+    })
+}
+
+/// Signal a wedged child and then WAIT for it — both halves, on every path
+/// that gives up on a command.
+///
+/// The pattern `components/agent/src/images.rs` already carries for `curl`
+/// (`kill_and_reap` there), mirrored here rather than shared: a driver may
+/// not depend on the agent crate that defines it, the dependency runs the
+/// other way. Neither error here is worth more than a debug line — "the
+/// process is already gone" is exactly the outcome a kill is asking for.
+async fn kill_and_reap(child: &mut tokio::process::Child) {
+    if let Err(e) = child.start_kill() {
+        debug!(error = %e, "an ip/nft child was already gone when it was stopped");
+    }
+    if let Err(e) = child.wait().await {
+        debug!(error = %e, "reaping a stopped ip/nft child");
+    }
+}
+
 impl crate::LinuxNetworkDriver {
     /// This node's gateway slot, or the sentence it owes whoever asked for a
     /// router.
@@ -306,16 +362,40 @@ impl crate::LinuxNetworkDriver {
 
     /// Run `ip`, with the arguments spelled exactly as an operator would type
     /// them.
+    ///
+    /// Astra finding R3-F08, 2026-09-25: bounded by [`COMMAND_DEADLINE`]. `ip`
+    /// waiting on a stuck netns mount, or a kernel that has stopped answering
+    /// netlink, used to hang this call for ever — and every command after it:
+    /// the agent's own pump (`components/agent/src/lib.rs`) reads the
+    /// controller's stream serially, and `handle_ensure_router` holds the
+    /// node's one `ops` lock for the whole of its driver call, so one router
+    /// with a bad day took every other command on the node down with it. On
+    /// a timeout the child is killed and reaped, never merely abandoned — an
+    /// unreaped `ip` is a zombie for the life of this agent.
     async fn ip(&self, args: &[&str]) -> networking::Result<String> {
         let binary = &self.gateway()?.ip;
-        let out = tokio::process::Command::new(binary)
+        let mut child = tokio::process::Command::new(binary)
             .args(args)
             .stdin(Stdio::null())
-            .output()
-            .await
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| {
                 NetworkError::Backend(anyhow::anyhow!("running {binary} {}: {e}", args.join(" ")))
             })?;
+        let out = match tokio::time::timeout(COMMAND_DEADLINE, drain_and_wait(&mut child)).await {
+            Ok(result) => result.map_err(|e| {
+                NetworkError::Backend(anyhow::anyhow!("running {binary} {}: {e}", args.join(" ")))
+            })?,
+            Err(_) => {
+                kill_and_reap(&mut child).await;
+                return Err(NetworkError::Backend(anyhow::anyhow!(
+                    "{binary} {} did not answer within {}s and was stopped",
+                    args.join(" "),
+                    COMMAND_DEADLINE.as_secs()
+                )));
+            }
+        };
         if !out.status.success() {
             return Err(NetworkError::Backend(anyhow::anyhow!(
                 "{binary} {} failed: {}",
@@ -425,6 +505,12 @@ impl crate::LinuxNetworkDriver {
     ///
     /// The script goes in on stdin for the reason the tap guard's does: a rule
     /// containing a set literal never has to survive an argv split.
+    ///
+    /// Astra finding R3-F08, 2026-09-25: bounded by [`COMMAND_DEADLINE`], the
+    /// same deadline and the same kill-and-reap `ip` takes and for the same
+    /// reason — see its doc. The write to stdin is inside the bound too and
+    /// not only the wait for exit: a script `nft` is not draining would hang
+    /// there first, before `wait_with_output` is ever reached.
     async fn netns_nft(&self, netns: &str, script: &str) -> networking::Result<()> {
         use tokio::io::AsyncWriteExt;
         let g = self.gateway()?;
@@ -435,17 +521,25 @@ impl crate::LinuxNetworkDriver {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| NetworkError::Backend(anyhow::anyhow!("running {}: {e}", g.ip)))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| NetworkError::Backend(anyhow::anyhow!("nft stdin vanished")))?
-            .write_all(script.as_bytes())
-            .await
-            .map_err(|e| NetworkError::Backend(e.into()))?;
-        let out = child
-            .wait_with_output()
-            .await
-            .map_err(|e| NetworkError::Backend(e.into()))?;
+        let talk = async {
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| std::io::Error::other("nft stdin vanished"))?
+                .write_all(script.as_bytes())
+                .await?;
+            drain_and_wait(&mut child).await
+        };
+        let out = match tokio::time::timeout(COMMAND_DEADLINE, talk).await {
+            Ok(result) => result.map_err(|e| NetworkError::Backend(e.into()))?,
+            Err(_) => {
+                kill_and_reap(&mut child).await;
+                return Err(NetworkError::Backend(anyhow::anyhow!(
+                    "nft did not answer within {}s in {netns} and was stopped",
+                    COMMAND_DEADLINE.as_secs()
+                )));
+            }
+        };
         if out.status.success() {
             return Ok(());
         }
@@ -1115,22 +1209,19 @@ impl crate::LinuxNetworkDriver {
     /// EVERY router this pass looked at, `Silencing`'s whole reason to
     /// exist — see Astra finding R3-F06 below.
     ///
-    /// Astra finding R3-F06, 2026-09-25: `Silencing` and not the `Vec` of
-    /// the ones that worked. `stop_speaking_for_every_router`
-    /// (`components/agent/src/lib.rs`) is the caller that this was for: it
-    /// used to see any `Ok` as "this outage is handled" regardless of
-    /// whether every router answered, and a router whose `ensure_router`
-    /// failed here got no second try for the rest of the outage -- the
-    /// two-MAC defect S08 was written to close, moved one router over.
-    ///
-    /// Astra finding R3-F07, 2026-09-25: this used to walk
+    /// Astra finding R3-F06, 2026-09-25: this used to walk
     /// `list_routers_impl`'s output and skip whatever it left out, which
     /// meant a router whose record could not be read was invisible here
-    /// exactly as it was in the inventory -- the dead man never found it to
-    /// silence. This walks the record directory itself instead, so a
-    /// record this build cannot read is not skipped: its namespace is
+    /// exactly as it was in the inventory (R3-F07) — the dead man never
+    /// found it to silence. This walks the record directory itself instead,
+    /// so a record this build cannot read is not skipped: its namespace is
     /// silenced directly, by the id its FILE NAME still gives, unconditional
-    /// on the `active` flag no unparseable record can supply.
+    /// on the `active` flag no unparseable record can supply. And the
+    /// caller — `components/agent/src/lib.rs`'s dead man — now gets told
+    /// WHICH routers failed rather than only whether the call returned
+    /// `Ok`, which is the other half of R3-F06: a partial pass used to be
+    /// indistinguishable from a complete one, and the failed router got no
+    /// second try for the rest of the outage.
     #[instrument(skip_all)]
     pub(crate) async fn fall_silent_impl(&self) -> networking::Result<networking::Silencing> {
         let dir = self.gateway()?.state_dir.clone();
@@ -1658,6 +1749,55 @@ esac
             path.exists(),
             "the broken record itself is untouched by any of the three passes"
         );
+    }
+
+    /// A fake `ip` that never answers is killed within the deadline, not
+    /// waited on for ever, and the command after it is not blocked by the
+    /// one that hung.
+    ///
+    /// Astra finding R3-F08, 2026-09-25. The busy loop and not `sleep` is
+    /// deliberate: `sleep` would fork a grandchild the test's kill can never
+    /// reach (`Child::start_kill` signals the direct child, the `sh`
+    /// wrapper, and a real `ip`/`nft` never forks one — but a naive fake
+    /// that did would leave a process running for the rest of its own
+    /// sleep). A `while` loop is the wrapper itself spinning, so killing it
+    /// leaves nothing behind. It hangs on `netns list` alone and answers
+    /// everything else at once, so the SECOND call below proves the driver
+    /// itself is free again and not just that a differently-hung call would
+    /// also eventually time out.
+    #[tokio::test]
+    async fn a_hung_ip_is_killed_within_the_deadline_and_a_following_command_runs() {
+        let temp = tempfile::Builder::new()
+            .prefix("ms-router-r3f08-hang-")
+            .tempdir()
+            .expect("a directory");
+        let d = fake_driver(
+            temp.path(),
+            "case \"$1 $2\" in\n\"netns list\") while :; do :; done;;\n*) exit 0;;\nesac\n",
+        );
+
+        let start = std::time::Instant::now();
+        let err = d
+            .ip(&["netns", "list"])
+            .await
+            .expect_err("a command that never answers is an error, not an eternal wait");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < COMMAND_DEADLINE + Duration::from_secs(3),
+            "bounded by the deadline this driver keeps, not by the fake's own hang: {elapsed:?}"
+        );
+        assert!(
+            format!("{err:#}").contains("did not answer within"),
+            "{err:#}"
+        );
+
+        // A following command is not blocked by the one that hung: the
+        // child was killed and reaped, not merely abandoned.
+        let out = d
+            .ip(&["true"])
+            .await
+            .expect("a following command must not inherit the hang");
+        assert_eq!(out, "");
     }
 
     #[test]
