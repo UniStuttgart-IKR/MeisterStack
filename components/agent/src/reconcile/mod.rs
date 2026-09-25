@@ -515,6 +515,27 @@ impl Reconciler {
     /// Everything else in it is the bookkeeping around those three — the
     /// backoff that keeps a broken VM from eating the pass, the marker a dead
     /// backend leaves, and the two ways the loop ends early.
+    /// Attach the recorder to this VM's serial line now, rather than on the
+    /// next periodic pass.
+    ///
+    /// The pass runs every thirty seconds and attaches recorders as it goes
+    /// (`reconcile_all`). A guest made or started at the node's socket boots
+    /// in well under a second, and what it said before a recorder was there
+    /// is only what the VMM's ring replays — measured at 278 bytes of a
+    /// 20 750-byte boot (tools/meister-deploy/src/verify.rs, `read_console`),
+    /// so the marker a booted guest prints was never in `vm logs` for a guest
+    /// a person made by hand at the socket (`checks.vm-single-node` found
+    /// it). The api calls this the moment the VMM has its socket. Idempotent:
+    /// `ensure` is what the pass calls too, and a recorder that is there
+    /// stays.
+    pub async fn record_console(&self, id: &VmId) {
+        if let Some(hypervisor) = &self.drivers.hypervisor
+            && let Some(socket) = hypervisor.console_socket(id)
+        {
+            self.consoles.ensure(id, &socket).await;
+        }
+    }
+
     #[instrument(skip_all, fields(vm_id = %id, ?trigger))]
     pub async fn reconcile(&self, id: VmId, trigger: Trigger) -> Result<Action> {
         if self.in_backoff(&id) {

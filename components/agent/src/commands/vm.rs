@@ -102,7 +102,12 @@ impl Agent {
         }
 
         let _guard = self.ops.lock().await;
-        self.provisioner.provision(id, spec, desired, true).await
+        self.provisioner.provision(id, spec, desired, true).await?;
+        // The recorder on the serial line, now, on this road as on the
+        // socket's: a guest boots faster than the periodic pass comes round
+        // (Reconciler::record_console says what that cost `vm logs`).
+        self.reconciler.record_console(&id).await;
+        Ok(())
     }
 
     /// The controller only ever names VMs it owns, so a record it sends is

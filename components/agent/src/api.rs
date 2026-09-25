@@ -533,6 +533,10 @@ async fn set_desired_and_reconcile(
     else {
         return Err(ApiError::not_found(format!("no record for vm {id}")));
     };
+    // A start is a new VMM and a new serial socket (Reconciler::record_console).
+    if desired == Desired::Running {
+        st.reconciler.record_console(&vm_id).await;
+    }
     Ok(Json(ReconcileResponse {
         action: format!("{action:?}"),
     }))
@@ -661,6 +665,10 @@ async fn create_vm(
     // Not managed: a VM born on this socket stays out of reach of the
     // controller's desired-state snapshot.
     st.provisioner.provision(id, spec, desired, false).await?;
+    // The recorder on the serial line, now: a guest boots faster than the
+    // periodic pass comes round, and what it printed before a recorder was
+    // there is lost to `vm logs` (Reconciler::record_console says how much).
+    st.reconciler.record_console(&id).await;
 
     Ok((
         StatusCode::CREATED,
