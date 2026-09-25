@@ -607,23 +607,65 @@ async fn release(store: &EtcdStore, migration: &VmMigration) {
 /// revision order, which every replica derives the same way. See
 /// `controller_api::reservation_holds`.
 ///
-/// `None` is "could not be established" and NEVER "does not fit": a store
-/// that did not answer must not be the reason a migration is refused, and the
-/// promise standing is the safe side of that — it makes the node look fuller
-/// than it is until the move is over.
+/// `Err` is "could not be established", and it is NEVER read as "fits".
+/// Astra finding R3-F04, 2026-09-24: this answered `Option<bool>`, turned
+/// every read error into `None` with `.ok()?`, and the caller stopped only
+/// on `Some(false)` — so a store that did not answer passed as a positive
+/// capacity check, and the destination was built on a sum nobody had seen.
+/// The verdict is a `Result` now: the caller prepares on `Ok(true)` alone
+/// and ends the step on `Err`, before the claim and before anything is
+/// dispatched. Ending the step is the safe side, and it costs one tick: the
+/// promise stands, the node looks fuller than it is until the next pass, and
+/// that pass finds the promise as `Reserved::Standing` and asks again.
 async fn confirm(
     store: &EtcdStore,
     mine: &CapacityReservation,
     overcommit: Overcommit,
-) -> Option<bool> {
-    let node: Node = store.get(&mine.spec.node).await.ok()?;
-    let vms: Vec<Vm> = store.list().await.ok()?;
-    let held = reservations(store).await.ok()?;
+) -> anyhow::Result<bool> {
+    let node = store.get::<Node>(&mine.spec.node).await;
+    let vms = store.list::<Vm>().await;
+    let held = reservations(store).await;
+    verdict(node, vms, held, mine, overcommit)
+}
+
+/// The decision half of `confirm`, over the three readings as they came
+/// back: a reading that failed is a verdict that failed, never one that
+/// passed.
+///
+/// Split from the reads so that each of the three failing can be tested
+/// without a store that fails on cue — the mapping from "could not read" to
+/// "could not confirm" is the whole of finding R3-F04, and it is the part of
+/// this function that has to stay true.
+fn verdict(
+    node: Result<Node, StoreError>,
+    vms: Result<Vec<Vm>, StoreError>,
+    held: anyhow::Result<Vec<CapacityReservation>>,
+    mine: &CapacityReservation,
+    overcommit: Overcommit,
+) -> anyhow::Result<bool> {
+    let node = node.map_err(|e| {
+        anyhow::anyhow!(
+            "node {} could not be read to confirm its room: {e}",
+            mine.spec.node
+        )
+    })?;
+    let vms = vms.map_err(|e| {
+        anyhow::anyhow!(
+            "the vms could not be listed to confirm the room on {}: {e}",
+            mine.spec.node
+        )
+    })?;
+    let held = held.map_err(|e| {
+        anyhow::anyhow!(
+            "the reservations could not be listed to confirm the room on {}: {e:#}",
+            mine.spec.node
+        )
+    })?;
     // The room BEFORE any promise, which is what the queue is measured
     // against — read through the same function the candidate list is built
     // with, so the two cannot drift apart.
     let room = crate::reconcile::free_on(&mine.spec.node, &node.status.capacity, &vms, overcommit);
-    Some(controller_api::reservation_holds(room, mine, &held))
+    Ok(controller_api::reservation_holds(room, mine, &held))
 }
 
 /// One migration, one step.
@@ -853,16 +895,30 @@ async fn prepare(
     // and asks where in the queue it stands — see `confirm`, and
     // `reservation_holds` for the order, which is etcd's own and therefore
     // the same on every replica.
-    if confirm(store, &mine, overcommit).await == Some(false) {
-        return fail(
-            store,
-            migration,
-            format!(
-                "another migration promised the last of {target}'s room first; this record \
-                 ends here and the move can be asked for again"
-            ),
-        )
-        .await;
+    match confirm(store, &mine, overcommit).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return fail(
+                store,
+                migration,
+                format!(
+                    "another migration promised the last of {target}'s room first; this record \
+                     ends here and the move can be asked for again"
+                ),
+            )
+            .await;
+        }
+        // Astra finding R3-F04, 2026-09-24: a reading that failed is not a
+        // passed check. The step ends here — before the claim, before the
+        // disks are opened, before anything is sent to the destination — and
+        // the migration stays Pending with its promise standing. The next
+        // pass finds the promise, adopts it, and asks again.
+        Err(e) => {
+            return Err(e.context(format!(
+                "migration {name}: the room at {target} could not be confirmed; \
+                 nothing was prepared and the next pass asks again"
+            )));
+        }
     }
 
     // The claim before the command, exactly as every other dispatch in this
@@ -2423,6 +2479,78 @@ mod tests {
         assert_eq!(
             choose_target(&FirstFit, &second, "agent-1", None, &fleet),
             Ok("agent-2".to_string())
+        );
+    }
+
+    /// Astra finding R3-F04, 2026-09-24: a store that did not answer used to
+    /// pass as a positive capacity check.
+    ///
+    /// `confirm` reads three things — the node, the vms, the reservations —
+    /// and answered `Option<bool>`, with every read error folded into `None`
+    /// by `.ok()?`. The caller stopped only on `Some(false)`, so a transient
+    /// read error walked straight through to the claim and the dispatch, and
+    /// the destination was built on a sum nobody had seen. Each of the three
+    /// readings is failed here on its own, and the verdict for each is an
+    /// error and never a pass. The store is not involved: the mapping is the
+    /// finding, and `verdict` is where the mapping lives.
+    #[test]
+    fn a_reading_that_fails_is_not_a_passed_check() {
+        let guest = whole_machine("web-1");
+        let moving = migration("web-1", VmMigrationPhaseKind::Pending);
+        let mine = CapacityReservation::of(&moving, &guest, "agent-2");
+        let mut node = node_object("agent-2", None);
+        node.status.capacity = controller_api::NodeCapacity {
+            vcpus: 8,
+            mem_mib: 8192,
+            ..Default::default()
+        };
+        let broken = || StoreError::Timeout("get", Duration::from_secs(5));
+        let overcommit = Overcommit::default();
+
+        // With all three readings in hand the promise holds: an empty
+        // machine, and nothing promised ahead of this.
+        let all_read = verdict(
+            Ok(node.clone()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            &mine,
+            overcommit,
+        );
+        assert!(matches!(all_read, Ok(true)), "{all_read:?}");
+
+        // The node could not be read.
+        let no_node = verdict(
+            Err(broken()),
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            &mine,
+            overcommit,
+        );
+        assert!(no_node.is_err(), "an unread node is not room: {no_node:?}");
+
+        // The vms could not be listed — the half of the sum that says what
+        // is bound there already.
+        let no_vms = verdict(
+            Ok(node.clone()),
+            Err(broken()),
+            Ok(Vec::new()),
+            &mine,
+            overcommit,
+        );
+        assert!(no_vms.is_err(), "unlisted vms are not room: {no_vms:?}");
+
+        // The reservations could not be listed — the queue this promise has
+        // to find its place in.
+        let no_held = verdict(
+            Ok(node),
+            Ok(Vec::new()),
+            Err(anyhow::anyhow!("etcd did not answer")),
+            &mine,
+            overcommit,
+        );
+        assert!(
+            no_held.is_err(),
+            "an unread queue is not a place in it: {no_held:?}"
         );
     }
 
