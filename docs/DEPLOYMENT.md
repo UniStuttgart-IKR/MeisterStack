@@ -409,7 +409,10 @@ check the NAR hash) → cordon/drain if the step interrupts an agent →
 `action.irreversible` in the journal → activate → reboot if the class says so
 → verify → confirm → uncordon → unlock. A reapply of an unchanged fleet
 writes an `unchanged` receipt and touches nothing (V10, measured in
-`vm-managed-update` and in the lab).
+`vm-managed-update` and in the lab). Touches nothing, and still looks: the
+host's required checks are made and journalled, and a host that runs the
+release with a required unit down is `failed`, not `unchanged` (MD07,
+executor test `an_unchanged_host_whose_required_unit_is_down_fails_its_checks`).
 
 **Workload protection** needs `[operator] cli_config`/`cli_profile`. Without
 it, steps that would interrupt an agent are `blocked` with a sentence — there
