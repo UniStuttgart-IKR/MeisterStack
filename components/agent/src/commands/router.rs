@@ -103,6 +103,25 @@ impl Agent {
         // verb takes: a router's legs join bridges that a VM's provisioning
         // is also making, and two of those at once on one node is two
         // netlink conversations about the same link.
+        //
+        // Astra finding R3-F08, 2026-09-25, asked whether this could be
+        // narrowed to only the state-changing LOCAL steps rather than the
+        // whole driver call. From here it already is exactly that: nothing
+        // before this line has a side effect (`validate_router` and
+        // `bridge()` are both reads), nothing follows the call but a log
+        // line, and `ensure_router` is the one call this trait exposes for
+        // "build or converge a router" — it is not this file's call to make
+        // to split "touches the shared provider/overlay bridges" from
+        // "namespace-private setup" inside it, because the trait is
+        // deliberately backend-agnostic (this file's own module doc: a
+        // second backend, OVN or a DPU offload, answers the same six
+        // methods with a logical router and nothing HERE changes) and a
+        // narrower lock boundary would have to be a property of every
+        // implementation, not an assumption this caller bakes in about one
+        // of them. What actually bounds the hold time now is
+        // `drivers/linux-network/src/router.rs`'s R3-F08 fix: every `ip`/
+        // `nft` call the driver makes is under its own deadline, so a
+        // wedged one costs this lock seconds and not for ever.
         let _guard = self.ops.lock().await;
         let state = bridge
             .ensure_router(&spec)

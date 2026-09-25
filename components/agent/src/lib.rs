@@ -1148,7 +1148,13 @@ async fn dial_forever(
         if let Some(wait) = wait {
             warn!(?wait, endpoints = of, "no controller answered, waiting");
         }
-        wait_out_the_backoff(agent, last_up, &mut silenced, wait.unwrap_or_default()).await;
+        wait_out_the_backoff(
+            agent.reconciler.drivers().bridge.as_deref(),
+            last_up,
+            &mut silenced,
+            wait.unwrap_or_default(),
+        )
+        .await;
     }
 }
 
@@ -1178,30 +1184,44 @@ fn should_fall_silent(last_seen: Instant, now: Instant, threshold: Duration) -> 
 /// is nothing left to wake up for and the rest of the backoff is slept in one
 /// piece.
 ///
-/// It silences ONCE per outage. `dial_forever` clears the flag when a session
-/// says Hello again, which is the only thing that makes this node a candidate
-/// to speak for anything.
+/// It silences once per outage AND ONCE IT IS VERIFIABLY COMPLETE. `dial_
+/// forever` clears the flag when a session says Hello again, which is the
+/// only thing that makes this node a candidate to speak for anything.
+///
+/// Astra finding R3-F06, 2026-09-25: a pass that only PARTIALLY silences
+/// this node's routers no longer sets `*silenced`, so the next backoff
+/// round tries again -- before this, `stop_speaking_for_every_router`
+/// returned nothing, `*silenced` was set unconditionally, and a router
+/// whose `ensure_router` failed here got no second try for the rest of the
+/// outage: exactly the two-MAC defect S08 was written to close, moved one
+/// router over. One attempt per round and not a retry loop inside this
+/// call, deliberately: `*silenced` staying false keeps the deadline branch
+/// live, and without `tried_this_round` it would fire again on the very
+/// next iteration of the loop below with nothing slept in between --
+/// hammering `ip`/`nft` for the rest of `wait` instead of trying again on
+/// the NEXT round, which is what the redial backoff between rounds is for.
 async fn wait_out_the_backoff(
-    agent: &Arc<Agent>,
+    bridge: Option<&dyn agent_api::networking::BridgeDriver>,
     last_up: Instant,
     silenced: &mut bool,
     wait: Duration,
 ) {
     let until = Instant::now() + wait;
+    let mut tried_this_round = false;
     loop {
         let now = Instant::now();
-        if !*silenced && should_fall_silent(last_up, now, ROUTER_DEAD_MAN) {
+        if !*silenced && !tried_this_round && should_fall_silent(last_up, now, ROUTER_DEAD_MAN) {
             warn!(deadline = ?ROUTER_DEAD_MAN,
                   "no controller has answered for longer than the dead man's deadline; this \
                    node stops answering for its routers' addresses before the cluster can give \
                    them to a standby");
-            stop_speaking_for_every_router(agent).await;
-            *silenced = true;
+            tried_this_round = true;
+            *silenced = stop_speaking_for_every_router(bridge).await;
         }
         if now >= until {
             return;
         }
-        let next = match *silenced {
+        let next = match *silenced || tried_this_round {
             true => until,
             false => until.min(last_up + ROUTER_DEAD_MAN),
         };
@@ -1238,7 +1258,12 @@ async fn say_goodbye(agent: &Arc<Agent>) {
         );
     }
     give_back_what_is_half_built(agent).await;
-    stop_speaking_for_every_router(agent).await;
+    // The result is not checked here: this is the one-shot, orderly
+    // farewell, and there is no next backoff round for a router that failed
+    // to retry on. `wait_out_the_backoff`'s caller is the one that acts on
+    // partial success (R3-F06); this one has already logged whatever went
+    // wrong and is going either way.
+    let _ = stop_speaking_for_every_router(agent.reconciler.drivers().bridge.as_deref()).await;
 }
 
 /// The router half of the farewell: this node stops answering for addresses
@@ -1259,16 +1284,44 @@ async fn say_goodbye(agent: &Arc<Agent>) {
 /// about to promote a standby on a timer. Same call, same result, and
 /// deliberately the same function -- two definitions of "stop speaking" is
 /// how the two of them start disagreeing.
-async fn stop_speaking_for_every_router(agent: &Agent) {
-    let Some(bridge) = agent.reconciler.drivers().bridge.as_ref() else {
-        return;
+///
+/// Takes the bridge directly rather than the whole `Agent` -- the same shape
+/// `sweep_orphan_overlays` already has, and for the same reason: it is
+/// testable against a fake `BridgeDriver` with no store, no reconciler and
+/// no catalogues to construct.
+///
+/// Astra finding R3-F06, 2026-09-25: returns whether every one of this
+/// node's active routers is now VERIFIABLY silent, so `wait_out_the_backoff`
+/// can tell "all of them" from "some of them" and retry only in the second
+/// case. `false` on anything short of that: an error from the driver, or a
+/// `Silencing` that names a router that did not go quiet. No bridge at all
+/// is vacuously `true` -- a node with none has nothing to answer for.
+async fn stop_speaking_for_every_router(
+    bridge: Option<&dyn agent_api::networking::BridgeDriver>,
+) -> bool {
+    let Some(bridge) = bridge else {
+        return true;
     };
     match bridge.fall_silent().await {
-        Ok(silenced) if silenced.is_empty() => {}
-        Ok(silenced) => info!(?silenced, "this node's routers fell silent on the way out"),
-        Err(e) => warn!(error = %format!("{e:#}"),
-                        "this node's routers could not be silenced; it may still answer for \
-                         addresses its cluster has moved"),
+        Ok(outcome) if outcome.complete() => {
+            if !outcome.silenced.is_empty() {
+                info!(silenced = ?outcome.silenced, "this node's routers fell silent on the way out");
+            }
+            true
+        }
+        Ok(outcome) => {
+            warn!(silenced = ?outcome.silenced, failed = ?outcome.failed,
+                  "this node's routers could only be PARTIALLY silenced; the ones that failed \
+                   may still answer for addresses its cluster has moved, and are retried on the \
+                   next backoff round");
+            false
+        }
+        Err(e) => {
+            warn!(error = %format!("{e:#}"),
+                  "this node's routers could not be silenced; it may still answer for \
+                   addresses its cluster has moved, and are retried on the next backoff round");
+            false
+        }
     }
 }
 
@@ -1709,6 +1762,168 @@ mod tests {
              this end one keepalive interval plus its timeout, and the \
              controller's own clock started when the wire did"
         );
+    }
+
+    /// A bridge whose `fall_silent` answers a scripted sequence of outcomes,
+    /// one per call, and counts how many times it was asked — so a caller's
+    /// behaviour across SEVERAL attempts (retried on a later backoff round,
+    /// or not retried a second time within one) can be asserted without a
+    /// kernel or a namespace underneath it.
+    ///
+    /// Astra finding R3-F06, 2026-09-25.
+    #[derive(Default)]
+    struct ScriptedBridge {
+        answers: Mutex<
+            std::collections::VecDeque<
+                agent_api::networking::Result<agent_api::networking::Silencing>,
+            >,
+        >,
+        calls: Mutex<u32>,
+    }
+
+    impl ScriptedBridge {
+        fn new(
+            answers: Vec<agent_api::networking::Result<agent_api::networking::Silencing>>,
+        ) -> Self {
+            Self {
+                answers: Mutex::new(answers.into()),
+                calls: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl agent_api::networking::BridgeDriver for ScriptedBridge {
+        async fn ensure(&self, _name: &str) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn ensure_address(
+            &self,
+            _name: &str,
+            _addr: std::net::IpAddr,
+            _prefix_len: u8,
+        ) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn destroy(&self, _name: &str) -> agent_api::networking::Result<()> {
+            Ok(())
+        }
+        async fn fall_silent(
+            &self,
+        ) -> agent_api::networking::Result<agent_api::networking::Silencing> {
+            *self.calls.lock().unwrap() += 1;
+            self.answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("the test scripted one answer per expected call")
+        }
+    }
+
+    fn router(n: u128) -> agent_api::networking::RouterId {
+        agent_api::networking::RouterId::from_u128(n)
+    }
+
+    /// Two routers, the first attempt fails one of them, the second attempt
+    /// reaches both. This is the regression for R3-F06's whole point: a
+    /// partial pass must not be reported the same as a complete one.
+    #[tokio::test]
+    async fn a_router_that_failed_to_fall_silent_is_reported_as_partial_not_complete() {
+        let a = router(1);
+        let b = router(2);
+        let bridge = ScriptedBridge::new(vec![
+            Ok(agent_api::networking::Silencing {
+                silenced: vec![a],
+                failed: vec![b],
+            }),
+            Ok(agent_api::networking::Silencing {
+                silenced: vec![a, b],
+                failed: Vec::new(),
+            }),
+        ]);
+
+        let complete = stop_speaking_for_every_router(Some(&bridge)).await;
+        assert!(
+            !complete,
+            "one router still answering is not a completed farewell"
+        );
+
+        let complete = stop_speaking_for_every_router(Some(&bridge)).await;
+        assert!(complete, "the retry reached every router");
+        assert_eq!(*bridge.calls.lock().unwrap(), 2);
+    }
+
+    /// A driver error is exactly as incomplete as a partial `Silencing`: the
+    /// caller has no routers it can name as silenced, and none of them is
+    /// reported as if they were.
+    #[tokio::test]
+    async fn a_total_driver_failure_falling_silent_is_reported_as_incomplete() {
+        let bridge = ScriptedBridge::new(vec![Err(agent_api::networking::NetworkError::Backend(
+            anyhow!("the netns directory could not be read"),
+        ))]);
+        assert!(!stop_speaking_for_every_router(Some(&bridge)).await);
+    }
+
+    /// No bridge at all -- a node with no gateway slot -- has nothing to
+    /// answer for, and that is vacuously a completed farewell: `dial_
+    /// forever` must not retry a router that was never built.
+    #[tokio::test]
+    async fn a_node_with_no_bridge_driver_has_nothing_to_silence() {
+        assert!(stop_speaking_for_every_router(None).await);
+    }
+
+    /// The retry contract `wait_out_the_backoff` owes the dead man: one
+    /// attempt per backoff ROUND, not a busy retry inside one -- and a
+    /// round whose silencing failed leaves `*silenced` false so the very
+    /// next round tries again.
+    #[tokio::test]
+    async fn a_failed_round_is_retried_on_the_next_backoff_round_and_not_inside_one() {
+        let a = router(1);
+        let b = router(2);
+        let bridge = ScriptedBridge::new(vec![
+            Ok(agent_api::networking::Silencing {
+                silenced: vec![a],
+                failed: vec![b],
+            }),
+            Ok(agent_api::networking::Silencing {
+                silenced: vec![a, b],
+                failed: Vec::new(),
+            }),
+        ]);
+        // Already well past the dead man's deadline, so the very first
+        // iteration of the loop inside `wait_out_the_backoff` is ready to
+        // fall silent.
+        let last_up = Instant::now() - ROUTER_DEAD_MAN - Duration::from_millis(1);
+        let mut silenced = false;
+
+        wait_out_the_backoff(
+            Some(&bridge),
+            last_up,
+            &mut silenced,
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(
+            !silenced,
+            "a partial silencing must not be reported as complete"
+        );
+        assert_eq!(
+            *bridge.calls.lock().unwrap(),
+            1,
+            "one attempt per backoff round, not a busy retry for the rest of it"
+        );
+
+        // The next backoff round: `dial_forever` calls this again with the
+        // same `last_up` and the same `silenced` flag it was left with.
+        wait_out_the_backoff(
+            Some(&bridge),
+            last_up,
+            &mut silenced,
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(silenced, "the retry on the next round reached every router");
+        assert_eq!(*bridge.calls.lock().unwrap(), 2);
     }
 
     /// The two words a node puts in `RouterReport.phase`, held against the
