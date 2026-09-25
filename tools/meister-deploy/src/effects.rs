@@ -58,6 +58,20 @@ pub trait Files {
     fn read_to_string(&self, path: &Path) -> Result<String>;
     fn exists(&self, path: &Path) -> bool;
 
+    /// The file's text, `None` when there is no file at this path — and an
+    /// error for everything else.
+    ///
+    /// Astra finding MD06, 2026-09-25: a caller that asks "is there an
+    /// installation mark on this disk" has three answers to tell apart, not
+    /// two. "No such file" is the one that means "not installed"; a file
+    /// that is there and cannot be read (an I/O error, bytes that are not
+    /// utf-8, a directory where a file was expected) is a disk whose
+    /// history this program does not know, and a guard that folds that
+    /// into "not installed" is a guard that does not guard. `exists` cannot
+    /// carry the distinction either: it answers `false` for a path it is
+    /// not allowed to look at.
+    fn read_if_present(&self, path: &Path) -> Result<Option<String>>;
+
     /// Write the whole file or none of it: a temporary in the same directory,
     /// `fsync`, `rename`, then `fsync` of the directory. Same directory
     /// because `rename` is only atomic within a filesystem, and the directory
@@ -180,6 +194,14 @@ impl Files for RealFiles {
 
     fn read_to_string(&self, path: &Path) -> Result<String> {
         std::fs::read_to_string(path).with_context(|| format!("reading {} failed", path.display()))
+    }
+
+    fn read_if_present(&self, path: &Path) -> Result<Option<String>> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading {} failed", path.display())),
+        }
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -473,6 +495,17 @@ impl Files for MemFiles {
     fn read_to_string(&self, path: &Path) -> Result<String> {
         let bytes = self.read(path)?;
         String::from_utf8(bytes).with_context(|| format!("{} is not utf-8", path.display()))
+    }
+
+    fn read_if_present(&self, path: &Path) -> Result<Option<String>> {
+        // Only a path nothing at all is at is "not there": a directory, a
+        // link or an `other` at this path is something this test put there
+        // to be found and not read, which is the case `read_to_string`
+        // reports.
+        if !self.exists(path) {
+            return Ok(None);
+        }
+        self.read_to_string(path).map(Some)
     }
 
     fn exists(&self, path: &Path) -> bool {

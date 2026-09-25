@@ -670,10 +670,27 @@ impl<'a> Installer<'a> {
                 );
             }
             let path = self.probe_dir.join(MARK_PATH);
-            let found = self.files.read_to_string(&path).ok();
+            // Astra finding MD06, 2026-09-25: this was `.ok()`, which made
+            // every failure to read the mark — an I/O error, bytes that are
+            // not utf-8, a directory where the file should be — into "there
+            // is no mark", and "no mark" is what lets `prepare` go on to
+            // the disko script without `--reinstall`. Only "no such file"
+            // means that; the unmount happens first either way, and any
+            // other answer stops here, before anything is written.
+            let found = self.files.read_if_present(&path);
             self.runner.run(
                 &Cmd::new(Effect::Read, "umount", QUICK).arg(self.probe_dir.display().to_string()),
             )?;
+            let found = found.map_err(|e| {
+                anyhow::anyhow!(
+                    "{} carries something at {} that could not be read ({e:#}). This program \
+                     cannot tell whether the disk is already installed, and going on as if it \
+                     were not is exactly what `--reinstall` exists to prevent. Look at that \
+                     partition by hand. Nothing was changed.",
+                    partition.path,
+                    MARK_PATH
+                )
+            })?;
             if let Some(text) = found {
                 let mark = InstalledMark::from_json(&text, &path.display().to_string())?;
                 return Ok(Some((partition.path.clone(), mark)));
@@ -1686,6 +1703,53 @@ mod tests {
         assert!(err.contains("/dev/vdb2"), "{err}");
         assert!(err.contains("Nothing was changed"), "{err}");
         runner.verify().unwrap();
+    }
+
+    /// Astra finding MD06, 2026-09-25: the mount succeeds and the mark is
+    /// there and cannot be read. That used to be "no mark", and "no mark"
+    /// is the one answer that lets a disk be formatted without
+    /// `--reinstall`.
+    fn a_mark_that_cannot_be_read(files: MemFiles) {
+        let runner = StrictFake::new()
+            .expect(lsblk_matcher(), Output::stdout(lsblk(&["/dev/vdb2"], SIZE)))
+            .expect(realpath(DISK), Output::stdout("/dev/vdb\n"))
+            .expect(realpath(BY_ID), Output::stdout("/dev/vdb\n"))
+            .expect(
+                Matcher::prefix("mount", ["-o", "ro,nosuid,nodev", "/dev/vdb2"]),
+                Output::stdout(""),
+            )
+            // Unmounted whatever the read said.
+            .expect(Matcher::exact("umount", [PROBE_DIR]), Output::stdout(""));
+        let clock = FakeClock::fixed();
+        let err = installer(&runner, &files, &clock)
+            .confirm("box", "MEISTERTEST01", None, false, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not be read"), "{err}");
+        assert!(err.contains("/dev/vdb2"), "{err}");
+        assert!(err.contains("--reinstall"), "{err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+        // And in particular: nothing further ran — no disko, no install.
+        runner.verify().unwrap();
+        assert!(
+            !files.attempts().iter().any(|a| a.contains("write")),
+            "{:?}",
+            files.attempts()
+        );
+    }
+
+    #[test]
+    fn a_mark_that_is_not_a_file_stops_the_install() {
+        a_mark_that_cannot_be_read(
+            files_with(&target()).given_other(format!("{PROBE_DIR}/{MARK_PATH}")),
+        );
+    }
+
+    #[test]
+    fn a_mark_that_is_not_utf8_stops_the_install() {
+        a_mark_that_cannot_be_read(
+            files_with(&target()).given(format!("{PROBE_DIR}/{MARK_PATH}"), vec![0xff, 0xfe, 0x00]),
+        );
     }
 
     // -----------------------------------------------------------------
