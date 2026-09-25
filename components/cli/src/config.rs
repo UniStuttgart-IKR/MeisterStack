@@ -115,12 +115,20 @@ pub struct Config {
     pub dir: Option<PathBuf>,
 }
 
+/// The config a machine ships for everybody on it: what a single node
+/// (nix/single-node.nix) writes, so that `meister agent vm ls` works on it
+/// without anybody writing a profile first.
+pub const SYSTEM_CONFIG: &str = "/etc/meisterstack/cli.toml";
+
 /// Default config Paths are $MEISTER_CONFIG >> $XDG_CONFIG_HOME/meisterstack/config.toml >>
-/// ~/.config/meisterstack/config.toml
+/// ~/.config/meisterstack/config.toml >> /etc/meisterstack/cli.toml.
+///
+/// The last one is the machine's, and it is only a FALLBACK: a person's own
+/// file wins by existing, and `MEISTER_CONFIG` wins over both. When neither
+/// the person's nor the machine's file is there, the person's path is the
+/// answer — that is where a `meister login` would write, and the error a
+/// missing profile produces should name it.
 pub fn default_config_path() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var(ENV_CONFIG) {
-        return Ok(PathBuf::from(p));
-    }
     let base = match std::env::var("XDG_CONFIG_HOME") {
         Ok(p) if !p.is_empty() => PathBuf::from(p),
         _ => {
@@ -128,7 +136,34 @@ pub fn default_config_path() -> Result<PathBuf> {
             PathBuf::from(home).join(".config")
         }
     };
-    Ok(base.join("meisterstack").join("config.toml"))
+    let user = base.join("meisterstack").join("config.toml");
+    Ok(pick_config_path(
+        std::env::var(ENV_CONFIG).ok().map(PathBuf::from),
+        user,
+        PathBuf::from(SYSTEM_CONFIG),
+        |p| p.is_file(),
+    ))
+}
+
+/// The choice above, without the environment: the override, else the
+/// person's file if it exists, else the machine's if that exists, else the
+/// person's path.
+fn pick_config_path(
+    env_override: Option<PathBuf>,
+    user: PathBuf,
+    system: PathBuf,
+    is_file: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(p) = env_override {
+        return p;
+    }
+    if is_file(&user) {
+        return user;
+    }
+    if is_file(&system) {
+        return system;
+    }
+    user
 }
 
 impl Config {
@@ -751,5 +786,33 @@ mod tests {
     fn bearer_is_redacted_in_debug() {
         let c = Credential::Bearer("super-secret".into());
         assert!(!format!("{c:?}").contains("super-secret"));
+    }
+
+    // The machine's config is a fallback and never an override.
+    #[test]
+    fn the_machines_config_is_taken_only_when_the_person_has_none() {
+        let user = PathBuf::from("/home/x/.config/meisterstack/config.toml");
+        let system = PathBuf::from(SYSTEM_CONFIG);
+        let env = Some(PathBuf::from("/tmp/mine.toml"));
+        // The environment wins whatever exists.
+        assert_eq!(
+            pick_config_path(env.clone(), user.clone(), system.clone(), |_| true),
+            PathBuf::from("/tmp/mine.toml")
+        );
+        // The person's file wins by existing.
+        assert_eq!(
+            pick_config_path(None, user.clone(), system.clone(), |_| true),
+            user
+        );
+        // Without it, the machine's — when the machine has one.
+        assert_eq!(
+            pick_config_path(None, user.clone(), system.clone(), |p| p == system),
+            system
+        );
+        // And with neither, the person's path: that is where a login writes.
+        assert_eq!(
+            pick_config_path(None, user.clone(), system, |_| false),
+            user
+        );
     }
 }
