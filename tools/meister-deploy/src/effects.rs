@@ -323,23 +323,55 @@ impl Files for RealFiles {
 
     fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         self.may_write(path)?;
-        // Not through a temporary and a rename: a rename REPLACES, and the
-        // whole point here is to lose the race rather than win it silently.
-        // `O_EXCL` is the one operation two processes can both attempt and
-        // exactly one succeed at.
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(path)
-            .with_context(|| format!("creating {} failed", path.display()))?;
-        file.write_all(bytes)
-            .with_context(|| format!("writing {} failed", path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("making {} durable failed", path.display()))?;
+        // Astra finding MD03, 2026-09-25: this used to open `path` itself
+        // with `O_EXCL` and write the bytes into it afterwards — so the NAME
+        // was there before the contents were, and a process that lost the
+        // race and read the file in that window read nothing. For a lock
+        // that names its holder, nothing looked like nobody, and the reader
+        // removed the name and took the lock for itself.
+        //
+        // So the bytes go into a private temporary first, whole and fsynced,
+        // and the name is published with `link(2)`: it fails with `EEXIST`
+        // when the name is taken, as exclusively as `O_EXCL` does, and when
+        // it succeeds the file behind the name is already complete. Not a
+        // rename: a rename REPLACES, and the whole point here is to lose the
+        // race rather than win it silently.
+        let dir = parent_of(path);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "out".to_string());
+        // The pid and a counter in the name: two processes on one NFS state
+        // directory, and two threads of one process, must not land on the
+        // same temporary.
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = dir.join(format!(
+            ".{name}.new.{}.{}",
+            std::process::id(),
+            NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let write = || -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&tmp)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok(())
+        };
+        if let Err(e) = write() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("writing {} failed", tmp.display()));
+        }
+        let published = std::fs::hard_link(&tmp, path);
+        // The temporary is done with either way: when the link was made,
+        // the name is the file; when it was not, there is nothing to keep.
+        let _ = std::fs::remove_file(&tmp);
+        published.with_context(|| format!("creating {} failed", path.display()))?;
         // The directory too: a lock that is not durable is a lock a power
         // cut hands to the next run.
-        std::fs::File::open(parent_of(path))
+        std::fs::File::open(dir)
             .and_then(|d| d.sync_all())
             .with_context(|| format!("making the new {} durable failed", path.display()))
     }
@@ -749,6 +781,7 @@ mod tests {
     }
 
     use super::*;
+    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn an_atomic_write_leaves_no_temporary_and_the_mode_asked_for() {
@@ -765,6 +798,46 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(left, vec!["manifest.json"], "no temporary was left behind");
+    }
+
+    // Astra finding MD03, 2026-09-25.
+    #[test]
+    fn an_exclusive_create_publishes_a_whole_file_and_refuses_a_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let files = RealFiles::new(Policy::real());
+        files.create_new(&path, b"confirm pid 4711", 0o600).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"confirm pid 4711");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().nlink(),
+            1,
+            "the temporary the file was published from is gone"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["lock"], "no temporary was left behind");
+
+        // The second one loses, and loses without touching the first.
+        let err = files
+            .create_new(&path, b"revert pid 4712", 0o600)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("creating"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"confirm pid 4711");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["lock"],
+            "the loser left no temporary behind either"
+        );
     }
 
     #[test]

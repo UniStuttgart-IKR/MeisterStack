@@ -332,6 +332,35 @@ fn is_running(pid: u32) -> bool {
     )
 }
 
+/// The refusal `deciding` gives when a process that is running holds the
+/// transaction: a confirm and a revert at once leave the machine on one
+/// system and the record saying the other.
+///
+/// A type and not a sentence, because one caller reads it differently from
+/// the rest: the deadline (Astra finding MD02, 2026-09-25) waits for the
+/// holder to finish rather than giving up, since the holder it finds is the
+/// activation whose deadline it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeingDecided {
+    pub id: String,
+    /// The record as it stands: `<verb> pid <n> at <time>`.
+    pub holder: String,
+}
+
+impl std::fmt::Display for BeingDecided {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the transaction {} is being decided right now ({}). A confirm and a revert at \
+             once leave the machine on one system and the record saying the other, so this \
+             one did nothing.",
+            self.id, self.holder
+        )
+    }
+}
+
+impl std::error::Error for BeingDecided {}
+
 /// Who asked for a revert.
 ///
 /// Astra finding F07, 2026-09-23: the three differ in exactly one thing —
@@ -1001,41 +1030,118 @@ impl<'a> Helper<'a> {
         let path = self.txn_dir().join(format!("{id}.deciding"));
         self.files.create_dir_all(&self.txn_dir())?;
         let mine = format!("{what} pid {} at {}", std::process::id(), self.clock.now());
-        if let Err(e) = self.files.create_new(&path, mine.as_bytes(), 0o600) {
-            let held = self.files.read_to_string(&path).unwrap_or_default();
-            // No exception for this process's own pid: nothing here decides
-            // one transaction inside another, so a holder that is running is
-            // a holder whatever its number is.
-            if let Some(pid) = deciding_pid(&held)
-                && is_running(pid)
-            {
-                bail!(
-                    "the transaction {id} is being decided right now ({}). A confirm and a \
-                     revert at once leave the machine on one system and the record saying the \
-                     other, so this one did nothing.",
-                    held.trim()
-                );
-            }
-            // Nobody is behind it. It is taken over, and the takeover is
-            // the same exclusive create once the stale one is gone.
-            self.files.remove_file(&path)?;
-            self.files
-                .create_new(&path, mine.as_bytes(), 0o600)
-                .with_context(|| {
-                    format!(
-                        "the transaction {id} could not be held for this decision ({e:#}), and the \
-                     record that was there ({}) could not be replaced either.",
-                        held.trim()
-                    )
-                })?;
-        }
+        self.hold_decision(id, &path, &mine)?;
         let out = f();
         // Given back whatever happened: a decision that failed is a
         // decision somebody has to be able to make again.
-        if let Err(e) = self.files.remove_file(&path) {
-            eprintln!("note: {} was not removed: {e:#}", path.display());
+        //
+        // Astra finding MD03, 2026-09-25: given back only while it is still
+        // this process's. The name alone is not ownership — a holder whose
+        // process died is succeeded by the next decider (`hold_decision`),
+        // and a remove by name here would have removed THAT one's lock.
+        match self.files.read_if_present(&path) {
+            Ok(Some(held)) if held == mine => {
+                if let Err(e) = self.files.remove_file(&path) {
+                    eprintln!("note: {} was not removed: {e:#}", path.display());
+                }
+            }
+            Ok(Some(held)) => eprintln!(
+                "note: {} is held by {} now, so it was left where it is.",
+                path.display(),
+                held.trim()
+            ),
+            Ok(None) => {}
+            Err(e) => eprintln!("note: {} could not be read back: {e:#}", path.display()),
         }
         out
+    }
+
+    /// Take `<id>.deciding` for this process, or say who has it.
+    ///
+    /// Astra finding MD03, 2026-09-25. Two things were wrong with the take:
+    /// a record nobody could read was treated as nobody's, and a stale one
+    /// was succeeded by a remove and a create — three steps two deciders
+    /// could both take, the loser's remove taking away the winner's fresh
+    /// lock. Now an unreadable record is a refusal (a file in this place
+    /// that this program did not write is the operator's to look at), and
+    /// the succession is a rename, which exactly one of two deciders can
+    /// succeed at; what was carried away is read once more, because between
+    /// the read and the rename the dead holder may have been succeeded by a
+    /// live one, and that one goes back with `create_new`, which cannot
+    /// overwrite.
+    ///
+    /// No exception for this process's own pid: nothing here decides one
+    /// transaction inside another, so a holder that is running is a holder
+    /// whatever its number is.
+    fn hold_decision(&self, id: &str, path: &Path, mine: &str) -> Result<()> {
+        // A few tries, not a loop: a name that vanishes between the failed
+        // create and the read is a holder that finished, and the create is
+        // simply asked again. A name that keeps changing hands is reported.
+        for _ in 0..4 {
+            let Err(e) = self.files.create_new(path, mine.as_bytes(), 0o600) else {
+                return Ok(());
+            };
+            let Some(held) = self.files.read_if_present(path)? else {
+                continue;
+            };
+            match deciding_pid(&held) {
+                Some(pid) if is_running(pid) => {
+                    return Err(BeingDecided {
+                        id: id.to_string(),
+                        holder: held.trim().to_string(),
+                    }
+                    .into());
+                }
+                Some(_) => {}
+                None => bail!(
+                    "{} exists and is not a record this program wrote ({}), so the transaction \
+                     {id} cannot be decided from here ({e:#}). Nothing here removes a file that \
+                     might be somebody's lock: read it, and remove it by hand if it is rubbish.",
+                    path.display(),
+                    held.trim()
+                ),
+            }
+            // A holder whose process is gone is not a holder: a machine
+            // that lost power while deciding must not be a machine whose
+            // timer can never fire again. The succession is the rename.
+            let claim =
+                path.with_file_name(format!("{id}.deciding.taken-by-{}", std::process::id()));
+            if self.files.rename(path, &claim).is_err() {
+                // Somebody else carried it away first; from the top, where
+                // that somebody's fresh lock is found with a running pid.
+                continue;
+            }
+            let carried = self.files.read_to_string(&claim).unwrap_or_default();
+            if let Some(pid) = deciding_pid(&carried)
+                && is_running(pid)
+            {
+                match self.files.create_new(path, carried.as_bytes(), 0o600) {
+                    Ok(()) => {
+                        let _ = self.files.remove_file(&claim);
+                        return Err(BeingDecided {
+                            id: id.to_string(),
+                            holder: carried.trim().to_string(),
+                        }
+                        .into());
+                    }
+                    Err(back) => bail!(
+                        "the transaction {id} is being decided right now ({}), and its lock could \
+                         not be put back on {} ({back:#}) because something else took that name \
+                         in the meantime. Nothing was decided; the record that was there is in \
+                         {}.",
+                        carried.trim(),
+                        path.display(),
+                        claim.display()
+                    ),
+                }
+            }
+            self.files.remove_file(&claim)?;
+        }
+        bail!(
+            "the transaction {id} could not be held for this decision: {} kept changing hands. \
+             Nothing was decided.",
+            path.display()
+        )
     }
 
     /// Keep it. The intent goes down, then the timer goes, then the record
@@ -4305,4 +4411,111 @@ mod tests {
                 .is_empty()
         );
     }
+
+    // --- Astra finding MD03, 2026-09-25 ---------------------------------
+
+    fn deciding_path(helper: &Helper<'_>) -> PathBuf {
+        helper.txn_dir().join("run-1.deciding")
+    }
+
+    #[test]
+    fn a_decision_file_this_program_did_not_write_is_not_replaced() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let path = deciding_path(&helper);
+        files.create_dir_all(&helper.txn_dir()).unwrap();
+        files.write_atomic(&path, b"rubbish", 0o600).unwrap();
+        let err = helper
+            .deciding("run-1", "confirm", || Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a record this program wrote"), "{err}");
+        assert_eq!(
+            files.read_to_string(&path).unwrap(),
+            "rubbish",
+            "left as it was"
+        );
+    }
+
+    #[test]
+    fn a_decision_whose_holder_died_is_succeeded_and_given_back_afterwards() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let path = deciding_path(&helper);
+        files.create_dir_all(&helper.txn_dir()).unwrap();
+        // Positive, and above every `pid_max` a Linux kernel hands out.
+        files
+            .write_atomic(
+                &path,
+                b"revert pid 2147483646 at 2026-09-22 11:00:00 UTC",
+                0o600,
+            )
+            .unwrap();
+        let mine = format!("confirm pid {} at ", std::process::id());
+        let out = helper
+            .deciding("run-1", "confirm", || {
+                let held = files.read_to_string(&path).unwrap();
+                assert!(held.starts_with(&mine), "{held}");
+                Ok(7)
+            })
+            .unwrap();
+        assert_eq!(out, 7);
+        assert!(!files.exists(&path), "given back");
+        let claim = path.with_file_name(format!("run-1.deciding.taken-by-{}", std::process::id()));
+        assert!(!files.exists(&claim), "no claim is left lying about");
+    }
+
+    #[test]
+    fn a_decision_being_made_by_a_running_process_is_refused_as_such() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let path = deciding_path(&helper);
+        files.create_dir_all(&helper.txn_dir()).unwrap();
+        // pid 1 is init: `kill(1, 0)` answers EPERM, which is "running".
+        files
+            .write_atomic(&path, b"revert pid 1 at 2026-09-22 11:00:00 UTC", 0o600)
+            .unwrap();
+        let err = helper.deciding("run-1", "confirm", || Ok(())).unwrap_err();
+        let held = err
+            .downcast_ref::<BeingDecided>()
+            .expect("the refusal is the typed one");
+        assert_eq!(held.id, "run-1");
+        assert!(held.holder.contains("revert pid 1"), "{}", held.holder);
+        assert_eq!(
+            files.read_to_string(&path).unwrap(),
+            "revert pid 1 at 2026-09-22 11:00:00 UTC",
+            "left as it was"
+        );
+    }
+
+    #[test]
+    fn a_decision_gives_back_only_its_own_record() {
+        let files = host();
+        let runner = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        let path = deciding_path(&helper);
+        // While this process decides, somebody who took it for dead
+        // succeeds it. The record is theirs then, and stays.
+        helper
+            .deciding("run-1", "confirm", || {
+                files
+                    .write_atomic(&path, b"revert pid 1 at 2026-09-22 11:30:00 UTC", 0o600)
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            files.read_to_string(&path).unwrap(),
+            "revert pid 1 at 2026-09-22 11:30:00 UTC"
+        );
+    }
+
+
 }
