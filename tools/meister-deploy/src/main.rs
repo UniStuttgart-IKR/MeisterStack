@@ -978,7 +978,9 @@ struct ApplyArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Print the receipt as json instead of as a table
+    /// Print the receipt as json instead of as a table: one json document
+    /// on stdout and nothing else there (the run id is in it as `run_id`,
+    /// a halt for a provider as `waiting`, a stop as `stopped`)
     #[arg(long)]
     json: bool,
 }
@@ -2996,7 +2998,14 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
     );
     // The id on stdout and nothing else, so that a script can capture it and
     // `report --run` it afterwards.
-    println!("{run_id}");
+    //
+    // Astra finding MD09, 2026-09-25: not under `--json`. There stdout is
+    // the one document the flag promises, and a bare line in front of it is
+    // what makes `apply --json | jq` fail; the id is in the receipt as
+    // `run_id` and on stderr in the line above.
+    if !args.json {
+        println!("{run_id}");
+    }
 
     let (control, note) = workload_control(&files, &release, args.inventory.as_deref());
     if let Some(note) = note {
@@ -3066,7 +3075,12 @@ fn apply(args: &ApplyArgs) -> Result<Answer> {
     // three store paths. (stdout already carries the run id on a line of
     // its own, so a second line is the shape this verb already has.)
     if let Some(wait) = &applied.waiting {
-        println!("{}", serde_json::to_string(&wait.to_json())?);
+        // Astra finding MD09, 2026-09-25: under `--json` this object is the
+        // receipt's `waiting`, printed above, and a second document on
+        // stdout would make the first one unparseable.
+        if !args.json {
+            println!("{}", serde_json::to_string(&wait.to_json())?);
+        }
         eprintln!(
             "==> {} is waiting for its provider. Nothing else was started.",
             wait.host

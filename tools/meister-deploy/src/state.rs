@@ -2233,6 +2233,8 @@ mod tests {
             breaks: Vec::new(),
             journal_path: "journal.jsonl".to_string(),
             journal_sha256: "0".repeat(64),
+            stopped: None,
+            waiting: None,
         };
         receipt.to_json().unwrap()
     }

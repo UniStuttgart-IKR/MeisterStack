@@ -1144,6 +1144,24 @@ pub struct DeploymentReceipt {
     pub breaks: Vec<String>,
     pub journal_path: String,
     pub journal_sha256: String,
+    // --- Astra finding MD09, 2026-09-25 ---
+    /// Why the RUN stopped, when it did: the sentence `run.end` carries.
+    ///
+    /// `outcome` above is about the hosts and stays that way (Astra finding
+    /// F06): a run that confirmed every host and then failed an `uncordon`
+    /// has forward hosts and is not a run that came through. The exit code
+    /// says so; this field says it in the document, so that a script reads
+    /// both from one place. Absent from a receipt `report` folds out of a
+    /// journal, because the journal of a run that has not ended has no
+    /// `run.end` to take it from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<String>,
+    /// The `provider-reboot` the run halted in front of, if it did: the
+    /// same object `apply` prints on its own line for a launcher (lane
+    /// 3-integration), carried here so that `--json` is one document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<serde_json::Value>,
+    // --- end Astra finding MD09 ---
 }
 
 impl DeploymentReceipt {
@@ -1235,6 +1253,8 @@ pub fn receipt(
         breaks: state.breaks.clone(),
         journal_path: journal.path.clone(),
         journal_sha256: journal.sha256.clone(),
+        stopped: None,
+        waiting: None,
     }
 }
 

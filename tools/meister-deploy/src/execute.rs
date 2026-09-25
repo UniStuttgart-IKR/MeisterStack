@@ -472,7 +472,12 @@ impl<'a> Executor<'a> {
         let read = read_journal(self.files, &journal_path)?;
         let folded = fold(&read.events)?;
         let reference = journal_ref(self.files, &journal_path)?;
-        let built = receipt(self.plan, &folded, &reference, self.clock.now());
+        let mut built = receipt(self.plan, &folded, &reference, self.clock.now());
+        // Astra finding MD09, 2026-09-25: the run's own two facts go into
+        // the document, so that `apply --json` is one document and not a
+        // receipt with a halt line after it.
+        built.stopped = stopped.clone();
+        built.waiting = waiting.as_ref().map(ProviderWait::to_json);
         self.state.write_receipt(self.files, &built)?;
         Ok(Applied {
             receipt: built,

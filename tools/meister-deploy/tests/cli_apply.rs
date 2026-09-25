@@ -878,3 +878,66 @@ fn a_halt_in_front_of_a_provider_is_exit_two_a_sentence_and_one_line_of_json() {
     assert_eq!(receipt["hosts"]["n1"]["state"], "awaiting-reboot");
     assert_ne!(receipt["outcome"], "success");
 }
+
+// Astra finding MD09, 2026-09-25: `--json` promised one json document and
+// printed the run id as a bare line in front of it, and the halt for a
+// provider as a second document after it. A parser fed the whole of stdout
+// failed on the first byte.
+#[test]
+fn apply_json_is_one_document_that_carries_the_run_id_the_halt_and_the_stop() {
+    let sandbox = waiting_for_a_provider();
+    let approvals: Vec<String> = sandbox
+        .plan
+        .approvals
+        .iter()
+        .map(|a| format!("--approve {}={}", a.class, a.bound_plan_id))
+        .collect();
+    let mut args = vec![
+        "apply",
+        "--json",
+        "--plan",
+        "plan.json",
+        "--release",
+        "release.json",
+        "--repo",
+        ".",
+        "--inventory",
+        "fleet.toml",
+    ];
+    let granted: Vec<&str> = approvals
+        .iter()
+        .flat_map(|a| a.split(' '))
+        .filter(|s| !s.is_empty())
+        .collect();
+    args.extend(granted);
+    let out = sandbox.run(&args);
+    assert_eq!(code(&out), 2, "{}\n{}", stdout(&out), stderr(&out));
+
+    // The WHOLE of stdout, not a line picked out of it.
+    let document: serde_json::Value = serde_json::from_str(&stdout(&out))
+        .unwrap_or_else(|e| panic!("stdout is not one json document ({e}):\n{}", stdout(&out)));
+    let run = document["run_id"]
+        .as_str()
+        .expect("the receipt names the run")
+        .to_string();
+    assert!(!run.is_empty());
+    assert_eq!(document["waiting"]["waiting_for"], "provider-reboot");
+    assert_eq!(document["waiting"]["host"], "n1");
+    assert_eq!(document["waiting"]["resume"], run);
+    assert!(
+        document["stopped"]
+            .as_str()
+            .is_some_and(|s| s.contains("n1")),
+        "{document}"
+    );
+    // The run id still reaches the person, on stderr.
+    assert!(stderr(&out).contains(&run), "{}", stderr(&out));
+    // And the receipt on the disk is the same document.
+    let on_disk: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(sandbox.state().join("runs").join(&run).join("receipt.json"))
+            .expect("the run wrote a receipt"),
+    )
+    .expect("the receipt is json");
+    assert_eq!(on_disk["waiting"], document["waiting"]);
+    assert_eq!(on_disk["stopped"], document["stopped"]);
+}
