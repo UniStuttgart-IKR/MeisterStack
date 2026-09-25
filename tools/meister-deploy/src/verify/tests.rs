@@ -1158,17 +1158,102 @@ fn the_guest_spec_is_the_one_the_package_builds() {
     assert_eq!(value["devices"][0]["params"]["pci_address"], "0000:41:00.0");
 }
 
+// Astra finding MD08, 2026-09-25: a refused delete and a listing that exits
+// 0 with nothing on stdout. That used to be a `deleted` resource — the
+// empty answer counted as "not listed" — and a guest left on the node with a
+// green line in the ledger.
+#[test]
+fn a_listing_that_says_nothing_leaves_a_refused_delete_lost_not_deleted() {
+    let world = world();
+    let files = MemFiles::new();
+    let clock = FakeClock::at(at("2026-09-22T19:00:00Z"));
+    let name = guest(1);
+    let mut rm = head();
+    rm.extend(["--yes", "vm", "rm"].iter().map(|a| a.to_string()));
+    rm.push(name.clone());
+
+    let mut fake = StrictFake::new()
+        .expect(
+            Matcher::prefix("meister", cli_args(&["vm", "create", &name, "-f"])),
+            created(&name, "n1"),
+        )
+        .expect(
+            Matcher::exact("meister", cli_args(&["vm", "get", &name])),
+            phase(&name, "n1", "Running"),
+        )
+        .expect(
+            Matcher::exact(
+                "meister",
+                cli_args(&["vm", "logs", &name, "--lines", "200"]),
+            ),
+            console(TINY_MARKER),
+        )
+        .expect(
+            Matcher::exact("meister", rm),
+            Output::failing(1, "the node refused: still terminating"),
+        )
+        // Exit 0 and not a byte: the one listing, because an answer nobody
+        // can read ends the wait rather than being asked again.
+        .expect(
+            Matcher::exact("meister", cli_args(&["vm", "ls"])),
+            Output::stdout(""),
+        );
+    fake = a_good_guest(fake, &guest(2), "n1");
+
+    let mut verifier = Verifier::new(
+        &fake,
+        &files,
+        &clock,
+        state(),
+        &world.release,
+        &world.observation,
+        vec!["n1".to_string()],
+        options(Suite::VmLifecycle),
+    )
+    .as_mock();
+    let run = verifier.run().expect("the suite runs");
+    fake.verify().expect("every expectation was used");
+
+    let left = run
+        .ledger
+        .resources
+        .iter()
+        .find(|r| r.name == name)
+        .expect("the guest is in the ledger");
+    assert_eq!(left.state, ResourceState::Lost, "{left:?}");
+    let delete = run
+        .checks
+        .iter()
+        .find(|c| c.id == "vm.delete" && c.subject.resource.as_deref() == Some(name.as_str()))
+        .expect("the delete produced a check");
+    assert_eq!(delete.status, Status::Unknown);
+    assert!(
+        delete.observed.contains("nothing at all"),
+        "{}",
+        delete.observed
+    );
+    assert_ne!(run.outcome, Outcome::Success);
+}
+
+// Astra finding MD08, 2026-09-25: an answer nobody can read is not an
+// answer in EITHER direction. This test used to require an empty stdout to
+// be read as "gone".
 #[test]
 fn an_answer_that_cannot_be_read_is_never_read_as_gone() {
-    assert!(lists_name(r#"{"items":[{"metadata":{"name":"a"}}]}"#, "a"));
-    assert!(!lists_name(r#"{"items":[]}"#, "a"));
+    assert!(lists_name(r#"{"items":[{"metadata":{"name":"a"}}]}"#, "a").unwrap());
+    assert!(!lists_name(r#"{"items":[]}"#, "a").unwrap());
     // Not json, and not empty: something answered and nobody understood it.
-    assert!(lists_name("Error: the cluster is not reachable", "a"));
-    // Nothing at all: the listing is empty, which is an answer.
-    assert!(!lists_name("", "a"));
+    let err = lists_name("Error: the cluster is not reachable", "a").unwrap_err();
+    assert!(err.to_string().contains("not json"), "{err}");
+    // Nothing at all: a process that printed nothing has said nothing, and
+    // in particular it has not said that `a` is gone.
+    let err = lists_name("", "a").unwrap_err();
+    assert!(err.to_string().contains("nothing at all"), "{err}");
+    assert!(lists_name("  \n\t \n", "a").is_err());
     // A document without `items` is one this tool does not know, and
     // guessing "gone" from it is how a leak becomes a green line.
-    assert!(lists_name(r#"{"kind":"Status","code":500}"#, "a"));
+    let err = lists_name(r#"{"kind":"Status","code":500}"#, "a").unwrap_err();
+    assert!(err.to_string().contains("no `items`"), "{err}");
 }
 
 #[test]

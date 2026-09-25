@@ -2110,7 +2110,7 @@ impl<'a> Verifier<'a> {
             .arg("ls")
             .expect(Expect::ExitZero);
         let out = self.exec(&cmd)?;
-        Ok(lists_name(&out.stdout, name))
+        lists_name(&out.stdout, name)
     }
 
     // --- small answers ----------------------------------------------------
@@ -2546,22 +2546,45 @@ pub fn placement_of(text: &str) -> (Option<String>, Option<String>) {
 
 /// Whether `meister vm ls -o json` still has this name.
 ///
-/// An answer that cannot be parsed is treated as "it is there": the caller
+/// An answer that is not a list is an error, never an answer: the caller
 /// uses this to decide that a guest is gone, and guessing "gone" from a
 /// broken answer is how a leak becomes a green line.
-pub fn lists_name(text: &str, name: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
-        return !text.trim().is_empty();
-    };
+///
+/// Astra finding MD08, 2026-09-25: it used to guess in one direction only.
+/// Text that was not json counted as "still there" — and an EMPTY answer
+/// counted as "gone", on the reasoning that an empty listing is a listing
+/// without this name. It is not: `meister -o json` prints whatever bytes
+/// the server sent when they do not parse, and a process that exited 0
+/// with nothing on stdout has said nothing about what exists. So the only
+/// "gone" is a json document with an `items` list that does not carry the
+/// name; everything else is "nobody knows", which `remove` turns into a
+/// `lost` resource rather than a `deleted` one.
+pub fn lists_name(text: &str, name: &str) -> Result<bool> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!(
+            "the listing answered nothing at all, and an empty answer is not a list that \
+             lacks {name}."
+        );
+    }
+    let value = serde_json::from_str::<serde_json::Value>(trimmed).map_err(|e| {
+        anyhow::anyhow!(
+            "the listing is not json ({e}), so it does not say whether {name} is there: {}",
+            last_lines(trimmed)
+        )
+    })?;
     let Some(items) = value.get("items").and_then(serde_json::Value::as_array) else {
-        return true;
+        bail!(
+            "the listing carries no `items`, so it does not say whether {name} is there: {}",
+            last_lines(trimmed)
+        );
     };
-    items.iter().any(|item| {
+    Ok(items.iter().any(|item| {
         item.get("metadata")
             .and_then(|m| m.get("name"))
             .and_then(serde_json::Value::as_str)
             == Some(name)
-    })
+    }))
 }
 
 /// Everything the guest printed, out of `meister vm logs -o json`.
