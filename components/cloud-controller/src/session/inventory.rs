@@ -595,49 +595,141 @@ async fn snapshots_of(
 /// A volume the cluster did not name. Only a DELETED one may conclude
 /// anything from that, and only from a list that is all of them: a volume
 /// this cloud created a moment ago is simply not down there yet.
-async fn finish_volume_delete(
+///
+/// Astra round 3, finding R3-F02: the check ran on the listed object and the
+/// delete then went out by NAME alone. Between the two, the object could be
+/// written (a fresher observation that makes the conclusion wrong) or deleted
+/// and recreated under the same name, and the unguarded delete removed
+/// whatever the name named by then. `finish_delete` deletes only the revision
+/// that was checked.
+pub(super) async fn finish_volume_delete(
     store: &EtcdStore,
     volume: &Volume,
     cluster: &str,
     status: &ClusterStatus,
     at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    if volume.metadata.deletion_timestamp.is_some()
-        && status.volumes_complete
-        && controller_api::mirror::is_current(
-            volume.metadata.deletion_timestamp,
-            volume.status.observed_at,
-            at,
-        )
-    {
-        store.delete::<Volume>(&volume.metadata.name).await?;
+    let concluded = |v: &Volume| volume_gone(v, cluster, status, at);
+    if finish_delete(store, volume, concluded).await? {
         info!(volume = %volume.metadata.name, cluster, "volume deleted");
     }
     Ok(())
 }
 
+/// Whether a complete report that does not name `volume` finishes its delete.
+///
+/// Pure, and asked of every revision `finish_delete` is about to remove, not
+/// only of the one the listing handed in. The record must still be at this
+/// cluster: a volume that moved while its delete was pending is absent from
+/// the old cluster's list for a reason that has nothing to do with deletion.
+/// A record with no `status.cluster` yet was not dispatched anywhere, and
+/// the listing already placed it here by its pool.
+pub(super) fn volume_gone(
+    volume: &Volume,
+    cluster: &str,
+    status: &ClusterStatus,
+    at: DateTime<Utc>,
+) -> bool {
+    volume.metadata.deletion_timestamp.is_some()
+        && status.volumes_complete
+        && volume
+            .status
+            .cluster
+            .as_deref()
+            .is_none_or(|at_cluster| at_cluster == cluster)
+        && controller_api::mirror::is_current(
+            volume.metadata.deletion_timestamp,
+            volume.status.observed_at,
+            at,
+        )
+}
+
 /// The same rule for a snapshot the cluster did not name.
-async fn finish_snapshot_delete(
+///
+/// Astra round 3, finding R3-F02, as for `finish_volume_delete`.
+pub(super) async fn finish_snapshot_delete(
     store: &EtcdStore,
     snapshot: &controller_api::VolumeSnapshot,
     cluster: &str,
     status: &ClusterStatus,
     at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    if snapshot.metadata.deletion_timestamp.is_some()
+    // The snapshot's home was derived from the volume it names, so a
+    // revision that names another volume is not the one the listing placed
+    // at this cluster.
+    let volume = snapshot.spec.volume.clone();
+    let concluded = |s: &controller_api::VolumeSnapshot| {
+        s.spec.volume == volume && snapshot_gone(s, status, at)
+    };
+    if finish_delete(store, snapshot, concluded).await? {
+        info!(snapshot = %snapshot.metadata.name, cluster, "snapshot deleted");
+    }
+    Ok(())
+}
+
+/// Whether a complete report that does not name `snapshot` finishes its
+/// delete. Pure, for the reason `volume_gone` is.
+pub(super) fn snapshot_gone(
+    snapshot: &controller_api::VolumeSnapshot,
+    status: &ClusterStatus,
+    at: DateTime<Utc>,
+) -> bool {
+    snapshot.metadata.deletion_timestamp.is_some()
         && status.snapshots_complete
         && controller_api::mirror::is_current(
             snapshot.metadata.deletion_timestamp,
             snapshot.status.observed_at,
             at,
         )
-    {
-        store
-            .delete::<controller_api::VolumeSnapshot>(&snapshot.metadata.name)
-            .await?;
-        info!(snapshot = %snapshot.metadata.name, cluster, "snapshot deleted");
+}
+
+/// How often a guarded delete is retried after a concurrent write before the
+/// next report is left to try again. The same bound `mutate` uses.
+const FINISH_DELETE_ATTEMPTS: usize = 8;
+
+/// Delete `checked` by the revision it was judged at, never by name alone.
+///
+/// Astra round 3, finding R3-F02. `concluded` is the verdict, and it is asked
+/// of the exact revision the guarded delete names. A conflict means the key
+/// moved on since that revision was read: the object is read again and, if
+/// it is still the same object (same uid) and the verdict still holds of it,
+/// the delete is retried against the fresh revision. A name that now holds a
+/// different object, or no object, ends it without a delete; so does a
+/// verdict that no longer holds. `true` means this call removed the object.
+async fn finish_delete<T: Resource>(
+    store: &EtcdStore,
+    checked: &T,
+    concluded: impl Fn(&T) -> bool,
+) -> anyhow::Result<bool> {
+    let name = checked.metadata().name.clone();
+    let uid = checked.metadata().uid.clone();
+    let mut current = checked.clone();
+    for _ in 0..FINISH_DELETE_ATTEMPTS {
+        if !concluded(&current) {
+            return Ok(false);
+        }
+        match store
+            .delete_if::<T>(&name, &current.metadata().resource_version)
+            .await
+        {
+            Ok(()) => return Ok(true),
+            Err(StoreError::Conflict(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match store.get::<T>(&name).await {
+            Ok(fresh) if fresh.metadata().uid == uid => current = fresh,
+            Ok(_) => {
+                debug!(resource = T::RESOURCE, name = %name,
+                       "recreated under the same name while its delete was finishing; left alone");
+                return Ok(false);
+            }
+            Err(StoreError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
     }
-    Ok(())
+    warn!(resource = T::RESOURCE, name = %name,
+          "finishing a delete kept losing to concurrent writes; the next report tries again");
+    Ok(false)
 }
 
 /// What a reported name amounts to. Empty is silence — a cluster that has not
