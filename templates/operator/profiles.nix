@@ -12,4 +12,5 @@
   compute-cpu = import ./profiles/compute-cpu.nix;
   compute-gpu-pro6000 = import ./profiles/compute-gpu-pro6000.nix { inherit lib leandro; };
   observability-local = import ./profiles/observability-local.nix;
+  single-node = import ./profiles/single-node.nix;
 }

@@ -448,9 +448,17 @@ let
             # An agent has to know which cluster it reports to.
             # `controller_group` is the answer; a raft group it is itself a
             # member of is the one-box case.
+            #
+            # Unless there is no cluster to report to at all: a fleet without
+            # a single cluster role is one or more SINGLE NODES
+            # (nix/single-node.nix), and their agents run standalone by
+            # design. The rule keeps catching the forgotten controller_group
+            # in a fleet that has a cluster, which is the mistake it exists
+            # for.
             ++ (lib.optional
               (h.has "agent" && h.controllerGroup == null
-                && !(builtins.any (g: clusterHostsOf g != [ ]) h.groups))
+                && !(builtins.any (g: clusterHostsOf g != [ ]) h.groups)
+                && builtins.any (o: o.has "cluster") (lib.attrValues hosts'))
               ("${where}: agent ${h.id} has no controller_group, and no group it is in runs a "
                 + "cluster controller; name the cluster's group in controller_group"))
             ++ (lib.optional (h.has "cluster" && cloudHosts == [ ])

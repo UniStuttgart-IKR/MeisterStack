@@ -60,6 +60,9 @@
       exampleProfiles = import ./examples/fleet/profiles.nix { inherit lib; };
       example = fleetOf ./examples/fleet/one-box.toml exampleProfiles;
       exampleHa = fleetOf ./examples/fleet/ha.toml exampleProfiles;
+      # And the smallest deployment there is: one host, the agent and the
+      # CLI, no control plane (nix/single-node.nix).
+      exampleSingle = fleetOf ./examples/fleet/single-node.toml exampleProfiles;
 
     in
     {
@@ -263,6 +266,7 @@
         # derived against the types that read it (`manifest-json`).
         example.checks.${system}
         // lib.mapAttrs' (n: lib.nameValuePair "ha-${n}") exampleHa.checks.${system}
+        // lib.mapAttrs' (n: lib.nameValuePair "single-${n}") exampleSingle.checks.${system}
         // {
           # nix/services.nix decides nothing about the machine.
           services-are-pure = import ./nix/tests/services-are-pure.nix {
@@ -487,6 +491,27 @@
           # is a real system: an agent with no controller of its own, whose
           # addresses come from the group its inventory entry names.
           example-cpu-host = example.nixosConfigurations.n1.config.system.build.toplevel;
+
+          # The single node: one machine, the agent and the CLI, nobody
+          # above it. What is asserted is the two files the machine ships —
+          # an agent config that names no controller (which is what makes
+          # the agent run standalone) and a CLI config that names the
+          # agent's socket — read off the evaluated host rather than the
+          # whole system built, because these two lines are the claim.
+          example-single-node =
+            let host = exampleSingle.nixosConfigurations.rig.config; in
+            pkgs.runCommand "example-single-node" { } ''
+              agent=${host.environment.etc."meisterstack/agent.toml".source}
+              cli=${host.environment.etc."meisterstack/cli.toml".source}
+              grep -q '^node_id = "rig"' "$agent"
+              if grep -q 'controller_addr' "$agent"; then
+                echo "the single node's agent names a controller:"; cat "$agent"; exit 1
+              fi
+              grep -q 'socket_group = "meister"' "$agent"
+              grep -q 'default_profile = "local"' "$cli"
+              grep -q 'endpoint = "unix:///run/meisterstack/agent/agent.sock"' "$cli"
+              touch $out
+            '';
 
           # And a whole small topology: the control plane and both carriers.
           example-topology = pkgs.runCommand "example-topology" { } ''

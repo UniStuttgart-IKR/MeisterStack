@@ -1,0 +1,41 @@
+# The smallest deployment there is: one host, the agent and the CLI, no
+# control plane. A workstation or a lab box that should make guests the way
+# the fleet does — the same VMM, the same spec, the same device drivers —
+# without a cloud, a cluster or a scheduler.
+#
+# What makes it a single node is what is NOT here: no `[[group]]`, no
+# `controller_group` on the host, and the one role `agent`. With nothing to
+# report to, the agent runs standalone and serves its socket; the
+# `single-node` profile (profiles.nix, nix/single-node.nix) ships the CLI's
+# config for that socket and puts the operators into the group that owns it.
+#
+#   meister-deploy inventory -f examples/fleet/single-node.toml
+#   nix build .#checks.x86_64-linux.example-single-node
+#
+# The same host under `meister-deploy plan` → `apply` is a rollout of one
+# machine: no waves to order, no quorum to lose, and the receipt still says
+# what happened.
+schema = 2
+
+[fleet]
+name = "single-node"
+
+[defaults]
+ssh = { user = "root", port = 22 }
+# `adopted`: a machine somebody else partitioned, its root by label. A box
+# this tool installs names an `install` table instead (one-box.toml).
+profiles = ["base", "adopted", "single-node"]
+rollout = { max_unavailable = 1, reboot = "approve" }
+# `session` on an agent is the agent unit and its socket answering, which a
+# standalone node has; nothing here waits for a controller.
+checks = { required = ["units", "session"] }
+
+[[host]]
+id = "rig"
+name = "rig"
+deployment = "nixos"
+roles = ["agent"]
+site = "desk"
+failure_domain = "desk"
+networks.management = { address = "10.0.0.20", prefix = 24, interface = "eth0", gateway = "10.0.0.1", static = true }
+capabilities = ["kvm"]

@@ -84,6 +84,8 @@ meister --endpoint http://127.0.0.1:3001 vm ls   # to talk to the cluster-level 
 
 See [Deployment](docs/DEPLOYMENT.md) for further information. A special deployment tool `meister-deploy` is under active development.
 
+One machine with a card and no control plane — the agent and the CLI at its socket, for a local rig — is the single node, [Deployment §20](docs/DEPLOYMENT.md#20-single-node-cli--agent): a NixOS profile, or `scripts/single-node-install.sh` on any other Linux.
+
 ## Architecture
 
 ![Architecture](docs/diagrams/architecture.svg "Architecture of MeisterStack")

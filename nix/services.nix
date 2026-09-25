@@ -42,6 +42,7 @@ in
     ./etcd.nix
     ./controllers.nix
     ./agent.nix
+    ./single-node.nix
     # --- lane 4B: the fabric tools of a host with an RDMA card ---
     ./rdma.nix
     # --- end lane 4B ---

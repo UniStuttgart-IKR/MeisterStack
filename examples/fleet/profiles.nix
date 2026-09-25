@@ -78,4 +78,17 @@
     meisterstack.agent.frr.enable = false;
     meisterstack.agent.nvmeTcp.enable = false;
   };
+  # One machine, the agent and the CLI, nobody above it: what
+  # examples/fleet/single-node.toml gives its one host. The module says what
+  # it refuses (nix/single-node.nix); this profile only switches it on and
+  # names who may drive the node.
+  single-node = { ... }: {
+    meisterstack.singleNode.enable = true;
+    meisterstack.singleNode.operators = [ "operator" ];
+    users.users.operator = { isNormalUser = true; };
+    # A carrier that neither routes nor attaches remote volumes, like
+    # compute-cpu: a single node has no fabric to join.
+    meisterstack.agent.frr.enable = false;
+    meisterstack.agent.nvmeTcp.enable = false;
+  };
 }

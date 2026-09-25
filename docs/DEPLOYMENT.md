@@ -28,6 +28,7 @@ afterwards proves what happened.
 |---|---|---|
 | change what a host runs | edit the Nix files in **your** repository | the configuration is the repository; nothing else is |
 | put that on one machine that is not in a fleet | `nixos-rebuild switch --flake .#host` | no ordering to get right, no quorum to lose, nothing to prove |
+| run guests on one machine, with no control plane at all | the `single-node` profile, or `scripts/single-node-install.sh` off NixOS; then `meister agent vm …` on the box (§20) | the agent standalone, the CLI at its socket: nothing to place, nothing to order |
 | put it on a fleet | `meister-deploy plan` → `apply` | waves, canaries, quorum, cordon/drain, locks, journal, receipt |
 | install a machine that has no OS yet | `meister-deploy install`, then `meister-install confirm` **on the machine** | a disk is formatted by a person who read the serial off the sheet |
 | let a new machine into the fleet | `meister-deploy keys enroll` | the fingerprint comes from the console, never from the network |
@@ -756,3 +757,125 @@ managed) are preconditions. Without N4 every migrated VM has to be `direct`.
 * **This tool has never run against 70 real machines.** Everything above was
   measured in VMs, in the lab against two fresh OpenNebula VMs, or on this
   workstation. Where a number is extrapolated, it says so.
+
+---
+
+## 20. Single node: CLI + agent
+
+One machine, the agent and the CLI, nobody above it. A workstation or a lab
+box that makes guests the way a fleet host does — the same VMM, the same
+`NewVmSpec`, the same device drivers (`vfio`, `nvrm`, `crosvm-gpu`, `input`)
+— without a cloud, a cluster, a scheduler or a session. What it is not: a
+fleet. Nothing places a guest, nothing migrates it, there are no `Volume`,
+`Image` or `Node` objects, and `meister agent volume` is read-only (a volume
+is made over the controller session, never at the socket). A single node's
+disks are the ephemeral ones inside a spec — `volumes[].base_image` and
+`size_bytes` — made with the guest and unmade with it.
+
+The agent needs no change for this. With neither `controller_addr` nor
+`controller_addrs` in its config it logs `no controller configured, running
+standalone`, serves its socket and reports to nobody
+(`components/agent/src/lib.rs`). `meister agent vm …` is that socket's client
+(`components/cli/src/agent.rs`): `ls`, `get`, `create -f spec.json`, `start`,
+`stop`, `pause`, `resume`, `rm`, `logs`, `observe`, `reconcile`. What is new
+is only what a person would otherwise write by hand on every such box: a
+NixOS profile, and an install script for everything else.
+
+**NixOS: a fleet of one.** `examples/fleet/single-node.toml` is the whole
+inventory — one host, `roles = ["agent"]`, no `[[group]]`, no
+`controller_group`, the profiles `base`, `adopted` and `single-node`. The
+rule that every agent names its cluster (`nix/lib/inventory.nix`) is lifted
+for a fleet that has no cluster at all and stays for one that has, because
+the forgotten `controller_group` is the mistake it exists for. The
+`single-node` profile (`examples/fleet/profiles.nix`,
+`templates/operator/profiles/single-node.nix`) enables
+`meisterstack.singleNode` (`nix/single-node.nix`), which
+
+* refuses a host with any other role, or one whose agent config names a
+  controller — two assertions, each with the sentence that says why;
+* ships `/etc/meisterstack/cli.toml`: the one profile `local`, endpoint
+  `unix:///run/meisterstack/agent/agent.sock`, `credential = { type = "none" }`
+  (the socket has no authenticator; its group is the access rule);
+* puts `meisterstack.singleNode.operators` into the group `meister`, which
+  owns the socket. Nobody by default: a membership is a grant.
+
+The CLI takes the machine's file when the person running it has none of
+their own — `$MEISTER_CONFIG`, then `~/.config/meisterstack/config.toml`, then
+`/etc/meisterstack/cli.toml` (`components/cli/src/config.rs`,
+`SYSTEM_CONFIG`) — so `meister agent vm ls` works on the box as installed,
+and a person's own profiles still win.
+
+Onto the machine: `meister-deploy plan` → `apply` with that inventory is a
+rollout of one host (no waves to order, no quorum to lose; the receipt still
+says what happened), or, as §1 says for one machine,
+`nixos-rebuild switch --flake .#rig`. **Verified:** `checks.example-single-node`
+evaluates the host and reads the two files it ships — an agent config with
+no controller key, a CLI config that names the socket — and the unit test
+`the_machines_config_is_taken_only_when_the_person_has_none` fixes the
+lookup order. **Not verified:** a guest made on such a host end to end; the
+first single-node box is where the happy path below runs for real.
+
+**Any other Linux: `scripts/single-node-install.sh`.** Build the static
+binaries on any machine that has nix — `nix build .#meisterstack-static`
+(`meister`, `meister-agent`, …: musl, nothing from the store inside) and
+`nix build .#cloud-hypervisor-meister-static` — put the three into one
+directory, and on the box, as root:
+
+```
+scripts/single-node-install.sh --bin-dir ./bin --operator alice \
+    [--node-id rig] [--bridge meister_br0 --bridge-addr 10.42.0.1/24]
+```
+
+It copies the binaries to `/opt/meisterstack/bin` and links `meister` into
+`/usr/local/bin`; writes `/etc/meisterstack/agent.toml` (standalone: no
+controller, `socket_group = "meister"`, the same directories under
+`/var/lib/meisterstack` a fleet host has) and `/etc/meisterstack/cli.toml`;
+makes the group and puts the operators in it; installs and enables
+`meister-agent.service`. It refuses to overwrite a file that is there
+(`--force` says otherwise), checks the config it wrote with
+`meister-agent --check-config` before it enables anything, and `--dry-run`
+prints every step and does nothing. The machine brings `ip`, `qemu-img`,
+`curl` and `/dev/kvm`; the script says which is missing. `--hypervisor PATH`
+takes a cloud-hypervisor the machine already has. **Verified:** run with
+`--root` into a scratch directory against the nix-built binaries, it writes
+both configs and the unit, the agent accepts the config (`ok:`), and a
+second run keeps every file. **Not verified:** a real non-NixOS host —
+none with a card was free when this was written.
+
+**The happy path, with a card.** A spec is the same JSON every tier takes
+(`config/json/*.json` are the shapes); a card is one entry of `devices[]`,
+with a driver, a partition and — for `nvrm` — a profile the node's config
+declares. `base_image` names a file in `[paths] image_dir`.
+
+```json
+{
+  "vcpus": 4, "memory_mib": 8192,
+  "boot": { "kind": "direct_kernel", "kernel": "vmlinux", "initramfs": "initrd",
+            "cmdline": "console=ttyS0 root=/dev/vda" },
+  "volumes": [ { "base_image": "guest.raw", "size_bytes": 21474836480 } ],
+  "nics": [ { "bridge": "meister_br0" } ],
+  "devices": [ { "driver": "nvrm", "partition": "mediated", "profile": "2q" } ]
+}
+```
+
+A whole card instead is `{ "driver": "vfio", "partition": "exclusive",
+"params": { "pci_address": "0000:23:00.0" } }` (`config/json/passthrough.json`),
+and needs no section in the agent's config. `nvrm` needs one —
+`[device.nvrm]` with the backend binaries and `[device.nvrm.profiles.2q]`
+with the vGPU type (`config/examples/agent.toml`); on NixOS the
+`compute-gpu-pro6000` profile writes it from the `leandro` input, on any
+other Linux the paths are typed once into `/etc/meisterstack/agent.toml`.
+Then:
+
+```
+meister agent vm create -f gpu.json      # the node assigns the id
+meister agent vm observe <id>            # phase, and what the node sees
+meister agent vm logs <id>
+meister agent vm rm <id>
+```
+
+There is no scheduling in this — the node makes the devices it is told to,
+on the card it is told to — and that is the point of the single node: the
+fleet's GPU inventory (`hardware.gpus`, the `gpu` verify suite) is what
+decides where a guest with a card may go; on one machine there is nowhere
+else.
