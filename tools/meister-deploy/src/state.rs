@@ -517,28 +517,53 @@ pub fn acquire_lock(
                 // gone — the shape `apply --resume` has after a kill. A run
                 // id that is the same and a process that is still running is
                 // a SECOND writer, and it is refused like any other.
+                Some(held) if held.run_id == run_id && held.pid == std::process::id() => Ok(held),
+                // The same run and a process that is demonstrably gone: the
+                // shape `apply --resume` has after a kill.
+                //
+                // Astra finding MD01, 2026-09-25: this arm used to hand back
+                // the OLD record, so the file kept naming the dead process
+                // for as long as the resume ran — and a second resume,
+                // reading the same dead pid, came through the same arm. The
+                // record is now replaced by this process's own, and the
+                // replacement is the one step two resumes cannot both take
+                // (`succeed_dead_holder`). `Gone` and only `Gone`: a lock
+                // taken on another workstation, or a pid this machine
+                // cannot judge, is not known to be dead, and "not known to
+                // be running" was the reading that let it through.
                 Some(held)
-                    if held.run_id == run_id
-                        && (held.pid == std::process::id()
-                            || held.liveness(operator) != Liveness::Running) =>
+                    if held.run_id == run_id && held.liveness(operator) == Liveness::Gone =>
                 {
-                    Ok(held)
+                    succeed_dead_holder(files, state, &held, record, operator)
                 }
-                // The same run, and somebody else is running it right now.
-                // The refusal below would tell this operator to resume the
-                // run they are already resuming, so it gets a sentence of
-                // its own.
-                Some(held) if held.run_id == run_id => bail!(
-                    "the run {run_id} is already being carried on by the process {} on {} \
-                     (operator {}, since {}). Two processes writing one run write one journal \
-                     twice and make it unreadable, so this one did nothing. Wait for that \
-                     process, or take the run over with `--takeover {run_id}` once you know \
-                     it is gone.",
-                    held.pid,
-                    held.workstation,
-                    held.operator,
-                    held.acquired_at.to_rfc3339()
-                ),
+                // The same run, and somebody else is running it right now —
+                // or nobody here can tell. The refusal below would tell this
+                // operator to resume the run they are already resuming, so
+                // it gets a sentence of its own.
+                Some(held) if held.run_id == run_id => {
+                    let and = match held.liveness(operator) {
+                        Liveness::Running => "That process is running.".to_string(),
+                        Liveness::Elsewhere => format!(
+                            "It was taken on {}, so whether it is still running cannot be \
+                             decided from here.",
+                            held.workstation
+                        ),
+                        Liveness::Unknown | Liveness::Gone => {
+                            "Whether that process is still running could not be told.".to_string()
+                        }
+                    };
+                    bail!(
+                        "the run {run_id} is already being carried on by the process {} on {} \
+                         (operator {}, since {}). {and} Two processes writing one run write \
+                         one journal twice and make it unreadable, so this one did nothing. \
+                         Wait for that process, or take the run over with `--takeover \
+                         {run_id}` once you know it is gone.",
+                        held.pid,
+                        held.workstation,
+                        held.operator,
+                        held.acquired_at.to_rfc3339()
+                    )
+                }
                 Some(held) => bail!("{}", held.refusal(operator, run_id)),
                 // The file is there and cannot be read as a lock record.
                 // Nothing here rewrites it: a file in this place that this
@@ -551,6 +576,84 @@ pub fn acquire_lock(
                 ),
             }
         }
+    }
+}
+
+/// Put this process's record where a dead process's record of the same run
+/// is, so that the lock names the process that is carrying the run.
+///
+/// Astra finding MD01, 2026-09-25. The same rule `take_over_lock` follows:
+/// the claim is a rename, which exactly one of two takers can succeed at;
+/// only then is the carried-away record read, and one that turns out to be
+/// somebody else's — a resume that succeeded the dead process between this
+/// process's read and its rename — goes back with `create_new`, which cannot
+/// overwrite. The claim's name carries the pid, so two resumes of one run
+/// do not even share a claim.
+fn succeed_dead_holder(
+    files: &dyn Files,
+    state: &StateDir,
+    dead: &LockRecord,
+    mine: LockRecord,
+    operator: &Operator,
+) -> Result<LockRecord> {
+    let path = state.lock_path();
+    let claim = path.with_file_name(format!("lock.taken-by-{}.{}", mine.run_id, mine.pid));
+    files.rename(&path, &claim).with_context(|| {
+        format!(
+            "the run {} could not be resumed here: another resume of it took the lock on {} \
+             first, or the run gave it back while this one was reading. Nothing was done; \
+             look at `meister-deploy report --run {}` and try again.",
+            mine.run_id,
+            path.display(),
+            mine.run_id
+        )
+    })?;
+    let bytes = files.read(&claim)?;
+    let carried = serde_json::from_slice::<LockRecord>(&bytes).ok();
+    let is_the_dead_one = carried.as_ref().is_some_and(|c| {
+        c == dead || (c.run_id == mine.run_id && c.liveness(operator) == Liveness::Gone)
+    });
+    if is_the_dead_one {
+        files.remove_file(&claim)?;
+        files
+            .create_new(&path, &mine.to_json()?, 0o644)
+            .with_context(|| {
+                format!(
+                    "the run {} could not be resumed here: another process took the lock on \
+                     {} while this one was replacing the record of the process that had \
+                     died. Nothing was done.",
+                    mine.run_id,
+                    path.display()
+                )
+            })?;
+        return Ok(mine);
+    }
+    // Not the dead record: somebody's live lock was carried away. It goes
+    // back exactly as it was.
+    let whose = match &carried {
+        Some(held) => format!(
+            "the process {} on {} (operator {})",
+            held.pid, held.workstation, held.operator
+        ),
+        None => "a file this tool did not write".to_string(),
+    };
+    match files.create_new(&path, &bytes, 0o644) {
+        Ok(()) => {
+            files.remove_file(&claim)?;
+            bail!(
+                "the run {} is already being carried on by {whose}: the lock changed hands \
+                 while this resume was reading it. Nothing was done.",
+                mine.run_id
+            )
+        }
+        Err(e) => bail!(
+            "the run {} is being carried on by {whose}, and its lock could not be put back on \
+             {} ({e:#}) because something else took that name in the meantime. Nothing was \
+             done; the record that was there is in {}.",
+            mine.run_id,
+            path.display(),
+            claim.display()
+        ),
     }
 }
 
@@ -1628,6 +1731,140 @@ mod tests {
             !files.exists(&state.lock_path().with_file_name("lock.taken-by-run-third")),
             "the claim of a takeover that failed is not left lying about"
         );
+    }
+
+    /// A record of this run whose process is not on this machine any more.
+    fn dead_record_of_this_run(workstation: &str) -> LockRecord {
+        LockRecord {
+            schema: LOCK_SCHEMA.to_string(),
+            run_id: run_id(),
+            operator: "silas".to_string(),
+            workstation: workstation.to_string(),
+            // Positive, and above every `pid_max` a Linux kernel hands out.
+            pid: 2_147_483_646,
+            acquired_at: at("2026-09-21T12:00:00Z"),
+        }
+    }
+
+    /// A record of this run whose process is running: pid 1 is init, and
+    /// `kill(1, 0)` answers EPERM — "it exists and is somebody else's".
+    fn live_record_of_this_run() -> LockRecord {
+        LockRecord {
+            pid: 1,
+            ..dead_record_of_this_run(&operator().workstation)
+        }
+    }
+
+    fn claim_of_this_process() -> PathBuf {
+        state().lock_path().with_file_name(format!(
+            "lock.taken-by-{}.{}",
+            run_id(),
+            std::process::id()
+        ))
+    }
+
+    // Astra finding MD01, 2026-09-25.
+    #[test]
+    fn a_resume_after_a_kill_puts_its_own_process_into_the_lock() {
+        let files = MemFiles::new();
+        let state = state();
+        let dead = dead_record_of_this_run(&operator().workstation);
+        files
+            .write_atomic(&state.lock_path(), &dead.to_json().unwrap(), 0o644)
+            .unwrap();
+        let held = acquire_lock(
+            &files,
+            &state,
+            &run_id(),
+            &operator(),
+            at("2026-09-21T12:05:00Z"),
+        )
+        .expect("a resume of a run whose process is gone may write");
+        // The lock names THIS process now, not the one that died: a second
+        // resume reads a running pid here and is refused.
+        assert_eq!(held.pid, std::process::id());
+        assert_eq!(held.acquired_at, at("2026-09-21T12:05:00Z"));
+        assert_eq!(read_lock(&files, &state).unwrap().unwrap(), held);
+        assert!(
+            !files.exists(&claim_of_this_process()),
+            "no claim is left lying about"
+        );
+    }
+
+    // Astra finding MD01, 2026-09-25.
+    #[test]
+    fn a_second_resume_of_a_run_that_is_being_carried_on_is_refused() {
+        let files = MemFiles::new();
+        let state = state();
+        let live = live_record_of_this_run();
+        files
+            .write_atomic(&state.lock_path(), &live.to_json().unwrap(), 0o644)
+            .unwrap();
+        let err = acquire_lock(
+            &files,
+            &state,
+            &run_id(),
+            &operator(),
+            at("2026-09-21T12:05:00Z"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already being carried on"), "{err}");
+        assert!(err.contains("That process is running"), "{err}");
+        assert_eq!(read_lock(&files, &state).unwrap().unwrap(), live);
+    }
+
+    // Astra finding MD01, 2026-09-25: `Elsewhere` is not `Gone`.
+    #[test]
+    fn a_lock_of_this_run_from_another_workstation_is_not_a_resume_target() {
+        let files = MemFiles::new();
+        let state = state();
+        let elsewhere = dead_record_of_this_run("somewhere-else");
+        files
+            .write_atomic(&state.lock_path(), &elsewhere.to_json().unwrap(), 0o644)
+            .unwrap();
+        let err = acquire_lock(
+            &files,
+            &state,
+            &run_id(),
+            &operator(),
+            at("2026-09-21T12:05:00Z"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("somewhere-else"), "{err}");
+        assert!(err.contains("cannot be decided from here"), "{err}");
+        assert!(err.contains("--takeover"), "{err}");
+        assert_eq!(read_lock(&files, &state).unwrap().unwrap(), elsewhere);
+    }
+
+    // Astra finding MD01, 2026-09-25: the read said "dead", and by the time
+    // of the rename another resume had put its live lock there.
+    #[test]
+    fn a_resume_that_carries_away_a_live_lock_puts_it_back_and_is_refused() {
+        let files = MemFiles::new();
+        let state = state();
+        let dead = dead_record_of_this_run(&operator().workstation);
+        let live = live_record_of_this_run();
+        files
+            .write_atomic(&state.lock_path(), &live.to_json().unwrap(), 0o644)
+            .unwrap();
+        let mine = LockRecord::new(
+            &run_id(),
+            &operator(),
+            std::process::id(),
+            at("2026-09-21T12:05:00Z"),
+        );
+        let err = succeed_dead_holder(&files, &state, &dead, mine, &operator())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed hands"), "{err}");
+        assert_eq!(
+            read_lock(&files, &state).unwrap().unwrap(),
+            live,
+            "the live lock is back where it was"
+        );
+        assert!(!files.exists(&claim_of_this_process()));
     }
 
     #[test]
