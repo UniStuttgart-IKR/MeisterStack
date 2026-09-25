@@ -813,7 +813,12 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
 
     // One cache per agent, over the configured image directory: what it puts
     // there is exactly what the volume drivers look up.
-    let images = Arc::new(crate::images::Cache::new(cfg.paths.image_dir.clone()));
+    //
+    // And with the operator's egress policy (Astra finding R3-F10): without
+    // `[images] allowed_sources` it fetches from nowhere.
+    let images = Arc::new(
+        crate::images::Cache::new(cfg.paths.image_dir.clone()).with_egress(cfg.egress_policy()?),
+    );
     let provisioner = Arc::new(
         Provisioner::new(
             store.clone(),

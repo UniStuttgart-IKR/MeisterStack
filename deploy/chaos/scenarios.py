@@ -385,15 +385,15 @@ def s7():
         # thing an sha256 means anything with.
         ("chaos-img-url.raw", 201,
          {"format": "raw", "source": "chaos-img-url.raw",
-          "url": "http://127.0.0.1:1/chaos-img-url.raw", "sha256": "0" * 64}),
+          "url": "http://images.invalid/chaos-img-url.raw", "sha256": "0" * 64}),
         # the wrong checksum, twice, and both refusals are the point of the
         # scenario's name: not hex, and missing altogether next to a url.
         ("chaos-img-hex.raw", 422,
          {"format": "raw", "source": "chaos-img-hex.raw",
-          "url": "http://127.0.0.1:1/chaos-img-hex.raw", "sha256": "nothex"}),
+          "url": "http://images.invalid/chaos-img-hex.raw", "sha256": "nothex"}),
         ("chaos-img-nosum.raw", 422,
          {"format": "raw", "source": "chaos-img-nosum.raw",
-          "url": "http://127.0.0.1:1/chaos-img-nosum.raw"}),
+          "url": "http://images.invalid/chaos-img-nosum.raw"}),
     )
     for nm, want, spec in cases:
         cloud("DELETE", f"/images/{nm}")

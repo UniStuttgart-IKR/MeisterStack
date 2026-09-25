@@ -240,6 +240,32 @@ pub struct AgentConfig {
     /// far says.
     #[serde(default)]
     pub volume: Sections,
+    /// `[images]` -- where this node may fetch a base image from. Absent is
+    /// the same as empty, and empty fetches from nowhere: see
+    /// [`ImagesConfig::allowed_sources`].
+    #[serde(default)]
+    pub images: ImagesConfig,
+}
+
+/// `[images]`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImagesConfig {
+    /// The image sources this node may fetch from: host names
+    /// (`cloud-images.ubuntu.com`), `*.domain` for every name below a domain,
+    /// `*` for any host name, and CIDRs (`10.0.8.0/24`).
+    ///
+    /// Astra finding R3-F10, 2026-09-25: a member may create an image with
+    /// any url, and this node fetched it from inside the management network.
+    /// So the node now fetches only from what an operator listed. Empty, the
+    /// default, fetches from NOWHERE: this fleet has no catalogue or mirror
+    /// of its own that could be the safe default, and a url image on a node
+    /// without this key fails with a sentence naming it. Loopback,
+    /// link-local and metadata addresses are refused whatever this says;
+    /// private ranges need a CIDR here, a host name alone does not open
+    /// them. Ports 80 and 443 only. See `images::egress`.
+    #[serde(default)]
+    pub allowed_sources: Vec<String>,
 }
 
 fn default_stop_grace_secs() -> u64 {
@@ -836,6 +862,7 @@ impl AgentConfig {
         config
             .parsed_bridge_addr()
             .context("[network] bridge_addr")?;
+        config.egress_policy()?;
 
         Ok(config)
     }
@@ -852,6 +879,13 @@ impl AgentConfig {
         config.paths.socket_gid()?;
 
         Ok(config)
+    }
+
+    /// `[images] allowed_sources`, parsed. At start-up for its refusal, and
+    /// again where the image cache is built.
+    pub fn egress_policy(&self) -> anyhow::Result<crate::images::egress::EgressPolicy> {
+        crate::images::egress::EgressPolicy::from_sources(&self.images.allowed_sources)
+            .context("[images] allowed_sources")
     }
 
     /// The tap guard's configuration: where `nft` is, and which addresses no
@@ -1356,6 +1390,10 @@ mod tests {
         assert!(nfs.mount_spec().unwrap().is_some());
         let managed: Vec<ManagedDevice> = one(&cfg.device, "device", "managed");
         assert_eq!(managed.len(), 1);
+        // And the image sources (R3-F10) are a list the node accepts.
+        assert_eq!(cfg.images.allowed_sources.len(), 2);
+        cfg.egress_policy()
+            .expect("the example's image sources parse");
 
         // The M5 half of the example: the overlay section and the two-agents
         // recipe are commented-out KEYS, so uncommenting them has to give a
@@ -1572,6 +1610,40 @@ mod tests {
             (32, 64_000),
             "the machine wins"
         );
+    }
+
+    /// `[images] allowed_sources` is read when the config is, and a typo in
+    /// it stops the agent rather than every url image silently. Astra
+    /// finding R3-F10, 2026-09-25.
+    #[test]
+    fn the_image_sources_are_parsed_when_the_config_is_read() {
+        assert!(
+            config_with("").images.allowed_sources.is_empty(),
+            "nothing by default"
+        );
+        let cfg = from_str::<AgentConfig>(
+            r#"
+            node_id = "n1"
+            [paths]
+            db_path = "/tmp/a.redb"
+            run_dir = "/tmp/run"
+            image_dir = "/tmp/img"
+            volume_dir = "/tmp/vol"
+            cgroup_root = "/sys/fs/cgroup/x"
+            [images]
+            allowed_sources = ["cloud-images.ubuntu.com", "*.example.org", "10.0.8.0/24"]
+            "#,
+        )
+        .expect("config parses");
+        cfg.egress_policy().expect("three shapes, all of them real");
+        let typo = AgentConfig {
+            images: ImagesConfig {
+                allowed_sources: vec!["https://cloud-images.ubuntu.com".into()],
+            },
+            ..cfg
+        };
+        let err = format!("{:#}", typo.egress_policy().unwrap_err());
+        assert!(err.contains("allowed_sources"), "{err}");
     }
 
     /// The guard's config, parsed at start-up rather than at the first VM

@@ -102,6 +102,7 @@ fn node(root: &std::path::Path, store: Arc<Store>) -> (Arc<Provisioner>, Reconci
                     qemu_img: "qemu-img".into(),
                     // No base image, so nothing is converted here.
                     convert: agent_api::base_image::Sandbox::default(),
+                    host_id: "test-node".into(),
                 },
             )
             .expect("a filesystem pool"),
