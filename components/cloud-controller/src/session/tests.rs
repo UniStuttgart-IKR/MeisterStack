@@ -834,3 +834,115 @@ async fn a_snapshot_recreated_under_the_same_name_survives_the_old_delete() {
     let still: controller_api::VolumeSnapshot = store.get("snap").await.expect("the new one");
     assert_eq!(still.metadata.uid, fresh.metadata.uid);
 }
+
+/// A vm bound to `cluster`, for the rebind tests below.
+fn bound_vm(name: &str, cluster: &str) -> Vm {
+    let mut v = controller_api::resources::new_vm(
+        name,
+        controller_api::VmSpec {
+            class: Default::default(),
+            cluster_selector: Default::default(),
+            node_selector: Default::default(),
+            anti_affinity: Vec::new(),
+            node_name: None,
+            cluster_name: Some(cluster.to_string()),
+            run_strategy: controller_api::RunStrategy::Stopped,
+            evacuation: Default::default(),
+            tenant: None,
+            vm: serde_json::json!({}),
+        },
+    );
+    v.metadata.uid = format!("u-{name}");
+    v
+}
+
+/// Astra round 3, finding R3-F03: the cloud's `ingest_phases` matched the
+/// report to a vm of a stale listing and wrote BY NAME, so a delayed report
+/// from the old cluster landed on a vm that had meanwhile been rebound, and
+/// one about a deleted vm landed on a new vm recreated under its name. The
+/// write now pins the uid and asks the binding again of the object it read.
+///
+/// `#[ignore]`: needs an etcd (`MEISTER_TEST_ETCD`).
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_report_from_the_old_cluster_does_not_land_after_a_rebind_or_a_recreate() {
+    let store = delete_test_store().await;
+    let ours = |v: &Vm| v.spec.cluster_name.as_deref() == Some("c1");
+    let report = |uid: &str| ClusterStatus {
+        vms: vec![VmStatusReport {
+            id: uid.to_string(),
+            phase: "Failed".into(),
+            message: String::new(),
+            attached_volumes: Vec::new(),
+            node: String::new(),
+            volumes: Vec::new(),
+            reason: String::new(),
+            nics: Vec::new(),
+        }],
+        ..status(true, &[])
+    };
+
+    // Rebound: the listing says c1, the store says c2 by the time it lands.
+    let listed = vec![store.create(&bound_vm("web", "c1")).await.expect("the vm")];
+    store
+        .mutate::<Vm, _>("web", |v| v.spec.cluster_name = Some("c2".into()))
+        .await
+        .expect("rebound to c2");
+    ingest_phases(&store, "c1", &report("u-web"), &listed, ours, at(10)).await;
+    let after: Vm = store.get("web").await.expect("the vm");
+    assert!(
+        after.status.reported.is_none(),
+        "c1's word must not land on a vm now bound to c2: {:?}",
+        after.status.reported
+    );
+
+    // Recreated: same name, same binding, another uid.
+    let listed = vec![store.create(&bound_vm("db", "c1")).await.expect("the vm")];
+    store.delete::<Vm>("db").await.expect("the old vm goes");
+    let mut fresh = bound_vm("db", "c1");
+    fresh.metadata.uid = "u-db-2".into();
+    store
+        .create(&fresh)
+        .await
+        .expect("a new vm under the same name");
+    ingest_phases(&store, "c1", &report("u-db"), &listed, ours, at(10)).await;
+    let after: Vm = store.get("db").await.expect("the new vm");
+    assert_eq!(after.metadata.uid, "u-db-2");
+    assert!(
+        after.status.reported.is_none(),
+        "a report about the old uid must not land on the new vm: {:?}",
+        after.status.reported
+    );
+}
+
+/// Astra round 3, finding R3-F03, the placement half: the node, the disks and
+/// the MAC lines from the old cluster do not land on a rebound vm either.
+///
+/// `#[ignore]`: needs an etcd (`MEISTER_TEST_ETCD`).
+#[tokio::test]
+#[ignore = "needs an etcd (MEISTER_TEST_ETCD)"]
+async fn a_placement_from_the_old_cluster_does_not_land_after_a_rebind() {
+    let store = delete_test_store().await;
+    let ours = |v: &Vm| v.spec.cluster_name.as_deref() == Some("c1");
+    let listed = vec![store.create(&bound_vm("web", "c1")).await.expect("the vm")];
+    store
+        .mutate::<Vm, _>("web", |v| v.spec.cluster_name = Some("c2".into()))
+        .await
+        .expect("rebound to c2");
+    let report = ClusterStatus {
+        vms: vec![VmStatusReport {
+            id: "u-web".into(),
+            phase: "Running".into(),
+            message: String::new(),
+            attached_volumes: Vec::new(),
+            node: "old-node".into(),
+            volumes: Vec::new(),
+            reason: String::new(),
+            nics: Vec::new(),
+        }],
+        ..status(true, &[])
+    };
+    ingest_placements(&store, "c1", &report, &listed, ours).await;
+    let after: Vm = store.get("web").await.expect("the vm");
+    assert_eq!(after.status.node_name, None, "{:?}", after.status.node_name);
+}

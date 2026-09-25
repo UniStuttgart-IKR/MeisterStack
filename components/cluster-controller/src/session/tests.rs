@@ -1089,3 +1089,103 @@ async fn a_session_whose_certificate_was_revoked_is_ended() {
         "the entry belongs to the stream; only its unwinding takes it away"
     );
 }
+
+/// Astra round 3, finding R3-F03: a `Gone` is judged against the volume as
+/// the write reads it. The ingest used to decide `home` off the listing, so
+/// a `Gone` from a node that was the home when the listing was taken cleared
+/// `status.node` on a volume that had meanwhile been handed to another node.
+#[test]
+fn a_gone_from_a_node_that_is_no_longer_home_leaves_the_volume_where_it_is() {
+    let t0 = chrono::Utc::now();
+    let at = t0 + chrono::Duration::seconds(5);
+    let volume = |node: &str, open_on: &[&str]| {
+        let mut v =
+            controller_api::resources::new_volume("data", controller_api::VolumeSpec::default());
+        v.status.node = Some(node.into());
+        v.status.open_on = open_on.iter().map(|n| n.to_string()).collect();
+        v.status.backend = "lv-data".into();
+        v.status.observed_at = Some(t0);
+        v
+    };
+
+    // Rehomed to n2 since the listing: n1's `Gone` says nothing any more.
+    let mut moved = volume("n2", &[]);
+    let before = serde_json::to_value(&moved).expect("serialises");
+    assert_eq!(apply_gone(&mut moved, "n1", false, at), GoneOutcome::NoWord);
+    assert_eq!(
+        serde_json::to_value(&moved).expect("serialises"),
+        before,
+        "nothing is written"
+    );
+
+    // n1 only still holds it open: it lets go, and the home stands.
+    let mut held = volume("n2", &["n1", "n2"]);
+    assert_eq!(
+        apply_gone(&mut held, "n1", false, at),
+        GoneOutcome::HolderLetGo
+    );
+    assert_eq!(held.status.node.as_deref(), Some("n2"));
+    assert_eq!(held.status.backend, "lv-data");
+    assert_eq!(held.status.open_on, vec!["n2".to_string()]);
+
+    // n1 is still the home: the tombstone.
+    let mut home = volume("n1", &["n1"]);
+    assert_eq!(
+        apply_gone(&mut home, "n1", false, at),
+        GoneOutcome::Tombstoned
+    );
+    assert_eq!(home.status.node, None);
+    assert!(home.status.backend.is_empty());
+    assert!(home.status.open_on.is_empty());
+
+    // A report older than the last write is no word, home or not.
+    let mut fresher = volume("n1", &["n1"]);
+    fresher.status.observed_at = Some(at + chrono::Duration::seconds(1));
+    assert_eq!(
+        apply_gone(&mut fresher, "n1", false, at),
+        GoneOutcome::NoWord
+    );
+    assert_eq!(fresher.status.node.as_deref(), Some("n1"));
+
+    // And the cheap pre-check the listing is asked says the same thing.
+    assert!(!speaks_for_volume(&volume("n2", &[]), "n1"));
+    assert!(speaks_for_volume(&volume("n2", &["n1"]), "n1"));
+}
+
+/// Astra round 3, finding R3-F03: `forget_unbound` decides the let-go off a
+/// listing. A vm bound again between the listing and the write keeps its
+/// holder and its reschedule count.
+///
+/// `#[ignore]`: needs an etcd; see
+/// `two_replicas_assigning_at_once_hand_out_two_namespaces`.
+#[tokio::test]
+#[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
+async fn a_vm_bound_again_after_the_listing_is_not_let_go() {
+    let endpoint =
+        std::env::var("MEISTER_TEST_ETCD").unwrap_or_else(|_| "http://127.0.0.1:23700".to_string());
+    let prefix = format!("/letgo-test/{}", uuid::Uuid::new_v4());
+    let store = EtcdStore::connect(&[endpoint], &prefix)
+        .await
+        .expect("an etcd to talk to");
+
+    // Unbound, still held by n1: the shape `letting_go` picks.
+    let mut web = vm("u-web");
+    web.status.node_name = Some("n1".into());
+    let listed = vec![store.create(&web).await.expect("the vm")];
+    // Bound again to n1 before the report lands.
+    store
+        .mutate::<Vm, _>("u-web", |v| v.spec.node_name = Some("n1".into()))
+        .await
+        .expect("bound again");
+
+    let report = StatusReport {
+        vms_complete: true,
+        ..Default::default()
+    };
+    forget_unbound(&store, &listed, "n1", &report, chrono::Utc::now())
+        .await
+        .expect("the let-go pass");
+    let after: Vm = store.get("u-web").await.expect("the vm");
+    assert_eq!(after.status.node_name.as_deref(), Some("n1"));
+    assert_eq!(after.status.reschedules, 0);
+}

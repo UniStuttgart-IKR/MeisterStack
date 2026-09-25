@@ -68,12 +68,22 @@ pub(super) async fn ingest_images(
         let lines: Vec<&proto::ImageStateReport> =
             by_image.get(name.as_str()).cloned().unwrap_or_default();
         let mine = lines_of(cluster, &name, &lines, &complete);
-        let merged = merged_lines(&current, cluster, mine);
+        let merged = merged_lines(&current, cluster, mine.clone());
         if same_node_states(&current.status.nodes, &merged) {
             continue;
         }
+        // Astra round 3, finding R3-F03: the merge is made again of the
+        // object as the write reads it, under the uid of the catalogue entry
+        // it was computed for. Merged into the listing's copy it would put
+        // back every OTHER cluster's lines as they were at the listing — a
+        // second cluster's report landing in between was lost — and a name
+        // recreated in between would inherit the old image's lines (and,
+        // through `first_bound_digest`, its digest; Astra S02).
+        let uid = current.metadata.uid.clone();
+        let mut merged = merged;
         let result = store
-            .mutate::<Image, _>(&name, |i| {
+            .mutate_if::<Image, _>(&name, &uid, |i| {
+                merged = merged_lines(i, cluster, mine.clone());
                 // The FACT, and nothing else. What the fleet's words add up
                 // to is `settle_image`, which the store runs on the way out —
                 // so there is exactly one rule for "is this image usable" and
@@ -310,12 +320,27 @@ pub(super) async fn ingest_pools(
             // SAYS so — `settle_storage_pool` turns the pointer fact plus the
             // missing entry into `Pending { ClusterHasNoPool }`.
             if spoke || pool.status.clusters.iter().any(|e| e.cluster == cluster) {
-                store
-                    .mutate::<controller_api::StoragePool, _>(&pool.metadata.name, |p| {
-                        note_pointer(p, cluster, home);
-                        p.status.clusters.retain(|e| e.cluster != cluster);
-                    })
-                    .await?;
+                // Astra round 3, finding R3-F03: whether this cluster serves
+                // the pool, and whether it is its home, were read off the
+                // listing; they are read again off the object being written.
+                if let Err(e) = store
+                    .mutate_if::<controller_api::StoragePool, _>(
+                        &pool.metadata.name,
+                        &pool.metadata.uid,
+                        |p| {
+                            if !p.spec.serves(cluster) {
+                                return;
+                            }
+                            let home = p.spec.home() == Some(cluster);
+                            note_pointer(p, cluster, home);
+                            p.status.clusters.retain(|e| e.cluster != cluster);
+                        },
+                    )
+                    .await
+                {
+                    warn!(pool = %pool.metadata.name, cluster, error = format!("{e:#}"),
+                          "writing storage pool status failed");
+                }
             }
             continue;
         };
@@ -324,22 +349,37 @@ pub(super) async fn ingest_pools(
         if !spoke && pool_unchanged(&pool, home, &entry, reported) {
             continue;
         }
-        store
-            .mutate::<controller_api::StoragePool, _>(&pool.metadata.name, |p| {
-                note_pointer(p, cluster, home);
-                if home {
-                    p.status.locality = locality;
-                    p.status.nodes = nodes.clone();
-                }
-                // Each cluster replaces its own entry and no other's — the
-                // same "evidence, whole" rule the node list one field over
-                // follows, applied per reporter. The FACT, and nothing else:
-                // what the pointer therefore IS is `settle_storage_pool`.
-                p.status.clusters.retain(|e| e.cluster != cluster);
-                p.status.clusters.push(entry.clone());
-                p.status.clusters.sort_by(|a, b| a.cluster.cmp(&b.cluster));
-            })
-            .await?;
+        // Astra round 3, finding R3-F03: as above, the binding is read again
+        // off the object being written, under the listing's uid.
+        let result = store
+            .mutate_if::<controller_api::StoragePool, _>(
+                &pool.metadata.name,
+                &pool.metadata.uid,
+                |p| {
+                    if !p.spec.serves(cluster) {
+                        return;
+                    }
+                    let home = p.spec.home() == Some(cluster);
+                    note_pointer(p, cluster, home);
+                    if home {
+                        p.status.locality = locality;
+                        p.status.nodes = nodes.clone();
+                    }
+                    // Each cluster replaces its own entry and no other's — the
+                    // same "evidence, whole" rule the node list one field over
+                    // follows, applied per reporter. The FACT, and nothing else:
+                    // what the pointer therefore IS is `settle_storage_pool`.
+                    p.status.clusters.retain(|e| e.cluster != cluster);
+                    p.status.clusters.push(entry.clone());
+                    p.status.clusters.sort_by(|a, b| a.cluster.cmp(&b.cluster));
+                },
+            )
+            .await;
+        if let Err(e) = result {
+            warn!(pool = %pool.metadata.name, cluster, error = format!("{e:#}"),
+                  "writing storage pool status failed");
+            continue;
+        }
         debug!(pool = %pool.metadata.name, cluster, phase = entry.phase.as_str(),
                "storage pool observed");
     }
@@ -455,11 +495,26 @@ pub(super) async fn ingest_snapshots(
         if snapshot_unchanged(snapshot, cluster, reported, phase) {
             continue;
         }
-        store
-            .mutate::<controller_api::VolumeSnapshot, _>(&snapshot.metadata.name, |s| {
-                write_snapshot_status(s, cluster, reported, phase, at)
-            })
-            .await?;
+        // Astra round 3, finding R3-F03: under the uid the report named, and
+        // only while the snapshot still names the volume whose home placed it
+        // at this cluster.
+        let volume = snapshot.spec.volume.clone();
+        if let Err(e) = store
+            .mutate_if::<controller_api::VolumeSnapshot, _>(
+                &snapshot.metadata.name,
+                &snapshot.metadata.uid,
+                |s| {
+                    if s.spec.volume == volume {
+                        write_snapshot_status(s, cluster, reported, phase, at)
+                    }
+                },
+            )
+            .await
+        {
+            warn!(snapshot = %snapshot.metadata.name, cluster, error = format!("{e:#}"),
+                  "writing snapshot status failed");
+            continue;
+        }
         debug!(snapshot = %snapshot.metadata.name, cluster, phase = phase.as_str(),
                "snapshot observed");
     }
@@ -506,11 +561,22 @@ pub(super) async fn ingest_volumes(
         if volume_unchanged(volume, cluster, reported, phase) {
             continue;
         }
-        store
-            .mutate::<Volume, _>(&volume.metadata.name, |v| {
-                write_volume_status(v, cluster, reported, phase, at)
+        // Astra round 3, finding R3-F03: under the uid the report named, and
+        // only while the record is still at this cluster as the object reads
+        // NOW. A volume handed to another cluster in between would otherwise
+        // take the old cluster's word, node and holder included.
+        if let Err(e) = store
+            .mutate_if::<Volume, _>(&volume.metadata.name, &volume.metadata.uid, |v| {
+                if still_at(v, cluster) {
+                    write_volume_status(v, cluster, reported, phase, at)
+                }
             })
-            .await?;
+            .await
+        {
+            warn!(volume = %volume.metadata.name, cluster, error = format!("{e:#}"),
+                  "writing volume status failed");
+            continue;
+        }
         debug!(volume = %volume.metadata.name, cluster, phase = phase.as_str(),
                "volume observed");
     }
@@ -616,6 +682,21 @@ pub(super) async fn finish_volume_delete(
     Ok(())
 }
 
+/// Whether a volume record the listing placed at `cluster` is still there as
+/// this revision reads.
+///
+/// A record with no `status.cluster` yet was not dispatched anywhere, and the
+/// listing already placed it here by its pool; one that names a cluster names
+/// exactly the one the cloud handed it to. Astra round 3, findings R3-F02 and
+/// R3-F03: asked of the revision a write or a delete is about to act on.
+pub(super) fn still_at(volume: &Volume, cluster: &str) -> bool {
+    volume
+        .status
+        .cluster
+        .as_deref()
+        .is_none_or(|at_cluster| at_cluster == cluster)
+}
+
 /// Whether a complete report that does not name `volume` finishes its delete.
 ///
 /// Pure, and asked of every revision `finish_delete` is about to remove, not
@@ -632,11 +713,7 @@ pub(super) fn volume_gone(
 ) -> bool {
     volume.metadata.deletion_timestamp.is_some()
         && status.volumes_complete
-        && volume
-            .status
-            .cluster
-            .as_deref()
-            .is_none_or(|at_cluster| at_cluster == cluster)
+        && still_at(volume, cluster)
         && controller_api::mirror::is_current(
             volume.metadata.deletion_timestamp,
             volume.status.observed_at,
