@@ -321,8 +321,40 @@ pub trait BridgeDriver: Send + Sync {
     /// exactly what this leaves behind.
     ///
     /// Best effort: a node on its way out reports what it managed and goes.
-    async fn fall_silent(&self) -> Result<Vec<RouterId>> {
-        Ok(Vec::new())
+    ///
+    /// Astra finding R3-F06, 2026-09-25: `Silencing` and not `Vec<RouterId>`
+    /// of the ones that WORKED. The old signature could not say "seven of
+    /// eight fell silent" from "all eight did" -- both were `Ok(seven ids)`
+    /// and `Ok(eight ids)` respectively, indistinguishable in SHAPE from a
+    /// caller that only ever looked at whether the call was `Ok` at all --
+    /// and the agent's dead man was exactly that caller: it took any `Ok` as
+    /// "done for this outage", never retried the eighth, and answered for
+    /// its address for the rest of the outage. `Silencing::complete` is the
+    /// question that matters and the one the old type could not ask.
+    async fn fall_silent(&self) -> Result<Silencing> {
+        Ok(Silencing::default())
+    }
+}
+
+/// The per-router outcome of one farewell pass: which routers fell silent,
+/// and which did not.
+///
+/// Astra finding R3-F06, 2026-09-25. Both lists rather than a count or a
+/// bare bool, because the reader that matters most -- an operator reading a
+/// log line during an outage -- needs to know WHICH router is still
+/// answering, not just that one is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Silencing {
+    pub silenced: Vec<RouterId>,
+    pub failed: Vec<RouterId>,
+}
+
+impl Silencing {
+    /// Every router this pass looked at is now verifiably silent. Vacuously
+    /// true when there was nothing to silence at all, which is the default
+    /// and matches the old `Ok(Vec::new())` this type replaces.
+    pub fn complete(&self) -> bool {
+        self.failed.is_empty()
     }
 }
 

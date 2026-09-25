@@ -985,10 +985,19 @@ impl crate::LinuxNetworkDriver {
     /// told, instead of shouting from the first pass.
     ///
     /// Best effort per router: one namespace that will not co-operate must
-    /// not keep the others speaking.
+    /// not keep the others speaking. Reports which of the two it was for
+    /// EVERY router this pass looked at.
+    ///
+    /// Astra finding R3-F06, 2026-09-25: `Silencing` and not the `Vec` of
+    /// the ones that worked. `stop_speaking_for_every_router`
+    /// (`components/agent/src/lib.rs`) is the caller that this was for: it
+    /// used to see any `Ok` as "this outage is handled" regardless of
+    /// whether every router answered, and a router whose `ensure_router`
+    /// failed here got no second try for the rest of the outage -- the
+    /// two-MAC defect S08 was written to close, moved one router over.
     #[instrument(skip_all)]
-    pub(crate) async fn fall_silent_impl(&self) -> networking::Result<Vec<RouterId>> {
-        let mut silenced = Vec::new();
+    pub(crate) async fn fall_silent_impl(&self) -> networking::Result<networking::Silencing> {
+        let mut outcome = networking::Silencing::default();
         for router in self.list_routers_impl().await? {
             if !router.active {
                 continue;
@@ -1003,13 +1012,16 @@ impl crate::LinuxNetworkDriver {
                 Ok(_) => {
                     info!(router = %spec.id,
                           "this node is going and its router falls silent; the standby speaks now");
-                    silenced.push(spec.id);
+                    outcome.silenced.push(spec.id);
                 }
-                Err(e) => warn!(router = %spec.id, error = %format!("{e:#}"),
-                                "this router could not be silenced on the way out"),
+                Err(e) => {
+                    warn!(router = %spec.id, error = %format!("{e:#}"),
+                          "this router could not be silenced on the way out");
+                    outcome.failed.push(spec.id);
+                }
             }
         }
-        Ok(silenced)
+        Ok(outcome)
     }
 }
 

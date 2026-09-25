@@ -857,12 +857,12 @@ impl BridgeDriver for LinuxNetworkDriver {
         }
     }
 
-    async fn fall_silent(&self) -> networking::Result<Vec<networking::RouterId>> {
+    async fn fall_silent(&self) -> networking::Result<networking::Silencing> {
         // A node with no gateway slot holds no router and has nothing to stop
         // saying — the same answer `sweep_routers` gives one line up.
         match self.gateway.is_some() {
             true => self.fall_silent_impl().await,
-            false => Ok(Vec::new()),
+            false => Ok(networking::Silencing::default()),
         }
     }
 }
