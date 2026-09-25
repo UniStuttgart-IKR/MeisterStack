@@ -1565,6 +1565,48 @@ pub fn spend(candidates: &mut [Candidate], name: &str, vm: &Vm) {
     }
 }
 
+/// What is still free on one node BEFORE any promise: the allowance its
+/// reported capacity gives under the configured overcommit, minus everything
+/// already bound to it.
+///
+/// Both halves are things the controller already has in hand — the Node
+/// object and the VM listing this pass made anyway — which is why nothing is
+/// stored. A second copy of this number in etcd would be a number that can be
+/// wrong, and it would be wrong in the direction that fills a node.
+///
+/// Every phase counts, a Pending one included. A VM that has been bound and
+/// not yet started is a claim on this node, and leaving it out is how a node
+/// takes on twice its memory in one burst of creates.
+///
+/// What it does NOT count is a guest on its way here that is bound nowhere
+/// yet — a live migration's for the length of the move, a placement's for
+/// the length of its binding. That claim is an object of its own and is
+/// taken off by [`hold`] where the candidate list is built, and counted in
+/// revision order by [`reservation_holds`] where a claim is confirmed; see
+/// `CapacityReservationSpec`. Here rather than in either controller because
+/// the candidate list and the confirmation both need exactly this number,
+/// and two functions computing it beside each other are two answers to one
+/// question.
+pub fn free_on(
+    node: &str,
+    capacity: &crate::resources::NodeCapacity,
+    vms: &[Vm],
+    overcommit: Overcommit,
+) -> Capacity {
+    let bound = vms
+        .iter()
+        .filter(|v| v.spec.node_name.as_deref() == Some(node))
+        .fold(Capacity::default(), |sum, vm| {
+            sum.plus(Capacity::wanted_by(vm))
+        });
+    overcommit
+        .allowance(Capacity {
+            vcpus: capacity.vcpus,
+            mem_mib: capacity.mem_mib,
+        })
+        .minus(bound)
+}
+
 /// What is promised on `node` by reservations that have not been delivered.
 ///
 /// Astra finding S07, 2026-09-23: the other half of what a machine is
@@ -1572,7 +1614,9 @@ pub fn spend(candidates: &mut [Candidate], name: &str, vm: &Vm) {
 /// live migration is moving there is bound to the SOURCE until the transfer
 /// has finished — so for the length of a migration the destination is
 /// carrying a guest that no sum over the VM objects can see. This is that
-/// guest, counted where it is going.
+/// guest, counted where it is going — and since Astra finding R3-F05,
+/// 2026-09-24, a guest an ordinary placement has decided on and not yet
+/// bound is counted here the same way, under its own claim.
 pub fn reserved_on(node: &str, held: &[CapacityReservation]) -> Capacity {
     held.iter()
         .filter(|r| r.spec.node == node)
@@ -3018,6 +3062,7 @@ mod tests {
                 node: node.to_string(),
                 vm: format!("{name}-vm"),
                 vm_uid: format!("vm-uid-{name}"),
+                claimant: crate::resources::Claimant::Migration,
                 migration: name.to_string(),
                 migration_uid: format!("migration-uid-{name}"),
                 vcpus,
