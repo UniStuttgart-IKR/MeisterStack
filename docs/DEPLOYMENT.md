@@ -28,7 +28,8 @@ afterwards proves what happened.
 |---|---|---|
 | change what a host runs | edit the Nix files in **your** repository | the configuration is the repository; nothing else is |
 | put that on one machine that is not in a fleet | `nixos-rebuild switch --flake .#host` | no ordering to get right, no quorum to lose, nothing to prove |
-| run guests on one machine, with no control plane at all | the `single-node` profile, or `scripts/single-node-install.sh` off NixOS; then `meister agent vm …` on the box (§20) | the agent standalone, the CLI at its socket: nothing to place, nothing to order |
+| run guests on one machine, with no control plane at all | the `single-node` profile, or `scripts/meisterstack-install.sh single-node` off NixOS; then `meister agent vm …` on the box (§20) | the agent standalone, the CLI at its socket: nothing to place, nothing to order |
+| put the CLI on a laptop, a runner, a jump host | `scripts/meisterstack-install.sh cli --endpoint …` (§20), or `nix build .#meisterstack-static` and copy `meister` | one binary and one profile; the credential stays the person's |
 | put it on a fleet | `meister-deploy plan` → `apply` | waves, canaries, quorum, cordon/drain, locks, journal, receipt |
 | install a machine that has no OS yet | `meister-deploy install`, then `meister-install confirm` **on the machine** | a disk is formatted by a person who read the serial off the sheet |
 | let a new machine into the fleet | `meister-deploy keys enroll` | the fingerprint comes from the console, never from the network |
@@ -810,23 +811,46 @@ rollout of one host (no waves to order, no quorum to lose; the receipt still
 says what happened), or, as §1 says for one machine,
 `nixos-rebuild switch --flake .#rig`. **Verified:** `checks.example-single-node`
 evaluates the host and reads the two files it ships — an agent config with
-no controller key, a CLI config that names the socket — and the unit test
+no controller key, a CLI config that names the socket — the unit test
 `the_machines_config_is_taken_only_when_the_person_has_none` fixes the
-lookup order. **Not verified:** a guest made on such a host end to end; the
-first single-node box is where the happy path below runs for real.
+lookup order, and `checks.vm-single-node` boots such a host in a VM: the
+agent's journal says `running standalone`, the socket is 0660 `meister`,
+`meister agent vm ls` works as root and as the operator with no config of
+their own and is refused for a user outside the group, and a guest-tiny
+made at the socket boots, prints its marker and is taken away. **Not
+verified:** a card — the VM has none; the first single-node box with one is
+where the happy path below runs for real.
 
-**Any other Linux: `scripts/single-node-install.sh`.** Build the static
-binaries on any machine that has nix — `nix build .#meisterstack-static`
-(`meister`, `meister-agent`, …: musl, nothing from the store inside) and
-`nix build .#cloud-hypervisor-meister-static` — put the three into one
+**Any other Linux: `scripts/meisterstack-install.sh`.** One script, two
+shapes: `single-node` is the agent and the CLI on the box; `cli` is the CLI
+alone, on a machine that talks to a control plane somewhere else — an
+operator's laptop, a CI runner, a jump host. Build the static binaries on
+any machine that has nix — `nix build .#meisterstack-static` (`meister`,
+`meister-agent`, …: musl, nothing from the store inside) and, for a single
+node, `nix build .#cloud-hypervisor-meister-static` — put them into one
 directory, and on the box, as root:
 
 ```
-scripts/single-node-install.sh --bin-dir ./bin --operator alice \
+scripts/meisterstack-install.sh single-node --bin-dir ./bin --operator alice \
     [--node-id rig] [--bridge meister_br0 --bridge-addr 10.42.0.1/24]
+
+scripts/meisterstack-install.sh cli --bin-dir ./bin \
+    [--endpoint https://cloud.example:3000 --ca-cert ca.crt --profile cloud \
+     --oidc https://idp.example/oauth2/openid/meister-cli meister-cli]
 ```
 
-It copies the binaries to `/opt/meisterstack/bin` and links `meister` into
+The `cli` shape puts `meister` on PATH and, given `--endpoint`, writes
+`/etc/meisterstack/cli.toml` with that one profile: the endpoint, the CA
+(copied to `/etc/meisterstack/ca.crt`) and, with `--oidc`, the identity
+provider a person then logs in at with `meister login --oidc`. What it
+never writes is a credential — a certificate, a key or a token is a
+person's, lives in that person's own `~/.config/meisterstack/config.toml`,
+which wins over the machine's file, and is put there by `meister login` or
+by the person. Without `--endpoint` it writes no config at all.
+
+The `single-node` shape:
+
+it copies the binaries to `/opt/meisterstack/bin` and links `meister` into
 `/usr/local/bin`; writes `/etc/meisterstack/agent.toml` (standalone: no
 controller, `socket_group = "meister"`, the same directories under
 `/var/lib/meisterstack` a fleet host has) and `/etc/meisterstack/cli.toml`;
@@ -836,11 +860,13 @@ makes the group and puts the operators in it; installs and enables
 `meister-agent --check-config` before it enables anything, and `--dry-run`
 prints every step and does nothing. The machine brings `ip`, `qemu-img`,
 `curl` and `/dev/kvm`; the script says which is missing. `--hypervisor PATH`
-takes a cloud-hypervisor the machine already has. **Verified:** run with
-`--root` into a scratch directory against the nix-built binaries, it writes
-both configs and the unit, the agent accepts the config (`ok:`), and a
-second run keeps every file. **Not verified:** a real non-NixOS host —
-none with a card was free when this was written.
+takes a cloud-hypervisor the machine already has. **Verified:**
+`checks.install-script` runs both shapes with `--root` into a scratch root
+against the nix-built binaries: the files, their content, the agent's own
+`--check-config` on what was written, a second run that keeps every file,
+`--force`, the refusals, and that no credential was invented. **Not
+verified:** a real non-NixOS host — none with a card was free when this
+was written.
 
 **The happy path, with a card.** A spec is the same JSON every tier takes
 (`config/json/*.json` are the shapes); a card is one entry of `devices[]`,

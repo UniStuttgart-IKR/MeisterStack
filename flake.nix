@@ -304,6 +304,19 @@
           };
           # --- end lane 5C ---
 
+          # scripts/meisterstack-install.sh, both shapes, into a scratch root
+          # against the real binaries (docs/DEPLOYMENT.md §20).
+          install-script = import ./nix/tests/install-script.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
+          # The single node in a real machine: the agent standalone, the CLI
+          # at its socket with the machine's config, the group as the access
+          # rule, and one guest that boots (docs/DEPLOYMENT.md §20).
+          vm-single-node = import ./nix/tests/single-node.nix {
+            inherit nixpkgs lib pkgs system self;
+          };
+
           # What the target-side helper does to a REAL machine: the profile
           # moves, the timer fires, and a host nobody confirms comes back by
           # itself (M2C).

@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
+# SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
+# The single node, in a real machine: the agent with nobody above it, the
+# CLI at its socket, a person in the group, and one guest that boots.
+#
+# What docs/DEPLOYMENT.md §20 promises and `checks.example-single-node` only
+# reads off the evaluated host is proved here on a running one:
+#
+#   * the agent runs standalone — its journal says so — and serves its
+#     socket, mode 0660 and owned by the group `meister`;
+#   * `meister agent vm ls` works as root and as the operator the profile
+#     named, with no config of their own: the machine's
+#     /etc/meisterstack/cli.toml is the fallback (components/cli/src/config.rs);
+#   * a user who is NOT in the group is refused at the socket, which is the
+#     whole access rule;
+#   * a guest-tiny made with `meister agent vm create` boots and prints its
+#     marker on the console the agent recorded, and `rm` takes it away.
+#
+# The guest is a real nested VM: this test needs /dev/kvm inside the test
+# machine, like every test of this flake that boots a guest.
+{ nixpkgs, lib, pkgs, system, self }:
+let
+  marker = "MS-S0-TINY-OK";
+  spec = pkgs.writeText "tiny.json" (builtins.toJSON {
+    vcpus = 1;
+    memory_mib = 256;
+    boot = {
+      kind = "direct_kernel";
+      kernel = "bzImage";
+      initramfs = "initrd";
+      cmdline = "console=ttyS0 reboot=k panic=1";
+    };
+    volumes = [{ size_bytes = 67108864; }];
+  });
+in
+pkgs.testers.runNixOSTest {
+  name = "meister-single-node";
+  nodes.rig = { ... }: {
+    imports = [ self.nixosModules.services self.nixosModules.managed ];
+    meisterstack.managed.enable = true;
+    # Required by nix/managed.nix and never used here: nothing is copied in.
+    meisterstack.managed.trustedPublicKeys = [ "single-node-test:not-a-real-key" ];
+    # The whole of what makes it a single node: the one role, the profile,
+    # and no controller anywhere — nix/single-node.nix asserts both.
+    meisterstack.roles = [ "agent" ];
+    meisterstack.singleNode.enable = true;
+    meisterstack.singleNode.operators = [ "tester" ];
+    users.users.tester = { isNormalUser = true; };
+    # Nothing to route to, nothing to attach over fabrics.
+    meisterstack.agent.frr.enable = false;
+    meisterstack.agent.nvmeTcp.enable = false;
+    # The guest's kernel and initrd, in this machine's closure so that they
+    # can be copied into the agent's image directory.
+    environment.etc."guest-tiny".source = pkgs.guest-tiny;
+    virtualisation.memorySize = 2048;
+    virtualisation.diskSize = 4096;
+  };
+  testScript = ''
+    rig.wait_for_unit("multi-user.target")
+    rig.wait_for_unit("meister-agent.service")
+    rig.wait_until_succeeds("journalctl -u meister-agent.service | grep -q 'running standalone'", timeout=60)
+    rig.wait_for_file("/run/meisterstack/agent/agent.sock")
+
+    # The socket, and who owns it.
+    assert rig.succeed("stat -c %G /run/meisterstack/agent/agent.sock").strip() == "meister"
+    assert rig.succeed("stat -c %a /run/meisterstack/agent/agent.sock").strip() == "660"
+
+    # The machine's config is the fallback: nobody here has one of their own.
+    rig.fail("test -e /root/.config/meisterstack/config.toml")
+    assert "no vms on this node" in rig.succeed("meister agent vm ls")
+    assert "no vms on this node" in rig.succeed("su tester -c 'meister agent vm ls'")
+    # …and the group is the access rule.
+    refused = rig.fail("su nobody -s /bin/sh -c 'meister agent vm ls' 2>&1")
+    assert "ermission denied" in refused, refused
+
+    # One guest, made at the socket, booted, seen, taken away.
+    rig.succeed("install -m 0644 /etc/guest-tiny/bzImage /var/lib/meisterstack/images/bzImage")
+    rig.succeed("install -m 0644 /etc/guest-tiny/initrd /var/lib/meisterstack/images/initrd")
+    vm = rig.succeed("meister agent vm create -f ${spec}").strip()
+    assert vm, "create printed no id"
+    rig.wait_until_succeeds(f"meister agent vm logs {vm} | grep -q '${marker}'", timeout=180)
+    assert vm in rig.succeed("meister agent vm ls")
+    rig.succeed(f"meister agent vm rm {vm}")
+    rig.wait_until_succeeds("meister agent vm ls | grep -q 'no vms on this node'", timeout=60)
+  '';
+}
