@@ -2,34 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! People log in at an identity provider; this is the link of the chain that
-//! believes the result.
+//! Convert verified OIDC tokens into control-plane identities.
 //!
-//! One more link and nothing else. It produces the same `Identity { name,
-//! groups }` the other two produce, and everything downstream of it —
-//! `grant_of`, `permits`, `permits_object` — is untouched and unaware.
-//!
-//! **The division of labour, which is the whole design.** A token proves
-//! WHO. The user directory says WHAT THEY MAY DO. Nothing in this file reads
-//! a role out of a claim, and that is not a simplification to be lifted
-//! later: `auth::permits` already documents why the cloud reads the role off
-//! the `User` object rather than off the credential — because the directory
-//! is the truth and a role change there has to take effect at once. A role
-//! carried in a token would take effect when the token was next minted,
-//! which is the opposite property.
-//!
-//! It follows that a token for somebody the directory does not know is worth
-//! nothing here, and that already happens without a line of code in this
-//! file: `rest::grant_of` answers `(None, None)` for a name it cannot find,
-//! and `permits` refuses every verb — reads included — to a caller with no
-//! role. A person who has authenticated and is not in the directory gets a
-//! 403 that says so, which is the same answer somebody whose account was
-//! deleted gets, and for the same reason.
-//!
-//! Certificates stay what they were. Machines — `system:node:<name>`,
-//! `system:cluster:<name>` — authenticate with mTLS and always will:
-//! certificates are for things that have no browser, OIDC is for people, and
-//! not mixing those two is the decision this whole feature rests on.
+//! Tokens establish identity; the cloud User directory supplies roles and tenant
+//! membership. Token role claims grant no permissions, and names in the reserved
+//! `system:` namespace are refused. Machine sessions use their own credentials.
 
 use std::sync::Arc;
 

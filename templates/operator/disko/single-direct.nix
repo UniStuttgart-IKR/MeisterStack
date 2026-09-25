@@ -1,25 +1,8 @@
 # SPDX-License-Identifier: MIT
-# One disk, one filesystem, no boot partition — for a guest whose hypervisor
-# hands it kernel, initrd and command line (`boot = "direct"`).
-#
-# There is no ESP and no boot loader in here, and that is the whole point of
-# the file: a direct-boot guest never reads a boot menu, so a partition for
-# one would be a partition nothing ever writes to. What the machine needs is
-# a root filesystem the kernel can find from the command line, which is why
-# the partition carries the label `nixos`.
-#
-# The way FORWARD for such a host is the provider: `meister-deploy build`
-# exports a bundle (kernel, initrd, cmdline) per direct host, and the
-# provider loads it. The way BACK is the switch rollback, which is userland
-# and works unchanged; there is no boot rollback here, because
-# `bootctl set-oneshot` needs a boot menu (`meister-activate activate
-# --mode boot` refuses on such a host, with that sentence).
-#
-# The DEVICE is not in here: it belongs to the host (hosts/<id>.nix binds it
-# through /dev/disk/by-id by the disk's serial), because a layout is a shape
-# and a device is a machine.
+# Direct-boot layout: labelled ext4 root, no ESP or in-guest bootloader.
+# The provider supplies kernel, initrd and command line. Bind the device in the host module.
 {
-  # No ESP, and the inventory module holds `boot = "direct"` to exactly that.
+  # Must match boot = "direct" in the inventory.
   meisterstack.install.hasEsp = false;
 
   disko.devices.disk.main = {
@@ -35,9 +18,7 @@
             type = "filesystem";
             format = "ext4";
             mountpoint = "/";
-            # The label a direct-boot command line can name
-            # (`root=LABEL=nixos`), for a guest whose disk lands on whichever
-            # bus the hypervisor chose that day.
+            # Let the provider command line locate root by label.
             extraArgs = [ "-L" "nixos" ];
           };
         };

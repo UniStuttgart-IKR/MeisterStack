@@ -29,10 +29,8 @@ struct Args {
     /// TOML config; missing file = built-in defaults. Flags override it.
     #[arg(long, default_value = "/etc/meisterstack/cluster.toml")]
     config: std::path::PathBuf,
-    /// Read the config, check it, say so and exit. Starts nothing: no
-    /// listener, no etcd connection, and nothing that opens a file the
-    /// config points at — so a build host can check a config for a machine
-    /// it is not.
+    /// Validate configuration and exit without starting listeners or connecting
+    /// to etcd. Reads a configured certificate revocation list.
     #[arg(long)]
     check_config: bool,
     /// REST API listen address (cluster #n defaults to 3000+n)

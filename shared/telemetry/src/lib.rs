@@ -2,21 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Telemetry for all three components: one subscriber setup, one traceparent
-//! format, one place that knows whether an exporter is attached.
+//! Tracing and log setup shared by agents and controllers.
 //!
-//! The shape is deliberately conservative. `otlp_endpoint = None` is the
-//! behaviour that has been running in the lab all along — an `fmt` subscriber
-//! and nothing else — and setting it adds a layer beside that one rather than
-//! replacing it. Nothing about how the stack logs changes when tracing is
-//! turned on, and nothing about how it traces is lost when it is turned off:
-//! the trace id is a span field either way (see `traceparent`).
-//!
-//! `log_format` is the envelope around that and nothing more. It decides
-//! whether a line is written for a person reading `journalctl` or for a
-//! collector reading keys; it changes no level, no filter and no field. The
-//! log-level contract and the ascii rule are the CONTENT of a line and they
-//! are the same in both formats.
+//! Without an OTLP endpoint, install only formatted logging. Configuring an
+//! exporter adds an OpenTelemetry layer. Text and JSON formats use the same
+//! level filter and fields; explicit trace IDs remain available without OTLP.
 
 pub mod metrics;
 pub mod traceparent;
@@ -77,35 +67,10 @@ pub struct Setup<'a> {
     pub log_format: LogFormat,
 }
 
-/// The one layer that writes log lines, in whichever format was asked for.
-///
-/// Split out of `init` because `init` installs a global subscriber and can
-/// therefore be called once per process — which would leave the two formats
-/// untestable. `writer` is what makes it testable: production passes the
-/// default (stdout), the test passes a buffer it can read back.
-///
-/// What `Json` produces, and why each piece:
-///
-///   `flatten_event(true)`   the event's own fields are TOP-LEVEL keys rather
-///                           than nested under `fields`. Loki's `| json`
-///                           flattens nested objects with an underscore, so
-///                           without this every field a line carries would be
-///                           `fields_<name>`.
-///   `with_current_span`     the enclosing span's fields, under `span`. This
-///                           is where `trace_id` lives: every hop of this
-///                           stack puts it on a SPAN (`traceparent`), not on
-///                           each event, so `span.trace_id` — `span_trace_id`
-///                           after Loki's parser — is the key that joins a log
-///                           line to a trace.
-///   `with_span_list(false)` the full ancestor list, which the json format
-///                           writes by default, is off. It is the same
-///                           information one level less precise, and in Loki
-///                           an array turns into one label per element per
-///                           line. The current span is the one being asked
-///                           about.
-///
-/// `Human` is exactly the layer this stack has always installed; the branch
-/// adds a format, it does not reshape the old one.
+/// Build the formatter without installing a global subscriber. The writer is
+/// injected for tests. JSON flattens event fields, includes the current span
+/// under `span` and omits the ancestor span list. Human output uses the standard
+/// formatter. Trace IDs carried by the current span remain available in both.
 fn fmt_layer<S, W>(
     format: LogFormat,
     span_close_events: bool,

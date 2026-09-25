@@ -2,12 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a peer certificate says, and whether one of our CAs said it.
+//! Parse peer certificate identity and verify its issuer and validity.
 //!
-//! rustls has already checked the chain by the time a request reaches a
-//! handler, so re-checking here is belt and braces — but it is belt and
-//! braces that can be unit-tested without a TCP socket, and the identity
-//! extraction has to parse the certificate anyway. One parse, both answers.
+//! The REST TLS handshake also validates certificate chains. This module keeps
+//! identity extraction and direct issuer checks available to non-socket callers
+//! and tests.
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeZone, Utc};

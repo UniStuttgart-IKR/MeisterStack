@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Writing part of an object: the spec-only PUT, the JSON merge patch, and
-//! the retry a compare-and-swap needs. Moved out of `rest.rs` unchanged.
+//! Spec-only PUT, JSON merge patch and bounded conflict retries.
 
 use super::*;
 
@@ -32,27 +31,10 @@ pub struct SpecUpdate<S> {
     pub status: Option<serde_json::Value>,
 }
 
-/// Apply a spec-only PUT onto the object as it is stored.
-///
-/// The one write path for the fields an operator owns on a controller-owned
-/// object: `spec.schedulable` on a Node, the same on a Cluster. Everything
-/// else about the object is server-owned and survives the round trip
-/// untouched — uid, creation, deletion, finalizers, and status.
-///
-/// Status is REFUSED rather than silently kept, which is the one place this
-/// differs from `update_vm`. The difference is who is being talked to: a VM
-/// spec is a document a client authored and re-sends whole, so quietly
-/// keeping the server's half is the only way a client can round-trip one at
-/// all. A Node object is authored by the controller from what an agent
-/// reported, and the only reason to PUT one is to flip a field of `spec` — so
-/// a body that also carries a different status is a client that believes it
-/// can set `ready` or `capacity`, and telling it no is worth more than
-/// accepting the write and discarding half of it. A body that repeats the
-/// status it just read is not that, and passes.
-///
-/// The resourceVersion is the CLIENT's, exactly as in `update_vm`: it is what
-/// makes the store's compare-and-swap a compare-and-swap. A body without one
-/// is refused by the store with the same message every other update gets.
+/// Apply writable spec and metadata fields while retaining server identity,
+/// creation/deletion timestamps, finalizers and status. Status may be omitted
+/// or echoed unchanged; an altered status is refused. The supplied resource
+/// version remains the condition used by the store.
 pub fn apply_spec_update<S, St>(
     body: SpecUpdate<S>,
     name: &str,
@@ -139,31 +121,10 @@ pub fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
     }
 }
 
-/// The body a PATCH turns into: the object as it stands, with the patch
-/// applied, read back as the type this route's PUT takes.
-///
-/// This is what makes PATCH a PUT with a server-filled body rather than a
-/// second write path. Whatever the PUT handler does afterwards — the
-/// ownership checks, the fields it keeps, the sentences it refuses with —
-/// happens to a patched object exactly as it happens to one a client sent
-/// whole, because it is the same handler.
-///
-/// Three things are decided before the merge and one after it:
-///
-/// * `status` in a patch is refused, as it is on a PUT. `SpecUpdate` already
-///   has that rule for the objects a controller owns, and the reason is the
-///   same for the rest: a client that believes it can set a phase is a client
-///   to tell no, rather than one to accept the write from and discard half of.
-/// * `apiVersion` and `kind` may be there and have to be right if they are —
-///   a patch is usually three lines and naming neither is the normal case.
-/// * `metadata.resourceVersion` is optional. Named, it is the client's
-///   compare-and-swap against exactly that version; not named, the merged
-///   document keeps the one just read, so a writer that slipped in between
-///   still loses the race and is told.
-/// * And the type check runs AFTER the merge, which is the whole reason the
-///   patched document goes back through `from_value`: a patch that puts a
-///   string where a bool belongs is a 422 about the object, not a 500 about
-///   us.
+/// Merge a patch into the current object and deserialize the PUT body.
+/// Reject status, validate any supplied kind and apiVersion, and preserve the
+/// current resourceVersion unless the patch supplies a condition. Type errors
+/// after merging are client validation errors. PUT admission runs afterwards.
 pub fn apply_merge_patch<T, B>(
     current: &T,
     patch: &serde_json::Value,
@@ -226,31 +187,10 @@ pub(super) fn patch_states_version(patch: &serde_json::Value) -> bool {
         .is_some_and(|v| !v.is_null())
 }
 
-/// Run a PATCH's read-merge-write, and run it again if the client stated no
-/// condition and lost the compare-and-swap.
-///
-/// The bug this exists for: `PATCH /nodes/x {"spec":{"schedulable":false}}`
-/// reads the object, merges, and writes with a CAS against the version it
-/// just read — while the agent's heartbeat writes `status` into the same
-/// object every three seconds. A cordon that lands in that window is a 409
-/// for a client that never asked for one. The client stated no
-/// `resourceVersion`, so the version in the CAS is not the client's condition
-/// at all: it is this server's own bookkeeping, and losing a race against it
-/// is this server's problem to solve. Kubernetes answers the same way, in the
-/// same place.
-///
-/// A client that DID state a version stated a condition, and the first 409 is
-/// the answer — retrying would merge its patch onto a document it has never
-/// seen, which is precisely what it asked not to happen.
-///
-/// Only `Conflict` is retried. `AlreadyExists` and `Terminating` are 409 too
-/// and are both facts about the object rather than races: trying them again
-/// three times would be three times the same answer, one third as fast.
-///
-/// `once` is a closure returning a fresh future rather than an `AsyncFnMut`:
-/// an async closure's future borrows the closure, and a future that borrows
-/// something is a future axum cannot prove is `Send`. The caller hands over a
-/// factory instead, and each pass builds its own.
+/// Retry a read/merge/write CAS conflict only when the client supplied no
+/// resourceVersion. An explicit version is a condition that must not be rebased.
+/// Other errors, including AlreadyExists and Terminating, are not retried.
+/// The closure creates a fresh future for each bounded attempt.
 pub async fn patch_with_retry<T, F, Fut>(
     patch: &serde_json::Value,
     mut once: F,

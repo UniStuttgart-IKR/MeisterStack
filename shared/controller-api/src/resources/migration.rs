@@ -2,30 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `VmMigration` kind: one live move of one VM, the
-//! intent and how far it got. Moved out of `resources.rs`
-//! unchanged.
+//! Migration intent, progress and evidence for one VM attempt.
 
 use super::*;
 
-/// One live migration of one VM.
-///
-/// KubeVirt's shape, and the argument for it is the one KubeVirt makes: a
-/// migration is a thing with a lifetime, a source, a target and an outcome,
-/// and a verb has nowhere to keep any of those. `POST` one and it says
-/// "move this VM while it runs"; read it back and it says how far that got
-/// and, if it did not, what stopped it. `node drain` creates them itself for
-/// the VMs it can move that way.
-///
-/// The other reason it is a resource rather than a verb is the milestone
-/// rule: inside `meister.io/v1` only new FIELDS with a default and new
-/// RESOURCES are allowed, and a new verb on `Vm` would be neither.
-///
-/// Tenant-scoped, so a tenant can see what is happening to its own VMs — and
-/// operator-written, because a migration is an OPERATION on the estate rather
-/// than a thing a member does to their own VM. That pair is the fifth class
-/// in the permission table (`auth::Class::TenantOperated`) and it is the only
-/// resource in it.
+/// Intent and progress for one live migration within a cluster. The resource
+/// retains source, target and outcome after the operation ends. It is tenant
+/// scoped and requires Operator write authority; drain may also create it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VmMigrationSpec {
@@ -99,12 +82,12 @@ phases! {
         /// The source has been told to send. The guest is still the source's
         /// until it is not.
         Running { reason, message, since } => "Running",
-        /// The target reports the VM Running and the source has stopped naming
-        /// it. `Vm.spec.nodeName` is the target.
+        /// The attempt is recorded as completed and the binding moved to its target.
+        /// The reconciler must establish matching Gone and Arrived evidence first.
         Succeeded { message, since } => "Succeeded",
-        /// It did not happen, and the message says what stopped it. **The
-        /// source VM is still running** — that is the invariant the whole
-        /// reconciler is built around, and it is why this phase is safe to reach.
+        /// The attempt ended unsuccessfully with an explanation. This phase alone
+        /// is not cleanup authority; unresolved ownership must remain nonterminal
+        /// and retain recovery protection.
         Failed { reason, message, since } => "Failed",
     }
 }
@@ -229,24 +212,10 @@ pub const SEND_STILL_HERE: &str = "StillHere";
 /// In-flight records retain ownership and cannot be deleted through the API.
 pub type VmMigration = Object<VmMigrationSpec, VmMigrationStatus>;
 
-/// How far the move got, out of the last word anybody established about it.
-///
-/// The thinnest of the three "last word" derivations and the one where that
-/// is least surprising: a migration is not a thing whose state somebody
-/// observes, it is an OPERATION this tier runs, and its phase is the step it
-/// has reached. Which is why nearly every word here carries no node.
-///
-/// What the one place is for:
-///
-/// * **`Succeeded` demands a machine.** It is the one resting word, and what
-///   it claims is that a guest is executing somewhere else — so it has to
-///   name the destination that reported `Running`. A step this tier took
-///   cannot be the evidence for that; see `VmMigrationReported`.
-/// * **No phase without a reason.** A record nobody has acted on is
-///   `Pending { AwaitingTarget }`, which is the sentence
-///   `VmMigrationPhase::Pending` has carried in its own doc comment since it
-///   was written and that nothing ever put on an object.
-/// * **One `since`,** so "Running since" is when the send started.
+/// Derive migration phase from its recorded observation. Succeeded requires
+/// a destination node; callers must establish matching durable attempt evidence
+/// before recording success. This function does not itself verify that protocol.
+/// An untouched record waits with AwaitingTarget; timestamps follow kind changes.
 pub fn settle_vm_migration(status: &VmMigrationStatus) -> VmMigrationPhase {
     match status
         .reported

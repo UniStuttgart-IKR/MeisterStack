@@ -19,23 +19,9 @@ use super::*;
 use controller_api::network::{self, NetworkBackend, RouterOutcome, RouterPlan, RouterSink};
 use controller_api::{ProviderNetwork, Router, RouterPhaseKind};
 
-/// Who, of several leaderless replicas, may act on this router: anybody who
-/// can reach ONE of the machines it is on, and everybody while it is on none.
-///
-/// Deliberately looser than `may_reconcile`, and the looseness is the point.
-/// A VM's owner is the replica holding its node's session, which works because
-/// a VM has one node and because a VM whose node is gone is a VM nobody can do
-/// anything for anyway. A router with two gateway nodes has two sessions,
-/// possibly on two replicas, and the very case the object exists for — the
-/// active machine dies and the standby takes over — is the case where the
-/// obvious owner is the one that just went away.
-///
-/// What that costs is two replicas planning the same router in the same pass.
-/// It costs nothing: the plan is a pure function of the store (see
-/// `network::plan_nodes`), so they compute the same list, send the same
-/// level-triggered commands and write the same status — and one of them loses
-/// the compare-and-swap and drops it, exactly as two replicas expiring one
-/// heartbeat do.
+/// Any replica reaching a planned gateway may reconcile the router.
+/// Unassigned routers are eligible everywhere. Plans use shared fleet state;
+/// commands are idempotent and status updates use CAS.
 pub fn may_reconcile_router(router: &Router, sessions: &HashSet<String>) -> bool {
     router.status.nodes.is_empty() || router.status.nodes.iter().any(|n| sessions.contains(n))
 }
@@ -69,12 +55,7 @@ pub(super) async fn reconcile_routers(
     Ok(())
 }
 
-/// What one router's pass decides, before anything is sent.
-///
-/// Split out of the acting half because it is the half worth testing: it
-/// takes objects and candidates and answers with a plan or with the sentence
-/// that says why there is none, and it touches neither the store nor a
-/// session.
+/// Derive a router plan from stored resources and fleet candidates without I/O.
 pub(crate) fn plan_router(
     router: &Router,
     networks: &[ProviderNetwork],
@@ -295,21 +276,9 @@ async fn reconcile_router(
     Ok(())
 }
 
-/// Cut the router's external address and look again -- every pass.
-///
-/// The second look is what makes this safe without a lock: two replicas
-/// placing two different routers in the same instant both read the same free
-/// address and both write it, so after writing we ask whether anybody else
-/// now holds it and the higher name gives it up. Deterministic, so the two
-/// replicas agree about which of them lost, and level-triggered, so the loser
-/// simply has no address again on the next pass and takes the next one. The
-/// same shape `create_routed_subnet` uses for the same reason.
-///
-/// Astra finding S09, 2026-09-23: it used to return here the moment
-/// `status.external_addr` was set, so the router that wrote FIRST -- the one
-/// that found no conflict when it looked -- never looked again. The rule and
-/// the re-check both live in `network::settle_external_addr` now, and the
-/// cloud tier asks the same function the same question.
+/// Allocate and recheck the external address on every pass.
+/// Concurrent claims are resolved deterministically by the shared allocator,
+/// including conflicts that appeared after an earlier successful check.
 async fn ensure_external_addr(
     pass: &Pass<'_>,
     router: Router,
@@ -483,19 +452,9 @@ async fn note(
     Ok(())
 }
 
-/// What the backend answered, onto the object.
-///
-/// `status.nodes` is the plan minus what REFUSED it, and the distinction
-/// between refusing and not answering is the whole of this function. A
-/// machine that said "no gateway slot" is not a candidate any more and never
-/// appears there — that is what makes `status.refused` a fact rather than a
-/// note. A machine this REPLICA could not reach said nothing at all, and it
-/// stays on the list: its session hangs off a sibling, that sibling's pass
-/// derives the same plan out of the same store and sends it the same command,
-/// and dropping it here would be this process reporting its own reach as the
-/// fleet's shape. That was the lab's finding — a router on two gateway nodes
-/// lost one of them the moment its session moved to another replica, and the
-/// list never grew back.
+/// Persist the backend outcome, preserving unreachable planned nodes.
+/// Only explicit refusals remove a node from the plan; release debt remains
+/// until DestroyRouter is acknowledged.
 async fn settle(
     pass: &Pass<'_>,
     router: &Router,
@@ -535,14 +494,8 @@ async fn settle(
     .await
 }
 
-/// What is still owed a `DestroyRouter` after a pass.
-///
-/// Everything that held the router and is not on the new list, minus whatever
-/// acknowledged letting go. A machine nobody could reach stays on it, and that
-/// is the whole point of the field — see `RouterStatus::releasing`.
-///
-/// Sorted and named once, so that the comparison in `note` is a comparison of
-/// two lists and not of two orderings.
+/// Previous and outstanding gateway placements absent from the new plan,
+/// excluding nodes that acknowledged destruction. Return a sorted unique list.
 pub(crate) fn still_owed(router: &Router, planned: &[String], released: &[String]) -> Vec<String> {
     let owed: std::collections::BTreeSet<String> = owed(router)
         .filter(|n| !planned.contains(n))

@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `StoragePool` kind: where volumes may be cut from. Moved
-//! out of `resources.rs` unchanged.
+//! Storage pool configuration, reachability and reported backend state.
 
 use super::*;
 
@@ -55,45 +54,15 @@ pub struct StoragePoolSpec {
     /// [`QUOTA_EVERYONE`]: StoragePoolSpec::QUOTA_EVERYONE
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub quota: BTreeMap<String, u64>,
-    /// Which CLUSTER serves this pool — at the cloud tier only.
-    ///
-    /// A cloud pool is a cluster pool seen from above: the cloud does not
-    /// create it down there (an admin does, or the cluster's own
-    /// configuration), it only points at it. So this is a reference and not a
-    /// definition, and an empty one at the cloud is a 422 — without a cluster
-    /// there is nothing to dispatch a volume to.
-    ///
-    /// Empty at the CLUSTER tier, always: a cluster is what that process IS,
-    /// and it has no object of its own there. One `StoragePoolSpec` serves
-    /// both tiers for the same reason one `VmSpec` does — each tier writes
-    /// its own binding and ignores the other's.
-    ///
-    /// Why the cloud does not schedule volumes across clusters: it would have
-    /// to compare two pools on two clusters on facts it does not have (how
-    /// full the thin pool is, which nodes mount the export), and the answer
-    /// would go stale between the decision and the dispatch. The pool naming
-    /// its cluster is the operator writing down what they already know.
+    /// Home cluster for a cloud pool reference. Cloud pools refer to existing
+    /// cluster pools; they do not define backend storage there. Empty at the
+    /// cluster tier. `served_by` combines this field with `clusters`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cluster: String,
-    /// The same statement for MORE than one cluster, when the bytes really
-    /// are reachable from more than one.
-    ///
-    /// Additive, and `spec.cluster` stays the short form for the ordinary
-    /// case of one — a pool that names only `cluster` reads exactly as it
-    /// always did, and [`served_by`] is the one place that stops caring which
-    /// of the two an operator wrote.
-    ///
-    /// Only two kinds of pool may say this truthfully, and the difference is
-    /// the driver's rather than the operator's: a `networked` pool (an
-    /// import provider pointing at a target both clusters can dial) and a
-    /// `shared` one whose clusters mount THE SAME export. The second is the
-    /// one that can be written down wrongly, so it is checked rather than
-    /// believed — see `StoragePoolStatus::clusters`, which is what each
-    /// cluster says its own pool of this name is made of.
-    ///
-    /// What it buys is the cloud-tier reschedule: a stopped VM may leave its
-    /// cluster, and its disks can only follow it if something says they are
-    /// reachable from where it is going.
+    /// Additional clusters that reach the same backend. Shared and networked
+    /// storage may span clusters; node-local storage cannot. Shared pools must
+    /// report matching backend parameters. `served_by` combines this list with
+    /// `cluster`, preserving the latter as the home when set.
     ///
     /// [`served_by`]: StoragePoolSpec::served_by
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -289,24 +258,10 @@ pub struct StoragePoolStatus {
     /// still has to answer "could a VM using this disk run over there".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<String>,
-    /// Which namespace of this pool belongs to which volume: the NQN as the
-    /// pool's params spell it, to the volume's uid.
-    ///
-    /// Empty for every pool that does not hand out countable pieces, which is
-    /// nearly all of them — an lvm-thin pool cuts a new logical volume per
-    /// request and there is nothing to assign.
-    ///
-    /// The table is HERE, on the pool, because a compare-and-swap on one
-    /// object is the whole of the lock: two replicas reaching for the last
-    /// free namespace both write, one loses, and the loser reads the table
-    /// again. A second object would have made the assignment two writes that
-    /// can disagree.
-    ///
-    /// Why it is `status` and not `spec`: the pool's SPEC is what an operator
-    /// wrote down (the target, its port, the namespaces it exports) and this
-    /// is what the control plane has done with it. See the cluster's
-    /// `reconcile::namespaces` for the defect it answers — a claim file on
-    /// one node cannot lock a pool the whole cluster reaches.
+    /// Namespace NQN to volume UID assignments for pools with finite namespaces.
+    /// Assignments share the pool object so CAS prevents concurrent allocation of
+    /// the same namespace. Empty for backends that allocate a new object per
+    /// volume. Operator-provided namespaces remain in spec; assignments are status.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub claims: BTreeMap<String, String>,
     /// The same three facts, once per cluster that serves this pool.
@@ -445,39 +400,13 @@ fn is_unrecorded_pool_reason(reason: &StoragePoolReason) -> bool {
     *reason == StoragePoolReason::Unrecorded
 }
 
-/// What a pool's own facts add up to — **one function for both tiers**,
-/// because the type is the same type and a second copy is where the two would
-/// start disagreeing about what `Ready` means.
+/// Derive pool phase for both tiers. Pools naming clusters are cloud
+/// references; pools without them describe cluster storage.
 ///
-/// The tiers are told apart by the spec and not by a flag: `spec.cluster` is
-/// empty at a cluster, always (a cluster IS the process, it has no reference
-/// to itself to write down), and a cloud pool without one is a 422 at the
-/// create edge. So a pool that names a cluster is a POINTER, and one that
-/// does not is the real thing.
-///
-/// **The real thing** is decided by the nodes that can reach it:
-///
-/// * two of them disagree about the driver's locality → `Failed`. It cannot
-///   be a setting — locality is compiled in — so it is two binaries of
-///   different ages, and both machines are named because which two is the
-///   whole of what an operator needs.
-/// * somebody said → `Ready`.
-/// * nobody said → `Pending { AwaitingNode }`. Not `Failed`: a pool whose
-///   nodes are all down is a pool nothing is KNOWN about, and placement falls
-///   back to the soft preference it always had.
-///
-/// **The pointer** is decided by what the cluster it names has said, and this
-/// is D-C11:
-///
-/// * the cluster reported a pool of this name → its own word, relayed.
-/// * it reported and named no such pool → `Pending { ClusterHasNoPool }`.
-/// * it has never reported → `Pending { ClusterSilent }`.
-///
-/// The last two both used to be the object standing at its birth phase with
-/// no reason on it, and the chaos run watched one do that for six minutes.
-/// They are two different mistakes: the first is a name somebody typed
-/// wrongly or a pool nobody made down there, the second is a cluster that is
-/// not talking to this cloud at all.
+/// Local pools fail on conflicting locality reports, become Ready when a node
+/// reports reachability, and otherwise wait for a node. Cloud references relay
+/// cluster pool observations and distinguish a silent cluster from a cluster
+/// that reported no pool of this name.
 pub fn settle_storage_pool(
     name: &str,
     spec: &StoragePoolSpec,

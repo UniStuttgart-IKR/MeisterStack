@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The edge's tests, verbatim out of `api.rs`. The module path is unchanged
-//! (`api::tests`), so every test still answers to the name it had before.
+//! Tests for src/api decisions and API contracts.
+//! Store-backed cases explicitly require etcd; value-level cases run without it.
 
 use super::*;
 
@@ -748,12 +748,7 @@ fn every_resource_of_this_control_plane_is_served_here_or_named_as_not_served() 
     }
 }
 
-/// A volume starts from exactly one thing, and both tiers say so.
-///
-/// Empty, a catalogue image, or somebody's own point in time. A spec that
-/// named two would be a spec whose author believes one of them, and a
-/// silent winner hands somebody a disk they did not ask for — a blank one
-/// where they asked for their data, which is the direction that costs.
+/// Allow zero or one nonempty seed reference, and reject image plus snapshot.
 #[test]
 fn a_volume_starts_from_an_image_or_from_a_snapshot_and_never_both() {
     let volume = |image: Option<&str>, snapshot: Option<&str>| {
@@ -823,22 +818,9 @@ fn the_snapshot_claim_is_what_a_pool_is_asked_for() {
     );
 }
 
-/// The one exception to `spec.nodeName` being the scheduler's, and the
-/// two conditions it needs.
-///
-/// `runStrategy` is the INTENT and the phase is the OBSERVATION, and a VM
-/// that has been told to stop and has not finished stopping satisfies the
-/// first and not the second. Moving that one would be moving something
-/// that is still running, which is exactly what this is not: no live
-/// migration, no restart of anything that is up.
-/// Silas' rule at this tier: an `Unknown` binding is let go only while the
-/// machine holding it is reporting, and 409 says so when it is not.
-///
-/// `stopped_enough` calls `Unknown` stopped enough (D12), and on its own that
-/// was an assertion nobody could back — `Unknown` is exactly the phase in
-/// which this control plane does not know whether the guest is running. The
-/// second half is evidence: a current heartbeat is the node's session, and
-/// with the node back the ordinary stop runs before the binding moves.
+/// Unknown permits releasing a stopped-intent binding only while its node
+/// reports recently. Failed needs no heartbeat evidence; release events identify
+/// the additional uncertainty of Unknown.
 #[test]
 fn an_unknown_binding_is_only_let_go_while_its_node_reports() {
     let at = |secs: i64| chrono::DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap();
@@ -964,9 +946,8 @@ fn a_binding_may_only_be_let_go_of_a_vm_that_is_standing_still() {
     }
 }
 
-/// D12: `Failed` and `Unknown` are stopped enough, and they are the phases a
-/// VM on a node that executes nothing is actually in. Before this the only
-/// exit from that state was a pair of hands.
+/// The shape-level reschedule check accepts stopped intent with Failed or
+/// Unknown; the caller applies the separate Unknown heartbeat guard.
 #[test]
 fn a_vm_whose_node_executes_nothing_is_standing_still_enough() {
     use controller_api::{RunStrategy, VmPhaseKind};
@@ -998,18 +979,9 @@ fn a_binding_may_be_cleared_by_hand_and_never_re_pointed() {
         refused.message()
     );
 }
-/// The machine, refused while a person is still at the keyboard.
-///
-/// The fifth refusal, and the one that is not about this VM at all: a live
-/// migration moves a MACHINE STATE, and cloud-hypervisor v53 checks the CPUID
-/// before a transfer and nothing else. Without this the operator's command is
-/// accepted, a VMM is built on the destination, disks are opened on it, the
-/// guest is paused — and then it fails two milliseconds after the vCPUs are
-/// made, in a log file nothing in this stack reads. That is D-X1, and it cost
-/// the lab two nights.
-///
-/// A named node is answered about BY NAME, because somebody who typed
-/// `--to agent-2` asked about agent-2.
+/// Migration admission reports incompatible machine profiles before dispatch.
+/// A named destination is checked directly; missing profiles permit compatibility
+/// fallback, and earlier lifecycle/storage refusals take precedence.
 #[test]
 fn a_migration_into_a_machine_that_cannot_hold_the_state_is_refused_at_the_edge() {
     let vm = running_vm("web-1");
@@ -1050,13 +1022,7 @@ fn a_migration_into_a_machine_that_cannot_hold_the_state_is_refused_at_the_edge(
     assert!(why.contains("only a running vm"), "{why}");
 }
 
-/// A VM whose holder has said it is in this phase, through the derivation.
-///
-/// The only way in since struktur 4, and that is the point of the round: what
-/// a test used to set with one assignment it states as a FACT — a machine
-/// said this — and lets `settle_vm` say the word. A resting phase is refused
-/// unless a machine is named (see `VmReported`), so the word carries the
-/// holder the object already names.
+/// Record holder evidence and derive the VM phase from it.
 fn said_to_be(vm: &mut Vm, phase: controller_api::VmPhaseKind) {
     let holder = vm
         .status

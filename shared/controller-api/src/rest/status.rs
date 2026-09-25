@@ -2,9 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `Status` kind: what a route that does not exist answers, what a method
-//! no route registers answers, and what readiness says. Moved out of
-//! `rest.rs` unchanged.
+//! Status envelopes for errors, readiness, deletion and unmatched routes.
 
 use super::*;
 

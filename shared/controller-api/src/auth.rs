@@ -2,20 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Who is calling, and what they may do.
+//! Authentication chains and REST authorization policy.
 //!
-//! Kubernetes' answer, kept: authentication is a chain of authenticators that
-//! each look at a request and either recognise it or pass; identity is a name
-//! plus a set of groups; and the identity lives in the client certificate
-//! while the authorization objects live in etcd. Nothing here reads a private
-//! key, because nothing here has one to read.
-//!
-//! The chain's contract is the part worth stating twice. `Ok(None)` means
-//! "not mine, ask the next one". `Err` means "mine, and no" — and it ends the
-//! chain, because a request that has failed a real check must not get a
-//! second opinion from a weaker one behind it. An empty chain is not a broken
-//! chain: it is the anonymous mode this stack ran in for its first four
-//! milestones, and it stays the default.
+//! An authenticator returns `Ok(None)` to defer, an identity to accept, or an
+//! error to reject the request without consulting later authenticators. An empty
+//! chain enables anonymous access. Identities name callers; roles, resource
+//! classes and tenant scope determine their permissions.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1074,35 +1066,15 @@ pub fn least_role(class: Class, verb: Verb) -> Option<Role> {
     }
 }
 
-/// The verb half of the policy: may this caller do this KIND of thing at all.
+/// Check resource-class and verb permissions for an established grant.
 ///
-/// A table since the roles became four: `class_of` says which cell,
-/// `least_role` says what it costs, and the comparison is one `<`. The
-/// `match` this replaced grew a branch per role per resource and could not be
-/// read as a policy at all, which is how "system may do anything" survived in
-/// it for four milestones.
+/// `role` and `tenant` come from the cloud User directory. Middleware refuses
+/// ordinary users at tiers without that directory; certificate role claims
+/// are not a fallback. Tenant object checks follow in `permits_object`.
 ///
-/// `role` is what the caller could establish: the cloud reads it off the
-/// `User` object, because the directory is the truth and a role change there
-/// has to take effect at once; the cluster has no directory and passes what
-/// the certificate claims. That difference is real and it is the price of the
-/// design rule that there is one user directory in the stack — a role change
-/// is instant at the cloud and takes effect at the cluster when the
-/// certificate is re-issued.
-///
-/// `tenant` is the caller's, out of the same directory entry, and it is what
-/// opens the write door for a member: a tenant-scoped write is allowed HERE
-/// only so that `permits_object` can decide it THERE, against the object.
-/// A tier that cannot establish a tenant — the cluster, which keeps no users
-/// — passes `None`, and a member's writes are refused exactly as they were
-/// before this milestone. That is not a gap left open: authorization needs
-/// the directory, the directory is the cloud's, and a cluster inventing a
-/// second answer to "whose VM is this" is the failure mode the one-directory
-/// rule exists to prevent.
-///
-/// `own_peer` is the one system identity this router lets in besides
-/// `system:masters`: the tier it IS, reading. See the `system:` block below.
-/// A tier with no siblings passes `None`.
+/// The masters group bypasses this policy. Other machine identities may only
+/// read as an exact sibling identity, or make the explicitly allowed forwarded
+/// writes. Both peer kind and peer name must match.
 pub fn permits(
     identity: &Identity,
     role: Option<Role>,
@@ -1115,24 +1087,11 @@ pub fn permits(
         return true;
     }
     if identity.is_system() {
-        // Every other machine identity has NOTHING at REST, and that is the
-        // change this table makes on purpose. `system:nodes` and
-        // `system:clusters` speak the gRPC session, which is the only place
-        // they need; a node's key used to be a key to every object of every
-        // tenant through this door, for no purpose anybody could name.
-        //
-        // One exception, and it is what `vm logs` needs: a replica of this
-        // same tier may READ here — a replica asking its sibling is the tier
-        // asking itself.
-        //
-        // It takes the KIND as well as the name since the cloud grew the same
-        // need. `system:cluster:cluster-1` at a cloud called `cluster-1`
-        // would otherwise be a cluster reading the cloud's whole estate,
-        // which is the door this table exists to shut.
+        // Machine identities need an exact sibling match at REST. Including kind
+        // prevents equally named cloud and cluster identities from crossing tiers.
         return match (own_peer, attempt.verb) {
             (Some(peer), Verb::Read) => identity.name == Identity::peer_name(peer.kind, peer.name),
-            // And the write half, which is two named routes wide. See
-            // `OwnPeer::forwarded` for why it is not the whole door.
+            // Forwarded writes are limited to `forwardable_write` routes.
             (Some(peer), Verb::Write) => {
                 peer.forwarded
                     && forwardable_write(attempt)
@@ -1153,41 +1112,17 @@ pub fn permits(
     if role < least {
         return false;
     }
-    // The one thing the table cannot say, because it is about the CALLER and
-    // not about the resource: a tenant-scoped write needs an established
-    // tenant to be scoped to. A tier that keeps no directory establishes
-    // none, so a member there is read-only exactly as it was in M4.5 — see
-    // the paragraph above.
+    // Member writes to tenant resources require an established tenant.
+    // Object-level policy checks the actual owner separately.
     if class == Class::Tenant && attempt.verb == Verb::Write && role < Role::Operator {
         return tenant.is_some_and(|t| !t.is_empty());
     }
     true
 }
 
-/// The two routes a sibling may write through, and nothing else.
-///
-/// Named rather than inlined because it is a policy statement, and the two
-/// entries are the same statement one tier apart: what a forwarded write may
-/// reach is something whose write has to travel down a gRPC SESSION, which is
-/// the only kind of write a replica cannot serve on its own. Every other
-/// write at either tier goes into the shared store and any replica can do it,
-/// so no other route needs this and no other route gets it.
-///
-///   * `clusters/<name>/nodes/<node>` — a `node cordon` or `node drain` at
-///     the cloud, which travels down the cluster's session.
-///   * `nodes/<name>/commands` — a live migration's command at the cluster,
-///     which travels down the node's session. The one object this tier
-///     reconciles that is about TWO machines, whose sessions can hang off two
-///     replicas; see the cluster's `dispatch` module. The BODY of that route
-///     is a closed enum of four migration commands, which is where the
-///     narrowness actually lives — this table only says who may knock.
-///   * `vmmigrations` at the CLOUD — `vm migrate` asked one tier up, which
-///     travels down the CLUSTER's session as `CreateVmMigration`. It has the
-///     same shape as the first entry and it was left out: the forward was
-///     built for it and the door was not opened, so the verb worked only if
-///     the caller happened to dial the replica holding that cluster's
-///     session — one in three, and silently. Found in the lab, where it
-///     answered "system:cloud:cloud may not Write vmmigrations".
+/// Writes that require a session held by another replica: cluster node
+/// updates, node migration commands and cloud migration creation. This route
+/// allowlist supplements exact sibling identity and forwarding-marker checks.
 fn forwardable_write(attempt: &Attempt<'_>) -> bool {
     let cluster_node = attempt.resource == crate::resources::Cluster::RESOURCE
         && attempt.subresource == Some("nodes");
@@ -1198,38 +1133,17 @@ fn forwardable_write(attempt: &Attempt<'_>) -> bool {
     cluster_node || node_command || vm_migration
 }
 
-/// The tier a router IS, for the one system identity it lets in besides break
-/// glass: itself, reading.
-///
-/// Kind and name together, and the kind is not decoration. Both tiers issue
-/// their identities through `Identity::peer_name`, so `system:cluster:acme`
-/// and `system:cloud:acme` are two different certificates that differ in one
-/// word — and a comparison that ignored the word would let a cluster read
-/// everything a cloud holds the moment somebody named them alike.
+/// This tier's sibling identity for REST reads and selected forwarded writes.
+/// Kind and name must both match; equal names across tiers confer no access.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnPeer<'a> {
     /// `"cluster"` or `"cloud"` — the middle word of the certificate's CN.
     pub kind: &'a str,
     /// This tier's own name: the cluster name, or the cloud name.
     pub name: &'a str,
-    /// Whether this request carries `x-meister-forwarded` — a sibling passing
-    /// on something a person asked it, once.
-    ///
-    /// It is what opens the WRITE door, and only for a node of a cluster.
-    /// The reason the door is that narrow: a `node drain` at the cloud cannot
-    /// be served by the replica that was asked, because it travels down the
-    /// cluster's gRPC session and only one replica holds it — so two of every
-    /// three `node cordon` calls answered 503 "no active session" and the
-    /// client had to guess which replica to ask. Every other write at this
-    /// tier goes into the shared store and any replica can do it, so no other
-    /// route needs this and no other route gets it.
-    ///
-    /// The header is not a credential and is not treated as one: the caller
-    /// still has to present this tier's own `system:<kind>:<name>`
-    /// certificate, which nothing outside the control plane holds. What the
-    /// header adds is that a sibling cannot be talked into a write by
-    /// somebody who merely stole a look at the CA — a direct call with that
-    /// identity and no header is refused exactly as it was before.
+    /// Whether `x-meister-forwarded` is present. Selected writes require this
+    /// marker and the exact sibling identity. The marker alone authenticates
+    /// nothing; see `forwardable_write` for the route allowlist.
     pub forwarded: bool,
 }
 

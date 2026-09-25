@@ -2,42 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! One command to one node, from whichever replica is holding the object.
+//! Forward the closed set of node commands needed by operations spanning sessions.
 //!
-//! ## Why this exists
-//!
-//! Everything else this tier reconciles is owned by the replica that holds
-//! the node's session: a VM, a volume and a snapshot are all about ONE
-//! machine, so the replica that can reach it takes the object and the others
-//! leave it alone (`reconcile::may_reconcile`). No forwarding, no leader.
-//!
-//! A live migration is the one object that is about TWO machines, and the two
-//! sessions can hang off two different replicas. Then no ownership rule can
-//! work: whichever replica took it can reach one end and not the other. The
-//! defect that found this (rollout 59, D-P2) is exactly that shape — the
-//! migration reconciler called the LOCAL registry for the source's session,
-//! and on a three-replica cluster a migration only ran when the same replica
-//! happened to hold both ends. Measured: roughly one attempt in three, and
-//! the other two answered "node agent-1a has no active session" about a node
-//! that was up and healthy.
-//!
-//! So a migration forwards, the way a console read has since the cluster grew
-//! replicas: the replica that holds the object looks at
-//! `Node.status.session_endpoint`, which the holder wrote at Hello, and asks
-//! that replica to say the sentence for it. Once — the hop carries
-//! `x-meister-forwarded` and a replica that sees the header and holds no
-//! session answers rather than passing it on again.
-//!
-//! ## What may travel this way
-//!
-//! `NodeCommand`, and nothing else. The commands a migration sends, as a
-//! closed enum with no room in it for anything else: this is a door through
-//! which one control-plane process tells another process's agent what to do,
-//! and a generic "send this command" route would be a remote shell for
-//! anybody holding a replica's certificate. Widening it is a decision, not a
-//! detail — it was four for the whole of the migration work, and `ForgetVolume`
-//! is the fifth because the source of a finished migration has to be told to
-//! let go of a disk it no longer has any business with.
+//! Migration, router placement and image cleanup may reach nodes held by different
+//! replicas. Dispatch uses the local registry or the Node's advertised sibling
+//! endpoint. A forwarded request cannot be forwarded again. Authentication follows
+//! the configured sibling transport and the receiving API permission policy.
 
 use std::sync::Arc;
 
@@ -60,41 +30,10 @@ const ABOUT: controller_api::forward::About = controller_api::forward::About {
 /// Where a forwarded command lands. `{name}` is the node.
 pub const COMMAND_PATH: &str = "/apis/meister.io/v1/nodes/{name}/commands";
 
-/// The commands one replica of this cluster may have another replica's agent
-/// carry out.
-///
-/// A type of its own rather than `proto::command::Op`: the protobuf types
-/// carry no serde derives, the hop is JSON, and — the actual reason — this
-/// enum is the whole of what a sibling may be talked into doing. Every
-/// variant here is something the migration reconciler, the router reconciler
-/// or a cloud command sends today; nothing here is reachable by a client.
-///
-/// Two fields the protobuf messages have are deliberately absent.
-/// `PrepareMigration.listen` is always empty (the destination picks the
-/// address, because it is the only party that knows which of its addresses a
-/// peer can reach) and `ProvisionVolume.from_snapshot` is always empty (a
-/// migrating guest's disk exists already). A field that is always empty is
-/// not a field, and putting one on this wire would be putting a lever there
-/// for somebody to find.
-///
-/// **The two router commands are the widening the doc above calls a
-/// decision, made.** A router is the second object in this control plane that
-/// is about several machines at once — it is built on its whole priority list
-/// — and it is worse than a migration in the way that matters here: the
-/// failover it exists for is exactly the moment the machine an ownership rule
-/// would have hung it on stops answering. A reconciler asking its own session
-/// registry would build the half of the list it can reach and call the rest
-/// unreachable, which is D-P2 one object over. So they travel this road, and
-/// the enum stays closed around them.
-///
-/// **`DropImage` is the same widening for a different reason.** It is not
-/// about several machines this cluster's ownership rule already hands to one
-/// replica — it is about EVERY node in the cluster at once, on purpose (Astra
-/// finding S02, 2026-09-23, rest b): a deleted image's bytes may be cached
-/// anywhere, this tier keeps no record of which nodes have fetched what, and
-/// a broadcast confined to whichever nodes happen to hold a session on the
-/// replica that received the cloud's command would silently skip every node
-/// a sibling replica is talking to — the exact D-P2 shape, one fan-out wider.
+/// Commands accepted by the sibling command route.
+/// Keep this set explicit: adding a variant expands what a permitted caller can
+/// ask a node to do. PrepareMigration.listen is selected by the destination, and
+/// ProvisionVolume.from_snapshot is omitted because migration uses existing disks.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "command", rename_all = "camelCase")]
 pub enum NodeCommand {

@@ -2,14 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Scheduling as a plugin trait: v1 ships best-effort First-Fit; smarter
-//! strategies (distributed best effort, bin packing, GPU-topology aware)
-//! replace the implementation, not the reconciler.
+//! Shared placement interface for choosing nodes or clusters.
 //!
-//! One trait serves both tiers. A cluster picks a node for a VM, the cloud
-//! picks a cluster for a VM, and the decision is the same shape both times —
-//! so the candidate is named for what it is to the scheduler, not for which
-//! tier it happens to live on.
+//! FirstFit filters candidates by selectors, capabilities, capacity and storage
+//! constraints. Both tiers provide the same candidate shape and own the commit
+//! of the selected binding.
 
 use common::capability::{self, Locality, offers};
 use tracing::debug;
@@ -186,24 +183,9 @@ pub struct Candidate {
     /// its node's session (`may_reconcile`). See `alive` for the other
     /// question, which is not the same one.
     pub connected: bool,
-    /// The machine is up, as the STORE says — `Node.status.ready`, written by
-    /// whichever replica holds its session, read by all of them.
-    ///
-    /// The fleet-wide fact, and it exists because one thing this control
-    /// plane places is deliberately placed on SEVERAL machines at once. A
-    /// router's priority list has to be the same list at every replica, or a
-    /// three-replica cluster whose two gateway nodes hang off two different
-    /// replicas can never plan a router onto both — each replica sees the
-    /// other's machine as "not connected" and plans around it. Seen exactly
-    /// that way in the lab: a router that came up on two nodes lost one of
-    /// them the moment that node's session moved, and never got it back.
-    ///
-    /// The sending half is answered elsewhere and already: a router's
-    /// commands go through `Dispatch`, which forwards to the replica that
-    /// holds the session. So the planner may name a machine this process
-    /// cannot itself reach.
-    ///
-    /// Equal to `connected` at the cloud tier, where there is one view.
+    /// Fleet-wide readiness from stored node status, independent of which replica
+    /// holds its session. Router planning uses this view; Dispatch forwards commands
+    /// to the session holder. At the cloud tier this equals `connected`.
     pub alive: bool,
     /// `spec.schedulable` — an operator draining it without stopping it.
     pub schedulable: bool,
@@ -402,24 +384,9 @@ fn wedged_sentence(field: &[Candidate]) -> String {
         .join(", ")
 }
 
-/// What a volume demands of the machine that would PROVISION it.
-///
-/// The storage mirror of `DevicePolicy`, and deliberately the same shape: a
-/// policy derived once from the objects, then asked as often as a scheduler
-/// likes. Two conjuncts, and they are different KINDS of fact, which is why
-/// neither can stand in for the other:
-///
-///   * the backend — `volume/lvm-thin` in the node's own catalogue, the same
-///     entry a VM asking for that driver already matches. A node without the
-///     driver cannot make the volume whatever an object says.
-///   * reachability — `StoragePoolSpec.nodes`, which is an operator's
-///     statement about wiring. A volume group is on ONE machine and an export
-///     is mounted by a handful; no catalogue entry can say which, because the
-///     agent does not know what a pool is.
-///
-/// An empty node list is every node — see the field. That is the
-/// single-machine lab, and there the policy degenerates to the catalogue
-/// check the VM half already does.
+/// Requirements for provisioning a volume: the requested backend capability
+/// and the pool's allowed nodes. These are independent; having a driver does
+/// not establish access to a particular pool. An empty node list allows all.
 pub struct StoragePolicy {
     driver: String,
     nodes: Vec<String>,
@@ -601,26 +568,11 @@ pub struct VolumeBinding {
 }
 
 impl VolumeBinding {
-    /// The nodes that can serve this volume, or `None` for "no hard rule".
+    /// Allowed nodes from volume locality, or None when no hard restriction applies.
     ///
-    /// The one place the locality axis is actually spent, and each arm is a
-    /// different sentence:
-    ///
-    ///   * `node-local` — the bytes are on ONE machine, so the VM runs there
-    ///     or nowhere. HARD, and it is the reason the axis exists: the same
-    ///     rule as a soft preference would place the VM next to an empty
-    ///     directory and boot it.
-    ///   * `shared` — every node in the pool sees the same bytes, so the pool
-    ///     is the rule and the volume's own node means nothing. Still soft in
-    ///     effect where the pool names no nodes, because then the pool is
-    ///     every node.
-    ///   * `networked` — the bytes are elsewhere and the DRIVER says which
-    ///     nodes can reach them. No driver claims it yet (position 18 of the
-    ///     catalogue brings NVMe-oF); the arm is here so the axis is complete
-    ///     and the day a driver arrives this is the line that changes.
-    ///   * `None` — nobody has said. Falls back to the soft preference this
-    ///     scheduler has always had, which is what keeps a mixed-version
-    ///     cluster placing VMs at all.
+    /// Node-local pins to the volume holder. Shared uses the pool's node list.
+    /// Networked uses the backend capability. Unknown locality retains only a
+    /// soft preference for the previous holder.
     pub fn required(&self) -> Option<Vec<String>> {
         match self.locality {
             Some(Locality::NodeLocal) => self.node.clone().map(|n| vec![n]),
@@ -770,26 +722,10 @@ pub fn volume_pending_reason(
     )
 }
 
-/// Why the machines this VM's volumes pinned it to cannot take it — the
-/// sentence for a narrowing that left nodes standing and a scheduler that
-/// then threw every one of them out.
-///
-/// `volume_pending_reason` above answers the case where the narrowing emptied
-/// the candidate list. This answers the OTHER one, and until it existed that
-/// case fell through to `pending_reason_of` against the FULL node list: a VM
-/// whose `node-local` disks are on a drained `agent-1` was told *"no single
-/// candidate offers all of [hypervisor] at once"* while both nodes offered
-/// `hypervisor` and the truth was that the only node it could use was
-/// drained. An operator read a sentence about hypervisors and went looking at
-/// the wrong end of the cluster.
-///
-/// `None` means the volumes are not the reason and the ordinary sentence is
-/// the true one: nothing was pinned, or a usable node survived the narrowing
-/// and something else defeated it (room, a selector, a device).
-///
-/// Asked AFTER `assign` and not before, which is the whole correction. Before
-/// it, "is this node usable" has not been decided by the party that decides
-/// it.
+/// Explain when volume locality left candidates but all were unusable.
+/// Run after assignment fails so the message reflects actual eligibility.
+/// Return None when locality did not cause the failure; ordinary capacity,
+/// selector and capability diagnostics then apply.
 pub fn volume_nodes_unusable(
     bindings: &[VolumeBinding],
     allowed: &[&Candidate],
@@ -968,32 +904,10 @@ impl SchedulerConfig {
     }
 }
 
-/// What the VM's opaque spec demands of a candidate's catalogue.
-///
-/// The controller deliberately does not parse the whole NewVmSpec — the
-/// agent's serde stays the validator — but the driver names in it are the one
-/// part scheduling cannot be correct without. Two lists now, one shape:
-/// `devices[].driver`/`.profile` as they always were, and `volumes[].driver`
-/// as a profile of the `volume` capability, because that is how a node claims
-/// a storage backend (see `common::capability::VOLUME`). Without the second
-/// half, an lvm-thin VM lands wherever there is room and fails at the first
-/// `lvcreate`.
-///
-/// A volume that names no driver — or names the default one — produces no
-/// request at all. It genuinely constrains nothing: every node registers that
-/// backend whether or not it is configured. And asking for it anyway would
-/// strand such a VM on any node whose agent predates the volume catalogue,
-/// which claims no `volume/*` entries and would then never take a plain disk
-/// again. A mixed-version cluster is the normal state during a rollout, and
-/// that is the case this rule is for.
-///
-/// Three lists now: `nics[].vxlan_id` is the third, as a profile of the
-/// `network` capability. The same argument one more time and a sharper one —
-/// an overlay VM on a node with no `[network.vxlan]` section does not merely
-/// fail late; the agent there refuses it outright, and the only alternative to
-/// refusing would be a tenant's VM on the shared default bridge. A NIC that
-/// names no overlay asks for nothing, so a plain VM still lands on any node,
-/// including one whose agent predates all of this.
+/// Extract capability requests from VM fields: hypervisor, devices, nondefault
+/// volume backends, overlays and provider networks. Shape validation is done at
+/// the API edge. The default volume backend adds no requirement; every VM still
+/// requires a hypervisor capability.
 fn resource_requests(vm: &Vm) -> Vec<(String, Option<String>)> {
     let array = |field: &str| -> &[serde_json::Value] {
         vm.spec
@@ -1538,26 +1452,10 @@ pub fn pending_reason(vm: &Vm, candidates: &[Candidate]) -> String {
     pending_reason_of(vm, candidates).1
 }
 
-/// Put a VM onto a candidate, in the pass's own picture of the world.
-///
-/// Called by a pass the moment it decides, and that timing is the whole
-/// point: a pass places VMs one after another out of one listing, so without
-/// this the second VM of a pass would be measured against a machine that
-/// still looks empty. An API-edge check cannot do this at all — the objects
-/// it would have to count do not exist yet when it runs.
-///
-/// **Both halves, in one call, on purpose.** A placement changes two things
-/// about a candidate — it has less room, and it now holds something. The
-/// first was booked here from the beginning and the second was not, and the
-/// consequence was measured in the lab: a burst of creates that one pass sees
-/// together stacked five VMs with a `required` anti-affinity term onto one
-/// node while free nodes stood beside it, because `collides()` was asking an
-/// inventory from before the pass. Two functions to call in the right order
-/// is an invitation to call one; there is one.
-///
-/// A binding whose write then loses its compare-and-swap leaves this pass
-/// with one candidate too poor and one label too many, which costs at most
-/// one VM one tick: the next pass derives both from the store again.
+/// Book a placement in this pass's candidate view: subtract capacity and add
+/// the hosted labels used by anti-affinity. Later choices must see both changes.
+/// If the binding loses CAS, this pass conservatively retains the booking; the
+/// next pass rebuilds its view from the store.
 pub fn spend(candidates: &mut [Candidate], name: &str, vm: &Vm) {
     if let Some(c) = candidates.iter_mut().find(|c| c.name == name) {
         c.free = c.free.minus(Capacity::wanted_by(vm));
@@ -1579,56 +1477,20 @@ pub fn reserved_on(node: &str, held: &[CapacityReservation]) -> Capacity {
         .fold(Capacity::default(), |sum, r| sum.plus(r.spec.size()))
 }
 
-/// Take what is promised off the room each candidate has.
-///
-/// The sibling of [`spend`], and the argument for it is the same one: a
-/// decision measured against a machine that still looks empty is a decision
-/// that fills it twice. `spend` books what a pass has just DONE; this books
-/// what the fleet has already PROMISED, and it is applied where the candidate
-/// list is built, so that every reader of `free` — `feasible`, the pending
-/// sentence, every strategy that will ever be written — sees one number and
-/// not two.
-///
-/// It is what makes the fix cover ordinary placement as well as migration: a
-/// new VM must not be given a slot a guest is already on its way into, and a
-/// scheduler that only migrations consulted would have handed it out.
-///
-/// Saturating, through `Capacity::minus`: reservations that exceed what a
-/// node has left make it full and never negative, which is the same direction
-/// `free_on` is already wrong in when an operator shrinks a node under its
-/// guests.
-///
-/// **Apply it once.** Room taken off twice is a machine that looks fuller
-/// than it is, and because the subtraction saturates it cannot be undone by
-/// adding the same number back — see `prepare`, which holds only the
-/// reservations its pass did not already know about.
+/// Subtract outstanding reservations from candidate capacity, saturating at
+/// zero. Apply once when building the candidate view, so ordinary placement
+/// and migration account for the same promised room. Saturation makes a
+/// double subtraction impossible to undo by simply adding capacity back.
 pub fn hold(candidates: &mut [Candidate], held: &[CapacityReservation]) {
     for candidate in candidates.iter_mut() {
         candidate.free = candidate.free.minus(reserved_on(&candidate.name, held));
     }
 }
 
-/// Does `mine` still fit on a machine with `room` for guests that have not
-/// arrived, once every reservation made BEFORE it is counted?
-///
-/// The confirmation after the fact, and it exists because a create-only write
-/// makes one key unique and says nothing about a SUM. Two replicas preparing
-/// two migrations onto one node in the same millisecond each read the
-/// reservations, each saw room, and each then wrote a key of its own: both
-/// creates succeed, and the node is overcommitted by exactly the guest the
-/// second one is sending. So after writing, the writer looks again and asks
-/// where in the queue it is standing.
-///
-/// The order is etcd's `mod_revision`, which for an object nothing ever
-/// updates is the revision it was created at: a total order over the writes,
-/// agreed by every replica because it is the store's own. So of two
-/// reservations against one slot both reach the same verdict about which of
-/// them keeps it, and the loser releases what it wrote and says so. A version
-/// that cannot be read sorts last, which makes it the one that yields.
-///
-/// `room` is what the machine has free BEFORE any reservation — capacity
-/// under overcommit, minus the guests bound to it — because the reservations
-/// are what this is counting.
+/// Check a created reservation against room before reservations. Count earlier
+/// reservations by etcd revision; malformed versions sort last. This gives
+/// replicas a consistent winner when separate create-only keys overbook a
+/// node. The losing caller must release its own reservation.
 pub fn reservation_holds(
     room: Capacity,
     mine: &CapacityReservation,

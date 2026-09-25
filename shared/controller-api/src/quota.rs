@@ -2,47 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! How much one tenant may hold.
+//! Tenant VM, CPU, memory and per-pool storage accounting.
 //!
-//! `floatingpool quota` was the only quota in this system: no limit on VM
-//! count, vCPU, memory or disk per tenant. The tenancy BOUNDARY was sharp
-//! from M5 — a member sees its own objects and writes its own objects — and
-//! only the quantity behind it was missing. Together with capacity admission
-//! that is the class of trouble somebody causes who does not mean any harm:
-//! admission stops one machine being asked for more than it has, and this
-//! stops one tenant asking for all of them.
-//!
-//! ## The same seam admission laid
-//!
-//! What a VM costs is [`Capacity::wanted_by`] — the same function the
-//! scheduler measures a candidate with, over the same two numbers. There is
-//! deliberately no second reading of a VM's size here: two rejection paths
-//! that each derive "how big is this VM" separately are two paths that start
-//! disagreeing, and the one that is wrong is whichever an operator is not
-//! looking at.
-//!
-//! ## Every phase counts, Pending included
-//!
-//! A VM that is waiting for a placement is a VM this tenant asked for, and
-//! leaving it out is how a tenant puts a thousand of them in the queue and
-//! walks past the ceiling. A VM on its way out counts too, until its object
-//! is gone: it still holds a disk and a slice on some node, and the quota is
-//! released by the teardown finishing rather than by the DELETE being
-//! accepted.
-//!
-//! ## Storage is the same argument, one noun over
-//!
-//! [`StorageUsage`] is the per-pool half: how many GiB one tenant holds in
-//! one pool, measured over the `Volume` objects the store already has. It is
-//! HERE and not in a handler for the reason the module's first paragraph
-//! gives — a second place that decides "is this tenant over its limit" is a
-//! second place that can say a different thing, and the one that is wrong is
-//! whichever an operator is not looking at.
-//!
-//! A `Releasing` volume still counts. The bytes are still on a disk somewhere
-//! and go when the last consumer lets go, so the quota is released by the
-//! deprovision finishing rather than by the DELETE being accepted — the same
-//! sentence the VM half makes, with more at stake.
+//! VM sizing uses the scheduler's [`Capacity::wanted_by`]. All existing VM objects
+//! count, including Pending and deleting objects. Releasing volumes also count
+//! until deprovisioning removes the object. Admission callers must serialize
+//! quota checks and writes with the store's admission fence.
 
 use crate::resources::{StoragePool, TenantQuota, TenantUsage, Vm, Volume, VolumePhaseKind};
 use crate::scheduler::Capacity;

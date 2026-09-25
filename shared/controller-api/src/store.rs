@@ -2,12 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! etcd-backed object store. Keys are `<prefix>/registry/<resource>/<name>`,
-//! values the JSON of the whole object; `metadata.resource_version` carries
-//! the etcd mod_revision out and is compared on update (CAS). The prefix is
-//! configuration — an all-in-one box shares one etcd under /cloud and
-//! /cluster, real separation is a different endpoint. No controller ever
-//! reads a foreign prefix (the Oakestra rule).
+//! etcd persistence at `<prefix>/registry/<resource>/<name>`.
+//!
+//! Values contain complete JSON objects. Reads attach etcd's modification
+//! revision as `resourceVersion`; updates compare it before writing. Shared
+//! admission fences additionally serialize decisions spanning several objects.
+//! Controller tiers use separate configured prefixes or endpoints.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -49,26 +49,12 @@ fn lease_dir(prefix: &str, resource: &str) -> String {
     format!("{prefix}/leases/{resource}/")
 }
 
-/// A key whose only content is its revision: `<prefix>/fences/<name>`.
+/// Revision marker at `<prefix>/fences/<name>` for admission over multiple keys.
 ///
-/// The one thing the store cannot do by itself is keep a promise about MANY
-/// objects. Its compare-and-swap is per key, so a rule over a set — "this
-/// tenant holds at most one VM" — was checked by listing the set and then
-/// writing a key of its own, and two writers that each listed before the
-/// other wrote each got a yes (F03). Two different keys, nothing for etcd to
-/// see as a collision.
-///
-/// A fence gives the rule a key. Everybody who would make the set bigger
-/// reads the fence first, looks at the set, and writes through
-/// `create_fenced`/`update_fenced`, which compares the fence in the same
-/// transaction and moves it. Of two writers that read the same fence, the
-/// second finds it moved and looks again, and what it sees then includes the
-/// first. Across replicas as much as within one: the fence is in etcd.
-///
-/// Deliberately NOT a counter. The value is only a note of what last went
-/// through — the answer to "how much is held" stays the objects themselves,
-/// counted where it is asked, because a second copy of a number is a number
-/// that can be wrong (`TenantUsage` makes the same argument).
+/// Read it before listing the admitted set, then compare and advance it in the
+/// same transaction as the resource write. A losing writer must reread both.
+/// Every writer that can invalidate the invariant must use this protocol. The
+/// objects remain the source of usage counts; the marker is not a counter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fence {
     key: String,
@@ -225,24 +211,8 @@ impl EtcdStore {
         })
     }
 
-    /// A client for ONE request.
-    ///
-    /// The etcd client's own methods take `&mut self`, which is why this used
-    /// to be a `Mutex<Client>` — and a mutex whose guard is held across the
-    /// await of a network round trip is not a lock, it is a queue. Every
-    /// store operation in the process stood in it: the reconcile pass on its
-    /// 5s tick, the session ingest writing a heartbeat, the REST handler
-    /// somebody is waiting on. One request that ran into `REQUEST_TIMEOUT`
-    /// stopped all of them for five seconds.
-    ///
-    /// `etcd_client::Client` is `Clone` and a clone is a handle, not a
-    /// connection: the sub-clients it holds are tonic clients over one
-    /// `tonic::transport::Channel`, which is itself a cheap handle onto the
-    /// shared connection pool, and the auth token behind them is one
-    /// `Arc<RwLock<_>>` all clones read. So a clone per request costs a few
-    /// atomic increments and gives every caller its own `&mut`, which is what
-    /// the queue was standing in for. gRPC multiplexes the requests on the
-    /// one connection, as it was always going to.
+    /// Clone the etcd client handle for one request. Clones share the multiplexed
+    /// channel and authentication state, avoiding a mutex held across network I/O.
     fn handle(&self) -> Client {
         self.client.clone()
     }
@@ -346,29 +316,9 @@ impl EtcdStore {
         Ok((out, resp.kvs().len()))
     }
 
-    /// Record that this peer has just spoken, in a key of its own.
-    ///
-    /// D-C7, and the number behind it is the whole argument: a 20-second
-    /// watch on an idle lab showed twelve PUTs, every one of them a whole
-    /// `Node` object rewritten because `lastHeartbeat` had moved 108 ms. Two
-    /// megabytes of live data in a 2029-megabyte database, 1.13 revisions a
-    /// second with nobody doing anything, and a `cpuFlags` string of about
-    /// 300 bytes persisted with each of them. Liveness is the most volatile
-    /// thing this control plane knows and it was living in the same object as
-    /// the spec and the inventory, which are the least.
-    ///
-    /// So it lives here: `<prefix>/leases/<resource>/<name>`, about sixty
-    /// bytes, and the object itself is written only when something about the
-    /// MACHINE changed. Kubernetes left `Node.status` for `Lease` in
-    /// `kube-node-lease` for exactly this reason.
-    ///
-    /// **No etcd TTL.** The deadline stays [`crate::heartbeat::expired`] — 30
-    /// seconds, one constant, read at both tiers — because a key that
-    /// vanished on its own would make "has not reported in 40 s" and "has
-    /// never reported" the same answer, and those are the two cases the
-    /// timeout function exists to keep apart. A lease that stops moving is
-    /// evidence; a lease that is gone is silence about a peer that may never
-    /// have existed.
+    /// Store a heartbeat under `<prefix>/leases/<resource>/<name>` without
+    /// rewriting the resource inventory. These keys have no etcd TTL: expiry is
+    /// computed by `heartbeat::expired`, preserving the last-seen timestamp.
     pub async fn beat<T: Resource>(&self, name: &str, at: DateTime<Utc>) -> Result<()> {
         let key = lease_key(&self.prefix, T::RESOURCE, name);
         let value = serde_json::to_vec(&Lease { at })
@@ -453,24 +403,9 @@ impl EtcdStore {
     /// never fit anywhere downstream is not worth storing.
     const MAX_NAME: usize = 63;
 
-    /// A name is the last segment of an etcd key, a piece of a file name on a
-    /// node, and part of an interface name. That is three places downstream,
-    /// and the DNS label is the intersection of what all three survive —
-    /// Kubernetes' own answer, for the same reason.
-    ///
-    /// It is not, however, the answer for every resource, because the third
-    /// place does not apply to all of them. `NameShape::Dotted` is the same
-    /// rule with `.` allowed inside it, for the two resources whose name was
-    /// never a word an operator chose: a floating address, and the file name
-    /// an image is looked up as. See [`crate::object::NameShape`].
-    ///
-    /// The lab found what the check before this let past, and each one is a
-    /// different kind of trouble: a name with a SPACE (a shell word boundary
-    /// on every node that handles it), non-ASCII (`chaos-üml`, which is not
-    /// one byte per character anywhere it is counted), uppercase (two objects
-    /// that differ only in case are one file on a case-insensitive mount),
-    /// 300 characters, and an embedded `..` that it only caught when the
-    /// whole name was `..`. None of those is allowed under either shape.
+    /// Validate a bounded ASCII DNS-label name used in keys and downstream paths.
+    /// `NameShape::Dotted` additionally allows internal dots for image names and
+    /// addresses. Neither shape allows traversal, uppercase or whitespace.
     fn check_name(name: &str, shape: NameShape) -> Result<()> {
         let invalid = |why: &str| {
             Err(StoreError::Invalid(format!(
@@ -608,25 +543,9 @@ impl EtcdStore {
             .unwrap_or(false)
     }
 
-    /// The object as the store now holds it, without asking the store again.
-    ///
-    /// A successful txn's header revision IS the mod_revision of the key it
-    /// just wrote — etcd stamps every response with the revision the request
-    /// was applied at, and for a txn that put one key that revision is that
-    /// key's. `value` is the byte-for-byte record that landed there. So
-    /// decoding our own bytes at that revision is what a `get` would have
-    /// returned, one round trip earlier.
-    ///
-    /// It is also the more correct of the two answers, which is the reason
-    /// worth writing down. A read AFTER the write reads whatever is there
-    /// NOW: a create or an update that was overwritten a millisecond later
-    /// used to hand its caller the OTHER writer's object, under the caller's
-    /// own name, with a resourceVersion that is not the one its own write
-    /// produced — and an `update` built on that version would then CAS
-    /// successfully against a document nobody in this process had ever seen.
-    ///
-    /// A response without a header is not something etcd sends. If one ever
-    /// does arrive, the read it replaced is still there to fall back on.
+    /// Decode the bytes just written using the transaction revision. This returns
+    /// the caller's own write even if another writer immediately replaces it.
+    /// A response lacking a header falls back to a store read.
     async fn written<T: Resource>(
         &self,
         name: &str,

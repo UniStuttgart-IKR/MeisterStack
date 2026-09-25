@@ -2,9 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The cloud's REST API — the end API of the stack, in the same K8s-style
-//! shape the cluster serves one tier down. One CLI, two endpoints; what
-//! differs is only the resources (cloud: clusters, vms, images).
+//! Cloud REST routes, discovery metadata and shared handler state.
+//! Tenant authorization and admission run at this tier; execution is delegated to clusters.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -35,12 +34,8 @@ use proto::cloud_command;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
-/// The CA this API server signs with, and the two decisions that go with it.
-///
-/// `None` means no CA is configured: the certificatesigningrequests resource
-/// still exists and still records requests, and approving one answers 501.
-/// A control plane that accepted requests it could never fulfil would be
-/// worse than one that says so.
+/// Optional certificate signer and issuance policy. Without a signer, requests can
+/// be recorded but approval returns 501.
 pub struct Signing {
     pub ca: pki::Ca,
     /// Approve every request the moment it arrives. The lab switch, and it is
@@ -92,16 +87,8 @@ pub struct ApiState {
     sibling: controller_api::forward::Sibling,
 }
 
-/// What this endpoint serves, as `GET /apis/meister.io/v1` reports it.
-///
-/// Beside the routes and deliberately not derived from them. The router below
-/// stays written out route by route; this is a second, independent statement
-/// about it, and the test at the bottom of this file holds the two together.
-/// A table the routes were built from would be true by construction and would
-/// therefore tell a client nothing.
-///
-/// `verbs` is what the router really offers — `clusters` has no POST and no
-/// DELETE because a cluster joins and leaves by session, not by request.
+/// Discovery resource metadata, checked against the independently declared routes
+/// by tests. Clusters join through sessions, so they have no create/delete routes.
 pub const RESOURCES: &[ApiResource] = &[
     ApiResource::new(
         Vm::RESOURCE,
@@ -254,12 +241,7 @@ pub const RESOURCES: &[ApiResource] = &[
     .shaped(controller_api::schema_of::<controller_api::VmMigration>),
 ];
 
-/// What this endpoint does that is not a resource and not a verb.
-///
-/// A second statement beside the routes, exactly as the resource table is,
-/// and held to them by the test at the bottom of this file: a name here is a
-/// promise, and a promise nothing keeps is worse than silence. See
-/// `controller_api::rest::features`.
+/// Advertised non-resource features; tests compare this list with served behavior.
 pub const FEATURES: &[&str] = &[
     controller_api::rest::features::DRY_RUN,
     controller_api::rest::features::LABEL_SELECTOR,
@@ -271,12 +253,8 @@ pub const FEATURES: &[&str] = &[
     controller_api::rest::features::CONSOLE_WEBSOCKET,
 ];
 
-/// The rows of `resources!` this tier deliberately does not serve.
-///
-/// Its own list rather than an omission, so that a new resource in
-/// `controller_api::resources` is a decision somebody makes here rather than
-/// a hole nobody notices: the test below fails on a row that is in neither
-/// list.
+/// Resources intentionally absent from cloud discovery. Tests require every shared
+/// resource to appear here or in RESOURCES.
 #[cfg(test)]
 const NOT_SERVED: &[&str] = &[
     // Server-owned bookkeeping (the VNI allocator's). Nothing an operator
@@ -298,13 +276,7 @@ const NOT_SERVED: &[&str] = &[
     controller_api::Ticket::RESOURCE,
 ];
 
-/// Everything this API server needs from the config, in one place.
-///
-/// A struct rather than eight parameters, and it earned that when the
-/// placement preview added the seventh and eighth: a call site with eight
-/// positional values of which three are `Option` is a call site where two
-/// arguments get swapped and nothing complains. Each field is read by one or
-/// two routes; see `ApiState`, which is what they become.
+/// API settings collected from configuration and passed into handler state.
 pub struct Settings {
     pub signing: Option<Arc<Signing>>,
     /// See `ApiState::kek`.
@@ -527,34 +499,14 @@ pub fn router(
     controller_api::statuses(router)
 }
 
-/// A Cluster has nothing the server keeps from a client, and that is a
-/// finding rather than an omission: its whole spec is `schedulable` and
-/// `labels`, and both are exactly what an operator edits. Everything a
-/// controller writes about a cluster lives in `status`, which
-/// `apply_spec_update` refuses outright — a different mechanism, one layer up
-/// from this table.
-///
-/// Declared empty rather than left out, so that
-/// `every_writable_resource_publishes_its_mutability` can tell "nothing is
-/// owned here" from "nobody has looked".
+/// All cluster spec fields are client-editable; status is rejected separately.
+/// An explicit empty table distinguishes this decision from missing discovery metadata.
 const CLUSTER_OWNED: &[Owned] = &[];
 
-/// Nothing in a `User` is the server's. Role, tenant and description are all
-/// an administrator's to change, and changing the first two IS the point of
-/// the resource — a demotion and a move between tenants are the two things
-/// the directory exists to make possible. `status` holds the issued
-/// certificates and is refused separately.
-///
-/// Declared empty on purpose; see `CLUSTER_OWNED`.
+/// User spec fields are administrator-editable. Issued-certificate status is server-owned.
 const USER_OWNED: &[Owned] = &[];
 
-/// Nothing in a `FloatingPool` is the server's either. Its ranges, its
-/// scope, its default flag and its per-tenant quotas are all an
-/// administrator's — what the API does instead is REFUSE a pool whose ranges
-/// do not parse or overlap another's, which is a validity rule and not an
-/// ownership one.
-///
-/// Declared empty on purpose; see `CLUSTER_OWNED`.
+/// Pool spec fields are administrator-editable, subject to range and reservation validation.
 const FLOATING_POOL_OWNED: &[Owned] = &[];
 
 async fn healthz() -> &'static str {

@@ -2,19 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Draining a node: who has to leave, who may stay, and what the
-//! `Draining` status says while it happens. Moved out of `reconcile.rs`
-//! unchanged.
+//! Node evacuation and persisted drain progress.
 
 use super::*;
 
-/// Empty every node an operator has asked to empty, and say what is left.
-///
-/// Level-triggered like everything else here: `spec.drain` is a standing
-/// instruction rather than an event, so this reaches the same conclusion
-/// every tick and writes only when the conclusion has changed. That is also
-/// what makes it survive a controller restart — there is no progress to
-/// resume, only a condition to keep working at.
+/// Re-evaluate the standing drain request each pass.
+/// Progress is derived from stored objects, so a controller restart needs no
+/// in-memory continuation. Clear drain status when the request is removed.
 pub(super) async fn drain_nodes(p: &Pass<'_>, vms: &[Vm]) -> anyhow::Result<()> {
     for node in p.store.list::<Node>().await? {
         let name = node.metadata.name.clone();
@@ -37,13 +31,8 @@ pub(super) async fn drain_nodes(p: &Pass<'_>, vms: &[Vm]) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// One node's drain: the table from the brief, applied to every VM on it.
-///
-/// Two kinds of VM count as "on it", and the second is the one that is easy
-/// to forget: a VM whose binding has already fallen is not on this node by
-/// `spec` any more and its guest is still there until the node's report stops
-/// naming it. Counting only the first would make a drain report itself
-/// finished while VMs were still being torn down.
+/// Apply evacuation policy to VMs bound to or still reported on this node.
+/// A removed binding alone does not prove that the old guest has been torn down.
 pub(super) async fn drain_node(p: &Pass<'_>, node: &str, vms: &[Vm]) -> anyhow::Result<()> {
     let mut leaving: Vec<String> = Vec::new();
     let mut staying: Vec<controller_api::StayingVm> = Vec::new();
@@ -202,25 +191,8 @@ pub(super) async fn drain_node(p: &Pass<'_>, node: &str, vms: &[Vm]) -> anyhow::
     Ok(())
 }
 
-/// How many VMs left this machine between the last pass and this one.
-///
-/// The whole of the cumulative counter, and it is a difference rather than a
-/// memory: a name that was leaving last pass, is on neither list now, and
-/// still exists bound somewhere else has arrived somewhere else. Everything
-/// else it could be is excluded on purpose —
-///
-///   * still leaving, or now staying: it has not left. A live migration that
-///     failed puts a name back on the staying list, and counting it as moved
-///     would be a drain reporting a success it did not have.
-///   * gone from the store entirely: somebody deleted the VM during the
-///     drain. That is not a machine emptied, it is a machine deleted, and a
-///     drain that counted it would flatter itself.
-///   * still named by this node: `status.nodeName` is the window between a
-///     binding falling and the old node letting go, and a guest in it is
-///     still on this machine.
-///
-/// Pure, so the rule can be argued without an etcd — which is what the first
-/// version of this number lacked.
+/// Count previously leaving VMs that no longer appear on either drain list
+/// and are neither bound to nor reported on this node. Deleted VMs do not count.
 pub(super) fn departed(
     previous: Option<&controller_api::Draining>,
     leaving: &[String],
@@ -297,16 +269,8 @@ pub(super) async fn drain_facts(
     }))
 }
 
-/// Is there anywhere for this VM to move live to?
-///
-/// Asked against the pass's own candidate list — the list a placement would
-/// actually be made from, with this pass's spending already taken off it.
-///
-/// It is a `live_possible` INPUT rather than something the migration
-/// reconciler discovers later, and that is because of what the drain does
-/// with the answer: a VM that cannot move live has to be LISTED, with a
-/// sentence, and a drain that created a migration doomed to fail would have
-/// written the wrong sentence on the node.
+/// Check the pass's remaining candidate capacity and migration machine profiles.
+/// A refusal is reported as a drain blocker before creating a migration.
 fn live_target_exists(p: &Pass<'_>, vm: &Vm, node: &str) -> (bool, Option<String>) {
     let nodes = p.nodes.lock().unwrap();
     // The source is cut away first, because "it could stay where it is" is

@@ -2,31 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! One replica asking its sibling, for both tiers.
+//! Forward a request to the replica holding the relevant peer session.
 //!
-//! ## Why a replica forwards at all
-//!
-//! A peer dials ONE replica and only that one can ask it anything. A node
-//! dials one cluster-controller; a cluster dials one cloud-controller. With
-//! three replicas behind one address, two of every three requests for a
-//! console or a log land somewhere that cannot answer — and the client cannot
-//! know which, because which replica holds a peer is a fact about a gRPC
-//! stream and not about anything a client can see.
-//!
-//! So the replica that was asked looks at the endpoint the holder published
-//! (`Node.status.sessionEndpoint`, `Cluster.status.sessionEndpoint`) and asks
-//! it. Once: the forward carries a header that says so, and a replica that
-//! sees the header and does not hold the session answers rather than passing
-//! it on again.
-//!
-//! ## Why it is here and not in a tier
-//!
-//! It was the cluster tier's, written for a node's console. The cloud grew
-//! exactly the same need one scope up — a `vm logs` at the cloud answers only
-//! on the replica holding the CLUSTER's session — and the two ends of the
-//! same idea in two files is how a header name, a timeout and a loop rule
-//! start disagreeing. What stayed in the tiers is what differs: which object
-//! carries the endpoint, and what is being asked for.
+//! The holder publishes its endpoint in Node or Cluster status. A forwarded
+//! request carries a marker so a stale endpoint cannot cause a forwarding loop.
+//! Each tier selects the holder and applies its own route authorization.
 
 use std::sync::Arc;
 use std::time::Duration;

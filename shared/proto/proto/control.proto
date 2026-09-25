@@ -57,24 +57,10 @@ message AgentMessage {
     ConsoleClose console_close = 6;
   }
 }
-// ---------------------------------------------------------------------------
-// The interactive console.
-//
-// A session that lives, unlike a command: one `ConsoleOpen` starts it, frames
-// travel both ways under the same `session_id` until either end sends
-// `ConsoleClose`, and a dropped transport ends it without anything having to
-// say so. It rides the SAME stream as commands and heartbeats on purpose —
-// there is exactly one connection between two tiers and inventing a second
-// would double every question about who dials whom, who retries and who
-// re-homes.
-//
-// What keeps a chatty guest from starving the heartbeat is not this file: the
-// node drops output for a holder that has fallen behind (see the agent's
-// `attach`), so what reaches this stream is bounded by what a reader keeps
-// up with, and a console nobody is reading sends nothing at all.
-// ---------------------------------------------------------------------------
+// Interactive consoles share the command session. ConsoleOpen, data and close
+// messages use one session_id. A dropped transport ends the console. Agents
+// bound output buffering so a slow console cannot indefinitely block status.
 
-// Take a VM's serial line. Answered with ConsoleOpened, once.
 message ConsoleOpen {
   string session_id = 1;
   // The uid at the tier below, exactly as FetchLogs and CreateInstance carry
@@ -119,32 +105,9 @@ message Hello {
   MachineProfile machine = 4;
 }
 
-// The machine a guest runs ON, as far as its saved state is concerned.
-//
-// **Why this travels at all.** A live migration does not move a program, it
-// moves a MACHINE STATE — vCPU registers, MSRs, the nested-virtualisation
-// state — and that state is only restorable into a machine that can hold it.
-// cloud-hypervisor v53 checks the CPUID before the transfer ("No CPU
-// incompatibility detected") and does not check the rest, so the failure
-// arrives 2 ms after the vCPUs are made, in one line the control plane never
-// sees:
-//
-//     Request to create new vCPUs: desired = 1 …
-//     WARN Migration aborted as migration command State failed:
-//          Failed to receive migratable component snapshot
-//
-// The lab spent two nights on that (D-X1). The answer, measured with two bare
-// v53 processes and no MeisterStack at all: the same guest moved between two
-// processes on ONE physical host and failed between two agent VMs on TWO
-// physical hosts, every time, with or without a NIC and with or without the
-// fabric disk. Nested KVM state does not cross a physical host.
-//
-// So the node says what it is, once, at Hello — and the tier that chooses a
-// destination compares before it opens a stream instead of after. A refusal
-// costs nothing: the guest keeps running and a drain moves it by reboot.
-//
-// Every field may be empty, and an empty field is never evidence. A
-// comparison refuses only on two values that are both present and differ.
+// Machine properties for migration compatibility checks, reported at Hello.
+// Missing fields provide no evidence. Controllers compare CPU properties and
+// apply the nested-host restriction before opening a transfer.
 message MachineProfile {
   // `/proc/cpuinfo` `vendor_id` — `GenuineIntel`, `AuthenticAMD`. The
   // coarsest difference there is, and the one no profile can paper over.
@@ -195,16 +158,9 @@ message MachineProfile {
 message DriverInfo {
   string name = 1;
   repeated string profiles = 2;
-  // For a VOLUME entry: where that backend's bytes are — `node-local`,
-  // `shared` or `networked`. Empty for every other kind of driver, and empty
-  // from an agent that predates this field, which reads as "did not say".
-  //
-  // One locality per entry and therefore one ENTRY per volume backend: a node
-  // sends `volume`/[lvm-thin]/node-local beside `volume`/[nfs]/shared rather
-  // than one entry listing both, because the two backends do not have the
-  // same answer and a single string could only be one of them. The flattened
-  // catalogue one tier up is unchanged either way — it is built per
-  // (name, profile) pair.
+  // Volume backend locality: node-local, shared or networked. Use one entry
+  // per backend so each profile has its own locality. Empty means unknown or
+  // not a volume driver; capability flattening still uses (name, profile).
   string locality = 3;
 }
 
@@ -215,103 +171,34 @@ message StatusReport {
   repeated VmStatusReport vms = 2;
   // Empty for every agent from before 6k.
   repeated RouterReport routers = 7;
-  // What this node has learned about the base images it was asked to fetch.
-  // Only the ones it has an opinion about: a path-based image is somebody
-  // else's file on shared storage and this node has never claimed to know
-  // anything about it.
-  //
-  // Upwards on the status road rather than as an answer to a command,
-  // because that is what the fact IS: whether an image is usable is not a
-  // question the cloud can answer by itself once the NODE is what fetches it,
-  // and a node's continuous statement about its own disk is exactly what a
-  // status report is for.
+  // Image observations. Absence establishes nothing unless images_complete
+  // asserts that this report contains the full local inventory.
   repeated ImageStateReport images = 3;
-  // What this node knows about the volumes it was told to make, one entry
-  // each. The same road the VMs and the images take, and for the same reason:
-  // whether bytes exist is a fact about a node, and a node's continuous
-  // statement about its own disk is what a status report is.
-  //
-  // ABSENCE IS NOT PROOF here, unlike `ClusterStatus.vms`. A node that does
-  // not name a volume does not KNOW it — a restart before the first
-  // provision, a record that could not be read — and reading that as "the
-  // data is gone" would drop an object whose bytes are still on a disk.
-  // `Gone` is the explicit answer to a Deprovision, and only it releases.
+  // Volume observations. Absence does not prove deletion: an unreadable or
+  // not-yet-provisioned record may be omitted. Gone explicitly acknowledges
+  // deprovisioning; readers must not infer it from a missing entry.
   repeated VolumeStateReport volumes = 4;
   // And the same for the snapshots it was told to take. Its own list rather
   // than a phase on the volume, because a snapshot outlives the volume it
   // came from: a report that carried it on the volume would lose it exactly
   // when the object it belongs to is the only one left.
   repeated SnapshotStateReport snapshots = 5;
-  // This is the last report: the agent was asked to stop and is going.
-  //
-  // The heartbeat's absence is ambiguous by construction — a node whose
-  // agent was stopped, one whose machine died and one whose network went
-  // away all look identical for the length of the watchdog — and the
-  // controller has to wait the whole of it before it may believe anything.
-  // A node that is leaving on purpose knows better, and saying so costs one
-  // bool: the tier above can act at once instead of guessing for 30 s.
-  //
-  // False on every other report and from every agent that predates the
-  // field, which reads as "did not say" and leaves the watchdog exactly as
-  // it was. It is a statement about THIS report and not about the machine:
-  // a node that says it is stopping and then stays is a node whose next
-  // report says nothing of the kind.
+  // The agent is intentionally stopping. Controllers can mark it unavailable
+  // without waiting for heartbeat expiry. This does not mean its guests stopped.
+  // False leaves ordinary heartbeat handling in effect.
   bool stopping = 6;
-  // What became of the guests this node was told to SEND.
-  //
-  // The other half of a live migration's evidence, and the reason it is on
-  // the status road rather than in the answer to `MigrateOut`: a transfer is
-  // a guest's memory over a network and takes as long as that takes, so a
-  // command that answered with the OUTCOME had to be awaited for the whole of
-  // it. The cluster's reconcile pass did exactly that, and for 45 s on a
-  // large guest no other VM in that cluster was placed or repaired
-  // (migration D16). `MigrateOut` says "accepted, the send has started", and
-  // what says how it ended is this — read, not waited for.
-  //
-  // Empty on every node with no migration in flight and from every agent
-  // older than this field, which reads as "did not say" and leaves the
-  // cluster's own transfer timeout exactly as it was.
+  // Durable outcomes for outgoing migration attempts. MigrateOut acknowledges
+  // initiation; these reports carry later evidence keyed by VM and attempt IDs.
+  // An empty list or a timeout does not establish an outcome.
   repeated MigrationReport migrations = 8;
-  // The `images` list above is EVERY base image under this node's image
-  // directory, not only the ones it has an opinion about.
-  //
-  // What it buys is the other half of F16. A path image is somebody else's
-  // file on shared storage, and the node only ever heard of one through a
-  // record that named it — so an `Image` object nothing on this fleet used
-  // was described by nobody, and the cloud went on calling a catalogue entry
-  // that points at nothing `Ready`. There is no way to tell a node about such
-  // an image: `SyncState` carries VMs, and there is no image command.
-  //
-  // So the node stops waiting to be asked and says what it HAS. With this
-  // flag set, the tier above may read the absence of a name as absence of the
-  // file — "the inventory is complete and this image is not in it" — and put
-  // a path image on `Failed { NotFound }` without anybody's record naming it.
-  //
-  // False means "not saying", exactly as an empty list does: an agent from
-  // before this field, a node whose image directory could not be read, and
-  // the heartbeat-only report that carries no lists at all. A reader may
-  // never turn a false into a statement about a file.
-  //
-  // The list is a `readdir` of regular files, cached on the directory's own
-  // mtime; the catalogue name IS the file name (`check_image_name` at the
-  // cloud refuses anything else), so no translation happens on either side.
-  // Nothing is fetched and nothing is hashed for it.
+  // True only when images contains the complete local image inventory.
+  // A missing name then establishes absence from that inventory. False means
+  // unavailable or incomplete, including heartbeat-only and older reports;
+  // readers must not infer file absence from it.
   bool images_complete = 9;
-  // The `vms` list above is EVERY vm this node has a record of.
-  //
-  // The same word as `images_complete`, for the list the control plane acts
-  // on hardest. `vms` is empty in two entirely different situations and they
-  // used to look identical on the wire: a node that has no guests, and a node
-  // whose per-vm half could not be read at all (`heartbeat_only`, which sends
-  // the node's facts and empty lists). `session::ingest::forget_unbound`
-  // treats absence from this list as proof that the node has let a vm go, and
-  // clears the binding a client released — so one unreadable beat from a
-  // healthy node was enough to declare its guests unplaced while their VMMs
-  // went on serving them. Astra finding S12, 2026-09-23.
-  //
-  // False means "not saying", exactly as an empty list does, and every agent
-  // from before this field says false. A reader may turn a false into no
-  // statement at all; only a true licenses "this vm is not on that node".
+  // True only when vms contains the complete record inventory. A reader may
+  // use absence to release a stale binding only with this flag. Unreadable
+  // inventory and heartbeat-only reports must leave it false.
   bool vms_complete = 10;
 }
 
@@ -378,40 +265,13 @@ message VolumeStateReport {
   //
   // Zero from a node that predates the field, which reads as "did not say".
   uint64 size_bytes = 5;
-  // Why this volume is in the phase above, in one closed word.
-  //
-  // The node's own vocabulary (`reconcile::observe::VolumeReason`) and not the
-  // control plane's, for the reason `VmStatusReport.reason` gives at length.
-  // It is the half `message` could never be: the message is a driver's
-  // sentence, which is what an operator reads and what no program may branch
-  // on, and the two `Failed` cases behind it are a provision that did not
-  // work and a backend that has LOST a volume it once wrote -- one fix is a
-  // retry, the other is somebody's data.
-  //
-  // Empty for `Ready`, and empty from every node that predates the field.
+  // Bounded node reason from proto::reasons::VOLUME. Preserve unknown words
+  // in diagnostic messages. An empty value supplies no reason.
   string reason = 6;
-  // This node has the volume OPEN right now.
-  //
-  // Read off the VM RECORDS of this node and not off the volume record above:
-  // a disk is open because something here holds it, and the record that holds
-  // it is the VM's. Every record counts, whatever its own state — one on its
-  // way out whose teardown has not run yet, one whose guest has already left
-  // for another machine — and the answer turns false at exactly one moment,
-  // when `Provisioner::teardown` (or a stop, or a hot-unplug) has actually
-  // run `detach` for this disk.
-  //
-  // It travels because the union of `VmStatusReport.attached_volumes` is not
-  // the same statement and cannot be made into one: a VM with `desired =
-  // Absent` drops out of the report at once (`observe::report`), so between
-  // the receipt of a `DestroyInstance` and the pass that finishes the
-  // teardown, the disk was held by a VMM that nothing upstairs could see any
-  // more. A blocked teardown — a snapshot or a migration owns the record —
-  // stretches that window to the next pass, and `openOn` went empty inside
-  // it while the fd was open.
-  //
-  // False from a node that predates the field, which is why the tier above
-  // may only read a `true` as evidence and has to keep its own rule for a
-  // node that says nothing at all.
+  // Whether local VM records still hold this volume, including records being
+  // torn down. Keep the observation until detach completes. Do not derive it
+  // from the reported VM list, which may omit VMs with desired Absent. Older
+  // agents default this field to false, so absence of a claim needs care.
   bool open = 7;
 }
 
@@ -423,68 +283,25 @@ message ImageStateReport {
   // not in the list.
   string phase = 2;
   string message = 3;
-  // WHICH node this line is about.
-  //
-  // Empty on the AGENT's road, where it would say nothing: a node reporting
-  // its own name back to the controller it is addressing adds nothing. It is
-  // filled on the CLUSTER's road, and there it changes the shape of the
-  // message: the cluster used to send one line per image, already merged, and
-  // now sends one line per image PER NODE. The merge moves up to the cloud,
-  // which needs both halves — the union is what `status.phase` says, and the
-  // lines are what `status.nodes[]` is.
-  //
-  // Empty from a CLUSTER means a cluster older than this field, and the cloud
-  // reads it exactly as it read every report before: an already-merged phase
-  // for the image, with nothing to say about nodes.
+  // Node associated with this image observation. Empty on the agent hop;
+  // filled by the cluster for per-node aggregation at the cloud. An empty
+  // cluster value is a legacy aggregate with no node-level evidence.
   string node = 4;
-  // Why, in one closed word: `NotFound` for a path image whose bytes are not
-  // at the path this node looks at, `NotAFile` for a directory under the
-  // catalogue name, `FetchFailed` for a url image that did not arrive or did
-  // not hash to what the spec said.
-  //
-  // `NotFound` is the one F16 is about. A path image is somebody else's file
-  // on shared storage, so a node that had never been asked to fetch anything
-  // said nothing at all about it -- and a catalogue entry nobody had looked
-  // at went on reading `Ready`. The word is what lets the tier above tell
-  // "this node cannot see the bytes" from "this node could not get them".
-  //
-  // Empty for `Ready` and from every node that predates the field.
+  // Image failure category, such as NotFound, NotAFile or FetchFailed.
+  // Empty means no reason was supplied.
   string reason = 5;
-  // The sha256 this node computed for a PATH image's bytes, the first time
-  // it found them present and Ready.
-  //
-  // Astra finding S02, 2026-09-23 (rest a). A path registration names a file
-  // nobody had ever hashed — that is what distinguishes it from a url image,
-  // which carries `spec.sha256` from the moment it is created — so nothing
-  // bound the catalogue name to particular bytes. The cloud pins the first
-  // one it sees onto `Image.status.digest` and holds every later report to
-  // it; see `settle_image`.
-  //
-  // Empty for a url image (already bound by its own checksum, which this
-  // field would only repeat), for a node that has not looked yet, and for a
-  // node older than this field. None of those may be read as a claim about
-  // the bytes — only a non-empty value is one.
+  // SHA-256 of a path image after inspection. The cloud pins the first digest
+  // and checks later observations against it. Empty supplies no evidence; URL
+  // images already carry their expected checksum in spec.
   string digest = 6;
 }
 
 message NodeStatus {
   uint32 vcpus = 1;
   uint64 mem_mib = 2;
-  // What is wrong with this node, as the node itself knows it.
-  //
-  // Beside the capacity because it answers the other half of the same
-  // question: `vcpus` and `mem_mib` say how much this machine could host,
-  // and this says whether it can host anything at all. The heartbeat says a
-  // process is alive; the mini-chaos run showed what that leaves out — a node
-  // whose store had taken one I/O error refused every command for three hours
-  // while `ready`, the session and check.sh all said green, and the scheduler
-  // kept sending work to it.
-  //
-  // Empty is the ordinary answer and it means nothing is wrong. It is also
-  // what every agent built before this field says, which is why absence may
-  // never be read as a condition: a report that does not name `DiskPressure`
-  // is not a report that has ruled it out. The controller half reads the list
-  // as a VETO and never as a permission.
+  // Reported health conditions that veto placement. Any nonempty list blocks
+  // new work, including unknown condition names. Empty supplies no negative
+  // condition; it does not certify checks omitted by an older agent.
   repeated NodeCondition conditions = 3;
 }
 
@@ -495,21 +312,9 @@ message NodeStatus {
 // what an operator reads, and asking a program to match on prose is asking
 // it to break.
 message NodeCondition {
-  // A closed set, spelled exactly:
-  //
-  //   DiskPressure     the disk this node stores on has no room left
-  //   StoreUnhealthy   the node's own database refuses reads or writes
-  //   CgroupUnusable   `cgroup_root` is not a cgroup2 filesystem, so no
-  //                    teardown on this node can finish
-  //
-  // Every one of them means the same thing to the tier above — put nothing
-  // here — which is why the controller half branches on the LIST being
-  // non-empty rather than on the individual word. The word is for the
-  // operator's column and for the sentence.
-  //
-  // So an unknown type from a newer agent is still handled correctly by an
-  // older controller: the node stops being a candidate, and the word it was
-  // given is what gets printed.
+  // Known types include DiskPressure, StoreUnhealthy and CgroupUnusable.
+  // Controllers treat every nonempty condition, including unknown types, as
+  // a placement veto and retain the word for diagnosis.
   string type = 1;
   // The same fact in words, naming what would have to change.
   string message = 2;
@@ -521,90 +326,24 @@ message VmStatusReport {
   // One of the controller's VmPhase variants, spelled exactly.
   string phase = 2;
   string message = 3;
-  // The uids of the `Volume` objects this node currently has attached to this
-  // VM -- what the node HAS, not what it was told to have.
-  //
-  // Referenced volumes only. An inline disk's id was minted by this node and
-  // names no object one tier up, so reporting it would be noise nobody can
-  // resolve. Empty for a VM with no referenced disks, and for every node from
-  // before storage B -- which is why the controller reads "did the reported
-  // set match the spec" only for a VM that asks for at least one.
-  //
-  // This is what closes a hot-plug: `observedGeneration` for a spec that
-  // changed `volumes[]` is set when this list matches the spec, not when the
-  // command was dispatched. It is the one place in this stack where
-  // "dispatched" is not "observed", and the reason is that an attach can
-  // fail INSIDE the node -- the disk exists, the guest was told, and the
-  // telling is what may not have worked.
+  // UIDs of referenced volumes actually attached to this VM. Inline disks
+  // are omitted. Controllers compare this observation with desired references
+  // before acknowledging hot-plug completion; command receipt is insufficient.
   repeated string attached_volumes = 4;
-  // The machine this VM is on, as the reporter knows it.
-  //
-  // Empty on the AGENT's road, by construction: a node reporting its own name
-  // back to the controller that addressed it would be saying nothing. It is
-  // filled on the CLUSTER's road, where it is the one fact the tier above
-  // cannot derive — the cloud binds a VM to a CLUSTER, and which machine
-  // inside it runs the VM is the cluster's own decision.
-  //
-  // Empty from a cluster means "not placed", which is a real state and the
-  // one an unbound VM is in. It is evidence and never a claim about the
-  // future: a cloud reads it and writes `status.nodeName`, nothing else.
+  // Actual node, filled by the cluster and empty on the agent hop. At the
+  // cloud this updates observed node placement, not the desired binding.
   string node = 5;
-  // The evidence half of hot-plug, by NAME, on the cluster's road.
-  //
-  // `attached_volumes` above is the agent's road and speaks uids the agent
-  // was handed; this is the same fact one tier up, where the objects have
-  // names and the tier that owns both has already resolved them. A tenant
-  // reads their VM at the cloud and nowhere else, so without this the only
-  // thing they can see is the INTENT in `spec.vm.volumes[]` — the cluster
-  // knew which disk had actually arrived and the cloud did not.
-  //
-  // Empty on the AGENT's road, where the uid list above is the answer, and
-  // empty from a cluster that predates the field.
+  // Named attachment observations on the cluster-to-cloud hop. The cluster
+  // resolves the agent's attached_volumes UIDs to Volume names. Empty on the
+  // agent hop and from older cluster reports.
   repeated VolumeAttachment volumes = 6;
-  // Why this VM is in the phase above, in one closed word.
-  //
-  // It was `pending_reason` and carried the scheduler's word only, on the
-  // cluster's road: a Pending VM at the cloud was a dead end for anybody
-  // holding just that tier's API, which is every tenant. Same field number,
-  // same wire type; what widened is WHICH phases may put something in it,
-  // because a phase without a reason is a line an operator cannot act on —
-  // `Pending` that does not say what is missing, `Failed` that does not say
-  // what broke, `Provisioning` that does not say whether a pass is working or
-  // a backoff is waiting.
-  //
-  // A string and not an enum, on BOTH roads, and that is deliberate: the
-  // agent does not depend on `controller-api` (see `CANNOT_SERVE` for the
-  // same argument about `ErrorMsg.reason`), so it cannot name the control
-  // plane's variants and does not try to. It writes the words of its own
-  // table -- one enum per resource, `reconcile::observe::reason_table` -- and
-  // the tier above parses them. A word no reader knows may not be dropped: a
-  // drifting agent has to be visible, so an unparsed reason travels on in the
-  // message.
-  //
-  // Empty is the ordinary answer for `Running`, `Stopped`, `Paused` and
-  // `Ready`, which need no reason, and it is what every reporter from before
-  // this field says.
+  // Bounded reason for the reported phase. Node and controller vocabularies
+  // are shared through proto::reasons. Unknown words must survive in messages
+  // so version skew remains visible. Empty supplies no reason.
   string reason = 7;
-  // The hardware addresses of this VM's taps, as the NODE made them.
-  //
-  // The half of `Vm.status.addresses[]` no tier above can derive. There is no
-  // agent inside the guest and there will not be one, so the address the
-  // control plane honestly knows is not an IP: it is the MAC a DHCP lease is
-  // looked up by and the one an operator matches against `ip neigh`. The
-  // other half — a floating address pointed at the VM — is the cloud's own
-  // object and needs nobody's report.
-  //
-  // Same rule as `attached_volumes` above and for the same reason: what the
-  // node HAS, one entry per tap it actually made, and nothing for a tap whose
-  // driver does not know an address. An EMPTY list is therefore not "this VM
-  // has no addresses" — it is an agent from before this field, and a
-  // controller reads nothing at all out of it, not even "none". A tap that
-  // has gone away drops out of the list on the same report that still names
-  // the others, which is what keeps the list self-healing.
-  //
-  // Filled on the CLUSTER's road too, out of the same VM's `status.addresses`
-  // — the cloud is where a tenant reads their VM, and without this hop the
-  // MAC stopped one tier below them.
+  // Tap MAC addresses reported by the node and relayed by the cluster.
+  // These are not guest IP discovery. A nonempty list replaces known MAC
+  // entries; empty lists leave them unchanged for older-peer compatibility.
   repeated NicReport nics = 8;
 }
 
@@ -690,57 +429,18 @@ message Command {
   }
 }
 
-// Stop being a node that holds this volume. **The bytes stay.**
-//
-// The command a live migration needed and did not have. When a guest moves,
-// the destination opens the disk before the source lets go — that is what
-// `Volume.status.openOn` is a set for — and afterwards the object's home moves
-// with the guest. What is left on the SOURCE is a volume record for a disk it
-// has no business with: it goes on reporting the volume on every heartbeat,
-// and the cluster drops every one of those reports because that node is
-// neither the volume's home nor a holder of it. One line per node per report,
-// for ever (migration D8/D20).
-//
-// Deliberately NOT `DeprovisionVolume`, and the distance between the two is
-// somebody's data: deprovision destroys an `lvm-thin` LV and unlinks a
-// `filesystem` pool's file. This removes the node's record and asks the
-// backend to release whatever it holds PER NODE — for nvmeof-import a claim
-// over a namespace, for everything else nothing at all — and never touches
-// what is on the disk.
-//
-// And deliberately not answered with a tombstone, unlike a deprovision. A
-// `Gone` means "the bytes are not on this node", and from a node the control
-// plane still believes is the home that word clears `status.node` and strands
-// the volume. Forgetting is absence, and absence up there means "this node
-// does not know", which is exactly what has become true.
-//
-// Idempotent for an id this node has never heard of: it is already forgotten.
-// Refused only while a VM on this node still holds the disk — the same last
-// defence a deprovision has, and reaching it means the tier above is wrong.
+// Forget the local volume record and release per-node claims while preserving
+// data. Refuse while a local VM still holds the volume. Repeating an already
+// completed request succeeds. Do not emit a Gone tombstone: forgetting local
+// bookkeeping is not evidence that backend bytes were deleted.
 message ForgetVolume {
   // The Volume object's metadata.uid, exactly as ProvisionVolume carries it.
   string id = 1;
 }
 
-// An image the cloud let go of. Told down both hops unchanged — cloud to
-// cluster as CloudCommand.drop_image, cluster to every node as
-// Command.drop_image — because neither tier keeps an id space of its own for
-// an image the way it does for a VM: the cloud mints `uid` once and it
-// travels verbatim all the way to `agent::images::Source::uid`.
-//
-// Astra finding S02, 2026-09-23 (rest b): deleting the Image object used to
-// tell nobody, so whatever a node had fetched for it sat in its cache
-// forever, including across a name recycled for a different registration.
-// `uid` is what makes this safe to broadcast rather than target: a node that
-// never fetched this uid does nothing, and a node holding a DIFFERENT
-// image's bytes under a re-registered `name` is untouched because the
-// removal is keyed on `uid`, never on `name` alone — see `Cache::drop_uid`.
-//
-// Sent to every connected cluster, and inside a cluster to every connected
-// node, rather than only the ones known to have it: that knowledge is only
-// ever as fresh as the last heartbeat, and a stale or incomplete inventory
-// must not be the reason bytes are never dropped. A node with nothing under
-// this uid answers with nothing to do.
+// Invalidate an image UID through both session tiers. Broadcast to connected
+// peers; incomplete inventory must not suppress delivery. Remove a name link
+// only when it still identifies this UID, preserving any newer registration.
 message DropImage {
   // The catalogue name, so a node can tell whether ITS link under that name
   // still points at the uid being dropped before it removes the link too.
@@ -764,8 +464,9 @@ message EnsureRouter {
   bool active = 8;
 }
 
-// OVN's two NAT kinds, spelled the same: `snat` (logical_ip empty = the
-// whole internal subnet) and `dnat_and_snat` (a floating address, 1:1).
+// Rule kind: snat, dnat_and_snat or routed. For snat, empty logical_ip means
+// the full internal subnet. Routed carries a prefix in logical_ip and has no
+// external_ip or address translation.
 message NatRule {
   string kind = 1;
   string external_ip = 2;
@@ -788,17 +489,8 @@ message RouterReport {
   string phase = 2;
   string message = 3;
   bool active = 4;
-  // The machine this router is active on.
-  //
-  // Empty on the AGENT's road, by construction: a node naming itself back to
-  // the controller that addressed it says nothing. Filled on the CLUSTER's
-  // road, where it is the one fact the cloud cannot derive — the cloud
-  // decides which FLEET carries a tenant's way out, and which machine inside
-  // it holds the netns right now is the cluster's own answer, and the answer
-  // that changes when a gateway node dies.
-  //
-  // Empty from a cluster means "on none of them", which is a real state: a
-  // router whose whole priority list is down is planned and unserved.
+  // Active node, filled by the cluster; empty on the agent hop. An empty
+  // cluster value means no node is currently reported active.
   string node = 5;
   // The priority list this router was planned onto, in order.
   //
@@ -808,38 +500,15 @@ message RouterReport {
   // is where a tenant reads it. Evidence: the cloud mirrors it and never
   // writes into it.
   repeated string nodes = 6;
-  // Why this router is not `Ready`, in one closed word: `NetnsGone` (the
-  // namespace this node built is not there any more), `LegGone` (it is, and a
-  // leg of it is not), `DriverUnreachable` (the kernel could not be asked, so
-  // this is what the NODE could not find out rather than what is broken).
-  //
-  // The third is the one worth the field: a `Failed` that means "we could not
-  // look" and a `Failed` that means "it is gone" send an operator to two
-  // different machines, and until now both arrived as a sentence nobody could
-  // branch on. The words are the node's own
-  // (`agent_api::networking::RouterReason`), beside `ROUTER_READY` and for
-  // the same reason.
-  //
-  // Empty for `Ready` and from every reporter that predates the field.
+  // Bounded router failure reason, such as NetnsGone or FabricUnhealthy.
+  // Unknown words must remain visible in the message; empty supplies no reason.
   string reason = 7;
 }
 
-// Make this node ready to RECEIVE a running guest, and say where to send it.
-//
-// The destination half of a live migration, and the only command in this file
-// whose Ack carries an answer the caller cannot derive: `Ack.payload` holds
-// the address the SOURCE must dial, as JSON `{"peer": "tcp:<addr>:<port>"}`.
-// The node picks it, because only the node knows which of its addresses is
-// reachable and which port is free — and the string is in cloud-hypervisor's
-// own spelling and travels through the control plane unopened, so that no
-// tier above has to hold an opinion about a VMM's idea of a URL.
-//
-// Everything the arriving guest needs that is NOT the VMM has to exist here
-// before the stream opens, at the SAME paths the source uses: the
-// configuration travels inside the stream and names them. That is the whole
-// of what this command does — the same resource chain a CreateInstance runs,
-// stopped one step short of creating a VM, because v53 refuses to receive a
-// migration into a VM that has been created.
+// Prepare resources and a VMM listener for a migration attempt. Ack.payload
+// returns JSON {"peer": "tcp:<addr>:<port>"}; intermediate tiers carry this
+// address unchanged. Disks, taps and paths must match the transferred config.
+// The receiving VMM must not already contain a created guest.
 message PrepareMigration {
   // The VM's uid, the same one CreateInstance carries. It is the SAME vm: a
   // live migration moves a guest between machines and does not make a second
@@ -857,16 +526,9 @@ message PrepareMigration {
   string migration_id = 4;
 }
 
-// Send this node's running guest to `peer`.
-//
-// **The only command in a live migration that touches the source, and the
-// last one issued.** By the time it goes out the destination has a VMM
-// listening and every disk and tap the arriving config names; everything
-// before it can fail without the guest noticing, which is why a failed
-// migration costs a record and nothing else.
-//
-// Ack means accepted. Errors and lost replies do not prove an abort. The durable
-// attempt remains protected until matching terminal evidence is established.
+// Start sending the source guest to the prepared destination. Ack confirms
+// acceptance only. Errors and lost replies do not prove an abort; retain
+// attempt protection until matching durable evidence resolves ownership.
 message MigrateOut {
   string id = 1;
   // The address the destination answered with, verbatim. Not parsed at any
@@ -911,19 +573,9 @@ message ProvisionVolume {
   string from_snapshot = 3;
 }
 
-// Freeze what a volume holds right now, on the node that HAS it.
-//
-// To the provisioning node and not to the node the VM runs on -- under a
-// `shared` pool those are two machines, and a snapshot is a statement about
-// data and needs no consumer. Idempotent by id: the backend derives the
-// snapshot's name from `snapshot_id`, so a second command finds the first
-// one's copy.
-//
-// Whether the VM has to stand still across this is the DRIVER's answer
-// (`snapshot_support`), asked and acted on by the cluster: `NeedsQuiesce`
-// buys a PauseInstance before and a ResumeInstance after, `Atomic` buys
-// nothing. The node does not pause anything on its own -- the VM may be on
-// another machine, and only the tier that knows both can sequence the two.
+// Snapshot on the volume's provisioning node, idempotently by snapshot_id.
+// For NeedsQuiesce drivers, the cluster sequences guest pause and resume; the
+// consumer may run on another node. Atomic drivers require no such pause.
 message SnapshotVolume {
   // The Volume object's uid: which disk to copy.
   string id = 1;
@@ -951,17 +603,9 @@ message ResizeVolume {
   uint64 size_bytes = 2;
 }
 
-// Tell a GUEST that its disk has grown, on the node the VM runs on.
-//
-// The second half, and it goes to a different node than the first whenever
-// the pool is shared. It changes nothing about the data: cloud-hypervisor's
-// `vm.resize-disk` grows a file itself and merely verifies a block device,
-// so by the time this arrives the bytes are already there.
-//
-// A failure here is NOT a failure of the resize: the backend grew, and what
-// did not happen is the notification. The object says so in its message and
-// keeps `status.sizeGib` at the old value, because a guest that has not been
-// told does not have the room.
+// Notify the guest after backend growth, on the node running the VM. A failed
+// notification does not undo the grown bytes. Reported size remains old until
+// the guest-side operation completes.
 message ResizeAttachment {
   // The Vm object's uid -- the id the node was handed on CreateInstance.
   string vm = 1;
@@ -1148,31 +792,16 @@ message ClusterStatus {
   repeated VolumeSnapshotStatusReport snapshots = 11;
   // The same statement `volumes_complete` makes, about this list.
   bool snapshots_complete = 12;
-  // The routers this cluster holds for the cloud, the ones on their way out
-  // included. `RouterReport.id` is the uid the CLOUD handed out on
-  // CreateRouter, and `node`/`nodes` are the two fields the road one tier
-  // down leaves empty — see RouterReport.
-  //
-  // The router is the one object of this stack whose PLACEMENT is a moving
-  // fact rather than a settled one: a VM is on the machine it was put on
-  // until somebody moves it, and a router changes machines by itself when one
-  // dies. So this list is read the way a heartbeat is read, and it is what
-  // makes a failover visible one tier up rather than only in a node's log.
+  // Cloud-managed router observations, including routers being deleted. IDs
+  // are cloud UIDs. The cluster fills active node and candidate nodes so
+  // gateway failover is visible at the cloud.
   repeated RouterReport routers = 14;
   // The same statement `vms_complete` makes, about this list. Absence from a
   // COMPLETE list is the cloud's proof that a router was torn down; absence
   // from an incomplete one is proof of nothing at all.
   bool routers_complete = 15;
-  // The cloud-managed secrets this cluster is holding, sealed.
-  //
-  // Evidence, and it buys two things the mirror could not have without it.
-  // The cloud used to send EVERY secret to EVERY cluster in every pass —
-  // there was nothing to compare against — and a cluster that was offline
-  // when somebody ran `secret rm` kept its sealed copy for ever, because a
-  // deletion cannot be derived from a list the object has already left. Both
-  // are answered by the cluster saying what it has: what it already holds at
-  // the current generation is not re-sent, and what it holds that the cloud
-  // does not have is told to go.
+  // Cloud-managed secret UIDs and generations held by the cluster. The cloud
+  // avoids resending unchanged copies and removes mirrors absent upstream.
   repeated SecretStateReport secrets = 13;
 }
 
@@ -1244,19 +873,8 @@ message StoragePoolStatusReport {
   // cluster's pool is a separate object down there. This is the evidence the
   // comparison is made on.
   string params_json = 6;
-  // Why this pool is in the phase above, in one closed word.
-  //
-  // D-C11 is the line this field is for. A pool at the cloud is a POINTER at
-  // one a cluster admin made, and a pointer whose cluster has no such pool
-  // sat at `Pending` with an empty status for as long as anybody watched:
-  // `"status": { "phase": "Pending" }` was the whole of it, six minutes in,
-  // and nothing anywhere said that the cluster half was missing.
-  //
-  // No agent writes this one -- a node reports DRIVERS (`DriverInfo`, with
-  // the locality), and the pool objects are made one tier up out of them. It
-  // is filled on the cluster's road and read at the cloud.
-  //
-  // Empty for `Ready` and from every cluster that predates the field.
+  // Pool reason supplied by the cluster; agents report driver capabilities
+  // instead of pool objects. Distinguishes a missing pool from a silent peer.
   string reason = 7;
 }
 
@@ -1281,29 +899,11 @@ message VolumeStatusReport {
   // and an operator reading a cloud-tier volume would otherwise see nothing
   // at all. Empty until a node has said it; empty never means "gone".
   string backend = 6;
-  // How big the disk actually IS, in GiB, as the node measured it — the
-  // evidence half of `spec.sizeGib`, which is the intent.
-  //
-  // It travels because a resize is two steps on possibly two machines and can
-  // half-happen: the backend grows and the guest is told, in that order, and
-  // between the two the spec says 2 and this says 1. Without this field that
-  // state is not observable at the cloud at all, and the tier most operators
-  // read would answer a resize with the number that was asked for rather than
-  // the number that happened.
-  //
-  // Zero = not measured, on every volume no node has reported yet and from
-  // every cluster older than this field.
+  // Observed size in GiB after resize processing, independent of requested
+  // spec.sizeGib. Zero means unmeasured or omitted by an older peer.
   uint64 size_gib = 7;
-  // Every node inside that cluster that has the volume OPEN right now.
-  //
-  // Normally one and the same machine `node` names; TWO for the length of a
-  // live migration, which is the whole reason the field exists. It travels
-  // because an operator watching a migration reads it at whichever tier they
-  // are logged into, and a cloud that showed one node while two had the disk
-  // would be describing a state that is not happening.
-  //
-  // Empty from a cluster older than this field, which reads as "did not say"
-  // and never as "nobody has it".
+  // Nodes reporting this volume open. A migration can temporarily name two.
+  // An empty list from an older cluster is not proof of closure.
   repeated string open_on = 8;
   // Why this volume is in the phase above, in one closed word — the same
   // vocabulary `VolumeStateReport.reason` carries one road further down, and
@@ -1346,52 +946,15 @@ message NodeReport {
   // same list through the same predicate, so "unhealthy" cannot come to mean
   // two different things one hop apart.
   repeated NodeCondition conditions = 10;
-  // What the drain of this machine has actually done, when one is running.
-  //
-  // `drain` above is the ASK — an operator wrote `spec.drain` — and this is
-  // the evidence, which is a different fact and the one somebody watching a
-  // drain is waiting for: how many guests have left, how many are still on
-  // their way, and what is staying behind and why. Absent means no drain, and
-  // that is also what a cluster from before this field sends: the cloud shows
-  // no drain column for a machine it has no evidence about, which is what it
-  // did before the field existed.
-  //
-  // The proto form of `controller_api::Draining` and nothing more. The
-  // cluster owns that object; this message exists so the tier above can read
-  // it, not so it can hold a second opinion about it.
+  // Observed drain progress, mirroring controller_api::Draining. Absent means
+  // no reported drain; the spec drain flag remains the requested policy.
   DrainingReport draining = 11;
-  // `spec.accepts` — the workload classes this machine takes, empty for a
-  // machine that takes everything.
-  //
-  // It travels for the reason `schedulable` and `drain` do, and one reason
-  // more. A cloud that cannot see it places a router-only gateway node's
-  // cluster for an ordinary VM, the cluster refuses it down there, and the
-  // tenant reads a Pending sentence at the cloud about a machine the cloud
-  // never knew was fussy. With the field the cloud makes the same decision
-  // the cluster would have, one hop earlier — the same rule `capabilities`
-  // follows: both tiers read one fact through one predicate, so "will take
-  // this workload" cannot come to mean two things one hop apart.
+  // Accepted workload classes from NodeSpec. Empty accepts every class.
+  // The cloud uses the same class predicate as cluster placement.
   repeated string accepts = 12;
-  // Whether this node's share of `ClusterStatus.images` is EVERY base image
-  // under its image directory, and not only the ones it has an opinion
-  // about.
-  //
-  // The node's own `StatusReport.images_complete`, relayed per node because
-  // that is the granularity the statement has: one node's image directory
-  // may be unreadable while its neighbour's is fine, and a cluster-wide flag
-  // would have to be the AND of them — which turns one broken node into
-  // "this cluster says nothing about any image".
-  //
-  // What it buys is the cloud half of F16. Only the cloud holds the
-  // catalogue, so only the cloud can ask "is there an `Image` object whose
-  // name this complete inventory does not list" — and a name missing from a
-  // complete inventory is a file that is not there. Without the flag the
-  // absence of a name means nothing at all: an agent from before the field,
-  // a directory that could not be read, a heartbeat that carries no lists.
-  //
-  // False is "not saying" and a reader may never turn it into a statement
-  // about a file. See `StatusReport.images_complete`, which is the same
-  // sentence one tier down.
+  // Completeness of this node's image inventory, relayed separately per node.
+  // False means unavailable or incomplete; absence then proves nothing. See
+  // StatusReport.images_complete for the corresponding agent-hop contract.
   bool images_complete = 13;
 
 }
@@ -1473,21 +1036,9 @@ message CloudCommand {
   }
 }
 
-// A tenant's way out, handed to the fleet that will carry it.
-//
-// The cloud/cluster half of what EnsureRouter is one tier further down, and
-// the split between the two is the same split CreateVm makes. Everything a
-// router needs that is a fact about OBJECTS is resolved up here, because this
-// is where those objects are: the tenant and its VNI, the provider network
-// and the address cut out of its allocation, the floating addresses pointed
-// at this router, the prefixes it announces. WHICH MACHINES carry it is the
-// cluster's decision (decision 4) and nothing in this message has an opinion
-// about it — there is deliberately no node here, exactly as CreateVm carries
-// none.
-//
-// Idempotent by uid down there, like every other create on this session: a
-// second one with the same uid finds the first, and one with a different uid
-// is refused rather than adopted.
+// Create a tenant router from resolved tenant, provider-network and address
+// objects. The cluster selects its gateway nodes. Repeated delivery with the
+// same UID is idempotent; a different UID must not adopt an existing object.
 message CreateRouter {
   // What the router is called. The tenant's name for it, the same one at
   // both tiers.
@@ -1497,17 +1048,8 @@ message CreateRouter {
   string spec_json = 2;
   // The cloud object's metadata.uid, and the only thing a create adopts on.
   string uid = 3;
-  // The provider network this router goes out over, mirrored down beside it:
-  // its name, and its spec as JSON.
-  //
-  // It travels WITH the router rather than as an object of its own, and that
-  // is a decision worth stating. A ProviderNetwork describes a wire that a
-  // fleet's machines really have, so a cluster needs a copy to plan against —
-  // the physnet to match a gateway node's catalogue on, the gateway address
-  // to put in the netns' default route. Making an operator declare the same
-  // wire twice, once at each tier, would mean two objects that can disagree
-  // and a router that goes Pending when they do. So the cloud's copy is the
-  // one somebody writes, and the cluster's is a mirror this command makes.
+  // Provider-network name and JSON spec mirrored with the router so cluster
+  // placement uses the cloud's network definition.
   string network_name = 4;
   string network_json = 5;
   // The external address, cut out of that network's allocation, CIDR.
@@ -1542,29 +1084,10 @@ message DeleteRouter {
   string uid = 2;
 }
 
-// Ask a cluster to move one of its guests between two of its machines.
-//
-// The one verb an operator could reach at the cluster and not at the cloud.
-// `vm migrate` against a cloud ended in "this endpoint is a cloud and has no
-// \"vmmigrations\"" — true, and a dead end for somebody who is logged into the
-// only endpoint their credential works at (D-P9). Everything else a cloud
-// forwards travels this way already; there was simply no message for this.
-//
-// **It carries no destination decision and no schedule.** A live migration is
-// a record of a guest moving between two NODES, and nodes are a cluster's
-// nouns — so what travels down is the ASK, and the cluster's own reconciler
-// chooses the destination, opens the disks, sequences the transfer and writes
-// the record. This is the same object an operator would have made by hand at
-// the cluster, made for them one tier up.
-//
-// There is deliberately no live migration ACROSS clusters, and this does not
-// invent one: `vm` names a guest the receiving cluster already has.
-//
-// Idempotent by name, like every other create on this session: a second one
-// with the same name finds the first. The name is the CLIENT's — it is the
-// vm and the moment, in the shape `vmmigration ls` prints — because a
-// migration is a record somebody reads once rather than a thing they refer to
-// by name later, and a name minted down here could not be answered with.
+// Request migration between nodes of the receiving cluster. The cluster owns
+// destination selection and transfer sequencing; this message does not enable
+// cross-cluster live migration. The client supplies the record name so the
+// cloud can return it; repeated creation is handled idempotently by name.
 message CreateVmMigration {
   // What the record is called at the cluster. `<vm>-<yyyymmdd>t<hhmmss>`, as
   // the CLI builds it.
@@ -1580,26 +1103,10 @@ message CreateVmMigration {
   string tenant = 4;
 }
 
-// Let go of the RECORD and keep the bytes.
-//
-// The one command in this file that is a delete and destroys nothing, and it
-// exists because a volume can change clusters without moving. A `networked`
-// pool is one target dialled from two clusters and a `shared` one is one
-// export mounted by two; when a stopped VM's binding moves from cluster a to
-// cluster b, the disk has to stop being a's object and start being b's, and
-// neither half of that is allowed to touch what is on the disk.
-//
-// So this is deliberately NOT `DestroyVolume` with a flag: destroy sets a
-// deletionTimestamp and walks the finalizer, which ends in a deprovision at
-// the node — a `filesystem` copy would be unlinked and an `lvm-thin` LV
-// removed. This one removes the object and tells no node anything. The node
-// keeps whatever claim it holds, which is exactly right for the two
-// localities that can be released at all: the bytes are not that node's and
-// the create at the other cluster finds them again by the same uid.
-//
-// Idempotent by name with the same uid guard every other cloud command
-// carries, and acked after the object is gone — no absence proof is needed
-// because nothing below this tier was asked anything.
+// Release the cluster's volume object without deprovisioning backend data.
+// Used when shared or networked storage changes cluster ownership. Guard by
+// UID so a stale request cannot delete a replacement. Ack follows removal of
+// the object; no node-side deletion is requested.
 message ReleaseVolume {
   string name = 1;
   // Same rule as CreateVolume and DestroyVolume: only the object carrying
@@ -1673,20 +1180,9 @@ message DestroyVolume {
   string uid = 2;
 }
 
-// A tenant's secret, mirrored one tier down.
-//
-// The cluster needs it because the cluster is what hands a node its
-// cloud-init: `spec.vm.cloud_init.user_data_from` names a secret, and the
-// reference travels in CreateVm while the VALUE does not. So the object has
-// to exist down there before a VM referring to it can be dispatched, and a VM
-// whose secret has not arrived yet is Pending with a reason rather than
-// Failed.
-//
-// `spec_json` carries the object's spec with its values STILL SEALED. Both
-// tiers hold the same KEK (push.sh pki puts it on both), so the ciphertext
-// travels as it stands and no plaintext ever crosses this session — which is
-// the one property that makes mirroring a secret different from mirroring a
-// volume.
+// Mirror a sealed Secret spec to a cluster using the same KEK. The ciphertext
+// remains sealed over this session. The cluster resolves cloud-init references
+// before agent dispatch; a missing mirror keeps the dependent VM pending.
 message CreateSecret {
   string name = 1;
   string spec_json = 2;
@@ -1733,23 +1229,8 @@ message UpdateNode {
   // Labels to take off, applied after `labels` — so naming a key in both
   // means it goes, the same rule `meister node label --rm` has always had.
   repeated string remove_labels = 4;
-  // The workload classes this machine takes — `NodeSpec.accepts`, empty for
-  // one that takes everything.
-  //
-  // A SUBMESSAGE and not a bare `repeated string`, for the reason
-  // `DrainingReport` is one: absent has to be a real answer. On the wire a
-  // repeated field cannot tell "said nothing about it" from "said the empty
-  // list", and here those are the two opposite instructions — leave the
-  // machine's classes alone, or take its restriction off and let it accept
-  // everything again. `optional bool` does the same job for the two flags
-  // above and cannot be spelled for a list.
-  //
-  // It travels for the reason `labels` does: this route exists so that
-  // operating a machine is done from the tier an operator is logged into,
-  // and `node accepts` was the one verb of that route that could not be
-  // reached from the cloud at all — the CLI offered it and the cloud
-  // answered "a node patch may set spec.schedulable, spec.drain and
-  // spec.labels".
+  // Optional update of NodeSpec.accepts. A submessage distinguishes no update
+  // from an explicit empty list, which removes class restrictions.
   AcceptsUpdate accepts = 6;
 }
 
@@ -1802,16 +1283,9 @@ message CreateVm {
   // a name is a label people reuse, and adopting on the name alone would hand
   // a new VM somebody else's disk.
   string uid = 3;
-  // The VXLAN network of the tenant this VM belongs to, resolved by the cloud
-  // because the cloud is where the Tenant object lives. The CLUSTER is what
-  // writes it into the NIC entries of the spec before anything reaches a
-  // node — the truth is made at the edge, and the agent stays dumb and only
-  // checks types. Unset = no tenant, or a tenant from before overlays: the
-  // VM lands on the node's default bridge exactly as it always did.
-  //
-  // A standalone cluster with no cloud above it has the other road: a NIC in
-  // the spec may name its own `vxlan_id`, and an explicit one is never
-  // overwritten by this.
+  // Tenant VNI resolved at the cloud and injected by the cluster into NICs
+  // without explicit overlay or provider-network settings. Unset supplies no
+  // tenant overlay. Explicit standalone NIC VNIs remain unchanged.
   optional uint32 vni = 4;
   // The floating addresses reserved for this VM, resolved by the cloud
   // because the FloatingIp objects live there. Same road as `vni` and for the

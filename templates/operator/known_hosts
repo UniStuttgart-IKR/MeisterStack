@@ -1,11 +1,3 @@
 # SPDX-License-Identifier: MIT
-# The ssh host keys of this fleet, written by `meister-deploy keys enroll`.
-#
-# It is PUBLIC and it is committed: every ssh this tool runs uses
-# `-o StrictHostKeyChecking=yes -o UserKnownHostsFile=<this file>`, so a
-# host that is not in here is a host nothing talks to — and a host whose key
-# changed is a refusal rather than a shrug (D10).
-#
-# `keys enroll <host> --fingerprint SHA256:…` takes the fingerprint from the
-# installer output or the console, checks it against ssh-keyscan, and appends
-# the key here. It never accepts a key it was not told to expect.
+# Public SSH host keys, populated after verifying fingerprints through a trusted channel.
+# Do not treat an unverified ssh-keyscan response as enrollment evidence.

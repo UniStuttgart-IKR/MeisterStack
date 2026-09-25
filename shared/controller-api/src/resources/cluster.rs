@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `Cluster` kind: one cluster tier as the cloud sees it.
-//! Moved out of `resources.rs` unchanged.
+//! Cluster configuration and the capacity and health reported to the cloud.
 
 use super::*;
 

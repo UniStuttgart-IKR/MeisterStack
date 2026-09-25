@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `Vm` kind: what a client asks for, and what the control
-//! plane says about it. Moved out of `resources.rs` unchanged.
+//! VM intent, placement, observed state and runtime access information.
 
 use super::*;
 
@@ -89,39 +88,11 @@ impl Evacuation {
 }
 
 reasons! {
-    /// Why a VM is what it is — the CATEGORY behind the sentence, in a form a
-    /// program can hold and a metric label can carry.
+    /// Bounded reason categories for API status and metrics.
     ///
-    /// **One list, out of two vocabularies.** The first eight are this tier's
-    /// own words, each one a sentence the controllers already wrote:
-    /// `Unplaced` and `NotReady` are the twelve `PendingReason` categories
-    /// split where the split changes what an operator DOES (a wall, or a
-    /// wait) — see `PendingReason::category`; `Unbound` is the two ingest
-    /// paths that say "let go; waiting to be placed"; `Dispatched` is the
-    /// anticipation the reconciler writes when a create goes out; `Refused`
-    /// is `CannotServe` and the cloud's refusal of a create; `Silent` is
-    /// `unheard_of` and its counterpart at the cloud.
-    ///
-    /// The nine after them are the NODE's, verbatim — `proto::reasons::VM`,
-    /// the list the agent writes on the wire. There is no `Reported` here any
-    /// more, and that absence is the decision: a phase that came up from
-    /// below used to arrive as "Reported" with the node's word buried in the
-    /// sentence, so the closed set said only which ROAD the phase came down
-    /// and never what had happened. A guest whose VMM is gone and one whose
-    /// storage backend died under a live VMM were the same word, and they are
-    /// not the same problem — one is repaired by a pass and the other must
-    /// not be. Now the word on the object IS the node's word, and
-    /// `every_word_a_node_can_say_parses_into_the_reason_of_its_resource`
-    /// holds the two lists together.
-    ///
-    /// So the cap of eight from the brief is gone. What replaced it is the
-    /// rule that was behind it: no stock reasons — every word here is written
-    /// by a place in this tree or read off a wire by one.
-    ///
-    /// The sentence is not replaced by any of this and never will be: it
-    /// counts candidates and names capabilities, which is what an operator
-    /// reads. This is the closed set behind it, so that "how many VMs are
-    /// waiting, and why" is a time series rather than a string.
+    /// Controller decisions and node reports share this list; node reason names
+    /// must match `proto::reasons::VM`. Messages retain detailed context such as
+    /// candidate counts and missing capabilities.
     VmReason [18] {
         /// Nobody recorded one.
         ///
@@ -241,32 +212,12 @@ phases! {
         Paused { message, since } => "Paused",
         Failed { reason, message, since } => "Failed",
         Quarantined { reason, message, since } => "Quarantined",
-        /// Nobody has heard from the machine this VM is on for longer than the
-        /// heartbeat allows, so nothing here knows what the guest is doing.
+        /// The holder has stopped reporting; the guest state is unknown.
         ///
-        /// NOT `Failed`, and the difference is the whole reason this variant
-        /// exists: `Failed` is a claim that something went wrong, and nothing
-        /// went wrong that anybody can point at — the guests on a node whose
-        /// agent was killed keep running, which is exactly what the mini-chaos
-        /// run found on manacor (agent dead 20 h, eleven guests alive). What is
-        /// true is only that the control plane has stopped knowing, and that is
-        /// what this says.
-        ///
-        /// It is also not a `Failed` because of what `Failed` COSTS: it is the
-        /// phase the requeue curve acts on, and requeueing a VM whose node simply
-        /// stopped talking would be this tier repairing something it has no
-        /// evidence is broken.
-        ///
-        /// One report from the node replaces it with whatever is true, and that
-        /// is the whole exit — there is no timer that promotes it to anything.
-        /// `unknown_needs_its_holder`: nothing in this stack turns this into
-        /// `Failed`, however long it stands. What a deadline buys is an event
-        /// and a metric (see `stuck`), not a verdict.
-        ///
-        /// It is PARSED as well as written: an agent that comes back reports a
-        /// real phase, but a CLUSTER relaying its own stored phase to the
-        /// cloud sends this word, and a tier that rejected it would keep
-        /// showing Running for a VM its own cluster has given up on.
+        /// Silence is not proof that a guest stopped. This phase does not enter
+        /// failure requeue or become Failed after a deadline. A fresh observation
+        /// resolves it; deadlines only produce events and metrics. Cluster reports
+        /// may relay Unknown to the cloud.
         Unknown { reason, message, since } => "Unknown",
     }
 }
@@ -378,33 +329,11 @@ pub struct VmSpec {
     /// inventories.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anti_affinity: Vec<AntiAffinity>,
-    /// The agent's create document as raw JSON, carried and not read.
-    ///
-    /// Carried, still: nothing here interprets it, and a field added to it at
-    /// the node travels through both tiers without a change to this struct.
-    /// What DID change is that its shape is now published — `/schemas` shows
-    /// the fields, derived from `agent_api::spec::NewVmSpec` itself, so a form
-    /// can list them instead of copying them out of a guide. The type is
-    /// named only for the schema and for the edge check; the value stays a
-    /// `Value` on the way through.
-    ///
-    /// The boundary that survives is the one that matters: this control plane
-    /// still knows nothing about sizing, images on disk or drivers. It knows
-    /// the FIELDS, which are not a secret.
-    ///
-    /// Note the snake_case inside it — `vcpus`, `memory_mib`, `base_image`,
-    /// `cloud_init` — while everything outside is camelCase. It is another
-    /// crate's document, and it keeps its own spelling.
-    ///
-    /// What IS checked here: `vcpus >= 1` and `memory_mib >= 1`, because
-    /// those are structural rather than a question of size. See
-    /// `crate::vm_spec`.
-    ///
-    /// This is the one field of any spec in this file whose contents
-    /// `deny_unknown_fields` does not reach — it is a `Value`, so serde has
-    /// nothing to compare against. The rule is not missing, it is made one
-    /// step later: `vm_spec::check` deserialises it into `NewVmSpec`, which
-    /// carries the attribute itself.
+    /// Agent create fields retained as JSON. Inner fields use snake_case; the
+    /// outer resource uses camelCase. `crate::vm_spec` validates the edge shape,
+    /// including positive CPU and memory values and unresolved secret references.
+    /// Controllers resolve references and injected fields before node delivery;
+    /// local image and driver validation remains on the agent.
     #[schemars(with = "agent_api::spec::NewVmSpec")]
     pub vm: serde_json::Value,
 }
@@ -422,44 +351,10 @@ impl VmSpec {
         }
     }
 
-    /// The `Volume` objects this VM's disks REFER to, by name and in order.
-    ///
-    /// The one field of `spec.vm` this control plane reads, and the exception
-    /// is deliberate rather than a crack in the boundary. Everything else in
-    /// that document describes something the NODE does, so carrying it
-    /// unopened is exactly right; `volumes[].volume` describes something only
-    /// this tier can do — resolve a name to an object, check whose it is,
-    /// find out where its bytes are and place the VM accordingly. A node
-    /// cannot do any of that, so the field would be meaningless if it were
-    /// carried unopened.
-    ///
-    /// One string per referring entry, and an entry that refers to nothing is
-    /// simply absent from the answer: an inline disk is ephemeral and this
-    /// tier has nothing to say about it. Empty for every VM ever written
-    /// before the field existed.
-    ///
-    /// Total by construction — a spec that is not an object, has no
-    /// `volumes`, or whose entries are not objects yields an empty list
-    /// rather than an error. Whether the document is a VM at all is
-    /// `check_vm_shape`'s question at the edge, and asking it twice in two
-    /// places is how the two answers start to differ.
-    /// The first `volumes[]` entry that both NAMES a volume and describes
-    /// one, if there is such an entry.
-    ///
-    /// A referenced volume has its size and its base image already — they
-    /// belong to the disk that exists — so an entry that says both is an
-    /// entry whose author believes one of the two. The wrong belief is the
-    /// one where a 10 GiB disk silently stays the 1 GiB somebody typed, so
-    /// this is a refusal and not a field that quietly wins.
-    ///
-    /// Checked at the API edge as well as at the node. The node's refusal is
-    /// the one that cannot be bypassed and stays; this one is the one a
-    /// PERSON sees, while they are still holding the request, instead of
-    /// finding a Failed VM later.
-    ///
-    /// `params` is the exception and is not listed: attach options are a
-    /// property of the connection rather than of the bytes, and two VMs of
-    /// one volume over time may mount it under two names.
+    /// Find the first volume reference that also supplies an inline disk
+    /// definition. Size and image belong to the referenced Volume, so combining
+    /// these forms is rejected at both edges. `params` remains allowed because
+    /// it configures the attachment rather than the stored bytes.
     pub fn malformed_volume_reference(&self) -> Option<&'static str> {
         let entries = self
             .vm
@@ -529,6 +424,8 @@ impl VmSpec {
         literal && self.user_data_from().is_some()
     }
 
+    /// Referenced Volume names in spec order; inline disks are omitted.
+    /// Malformed or absent lists yield no references; edge validation is separate.
     pub fn referenced_volumes(&self) -> Vec<String> {
         self.vm
             .get("volumes")
@@ -546,34 +443,12 @@ impl VmSpec {
     }
 }
 
-/// The part of `spec.vm` an update may not touch — everything, except
-/// `volumes[]` from its SECOND entry on, and there only the entries that
-/// refer to a `Volume` object.
+/// Project the immutable portion of `spec.vm` for structural update checks.
 ///
-/// This is the projection behind the `spec.vm` row of both tiers' mutability
-/// tables (`Owned::structural`), and it is the whole of the hot-plug rule:
-///
-///   * **the boot entry never moves.** `volumes[0]` is what the guest boots
-///     from; a VM whose root disk was swapped underneath it is not the same
-///     VM, and there is no moment at which a running guest would survive it.
-///   * **an inline entry never moves either** — not added, not removed, not
-///     edited. An inline entry is an instance store: it came into being with
-///     the VM and goes with it, and one does not plug an instance store in
-///     afterwards. It stays in the projection wherever it sits, so its ORDER
-///     among the other inline entries is frozen too.
-///   * **referenced entries from index 1 on are free.** Adding one is the
-///     attach, leaving one out is the detach, and what follows is the
-///     reconciler's business rather than a verb of its own — KubeVirt
-///     deprecated `addvolume` in 1.6 for exactly this reason.
-///
-/// Everything else in the document — vcpus, memory, boot, nics, devices,
-/// cloud-init — is copied into the projection unchanged and therefore stays
-/// immutable, which is what it was before any of this.
-///
-/// Total, like every other reader of this document: a `spec.vm` that is not
-/// an object, or has no `volumes`, projects to itself, and two of those
-/// compare exactly as they did before. Whether the document is a VM at all is
-/// the edge's question and is asked in one place.
+/// The boot entry and every inline volume retain their content and relative
+/// order. Referenced volumes after index zero may be added, removed or edited
+/// for hot-plug. All other VM fields remain immutable. Nonobjects and objects
+/// without a volume list project to themselves; shape validation is separate.
 pub fn frozen_vm_shape(vm: &serde_json::Value) -> serde_json::Value {
     let Some(entries) = vm.get("volumes").and_then(serde_json::Value::as_array) else {
         return vm.clone();
@@ -767,45 +642,14 @@ pub struct VmStatus {
     /// VM is: the node underneath it belongs to the cluster's own picture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_name: Option<String>,
-    /// When the phase above last CHANGED, as this tier saw it.
-    ///
-    /// The only field in this struct that had no doc comment, and the mistake
-    /// that cost was reading it as a freshness stamp. It is not one and must
-    /// not become one: `observe` drops a report that says what is already
-    /// stored, so a VM that has been happily Running for a fortnight carries
-    /// a fortnight-old instant — the lab showed `cloud-probe` at thirteen
-    /// days on a node that was answering every ten seconds. Turning it into a
-    /// per-report write would be an etcd revision per VM per ten seconds, and
-    /// a vm watch woken by every one of them, to record that nothing
-    /// happened.
-    ///
-    /// What it IS for is ordering: `mirror::is_current` uses it as the floor
-    /// a report has to clear, so a status built before the last command
-    /// cannot be read as describing the world after it.
-    ///
-    /// Whether a VM's phase is still TRUE is a question about its node, and
-    /// the node's `status.lastHeartbeat` is where it is answered — see
-    /// `unheard_of` in the cluster reconciler.
+    /// Time of the latest observed state change, not heartbeat freshness.
+    /// Unchanged reports leave it intact. `mirror::is_current` uses it to reject
+    /// reports older than a command; node heartbeat state determines freshness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<DateTime<Utc>>,
-    /// What the control plane knows about how to reach this VM.
-    ///
-    /// Named for exactly what it is, because the honest answer is smaller
-    /// than "the addresses of this vm": the IP a guest configured itself is
-    /// known to the guest and to nobody here. There is no agent inside the
-    /// guest and there will not be one, so a list called `ipAddresses` would
-    /// either stay empty for ever or become a lie the first time DHCP handed
-    /// out something else.
-    ///
-    /// Two things ARE known and both belong in this list. A floating address
-    /// pointed at this VM, which is this cloud's own object and needs
-    /// nobody's report. And the MAC of every tap a node made, which is what a
-    /// DHCP lease is looked up by and what an operator matches against `ip
-    /// neigh` — reported by the node, so absent until one reports it, and
-    /// absent for as long as the node's agent predates `NicReport`.
-    ///
-    /// Empty is honest and is the state of a VM nobody has said anything
-    /// about yet.
+    /// Known access information: floating addresses assigned by the cloud and
+    /// tap MACs reported by nodes. Guest-configured IP addresses are not
+    /// discovered. The list can be empty until a node reports.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<VmAddress>,
     /// The referenced volumes of this VM's spec, and whether the NODE says it
@@ -994,31 +838,13 @@ pub struct VmPlacement {
     pub at: DateTime<Utc>,
 }
 
-/// What a VM IS, out of the facts on it — **one rule for both tiers**,
-/// because the type is the same type and `Running` must not come to mean two
-/// things one hop apart.
+/// Derive the same phase at both controller tiers, in precedence order:
 ///
-/// Four rules in one order, and the order is the whole content:
-///
-/// 1. **Silence beats every word.** A holder that has stopped answering
-///    makes its last word no longer KNOWN to be true, which is exactly what
-///    `Unknown` says and the only thing that is honest. Nothing promotes it
-///    — not a timer, not a requeue — and the reason is in
-///    `VmPhaseKind::Unknown`'s own doc: the guests on a node whose agent was
-///    killed keep running.
-/// 2. **A VM nobody claims is `Pending`.** Not bound, and no holder named on
-///    the status either: it is nowhere, so a phase describing a guest would
-///    be describing one that does not exist. The scheduler's word says why.
-///    The second half of that test is what keeps a guest that is still
-///    RUNNING on a node this tier has unbound from reading as nowhere — the
-///    old node is still named on the status until it lets go.
-/// 3. **Otherwise the last word, and a resting word demands a machine.**
-///    `Running`, `Stopped` and `Paused` are claims about a guest, and this
-///    tier has not seen one. A dispatch that anticipated `Running` would be
-///    F16's mistake on the object that matters most.
-/// 4. **Otherwise it is waiting,** and the sentence says for what: the
-///    scheduler's, if it has spoken, or the machine that has not reported
-///    yet.
+/// 1. A silent holder makes the state Unknown.
+/// 2. No binding and no reported holder means Pending. A reported holder
+///    preserves evidence about a guest even after its desired binding clears.
+/// 3. Use the last observation; Running, Stopped and Paused require a node.
+/// 4. Otherwise wait for placement or a node report, retaining the explanation.
 pub fn settle_vm(spec: &VmSpec, status: &VmStatus) -> VmPhase {
     // Rule 1.
     if let Some(silence) = &status.silence {

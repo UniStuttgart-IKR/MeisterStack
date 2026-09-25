@@ -1,3 +1,4 @@
+# Shared agent contracts and VM schema types; no driver implementations.
 [package]
 name = "meister-agent-api"
 version = "0.1.0"
@@ -6,25 +7,14 @@ edition = "2024"
 [dependencies]
 uuid = { workspace = true }
 serde = { workspace = true }
-# `spec`: the shape of a VM document is published under `/schemas`, and the
-# only honest way to publish it is to derive it from the very types serde
-# reads. The controllers ask for it; the agent pays a derive it never calls.
 schemars = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 common = { package = "meister-common", path = "../common" }
-# getpwnam and chown, for `vmm_user`: who the hypervisor runs as is resolved
-# from a name once at start-up, and the files it must open are handed over by
-# the agent. Shelling out to `id`/`chown` would make a privilege decision
-# depend on a unit's PATH.
 nix = { workspace = true }
 libc = { workspace = true }
-# `base_image`: the probe that judges a base image before a driver converts
-# it runs `qemu-img info` and stats the file, and both happen on the async
-# path a create is already on. Every driver that calls it already builds
-# tokio, so this is a dependency the tree pays for once and not again.
 tokio = { workspace = true }
 
 [dev-dependencies]

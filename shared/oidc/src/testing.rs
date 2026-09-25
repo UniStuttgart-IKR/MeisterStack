@@ -2,22 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! An identity provider that fits in a test process.
+//! In-process signing-key and token fixtures for OIDC tests.
 //!
-//! This is the file that makes the claim in the brief true — that none of
-//! this needs a running provider to prove. It generates a key pair, publishes
-//! it as a JWKS the real parser reads, and signs tokens the real verifier
-//! checks. Nothing here is a mock of our own code: the only thing it stands
-//! in for is somebody else's http server.
-//!
-//! It can also forge. `sign_with` takes the header verbatim, so a test can
-//! say `alg: none`, name a key that does not exist, or claim `HS256` over an
-//! RSA signature — which is what the table of refusals in `jwt` is written
-//! against.
-//!
-//! Behind the `testing` feature so that the controller's own tests can build
-//! tokens too. Resolver 2 keeps a dev-dependency's features out of a plain
-//! `cargo build`, so none of this reaches a shipped binary.
+//! Generate keys, publish JWKS documents and sign tokens consumed by the real
+//! parser and verifier. Custom headers exercise rejected algorithms and unknown
+//! keys. Available only with the `testing` feature.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

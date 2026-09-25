@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `User` kind and the certificates it is known by. Moved out
-//! of `resources.rs` unchanged.
+//! Directory roles, tenant membership and issued client certificates.
 
 use super::*;
 

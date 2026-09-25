@@ -2,40 +2,16 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The four kinds a cluster mirrors upward beside its vms: images, storage
-//! pools, volume snapshots and volumes.
+//! Mirror cluster image, pool, volume and snapshot evidence.
 //!
-//! Each is a report the cluster owns and this cloud only keeps a copy of, so
-//! each writes the copy and none of them stops the others. Verbatim out of
-//! `session.rs`.
+//! Each inventory is processed independently. Complete, sufficiently recent
+//! volume and snapshot inventories can complete deletion; incomplete lists cannot.
 
 use super::*;
 
-/// What the fleet has learned about a base image, onto the Image object.
-///
-/// This is the whole reason the phase is not something the cloud decides by
-/// itself: the NODE is what fetches a URL image, so whether the bytes are
-/// obtainable and hash to what the spec said is a fact only a node can
-/// establish. The report is that fact travelling up.
-///
-/// Written only when it CHANGED. A cluster reports every ten seconds and says
-/// the same thing every time; a write per report would churn etcd revisions
-/// and wake the image watch for nothing — the same rule
-/// `controller_api::mirror` applies to a VM phase, applied by hand here
-/// because there is one field and no index to build.
-///
-/// An image the cloud does not know is skipped rather than created: a cluster
-/// naming one is a cluster with a stale spec or a node with a leftover cache
-/// entry, and inventing a catalogue entry for it would be this control plane
-/// making up an image nobody registered. The same rule from the other side is
-/// why the walk below is over the CATALOGUE and not over the report: a node's
-/// inventory names every file under its image directory, including an
-/// operator's hand-placed one and, on shared storage, another cluster's.
-///
-/// Walking the catalogue is also what closes F16's second half. The absence
-/// of a name from a COMPLETE inventory is the only evidence there is that a
-/// path image points at nothing — and an absence can only be noticed by
-/// whoever holds the list of names, which is this tier and no other.
+/// Merge cluster evidence into registered catalogue images.
+/// Complete node inventories contribute missing-file evidence. Unknown image
+/// names do not create catalogue entries; unchanged evidence avoids a store write.
 pub(super) async fn ingest_images(
     store: &EtcdStore,
     cluster: &str,
@@ -99,20 +75,8 @@ pub(super) async fn ingest_images(
     }
 }
 
-/// This cluster's lines about one image: what its nodes said, plus what their
-/// silence says.
-///
-/// The second half is F16. A node that reports a complete inventory and does
-/// not name the image has told this tier that the file is not on its disk —
-/// there is no command that asks a node about an image, so silence was the
-/// only answer a path image nothing used ever got, and a catalogue entry
-/// pointing at nothing read `Ready` for ever.
-///
-/// A node whose report is not complete contributes nothing. That is the
-/// asymmetry the flag exists for: an agent from before the field, a directory
-/// that could not be read and a heartbeat carrying no lists all look like
-/// silence, and reading any of them as "the file is gone" would fail a
-/// working image.
+/// Collect this cluster's image evidence, including absence from complete node
+/// inventories. Incomplete or legacy inventories make no absence claim.
 pub(super) fn lines_of(
     cluster: &str,
     name: &str,
@@ -138,15 +102,8 @@ pub(super) fn lines_of(
     mine
 }
 
-/// The report's lines, grouped by the image they are about.
-///
-/// One line per image per node since the cluster stopped merging. The merge
-/// is here now, which is where both halves are wanted: the union is what
-/// `status.phase` says, and the lines are what `status.nodes[]` is.
-///
-/// A cluster older than the field sends the already-merged form with an empty
-/// `node`. It groups to one entry, the union of one thing is itself, and it
-/// contributes no lines — which is exactly how it was read before.
+/// Group per-node image reports. Legacy merged reports have no node name
+/// and contribute aggregate evidence without a per-node status entry.
 fn by_image(
     reports: &[proto::ImageStateReport],
 ) -> std::collections::BTreeMap<&str, Vec<&proto::ImageStateReport>> {
@@ -161,11 +118,8 @@ fn by_image(
     by_image
 }
 
-/// What one cluster's lines about one image add up to: the phase the whole
-/// cluster is at, the sentence that came with it, and this cluster's lines.
-///
-/// `None` when not one line could be read, which is the case in which there
-/// is nothing to write.
+/// Translate recognized per-node image reports into status entries.
+/// Unknown phases and reports without a node name contribute no entry.
 fn node_states(
     cluster: &str,
     name: &str,
@@ -226,19 +180,7 @@ fn merged_lines(
     merged
 }
 
-/// Two node lists that say the same thing.
-///
-/// Written out rather than derived, because `ImageNodeState` is an API type
-/// and giving it `PartialEq` would be making a promise about it that nothing
-/// else needs. Every cluster reports every ten seconds and almost every
-/// report says what the last one said; a write per report would churn etcd
-/// revisions while nothing about the image happened.
-///
-/// `digest` is compared for the same reason every other field is: an agent
-/// that upgrades mid-fleet starts reporting one for a name that was already
-/// `Ready` under the old binary, and that IS a change — the one `ingest_images`
-/// has to write for `first_bound_digest` ever to see it. Astra finding S02,
-/// 2026-09-23 (rest a).
+/// Compare image node evidence, including digest, to avoid unchanged writes.
 pub(super) fn same_node_states(
     a: &[controller_api::ImageNodeState],
     b: &[controller_api::ImageNodeState],
@@ -254,25 +196,8 @@ pub(super) fn same_node_states(
         })
 }
 
-/// A cluster status is the cluster's heartbeat, the aggregate the cloud places
-/// against, and the phase of every VM it holds for us.
-///
-/// Every session's status is a heartbeat; only the speaker's is a description
-/// (see `SessionRegistry::speaker`). A standby replica reads the same cluster
-/// etcd, so its aggregate is not wrong — it is merely a second, slightly older
-/// account of the same thing, and letting two accounts write the same fields
-/// buys nothing but a phase that walks backwards for one interval.
-/// Mirror what a cluster says its storage pools ARE onto the cloud's pools.
-///
-/// A cloud pool is a pointer: an admin writes `spec.cluster` and a driver
-/// name and nothing about machines. Everything else — whether the pool holds
-/// together, where its bytes are, which nodes reach it — is decided down
-/// there by the drivers that run, and this is the only road it travels.
-///
-/// The locality is the field that earns the whole message. Without it the
-/// cloud cannot answer "could a VM that uses this disk run on that cluster",
-/// because the answer for a `node-local` pool is "only on the one node that
-/// holds the bytes" and for a `shared` one is "anywhere in the pool".
+/// Mirror pool evidence from each serving cluster.
+/// The home cluster also supplies the pointer status and compatibility flat fields.
 pub(super) async fn ingest_pools(
     store: &EtcdStore,
     cluster: &str,
@@ -346,12 +271,7 @@ pub(super) async fn ingest_pools(
     Ok(())
 }
 
-/// Record that the cluster this pointer names has spoken. See
-/// `StoragePoolStatus::pointer_target`.
-///
-/// Only for the HOME cluster, because that is the one `spec.cluster` points
-/// at and the one `settle_storage_pool` asks about. A second serving cluster
-/// contributes an entry and nothing about the pointer.
+/// Record a report from the pool's home cluster for pointer status derivation.
 fn note_pointer(pool: &mut controller_api::StoragePool, cluster: &str, home: bool) {
     if !home {
         return;
@@ -422,12 +342,8 @@ fn pool_unchanged(
             || (pool.status.locality == entry.locality && pool.status.nodes == reported.nodes))
 }
 
-/// The same road as `ingest_volumes`, one object over, with the one hop more
-/// that a snapshot's home takes: it names a volume, the volume names the
-/// pool, the pool names the cluster.
-///
-/// Everything written here is EVIDENCE, and absence from a COMPLETE list is
-/// the proof that the copy is gone.
+/// Mirror snapshots assigned through their source volume's cluster or pool home.
+/// Only sufficiently recent complete inventory absence can finish deletion.
 pub(super) async fn ingest_snapshots(
     store: &EtcdStore,
     cluster: &str,
@@ -466,19 +382,8 @@ pub(super) async fn ingest_snapshots(
     Ok(())
 }
 
-/// Mirror a cluster's word about its volumes onto this cloud's objects, and
-/// finish a delete when the volume stops being named.
-///
-/// The uid is the key, exactly as it is for VMs: this cloud handed it out on
-/// `CreateVolume` and the cluster speaks it back. Everything written here is
-/// EVIDENCE — phase, node, holder, message — and this tier writes none of it
-/// itself.
-///
-/// Absence from a COMPLETE list is the proof of teardown, and that is the one
-/// place this differs from the road one tier further down: there the reporter
-/// is a node, which knows only what it was told, so absence proves nothing;
-/// here the reporter is a control plane that owns the objects and says
-/// whether it managed to read all of them.
+/// Mirror volume evidence by UID from its owning cluster.
+/// Only sufficiently recent complete inventory absence can finish deletion.
 pub(super) async fn ingest_volumes(
     store: &EtcdStore,
     cluster: &str,
@@ -517,10 +422,7 @@ pub(super) async fn ingest_volumes(
     Ok(())
 }
 
-/// Which cluster each pool is at home on, read once for a whole report.
-///
-/// Per volume it would be a read amplification for a fact that barely ever
-/// changes: a status arrives every ten seconds and names every object.
+/// Read each pool's home once for the whole report.
 async fn pool_homes(
     store: &EtcdStore,
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
@@ -532,16 +434,8 @@ async fn pool_homes(
         .collect())
 }
 
-/// The volumes this cluster holds for the cloud.
-///
-/// Whose volume this is, is the VOLUME's answer now and the pool's only where
-/// the volume has not been dispatched yet. A pool may name two clusters, and
-/// then "the pool's cluster" is not a value — while `status.cluster` is
-/// exactly the one the cloud handed this record to.
-///
-/// It matters most where it costs most: absence from a complete list is what
-/// finishes a delete, and a volume that has MOVED is absent from its old
-/// cluster's list for a reason that has nothing to do with deletion.
+/// Select volumes by status.cluster, falling back to the pool home.
+/// After movement, absence in the former cluster must not imply deletion.
 async fn volumes_of(store: &EtcdStore, cluster: &str) -> anyhow::Result<Vec<Volume>> {
     let serves = pool_homes(store).await?;
     let record_at = |v: &Volume| -> Option<String> {
@@ -558,14 +452,8 @@ async fn volumes_of(store: &EtcdStore, cluster: &str) -> anyhow::Result<Vec<Volu
         .collect())
 }
 
-/// The snapshots this cluster holds for the cloud, one hop further out than
-/// the volumes: a snapshot names a volume, the volume names the pool, the
-/// pool names the cluster.
-///
-/// A snapshot whose volume has already gone belongs to no cluster this pass
-/// can name; it is left out rather than concluded about, because the
-/// alternative is deleting an object on the strength of a list that was never
-/// about it.
+/// Select snapshots using the source volume's cluster, then its pool home.
+/// A snapshot whose source volume is missing has no owner resolved by this pass.
 async fn snapshots_of(
     store: &EtcdStore,
     cluster: &str,
@@ -647,14 +535,7 @@ fn said(s: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// Whether the object already says everything this line says.
-///
-/// Every cluster reports every ten seconds, and a write per report would
-/// churn etcd revisions while nothing about the volume happened. It does not
-/// bite here as often as one tier up — this cluster's reconciler moves a
-/// volume off Pending within a pass, and that IS a change — but a volume it
-/// cannot move (no node serves the pool yet) sat at the default, was never
-/// observed, and had its create re-sent every five seconds.
+/// Compare reported volume facts before writing; unchanged heartbeats need no revision.
 fn volume_unchanged(
     volume: &Volume,
     cluster: &str,
@@ -728,15 +609,8 @@ fn write_volume_status(
     v.status.observed_at = Some(at);
 }
 
-/// The same question one object over.
-///
-/// `observed_at` comes first here, because it is not a field of the report:
-/// it is this cloud saying "the cluster has spoken about this", and the
-/// dispatcher reads it to stop re-sending the create. A snapshot can
-/// legitimately sit at Pending — nothing about it differs from the default
-/// until a node takes the copy — so a mirror that wrote only on a CHANGE
-/// would never write at all, and the create would go down every five seconds
-/// for ever.
+/// Compare snapshot evidence and require an observed timestamp.
+/// Even an initial Pending report acknowledges that the cluster knows the object.
 fn snapshot_unchanged(
     snapshot: &controller_api::VolumeSnapshot,
     cluster: &str,

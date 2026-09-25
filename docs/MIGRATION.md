@@ -1,12 +1,12 @@
 # Live migration: ownership, evidence and recovery
 
-This document describes the implemented migration safety contract. It is a technical
-basis for architectural discussion and evaluation, not a formal proof or a claim of
-successful hardware testing. The implementation coordinates a cluster-controller
+This document describes the migration design contract and its implementation.
+Two receive-side gaps found in the source review mean the contract is not yet
+satisfied end to end. It is not a formal proof or a hardware test report. The implementation coordinates a cluster-controller
 record in etcd with durable endpoint records in each agent's redb database. The VMM
 owns the actual transfer and can outlive either agent process.
 
-## Safety properties
+## Required safety properties
 
 1. Missing reports, a lost command reply and an expired deadline do not establish
    failure. They never authorize destination destruction or automatic source repair.
@@ -21,7 +21,7 @@ owns the actual transfer and can outlive either agent process.
    the etcd revision comparison. Cleanup is conditional on the agent's matching
    attempt, and missing cleanup acknowledgement keeps the reservation.
 
-These properties deliberately prefer retaining an unresolved operation over
+These requirements prefer retaining an unresolved operation over
 restarting a potentially duplicated guest. In particular, a transfer pause is not
 permission to resume the source. This matters when both nodes can access writable
 storage: automatic source repair could introduce two writers.
@@ -103,7 +103,7 @@ reconciliation also observe the durable attempt.
 | During send / while source is paused | Preserve the marker; do not provision, start or resume. |
 | After source exit, before outcome persistence | Observe recorded process absence; persist `Migrated` before detaching volumes. |
 | After watcher deadline | Keep the marker and report `Unknown`; later reconciliation can consume terminal evidence. |
-| During target reception | Keep the receiver; an agent restart or stop does not cancel the VMM transfer. |
+| During target reception | Shutdown retains the VMM, but receiver adoption after restart is incomplete; see the receive-side gaps below. |
 | After target arrival, before binding update | Report the durable attempt and protect it from reconnect orphan cleanup. |
 | After controller cancellation, before cleanup acknowledgement | Retry the same conditional cleanup; retain capacity meanwhile. |
 
@@ -124,10 +124,42 @@ If send acceptance was never durably acknowledged, a responsive source alone doe
 not release the barrier.
 
 Receive deadlines are retained in records for compatibility, but are advisory.
-Only an explicit driver receive failure may trigger local failed-receive cleanup.
+The planner uses the driver receive-failure signal to authorize local cleanup.
+The Cloud Hypervisor adapter currently also sets that signal on API timeouts;
+therefore this signal is not sufficient terminal evidence.
 Agent shutdown no longer tears down receiving VMMs. The controller's conditional
 cleanup also refuses a destination whose phase or observed guest state says that
 it already received the guest.
+
+## Known receive-side gaps
+
+The September 2026 review identified two paths outside the existing deterministic
+regression coverage:
+
+1. **Driver API timeout becomes failure.**
+   `drivers/cloud-hypervisor/src/api.rs::receive_migration` stores an API error,
+   including its request timeout, in `receive_answer`. `process.rs::receive_failure`
+   exposes it; agent observation marks `receive_failed`; the planner can tear down
+   the receiver. The VMM can continue receiving after the API request times out.
+   A future fix must distinguish lost or delayed replies from established aborts.
+2. **Receiving VMM is not adopted after restart.** The driver begins with an empty
+   in-memory VM map. Agent observation queries guest state only for tracked,
+   responsive VMMs. A persisted `Receiving` record has no adoption action in that
+   state, so the surviving receiver can remain untracked and fail to report arrival.
+   Retaining the process is not sufficient recovery.
+
+Both findings are source-confirmed; live VMM reproductions were not performed in
+this review. Required regressions must exercise the real adapter timeout mapping
+and an empty driver registry with a surviving receiving process. Mock planner tests
+alone cannot establish either property. No receive-side fix is included in this
+comments-and-documentation change.
+
+A separate completion gap exists after ownership transfer: `settle` performs
+best-effort volume-home updates and source record forgetting, then commits
+`Succeeded` even when a home update failed. If forgetting succeeds, later volume
+operations can still route to the old node. The terminal migration does not retry
+that update.
+Success of VM transfer therefore does not establish converged volume metadata.
 
 ## Version compatibility and upgrades
 
@@ -168,7 +200,7 @@ or clearing a source marker is not a recovery procedure.
 | Durable source barrier | `agent/src/provision/migrate.rs`: `begin_migrate_out`, `observe_send`, `finish_migrate_out`; startup reconcile | `restart_keeps_an_unresolved_source_protected`; `persisted_send_recovery_never_provisions_or_resumes_a_second_guest` |
 | Late completion after deadline | Same source watcher and reconciler | `deadline_keeps_ownership_and_later_evidence_resolves_the_same_attempt` |
 | Conditional cleanup and replay | `agent/src/store.rs`: `claim_migration`; provisioner's `cleanup_migration` | `cleanup_is_attempt_bound_and_cancel_before_prepare_survives_restart` |
-| Receive timeout and restart | `agent/src/reconcile/observe.rs`, `plan.rs` | `a_receive_deadline_does_not_authorize_cleanup` |
+| Planner receive deadline | `agent/src/reconcile/observe.rs`, `plan.rs` | `a_receive_deadline_does_not_authorize_cleanup`; does not cover driver API timeout or receiver adoption |
 | Legacy persistence | `agent/src/types.rs`, controller migration status | `legacy_records_load_without_inventing_attempt_evidence` |
 | Real etcd mutation / reservation path | Controller migration reconciler and ingest | `timeout_retains_reservation_and_accepts_late_completion_reports` (requires an existing etcd) |
 

@@ -2,22 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The W3C `traceparent` header, as a value this stack can carry by hand.
+//! Explicit W3C trace-context propagation across asynchronous reconciliation.
 //!
-//! Propagation here is explicit rather than ambient, and that is the design
-//! decision worth stating: nothing in this control plane is a call stack. A
-//! `POST /vms` writes an object and returns; the reconciler that acts on it
-//! wakes up later, in another task, possibly in another process, possibly
-//! after a restart. There is no context to inherit — so the context travels
-//! as data, on the object and on the command, exactly like the spec does.
-//!
-//! The upshot is that the chain works with or without an OTLP exporter. With
-//! one, `attach_parent` turns the string back into a real parent and Jaeger
-//! shows one trace; without one, the same string is a `trace_id` field on the
-//! span, and the fmt logs of all three components carry the same id.
-//!
-//! Format (W3C Trace Context, version 00):
-//!   00-<32 hex trace-id>-<16 hex span-id>-<2 hex flags>
+//! Trace context travels in resource annotations and session commands because a
+//! later reconcile pass cannot inherit the original request's task context.
+//! With OTLP, attach it as a span parent; without OTLP, retain the trace ID in
+//! logs. Version 00 uses `00-<32 hex trace-id>-<16 hex span-id>-<2 hex flags>`.
 
 use std::fmt;
 

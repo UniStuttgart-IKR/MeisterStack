@@ -2,9 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `Volume` and `VolumeSnapshot` kinds: a disk with a life
-//! of its own, and a point in time of one. Moved out of
-//! `resources.rs` unchanged.
+//! Persistent volumes, attachment claims and point-in-time snapshots.
 
 use super::*;
 
@@ -159,25 +157,9 @@ impl VolumePhaseKind {
     }
 }
 
-/// Does the claim on this volume still hold?
-///
-/// **The whole of D4.** `attachedTo` is the CLAIM and `openOn` is the
-/// OBSERVATION, and the claim falls only when both halves say it may: no `Vm`
-/// object carries it any more (`claimantGone`, written by the pass that lists
-/// the VMs) and no machine reports the bytes open.
-///
-/// It used to fall on the way OUT of a teardown — `release_volumes` cleared
-/// it as the `DestroyInstance` was dispatched — and that is one command's
-/// round trip too early. Between the dispatch and the node's `detach` there
-/// was an object saying nobody held the disk while a VMM still had it open,
-/// and that is exactly the window in which a DELETE takes somebody's data:
-/// `Release::HeldBy` reads this field, finds nothing, and lets the
-/// deprovision go.
-///
-/// A reschedule of the SAME VM keeps the claim, and it keeps it for free:
-/// the name is the same name, so the pass that lists the VMs finds the object
-/// and `claimantGone` stays false. That is the case a timeout-based answer
-/// would have got wrong.
+/// Retain the attachment claim until the claimant VM is gone and no node
+/// reports the bytes open. Dispatching destroy is insufficient: detach may
+/// still be in progress. Rescheduling the same VM preserves its claim.
 pub fn volume_claim_holds(status: &VolumeStatus) -> bool {
     match status.attached_to {
         // Nothing to drop, so nothing to decide. `true` rather than `false`
@@ -188,27 +170,9 @@ pub fn volume_claim_holds(status: &VolumeStatus) -> bool {
     }
 }
 
-/// What a volume IS, out of the facts on it.
-///
-/// One rule for both tiers, and the first derivation in this file with a real
-/// ORDER to it — three of them, and each one exists because two writers used
-/// to reach different answers about the same volume:
-///
-/// 1. **A volume being released is `Releasing`, whatever anybody says about
-///    the bytes.** The `deletionTimestamp` is the decision and the phase
-///    follows it. Before this, three edges each stamped `Releasing` when they
-///    set the timestamp (two REST handlers and the quota pass) and the node
-///    report path carried a special case to avoid undoing them — an object
-///    whose own status could contradict its own metadata if any one of the
-///    four was missed.
-/// 2. **Otherwise the last word, and `Ready` demands a machine.** A word with
-///    no `node` is this tier's own conclusion: a dispatch, a missing source,
-///    a command that did not arrive. None of those is evidence that bytes
-///    exist. See `VolumeReported`.
-/// 3. **Otherwise it is waiting for a node,** and the sentence says which
-///    kind of waiting: nothing has placed it, or the node it was placed on
-///    has not been told yet. That second state used to be `Pending` with
-///    nothing beside it.
+/// Derive volume phase in precedence order: deletion means Releasing, then use
+/// the latest observation, otherwise wait for placement or provisioning. Ready
+/// requires a node observation; controller dispatch is not evidence of bytes.
 pub fn settle_volume(deleting: bool, status: &VolumeStatus) -> VolumePhase {
     let said = status.reported.as_ref();
     if deleting {
@@ -389,29 +353,10 @@ pub struct VolumeStatus {
     /// The node that provisioned it. `None` while Pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
-    /// Every node that has this volume OPEN right now. Normally one, empty
-    /// while nobody holds it, and TWO for the length of a live migration.
-    ///
-    /// `status.node` keeps the meaning it has always had — the machine that
-    /// made the bytes, the volume's home — and this is the other half that
-    /// was hiding inside it: who has it attached. Until a VM could move while
-    /// it ran, those were one fact. A live migration is the case that
-    /// separates them, because the destination has to open the disk BEFORE
-    /// the source lets go: there is no instant in a live migration at which
-    /// exactly one machine has the volume open, so a field that can name only
-    /// one machine cannot describe one.
-    ///
-    /// The one exception to `AccessMode`, written down rather than implied: a
-    /// second entry is legitimate only while a `VmMigration` for the VM
-    /// holding this volume is `Preparing` or `Running`
-    /// (`second_open_is_a_migration`). Outside that window a second open is a
-    /// conflict exactly as it was before this field existed — one consumer,
-    /// one machine.
-    ///
-    /// Sorted and without duplicates, so that two writers adding the same
-    /// node produce one entry and a reader can compare two of these for
-    /// equality. Empty on every volume written before the field, which reads
-    /// as "no node has said yet" rather than "nobody has it".
+    /// Nodes reporting this volume open, sorted and deduplicated. This differs
+    /// from `status.node`, the provisioning location. A second open is allowed
+    /// only during Preparing or Running migration; see `second_open_is_a_migration`.
+    /// An empty list on older records means no observation, not verified closure.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_on: Vec<String>,
     /// Which CLUSTER's record holds this volume — at the cloud tier only.
@@ -510,24 +455,10 @@ pub struct VolumeStatus {
 }
 
 impl VolumeStatus {
-    /// Record that `node` has the volume open. Idempotent, and it keeps the
-    /// list sorted so that "the same two nodes" is one value and not two.
-    ///
-    /// Returns whether anything changed, because the writer of this field is
-    /// inside a store mutation that must not churn a revision per report.
-    ///
-    /// **One writer, since D4:** the volume half of a node's status report
-    /// (`VolumeStateReport.open`). There used to be five — the dispatch in
-    /// `hold_volumes`, the release, both ends of a live migration, and a pass
-    /// that derived the set from the union of every VM's
-    /// `attached_volumes` — and the last of them is where D-B2's shape came
-    /// from: five writers of one set, each right about its own half and none
-    /// of them able to see what the others knew.
-    ///
-    /// What replaced them is the node saying it directly, and saying it until
-    /// the `detach` has actually run: `openOn` is now true exactly while some
-    /// machine has the bytes open, which is the whole of what a delete has to
-    /// wait for.
+    /// Record a node-reported open attachment, retaining sorted set semantics.
+    /// Return whether it changed so unchanged reports do not create revisions.
+    /// Only the volume status report owns this observation; command dispatch
+    /// does not establish that attach or detach finished.
     pub fn open_here(&mut self, node: &str) -> bool {
         match self.open_on.binary_search_by(|n| n.as_str().cmp(node)) {
             Ok(_) => false,
@@ -607,25 +538,12 @@ pub const VOLUME_RELEASE_FINALIZER: &str = "meister.io/release";
 
 pub type Volume = Object<VolumeSpec, VolumeStatus>;
 
-/// A point in time of a volume — and an object that outlives it.
+/// A crash-consistent volume snapshot. It can remain after deletion is
+/// requested for its origin: the origin stays Releasing until snapshot holds
+/// are removed. Backend dependencies therefore remain protected.
 ///
-/// The asymmetry is the design. A snapshot names the volume it was taken of
-/// and keeps meaning something after that volume is deleted, because what it
-/// holds is a copy and not a reference. So a `Volume` DELETE with a snapshot
-/// standing does not fail — it becomes `Releasing` with "held by snapshot
-/// <s>", the same `HeldBy` sentence a VM produces, and the data goes when the
-/// last snapshot of it does. Two reasons a volume can be held, one shape.
-///
-/// (`lvm-thin` would hold its origin LV itself — a thin snapshot shares the
-/// origin's blocks — so this rule is what makes `filesystem` and `lvm-thin`
-/// behave the same from an operator's chair rather than each behaving like
-/// its backend.)
-///
-/// Crash-consistent, and that is written here rather than in a release note:
-/// what a snapshot holds is what the disk held at that instant, which is what
-/// the guest would have found after losing power. There is no guest agent in
-/// this stack and no `fsfreeze` — exactly EBS without one. A database that
-/// needs more than that flushes before asking.
+/// There is no guest freeze; applications needing stronger consistency must
+/// flush or quiesce before requesting the snapshot.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VolumeSnapshotSpec {
@@ -789,25 +707,9 @@ pub fn new_volume_snapshot(name: &str, spec: VolumeSnapshotSpec) -> VolumeSnapsh
     snapshot
 }
 
-/// What a copy IS, out of the last word anybody said about it.
-///
-/// One rule for both tiers, and the thinnest derivation in this file, because
-/// a snapshot really is only ever "what the last party established": nothing
-/// schedules it (it goes to the node its volume is on), nothing else holds it,
-/// and there is no claim on it to fall.
-///
-/// What the one place buys is therefore not an ordering but three guarantees
-/// that were spread over seven writers before:
-///
-/// * **`Ready` demands a machine.** A word with no `node` is this tier's own
-///   conclusion, and this tier may not conclude that bytes exist — see
-///   `VolumeSnapshotReported`. A dispatch that anticipated `Ready` would be
-///   the F16 mistake one object over.
-/// * **No phase without a reason.** A copy nobody has said anything about is
-///   `Pending { AwaitingNode }` and not `Pending { Unrecorded }`, which is
-///   what a fresh object read as before.
-/// * **One `since`.** It moves with the word and not with the report, so
-///   "Creating since" is not "last heard from".
+/// Derive snapshot phase from the last observation. Ready requires a node;
+/// without an observation use Pending with AwaitingNode. The phase timestamp
+/// changes with the kind, not with repeated reports.
 pub fn settle_volume_snapshot(status: &VolumeSnapshotStatus) -> VolumeSnapshotPhase {
     match status
         .reported

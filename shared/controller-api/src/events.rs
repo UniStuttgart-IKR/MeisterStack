@@ -2,35 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Writing down what happened to an object.
+//! Record aggregated resource transitions with an etcd TTL.
 //!
-//! `VmStatus.message` holds one sentence, so "it failed three times and came
-//! up on the fourth" was written down nowhere at all. This is the record of
-//! the transitions, and it is only useful if three things hold. Two of them
-//! live here; the third lives at every call site and is the one worth saying
-//! out loud.
-//!
-//! **They expire.** Every event is written under an etcd lease, so etcd
-//! deletes it and nothing has to be alive for that to happen — no sweeper
-//! task, no reconcile pass, no partial cleanup after a crash. A control plane
-//! that was down for two hours comes back to an event log that has already
-//! tidied itself.
-//!
-//! **They are aggregated.** The object's NAME is derived from what it is
-//! about and why, so the twentieth occurrence of the same thing finds the
-//! object the first one made and raises `count` and `last_seen`. The window
-//! is the TTL: once the object has expired, the next occurrence starts a new
-//! one, which is the honest meaning of "recently, this happened N times".
-//!
-//! **They are made on CHANGE, never per pass.** Nothing here can enforce
-//! that, because it is a property of where `record` is called from. The
-//! reconcilers are level-triggered — every pass re-derives every decision
-//! from the store and reaches the same conclusion — so an event per pass
-//! would be one write per VM per tick, for ever. Every call site in this tree
-//! sits inside a branch that has already established that something moved:
-//! the CAS that bound a VM succeeded, the sentence on the object differs from
-//! the one about to be written, the phase that arrived is not the phase that
-//! was stored. The rule is written into the tests those call sites have.
+//! An event name identifies its subject and reason; repeated occurrences update
+//! its count and last-seen time. The lease expires the record without a sweeper.
+//! Callers must record changes, not every reconciliation pass.
 
 use chrono::Utc;
 use tracing::warn;
@@ -119,17 +95,9 @@ pub struct Happening<'a> {
     pub tenant: Option<&'a str>,
 }
 
-/// The aggregation key, as a name.
-///
-/// Deterministic in (kind, uid, reason) and in nothing else, which is what
-/// makes the second occurrence find the first one's object with a plain `get`
-/// instead of a scan. The uid is in it rather than the name for the reason
-/// the field is: a VM deleted and recreated under the same name is a
-/// different VM, and its history is its own.
-///
-/// Lowercased and joined with `-`, so the result is one path segment and
-/// therefore a name the store accepts (`EtcdStore::check_name`). A uid is a
-/// uuid and a reason is a CamelCase word, so neither can contain a slash.
+/// Lowercase aggregation key from kind, UID (or name when UID is absent) and
+/// reason. It separates recreated objects and lets repeated events find the
+/// same record. Callers supply the resource identity and a bounded reason.
 pub fn name_of(kind: &str, uid: &str, name: &str, reason: &str) -> String {
     // The uid where there is one, the name where there is not — a Node has no
     // uid of its own in this control plane, and its name IS its identity.

@@ -2,9 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The REST layer's tests, verbatim out of `rest.rs`. The module path is
-//! unchanged (`rest::tests`), so every test still answers to the name it had
-//! before.
+//! REST envelopes, admission, patching, discovery and authorization tests.
 
 /// `?dryRun` is read out of a raw query, so the tests are about the query
 /// and not about a struct. The typo case is the one that matters: a value

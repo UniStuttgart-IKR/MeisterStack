@@ -2,9 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The reconciler's tests, verbatim out of `reconcile.rs`. The module path
-//! is unchanged (`reconcile::tests`), so every test still answers to the name
-//! it had before.
+//! Tests for src/reconcile decisions and API contracts.
+//! Store-backed cases explicitly require etcd; value-level cases run without it.
 
 use super::*;
 
@@ -168,17 +167,8 @@ fn silence_leaves_the_pool_without_a_locality_rather_than_with_a_guess() {
     );
 }
 
-/// What a verdict becomes on the object. The one that matters is the
-/// third: a version mix does not erase what was already known, and the
-/// disagreement names both machines so an operator knows which two to look
-/// at.
-///
-/// It asserts on FACTS now and not on a phase, because that is what the pass
-/// writes: the phase is `controller_api::settle_storage_pool`, one place for
-/// both tiers, and the sentence about a version mix is written there. What
-/// this test used to check about the sentence it checks here about the four
-/// names the sentence is built from — which is the stronger assertion of the
-/// two, and the whole reason a disagreement is data.
+/// Pool disagreement preserves the earlier locality while deriving Failed.
+/// An unheard pool clears locality; agreement publishes the current value.
 #[test]
 fn a_verdict_becomes_a_phase_and_keeps_what_was_already_known() {
     assert_eq!(
@@ -267,19 +257,8 @@ fn a_released_volume_only_goes_when_nothing_is_left_to_lose() {
     assert_eq!(release_action(&released(None, None), &none), Release::Drop);
 }
 
-/// The second holder storage B adds, and the sentence that tells it from
-/// the first.
-///
-/// A snapshot standing on a file that has been deleted is a snapshot of
-/// nothing, so the bytes stay until the last copy of them goes — the same
-/// `HeldBy` shape a VM produces, with a different way out: a VM lets go
-/// when it is deleted, a snapshot has to be deleted itself, and the two
-/// sentences say so.
-///
-/// (`lvm-thin` would hold its origin LV on its own, because a thin
-/// snapshot shares the origin's blocks. This rule is what makes
-/// `filesystem` behave the same way, so an operator sees one storage
-/// system rather than one per backend.)
+/// A nondeleting snapshot keeps its source Volume from being released.
+/// The control-plane hold applies uniformly across snapshot backends.
 #[test]
 fn a_snapshot_holds_the_volume_it_was_taken_of() {
     let held = ["snap-1".to_string()];
@@ -396,14 +375,8 @@ fn an_unbound_vm_may_be_scheduled_by_any_replica() {
     assert!(may_reconcile(&bound_to(None), &sessions(&["node-a"])));
 }
 
-/// D13: a finished drain says what it moved.
-///
-/// `leaving` is a snapshot and goes to zero exactly when the work is done, so
-/// the report of a drain that had emptied a machine read
-/// `{"report.moved":0,"report.staying":3,"really_moved":1}` — a number that
-/// is true about now and useless as an answer to "how did the drain go". The
-/// cumulative half is a difference against the last pass, which is why it
-/// needs no memory beyond the number itself.
+/// Drain progress accumulates departures instead of reporting only the current
+/// number of leaving VMs.
 #[test]
 fn a_drain_counts_what_it_actually_moved() {
     let was = |names: &[&str], total: u32| controller_api::Draining {
@@ -520,13 +493,7 @@ fn on_agent_1a(phase: VmPhaseKind) -> Vm {
     vm
 }
 
-/// A VM whose node has said it is in this phase, through the derivation.
-///
-/// There is no other way in since struktur 4, and that is the whole point of
-/// the round: what a test used to set with one assignment it now has to state
-/// as a FACT — a machine said this — and let `settle_vm` say the word. A
-/// resting phase is refused unless a machine is named, so the node goes in
-/// the word (see `VmReported`).
+/// Record node evidence and derive the VM phase from it.
 fn reported_as(vm: &mut Vm, node: &str, phase: VmPhaseKind) {
     vm.status.reported = Some(controller_api::VmReported::by(
         node,
@@ -538,13 +505,7 @@ fn reported_as(vm: &mut Vm, node: &str, phase: VmPhaseKind) {
     vm.settle(Utc::now());
 }
 
-/// D10: a VM on a node nobody has heard from stops claiming to be Running.
-///
-/// The run measured three minutes and the lab's inventory showed days —
-/// eleven guests on manacor reporting `Running` while the agent that would
-/// know had been dead for twenty hours. Frozen clock, because the rule is
-/// about a duration and a test that waited for one would be a test nobody
-/// runs.
+/// The watchdog withdraws Running after the heartbeat budget expires.
 #[test]
 fn a_vm_on_a_silent_node_stops_claiming_to_be_running() {
     let timeout = controller_api::HEARTBEAT_TIMEOUT_SECS;
@@ -649,15 +610,7 @@ fn the_watchdog_only_takes_back_a_claim_about_a_guest() {
     assert!(!silent(&unbound, Some(at(0)), at(timeout)));
 }
 
-/// D-C1, the half the derivation alone did not close: an `Unknown` written
-/// by a binary from before struktur 4.
-///
-/// Such an object has the word and nothing behind it — no reason, no fact,
-/// and a `since` that is only the moment somebody read it. The watchdog used
-/// to walk past it, because `Unknown` does not claim a guest; so nothing ever
-/// wrote it again, `settle` never ran on it, and the stuck deadline never saw
-/// the one object it was made for. The lab had fourteen of these the night
-/// this shipped, every one of them manacor's.
+/// Legacy Unknown status without a silence fact is eligible for watchdog explanation.
 #[test]
 fn an_unknown_nobody_explained_is_the_watchdogs_to_explain() {
     let timeout = controller_api::HEARTBEAT_TIMEOUT_SECS + 1;
@@ -737,16 +690,8 @@ fn placed_on(node: Option<&str>) -> Volume {
     v
 }
 
-/// D1, the whole of it: three replicas, one delivery, and the two that
-/// cannot reach the node do not touch the object.
-///
-/// Before this rule existed, all three reconciled every volume. The one
-/// holding the node's session provisioned it; the other two asked their own
-/// registries, were told "node agent-1a has no active session", and wrote
-/// that on the object as `Failed`. In the mini-chaos run EVERY provision on a
-/// three-replica cluster went through `Failed` at least once, and a client
-/// reading a phase it is entitled to treat as final saw a failure that had
-/// not happened.
+/// Placed volumes, including deleting ones, belong to the replica holding
+/// the assigned node session.
 #[test]
 fn a_placed_volume_is_only_reconciled_by_the_replica_its_node_talks_to() {
     let volume = placed_on(Some("agent-1a"));
@@ -790,14 +735,7 @@ fn snapshot_on(node: Option<&str>) -> VolumeSnapshot {
     s
 }
 
-/// D1 a third time, on the object it was never applied to (chaos B-C1).
-///
-/// `take_snapshots` walked every snapshot on every replica. The one holding
-/// the node's session took the copy; the other two asked their own registry,
-/// were told the node has no active session, and `note_snapshot_failed` wrote
-/// that onto the object as `Failed` — the same wrong sentence on the same
-/// three-replica cluster the volume half showed, on an object a client is
-/// entitled to read as final.
+/// Once a snapshot has a node, only its session holder reconciles it.
 #[test]
 fn a_dispatched_snapshot_is_only_reconciled_by_the_replica_its_node_talks_to() {
     let snapshot = snapshot_on(Some("agent-1a"));
@@ -824,14 +762,9 @@ fn a_dispatched_snapshot_is_only_reconciled_by_the_replica_its_node_talks_to() {
     assert!(!may_reconcile_snapshot(&deleting, &other));
 }
 
-/// A snapshot nobody has dispatched yet belongs to everybody, and it answers
-/// the question exactly as an unplaced volume does.
-///
-/// It has to: a fresh snapshot on a cluster whose replicas hold different
-/// nodes would otherwise be taken by nobody. What keeps the dispatch honest
-/// is the volume it copies — the node comes from `volume.status.node`, and a
-/// volume is only ever placed onto a node of the placing replica's own
-/// session map.
+/// An unassigned snapshot passes the ownership gate on every replica.
+/// This test covers that gate only; dispatch currently does not verify that the
+/// winning replica owns the source volume node's session.
 #[test]
 fn an_undispatched_snapshot_may_be_taken_by_any_replica_that_holds_its_volume() {
     for names in [&[][..], &["agent-1a"][..], &["agent-1b"][..]] {
@@ -888,15 +821,8 @@ fn a_volume_and_a_vm_answer_the_same_question_the_same_way() {
     }
 }
 
-/// Draining is one bit and it belongs to the scheduler alone.
-///
-/// The session is what decides who reconciles a VM and what makes a
-/// candidate `connected`; `spec.schedulable` is a separate field that
-/// only ever narrows the set FirstFit may pick from. So a cordoned node
-/// goes on owning, running and reconciling everything already bound to
-/// it, and the only thing that changes is that nothing new lands there —
-/// which is why cordon cannot evict, migrate or stop anything, and why
-/// there is nothing in this file that would have to be careful not to.
+/// A cordoned candidate rejects new placement without changing ownership of
+/// already bound VMs. This test sets schedulable, not the separate drain flag.
 #[test]
 fn draining_a_node_changes_only_what_the_scheduler_may_pick() {
     let mine = sessions(&["manacor"]);
@@ -1139,9 +1065,8 @@ fn expected_requeue(vm: &Vm, policy: &dyn RequeuePolicy, now: DateTime<Utc>) -> 
     }
 }
 
-/// Every cell of both decisions at once — 2304 of them — against the
-/// guards above. What this buys over the two tables separately is the
-/// next test; this one is what makes it trustworthy.
+/// Enumerate policy, phase, intent, binding and retry-time combinations
+/// and compare the retry decision with the expected guards.
 #[test]
 fn the_joint_cross_product_decides_what_the_guards_say() {
     let policies = policies();
@@ -1162,18 +1087,8 @@ fn the_joint_cross_product_decides_what_the_guards_say() {
     );
 }
 
-/// The invariant the pair exists to keep and neither half can state: the
-/// two never both send. A Kick re-sends the whole spec as a Create; a
-/// lifecycle command names a transition on a record the agent already
-/// has. Both in one pass would be the controller arguing with itself
-/// about the same VM in the same tick — and the node would see the two in
-/// whichever order they happened to leave.
-///
-/// It holds structurally, and it is worth pinning because it holds for a
-/// reason that is easy to lose: Kick fires only at Failed, and Failed is
-/// exactly one of the phases `lifecycle_command` refuses to argue with.
-/// Moving Failed to the stable side of that line — which has been done
-/// once already, see 6315d84 — would break this silently.
+/// Retry Kick and lifecycle commands must be mutually exclusive.
+/// Kick requires Failed, which is excluded from lifecycle transitions.
 #[test]
 fn a_requeue_kick_and_a_lifecycle_command_never_fire_in_the_same_pass() {
     let policies = policies();
@@ -1737,15 +1652,9 @@ fn the_catalogue_says_whether_a_copy_needs_a_standstill() {
     assert_eq!(consistency_in(&[], "filesystem"), None);
 }
 
-/// The quiesce sequence, which is the part of a snapshot with something
-/// at stake in it.
-///
-/// Three rules, and each is a different thing that goes wrong otherwise:
-/// a pause that failed cancels the work (a copy nobody was told is torn
-/// is worse than no copy); the resume runs whatever happened (a guest
-/// left paused by a backup is an outage this stack caused); and a resume
-/// that failed does not replace the work's answer (the operator has two
-/// problems and hiding the first behind the second helps with neither).
+/// After a successful pause, completion or failure of the supplied future
+/// attempts resume without replacing the work result. This tests helper sequencing;
+/// it does not establish actual quiescence or exclusive freeze ownership.
 #[tokio::test]
 async fn the_guest_is_resumed_whatever_the_copy_did() {
     use std::sync::Mutex as StdMutex;
@@ -1976,24 +1885,8 @@ fn an_unbinding_vm_belongs_to_the_replica_that_can_reach_the_node_it_leaves() {
     assert!(may_reconcile(&vm, &sessions(&[])));
 }
 
-/// A volume that follows its vm to another node is dispatched THERE, and
-/// never handed back to the pass that picks a node out of the pool.
-///
-/// The lab found this as a livelock rather than a wrong node. `no-nic` was
-/// placed on agent-1b because agent-1a had no memory left; its volume `ns-b`
-/// was open on agent-1a; the vm pass cleared `status.node` so the volume
-/// would be re-opened, and `place_volume` — which takes the first feasible
-/// node of the pool and has never heard of a vm — put it straight back on
-/// agent-1a. Every five seconds, for as long as anybody watched, with the
-/// guest `Pending` throughout:
-///
-/// ```text
-/// INFO  the record follows the vm; the bytes stay where they are  from=agent-1a to=agent-1b
-/// WARN  vm reconcile failed: volume ns-b is being re-opened on agent-1b
-/// ```
-///
-/// So the assertion is about both halves at once: what the vm pass writes,
-/// and what the volume pass then does with it.
+/// A following volume keeps the VM's chosen node and reaches provisioning.
+/// Clearing the node would let independent volume placement undo the move.
 #[test]
 fn a_volume_following_its_vm_is_provisioned_on_the_vms_node_not_placed_again() {
     let mut v = volume_at(Some("agent-1a"), VolumePhaseKind::Ready);
@@ -2732,14 +2625,8 @@ fn a_destroy_that_has_been_quittanced_has_not_let_go_of_the_disk() {
     );
 }
 
-/// F04, the cluster half: the cloud's larger size becomes this tier's desired
-/// size, and the ordinary resize becomes due.
-///
-/// `handle_create_volume` used to answer a create for a uid it already held
-/// with "nothing to change — a volume's spec is immutable", which stopped
-/// being true when `sizeGib` became growable. The stuck state was: cloud spec
-/// 20 GiB, cluster spec 10 GiB, backend 10 GiB, and no pass that would ever
-/// move any of them.
+/// A larger mirrored size advances the cluster spec and makes resize due.
+/// Equal or older requests cannot shrink it or advance generation.
 #[test]
 fn a_cloud_volume_grown_after_it_was_seen_is_grown_here() {
     // Fully observed at 10 GiB: made, reported, settled.
@@ -2815,21 +2702,9 @@ fn scripted_node(
     heard
 }
 
-/// F05: the bytes grew and the guest was not told — and that stays a thing
-/// to do after the node has reported the bytes grown.
-///
-/// A resize is two steps on possibly two machines: the backend grows, then
-/// the guest holding the disk is told. The second failing was written down
-/// as a sentence, and `next_for` read `status.sizeGib` alone — so the node's
-/// next report, which says the bytes ARE 20 GiB, took the volume to Settled
-/// and overwrote the sentence with it. The guest kept its 10 GiB until
-/// somebody restarted it, and nothing anywhere said so any more.
-///
-/// What this checks is the retry itself: the second pass sends the
-/// notification, and nothing else.
-///
-/// `#[ignore]`: it needs an etcd, the way
-/// `two_replicas_assigning_at_once_hand_out_two_namespaces` does.
+/// Guest-notification debt survives a backend size report.
+/// The next pass retries the notification without growing the backend again.
+/// Requires etcd.
 #[tokio::test]
 #[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
 async fn a_guest_that_was_not_told_is_told_on_the_next_pass() {

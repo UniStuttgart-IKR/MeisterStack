@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `Counter` kind: the one object nobody creates by hand.
-//! Moved out of `resources.rs` unchanged.
+//! Persisted allocation counters.
 
 use super::*;
 

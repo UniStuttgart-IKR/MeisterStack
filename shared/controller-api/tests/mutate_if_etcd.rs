@@ -2,21 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `mutate_if` against a real etcd: the same ABA `delete_if` guards against
-//! (see `delete_if_etcd`), one write instead of one delete.
+//! UID-guarded mutation rejects a replacement on every retry.
 //!
-//! `#[ignore]` for the reason `fence_etcd` is. Start an etcd and name it:
+//! Ignored by default; requires a running etcd:
 //!
 //! ```text
 //! MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
 //!   cargo test -p meister-controller-api --test mutate_if_etcd -- --ignored
 //! ```
-//!
-//! Astra finding S20, 2026-09-23: `mutate` re-reads BY NAME on every CAS
-//! retry with no identity check at all. `mutate_if` is given the uid the
-//! caller resolved `name` from, and re-checks it after every read —
-//! including a retry's, because a recreation can land between any two of
-//! them, not only before the first.
 
 use meister_controller_api::resources::new_vm;
 use meister_controller_api::{EtcdStore, StoreError, Vm, VmSpec};

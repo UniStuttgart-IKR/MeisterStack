@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `floatingips` and `floatingpools` resources, and the claim race neither the store nor a lock can arbitrate. See `events` for why the module and the file are named differently.
+//! Floating-address reservations and pool admission. Range claims use a post-write
+//! collision check; this is separate from allocation of individual address keys.
 
 use super::*;
 
@@ -117,35 +118,9 @@ pub(super) async fn get_floating_ip(
     Ok(Json(ip))
 }
 
-/// Point the address at a VM, or take it off one. That is the whole of what
-/// an update may do.
-///
-/// The tenant, the pool and the address are what the reservation IS, and every
-/// one of them is server-owned for the same reason the VM's tenant is: an
-/// address that changed tenants would be an address whose old owner's node is
-/// still letting frames through for it, and one that changed pool would be an
-/// address outside the range it was cut from.
-///
-/// The assignment reaches a node when the VM is CREATED there — the addresses
-/// are written into the spec, and a node's spec is immutable once it has it.
-/// So this changes the object now and the tap when the VM is next recreated;
-/// stopping and starting it keeps the same tap and the same rules. Making a
-/// re-home live is a documented nice-to-have and not this milestone's job; see
-/// `floating::inject_nic_list`.
-/// What an update of this resource may not change, and why.
-///
-/// One table per resource, next to the handler that enforces it, and the rule
-/// they all say: a field the controller acts on ONCE — when it creates the
-/// thing — is immutable, and a field a controller writes belongs to the
-/// server. Everything not named here is free, and the free half is the half
-/// that matters: `spec.runStrategy`, `spec.schedulable`, the quotas, the
-/// labels and the annotations all stay editable, because they are the fields
-/// an operator edits.
-///
-/// `spec.vm` is deliberately NOT here: the assign is the one thing an update
-/// of a reservation is for. What cannot move is which address this is — the
-/// name IS the address — and which pool it was taken out of, because that is
-/// the quota it was counted against.
+/// Address, pool and tenant identify the reservation and cannot change. VM/router
+/// assignment is editable; existing VM tap permissions are refreshed on recreation,
+/// not by this update or by a stop/start of the existing instance.
 pub(super) const FLOATING_IP_OWNED: &[Owned] = &[
     Owned::immutable(
         "spec.address",
@@ -194,15 +169,8 @@ pub(super) async fn update_floating_ip(
     Ok(Json(updated))
 }
 
-/// Give the address back. A hard delete — a reservation owns nothing — and the
-/// address is free for the next allocation immediately.
-///
-/// The VM that had it keeps sending from it until it is recreated, and that is
-/// not a hole: the tap rules of a RUNNING vm were built from the assignment
-/// that was true when it was created, and the next VM to be given this address
-/// gets its own rules at its own create. Two VMs briefly permitted the same
-/// address is the same window a DHCP lease has, and the way to close it is the
-/// runtime re-home above.
+/// Release the reservation immediately. An existing VM retains its tap permissions
+/// until recreation, so reuse can temporarily authorize the same address on two VMs.
 pub(super) async fn delete_floating_ip(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -355,18 +323,8 @@ pub(super) enum Claimant<'a> {
     Subnet(&'a str),
 }
 
-/// Did the write that produced `mine` land after the one that produced
-/// `theirs`?
-///
-/// `resourceVersion` is the etcd mod_revision, and on an object that was just
-/// created it is the revision of the create itself — a strict total order over
-/// the writes of one etcd, agreed on by every replica without any of them
-/// asking the others.
-///
-/// A revision that will not parse is not an order, and then the answer is
-/// "yes". Two claimants that both take themselves back cost a retry and an
-/// honest refusal; two that both keep theirs cost an overlap that nothing
-/// afterwards can explain or repair.
+/// Compare etcd modification revisions. An unreadable revision yields the claim,
+/// favoring a retry over retaining an unresolved overlap.
 pub(super) fn arrived_after(mine: &str, theirs: &str) -> bool {
     match (mine.parse::<i64>(), theirs.parse::<i64>()) {
         (Ok(mine), Ok(theirs)) => mine > theirs,
@@ -374,13 +332,8 @@ pub(super) fn arrived_after(mine: &str, theirs: &str) -> bool {
     }
 }
 
-/// The collision this claim has to yield to, if there is one.
-///
-/// Both sides of a race run this same comparison against each other, so
-/// exactly one of them yields and the survivor is the claim that reached etcd
-/// first. A collision with something that arrived AFTER us is not ours to act
-/// on: that writer is running this same function right now and will take
-/// itself back.
+/// Find an earlier conflicting write. Later claimants are expected to withdraw
+/// their own objects; interruption or rollback failure can leave overlaps.
 pub(super) fn lost_to<'a>(mine: &str, hits: &'a [Collision]) -> Option<&'a Collision> {
     hits.iter().find(|c| arrived_after(mine, &c.revision))
 }

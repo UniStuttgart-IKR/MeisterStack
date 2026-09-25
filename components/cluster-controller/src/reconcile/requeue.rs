@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The requeue decision: what a Failed VM's history says the pass may do to
-//! it now. Moved out of `reconcile.rs` unchanged.
+//! Pure retry decision for Failed VMs using persisted attempt history.
 
 use super::*;
 

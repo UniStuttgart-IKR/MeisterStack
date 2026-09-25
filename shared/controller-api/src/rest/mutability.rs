@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Who owns which field: the table a tier keeps, the check that reads it, and
-//! the two envelope rules that go with it. Moved out of `rest.rs` unchanged.
+//! Field ownership, immutable-field checks and generation accounting.
 
 use super::*;
 
@@ -216,25 +215,9 @@ pub(super) fn at<'a>(document: &'a serde_json::Value, path: &str) -> &'a serde_j
     here
 }
 
-/// Carry `metadata.generation` across an API write: one more than the stored
-/// object's if this write leaves a different spec behind, the same if it does
-/// not.
-///
-/// Every update handler of both tiers calls this, in the one line before it
-/// hands the object to the store, and that placement is the whole rule: what
-/// counts is what a CLIENT asked for, so the comparison happens after the
-/// handler has put the server's own fields back — the scheduler's binding,
-/// the tenant, the ownership marks. A `PUT` that only re-sends those is a
-/// round trip and not a change, and it must not tick.
-///
-/// The compare is on the SERIALISED spec rather than on the field a handler
-/// happens to care about, because the field a handler happens to care about
-/// is exactly what gets forgotten when a spec grows one. Two specs that
-/// serialise the same are the same intent, whatever they are made of.
-///
-/// Reconcilers never come through here. They write with `store.mutate`, which
-/// does not touch the count — a binding is the server's decision about a
-/// client's intent, not a new intent.
+/// Increment generation only when an API update changes the serialized spec.
+/// Call after restoring server-owned fields so controller decisions are not
+/// counted as new client intent. Store mutations do not call this helper.
 pub fn carry_generation<S: serde::Serialize, St>(
     current: &Object<S, St>,
     next: &mut Object<S, St>,

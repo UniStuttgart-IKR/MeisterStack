@@ -2,13 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The gateway slot against a real kernel: namespaces, veth pairs, addresses,
-//! routes and nftables, built by the driver and read back off the links.
+//! Check router namespaces, links, addresses, routes and nftables against Linux.
 //!
-//! `#[ignore]` for the reason the etcd tests carry it: it needs something the
-//! workspace cannot provide. Here that is a network namespace of its own to
-//! build in, a private mount namespace so that `ip netns` may pin namespaces
-//! under `/var/run/netns`, and `nft`, `ip` and `sysctl` on PATH. Run it with
+//! Requires `ip`, `nft`, `sysctl`, and isolated network and mount namespaces:
 //!
 //! ```text
 //! unshare -rnm --propagation private sh -c \
@@ -17,26 +13,9 @@
 //!    --test gateway_netns -- --ignored --nocapture'
 //! ```
 //!
-//! `-r` maps the caller to root, `-n` gives the test its own network stack —
-//! so the links it creates are nobody else's — and `-m` plus the tmpfs is what
-//! makes `/var/run/netns` a directory this user may write to. The `mkdir` is
-//! part of the recipe and not an afterthought: a fresh tmpfs over `/run` has
-//! no `netns` directory, and `ip netns` does not make one for a file somebody
-//! else writes — without it the test dies planting its dead namespace, four
-//! assertions before anything interesting. Nothing outside that namespace is
-//! touched, and everything in it goes away when it exits.
-//!
-//! One thing has to be true OUTSIDE the namespace: `dummy`, `veth`, `vxlan`,
-//! `nft_ct`, `nft_nat` and `nft_masq` have to be loaded already. A process in a user
-//! namespace may not autoload a kernel module, and the failure reads as
-//! "Unknown device type" or as nft refusing a rule with "No such file or
-//! directory". On a node this does not arise — the agent is real root and the
-//! kernel autoloads what the first router asks for, exactly as it does for
-//! the tap guard's `netdev` table today.
-//!
-//! What it proves is the half of N-A3 that no rendering test can: that the
-//! things this driver claims to build are actually there afterwards, and that
-//! the same call twice is one router.
+//! Load `dummy`, `veth`, `vxlan`, `nft_ct`, `nft_nat` and `nft_masq` on the
+//! host first; a user namespace cannot autoload kernel modules. The private
+//! `/run` holds test namespace mounts and the planted stale namespace file.
 
 use std::collections::BTreeMap;
 
@@ -202,12 +181,7 @@ async fn a_router_is_built_and_taken_down_again() {
     let id = RouterId::from_u128(0x6b00_0001);
     let netns = router_netns(&id);
 
-    // A corpse wearing the name, first: a zero-byte file under /run/netns is
-    // what is left when the bind mount goes and the file does not, and
-    // everything then behaves as if the namespace existed — `add` says the
-    // name is taken, `exec` says "Invalid argument", and without
-    // `clear_dead_netns` the router is Failed on this machine for ever. The
-    // lab produced one of these on 2026-09-10 and could not get rid of it.
+    // A stale namespace file must be removed before the namespace can be rebuilt.
     std::fs::write(format!("/var/run/netns/{netns}"), b"").expect("plant a dead namespace");
     assert!(
         netns_exists(&netns),
@@ -240,10 +214,7 @@ async fn a_router_is_built_and_taken_down_again() {
          away, not the veth default: {}",
         in_netns(&netns, &["ip", "-o", "link", "show", "ext"])
     );
-    // The point of reading it rather than leaving it unset: a bridge takes
-    // the MTU of its smallest port, so a leg on the veth default would have
-    // pulled the operator's 9000-byte provider network down to 1500 — which
-    // is what manacor's `vlan128` did on 2026-09-10.
+    // A veth with a smaller MTU would lower the provider bridge MTU.
     assert!(
         ip(&["-o", "link", "show", &bridge]).contains("mtu 9000"),
         "and the provider bridge keeps the operator's mtu: {}",
@@ -286,11 +257,7 @@ async fn a_router_is_built_and_taken_down_again() {
     assert!(rules.contains("masquerade"), "{rules}");
     assert!(rules.contains("ct state invalid"), "{rules}");
 
-    // The same call twice is one router, and this is the step where "twice"
-    // used to cost something visible: the ruleset is rendered with a `flush
-    // chain` in front of it, so every pass threw the counters away. They are
-    // what an operator reads to find out whether a floating address carries
-    // anything, so a second ensure has to leave them alone.
+    // An unchanged ensure must preserve nftables counters and existing rules.
     in_netns(
         &netns,
         &[
@@ -328,13 +295,7 @@ async fn a_router_is_built_and_taken_down_again() {
         "the same Ensure twice is one router"
     );
 
-    // --- the farewell: a stopping node stops speaking, and stays built -----
-    // The measured failure this answers: manacor was stopped with `systemctl
-    // stop`, its cluster made the standby active eight seconds later, and
-    // manacor went on answering ARP for 10.128.1.210 — two MACs replied to
-    // one arping. A namespace outlives the agent, the DestroyRouter went to a
-    // node that was already down, and the start-up sweep keeps every
-    // namespace whose record is still there.
+    // Shutdown suppresses ARP without destroying the router namespace.
     let silenced = d.fall_silent().await.expect("a node on its way out");
     assert_eq!(silenced, [id], "the one router that spoke here fell silent");
     assert_eq!(sysctl(&netns, "net.ipv4.conf.ext.arp_ignore"), "8");
@@ -347,24 +308,16 @@ async fn a_router_is_built_and_taken_down_again() {
         !d.list_routers().await.expect("still one router")[0].active,
         "and the RECORD says standby, so the node does not shout on its way back up"
     );
-    // Astra finding S08, 2026-09-23: this function has a second caller now.
-    // The agent's dead man (`ROUTER_DEAD_MAN`) calls it when the controller
-    // is merely LOST rather than when the unit is stopped, so what it leaves
-    // behind is what an operator gets on every control-plane outage, not only
-    // on a `systemctl stop`. Both halves of that are worth asserting here,
-    // because they are the two things the cluster is relying on when it
-    // promotes a standby on a timer.
+    // Controller-loss handling also uses fall_silent. Keep a readable standby
+    // record so reconnect can reactivate the existing namespace.
     let silent = d.list_routers().await.expect("still one router");
     assert!(
         silent[0].announce.is_empty(),
         "the withdraw: a silent router asks the fabric for nothing, not even \
          the floating address it was translating"
     );
-    // The addresses are still ON the leg, and that is not a contradiction of
-    // the line above: with `arp_ignore = 8` nothing on either wire learns
-    // they are here, and keeping them configured is exactly what makes the
-    // way back a sysctl rather than a build. A namespace with no addresses
-    // would be a failover that has to build a router.
+    // Addresses remain configured while arp_ignore suppresses replies.
+    // Reactivation can reuse the namespace.
     let on_ext = in_netns(&netns, &["ip", "-o", "addr", "show", "ext"]);
     assert!(
         on_ext.contains("203.0.113.10/24") && on_ext.contains("203.0.113.55/32"),

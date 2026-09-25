@@ -23,10 +23,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 tokio-stream = "0.1.18"
 async-trait = "0.1.89"
 
-# gRPC
-# tls-ring: the two session ports terminate TLS with tonic's own plumbing
-# rather than a second hand-rolled loop, and ring keeps it the same crypto
-# stack the REST side uses.
+# gRPC sessions use rustls with the ring provider.
 tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost-build = "0.14"
 tonic-prost = "0.14"
@@ -36,34 +33,26 @@ prost-types = "0.14"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# JSON Schema, derived from the very types serde reads. The API publishes
-# these, so a second client — a web interface, a generator, an agent — can
-# learn the shape of an object instead of being told it in prose.
+# Derive API schemas from the serialized resource types.
 schemars = { version = "1", features = ["chrono04"] }
 
 # Error Handling
 anyhow = "1"
 thiserror = "2"
 
-# Persistant data
+# Persistent data
 redb = "4.1.0"
 etcd-client = "0.19.0"
 
-# REST utilities: Hyper
-# "server" is the controllers' TLS accept loop: axum::serve cannot hand a
-# handler the peer's certificate, so the mTLS path drives hyper directly.
+# REST transport; controllers use Hyper directly to inspect TLS peer certificates.
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 axum = { version = "0.8" }
-# The Service trait and `oneshot`, for handing a hyper connection to an axum
-# Router by hand. Already in the tree under axum.
+# Bridge Hyper connections to Axum routers.
 tower = { version = "0.5", features = ["util"] }
 
-# Test utilities. A test that writes a file writes it somewhere nobody else
-# is: a fixed path under /tmp turns two concurrent `cargo test` runs — or one
-# run beside a leftover from a crashed one — into a flake nobody can
-# reproduce, and the directory goes away on a panic as well as on a pass.
+# Isolated temporary files for tests.
 tempfile = "3"
 
 # Utils
@@ -73,34 +62,21 @@ bytes = { version = "1", default-features = false }
 futures = "0.3"
 toml = "1.1"
 
-# TLS and PKI. rustls everywhere, ring everywhere: tonic's tls-ring, the
-# controllers' axum termination and the CLI's client all end up in the same
-# provider, so there is one crypto stack in the tree rather than two.
+# TLS and PKI share the ring provider.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
-# The CA half: parses a CSR, signs it, and writes PEM back out.
+# CSR signing and PEM output.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
-# The reading half: what a peer certificate actually says (CN, O, validity)
-# and whether our CA signed it. "verify" is the signature check.
+# Certificate parsing and signature verification.
 x509-parser = { version = "0.18", features = ["verify"] }
 sha2 = "0.10"
-# The JOSE half. `base64` is base64url without padding, which is every field
-# of a JWT and every field of a JWK; `ring` is the signature check itself,
-# and it is deliberately the SAME ring rustls already uses rather than a
-# second crypto stack brought in by a JWT library. Both were already in the
-# tree as transitive dependencies.
+# JWT/JWK encoding and signature verification.
 base64 = "0.22"
 ring = "0.17"
-# Mozilla's root list as rustls trust anchors, and nothing else — no code, no
-# crypto, no second provider. An identity provider is on the public internet
-# and its certificate is signed by a CA that no lab bundle contains, which is
-# the one place in this stack where the system's own roots are the right
-# answer. A lab provider with a private CA names it in the config instead.
+# Public roots for OIDC provider connections; controller APIs use an explicit CA.
 webpki-roots = "1"
-# X.509 validity is an OffsetDateTime in rcgen's API and nowhere else in this
-# tree; it is here to say "now + ninety days" to that one function. Already in
-# the tree as rcgen's own dependency, so it costs nothing to build.
+# Time representation used for certificate validity.
 time = { version = "0.3", default-features = false }
 
 # networking
@@ -108,25 +84,15 @@ rtnetlink = "0.21"
 
 # telemetry
 tracing = "0.1"
-# "json" is the second log format (telemetry::LogFormat). It is a feature
-# rather than a default because it pulls serde_json into every binary that
-# links the subscriber, and this stack wants that trade said out loud: a
-# collector reads json, a human reads the other one.
+# Text and JSON logs with runtime filtering.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.33"
-# Metrics are the second signal and a separate one: traces leave over OTLP,
-# time series are SCRAPED. No default features — the protobuf exposition and
-# the process collector are both off, which leaves the registry and the text
-# encoder, and the text format is the only one a Prometheus needs.
+# Prometheus text exposition; process and protobuf collectors are disabled.
 prometheus = { version = "0.14", default-features = false }
 
-# os utils
-# "user" is getgrnam: the agent turns [paths] socket_group into a gid without
-# shelling out to a tool that may not be on a unit's PATH.
-# "socket" is sendmsg with SCM_RIGHTS: the agent hands the VMM an open tap
-# instead of the right to make one (drivers/cloud-hypervisor/src/fd.rs).
+# Unix users, process control and descriptor passing (SCM_RIGHTS).
 nix = { version = "0.31", features = ["fs", "zerocopy", "ioctl", "process", "signal", "resource", "socket", "term", "user"] }
 libc = "0.2"

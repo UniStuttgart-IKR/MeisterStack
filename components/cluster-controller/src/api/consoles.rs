@@ -2,22 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The console edge: the upgrade, the wait for the agent to open one, and
-//! the pump that carries bytes both ways. Moved out of `api.rs` unchanged.
+//! Console upgrades, agent-open acknowledgement and bidirectional byte relay.
 
 use super::*;
 
-/// Take a VM's serial line, for a client that reached THIS replica.
-///
-/// Two callers and the same route: a sibling replica forwarding a console it
-/// cannot serve, and anybody talking to this tier directly. Both get the same
-/// answer, which is the point — a forward is not a special case, it is this
-/// route being used by a process instead of a person.
-///
-/// Only nodes this replica holds. A replica that does not hold the node
-/// refuses rather than forwarding again: a cluster's replicas all see the
-/// same `session_endpoint`, so a second hop could only ever be a mistake, and
-/// a mistake that bounces a live stream between two processes.
+/// Open a console only for a node session held by this replica. Refuse another
+/// hop when the session is elsewhere, and wait for the agent before returning 101.
 pub(super) async fn vm_console(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -153,11 +143,7 @@ pub(super) trait Duplex:
 
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Duplex for T {}
 
-/// The 101 that opens the line, in whichever dialect was asked for.
-///
-/// A WebSocket client that got `Upgrade: meister-console` and no
-/// `Sec-WebSocket-Accept` threw the connection away without a word — the
-/// cloud's own bug before fremdsicht 6, and this tier's until now.
+/// Return the requested WebSocket or raw console upgrade handshake.
 pub(super) fn switching(websocket: Option<String>) -> axum::response::Response {
     let response = axum::response::Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)

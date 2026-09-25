@@ -2,46 +2,17 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `CapacityReservation` kind: room held on a node for a guest that is on
-//! its way there and is not counted anywhere else yet.
+//! Capacity reserved for a VM that has not yet reached its destination.
 
 use super::*;
 
-/// Room promised on one machine to one guest that has not arrived.
+/// Capacity held before a migration destination is prepared, while ordinary
+/// VM bindings do not yet account for the arriving guest. The migration name
+/// is the create-only key; VM and migration UIDs identify the incarnations.
 ///
-/// Astra finding S07, 2026-09-23: `Candidate::free` is derived from the VMs
-/// BOUND to a node, and a live migration does not bind its guest to the
-/// destination until the transfer has finished. So between `prepare` — which
-/// opens the disks there and builds a VMM — and the binding in `settle`,
-/// there is a guest on its way to a machine that nothing in the control plane
-/// can see. Two migrations, or a migration and an ordinary create, aimed at
-/// one node in that window all measured themselves against the same numbers
-/// and all passed. What the last of them met was the OOM killer, on a machine
-/// the scheduler believed had room.
-///
-/// This is the missing entry. It is an OBJECT and not a field on the node,
-/// for three reasons and each of them is the reason a resource exists at all:
-/// several replicas share nothing but their etcd, so the promise has to be in
-/// the store; a create-only write on a key is the only way to make "exactly
-/// one reservation for this migration" a fact rather than a convention; and a
-/// promise that has to be reaped needs something to list.
-///
-/// **The invariant: a reservation outlives nothing.** It is created before
-/// anything is built at the destination and it is taken away the moment the
-/// migration reaches a final state or the guest's binding moves to the
-/// target, whichever comes first — and if the process that made it dies
-/// between those two moments, the reaper on the reconcile tick removes it,
-/// because a reservation whose migration is final, deleted or gone is capacity
-/// nobody is coming for. Nothing here may be the last word on a machine's
-/// room.
-///
-/// Named after its MIGRATION — the object's name is the migration's name —
-/// which is the (node, vm, migration) triple the finding asks for, stated
-/// once instead of three times: a migration has exactly one destination and
-/// exactly one guest, so the migration names the triple, and a create-only
-/// write on that one key is what forbids a second reservation for the same
-/// move. The node and the guest are in the spec so that the arithmetic and
-/// the reaper read fields rather than parse a name.
+/// Release must follow the migration ownership protocol. An unresolved attempt
+/// retains its reservation; elapsed time or a lost reply does not free capacity.
+/// The stored resource amounts keep accounting independent of later VM edits.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapacityReservationSpec {

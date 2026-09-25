@@ -74,12 +74,9 @@ pub(super) async fn reconcile_routers(
     Ok(())
 }
 
-/// The finalizer flow: the cluster is told to tear the router down and acks
-/// that it wrote the order down — which is not the same as having carried it
-/// out. The proof is the router leaving the cluster's status, and only then
-/// may the cloud's object go. Exactly the promise `vms::teardown` makes, and
-/// for its reason: an object deleted early is a netns nobody is left to
-/// delete.
+/// Request cluster teardown while a complete router inventory still names the UID.
+/// The current check accepts absence without comparing report age to dispatch
+/// or deletion time; it therefore does not establish the VM path's freshness guarantee.
 async fn teardown(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -355,39 +352,15 @@ async fn reconcile_router(
         store, registry, &cluster, &router, network, &nats, &announced,
     )
     .await?;
-    // What the dispatch really carried, written back onto the objects it was
-    // carried FOR. Only on the acked branch, exactly as `stamp_addresses` does
-    // it for the addresses a `CreateVm` takes down.
+    // This records the rendered plan. Dispatch also returns Ok after logging
+    // a rejected or undeliverable command, so this is not delivery evidence.
     stamp_floating(store, &router, estate.floating, &nats).await;
     Ok(())
 }
 
-/// A floating address whose rule has reached the cluster is `APPLIED`, and
-/// says so.
-///
-/// `observedGeneration` is the whole of the `APPLIED` column, and for a
-/// floating address there were two roads to it and only one wrote the stamp:
-/// an address a `CreateVm` carries down is stamped on that command's ack
-/// (`floating::stamp_addresses`), and an address a ROUTER translates is
-/// carried by `EnsureRouter` instead — which stamped nothing. So an address
-/// created after its guest, pointed at a router, working, with the DNAT rule
-/// in place and the counters running, read `pending` for ever. Seen on manacor
-/// on 2026-09-10 with `10.128.1.217`, which was answering pings from outside
-/// while the column said it had not been applied.
-///
-/// The ack of the `EnsureRouter` that carried the rule is the fact, and it is
-/// the same fact the other road stamps on: the tier below has taken the rule.
-/// Whether the namespace then built it is the ROUTER's phase to report, and it
-/// is reported — one object over, where an operator looks when an address that
-/// says `applied` does not answer.
-/// Did the `EnsureRouter` that just went down carry this address's rule, and
-/// is that news?
-///
-/// Four questions and all four have to be yes. The third is the one that keeps
-/// this from being a write every five seconds; the fourth is what makes the
-/// stamp honest — an address whose `internalAddress` is unset renders no rule
-/// at all and is NOT applied, which is the true answer and the state
-/// `floatingip attach` leaves behind for a moment.
+/// Whether a rendered NAT rule matches this tenant's floating address and router
+/// and its generation has not yet been stamped. This predicate checks the plan;
+/// it does not establish command acknowledgement.
 pub(crate) fn carried_down(
     ip: &controller_api::FloatingIp,
     router: &Router,

@@ -82,15 +82,9 @@ pub(super) async fn update_user(
     Ok(Json(updated))
 }
 
-/// Deleting a user does NOT revoke the certificates they hold — nothing here
-/// has a revocation list. What it does is take the name out of the directory,
-/// and the directory is what the guard consults on every request: from the
-/// next call onwards that certificate authenticates to somebody the cloud
-/// does not know, and somebody the cloud does not know may do nothing.
-///
-/// That is the whole revocation story of this milestone, and it is worth
-/// saying out loud rather than implying: it works at the cloud, and the
-/// cluster tier keeps honouring the certificate until it expires.
+/// Delete the directory entry consulted by cloud authorization on every request.
+/// Issued certificates are not revoked cryptographically. Cluster APIs have no
+/// directory and refuse ordinary user identities independently of this entry.
 pub(super) async fn delete_user(
     State(st): State<ApiState>,
     Path(name): Path<String>,

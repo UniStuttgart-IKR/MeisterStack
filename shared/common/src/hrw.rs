@@ -2,16 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Rendezvous hashing (HRW) over a list of endpoints.
+//! Rendezvous hashing (HRW) for stable endpoint preference orders.
 //!
-//! Every dialling party sorts the endpoints by `hash(id, endpoint)` and works
-//! down that order. Nothing is negotiated and nothing is stored: the order is
-//! a pure function of the dialler's own name, so agents spread themselves over
-//! the controller replicas — and cluster-controllers over the cloud replicas —
-//! without a registry, each picks the same favourite after every restart, and
-//! losing a replica moves only the diallers that were on it: the relative
-//! order of the survivors cannot change, which is exactly what HRW buys over
-//! hashing modulo the number of replicas.
+//! Each caller sorts endpoints by `hash(id, endpoint)`. Removing an endpoint
+//! preserves the relative order of the survivors, so only callers using the
+//! removed endpoint need to change their preferred replica.
 
 /// FNV-1a by hand, and that is the point: `DefaultHasher` is seeded per
 /// process, so the same agent would draw a different order after every

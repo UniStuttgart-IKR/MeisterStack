@@ -2,10 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Fences against a real etcd: a promise about many objects, kept by one
-//! key.
+//! Multi-object admission fences against a real etcd.
 //!
-//! `#[ignore]` for the reason `tickets_etcd` is. Start an etcd and name it:
+//! Ignored by default; requires a running etcd:
 //!
 //! ```text
 //! MEISTER_TEST_ETCD=http://127.0.0.1:23700 \

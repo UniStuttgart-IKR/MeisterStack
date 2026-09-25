@@ -1279,22 +1279,9 @@ async fn handle_delete_router(store: &EtcdStore, d: proto::DeleteRouter) -> anyh
     Ok(())
 }
 
-/// The cloud told this cluster an image was deleted; every node hears it.
-///
-/// Astra finding S02, 2026-09-23 (rest b). This tier keeps no `Image`
-/// objects and no record of which of its nodes fetched what — the whole
-/// reason `DropImage` is answered by fanning out rather than by looking
-/// anything up first. `Cache::drop_uid` at each node is where the real
-/// decision is: this function's only job is to reach every node, including
-/// the ones a sibling replica's session holds.
-///
-/// Best-effort per node and never a failure of the command as a whole: a
-/// node that is offline right now keeps its stale cache until it next
-/// reconnects and is told again on the NEXT delete of a *different* image
-/// that happens to fan out while it is up — which is not a repeat of this
-/// one. An offline node's cache staying stale for a while is the accepted
-/// cost of this design; see the module doc on `DropImage` for the
-/// broadcast-over-target reasoning.
+/// Fan out an image deletion to known nodes, using sibling forwarding where needed.
+/// Each node failure is logged without failing the cloud command. No durable retry
+/// or deletion tombstone is kept here, so unreachable nodes may retain stale caches.
 async fn handle_drop_image(
     store: &EtcdStore,
     fanout: &Dispatch,

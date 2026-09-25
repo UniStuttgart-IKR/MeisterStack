@@ -58,21 +58,9 @@ pub(crate) use snapshots::*;
 pub(crate) use vms::*;
 pub(crate) use volumes::*;
 
-/// Who, of several leaderless replicas, may act on this VM: the one its node
-/// is dialled into. The session is the ownership token — it is a fact the
-/// replica can observe by itself, it is already exclusive (an agent holds one
-/// session at a time), and it is the only replica that can reach the node
-/// anyway, so nothing is lost by declaring it the owner.
-///
-/// An unbound VM belongs to everybody: any replica may schedule it, but only
-/// onto nodes of its own session map (`Candidate::connected`), so whoever wins
-/// the binding CAS binds the VM to a node it already owns and ownership
-/// follows the binding for free. No hand-off, no forwarding, no leader.
-///
-/// The edge this leaves open, deliberately: a VM whose node is dialled into
-/// no replica at all is reconciled by nobody. It waits — including a deleting
-/// one, which stays Terminating until its node comes back, because tearing a
-/// VM down is something only its agent can do.
+/// Reconcile through the session that owns the bound node.
+/// After unbinding, the old reported node retains ownership until teardown is
+/// observed. An entirely unbound VM may be placed by any replica through CAS.
 pub fn may_reconcile(vm: &Vm, sessions: &HashSet<String>) -> bool {
     match vm.spec.node_name.as_deref() {
         Some(node) => sessions.contains(node),
@@ -88,32 +76,8 @@ pub fn may_reconcile(vm: &Vm, sessions: &HashSet<String>) -> bool {
     }
 }
 
-/// The same question for a volume, and the answer it never got.
-///
-/// A VM has had `may_reconcile` since the leaderless design was written: the
-/// replica holding the node's session owns the object on it, and the others
-/// leave it alone. Volumes were reconciled by every replica, and the two that
-/// could not reach the node found out by SENDING — their local registry
-/// answered "node X has no active session", and they wrote that on the object
-/// as `phase = Failed` with a sentence that is, from a client's chair, simply
-/// false: the node was up, healthy, and provisioning the volume for the
-/// replica that did hold it.
-///
-/// Measured (mini-chaos D1): on a three-replica cluster EVERY volume
-/// provision went through `Failed` at least once, p50 29.2 s against 13.1 s
-/// on a one-replica cluster. On a single replica the defect cannot appear at
-/// all, which is why it survived every local run.
-///
-/// The other repair would have been a forward, the way the REST path
-/// forwards a console to the replica holding the session. It is the wrong one
-/// here: a reconcile is a level-triggered pass and not a request, so there is
-/// no caller waiting for an answer, and the replica that DOES hold the
-/// session reaches the same volume on its own next tick. Ownership follows
-/// the session, as it does everywhere else in this file.
-///
-/// Same deliberate edge as the VM rule: a volume whose node is dialled into
-/// no replica at all is reconciled by nobody and waits — including a deleting
-/// one, because destroying bytes is something only that node can do.
+/// Only the replica holding the volume node's session reconciles it.
+/// An unplaced volume is eligible on every replica; placement is claimed by CAS.
 pub fn may_reconcile_volume(volume: &Volume, sessions: &HashSet<String>) -> bool {
     match volume.status.node.as_deref() {
         Some(node) => sessions.contains(node),
@@ -125,14 +89,9 @@ pub fn may_reconcile_volume(volume: &Volume, sessions: &HashSet<String>) -> bool
     }
 }
 
-/// Who, of several leaderless replicas, may act on this snapshot: the one
-/// whose session reaches the node that holds the copy.
-///
-/// D1 one object further (chaos B-C1). `take_snapshots` walked every snapshot
-/// on every replica; the two that cannot reach the node asked their own
-/// registry, were told the node has no session, and `note_snapshot_failed`
-/// wrote that sentence onto an object a third replica was in the middle of
-/// taking. `Failed` is a phase a client is entitled to read as final.
+/// Reconcile an assigned snapshot through its node's session owner.
+/// An unassigned snapshot is eligible on every replica. Initial dispatch does
+/// not yet restrict eligibility to the source volume's session owner.
 pub fn may_reconcile_snapshot(snapshot: &VolumeSnapshot, sessions: &HashSet<String>) -> bool {
     match snapshot.status.node.as_deref() {
         Some(node) => sessions.contains(node),
@@ -202,22 +161,9 @@ pub async fn run(
     }
 }
 
-/// No non-terminal state without a deadline: one pass over every kind this
-/// tier holds, once a minute.
-///
-/// It writes NOTHING onto the objects. That is decision 7 and it is the whole
-/// design: a deadline buys a number (`meister_phase_stuck`) and a sentence
-/// (one `PhaseStuck` event on crossing), and never a promotion — `Unknown`
-/// does not become `Failed` however long it stands, because `Failed` is what
-/// the requeue curve acts on and a timer that promoted a silence would be
-/// this tier re-creating a guest on the strength of no evidence at all.
-///
-/// Its own pass with its own listings rather than a rider on the reconcile
-/// sub-passes, and that is worth the reads: the question is asked of EVERY
-/// object of every kind, including the ones a reconcile pass skips because
-/// another replica owns them — and a machine that fell out is exactly the
-/// case where no replica owns anything. D-C1 stood for four and a half days
-/// behind an ownership check of that shape.
+/// Report overdue phases through metrics and events without changing resource state.
+/// Unknown observations remain Unknown; elapsed time does not authorize recovery.
+/// Run across all objects, including those without a live session owner.
 async fn deadlines(store: &EtcdStore, tick: Duration) -> anyhow::Result<()> {
     let now = Utc::now();
     use controller_api::stuck::{About, Late};
@@ -450,15 +396,7 @@ fn publish_vm_gauges(vms: &[Vm]) {
     }
 }
 
-/// Everything one pass carries from VM to VM, in one place: the store it
-/// writes through, the session map that says which VMs are this replica's,
-/// the nodes it may place on and the two policies that decide placement and
-/// healing.
-///
-/// A struct rather than a parameter list because none of it is per-VM — the
-/// six were the same six at every step of every VM, and the only thing that
-/// actually changes between the steps below is the VM itself. What the steps
-/// take is what they are about.
+/// Shared inputs, capacity accounting, and diagnostics for one reconcile pass.
 struct Pass<'a> {
     store: &'a EtcdStore,
     registry: &'a SessionRegistry,

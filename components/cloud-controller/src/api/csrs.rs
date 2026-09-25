@@ -8,10 +8,7 @@ use super::*;
 
 // --- certificate signing requests ------------------------------------------
 
-/// What a PUT to `.../approval` says. Deliberately not the whole object: the
-/// only thing an approver decides is yes or no and why, and a handler that
-/// took a full object would have to work out which of its fields it was
-/// allowed to believe.
+/// Approval decision, separate from the client-supplied CSR resource.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Approval {
@@ -36,23 +33,12 @@ pub(super) async fn list_csrs(
     })))
 }
 
-/// Accept a request for a certificate.
+/// Validate the signed CSR, requested identity and directory entry before creating it.
+/// An omitted name uses the username and a UID prefix. Non-admin callers may request
+/// only their own identity.
 ///
-/// `metadata.name` may be empty, and normally is: certificate requests happen
-/// to the same person repeatedly, so a name the client picked would collide
-/// with its own last one. The server derives `<username>-<8 of the uid>`,
-/// which is unique because the uid is.
-///
-/// Three checks, and each of them exists because of something a client could
-/// otherwise get away with:
-///
-///   - the request has to parse and its signature has to check out, or the
-///     store would fill with documents the signer will choke on later;
-///   - the name in the request has to be the name being asked for, so that
-///     what the client signed is what it asked for;
-///   - a caller who is not an admin may only ask for its own name. This is
-///     the one that matters: without it, `auto_approve` plus any member's
-///     certificate is a path to the administrator's.
+/// With auto-approval enabled, signing and the user certificate record happen before
+/// the dry-run preview; this path currently issues credentials even for a preview.
 pub(super) async fn create_csr(
     State(st): State<ApiState>,
     caller: Caller,
@@ -154,15 +140,9 @@ pub(super) async fn delete_csr(
     ))
 }
 
-/// Approve or deny, and — on approval — sign, because this process is both
-/// the approver and the signer.
-///
-/// Kubernetes splits those two roles across two components and that split is
-/// worth something there: the approver decides policy and the signer holds
-/// the key, and they can be operated by different people. Here one process
-/// holds the key and serves the API, so splitting them would be ceremony
-/// around a boundary that does not exist. The condition still records who
-/// approved, which is the part of the split that carries the meaning.
+/// Approve and sign, or record a final denial. An existing certificate is returned
+/// without re-signing. Dry-run approval is refused because a signed certificate is
+/// a usable credential.
 pub(super) async fn approve_csr(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -221,11 +201,8 @@ pub(super) async fn approve_csr(
     Ok(Json(st.store.update(&csr).await?))
 }
 
-/// Stamp the approval, sign, and record the fingerprint on the user.
-///
-/// The subject comes from the directory and nowhere else: the common name is
-/// the user object's name and the one group is the role it carries. Nothing a
-/// client wrote reaches the certificate.
+/// Sign with the directory user’s name and role label, then record the fingerprint.
+/// Authorization reads the current directory role rather than that certificate label.
 pub(super) async fn approve_and_sign(
     st: &ApiState,
     csr: &mut CertificateSigningRequest,

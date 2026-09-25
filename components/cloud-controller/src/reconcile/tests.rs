@@ -2,9 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The reconciler's tests, verbatim out of `reconcile.rs`. The module path
-//! is unchanged (`reconcile::tests`), so every test still answers to the name
-//! it had before.
+//! Tests for src/reconcile decisions and API contracts.
+//! Store-backed cases explicitly require etcd; value-level cases run without it.
 
 use super::*;
 use controller_api::{VmSpec, resources::new_vm};

@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `Secret` kind: a tenant's own bytes, sealed before they
-//! reach etcd. Moved out of `resources.rs` unchanged.
+//! Tenant secret values, sealed before storage in etcd.
 
 use super::*;
 

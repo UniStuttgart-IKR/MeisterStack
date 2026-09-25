@@ -2,9 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The resource table's tests, verbatim out of `resources.rs`.
-//! The module path is unchanged (`resources::tests`), so every
-//! test still answers to the name it had before.
+//! Resource serialization, compatibility, phase and ownership tests.
 
 use super::*;
 

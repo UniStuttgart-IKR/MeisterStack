@@ -2,23 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The provider's public keys: what a JWKS document says, and what of it we
-//! are willing to believe.
+//! Parse provider public keys and verify supported asymmetric signatures.
 //!
-//! Two rules run through this file and both exist to stop the same attack.
-//!
-//! The first is that an algorithm is something WE decide, not something the
-//! token announces. `Alg` has no `none` and no `HS*` variant, so a header
-//! naming either does not parse into an algorithm this crate can hand to a
-//! verifier; there is no code path from an attacker's `alg` to a symmetric
-//! check, because there is no symmetric check.
-//!
-//! The second is that a key and an algorithm have to agree in KIND. An RSA
-//! key cannot be asked to verify an ECDSA signature and an EC key cannot be
-//! asked to verify an RSA one, which is checked in `PublicKey::verify`
-//! rather than assumed. The classic confusion — take the provider's RSA
-//! public key, call it an HMAC secret, sign your own token with it — needs
-//! both of those doors open. Here neither is a door.
+//! The verifier accepts only configured algorithms and requires a matching key
+//! kind. Unsigned tokens and HMAC algorithms are unsupported, preventing an RSA
+//! public key from being used as an HMAC secret.
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;

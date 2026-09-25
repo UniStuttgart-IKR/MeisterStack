@@ -2,20 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `providernetworks` and `routers` resources, one tier down.
+//! Provider networks and routers at the cluster API.
 //!
-//! Both are served here and not only at the cloud, and the reason is the same
-//! one `vms` and `volumes` are: this is the tier that BUILDS the thing. The
-//! reconciler here picks the gateway nodes, cuts the external address and
-//! sends `EnsureRouter`; a router that could not be read or written at this
-//! tier would be a router nobody could look at from the machine it is on, and
-//! the standalone road — a cluster with no cloud above it, which is how this
-//! controller ran before M4 and how it goes on running when the cloud is away
-//! — would have no way to make one at all.
-//!
-//! What is NOT here is the tenant directory: `spec.tenant` is a label at this
-//! tier, as it is on a `Vm`, and it is not checked against anything. The
-//! cloud is where a tenant exists.
+//! Standalone clusters may declare their own resources. Cloud-managed routers
+//! arrive with resolved tenant facts; this tier does not host the tenant directory.
 
 use super::*;
 

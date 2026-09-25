@@ -3,22 +3,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# MeisterStack — `tools/meister-ca --index-rebuild|--revoke|--gencrl` gegen
-# echtes openssl
-#
-# Ein Widerruf ist eine Zeile in einer Datei, die sonst niemand ansieht: das
-# Zertifikat auf der Platte sieht nach dem Widerruf genauso aus wie davor.
-# Was schiefgehen kann, sieht man nur an einem echten Index und einer echten
-# CRL — ein Rebuild, der die `R`-Zeile ueberschreibt (M0-Befund 7), ein
-# Serial, das in keiner der drei Schreibweisen gefunden wird, eine CRL, die
-# den Grund nicht traegt, ein `openssl verify`, das das widerrufene
-# Zertifikat trotzdem nimmt.
-#
-#   scripts/check-ca-revoke.sh    # Exit 0 = alles wie beschrieben
-#
-# Alles passiert in einem mktemp -d: eine Wegwerf-CA, vier Identitaeten, eine
-# per CSR ausgestellte. Kein Lab, kein echter CA-Schluessel, kein Netz, kein
-# Root.
+# Exercise CA indexing, revocation and CRL generation with temporary keys and OpenSSL.
+# No running service or existing CA is used.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,7 +25,7 @@ rows()    { cut -f4 "$DIR/index.txt" | grep -c . ; }
 state_of() { awk -F'\t' -v s="$1" '$4 == s { print $1 }' "$DIR/index.txt"; }
 serial_of() { openssl x509 -in "$1" -noout -serial | cut -d= -f2; }
 
-# --- eine CA mit vier Identitaeten -----------------------------------------
+# Create four initial identities.
 "$CA" --dir "$DIR" --node a --node b --admin root --serving box >/dev/null 2>&1
 if [ -f "$DIR/ca.crt" ] && [ -f "$DIR/system-node-a.crt" ]; then
 	ok "die Wegwerf-CA steht"
@@ -48,11 +34,7 @@ else
 	printf '\n%d ok, %d FAIL\n' "$pass" "$fail"; exit 1
 fi
 
-# --- und eine fuenfte ueber eine fremde Anfrage, mit --out woanders ---------
-#
-# Genau der Weg, den `meister-deploy keys issue` faehrt: das Zertifikat landet
-# im Repository des Betreibers. Die CA muss trotzdem wissen, was sie
-# unterschrieben hat, sonst ist es nicht widerrufbar.
+# A certificate delivered elsewhere must remain indexed by its issuing CA.
 openssl genpkey -quiet -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 \
 	-out "$T/n1.key" 2>/dev/null
 openssl req -new -key "$T/n1.key" -out "$T/n1.csr" -subj "/CN=egal" 2>/dev/null
@@ -70,7 +52,7 @@ else
 	bad "die Kopie unterscheidet sich vom ausgelieferten Zertifikat"
 fi
 
-# --- der Backfill -----------------------------------------------------------
+# Build the certificate index.
 "$CA" --dir "$DIR" --index-rebuild >/dev/null 2>&1
 for f in index.txt index.txt.attr crlnumber serial openssl.cnf; do
 	if [ -f "$DIR/$f" ]; then ok "--index-rebuild legt $f an"; else bad "$f fehlt"; fi
@@ -85,8 +67,7 @@ if grep -q 'unique_subject = no' "$DIR/index.txt.attr"; then
 else
 	bad "index.txt.attr sagt nichts ueber unique_subject"
 fi
-# Der Pfad in der Konfiguration ist absolut: openssl loest ihn gegen das
-# Arbeitsverzeichnis auf, und dieses Skript wird von ueberall gestartet.
+# OpenSSL paths must work independently of the caller's directory.
 if grep -qE '^database *= */' "$DIR/openssl.cnf"; then
 	ok "die openssl.cnf traegt absolute Pfade"
 else
@@ -102,7 +83,7 @@ else
 	bad "die Zeile von a ist kein V" "$(cat "$DIR/index.txt")"
 fi
 
-# --- der Widerruf ueber die Datei ------------------------------------------
+# Revoke by certificate path.
 "$CA" --dir "$DIR" --revoke "$DIR/system-node-a.crt" --reason keyCompromise --gencrl >/dev/null 2>&1
 if [ "$(state_of "$A_SERIAL")" = "R" ]; then
 	ok "--revoke <datei> macht aus dem V ein R"
@@ -111,13 +92,7 @@ else
 fi
 if [ -f "$DIR/crl.pem" ]; then ok "--gencrl schreibt crl.pem"; else bad "crl.pem fehlt"; fi
 
-# --- ein zweiter Widerruf ueber dieselbe Datei (Astra-Befund F13) ----------
-#
-# `retire`/`keys revoke --host` widerrufen mehrere Zertifikate eines Hosts
-# der Reihe nach und schreiben die Liste erst am Ende; ein Neustart nach
-# einem Teillauf widerruft dasselbe Zertifikat ein zweites Mal, ueber
-# dieselbe Datei. Das war vorher ein toter Lauf: openssl meldet "Already
-# revoked" mit einem Fehlerstatus, und das Skript nahm das als fatal.
+# Repeated path-based revocation must be idempotent.
 out="$("$CA" --dir "$DIR" --revoke "$DIR/system-node-a.crt" --reason keyCompromise 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ] && [ "$(state_of "$A_SERIAL")" = "R" ]; then
@@ -153,11 +128,7 @@ else
 	ok "nur das widerrufene Serial steht drin"
 fi
 
-# --- der zweite Rebuild verliert nichts (M0-Befund 7) -----------------------
-#
-# Die einzige Stelle, an der ein Widerruf ueberhaupt aufgeschrieben ist, ist
-# diese Zeile. Ein Rebuild, der den Index aus den *.crt neu schreibt, nimmt
-# jeden Widerruf zurueck — und niemand saehe es.
+# Rebuilding the index must preserve revocations while adding new certificates.
 "$CA" --dir "$DIR" --node c >/dev/null 2>&1
 "$CA" --dir "$DIR" --index-rebuild >/dev/null 2>&1
 if [ "$(state_of "$A_SERIAL")" = "R" ]; then
@@ -171,12 +142,7 @@ else
 	bad "der Rebuild hat $(rows) Zeilen statt 6" "$(cat "$DIR/index.txt")"
 fi
 
-# --- der Widerruf ueber das Serial -----------------------------------------
-#
-# Ein reinstallierter Host laesst kein Zertifikat zurueck, nur eine Nummer in
-# einem Beleg. Und die drei Schreibweisen dieser Nummer in diesem Stack sind
-# openssl (gross, ohne Trenner), x509-parser (klein, mit Doppelpunkten — was
-# ein Controller in seinen Beleg schreibt) und was ein Mensch abtippt.
+# Accept serial representations used by OpenSSL and controller reports.
 lower_colon() { printf '%s' "$1" | tr 'A-Z' 'a-z' | sed 's/\(..\)/\1:/g; s/:$//'; }
 "$CA" --dir "$DIR" --revoke "$(lower_colon "$N1_SERIAL")" --reason superseded --gencrl >/dev/null 2>&1
 if [ "$(state_of "$N1_SERIAL")" = "R" ]; then
@@ -215,7 +181,7 @@ else
 	bad "--reason nonsense ging durch" "rc=$rc" "$out"
 fi
 
-# --- die Liste ohne Widerruf erneuern --------------------------------------
+# Refresh the CRL without adding a revocation.
 n1="$(openssl crl -in "$DIR/crl.pem" -noout -crlnumber | cut -d= -f2)"
 "$CA" --dir "$DIR" --gencrl >/dev/null 2>&1
 n2="$(openssl crl -in "$DIR/crl.pem" -noout -crlnumber | cut -d= -f2)"
@@ -230,16 +196,11 @@ else
 	bad "die erneuerte Liste hat einen Widerruf verloren" "$(crl_text)"
 fi
 
-# --- und was openssl selbst dazu sagt --------------------------------------
-#
-# Die Gegenprobe, die nichts von diesem Skript benutzt: `openssl verify
-# -crl_check` prueft die Kette UND die Liste.
+# Verify the chain and CRL with OpenSSL independently of helper state.
 verify() {
 	openssl verify -CAfile "$DIR/ca.crt" -CRLfile "$DIR/crl.pem" -crl_check "$1" 2>&1
 }
-# Die Ausgabe wird EINGESAMMELT und dann gelesen: `openssl verify` beendet
-# sich bei einem widerrufenen Zertifikat mit 2, und unter `pipefail` wuerde
-# eine Pipe daraus die Antwort verschlucken, auf die es hier ankommt.
+# Capture output before checking it; revoked certificates return a nonzero status.
 said="$(verify "$DIR/system-node-a.crt")"
 case "$said" in
 	*revoked*) ok "openssl verify -crl_check lehnt das widerrufene Zertifikat ab" ;;
@@ -256,13 +217,7 @@ case "$said" in
 	*) bad "das CSR-Zertifikat gilt trotz Widerruf" "$said" ;;
 esac
 
-# --- ein zweites --sign-csr fuer denselben Namen+Kind (Astra-Befund F12) ---
-#
-# `--out` ist nicht gesetzt, also IST `$out` `$kept` -- openssl's `-out`
-# ueberschreibt die Datei, bevor das Skript ueberhaupt zum `cp` kommt. Vor
-# dem Fix verlor die zweite Ausstellung damit die einzige Kopie der ersten,
-# und mit ihr das Einzige, an dem `--index-rebuild` sie spaeter noch finden
-# konnte.
+# Reissuing the same name and kind must retain both serials for later revocation.
 openssl genpkey -quiet -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 \
 	-out "$T/re1.key" 2>/dev/null
 openssl req -new -key "$T/re1.key" -out "$T/re1.csr" -subj "/CN=egal" 2>/dev/null
@@ -306,7 +261,7 @@ else
 	bad "das zweite Serial ist nicht widerrufbar" "rc=$rc" "$out"
 fi
 
-# --- der alte Weg lebt ------------------------------------------------------
+# Keep the direct identity-generation path covered.
 "$CA" --dir "$DIR" --node d >/dev/null 2>&1
 if [ -f "$DIR/system-node-d.crt" ] && [ -f "$DIR/bundle/system-node-d.md" ]; then
 	ok "der bestehende Weg (--node) ist unveraendert"

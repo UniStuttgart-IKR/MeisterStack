@@ -2,31 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Placement: what the candidate list is, what a preview would decide, and
-//! the binding itself. Moved out of `reconcile.rs` unchanged.
+//! Node candidates, placement previews, and compare-and-swap VM binding.
 
 use super::*;
 
-/// What is still free on one node: the allowance its reported capacity gives
-/// under the configured overcommit, minus everything already bound to it.
-///
-/// Both halves are things the controller already has in hand — the Node
-/// object and the VM listing this pass made anyway — which is why nothing is
-/// stored. A second copy of this number in etcd would be a number that can be
-/// wrong, and it would be wrong in the direction that fills a node.
-///
-/// Every phase counts, a Pending one included. A VM that has been bound and
-/// not yet started is a claim on this node, and leaving it out is how a node
-/// takes on twice its memory in one burst of creates.
-///
-/// What it does NOT count is a guest on its way here that is still bound to
-/// the machine it is leaving — a live migration's, for the length of the
-/// move. That claim is an object of its own and is taken off by
-/// `controller_api::hold`; see `CapacityReservationSpec` and Astra finding
-/// S07, 2026-09-23. `pub(crate)` for that reason: `migration::confirm` needs
-/// the room a node has BEFORE any promise, which is exactly this number, and
-/// a second function computing it beside this one is two answers to one
-/// question.
+/// CPU and memory allowance after subtracting every bound VM, including Pending VMs.
+/// Migration destination reservations are subtracted separately by `hold`.
+/// Device claims remain in the capability catalogue; this does not account for GPU use.
 pub(crate) fn free_on(
     node: &str,
     capacity: &controller_api::NodeCapacity,
@@ -47,13 +29,8 @@ pub(crate) fn free_on(
         .minus(bound)
 }
 
-/// The label sets of the VMs already bound to `on` — what anti-affinity is
-/// measured against.
-///
-/// Every phase counts, exactly as `free_on` counts them: a VM that has been
-/// bound and not yet started is already there as far as "do not put these two
-/// together" is concerned, and skipping it is how two replicas land on one
-/// machine in a single burst of creates.
+/// Labels of all VMs bound to this candidate, including VMs that have not started.
+/// Anti-affinity must account for reservations made earlier in the same pass.
 pub(super) fn hosted_on(
     on: &str,
     vms: &[Vm],
@@ -65,34 +42,15 @@ pub(super) fn hosted_on(
         .collect()
 }
 
-/// The condition TYPES of a node, in the order it reported them.
-///
-/// Types and not sentences: `Candidate::unhealthy` is read as a set and
-/// printed as a column, and the sentence belongs on the object where an
-/// operator reads it with `node get`.
+/// Condition types used by candidate health checks and diagnostics.
 pub(crate) fn condition_types(conditions: &[controller_api::NodeCondition]) -> Vec<String> {
     conditions.iter().map(|c| c.type_.clone()).collect()
 }
 
-/// The candidate list as a PREVIEW sees it: read-only, and from the shared
-/// facts rather than from this replica's own.
-///
-/// `expire_and_collect_nodes` below cannot serve `?dryRun=All`, and the
-/// reason is in its name: it WRITES — a node whose heartbeat has run out is
-/// marked not-ready as a side effect of being counted. A request that asked
-/// to be shown something must not change the fleet's opinion of a machine.
-///
-/// Two differences from the pass's list, and both are deliberate:
-///
-///   * `connected` comes from `status.ready`, which is in etcd and is
-///     therefore the CLUSTER's word, rather than from this process's session
-///     set. A preview answers "what would this cluster do", and which replica
-///     happens to hold a node's session is not part of that question — asking
-///     it would make the same preview come out differently depending on which
-///     replica a client's request landed on.
-///   * an expired heartbeat is read as not-ready here without the object
-///     being changed, so the preview and the next pass agree about the node
-///     even though only one of them writes it down.
+/// Build candidates without changing readiness or reserving capacity.
+/// Readiness comes from shared status and heartbeat age, independent of which
+/// replica owns a session. Unlike live placement, this path uses `schedulable`
+/// without applying the node drain flag.
 pub(crate) async fn candidates_for_preview(
     store: &EtcdStore,
     overcommit: Overcommit,
@@ -138,22 +96,9 @@ pub(crate) async fn candidates_for_preview(
     Ok(out)
 }
 
-/// Expire stale heartbeats and hand the scheduler what is left. Both halves
-/// read the same Node objects, so a node that just expired cannot still be
-/// scheduled onto in the same pass.
-///
-/// Expiry is every replica's business, not just the owner's: the heartbeat it
-/// judges was written to the shared store by whichever replica holds the
-/// session, and the verdict — `ready = false` — is idempotent under CAS, so
-/// two replicas reaching it at once cost one redundant write and nothing else.
-/// `connected` stays strictly local, though: a node with a live session
-/// *somewhere* is still not a node this replica can send anything to.
-///
-/// `held` is what the fleet has promised to guests that are on their way but
-/// not yet bound — a live migration's destination, and nothing else. It is
-/// read by the caller rather than here, because the same listing is what the
-/// reaper walks one step later in the same pass, and two readings of it could
-/// disagree about which promises are standing.
+/// Expire shared heartbeats and build candidates from the same node listing.
+/// `alive` reflects shared readiness; `connected` also requires a local session.
+/// Subtract the caller's reservation snapshot, which is also used by the reaper.
 pub(super) async fn expire_and_collect_nodes(
     store: &EtcdStore,
     sessions: &HashSet<String>,
@@ -277,26 +222,12 @@ pub(super) async fn expire_and_collect_nodes(
     Ok((out, localities))
 }
 
-/// What every node in this cluster said about every volume backend it runs,
-/// by node name and then by backend name.
-///
-/// Built once per pass out of the same listing the candidates come from, so
-/// that deriving a pool's locality costs no second read of the inventory.
+/// Backend localities indexed by node and driver, from this pass's node listing.
 pub(super) type NodeLocalities = BTreeMap<String, BTreeMap<String, Locality>>;
 
-/// Bind an unbound VM to a node, or leave it Pending for the next pass.
-/// What the scheduler would say about a VM that does not exist yet — the
-/// `?dryRun=All` half of `POST /vms`.
-///
-/// The same three steps `place` takes, in the same order and through the same
-/// functions: resolve the volumes, narrow by them, ask `decide`. What it does
-/// NOT do is the fourth — spend, and write. So the sentence is true of the
-/// cluster as it stands and is not a reservation: two previews in the same
-/// second both say "would place on agent-1", and only a create takes it.
-///
-/// `status.message` is where it goes, because that is where the reason a real
-/// VM is Pending already goes. A UI showing a model's suggestion reads one
-/// field either way.
+/// Preview volume resolution and scheduling without spending capacity or binding.
+/// A preview is advisory: concurrent creates and per-VM refusal history may change
+/// the eventual placement.
 pub(crate) async fn would_place(
     store: &EtcdStore,
     scheduler: &dyn controller_api::Scheduler,
@@ -330,20 +261,9 @@ pub(crate) async fn would_place(
     )
 }
 
-/// Which node, or why none — over a candidate list somebody else owns.
-///
-/// Pulled out of `place` when `?dryRun=All` arrived, and pulled out rather
-/// than copied for the obvious reason: a preview that answered this question
-/// its own way would be a preview of a different scheduler. The pass calls it
-/// under the lock and spends what it returns; the preview calls it over a
-/// list nobody is spending from, and neither has an opinion of its own.
-///
-/// `allowed` is the volume-narrowed list and `local` is the preference inside
-/// it — both computed by the caller, because the pass computes them from a
-/// borrowed lock guard.
-///
-/// `Err` carries how many candidates were known and the sentence-with-category
-/// for the object.
+/// Select a node from volume-compatible candidates, preferring nodes with the data.
+/// The preview and live placement share this decision. On failure, return the
+/// candidate count and a reason derived from the candidates actually considered.
 pub(super) fn decide(
     scheduler: &dyn controller_api::Scheduler,
     vm: &Vm,
@@ -386,16 +306,8 @@ pub(super) fn decide(
     }
 }
 
-/// Whose machines these are, widened from "mine" to "the fleet's".
-///
-/// `Candidate::connected` is this replica's own reach — a session in THIS
-/// process — because that is what decides who may command a machine. Whether
-/// a machine EXISTS and is being held at all is a different question, and the
-/// Node object answers it: `status.ready` and a `sessionEndpoint` mean some
-/// replica has it. The same evidence `migration.rs::reaches` reads, and it is
-/// only ever widening — a machine this replica can reach stays reachable
-/// whatever the object says, so a stale endpoint cannot take a session away
-/// from the replica that holds it.
+/// Include ready nodes whose sessions belong to another controller replica.
+/// A local session remains reachable even if its stored endpoint is stale.
 pub(crate) fn widen_to_fleet(fleet: &mut [Candidate], nodes: &[Node]) {
     for candidate in fleet.iter_mut() {
         candidate.connected = candidate.connected
@@ -407,18 +319,8 @@ pub(crate) fn widen_to_fleet(fleet: &mut [Candidate], nodes: &[Node]) {
     }
 }
 
-/// The same decision, asked of the whole FLEET instead of this replica.
-///
-/// `None` means somebody else can take this VM, so this replica must say
-/// nothing: the machine is real, its session hangs off a sibling, and that
-/// sibling's next pass will place it. `Some(sentence)` means nobody anywhere
-/// can, and then every replica derives the same sentence out of the same
-/// store — which is what makes it worth writing on the object at all.
-///
-/// The widening is `Node.status.sessionEndpoint`, exactly the evidence
-/// `migration.rs::reaches` reads and for the same reason: a node object that
-/// names a session endpoint is a node SOME replica is holding. Nothing is
-/// spent here and nothing is bound — this only decides whether to speak.
+/// Suppress a local scheduling failure when another replica could place the VM.
+/// Only a fleet-wide failure is published on the VM; this check reserves nothing.
 async fn fleet_verdict(
     p: &Pass<'_>,
     vm: &Vm,
@@ -601,17 +503,8 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The nodes whose refusal of this VM is still standing at `now`.
-///
-/// Expiry rather than for ever, and the reason is the shape of the fact: a
-/// node says `CannotServe` because of how it is CONFIGURED, and a
-/// configuration changes. An operator who installs the driver or rolls out
-/// the agent should get their node back as a candidate without having to
-/// clear a field nobody told them about.
-///
-/// A refusal that has expired is simply not counted; it is not swept, because
-/// the next create either succeeds — and nothing looks at the list again — or
-/// is refused, which overwrites the entry.
+/// Nodes whose configuration refusal has not expired.
+/// Expired entries remain recorded but no longer exclude a node from placement.
 pub(super) fn refusing_now(vm: &Vm, now: DateTime<Utc>) -> Vec<String> {
     vm.status
         .refused_by
@@ -630,13 +523,9 @@ pub(super) enum Bindings {
     NotReady(String),
 }
 
-/// Resolve the `Volume` objects a VM refers to into what the scheduler needs.
-///
-/// Two objects per volume: the volume for `status.node`, and its pool for the
-/// locality and the wiring. Both are read here rather than passed in because
-/// this is the only place that knows which volumes a given VM names, and a
-/// VM with no references — every VM before this milestone — reads nothing at
-/// all.
+/// Resolve referenced volume placement and pool locality.
+/// Missing or unready volumes delay placement. A missing pool leaves locality
+/// unknown, so the scheduler can only apply a preference.
 pub(super) async fn volume_bindings(store: &EtcdStore, vm: &Vm) -> anyhow::Result<Bindings> {
     let names = vm.spec.referenced_volumes();
     if names.is_empty() {
@@ -686,14 +575,8 @@ pub(super) async fn volume_bindings(store: &EtcdStore, vm: &Vm) -> anyhow::Resul
     Ok(Bindings::Ready(bindings))
 }
 
-/// Say WHY on the VM, and only when it changed.
-///
-/// Lifted out of `place` because there are two callers now: the scheduler
-/// finding no node, and a volume that is not ready yet. Both write the same
-/// two fields and record the same event, and both must do it only on a
-/// CHANGE — a level-triggered pass reaches the same conclusion every five
-/// seconds, and an event per pass is a store filling at one write per VM per
-/// tick.
+/// Record a changed placement reason and emit one scheduling failure event.
+/// The placement fact does not overwrite an existing observation of a running VM.
 pub(super) async fn note_vm_pending(
     p: &Pass<'_>,
     vm: &Vm,

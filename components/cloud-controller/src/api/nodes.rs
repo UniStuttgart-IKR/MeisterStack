@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! A cluster's nodes, read here and drained here — the one write on this tier that goes down a session instead of into this store.
+//! Project reported cluster nodes into API objects and forward node patches to the
+//! cluster session holder. This tier stores no Node resources.
 
 use super::*;
 
@@ -18,31 +19,9 @@ use super::*;
 // here writes into `status.nodes`: intent travels down, evidence travels up,
 // and that is the rule of the whole stack rather than a detail of this route.
 
-/// One reported node, in the envelope the `Node` kind wears one tier down.
-///
-/// The stored `NodeSummary` is flat because it is a report, and this is what
-/// makes it an API object: spec is what an operator decided and status is
-/// what the agent said, exactly as the Node object at the cluster splits
-/// them. So one `meister node ls` renders both endpoints and `-o json` reads
-/// the same at either — which is the whole point of there being one CLI.
-///
-/// What it does not carry is a uid, a resourceVersion or a heartbeat. It is
-/// evidence, and evidence has no version to compare against; a write goes
-/// down the session as intent, never as a PUT of this document.
-///
-/// `spec.drain` travels because it is what an operator asked for from HERE.
-/// It was missing (chaos B-C3): a `node drain` sent from the cloud landed,
-/// the cluster carried it out, and the cloud's own document of that node did
-/// not say so — so `node ls` up here showed no drain column at all and the
-/// person who started the drain had to go one tier down to see it.
-///
-/// `status.draining` is the evidence half beside it — how many guests have
-/// left, how many are still going, what is staying and why. It travels on
-/// `proto::NodeReport` and lands in `NodeSummary`; here it is written only
-/// when there is one, so the document of a machine nobody is emptying reads
-/// exactly as it always did. The CLI needs nothing for it: `cluster.rs::
-/// node_row` already renders this field for the tier below, and the two
-/// documents are meant to read alike.
+/// Render a NodeSummary in the cluster Node envelope. It carries reported facts,
+/// not a UID, resource version or heartbeat suitable for a conditional PUT. Empty
+/// optional fields retain the cluster API’s omission behavior.
 pub(super) fn as_node_object(n: &controller_api::NodeSummary) -> serde_json::Value {
     let mut object = json!({
         "apiVersion": API_VERSION,
@@ -113,9 +92,7 @@ pub(super) async fn list_cluster_nodes(
     })))
 }
 
-/// One of them. 404 when the cluster has never named it — which is also what
-/// a node that has left looks like, and the two are the same sentence at this
-/// distance.
+/// Read one reported node, or return 404 when the latest stored inventory omits it.
 pub(super) async fn get_cluster_node(
     State(st): State<ApiState>,
     Path((cluster, node)): Path<(String, String)>,
@@ -135,13 +112,8 @@ pub(super) async fn get_cluster_node(
         })
 }
 
-/// What a merge patch on a node is allowed to say up here.
-///
-/// Four fields, and deliberately only four: `schedulable` is the cordon,
-/// `drain` empties the machine, `labels` is what a vm's nodeSelector selects
-/// against, and `accepts` is what the machine takes. Everything else on a
-/// node is what the agent reported, and there is no writing that from
-/// anywhere.
+/// Allowed node intent: cordon, drain, labels and accepted workload classes.
+/// Reported node status cannot be patched here.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct NodePatch {
@@ -192,14 +164,8 @@ impl NodeSpecPatch {
     }
 }
 
-/// Drain or label one node of one cluster.
-///
-/// 202 and not 200, and the whole design is in that number: the cloud sends
-/// the command, the cluster applies it to its own object, and the evidence
-/// comes back with the next status a moment later. The body is the entry as
-/// it WILL look — what was asked for, applied to what is known — so that a
-/// script has something to read and a person sees what they asked for. The
-/// next `node ls` is where it becomes true.
+/// Forward node intent and return 202 with the projected result. The cluster writes
+/// the actual Node object; a later report updates this cloud’s stored view.
 pub(super) async fn patch_cluster_node(
     State(st): State<ApiState>,
     Path((cluster, node)): Path<(String, String)>,
@@ -317,14 +283,8 @@ pub(super) async fn patch_cluster_node(
     }
 }
 
-/// The sibling's answer, as this replica's own.
-///
-/// The status travels: a 404 for a node the cluster does not report is a 404
-/// wherever it was decided, and turning it into the 503 a read collapses
-/// everything into would tell a client to retry something that will never
-/// work. The body travels unopened for the reason `json_passthrough` gives —
-/// two tiers of deserialise-and-reserialise are two chances to change what
-/// the other replica said.
+/// Preserve the sibling’s HTTP status and parse its JSON response. Invalid JSON
+/// returns 502 naming the sibling endpoint.
 pub(super) fn forwarded_answer(
     endpoint: &str,
     answer: controller_api::forward::Answer,
@@ -339,13 +299,8 @@ pub(super) fn forwarded_answer(
     Ok((answer.status, Json(body)))
 }
 
-/// The patch, turned into the one command that carries it down and into the
-/// entry as it will read afterwards.
-///
-/// Its own function because it is the only part of the route with a decision
-/// in it, and the decision — a label with `null` becomes a `remove_labels`
-/// entry — is worth a test that does not need a session, a store or a second
-/// process.
+/// Convert a patch into a command and projected node summary. Null label values
+/// become removals; omitted fields leave existing intent unchanged.
 pub(super) fn node_update(
     node: &str,
     patch: NodePatch,

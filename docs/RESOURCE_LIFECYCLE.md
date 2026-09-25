@@ -1,6 +1,6 @@
 # Resource cleanup: ownership and incomplete work
 
-This document describes the cleanup guarantees implemented for overlays, local
+This document describes local cleanup checks implemented for overlays, local
 anti-spoofing rules and VM volumes. Migration has a separate
 [ownership and recovery contract](MIGRATION.md). These guarantees are local to an
 agent; they do not establish distributed fencing for shared storage.
@@ -114,3 +114,14 @@ redb files, explicit future polling for the lock ordering, and injected backend
 failures. Reopening a database tests process restart semantics, not power-loss
 durability. For thesis evaluation, report these limits separately from live network,
 VMM and storage experiments.
+
+## Remaining cleanup gaps
+
+The review found that some teardown paths continue to inline-volume deletion after
+failed detach or process termination. Adopted backend termination can acknowledge
+SIGTERM without waiting for exit. These paths must not be treated as proof that all
+writers stopped. Controller router inventory handling can also mistake undecodable
+records for absence and request removal; the local overlay guards above do not
+repair that upstream decision. See [agent](AGENT.md), [storage](STORAGE.md) and
+[networking](NETWORKING.md) for the affected mechanisms. No fixes to those paths
+are part of this documentation revision.

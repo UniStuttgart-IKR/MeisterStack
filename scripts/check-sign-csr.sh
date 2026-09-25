@@ -3,18 +3,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# MeisterStack — `tools/meister-ca --sign-csr` gegen echtes openssl
-#
-# Der CSR-Weg ist die Stelle, an der ein Zertifikat ueber einen Schluessel
-# ausgestellt wird, den diese Maschine nie gesehen hat. Was daran schiefgehen
-# kann, sieht man nur an einem echten Zertifikat: falsches Subjekt (die CA
-# uebernimmt die CN der Anfrage), falsche EKU (ein Client-Zertifikat, das auch
-# serverAuth kann), fehlende SANs, eine Anfrage ohne gueltige Signatur.
-#
-#   scripts/check-sign-csr.sh    # Exit 0 = alles wie beschrieben
-#
-# Alles passiert in einem mktemp -d: eine Wegwerf-CA, vier Anfragen, vier
-# Zertifikate. Kein Lab, kein echter CA-Schluessel, kein Netz, kein Root.
+# Exercise meister-ca CSR signing with temporary keys and OpenSSL.
+# Checks identity policy, key usage, SANs, signature rejection and retained certificates.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,7 +22,7 @@ command -v openssl >/dev/null || { printf 'openssl is not on PATH\n' >&2; exit 1
 
 DIR="$T/ca"
 
-# --- die Wegwerf-CA ---------------------------------------------------------
+# Create an isolated CA.
 "$CA" --dir "$DIR" >/dev/null 2>&1
 if [ -f "$DIR/ca.crt" ] && [ -f "$DIR/ca.key" ]; then
 	ok "eine CA ohne Identitaeten ist nur eine CA"
@@ -41,9 +31,7 @@ else
 	printf '\n%d ok, %d FAIL\n' "$pass" "$fail"; exit 1
 fi
 
-# --- eine Anfrage, wie sie meister-activate keygen erzeugt -------------------
-# Der Schluessel entsteht hier und bleibt hier: unten wird geprueft, dass das
-# Zertifikat zu ihm passt und dass die CA ihn nie hatte.
+# Generate the requester key locally; signing must not create a copy in the CA.
 mkcsr() {
 	local stem="$1" cn="$2"
 	openssl genpkey -quiet -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -87,7 +75,7 @@ case "$eku" in
 	*) ok "und serverAuth kann es nicht" ;;
 esac
 
-# Und der Schluessel, den die CA nie gesehen hat, passt trotzdem.
+# Check that the issued certificate matches the requester key.
 pub_crt="$(openssl x509 -in "$crt" -noout -pubkey 2>/dev/null)"
 pub_key="$(openssl pkey -in "$T/node.key" -pubout 2>/dev/null)"
 if [ "$pub_crt" = "$pub_key" ]; then
@@ -101,7 +89,7 @@ else
 	ok "--sign-csr hat keinen privaten Schluessel angelegt"
 fi
 
-# --- cluster und cloud ------------------------------------------------------
+# Check controller identity subjects.
 for kind in cluster cloud; do
 	mkcsr "$kind" "egal"
 	"$CA" --dir "$DIR" --sign-csr "$T/$kind.csr" --kind "$kind" --name cp >/dev/null 2>&1
@@ -112,7 +100,7 @@ for kind in cluster cloud; do
 	esac
 done
 
-# --- serving: SANs und beide EKU --------------------------------------------
+# Check serving identity, SANs and extended key usage.
 mkcsr serving "egal"
 "$CA" --dir "$DIR" --sign-csr "$T/serving.csr" --kind serving --name meister-box \
 	--san "meister-box,10.0.0.10" >/dev/null 2>&1
@@ -135,10 +123,7 @@ case "$eku" in
 	*) bad "serving: EKU falsch" "$eku" ;;
 esac
 
-# --- was abgelehnt wird -----------------------------------------------------
-# Eine Anfrage, deren Signatur nicht aufgeht, ist keine Anfrage: sonst koennte
-# jemand den oeffentlichen Schluessel eines anderen unter eigenem Namen
-# einreichen und sich fuer einen Schluessel verbuergen lassen, den er nicht hat.
+# Reject invalid signatures and incomplete or inappropriate arguments.
 sed 's/^\(.\{20\}\)A/\1B/; s/^\(.\{20\}\)B/\1A/' "$T/node.csr" > "$T/tampered.csr"
 if "$CA" --dir "$DIR" --sign-csr "$T/tampered.csr" --kind node --name evil >/dev/null 2>&1; then
 	bad "eine verfaelschte Anfrage wurde signiert"
@@ -168,9 +153,7 @@ else
 	ok "eine nicht vorhandene Anfrage wird abgelehnt"
 fi
 
-# --- additiv ----------------------------------------------------------------
-# Was M5A braucht: jedes ausgestellte Zertifikat bleibt liegen, damit
-# `--index-rebuild` es einliest (M0 S9).
+# Retain earlier issued certificates for indexing and revocation.
 count="$(find "$DIR/issued" -name '*.crt' | wc -l)"
 mkcsr node2 "egal"
 "$CA" --dir "$DIR" --sign-csr "$T/node2.csr" --kind node --name n2 >/dev/null 2>&1
@@ -181,7 +164,7 @@ else
 	bad "die Ablage ist nicht additiv" "$count -> $after"
 fi
 
-# --- die alten Pfade leben weiter -------------------------------------------
+# Keep the direct key-and-certificate path covered.
 "$CA" --dir "$DIR" --node alt --serving alt-host:10.0.0.9 >/dev/null 2>&1
 if [ -f "$DIR/system-node-alt.key" ] && [ -f "$DIR/system-node-alt.crt" ] && [ -f "$DIR/alt-host.crt" ]; then
 	ok "der Schluessel-und-Zertifikat-Weg (--node/--serving) ist unveraendert"

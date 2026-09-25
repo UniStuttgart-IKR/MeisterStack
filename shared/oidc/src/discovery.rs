@@ -2,13 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Where the provider keeps things, asked once, plus the task that keeps the
-//! keys current.
+//! OIDC discovery and background signing-key refresh.
 //!
-//! `KeySource` is the seam the brief asks for and the reason none of this
-//! needs a running identity provider to test: everything above it — the
-//! cache, the rate limit, the authenticator, the whole table of tokens that
-//! must be refused — talks to a trait, and the test hands it a document.
+//! [`KeySource`] separates document retrieval from cache and verification logic,
+//! allowing those paths to be tested without a live provider.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};

@@ -2,22 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The device authorization grant, RFC 8628 — how a person logs in from a
-//! terminal.
+//! OIDC device authorization and refresh grants for terminal login.
 //!
-//! The alternative was the authorization code flow with a redirect back to
-//! `localhost`, and it was rejected for a practical reason rather than a
-//! security one: this CLI is most often run over ssh on a machine with no
-//! browser, and a redirect to that machine's `localhost` goes nowhere the
-//! person can see. The device flow prints a code and a url instead, and the
-//! browser can be on any device in the room.
-//!
-//! What comes back is a short-lived access token and, if the provider was
-//! asked for offline access, a refresh token. Both matter. An access token
-//! measured in minutes with no way to renew it means a person logs in again
-//! every time they run two commands, which is not what they will do — they
-//! will use the static bearer token instead, and the whole exercise will
-//! have made things worse.
+//! The device flow provides a URL and code that can be opened on another
+//! machine, including when the CLI runs over SSH. A provider may also return a
+//! refresh token for renewing short-lived access tokens.
 
 use std::path::Path;
 use std::time::Duration;

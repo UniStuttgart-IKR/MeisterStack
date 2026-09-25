@@ -2,20 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Reading a peer's VM list against the VMs this tier stores.
+//! Match peer VM reports to stored objects by UID and placement.
 //!
-//! Both tiers do this with every status that arrives: the agent tells its
-//! cluster the phase of each VM on the node, the cluster tells the cloud the
-//! phase of each VM it holds for it, and both times the peer speaks uids while
-//! the store is keyed by name — so the reported list doubles as the index.
-//!
-//! The rules are the same at both altitudes and live here: which stored VM a
-//! reported uid is, whether the peer that sent it may speak for that VM at
-//! all, whether the phase is one this control plane has, and whether anything
-//! actually changed. What is NOT here is what each tier does with the answer:
-//! an uid nobody knows is a debug line one floor down and a warning one floor
-//! up, and where an observed phase is filed differs too. Those are decisions
-//! about the tier, so they stay at the tier — see `Observation`.
+//! Reject reports from a peer that does not own the binding, decode phases and
+//! identify changes. Each controller tier decides how to persist or log the
+//! resulting observation.
 
 use std::collections::HashMap;
 
@@ -54,25 +45,10 @@ pub fn is_current(
     }
 }
 
-/// A VM's address list with the taps a peer just reported in it.
-///
-/// Here for the reason the rest of this module is: both tiers apply it, and
-/// the two must agree exactly. The agent tells its cluster which taps it made
-/// and the cluster tells the cloud the same thing off the object it wrote —
-/// one rule, one place.
-///
-/// **An empty `reported` is not an answer and clears nothing.** A peer that
-/// names no tap is a peer from before the field, and reading it as "this VM
-/// has no addresses" would blank a working VM's list the moment an old binary
-/// reconnected. A peer that names some replaces the MAC lines wholesale,
-/// which is what makes a tap that has gone away drop out on its own.
-///
-/// Everything that is not a MAC line is kept untouched, because it belongs to
-/// another writer — the cloud's floating addresses are the one there is. And
-/// the MAC lines come FIRST, which is not cosmetic: the floating pass keeps
-/// what it does not own and appends its own after it, so two passes that
-/// agreed on the content and disagreed on the order would each read the
-/// other's document as a change and rewrite it every ten seconds, for ever.
+/// Replace reported MAC entries while preserving addresses owned by other
+/// writers. An empty report clears nothing for compatibility with older peers.
+/// MAC entries come first so this writer and the floating-address reconciler
+/// agree on order and avoid repeated no-op updates.
 pub fn addresses_with(current: &[VmAddress], reported: &[proto::NicReport]) -> Vec<VmAddress> {
     if reported.is_empty() {
         return current.to_vec();

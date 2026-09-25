@@ -2,44 +2,15 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Who the VMM and its backends run as, when that is not the agent.
+//! Resolve the account used by VMMs and vhost-user backends.
 //!
-//! Stufe 3 of `design/privilege-separation.md`, and the shape every stack
-//! that does this has: one privileged process prepares — taps, cgroups,
-//! device nodes, volumes — and the process that runs guest code has nothing.
-//! libvirt changes uid "immediately before executing the QEMU binary", Incus
-//! hands QEMU `-run-with user=`, Firecracker's jailer `setuid`s before
-//! `exec`, Kata gives the VMM a `kata-<n>` user. This type is the value all
-//! four of those need: a resolved uid and gid, resolved ONCE at start-up
-//! rather than at every spawn.
+//! Resolve the UID, primary GID and supplementary groups at startup, before VM
+//! creation. Backends that map guest memory share the VMM's trust boundary and
+//! must drop privileges too.
 //!
-//! **Resolved once on purpose.** A name is looked up in `/etc/passwd` (or
-//! wherever NSS points), and a node whose `vmm_user` does not exist must fail
-//! at start-up with a sentence naming the user — not at the first VM, with an
-//! errno, in front of somebody trying to boot a guest.
-//!
-//! # The backends are not outside this
-//!
-//! `nvrm`, `input` and `crosvm-gpu` run as this user too, and that is not
-//! thoroughness. A vhost-user backend has the guest's memory mapped and CH
-//! says so itself ("Cloud Hypervisor gives vhost-user devices complete
-//! control over the guest"); QEMU's own security document is blunter: "There
-//! is not considered to be security boundary between QEMU and the vhost-user
-//! & vfio-user backends." An unprivileged VMM beside a root backend is a root
-//! VMM with extra steps.
-//!
-//! # What this user must NOT be in
-//!
-//! The agent's own group. The agent's socket is `0660` with
-//! `[paths] socket_group`, and whoever can reach that socket can name image
-//! paths, virtiofs shares and devices — on a node whose agent is privileged
-//! that is the whole machine. Stufe 3 only buys anything if the VMM cannot
-//! open it, so `meister-vmm` stays out of `meister`.
-//!
-//! The consequence runs the other way instead: the files the VMM makes belong
-//! to the VMM, so an agent that is NOT root has to be in the VMM's group to
-//! read them. That direction is safe — group membership is not symmetric —
-//! and it is the no-root lane's business to arrange.
+//! The VMM account must not belong to the group that can access the agent's
+//! control socket. An unprivileged agent may instead need membership in the VMM
+//! group to read files created by the VMM.
 
 use std::fmt;
 
@@ -104,30 +75,12 @@ impl VmmUser {
         })
     }
 
-    /// Become this user, in the child, between `fork` and `exec`.
+    /// Set child credentials between fork and exec: supplementary groups, then
+    /// GID, then UID. The retained groups provide access to devices such as KVM.
     ///
-    /// **Why this is not `Command::uid`/`Command::gid`.** Those do the right
-    /// thing in the wrong amount: std's own `do_exec` calls
-    /// `setgroups(0, NULL)` before `setuid` — "This will also trigger a call
-    /// to `setgroups(0, NULL)` in the child process if no groups have been
-    /// specified" — which is correct for the general case and fatal for this
-    /// one. It throws away `kvm`, `render`, `video` and `input`, and those
-    /// groups ARE the VMM's access to `/dev/kvm` and to every device it is
-    /// meant to have. A VMM without group `kvm` on a node whose `/dev/kvm`
-    /// is `0660` cannot start a guest at all.
-    ///
-    /// So the whole credential change happens here instead, in the one order
-    /// that cannot be undone: supplementary groups, then group, then user.
-    /// After `setuid` to a non-zero uid the process has no capability left to
-    /// widen anything it skipped.
-    ///
-    /// `Command::groups` would do this on the library's side, and it is
-    /// unstable (`setgroups`, rust-lang/rust#38527), which is why this is
-    /// here at all.
-    ///
-    /// Only syscalls, because this runs in the child of a `fork` in a process
-    /// with threads: nothing here allocates, opens a file or takes a lock.
-    /// The group list was resolved at start-up for exactly that reason.
+    /// Only syscalls are permitted here: the multithreaded parent may have held
+    /// locks at fork. Resolve groups before spawning; do not allocate or lock in
+    /// this hook.
     pub fn switch_to(&self) -> std::io::Result<()> {
         let groups: Vec<libc::gid_t> = self.groups.iter().map(|g| *g as libc::gid_t).collect();
         // SAFETY: three FFI calls with a slice this function owns and scalars.

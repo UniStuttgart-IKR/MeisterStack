@@ -2,19 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `secrets` resource: a tenant's own bytes, sealed before they reach
-//! etcd and never handed back.
-//!
-//! Two rules run through every handler here, and they are the whole feature:
-//!
-//!   * **Nothing is stored in the clear.** The seal happens between the
-//!     validation and the write, in this file, so there is no code path that
-//!     reaches the store with a plaintext value. Without a key there is no
-//!     path at all — `POST` answers 501 rather than storing what it could not
-//!     seal, because a `Secret` in plaintext would be `user_data` with a new
-//!     name (feature catalogue, fourth sharpening).
-//!   * **Nothing comes back out.** `Secret::redacted` is what every read
-//!     goes through, and a read answers with `spec.keys`.
+//! Tenant secret CRUD. Values are sealed before storage and omitted from all
+//! API responses. Dispatch resolves them separately for agents.
 
 use super::*;
 
@@ -57,11 +46,7 @@ pub(super) async fn get_secret(
     Ok(Json(secret.redacted()))
 }
 
-/// The key this cloud seals with, or the 501 that says what is missing.
-///
-/// A refusal and not a silent plaintext write, which is the decision this
-/// whole resource turns on. 501 rather than 503: it is not a thing that comes
-/// back on its own, and the sentence names the file and the tier.
+/// Require the configured sealing key; absence returns 501 without storing plaintext.
 fn sealer(st: &ApiState) -> Result<&controller_api::secrets::Kek, ApiError> {
     st.kek.as_deref().ok_or_else(|| {
         ApiError::new(
@@ -163,17 +148,8 @@ pub(super) async fn create_secret(
     Ok((StatusCode::CREATED, Json(created.redacted())))
 }
 
-/// A secret's spec is REPLACED, whole.
-///
-/// No mutability table and no `check_owned` here, and that is not an omission:
-/// there is nothing on this spec a client may keep. `spec.data` is write-only,
-/// so a PUT cannot round-trip the object it read — it does not have it — and a
-/// merge would leave whoever sent it unable to say "this key goes". Whole
-/// replacement is the only rule that can be stated to a client that can never
-/// see what is there.
-///
-/// `spec.tenant` is the exception and is server-owned: whose a secret is, is
-/// decided once.
+/// Replace every secret value. Reads are redacted, so PUT requires the complete
+/// plaintext key set; tenant ownership remains unchanged.
 pub(super) async fn update_secret(
     State(st): State<ApiState>,
     Path(name): Path<String>,

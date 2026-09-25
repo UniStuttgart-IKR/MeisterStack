@@ -1,105 +1,51 @@
-> [!IMPORTANT]
-> At the moment MeisterStack is active coursework and in proof-of-concept phase. Feature requests and bug-fixes do not have high priority.
-
 # MeisterStack
 
-MeisterStack is a lightweight Infrastructure-as-a-Service (IaaS) tool that enables the user to mange
-virtual machines, block-storage and networking resources across multiple machines in multiple clusters.
-Its goal is to enable small labs and research clusters with a cloud-like experience. It's architecture
-is inspired by Kubernetes, Oakestra and OpenStack.
-For a list of already supported and planned features read the [docs](docs/FEATURES.md).
+MeisterStack orchestrates virtual machines, storage and networks across lab and
+research clusters. A cloud controller manages tenants and cluster placement;
+cluster controllers schedule nodes; agents manage local Linux resources and VMMs.
+The project is research software in the alpha stage.
 
-MeisterStack supports sharing NVIDIA GPUs with its `nvrm` driver that utilizes [Project Leandro](https://github.com/UniStuttgart-IKR/Leandro).
+The runtime is written in Rust. Drivers are compiled into the agent and configured
+at startup. Supported paths include Cloud Hypervisor, Linux networking, local and
+shared storage, PCI passthrough and NVIDIA GPU sharing through Project Leandro.
+Feature availability depends on the build, host and driver configuration.
 
-> [!WARNING]
-> The project is at the moment considered in `ALPHA` stage, [most features are proven in the lab]("docs/FEATURES.md") but to reach
-> `BETA`, long-term tests and support for Linstor and Vitastor is planned to support SDS solutions.
-> This project heavily used [AI for implementation and testing]("docs/AI_GUIDELINES.md"), when the project reaches `BETA` stage the generated
-> code will be fully reviewed!
+## Start here
 
-## Quick Start
+- [Documentation index](docs/README.md): mechanisms, operation and source map.
+- [Architecture](docs/ARCHITECTURE.md): ownership, data flow and component boundaries.
+- [Deployment](docs/DEPLOYMENT.md): runtime prerequisites and operating modes.
+- [CLI](docs/CLI.md) and [configuration](docs/CONFIGURATION.md).
+- [Migration](docs/MIGRATION.md): recovery contract and known implementation gaps.
+- [Testing](docs/TESTING.md): what each test layer establishes.
 
-Requirements:
+Build the runtime binaries from the locked workspace:
 
-
-Prerequisites:
-
-```bash
-./get_patched_binaries.sh
-cargo build
+```sh
+cargo build --locked -p meister-agent -p meister-cluster-controller \
+  -p meister-cloud-controller -p meister-cli
 ```
 
-Setup local etcd (one for both tiers):
+Use the [Nix development environment](docs/NIX.md) for the pinned host tools and
+build dependencies. Building the binaries does not provision a host or start a
+cluster. Review [deployment prerequisites](docs/DEPLOYMENT.md) before running an
+agent: it manages privileged processes, devices, storage and network interfaces.
 
-```bash
-etcd --data-dir /tmp/ms-dev/etcd --listen-client-urls http://127.0.0.1:2379 --advertise-client-urls http://127.0.0.1:2379
-```
+The controller APIs expose discovery through `meister api-resources`. Start with
+`meister --help`; use an explicit profile or endpoint for each operating mode.
+Example configuration is in [config/](config/README.md).
 
-Setup *cloud-tier*:
+## Project status
 
-```bash
-cp config/examples/cloud.toml /tmp/ms-dev/cloud.toml     # uses port 3000 and 50050
-target/debug/meister-cloud-controller --config /tmp/ms-dev/cloud.toml
-```
+The source contains deterministic tests and privileged integration tests. A passing
+unit suite does not establish hardware compatibility, safe recovery under every
+failure, or production readiness. Documentation distinguishes implemented behavior,
+design goals and unresolved limits; the migration receive path still has known
+timeout and restart gaps.
 
-Setup *cluster-tier*:
+`tools/meister-deploy` supplies deployment tooling. Its implementation is outside
+the current runtime review. No deployment was performed for this documentation.
 
-```bash
-cp config/examples/cluster.toml /tmp/ms-dev/cluster.toml    # uses port 3001 and 50051
-target/debug/meister-cluster-controller --config /tmp/ms-dev/cluster.toml
-```
-
-Setup *agent*:
-
-```bash
-sudo target/debug/meister-agent --config config/agent.dev.toml
-```
-*Note that the image `nixos.raw` has to sit in `../images` relative to the config.
-
-
-Create  *CLI-profiles*:
-
-CLI-profiles are files that hold an endpoint and the required credentials. This makes it more easy to specify to which layer you want to talk.
-For this example you can jsut use the `config/cli.dev.toml` or specify `--endpoint "http://127.0.0.1:3000" before each command.
-
-```bash
-cp config/cli.dev.toml ~/.config/meisterstack/config.toml
-```
-
-Use MeisterStack:
-
-```bash
-meister api-resources
-meister whoami
-
-meister node ls --cluster cluster-1   # the agent must show up here before a VM can land
-meister tenant create lab
-meister image create nixos.raw --source /absolute/path/to/images/nixos.raw
-meister vm create -t lab -f config/json/plain.json demo
-meister vm ls -t lab
-meister vm logs demo
-
-meister --endpoint http://127.0.0.1:3001 vm ls   # to talk to the cluster-level API
-```
-
-See [Deployment](docs/DEPLOYMENT.md) for further information. A special deployment tool `meister-deploy` is under active development.
-
-One machine with a card and no control plane — the agent and the CLI at its socket, for a local rig — is the single node, [Deployment §20](docs/DEPLOYMENT.md#20-single-node-cli--agent): a NixOS profile, or `scripts/meisterstack-install.sh` on any other Linux (which also puts the CLI alone on a laptop or a runner).
-
-## Architecture
-
-![Architecture](docs/diagrams/architecture.svg "Architecture of MeisterStack")
-
-MeisterStack is organized in three tiers. The *Agent* that runs locally on the hypervisor. The *Cluster-Controller* and the *Cloud-Controller*
-that act as two tiered, *etcd* backed control-plane. *Plugins* and *Drivers* allow to utilize traits and abstract capabilities on specific devices
-and adapt to other software stacks at compile time. The three tiers of the system communicate via *gRPC* and use an three-tiered, Kubernetes inspired
-reconcile mechanism to control the cloud.
-The control-plane supports high-availability on both levels, for the future it is planned to make the cluster-controller more modular to adapt more easy
-to already existing solutions for storage and networking like `OVN/OVS` and software defined storage of any kind.
-
-See the [docs](docs/ARCHITECTURE.md) for more detailed information.
-
-## License
-
-The project is opensource and under MIT License.
-
+MeisterStack is developed as a master's thesis project at the University of
+Stuttgart, IKR. See [acknowledgements](docs/ACKNOWLEDGEMENT.md) and
+[AI contribution guidance](docs/AI_GUIDELINES.md). Licensed under [MIT](LICENSE).

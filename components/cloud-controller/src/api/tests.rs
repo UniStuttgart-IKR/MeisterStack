@@ -2,9 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The cloud edge's router-contract tests, verbatim out of `mod.rs`. The
-//! module path is unchanged (`api::tests`), so every test still answers to
-//! the name it had before.
+//! Tests for src/api decisions and API contracts.
+//! Store-backed cases explicitly require etcd; value-level cases run without it.
 
 use super::*;
 

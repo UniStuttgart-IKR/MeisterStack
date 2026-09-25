@@ -2,23 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Planning a router and making it so: which machines may carry it, in what
-//! order, what it translates — and the seam a second backend goes behind.
+//! Router placement policy and the network backend interface.
 //!
-//! The split here is the one `scheduler` makes and it is worth naming,
-//! because the whole point of 6k's object model is that an OVN backend should
-//! be a translator rather than a rewrite. Everything above [`NetworkBackend`]
-//! is a DECISION and is backend-independent: which nodes claim the physnet,
-//! which of them accepts the class, which is active, which address the router
-//! holds, what the NAT rules are. Everything behind the trait is how that
-//! decision is CARRIED OUT — for `meister`, an `EnsureRouter` down each
-//! node's session; for an `ovn` backend that does not exist yet, a write into
-//! the northbound database and no commands at all.
-//!
-//! A plugin trait with one implementation wired in by hand is not a seam, it
-//! is a comment about one. So this resolves through the controller config
-//! (`network = "meister"`) exactly as `scheduler = "first-fit"` does, and a
-//! second backend is a new arm and a new line in a TOML file.
+//! Planning selects eligible gateway nodes, active placement, addresses and NAT
+//! rules. [`NetworkBackend`] applies that plan. The configured `meister` backend
+//! sends commands through agent sessions; other backends can implement the same
+//! interface.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -221,33 +210,11 @@ pub fn other_holders<'a>(name: &str, address: &str, routers: &'a [Router]) -> Ve
     holders
 }
 
-/// The whole of the external-address decision for one router, out of the
-/// listing as it stands.
+/// Choose whether a router keeps, acquires or yields its external address.
 ///
-/// Astra finding S09, 2026-09-23: this used to be two half-rules, one per
-/// tier. The cluster asked the question only while the address was still
-/// empty and, having written one, made only ITSELF give way and only to a
-/// lower name; the cloud asked nothing at all after writing. That leaves one
-/// interleaving in which a duplicate stands for ever: A and B both cut `.10`
-/// out of the same stale listing, B writes first and finds no conflict, A
-/// writes, sees B, and keeps `.10` because A sorts lower -- which is right --
-/// and B never looks again. Two routers then answer for one address on the
-/// provider wire, and the next `cut_external_addr` hands the next caller a
-/// third.
-///
-/// Two properties make the duplicate impossible instead of unlikely:
-///
-///   * the question is asked on EVERY pass, whether or not an address is
-///     already written, so the router that wrote first re-checks too, and
-///   * the rule is symmetric -- a router keeps the address only if its own
-///     name is the minimum of {itself} and everybody else holding it -- so
-///     out of any set of holders exactly one keeps it and every other one
-///     yields, at whatever pass each of them next runs.
-///
-/// Deterministic out of names alone, which is what lets leaderless replicas
-/// reach it without agreeing on anything, and level-triggered: a router that
-/// yielded simply has no address on the next pass and takes the next free
-/// one.
+/// Recheck on every pass, including after allocation. Among duplicate holders,
+/// only the lowest name keeps the address; the others yield and retry later.
+/// This deterministic rule repairs concurrent allocations from stale listings.
 pub fn claim_external_addr(
     router: &Router,
     network: &ProviderNetwork,
@@ -314,37 +281,14 @@ pub async fn settle_external_addr(
     Ok(router)
 }
 
-/// The rules this router really carries, derived from what is stored.
+/// Derive ordered router rules from stored intent and allocations:
 ///
-/// Decision 5, and the derivation is the whole of it: an operator writes
-/// `snat: true` and points a floating address at a router, and what comes out
-/// is a list somebody can read next to the ruleset on the machine. Two kinds
-/// and no third:
+/// * `snat` when enabled, with empty logicalIp meaning the whole internal subnet.
+/// * `dnat_and_snat` for floating addresses with a router and internal address.
+/// * `routed` for announced prefixes, carried in logicalIp without translation.
 ///
-///   * `snat` — one rule, present exactly when `spec.snat` is true. Its
-///     `logicalIp` is deliberately EMPTY, which is what
-///     `proto::NatRule` spells as "the whole internal subnet": the subnet is
-///     the prefix of the router's own overlay address, the node has that
-///     address anyway, and a prefix written twice is a prefix that can
-///     disagree with itself.
-///   * `dnat_and_snat` — one per floating address that names this router AND
-///     says what it translates to. A reservation that names the router and no
-///     inside address yields nothing, on purpose: half a 1:1 rule is not a
-///     rule, and its absence from this list is the visible form of the
-///     question. See `FloatingIpSpec::internal_address`.
-///
-///   * `routed` — one per announced prefix, and it is not a translation at
-///     all. `proto::EnsureRouter` carries no field for the announcement, so
-///     this is the road it takes: the prefix in `logicalIp`, no `externalIp`,
-///     and the driver renders no rule for it and announces it instead. The
-///     agent side of 6k settled the spelling; see [`NatKind::Routed`].
-///
-/// Sorted within each kind, because this list is compared against the stored
-/// one to decide whether a write is worth making, and two passes that agreed
-/// on the content and disagreed on the order would rewrite the object every
-/// five seconds. The kinds keep their order — the masquerade, then the
-/// floating addresses, then the announcements — because that is the order
-/// somebody reads them in.
+/// Sort within each kind to keep repeated reconciliation from changing order.
+/// The kind order is SNAT, floating translations, then announcements.
 pub fn nat_rules(router: &Router, floating: &[FloatingIp], announced: &[String]) -> Vec<NatRule> {
     let external = router.status.external_addr.split('/').next().unwrap_or("");
     let mut rules = Vec::new();

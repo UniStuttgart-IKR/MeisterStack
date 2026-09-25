@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: MIT
-# The profiles of this fleet. A host gets the ones its inventory entry names.
-#
-# `leandro` is the GPU stack and is `null` unless flake.nix declares that
-# input. Only the GPU profile looks at it, and it configures no card when it
-# is not there — which is what lets a CPU-only fleet build without anybody's
-# home directory.
+# Map inventory profile names to host modules.
+# Only the GPU profile consumes the optional Leandro input.
 { lib, leandro ? null }:
 {
   base = import ./profiles/base.nix;

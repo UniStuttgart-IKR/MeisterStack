@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The discovery document: what this tier serves, under which verbs, with
-//! which subresources and which features. Moved out of `rest.rs` unchanged.
+//! Discovery for the resources, verbs, subresources and features of a tier.
 
 use super::*;
 

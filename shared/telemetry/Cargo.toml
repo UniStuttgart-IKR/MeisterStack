@@ -1,3 +1,4 @@
+# Logging, trace propagation and a separate Prometheus metrics listener.
 [package]
 name = "meister-telemetry"
 version.workspace = true
@@ -17,18 +18,10 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
-# The metrics half. `prometheus` carries the registry and the text exposition
-# format; `axum` and `tokio` are the listener that serves it, which is its own
-# port and never the tenant router (see `metrics::serve`).
 prometheus = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-# Only the test reads a log line back. The subscriber writes json through
-# tracing-subscriber's own "json" feature; nothing here parses one in
-# production, and nothing should.
 serde_json = { workspace = true }
-# The config key `log_format` is spelled in TOML on every node; the test that
-# says so reads it the same way the three roles do.
 toml = { workspace = true }

@@ -2,50 +2,25 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What an address range IS — in one place, for the three parties that have
-//! to agree on it.
+//! IPv4 range parsing shared by allocation and network enforcement.
 //!
-//! The cloud parses a floating pool's `cidrs` to hand out an address and to
-//! refuse an overlapping subnet; the node parses the same strings out of its
-//! own config to build the nftables set that guards them; and both of them
-//! have to mean exactly the same addresses by the same text, or a VM gets an
-//! address the node then drops its frames for. So the parser is here rather
-//! than in either crate, for the same reason `capability` is: the tier that
-//! WRITES the string and the tier that MATCHES against it are different
-//! crates, and this is what they share.
-
-//!
-//! IPv4 only, and that is a decision rather than an omission. A floating
-//! address is a scarce thing an operator hands out one at a time, which is
-//! what IPv4 is and what IPv6 deliberately is not — the v6 story is a routed
-//! prefix per tenant (Part B), not a pool of single addresses. When v6
-//! floating addresses do become a thing worth having, it is a second range
-//! type beside this one and not a widening of it: the arithmetic below fits
-//! in a u32 on purpose.
+//! CIDRs, individual addresses and inclusive address ranges must describe the
+//! same set in controller allocation and agent anti-spoofing rules. Allocation
+//! excludes network and broadcast addresses for CIDRs wider than /31; containment
+//! checks still include those addresses.
 
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
-/// A contiguous run of IPv4 addresses, inclusive at both ends.
-///
-/// Three spellings parse into it, and an operator uses all three: a CIDR
-/// (`10.255.0.0/16`), a single address (`203.0.113.7`, or `203.0.113.7/32`),
-/// and a bare range (`203.0.113.8-203.0.113.11`). Four scattered public
-/// addresses are one pool with four entries — which is the actual shape of
-/// the addresses a hoster gets, and the reason the field is a list of strings
-/// rather than one CIDR.
+/// An inclusive IPv4 range parsed from a CIDR, one address or `start-end`.
+/// A pool may contain several ranges for noncontiguous allocations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ipv4Range {
     start: u32,
     end: u32,
-    /// This range was written as a CIDR big enough to have a network and a
-    /// broadcast address, so allocation skips its first and last.
-    ///
-    /// Only allocation skips them. The GUARD covers them like every other
-    /// address in the range: an operator who wrote `10.255.0.0/16` meant that
-    /// no VM may source from anywhere in it, and a hole at `.0` would be a
-    /// hole somebody eventually walks through.
+    // CIDR network and broadcast addresses are excluded from allocation for
+    // prefixes shorter than /31. Containment checks still include them.
     edges_reserved: bool,
 }
 

@@ -2,58 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The gateway slot: a tenant router as a network namespace with two legs.
-//!
-//! ## The shape, and why it is this one
-//!
-//! A router is a box that is on two networks and on neither host. A network
-//! namespace is exactly that box: its own routing table, its own conntrack,
-//! its own nftables, its own addresses — so two tenants' routers on one node
-//! cannot see each other's routes, and neither of them can see the host's.
-//! One veth pair per leg carries it out of the namespace: one end in the
-//! namespace, the other enslaved to a bridge this node already has — the
-//! provider bridge for the outside, the tenant's overlay bridge for the
-//! inside.
-//!
-//! Nothing here is new machinery. The overlay bridge is M5's, the provider
-//! bridge is one `ensure` with an interface in it, and the NAT is `nft`
-//! reading a script on stdin exactly as the tap guard does. What 6k adds is
-//! where those pieces stand relative to each other.
-//!
-//! ## Active and standby are the same build
-//!
-//! Festlegung 7: HA is a BGP withdraw, so a standby has to be a router that
-//! is finished and silent rather than a router that is not there. Both nodes
-//! get the whole namespace, both legs, both addresses and every rule; the
-//! standby differs in two facts and nothing else —
-//!
-//! * it announces nothing (`RouterState::announce` is empty, and the
-//!   announcement pass hands the empty set to FRR), and
-//! * both its legs answer no ARP (`arp_ignore = 8`), so nothing on either
-//!   wire learns it is there.
-//!
-//! A failover is therefore one `EnsureRouter` with `active = true` on the
-//! standby, and no build at all. That is what makes it fast, and it is why
-//! `active` is a field of the spec rather than a command of its own.
-//!
-//! ## `ip netns` and not netlink
-//!
-//! The same trade this driver makes with `nft` and the FRR half makes with
-//! `vtysh`: `ip netns add` PINS the namespace under `/var/run/netns`, and
-//! that is what lets an operator standing at the node run
-//! `ip netns exec meister-rt-<id> ip a` and see what this code built. A
-//! netlink implementation would build the identical namespace and leave
-//! nobody a way to look into it.
-//!
-//! ## The record, and the sweep it makes possible
-//!
-//! One JSON file per router under `<run_dir>/routers`, holding the spec it
-//! was built from. It is in `run_dir` on purpose: a namespace lives in the
-//! kernel and dies with the machine, so a record that outlived a reboot would
-//! be a record of something that is gone. The two are lost together, which is
-//! the property the sweep needs — a namespace of ours with no record beside
-//! it is one a `kill -9` left half-built, and nothing else would ever remove
-//! it.
+//! Tenant routers implemented as network namespaces with provider and overlay veths.
+//! Active and standby routers both have addresses and NAT state; standby suppresses
+//! ARP replies and route announcements. This is not a distributed fencing mechanism.
+//! A JSON spec under run_dir identifies each router across agent restarts. Router
+//! listing skips unreadable records, while overlay ownership checks reject them.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -123,14 +76,7 @@ pub fn veth_internal(id: &RouterId) -> String {
     format!("rti{}", router_key(id))
 }
 
-/// A physnet name whose bridge would not fit in an interface name, refused in
-/// words.
-///
-/// `IFNAMSIZ` is 16 with the NUL, so a link name is 15 characters and
-/// `meister-px-` spends 11 of them. Four are left, which is enough for the
-/// names a provider network actually gets (`ext`, `dmz`, `wan`) and is worth
-/// saying out loud rather than discovering as a netlink `EINVAL` at start-up.
-/// The same check `check_overlay_name` makes for a VNI, for the same reason.
+/// Validate provider names against the 15-byte generated bridge-name limit.
 pub fn check_physnet_name(physnet: &str) -> networking::Result<()> {
     const MAX: usize = 15;
     if physnet.is_empty() {
@@ -159,11 +105,7 @@ pub fn check_physnet_name(physnet: &str) -> networking::Result<()> {
     Ok(())
 }
 
-/// What this driver wrote down about one router it built.
-///
-/// The spec and nothing derived from it: everything else — the namespace
-/// name, the link names, the prefixes to announce — is a function of the spec
-/// and would be a second truth if it were stored beside it.
+/// Record the spec used to construct a router; link names are derived from its ID.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct RouterRecord {
     spec: RouterSpec,
@@ -200,21 +142,7 @@ pub(crate) async fn overlay_vnis(dir: &Path) -> networking::Result<Vec<u32>> {
     Ok(vnis)
 }
 
-/// The prefixes an ACTIVE router asks the fabric to send it.
-///
-/// Its own function and not a loop inside the caller, for the reason
-/// `floating_prefixes` is one tier up: which addresses end up announced is the
-/// whole of the failover semantics, and it is worth asserting.
-///
-/// Three sorts, and the third is the only one that is not a host route:
-///
-/// * the router's own external address, which is what an `snat` rule hides a
-///   subnet behind,
-/// * every floating address it holds a 1:1 pair for, because that address
-///   lives on THIS router now and the fabric has to be told where,
-/// * the routed subnets, as prefixes. Festlegung 5: no NAT, and the prefix is
-///   announced by every active router of the subnet — stateless, so two of
-///   them announcing it is ECMP and not a conflict.
+/// Return an active router's external host route, floating host routes and routed prefixes.
 pub fn router_prefixes(spec: &RouterSpec) -> Vec<String> {
     if !spec.active {
         return Vec::new();
@@ -242,19 +170,7 @@ pub fn router_prefixes(spec: &RouterSpec) -> Vec<String> {
     out
 }
 
-/// Every address a router that has just become active has to shout about, in
-/// the order it shouts.
-///
-/// The router's own outside address first, then one per floating address —
-/// which is the same list `router_prefixes` announces to the fabric, minus the
-/// routed subnets. A routed subnet is reached through the fabric and its next
-/// hop is the outside address, so shouting about the outside address covers it
-/// too; a floating address is a /32 that answers ARP on the wire and has to be
-/// shouted about on its own.
-///
-/// Empty for a standby, and that is the whole of the safety: `arp_ignore = 8`
-/// makes a standby silent, and a standby that sent a gratuitous ARP would
-/// point every neighbour at a namespace that then answers nothing.
+/// Return external addresses for gratuitous ARP on activation. Standby returns none.
 pub fn garp_addresses(spec: &RouterSpec) -> Vec<String> {
     if !spec.active {
         return Vec::new();
@@ -267,18 +183,8 @@ pub fn garp_addresses(spec: &RouterSpec) -> Vec<String> {
     out
 }
 
-/// How one gratuitous ARP is spelled, as an operator would type it.
-///
-/// `-U` is iputils' unsolicited mode: the address is the SENDER of the ARP and
-/// no reply is expected, which is exactly "everyone please forget the MAC you
-/// have for this". Three of them, because ARP is on the wire and unacked, and
-/// `-w 1` so that a failover never waits on this — the data path is already
-/// live when it runs, the shout only shortens the neighbour's cache.
-///
-/// On the outside leg only. The inside leg is the tenant's default gateway and
-/// its address does not move between nodes: both nodes hold the same
-/// `internal_addr`, and the guests never see the MAC change because only one
-/// of the two ever answers.
+/// Build an unsolicited ARP command on the external leg.
+/// The internal leg receives no equivalent announcement here.
 pub fn garp_command<'a>(arping: &'a str, netns: &'a str, address: &'a str) -> Vec<&'a str> {
     vec![
         "netns",
@@ -296,11 +202,7 @@ pub fn garp_command<'a>(arping: &'a str, netns: &'a str, address: &'a str) -> Ve
     ]
 }
 
-/// The two sysctl values that decide whether a leg answers for itself.
-///
-/// `arp_ignore = 8` is "reply for no local address at all", which is what
-/// makes a standby silent on both wires without taking a link down — the
-/// namespace stays complete, so becoming active is a sysctl and not a build.
+/// Suppress replies for all local addresses when standby.
 fn arp_ignore(active: bool) -> &'static str {
     match active {
         true => "0",
@@ -343,25 +245,16 @@ impl crate::LinuxNetworkDriver {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    /// The same, for a step that is allowed to have happened already.
-    ///
-    /// `ip link add` on a link that is there says "File exists" and exits
-    /// non-zero, and a level-triggered ensure must not turn that into a
-    /// failure. Everything this is used for is checked afterwards by asking
-    /// whether the thing now exists, so a swallowed error that was NOT the
-    /// idempotent one still surfaces — one step later, and as the fact rather
-    /// than as the complaint.
+    /// Best-effort ip operation: all errors are logged and swallowed.
+    /// Callers must verify required postconditions separately; not every caller does.
     async fn ip_again(&self, args: &[&str]) {
         if let Err(e) = self.ip(args).await {
             debug!(error = %format!("{e:#}"), args = %args.join(" "), "ip step already done");
         }
     }
 
-    /// Are the rules in this namespace already the rules we would write?
-    ///
-    /// See the caller for why this exists. Conservative in the one direction
-    /// that matters: anything it cannot establish is a "no", and a "no" costs
-    /// one `nft -f` — which is what every pass did before this.
+    /// Compare the persisted spec's rendered rules and require the table to exist.
+    /// This does not compare the installed rules with the desired rules.
     async fn ruleset_is_current(&self, netns: &str, rules: &str, spec: &RouterSpec) -> bool {
         let dir = match self.gateway() {
             Ok(g) => &g.state_dir,
@@ -388,23 +281,8 @@ impl crate::LinuxNetworkDriver {
         .is_ok()
     }
 
-    /// A namespace that is listed and cannot be entered is a corpse: take the
-    /// name back.
-    ///
-    /// `ip netns add` PINS a namespace with a bind mount under `/run/netns`,
-    /// and what is left when the mount goes without the file is a zero-byte
-    /// regular file wearing the name. Everything then behaves as if the
-    /// namespace existed and nothing works in it: `add` says the name is
-    /// taken, `exec` and `ip -n` say "Invalid argument", and the router is
-    /// Failed on that machine for ever — level-triggered or not, every pass
-    /// re-derives the same broken state. Seen in the lab on 2026-09-10, where
-    /// the cause was the agent's own mount namespace (`MountFlags` in
-    /// nix/agent.nix); a hard reset of a machine can leave the same thing
-    /// behind, so the driver answers it rather than only the deployment.
-    ///
-    /// Only ever runs against a name that is UNUSABLE — a live namespace
-    /// answers `ip -n <ns> link show` and is left exactly alone, which is
-    /// what keeps this from being a router that rebuilds itself every pass.
+    /// Delete a listed namespace when link inspection fails.
+    /// The current probe does not distinguish an invalid namespace from a transient error.
     async fn clear_dead_netns(&self, netns: &str) {
         if self.ip(&["-n", netns, "-o", "link", "show"]).await.is_ok() {
             return;
@@ -472,27 +350,8 @@ impl crate::LinuxNetworkDriver {
         )))
     }
 
-    /// The shout a router gives when it has just become the active one.
-    ///
-    /// Measured on manacor on 2026-09-10: a planned failover moved the control
-    /// plane in 4,4 s, the router's own address came back after 0,21 s — one
-    /// probe interval — and the floating address after **5,20 s**. The whole
-    /// of that difference is one neighbour's ARP cache. `arp_ignore` stops the
-    /// old node ANSWERING, it does not tell anyone who has already asked, so a
-    /// warm entry keeps pointing at the node that fell silent until it ages
-    /// out. A gratuitous ARP is the sentence that was missing: the new active
-    /// node says the address is at ITS MAC, unasked, and the neighbour
-    /// overwrites the entry it has.
-    ///
-    /// Best effort throughout, and deliberately: the data path is already live
-    /// when this runs — `arp_ignore` is 0, the addresses are on the leg and
-    /// the rules are in place — so a node without `arping` loses the 5 seconds
-    /// back and nothing else. It must never turn a completed failover into a
-    /// failed one.
-    ///
-    /// Every address is spawned before any is waited on, so the whole shout
-    /// costs the one second of `-w 1` no matter how many floating addresses a
-    /// router carries.
+    /// Send external gratuitous ARPs after activation, with best-effort error handling.
+    /// Children start before waiting; arping supplies its own requested deadline.
     async fn announce_garp(&self, netns: &str, spec: &RouterSpec) {
         let addresses = garp_addresses(spec);
         let Ok(g) = self.gateway() else {
@@ -530,12 +389,7 @@ impl crate::LinuxNetworkDriver {
         }
     }
 
-    /// The namespaces of ours that exist right now.
-    ///
-    /// Read off `ip netns list` and not off the records, because the ones this
-    /// is about are precisely the ones no record names. What marks a namespace
-    /// as ours is its name, which is also what keeps the sweep off every other
-    /// namespace on the node.
+    /// List namespace names with this driver's prefix.
     async fn netns_present(&self) -> networking::Result<Vec<String>> {
         Ok(self
             .ip(&["netns", "list"])
@@ -609,12 +463,7 @@ impl crate::LinuxNetworkDriver {
                  {name:?}, and this node has no such interface"
             ))
         })?;
-        // The one refusal that is a REFUSAL and not a repair. An address here
-        // is somebody still using this interface — a management address, a
-        // leftover from DHCP — and a router put on it would answer for a
-        // network the host is also on, which is exactly the confusion the
-        // "give an interface away" rule exists to prevent. The operator has to
-        // decide, so this node does not come up.
+        // Refuse a provider interface carrying a non-link-local host address.
         let addresses = self.global_addresses(index).await?;
         if !addresses.is_empty() {
             return Err(NetworkError::InvalidSpec(format!(
@@ -636,14 +485,8 @@ impl crate::LinuxNetworkDriver {
         Ok(bridge)
     }
 
-    /// N-A3, the whole of it: the namespace, both legs, the addresses, the
-    /// route, the rules and the two sysctls that decide whether it speaks.
-    ///
-    /// Level-triggered from end to end. Every step is either "make it if it is
-    /// not there" or "make it say this" — the addresses are flushed and set
-    /// rather than added, the route is `replace`, and the ruleset is
-    /// add-then-flush — so the second Ensure with the same spec changes
-    /// nothing and the second Ensure with a different one converges to it.
+    /// Ensure namespace, veths, addresses, routes, NAT and ARP mode.
+    /// Address replacement runs on every call; obsolete explicit subnet routes are not removed.
     #[instrument(skip_all, fields(router = %spec.id, physnet = %spec.physnet,
                                   vni = spec.vxlan_id, active = spec.active))]
     pub(crate) async fn ensure_router_impl(
@@ -715,23 +558,7 @@ impl crate::LinuxNetworkDriver {
                 .await?
                 .ok_or_else(|| NetworkError::BridgeNotFound(bridge.clone()))?;
             self.enslave(host_index, bridge_index).await?;
-            // The INSIDE leg takes the overlay's MTU for the reason a tap
-            // does: a Linux bridge takes the MTU of its smallest port, so a
-            // 1500-byte veth in a 1450-byte bridge drags the bridge back up
-            // and the first full-size frame is dropped by the VXLAN device
-            // with nothing in any log to say why.
-            //
-            // The OUTSIDE leg is on the provider bridge, which is a wire this
-            // control plane did not make and whose MTU is the operator's —
-            // the interface they gave away carries it, and THAT is the number
-            // this leg takes. Giving it the overlay's MTU was simply wrong,
-            // and so was the repair that followed: leaving it unset does not
-            // "let the bridge decide", because a bridge takes the MTU of its
-            // SMALLEST port. On manacor, whose `vlan128` is 9000, the veth
-            // default of 1500 pulled the whole provider bridge from 9000 down
-            // to 1500 the moment the first router was built on it — measured
-            // 2026-09-10, and the reason this reads the interface instead of
-            // trusting a default.
+            // Use overlay MTU internally and the provider interface's MTU externally.
             let leg_mtu = match leg == LEG_INTERNAL {
                 true => self.vxlan_mtu(),
                 false => provider_mtu,
@@ -756,18 +583,7 @@ impl crate::LinuxNetworkDriver {
             self.ip(&["-n", &netns, "addr", "add", addr, "dev", leg])
                 .await?;
         }
-        // Every floating address as a /32 on the outside leg, beside the
-        // router's own.
-        //
-        // Not for the local stack -- the DNAT in `prerouting` runs BEFORE the
-        // routing decision, so a packet for the address is translated and
-        // forwarded whether or not the address is configured here. It is for
-        // ARP: on a provider network that is plain layer 2, whatever wants to
-        // reach the floating address asks who has it, and without this nobody
-        // answers. The announcement (`router_prefixes`) is the other half and
-        // the one that works where the provider network is ROUTED to; a
-        // deployment normally has one of the two, and having both costs an
-        // address the standby does not answer for anyway.
+        // Assign floating /32s externally so the active router can answer provider ARP.
         for nat in spec.nats.iter().filter(|n| n.kind == NatKind::DnatAndSnat) {
             let fip = format!("{}/32", address_of(&nat.external_ip));
             self.ip(&["-n", &netns, "addr", "add", &fip, "dev", LEG_EXTERNAL])
@@ -787,22 +603,8 @@ impl crate::LinuxNetworkDriver {
         ])
         .await?;
 
-        // And a route for every prefix this router ANNOUNCES, onto the
-        // inside leg.
-        //
-        // Announcing a routed subnet and not knowing where it is was the
-        // whole of the hole: the fabric was told "the prefix is here", the
-        // packets arrived, and the router sent the replies back out of `ext`
-        // on its default route, because the only inside route it had was the
-        // /24 of its own `internal_addr`. A guest addressed out of a routed
-        // subnet could therefore reach nothing at all — not even the router
-        // itself, whose ARP reply went the wrong way. Found in the lab the
-        // first time a guest was given an address out of a /29.
-        //
-        // `scope link` and via no gateway: the prefix is ON the overlay, the
-        // guests answer for their own addresses there, and a next hop would
-        // be a second thing to be wrong about. Replace and not add, so the
-        // second pass is the first.
+        // Route advertised subnets directly onto the overlay.
+        // Errors are swallowed here and obsolete subnet routes are not deleted.
         for prefix in &spec.routed_subnets {
             self.ip_again(&[
                 "-n",
@@ -833,21 +635,8 @@ impl crate::LinuxNetworkDriver {
             .await?;
         }
 
-        // The rules, only when they are not already the rules that are there.
-        //
-        // Level-triggered means the same plan twice is one router, and this is
-        // the one step where "twice" used to cost something visible: the
-        // ruleset is rendered with `flush chain` in front of it, so every pass
-        // — one every five seconds — threw the counters away and started them
-        // at nought. The counters are what an operator reads to find out
-        // whether a floating address is carrying anything, and a counter that
-        // is reset before it can be read is not evidence. Found in the lab
-        // while trying to use exactly that as the proof of SNAT.
-        //
-        // Two questions, and both have to be yes to skip: the record beside
-        // the namespace renders the same ruleset (so nothing about this router
-        // has changed), and the table is really in the namespace (so a
-        // namespace that was rebuilt under us is filled in again).
+        // Skip unchanged rendered rules when the table exists, preserving counters.
+        // External rule changes within an existing table are not detected.
         if !self.ruleset_is_current(&netns, &rules, spec).await {
             self.netns_nft(&netns, &rules).await?;
         }
@@ -880,26 +669,13 @@ impl crate::LinuxNetworkDriver {
         Ok(self.state_of(spec, &[netns]).await)
     }
 
-    /// Everything this driver made for one router, gone.
-    ///
-    /// The namespace first and the host-side legs after it: deleting a
-    /// namespace takes its half of every veth pair with it, and the kernel
-    /// removes the other half — so the two `link del` calls are for the
-    /// interrupted build where the pair was made and the move into the
-    /// namespace was not.
+    /// Delete the namespace and host veths, then remove the router record.
     #[instrument(skip_all, fields(router = %id))]
     pub(crate) async fn destroy_router_impl(&self, id: &RouterId) -> networking::Result<()> {
         let netns = router_netns(id);
         self.ip_again(&["netns", "del", &netns]).await;
-        // Astra finding S10, 2026-09-23: `ip_again` swallows every failure,
-        // so a `netns del` that did NOT happen -- a namespace something still
-        // holds open, an `ip` that is not on PATH -- used to run straight on
-        // into the record removal and report the router gone. The tier above
-        // then believes the external address is free and hands it to another
-        // node while this namespace is still answering for it. Ask the kernel
-        // instead of the exit code: the name has to be off `ip netns list`
-        // before anything here may claim the router was taken down, and the
-        // record stays on disk until it is, so the next pass retries.
+        // Keep the record if the namespace name remains after deletion.
+        // This checks the named mount, not every possible reference to the namespace.
         if self.netns_present().await?.iter().any(|n| n == &netns) {
             return Err(NetworkError::Backend(anyhow::anyhow!(
                 "the namespace {netns} is still listed after `ip netns del`, so this router was \
@@ -966,14 +742,7 @@ impl crate::LinuxNetworkDriver {
         Ok(self.state_of(&record.spec, &live).await)
     }
 
-    /// The namespaces of ours that no record names, taken down once.
-    ///
-    /// The router twin of `sweep_orphan_overlays`, and the failure it answers
-    /// is the one that cannot heal itself: `ensure_router` writes its record
-    /// last, so a `kill -9` in the middle leaves a namespace with two legs in
-    /// two bridges that nothing on this node knows about. It is not reference
-    /// -counted from anywhere, nobody will ask for it again, and it would
-    /// stand for the life of the machine.
+    /// Sweep named namespaces without record files after an interrupted build.
     #[instrument(skip_all)]
     pub(crate) async fn sweep_routers_impl(&self) -> networking::Result<Vec<String>> {
         let dir = self.gateway()?.state_dir.clone();
@@ -988,11 +757,7 @@ impl crate::LinuxNetworkDriver {
                 continue;
             }
             self.ip_again(&["netns", "del", &netns]).await;
-            // Astra finding S10, 2026-09-23: the same swallowed failure, and
-            // here it would become a sentence to the tier above -- the swept
-            // list travels to `session::ingest::sweep_routers`, which reads
-            // it as "these are gone". A namespace that would not go is named
-            // in the log and left out of that list.
+            // Report a sweep only after the namespace name disappears.
             if self.netns_present().await?.iter().any(|n| n == &netns) {
                 warn!(netns = %netns,
                       "this orphaned namespace is still listed after `ip netns del`; \
@@ -1005,18 +770,8 @@ impl crate::LinuxNetworkDriver {
         Ok(swept)
     }
 
-    /// Every router of ours, made standby, in place.
-    ///
-    /// One `ensure_router` per record with `active` turned off, and nothing
-    /// of its own: whatever a standby is, is whatever that call builds, and a
-    /// second implementation of "silent" here would be a second definition of
-    /// failover to keep in step with the first. The record is rewritten as a
-    /// side effect of the same call, which is the half that matters after a
-    /// restart — a node that comes back reading `active = false` waits to be
-    /// told, instead of shouting from the first pass.
-    ///
-    /// Best effort per router: one namespace that will not co-operate must
-    /// not keep the others speaking.
+    /// Make readable active records standby through ensure_router.
+    /// Continue after individual failures; unreadable records are omitted by listing.
     #[instrument(skip_all)]
     pub(crate) async fn fall_silent_impl(&self) -> networking::Result<Vec<RouterId>> {
         let mut silenced = Vec::new();
@@ -1044,20 +799,8 @@ impl crate::LinuxNetworkDriver {
     }
 }
 
-/// What a router IS, from the two facts there are about it: whether its
-/// namespace is still there, and what the links inside it are.
-///
-/// A pure function and not three arms inside `state_of`, for the reason
-/// `reconcile::plan` is one in the agent: this is the whole of what the tier
-/// above acts on, and the three answers it can give are worth asserting
-/// without a kernel, a namespace and root. `None` for `links` means the
-/// namespace was not there and nothing was asked.
-///
-/// Each answer carries the word the reader branches on.
-/// [`RouterReason::DriverUnreachable`] is the arm worth the type: it does not
-/// say that anything is broken, only that this node could not find out, and a
-/// reader that took it for "the router is gone" would fail a router over on
-/// the strength of an `ip` that did not answer.
+/// Classify namespace absence, inspection failure and missing named legs separately.
+/// Ready means both leg names exist; it does not verify routes, rules or packet flow.
 fn classify(
     netns: &str,
     links: Option<networking::Result<String>>,
@@ -1284,12 +1027,7 @@ mod tests {
         assert_eq!(router_prefixes(&s), ["203.0.113.10/32"]);
     }
 
-    /// D-B4: what a node that has just become active says on the outside
-    /// wire, and in which words.
-    ///
-    /// The words matter, because nobody sees them in a unit test twice: this
-    /// is the one place the argv is written down, and a typo in it is five
-    /// seconds of a dead floating address in front of an audience.
+    /// Check the external gratuitous ARP address list and command arguments.
     #[test]
     fn the_new_active_node_shouts_for_its_address_and_for_every_floating_one() {
         let mut s = spec(true);
@@ -1356,25 +1094,7 @@ mod tests {
         assert_eq!(arp_ignore(true), "0");
         assert_eq!(arp_ignore(false), "8");
     }
-    /// The three answers about a router, and the word each one carries.
-    ///
-    /// Two `Failed`s that mean different things is the whole point: "the
-    /// namespace is gone" sends an operator to this node, "the kernel could
-    /// not be asked" sends them to whatever is wrong with `ip` on it, and the
-    /// tier above may fail a router over on the first and must not on the
-    /// second. Until the word existed both arrived as the same phase with a
-    /// different sentence.
-    /// Astra finding S10, 2026-09-23: a teardown reports what the kernel
-    /// says, not what `ip netns del` returned.
-    ///
-    /// `ip_again` swallows every failure on purpose -- a level-triggered
-    /// ensure must not trip over "File exists" -- and the teardown used to
-    /// borrow it for `netns del` as well. A namespace that something still
-    /// holds open therefore ended as `Ok(())` with the record deleted, and
-    /// the tier above handed the external address to another node while this
-    /// namespace was still answering for it on the wire. The fake `ip` below
-    /// is exactly that kernel: the delete is refused and the name goes on
-    /// being listed.
+    /// A failed namespace deletion must retain the record and report failure.
     #[tokio::test]
     async fn a_teardown_that_leaves_the_namespace_behind_is_not_ok() {
         let temp = tempfile::Builder::new()

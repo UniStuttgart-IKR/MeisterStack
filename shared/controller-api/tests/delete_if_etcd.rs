@@ -2,21 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `delete_if` against a real etcd: the ABA a per-key compare-and-swap alone
-//! does not see, because a NAME is not the object.
+//! Revision-guarded delete cannot remove an object recreated under the same name.
 //!
-//! `#[ignore]` for the reason `fence_etcd` is. Start an etcd and name it:
+//! Ignored by default; requires a running etcd:
 //!
 //! ```text
 //! MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
 //!   cargo test -p meister-controller-api --test delete_if_etcd -- --ignored
 //! ```
-//!
-//! Astra finding S19, 2026-09-23: `delete` acts on a name, and a name that
-//! was freed and taken by an unrelated object between a caller's read and
-//! its write is a name that still exists — just not the object the caller
-//! meant. `delete_if` is the guard: a resource_version compare, the same one
-//! `update_fenced` already makes for a write, applied to a delete.
 
 use meister_controller_api::{EtcdStore, Secret, SecretSpec, StoreError};
 

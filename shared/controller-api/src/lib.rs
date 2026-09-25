@@ -2,10 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Shared control-plane API: the K8s-style object envelope, the typed
-//! resources of both tiers, the etcd-backed store, and the plugin traits
-//! (scheduler first). Both controllers build on this crate; the design is
-//! docs/design/control-plane.md.
+//! Shared controller resource types, REST contracts and etcd persistence.
+//!
+//! Both controller tiers use the object envelope, typed resources, authorization
+//! policy and scheduler traits defined here. See `docs/API.md` and
+//! `docs/CONTROL_PLANE.md` for their integration.
 
 pub mod auth;
 pub mod command;

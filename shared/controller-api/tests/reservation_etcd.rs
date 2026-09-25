@@ -2,23 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `CapacityReservation` against a real etcd: the create-only write that
-//! makes one migration's promise unique, and the guarded release that gives
-//! it back.
+//! Create-only migration reservations and revision-guarded release.
 //!
-//! `#[ignore]` for the reason `delete_if_etcd` is. Start an etcd and name it:
+//! Ignored by default; requires a running etcd:
 //!
 //! ```text
 //! MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
 //!   cargo test -p meister-controller-api --test reservation_etcd -- --ignored
 //! ```
-//!
-//! Astra finding S07, 2026-09-23: nothing reserved room at a live migration's
-//! destination between `prepare` and the guest's arrival, so N migrations
-//! aimed at one node all measured themselves against the same numbers and all
-//! passed. The reservation is the missing entry, and the two store facts it
-//! needs are exactly these: it can be written once, and it can be given back
-//! by the writer and by nobody else.
 
 use meister_controller_api::{
     CapacityReservation, CapacityReservationSpec, EtcdStore, StoreError, reserved_on,

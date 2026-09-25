@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `Image` kind: the catalogue a VM boots from. Moved out of
-//! `resources.rs` unchanged.
+//! Image catalogue entries and evidence reported by nodes.
 
 use super::*;
 
@@ -128,24 +127,8 @@ reasons! {
 }
 
 phases! {
-    /// Whether the bytes are there and are the right bytes.
-    ///
-    /// **Every variant of this needs an observation, and that is F16's
-    /// answer.** A path image used to be `Ready` the moment it was
-    /// registered, on the argument that a catalogue entry over storage
-    /// somebody else filled is not this control plane's to check — but
-    /// `Ready` is not "we make no claim", it is a claim, and the chaos-extrem
-    /// run found an entry pointing at nothing wearing it for as long as
-    /// anybody looked. A VM booting from it failed at the node, with the
-    /// storage driver's own words, one tier away from the object that had
-    /// promised the bytes were fine.
-    ///
-    /// So the node is what looks — at a url image it fetched and at a path
-    /// image it merely finds, and it lists its whole image directory so that
-    /// an entry nothing uses is described too (`StatusReport.images_complete`).
-    /// The phase is derived from those words and from nothing else; see
-    /// [`settle_image`] for the four rules and `ImageNodeState` for what one
-    /// machine's word looks like.
+    /// Image availability derived from node observations, including complete
+    /// inventories. Registration alone cannot establish Ready. See [`settle_image`].
     ImagePhase / ImagePhaseKind / ImageReason / ImagePhaseWire / ImageReported [3] {
         Pending { reason, message, since } => "Pending",
         Ready { message, since } => "Ready",
@@ -302,40 +285,11 @@ fn refuse_available_on<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::
 /// nothing for a teardown to do and DELETE can mean delete.
 pub type Image = Object<ImageSpec, ImageStatus>;
 
-/// What the fleet's words about an image ADD UP TO. The whole of F16's
-/// controller half, and the first derivation of this round.
-///
-/// A pure function of the spec and `status`, which is the only fact there is
-/// about an image: no node has ever been asked a question about one, they
-/// simply say what is on their disks. Five rules, in this order:
-///
-/// 1. **Nobody has said anything → `Pending { AwaitingNode }`.** This is F16.
-///    A path image used to be `Ready` the moment it was registered — a
-///    catalogue entry over shared storage somebody else was supposed to have
-///    filled — and the chaos run found one pointing at nothing, `Ready`, for
-///    as long as anybody looked. `Ready` demands an observation now, and
-///    there is no path that writes it without one.
-/// 2. **A fact about the BYTES beats everything.** `ChecksumMismatch` and
-///    `NotAFile` are true wherever the bytes are: a checksum that did not
-///    match will not start matching, and a directory under the catalogue name
-///    is a path no storage driver can open. One node saying either is the
-///    image's answer. **A digest that disagrees with `status.digest` is the
-///    same kind of fact, for the image kind that had no checksum at all:**
-///    Astra finding S02, 2026-09-23 (rest a). A path registration's bytes
-///    were never bound to anything until a node hashed them, so a later
-///    report of different bytes under the same name is exactly what this
-///    rule is for — it is just read off a different field, because there was
-///    no `spec.sha256` to compare against.
-/// 3. **Otherwise one `Ready` is enough.** A fact about a NODE — `NotFound`,
-///    `FetchFailed` — is not a fact about the image, and this is the rule
-///    that CHANGED: the union used to let any `Failed` win, so a four-node
-///    fleet mid-roll-out showed a working image as broken. `ImageNodeState`'s
-///    own doc comment has said so since it was written ("a rollout in
-///    progress and a checksum that will never match look the same from up
-///    there, and the first is a wait while the second is a mistake"); the
-///    per-node list is where that detail now lives, and it is complete.
-/// 4. **Every node that looked failed → `Failed`,** with the first line's
-///    word and a sentence naming the machine.
+/// Derive image state from observations. No observations means AwaitingNode.
+/// Checksum mismatch, a non-file or disagreement with the pinned digest takes
+/// precedence over readiness. Otherwise one Ready node is sufficient; if all
+/// report failure, retain the failure and identify its node. Per-node details
+/// remain available even when the aggregate is Ready.
 pub fn settle_image(spec: &ImageSpec, status: &ImageStatus) -> ImagePhase {
     let said = |line: &ImageNodeState| match &line.message {
         Some(message) => format!("{}: {message}", line.name),

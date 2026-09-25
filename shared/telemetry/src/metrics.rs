@@ -2,50 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The second signal: time series, scraped.
+//! Prometheus metrics with one registry per process.
 //!
-//! Traces already leave this stack over OTLP and answer "what happened to
-//! THIS request". Nothing answered "what is happening, continuously" — the
-//! convergence times a chaos run measures from outside with a stopwatch are
-//! the same quantities this publishes from inside, and the difference between
-//! the two is a table from one run against a curve.
+//! Recording is unconditional. Serving requires a configured listener separate
+//! from the authenticated REST API: metrics expose infrastructure data across
+//! tenants and have no API authorization layer.
 //!
-//! Three decisions are worth stating rather than reading out of the code.
-//!
-//! **A separate library from the OTLP stack.** `opentelemetry-prometheus`
-//! exists at 0.32 and would match the pinned `opentelemetry` crates, but it
-//! is a bridge from the OTel METRICS sdk — which is not in this tree — and it
-//! decorates what it exports: `otel_scope_name` and `otel_scope_version` on
-//! every series, a `target_info` gauge beside them, and unit suffixes derived
-//! from the instrument rather than written into the name. The requirement is
-//! a stock Prometheus with a stock Grafana and no glue in between, and those
-//! decorations are exactly the glue. `prometheus` without default features is
-//! the registry and the text exposition format, nothing else, and every name,
-//! bucket and label below is spelled out here rather than derived.
-//!
-//! **One registry per process, reached globally.** A metric is written from
-//! inside a reconcile pass, a driver call and an etcd operation — three places
-//! that have no state in common and would each need a handle threaded through
-//! them. `prometheus` itself takes this shape (`default_registry`), and the
-//! cost of the alternative is a parameter on every function between `main`
-//! and the write.
-//!
-//! **Recording is unconditional; SERVING is not.** Without a configured
-//! address nothing listens (`serve(None)`), and that is the security half:
-//! the REST edge is authenticated and tenant-scoped, `/metrics` is neither,
-//! and these series name nodes, clusters and drivers across every tenant.
-//! The counters still count — a few atomics nobody reads — because the
-//! alternative is a branch at every call site that can only ever be wrong in
-//! one direction.
-//!
-//! ## The cardinality rule
-//!
-//! Never a vm id, an address, a socket path or an error text as a label
-//! value. Node, cluster and driver names are bounded by the fleet and are
-//! allowed; everything else that varies per object goes in the log line, not
-//! in a label. A label with an unbounded value range does not fail here — it
-//! fails months later in somebody's Prometheus — so
-//! `the_label_names_are_the_ones_that_are_bounded` holds the list.
+//! Labels must have bounded values. Fleet node, cluster and driver names are
+//! allowed; VM IDs, addresses, socket paths and error text belong in logs.
 
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -234,18 +198,9 @@ impl Etcd {
         self.errors.with_label_values(&[operation, result]).inc();
     }
 
-    /// The store revision an operation just came back stamped with.
-    ///
-    /// A gauge by type and not a counter: it is a position in the store's
-    /// history, not a count of anything this process did, and a restore moves
-    /// it backwards — which a counter would have to report as a reset to
-    /// zero, and `rate()` would then read as a burst of a billion.
-    ///
-    /// Only ever forwards here, though. Operations answer concurrently and
-    /// out of order, and a gauge that took whichever answer arrived last
-    /// would sawtooth around the real revision instead of following it. The
-    /// read-then-set is not atomic and does not need to be: the only thing a
-    /// lost race costs is one revision this process had already seen.
+    /// Record a newly observed etcd revision. The gauge is a position rather than
+    /// a count. The read-then-set is not atomic, so concurrent replies may briefly
+    /// replace a higher observation with a lower one.
     pub fn saw_revision(&self, revision: i64) {
         if revision > self.revision.get() {
             self.revision.set(revision);

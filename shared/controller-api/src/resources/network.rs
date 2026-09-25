@@ -2,26 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The north-south kinds: `ProviderNetwork` — the wire a cluster gave away —
-//! and `Router`, a tenant's way out over it.
-//!
-//! Everything else in this tree describes the inside of a tenant: an overlay
-//! it is alone on, addresses it may source from, disks it owns. None of it
-//! says how a packet leaves. Until 6k it did not have to be said, because
-//! nothing carried one: a floating address lived IN the guest, the node
-//! announced a /32 for it, and a tenant with private space behind no
-//! appliance had no egress at all.
-//!
-//! The shape is OVN's, deliberately and from the first line, because the
-//! alternative is a model that has to be replaced rather than translated the
-//! day a real SDN is under it. `ProviderNetwork` is OVN's localnet — a
-//! physical network named by a `physnet` that a chassis maps to an interface.
-//! `Router` is a logical router with one leg on that localnet and one on the
-//! tenant's logical switch, and its placement is `gateway_chassis`: a list of
-//! candidates with a priority, of which the first live one is active. The NAT
-//! is OVN's two kinds, spelled OVN's way and neither implied nor derived.
-//! What is not here yet — ACLs on port groups, a `Port` object of its own —
-//! is absent rather than approximated.
+//! Provider networks and tenant routers. A provider maps a physical network
+//! name to node uplinks; a router connects that network to a tenant overlay.
+//! Gateway candidates have explicit priority, and NAT rules are explicit.
 
 use super::*;
 
@@ -85,29 +68,9 @@ pub struct ProviderNetworkStatus {}
 /// floating pool with reservations in it cannot be deleted.
 pub type ProviderNetwork = Object<ProviderNetworkSpec, ProviderNetworkStatus>;
 
-/// What one entry of a router's rule list says.
-///
-/// The whole of decision 5: **NAT as explicit rules**. A router does not
-/// "have NAT on"; it carries a list, every entry of which says what is
-/// translated to what, and the list is readable on the object. The
-/// alternative — deriving the rules at the node from a bool and a subnet —
-/// is what makes a floating address that does not work unanswerable, because
-/// there is nothing to look at between the intent and the nftables ruleset.
-///
-/// Two of the three are OVN's, spelled OVN's way, underscore and all, and it
-/// is the wire spelling too (`proto::NatRule.kind`): one string reaches from
-/// `meister router get` through the session into the driver, so nothing on
-/// the way has to translate and nothing on the way can translate wrongly.
-///
-/// The third is not a translation at all and rides in this list because the
-/// contract has nowhere else for it. `proto::EnsureRouter` carries the
-/// physnet, both addresses, the VNI, this list and the active bit — and no
-/// field that says what to ANNOUNCE. So the routed subnets travel as
-/// [`NatKind::Routed`] entries, which is what the agent side of 6k settled
-/// on: a prefix in `logicalIp`, no `externalIp`, and no rule rendered for it.
-/// A `NatRule` list that is really "what this router does with a prefix" is a
-/// slightly wider noun than its name, and the alternative was a proto change
-/// in a locked file.
+/// Explicit router rule kinds, shared with the wire contract. `snat` and
+/// `dnat_and_snat` describe translations. `routed` carries an announced prefix
+/// in logicalIp with no externalIp and produces no translation rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NatKind {
@@ -196,25 +159,10 @@ pub fn accepts_class(accepts: &[String], class: &str) -> bool {
     accepts.is_empty() || accepts.iter().any(|a| a == class)
 }
 
-/// The same question about a whole FLEET: which classes a cluster takes, out
-/// of what its machines take.
-///
-/// A cluster is not a machine, so its `accepts` is not a field somebody
-/// writes — it is derived, and the derivation is the only one that keeps the
-/// answer the same at both tiers: a cluster takes a class if one machine of
-/// it that could actually run something takes that class. One machine with an
-/// empty list makes the whole fleet open, because that machine takes anything
-/// sent to it.
-///
-/// "Could actually run something" is the gate `NodeDemand::met_by_a_node`
-/// uses, for its reason: a fleet whose only general-purpose machine is down,
-/// drained or wedged is a fleet an ordinary VM should not be bound to, and
-/// finding that out after the binding is what leaves a tenant reading Pending
-/// at a tier that has nothing more to say.
-///
-/// Empty out of an empty fleet, which reads as "said nothing" — the same
-/// thing an old cluster's report says, and the conservative answer: the
-/// refusal is then made one tier down, exactly as it was before this field.
+/// Classes accepted by usable nodes in a cluster. Any usable node with an
+/// empty list makes the cluster unrestricted. Unready, drained or unhealthy
+/// nodes do not broaden acceptance. An empty fleet returns an empty list;
+/// node-level placement remains the final eligibility check.
 pub fn cluster_accepts(nodes: &[crate::NodeSummary]) -> Vec<String> {
     let usable: Vec<&crate::NodeSummary> = nodes
         .iter()
@@ -541,51 +489,16 @@ pub struct RouterStatus {
     /// objects as they stand.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nats: Vec<NatRule>,
-    /// The nodes that answered `EnsureRouter` with "no gateway slot" — a
-    /// structural refusal about the MACHINE and not about the router.
-    ///
-    /// Remembered rather than re-asked, because a node whose claim and whose
-    /// answer disagree will disagree again on the next pass, and a planner
-    /// that put it back every five seconds would be a loop that fills a log
-    /// and never converges. The planner skips whatever is named here.
-    ///
-    /// Cleared in two moments, and both are somebody saying something new:
-    /// the router's `spec` changes, or the node opens a NEW SESSION.
-    ///
-    /// The second was missing and it was the expensive half. A Hello is not
-    /// a heartbeat and not a report — it is the agent stating its whole
-    /// catalogue at the start of a session, `gateway:<physnet>` among it — so
-    /// a refusal recorded against the process that has just been replaced is
-    /// evidence about something that no longer exists. Without it a machine
-    /// whose provider bridge had been repaired stayed off every priority list
-    /// until an operator noticed and patched an unrelated object. The cost of
-    /// being wrong is one `EnsureRouter` that is refused again and written
-    /// down again.
-    ///
-    /// A node-level `Condition` would be the other place for it and is the
-    /// wrong one: `NodeStatus.conditions` is what the NODE says about itself
-    /// and is replaced wholesale by every status report, so a word written
-    /// there by a controller lives ten seconds.
+    /// Nodes that structurally refused EnsureRouter despite their capability
+    /// claim. The planner skips them until the router spec changes or a new
+    /// node session supplies fresh capability evidence. Transient silence is
+    /// not cached as a structural refusal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<String>,
-    /// The nodes that still have to be told to let this router go, and could
-    /// not be told yet.
-    ///
-    /// A machine that drops off `nodes` while it is DOWN cannot be told
-    /// anything, and it also stops being on `nodes` — so the next pass derives
-    /// the release list out of the list it has just shortened and the machine
-    /// is never told at all. It comes back holding a whole namespace that
-    /// answers for an address another node is now carrying. Seen on manacor on
-    /// 2026-09-10: a `DestroyRouter` went to a node that was already down, and
-    /// its start-up sweep kept every namespace whose record was still beside
-    /// it — `run_dir` is a tmpfs, so a REBOOT would have taken it, but a
-    /// restart of the agent does not.
-    ///
-    /// So it is remembered instead, and the debt is paid the first pass the
-    /// machine is reachable again. Level-triggered in both directions: a node
-    /// that is planned onto this router again leaves the list without a
-    /// command, and a destroy that is acknowledged leaves it because it is
-    /// done.
+    /// Former holders still owed router cleanup. Preserve unreachable nodes
+    /// here after removing them from placement, so reconnection can trigger
+    /// DestroyRouter. Remove the entry after acknowledgement, or when the node
+    /// becomes a planned holder again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub releasing: Vec<String>,
     /// The prefixes this router announces, resolved from

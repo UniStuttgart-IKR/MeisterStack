@@ -155,57 +155,23 @@ pub trait BridgeDriver: Send + Sync {
         )))
     }
 
-    /// Take the overlay `vni` off this node again: its bridge, its
-    /// encapsulation device, and nothing else.
+    /// Remove this driver's overlay bridge and encapsulation device.
     ///
-    /// The counterpart `ensure_overlay` never had. What makes it safe to have
-    /// now is that somebody counts: the linux driver's own doc argued that
-    /// reaping is a question a level-triggered agent cannot answer — "is
-    /// another VM for this tenant arriving in the next second?" — and that is
-    /// still true, which is why this is NOT a timer or a sweep. It is driven
-    /// by the agent's store, which knows every VM this node was told to run,
-    /// and the caller asks it only when no record names the VNI any more.
-    ///
-    /// Two links and not one, which is why `destroy` cannot stand in for it:
-    /// deleting a bridge unenslaves its ports, it does not delete them, so
-    /// `mvx<vni>` would outlive `meister-vx<vni>` and the leak would be half
-    /// as big rather than gone.
-    ///
-    /// Idempotent by contract, exactly as `destroy` is: an overlay that is
-    /// not there is `Ok(())`. The default is a no-op for the same reason
-    /// `ensure_overlay`'s default is a refusal — a driver that never built one
-    /// has nothing to take down.
-    ///
-    /// `bridge` is what the VM's record says this overlay was CALLED — the
-    /// answer this driver gave at `ensure_overlay` — and `None` means nobody
-    /// wrote it down, which is every record from before it was kept. An
-    /// implementation whose own name for the VNI is a different one must
-    /// refuse rather than remove: the number alone does not say whose the
-    /// overlay is, and on a node with two network drivers this call used to
-    /// reach whichever one the agent held and take down its link, or none.
+    /// Call only after checking every VM and router reference under the agent
+    /// lifecycle guard. Unreadable records cannot authorize removal. `bridge`
+    /// is the recorded name returned by `ensure_overlay`; implementations must
+    /// refuse a mismatched name rather than remove another driver's overlay.
+    /// Missing overlays succeed. The default has nothing to remove.
     async fn destroy_overlay(&self, _vni: u32, _bridge: Option<&str>) -> Result<()> {
         Ok(())
     }
 
-    /// Take down every overlay this driver built that is not in `keep`, and
-    /// say which ones went.
+    /// Remove this driver's overlays absent from `keep` and return their VNIs.
     ///
-    /// The one sweep in this trait, and the reason it is allowed where the
-    /// per-VM reference count is not: it runs ONCE, at start-up, against the
-    /// whole record table at a moment when nothing is being provisioned, so
-    /// "is another VM for this tenant arriving in the next second?" — the
-    /// question a level-triggered reaper cannot answer — has an answer here.
-    /// It is not a timer.
-    ///
-    /// `keep` is every VNI any record on this node names. The caller must not
-    /// call this at all unless it could read the whole table: a record it
-    /// could not read might name any VNI, and a sweep on an incomplete list
-    /// is a sweep that takes a live tenant's wire down.
-    ///
-    /// Only this driver's own overlays. Whatever marks them — a name, a
-    /// label, a directory — is the implementation's business, and a driver
-    /// that cannot tell its own from the rest of the node's links must sweep
-    /// nothing, which is what the default does.
+    /// The caller must have a complete VM and router inventory and exclude
+    /// concurrent provisioning. Unreadable records prevent the sweep. A driver
+    /// that cannot identify its own overlays must remove nothing; the default
+    /// does nothing.
     async fn sweep_overlays(&self, _keep: &[u32]) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
@@ -300,27 +266,10 @@ pub trait BridgeDriver: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Make every router this node holds STOP SPEAKING, and take none of them
-    /// down. Says which ones fell silent.
-    ///
-    /// The router half of saying goodbye, and the reason it exists is a
-    /// measurement: a gateway node stopped with `systemctl stop` told its
-    /// cluster it was going, the cluster made the standby active eight
-    /// seconds later — and the leaving node went on answering ARP for the
-    /// router's external address, its floating addresses and the tenant's
-    /// gateway, because a namespace outlives the agent that built it. Two
-    /// machines answered one `arping` on manacor on 2026-09-10, with two
-    /// different MACs, and nothing ever ended it: the `DestroyRouter` the
-    /// cluster sent went to a node that was already down, and the start-up
-    /// sweep keeps every namespace whose record is still there.
-    ///
-    /// Silent and not destroyed, deliberately. `systemctl restart` must not
-    /// be an outage — the same rule that keeps a stopping agent's guests
-    /// running — and a router that is still built is a router the next
-    /// `EnsureRouter` makes active again in one pass. What a standby is, is
-    /// exactly what this leaves behind.
-    ///
-    /// Best effort: a node on its way out reports what it managed and goes.
+    /// Silence all local routers without destroying their namespaces, returning
+    /// the affected IDs. Used on shutdown to stop stale ARP and routing activity
+    /// before another gateway takes over. A later `EnsureRouter` can reactivate
+    /// the retained router. Best effort during shutdown.
     async fn fall_silent(&self) -> Result<Vec<RouterId>> {
         Ok(Vec::new())
     }

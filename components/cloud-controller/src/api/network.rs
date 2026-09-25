@@ -2,15 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `providernetworks` and `routers` resources — the two halves of
-//! north-south, at the tier where both are declared.
-//!
-//! They are one file because they are one decision read from two sides. A
-//! provider network is what an operator gave away and is an administrator's
-//! to declare; a router is a tenant's way out over one, readable by that
-//! tenant and written by an operator (see `auth::Class::TenantOperated`).
-//! Splitting them would put the refusal that keeps a network from vanishing
-//! under a router in a file that cannot see the router.
+//! Provider-network and tenant-router admission. Provider networks describe
+//! external connectivity; routers select a tenant overlay and provider network.
 
 use super::*;
 
@@ -117,20 +110,8 @@ pub(super) fn check_provider_addresses(
     Ok(())
 }
 
-/// What an update of a provider network may not change.
-///
-/// The physnet is what joins this object to an interface out there, and every
-/// router already built on it took its address from this allocation. Moving
-/// either would move the ground under a running gateway — so the two roads
-/// are: edit the description and the labels, or delete the network (which its
-/// routers refuse) and declare another.
-///
-/// `allocation` is deliberately NOT here. Adding a range is how an operator
-/// makes room for the next router, and a router that already holds an address
-/// keeps it: `status.externalAddr` is written once and read from then on. A
-/// range REMOVED under a router that holds an address out of it is the case
-/// this leaves open, and it is the honest one — the address goes on working
-/// and the operator can see it in `router ls`.
+/// The physnet binding is immutable. Address configuration remains editable;
+/// existing router addresses are retained even when allocation ranges change.
 pub(super) const PROVIDER_NETWORK_OWNED: &[Owned] = &[Owned::immutable(
     "spec.physnet",
     "is immutable; it is the name the nodes claim this network under, and changing it \
@@ -319,19 +300,9 @@ pub(super) async fn create_router(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-/// Is there ALREADY another way out for this tenant on this wire?
-///
-/// "Another" is the word that matters, and it is the whole of the function.
-/// A router of this very name is not a second way out — it is this one — so a
-/// POST that names it falls through to the store, the store answers
-/// AlreadyExists, and `meister apply` reads that as "replace instead of
-/// create". Without the name cut a router could never be applied twice, and
-/// changing what it announces meant deleting it and losing its address. Found
-/// in the lab, on the first `apply` of an edited router.
-///
-/// The rule itself stands: one way out per tenant per wire (see
-/// `create_router`), because two would be two addresses on one L2 for one
-/// overlay and a fabric that has to choose between them.
+/// Find another named router for this tenant/provider-network pair. Excluding the
+/// requested name lets repeated create return AlreadyExists for apply workflows.
+/// The read does not reserve the pair against concurrent creates.
 fn other_router_on<'a>(
     existing: &'a [controller_api::Router],
     name: &str,
@@ -387,23 +358,8 @@ pub(super) async fn update_router(
     }
 }
 
-/// Marked, not removed — and the floating addresses pointed at it are not a
-/// refusal.
-///
-/// The addresses are deliberate, and it is the same argument
-/// `delete_routed_subnet` makes: taking the router away NARROWS what a tenant
-/// can reach — the DNAT rules that were derived from those reservations
-/// simply stop being derived, the addresses stay reserved, and pointing them
-/// at another router is one patch. A refusal here would make deleting a
-/// router a two-step dance through somebody else's objects for no safety at
-/// all.
-///
-/// The marking is what changed when the router started travelling down a
-/// session. A cloud object dropped here and now would leave the cluster's
-/// copy standing with nobody left to tell it to go, and the netns forwarding
-/// for a tenant who has deleted their router. So this sets the timestamp and
-/// `reconcile::teardown` finishes it once the cluster has stopped naming the
-/// router — the same promise `vm rm` makes.
+/// Mark a bound router for asynchronous cluster teardown. Floating reservations
+/// remain allocated and can be reassigned. An unbound router is removed immediately.
 pub(super) async fn delete_router(
     State(st): State<ApiState>,
     Path(name): Path<String>,

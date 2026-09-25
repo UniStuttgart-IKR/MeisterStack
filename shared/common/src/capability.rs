@@ -2,21 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! How a node's device capability is spelled — in one place, for both sides
-//! of the sentence.
+//! Capability strings shared by agents, controllers and schedulers.
 //!
-//! A node says what it can serve; a scheduler asks whether a candidate serves
-//! what a VM wants. Both halves have to agree on one string format, and until
-//! now each carried its own copy of it: the cluster session flattened
-//! `DriverInfo` into `<driver>/<profile>` on its way into NodeCapacity, and
-//! FirstFit built the same string again to compare against. Two spellings of
-//! one convention, in two crates, with nothing between them but the tests
-//! that happened to use the same examples.
-//!
-//! Neither half is device-specific — a driver name and an optional profile is
-//! all this knows, and it is why the module is here rather than in
-//! `controller-api`: the tier that BUILDS the catalogue and the tier that
-//! MATCHES against it are different crates, and this is what they share.
+//! Agents advertise driver/profile claims; placement and admission compare those
+//! same claims. Storage claims use a `volume/` namespace to avoid colliding with
+//! device names. Locality and snapshot consistency travel with backend claims.
 
 /// The catalogue driver every STORAGE backend is a profile of: a node with
 /// the LVM-thin driver claims `volume/lvm-thin`, and a VM whose spec names
@@ -152,27 +142,9 @@ pub fn parse_snapshot_claim(profile: &str) -> Option<(&str, SnapshotConsistency)
     Some((backend, SnapshotConsistency::parse(consistency)?))
 }
 
-/// The catalogue driver every HYPERVISOR is a profile of: a node running the
-/// cloud-hypervisor driver claims `hypervisor/cloud-hypervisor`.
-///
-/// New with the storage split, and it exists because a node stopped being
-/// synonymous with "machine that runs VMs". A storage node has no hypervisor
-/// at all, and without this entry it would look to a scheduler like an
-/// ordinary candidate — the first VM asking for nothing in particular would
-/// land there and fail at the first `create`.
-///
-/// The other half of the sentence — that every VM implicitly REQUESTS one —
-/// shipped with storage A. It was held back for exactly as long as any node
-/// in the fleet ran an agent that predates this entry: such a node claims no
-/// `hypervisor/*`, and a VM that required one would go Pending on it forever.
-/// Claiming is additive and safe on a mixed-version cluster; requiring is
-/// not, and a rollout is the normal state. The last node still on a
-/// hand-started binary from before the claim was replaced by the image round,
-/// so the condition is met. See `scheduler::resource_requests`.
-///
-/// The request is BARE — any hypervisor answers it. Which one a node runs is
-/// its own business, and matching the name would be sizing knowledge the
-/// scheduler does not have.
+/// Hypervisor capability namespace, for example `hypervisor/cloud-hypervisor`.
+/// Every VM implicitly requests a bare hypervisor capability, so storage-only
+/// nodes cannot receive VMs. An agent omitting the claim is not VM-eligible.
 pub const HYPERVISOR: &str = "hypervisor";
 
 /// The catalogue driver every NETWORK capability is a profile of. A node
@@ -200,26 +172,10 @@ pub const VXLAN: &str = "vxlan";
 /// an overlay, not for how the overlay finds its peers.
 pub const EVPN: &str = "evpn";
 
-/// The network profile a node claims once per PROVIDER network it holds an
-/// interface for: `gateway:ext` beside `vxlan`, flattening one tier up into
-/// `network/gateway:ext`.
-///
-/// Decision 2 of 6k: **gateway is a capability out of the agent's config**,
-/// not a separate agent and not a compile feature. A node with
-/// `[network.provider] physnets = { ext = "eth1" }` builds the provider
-/// bridge for `ext`, checks that the interface carries no address — the
-/// interface was given away — and claims this. A node with no physnet claims
-/// none and is no candidate for a router.
-///
-/// The physnet rides INSIDE the profile after a colon, exactly as a snapshot
-/// backend's consistency does and for the same reason: the catalogue is split
-/// on `/` into `<driver>/<profile>` by everything that reads it, and a third
-/// slash would turn this into an entry those splitters count differently.
-/// See [`CONSISTENCY_SEP`], which is the same character doing the same job.
-///
-/// Additive and safe on a mixed-version fleet, like every other claim here:
-/// an agent that predates it claims nothing, and the routers simply do not go
-/// there.
+/// Gateway profile for one configured provider network, such as `gateway:ext`
+/// and the flattened capability `network/gateway:ext`. The colon keeps the
+/// physnet inside the profile; `/` remains the driver/profile separator.
+/// Nodes without this claim cannot host a router on that provider network.
 pub const GATEWAY: &str = "gateway";
 
 /// What a gateway node claims for one physnet: `gateway:ext`.
@@ -265,26 +221,10 @@ pub fn gateway_physnets(catalogue: &[String]) -> Vec<&str> {
 /// there again. `agent_api::default_volume_driver` returns this string.
 pub const DEFAULT_VOLUME_DRIVER: &str = "filesystem";
 
-/// WHERE a volume backend's bytes are, from the point of view of the nodes
-/// that can reach them.
-///
-/// A property of the DRIVER and never a setting on a pool. lvm-thin writes
-/// into a volume group on one machine; the `filesystem` backend writes a file
-/// into a directory on one machine; NFS hands every node that mounts the
-/// export the same bytes. An admin who could call an lvm-thin pool `shared`
-/// would be lying to the scheduler, and the VM placed on the strength of that
-/// lie would come up on a node where the disk is not.
-///
-/// Here rather than in `agent-api` for the reason the rest of this module is
-/// here: the tier that STATES the fact and the tier that ACTS on it are
-/// different crates, and neither controller depends on `agent-api` (see
-/// `VmSpec.vm`). `agent_api::storage` re-exports it, so a driver names it
-/// where a driver lives.
-///
-/// The strings are the wire form: a `DriverInfo.locality` in the Hello, and
-/// `StoragePool.status.locality` in the API. One spelling, three variants,
-/// and a fourth would be a new variant here rather than a new convention
-/// somewhere else.
+/// Backend locality shared by agents and schedulers. It is reported by the
+/// driver, not configured on a pool: local bytes require their node, shared
+/// bytes require access to the same backend, and networked bytes are reached
+/// through a remote target. Strings are used by Hello and pool status.
 #[derive(
     Clone,
     Copy,

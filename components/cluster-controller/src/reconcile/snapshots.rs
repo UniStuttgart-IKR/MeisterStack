@@ -2,17 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Volume snapshots: dispatch, the standstill a non-atomic backend needs,
-//! requeue and teardown. Moved out of `reconcile.rs` unchanged.
+//! Snapshot dispatch, guest pause/resume sequencing, retries, and deletion.
 
 use super::*;
 
-/// Every snapshot this cluster holds, once per pass.
-///
-/// Its own pass beside `place_volumes` and not folded into it: a snapshot is
-/// dispatched to the node the VOLUME is on, so it makes no placement decision
-/// of its own, and a loop that had to do both would be a loop with two
-/// meanings for "unplaced".
+/// Reconcile snapshots separately from volume placement.
+/// Each snapshot targets the node recorded on its source volume.
 pub(super) async fn take_snapshots(p: &Pass<'_>) -> anyhow::Result<()> {
     let snapshots = p.store.list::<VolumeSnapshot>().await?;
     if snapshots.is_empty() {
@@ -56,42 +51,10 @@ pub(super) async fn reconcile_snapshot(
     }
 }
 
-/// Send the snapshot to the node that has the bytes, pausing the guest across
-/// the call if the backend needs it.
-///
-/// # The quiesce sequence, in miniature
-///
-/// A backend that COPIES cannot promise that its copy is of one instant while
-/// the guest is writing, so the vCPUs stop for the length of the call:
-///
-/// ```text
-///   PauseInstance  -> the node the VM runs on
-///   SnapshotVolume -> the node the VOLUME is on   (a different one, under a
-///   ResumeInstance -> the node the VM runs on      shared storage)
-/// ```
-///
-/// Three things about it are load-bearing:
-///
-///   * **The resume happens whatever the snapshot did.** A failure in the
-///     middle leaves a paused guest, and a paused guest that nobody resumes is
-///     an outage caused by a backup. So the resume is unconditional and its
-///     own failure is logged beside the first one rather than replacing it.
-///   * **Two nodes, and the tier that can see both is this one.** The node
-///     holding the volume cannot pause a VM on another machine, and the node
-///     running the VM does not have the bytes. That is why the pause is
-///     sequenced here and not inside `SnapshotVolume`.
-///   * **`Atomic` pauses nothing.** A thin LV's snapshot is one instant by
-///     construction, and so is a reflink clone; stopping a guest for either
-///     would be a cost with nothing bought. WHICH backends are atomic is the
-///     NODE's answer and not a list here — `filesystem` copies on ext4 and
-///     reflinks on XFS, and it learns which by probing its own pool. See
-///     `snapshot_consistency`.
-///
-/// This is the same shape the floppy brief needs for its barrier across N
-/// replicas — pause the writers, do the thing, resume them whatever happened
-/// — one node smaller. What it does not have is the part that makes a barrier
-/// a barrier: an ordering across several nodes that all have to be quiet at
-/// once. Here there is exactly one writer, so "pause it" IS the barrier.
+/// Claim the snapshot by CAS, then dispatch to the volume node.
+/// For non-atomic backends, request a pause on the holder's node before dispatch
+/// and a resume after the command reply. That reply acknowledges dispatch, not
+/// completion of the asynchronous backend copy; see `docs/STORAGE.md`.
 pub(super) async fn dispatch_snapshot(
     p: &Pass<'_>,
     snapshot: &VolumeSnapshot,
@@ -151,10 +114,8 @@ pub(super) async fn dispatch_snapshot(
         Err(e) => return Err(e.into()),
     }
 
-    // Who has to stand still, if anybody. `None` where the backend is atomic,
-    // where nobody is holding the volume, or where the holder is not running:
-    // a guest that is not executing is already as quiesced as a pause makes
-    // it.
+    // Pause only the holder returned by snapshot_needs_quiesce. A missing
+    // holder includes non-Running phases; it does not prove there are no writers.
     let quiesce = snapshot_needs_quiesce(p, &volume).await?;
     let guest = quiesce.clone();
     let outcome = quiesced(
@@ -193,12 +154,7 @@ pub(super) async fn dispatch_snapshot(
     Ok(())
 }
 
-/// Which way a guest is being told to go, for the one closure the sequence
-/// below takes.
-///
-/// One closure and an enum rather than two closures, because what has to be
-/// exercised is the ORDER of the two calls — and a test that could pass one
-/// of them and not the other could not see an ordering at all.
+/// Guest command used by the pause/resume sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Halt {
     Pause,
@@ -220,29 +176,11 @@ pub(super) async fn tell_guest(
     registry.send_command(&node, "", op).await.map(|_| ())
 }
 
-/// Run `work` with the guest stopped, and start it again whatever happened.
-///
-/// Three rules, and each of them is a thing that goes wrong otherwise:
-///
-///   * **A pause that failed cancels the work.** The pause is what makes the
-///     copy worth having; taking it anyway would produce a copy nobody was
-///     told is torn, which is worse than no copy at all.
-///   * **The resume is unconditional.** It runs whether the work succeeded,
-///     failed, or was never reached — a guest left paused by a backup is an
-///     outage this stack caused, and no error is worth one.
-///   * **A resume that failed does not replace the work's answer.** It is
-///     logged at ERROR beside it: the operator has two problems, and hiding
-///     the first behind the second helps with neither.
-///
-/// `guest` is `None` where nothing has to stand still — an atomic backend, a
-/// volume nobody holds, a guest that is not running — and then this is `work`
-/// and nothing else.
-///
-/// This is the shape the floppy brief needs for its barrier across N
-/// replicas, one node smaller. What it does not have is what makes a barrier
-/// one: an ordering over several writers that all have to be quiet at the
-/// same instant. Here there is exactly one writer, so "pause it" IS the
-/// barrier.
+/// Request a pause, run `work`, then attempt a resume.
+/// A pause error returns immediately. After a successful pause, resume is attempted
+/// on either work result; a resume failure is logged without replacing that result.
+/// Cancellation or process failure can interrupt this sequence. `guest = None`
+/// runs the work directly. The caller must define when `work` is complete.
 pub(super) async fn quiesced<T, Fut>(
     guest: Option<&(String, String)>,
     tell: impl Fn(String, String, Halt) -> Fut,
@@ -268,13 +206,8 @@ where
     outcome
 }
 
-/// The VM that has to stand still for this copy, and the node it runs on.
-///
-/// `None` — nothing is paused — in three cases, and each is a different
-/// sentence: the backend takes its copy at one instant anyway (`Atomic`),
-/// nobody is holding the volume, or the holder is not running. The third
-/// matters more than it looks: a stopped guest is not writing, and pausing
-/// something that is not executing would buy nothing and could fail.
+/// Find a running holder unless the volume node advertises atomic snapshots.
+/// Missing consistency information conservatively requests a pause.
 pub(super) async fn snapshot_needs_quiesce(
     p: &Pass<'_>,
     volume: &Volume,
@@ -311,12 +244,8 @@ pub(super) async fn snapshot_needs_quiesce(
     holder_of(p, volume).await
 }
 
-/// What the node holding these bytes says its backend needs.
-///
-/// The node that HOLDS the volume and not any node serving the pool: under a
-/// `shared` pool two machines can serve the same bytes with different
-/// filesystems underneath, and the one that will take the copy is the one
-/// whose answer counts.
+/// Read consistency from the node that will execute the snapshot.
+/// Other nodes serving a shared pool may have different backend capabilities.
 pub(super) async fn snapshot_consistency(
     p: &Pass<'_>,
     volume: &Volume,
@@ -336,13 +265,8 @@ pub(super) async fn snapshot_consistency(
     Ok(consistency_in(&node.status.capacity.capabilities, driver))
 }
 
-/// The consistency this catalogue claims for one backend, if it claims one.
-///
-/// The flat `volume/<backend>/snapshot:<consistency>` entries, read back. Its
-/// own function so that the rule can be stated without a store: `None` is
-/// "this catalogue said nothing about it", which includes a node that claims
-/// only the bare `volume/<backend>/snapshot` — every node from before the
-/// claim existed.
+/// Parse the backend's `volume/<backend>/snapshot:<consistency>` claim.
+/// A bare legacy snapshot claim supplies no consistency information.
 pub(super) fn consistency_in(
     catalogue: &[String],
     driver: &str,
@@ -378,15 +302,7 @@ pub(super) async fn holder_of(
     }
 }
 
-/// Say a snapshot failed, and start the requeue clock. Only on a change, like
-/// every other status write in this file.
-///
-/// The reason is the CALLER's, because the two callers know two different
-/// things and the object used to carry the same word for both: a volume that
-/// is not there any more is `SourceGone` and somebody has to make a new
-/// request, and a dispatch that never reached the node is `Undeliverable` and
-/// the next pass will try again. It said "Reported" for both, which was the
-/// name of a road nothing had come down.
+/// Record the caller's failure reason for snapshot retry and diagnostics.
 pub(super) async fn note_snapshot_failed(
     p: &Pass<'_>,
     snapshot: &VolumeSnapshot,
@@ -407,10 +323,7 @@ pub(super) async fn note_snapshot_failed(
     Ok(())
 }
 
-/// A Failed snapshot, kicked on the same curve everything else here rides.
-///
-/// The kick is another dispatch, which is idempotent at the node — so the
-/// repair path is the ordinary path and there is no second one to get wrong.
+/// Return a failed snapshot to Pending when its retry delay expires.
 pub(super) async fn requeue_snapshot(
     p: &Pass<'_>,
     snapshot: &VolumeSnapshot,
@@ -453,16 +366,8 @@ pub(super) async fn requeue_snapshot(
     Ok(())
 }
 
-/// Tell the node to destroy the copy, and finish the delete once it says it
-/// is gone.
-///
-/// The same order and the same argument as `deprovision_volume`: the object
-/// goes only AFTER the node has said `Gone`, because absence from a report is
-/// "this node does not know" and a restart before the first report would
-/// otherwise take an object whose bytes are on a disk.
-///
-/// A snapshot with no node never had one told about it, so there is nothing
-/// to destroy and the finalizer comes off at once.
+/// Request deletion and retain the object until a node reports `Gone`.
+/// A snapshot with no recorded node can be deleted immediately.
 pub(super) async fn drop_snapshot(p: &Pass<'_>, snapshot: &VolumeSnapshot) -> anyhow::Result<()> {
     let name = snapshot.metadata.name.clone();
     let Some(node) = snapshot.status.node.clone() else {
@@ -490,21 +395,9 @@ pub(super) async fn drop_snapshot(p: &Pass<'_>, snapshot: &VolumeSnapshot) -> an
     Ok(())
 }
 
-/// The snapshots that still stand on a volume's bytes, by name.
-///
-/// What turns a `volume rm` into `Releasing` rather than a deprovision — the
-/// same `HeldBy` shape a VM produces, and the reason is the same one word
-/// long: a snapshot standing on a file that has been deleted is a snapshot of
-/// nothing.
-///
-/// (`lvm-thin` would hold its origin LV itself, because a thin snapshot
-/// shares the origin's blocks. This rule is what makes `filesystem` behave
-/// the way `lvm-thin` behaves anyway, so an operator sees one storage system
-/// rather than one per backend.)
-///
-/// A snapshot that is itself being deleted does not hold: it is on its way
-/// out, and holding the volume for it would make two deletes wait for each
-/// other.
+/// Names of undeleted snapshots referencing a volume.
+/// These references block volume deprovisioning across backends. Snapshots already
+/// marked for deletion are excluded from this guard.
 pub(super) fn snapshots_holding(snapshots: &[VolumeSnapshot], volume: &str) -> Vec<String> {
     snapshots
         .iter()

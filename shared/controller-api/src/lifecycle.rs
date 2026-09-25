@@ -2,13 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Intent against observation for a running VM, as one pure function both
-//! tiers use.
+//! Compare VM intent with observation using the same policy in both tiers.
 //!
-//! The cluster turns the answer into a command for the agent; the cloud only
-//! asks whether there is one, because at its altitude a drifted intent means
-//! "hand the spec down again and let the cluster do the arguing". Same table,
-//! one place, so the two tiers can never disagree about what drift is.
+//! The cluster turns an action into an agent command. The cloud uses the same
+//! decision to determine whether to resend the spec to the cluster.
 
 use chrono::{DateTime, Utc};
 
@@ -48,41 +45,13 @@ pub fn lifecycle_command(strategy: RunStrategy, phase: VmPhaseKind) -> Option<Li
     })
 }
 
-/// May this VM let its binding go — the question both tiers' `reschedule`
-/// asks, as one function so that they cannot answer it differently.
+/// Check intent and phase prerequisites for rescheduling at either tier.
 ///
-/// The intent half has never been in doubt: nobody moves a VM somebody still
-/// wants running, so `runStrategy` must say `Stopped`. What was wrong was the
-/// observation half, which demanded `phase == Stopped` and nothing else.
-///
-/// D12, measured: a VM on a node that executes no commands sits at `Failed`
-/// and can never reach `Stopped` — because reaching `Stopped` is something
-/// that node would have to do. The one API call that would rescue it was
-/// refused, with the advice to do what had already been done:
-///
-/// ```text
-/// $ meister vm get mc-r1 -o json | jq -r '.spec.runStrategy, .status.phase().kind()'
-/// Stopped
-/// Failed
-/// $ meister vm reschedule mc-r1
-/// Error: 422: reschedule needs a stopped vm (phase Failed); stop it first
-/// ```
-///
-/// So `Failed` and `Unknown` are stopped enough. Neither is a guest anybody
-/// is promising is running: `Failed` is the node's own word that it is not,
-/// and `Unknown` (D10) is nobody knowing — and what an operator asserts by
-/// asking for a reschedule of an `Unknown` VM is exactly that the machine is
-/// gone. It is the one case here that is a judgement rather than a
-/// derivation, and it is theirs to make: the alternative is the dead end this
-/// rule exists to open, and the guards that remain are real — a node-local
-/// disk still refuses to follow, and a backend write lock is still a write
-/// lock.
-///
-/// `Paused` is NOT enough, and that is the pair worth stating: a paused guest
-/// has its memory, its disks open and its VMM alive, so moving the binding
-/// would be two VMMs on one disk the moment the old one is resumed.
-/// `Pending` and `Provisioning` are a pass in flight, and `Quarantined` is
-/// deliberately nobody's to touch.
+/// Intent must be Stopped. Stopped, Failed and Unknown pass this check, but
+/// Unknown additionally requires `unknown_needs_its_holder`; it does not prove
+/// the old guest is gone. Storage and migration guards remain separate.
+/// Paused retains live machine state; Pending and Provisioning are in flight;
+/// Quarantined requires operator recovery. These phases fail this check.
 pub fn stopped_enough(strategy: RunStrategy, phase: VmPhaseKind) -> bool {
     strategy == RunStrategy::Stopped
         && matches!(
@@ -131,27 +100,10 @@ impl Holder {
     }
 }
 
-/// Why an `Unknown` binding may not be let go right now — or `None`, meaning
-/// it may.
-///
-/// `stopped_enough` calls `Unknown` stopped enough, and on its own that is a
-/// claim nobody can back: `Unknown` is precisely the phase in which the
-/// control plane does not know whether a guest is running. Rescheduling on
-/// that would place the VM a second time while the first one may still hold
-/// its disks open — two VMMs on one file, which is the outcome the whole
-/// binding rule exists to prevent.
-///
-/// So the phase alone is not enough, and the second half is EVIDENCE: the
-/// holder has to be talking. A heartbeat that is current is exactly that — it
-/// is written by the replica holding the holder's session, every beat, and it
-/// is the same fact the watchdog read to call the phase `Unknown` in the first
-/// place. With the holder back, the ordinary stop runs first and the phase
-/// settles into one this call takes anyway; with the holder silent, this
-/// refuses and says what the two ways out are.
-///
-/// `Failed` is untouched, and that is the pair worth stating: `Failed` is the
-/// holder's OWN word that the guest is not running, which is evidence. Only
-/// `Unknown` is an absence of evidence.
+/// Require a current holder heartbeat before releasing an Unknown binding.
+/// The phase alone says nothing about whether the old guest is still running.
+/// A silent holder must not allow a second placement. Failed follows separate
+/// rules because it carries an explicit observation rather than silence.
 pub fn unknown_needs_its_holder(
     phase: VmPhaseKind,
     holder: Holder,

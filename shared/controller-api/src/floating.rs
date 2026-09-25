@@ -2,29 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Handing out a floating address, and cutting a routed subnet: the two
-//! allocations Part A and Part B need, and the one compare-and-swap that makes
-//! both of them safe.
+//! Floating address allocation and routed subnet selection.
 //!
-//! A floating address is not a label either — it is what a node's nftables
-//! rules will let exactly one tap send from, so two tenants issued the same
-//! one are two tenants whose frames the same rule permits, which is the
-//! precise thing the reservation exists to prevent. So this is the same
-//! argument `vni` makes, with a better answer available: the object's NAME is
-//! the address, so two allocators racing for the same gap both try to create
-//! `10.255.0.7`, and etcd's own create lets exactly one of them win. The loser
-//! reads the store again and takes the next gap. Nothing new was built for it;
-//! the allocator is a scan and a retry.
-//!
-//! The scan is a GAP scan and not a high-water mark, which is the other
-//! difference from `vni`. A VNI released by a deleted tenant is one number out
-//! of sixteen million and nobody misses it; a public address released by a
-//! tenant is one of the four an operator was given, and a counter that only
-//! moved forward would exhaust that pool on the fourth release.
-//!
-//! Neither allocation ROUTES anything. What comes out of here is ownership —
-//! who may use which address — and everything downstream (the tap rules, the
-//! BGP announcement) is a consequence of it.
+//! Floating allocation names identify addresses. Concurrent allocators may choose
+//! the same gap, but only one create succeeds; losers rescan. Subnet selection
+//! returns a candidate that its caller must commit with a concurrency guard.
+//! Downstream reconcilers configure packet filtering and routing.
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -175,59 +158,18 @@ fn pick_address(
     Ok(addr)
 }
 
-/// Whether the reservation that has just been written is one the quota still
-/// allows, counted from a list that INCLUDES it.
+/// Check quota from a linearizable list containing the new reservation.
 ///
-/// The quota check before the create is a check-then-act and cannot be
-/// anything else: two requests for the same tenant read the same list, both
-/// see room, and both write. etcd arbitrates the ADDRESS — the object's name
-/// IS the address, so two scans racing for the same gap collide and one of
-/// them loses — but two requests that NAME two different addresses collide on
-/// nothing at all, and the tenant ends up one over its ceiling with no pass
-/// that will ever notice.
-///
-/// So the count is taken again afterwards, and whoever sees a list that is
-/// over the line gives its own address back. What makes that an answer rather
-/// than a second race is that etcd's reads are linearizable: each racer reads
-/// after its own write, so of any two of them at least one sees the other's
-/// object — for both to miss each other, each read would have to come before
-/// the other's write, and one of the two writes came first. Whoever sees both
-/// counts both, and gives its address back.
-///
-/// The honest price, twice over. Two racers can BOTH see the full list and
-/// both give their address back, so a tenant that had room for one ends up
-/// with none and an error saying its quota is used up; the round then starts
-/// over, the re-read shows the truth, and `MAX_ROUNDS` bounds how long that
-/// can go on. And there is a window, between the create and the rollback, in
-/// which a concurrent reader sees an over-quota reservation. Both are the cost
-/// of not holding a lock per tenant, and both are recoverable by asking again
-/// — which the thing they replace, an over-grant no pass takes back, is not.
+/// Per-address create CAS prevents duplicate addresses, but different addresses
+/// can race past the same tenant quota. A post-create read detects excess and
+/// rolls back this caller's allocation. Both racers may roll back, and readers
+/// may briefly see excess; bounded retries recover without a tenant lock.
 fn within_quota(after: &[FloatingIp], tenant: &str, pool: &str, quota: u32) -> bool {
     held_by(after, tenant, pool) <= quota
 }
 
-/// Take an address out of `pool` for `tenant`.
-///
-/// `wanted` is the explicit request: an address a caller names is either given
-/// to them or refused with the reason, never quietly replaced by another one.
-/// Without it the first gap in the pool's ranges is taken, in the order the
-/// operator wrote them.
-///
-/// The quota is checked inside the retry loop and not before it, because a
-/// round that lost its race is a round whose count may have changed — the
-/// tenant that beat us to the address may also have been our own. And it is
-/// checked a second time AFTER the write, because the check before it is a
-/// check-then-act that two requests naming two different addresses walk
-/// straight through: `within_quota` has that argument in full.
-/// What a reservation POINTS AT — everything about it that is not the address
-/// itself.
-///
-/// A struct rather than a fourth, fifth and sixth parameter on `allocate`,
-/// and the split is the honest one: the allocator's business is the tenant,
-/// the pool and which address is free, and none of these three change that
-/// answer. They are carried onto the object the allocator writes, because the
-/// alternative is a create followed by a patch and a window in between where
-/// the reservation exists and points nowhere.
+/// References stored with a floating allocation. Carry them in the initial
+/// create so the address does not temporarily exist without its target.
 #[derive(Clone, Debug, Default)]
 pub struct Pointing {
     /// The VM this address is for, by name. `None` = reserved and unassigned.
@@ -476,36 +418,12 @@ pub async fn all_pools(store: &EtcdStore) -> Result<Vec<FloatingPool>> {
 
 // --- injection --------------------------------------------------------------
 
-/// Write a list of strings into every NIC of an agent NewVmSpec, and say how
-/// many NICs that was.
+/// Fill empty NIC address lists and return the number changed. Every eligible
+/// NIC receives the VM's full list because the controller does not select a
+/// particular interface for an address. Explicit NIC lists remain unchanged.
 ///
-/// The same injection `vni::inject_vxlan_id` does and in the same place, for
-/// the same reason: whose address this is, is a control-plane fact, and by the
-/// time a spec reaches a node it should say plainly which addresses this VM
-/// may source from. The agent then only checks types.
-///
-/// Every NIC gets the whole list, and that is the honest v1: which of a VM's
-/// two NICs a floating address belongs on is a question this control plane
-/// cannot answer — it knows the VM holds the address, not which wire it means
-/// to answer for it on. The rules the node builds are a permission and not a
-/// route, so a permission on both taps of a two-NIC VM costs nothing and
-/// forbids nothing that was allowed before.
-///
-/// A NIC that already carries entries under `field` is left alone: that is the
-/// standalone road, exactly as it is for `vxlan_id` — a cluster with no cloud
-/// above it has no FloatingIp objects to resolve, and putting the addresses
-/// straight in the spec has to keep working.
-///
-/// WHEN a change takes effect, exactly: the addresses are read at CREATE and
-/// written into the spec the node stores, and a node's spec is immutable once
-/// it has it. So a VM created after the assignment has it, and an existing one
-/// picks it up when it is RECREATED — not when it is merely stopped and
-/// started, which keeps the same tap and the same record.
-///
-/// NICE-TO-HAVE, not built, and this is the gap it closes: a session message
-/// that re-applies one tap's chain from a new list. The chain is already
-/// computed from a list and rebuilt whole on every apply, so the work is the
-/// plumbing and not the rules.
+/// Injection happens in the create payload. Existing agent records pick up
+/// new lists only when recreated, not by a stop/start of the same record.
 pub fn inject_nic_list(spec: &mut serde_json::Value, field: &str, values: &[String]) -> usize {
     if values.is_empty() {
         return 0;

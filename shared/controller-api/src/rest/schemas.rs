@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `/schemas`: the shape of every resource this tier serves, generated from
-//! the types themselves. Moved out of `rest.rs` unchanged.
+//! JSON schemas and field mutability for resources served by a tier.
 
 use super::*;
 

@@ -2,12 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! N-A5: packets, not links. A guest reaches the outside through SNAT, the
-//! outside reaches the guest through the floating address, and a standby
-//! router answers neither until it is made active.
+//! Exercise router SNAT, floating-IP translation and standby ARP suppression.
 //!
-//! `#[ignore]` and run the same way `gateway_netns` is — see that file's note
-//! for the namespaces and the kernel modules it needs:
+//! Requires isolated network and mount namespaces, `ip`, `nft`, `arping`,
+//! `ping`, and the kernel modules listed in `gateway_netns.rs`.
 //!
 //! ```text
 //! unshare -rnm --propagation private sh -c \
@@ -15,28 +13,16 @@
 //!    --test gateway_datapath -- --ignored --nocapture'
 //! ```
 //!
-//! ## The three parties
-//!
 //! ```text
-//!   [outside]---veth---( meister-px-ext )---ext[ meister-rt-<id> ]int---( meister-vx10008 )---veth---[guest]
-//!    203.0.113.1                              203.0.113.10/24            10.7.1.1/24              10.7.1.9/24
-//!    (also the router's default gateway)      203.0.113.55/32 (fip)
+//! outside -- provider bridge -- router namespace -- overlay bridge -- guest
+//! 203.0.113.1                 203.0.113.10 / 10.7.1.1               10.7.1.9
+//!                            floating IP: 203.0.113.55
 //! ```
 //!
-//! Both ends are network namespaces and neither is a VM. The figure the round
-//! -3 report offers — a guest booted with `direct_kernel` on the host kernel
-//! and no rootfs — reaches `Running` and then panics on `VFS: Unable to mount
-//! root fs`, so it has no userspace and cannot send a packet: it is the right
-//! figure for a question about a live VMM and the wrong one for a question
-//! about a data path. A namespace on the tenant's overlay bridge is what a
-//! guest looks like to this router, frame for frame.
-//!
-//! The one thing the outside is given by hand is the route to the floating
-//! address. That is what BGP would install — see `router_prefixes`, which
-//! puts exactly this prefix in the announcement — and there is no speaker in
-//! a `unshare`d namespace to install it. The `arping` below proves the other
-//! half, which needs nobody: the router answers for the floating address on
-//! plain layer 2 while it is active, and does not while it is standby.
+//! Both endpoints are network namespaces. The outside route to the floating
+//! IP is installed manually; this test does not exercise BGP or a guest VMM.
+//! Neighbour caches are flushed before standby checks, so these checks do not
+//! establish failover behaviour with cached neighbours.
 
 use std::collections::BTreeMap;
 
@@ -98,11 +84,7 @@ fn inside(netns: &str, args: &[&str]) -> String {
     text
 }
 
-/// One ping, one second of patience.
-///
-/// Prints what it got, because this test IS the proof of N-A5 and a proof
-/// nobody can read is an assertion. `--nocapture` shows it; without the flag
-/// the harness swallows it and the assertions still hold.
+/// Run one ping with a one-second timeout and retain its output.
 fn ping(from: &str, to: &str) -> (bool, String) {
     let (ok, text) = tried(from, &["ping", "-c", "1", "-W", "1", to]);
     println!(
@@ -130,10 +112,7 @@ fn arping(from: &str, dev: &str, addr: &str) -> bool {
     ok
 }
 
-/// The packet counter of the router rule whose comment is `name`.
-///
-/// Read out of the router's own namespace, which is the proof an operator
-/// gets to run: `nft list table ip meister-rt` says which rule did the work.
+/// Read the counter of the named rule in the router namespace.
 fn counter(netns: &str, name: &str) -> u64 {
     let rules = inside(netns, &["nft", "list", "table", "ip", "meister-rt"]);
     let line = rules
@@ -316,12 +295,8 @@ async fn a_guest_reaches_the_outside_and_the_outside_reaches_it_back() {
 
     // --- 3. out, and the order of the two rules is the meaning ------------
     println!("\n=== 3. out, through the router ===");
-    //
-    // The outside has no route to `10.7.1.0/24` at all, so a reply that comes
-    // back is proof the packet left translated. WHICH rule translated it is
-    // the interesting half: the guest holding the floating address leaves as
-    // that address, and its neighbour holding nothing leaves behind the
-    // router's. Both are the same ping and the counters say which is which.
+    // The outside has no tenant route. Replies and rule counters distinguish
+    // floating-IP SNAT from the router's default SNAT.
     let (fip_before, snat_before) = (counter(&netns, "fip-out"), counter(&netns, "snat"));
     let (reached, said) = ping(GUEST, OUTSIDE_ADDR);
     assert!(reached, "the guest reaches the outside: {said}");
@@ -372,10 +347,8 @@ async fn a_guest_reaches_the_outside_and_the_outside_reaches_it_back() {
     d.ensure_router(&spec(id, false))
         .await
         .expect("standby again");
-    // The tenant's neighbour cache still holds the router's address from
-    // step 3; a real failover waits for it to expire or for the new active
-    // router's gratuitous ARP. What is being asserted here is the ARP, which
-    // is what decides where the traffic goes once the cache is empty.
+    // Flush cached neighbours to test standby ARP suppression. This does not
+    // exercise failover with existing neighbour entries.
     inside(GUEST, &["ip", "neigh", "flush", "all"]);
     inside(OUTSIDE, &["ip", "neigh", "flush", "all"]);
     assert!(

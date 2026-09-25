@@ -2,36 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Sealing a secret's values before they reach etcd, and opening them again.
+//! Encrypt Secret values before persisting them in etcd.
 //!
-//! ## Why this exists at all
-//!
-//! `spec.vm.cloud_init.user_data` is the only way into a guest today, it is
-//! immutable, and it is PLAINTEXT in etcd — a store that is unauthenticated
-//! and unencrypted in this deployment. The catalogue's fourth sharpening says
-//! the rest: a `Secret` object without encryption would be `user_data` under
-//! a new name, so the object and the sealing land together or neither does.
-//!
-//! ## The shape, and what it is not
-//!
-//! One key encrypts every value: AES-256-GCM, a fresh nonce per value, and
-//! the value's own path as additional data. That is Kubernetes' `aesgcm`
-//! provider and not a full envelope with a per-object data key — the
-//! difference is what a key rotation costs, and rotation is exactly what this
-//! does not have yet (there is no verb, deliberately; the report says what
-//! one would need). Naming it envelope encryption is right in the sense that
-//! matters here: the ciphertext is in etcd and the key is not, so an etcd
-//! backup is not a pile of somebody's cloud-init.
-//!
-//! ## What the AAD buys
-//!
-//! `<resource>/<name>/<key>` travels as additional authenticated data, so a
-//! ciphertext is bound to the exact slot it was written to. Without it, a
-//! caller who could write one field of one object — or anybody with the etcd
-//! socket, which is the threat this is actually about — could move
-//! `prod/db-password` into `dev/motd` and read it back through a VM they own.
-//! GCM would verify happily; the bytes are the same bytes. With it, the open
-//! fails, and it fails as tampering rather than as a wrong value.
+//! AES-256-GCM uses one configured 256-bit key and a fresh nonce per value.
+//! Additional authenticated data binds ciphertext to `<resource>/<name>/<key>`.
+//! The key remains outside etcd. There is no per-object data key or built-in key
+//! rotation, and unrelated inline cloud-init data is not encrypted here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

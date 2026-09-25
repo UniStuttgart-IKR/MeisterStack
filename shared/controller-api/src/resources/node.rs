@@ -2,69 +2,31 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `Node` kind: one machine, what it may be asked to carry,
-//! and what it reports back. Moved out of `resources.rs`
-//! unchanged.
+//! Node scheduling policy, capacity, health and machine compatibility.
 
 use super::*;
 
-/// A node is an agent the cluster knows about. The object is created on the
-/// first Hello and outlives the session: spec is what an operator decided,
-/// status is what the agent last reported (§2 of the design).
+/// Operator policy for a node registered by an agent Hello.
+/// The object outlives its session; status records the latest observations.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeSpec {
-    /// False CORDONS the node — the scheduler places nothing new on it while
-    /// the running VMs and the session stay untouched.
-    ///
-    /// Deliberately still its own field beside `drain`, and the pair is the
-    /// distinction Kubernetes draws with the same two words: cordon is a
-    /// statement about the FUTURE and drain is an instruction about the
-    /// present. An operator who wants nothing new here and nothing moved has
-    /// exactly one way to say so, and it is this one.
+    /// Allow new placements. Clearing this cordons the node without moving VMs.
     #[serde(default = "schedulable_default")]
     pub schedulable: bool,
-    /// True empties the node: every VM on it that CAN go, goes, and
-    /// `status.draining` says what happened to each one that could not.
+    /// Request evacuation according to [`crate::drain::verdict`].
     ///
-    /// Additive and false by default, which is every node ever written — a
-    /// drain is something somebody asks for, and a field that defaulted the
-    /// other way would empty a fleet on upgrade.
-    ///
-    /// It implies the cordon (a node being emptied is not a placement
-    /// target) without SETTING `schedulable`, because the two are the
-    /// operator's two separate statements and a controller writing into one
-    /// of them would be a controller editing intent. `undrain` therefore
-    /// gives back exactly the schedulability the operator had asked for.
-    ///
-    /// What "can go" means is the table in [`crate::drain::verdict`], and its
-    /// short form is: a stopped VM is rescheduled, a running one is rebooted
-    /// into place only if its owner said `evacuation = restart`, a VM with a
-    /// persistent node-local disk never moves, and nothing with a device
-    /// moves live.
+    /// Drain prevents new placements without changing `schedulable`, so clearing
+    /// it restores the existing cordon policy. Status records progress and
+    /// blockers. Node-local persistent disks prevent movement; devices prevent
+    /// live migration. Running guests require an allowed evacuation strategy.
     #[serde(default, skip_serializing_if = "is_false")]
     pub drain: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
-    /// The workload classes this machine takes, and nothing else.
-    ///
-    /// Decision 6 of 6k, and Kubernetes' taint and toleration said in one
-    /// word from the side an operator actually thinks about it: "this machine
-    /// is for routers". A workload names its class (`VmSpec.class`,
-    /// `RouterSpec.class`), a node names what it accepts, and the scheduler
-    /// asks [`crate::resources::accepts_class`].
-    ///
-    /// **Empty is everything**, which is what makes the field additive: every
-    /// node ever written carries no list, and reading an empty list as
-    /// "nothing" would empty a fleet on upgrade. A node that names classes is
-    /// EXCLUSIVE — it stops taking the ordinary `vm` class the moment it says
-    /// `["router"]`, and that is the whole point of it. An operator who wants
-    /// a machine to do both writes both.
-    ///
-    /// It is the operator's statement and not the machine's, which is why it
-    /// is spec and not status: a gateway-capable node is capable of running
-    /// VMs too, and whether it SHOULD is a decision nobody but an operator
-    /// can make.
+    /// Accepted workload classes. Empty accepts every class; a nonempty list
+    /// accepts only those named. This is operator policy, independent of driver
+    /// capabilities. See [`crate::resources::accepts_class`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepts: Vec<String>,
 }
@@ -76,30 +38,13 @@ pub struct NodeCapacity {
     pub vcpus: u32,
     #[serde(default)]
     pub mem_mib: u64,
-    /// The node's device catalogue, flattened to `<driver>/<profile>` (and the
-    /// bare driver name where a driver resolves no profiles, e.g. vfio). One
-    /// flat list, because matching a VM's device request against it is what a
-    /// DevicePolicy will do.
-    /// `gpuProfiles` was the name until 2026-08-28, and it was wrong from the
-    /// day the list stopped being about GPUs: `volume/filesystem` and
-    /// `network/vxlan` stand in it beside `nvrm/4q`. The alias keeps objects
-    /// written under the old name readable — the fleet's etcd is full of them
-    /// until the next rollout.
+    /// Driver capabilities as `<driver>/<profile>` or a bare driver name.
+    /// The `gpuProfiles` alias accepts older stored objects.
     #[serde(default, alias = "gpuProfiles", skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
-    /// What each VOLUME backend in `capabilities` said about where its bytes
-    /// are, by backend name: `{"lvm-thin": "node-local", "nfs": "shared"}`.
-    ///
-    /// Beside the flat catalogue rather than inside it, because it is a
-    /// different KIND of statement. The catalogue answers "can this node serve /// the request", which is a yes or no and belongs in a list of strings; a
-    /// locality answers "and if it does, who else can see the result", which
-    /// is what a pool's status is derived from and what decides whether a VM
-    /// is pinned to this machine.
-    ///
-    /// Empty is the ordinary reading of an agent that predates the field, and
-    /// it means "did not say" rather than "node-local": a pool whose nodes all
-    /// say nothing keeps no locality at all, and placement falls back to the
-    /// soft preference it has always had.
+    /// Reported volume locality by backend, such as `nfs: shared`.
+    /// An absent entry means unknown, not node-local; placement then uses the
+    /// legacy soft preference. Locality is separate from capability matching.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub volume_localities: BTreeMap<String, Locality>,
 }
@@ -110,22 +55,9 @@ pub struct NodeStatus {
     /// The agent has a session AND its heartbeat has not expired.
     #[serde(default)]
     pub ready: bool,
-    /// When this node last reported, as the API answers it.
-    ///
-    /// **Not stored on this object any more.** It lives in a key of its own
-    /// (`<prefix>/leases/nodes/<name>`, see `EtcdStore::beat`) and the REST
-    /// layer joins it in on GET and LIST, which is why the field is still
-    /// here and still spelled the same: `meister node ls` shows the column it
-    /// always showed, and Tofu and the UI read the key they always read.
-    ///
-    /// D-C7 is what moved it. Every beat rewrote this whole object —
-    /// `machine.cpuFlags` and all, about 1.5 kB — to move one instant by
-    /// 108 ms, at 1.13 etcd revisions a second on an idle lab. A field that
-    /// changes every ten seconds cannot share an object with a spec and an
-    /// inventory that change once a week.
-    ///
-    /// `None` on a node this store has never heard from, which is exactly
-    /// what [`crate::heartbeat::expired`] reads as gone.
+    /// Latest heartbeat, joined by REST from `<prefix>/leases/nodes/<name>`.
+    /// It is stored separately to avoid rewriting the node inventory per beat.
+    /// `None` is treated as expired by [`crate::heartbeat::expired`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_heartbeat: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,16 +67,9 @@ pub struct NodeStatus {
     /// VMs the agent reported in its last status report.
     #[serde(default)]
     pub vms: u32,
-    /// The REST address of the cluster-controller replica that holds this
-    /// node's session, while one does.
-    ///
-    /// A node dials ONE replica and only that one can ask it anything — the
-    /// console among it. With three replicas behind one address a client
-    /// cannot know which, and should not have to: the replica that was asked
-    /// reads this and forwards once. Written at Hello, cleared when the
-    /// stream ends, and empty at a cluster whose `advertise_api` is unset and
-    /// whose `listen_api` is a wildcard, because a replica that cannot name
-    /// itself must not name something wrong.
+    /// REST address of the replica holding the node session. Other replicas
+    /// forward session-bound requests here once. Set at Hello and cleared on
+    /// disconnect; absent when the holder cannot advertise a usable address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_endpoint: Option<String>,
     /// What the drain of this node has done, and what it could not do.
@@ -182,32 +107,10 @@ pub struct NodeStatus {
     pub machine: Option<MachineProfile>,
 }
 
-/// The machine a guest runs ON, as far as its saved state is concerned.
-///
-/// **Why this exists.** A live migration does not move a program, it moves a
-/// MACHINE STATE — vCPU registers, MSRs, the nested-virtualisation state —
-/// and that state is only restorable into a machine that can hold it.
-/// cloud-hypervisor v53 checks the CPUID before the transfer and does not
-/// check the rest, so the failure arrives two milliseconds after the vCPUs
-/// are made, in one line the control plane never sees:
-///
-/// ```text
-/// Request to create new vCPUs: desired = 1 …
-/// WARN Migration aborted as migration command State failed:
-///      Failed to receive migratable component snapshot
-/// ```
-///
-/// The lab spent two nights on that (D-X1), and the answer was measured with
-/// two bare v53 processes and no MeisterStack at all: the same guest moved
-/// between two processes on ONE physical host and failed between two agent
-/// VMs on TWO physical hosts, every time, with or without a NIC and with or
-/// without the fabric disk. Nested KVM state does not cross a physical host.
-///
-/// So the node says what it is, and [`live_migration_refusal`] compares two
-/// of these before a stream is opened rather than after. A refusal costs
-/// nothing: the guest keeps running and a drain moves it by reboot.
-///
-/// Every field may be empty, and an empty field is never evidence.
+/// Machine properties used to check whether saved guest state can be restored
+/// on another node. See [`live_migration_refusal`]. Empty fields provide no
+/// compatibility evidence. Nested hosts require special handling because their
+/// saved virtualization state can depend on the physical host.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineProfile {
@@ -284,39 +187,13 @@ impl MachineProfile {
     }
 }
 
-/// Why a running guest's machine state cannot be restored from `source` into
-/// `target` — or `None`, meaning it may be tried.
+/// Explain a known incompatibility between migration endpoints.
 ///
-/// **The pre-flight check D-X1 asked for**, and the whole of it is here so
-/// that it can be argued and enumerated without a fleet. Four rules, in the
-/// order of how coarse the difference is:
-///
-///   * **the vendor.** No profile papers over Intel against AMD.
-///   * **the cpu model.** Two generations of one vendor differ in what a
-///     saved vCPU state names, and v53 pins `profile: Host`, which means "give
-///     the guest exactly this machine's cpuid". The day `CpuProfile` has a
-///     second variant, a fleet that sets the same one everywhere is a fleet
-///     whose guests move between different models — which is what the third
-///     rule is for.
-///   * **the cpu profile.** Two ends that would give the guest different
-///     cpuid are two ends between which nothing restores, whatever the
-///     silicon is.
-///   * **nested, across hosts.** The one the lab measured. A nested machine's
-///     saved state carries its own host's nested-virtualisation state, and
-///     that does not cross a physical host. Two nested nodes are refused
-///     unless BOTH name a physical host and both name the same one — because
-///     "we cannot tell" is not "it is fine", and the lab's answer to "we
-///     cannot tell" was two nights.
-///
-/// **Silence is never a refusal.** A profile that says nothing is what an
-/// agent from before this field sends, and a comparison that refused on one
-/// would turn a rolling upgrade into a fleet that cannot migrate. Each rule
-/// needs both sides to have spoken.
-///
-/// The kernel and the hypervisor version are deliberately NOT rules. Both are
-/// worth naming beside a refusal somebody else caused, and neither is on its
-/// own a reason a guest cannot move — a fleet mid-upgrade differs in both and
-/// migrates perfectly well.
+/// Compare CPU vendor, model and profile when both endpoints report them.
+/// Nested nodes must identify the same physical host when that check applies.
+/// Missing CPU information alone is not a refusal, for older agents. Kernel
+/// and hypervisor versions are diagnostic fields, not compatibility rules.
+/// `None` permits an attempt; it does not guarantee restoration.
 pub fn live_migration_refusal(
     source_node: &str,
     source: &MachineProfile,
@@ -485,24 +362,9 @@ pub struct Draining {
     /// names say what it is waiting for.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leaving_vms: Vec<String>,
-    /// How many VMs this drain has actually got off the machine, since it
-    /// started.
-    ///
-    /// The other honest answer the doc above asks for, and the one a person
-    /// means by "how did the drain go": `leaving` is a fact about now and
-    /// goes to zero exactly when the work is done, so a finished drain that
-    /// moved two machines' worth of guests reported `0 leaving, 1 staying
-    /// (done)` and looked like a drain that had done nothing. Measured:
-    /// `{"seconds":39.1,"report.moved":0,"really_moved":1}`.
-    ///
-    /// It is a counter and it has the lifetime the doc above worried about,
-    /// stated rather than avoided: the whole `Draining` block is cleared when
-    /// `spec.drain` goes false, so a counter never outlives the drain it
-    /// counted and an `undrain` + `drain` starts at zero. Derived by
-    /// comparing this pass's list against the last one — a name that was
-    /// leaving, is not here any more, and still exists somewhere else has
-    /// left — so nothing has to be remembered between passes except this
-    /// number.
+    /// VMs moved during this drain, accumulated from the previous leaving list.
+    /// A VM counts when it leaves this node and still exists elsewhere. Clearing
+    /// `spec.drain` clears this count along with the rest of the drain status.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub moved_total: u32,
     /// VMs that are still here and are not going.

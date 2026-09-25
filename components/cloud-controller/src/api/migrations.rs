@@ -2,37 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `vmmigrations` at the cloud: one verb, and it keeps nothing.
-//!
-//! The one resource this tier serves and does not store. Everywhere else the
-//! cloud holds the object and the cluster holds a copy; here the object lives
-//! at the cluster and this is a door to it, because a live migration is a
-//! record of a guest moving between two MACHINES and machines are a cluster's
-//! nouns. There is deliberately no live migration across clusters (the
-//! storage is why: two clusters that could both reach one VM's disk is a
-//! claim, and a live stream between two machines that do not share a control
-//! plane is a second one), so there is nothing here for a cloud to own.
-//!
-//! What there WAS instead, until now, is a dead end. `meister vm migrate`
-//! against a cloud answered `this endpoint is a cloud and has no
-//! "vmmigrations"` — true, and useless to somebody whose credential works at
-//! exactly one endpoint (D-P9). Every other write this tier forwards travels
-//! down the cluster's own session; there was simply no message for this one,
-//! and now there is: `CreateVmMigration`.
-//!
-//! **Create and nothing else, and the discovery document says so.** A listing
-//! here would have to invent a mirror of an object this tier does not keep,
-//! and `vmmigration ls` at a cloud already answers with the sentence that
-//! names where the records are. One verb that works beats four that half do.
+//! Forward migration creation to the VM’s cluster. Migration records and their
+//! lifecycle remain at that tier; cloud discovery therefore advertises create only.
+//! Live migration across clusters is not implemented.
 
 use super::*;
 
-/// The document a client POSTs here.
-///
-/// Its own type rather than `controller_api::VmMigration`, and the reason is
-/// what this route IS: nothing is stored, so there is no envelope to fill in,
-/// no `status` to answer with and no `resourceVersion` to hand back. What
-/// travels is an ask, and the four fields below are the whole of it.
+/// Fields forwarded to the cluster; the cloud stores no migration resource.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct MigrationRequest {
@@ -59,19 +35,8 @@ struct RequestSpec {
     tenant: Option<String>,
 }
 
-/// `POST /apis/meister.io/v1/vmmigrations` — ask the cluster that runs this
-/// guest to move it.
-///
-/// The node-patch forward, one noun over, and deliberately the same one: two
-/// ends of one idea in two places is how a header name, a timeout and a loop
-/// rule start disagreeing. What differs is only which command goes down the
-/// session.
-///
-/// **Accepted, not done.** The answer is the object as the cluster will have
-/// written it, with no status on it — because there is none yet, and inventing
-/// `Pending` here would be this tier claiming to know something the cluster
-/// has not said. `vmmigration get` at the cluster is where the phases are, and
-/// the note the CLI prints says so.
+/// Authorize access to the VM and forward a migration request to its cluster.
+/// A 202 response describes accepted intent; read migration progress at the cluster.
 pub(super) async fn create_vm_migration(
     State(st): State<ApiState>,
     caller: Caller,

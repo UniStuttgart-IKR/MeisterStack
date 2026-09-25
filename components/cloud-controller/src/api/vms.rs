@@ -25,26 +25,9 @@ pub(super) fn base_images(vm: &serde_json::Value) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// A VM has at least one CPU and at least one megabyte, and that is the whole
-/// of what this checks.
-///
-/// Deliberately structural and not a sizing rule. The cloud does NOT work out
-/// how big a VM is or whether it fits — that is the scheduler's, against real
-/// capacity, and a second place that answers "how big" is exactly the drift
-/// this control plane is careful about elsewhere. So `vcpus: 100000` passes
-/// here and comes to rest as `Pending` with a reason, which is the honest
-/// answer: nothing has room for it today, and something might tomorrow.
-///
-/// But `vcpus: 0` and `memory_mib: -1` are not sizing questions. They are not
-/// a VM. Before this they answered 201, bound, burned a scheduling slot and
-/// came back `Failed` when the agent could not build them — a refusal three
-/// tiers and a round trip away from the request that caused it.
-///
-/// The fields are read out of the JSON rather than off `InstanceSpec` because
-/// at this tier `spec.vm` IS json: the cloud carries the agent's document
-/// without deserialising it, on purpose, so that a spec field added below can
-/// travel without a change here. `-1` never reaches the `u32` that would have
-/// refused it.
+/// Reject referenced-volume entries that also supply inline disk fields.
+/// General VM JSON validation, including CPU and memory bounds, is performed by
+/// vm_spec::check before this helper.
 pub(super) fn check_vm_shape(vm: &serde_json::Value) -> Result<(), ApiError> {
     // A referenced volume has its size and image already, refused where a
     // person can still read it. Built through `VmSpec` so the rule is the one
@@ -720,21 +703,9 @@ pub(super) async fn get_vm(
     Ok(Json(vm))
 }
 
-/// What an update of this resource may not change, and why.
-///
-/// One table per resource, next to the handler that enforces it, and the rule
-/// they all say: a field the controller acts on ONCE — when it creates the
-/// thing — is immutable, and a field a controller writes belongs to the
-/// server. Everything not named here is free, and the free half is the half
-/// that matters: `spec.runStrategy`, `spec.schedulable`, the quotas, the
-/// labels and the annotations all stay editable, because they are the fields
-/// an operator edits.
-///
-/// `spec.vm` is the hard one and the reason this whole table exists: a node
-/// takes a spec when it CREATES the instance and never again, so a PUT that
-/// changed it answered 200 and did nothing. The honest answer names the only
-/// way to get a different VM — and says it out loud, because with volumes
-/// that do not outlive a VM today that way costs data.
+/// Field ownership and mutability for VM updates.
+/// Boot shape and inline disks are immutable; later referenced disks may change
+/// for hot-plug. A binding may only be cleared through the reschedule guards.
 pub(super) const VM_OWNED: &[Owned] = &[
     // The row storage B rewrote, and the whole of what it says about
     // volumes: `spec.vm` is immutable in everything EXCEPT `volumes[]` from
@@ -1411,30 +1382,10 @@ pub(super) async fn vm_console_ticket(
     })))
 }
 
-/// The same raw upgrade the agent serves, relayed — and, for a browser, the
-/// same bytes in WebSocket frames.
-///
-/// One route and two framings, told apart by the request's own `Upgrade`
-/// header. Before this the token was never looked at: a WebSocket handshake
-/// got a 101 carrying `Upgrade: meister-console` and no `Sec-WebSocket-Accept`,
-/// and the browser — correctly — threw the connection away. So the console
-/// worked through both tiers to the node and was reachable from nothing that
-/// has a screen.
-///
-/// The framing is an ADAPTER and stops at this function: `websocket::adapt`
-/// hands back an ordinary duplex stream, so the pump below and the socket
-/// splice that forwards to a sibling replica both go on speaking raw bytes
-/// and neither knows which kind of client it has.
-///
-/// Tenant-scoped exactly as `vm logs` is, and through the same `Grant`: a
-/// console is the most revealing thing a VM has, and typing into somebody
-/// else's is worse than reading it.
-///
-/// **Which replica.** A console is a live stream through the session this
-/// process holds, so only the replica holding the cluster's session can serve
-/// one. The others answer 503 and say so rather than pretending — the same
-/// honest gap `vm logs` has one tier down, and the same reason: forwarding a
-/// stream is a proxy, not a redirect, and that is its own piece of work.
+/// Open a raw or WebSocket guest console after tenant-scoped write authorization.
+/// Use the local cluster session or one authenticated sibling hop; wait for
+/// ConsoleReady before upgrading so a refusal can retain an HTTP status.
+/// ConsoleOpen currently carries a VM name without the cloud UID.
 pub(super) async fn vm_console(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -1602,27 +1553,11 @@ pub(super) fn switching(websocket: Option<String>) -> axum::response::Response {
     .expect("a fixed response")
 }
 
-/// Hand a whole console to the sibling replica that holds the cluster.
-///
-/// A pure socket proxy, and simpler than the tier below's forward for one
-/// reason: nothing here has to be translated. The sibling answers the very
-/// route this one serves, so what travels between the two connections is the
-/// same byte stream in both directions — no session frames, no ids.
-///
-/// One hop, and it needs no header to say so: a forward asks a SIBLING, and a
-/// sibling that has no session either refuses rather than forwarding again —
-/// they all read the same `session_endpoint`, so a second hop could only be a
-/// mistake that bounces a live stream between two processes.
-/// A forwarded console, whichever way this cloud is spoken to.
-///
-/// A boxed trait object rather than a generic, and the reason is what happens
-/// at the end of this function: the stream is spliced to the client's with
-/// `copy_bidirectional` inside a spawned task, so it has to be one type by
-/// then. Two monomorphisations of the whole splice for one boolean would be
-/// two copies of the hardest code in this file.
+/// A common byte stream for plain and TLS sibling connections.
 trait Console: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Console for T {}
 
+/// Proxy a console to one sibling, carrying the loop-prevention header.
 pub(super) async fn forward_console(
     sibling_tls: &controller_api::forward::Sibling,
     endpoint: &str,

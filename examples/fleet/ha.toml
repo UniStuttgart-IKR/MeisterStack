@@ -2,19 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# The other shape of the same fleet: a raft group of THREE, and two agents.
-#
-# It exists for one reason, and lane 1A named it (§8, open point 6): on a
-# one-box fleet the raft group has one member, so `MEISTER_ETCD_PEERS`,
-# `MEISTER_ETCD_MEMBER` and `MEISTER_ETCD_TOKEN` are empty and
-# nothing derived them. Here they are not empty, so the renderer
-# (nix/lib/render.nix) is exercised on the etcd road as well. (Until M5B
-# there was a second, boot-time renderer and `checks.render-parity` held
-# the two to each other; it went with the appliance image.)
-#
-# No addons role and therefore no OIDC issuer: that half is covered by
-# examples/fleet/one-box.toml, and a second copy of it here would only make
-# the check slower.
+# Three-member etcd group and two agents, exercising derived peer configuration.
+# The one-box example covers addons separately.
 
 schema = 2
 
@@ -24,9 +13,7 @@ domain = "lab.example"
 
 [defaults]
 ssh = { user = "root", port = 22 }
-# `adopted`, because no host of this fleet carries an `install` table: these
-# are machines somebody else partitioned, and that profile is where their
-# filesystems are stated. A fleet this tool installs gets them from disko.
+# Existing hosts declare mounts through the adopted profile instead of disko.
 profiles = ["base", "adopted"]
 rollout = { max_unavailable = 1, reboot = "approve" }
 checks = { required = ["units", "session", "mounts"] }

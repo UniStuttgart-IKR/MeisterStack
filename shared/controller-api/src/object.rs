@@ -2,9 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The K8s-style object envelope: apiVersion/kind/metadata around a
-//! spec/status pair. `resourceVersion` is the etcd mod_revision and the only
-//! concurrency control (compare-and-swap on update).
+//! Resource envelopes with apiVersion, kind, metadata, spec and status.
+//!
+//! `resourceVersion` exposes etcd's modification revision for object CAS.
+//! `generation` tracks accepted spec changes; `uid` identifies an incarnation
+//! independently of the reusable object name.
 
 use std::collections::BTreeMap;
 
@@ -21,29 +23,11 @@ pub struct Metadata {
     /// etcd mod_revision as a string; empty on objects not yet stored.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub resource_version: String,
-    /// How often a CLIENT has changed this object's spec. `1` when it is
-    /// created, `+1` on every API write that leaves a different spec behind.
-    ///
-    /// Kubernetes' field with Kubernetes' meaning, and it is here to make one
-    /// specific lie impossible: a `PUT` on a running VM used to change
-    /// `spec.vm`, answer 200 and do nothing at all, because a node takes a
-    /// spec once — when it creates the instance. Nothing in the API said so.
-    /// Paired with `observedGeneration` in a status, this is what says it:
-    /// `observedGeneration < generation` means exactly "the spec was changed
-    /// after the controller last acted on it".
-    ///
-    /// Three things deliberately do NOT count. A write that leaves the spec
-    /// as it was — a label, an annotation, a patch that says nothing new —
-    /// is not a change of intent. A controller's own write is not a CLIENT's
-    /// intent: the scheduler's binding puts a `nodeName` in the spec, and a
-    /// generation that counted it would tick on every placement and never
-    /// mean anything again. And `resourceVersion` is not this: that counts
-    /// every write of any kind and is the compare-and-swap; this counts the
-    /// ones a controller has to do something about.
-    ///
-    /// `0` is what an object written before this field existed carries. Its
-    /// `observedGeneration` is `0` too, so the pair reads "in sync", which is
-    /// true — and the first spec change makes it `1`.
+    /// Client spec revision: 1 on create, incremented by API writes that change
+    /// the spec. Metadata-only and controller binding writes do not increment it.
+    /// `observedGeneration` identifies the intent last acted on; resourceVersion
+    /// changes for all persisted writes and serves CAS. Legacy objects default
+    /// to generation 0 until their next client spec change.
     #[serde(default)]
     pub generation: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -208,32 +192,12 @@ pub trait Resource: StoredObject {
     /// resource table.
     const NAME_SHAPE: NameShape = NameShape::DnsLabel;
 
-    /// Work out what this object's own status SAYS, out of its spec and the
-    /// facts already written on it, and write that down. Called by the store
-    /// on every write, after whatever the caller did and before the bytes are
-    /// made.
+    /// Derive status from facts already present on the object before persistence.
     ///
-    /// The hook a phase stops being an assignment through. Until struktur 4 a
-    /// phase was whatever the last writer to come past the object happened to
-    /// know — 80 assignments in 23 files, none of which could see what any of
-    /// the others knew, which is how a `StoragePool` pointer stood on
-    /// `Pending` for six minutes without saying why (D-C11) and an `Image`
-    /// stood on `Ready` over a file nobody had looked at (F16). A derivation
-    /// needs exactly one place per resource and a moment at which it is
-    /// certain to run; this is the moment.
-    ///
-    /// **Nothing implements it in this lane.** The default is a no-op, so
-    /// every object goes on being written exactly as it was written before,
-    /// and the derivation lane fills it in one resource at a time — each with
-    /// its own table test, and each a behaviour change that is named in a
-    /// report rather than discovered in a lab.
-    ///
-    /// Total and silent by contract: it reads the object and nothing else (no
-    /// store, no other object, no clock but the one it is handed) and it
-    /// cannot fail. A derivation that needed another object would be a
-    /// derivation the store cannot run inside a compare-and-swap — which is
-    /// why the facts it needs are written ONTO the object by whichever pass
-    /// knows them.
+    /// Called by the store after mutation and before serialization. Implementations
+    /// must be total and perform no I/O; the supplied time is their only clock.
+    /// Cross-resource observations must first be copied onto the object by their
+    /// reconciler. The default leaves status unchanged.
     fn settle(&mut self, _now: DateTime<Utc>) {}
 }
 

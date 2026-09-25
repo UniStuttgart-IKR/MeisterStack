@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `CertificateSigningRequest` kind: how a client asks to be
-//! known. Moved out of `resources.rs` unchanged.
+//! Client certificate requests, approval conditions and issued certificates.
 
 use super::*;
 

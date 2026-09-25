@@ -8,12 +8,8 @@ use super::*;
 
 // --- images ----------------------------------------------------------------
 
-/// The catalogue name IS the reference: it is what a VM's `base_image` says,
-/// and what the node's block driver then looks up under its own image_dir. v1
-/// distributes nothing, so the only way those two namespaces can line up is
-/// for the name to be the file name — and a catalogue entry that cannot line
-/// up would be worse than no entry at all, because the 422 it buys is a
-/// promise the agent goes on to break.
+/// Require a bare filename matching the source basename.
+/// The catalogue name is passed unchanged to the node's image directory.
 pub(super) fn check_image_name(name: &str, source: &str) -> Result<(), ApiError> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err(invalid(
@@ -30,19 +26,8 @@ pub(super) fn check_image_name(name: &str, source: &str) -> Result<(), ApiError>
     Ok(())
 }
 
-/// The two rules a fetchable image has to obey, and both are about the
-/// checksum rather than about the URL.
-///
-/// A URL without one is refused because an image fetched over a network and
-/// not checked is an image whose contents somebody else chooses — every VM in
-/// the fleet booting whatever answered. And a checksum without a URL is
-/// refused because it would be a promise nobody checks: nothing fetches a
-/// path image, so nothing would ever compare it, and an operator reading the
-/// object would believe otherwise.
-///
-/// The shape is validated here rather than at the node for the reason every
-/// other spec rule is: the node is the last place to find out, and by then
-/// somebody is waiting for a VM.
+/// Require an HTTP(S) URL and a lowercase SHA-256 digest together.
+/// Path-based registrations have neither; this endpoint cannot verify their bytes.
 pub(super) fn check_fetchable(spec: &ImageSpec) -> Result<(), ApiError> {
     match (&spec.url, &spec.sha256) {
         (None, None) => Ok(()),
@@ -78,27 +63,10 @@ pub(super) fn check_fetchable(spec: &ImageSpec) -> Result<(), ApiError> {
     }
 }
 
-/// Whose registration a PATH-based image may be, and why it is not
-/// everybody's.
-///
-/// Astra finding S02, 2026-09-23. A registration with no url and no checksum
-/// says: "the bytes are already on the node, under this name". It names a
-/// file this control plane has never seen and cannot check, in a namespace
-/// every tenant shares — the catalogue name IS the file name, on every node —
-/// and `delete_image` removes the catalogue entry without removing anything
-/// from any node. So a tenant could register the NAME of an image somebody
-/// else had fetched, take the bytes that are still lying there, and boot a
-/// VM off them. Nothing in the object would look wrong.
-///
-/// The line is `Operator`, the same line `Grant::confined_to` draws
-/// everywhere else, and it is the honest one: adopting a file that is already
-/// on a node is a statement about the node's disk, and whoever runs the
-/// estate can already put anything on that disk. A member has no such
-/// standing and now has to say where the bytes come from — a url and a
-/// checksum, which is a claim this control plane can hold them to.
-///
-/// Anonymous mode says yes, here as it does everywhere else; that is the mode
-/// the lab has run in since M1.
+/// Restrict path-based registrations to identities not confined to a tenant.
+/// Such registrations adopt files in a node-wide namespace and could otherwise
+/// expose cached bytes from another tenant. Tenant registrations require a URL
+/// and checksum. Anonymous mode remains unrestricted.
 pub(super) fn check_source_kind(spec: &ImageSpec, confined: Option<&str>) -> Result<(), ApiError> {
     if spec.url.is_some() {
         return Ok(());
@@ -122,9 +90,7 @@ pub(super) fn check_source_kind(spec: &ImageSpec, confined: Option<&str>) -> Res
     )))
 }
 
-/// A member's catalogue is its own images plus the public ones — which is
-/// what a shared base image is for, and why the list is not simply filtered
-/// to one tenant the way the VM list is.
+/// List owned and public images, then apply the label selector.
 pub(super) async fn list_images(
     State(st): State<ApiState>,
     caller: Caller,
@@ -223,11 +189,9 @@ pub(super) async fn get_image(
     Ok(Json(image))
 }
 
-/// A hard delete, because an image object owns no resource anywhere and there
-/// is nothing for a teardown to do — but only once nothing names it. The
-/// catalogue's whole job is that "every base_image names an Image" holds, and
-/// deleting out from under a VM would break it silently, at the exact moment
-/// nobody is looking.
+/// Refuse deletion while a VM references the image, then request cache removal
+/// and delete the catalogue entry. This guard does not inspect Volume base-image
+/// references or reserve against concurrent new references.
 pub(super) async fn delete_image(
     State(st): State<ApiState>,
     Path(name): Path<String>,

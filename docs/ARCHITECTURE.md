@@ -1,77 +1,102 @@
 # Architecture
 
-MeisterStack is a lightweight, modular virtual machine orchestrator designed for edge and lab clusters.
-A two-tier control plane manages independent clusters of bare-metal nodes, each of which runs a node agent.
-The system's modular architecture makes it extensible to support new hardware, such as specialized PCIe devices.
+MeisterStack has two control-plane tiers and a node agent. The cloud selects a
+cluster; the cluster selects a node; the agent reconciles Linux resources and VMM
+processes. The CLI can address a controller or the agent's local Unix socket.
 
-MeisterStack is written in Rust and is fully open source.
+```mermaid
+flowchart TB
+    CLI[meister CLI] -->|REST| Cloud[Cloud controller]
+    CLI -->|REST| Cluster[Cluster controller]
+    CLI -->|Local Unix socket| Agent[Node agent]
+    Cluster -->|Outbound bidirectional gRPC session| Cloud
+    Agent -->|Outbound bidirectional gRPC session| Cluster
+    Cloud --- CE[(Cloud etcd namespace)]
+    Cluster --- KE[(Cluster etcd namespace)]
+    Agent --- DB[(Local redb)]
+    Agent --> Drivers[Compiled drivers]
+    Drivers --> Host[Linux resources and VMM processes]
+```
 
-This document describes the target architecture of MeisterStack.
+Session arrows show connection initiation. Commands travel back down the same
+streams; reports travel up. Agents also use data-plane listeners, including
+migration receivers. Outbound control sessions do not mean the node has no inbound
+network services.
 
-## Design Goals
+## State and ownership
 
-The architecture's design is guided by four main goals. The first is **modularity**, which features an advanced trait system that abstracts infrastructure such as networking, devices, storage, and the hypervisor itself. This makes replacing the underlying technologies possible.
+| Layer | Authoritative local state | Derived or observed state |
+| --- | --- | --- |
+| Cloud | Tenants, users, global resources, full VM intent and cluster binding | Cluster capacity, placement and workload reports |
+| Cluster | Node binding, local desired resources, migrations and reservations | Node inventory, process phases and volume reports |
+| Agent | Local ownership records, handles, process identities and operation receipts | Kernel resources and VMM state |
 
-The second design goal is to be **lightweight**. While modern hardware, especially server hardware, is very powerful, designing lightweight software is no longer a top priority. However, hardware constraints are still real on edge and lab clusters. Therefore low RAM and CPU usage are key requirements for the system to be viable on less capable hardware.
-To achieve this goal, MeisterStack allows the exclusion of unused backends via compile-time features.
+The cloud stores full VM specifications, not just VM stubs. Controllers persist
+resources in etcd and use revision comparisons for competing updates. Cloud and
+cluster namespaces can share a development etcd instance; independent deployments
+can use separate stores. Logical namespace separation does not itself provide
+independent failure domains.
 
-**Maintainability** is another key design goal of the system. To make it suitable for lab and edge clusters, the maintenance overhead should be minimal. The most effective way to achieve this goal is to design the system to be as modular as possible with as few moving parts as possible. This also includes traceability of errors and the state of the system.
+The agent's redb database is durable bookkeeping, not a disposable cache. Concrete
+paths, backend handles and migration barriers may exist only there. Losing that
+state can remove the evidence needed to distinguish an owned resource from an
+orphan. External processes can survive the agent that created them.
 
-The fourth goal the orchestrator is designed for is **first-class PCIe device support**. This goal involves supporting specialized devices, such as GPUs and NICs, and abstracting them as resources that can be scheduled through the same driver model as compute, storage, and networking resources. In modern infrastructure, cooperative sharing of NICs and GPUs is often a key requirement for increasing compute density by sharing those devices between multiple VMs.
+## Reconciliation
 
-MeisterStack does not support loading drivers at runtime. The set of available drivers is fixed at compile time. It is also not a general replacement for OpenStack or Kubernetes as an all-in-one infrastructure-as-a-service platform.
+```mermaid
+sequenceDiagram
+    participant U as CLI
+    participant C as Cloud
+    participant K as Cluster
+    participant A as Agent
+    participant H as Linux / VMM
+    U->>C: Write desired VM resource
+    C-->>U: Accepted resource
+    C->>K: Assign full desired VM
+    K->>A: Node command / desired-state snapshot
+    A->>H: Provision or reconcile
+    H-->>A: Observed process and resource state
+    A-->>K: Status and operation evidence
+    K-->>C: Cluster report
+    U->>C: Read observed status
+```
 
-## System Overview
+Controllers combine store watches, queued retries, periodic reconciliation and
+session reports. A successful write records intent. Agent acknowledgements usually
+confirm command acceptance; later observations establish completion. Reconnection
+replays desired state and reports, so handlers must tolerate duplicates and stale
+messages. See [control plane](CONTROL_PLANE.md) and [agent](AGENT.md).
 
-![MeisterStack system overview](diagrams/architecture.svg)
+## Resource boundaries
 
-*Figure 1: System overview. Showing the two-tier control plane, stretched over multiple clusters, controlling bare-metal nodes. Each node runs
-exactly one agent. Each agent has its dedicated local `redb` instance, and each cluster has its dedicated `etcd` cluster, and the cloud
-controller has its own `etcd` cluster. The arrows indicate the connection direction: Agent connects to its cluster, cluster connects to the cloud controller.*
+- **Placement:** cloud policy chooses a cluster; cluster policy checks node
+  readiness, selectors, capabilities, capacity and resource locality.
+- **Storage:** volume objects express ownership and lifecycle; drivers return local
+  handles. Shared reachability is distinct from exclusive writer ownership.
+- **Networking:** tenant overlays, provider access and public allocation are
+  reconciled separately. Local anti-spoofing protects attached interfaces.
+- **Devices:** driver capabilities participate in scheduling; acquisition returns
+  concrete attachments used by the VMM.
+- **Migration:** a durable attempt binds source and destination evidence. Unknown
+  outcome retains ownership. The receive driver and restart path have unresolved
+  gaps described in [migration](MIGRATION.md).
+- **Deletion:** finalizers retain objects while cleanup is incomplete. Local locks
+  serialize some races but are not distributed fencing.
 
-MeisterStack is divided into three tiers (see Figure 1): the agent, which provisions resources on individual bare-metal nodes; the cluster controller, which handles the placement of virtual machines with respect to available resource constraints and shared resources; and the cloud controller, which acts as a gateway, handles tenants, and manages global resources. One cloud controller holds one or more cluster controllers, each of which manages a cluster of agents running on individual nodes.
+## Extensibility and isolation
 
-The system uses a two-tier control plane to isolate public endpoints, particularly the REST API, from the part of the system that interacts directly with the infrastructure.
-This reduces the attack surface on MeisterStack clusters by isolating public services from the rest of the system. The system's hierarchical design allows the cloud to be separated into multiple clusters comparable to OpenStack's regions or AWS availability zones. These clusters are isolated without interfering noise and can be distributed over multiple locations. 
-Another positive side effect is that multiple small, independent etcd clusters, one per tier, scale better than one large etcd cluster stretched across all locations.
-The downside of a two-tier control plane is that the system has more moving parts, making it harder to maintain and design a consistent data structure across the two layers with a clear separation of concerns.
-Each cluster controller connects to the cloud controller via a gRPC stream, which also serves as a liveness test.
+Rust traits define hypervisor, device, network, storage and resource-limit
+boundaries. Driver selection happens at build time through Cargo features and at
+startup through configuration. There is no runtime plugin loader; a new driver
+requires a rebuild and must implement lifecycle, recovery and cleanup contracts.
 
-The agent communicated with the controll plane by gRPC stream. Despite the possibility to directly listen to the cluster's etcd, isolating the agent from the state store (cluster etcd) also reduces the attack surface of the system and enableing the controller to percisly control which information is visible to which agent and not sharing the complete cluster state 
-with all agents. The agent connects to the cluster controller by gRPC stream (see Figure 1), which allows no open ports on the agent side and by monitoring the stream the
-the controller can check the agents liveness.
+Controllers do not expose etcd directly to agents. TLS, authenticated sessions and
+resource authorization define trust boundaries; the local agent socket is an
+administrative interface. Details and current exceptions are in
+[security](SECURITY.md).
 
-As mentioned and shown in Figure 1, the system has three separate sources of truth, which makes data structure design more challenging. Cloud-etcd is tenant-oriented and stores tenant information, available images, available clusters, and VM stubs. A VM stub only describes the existence of a VM, its rough state, the owner (tenant), and the cluster in which the VM lives.
-The cluster layer stores the placement of VMs, their full specifications, and their device inventories, as well as all registered agents of that cluster. The agent layer stores the concrete results of the VM, such as file paths, device names, and the process id.
-There are multiple types of truth for storing information about virtual machines: the intent, which is stored in the cluster etcd and holds the desired state; the bookkeeping of what was done, which is stored in the agent's redb; and the reality that lives in the kernel. The bookkeeping is not a cache of the controller state it includes file paths, device names, and process IDs. That information only exists on the agent's redb and never leaves the agent's node
-During reconciliation, the agent compares the kernel's actual state against the intent from the cluster controller and its own bookkeeping in redb, and resolves any discrepancies.
-
-All infrastructure capabilities of the software stack are abstracted through Rust traits that are implemented in concrete drivers compiled into the agent. This behavior allows the system to replace the underlying software stack by implementing a driver that implements the respective trait for the specific software. For example, cloud-hypervisor could be replaced by qemu/libvirtd. As illustrated in Figure 1, the system provides traits for the hypervisor, devices, networking and storage. Other behaivoir like resource limitations are also abstracted by a trait but not illustrated in figure 1.
-Storage and networking are also abstracted on the control plane by Rust traits to make the responsible backends interchangeable. To avoid confusion, these abstractions are called plugins instead of drivers. The driver selection happens in two steps: first, at compile time, the driver needs to be activated as a Cargo feature; second, at boot time, the agent's configuration file configures the driver so it can be instantiated. Because Rust has no stable ABI, and loading drivers dynamically would forfeit Rust's compile-time guarantees, the decision was made to include drivers at compile time. Driver specific parameters are passed through the agent and only interpreted by the driver itself. Adding a driver requires a rebuild of the agent.
-
-## Components
-
-### Agent
-
-#### Drivers
-
-#### CLI `agentctl`
-
-### Cluster-Controller
-
-### Cloud-Controller
-
-### Live migration
-
-The implemented ownership, timeout, restart and upgrade contract is documented in
-[Live migration: ownership, evidence and recovery](MIGRATION.md).
-
-### Resource cleanup
-
-The local ownership checks, incomplete provisioning recovery and their limits are
-documented in [Resource cleanup: ownership and incomplete work](RESOURCE_LIFECYCLE.md).
-
-## Miscellaneous
-
-## Future Work
-
+The hierarchy reduces the amount of node detail required by the cloud, but adds
+replication, asynchronous ownership transfer and recovery work. Low overhead,
+scalability and fault isolation are design goals requiring measurement; the layout
+alone does not prove them.

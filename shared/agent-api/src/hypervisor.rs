@@ -112,82 +112,42 @@ pub trait Snapshottable: Send + Sync {
     async fn snapshot(&self, id: &VmId, target: &str) -> Result<()>;
     async fn restore(&self, id: &VmId, source: &str) -> Result<()>;
 }
-/// Moving a running guest between two machines.
+/// Optional live-migration operations, exposed by `Hypervisor::as_migratable`.
 ///
-/// Two calls and one string between them: the destination is made ready and
-/// says where to send, the source is told to send there. The string is a URL
-/// in the hypervisor's own spelling — see [`migration_url`] — and travels
-/// through the control plane unopened, which is what keeps a second VMM's
-/// idea of an address out of this crate.
-///
-/// Optional, through `Hypervisor::as_migratable`: a VMM that cannot do it
-/// says so by returning `None`, and everything above then treats a VM on that
-/// node exactly as it treats one with a passthrough device — it moves by
-/// reboot or it does not move.
-///
-/// **The order is the safety property and it is not negotiable.**
-/// `migrate_in` first, always: it makes the destination and returns only when
-/// something is listening there. `migrate_out` second, and it is the only
-/// call that touches the source. A failure anywhere leaves the source
-/// running, because nothing has been done to it.
+/// Prepare the destination with `migrate_in` before starting `migrate_out`.
+/// The transport address is opaque to the control plane; see [`migration_url`].
+/// Once sending may have started, errors and timeouts leave ownership ambiguous.
+/// The caller must resolve the attempt using durable source and destination
+/// evidence before destructive cleanup.
 #[async_trait::async_trait]
 pub trait Migratable: Send + Sync {
-    /// Send this VM to `peer`, the address the destination answered with.
-    ///
-    /// Returning `Ok` means the send has STARTED, not that it has finished —
-    /// cloud-hypervisor answers immediately and runs the transfer in a worker
-    /// — so nothing above may read it as "the guest is over there". What says
-    /// that is the destination reporting the VM Running.
+    // Start sending this VM to the prepared destination.
+    //
+    // `Ok` acknowledges initiation, not completion. A destination Running report
+    // alone is insufficient: completion requires matching attempt evidence from
+    // both endpoints.
     async fn migrate_out(&self, id: &VmId, peer: &str) -> Result<()>;
 
-    /// Make this machine ready to receive `id`, listening at `peer`.
-    ///
-    /// Returns the VMM's pid when the listener is up, so that the source can
-    /// be told to send the moment this comes back. The pid is what `create`
-    /// returns for the same reason: the agent records it, and after a restart
-    /// it is the only handle left on that process.
-    ///
-    /// Everything the arriving guest needs that is NOT the VMM — its taps,
-    /// its disks, at the same paths — has to exist before this is called: the
-    /// configuration travels inside the stream and names them, so a path that
-    /// is right on the source and absent here is a guest that arrives into
-    /// nothing.
+    // Prepare a receiver and return its VMM PID once it is listening.
+    //
+    // Required taps and disks must already exist at the paths carried in the
+    // transferred configuration. The agent records the PID for later probing.
     async fn migrate_in(&self, id: &VmId, peer: &str) -> Result<u32>;
 
-    /// Why the guest that was on its way here is not coming, if the
-    /// hypervisor has said so.
-    ///
-    /// The one answer a receiving node cannot work out for itself. A
-    /// transfer that fails leaves the destination's VMM alive and its API
-    /// answering again, holding nothing — a picture that from the outside is
-    /// indistinguishable from a VMM still waiting — and the tier above has to
-    /// tell the two apart, because one of them is a process and a disk
-    /// connection to give back and the other is a guest to wait for.
-    ///
-    /// `None` is "nothing has been said": still on its way, already here, or
-    /// a driver with no way of knowing. It is deliberately not "still on its
-    /// way": the caller has a deadline for that, and a driver that cannot
-    /// answer must not be able to cause a teardown.
-    ///
-    /// Synchronous and cheap, because it is asked once per VM per reconcile
-    /// pass beside the probe.
+    // Return a driver-reported receive failure, if known.
+    //
+    // `None` supplies no evidence: reception may be pending, complete or
+    // unobservable. Callers must bind the report to the active attempt and
+    // apply its ownership rules before cleanup. Called once per reconcile pass.
     fn receive_failed(&self, _id: &VmId) -> Option<String> {
         None
     }
 
-    /// Whether a send that was STARTED is over without the guest having
-    /// left, and why.
-    ///
-    /// The counterpart of `receive_failed`, and it exists for the same
-    /// reason from the other end: `migrate_out` returning `Ok` means the
-    /// send began, and the only thing the source can watch for afterwards is
-    /// its own VMM going away. That happens on SUCCESS. On failure the VMM
-    /// resumes the guest and goes on serving it, and waiting for a process
-    /// that is never going to exit is how a command turns into a hang.
-    ///
-    /// `None` is "still sending, or this driver cannot tell" — never "it
-    /// failed". A driver with no answer must not be able to end a transfer
-    /// that is running; what ends it then is the caller's ceiling.
+    // Return a driver-reported send failure, if known.
+    //
+    // A successful `migrate_out` only starts the transfer. `None` means the
+    // driver has no failure evidence; a caller timeout does not prove that
+    // the guest stayed on the source or permit destination teardown.
     async fn send_failed(&self, _id: &VmId) -> Option<String> {
         None
     }
@@ -231,25 +191,10 @@ pub trait HotPluggable: Send + Sync {
     /// happened before this call. What this does is tell the VMM.
     async fn add_disk(&self, id: &VmId, volume: &AttachedVolume) -> Result<()>;
 
-    /// Tell the guest that a disk has grown.
-    ///
-    /// **The second half of a resize and never the first.** What this does
-    /// depends on what is behind the disk, and cloud-hypervisor v53 is
-    /// explicit about it (`block/src/formats/raw/mod.rs`, `RawDisk::resize`):
-    /// for a FILE it calls `set_len` itself; for a BLOCK DEVICE it grows
-    /// nothing and only checks that the device already has the size asked
-    /// for, failing otherwise. So the backend grows the bytes first — the
-    /// storage driver's `resize` — and this tells the guest, which is the
-    /// part no storage driver can do.
-    ///
-    /// `size_bytes` must be a multiple of the sector size; a GiB is, and the
-    /// tier above measures in GiB. The vCPUs are paused across it by the VMM
-    /// itself, briefly, and nothing here has to arrange that.
-    ///
-    /// A qcow2 with a backing file is refused by CH. Nothing in this tree
-    /// hands one over — every clone from a base image is written out raw
-    /// since the image work — so it reaches nobody, and this is where
-    /// somebody will look when it does.
+    /// Notify the guest of a disk increase after the storage backend has grown
+    /// the bytes. For a block device, the VMM checks the existing size; a file
+    /// backend may also call set_len. `size_bytes` must align to the sector size.
+    /// The VMM handles any required brief vCPU pause.
     async fn resize_disk(&self, id: &VmId, disk_id: &str, size_bytes: u64) -> Result<()>;
 
     /// Unplug a disk by the name `add_disk` gave it.
@@ -409,52 +354,20 @@ pub trait Hypervisor: Send + Sync {
     async fn probe(&self, id: &VmId) -> bool;
     fn is_tracked(&self, id: &VmId) -> bool;
 
-    /// Is the process at `pid` still the VMM of `id`?
-    ///
-    /// Asked wherever the agent is about to ACT on a recorded pid — adopt it
-    /// after a restart, count it as alive, signal it — and the reason it has
-    /// to be asked is that a pid is not an identity. Linux hands the number
-    /// out again, a node that starts and stops VMs hands it out again soon,
-    /// and the record does not notice. One of the actions is `SIGKILL`.
-    ///
-    /// The default reads the VM's uuid off `/proc/<pid>/cmdline`, which is
-    /// right for every hypervisor this agent starts the way it starts
-    /// cloud-hypervisor: one process per VM, given a socket named after that
-    /// VM. That is a contract for a driver author rather than an accident —
-    /// a VMM whose command line does not name the VM cannot be recognised
-    /// after an agent restart by anything the agent has, so a driver that
-    /// spawns differently has to override this and say how ITS process can be
-    /// told from a stranger's.
-    ///
-    /// `false` for a dead pid, so it subsumes liveness.
+    /// Check that a live PID still belongs to this VM before adopting or acting
+    /// on it. PIDs can be reused. The default checks the VM UUID in the process
+    /// command line; drivers whose launch command does not identify the VM must
+    /// override it. This check is not an atomic process handle.
     fn owns_pid(&self, id: &VmId, pid: u32) -> bool {
         crate::pid::process_carries(pid, &id.to_string())
     }
 
-    /// VMMs this hypervisor is serving on this machine that `known` does not
-    /// name.
+    /// Enumerate locally running VMMs whose IDs are absent from `known`.
     ///
-    /// Asked because "the agent adopts what it has a record of" was only half
-    /// a rule: nothing said what happened to the other half. A VMM whose
-    /// record went while the process did not is a guest running on a machine
-    /// nobody manages — it answers no command, appears in no report, holds its
-    /// disks and its taps, and the first anybody hears of it is a second guest
-    /// failing on a write lock over the same volume. That is D18, and the lab
-    /// produced one: a destination whose agent was killed mid-migration
-    /// finished the transfer into a process nothing was watching.
-    ///
-    /// Discovered from the MACHINE and never from this driver's own map. The
-    /// map is empty at start-up, which is exactly when this question is worth
-    /// asking, so a driver that answered from it would always answer "none".
-    ///
-    /// `known` is every id the agent has a row for, corrupt rows included:
-    /// the question is whether a record EXISTS, not whether this build can
-    /// read it. A VM whose record cannot be deserialised is a VM this agent
-    /// cannot manage, and killing its guest over that would be the worst
-    /// possible reading of a bad row.
-    ///
-    /// Empty by default, which is the honest answer for a driver that cannot
-    /// enumerate: nothing is claimed and therefore nothing is ended.
+    /// Inspect the machine, not an in-memory map that is empty after restart.
+    /// `known` includes IDs with corrupt records: inability to decode a record
+    /// does not establish that its guest is orphaned. Drivers unable to identify
+    /// unmanaged VMMs return an empty list, as the default does.
     async fn strays(&self, known: &[VmId]) -> Vec<VmId> {
         let _ = known;
         Vec::new()

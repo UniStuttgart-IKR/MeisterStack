@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The migration edge: `VmMigration` objects, and the sentence that says why
-//! a VM cannot move live. Moved out of `api.rs` unchanged.
+//! Cluster migration requests, admission checks and ownership-aware deletion.
 
 use super::*;
 
@@ -213,25 +212,9 @@ pub(crate) struct MigrationFacts {
     pub machines: std::collections::BTreeMap<String, Option<controller_api::MachineProfile>>,
 }
 
-/// Why this VM cannot move live — or `None`, meaning it can be tried.
-///
-/// Four refusals, and each one is a fact that no waiting changes:
-///
-///   * **not Running.** There is nothing to move. A stopped VM has a cheaper
-///     verb (`vm reschedule`) and the sentence names it.
-///   * **a device.** cloud-hypervisor cannot carry a VFIO or vhost-user
-///     device across a migration — the state is in the hardware, not in the
-///     guest's memory — and NVIDIA vGPU live migration is deliberately out of
-///     scope. The sentence names the way out, which is a reboot.
-///   * **a persistent node-local disk.** The bytes are on the source machine.
-///     Nothing about a live migration moves them, and a guest that arrived
-///     without its disk is worse than one that did not arrive.
-///   * **no target.** Nowhere connected, schedulable and running a hypervisor
-///     that is not the machine it is already on. A named `targetNode` that is
-///     not among them is refused by name, because somebody who named a node
-///     asked about that node.
-///
-/// `evacuation: never` is NOT among them — see `create_vm_migration`.
+/// Refuse unsupported VM state, devices/disks, missing targets or known machine
+/// incompatibility. Missing machine profiles retain compatibility with older agents.
+/// Explicit requests do not apply the drain-only evacuation policy.
 pub(crate) fn migration_refusal(
     vm: &Vm,
     facts: &MigrationFacts,
@@ -323,18 +306,8 @@ pub(crate) fn migration_refusal(
     }
 }
 
-/// The first entry of `spec.vm.volumes[]` that is a disk in its own right
-/// rather than a reference to a `Volume` object, by its path in the spec.
-///
-/// The refusal beside this one reads `facts.node_local_disk`, which is built
-/// from the VM's REFERENCED volumes — and an inline disk has no `Volume`
-/// object at all, so it went straight through a check written to catch
-/// exactly its kind of problem (migration D6). Its bytes are made by the node
-/// when the VM is created and they are as node-local as bytes get.
-///
-/// Named by path and not by content, because an instance store has no name:
-/// `spec.vm.volumes[0]` is what an operator edits, and it is what the same
-/// document's other refusals already point at.
+/// Find an inline disk by its spec path. Its node-local bytes have no independent
+/// Volume record that can follow a live migration.
 pub(super) fn inline_disk(spec: &serde_json::Value) -> Option<String> {
     let volumes = spec.get("volumes")?.as_array()?;
     volumes

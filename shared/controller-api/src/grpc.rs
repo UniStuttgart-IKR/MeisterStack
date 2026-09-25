@@ -2,13 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The same two questions at the session ports: is this connection TLS, and
-//! who is on the other end of it.
+//! TLS setup, authentication and supervision for gRPC session listeners.
 //!
-//! Sessions get tonic's own TLS rather than the hand-rolled accept loop the
-//! REST side needs, for the plain reason that tonic already hands a handler
-//! the peer's certificates and axum does not. Same crypto stack underneath
-//! (`tls-ring`), same PEM files out of the same generator.
+//! Tonic supplies peer certificates to the shared authentication chain. Session
+//! identity checks bind a machine certificate to the peer named by Hello.
 
 use std::path::Path;
 use std::sync::Arc;

@@ -2,18 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `meister-cluster-controller --check-config`: does this file parse and hang
-//! together, and nothing else.
-//!
-//! Its reason for existing is the same as the agent's: a `nix flake check`
-//! on a build host has to be able to say that a controller's configuration
-//! is sound without being that controller. So the check binds no port, dials
-//! no etcd, and opens no file the configuration points at — the last of
-//! those is why the authenticator chain is checked in two halves
-//! (`rest::check_chain` decides which links stand, `rest::build_chain` opens
-//! their files), and this covers only the first.
-//!
-//! These tests run the real binary, because the claim is about the binary.
+//! Exercise the real --check-config binary without starting controller services.
+//! The check validates configuration and reads a configured CRL; other credential
+//! files and backend connectivity are not validated here.
 
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
@@ -118,8 +109,8 @@ fn checking_a_config_binds_nothing_dials_nothing_and_writes_nothing() {
         0,
         "the check created something in its working directory"
     );
-    // port 1 is not listening anywhere on this machine; the check returned
-    // in milliseconds rather than waiting for a connection that never comes.
+    // This fixture assumes port 1 cannot be bound by the test process.
+    // The assertion alone does not establish whether a connect was attempted.
     assert!(TcpListener::bind("127.0.0.1:1").is_err());
 }
 
@@ -158,8 +149,8 @@ fn a_revocation_list_is_read_by_the_check_and_named_when_it_cannot_be() {
         .output()
         .expect("bash");
     if !made.status.success() {
-        // No openssl on this machine: the two refusals above are the half
-        // of this test that needs nothing, and they have run.
+        // Any fixture-generation failure skips acceptance coverage.
+        // The missing and malformed CRL cases above have still run.
         eprintln!("skipping the accepted half: meister-ca did not run here");
         return;
     }

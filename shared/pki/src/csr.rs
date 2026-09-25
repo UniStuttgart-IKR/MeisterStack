@@ -2,13 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The client's half of the CSR flow: make a key, keep it, ask for a
-//! certificate over it.
+//! Generate client keys and certificate signing requests.
 //!
-//! `KeyAndCsr` is the whole reason this crate is shared. The private key is
-//! generated here, on the machine that will use it, and the only thing that
-//! travels is the request — a public key and a name, both of which the server
-//! is free to distrust. Nothing in this module can send anything anywhere.
+//! The private key stays with the caller; only the CSR is submitted for approval.
+//! Requested subjects are not authoritative until the server approves them.
 
 use anyhow::{Result, anyhow, bail};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};

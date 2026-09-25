@@ -2,14 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! One token, checked.
+//! Verify JWT algorithms, signatures and claims.
 //!
-//! The order of the checks in `verify` is part of what it means and is
-//! written to be read top to bottom: the algorithm is pinned before a key is
-//! chosen, the key is chosen before the signature is checked, and the
-//! signature is checked before a single claim is believed. Nothing below the
-//! signature line reads anything an attacker could have written, because
-//! everything below it has been signed by the provider.
+//! Pin the algorithm, choose a compatible provider key and verify the signature
+//! before accepting claims. A valid signature does not by itself establish the
+//! issuer, audience, validity period or local authorization.
 
 use std::collections::BTreeMap;
 use std::time::Duration;

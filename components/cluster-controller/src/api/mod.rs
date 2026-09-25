@@ -58,16 +58,8 @@ pub struct ApiState {
     scheduler: Arc<dyn controller_api::Scheduler>,
 }
 
-/// What this endpoint serves, as `GET /apis/meister.io/v1` reports it. See
-/// the cloud tier's table for why it stands beside the routes rather than
-/// under them.
-/// What this endpoint does that is not a resource and not a verb. See the
-/// cloud's list and `controller_api::rest::features`.
-///
-/// No `console.websocket`: this tier serves the raw upgrade a CLI asks for
-/// and mints no tickets, and a browser has no business at a cluster endpoint
-/// — there is no directory here to say who it is. Naming the feature anyway
-/// would be the one thing this document must never do.
+/// Advertised non-resource features. Console tickets are cloud-only; this tier also
+/// supports raw and WebSocket upgrades but does not advertise CONSOLE_WEBSOCKET.
 pub const FEATURES: &[&str] = &[
     controller_api::rest::features::DRY_RUN,
     controller_api::rest::features::LABEL_SELECTOR,
@@ -165,10 +157,8 @@ pub const RESOURCES: &[ApiResource] = &[
         .shaped(controller_api::schema_of::<Event>),
 ];
 
-/// The rows of `resources!` this tier deliberately does not serve, and the
-/// one sentence behind almost all of them: there is one user directory in
-/// this stack and it is the cloud's, and so are the catalogue and the address
-/// space that are written against it.
+/// Resources owned by the cloud or reserved for internal bookkeeping. Tests require
+/// each shared resource to appear here or in RESOURCES.
 #[cfg(test)]
 const NOT_SERVED: &[&str] = &[
     // Server-owned bookkeeping, as one tier up.
@@ -319,14 +309,8 @@ pub fn router(
     controller_api::statuses(router)
 }
 
-/// A router with no etcd behind it, for the tests of this crate that need a
-/// REST edge rather than a store.
-///
-/// `EtcdStore::connect` is lazy — it builds a channel and dials nothing — so
-/// a test that never reaches a handler which asks the store a question never
-/// notices. The registry is a parameter because the one test that DOES reach
-/// a handler is the migration forward, which needs the node dialled into this
-/// router's replica and not into its own.
+/// Build a router with a lazy, unreachable etcd client for tests that do not access
+/// the store. The supplied registry supports sibling command-forwarding tests.
 #[cfg(test)]
 pub(crate) async fn test_router(registry: Arc<crate::session::SessionRegistry>) -> Router {
     let store = Arc::new(
@@ -366,12 +350,8 @@ fn token(secret: &str) -> controller_api::BearerAuthenticator {
     )
 }
 
-/// Cluster-local objects the cloud owns are the cloud's to change. It is the
-/// only party that knows what the object one tier up says, and an edit made
-/// down here would either be quietly undone by the next thing the cloud hands
-/// over, or — worse — not undone at all, leaving the two tiers describing
-/// different machines. Local operation stays entirely free: this applies only
-/// to objects that carry the mark.
+/// Reject local changes to resources marked as cloud-managed. The cloud is the
+/// authority for their desired state.
 fn refuse_if_cloud_owned(vm: &Vm) -> Result<(), ApiError> {
     if !vm.metadata.managed_by_cloud() {
         return Ok(());
@@ -433,11 +413,7 @@ patch_object!(
 );
 patch_object!(patch_router -> update_router, controller_api::Router, controller_api::Router);
 
-/// The node's JSON, handed on as the bytes it is.
-///
-/// Deserialising it here to serialise it again would be two chances to change
-/// what a console said, in the two tiers between the node and the person
-/// reading it, for no gain at all.
+/// Relay the node’s JSON bytes without decoding and re-encoding the payload.
 pub(crate) fn json_passthrough(payload: Vec<u8>) -> axum::response::Response {
     use axum::response::IntoResponse;
     (
@@ -471,14 +447,7 @@ async fn list_events(
     })))
 }
 
-/// The inventory is the Node objects, not the live session map: a node that
-/// is down has to stay listed as NotReady, with the capacity it last had.
-/// Which secrets have arrived here, by name and by KEY name.
-///
-/// `Secret::redacted` is the same door the cloud's read goes through, and it
-/// is what makes this route safe to serve at a tier where the only human is
-/// holding break glass: the values never leave this process, and the answer
-/// is what the dispatch would find.
+/// List mirrored secret names and key names with values redacted, as in get_secret.
 async fn list_secrets(
     State(st): State<ApiState>,
     axum::extract::Query(q): axum::extract::Query<controller_api::ListQuery>,

@@ -2,28 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The provider's keys, held between requests, and the one rate limit that
-//! keeps holding them from becoming a way to hit the provider.
+//! Cached provider signing keys with bounded refresh requests.
 //!
-//! The shape here is decided by the shape of the thing above it: an
-//! `Authenticator` is a synchronous function, and fetching a document is
-//! not. So the request path never fetches. It reads the cache, and when a
-//! token names a key the cache does not have it drops a note on a channel
-//! and **refuses the request**. A background task picks the note up and
-//! fetches; the next request carrying that key succeeds.
-//!
-//! Refusing rather than waiting is the deliberate half. Waiting would mean
-//! a request blocking a worker thread on somebody else's http server, and a
-//! provider that has become slow would turn into an API that has stopped
-//! answering. One request loses a race with a key rotation; nothing else
-//! does.
-//!
-//! And the note is rate limited, which is the attack this file exists to
-//! close. A refetch per unknown `kid` is a request per token, and tokens are
-//! free to make: an attacker with a shell script and a random `kid` per
-//! token would have this controller hammering its own identity provider.
-//! `min_interval` is the ceiling on that, and it is per cache rather than
-//! per `kid` — counting `kid`s would only move the unbounded thing.
+//! Synchronous authentication reads only the cache. An unknown key rejects the
+//! current token and may request a background refresh; a later request can use
+//! the new key. The refresh limit applies to the whole cache, so arbitrary `kid`
+//! values cannot each trigger a provider request.
 
 use std::sync::Mutex;
 use std::time::Duration;

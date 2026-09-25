@@ -2,24 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Where a session loop dials next, and how long it waits before it starts
-//! the order over.
+//! Endpoint selection and retry delays for outbound control-plane sessions.
 //!
-//! Both tiers dial out: an agent to its cluster-controller replicas, a
-//! cluster-controller to its cloud replicas. The two sessions are different
-//! protocols and stay apart — different messages, different dispatch,
-//! different reasons to end. What is not different is the schedule around
-//! them, and it was written twice: hash the endpoint list into a preference
-//! order, dial the current entry, walk to the next one when a session ends,
-//! and wait only once the whole order has refused.
-//!
-//! That schedule is pure and has no generics in it, which is why this is the
-//! part worth sharing. It also means the rule the ha-cloud report asked for —
-//! reset the backoff on an established Hello, not on a clean end — is
-//! testable, which it was not while it lived inline in two loops.
-//!
-//! Sleeping is the caller's: `ended` hands back a duration rather than
-//! waiting, so this module needs no runtime and no dependency.
+//! Try endpoints in rendezvous-hash order without waiting between candidates.
+//! After exhausting the list, wait with exponential backoff from 500 ms to 30 s.
+//! A completed Hello resets the backoff, regardless of how the session later
+//! ends. Callers perform the sleeps returned by this runtime-independent policy.
 
 use std::time::Duration;
 

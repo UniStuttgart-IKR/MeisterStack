@@ -344,9 +344,7 @@ pub enum VmCmd {
         /// How many lines from the END (default 200)
         #[arg(long)]
         lines: Option<u32>,
-        /// Hide lines containing this text. Repeatable. A reading aid in this
-        /// client only — the server keeps answering with everything the guest
-        /// said
+        /// Hide matching lines before the node applies the line limit. Repeatable
         #[arg(long, value_name = "TEXT")]
         hide: Vec<String>,
         /// Show only lines containing this text. Repeatable; a line matching
@@ -1073,9 +1071,7 @@ pub enum AgentVmCmd {
         /// How many lines from the END (default 200)
         #[arg(long)]
         lines: Option<u32>,
-        /// Hide lines containing this text. Repeatable. A reading aid in this
-        /// client only — the server keeps answering with everything the guest
-        /// said
+        /// Hide matching lines before the node applies the line limit. Repeatable
         #[arg(long, value_name = "TEXT")]
         hide: Vec<String>,
         /// Show only lines containing this text. Repeatable; a line matching

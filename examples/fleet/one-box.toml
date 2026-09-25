@@ -2,15 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# The worked example: one box that is the whole control plane, and two hosts
-# it runs vms on. Schema 2.
-#
-# It is NOT the plan of this repository. MeisterStack builds no fleet out of
-# its own root any more — a deployment is an operator's own repository, and
-# `meister-deploy init <dir>` writes one. This file exists so that
-# `nix flake check` has a real fleet to check (`checks.example-cpu-host`,
-# `example-topology`, `manifest-json`), and it is read
-# through `lib.mkFleet` exactly the way an operator's `fleet.toml` is.
+# Schema 2 evaluation fixture: one combined controller and two compute hosts.
+# An operator deployment uses its own repository and inventory.
 
 schema = 2
 
@@ -24,14 +17,13 @@ profiles = ["base"]
 rollout = { max_unavailable = 1, reboot = "approve" }
 checks = { required = ["units", "session"] }
 
-# The raft group of one: a single-member etcd, which is what this lab has
-# always run, said out loud rather than implied by a group nobody named.
+# Single-member etcd group.
 [[group]]
 id = "box"
 kind = "raft"
 profiles = ["controller"]
 
-# The workload carriers. Interchangeable, so one canary class for all of them.
+# Compute hosts share a canary class.
 [[group]]
 id = "compute"
 kind = "compute"
@@ -46,14 +38,11 @@ roles = ["cloud", "cluster", "agent", "addons"]
 groups = ["box"]
 site = "ikr-lab"
 failure_domain = "rack1"
-# `static = true` is the plan claiming the interface. Without it the address
-# is documentation and the host's own configuration owns its network — which
-# is the right default for a box that gets its address from somewhere else.
+# static = true requests interface configuration; otherwise the address is descriptive.
 networks.management = { address = "10.0.0.10", prefix = 24, interface = "eth0", gateway = "10.0.0.1", static = true }
 install = { disk = { serial = "MEISTERBOX0001", size_gb = 960 }, layout = "disko/single-nvme.nix", preserve = ["/var/lib/meister-data"] }
 persistence = [{ path = "/var/lib/meister-data", device = "label:meister-data", required = true }]
-# The hardware of this box, which is not ours to model. Paths are relative to
-# THIS file and are imported into the host's system next to our modules.
+# Host modules are resolved relative to this inventory.
 modules = ["hw/box.nix"]
 hardware = { cpu = "AMD Ryzen 7 3800X", memory_gb = 32 }
 capabilities = ["kvm"]
@@ -64,8 +53,7 @@ name = "n1"
 deployment = "nixos"
 roles = ["agent"]
 groups = ["compute"]
-# Which cluster this agent reports to. Nobody types an address twice: the
-# controller addresses are derived from the members of that group.
+# Derive controller addresses from this group.
 controller_group = "box"
 site = "ikr-lab"
 failure_domain = "rack1"
@@ -84,18 +72,13 @@ controller_group = "box"
 site = "ikr-lab"
 failure_domain = "rack2"
 networks.management = { address = "10.0.0.12", prefix = 24, interface = "eth0", gateway = "10.0.0.1", static = true }
-# The other boot mode, in the example so that both roads are built rather
-# than only described: n2 is a guest whose hypervisor hands it kernel,
-# initrd and command line. No boot loader inside, therefore a layout with no
-# ESP — and `nix build .#example-direct-boot` is the bundle the provider is
-# handed.
+# Exercise provider-supplied kernel/initrd boot with a layout without an ESP.
 boot = "direct"
 install = { disk = { serial = "MEISTERN20001", size_gb = 480 }, layout = "disko/single-direct.nix", preserve = [] }
 modules = ["hw/n2.nix"]
 capabilities = ["kvm"]
 
-# Something this fleet depends on and does not deploy. Observed, never
-# changed, and its being unreachable does not block a run here.
+# Optional external observability endpoint; this fleet does not deploy it.
 [[service]]
 id = "observability-external"
 kind = "observability"

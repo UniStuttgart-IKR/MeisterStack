@@ -2,11 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# A schema 2 inventory that still carries the pre-v1 `[opennebula]` table.
-# The table was parsed and exported by both readers before v1 and read by
-# nothing at all (M0 §4b); the provider lives in the lab repository now. So
-# both readers refuse it by name rather than ignoring it, because an
-# inventory that quietly drops a table is an inventory whose diff lies.
+# Invalid fixture: schema 2 rejects the obsolete opennebula table.
 schema = 2
 
 [fleet]

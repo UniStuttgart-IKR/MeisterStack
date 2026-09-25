@@ -2,44 +2,16 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Storage as the agent sees it: a volume is PROVISIONED, and separately
-//! ATTACHED to whatever is going to read it.
+//! Storage provisioning and attachment contracts.
 //!
-//! # The two verbs, and why they had to come apart
+//! [`VolumeProvider`] owns persistent data; [`VolumeAttacher`] owns the consumer
+//! connection and any backend process assigned to the VM's cgroup. Drivers may
+//! implement both traits, including when both operations occur on the same node.
 //!
-//! There used to be one trait and one verb. `BlockDriver::create` took the
-//! VM's cgroup handle, because a backend process belongs in the VM's slice
-//! from the moment it is spawned; `destroy` took an attachment, because that
-//! is where the record remembered which device the data was on. Both are
-//! true of a CONNECTION and neither is true of a VOLUME, and together they
-//! made "delete this VM" and "delete this disk" the same act. A volume could
-//! not outlive its VM because the trait had no way to say what a volume was
-//! when no VM was holding it.
-//!
-//! So: [`VolumeProvider`] makes and unmakes the data, and knows nothing about
-//! any consumer. [`VolumeAttacher`] makes and unmakes the connection, and the
-//! cgroup lives here — virtiofsd, a vhost-user-blk backend, an `nvme connect`
-//! session are properties of the attachment and go when it does. A driver
-//! implements one or both; all three in this tree implement both, which makes
-//! them the degenerate case (provision and attach land on the same node) and
-//! is exactly what the split has to keep cheap.
-//!
-//! # One consumer at a time
-//!
-//! RWO, written down rather than half-supported. Multi-attach needs reference
-//! counting at detach — without it the one VM that stops tears the device out
-//! from under the other — and a `VolumeHandle` therefore identifies at most
-//! one live attachment. That is what lets [`VolumeAttacher::detach`] take the
-//! handle beside the attachment: under RWO the volume names its connection.
-//!
-//! # What is still missing above this file
-//!
-//! A `Volume` resource with its own lifecycle, a scheduler that picks where a
-//! volume is provisioned, a controller that attaches one to a node rather
-//! than creating one on it. This file is the seam those need and not the
-//! thing itself. The next backend the shape is for is the replicated one:
-//! `VhostUserBlk` is what an SPDK-style backend hands over, and
-//! `needs_shared_memory` is the one thing the hypervisor has to be told.
+//! A volume handle supports at most one live attachment (read-write-once).
+//! Detaching a consumer must not delete its volume. Inline VM disks and separate
+//! Volume resources use these same operations with different lifecycle owners;
+//! see `docs/RESOURCE_LIFECYCLE.md` for agent cleanup guarantees.
 
 use uuid::Uuid;
 
@@ -411,50 +383,18 @@ pub trait VolumeProvider: Send + Sync {
     /// needed, so it can be asked of a volume nobody is holding.
     async fn describe(&self, handle: &VolumeHandle) -> Result<VolumeState>;
 
-    /// What this backend holds under `id`, asked WITHOUT a handle.
+    /// Find provisioned bytes by ID without relying on a saved handle.
     ///
-    /// `Some(handle)` means the bytes are there and that handle is what
-    /// `deprovision` takes; `None` means this backend has nothing under that
-    /// id. Every backend here already knows the answer — it is the same
-    /// lookup that makes `provision` idempotent, because each of them derives
-    /// its name from `id` — and until now none of them could be asked.
-    ///
-    /// **Why the handle cannot be assumed.** The agent writes its volume
-    /// record BEFORE it calls `provision`, so that a crash in the middle
-    /// leaves a record without a handle rather than nothing at all; a
-    /// provision that fails leaves the same shape behind. Either of those
-    /// records may sit in front of bytes the backend created before it broke.
-    /// A `deprovision` of one used to be answered with a tombstone and no
-    /// driver call at all — "no handle, so nothing was ever made" — which
-    /// declared a volume `Gone` one tier up while its data was still on the
-    /// pool, with the object that pointed at it deleted. Astra finding S13,
-    /// 2026-09-23.
-    ///
-    /// **No default, deliberately**, and the same argument `locality` makes:
-    /// a default would be an answer the author of the next backend never had
-    /// to think about, and the one thing a wrong `None` here does is call
-    /// somebody's data gone.
+    /// Return a deprovisionable handle when present, or None only when absent.
+    /// A crash or failed provision can leave backend data before the agent saves
+    /// its handle; a missing handle is therefore not proof of absence. Each
+    /// backend must implement this lookup explicitly.
     async fn probe(&self, id: &VolumeId, spec: &VolumeSpec) -> Result<Option<VolumeHandle>>;
 
-    /// Where this backend's bytes are, once and for all.
+    /// Report the backend's locality: NodeLocal, Shared or Networked.
     ///
-    /// **No default, deliberately.** A default would be a value the author of
-    /// the next backend never had to think about, and the one thing a wrong
-    /// answer here does is place a VM on a node where its disk is not. So the
-    /// compiler asks, every time: an LVM volume group is on one machine
-    /// ([`Locality::NodeLocal`]), an NFS export is the same bytes on every
-    /// node that mounts it ([`Locality::Shared`]), an NVMe-oF namespace is
-    /// somewhere else entirely ([`Locality::Networked`]).
-    ///
-    /// A property of the DRIVER and not of the pool, which is why it is a
-    /// method here and not a field an admin fills in: `StoragePoolSpec` has no
-    /// locality, and an admin who could write one into it could tell the
-    /// scheduler that an lvm-thin pool is shared.
-    ///
-    /// `&self` rather than an associated const because a backend may one day
-    /// answer from its configuration — the same `nfs` driver serves block
-    /// files and shares, and a future driver reading a plugin's topology at
-    /// start-up is exactly the shape this leaves room for.
+    /// This is a driver property, not an operator claim on a pool. Implementors
+    /// must choose explicitly because placement depends on the answer.
     fn locality(&self) -> Locality;
 
     // --- snapshots ---------------------------------------------------------
@@ -572,30 +512,12 @@ pub trait VolumeProvider: Send + Sync {
         Err(StorageError::Unsupported("provision_from".into()))
     }
 
-    /// Let go of whatever THIS NODE holds for the volume, and touch no data.
+    /// Release node-local bookkeeping without deleting volume data.
     ///
-    /// The verb a live migration needed and no backend had. After a guest
-    /// moves, the source is left with a volume record, possibly a per-node
-    /// claim, and no business with either: the bytes belong to the
-    /// destination now and the object one tier up says so. `deprovision` is
-    /// the wrong call by a mile — for `filesystem` and `lvm-thin` it destroys
-    /// somebody's disk.
-    ///
-    /// So this is the narrow one. Everything a node holds ABOUT the volume
-    /// goes; everything the volume IS stays. For most backends that is
-    /// nothing at all, which is why the default does nothing and answers
-    /// `Ok`: a `filesystem` pool's file IS the data and an `lvm-thin` LV IS
-    /// the data, and neither node-local backend can be the source of a live
-    /// migration in the first place.
-    ///
-    /// The one backend with something to release is `nvmeof-import`, whose
-    /// claim file is a per-node reservation over a namespace somebody else
-    /// owns. Left behind, it is a name spoken for on a machine that has
-    /// nothing to do with it any more, and the next volume assigned that
-    /// namespace there is refused over a conflict with a guest that left.
-    ///
-    /// Idempotent, and `Ok` for a handle this backend has never seen: "let go
-    /// of something you are not holding" is already done.
+    /// Used after ownership moves elsewhere. Unlike `deprovision`, this may
+    /// remove claims such as nvmeof-import reservations but must preserve the
+    /// underlying bytes. Idempotent; absent claims succeed. The default has no
+    /// bookkeeping to release.
     async fn forget(&self, handle: &VolumeHandle) -> Result<()> {
         let _ = handle;
         Ok(())

@@ -2,12 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! rustls configs out of PEM paths — the server side for the two REST APIs,
-//! the client side for the CLI.
+//! Build REST server and CLI client rustls configurations from PEM files.
 //!
-//! Both ends are here because they are the same three files read three ways,
-//! and because the one thing that must agree between them (which crypto
-//! provider, which ALPN) is easier to keep true in one file than in two.
+//! Centralizes the crypto provider, trust roots, client identities and ALPN.
 
 use std::collections::BTreeSet;
 use std::path::Path;

@@ -2,9 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The typed resources. The embedded VM definition stays the agent's
-//! NewVmSpec JSON verbatim — one spec format everywhere, the agent is the
-//! validating authority.
+//! Typed API resources. VM payloads retain the agent format, with secret
+//! references resolved by the controller before delivery to the agent.
 
 use std::collections::BTreeMap;
 

@@ -2,21 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The volume half of the pass: hand a volume or a snapshot to the cluster
-//! that should carry it, and move a VM's volumes along when it is evacuated.
-//! Moved out of `reconcile.rs` unchanged.
+//! Dispatch volumes and snapshots to clusters and move shared-volume records.
 
 use super::*;
 
-/// Every volume this cloud holds, once per pass: hand it down to the cluster
-/// its pool names, or ask for it back.
-///
-/// No scheduling, and that is the design rather than a shortcut: a cloud pool
-/// NAMES its cluster, so which cluster a volume goes to is written down by an
-/// operator who knows the wiring. The cloud has no way to compare two pools
-/// on two clusters — how full a thin pool is and which nodes mount an export
-/// are facts down there — and an answer invented up here would go stale
-/// between the decision and the dispatch.
+/// Dispatch to the volume's recorded cluster, falling back to its pool home.
+/// The cluster chooses the provisioning node; the cloud does not schedule storage bytes.
 pub(super) async fn dispatch_volumes(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -44,22 +35,7 @@ pub(super) async fn dispatch_volumes(
     Ok(())
 }
 
-/// Whether the cluster has to be sent this volume (again).
-///
-/// Dedup by evidence, exactly as the VM half does: a volume the cluster
-/// already names in its status is a volume the cluster already has, and
-/// re-sending the create every five seconds would be a write per pass down
-/// there for nothing. `observed_at` is set by the mirror and by nothing else,
-/// so it is precisely "the cluster has spoken about this".
-///
-/// But having spoken about the volume is not having its current SPEC, and
-/// that half is the one `hand_down` already asks for a VM: a generation here
-/// that was never sent. `observedGeneration` is what this tier SENT (written
-/// below, after the send, and by nothing else), so the comparison is "there
-/// is a spec here the cluster has never been told about" and not a guess
-/// about what the cluster did with it. Found by review: `spec.sizeGib` became
-/// growable at this edge with storage B, the dedup never let the new size
-/// down, and the object said 20 GiB while the cluster held 10 for ever.
+/// Dispatch an unobserved volume or a spec generation not yet sent to its cluster.
 pub(super) fn needs_dispatch(volume: &controller_api::Volume) -> bool {
     volume.status.observed_at.is_none()
         || volume.metadata.generation > volume.status.observed_generation
@@ -151,12 +127,9 @@ pub(super) async fn dispatch_volume(
     Ok(())
 }
 
-/// Every snapshot this cloud holds, once per pass. Same road as the volumes,
-/// one object over — and one hop longer to the cluster, because a snapshot
-/// names a volume and the VOLUME names the pool that names the cluster.
-///
-/// Nothing is scheduled here either, and for a shorter reason than the
-/// volume's: a copy is taken where the bytes are.
+/// Route snapshots through their source volume's pool.
+/// This path currently reads `pool.spec.cluster`, not `volume.status.cluster`
+/// or the pool's multi-cluster home, so it cannot follow a relocated volume.
 pub(super) async fn dispatch_snapshots(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -257,16 +230,7 @@ pub(super) async fn dispatch_snapshot(
     Ok(())
 }
 
-/// Say what a snapshot is waiting for, and only when it changed.
-///
-/// It used to keep whatever kind the object had and replace the sentence
-/// beside it. That worked while the two were separate fields and cannot
-/// survive the derivation — a word carries its own sentence now — so the
-/// guard below is what takes over the job the kept kind was doing: a copy
-/// some cluster has already described is not waiting for anything. Its bytes
-/// exist down there, and this is only this tier having lost sight of the road
-/// to them. Writing `Pending` over it would be this tier un-observing an
-/// observation, which is D-B2's shape.
+/// Record a changed routing wait only if no node observation already exists.
 pub(super) async fn note_snapshot_pending(
     store: &EtcdStore,
     snapshot: &controller_api::VolumeSnapshot,
@@ -296,14 +260,7 @@ pub(super) async fn note_snapshot_pending(
     Ok(())
 }
 
-/// Say what a volume is waiting for, and only when it changed.
-///
-/// The same shape `note_snapshot_pending` took one object over, and the same
-/// guard for the same reason: this used to keep whatever kind the object had
-/// and replace the sentence beside it, which a derived phase cannot do. A
-/// volume some cluster has already described is not waiting — its bytes are
-/// down there, and this is only this tier having lost sight of the road to
-/// them.
+/// Record a changed routing wait without replacing a node's volume observation.
 pub(super) async fn note_volume_pending(
     store: &EtcdStore,
     volume: &controller_api::Volume,
@@ -333,29 +290,10 @@ pub(super) async fn note_volume_pending(
     Ok(())
 }
 
-/// Move this VM's referenced disks to the cluster it is now bound to, and say
-/// whether they are all there yet.
-///
-/// The step between the binding and the create, and it exists because a
-/// `Volume` at this tier is a REFERENCE to an object on one cluster: the
-/// bytes are on an export or a target that both clusters reach, but the
-/// record naming them belongs to exactly one of them at a time. Handing the
-/// VM down before the record has moved would be a create the target cluster
-/// cannot resolve.
-///
-/// Two commands and their order is the rule: **release at the old cluster
-/// first**, create at the new one after. The release destroys nothing (see
-/// `ReleaseVolume`), so the window between them is a window in which the
-/// bytes have no record anywhere — which is recoverable, because the handle
-/// is derived from the uid and the create finds them again. The other order
-/// is not recoverable: two clusters with a record of one export is two
-/// consumers of a disk whose `AccessMode` says one.
-///
-/// The release is synchronous and its ack IS the proof: nothing below the
-/// cluster was asked anything, so there is no absence to wait for.
-///
-/// `Ok(false)` means "not yet, come back next pass" and never an error — a
-/// cluster that is not dialled in right now is a fact about the session.
+/// Move referenced volume records before handing the VM to its new cluster.
+/// Release the old record first, preserving shared backend bytes, then reset
+/// dispatch evidence so the destination reconstructs its record from the UID.
+/// This record handoff does not itself copy data or provide distributed fencing.
 pub(super) async fn move_volumes(
     store: &EtcdStore,
     registry: &SessionRegistry,

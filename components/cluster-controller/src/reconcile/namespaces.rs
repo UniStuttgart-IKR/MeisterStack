@@ -2,47 +2,16 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Which namespace of an imported pool belongs to which volume.
+//! Assign imported namespaces through the pool's etcd claim table.
 //!
-//! ## The defect this answers
+//! Each namespace maps to a volume UID in `StoragePool.status.claims`. Pool CAS
+//! serializes claims across replicas and nodes. A retry recovers the same UID
+//! claim; a node-local claim file cannot coordinate this cluster-wide allocation.
 //!
-//! An `nvmeof-import` pool is a list of namespaces that already exist on a
-//! target somewhere on the network. The driver used to hand them out itself,
-//! with one claim file per namespace in its state directory — and the comment
-//! there names `O_EXCL` as the lock, correctly. But `O_EXCL` on a filesystem
-//! only one node can see locks against that one node, and the POOL is
-//! cluster-wide: rollout 59 bound a second pool over the same three
-//! namespaces to a node that had no claim file yet, and got two `Ready`
-//! volumes on the same 100 GiB block. Had a second guest started, two VMs
-//! would have written the same disk.
-//!
-//! The assignment belongs where the pool lives, which is this cluster's etcd
-//! — where `volumes/` has always been. `StoragePool.status.claims` is the
-//! table (namespace -> volume uid) and a compare-and-swap on the pool object
-//! is the lock: two replicas reaching for the last free namespace both write,
-//! one loses, and the loser reads the table again rather than believing what
-//! it read a moment ago.
-//!
-//! ## The contract with the driver
-//!
-//! The controller writes the assignment as `namespace` into the volume's
-//! driver parameters (`params_json`, a string, the namespace's NQN exactly as
-//! the driver names it in `params.namespaces[].nqn`). The driver takes a
-//! given `namespace` and chooses for itself ONLY when none is given and the
-//! pool's config says `allow_local_claims = true`, which defaults to false.
-//! So a pool written today is assigned from here, and a pool an operator
-//! deliberately kept node-local still works.
-//!
-//! ## Why this tier reads a driver's parameters at all
-//!
-//! It is the one exception to "this control plane routes on `driver` and
-//! reads nothing else" (`volume_spec_json`), and it is not a comfortable one.
-//! The reason it has to be made here: the thing being handed out is a
-//! CLUSTER-wide resource with a fixed number of pieces, so the only place
-//! that can hand it out is the one place all the nodes agree on. What keeps
-//! it narrow is the shape rather than a driver name — a pool whose params
-//! carry a `namespaces` list is a pool of countable pieces, whichever backend
-//! reads it, and a pool without one is untouched by every line below.
+//! The chosen NQN is injected as the volume parameter `namespace`. Pools with
+//! `allow_local_claims = true` delegate allocation to the node and require the
+//! operator to prevent cross-node conflicts. Pools without `params.namespaces`
+//! are unaffected. Duplicate NQNs across pool objects are checked at admission.
 
 use std::collections::BTreeMap;
 
@@ -115,28 +84,9 @@ fn listed(pool: &StoragePool) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The pool that already lists one of these namespaces, and which one.
-///
-/// # The defect this answers
-///
-/// `status.claims` made the assignment atomic across the nodes of ONE pool,
-/// and the E2E of round 4 walked straight past it: a second pool object over
-/// the same three namespaces, bound to a node that held none of them, handed
-/// out `…:meisterstack-test1` a second time. Two `Ready` volumes on one
-/// 100 GiB block, on two nodes — the rollout-59 finding again, by a different
-/// road. The table is per pool OBJECT, so two objects have two tables, and
-/// each counts from zero.
-///
-/// The node half cannot catch it either and never could: the driver's claim
-/// files describe THIS node, and the second guest was on another one.
-///
-/// So the refusal belongs where the second name is invented, which is the
-/// create. The comparison is on the NQN alone and not on `addr:port` beside
-/// it, and that is the point rather than a shortcut: an NVMe Qualified Name
-/// is unique by construction, so two pools listing one are two names for one
-/// block however each of them spells the target — including the case where
-/// one says an address and the other a hostname, which is the case an
-/// operator is most likely to write by hand.
+/// Find a namespace already listed by another pool, including locally claimed pools.
+/// Compare NQNs rather than target address spellings. This read is an admission
+/// check; it does not serialize concurrent creation of different pool objects.
 pub(crate) fn already_listed(
     pool: &StoragePool,
     existing: &[StoragePool],
@@ -228,12 +178,9 @@ pub(crate) fn held_by(pool: &StoragePool, volume: &Volume) -> Option<String> {
         .map(|(nqn, _)| nqn.clone())
 }
 
-/// Assign this volume a namespace out of its pool, or say why there is none.
-///
-/// `Ok(None)` is a pool that hands out nothing — the overwhelming majority,
-/// and the only cost to them is the pool object this pass already reads.
-/// `Err(sentence)` is "the pool is full", which the caller writes onto the
-/// volume as `Failed`: no later pass can make a namespace appear.
+/// Reuse or claim a namespace through a pool CAS, retrying a stale decision.
+/// Return None for pools outside this allocator and a refusal if no suitable
+/// namespace is free or contention exhausts the retry budget.
 pub(crate) async fn assign(
     store: &EtcdStore,
     volume: &Volume,

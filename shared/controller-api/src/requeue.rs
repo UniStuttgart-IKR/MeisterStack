@@ -2,14 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What to do about a VM whose phase is Failed: nothing, a bounded number of
-//! retries, or Kubernetes' answer — retry forever, ever more slowly.
+//! Retry policy for Failed VMs: disabled, bounded or indefinite with backoff.
 //!
-//! The retry itself is cheap and safe: the reconciler re-sends Start, the
-//! agent's `set_desired` clears its failure backoff and provisions afresh.
-//! The policy only decides WHEN that kick is due, from bookkeeping the
-//! reconciler keeps in `VmStatus` (`requeue_attempts`, `last_requeue`).
-//! Failed is the one phase this touches — Quarantined stays manual by design.
+//! The reconciler records attempts and the last retry time in VmStatus. A retry
+//! sends Start to clear the agent's failure backoff. Quarantined and Unknown VMs
+//! are excluded from this automatic recovery policy.
 
 use std::time::Duration;
 

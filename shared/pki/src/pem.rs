@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Reading PEM off disk, and writing the one file that must never be
-//! world-readable.
+//! PEM certificate and private-key loading, permission checks and secret writes.
 
 use std::path::{Path, PathBuf};
 
@@ -24,21 +23,16 @@ pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
-/// The private key, PKCS#8 / SEC1 / PKCS#1 alike — whatever the operator's
-/// openssl produced.
-///
-/// The permission check is here rather than at the call sites because this is
-/// the one function in the crate that opens a secret, and a key the group can
-/// read is a key that has left the machine already. Same rule and same
-/// message as the CLI's credential loader.
+/// Load a PKCS#8, SEC1 or PKCS#1 private key.
+/// On Unix, reject files readable by group or other users.
 pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     check_permissions(path)?;
     PrivateKeyDer::from_pem_file(path)
         .with_context(|| format!("reading the private key {}", path.display()))
 }
 
-/// Write a secret so that only its owner can read it, and never leave a
-/// readable window: created 0600 from the start rather than chmod'ed after.
+/// Write a secret, creating a new file with mode 0600 on Unix.
+/// Existing files are truncated without changing their permissions.
 pub fn write_secret(path: &Path, contents: &str) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;

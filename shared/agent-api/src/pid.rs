@@ -2,21 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Whether the process at a recorded pid is still the process that was
-//! recorded.
+//! Check recorded process IDs against resource markers in `/proc`.
 //!
-//! A pid is not an identity. Linux hands the number out again, and on a node
-//! that starts and stops VMs for a living it hands it out again soon: the
-//! agent writes `vmm_pid` down, the VMM dies, something else on the machine
-//! gets the number, and every later use of that record is now about a
-//! stranger. The uses are not harmless — one of them is `SIGKILL`.
-//!
-//! What makes this answerable is that every process this agent starts is
-//! started FOR one object and carries that object's uuid on its command line:
-//! cloud-hypervisor gets `--api-socket <run_dir>/<vm id>.sock`, virtiofsd gets
-//! `--socket-path <run_dir>/<volume id>.sock`. The uuid is the marker, the
-//! command line is where it can be read back, and neither can be true of a
-//! process the agent did not start.
+//! VMM and backend command lines contain a VM or volume UUID in their socket
+//! path. Checking this marker reduces the risk of acting on a reused PID; it is
+//! a command-line check, not a kernel process handle or an authentication check.
 
 /// Does the process at `pid` still carry `marker` on its command line?
 ///

@@ -171,18 +171,9 @@ pub(super) async fn create_storage_pool(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-/// Quotas, the node list, the default mark and the description all move. The
-/// DRIVER does not: a pool that changed backend would be a pool whose live
-/// volumes are on a backend its object does not name, and no reconciler could
-/// ever explain where the data went.
-/// What an update of this resource may not change, and why. See `VM_OWNED`
-/// for the rule the tables share.
-///
-/// The driver was a 409 before this and is a 422 now, which is the right
-/// word: nobody else took the pool, the request simply cannot be carried
-/// out. What hangs off the driver is every volume already provisioned from
-/// the pool — a changed driver would look them up in a backend that has
-/// never heard of them.
+/// Keep driver and single-cluster identity immutable while volumes may exist.
+/// Updates may widen multi-cluster reachability; narrowing is checked against
+/// the recorded locations of existing volumes.
 pub(super) const STORAGE_POOL_OWNED: &[Owned] = &[
     Owned::immutable(
         "spec.driver",
@@ -434,24 +425,7 @@ pub(super) async fn get_volume(
     Ok(Json(volume))
 }
 
-/// Reserve storage.
-///
-/// The tenant is the caller's own unless an admin says otherwise, the pool is
-/// resolved here and frozen, and `status` is entirely the server's — a client
-/// that could write `status.backend` could point its object at another
-/// tenant's data, which is the whole of what `check_owned_volume_status`
-/// refuses.
-///
-/// Nothing is provisioned. What this writes down is a RESERVATION against a
-/// pool's quota; a node that can reach the pool makes it real, and until then
-/// the volume is `Pending` and says so.
-/// A volume starts from exactly one thing.
-///
-/// Empty, a catalogue image, or somebody's own point in time — and never two
-/// of them. A spec that names both is a spec whose author believes one, and a
-/// silent winner would hand somebody a disk they did not ask for. Refused
-/// here, where a person is still holding the request, and again at the node,
-/// which is the refusal nobody can go around.
+/// Allow an empty volume, an image seed, or a snapshot seed; reject both seed kinds together.
 pub(super) fn check_one_seed(volume: &Volume) -> Result<(), ApiError> {
     let image = volume
         .spec
@@ -560,19 +534,8 @@ pub(super) fn check_owned_volume_status(volume: &Volume) -> Result<(), ApiError>
     Ok(())
 }
 
-/// The description moves and nothing else does.
-///
-/// Size, pool, mode, access mode and base image are what the volume IS. A
-/// resize is a real operation on a live filesystem and is explicitly out of
-/// scope until the object stands; letting the field move without it would be
-/// an object that lies about how big its data is.
-/// What an update of this resource may not change, and why. See `VM_OWNED`
-/// for the rule the tables share.
-///
-/// Everything about a volume except its description is decided when the disk
-/// is made, and at the end of a confused volume is data that is gone rather
-/// than an address that cannot be reached. The size was a 409 before this and
-/// is a 422 now: growing a disk is a real operation and this is not it.
+/// Volume identity, ownership, pool, and seed are immutable.
+/// Size may grow; the reconciler grows the backend before notifying the guest.
 pub(super) const VOLUME_OWNED: &[Owned] = &[
     // The row storage B changed, and the `note` storage A left the space for.
     //
@@ -669,18 +632,8 @@ pub(super) async fn update_volume(
     Ok(Json(stored))
 }
 
-/// Give the storage back — or say so, and wait.
-///
-/// The one delete in this API that does not delete. A volume somebody is
-/// holding keeps its data: the object is marked `Releasing`, the finalizer
-/// keeps it in the store, and the deprovision happens when the consumer lets
-/// go. That is not politeness about ordering, it is the difference between a
-/// tenant losing a VM and a tenant losing the contents of a disk.
-///
-/// A volume nobody holds goes the ordinary way: `Releasing` and the finalizer
-/// all the same, because the bytes are still on a node and it is the node
-/// saying they are gone that removes the object — not this handler saying they
-/// should be.
+/// Mark for release and retain the object while consumers or backend bytes remain.
+/// The reconciler and node reports complete deprovisioning.
 pub(super) async fn delete_volume(
     State(st): State<ApiState>,
     Path(name): Path<String>,

@@ -2,12 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a node says about itself and its guests, written down.
+//! Apply node reports to controller resources.
 //!
-//! One `StatusReport` per beat carries the node's own numbers and one line
-//! per vm; each `ingest_*` below owns one kind of line and nothing else, and
-//! `ingest_status` is the order they are read in. Verbatim out of
-//! `session.rs`; the module path of every caller is unchanged.
+//! Recheck ownership inside store mutations. Missing entries are cleanup evidence
+//! only where the protocol explicitly supplies a complete inventory; volume and
+//! snapshot deletion require an explicit Gone report.
 
 use super::*;
 
@@ -155,27 +154,9 @@ pub(super) async fn ingest_status(
     Ok(())
 }
 
-/// What a node says about the routers it holds.
-///
-/// Two rules, and both of them are the ones the rest of this file already
-/// follows one object over.
-///
-/// **The active node's word decides the phase**, because it is the node whose
-/// answer is "do packets go". A standby is deliberately silent — it holds the
-/// netns, announces nothing and answers no ARP — so its `Standby` says
-/// nothing the object does not already know. The exception is a standby that
-/// says `Failed`: a failover that will not work is worth knowing about before
-/// it is needed, and nothing else in this control plane would ever say so.
-///
-/// **A router nobody stores is one this node should let go of.** The same
-/// rule `SyncState` states for VMs — what is not in the list is gone — and
-/// the reason a `Router` needs no finalizer: an object deleted while its node
-/// was away leaves a netns that nothing names, and this is where it is found.
-/// The router this reported line is about, or `None` if NOBODY stores it.
-///
-/// The whole of what makes a reported router an orphan, and it is deliberately
-/// only this one question. "Stored but not on this machine's list right now"
-/// is NOT an orphan — see the caller for the loop that cost.
+/// Find a stored router by UID, regardless of its current placement list.
+/// Only a router absent from this listing is considered an orphan. Callers must
+/// account for the fact that an ordinary store listing skips undecodable entries.
 pub(super) fn held_here<'a>(
     stored: &'a [controller_api::Router],
     reported: &str,
@@ -183,21 +164,8 @@ pub(super) fn held_here<'a>(
     stored.iter().find(|r| r.metadata.uid == reported)
 }
 
-/// The node's word for what it HAS, in the tier's word for what the router
-/// IS.
-///
-/// Two vocabularies on purpose, and this is the hop that joins them. A node
-/// knows one thing about a router — the namespace and its two legs are there,
-/// or they are not — so it says `Ready` or `Failed` and nothing else. The
-/// object above is about a router that lives on SEVERAL machines, so its
-/// phases are `Active`, `Standby`, `Failed` and the rest, and which of the
-/// first two a healthy node means depends on whether it is the one
-/// announcing.
-///
-/// Parsing the node's word as this tier's own was the bug: `Ready` is not a
-/// `RouterPhaseKind`, so every report from every healthy gateway node was dropped
-/// with a warning, ten seconds apart, and the only thing a node could ever
-/// tell this tier was that something had broken.
+/// Translate node Ready into Active or Standby using controller placement.
+/// Failed is meaningful on either role; unknown wire phases are ignored.
 pub(super) fn observed_phase(said: &str, speaks: bool) -> Option<controller_api::RouterPhaseKind> {
     match said {
         proto::ROUTER_FAILED => Some(controller_api::RouterPhaseKind::Failed),
@@ -636,28 +604,9 @@ pub(super) async fn ingest_volumes(
     Ok(())
 }
 
-/// Take a node off `openOn` when it still has the volume and no longer has a
-/// guest on it.
-///
-/// # The defect this answers
-///
-/// Whether `node` has this volume open, as the node itself says.
-///
-/// The one writer of `openOn` since D4, and a function because both roads
-/// through this file — the ordinary report and the `Gone` tombstone — have to
-/// say it the same way. `VolumeStateReport.open` is the node's own answer out
-/// of its VM records, and it stays true until the `detach` has really run, so
-/// the set now means exactly "some machine has the bytes open". That is the
-/// whole of what a delete has to wait for.
-///
-/// What it replaced was FIVE writers of one set: a pass that derived it from
-/// the union of every VM's `attached_volumes` (`ingest_released`, gone with
-/// this), the dispatch half in `hold_volumes`, the release, and both ends of
-/// a live migration. Each was right about its own half and none could see
-/// what the others knew — and the union one was wrong in a way nothing could
-/// notice: a VM with `desired = Absent` drops out of a node's report the
-/// instant the record is written, so the set went empty while the VMM still
-/// had the disk. A DELETE in that window takes somebody's data.
+/// Update openOn from the node's explicit open-handle report.
+/// Both ordinary volume reports and Gone tombstones use this writer; command
+/// acknowledgements do not establish that a handle has closed.
 pub(super) fn note_open(volume: &mut Volume, node: &str, open: bool) {
     if open {
         volume.status.open_here(node);
@@ -801,19 +750,8 @@ pub(super) async fn ingest_addresses(
     Ok(())
 }
 
-/// Write what a node said about its snapshots onto the `VolumeSnapshot`
-/// objects.
-///
-/// The volume half's twin, and the same three rules: the uid is the key, a
-/// uid no stored object carries is dropped without a word, and `Gone` is the
-/// one answer that is not a phase — it is what lets the finalizer come off,
-/// because absence from a report is "this node does not know".
-///
-/// One difference from the volume half, and it is the point of the object: a
-/// snapshot is NOT checked against the node it was placed on. A snapshot
-/// outlives its volume, and after the volume is gone the only record of which
-/// machine holds the copy is `status.node` — which this function would then
-/// be comparing against itself.
+/// Apply snapshot reports by UID and assigned node.
+/// An explicit Gone removes the finalizer; absence from an agent report does not.
 pub(super) async fn ingest_snapshots(
     store: &EtcdStore,
     node_id: &str,
@@ -933,21 +871,9 @@ pub(super) async fn ingest_snapshots(
     Ok(())
 }
 
-/// Which VMs this report says the node has let go of — the whole decision
-/// [`forget_unbound`] acts on, as a value.
-///
-/// Pure, and apart from the write for that reason: what it decides is that a
-/// VM may be placed on another machine, and the two inputs that make that
-/// safe are worth being able to test without a store. Both of them are Astra
-/// finding S12, 2026-09-23:
-///
-/// * `vms_complete` false is a report making NO statement about VMs — the
-///   heartbeat-only beat an agent sends when its per-VM half could not be
-///   read carries empty lists — and an empty list that means "not saying"
-///   used to be read here as "naming none".
-/// * a VM the node is still tearing down is NAMED by a current agent
-///   (`Provisioning`/`Stopping`), so absence really is the end of the
-///   teardown rather than the beginning of it.
+/// Select deliberately unbound VMs absent from this node's complete inventory.
+/// An incomplete report releases nothing. Agents retain teardown records until
+/// cleanup completes, so those records continue to block reassignment.
 pub(super) fn letting_go<'a>(vms: &'a [Vm], node_id: &str, report: &StatusReport) -> Vec<&'a Vm> {
     if !report.vms_complete {
         return Vec::new();
@@ -958,47 +884,9 @@ pub(super) fn letting_go<'a>(vms: &'a [Vm], node_id: &str, report: &StatusReport
         .collect()
 }
 
-/// Clear the old node off a VM whose binding was let go, once that node has
-/// stopped naming it.
-///
-/// The second half of a reschedule. `spec.nodeName` is already `None` — a
-/// client cleared it and the reconciler told the old node to destroy the
-/// instance — and this is what says the old node is done, so the scheduler
-/// may decide again.
-///
-/// # Absence, and why it is proof HERE
-///
-/// Absence from a node's report is not proof in general, and this file says
-/// so about volumes at some length: a node that does not name something does
-/// not KNOW it, and a restart before the first report would otherwise be read
-/// as "gone". The question asked here is narrower, and it is exactly the one
-/// absence answers: **does this node still name this VM?** A node lists every
-/// record it has, so a report that does not carry the uid is a node that is
-/// no longer serving it.
-///
-/// It applies to nothing else. A VM whose `spec.nodeName` is still set is
-/// untouched however silent its node is — that is the heartbeat's business —
-/// and a VM this tier did not deliberately unbind is never looked at here.
-/// A false positive costs a placement that may land on the same node again
-/// and is idempotent there; the alternative — waiting for a proof this road
-/// cannot carry — costs a VM that never moves.
-///
-/// # And only when the node SAID the list is whole
-///
-/// Astra finding S12, 2026-09-23. The paragraph above was true of the report
-/// a healthy node builds and of nothing else: a beat whose per-VM half could
-/// not be read sends the node's facts and empty lists (`heartbeat_only` in
-/// the agent), and an empty `vms` there means "not saying", not "none". Every
-/// unbound VM on that node was then declared let-go on one bad beat, while
-/// its VMM went on serving the guest and holding the disks. The node says
-/// which of the two it is now, and this reads a false as no statement at all.
-///
-/// The other half of the same finding is in the agent: a record whose intent
-/// is `Absent` used to drop out of the report as soon as the intent was
-/// written, so "the node no longer names it" arrived long before the teardown
-/// had happened. It is reported as `Provisioning` with `Stopping` until the
-/// teardown takes the record away, which is what makes the absence below mean
-/// what this function reads it as.
+/// Clear the old node after its complete inventory stops naming an unbound VM.
+/// The scheduler waits for this observation before assigning another node. Bound
+/// VMs remain governed by their binding and heartbeat evidence.
 pub(super) async fn forget_unbound(
     store: &EtcdStore,
     vms: &[Vm],

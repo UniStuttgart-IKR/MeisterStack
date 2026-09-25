@@ -3,53 +3,10 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# meisterstack-install.sh — MeisterStack on a machine that is not NixOS
-# (docs/DEPLOYMENT.md §20). Two shapes, one script:
-#
-#   single-node   the agent and the CLI on one machine, nothing above them:
-#                 a workstation or a lab box that makes guests the way the
-#                 fleet does, without a cloud, a cluster or a scheduler
-#   cli           the CLI alone, on a machine that talks to a control plane
-#                 somewhere else: an operator's laptop, a CI runner, a
-#                 jump host
-#
-# What goes where, and why there:
-#
-#   /opt/meisterstack/bin/           the binaries, copied and not linked, so
-#                                    the directory they came from (a
-#                                    `nix build` result) can go away
-#   /usr/local/bin/meister           a link into the above, for PATH
-#   /etc/meisterstack/cli.toml       the CLI's config for everybody on the
-#                                    machine — the CLI takes it when the
-#                                    person has none of their own
-#   /etc/meisterstack/agent.toml     single-node only: the node's config; it
-#                                    names no controller, which is what makes
-#                                    the agent run standalone
-#   /etc/meisterstack/ca.crt         cli only, with --ca-cert: the control
-#                                    plane's CA, so that https:// verifies
-#   /var/lib/meisterstack/…          single-node only: images and volumes
-#   /etc/systemd/system/meister-agent.service   single-node only
-#   the group `meister`              single-node only: who may use the
-#                                    socket besides root; --operator puts a
-#                                    user in it
-#
-# What it does NOT write: a credential. A certificate, a key or a token is a
-# person's, lives in that person's own config (~/.config/meisterstack/
-# config.toml, which wins over the machine's), and is put there by
-# `meister login` or by the person — never by a script that runs as root
-# for everybody.
-#
-# The binaries come from `nix build .#meisterstack-static` (musl, nothing
-# from the nix store inside) and, for a single node,
-# `nix build .#cloud-hypervisor-meister-static`, made on any machine that
-# has nix, and are handed over as one directory (--bin-dir).
-#
-# It refuses to overwrite a config or a unit that is there (--force says
-# otherwise), checks the agent config it wrote with `meister-agent
-# --check-config` before it enables anything, and prints every step.
-# --dry-run prints them only. --root DIR writes everything below DIR — the
-# paths inside the configs too, like a chroot — and touches no service and
-# no group: that is what `checks.install-script` does with it.
+# Install static binaries for a standalone agent or a controller CLI client.
+# See docs/DEPLOYMENT.md for paths, prerequisites and current limitations.
+# --root confines installed paths to a scratch root and skips groups/systemd.
+# --dry-run prints operations; --force replaces existing configuration and units.
 set -euo pipefail
 
 usage() {
@@ -158,7 +115,7 @@ if [ -z "$root" ] && [ "$dry_run" = no ] && [ "$(id -u)" != 0 ]; then
   die "this writes to /opt, /etc and /var/lib; run it as root (or with --dry-run to read what it would do)"
 fi
 
-# Every path, once, so that --root prefixes all of them or none.
+# Apply the optional installation root consistently.
 opt="$root/opt/meisterstack/bin"
 link="$root/usr/local/bin/meister"
 etc="$root/etc/meisterstack"
@@ -170,8 +127,7 @@ run() {
   if [ "$dry_run" = yes ]; then echo "    $*"; else "$@"; fi
 }
 
-# A file is written whole or not at all, and never over one that is there
-# unless --force says so.
+# Replace each file atomically; keep existing files unless --force is set.
 write() {
   local path="$1" mode="$2"
   if [ -e "$path" ] && [ "$force" = no ]; then
@@ -203,7 +159,7 @@ if [ "$mode" = single-node ]; then
 fi
 run ln -sfn "$opt/meister" "$link"
 
-# --- cli: the profile of a control plane elsewhere --------------------------
+# CLI profile for a remote controller.
 if [ "$mode" = cli ]; then
   if [ -z "$endpoint" ]; then
     say "no --endpoint: the CLI is on PATH and no config was written. A profile is one file:"
@@ -241,9 +197,7 @@ CONF
   exit 0
 fi
 
-# --- single-node: the agent, standalone, and the CLI at its socket ---------
-# What the machine has to bring: the agent shells out to these
-# (drivers/linux-network, components/agent/src/images.rs).
+# Standalone agent and local CLI. Report missing host prerequisites.
 for tool in ip qemu-img curl; do
   command -v "$tool" >/dev/null 2>&1 || echo "note: '$tool' is not on PATH; the agent needs it (bridges and taps, images)" >&2
 done

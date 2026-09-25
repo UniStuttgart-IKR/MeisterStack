@@ -2,133 +2,22 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a base image has to be before a node writes it onto a disk.
+//! Validate and convert base images inside a transient systemd unit.
 //!
-//! Astra finding S01, 2026-09-23: both block backends ran `qemu-img convert
-//! -O raw <src> <dst>` with no `-f`, so the SOURCE format was whatever
-//! qemu-img decided the file was at the moment it opened it — and they
-//! refused nothing. Two things follow from that, and neither is theoretical:
+//! Only regular raw and qcow2 images without backing or external data files are
+//! accepted. Conversion pins the probed format with `-f`; callers must also keep
+//! the source bytes stable between probing and conversion.
 //!
-//! * A qcow2 with a `backing file` is a file that NAMES another file, and
-//!   `qemu-img convert` reads it. So is a qcow2 with an external `data file`.
-//!   The name is inside the image and is not a path this stack chose, so an
-//!   image somebody uploaded could say `/etc/shadow` — or another tenant's
-//!   volume — and the converter would faithfully copy it into a disk that
-//!   tenant then boots and reads. The converter runs as the agent, which on
-//!   a node with `unprivileged = false` (the default in `nix/agent.nix`) is
-//!   root.
-//! * Without `-f`, format detection happens twice: once when the size is
-//!   measured and once when the bytes are converted. A file that changed
-//!   between the two is converted as something other than what was judged.
+//! Both `qemu-img info` and conversion run as `meister-convert`, with no
+//! capabilities or network access and with memory, CPU and runtime limits. The
+//! source is read-only; the destination is the only writable data path. The
+//! sandbox still exposes files readable by an ordinary local account.
 //!
-//! So: one probe, which refuses a backing file, an external data file, a
-//! format that is not on the short list, and anything that is not a regular
-//! file — and then a convert that is TOLD the format the probe saw.
-//!
-//! Here rather than in either driver because both do the same thing and both
-//! got it wrong the same way. `filesystem` and `lvm-thin` already depend on
-//! this crate, and a check that exists twice is a check that will diverge.
-//!
-//! # Where qemu-img runs
-//!
-//! Astra finding S01, 2026-09-23, second half: judging the image is only
-//! half of it. `qemu-img` is a parser for a file somebody else wrote --
-//! qcow2 L1 and L2 tables, refcount blocks, compressed clusters -- and it
-//! ran in the agent's own process, which on a node with
-//! `unprivileged = false` (the default in `nix/agent.nix`) is root with
-//! every capability the agent holds. The probe above refuses the images this
-//! stack knows how to say no to; it cannot refuse the parser bug nobody has
-//! found yet. So the program that touches those bytes is moved out of the
-//! agent into a transient systemd unit that holds nothing:
-//!
-//! ```text
-//! systemd-run --wait --pipe --collect --quiet
-//!   -p User=meister-convert            an account with no shell and no home
-//!   -p NoNewPrivileges=yes             no setuid binary widens it again
-//!   -p CapabilityBoundingSet=          and there is nothing to widen to
-//!   -p AmbientCapabilities=
-//!   -p PrivateNetwork=yes              a converter has nobody to talk to
-//!   -p RestrictAddressFamilies=        not even over a unix socket (an
-//!                                      empty allow-list denies every
-//!                                      family; see `argv`)
-//!   -p ProtectSystem=strict            the hierarchy read-only
-//!   -p ProtectHome=yes
-//!   -p PrivateTmp=yes
-//!   -p SystemCallFilter=@system-service
-//!   -p MemoryMax= -p CPUQuota= -p RuntimeMaxSec=   a convert that does not
-//!                                      end, ends
-//!   -p BindReadOnlyPaths=<the image>   the one file it may read
-//!   -p BindPaths=<the destination>     the one it may write, or
-//!   -p DeviceAllow=<the node> rw       the one block device it may write
-//!   -- <qemu-img> convert -f <format> -O raw <image> <destination>
-//! ```
-//!
-//! plus the ones that cost nothing to add and would cost an afternoon to
-//! argue about after an incident: `ProtectKernelTunables`,
-//! `ProtectKernelModules`, `ProtectKernelLogs`, `ProtectControlGroups`,
-//! `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`,
-//! `RestrictNamespaces`, `RestrictRealtime`, `RestrictSUIDSGID`,
-//! `LockPersonality`, `SystemCallArchitectures=native`.
-//!
-//! **What this buys and what it does not.** `ProtectSystem=strict` makes the
-//! hierarchy read-ONLY; it does not make it unreadable, so a qemu-img that
-//! was taken over can still read whatever any local account can read. What
-//! it can no longer do is write anywhere but the one destination, open a
-//! socket, keep a capability, outlive its deadline, take the node's memory,
-//! or leave a unit behind. And the one file it can write is the disk the
-//! caller was about to hand that guest anyway. Making the tree unreadable
-//! as well wants `TemporaryFileSystem=/` and a bind of the binary's whole
-//! store closure, which is a second thing to keep right at every qemu
-//! update; that is a later step and it is not this one.
-//!
-//! `qemu-img info` is inside the same boundary, because it is the same
-//! parser reading the same file. A probe that ran as the agent would be the
-//! finding with one more step in front of it.
-//!
-//! # Why a static account and not `DynamicUser=yes`
-//!
-//! `DynamicUser=yes` is the obvious answer and it cannot work here. Its uid
-//! is allocated when the unit starts, so there is no uid to give the
-//! destination to BEFORE it starts -- and the destination always exists
-//! before it starts and belongs to the agent: the filesystem driver's
-//! `<id>.tmp`, which `write_volume_file` renames into place once the image
-//! is whole, and lvm-thin's `/dev/<vg>/<lv>.staging`, a device node that
-//! LVM made and udev owns `root:disk`. A dynamic uid can write neither, and
-//! the ways around that are worse than the problem:
-//! `SupplementaryGroups=disk` hands the converter every disk on the node,
-//! and a world-writable destination hands it to everybody.
-//!
-//! So: one system account, `meister-convert` (nix/services.nix, behind the
-//! agent role), and the agent gives it the destination for the length of the
-//! conversion and takes it back afterwards. That is libvirt's
-//! `dynamic_ownership` in miniature and the shape `vmm_user::take` /
-//! `give_back` already has in this crate. Taking it back is not best effort:
-//! a device node still owned by the converter after the unit is gone is the
-//! hole this exists to close, so a restore that fails fails the conversion
-//! -- and both drivers drop the half-written volume when a conversion fails.
-//!
-//! # There is no fallback
-//!
-//! If `systemd-run` is not on this node, if the account does not exist, or
-//! if the unit does not start, the conversion is REFUSED with a sentence
-//! naming which of the three it was. It is never run in the agent instead.
-//! A fallback would mean the most privileged path is the one that runs when
-//! something is wrong, which is this finding written the other way round.
-//!
-//! # What changes when the agent is not root (stage 2)
-//!
-//! Today the agent is root, and asking systemd for a transient unit needs no
-//! argument for that. An agent under `unprivileged = true` runs as `meister`
-//! and its D-Bus call is refused unless polkit says otherwise, so that lane
-//! has to ship either a polkit rule for
-//! `org.freedesktop.systemd1.manage-units` narrowed to this user and this
-//! unit prefix, or a small root helper the agent asks. The same lane owns
-//! the other half of it: an unprivileged agent cannot chown a destination to
-//! another account either, so there the destination has to be made by
-//! something that already runs as `meister-convert`, and the volume
-//! directory (`0750 meister meister` in nix/agent.nix) has to let that
-//! account walk to it. None of that is implemented here and nothing in this
-//! file pretends it is.
+//! A static account allows the agent to transfer destination ownership before
+//! starting the unit. Ownership must be restored before a successful result is
+//! returned. Missing accounts, failed units and restoration errors fail the
+//! operation; there is no unsandboxed fallback. An unprivileged agent needs
+//! separate authorization to start units and transfer file ownership.
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;

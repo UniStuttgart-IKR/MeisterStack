@@ -2,17 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The VM edge: list, create, read, log, patch, delete — and the checks a
-//! write has to pass before it reaches the store. Moved out of `api.rs`
-//! unchanged.
+//! Cluster VM admission, reads and lifecycle intent. Cloud-managed objects reject
+//! local mutation; standalone requests use the same shared spec validation.
 
 use super::*;
 
-/// Everything this tier can decide about a VM spec on its own — run from POST
-/// and from PUT both. A document that is only checked on the way in is a
-/// document that gets edited afterwards, and it is the edited one that
-/// travels down to the agent: a spec.vm that is not an object gets no further
-/// than build_spec_json, where it fails every pass, silently, forever.
+/// Validate the agent spec shape and controller-owned fields for both POST and PUT.
 pub(super) fn validate_vm_spec(spec: &VmSpec) -> Result<(), ApiError> {
     if !spec.vm.is_object() {
         return Err(invalid("spec.vm must be the agent's NewVmSpec object"));
@@ -335,14 +330,8 @@ pub(super) async fn vm_logs(
     Ok(json_passthrough(payload))
 }
 
-/// What an update of a VM may not change here, and why.
-///
-/// The rule, whole: a field the controller acts on ONCE — when it creates the
-/// instance — is immutable, and a field a controller writes belongs to the
-/// server. `spec.vm` is the hard one: a node takes a spec when it creates the
-/// instance and never again, so a PUT that changed it answered 200 and did
-/// nothing at all. What stays free is `spec.runStrategy`, which is exactly the
-/// field a level-triggered lifecycle reads every pass.
+/// Frozen placement/spec fields and the supported exceptions: referenced data-disk
+/// changes and clearing a binding after lifecycle checks. Run strategy remains editable.
 pub(super) const VM_OWNED: &[Owned] = &[
     // The row storage B rewrote, and the whole of what it says about
     // volumes: `spec.vm` is immutable in everything EXCEPT `volumes[]` from
@@ -618,12 +607,8 @@ pub(super) async fn delete_vm(
 // `spec.tenant` is carried and never enforced — the same thing a
 // cluster-local VM does with the field.
 
-/// Everything that happened to one VM, recently.
-///
-/// No tenant filter here, and that is not an omission: this tier keeps no
-/// user directory (one directory, and it is the cloud's), so a member reading
-/// it is read-only over everything exactly as they are over the VM objects
-/// themselves.
+/// Read events for this VM. This tier has no user directory; tenant filtering is
+/// not an authorization boundary here.
 pub(super) async fn vm_events(
     State(st): State<ApiState>,
     Path(name): Path<String>,

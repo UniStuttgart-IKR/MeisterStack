@@ -2,12 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a cluster says about itself and the vms it holds for this cloud.
-//!
-//! `ingest_status` is the order the steps below are read in; each one owns
-//! one kind of line out of the report and nothing else. The four kinds the
-//! cluster mirrors upward beside its vms live next door in `inventory.rs`.
-//! Verbatim out of `session.rs`.
+//! Ingest cluster heartbeat, inventory, placement and phase evidence. Only the
+//! selected session speaker updates resource evidence; other sessions renew heartbeat.
 
 use super::*;
 
@@ -350,29 +346,8 @@ pub(super) async fn ingest_inventory(
     }
 }
 
-/// A VM whose cluster binding fell, and whose old cluster has stopped naming
-/// it: the reschedule may go on.
-///
-/// The cloud tier's half of the same wait the tier below keeps for a node,
-/// and the same reading of absence. The question is not "does this VM exist"
-/// — absence never answers that — but *"does this cluster still name this
-/// VM"*, and a list the cluster itself calls COMPLETE answers exactly that.
-///
-/// It is stricter than the node-level version in one way, and it can afford
-/// to be: the reporter here is a control plane that owns its objects and says
-/// whether it read all of them, so `vms_complete` is a real gate rather than
-/// a hope. An incomplete list concludes nothing.
-///
-/// Narrow on purpose. A VM with a `spec.clusterName` is untouched however
-/// silent its cluster is, and one that never had a `status.clusterName` was
-/// never anywhere to leave.
-/// Which of these VMs this report proves have left `cluster`.
-///
-/// The decision, as a value: an unbound VM whose `status.clusterName` still
-/// names this cluster, and which a list the cluster itself calls COMPLETE
-/// does not mention. An incomplete list proves nothing and yields nobody —
-/// which is the whole of the difference from the tier below, where the
-/// reporter is a node and absence never proves anything at all.
+/// Select unbound VMs whose old cluster omits their UID from a complete inventory.
+/// Incomplete reports cannot release the old cluster binding.
 pub(super) fn leaving_cluster<'a>(
     vms: &'a [Vm],
     cluster: &str,
@@ -427,47 +402,9 @@ pub(super) async fn forget_unbound(
     Ok(())
 }
 
-/// The machine a VM ended up on, which is the one thing this tier cannot
-/// derive: the cloud binds to a CLUSTER, and which node inside it runs the
-/// VM is decided down there. Without it the fleet view — cluster, node, vm —
-/// stops one level short, and the NODE column of every listing is a dash.
-///
-/// Its own small pass rather than a field `observe` watches, because the
-/// same `VmStatusReport` is what an AGENT sends one tier down: there the
-/// field is empty by construction, so a matcher that compared it would
-/// call every agent report a change and write per report for ever.
-///
-/// Empty from a cluster means "not placed", which is a real state and the
-/// one an unbound VM is in — so it CLEARS. That is different from the
-/// backend-name rule next door, and deliberately: a name only ever
-/// arrives, a placement can be given up.
-///
-/// Two more facts ride this same pass, and for the same reason (D5): the
-/// cluster knows them, the cloud cannot derive them, and `observe` would
-/// never carry them because it only fires when the PHASE or the message
-/// changed. A disk arriving in a running guest changes neither.
-///
-///   * `status.volumes` — the evidence half of hot-plug. The cluster had
-///     it and the cloud did not, so a tenant, who reads their VM at the
-///     cloud and nowhere else, could see the intent in `spec.vm.volumes[]`
-///     and never the observation.
-///   * `status.reason` — the closed word for why a VM is not placed. It
-///     stopped one tier down, and a Pending VM at the cloud was a dead end
-///     for everybody without a cluster credential. Spelled `pendingReason`
-///     until struktur 4 folded it into the phase; the word it carries is a
-///     `VmReason` now and the key sits beside `phase` on the wire.
-///   * `status.addresses[]` — the MAC lines, which begin at a node's tap and
-///     stopped at the cluster. This is where a tenant reads their VM, so it
-///     is the one tier the address has to reach.
-///
-/// The addresses are the exception to the rule above about clearing, and the
-/// reason is that they have TWO writers: the floating half is this cloud's
-/// own object and `reconcile::floating` writes it. So this pass replaces the
-/// MAC lines and leaves everything else standing, and the floating pass does
-/// the mirror image of that. A cluster that names no MAC at all is a cluster
-/// from before the field, and it changes nothing here — which is also what an
-/// old AGENT looks like one tier further down, deliberately: neither of them
-/// is saying "this VM has no addresses".
+/// Mirror node placement, attachment evidence and MAC addresses for bound VMs.
+/// Node and volume fields can clear; address merging preserves cloud-owned floating
+/// entries and treats an absent NIC list as compatibility with older reporters.
 pub(super) async fn ingest_placements(
     store: &EtcdStore,
     cluster: &str,

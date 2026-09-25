@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `Event` kind: what happened, as an object with an expiry.
-//! Moved out of `resources.rs` unchanged.
+//! Expiring, aggregated observations about resource transitions.
 
 use super::*;
 
@@ -28,26 +27,9 @@ impl EventType {
     }
 }
 
-/// Something that happened to an object, kept for a while.
-///
-/// `VmStatus.message` holds exactly one sentence, so why a VM failed three
-/// times and came up on the fourth was written down nowhere. This is the
-/// record of the transitions themselves, cut to what is actually useful:
-/// Kubernetes' shape without the fields nobody reads.
-///
-/// Three properties decide whether this is worth having at all, and all three
-/// are enforced elsewhere rather than described here:
-///
-/// * **They expire.** Written through `EtcdStore::create_with_ttl`, so etcd
-///   reaps them and nothing has to be alive for that to happen. Events
-///   without an expiry fill a store and nobody ever tidies them.
-/// * **They are aggregated.** The object's NAME is derived from what it is
-///   about and why (see `events::name_of`), so the same thing happening
-///   twenty times finds the object it made the first time and raises `count`.
-/// * **They are made on CHANGE, never per pass.** That one is a property of
-///   every call site: the reconcilers are level-triggered and re-derive
-///   everything every few seconds, so an event per pass would be a store
-///   filling at one write per VM per tick.
+/// An expiring, aggregated resource observation. `events::record` creates it
+/// with a TTL and combines repeated (kind, identity, reason) occurrences.
+/// Callers record transitions rather than every reconcile pass.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventSpec {

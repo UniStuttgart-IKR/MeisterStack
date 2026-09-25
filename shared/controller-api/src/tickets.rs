@@ -2,42 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! One credential, for one URL, for thirty seconds.
+//! Path-bound, single-use console tickets with a 30-second etcd lease.
 //!
-//! It exists for exactly one reason and should exist for no other: a browser
-//! opening a `WebSocket` cannot set an `Authorization` header. The API is
-//! `new WebSocket(url)` and that is all of it — no headers, no body, no
-//! options. So a page holding a perfectly good bearer token has no way to
-//! present it, and the only thing left that reaches the server is the query
-//! string.
-//!
-//! A token in a query string is a token in an access log, which is why this
-//! one is shaped the way it is: it is minted by an authenticated request, it
-//! names the one path it opens, it is redeemed exactly once, and it is dead
-//! thirty seconds after it was made whether it was used or not. What it
-//! carries is not a new permission — it is the permission the caller ALREADY
-//! had, frozen at the moment they asked, so a ticket can never open a door
-//! its holder could not have walked through with their own credential.
-//!
-//! **It lives in the tier's etcd, and that is the fix** (Fremdsicht 6). It
-//! used to live in the memory of the process that minted it, and this module
-//! said so and called it a trade: "talk to the address you were served from".
-//! That is not a trade a browser can keep. A cloud behind one name with three
-//! replicas hands the mint to whichever one the load balancer picked and the
-//! `WebSocket` to whichever one it picks next, so two consoles in three were
-//! refused at an HA cloud — and the refusal was indistinguishable from a
-//! forged ticket.
-//!
-//! **Exactly once, across replicas.** Redeeming is a delete that returns what
-//! it deleted (`EtcdStore::take`), so the exclusivity is etcd's own and not a
-//! lock anybody here holds. A get followed by a delete would be two round
-//! trips with a window between them, and in that window the sister replica
-//! reads the same ticket and opens the same console a second time.
-//!
-//! **Thirty seconds is a lease.** The object is created with a TTL and etcd
-//! reaps the key itself, so an unused ticket needs no sweeper, no pass and
-//! nobody alive at all — the same mechanism `Event` already uses. There is no
-//! second clock in this process, deliberately: one question, one answer.
+//! Browsers cannot attach an Authorization header to a WebSocket constructor.
+//! An authenticated request therefore mints a short-lived ticket carrying the
+//! caller's current grant. Redemption atomically deletes and returns the record,
+//! so only one replica can accept it. Tickets expire even if unused.
 
 use std::sync::Arc;
 use std::time::Duration;

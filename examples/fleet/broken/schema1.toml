@@ -2,9 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# The pre-v1 plan. It has nodes instead of hosts, no groups, no deployment and
-# no install. Nothing reads it any more (the verbs that did went with M5B),
-# and this flake says so instead of listing thirty missing keys.
+# Invalid fixture: the former node-based inventory lacks schema 2 host definitions.
 [fleet]
 name = "old"
 

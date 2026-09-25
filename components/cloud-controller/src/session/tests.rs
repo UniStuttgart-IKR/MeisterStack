@@ -2,9 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The session's tests, verbatim out of `session.rs`. The module path is
-//! unchanged (`session::tests`), so every test still answers to the name it
-//! had before.
+//! Tests for src/session decisions and API contracts.
+//! Store-backed cases explicitly require etcd; value-level cases run without it.
 
 use super::ingest::*;
 use super::*;

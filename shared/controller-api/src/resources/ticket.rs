@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `Ticket` kind: one credential, for one URL, for thirty seconds, as an
-//! object several replicas can share.
+//! Short-lived, single-use credentials scoped to one console URL.
 
 use super::*;
 

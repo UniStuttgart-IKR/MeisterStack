@@ -6,22 +6,18 @@ config/token
 ctx.sh
 /tmp
 
-# local dev environments. `deploy/env` was read by deploy/push.sh and
-# deploy/check.sh; both went to the lab repository with M5B, and the file is
-# still ignored here because a checkout may carry one with real addresses in
-# it (L3 finding B5).
+# Legacy local deployment settings may contain real addresses or credentials.
 deploy/env
 deploy/env.*
 
-# Nix-Build-Ausgaben
+# Nix build outputs.
 /result
 /result-*
 
-# KI-Arbeitsdokumente -- ausgelagert nach ../MeisterStack-Journal (privat).
-# Nicht wieder hier anlegen: Briefs, Journals, Berichte gehoeren ins Journal-Repo.
+# Review reports and design journals belong in ../MeisterStack-Journal.
 docs/claude/
 docs/design/
 
-# Repowise-Index und -Caches (regenerierbar, binaer)
+# Regenerable Repowise indexes and caches.
 .repowise/
 .repowise-workspace/

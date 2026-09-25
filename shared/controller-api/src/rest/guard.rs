@@ -2,9 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Who is asking, and what they may do: the chain built from config, the
-//! middleware that runs it, what a caller is once it has run, and `whoami`.
-//! Moved out of `rest.rs` unchanged.
+//! Authentication configuration, request middleware, directory grants and whoami.
 
 use super::*;
 
@@ -362,34 +360,10 @@ pub(super) async fn grant_of(
     }
 }
 
-/// Make a `User` for somebody the identity provider vouched for and the
-/// directory has never seen.
-///
-/// **Switched on, this means that everybody the identity provider knows has
-/// a foot in the door.** That sentence is the switch's whole risk and it is
-/// why the default is off: with it on, the directory stops being a list an
-/// administrator wrote and becomes a list the provider writes.
-///
-/// Four things bound it, and none of them is decoration:
-///
-/// * Only an identity out of a token. A certificate for an unknown name is
-///   still nobody — that path has its own bootstrap (`system:masters`) and
-///   does not need a second one.
-/// * The role is always `Member`, hard-coded here, never read from a claim.
-///   Deriving a role from a token would contradict the invariant the rest of
-///   this file is built on: the directory is the truth about what somebody
-///   may do.
-/// * The tenant comes from the claim the operator nominated. There is no
-///   default tenant, because a default would be one room everybody the
-///   provider knows shares.
-/// * That tenant has to EXIST. This is the bound that makes the switch
-///   defensible: what a stranger gets a foot into is a room an administrator
-///   has already built and named, not one their own token invented.
-///
-/// Yes, this writes during a GET. It is the one write in the request path
-/// and it happens once per person, ever; the alternative — provisioning from
-/// a background task — would mean the first command after a login failing
-/// for reasons nobody could act on.
+/// Optionally provision an unknown OIDC identity as a Member. Requires an
+/// explicitly configured tenant claim naming an existing tenant; certificate
+/// identities do not use this path. Disabled by default. This may create the
+/// directory entry during the user's first authenticated GET.
 pub(super) async fn provision(st: &AuthState, identity: &Identity) -> anyhow::Result<Option<User>> {
     if !st.provision_oidc_users || !identity.has_group(crate::oidc::GROUP_OIDC) {
         return Ok(None);
@@ -674,25 +648,10 @@ impl Tier {
     }
 }
 
-/// Which links this configuration will stand up, and every refusal that does
-/// not need a file.
-///
-/// A link that has nothing to work with is left out rather than added and
-/// left useless — but only when the chain was defaulted. A chain that NAMES
-/// an authenticator it cannot build is an operator who thinks a door is shut
-/// that is not, and that is an error, loudly.
-///
-/// `serves_sessions` is whether this process also listens on its gRPC session
-/// port, and it decides the one refusal below that is not about the REST edge
-/// at all — see `mtls_or_no_peers`.
-///
-/// Separate from [`build_chain`] so that `--check-config` can run it. Building
-/// the chain opens the client CA, reads the bearer token file and fetches the
-/// provider's discovery document; a configuration check that needs those is a
-/// check that only answers on the host it is checking, and D12 asks for one
-/// that answers anywhere. What this half does NOT cover is therefore
-/// everything that needs the file: an unreadable CA, an empty token file, and
-/// the OIDC provider's own settings.
+/// Resolve authenticator configuration without file or network access.
+/// Default chains omit unconfigured links; explicit unusable links are errors.
+/// Session-serving processes must meet the mTLS requirement. File readability,
+/// file contents and provider discovery are checked during actual construction.
 pub fn check_chain(
     cfg: &AuthConfig,
     has_client_ca: bool,

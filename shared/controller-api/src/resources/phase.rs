@@ -2,39 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! A phase that carries why it is what it is.
+//! Phases carry a kind, reason, message and transition timestamp.
 //!
-//! Until this file a phase was one word and an assignment: whoever came past
-//! the object last stamped it out of whatever their code path happened to
-//! know, and the sentence beside it lived in a separate `status.message`
-//! field that another writer could clear. The chaos-extrem run produced the
-//! bill — a `StoragePool` pointer that stood on `Pending` for six minutes
-//! and said nothing (D-C11), an `Image` on `Ready` whose file was never
-//! looked at (F16), a node that fell out with nothing anywhere saying so
-//! (D-C1).
-//!
-//! So a phase is a value with fields now: the word, the CATEGORY behind it,
-//! the sentence, and since when. `Pending`, `Failed` and `Unknown` cannot be
-//! built without a reason slot at all — the type is what enforces it rather
-//! than a review.
-//!
-//! Two types per resource and not one, because the two answer different
-//! questions. `XPhaseKind` is the word — `Copy`, comparable, the thing a
-//! `match` branches on and a metric label carries, and it is exactly the enum
-//! that used to be called `XPhase`. `XPhase` is the word WITH its evidence,
-//! which is what the object stores.
-//!
-//! # Why a macro
-//!
-//! Seven resources, and the machinery is the same for all of them: a kind, a
-//! data-carrying phase, the four getters, and the flat wire form. Written out
-//! it is seven times ninety lines whose only differences are the variant
-//! names — and seven places for the wire form to drift apart, which is the
-//! defect this file exists to answer. The resource table (`resources!`) made
-//! the same argument one file up. What stays hand-written is everything that
-//! is a JUDGEMENT about one resource: `is_stable`, `is_final`, `is_terminal`
-//! and the doc comments, because those are the sentences somebody has to be
-//! able to disagree with.
+//! The macros define comparable `XPhaseKind` enums, evidence-bearing `XPhase`
+//! values and their flat wire representation. Resource-specific derivation and
+//! stability predicates remain explicit. A phase timestamp changes only when
+//! the kind changes; legacy records without a reason remain readable.
 
 use super::*;
 
@@ -87,33 +60,20 @@ macro_rules! phase_reason_of {
     };
 }
 
-/// Everything in this file writes seven copies of the same shape; this is the
-/// shape. See the module comment for why it is a macro.
-///
-/// One invocation per resource, beside the resource it belongs to:
+/// Generate phase kinds, evidence-bearing phases, wire forms and observations.
+/// Each resource invokes the macro beside its reason definitions.
 ///
 /// ```ignore
 /// phases! {
-///     /// Where a volume is in its own life.
-///     VolumePhase / VolumePhaseKind / VolumeReason / VolumePhaseWire / VolumeReported [5] {
-///         /// Reserved, not yet placed on a node that can provision it.
+///     VolumePhase / VolumePhaseKind / VolumeReason / VolumePhaseWire / VolumeReported [2] {
 ///         Pending { reason, message, since } => "Pending",
-///         /// The data exists.
 ///         Ready { message, since } => "Ready",
 ///     }
 /// }
 /// ```
 ///
-/// The count in brackets is the length of `ALL`, spelled out rather than
-/// counted: `ALL` keeps the `[Kind; N]` type it has always had — the tables
-/// that walk it walk an array — and a wrong number is a compile error.
-///
-/// Every variant carries `message` and `since`. A message is EVIDENCE and not
-/// a reason: a node reporting `Running` with "host rebooted" is saying
-/// something, and a `Ready` variant that could not hold it would drop a
-/// sentence this control plane used to show. `since` is on every variant
-/// because "how long has it been like this" is a question about any of them
-/// (see `stuck`).
+/// The array length must match the variants. Every variant retains a message
+/// and transition timestamp; only variants declaring `reason` carry a category.
 macro_rules! phases {
     ($(
         $(#[$about:meta])*
@@ -509,29 +469,9 @@ macro_rules! reasons {
                 Self::ALL.into_iter().find(|r| r.as_str() == s)
             }
 
-            /// A word off a wire and the sentence it arrived with, read the
-            /// honest way.
-            ///
-            /// The one reader for both wires a reason crosses: a stored
-            /// object being decoded, and a status report from the tier below.
-            /// Three cases, and only the third does anything:
-            ///
-            /// * an empty word is `Unrecorded` and the sentence is untouched
-            ///   — a peer that predates the field said nothing, which is not
-            ///   the same as saying something wrong.
-            /// * a word this binary knows is itself.
-            /// * a word it does NOT know is `Unrecorded`, and **the word is
-            ///   rescued into the front of the sentence**.
-            ///
-            /// That last line is the whole of decision 2 and it replaces
-            /// dropping the string. A word arrives that this tier cannot
-            /// name in exactly two situations — a newer agent rolled out
-            /// under an older controller, or a rename that only landed on one
-            /// side — and both are a drift somebody has to see. Dropped, it
-            /// showed up as an object with no reason at all, which reads as
-            /// "nobody recorded one": the two states a control plane must
-            /// never confuse are "I have nothing to say" and "I was told
-            /// something I do not understand".
+            /// Parse a stored or reported reason. Empty input is Unrecorded; known
+            /// words retain their category. Unknown words become Unrecorded and are
+            /// prefixed to the message so version skew remains visible.
             pub fn read(word: &str, message: Option<String>) -> (Self, Option<String>) {
                 if word.is_empty() {
                     return (Self::Unrecorded, message);
@@ -590,24 +530,9 @@ macro_rules! phased {
                 }
             }
 
-            /// The derived phase, onto the object, with the stamp rule
-            /// applied — the ONE place the field moves once `assign` is
-            /// gone.
-            ///
-            /// `pub(super)`, so it is reachable from the `Resource::settle`
-            /// implementations beside the resource table and from nowhere
-            /// else in this workspace. That is what makes a phase a
-            /// derivation rather than an assignment: there is no function a
-            /// reconciler can call to put a word on an object.
-            ///
-            /// `now` is used only when the WORD changes. A derivation runs on
-            /// every write — a status report arrives every ten seconds and
-            /// says what it said last time — and a stamp taken per write
-            /// would make "Running since" mean "last heard from" and turn
-            /// every one of those reports into an etcd revision. The one
-            /// exception is an object nobody has stamped at all
-            /// ([`UNSTAMPED`]): its first derivation IS its first stamp, even
-            /// onto the word it was born with.
+            /// Store a derived phase. Only resource `settle` implementations may call
+            /// this method. Preserve `since` while the kind is unchanged, except for
+            /// the first derivation of an UNSTAMPED object.
             pub(super) fn stamp(&mut self, phase: $phase, now: DateTime<Utc>) {
                 let since = if phase.kind() == self.phase.kind() && self.phase.since() != UNSTAMPED
                 {

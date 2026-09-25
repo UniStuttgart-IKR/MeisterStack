@@ -12,10 +12,7 @@ use syn::{
 
 use meister_common::attribution::License;
 
-/// Attribution that is present but empty is attribution that says nothing,
-/// and the whole point of these attributes being macros rather than comments
-/// is that the compiler checks them. Every field is checked for something —
-/// this is the check for the ones whose only requirement is content.
+/// Require nonblank attribution fields at compile time.
 fn non_empty(lit: &LitStr, what: &str) -> syn::Result<()> {
     if lit.value().trim().is_empty() {
         return Err(syn::Error::new(
@@ -88,9 +85,8 @@ impl Parse for SourcedArgs {
     }
 }
 
-/// A source attribution whose url cannot be opened is not an attribution.
-/// Only the scheme is checked — the macro cannot fetch anything, and a
-/// stricter shape check would reject perfectly good urls.
+/// Require a nonblank HTTP(S) source URL. This checks the scheme, not remote
+/// availability or the rest of the URL syntax.
 fn validate_url(url: &LitStr) -> syn::Result<()> {
     non_empty(url, "url")?;
     let v = url.value();

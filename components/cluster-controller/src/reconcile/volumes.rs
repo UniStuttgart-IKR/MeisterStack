@@ -2,9 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Volumes and the pools they live in: placement, provisioning, resize,
-//! release and the pool localities the scheduler reads. Moved out of
-//! `reconcile.rs` unchanged.
+//! Volume placement, provisioning, resize, release, and derived pool locality.
 
 use super::*;
 
@@ -28,14 +26,8 @@ pub(crate) async fn volume_uids(store: &EtcdStore, vm: &Vm) -> anyhow::Result<Vo
     Ok(out)
 }
 
-/// Every storage pool, once per pass: say where its bytes are, or say that/// Every storage pool, once per pass: say where its bytes are, or say that
-/// its nodes cannot agree.
-///
-/// The pool is the only object that can hold this answer. A locality is a
-/// property of the DRIVER, so it is stated by the nodes that run it and never
-/// by the admin who wrote the pool — `StoragePoolSpec` deliberately has no
-/// such field. What this pass does is collect the statements and check that
-/// they are one statement.
+/// Derive pool locality from the nodes reporting its driver.
+/// Locality is reported by drivers; it is not an operator-selected pool property.
 pub(super) async fn reconcile_pools(
     store: &EtcdStore,
     localities: &NodeLocalities,
@@ -51,13 +43,7 @@ pub(super) async fn reconcile_pools(
     Ok(())
 }
 
-/// What the nodes that can reach a pool say about its driver, as a value
-/// rather than as control flow.
-///
-/// The same shape `Release` has two functions down, and for the same reason:
-/// the interesting case is the one that goes wrong, the rule that decides it
-/// has to be exercisable without an etcd, and a rule that built its own
-/// sentence would be a rule whose test asserts on prose.
+/// Agreement, missing evidence, or a disagreement among the pool's reporting nodes.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum PoolLocality<'a> {
     /// Every node that serves this pool says the same thing.
@@ -119,16 +105,8 @@ pub(super) fn pool_locality<'a>(
     }
 }
 
-/// The verdict as the FACTS it puts on the pool. What phase those facts add
-/// up to is `controller_api::settle_storage_pool`, one place for both tiers.
-///
-/// It used to return the phase and the sentence as well. It returns neither
-/// now, and that is the whole shape of this round: a pass writes down what it
-/// found out, the derivation says what the object therefore IS. Two things
-/// followed from it here — the sentence about a version mix is written once,
-/// in the crate both tiers share, and a disagreement is DATA (`node`,
-/// `says`, `other`, `other_says`) rather than prose, so the test asserts on
-/// four names instead of on a string.
+/// Convert locality evidence into shared status facts.
+/// On disagreement, retain the previous locality and record both conflicting reports.
 pub(super) fn pool_facts(
     verdict: PoolLocality<'_>,
     previous: Option<Locality>,
@@ -239,23 +217,9 @@ pub(super) async fn place_volumes(p: &Pass<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether any `Vm` object still carries this volume's claim, written onto
-/// the volume so that `settle` can read it.
-///
-/// D4's other half. `attachedTo` is a name, and whether an object of that
-/// name still refers to this volume is a question about a SECOND object —
-/// which the derivation may not ask, because a derivation that needed another
-/// object could not run inside a compare-and-swap. So the pass that lists the
-/// VMs answers it, every pass, and `volume_claim_holds` reads it beside
-/// `openOn`.
-///
-/// A VM with a `deletionTimestamp` counts as gone, and that is what makes the
-/// claim fall at the right moment rather than at the right object: the guest
-/// is on its way out, so what is left to wait for is the `detach`, and
-/// `openOn` is what says when that has happened.
-///
-/// A reschedule of the same VM keeps the claim for free — the name is the
-/// same name, the object is found, and this writes `false` again.
+/// Record whether the named VM still claims this volume.
+/// Deleting VMs no longer count as claimants, but node open-handle reports must
+/// also clear before the derived attachment claim is released.
 async fn note_claimant(p: &Pass<'_>, volume: &Volume, vms: &[Vm]) -> anyhow::Result<()> {
     let Some(holder) = volume.status.attached_to.as_deref() else {
         return Ok(());
@@ -324,12 +288,7 @@ pub(super) async fn reconcile_volume(
     }
 }
 
-/// Which concern a volume that is staying belongs to, and on which node.
-///
-/// Pure and named because the answer to ONE of these — `Place` — is "let a
-/// pass that knows nothing about this volume's vm pick a node for it", and
-/// the difference between that and the others is the whole of a livelock the
-/// lab ran into (see `vms::ensure_volumes`, "the record follows the vm").
+/// The next operation required by a retained volume and its provisioning node.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Next<'a> {
     /// No node yet: choose one out of the pool.
@@ -376,50 +335,16 @@ pub(super) fn guest_not_told(size_gib: u64, error: &str) -> String {
     )
 }
 
-/// Whether this volume's spec asks for more room than the node has measured.
-///
-/// Read off `status.sizeGib` and not off `observedGeneration`, the same way
-/// hot-plug's drift is: a generation says a spec was written, and what has to
-/// be answered here is whether the bytes are there. A node that lost and
-/// re-made a volume, or one that predates `status.sizeGib` and reports zero,
-/// both come out as drift — the second asks for a resize every pass until the
-/// node is rolled out, which is idempotent at the backend and visible in the
-/// log.
-///
-/// `false` for a volume nobody has measured AND whose spec has not moved:
-/// zero is "not measured", so it cannot be compared, and the first report is
-/// what starts the comparison.
+/// Whether a positive backend size measurement is smaller than the requested size.
+/// Zero means unmeasured and does not trigger growth by itself.
 pub(super) fn grew(volume: &Volume) -> bool {
     volume.status.size_gib > 0 && volume.spec.size_gib > volume.status.size_gib
 }
 
-/// Grow the bytes, then tell the guest — in that order, on two nodes that may
-/// not be the same one.
-///
-/// **The order is not symmetric and not reversible**, and the reason is in
-/// cloud-hypervisor: `vm.resize-disk` grows a FILE itself but only VERIFIES a
-/// block device's size, failing if the device does not already have it. So an
-/// lvm-thin volume grows with `lvextend` or not at all, and the VMM's job is
-/// the part no storage driver can do — telling the guest.
-///
-/// **The two halves fail differently, and the message says which.** The first
-/// failing means nothing happened, and the requeue curve tries again. The
-/// second failing means the backend GREW and the guest was not told, and the
-/// sentence says that a retry resizes only the notification. Both are honest
-/// states; neither is a rollback, because there is no shrinking back.
-///
-/// **What keeps the second half due is `status.untoldGib`, and not the size.**
-/// This used to say the object kept `status.sizeGib` at the old value until
-/// the guest was told — but that field is the NODE's measurement of the
-/// bytes, and its next report said 20 whether anybody had told the guest or
-/// not. The volume read as settled and the notification was never tried again
-/// (F05). So the intent is written down first, before either half is asked
-/// for, and taken off only when the guest has heard; a pass that finds the
-/// bytes already measured at the new size does the second half and nothing
-/// else.
-///
-/// The guest half is skipped where there is no guest — a volume nothing is
-/// holding still grows, which is the case `vm.resize-disk` could never cover.
+/// Persist the notification intent, grow the backend, then notify a running holder.
+/// The volume and VM may be on different nodes. `untold_gib` keeps notification
+/// due after a restart or failure even when the backend already reports the new
+/// size. Growth is not rolled back if notification fails.
 pub(super) async fn resize_volume(p: &Pass<'_>, volume: &Volume, node: &str) -> anyhow::Result<()> {
     let name = volume.metadata.name.clone();
     let size_bytes = volume.spec.size_gib.saturating_mul(1024 * 1024 * 1024);
@@ -538,18 +463,8 @@ async fn told(p: &Pass<'_>, volume: &Volume) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Tell the node to make the bytes, and record that it was told.
-///
-/// A compare-and-swap onto the object this pass read, exactly as `place` does
-/// for a VM: several replicas may reach this at once, and the one that loses
-/// must not re-send.
-///
-/// `status.backend` is deliberately NOT touched, and since storage B nothing
-/// else writes it either: it is what the NODE calls the volume, so it arrives
-/// with the node's first report and is empty until then. Guessing it here —
-/// which the create edge used to do, with a `vol-<uid>` no driver in this tree
-/// uses — only produced a window in which the object named a path that was
-/// nowhere.
+/// Resolve namespace and seed, claim Provisioning by CAS, and dispatch.
+/// The backend handle remains empty until the node reports the resource it made.
 pub(super) async fn provision_volume(
     p: &Pass<'_>,
     volume: &Volume,
@@ -729,13 +644,9 @@ pub(super) async fn requeue_volume(
     provision_volume(p, &kicked, node).await
 }
 
-/// The agent's `VolumeSpec` for this volume: the pool's driver, the pool's
-/// params merged with the volume's, the size in bytes, the base image.
-///
-/// Merged HERE and not at the node, because a pool is a control-plane object
-/// and the node has never heard of one. Volume params win over pool params on
-/// a collision — the pool is the default and the volume is the request, the
-/// same way a VM's device params override nothing the node configured.
+/// Build the agent spec from the pool driver, size, seed, and backend parameters.
+/// The controller-assigned namespace overrides the pool's top-level default.
+/// The agent receives the resolved spec and does not need a pool resource.
 pub(crate) async fn volume_spec_json(store: &EtcdStore, volume: &Volume) -> anyhow::Result<String> {
     let pool: StoragePool = store.get(&volume.spec.pool).await?;
     // The one thing this tier writes INTO a driver's params rather than
@@ -795,17 +706,9 @@ pub(super) fn merge_params(
     }
 }
 
-/// The finalizer flow, and the one place "detach before delete" is actually
-/// carried out.
-///
-/// A volume somebody is holding keeps everything. The object stays, the data
-/// stays, and the pass comes back in five seconds — because the consumer
-/// letting go is an event that happens on a node, and no amount of deciding
-/// here can make it happen sooner. Only when nothing holds it does the
-/// finalizer come off and the object go.
-///
-/// A volume that was never placed has no data anywhere and goes at once: the
-/// node that would have provisioned it never did.
+/// Retain the finalizer while a VM or undeleted snapshot holds the volume.
+/// Otherwise request deprovisioning and wait for the node to report Gone.
+/// An unplaced volume can be removed immediately.
 pub(super) async fn release(p: &Pass<'_>, volume: &Volume) -> anyhow::Result<()> {
     let name = &volume.metadata.name;
     // Read once per volume rather than once per pass, because the answer is
@@ -843,13 +746,7 @@ pub(super) async fn release(p: &Pass<'_>, volume: &Volume) -> anyhow::Result<()>
     }
 }
 
-/// What a deleted volume's state calls for, as a value rather than as control
-/// flow.
-///
-/// Pure and separate because it is the rule with the most at stake in this
-/// file: getting it wrong once means data that is gone, and a rule that can
-/// only be exercised through an etcd is a rule that gets exercised by the
-/// lab. The executor above does nothing but carry each answer out.
+/// Deletion decision derived from recorded holders and node placement.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Release<'a> {
     /// Somebody is using it. Everything stays — the object, the data, the
@@ -873,15 +770,8 @@ pub(super) enum Release<'a> {
     Drop,
 }
 
-/// Tell the node to destroy the bytes, and finish the delete once it says
-/// they are gone.
-///
-/// The order is the rule and it is the one with data on the other side of it:
-/// the object goes only AFTER the node has said `Gone`. Absence would not do
-/// — a node that does not name a volume does not know it (see
-/// `StatusReport.volumes`), and a restart before the first report would
-/// otherwise be read as "the data is gone" and delete an object whose bytes
-/// are still on a disk.
+/// Request backend deletion and retain the object until explicit Gone evidence.
+/// Missing reports or an unreachable node do not establish that the bytes are gone.
 pub(super) async fn deprovision_volume(
     p: &Pass<'_>,
     volume: &Volume,
@@ -998,18 +888,9 @@ impl HeldBy<'_> {
     }
 }
 
-/// Pick a node that can provision this volume.
-///
-/// The second application of `feasible`, and the reason it is one rather than
-/// "send a command to some agent": the pool's reachability is the same KIND
-/// of cut a VM's device request is, and it belongs beside it rather than in a
-/// dispatcher. What is deliberately NOT shared is capacity — see
-/// `feasible_for_storage`.
-///
-/// A plain compare-and-swap on the object this pass read, exactly as `place`
-/// does for a VM and for the same reason: with several replicas scheduling at
-/// once, the binding is the one write that must not be retried onto a newer
-/// object.
+/// Choose a reachable pool node with the required backend capability.
+/// Storage placement does not spend VM CPU or memory capacity. Claim placement
+/// by one CAS; a losing writer must not overwrite the winning node.
 pub(super) async fn place_volume(
     p: &Pass<'_>,
     pools: &[StoragePool],
@@ -1072,18 +953,8 @@ pub(super) async fn place_volume(
     Ok(())
 }
 
-/// A sentence about a volume, onto the word that is already there.
-///
-/// The one thing a writer may do to somebody else's word, and it is worth a
-/// function because it is the case that used to be a phase assignment with
-/// the kind read back out of the object: a half-finished resize has grown the
-/// bytes and failed to tell the guest, so what the volume IS has not changed
-/// and only the sentence has. Writing the kind back would have been a second
-/// party deciding the word.
-///
-/// Nothing at all on a volume nobody has said anything about: there is no
-/// word to put a sentence on, and inventing one here would be this tier
-/// claiming an observation.
+/// Change only the diagnostic on an existing report, preserving its observation.
+/// Do nothing if no report exists; notification failure is not a new byte-state observation.
 fn note_on_volume(v: &mut Volume, message: Option<String>) {
     if let Some(said) = &mut v.status.reported {
         said.message = message;

@@ -2,13 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! When a peer that has stopped talking counts as gone.
+//! Shared heartbeat expiry policy for node and cluster peers.
 //!
-//! Both tiers ask the same question about the tier below them — the cluster
-//! about its nodes, the cloud about its clusters — and both answered it with
-//! the same function and the same constant, written twice. It is the same
-//! question: the peer reports on a fixed interval, and the only thing a dead
-//! one leaves behind is a timestamp that stops moving.
+//! A stopped heartbeat establishes lost contact, not the termination of workloads
+//! on the peer.
 
 use chrono::{DateTime, Utc};
 

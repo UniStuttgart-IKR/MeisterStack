@@ -3,23 +3,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# MeisterStack — die Optionstabelle in deploy/README.md, aus den Modulen
-#
-# Ein fremder Host, der `nixosModules.default` importiert, sieht
-# Optionsnamen und sonst nichts: keinen Brief, kein Beispiel, keine
-# Warteschlange. Die `description` in der Option IST also die Dokumentation,
-# und sie soll nicht ein zweites Mal abgetippt in einem README stehen.
-#
-# Also: `nix build .#module-options` erzeugt die JSON aus den Modulen
-# (nixosOptionsDoc, dieselbe Maschinerie wie das NixOS-Handbuch), und dieses
-# Skript macht daraus eine Tabelle und setzt sie zwischen die zwei Marken in
-# deploy/README.md. Quelle ist das Modul, Ziel ist das README, dazwischen
-# liegt nichts, was gepflegt werden muesste.
-#
-#   scripts/module-options.sh           # Tabelle schreiben
-#   scripts/module-options.sh --check   # nur pruefen, ob sie aktuell ist
-#
-# Braucht nix und python3.
+# Regenerate the marked option table in deploy/README.md from Nix module metadata.
+# Use --check to compare without writing the README. Requires Nix and Python.
 
 set -uo pipefail
 

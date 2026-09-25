@@ -2,22 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! VXLAN network identifiers: handing one out per tenant, exactly once, and
-//! writing it into the specs that have to carry it.
+//! Allocate tenant VXLAN identifiers through an etcd CAS counter.
 //!
-//! A VNI is not a label. It is the number on the wire that decides which
-//! frames a node's overlay bridge accepts, so two tenants issued the same one
-//! are not a naming conflict somebody notices in `tenant ls` — they are two
-//! tenants on one broadcast domain, which is the precise thing tenancy is for
-//! preventing. That is why this is a compare-and-swap against the store and
-//! not a `max(existing) + 1` over a list: the list read and the write are two
-//! moments, and two API servers creating a tenant in the same moment would
-//! both read the same maximum.
-//!
-//! The mechanism is the store's own. A counter object carries an ordinary
-//! `resourceVersion`, an update compares it, and the loser of a race is told
-//! `Conflict` and tries again with what the winner left behind. Nothing new
-//! was built for this; the allocator is one object and a retry.
+//! Concurrent tenant creation must not assign the same broadcast domain twice.
+//! The losing writer retries against the updated counter; allocated IDs are then
+//! injected into the relevant VM specifications.
 
 use crate::object::Resource;
 use crate::resources::{Counter, CounterSpec};
@@ -60,24 +49,8 @@ pub fn next_vni(current: Option<u32>, base: u32) -> Result<(u32, u32)> {
     Ok((issued, issued + 1))
 }
 
-/// Take the next VNI. Retries its own losses; every other error is the
-/// caller's to turn into a status code.
-///
-/// The bound on retries is a liveness one, not a correctness one: each round
-/// is one lost race, and a caller that has lost sixteen in a row is on an API
-/// server that has bigger problems than this tenant.
-/// The number `allocate` WOULD issue, without issuing it.
-///
-/// For `?dryRun=All`, and it is the reason the parameter needs a second
-/// function rather than a flag: a preview that burned a VNI would leave a
-/// hole in the space every time somebody asked to be shown a tenant, and a
-/// number out of sixteen million is cheap exactly once per tenant and not
-/// once per look.
-///
-/// A racy read, deliberately and harmlessly: two previews in the same instant
-/// name the same number, and neither of them holds it. What a preview
-/// promises is what the request would get if it went now, which is all any
-/// preview of an allocated resource can promise.
+/// Preview the next VNI without advancing the counter. Concurrent previews can
+/// return the same value; no allocation is reserved until the actual create.
 pub async fn peek(store: &EtcdStore, base: u32) -> Result<u32> {
     let current = match store.get::<Counter>(COUNTER_VNI).await {
         Ok(counter) => Some(counter.spec.next),
@@ -123,38 +96,9 @@ pub async fn allocate(store: &EtcdStore, base: u32) -> Result<u32> {
     )))
 }
 
-/// Write `vni` into every NIC of an agent NewVmSpec that names none, and say
-/// how many that was.
-///
-/// This is the injection the design puts at the controller and not at the
-/// agent: the tenant is a control-plane fact, the VNI is a control-plane
-/// allocation, and by the time a spec reaches a node it should say plainly
-/// which wire it wants. The agent then only checks types, exactly as it does
-/// for `base_image` — one place where the truth is made, one place where it
-/// is validated, and no node that has to know what a tenant is.
-///
-/// A NIC that already names a `vxlan_id` is left alone. That is the
-/// standalone road of the design: a cluster with no cloud above it has no
-/// Tenant object to resolve, and putting the number straight in the spec has
-/// to keep working. It is also the override — an admin who has said exactly
-/// which overlay a NIC belongs on has said something more specific than the
-/// tenant did.
-///
-/// **A NIC that names a `physnet` is left alone too, and that is 6k's third
-/// decision.** Such a NIC hangs on the provider bridge instead of the
-/// overlay: it is the appliance road and the single-tenant lab road, and it
-/// is exactly the gap the 6k survey found — "no NIC can go outside, the
-/// cluster writes the tenant VNI into every NIC that has no `vxlan_id` of its
-/// own". Writing one in here would put a VNI on a tap that is not on any
-/// overlay, and the agent refuses a NIC that names both. So the rule is: this
-/// function fills in the tenant's overlay for the NICs that asked for
-/// nothing, and a NIC that asked for something — either something — keeps it.
-///
-/// The field itself belongs to the OTHER crate: `agent_api::spec::NewNic` is
-/// `deny_unknown_fields`, so `POST /vms` refuses a spec naming `physnet`
-/// until the agent side of 6k adds it (N-A2). This half is written first on
-/// purpose — the rule about the VNI is this tier's and it has to be right the
-/// moment the field arrives, not a release later.
+/// Fill the tenant VNI into NICs that name neither a VNI nor a physnet, returning
+/// the count changed. Explicit overlays and provider-network NICs are preserved.
+/// The agent receives concrete network parameters and does not resolve tenants.
 pub fn inject_vxlan_id(spec: &mut serde_json::Value, vni: u32) -> usize {
     let Some(nics) = spec.get_mut("nics").and_then(|n| n.as_array_mut()) else {
         return 0;

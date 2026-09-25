@@ -2,8 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The storage edge: pools, volumes and their snapshots. Moved out of
-//! `api.rs` unchanged.
+//! Storage pool, volume, and snapshot APIs for a cluster.
 
 use super::*;
 
@@ -127,16 +126,7 @@ pub(super) async fn get_volume(
     Ok(Json(st.store.get(&name).await?))
 }
 
-/// Reserve storage here. Nothing is provisioned: the reconcile pass picks a
-/// node that can reach the pool, and the volume is `Pending` and says why
-/// until one is found.
-/// A volume starts from exactly one thing.
-///
-/// Empty, a catalogue image, or somebody's own point in time — and never two
-/// of them. A spec that names both is a spec whose author believes one, and a
-/// silent winner would hand somebody a disk they did not ask for. Refused
-/// here, where a person is still holding the request, and again at the node,
-/// which is the refusal nobody can go around.
+/// Reject a volume specifying both a base image and a snapshot seed.
 pub(super) fn check_one_seed(volume: &Volume) -> Result<(), ApiError> {
     let image = volume
         .spec
@@ -314,15 +304,9 @@ pub(super) async fn delete_volume(
     )
 }
 
-/// The snapshot a volume says it starts from has to be one this tenant has.
-///
-/// **404 and not 403** for a snapshot in another tenant, by the same argument
-/// `check_volume_refs` gives: a 403 would confirm that a snapshot of that
-/// name exists somewhere, which is what a caller probing names is after.
-///
-/// A snapshot that is merely not `Ready` yet is NOT refused — the copy is
-/// being made and the volume waits as Pending, the same way a VM waits for
-/// its disk. One that FAILED is refused: nothing about waiting fixes it.
+/// Require an existing snapshot that is neither deleting nor Failed.
+/// Pending snapshots are accepted; provisioning waits for Ready. Tenant directory
+/// authorization is performed at the cloud tier, not in this helper.
 pub(super) async fn check_snapshot_ready(st: &ApiState, named: &str) -> Result<(), ApiError> {
     let snapshot: VolumeSnapshot = match st.store.get::<VolumeSnapshot>(named).await {
         Ok(s) => s,
@@ -378,25 +362,9 @@ pub(super) async fn get_volume_snapshot(
     Ok(Json(st.store.get(&name).await?))
 }
 
-/// Ask for a point in time of a volume.
-///
-/// Nothing is copied here. What this writes down is that somebody wants one;
-/// the reconcile pass sends the command to the node that HAS the bytes, and
-/// the snapshot is `Pending` until it does.
-///
-/// Two refusals at the edge, and both are things no waiting will fix:
-///
-///   * a volume that is not there, or is another tenant's — **404**, never
-///     403, by the argument `check_volume_refs` gives: a 403 would confirm
-///     that a volume of that name exists somewhere.
-///   * a pool whose backend cannot snapshot at all — **422**, naming the
-///     driver and the node that said so. The catalogue answers this
-///     (`volume/<driver>/snapshot`), which is the same claim a GPU profile
-///     makes and is why the answer is available here rather than twenty
-///     seconds later as a `Failed` object.
-///
-/// A volume that is merely not `Ready` yet is neither: the copy waits, the
-/// same way a VM waits for its disk.
+/// Record a snapshot request for an existing, non-deleting volume.
+/// Check pool snapshot capabilities before creation. A volume that is not Ready
+/// yet may be named; the reconciler waits before dispatching.
 pub(super) async fn create_volume_snapshot(
     State(st): State<ApiState>,
     dry: controller_api::DryRun,
@@ -447,18 +415,9 @@ pub(super) async fn create_volume_snapshot(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-/// Refuse a snapshot of a volume whose pool cannot take one.
-///
-/// Asked of the CATALOGUE of the nodes the pool names, because that is where
-/// the answer is: a driver states `snapshot_support` and the agent claims
-/// `volume/<driver>/snapshot` for it, exactly as it claims a GPU profile. The
-/// sentence names the driver and one node that said no, because "the pool
-/// cannot" is not something an operator can act on and "the filesystem driver
-/// on agent-1 reports no snapshot support" is.
-///
-/// A pool whose nodes are not connected has no catalogue to ask and is
-/// refused too, with the same sentence a pool with no candidate gets
-/// elsewhere: silence here is not a yes.
+/// Require a stored snapshot capability claim from at least one pool node.
+/// This check does not filter node readiness or select the eventual snapshot node.
+/// A missing pool is left for reconciliation to diagnose.
 pub(super) async fn check_pool_can_snapshot(
     st: &ApiState,
     volume: &Volume,

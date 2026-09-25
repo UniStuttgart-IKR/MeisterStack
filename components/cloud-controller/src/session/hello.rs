@@ -2,13 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Hello and goodbye: the cluster that dials in, and the last replica of it
-//! that hangs up.
-//!
-//! Hello is the one message that creates a `Cluster` object, so it is also
-//! what keeps the first status from writing into nothing; `closed` is its
-//! mirror and is careful about which of the several replicas of one cluster
-//! it is saying goodbye to. Verbatim out of `session.rs`.
+//! Register cluster inventory on Hello and update readiness when sessions close.
 
 use super::*;
 

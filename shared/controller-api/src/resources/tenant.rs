@@ -2,9 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `Tenant` kind: who an object belongs to, and how much of
-//! the estate they may take. Moved out of `resources.rs`
-//! unchanged.
+//! Tenant ownership, network allocation and resource quotas.
 
 use super::*;
 

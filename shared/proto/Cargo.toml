@@ -1,3 +1,4 @@
+# Generated session messages and shared transport configuration.
 [package]
 name = "meister-proto"
 version = "0.1.0"
@@ -6,13 +7,10 @@ edition = "2024"
 [dependencies]
 tonic = { workspace = true }
 prost = { workspace = true }
-# The generated client/server code names tonic_prost::ProstCodec directly, so
-# this is a dependency of the OUTPUT rather than of anything written here.
+# Generated codecs refer to tonic_prost directly.
 tonic-prost = { workspace = true }
 anyhow = { workspace = true }
-# tonic's tls-ring asks for the process-wide crypto provider and panics
-# without one; `client_tls` installs it. Already in the tree under tonic, so
-# naming it costs nothing but the line.
+# client_tls installs the process-wide crypto provider required by tonic.
 rustls = { workspace = true }
 
 [build-dependencies]

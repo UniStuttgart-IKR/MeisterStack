@@ -2,28 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Asking the node a VM is bound to for what its guest printed.
+//! Fetch guest output for REST, cloud commands and sibling requests.
 //!
-//! One function, three callers: this tier's own REST route, the cloud's
-//! FetchVmLogs command, and a sibling replica forwarding. All of them want
-//! the same thing — the node's document, unopened — and having them ask
-//! through one place is what keeps the answers from drifting apart.
-//!
-//! Nothing here reads or reshapes the document. What a console printed is the
-//! node's answer; a tier that reformatted it on the way through would be a
-//! tier that could get it wrong, and there are two of them above the node.
-//!
-//! ## Why a replica forwards
-//!
-//! A node dials ONE cluster-controller replica and only that one can ask it
-//! anything. With three replicas behind one address, two of every three
-//! requests for a console land somewhere that cannot answer — and the client
-//! cannot know which, because which replica holds a node is a fact about a
-//! gRPC stream and not about anything a client can see. So the replica that
-//! was asked looks at `Node.status.session_endpoint`, which the holder wrote
-//! at Hello, and asks it. Once: the forward carries a header that says so,
-//! and a replica that sees the header and does not hold the session answers
-//! 503 rather than passing it on again.
+//! Return the agent document unchanged. If the node session is elsewhere, use
+//! its advertised endpoint for one authenticated sibling hop. The forwarded
+//! header prevents a stale endpoint from causing a forwarding loop.
 
 use anyhow::bail;
 use controller_api::{EtcdStore, Node, StoreError, Vm, VmPhaseKind};
@@ -43,12 +26,7 @@ const ABOUT: controller_api::forward::About = controller_api::forward::About {
     tier: "cluster",
 };
 
-/// Which lines a caller wants, as it travels this tier.
-///
-/// A pair of substring lists and nothing more: this tier neither reads them
-/// nor applies them. It carries them to the node, which is the only party
-/// holding the whole ring and therefore the only one that can filter BEFORE
-/// shortening — see the agent's `LogFilter` for why that order is the point.
+/// Filters carried to the node, where filtering precedes truncation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Keep {
     pub hide: Vec<String>,
@@ -100,9 +78,7 @@ impl Keep {
     }
 }
 
-/// What the fetch found. Not being placed yet is an ANSWER and not a failure:
-/// a Pending VM has printed nothing because nothing has started, which is the
-/// commonest true thing to say about one.
+/// Guest output or an explanation that the VM has not been dispatched.
 pub enum Logs {
     /// The node's JSON document, verbatim.
     From(Vec<u8>),
@@ -114,11 +90,7 @@ pub enum Logs {
 /// empty list of streams, in the same shape a node would have sent.
 pub const NO_STREAMS: &[u8] = b"[]";
 
-/// Everything a forward needs: who we are to the sibling, and how to trust
-/// it.
-///
-/// `None` for both is the plain-http lab, which is how every cluster in this
-/// stack has run so far and still runs by default.
+/// Cluster identity and transport credentials for a sibling request.
 pub struct Forward {
     /// This cluster's own name — what the sibling's permission table lets
     /// read, and what the log line says.
@@ -128,13 +100,8 @@ pub struct Forward {
     pub sibling: controller_api::forward::Sibling,
 }
 
-/// Ask this VM's node for the end of its output.
-///
-/// An error here is always about reaching the node — no session, a session
-/// that would not take the command, a node that did not answer — and never
-/// about the VM. The caller turns that into a 503, because "I could not reach
-/// the thing that has the answer" is a different sentence from "there is no
-/// answer".
+/// Fetch this VM's output locally or through one sibling.
+/// Transport failures and agent refusals propagate to the caller.
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch(
     registry: &SessionRegistry,
@@ -220,21 +187,8 @@ pub async fn fetch(
     }
 }
 
-/// Has this VM's spec never left this process?
-///
-/// The honest detour around a wrong word. A node answers "Rejected" when it
-/// is asked for the console of a VM it has no record of, and that travelled
-/// up as a 409 — a word from the agent API, which is not a client contract
-/// and is not being changed. But 409 says "two truths disagree", and about a
-/// VM that was never dispatched nothing disagrees at all: it has printed
-/// nothing because nothing was started, and the empty document says exactly
-/// that in the same shape a node would have sent.
-///
-/// The signal is `observedGeneration`, which is the reconciler's own record
-/// of having dispatched (see `dispatch_create`). `Pending` needs no such
-/// record — the phase IS "not dispatched". A VM that ran and then failed has
-/// a dispatch behind it, so it keeps the 409 with the node's own sentence,
-/// and there the word is right: the node had this VM and lost its record.
+/// Avoid asking an agent for a VM that has no dispatch evidence.
+/// Pending is treated as undispatched; Failed also requires observedGeneration zero.
 fn never_reached_the_node(vm: &Vm) -> bool {
     match vm.status.phase().kind() {
         VmPhaseKind::Pending => true,

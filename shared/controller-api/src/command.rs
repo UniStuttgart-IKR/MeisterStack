@@ -2,15 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Sending one command down a session and waiting for its result.
+//! Correlate session commands with replies by request ID.
 //!
-//! Both tiers hold a bidi session with the tier below them — the cluster with
-//! its agents, the cloud with its clusters — and both let a reconcile pass
-//! await an ack without owning the stream: the command carries a request_id,
-//! the peer's CommandResult carries it back, and a oneshot registered under
-//! that id is what joins the two. The proto messages differ; none of the
-//! bookkeeping does, down to the three failure paths and which of them has to
-//! take the entry back out of the map.
+//! Each command registers a oneshot sender before transmission. Replies resolve
+//! it; send failures and timeouts remove pending entries. The two session tiers
+//! provide their own protobuf message types.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

@@ -2,18 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The X.509 half of the control plane: what a certificate says, who signed
-//! it, and how to make a TLS config out of a few PEM files.
+//! Shared X.509 identity, certificate issuance and TLS configuration.
 //!
-//! It is a crate of its own for one reason — the CLI needs it. `meister login`
-//! generates a key pair, builds a CSR and then talks https to a controller,
-//! which is the same set of primitives the controllers use from the other
-//! side. Putting them in controller-api would have dragged etcd into the CLI.
-//!
-//! One rule runs through all of it: **a private key is a file on one machine
-//! and never anything else.** Nothing here serialises a key into an object, a
-//! config value or a log line; the only key that ever leaves a function is
-//! the one `csr::generate` hands its caller to write to disk.
+//! Controllers and the CLI use the same PEM loading and trust primitives.
+//! Private keys remain local files; API certificate requests carry public keys.
 
 pub mod ca;
 pub mod cert;

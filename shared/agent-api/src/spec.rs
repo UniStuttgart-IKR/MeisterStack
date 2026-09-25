@@ -2,26 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The document a VM is created from — `spec.vm` at both REST edges and the
-//! body of the node's own create route, one type.
+//! Shared VM request types for controller `spec.vm` and the agent create API.
 //!
-//! It lives HERE rather than in `components/agent` for a single reason: the
-//! refusal it makes has to be made where the client can still read it. A
-//! controller that takes `spec.vm` as an opaque `Value` answers 201 and lets
-//! the node say "unknown field `base_image`" three tiers down, asynchronously,
-//! into a status field nobody was waiting on. Both controllers now
-//! deserialise into these types at the edge and hand the serde sentence back
-//! as a 422 with the field in `details.field`.
-//!
-//! What did NOT move is everything that needs a node to be true: sizing,
-//! images on disk, a bridge, a driver. `into_spec` — the step that turns this
-//! document into the node's own record — stays in the agent, and so the tier
-//! boundary stays where it was. This module is the SHAPE, and the shape is
-//! not a secret: `/schemas` publishes it (schemars is derived here), so a
-//! form can list the fields without knowing a single rule.
-//!
-//! Note the case: everything outside `spec.vm` is camelCase, everything
-//! inside it is snake_case. That is this boundary, made visible.
+//! Controllers validate this shape before accepting a request. Conversion into
+//! node records and checks that require local drivers remain in the agent.
+//! `spec.vm` uses snake_case; the surrounding controller object uses camelCase.
+//! These same types supply the published JSON Schema.
 
 use serde::{Deserialize, Serialize};
 
@@ -115,27 +101,11 @@ pub struct NewVmSpec {
     pub cloud_init: Option<CloudInit>,
 }
 
-/// The volume half of a NewVmSpec. `driver` and `params` mirror `NewDevice`:
-/// both default, so every spec written before storage had more than one
-/// backend is still exactly the spec it was.
-///
-/// # Ephemeral, and why that needs no field
-///
-/// An entry here is an EPHEMERAL disk: it is made when the VM is made and it
-/// goes when the VM goes, like an instance store. Nothing on it says so
-/// because nothing has to — the axis is structural. A disk described INSIDE a
-/// VM's spec has no existence outside that VM, and a disk that is a `Volume`
-/// object was there before the VM and is there after it. Those are the two
-/// cases, they are told apart by WHERE the disk is written down, and a
-/// `ephemeral: true` anywhere would be a second way of saying the same thing
-/// — with the usual consequence that the two can disagree.
-///
-/// So there is deliberately no `ephemeral` on the `Volume` object either:
-/// somebody who wants scratch space writes it inline, here, and gets it.
-/// What the distinction costs elsewhere is one sentence in the placement
-/// rules: a VM whose local disks are all ephemeral may be moved to another
-/// node and have them made again there, and a VM holding one persistent
-/// node-local volume may not.
+/// A VM disk request: either an inline ephemeral disk or a reference to a
+/// persistent Volume. Inline disks share the VM lifecycle; referenced volumes
+/// outlive it. Persistent node-local volumes constrain placement even when
+/// ephemeral local disks can be recreated elsewhere. `driver` and `params`
+/// default for compatibility with older requests.
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewVolume {

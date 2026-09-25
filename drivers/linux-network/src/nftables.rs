@@ -2,62 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a tap is allowed to send, enforced where the guest's frames first
-//! reach the host.
-//!
-//! ## Why netdev/ingress and not the filter chains
-//!
-//! A tap on a bridge is not routed and not forwarded by the IP stack, so
-//! nothing a guest sends passes `hook forward` unless somebody has turned
-//! `br_netfilter` on — a module with its own performance story and its own
-//! surprises, and one this driver has no business demanding. The netdev family
-//! attaches a chain to ONE device at its ingress, which for a tap means
-//! exactly the frames the guest emitted, before bridging, before anything. It
-//! is the earliest and cheapest place to say no, it sees ARP as readily as IP
-//! because it sees raw frames, and it needs no module and no sysctl.
-//!
-//! One chain per tap, named after it (`meister-msk1a2b3c4d`), in one table
-//! (`netdev meister`) this driver owns outright. The chain is rebuilt whole on
-//! every create — `add` then `flush` then the rules, in one atomic `nft -f` —
-//! so applying it twice is applying it once, and a tap whose VM was given
-//! another address gets the new truth at its next boot rather than an
-//! accumulation of both.
-//!
-//! ## The three rules, in the order they matter
-//!
-//! 1. **MAC pinning, on every tap there is.** We hand out the MAC addresses,
-//!    so a frame from this tap with any other source MAC is a frame nobody
-//!    legitimately sent. This one does not depend on floating addresses, on
-//!    pools, or on anything being configured: it is true of every VM this
-//!    stack has ever booted, and a guest running `ip link set eth0 address …`
-//!    is either confused or hostile.
-//!
-//! 2. **The pool guard**, when the node has `guarded_ranges` and the VM's
-//!    tenant has no routed subnet. Source addresses (and ARP claims) inside
-//!    the floating pool are dropped on EVERY tap, with an accept in front of
-//!    it for the addresses this VM actually holds. No IPAM is needed for this
-//!    and none is wanted: we forbid only the addresses we hand out, never the
-//!    tenant's own — which we do not know and have no business knowing.
-//!
-//! 3. **The allowlist**, when the tenant HAS routed subnets. Then the tenant's
-//!    address space is written down, so the rule can be the strong one:
-//!    these subnets, these floating addresses, and nothing else. This is the
-//!    same guard turned inside out, and it is why Part B completes Part A
-//!    rather than sitting beside it.
-//!
-//! Every drop carries a `counter` and a comment. That is the proof in the E2E
-//! — `nft list chain netdev meister meister-<tap>` shows which rule stopped
-//! what — and it is the hook a future Phase-D security-group story reads
-//! rather than reinvents.
-//!
-//! ## What is deliberately NOT filtered
-//!
-//! IPv6 and everything that is neither IPv4 nor ARP pass untouched. The
-//! address model of this milestone is IPv4 (see `common::net`), and a rule
-//! written against addresses nobody allocates would be a rule nobody can
-//! debug. A node that wants v6 anti-spoofing wants a v6 address model first.
-//! Inbound traffic is untouched too: this is an egress guard, and what may
-//! reach a guest is the environment's firewall, not ours.
+//! Render and apply tap source guards and router NAT rules.
+//! Each tap has a netdev ingress chain: MAC pinning, then an IPv4/ARP allowlist
+//! or guarded-pool rules. Provider NICs receive only MAC pinning. IPv6 source
+//! addresses and inbound guest traffic have no address policy here.
+//! Router NAT uses a separate ip-family table inside each router namespace.
 
 use std::process::Stdio;
 
@@ -70,10 +19,7 @@ use tracing::{debug, info, instrument, warn};
 /// filtering.
 pub const TABLE: &str = "meister";
 
-/// `0.0.0.0`, which a guest sources from before it has an address at all
-/// (DHCP DISCOVER, and the ARP probe of duplicate-address detection). Always
-/// allowed: it is not an address anybody can impersonate with, and dropping it
-/// would break the one thing a fresh guest does first.
+/// Allow the unspecified source used by DHCP and ARP address probes.
 const UNSPECIFIED: &str = "0.0.0.0";
 
 /// The chain that guards one tap.
@@ -87,27 +33,12 @@ pub struct NftConfig {
     /// The binary. `nft` = whatever PATH says, which is right on a NixOS node
     /// and wrong nowhere in particular.
     pub binary: String,
-    /// The union of every floating pool's ranges, from the agent's own
-    /// `guarded_ranges`.
-    ///
-    /// Deliberate duplication of what the cloud holds in FloatingPool objects,
-    /// and the honest v1 trade: the deny rule needs the whole union on the
-    /// node, and the node has no way to ask the cloud for it — the session
-    /// carries commands about VMs, not a catalogue of pools.
-    ///
-    /// REFACTOR, not built here: push the pools down the session the way the
-    /// vni is pushed down, and this key becomes a fallback. That is the same
-    /// milestone as pushing a VXLAN peer list down (see the module doc in
-    /// lib.rs), it is the same mechanism twice, and doing either one alone
-    /// buys half a feature.
+    /// Locally configured floating-pool ranges. Keep them aligned with cloud allocation;
+    /// the controller session does not synchronize this catalogue.
     pub guarded: Ipv4Ranges,
 }
 
-/// The rules for one tap, as an `nft -f` script.
-///
-/// Pure and returned as text rather than executed, because the interesting
-/// part of this driver is WHICH rules a spec produces and that is worth
-/// asserting without a kernel. The runner below is four lines around a pipe.
+/// Render one complete tap chain for an nft batch.
 pub fn ruleset(tap: &str, spec: &NicSpec, guarded: &Ipv4Ranges) -> Result<String, RangeError> {
     let chain = chain_name(tap);
     let mut s = String::new();
@@ -130,25 +61,7 @@ pub fn ruleset(tap: &str, spec: &NicSpec, guarded: &Ipv4Ranges) -> Result<String
         spec.mac
     )));
 
-    // 2. A tap on a PROVIDER network stops here, with the MAC guard and
-    //    nothing else about addresses.
-    //
-    //    Everything below is about the TENANT's address space: the routed
-    //    subnets it was given, the floating addresses reserved for it, the
-    //    pool nobody may source from. A NIC with a physnet is not on that
-    //    wire at all — it is on somebody else's layer 2, the one the operator
-    //    handed over — and this control plane allocates nothing there and
-    //    knows no address on it. Rendering the tenant's overlay rules onto
-    //    such a tap fences the guest out of the very network it was put on:
-    //    seen in the lab, where a guest with `physnet = "ext"` and an address
-    //    from the lab's own range had every ARP dropped by `src-arp`, because
-    //    the allow-list was its tenant's routed subnet.
-    //
-    //    What still holds is the MAC: we handed it out, so a guest may not
-    //    wear another one, and that is the guard that keeps one tenant's tap
-    //    from answering for another's. Which ADDRESSES are legitimate on a
-    //    provider network is the operator's question and is answered where
-    //    the addresses are handed out, not here.
+    // Provider NICs use operator-managed address space; apply MAC pinning only.
     if spec.physnet.is_some() {
         return Ok(s);
     }
@@ -173,10 +86,7 @@ pub fn ruleset(tap: &str, spec: &NicSpec, guarded: &Ipv4Ranges) -> Result<String
     }
 
     if !guarded.is_empty() {
-        // 2. The tenant's own addresses are unknown, so forbid only ours —
-        //    with this VM's own reservations accepted in front of the ban.
-        //    Accept and not "!=" so that a VM holding two of the pool's
-        //    addresses needs one rule per direction and not one per address.
+        // Accept this VM's reservations before rejecting other guarded-pool sources.
         if !floating.is_empty() {
             let mine = floating.to_nft();
             s.push_str(&rule(&format!(
@@ -207,13 +117,7 @@ pub fn teardown(tap: &str) -> String {
 
 // --- the router's own table, inside its own namespace -----------------------
 
-/// The table a router owns inside its network namespace.
-///
-/// A different name from `TABLE` above and a different FAMILY, and neither is
-/// an accident. The tap guard is `netdev` on the host and sees raw frames at
-/// one device's ingress; a router NATs, and NAT lives in the `ip` family at
-/// the nat hooks. They never meet: this one only ever exists inside
-/// `meister-rt-<id>`, where nothing else of ours does.
+/// Router NAT table inside the network namespace, separate from host tap guards.
 pub const ROUTER_TABLE: &str = "meister-rt";
 
 /// The router's leg on the provider network, inside the namespace.
@@ -221,28 +125,9 @@ pub const LEG_EXTERNAL: &str = "ext";
 /// Its leg on the tenant's overlay, inside the namespace.
 pub const LEG_INTERNAL: &str = "int";
 
-/// Everything one router translates, as an `nft -f` script.
-///
-/// Pure and returned as text for the reason [`ruleset`] is: WHICH rules a
-/// spec produces is the interesting half of a NAT gateway, and it is worth
-/// asserting without a kernel and without a namespace.
-///
-/// ## The order is the meaning
-///
-/// A `snat` statement is terminal, so the FIRST matching rule in
-/// `postrouting` decides which address a packet leaves as. The 1:1 pairs
-/// therefore come before the subnet rule: a VM that holds a floating address
-/// must leave as that address, and a subnet rule in front of it would put the
-/// whole tenant, that VM included, behind the router's own address instead.
-///
-/// ## Masquerade, and when it is not
-///
-/// `snat` renders as `masquerade` while the rule's `external_ip` is the
-/// router's own external address, which is the ordinary case and Festlegung
-/// 5: masquerade takes the outgoing interface's address, so a router that is
-/// re-addressed keeps translating without anybody re-rendering a rule. A rule
-/// naming a DIFFERENT address is rendered as an explicit `snat to`, because
-/// then the address is the point and masquerade would quietly use another one.
+/// Render router NAT and forwarding rules.
+/// Place per-address SNAT before subnet SNAT. Use masquerade for the router's
+/// own external address and explicit SNAT for another address.
 pub fn router_ruleset(spec: &agent_api::networking::RouterSpec) -> Result<String, RangeError> {
     use agent_api::networking::NatKind;
 
@@ -263,12 +148,7 @@ pub fn router_ruleset(spec: &agent_api::networking::RouterSpec) -> Result<String
 
     let rule = |chain: &str, body: &str| format!("add rule ip {ROUTER_TABLE} {chain} {body}\n");
 
-    // Conntrack, and the whole of what this router says about state: the
-    // return half of every translated flow is already accepted by the entry
-    // above it, and a packet conntrack cannot place is not a packet a NAT
-    // gateway should forward. Counted and named, so that
-    // `nft list table ip meister-rt` in the namespace says which rule stopped
-    // what -- the same proof the tap chains give.
+    // Drop invalid conntrack traffic and accept established or related flows.
     s.push_str(&rule(
         "forward",
         "ct state invalid counter drop comment \"ct-invalid\"",
@@ -302,10 +182,7 @@ pub fn router_ruleset(spec: &agent_api::networking::RouterSpec) -> Result<String
 
     // ... and the whole-subnet rule behind them.
     for nat in spec.nats.iter().filter(|n| n.kind == NatKind::Snat) {
-        // An empty `logical_ip` is OVN's own spelling for "the subnet this
-        // router's internal leg is on", which is the ordinary case: the
-        // tenant asked for SNAT and named no subnet, because the router
-        // already knows which one it is standing in.
+        // An empty logical_ip selects the subnet of the router's internal address.
         let inside = match nat.logical_ip.trim().is_empty() {
             true => prefix_of(&spec.internal_addr)?,
             false => prefix_of(&nat.logical_ip)?,
@@ -333,10 +210,7 @@ pub fn address_of(cidr: &str) -> &str {
     }
 }
 
-/// One address, refused in words when it is a range or a prefix.
-///
-/// A NAT rule is about addresses: `dnat to 10.7.1.0/24` is not a translation
-/// anybody meant, and nft would take it as a range and balance across it.
+/// Require a single IPv4 address for an address-to-address NAT rule.
 fn one_address(raw: &str) -> Result<String, RangeError> {
     let range: common::net::Ipv4Range = raw.parse()?;
     match range.len() == 1 {
@@ -366,19 +240,7 @@ pub struct Nft {
 }
 
 impl Nft {
-    /// Check at start-up that this node can actually program nftables, exactly
-    /// as the lvm-thin driver checks its pool there rather than at the first
-    /// volume.
-    ///
-    /// It is a hard error and not a warning, and that is the security half of
-    /// this milestone in one decision: MAC pinning applies to every VM, so a
-    /// node that cannot write rules is a node that cannot keep the promise
-    /// this driver now makes. Starting anyway and logging about it would be a
-    /// stack that says it pins MACs and does not.
-    ///
-    /// Creating the table is the check. Anything less — `nft --version` — would
-    /// prove the binary exists and not that this process may use it, and the
-    /// failure that actually happens is the second one.
+    /// Create the guard table to verify both nft availability and permission to use it.
     pub fn new(binary: String) -> Result<Self, NetworkError> {
         let nft = Self { binary };
         let script = format!("add table netdev {TABLE}\n");
@@ -395,11 +257,7 @@ impl Nft {
         }
     }
 
-    /// The binary this driver programs nftables with.
-    ///
-    /// For the one caller that cannot use the two methods below: a router's
-    /// rules live inside its own network namespace, so they are applied
-    /// through `ip netns exec` and not in this process's namespace.
+    /// Expose the nft executable for commands run inside router namespaces.
     pub fn binary(&self) -> &str {
         &self.binary
     }
@@ -482,12 +340,7 @@ impl Nft {
         Ok(())
     }
 
-    /// Take the chain away with the tap.
-    ///
-    /// A failure is a warning and not an error, on purpose: the caller is a
-    /// teardown, the tap itself is about to be deleted, and a netdev chain
-    /// whose device is gone is removed by the kernel anyway. Failing the
-    /// teardown over it would strand a VM whose disks are already released.
+    /// Best-effort chain deletion before tap removal; failures are logged at debug level.
     #[instrument(skip_all, fields(tap = %tap))]
     pub async fn unguard(&self, tap: &str) {
         if let Err(e) = self.run(&teardown(tap)).await {
@@ -495,14 +348,8 @@ impl Nft {
         }
     }
 
-    /// Every chain in the table whose tap no longer exists.
-    ///
-    /// Called at start-up with the taps this node knows about. A chain left
-    /// behind by a `kill -9` between "delete the chain" and "delete the tap"
-    /// is harmless while the tap is gone — but tap names are derived from NIC
-    /// uuids, so it would be a stale rule waiting for a name nobody will reuse.
-    /// Reaping them keeps `nft list ruleset` honest, which is what the E2E
-    /// asserts and what an operator reads.
+    /// Remove chains absent from the supplied tap inventory.
+    /// The caller must provide a complete inventory; this function does not inspect VM records.
     #[instrument(skip_all)]
     pub async fn reap(&self, live_taps: &[String]) {
         let existing = match self.chains().await {
@@ -544,12 +391,7 @@ impl Nft {
     }
 }
 
-/// The chain names in `nft -j list table` output.
-///
-/// Its own function so the JSON shape is asserted rather than assumed: `nft`'s
-/// json_schema_version has moved before and this is the one place a change
-/// would be silent — a reap that finds nothing looks exactly like a node with
-/// nothing to reap.
+/// Extract chain names from nft JSON; malformed or unexpected input returns no names.
 pub fn chain_names(json: &str) -> Vec<String> {
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
         return Vec::new();
@@ -582,15 +424,7 @@ mod tests {
         }
     }
 
-    /// A tap on a provider network keeps the MAC guard and gets no address
-    /// rules at all.
-    ///
-    /// The lab's finding: a guest with `physnet = "ext"` and an address out of
-    /// the lab's own range had every ARP dropped by `src-arp`, because the
-    /// allow-list rendered onto its tap was its TENANT's routed subnet — an
-    /// address space that has nothing to do with the wire the guest was put
-    /// on. A provider network is somebody else's layer 2; this control plane
-    /// allocates nothing there and knows no address on it.
+    /// Provider NICs keep MAC pinning without tenant address rules.
     #[test]
     fn a_tap_on_a_provider_network_is_fenced_by_its_mac_and_by_nothing_else() {
         let mut on_the_wire = spec(&["203.0.113.7"], &["10.31.0.0/24"]);
@@ -637,10 +471,7 @@ mod tests {
         );
     }
 
-    /// The chain is built with add-then-flush and never with delete: a delete
-    /// of a chain that is not there fails, and a failing line aborts the whole
-    /// atomic script — so the first apply would work and every one after a
-    /// restart would not.
+    /// Use add and flush so both initial and repeated batches can create the chain.
     #[test]
     fn the_chain_is_rebuilt_whole_and_applying_twice_is_applying_once() {
         let script = ruleset("msk0", &spec(&[], &[]), &pool(&["10.255.0.0/16"])).unwrap();
@@ -719,10 +550,7 @@ mod tests {
         assert!(!script.contains("pool-ip"), "{script}");
     }
 
-    /// `0.0.0.0` is always in the allowlist. It is what a guest sources from
-    /// before it has an address at all — DHCP DISCOVER and the ARP probe of
-    /// duplicate-address detection — and it is not an address anybody can
-    /// impersonate with.
+    /// Allow initial DHCP and ARP probes before a guest has an address.
     #[test]
     fn a_guest_may_always_speak_before_it_has_an_address() {
         let script = ruleset("msk0", &spec(&[], &["10.7.1.0/24"]), &Ipv4Ranges::default()).unwrap();
@@ -848,10 +676,7 @@ mod tests {
         }
     }
 
-    /// A router with no NAT at all is still a router: it forwards, and it says
-    /// what it thinks of a packet conntrack cannot place. That is the routed
-    /// -subnet case of Festlegung 5, where the prefix is announced and
-    /// nothing is translated.
+    /// A router without NAT still renders forwarding rules.
     #[test]
     fn a_router_that_translates_nothing_still_forwards_and_counts() {
         let script = router_ruleset(&router(Vec::new())).unwrap();
@@ -878,10 +703,7 @@ mod tests {
         );
     }
 
-    /// `snat` with no `logical_ip` is OVN's own spelling for "the subnet this
-    /// router stands in", and the router already knows which one that is: the
-    /// prefix of its internal address, canonicalised — `10.7.1.1/24` is the
-    /// subnet `10.7.1.0/24` and a rule saying otherwise would match one host.
+    /// Empty logical_ip selects the canonical internal subnet.
     #[test]
     fn snat_without_a_subnet_means_the_one_the_router_is_standing_in() {
         let script = router_ruleset(&router(vec![snat("203.0.113.10", "")])).unwrap();
@@ -891,10 +713,7 @@ mod tests {
         );
     }
 
-    /// Masquerade while the rule names the router's own address, an explicit
-    /// `snat to` when it names another one. The first survives a re-addressing
-    /// without anybody re-rendering a rule; the second is a case where the
-    /// address IS the point and masquerade would quietly use a different one.
+    /// Use explicit SNAT when a rule names another external address.
     #[test]
     fn a_snat_rule_naming_another_address_is_rendered_as_that_address() {
         let script = router_ruleset(&router(vec![snat("203.0.113.77", "10.7.9.0/24")])).unwrap();
@@ -904,11 +723,7 @@ mod tests {
         );
     }
 
-    /// The 1:1 pair, both directions — and the order that makes it mean
-    /// something. `snat` is terminal, so the pair has to come BEFORE the
-    /// subnet rule: behind it, the VM holding the floating address would leave
-    /// as the router's address like everybody else, and the address it holds
-    /// would be a reservation that does nothing.
+    /// Per-address NAT precedes subnet SNAT.
     #[test]
     fn a_floating_address_is_a_pair_and_it_comes_before_the_subnet_rule() {
         let script = router_ruleset(&router(vec![
@@ -948,10 +763,7 @@ mod tests {
         }
     }
 
-    /// A NAT rule is about ADDRESSES. `dnat to 10.7.1.0/24` is not a
-    /// translation anybody meant — nft would read it as a range and balance
-    /// across it — so it is refused here, before a namespace exists to put it
-    /// in.
+    /// Reject address ranges where a NAT rule requires one address.
     #[test]
     fn a_nat_rule_that_names_a_range_instead_of_an_address_is_refused() {
         let err = router_ruleset(&router(vec![fip("203.0.113.55", "10.7.1.0/24")]))

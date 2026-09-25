@@ -2,23 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `spec.vm`, refused where the client can still read the refusal.
+//! Validate `spec.vm` at the REST edge using shared agent field types.
 //!
-//! Before this, both REST edges took `spec.vm` as an opaque `Value` and
-//! answered 201. The node — three tiers down and some seconds later —
-//! deserialised it into `agent_api::spec::NewVmSpec`, said `missing field
-//! "boot"` or `unknown field "base_image"`, and put that sentence into
-//! `status.message`, where no caller of the POST was listening. A declarative
-//! client had already written state and told its user the machine existed.
-//!
-//! There is no second schema here and there must not be: the tier boundary is
-//! right, and this edge still knows nothing about sizing, images on disk or
-//! what a driver is. What it does is the SAME deserialisation, at the front,
-//! and it hands serde's own sentence back as a 422 with `details.field`.
-//!
-//! Beside it, the one structural rule about the document that needs no node
-//! to be true: a VM needs a boot disk. `vcpus >= 1` has been checked at the
-//! edge since api-honesty for exactly the same reason.
+//! The edge accepts cloud-init secret references, which controllers must resolve
+//! before delivery to the agent. Local image, device and driver checks remain
+//! on the agent.
 
 use agent_api::spec::{BootSourceSpec, Desired, NewDevice, NewNic, NewVolume};
 
@@ -27,20 +15,10 @@ use crate::rest::{ApiError, invalid_field};
 /// Where a refusal about this document points when it cannot point closer.
 pub const ROOT: &str = "spec.vm";
 
-/// The node's own create document, field for field — except `cloud_init`,
-/// which this edge accepts in the shape THIS tier still owns.
-///
-/// Astra finding S21, 2026-09-23: this used to be `agent_api::spec::NewVmSpec`
-/// itself, whose `cloud_init` is `agent_api::spec::CloudInit` —
-/// `deny_unknown_fields`, `user_data` required. That is right for the
-/// document a NODE takes, and wrong for the one a CLIENT sends: a
-/// `user_data_from` secret reference is resolved into a literal `user_data`
-/// by the cluster controller before a node ever sees the document (see
-/// `reconcile::vms` and `resources::VmSpec::user_data_from`), so refusing it
-/// here — before it ever reaches that resolution — refused a document the
-/// rest of the stack already knew how to serve. The node's own `CloudInit` is
-/// untouched: a resolution that forgot to run is still a refused create at
-/// the node, exactly as it was, rather than a guest that boots unconfigured.
+/// The agent create shape with a cloud-init variant for unresolved secret
+/// references. Controllers resolve `user_data_from` before node delivery; the
+/// agent still requires literal `user_data`. Keep common fields aligned with
+/// `agent_api::spec::NewVmSpec`.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CloudVmSpec {

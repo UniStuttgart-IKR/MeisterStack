@@ -86,13 +86,7 @@ pub(super) async fn choose_subnet_cidr(
     }
 }
 
-/// The prefix length of a block, read off its own canonical spelling.
-///
-/// `Ipv4Range` is a first/last pair and says nothing about prefixes; the one
-/// place it does is `to_cidr`, which answers `None` for a range that is not an
-/// aligned block. So does this, and the caller then keeps whatever the client
-/// asked for — an unaligned range is a range no prefix length describes, and
-/// inventing one would be worse than the absent field this replaces.
+/// Return the prefix length only when the range is an aligned CIDR block.
 fn prefix_of(range: &common::net::Ipv4Range) -> Option<u32> {
     range.to_cidr()?.rsplit_once('/')?.1.parse().ok()
 }
@@ -171,24 +165,7 @@ pub(super) async fn create_routed_subnet(
     )))
 }
 
-/// The description moves. The tenant and the CIDR do not: both are what the
-/// subnet IS, and both are already inside the allowlist of every tap of that
-/// tenant's running VMs. Silently kept rather than refused, the same way a
-/// tenant's VNI is — a client that round-trips the object must not have to
-/// strip fields it did not write.
-/// What an update of this resource may not change, and why.
-///
-/// One table per resource, next to the handler that enforces it, and the rule
-/// they all say: a field the controller acts on ONCE — when it creates the
-/// thing — is immutable, and a field a controller writes belongs to the
-/// server. Everything not named here is free, and the free half is the half
-/// that matters: `spec.runStrategy`, `spec.schedulable`, the quotas, the
-/// labels and the annotations all stay editable, because they are the fields
-/// an operator edits.
-///
-/// A subnet is an address range somebody was really given and the tap rules
-/// are built from it. Editing one in place would move a tenant's allowlist
-/// under the VMs already running behind it.
+/// Tenant and CIDR cannot change after allocation; prefixLen records the chosen block.
 pub(super) const ROUTED_SUBNET_OWNED: &[Owned] = &[
     Owned::immutable(
         "spec.cidr",
@@ -224,10 +201,8 @@ pub(super) async fn update_routed_subnet(
     }
 }
 
-/// A hard delete, and no refusal for running VMs — deliberately. Taking a
-/// subnet away NARROWS what its tenant's taps may send from, and it takes
-/// effect when each of its VMs is next recreated. Nothing is left dangling and
-/// nothing keeps working that should not.
+/// Release the subnet immediately. Existing VM tap permissions persist until the
+/// VM is recreated; this operation does not revoke them before the range is reused.
 pub(super) async fn delete_routed_subnet(
     State(st): State<ApiState>,
     Path(name): Path<String>,

@@ -2,13 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Who is calling, and what that lets them touch.
-//!
-//! `Grant` is the caller as the tenant-scoped handlers want it — an identity,
-//! the role the directory gave it and the tenant from the same object — and
-//! the four checks below are the questions a handler asks that are not about
-//! its own object. Verbatim out of `mod.rs`, where they sat between the
-//! router and the tests.
+//! Tenant-scoped authorization, listing filters, and shared admission checks.
 
 use super::*;
 

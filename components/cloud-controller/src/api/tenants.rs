@@ -8,17 +8,8 @@ use super::*;
 
 // --- tenants ---------------------------------------------------------------
 
-/// The tenants, each with what it is holding right now.
-///
-/// The usage is computed here and never stored, for the reason a candidate's
-/// free capacity is: both halves are objects this server already has, and a
-/// stored copy would be a number that can be wrong — here in the direction
-/// that lets a tenant past its own ceiling.
-///
-/// Computed at the SERVER and not in the CLI, and that is a scoping decision
-/// rather than a convenience: `list_vms` filters to a member's own tenant, so
-/// a client-side aggregation would show that member every other tenant using
-/// nothing.
+/// List tenants with VM usage computed from server inventory. Server aggregation
+/// avoids deriving totals from a caller’s tenant-filtered VM listing.
 pub(super) async fn list_tenants(
     State(st): State<ApiState>,
     axum::extract::Query(q): axum::extract::Query<controller_api::ListQuery>,
@@ -35,20 +26,9 @@ pub(super) async fn list_tenants(
     ))
 }
 
-/// Creating a tenant allocates its network.
-///
-/// The VNI is server-set and a client's is ignored, exactly as `uid` is —
-/// and for a stronger reason than uid has. A uid a client could choose would
-/// collide with somebody's object; a VNI a client could choose would put two
-/// tenants on one broadcast domain, which is not a collision anybody would
-/// see from an object at all. The allocation is a compare-and-swap on a
-/// counter in the store (`controller_api::vni`), so two API servers creating
-/// a tenant in the same moment hand out two numbers.
-///
-/// Allocated BEFORE the create and not rolled back if the create then fails:
-/// the cost of a leaked VNI is one number out of sixteen million, and the
-/// cost of the other order — a tenant object that exists with no network —
-/// is a tenant whose VMs quietly land on the default bridge.
+/// Allocate a server-owned VNI before storing the tenant. The counter CAS gives
+/// concurrent creates distinct networks; failed creates may consume a VNI.
+/// Dry-run reads the next candidate without advancing the counter.
 pub(super) async fn create_tenant(
     State(st): State<ApiState>,
     dry: controller_api::DryRun,
@@ -90,18 +70,7 @@ pub(super) async fn get_tenant(
     Ok(Json(tenant))
 }
 
-/// What an update of this resource may not change, and why.
-///
-/// One table per resource, next to the handler that enforces it, and the rule
-/// they all say: a field the controller acts on ONCE — when it creates the
-/// thing — is immutable, and a field a controller writes belongs to the
-/// server. Everything not named here is free, and the free half is the half
-/// that matters: `spec.runStrategy`, `spec.schedulable`, the quotas, the
-/// labels and the annotations all stay editable, because they are the fields
-/// an operator edits.
-///
-/// The VNI is allocated once, at create, out of `vni_base` — an overlay
-/// identifier a tenant could edit is two tenants on one segment.
+/// The VNI is allocated once and cannot change while guests use its overlay.
 pub(super) const TENANT_OWNED: &[Owned] = &[Owned::server_owned(
     "spec.vni",
     "is allocated by the server when the tenant is created",
@@ -137,19 +106,8 @@ pub(super) async fn update_tenant(
     }
 }
 
-/// Everything that would be left ownerless by deleting `tenant`, said in one
-/// sentence — or nothing, and then the tenant may go.
-///
-/// Four kinds of thing name a tenant, not two, and all four have to be gone.
-/// Users and VMs are the obvious pair. The other two are the network:
-/// a FloatingIp or a RoutedSubnet left behind names an owner that no longer
-/// exists AND goes on holding its address space against everybody else, because
-/// `floating::occupied` and the gap scan count objects and not tenants. Nothing
-/// releases such a reservation afterwards — the API deletes it by name, and
-/// nobody is left who knows the name.
-///
-/// Pure, and taking the four lists rather than the store, so the rule is one
-/// readable thing instead of four repetitions inside a handler.
+/// Describe the first remaining user, VM, floating-address or routed-subnet owner.
+/// This check does not cover volumes, snapshots, secrets or routers.
 pub(super) fn tenant_still_holds(
     tenant: &str,
     users: &[User],
@@ -199,10 +157,8 @@ pub(super) fn tenant_still_holds(
     })
 }
 
-/// A hard delete — a tenant owns nothing yet — but only once nobody is in it
-/// and nothing of it is left. The same rule and the same reason as an image
-/// with a VM on it: the invariant "everything that names a tenant names one
-/// that exists" is worth exactly as much as the refusal that keeps it true.
+/// Delete after checking users, VMs and address reservations. These checks do not
+/// cover every tenant-scoped resource or serialize concurrent child creation.
 pub(super) async fn delete_tenant(
     State(st): State<ApiState>,
     Path(name): Path<String>,

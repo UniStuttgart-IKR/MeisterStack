@@ -2,21 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The REST edge both controllers share: how a request gets served, and who
-//! it is by the time a handler sees it.
+//! Shared REST serving and request helpers.
 //!
-//! Two things live here because they are two halves of one thing. TLS
-//! termination is where a peer certificate becomes available, and the
-//! authenticator chain is the only reason anybody wants one — `axum::serve`
-//! cannot hand a handler the certificate of the connection it arrived on, so
-//! the mTLS path drives hyper by hand and puts the chain on the request as an
-//! extension. The policy itself is `auth`, deliberately kept clear of axum:
-//! what a member may do should be decidable without a web framework.
-//!
-//! Plain HTTP is the default and stays the default. No TLS config means
-//! `axum::serve` exactly as before, no chain means every request is anonymous
-//! and may do anything, and the two are independent — a lab can have TLS
-//! without auth or (with a bearer token) auth without TLS.
+//! The TLS listener attaches peer certificates to requests for authentication.
+//! Authorization policy lives in `auth`; directory resolution lives in `guard`.
+//! TLS and authentication are configured independently. With no authenticators,
+//! requests are anonymous and unrestricted.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -320,27 +311,9 @@ pub fn forbidden(message: impl Into<String>) -> ApiError {
 
 // --- the preview ------------------------------------------------------------
 
-/// `?dryRun=All` — run the whole request except the write, and answer with the
-/// object as it WOULD have been stored.
-///
-/// Kubernetes' spelling and Kubernetes' single accepted value, deliberately:
-/// a client that knows one control plane should not have to learn a second
-/// word for the same idea, and "All" is a list of stages that has exactly one
-/// member in both systems.
-///
-/// What it is FOR is the UI. A model's suggestion is shown as the object it
-/// would produce before anybody agrees to it, and that is only worth
-/// something if the preview went through the same validation, the same
-/// mutability table, the same quota arithmetic and the same name rule as the
-/// real thing. So this is not a separate code path: the handler runs to the
-/// last line and stops there.
-///
-/// What it deliberately does NOT do: no event, no dispatch, no reconciler
-/// wake-up. Nothing downstream of a dry run happens, because nothing was
-/// written for anything downstream to notice.
-///
-/// The agent's own `dry_run` (`agent vm observe`, over the node socket) is a
-/// different question — "what would this node build" — and stays where it is.
+/// Parse the supported preview request, `?dryRun=All`. Handlers run validation
+/// and admission, then return a marked object without persisting or dispatching
+/// it. This is separate from the agent socket's local provisioning dry run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DryRun(bool);
 
@@ -354,26 +327,9 @@ impl DryRun {
         self.0
     }
 
-    /// The last line of a write handler: the object as it would have been
-    /// written, marked, or `None` for "this is a real request, go and write
-    /// it".
-    ///
-    /// Takes the object the handler built, borrowed exactly as the write
-    /// would take it, so the call site reads as the write it replaces.
-    ///
-    /// Two fields the STORE would have filled in are filled in here, because
-    /// a preview that differed from the real answer in a field a client reads
-    /// would be a preview of a different object:
-    ///
-    ///   * `generation` — `create` sets it to 1 and an update carried its own
-    ///     through `carry_generation`, so `max(1)` is right for both.
-    ///   * `resourceVersion` is deliberately NOT invented. It is etcd's
-    ///     revision; nothing happened, so there is no revision, and an empty
-    ///     one is the true statement. It is also what makes a preview fed
-    ///     back to `apply` behave as a create rather than as a conditional
-    ///     write against a version that never existed.
-    ///
-    /// The mark itself is `ANNOTATION_DRY_RUN`.
+    /// Return a marked preview, or None for a real write. Use generation at
+    /// least 1 and clear resourceVersion because no etcd revision was created.
+    /// The caller must run its ordinary validation before reaching this helper.
     pub fn preview<S, St>(self, object: &Object<S, St>) -> Option<Object<S, St>>
     where
         S: Clone,

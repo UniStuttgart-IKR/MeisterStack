@@ -2,9 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The address kinds: `FloatingPool`, `FloatingIp` and
-//! `RoutedSubnet` — what a tenant is reachable at. Moved out
-//! of `resources.rs` unchanged.
+//! Floating address pools, allocations and routed tenant subnets.
 
 use super::*;
 

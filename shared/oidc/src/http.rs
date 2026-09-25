@@ -2,19 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The smallest https client that can talk to an identity provider: one GET
-//! for a document, one form POST for a token.
+//! HTTPS GET and form POST requests for OIDC providers.
 //!
-//! Hand-rolled on hyper rather than pulled in as a client crate, and for the
-//! reason the workspace manifest gives for `ring`: every client crate worth
-//! having brings its own TLS backend, and a second crypto stack in a tree
-//! that has gone to some trouble to have exactly one is a worse cost than
-//! ninety lines. It is the same hyper, the same tokio-rustls and the same
-//! ring the CLI already dials controllers with.
-//!
-//! https only. A provider reached over plain http hands out bearer tokens to
-//! anyone on the path, and there is no configuration in which that is the
-//! intended behaviour, so it is not a setting.
+//! Plain HTTP provider URLs are refused. A configured CA bundle replaces the
+//! default public trust roots.
 
 use std::path::Path;
 use std::sync::Arc;

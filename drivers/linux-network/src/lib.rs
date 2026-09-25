@@ -2,70 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Bridges, taps, and — since M5 — one VXLAN overlay per tenant.
-//!
-//! The overlay is deliberately the smallest thing that isolates. Per VNI the
-//! node gets a bridge (`meister-vx<vni>`) and a VXLAN device (`mvx<vni>`)
-//! enslaved to it, and a tenant's taps join that bridge instead of the
-//! default one. Two tenants on one host are then two bridges with no path
-//! between them, and two tenants across hosts are two VNIs in the encap
-//! header, which the receiving kernel demultiplexes before the frame reaches
-//! any bridge at all.
-//!
-//! **Peer discovery is multicast**, and the group is DERIVED from the VNI
-//! (`239.<b1>.<b2>.<b3>` out of its three bytes, in the admin-scoped block).
-//! Nothing has to be configured per peer and nothing has to be told when a
-//! node joins: the kernel's own MAC learning fills the FDB from the frames
-//! that arrive. The cost is that the uplink's network has to pass multicast,
-//! which a lab switch does and some clouds do not.
-//!
-//! The documented alternative for a network that does not, NOT built here:
-//! static FDB entries, one per peer —
-//!
-//! ```text
-//! bridge fdb append 00:00:00:00:00:00 dev mvx10000 dst <peer-ip>
-//! ```
-//!
-//! — appended for every other node, which turns broadcast into head-end
-//! replication to a known list. It needs no multicast at all and it needs
-//! somebody to maintain the list, which is a control-plane job: the cluster
-//! knows every node's address, so the natural home for it is a peer list
-//! pushed down the session rather than a config file per node. That is a
-//! milestone of its own and this comment is where it starts.
-//!
-//! ## Hardware offload is why several of these choices are not free
-//!
-//! VXLAN is the overlay nearly every server NIC of the last decade can
-//! encapsulate and segment in hardware, and that is most of the reason to
-//! pick it over a cleverer encapsulation. In software, encapsulation costs a
-//! per-packet trip through the stack and gives up TSO/GRO on the inner
-//! frames — the difference between line rate and one core pegged at a few
-//! Gbit/s. On the NIC it costs almost nothing. So the settings below are
-//! chosen to stay ON the offload path, and the ones that would leave it are
-//! deliberately not set:
-//!
-//! - **The destination port is 4789 and is not configurable.** A NIC learns
-//!   which UDP ports are tunnels through `ndo_udp_tunnel_add`, the table it
-//!   keeps is small, and some parts only ever offload the IANA port. A custom
-//!   port is the easiest way to fall off hardware encapsulation with no error
-//!   to show for it.
-//! - **No `srcport` range is set.** The kernel derives the outer UDP source
-//!   port from a hash of the inner headers, which is what gives the receiving
-//!   NIC's RSS something to spread flows across queues with. Pinning it would
-//!   collapse every tenant flow between two nodes onto one receive queue.
-//! - **No UDP checksum is forced.** IPv4 VXLAN leaves it zero by default; a
-//!   NIC that offloads fills it in, and demanding it in software is a
-//!   per-packet cost for a check the outer IP header already covers.
-//! - **The MTU is a config key.** 1450 keeps an overlay frame inside a
-//!   1500-byte uplink; a jumbo uplink (9000, overlay 8950) removes most of
-//!   the segmentation work altogether, which is the shape to aim for on a
-//!   cluster fabric.
-//!
-//! What this driver cannot do is make a NIC offload — that is the uplink's
-//! own capability, checked with `ethtool -k <uplink> | grep udp_tnl`
-//! (`tx-udp_tnl-segmentation` and `tx-udp_tnl-csum-segmentation` on). A node
-//! whose NIC reports them off pays for its overlay in CPU. Nothing here turns
-//! them off, and nothing here should.
+//! Linux bridges, taps, VXLAN overlays and tenant gateways.
+//! Each VNI uses a bridge and VXLAN device. Multicast discovery is the default;
+//! EVPN mode delegates peer learning to FRR. Configure the same mode across peers.
+//! The driver sets UDP port 4789 and the configured overlay MTU; hardware offload
+//! and underlay reachability remain host properties. See docs/NETWORKING.md.
 
 pub mod frr;
 pub mod nftables;
@@ -93,14 +34,7 @@ fn is_overlay_consumer(attributes: &[LinkAttribute], bridge: u32, tunnel: &str) 
             .any(|a| matches!(a, LinkAttribute::IfName(name) if name == tunnel))
 }
 
-/// The IANA-assigned VXLAN port (RFC 7348 §5).
-///
-/// Not configurable, and the reason is hardware rather than convention: a NIC
-/// offloads encapsulation only for ports it has been told are tunnels, its
-/// table of them is small, and some parts only ever handle this one. A custom
-/// port drops the overlay onto the software path silently — no error, just a
-/// core at 100%. It is also what every `tcpdump` filter assumes, and a lab
-/// wanting a second overlay wants a second VNI, which is free.
+/// UDP destination port used by this driver's VXLAN devices.
 pub const VXLAN_PORT: u16 = 4789;
 
 /// What an overlay costs a frame: 14 bytes of inner Ethernet, 8 of VXLAN, 8
@@ -117,56 +51,21 @@ pub const DEFAULT_NFT: &str = "nft";
 /// How this node reaches other VXLAN endpoints.
 #[derive(Clone, Debug)]
 pub struct VxlanConfig {
-    /// The interface encapsulated frames leave by. Its address is what peers
-    /// see as the tunnel endpoint, so it has to be the one on the network the
-    /// other nodes are on — on a single host with no peers, a `dummy0` is
-    /// enough to prove the encapsulation happens.
+    /// Underlay interface used by the VXLAN tunnel.
     pub uplink: String,
-    /// MTU for the tenant bridge, its VXLAN device and the taps on it.
-    ///
-    /// 1450 fits an overlay frame inside a 1500-byte uplink. A jumbo uplink
-    /// is the shape to aim for on a cluster fabric — 9000 there means 8950
-    /// here, and most of the segmentation work disappears along with six
-    /// sevenths of the per-packet overhead.
+    /// MTU assigned to new overlay bridges, VXLAN devices and taps.
     pub mtu: u32,
-    /// Learn the overlay's MACs over BGP instead of flooding for them.
-    ///
-    /// With it on, the VXLAN device gets no multicast group and no kernel
-    /// learning at all: it gets a `local` address (its VTEP identity) and FRR
-    /// — told `advertise-all-vni` — reads the device, advertises the MACs
-    /// behind it as EVPN type-2 routes and the VTEP itself as type-3, and
-    /// programs the FDB from what its peers send back. What was a multicast
-    /// group is a BGP session, which is the answer for every network that does
-    /// not carry multicast: most clouds, and some switches.
-    ///
-    /// Off by default, and that default is M5's behaviour byte for byte: a
-    /// derived group, kernel learning, and no daemon anywhere.
-    ///
-    /// Cluster-wide, not per node. Two nodes of one overlay disagreeing about
-    /// this are two nodes that never learn each other's MACs — one floods to a
-    /// group nobody is in, the other waits for routes nobody sends. The
-    /// example config says so; there is no scheduling constraint that could
-    /// enforce it, because a VM does not ask for evpn, it asks for an overlay.
+    /// Use FRR EVPN with an explicit VTEP address and kernel learning disabled.
+    /// All peers of an overlay must use compatible discovery settings.
     pub evpn: bool,
 }
 
-/// The bridge a tenant's taps join on this node.
-///
-/// Named after the VNI and not after the tenant: the agent never learns what
-/// a tenant is called — that is the control plane's business — and the number
-/// is what both ends of the tunnel agree on anyway. An operator reading
-/// `ip link` sees the same number `tenant ls` prints and the same number in
-/// the encap header, which is the whole reason not to invent a third name.
+/// Bridge name derived from the VNI.
 pub fn overlay_bridge(vni: u32) -> String {
     format!("meister-vx{vni}")
 }
 
-/// The VNI of an overlay bridge this driver named, and `None` for every other
-/// link on the node.
-///
-/// The inverse of [`overlay_bridge`] and the only thing that tells this
-/// driver's overlays from the rest of the machine's links — a tap, an uplink,
-/// somebody's docker0. Kept beside its inverse so the two cannot drift.
+/// Parse this driver's overlay bridge naming convention.
 pub fn overlay_vni(name: &str) -> Option<u32> {
     name.strip_prefix("meister-vx")?.parse().ok()
 }
@@ -178,17 +77,8 @@ pub fn overlay_device(vni: u32) -> String {
     format!("mvx{vni}")
 }
 
-/// Why this driver will not take down the overlay a record names, if it will
-/// not.
-///
-/// `recorded` is the bridge the VM's record says its overlay actually got,
-/// and `None` — every record written before the name was kept — is a yes:
-/// nobody wrote it down, this driver answers for its own naming as it always
-/// did, and nothing changes for a node that has only ever had one network
-/// driver. A name that is not this driver's is the case the record exists
-/// for: it was built by something that names its links differently, so
-/// removing `meister-vx<vni>` here would take down a link this driver made
-/// for somebody else, or none at all, and say it had cleaned up either way.
+/// Refuse cleanup when the recorded bridge belongs to another naming scheme.
+/// Legacy records without a bridge name use this driver's conventional name.
 fn not_this_drivers_overlay(vni: u32, recorded: Option<&str>) -> Option<String> {
     let mine = overlay_bridge(vni);
     let said = recorded.filter(|name| *name != mine)?;
@@ -198,14 +88,8 @@ fn not_this_drivers_overlay(vni: u32, recorded: Option<&str>) -> Option<String> 
     ))
 }
 
-/// Whether this VNI's interfaces can be named at all.
-///
-/// A Linux interface name is 15 characters plus a NUL, so `meister-vx` plus
-/// the number fits up to five digits — VNI 99999, and with the default floor
-/// of 10000 that is ninety thousand tenants per deployment. The limit is the
-/// kernel's and not this driver's, and a node meeting it should say so at the
-/// first VM rather than fail inside a netlink call with `ENAMETOOLONG` and no
-/// hint which name was too long.
+/// Require the generated bridge name to fit Linux's interface-name limit.
+/// The meister-vx prefix leaves five decimal digits for the VNI.
 fn check_overlay_name(vni: u32) -> networking::Result<()> {
     let name = overlay_bridge(vni);
     if name.len() >= libc::IFNAMSIZ {
@@ -219,14 +103,7 @@ fn check_overlay_name(vni: u32) -> networking::Result<()> {
     Ok(())
 }
 
-/// The multicast group a VNI's endpoints meet in.
-///
-/// Derived rather than configured, and that is the point: two nodes given the
-/// same VNI by the control plane land in the same group without anybody
-/// distributing a second number. 239.0.0.0/8 is the administratively scoped
-/// block (RFC 2365) — the private-address equivalent for multicast — and the
-/// three bytes of a 24-bit VNI fit its lower three octets exactly, so the
-/// mapping is one-to-one and no two tenants can collide.
+/// Map the lower 24 VNI bits to an administratively scoped IPv4 multicast group.
 pub fn multicast_group(vni: u32) -> Ipv4Addr {
     let [_, b1, b2, b3] = vni.to_be_bytes();
     Ipv4Addr::new(239, b1, b2, b3)
@@ -281,17 +158,10 @@ pub struct LinuxNetworkDriver {
     /// `None` = this node serves no overlays, which is every node before M5
     /// and every node without a `[network.vxlan]` section.
     vxlan: Option<VxlanConfig>,
-    /// The tap guard. Not an Option, and that is the point: MAC pinning
-    /// applies to every VM this stack boots, whether or not anybody has
-    /// configured a floating pool. What IS optional is the pool inside it —
-    /// `guarded` is empty on a node with no `guarded_ranges`, and an empty set
-    /// produces no address rule at all.
+    /// Every created tap gets MAC pinning; address checks depend on its network spec.
     nft: nftables::Nft,
     guarded: common::net::Ipv4Ranges,
-    /// `None` = this node holds no gateway slot, which is every node before
-    /// 6k and every node with no `[network.provider]` section. It gave no
-    /// interface away, so no router can be placed here — see
-    /// `router::GatewayConfig`.
+    /// Optional provider-network mapping and router state directory.
     gateway: Option<router::GatewayConfig>,
 }
 
@@ -323,10 +193,7 @@ impl LinuxNetworkDriver {
         // Fails the start-up if this node cannot program nftables. See
         // `nftables::Nft::new` for why that is an error and not a warning.
         let nft = nftables::Nft::new(nft.binary)?;
-        // Said at start-up rather than at the first router, exactly as the
-        // guard above says its own piece: which provider networks a node
-        // gave away is a fact about the node, and an operator wants it in the
-        // log of the boot that made it true.
+        // Validate provider names and log the configured interface mappings.
         if let Some(g) = &gateway {
             for (physnet, interface) in &g.physnets {
                 router::check_physnet_name(physnet)?;
@@ -363,15 +230,7 @@ impl LinuxNetworkDriver {
         }
     }
 
-    /// What one link says its MTU is, or `None` when there is no such link.
-    ///
-    /// Read and not configured, because the number belongs to the operator:
-    /// the interface a node gives away to a provider network carries the
-    /// MTU of that wire, and everything this driver hangs into the same
-    /// bridge has to be told the same number. A Linux bridge takes the MTU
-    /// of its SMALLEST port, so a port that keeps the veth default of 1500
-    /// does not "let the bridge decide" — it decides for the bridge, and
-    /// drags a 9000-byte provider network down to 1500 for everybody on it.
+    /// Read the existing link MTU, used to size router provider-side veths.
     pub(crate) async fn link_mtu(&self, name: &str) -> networking::Result<Option<u32>> {
         let mut links = self
             .handle
@@ -390,14 +249,7 @@ impl LinuxNetworkDriver {
         }
     }
 
-    /// Every overlay bridge of this driver's own that is standing on the node
-    /// right now, by VNI, sorted and without repeats.
-    ///
-    /// The bridge and not the VXLAN device: `destroy_overlay` takes both
-    /// down, so either would do, and the bridge is the one whose name an
-    /// operator reads. A half-removed pair — the device gone and the bridge
-    /// left — is still found, which is what makes a sweep after an
-    /// interrupted teardown finish the job.
+    /// Enumerate overlay bridges by naming convention, including partially removed pairs.
     async fn overlays_present(&self) -> networking::Result<Vec<u32>> {
         let mut links = self.handle.link().get().execute();
         let mut found = Vec::new();
@@ -472,13 +324,7 @@ impl LinuxNetworkDriver {
         Ok(None)
     }
 
-    /// Put `index` into the bridge `controller` and bring it up, in one
-    /// netlink message.
-    ///
-    /// Pulled out because three callers now do it — a tap joining its bridge,
-    /// a provider interface joining its provider bridge, and each of a
-    /// router's two legs — and because doing it in two messages leaves a
-    /// window in which a link is up and on no bridge.
+    /// Enslave and raise a link in one netlink message.
     pub(crate) async fn enslave(&self, index: u32, controller: u32) -> networking::Result<()> {
         self.handle
             .link()
@@ -493,13 +339,7 @@ impl LinuxNetworkDriver {
             .map_err(|e| NetworkError::Backend(e.into()))
     }
 
-    /// Every address on a link that is not link-local, as text.
-    ///
-    /// The question `ensure_physnet` asks: an interface that has been given
-    /// away carries none. Link-local is left out because every interface has
-    /// one the moment it comes up (`fe80::/10`, and IPv4's `169.254/16` when
-    /// nothing answered DHCP) — neither is somebody using the interface, and
-    /// refusing over them would refuse every node.
+    /// Read non-link-local addresses before assigning a provider interface to a bridge.
     pub(crate) async fn global_addresses(&self, index: u32) -> networking::Result<Vec<String>> {
         use rtnetlink::packet_route::address::AddressAttribute;
         let mut addrs = self
@@ -539,20 +379,10 @@ impl LinuxNetworkDriver {
             .map_err(|e| NetworkError::Backend(e.into()))
     }
 
-    /// Where this NIC's tap belongs: the tenant's overlay bridge, or the one
-    /// the spec named.
-    ///
-    /// Derived here rather than carried in `NicSpec.bridge` so that the
-    /// record keeps saying what was ASKED for. A tap whose spec says
-    /// `bridge = "meister_br0", vxlan_id = 10000` is on the overlay, and an
-    /// operator reading the record can still see which default it would have
-    /// taken without the tenant.
+    /// Select the provider, overlay or explicitly configured bridge.
     fn target_bridge(spec: &NicSpec) -> networking::Result<String> {
         match (&spec.physnet, spec.vxlan_id) {
-            // Festlegung 3 and the refusal that guards it: the two say
-            // different things about where this tap belongs, and a precedence
-            // rule would put a tenant's guest on a wire the tenant does not
-            // own -- or the other way round -- without anybody being told.
+            // Provider and overlay selection are mutually exclusive.
             (Some(physnet), Some(vni)) => Err(NetworkError::InvalidSpec(format!(
                 "this nic names the provider network {physnet:?} and the overlay {vni}; a tap \
                  hangs on one wire, so name one of the two"
@@ -566,14 +396,7 @@ impl LinuxNetworkDriver {
         }
     }
 
-    /// The MTU a tap gets: the overlay's where there is one, and the
-    /// interface default otherwise.
-    ///
-    /// Set on the tap and not only on the bridge because a Linux bridge takes
-    /// the MTU of its smallest port: a 1500-byte tap joining a 1450-byte
-    /// bridge drags the bridge back up to 1500, and the first full-size frame
-    /// a guest sends is then dropped by the VXLAN device with nothing in any
-    /// log to say why.
+    /// Return the configured overlay MTU; other NICs keep their interface default.
     fn overlay_mtu(&self, spec: &NicSpec) -> Option<u32> {
         spec.vxlan_id.and(self.vxlan.as_ref()).map(|v| v.mtu)
     }
@@ -644,17 +467,8 @@ impl BridgeDriver for LinuxNetworkDriver {
         }
     }
 
-    /// The tenant's overlay on this node: a bridge, a VXLAN device in it, and
-    /// both up at the configured MTU.
-    ///
-    /// Idempotent by existence, exactly as `ensure` is — the second VM of a
-    /// tenant finds both links there and only makes sure they are up. What it
-    /// does NOT do is tear anything down; `destroy_overlay` below does, and
-    /// only when the agent has counted that nothing on this node still uses
-    /// the VNI. The old worry — "is another VM arriving in the next second?"
-    /// — is not a question a timer can answer, and the answer is not a timer:
-    /// it is the agent's own record table, which knows every VM this node was
-    /// told to run.
+    /// Ensure overlay links exist and are up. Existing link attributes are not fully
+    /// reconciled against changed configuration.
     #[instrument(skip_all, fields(vni, uplink = tracing::field::Empty))]
     async fn ensure_overlay(&self, vni: u32) -> networking::Result<String> {
         let Some(cfg) = &self.vxlan else {
@@ -698,20 +512,11 @@ impl BridgeDriver for LinuxNetworkDriver {
             let mut builder = LinkVxlan::new(&device, vni)
                 .dev(uplink)
                 .port(VXLAN_PORT)
-                // Deliberately NOT set here, and the module doc says why: no
-                // `port_range` (the inner-header hash in the outer source
-                // port is what the receiver's RSS spreads on) and no forced
-                // UDP checksum. Both are the difference between a NIC that
-                // encapsulates and a core that does.
+                // Leave source-port selection and checksum policy at their kernel defaults.
                 .mtu(cfg.mtu)
                 .up();
             if cfg.evpn {
-                // EVPN's shape: no group to flood into and no learning of our
-                // own, because both are FRR's job now. `local` is this node's
-                // VTEP identity — the address peers see as the tunnel end and
-                // the next hop FRR puts on every type-2 route it originates —
-                // so it has to be the uplink's own address and not the
-                // interface index the `dev` above carries.
+                // EVPN uses the uplink address as VTEP identity and does not join a multicast group.
                 let local = self.link_address(uplink).await?.ok_or_else(|| {
                     NetworkError::InvalidSpec(format!(
                         "[network.vxlan] evpn = true needs an ipv4 address on the uplink {:?}: it is \
@@ -759,24 +564,8 @@ impl BridgeDriver for LinuxNetworkDriver {
         Ok(bridge)
     }
 
-    /// Both links of one tenant's overlay, in the order that leaves nothing
-    /// behind if the second half fails.
-    ///
-    /// The encapsulation device FIRST: it is a port of the bridge, and
-    /// deleting a bridge only unenslaves its ports. Taking the bridge first
-    /// and then failing would leave `mvx<vni>` standing with no bridge to
-    /// join and nothing left that names it — which is a worse leak than the
-    /// one this method exists to end, because the next `ensure_overlay` for
-    /// that VNI would find the device there and re-enslave a device built
-    /// against whatever the uplink was then.
-    ///
-    /// A node with no `[network.vxlan]` section never built one, so it has
-    /// none to remove and says so by doing nothing. `destroy` is the
-    /// idempotent half both calls lean on: a link that is not there is not an
-    /// error.
-    ///
-    /// A record naming a bridge this driver would not have built is a refusal
-    /// and not a removal — see [`not_this_drivers_overlay`].
+    /// Remove an unused VXLAN device before its bridge, preserving a discoverable
+    /// bridge if the second deletion fails. Router records and live ports also protect it.
     #[instrument(skip_all, fields(vni))]
     async fn destroy_overlay(&self, vni: u32, recorded: Option<&str>) -> networking::Result<()> {
         if self.vxlan.is_none() {
@@ -791,22 +580,8 @@ impl BridgeDriver for LinuxNetworkDriver {
         Ok(())
     }
 
-    /// The overlays standing on this node that no record names any more.
-    ///
-    /// Nachlese 5: the chaos run left VNI 10003 and 10004 on three nodes. The
-    /// reference count hangs on records, and a VM whose record went while its
-    /// agent was not running takes the last counter of its overlay with it —
-    /// after which nobody counts again and the links stay for the life of the
-    /// machine.
-    ///
-    /// Read off the KERNEL and not off anything remembered, because the
-    /// overlays this is about are precisely the ones nothing remembers. What
-    /// marks one as this driver's is its name (`overlay_bridge`), which is
-    /// also what keeps the sweep off every other link on the node.
-    ///
-    /// Best effort per overlay: one that will not come down is logged and the
-    /// next is tried. A sweep that stopped at the first failure would leave
-    /// the rest for a restart that may not come.
+    /// Sweep unreferenced overlay bridges after router and live-port ownership checks.
+    /// Log individual failures and continue with the remaining overlays.
     #[instrument(skip_all)]
     async fn sweep_overlays(&self, keep: &[u32]) -> networking::Result<Vec<String>> {
         if self.vxlan.is_none() {
@@ -832,13 +607,7 @@ impl BridgeDriver for LinuxNetworkDriver {
         Ok(swept)
     }
 
-    // --- the gateway slot ---------------------------------------------------
-    //
-    // Six one-line forwards to `router.rs`, and the reason they are here is
-    // the seam itself: the agent asks the TRAIT for a router, so a second
-    // backend that answers with a logical router instead of a namespace slots
-    // in without the agent noticing. What each one does is documented at the
-    // implementation.
+    // Gateway operations are implemented in router.rs.
 
     async fn ensure_physnet(&self, name: &str, interface: &str) -> networking::Result<String> {
         self.ensure_physnet_impl(name, interface).await
@@ -938,22 +707,11 @@ impl NicDriver for LinuxNetworkDriver {
             .await
             .map_err(|e| NetworkError::Backend(e.into()))?;
 
-        // The guard goes on AFTER the tap is up and before the VMM is told
-        // about it: provisioning builds the tap, this builds its chain, and
-        // the hypervisor is spawned afterwards. A guest never sees an
-        // unguarded moment on its own tap — which is also why the rules follow
-        // the TAP's lifetime and not the VMM's, and why a stop/start keeps the
-        // rules it had while a recreate reads the spec again.
+        // Install the guard before returning the tap to VM provisioning.
+        // This ordering assumes no existing guest already uses the selected link name.
         self.nft.guard(&tap, spec, &self.guarded).await?;
 
-        // Handed back so the hypervisor can pass it to the guest: the tap and
-        // the bridge bound what the HOST forwards, and a guest that still
-        // believes in 1500 would go on emitting frames the overlay drops.
-        //
-        // The address is handed back for a narrower reason: `guard` above has
-        // just pinned it in this tap's chain, so it is no longer only what
-        // this driver was asked for — it is the one address a frame off this
-        // tap may carry, and the tier above has nowhere else to learn it.
+        // Return the configured MTU and pinned guest MAC to the VMM.
         Ok(Nic {
             id: *id,
             tap_name: tap,
@@ -965,10 +723,7 @@ impl NicDriver for LinuxNetworkDriver {
     #[tracing::instrument(skip_all, fields(nic_id = %id))]
     async fn destroy(&self, id: &NicId) -> networking::Result<()> {
         let tap = Self::tap_name(id);
-        // Chain first, tap second. The other order would leave a window in
-        // which a chain names a device that no longer exists, and the kernel
-        // reaps those on its own — which is fine, and is exactly why the
-        // failure here is a debug line rather than a failed teardown.
+        // Remove rules before the tap; unguard failure is logged but does not stop deletion.
         self.nft.unguard(&tap).await;
         match self.link_index(&tap).await? {
             Some(index) => self
@@ -993,10 +748,7 @@ impl NicDriver for LinuxNetworkDriver {
     async fn get(&self, id: &NicId) -> networking::Result<Nic> {
         let tap = Self::tap_name(id);
         match self.link_index(&tap).await? {
-            // Liveness only — `mtu` and `mac` are what a create SET, and this
-            // call is the reconciler asking whether the tap is still there.
-            // The link's own address is not the answer to either: a tap
-            // carries a random one the guest never uses.
+            // Check link existence only; this does not verify its type, MAC, MTU or guard.
             Some(_) => Ok(Nic {
                 id: *id,
                 tap_name: tap,
@@ -1024,14 +776,7 @@ mod tests {
         }
     }
 
-    /// The sweep can tell this driver's own overlays from every other link on
-    /// the node, and it can only do that by name.
-    ///
-    /// Nachlese 5: the two VXLAN corpses of the chaos run were `meister-vx`
-    /// links nothing named any more. What the sweep must never touch is
-    /// everything else — a tap, an uplink, somebody's `docker0` — so the
-    /// inverse of `overlay_bridge` is asserted against its own output and
-    /// against the shapes that come close.
+    /// Recognize overlay bridge names without matching unrelated interfaces.
     #[test]
     fn only_this_drivers_own_overlay_names_yield_a_vni() {
         for vni in [1, 10_000, 10_003, 99_999] {
@@ -1051,16 +796,7 @@ mod tests {
         }
     }
 
-    /// The overlay a record names is either this driver's or nobody removes
-    /// it here.
-    ///
-    /// Nachlese 4. `destroy_overlay` used to take the VNI alone and rebuild
-    /// the name from it, which is the right answer exactly while one driver
-    /// builds overlays on a node. The record now carries what the bridge was
-    /// CALLED when it was built, and the three cases are: this driver's own
-    /// name (go ahead), somebody else's (refuse, and say both names), and
-    /// nothing written down at all (go ahead, which is every record from
-    /// before the name was kept).
+    /// Respect recorded driver ownership while retaining compatibility with unnamed records.
     #[test]
     fn an_overlay_another_driver_named_is_not_this_ones_to_remove() {
         assert!(not_this_drivers_overlay(10_000, Some("meister-vx10000")).is_none());

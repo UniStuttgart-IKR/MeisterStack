@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# A raft group of two: it tolerates exactly as many losses as a group of one
-# and costs a box. Refused at evaluation.
+# Invalid fixture: a two-member raft group violates the supported group sizes.
 schema = 2
 
 [fleet]

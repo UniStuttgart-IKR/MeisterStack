@@ -2,27 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! No non-terminal state without a deadline.
+//! Report resources that exceed phase-specific observation deadlines.
 //!
-//! Decision 7 of struktur 4, and D-C1 is what asks for it: a node fell out of
-//! the lab and nothing anywhere said so. The VMs on it went to
-//! `Unknown { Silent }` — which is the honest phase and exactly right — and
-//! then stood there for four and a half days with no event, no metric and no
-//! line in any listing that distinguished them from a VM that went Unknown
-//! nine seconds ago.
-//!
-//! What a deadline buys here is a NUMBER and a SENTENCE, and nothing else.
-//! **Nothing is promoted.** `Unknown` never becomes `Failed`, however long it
-//! stands — Silas' rule `unknown_needs_its_holder`, and the argument is on
-//! `VmPhase::Unknown`: `Failed` is the phase the requeue curve acts on, so a
-//! timer that promoted a silence would be this tier re-creating a guest
-//! somewhere on the strength of no evidence at all. The eleven guests the
-//! mini-chaos run found alive on manacor, twenty hours after their agent
-//! died, are the reason.
-//!
-//! This file is the rule, the pass that applies it, and their tests: one
-//! event when a deadline is crossed, one gauge
-//! `meister_phase_stuck{kind,phase,reason}`, and nothing else.
+//! Crossing a deadline emits an event and updates the
+//! `meister_phase_stuck{kind,phase,reason}` gauge. It does not change the phase:
+//! lost contact with a node cannot establish that its guest stopped or authorize
+//! a replacement guest.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -90,24 +75,9 @@ pub fn stuck_after(word: &str) -> Option<Duration> {
     }
 }
 
-/// How far past its deadline this phase is, or `None` while it still has
-/// time — or has no deadline at all.
-///
-/// `terminal` is the caller's answer from `XPhaseKind::is_terminal`, and it
-/// comes first because it is the question that can make the rest moot: a
-/// phase nothing is going to move again cannot be late for anything. It is
-/// asked separately rather than derived from the word because it is a
-/// JUDGEMENT about one resource — `Failed` is an end for an `Image` and a
-/// backoff for a `Vm`, out of the same five letters.
-///
-/// The value is the OVERSHOOT and not the age, because that is what a
-/// sentence needs: "Pending for 5m over its 5m budget" says something
-/// "Pending for 10m" does not. Strictly positive when it is `Some`, so a
-/// caller can print it without checking.
-///
-/// A `since` in the future — a clock stepped back by NTP, a report from a
-/// machine whose clock is ahead — yields `None` rather than a huge number:
-/// the same choice `heartbeat::expired` makes, and for the same reason.
+/// Return positive time past the phase budget. Terminal phases, phases without
+/// a deadline and timestamps in the future yield None. Resource-specific
+/// terminal semantics come from the caller; a deadline never changes phase.
 pub fn stuck(
     terminal: bool,
     word: &str,

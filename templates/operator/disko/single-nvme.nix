@@ -1,20 +1,8 @@
 # SPDX-License-Identifier: MIT
-# One NVMe: an EFI system partition and the rest as the root filesystem.
-#
-# Used by the first install (`meister-deploy install`, M3), which partitions
-# with disko out of the layout the inventory's `install.layout` names. The
-# DEVICE is not in here: it belongs to the host (hosts/<id>.nix binds it
-# through /dev/disk/by-id by the disk's serial), because a layout is a shape
-# and a device is a machine.
-#
-# Measured in M0 probe S6 against the pinned nixpkgs: `disko.devices` of this
-# shape evaluates, and `fileSystems."/".device` comes out as
-# /dev/disk/by-partlabel/disk-main-root.
+# UEFI layout: a 1 GiB ESP and ext4 root on the remaining space.
+# Bind the device in the host module; install.layout selects this file.
 {
-  # This layout makes an ESP, so a host that uses it boots itself
-  # (`boot = "uefi"` in the inventory). nix/lib/inventory.nix compares the
-  # two and refuses the mismatch rather than installing a boot loader
-  # nowhere.
+  # Must match the inventory boot mode.
   meisterstack.install.hasEsp = true;
 
   disko.devices.disk.main = {
@@ -31,7 +19,7 @@
             type = "filesystem";
             format = "vfat";
             mountpoint = "/boot";
-            # The label base.nix' `fileSystems."/boot"` looks for.
+            # Label for the EFI system partition.
             extraArgs = [ "-n" "ESP" ];
           };
         };

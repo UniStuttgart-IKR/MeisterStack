@@ -2,17 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a drain does to one VM, as a table.
+//! Shared drain policy for node and cluster evacuation.
 //!
-//! Catalogue 16's second verb. `node drain` at the cluster and
-//! `cluster drain` at the cloud ask the same question about the same object —
-//! "may this VM be got off here, and how" — of two different inventories, so
-//! the rule lives once and each tier gathers its own facts for it.
-//!
-//! It is a pure function over a small struct on purpose. The table is the
-//! part with judgement in it and the part a person will argue with; a rule
-//! that could only be exercised through an etcd and two agents is a rule
-//! nobody checks.
+//! Each tier supplies VM facts to a pure decision function, then executes the
+//! chosen migration, restart or refusal through its own inventory and sessions.
 
 use crate::{Evacuation, RunStrategy, StayReason, Vm, VmPhaseKind};
 

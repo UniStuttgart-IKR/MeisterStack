@@ -2,26 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! RFC 6455, the server half of it, and no more of it than a console needs.
+//! Server-side WebSocket handshake and console framing.
 //!
-//! # Why by hand
-//!
-//! A console is a raw HTTP/1.1 upgrade to a byte stream — the right shape for
-//! a CLI, and a shape no browser can ask for: `WebSocket` sends only its own
-//! upgrade, and `fetch` may not set `Connection` or `Upgrade` at all (they
-//! are forbidden header names). So the only console the first foreign client
-//! could reach was the one it wrote a paragraph about instead of using.
-//!
-//! What that needs from this stack is a handshake and a frame header. Both
-//! are short and neither has a version to keep up with: the accept key is one
-//! SHA-1 over a constant, and the frames a terminal sends are binary, text,
-//! ping and close. A crate for that would be a dependency added for eighty
-//! lines, and this tree already carries the two primitives (`ring` does the
-//! SHA-1, `base64` the encoding) because rustls and the JWT half need them.
-//!
-//! What is NOT here, deliberately: permessage-deflate (a console is a
-//! keystroke at a time), extensions of any kind, and the client half. A
-//! server that negotiates nothing is a server with nothing to get wrong.
+//! Supports binary and text data, ping and close frames for console bridging.
+//! No compression extensions or client-side implementation are provided.
 
 use base64::Engine as _;
 

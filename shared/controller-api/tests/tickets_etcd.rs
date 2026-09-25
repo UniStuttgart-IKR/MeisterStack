@@ -2,28 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Console tickets against a real etcd, from two replicas at once.
+//! Single-use console tickets shared by independent replica connections.
 //!
-//! `#[ignore]` because it needs something to talk to, and the workspace's
-//! ordinary run has nothing: every other test in this repo is in-process.
-//! Start one and name it, then ask for them by name:
+//! Ignored by default; requires a running etcd:
 //!
 //! ```text
-//! etcd --data-dir /tmp/ms-struktur2-etcd \
-//!      --listen-client-urls http://127.0.0.1:23700 \
-//!      --advertise-client-urls http://127.0.0.1:23700 \
-//!      --listen-peer-urls http://127.0.0.1:23701 \
-//!      --initial-advertise-peer-urls http://127.0.0.1:23701 \
-//!      --initial-cluster default=http://127.0.0.1:23701
-//!
 //! MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
 //!   cargo test -p meister-controller-api --test tickets_etcd -- --ignored
 //! ```
-//!
-//! What these prove is the one thing no in-process test can: that "once"
-//! holds over two replicas that share nothing but their store (Fremdsicht 6).
-//! Two `Tickets` values on two `EtcdStore` connections against one etcd are
-//! exactly what a cloud behind a load balancer is.
 
 use std::sync::Arc;
 

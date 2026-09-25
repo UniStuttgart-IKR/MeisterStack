@@ -2,27 +2,16 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The node edge: what an operator may say about a machine, which is its
-//! spec and nothing else. Moved out of `api.rs` unchanged.
+//! Node spec updates, heartbeat joins, and authenticated command forwarding.
 
 use super::*;
 
-/// A Node has nothing the server keeps from a client — its spec is
-/// `schedulable` and `labels` and nothing else, and both are an operator's.
-/// What the agent reports lives in `status`, and the PATCH route refuses a
-/// body that names anything else outright. See the cloud tier's
-/// `CLUSTER_OWNED` for why this is declared rather than left out.
+/// All Node spec fields are operator-managed. Status is updated separately
+/// from agent reports; merge patch validation restricts the writable envelope.
 pub(super) const NODE_OWNED: &[Owned] = &[];
 
-/// `status.lastHeartbeat`, joined back onto the objects the API answers with.
-///
-/// The field moved into a key of its own (D-C7, `EtcdStore::beat`) and this is
-/// what keeps the API's answer the answer it always was: `meister node ls`
-/// shows the column it always showed, and Tofu and the UI read the key they
-/// always read. One batched read per LIST, one per GET.
-///
-/// A node with no lease gets no key at all rather than a null — which is what
-/// a node nobody has heard from has always looked like here.
+/// Join heartbeat keys into the API objects with one batched read.
+/// Missing heartbeat keys leave the optional field unset.
 async fn join_heartbeats(store: &EtcdStore, nodes: &mut [Node]) -> Result<(), ApiError> {
     let beats = store.beats::<Node>().await?;
     for node in nodes.iter_mut() {
@@ -31,9 +20,7 @@ async fn join_heartbeats(store: &EtcdStore, nodes: &mut [Node]) -> Result<(), Ap
     Ok(())
 }
 
-/// The same join for the one object a write answers with. A response that
-/// showed the instant left in etcd before the field moved would be a lie
-/// about a machine, and the only one this route could still tell.
+/// Join the current heartbeat into a single-object response.
 async fn join_one(store: &EtcdStore, node: &mut Node) -> Result<(), ApiError> {
     node.status.last_heartbeat = store.last_beat::<Node>(&node.metadata.name).await?;
     Ok(())
@@ -66,20 +53,9 @@ pub(super) async fn get_node(
     Ok(Json(node))
 }
 
-/// The only write on a Node, and the reason this route exists: `spec` is what
-/// an operator decides and `status` is what the agent reported.
-///
-/// `spec.schedulable` has been read by the scheduler at both tiers since it
-/// was added, and `pending_reason` has been able to say "none of the known
-/// candidates is both connected and schedulable" for as long — but nothing
-/// could ever set it to false. Draining a node meant writing into etcd by
-/// hand. This is the door.
-///
-/// Draining blocks NEW placements and nothing else. The VMs already on the
-/// node go on running and go on being reconciled, the session stays up, and
-/// no eviction and no migration happens: those are separate things with
-/// separate questions, and quietly starting to move somebody's VM because a
-/// flag was flipped would be the worst possible answer to both.
+/// Update the operator-managed Node spec.
+/// `schedulable = false` cordons the node; `drain = true` also asks the reconciler
+/// to evacuate existing VMs according to each VM's evacuation policy.
 pub(super) async fn update_node(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -103,13 +79,7 @@ pub(super) async fn patch_node(
     Ok(Json(node))
 }
 
-/// A merge patch onto one node's spec, from wherever it came: this tier's own
-/// PATCH route, or an `UpdateNode` the cloud sent down its session.
-///
-/// `pub(crate)` for that second caller, and that IS the point. Draining a node
-/// from the cloud and draining it from here are the same act on the same
-/// object, and a second write path for one of them is how the two ends of a
-/// drain start disagreeing about whether it happened.
+/// Apply the same node spec validation for local PATCH and cloud UpdateNode commands.
 pub(crate) async fn patch_node_spec(
     store: &EtcdStore,
     name: &str,
@@ -121,10 +91,8 @@ pub(crate) async fn patch_node_spec(
     write_node_spec(store, name, body, current, dry).await
 }
 
-/// The compare-and-swap itself, and the one line of log a drain is worth.
-///
-/// The client's resourceVersion is what the store compares, and a loser is
-/// told rather than overwritten. See `apply_spec_update`.
+/// Write with the client's resourceVersion, preserving concurrent updates.
+/// Dry-run returns the validated object without writing or logging a state change.
 pub(super) async fn write_node_spec(
     store: &EtcdStore,
     name: &str,

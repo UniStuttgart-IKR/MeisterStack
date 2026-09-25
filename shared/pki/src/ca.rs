@@ -2,15 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The signing half: a CA loaded from two PEM files, and the one thing it
-//! does with a CSR.
+//! Load a certificate authority and sign approved public keys.
 //!
-//! The rule that shapes this file: **a CSR is a public key, not a claim.**
-//! Everything in it that a client could have written to its own advantage —
-//! the subject, the basic constraints, the key usages, the validity — is
-//! thrown away here and replaced by what the API server decided. What
-//! survives from the request is the public key and nothing else, which is the
-//! only part of it the client is entitled to choose.
+//! A CSR supplies the public key. The API's approved subject, usages and validity
+//! replace request-supplied attributes so a requester cannot issue its own role
+//! or CA permissions.
 
 use std::path::Path;
 

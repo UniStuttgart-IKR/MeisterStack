@@ -2,10 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 #
-# Two groups of equal rank, and they disagree about one key. Nix throws with
-# the host, the key and BOTH groups in the sentence; `meister-deploy validate`
-# says the same thing (inventory.rs). `checks.inventory-conflicts` evaluates
-# this file and requires the evaluation to fail.
+# Invalid fixture: equal-rank groups disagree on rollout.reboot.
 schema = 2
 
 [fleet]
