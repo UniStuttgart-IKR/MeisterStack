@@ -410,6 +410,10 @@ fn build_filesystem(
         // turn it off, because a node that cannot build the unit is meant to
         // refuse the image rather than read it here.
         convert: agent_api::base_image::Sandbox::default(),
+        // Astra finding R3-F09, 2026-09-25: staging files are named after
+        // the node that writes them, so a pool directory two nodes share
+        // cannot have one node's start-up sweep remove the other's copy.
+        host_id: cfg.node_id.clone(),
     })?;
     Ok(Some(Arc::new(driver)))
 }
@@ -503,6 +507,8 @@ fn build_nfs(
         virtiofsd_args: n.virtiofsd_args.clone(),
         manage_mount: n.manage_mount,
         mount: n.mount_spec()?,
+        // The share is every node's pool; see R3-F09 in `staging`.
+        host_id: cfg.node_id.clone(),
     })?;
     Ok(Some(Arc::new(driver)))
 }

@@ -16,7 +16,9 @@ nix = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# The nonce in a staging file's name (R3-F09), so two attempts at one id
+# never write into the same file.
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-uuid = { workspace = true }

@@ -23,11 +23,6 @@ pub(crate) fn volume_path(dir: &Path, id: &VolumeId) -> PathBuf {
     dir.join(format!("{id}.raw"))
 }
 
-/// Where a volume is built before it is renamed into place.
-pub(crate) fn tmp_path(dir: &Path, id: &VolumeId) -> PathBuf {
-    dir.join(format!("{id}.tmp"))
-}
-
 /// Where a snapshot lives: beside the volumes, under the SNAPSHOT's id
 /// and a suffix of its own.
 ///
@@ -234,6 +229,24 @@ pub(crate) fn clone_or_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
 /// volume that is finished, and an interrupted provision leaves a `.tmp`
 /// that `deprovision` removes with the volume.
 pub(crate) fn write_volume_file(
+    src: Option<(PathBuf, Option<BaseImage>)>,
+    sandbox: &Sandbox,
+    qemu_img: &Path,
+    tmp: &Path,
+    final_path: &Path,
+    size: u64,
+) -> std::io::Result<()> {
+    let written = write_then_rename(src, sandbox, qemu_img, tmp, final_path, size);
+    // The staging name is this attempt's own since R3-F09, so the next
+    // attempt never overwrites it: a failed one takes its file with it here,
+    // and one killed outright is the start-up sweep's.
+    if written.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    written
+}
+
+fn write_then_rename(
     src: Option<(PathBuf, Option<BaseImage>)>,
     sandbox: &Sandbox,
     qemu_img: &Path,
