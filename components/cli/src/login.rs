@@ -2,18 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `meister login` — sugar over the certificatesigningrequests flow.
-//!
-//! Sugar, and nothing more: every step is a call an operator could make by
-//! hand with `meister csr`. What it saves is the part nobody wants to do by
-//! hand, which is generating a key pair and then not sending it.
-//!
-//! The claim this command makes, and the reason it exists at all: **the
-//! private key never leaves this machine.** It is generated here, written
-//! here at 0600, and what travels is a PKCS#10 request — a public key and a
-//! name, both of which the server is free to distrust and does. See
-//! `pki::csr`, where the test asserts that no line of the key appears in the
-//! request.
+//! Certificate enrollment through CertificateSigningRequest resources.
+//! The private key is generated locally; only the CSR is sent to the controller.
 
 use std::path::PathBuf;
 
@@ -23,10 +13,7 @@ use serde_json::json;
 
 use crate::client::Client;
 
-/// Where a certificate is asked for. Spelled out here rather than taken from
-/// the discovery document, and that is the one exception in this CLI: login
-/// runs against a profile whose credential does not exist yet, so it is the
-/// one command that may not be able to authenticate a discovery call first.
+/// CSR route, available before login can authenticate resource discovery.
 const CSRS: &str = "/apis/meister.io/v1/certificatesigningrequests";
 
 use crate::config::{Config, Target};
@@ -62,9 +49,7 @@ struct Condition {
     message: String,
 }
 
-/// How often to ask again while waiting for an approver. A person is on the
-/// other end of this; a second is patient enough for them and cheap enough
-/// for the API.
+/// Poll approval once per second.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub async fn run(
@@ -89,9 +74,7 @@ pub async fn run(
     let object = json!({
         "apiVersion": "meister.io/v1",
         "kind": "CertificateSigningRequest",
-        // Empty name = let the server derive one, from the user and the
-        // object's own uid. Requests happen to the same person repeatedly,
-        // and a name this side picked would collide with its own last one.
+        // Let the server assign a unique request name.
         "metadata": { "name": "" },
         "spec": { "request": made.csr_pem, "username": user },
     });
@@ -109,8 +92,7 @@ pub async fn run(
         None => wait_for_approval(&client, &name, args.wait_secs).await?,
     };
 
-    // The key first: a certificate on disk whose key is missing is a puzzle,
-    // a key whose certificate is missing is a re-run of this command.
+    // Write the key before its certificate; the pair is not committed atomically.
     pki::write_secret(&key_path, &made.key_pem)
         .with_context(|| format!("writing {}", key_path.display()))?;
     std::fs::write(&cert_path, &issued)
@@ -172,18 +154,8 @@ pub async fn run(
     Ok(())
 }
 
-/// Where the key and the certificate land.
-///
-/// The profile decides, and that is the whole of "writes it into the
-/// profile": a profile whose credential already says `mtls` names two paths,
-/// and login puts a fresh pair exactly there — so running it again is a
-/// renewal in place and the config file is never touched. Rewriting the TOML
-/// would have been the other option and it costs a comment-preserving
-/// editor and every comment in the file if you skip one.
-///
-/// A profile that names nothing yet gets `<config dir>/pki/<profile>.{key,crt}`
-/// and the fragment to paste, which is the same shape `tools/meister-ca`
-/// hands out.
+/// Choose --out, declared mTLS paths, or <config dir>/pki/<profile>.{key,crt}.
+/// Enrollment writes credential files without rewriting the TOML profile.
 fn destination(
     config: &Config,
     target: &Target,
@@ -196,10 +168,7 @@ fn destination(
             false,
         ));
     }
-    // What the profile DECLARES, not what this call resolved to. The
-    // difference is the bootstrap case and it matters: the first login is
-    // made with a bearer token, so the resolved credential is a token while
-    // the two paths the certificate belongs in are still the profile's.
+    // Use declared mTLS paths even when a bootstrap token overrides authentication.
     if let Some((cert, key)) = config.declared_mtls(&target.profile_name) {
         return Ok((key, cert, true));
     }
@@ -242,8 +211,7 @@ fn certificate(status: &Status) -> Result<Option<String>> {
     Ok(status.certificate.clone())
 }
 
-/// Poll until somebody says yes, the request is denied, or the patience runs
-/// out. With the controller's `csr_auto_approve` this is never entered.
+/// Poll until issuance, denial or timeout.
 async fn wait_for_approval(client: &Client, name: &str, wait_secs: u64) -> Result<String> {
     if wait_secs == 0 {
         bail!(

@@ -2,11 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `ProviderNetwork` and `Router`: the objects, their rows and their verbs.
-//!
-//! One file, as the two handlers at the cloud are: a provider network is what
-//! an operator gave away and a router is a tenant's way out over one, and
-//! reading either row without the other tells half a story.
+//! Provider network and tenant router commands and rows.
 
 use super::*;
 
@@ -60,10 +56,7 @@ pub async fn provider_network(ctx: &Ctx<'_>, cmd: &ProviderNetworkCmd) -> Result
         "kind": "ProviderNetwork",
         "metadata": { "name": name },
         "spec": {
-            // The physnet is what joins this object to an interface out
-            // there, so it defaults to the object's own name: an operator who
-            // calls the network `ext` and the physnet `ext` should type it
-            // once.
+            // Default the node interface mapping name to the resource name.
             "physnet": physnet.clone().unwrap_or_else(|| name.clone()),
             "description": description.clone().unwrap_or_default(),
         },
@@ -130,9 +123,7 @@ pub(super) struct NatRule {
 }
 
 pub(super) fn router_row(r: Router) -> Vec<String> {
-    // The rules by kind rather than one by one: a router with a masquerade
-    // and nine floating addresses is one cell, and `router get` is where the
-    // list itself is read.
+    // Summarize NAT rules by kind; individual rules remain available through get.
     let mut snat = 0;
     let mut dnat = 0;
     let mut routed = 0;
@@ -184,18 +175,14 @@ pub async fn router(ctx: &Ctx<'_>, cmd: &RouterCmd) -> Result<()> {
                     "description": description.clone().unwrap_or_default(),
                 },
             });
-            // Sent only when it is FALSE: the field defaults to true at the
-            // server, an absent key and a `false` key are different requests,
-            // and writing `true` here would make every router carry a
-            // decision nobody made.
+            // Omit the default SNAT setting unless explicitly disabled.
             if *no_snat {
                 object["spec"]["snat"] = json!(false);
             }
             if let Some(inside) = internal_addr {
                 object["spec"]["internalAddr"] = json!(inside);
             }
-            // Only when it was named: at a cloud the tenant answers this and
-            // a number typed here would override the answer.
+            // Omit VNI unless supplied; the cloud normally derives it from the tenant.
             if let Some(vni) = vni {
                 object["spec"]["vni"] = json!(vni);
             }
@@ -219,9 +206,7 @@ pub async fn router(ctx: &Ctx<'_>, cmd: &RouterCmd) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The rule cell is a count per kind and never a list: a router with a
-    /// masquerade and nine floating addresses has to fit in a column, and the
-    /// rules themselves are what `router get` is for.
+    /// Count rules by kind in one table cell.
     #[test]
     fn the_rules_are_counted_by_kind_in_one_cell() {
         let router: Router = serde_json::from_str(
@@ -243,9 +228,7 @@ mod tests {
         assert_eq!(row[8], "1/2/1", "snat/dnat/routed");
     }
 
-    /// A router nothing has placed yet reads as dashes and not as empty
-    /// cells — the same rule every other table here follows, so a column
-    /// that is not answered yet is visibly not answered.
+    /// Render missing placement fields as dashes.
     #[test]
     fn an_unplaced_router_shows_dashes_rather_than_gaps() {
         let router: Router = serde_json::from_str(

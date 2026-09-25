@@ -2,18 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The VM verbs, and the two tables this CLI renders most often.
-//!
-//! There is one tree now and one path — `vms` out of the discovery document —
-//! and the only thing the tier still decides is one column: a cloud places a
-//! VM on a CLUSTER and a cluster places it on a NODE, and the listing says
-//! which. Everything else about a VM reads the same at either endpoint,
-//! because it is the same object.
-//!
-//! The four lifecycle verbs are one merge patch each. They are sugar over a
-//! spec field and nothing more, which is why the answer is always "the intent
-//! is recorded" and never "the vm is stopped": that arrives later, in `vm ls`,
-//! from the node itself.
+//! VM commands and listings at cloud and cluster endpoints.
+//! Lifecycle commands update intent; observed completion arrives asynchronously.
 
 use std::path::Path;
 
@@ -84,12 +74,7 @@ pub enum Placement {
 }
 
 impl Placement {
-    /// `evac` is between `run` and the binding, because that is where it
-    /// belongs in a reading: what the vm is meant to be doing, what may be
-    /// done to it to move it, and where it is. It is shown only in a listing
-    /// where at least one vm has said something other than the default — a
-    /// column of `never` down the whole estate says nothing and costs a
-    /// column.
+    /// Show evacuation policy only when at least one VM has a non-default policy.
     fn headers(self, evacuation: bool) -> Vec<&'static str> {
         let binding = match self {
             Self::Node => "node",
@@ -142,16 +127,8 @@ fn row(placement: Placement, vm: Vm, evacuation: bool) -> Vec<String> {
     row
 }
 
-/// The object a `vm create` sends: the agent's NewVmSpec, read off disk and
-/// wrapped in the api object the tier takes.
-///
-/// `tenant` is omitted rather than sent as null when nobody named one: the
-/// server fills a member's own tenant in, and a key that is there saying
-/// "nothing" is not the same request as one that is absent. The cluster tier
-/// never names one at all.
-/// `class` is omitted the same way and for the same reason, one field over:
-/// the server reads an absent class as the ordinary one, and a key saying
-/// `"vm"` would put a decision nobody made onto every object.
+/// Wrap a NewVmSpec file in a VM resource.
+/// Omit unspecified tenant and class fields so the server can apply its defaults.
 fn object(
     name: &str,
     spec: &Path,
@@ -221,26 +198,14 @@ pub fn table(body: &Bytes, placement: Placement) -> Result<View> {
     ))
 }
 
-/// One stream of a guest's one-way output, as every tier serves it.
-///
-/// `Serialize` as well, for the one job that writes one back: a `--hide` under
-/// `-o json` has to reach the document a script reads, or the flag would be a
-/// flag that silently did nothing there.
+/// A guest log stream; serialization also supports structured output.
 #[derive(Deserialize, Serialize)]
 pub struct LogStream {
     pub stream: String,
     pub text: String,
 }
 
-/// `vm logs`, at whichever tier the client is pointed at.
-///
-/// Printed as text and not as a table: a console is lines, and a table cell
-/// with a kernel oops in it is a table nobody can read. Under `-o json` the
-/// document goes out as the server sent it, which is what a script wants.
-///
-/// A VM that has printed nothing prints nothing — an empty answer is an
-/// answer, and it is the commonest one for a VM that has only just been
-/// created.
+/// Render filtered guest logs as text or return the server JSON.
 pub async fn logs(ctx: &Ctx<'_>, name: &str, lines: Option<u32>, keep: &LogFilter) -> Result<()> {
     let path = format!("{}/logs{}", ctx.path("vms", Some(name))?, keep.query(lines));
     let body = ctx.client.get(&path).await?;
@@ -251,20 +216,7 @@ pub async fn logs(ctx: &Ctx<'_>, name: &str, lines: Option<u32>, keep: &LogFilte
     })
 }
 
-/// Which of a console's lines the caller wants — carried to the node, not
-/// applied here.
-///
-/// It began as a client-side filter and that was wrong, in a way the lab made
-/// obvious: the server shortens to `lines` FIRST, so a filter afterwards can
-/// only narrow what is already the last N lines. Ask for the last five lines
-/// of a guest whose init prints a heartbeat every ten seconds and all five
-/// are the heartbeat — filtering them away leaves nothing. The node holds the
-/// whole ring, so the node is the only party that can filter and THEN
-/// shorten, which is what `--lines 5 --hide alive` obviously means.
-///
-/// So this builds a query string and nothing else. Under `-o json` the
-/// document is the server's, byte for byte, filter or no filter — because the
-/// filtering happened before it was a document.
+/// Build server-side filters so matching happens before the line limit.
 #[derive(Debug, Default, Clone)]
 pub struct LogFilter {
     pub hide: Vec<String>,
@@ -307,10 +259,7 @@ impl LogFilter {
     }
 }
 
-/// Percent-encoding for a query VALUE, as far as a needle needs it: a
-/// dependency for eleven characters is a dependency too many, and what has to
-/// be escaped is exactly what would otherwise end the value or begin another
-/// parameter.
+/// Percent-encode query values, including separators and non-ASCII bytes.
 fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -325,12 +274,7 @@ fn urlencode(value: &str) -> String {
     out
 }
 
-/// The streams a node handed back, as lines.
-///
-/// A header per stream, but only when there is more than one: a direct-kernel
-/// boot puts everything on `console`, and a lone banner over the whole output
-/// is noise. Shared with the agent tree, which reads the same document one
-/// hop closer.
+/// Render nonempty streams, adding headings only when several remain.
 pub fn render_logs(streams: &[LogStream]) -> String {
     // A stream the node filtered empty says nothing, rather than getting a
     // header printed over nothing.
@@ -372,12 +316,7 @@ pub struct EventSpec {
     pub last_seen: chrono::DateTime<chrono::Utc>,
 }
 
-/// The event log, at whichever tier the client is pointed at.
-///
-/// `count` has a column of its own because it is the difference between "this
-/// went wrong" and "this went wrong twenty times", and the message is last
-/// because it is the one cell that carries a server sentence with spaces in
-/// it.
+/// Render events with separate repetition counts and a final message column.
 pub fn event_table(body: &Bytes) -> Result<View> {
     let now = chrono::Utc::now();
     output::table_of(
@@ -416,29 +355,9 @@ pub async fn remove(ctx: &Ctx<'_>, name: &str) -> Result<()> {
     output::emit_line(ctx.global, &body, "Terminating")
 }
 
-/// start/stop/pause/resume are sugar, not a second API: runStrategy is a spec
-/// field like any other, so each verb is one merge patch of it and the
-/// controller derives the command from the drift it causes. Which also means
-/// the answer here is "the intent is recorded", never "the vm is stopped" —
-/// that arrives later, in `vm ls`, from the node itself.
-///
-/// One call and no GET in front of it. This used to be a read, an edit and a
-/// compare-and-swap, and it lost that race often enough to need a retry loop:
-/// the controller writes the same object on every pass. The server now
-/// compares against the version it read itself, and there is nothing left to
-/// lose.
-/// Plug a volume into a running vm, or unplug one.
-///
-/// **One PATCH with the whole list**, and that is the price of the standard
-/// rather than a choice: a JSON merge patch replaces an array outright (RFC
-/// 7386), so "add one entry" cannot be said as a patch of one entry. The
-/// client therefore reads the vm, works out the new list, and sends it — and
-/// the server compares against the version IT read, so the round trip is not
-/// a race the operator can lose silently.
-///
-/// The boot entry is never touched: it is `volumes[0]`, the server refuses a
-/// change to it with a 422, and this refuses it here too so that a person
-/// asking for something impossible is told without a round trip.
+/// Read the volume list and replace it with one merge patch.
+/// The boot entry cannot be changed. The patch carries no resourceVersion from
+/// this read, so concurrent list edits can overwrite each other.
 pub async fn attach(ctx: &Ctx<'_>, name: &str, volume: &str, plug: bool) -> Result<()> {
     let body = ctx.client.get(&ctx.path("vms", Some(name))?).await?;
     let object: serde_json::Value = serde_json::from_slice(&body)?;
@@ -464,14 +383,8 @@ pub async fn attach(ctx: &Ctx<'_>, name: &str, volume: &str, plug: bool) -> Resu
     output::emit_line(ctx.global, &body, volume)
 }
 
-/// The list a vm's spec should carry after plugging `volume` in or taking it
-/// out, or the sentence that says why it should not change at all.
-///
-/// Pure, because it is the whole of what this client DECIDES: everything
-/// around it is one GET and one PATCH. Three refusals, and each is something
-/// the server would say too — said here so that a person asking for
-/// something impossible hears it without a round trip, and never instead of
-/// the server, which is the refusal nobody can go around.
+/// Compute an attachment list without changing the boot entry.
+/// Reject duplicate attachment, missing detachment and malformed lists locally.
 fn plugged(
     entries: &[serde_json::Value],
     volume: &str,
@@ -506,18 +419,9 @@ fn plugged(
     Ok(wanted)
 }
 
-/// Let a binding go so the scheduler decides again.
-///
-/// One merge patch of `spec.nodeName`, exactly like `stop` is one of
-/// `runStrategy`: the reschedule is a spec edit and the controller derives
-/// the destroy and the placement from the drift it causes. The server refuses
-/// it on a vm that is not standing still, and the sentence names the phase.
+/// Clear placement bindings so the controller can reschedule a stopped VM.
 pub async fn reschedule(ctx: &Ctx<'_>, name: &str) -> Result<()> {
-    // Both, because either tier may be the one holding this vm and each
-    // ignores the other's binding — the same "one Vm type, two tiers" rule
-    // the table column follows. At the CLOUD this is now a real move: the
-    // binding falls, the old cluster is told to destroy the vm, and disks on
-    // a pool both clusters serve change owner without being copied.
+    // Clear both tier-specific bindings; the serving controller uses its own field.
     let body = ctx
         .patch(
             "vms",
@@ -535,25 +439,10 @@ pub async fn reschedule(ctx: &Ctx<'_>, name: &str) -> Result<()> {
     )
 }
 
-/// `vm migrate NAME [--to NODE]` — one `VmMigration` object, named after the
-/// VM and the moment.
-///
-/// The name is generated rather than asked for, and that is the difference
-/// from every other create in this CLI: a migration is not a thing an
-/// operator will refer to by name later, it is a record they will read once,
-/// and making them invent a name for it would be making them do bookkeeping
-/// for the machine. `vmmigration ls` is how it is found.
+/// Create a VmMigration named from the VM and the current UTC second.
 pub async fn migrate(ctx: &Ctx<'_>, name: &str, to: Option<&str>) -> Result<()> {
-    // An endpoint that cannot create one at all — an older cloud, from before
-    // `CreateVmMigration` existed. The bare discovery refusal ("this endpoint
-    // is a cloud and has no \"vmmigrations\"") leaves an operator at a dead
-    // end, so this says which cluster runs the guest instead: one GET, and
-    // only on the endpoint where the answer is needed.
-    //
-    // A current cloud does not come here. It serves `create` — forwarded down
-    // the cluster's own session, which is how every other write this tier
-    // relays travels (D-P9) — and the POST below is the whole of what a
-    // client has to do differently, which is nothing.
+    // For older endpoints without migration creation, identify the owning cluster.
+    // Current clouds forward creation through the cluster session.
     if ctx.disc.offering("vmmigrations", "create").is_err() {
         let cluster = ctx
             .client
@@ -602,16 +491,7 @@ fn cluster_of(vm: &serde_json::Value) -> Option<&str> {
     None
 }
 
-/// What to tell somebody who asked a cloud to move a guest between machines.
-///
-/// Pure, because it is the whole of what this verb does at that endpoint and
-/// because the sentence IS the fix: the old one named what the endpoint does
-/// not have, this one names where to go and repeats the command they typed.
-///
-/// A cloud cannot forward this today, and that is not a decision anybody made
-/// here — a node patch travels down the cluster's session because there is an
-/// `UpdateNode` on that session to carry it, and there is no such message for
-/// a migration. Until there is, saying so beats a 404.
+/// Explain how to reach the owning cluster when discovery lacks migration creation.
 fn ask_the_cluster(vm: &str, cluster: Option<&str>, to: Option<&str>) -> String {
     let repeat = match to {
         Some(node) => format!("meister vm migrate {vm} --to {node}"),
@@ -630,22 +510,13 @@ fn ask_the_cluster(vm: &str, cluster: Option<&str>, to: Option<&str>) -> String 
     }
 }
 
-/// `<vm>-<utc, to the second>`, which is a DNS label and is unique for as
-/// long as nobody asks twice in one second.
-///
-/// Deliberately readable rather than a uuid: this is the name an operator
-/// sees in `vmmigration ls` beside three others, and "web-1-20260909t114233"
-/// answers "which move was that" where a uuid does not.
+/// Append a UTC timestamp with second precision.
+/// This does not prevent same-second collisions or enforce the name length limit.
 fn migration_name(vm: &str, now: DateTime<Utc>) -> String {
     format!("{vm}-{}", now.format("%Y%m%dt%H%M%S"))
 }
 
-/// `vm evacuation NAME never|restart`.
-///
-/// A word and not a flag on `node drain`, because the answer belongs to the
-/// vm's OWNER and the drain belongs to the operator. An operator who could
-/// pass it as a flag would be answering, for somebody else, whether their
-/// guest may be rebooted.
+/// Set the VM owner's permission for restart-based evacuation.
 pub async fn evacuation(ctx: &Ctx<'_>, name: &str, value: &str) -> Result<()> {
     if !matches!(value, "never" | "restart") {
         anyhow::bail!("evacuation is `never` or `restart`, not {value:?}");
@@ -666,12 +537,7 @@ pub async fn run_strategy(ctx: &Ctx<'_>, name: &str, strategy: &str) -> Result<(
 #[cfg(test)]
 mod tests {
 
-    /// What the CLI now does with `--hide`: it asks, it does not filter.
-    ///
-    /// The filtering moved to the node, and this is what is left here — the
-    /// query that carries the request. Held to the wire form because a needle
-    /// with a space or an ampersand in it would otherwise end the parameter
-    /// or start another one.
+    /// Filters must reach the node as correctly escaped query parameters.
     #[test]
     fn the_flags_become_the_query_the_node_reads() {
         let none = LogFilter::default();
@@ -825,10 +691,7 @@ mod tests {
     /// tells those two apart.
     #[test]
     fn an_unnamed_tenant_is_left_out_of_the_request() {
-        // A directory of its own, and one that goes away on a panic as well
-        // as on a pass: this used to be a FIXED path under /tmp, so two
-        // `cargo test` runs at once — or one beside the leftovers of a
-        // crashed one — raced over the same file.
+        // Isolate the fixture from concurrent test runs.
         let dir = tempfile::tempdir().expect("a directory of our own");
         let spec = dir.path().join("spec.json");
         std::fs::write(&spec, br#"{"vcpus":2}"#).unwrap();
@@ -843,22 +706,13 @@ mod tests {
         assert_eq!(owned["spec"]["tenant"], "ops");
         assert_eq!(owned["spec"]["runStrategy"], "Stopped");
 
-        // The class travels the same road, one field over: absent when
-        // nobody named one, because the server reads that as the ordinary
-        // class and a key saying `"vm"` would put a decision nobody made
-        // onto every object.
+        // Omit unspecified class so the server applies its default.
         assert!(bare["spec"].get("class").is_none());
         let gpu = object("a", &spec, None, None, Some("gpu")).unwrap();
         assert_eq!(gpu["spec"]["class"], "gpu");
     }
 
-    /// The list arithmetic behind `vm attach` and `vm detach`.
-    ///
-    /// The whole of what this client decides. Around it is one GET and one
-    /// PATCH — and the PATCH carries the WHOLE list, because a JSON merge
-    /// patch replaces an array outright (RFC 7386) and "add one entry"
-    /// therefore cannot be said as a patch of one entry. That is the price of
-    /// the standard, and it is what the guide says.
+    /// Attachment patches replace the whole array and preserve the boot entry.
     #[test]
     fn attaching_sends_the_whole_list_and_never_touches_the_boot_entry() {
         let vol = |n: &str| serde_json::json!({ "volume": n });
@@ -896,10 +750,7 @@ mod tests {
         assert_eq!(first, vec![vol("data-1")]);
     }
 
-    /// D-P9: `vm migrate` at a cloud ended in "this endpoint is a cloud and
-    /// has no \"vmmigrations\"" — true, and a dead end. The cloud knows
-    /// which cluster runs the guest, so the refusal now says where to go and
-    /// repeats the command that was typed.
+    /// Legacy discovery without migration creation should identify the owning cluster.
     #[test]
     fn a_migration_asked_of_a_cloud_names_the_cluster_that_can_serve_it() {
         let vm = serde_json::json!({

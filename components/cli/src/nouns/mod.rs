@@ -2,18 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The nouns that are only a cloud's, and how each of them is rendered.
-//!
-//! Two things live here and they are two halves of one job. The `*_row`
-//! functions are how a listing becomes a table, one per kind, chosen by the
-//! kind out of the discovery document — `ls` itself is in [`crate::generic`]
-//! and knows nothing about any of them. The verbs below them are the sugar: a
-//! create, and the handful of "set one field" verbs, every one of which is
-//! now a single merge patch rather than the read-edit-write it used to be.
-//!
-//! The VM verbs are in [`crate::vm`] and the machine verbs in
-//! [`crate::cluster`], for the same reason: they are the same act against a
-//! different inventory.
+//! Resource-specific table rows and convenience commands.
+//! Generic discovery and CRUD live in crate::generic; VM and node commands have separate modules.
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -80,16 +70,8 @@ struct Observed {
     observed_generation: u64,
 }
 
-/// `yes` or `pending`, from the generation pair.
-///
-/// The column exists because `floatingip assign` says "takes effect at the
-/// next recreate" in its help and nothing afterwards ever said whether it
-/// had. `pending` here is not an error and not a warning: it is the true
-/// answer to "is this address on the wire yet", and for an address assigned
-/// to a running VM it stays `pending` until that VM is created again.
-///
-/// A VM list gets no such column on purpose — a VM's own drift lasts one
-/// reconcile pass and is not something an operator runs a business on.
+/// Show whether the controller has observed the resource generation.
+/// This compares reported metadata; it is not an independent dataplane check.
 fn applied(generation: u64, observed: u64) -> String {
     if observed >= generation {
         "yes"
@@ -116,14 +98,7 @@ struct BareMeta {
 
 // --- the table for a kind ---------------------------------------------------
 
-/// The listing of one kind, chosen by the kind the discovery document named.
-///
-/// This is the whole of what `ls` knows about resources, and it is a lookup
-/// rather than a command tree: `meister <anything> ls` reaches the same
-/// function, and what differs is one row builder. A kind nothing here knows
-/// still lists — `NAME` and `AGE` come off metadata, which every object in
-/// this API has — so a resource added to the control plane is listable the
-/// day it exists and gets a table when somebody decides what its columns are.
+/// Select a row renderer by discovery kind. Unknown kinds use metadata columns.
 pub(crate) fn table_of_kind(
     kind: &str,
     body: &Bytes,
@@ -246,12 +221,7 @@ pub(crate) fn table_of_kind(
             &[
                 "pool",
                 "driver",
-                // The one field that says "this pool is unusable", and the
-                // only kind in this table that did not show it — `Image`,
-                // `VolumeSnapshot` and `VmMigration` all do. A pool whose
-                // driver no node offers is created without complaint and read
-                // `Pending` in the API while this table showed it beside the
-                // healthy ones (D14).
+                // Expose pool readiness independently of its driver and locality.
                 "phase",
                 // Where this pool's bytes are, which is what decides whether
                 // a VM using one of its disks is pinned to one machine.
@@ -279,10 +249,7 @@ pub(crate) fn table_of_kind(
                 // volume is gone, which is the whole point of the object.
                 "volume",
                 "phase",
-                // How big the copy came out, as the node measured it, and
-                // which machine has it. A snapshot outlives its volume, so
-                // after the volume goes this column is the only thing that
-                // says where the bytes are.
+                // Show measured snapshot size and the node retaining its bytes.
                 "size",
                 "node",
                 "age",

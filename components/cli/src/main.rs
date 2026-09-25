@@ -63,10 +63,8 @@ pub struct GlobalArgs {
     #[arg(long, global = true)]
     yes: bool,
 
-    /// Show what a create, apply or set WOULD write, and write nothing
-    /// (`?dryRun=All`). Every check the real request makes is made; the
-    /// object comes back annotated `meister.io/dry-run`, and a `vm create`
-    /// also carries what the scheduler would say in `status.message`.
+    /// Preview supported create, apply and set requests with dryRun=All.
+    /// This flag does not suppress DELETE, login or direct agent operations.
     #[arg(long, global = true)]
     dry_run: bool,
 
@@ -101,22 +99,8 @@ pub enum OutputFormat {
     Json,
 }
 
-// One tree, and the endpoint decides what is in it.
-//
-// What used to be here was three trees under three prefixes — `meister cloud
-// vm ls`, `meister cluster vm ls`, `meister agent ls` — and a `tier` key in
-// every profile that had to agree with which prefix an operator typed. The
-// tier was never a fact about the COMMAND: `vm ls` means the same thing
-// wherever it lands, and which nouns exist is something the server knows and
-// says (`GET /apis/meister.io/v1`). So the prefix is gone, the profile key is
-// gone, and a noun this endpoint does not serve is a sentence that says where
-// it does live.
-//
-// The agent keeps a subtree of its own, and that is not the tier coming back
-// in through the side door. A node's own socket is a different API — no
-// discovery, no objects, ids instead of names, and `observe`/`reconcile`,
-// which ask what one machine's processes are doing and have no counterpart
-// anywhere above. It is a different thing, so it has a different word.
+// Control-plane commands use discovery. Direct agent commands use a separate
+// subtree because the Unix API addresses local VM IDs without resource discovery.
 #[derive(Subcommand)]
 enum Cmd {
     /// Virtual machines
@@ -228,10 +212,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AgentCmd,
     },
-    /// The fleet: plan, image, push, keys, check. Runs `meister-deploy`,
-    /// which is a separate binary on purpose — it needs no endpoint, no
-    /// credential and no running control plane, and it is the one command
-    /// that works when nothing else does
+    /// Delegate arguments to the separate meister-deploy binary
     Deploy {
         /// Everything after `deploy`, handed to `meister-deploy` unchanged
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -256,9 +237,7 @@ fn exec_deploy(args: &[String]) -> Result<()> {
     )
 }
 
-/// What `events` narrows to. Both are filters and both are the server's
-/// work: the console had to filter the whole log in the browser, and a
-/// `curl` could not narrow it at all.
+/// Server-side event filters.
 #[derive(clap::Args, Debug, Default)]
 pub struct EventsArgs {
     /// Only about this object: `vm/web-1`, or a bare name for any kind
@@ -269,12 +248,7 @@ pub struct EventsArgs {
     pub since: Option<String>,
 }
 
-/// The two verbs every resource has, whatever it is.
-///
-/// Neither needs a line of code per resource: the path comes out of the
-/// discovery document and the table is chosen by the kind. Flattened into
-/// each noun below so that `meister vm ls` and `meister tenant ls` are one
-/// implementation and not twelve.
+/// Shared list/get commands; discovery supplies resource paths.
 #[derive(Subcommand)]
 pub enum ReadCmd {
     /// List them
@@ -298,9 +272,7 @@ pub struct ApplyArgs {
     pub file: Vec<std::path::PathBuf>,
 }
 
-/// `meister login` — sugar over the certificatesigningrequests flow, and
-/// nothing more than sugar: every step of it is a call an operator could
-/// make by hand.
+/// Certificate enrollment or OIDC device login.
 #[derive(Args, Debug)]
 pub struct LoginArgs {
     /// Log in at the profile's identity provider instead of asking for a
@@ -445,18 +417,8 @@ pub enum VmCmd {
     },
 }
 
-/// Cordon, drain, label.
-///
-/// The two verbs are two statements and not one. **Cordon** stops NEW
-/// placements and moves nothing: the vms on the node go on running. **Drain**
-/// empties the machine — every vm that can go, goes — and implies the cordon
-/// without setting it, so an `undrain` gives back exactly the schedulability
-/// that was asked for.
-///
-/// What "can go" is `meister vm evacuation` and the disks: a stopped vm is
-/// placed again, a running one only with `evacuation = restart`, and a vm
-/// with a persistent node-local disk never. `node get` lists what stayed and
-/// why.
+/// Node scheduling controls. Cordon blocks new placement; drain requests
+/// evacuation and implies a cordon without changing spec.schedulable.
 #[derive(Subcommand)]
 pub enum NodeCmd {
     /// List them
@@ -492,13 +454,8 @@ pub enum NodeCmd {
         /// Its name
         name: String,
     },
-    /// Say which workload classes this machine takes, and nothing else.
-    ///
-    /// The mirror image of a selector: a selector is a workload choosing
-    /// machines, this is a machine choosing workloads — Kubernetes' taint and
-    /// toleration in one word. Naming none takes everything back, which is
-    /// what every machine says by default; naming any is EXCLUSIVE, so a node
-    /// told `router` stops taking ordinary vms
+    /// Set accepted workload classes. An empty list accepts every class;
+    /// a nonempty list excludes all classes it does not name
     Accepts {
         /// Its name
         name: String,
@@ -800,10 +757,7 @@ pub enum RoutedSubnetCmd {
     },
 }
 
-/// A provider network is a wire, named by the `physnet` its nodes claim it
-/// under. Declaring one says an operator has given an interface away; whether
-/// any node really has is that node's own configuration, and a router on a
-/// network nobody claims stays pending with a sentence saying so.
+/// Provider network declaration. Nodes must separately configure its physnet.
 #[derive(Subcommand)]
 pub enum ProviderNetworkCmd {
     #[command(flatten)]
@@ -837,10 +791,8 @@ pub enum ProviderNetworkCmd {
     },
 }
 
-/// A router is one tenant's way out over one provider network: a leg on that
-/// wire, a leg in the tenant's overlay, and the translations between them.
-/// Where it runs is the cluster's decision — `router get` names the gateway
-/// nodes it was planned on and which of them is active.
+/// Router joining a tenant overlay to a provider network. The cluster selects
+/// its gateway nodes and active instance.
 #[derive(Subcommand)]
 pub enum RouterCmd {
     #[command(flatten)]
@@ -927,11 +879,7 @@ pub enum StoragePoolCmd {
     },
 }
 
-/// A secret is the one noun here whose `create` takes its content on the
-/// command line — and therefore the one where the shell's history is part of
-/// the threat model. `--from-file` exists for that: it is the form that does
-/// not put the value in `~/.bash_history` or in the process list of a shared
-/// machine, and it is what the guide recommends.
+/// Secret creation. Prefer --from-file to keep values out of shell history and argv.
 #[derive(Subcommand)]
 pub enum SecretCmd {
     #[command(flatten)]
@@ -1011,11 +959,7 @@ pub enum VolumeCmd {
     },
 }
 
-/// A point in time of a volume, which outlives the volume.
-///
-/// Its own noun and not a verb on `volume`, for the reason the object is its
-/// own object: it survives the disk it was taken of, so a subcommand of that
-/// disk would be a subcommand of something that may not be there.
+/// Snapshot resources outlive their source volumes.
 #[derive(Subcommand)]
 pub enum VolumeSnapshotCmd {
     #[command(flatten)]
@@ -1025,8 +969,7 @@ pub enum VolumeSnapshotCmd {
         /// Its name
         name: String,
     },
-    /// Freeze what a volume holds right now. Crash-consistent: no guest
-    /// agent, no fsfreeze — what a guest would have found after losing power
+    /// Request a backend snapshot. No guest filesystem freeze is performed
     Create {
         /// What to call it
         name: String,
@@ -1039,30 +982,19 @@ pub enum VolumeSnapshotCmd {
     },
 }
 
-/// Read and clean up, and deliberately no `create`.
-///
-/// A migration is asked for with `meister vm migrate`, which is where the
-/// refusals are and where the sentence naming the way out belongs. This noun
-/// is what you read afterwards: which move, from where to where, and — the
-/// useful one — what stopped the one that did not work.
+/// Inspect or remove migration records. Start a migration with `vm migrate`.
 #[derive(Subcommand)]
 pub enum VmMigrationCmd {
     #[command(flatten)]
     Read(ReadCmd),
-    /// Throw the record away. The vm is untouched: a migration owns nothing,
-    /// and the source guest is running throughout either way
+    /// Remove a pending or completed record; active migrations retain ownership
     Rm {
         /// Its name
         name: String,
     },
 }
 
-/// The node's own api, over its own socket.
-///
-/// It carries the noun `vm` already, although a node knows only vms today:
-/// the machine will manage more than vms (containers are named), and a second
-/// noun beside a nounless `agent ls` would be the next asymmetry. One word
-/// more now, no rewrite of the guide later.
+/// Direct agent API commands over the local Unix socket.
 #[derive(Subcommand)]
 pub enum AgentCmd {
     /// The vms this node is running
@@ -1078,13 +1010,7 @@ pub enum AgentCmd {
     },
 }
 
-/// Reading only, and that is the whole shape of it.
-///
-/// The lifecycle of a volume belongs to the `Volume` object one tier up: the
-/// controller decides, the node obeys, and a write verb at this socket would
-/// be a second owner of somebody's data reachable by anybody in the socket
-/// group. What this IS for is the question the object cannot answer — what
-/// does the node itself think it has.
+/// Read local volume records. The controller owns their lifecycle.
 #[derive(Subcommand)]
 pub enum AgentVolumeCmd {
     /// List them, tombstones and all
@@ -1186,10 +1112,7 @@ async fn main() -> ExitCode {
     }
 }
 
-/// anyhow's own `Debug` spreads a chain over five lines the moment anything
-/// on the way up added a `.context()`, and an operator reading a terminal
-/// gets one error per line or none. Whitespace inside a message collapses
-/// too, so a literal wrapped across source lines stays one line here.
+/// Flatten an error chain to one line and omit repeated adjacent messages.
 fn one_line(e: &anyhow::Error) -> String {
     let mut parts: Vec<String> = Vec::new();
     for cause in e.chain() {
@@ -1237,26 +1160,19 @@ async fn run() -> Result<()> {
         tolerate_missing_credential: matches!(cli.cmd, Cmd::Login(_)),
     };
 
-    // Before the config is even read: the fleet tool has its own file
-    // (fleet.toml) and needs no profile, no endpoint and no certificate.
+    // The fleet tool uses its own inventory and does not resolve a CLI target.
     if let Cmd::Deploy { args } = &cli.cmd {
         return exec_deploy(args);
     }
 
     match &cli.cmd {
-        // The node's own socket, and nothing that speaks to it goes through
-        // the discovery: a unix endpoint IS a node by definition, and asking
-        // it what group-version it serves would be asking the wrong question
-        // of the right machine.
+        // Direct agent commands bypass control-plane discovery.
         Cmd::Agent { cmd } => {
             let target = target_for(&cfg, &overrides).await?;
             refuse_wrong_tree(&target, true)?;
             agent::run(&target, cmd, &cli.global).await
         }
-        // Deliberately NOT through `target_for`: that renews an expired
-        // session before running, and this is the command whose whole job is
-        // to replace one. A revoked refresh token would otherwise fail the
-        // renewal and take the login that would have fixed it with it.
+        // Login must replace expired sessions without first attempting refresh.
         Cmd::Login(args) if args.oidc => {
             let target = config::resolve(&cfg, &overrides)?;
             debug!(profile = %target.profile_name, "resolved target");
@@ -1301,12 +1217,7 @@ async fn run() -> Result<()> {
     }
 }
 
-/// The two trees, and the one sentence for mixing them up.
-///
-/// A `unix://` endpoint is a node's own api by definition — it has no
-/// discovery, no objects and no names — so pointing a control-plane command
-/// at one is not a 404 to puzzle over, it is a profile pointed at the wrong
-/// thing. And the other way round for the same reason.
+/// Require Unix endpoints for agent commands and HTTP(S) for controller commands.
 fn refuse_wrong_tree(target: &Target, agent_command: bool) -> Result<()> {
     let is_socket = target.endpoint.starts_with("unix://");
     match (is_socket, agent_command) {
@@ -1456,14 +1367,7 @@ async fn read_verb(ctx: &Ctx<'_>, resource: &str, cmd: &ReadCmd) -> Result<()> {
     }
 }
 
-/// Resolve a profile and make its credential usable.
-///
-/// The second half is the reason this is a function rather than three lines
-/// repeated four times: an expired OIDC session is renewed here, once, for
-/// every command. Reading the credential cannot do it — renewing is a call
-/// to the identity provider and the credential is read synchronously — so
-/// there has to be exactly one place between resolving and sending, and
-/// this is it.
+/// Resolve a target and renew an expired OIDC session before dispatch.
 async fn target_for(cfg: &Config, ov: &Overrides) -> anyhow::Result<Target> {
     let mut target = config::resolve(cfg, ov)?;
     debug!(profile = %target.profile_name, endpoint = %target.endpoint, "resolved target");
@@ -1514,12 +1418,7 @@ mod tests {
         assert_eq!(one_line(&e), "404 Not Found: no such vm");
     }
 
-    /// Every subcommand says what it does and every argument says what it is.
-    ///
-    /// A test rather than a review habit, because help text is the only
-    /// documentation an operator has in the moment they need it, and the way
-    /// it rots is one flag at a time. The walk is recursive and the global
-    /// flags are in it: they are arguments of the root command.
+    /// Keep help text on every command and argument.
     #[test]
     fn every_subcommand_and_every_argument_carries_a_sentence() {
         fn walk(cmd: &clap::Command, path: &str) {
@@ -1547,9 +1446,7 @@ mod tests {
         walk(&Cli::command(), "meister");
     }
 
-    /// The two trees are told apart by the endpoint's scheme and nothing
-    /// else, and mixing them up is a sentence rather than a 404 from a server
-    /// that does not serve what was asked.
+    /// Reject mismatched endpoint schemes before sending an API request.
     #[test]
     fn pointing_a_command_at_the_other_tree_says_which_tree_it_is() {
         let target = |endpoint: &str| Target {
@@ -1634,10 +1531,7 @@ mod tests {
             assert!(verbs.contains(&"get"), "{noun} has no get: {verbs:?}");
         }
 
-        // `node accepts` is the machine's half of the class pairing, and it
-        // is a verb rather than a flag on `label` for the reason the doc on
-        // `NodeCmd::Accepts` gives: it is a statement, not a set somebody
-        // accumulates.
+        // Class admission remains a distinct command from labels.
         let node = cmd.find_subcommand("node").expect("node");
         let verbs: Vec<&str> = node.get_subcommands().map(|s| s.get_name()).collect();
         assert!(verbs.contains(&"accepts"), "{verbs:?}");

@@ -1,9 +1,17 @@
 # MeisterStack CLI
-CLI for the project depending on configuration see `config/cli.dev.toml` for agent, cluster-controller or cloud-controller.
 
-## Vibe-code disclaimer
+The `meister` binary talks to cloud and cluster REST APIs or a local agent Unix
+socket. Controller discovery determines available resources and verbs.
 
-Because of time reasons, this part of the project is at the moment vibe-coded and only poorly reviewed. After review and propper
-documentation this disclaimer is removed hopefully. For development Claude Opus and Fable are used.
+See the [CLI guide](../../docs/CLI.md) for profiles, authentication, command behavior
+and limits. Example profiles are in [config/](../../config/README.md).
 
-See `AI_GUIDELINES.md` section *Rapid prototyping*.
+```sh
+cargo test --locked -p meister-cli
+cargo run --locked -p meister-cli -- --help
+```
+
+Source layout: `main.rs` defines commands; `config.rs`, `client.rs` and `oidc.rs`
+resolve connections; `generic.rs` handles discovery and generic resources;
+`vm.rs`, `cluster.rs`, `agent.rs` and `nouns/` implement resource commands;
+`output.rs` renders responses.

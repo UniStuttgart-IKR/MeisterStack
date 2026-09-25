@@ -14,9 +14,7 @@ use tokio::net::UnixStream;
 
 use crate::config::{Credential, Target};
 
-/// What a JSON merge patch is called on the wire. RFC 7386, and the only
-/// patch format this control plane serves — there is no strategic merge and
-/// no RFC 6902 here.
+/// JSON merge-patch media type (RFC 7386).
 pub const MERGE_PATCH: &str = "application/merge-patch+json";
 
 pub enum Transport {
@@ -50,13 +48,7 @@ pub fn transport_for(endpoint: &str) -> Result<Transport> {
         });
     }
     if let Some(authority) = trimmed.strip_prefix("https://") {
-        // The name, not the address: a certificate is issued to a host, and
-        // ":3000" is not part of it.
-        //
-        // A bracketed IPv6 literal is why this is not one rsplit: "[::1]" has
-        // colons of its own, and cutting at the last one leaves ":" as the
-        // server name. Only a colon AFTER the closing bracket is a port
-        // separator; inside the brackets every colon belongs to the address.
+        // Separate the port without splitting an IPv6 literal.
         let port_sep = match authority.rfind(']') {
             Some(close) => authority[close + 1..].find(':').map(|i| close + 1 + i),
             None => authority.rfind(':'),
@@ -90,11 +82,7 @@ pub struct Client {
 }
 
 impl Client {
-    /// The finished `Authorization` header value, if this profile has one.
-    ///
-    /// For the one caller that does not go through `request`: a console keeps
-    /// its socket after the upgrade, so it writes its own request head and
-    /// needs the same credential this client would have sent.
+    /// Authorization header for callers that manage their own transport, such as consoles.
     pub fn authorization(&self) -> Option<&str> {
         self.auth.as_deref()
     }
@@ -104,14 +92,7 @@ impl Client {
         self.tls.clone()
     }
 
-    /// Build a client for one target.
-    ///
-    /// The two ways a credential and an endpoint can disagree are both errors
-    /// here rather than surprises later. A client certificate over plain http
-    /// would be silently unused — the profile says "authenticate me" and
-    /// nothing would; and an https endpoint with no CA would fall back to the
-    /// system trust store, which a lab CA is not in, turning a config mistake
-    /// into an opaque handshake failure.
+    /// Build a client, requiring HTTPS for mTLS and an explicit CA for HTTPS.
     pub fn new(target: &Target) -> Result<Self> {
         let transport = transport_for(&target.endpoint)?;
         let tls_endpoint = matches!(transport, Transport::Https { .. });
@@ -121,11 +102,7 @@ impl Client {
         match &target.credential {
             Credential::None => {}
             Credential::Bearer(token) => auth = Some(format!("Bearer {token}")),
-            // Unreachable in practice and refused rather than assumed:
-            // `main::target_for` renews an expired session before any
-            // command runs. If this ever fires, a code path has started
-            // building a client without going through it, and sending a
-            // dead token would be a 401 nobody could explain.
+            // Callers must renew expired OIDC sessions before constructing a client.
             Credential::StaleOidc => bail!(
                 "internal: profile {} has an expired oidc session that was never renewed",
                 target.profile_name
@@ -168,26 +145,14 @@ impl Client {
         })
     }
 
-    /// Turn every write this client makes into `?dryRun=All` — `--dry-run`.
-    ///
-    /// On the client and not on each verb, because the alternative is a
-    /// parameter on thirty-two call sites and one of them will be the one
-    /// that forgets. A flag that is honoured by every write except one is
-    /// worse than no flag: the request somebody meant to preview is the one
-    /// that lands.
-    ///
-    /// GET and DELETE are untouched. A dry-run GET is a GET, and a dry-run
-    /// DELETE is a thing this API does not offer — `?dryRun` is answered by
-    /// the write handlers, and adding the parameter to a delete would get it
-    /// ignored, which is the one answer a preview may never give.
+    /// Append `dryRun=All` to POST, PUT and PATCH requests.
+    /// GET and DELETE are unchanged; callers must reject unsupported dry runs.
     pub fn previewing(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
         self
     }
 
-    /// The path a WRITE goes to, with the preview parameter when one was
-    /// asked for. Appended with the right separator: several routes here
-    /// already carry a query of their own.
+    /// Append the preview parameter without replacing an existing query.
     fn write_path<'p>(&self, path: &'p str) -> std::borrow::Cow<'p, str> {
         if !self.dry_run {
             return std::borrow::Cow::Borrowed(path);
@@ -210,13 +175,7 @@ impl Client {
             .await
     }
 
-    /// A JSON merge patch (RFC 7386) — the way this CLI writes one field of
-    /// one object.
-    ///
-    /// Every "set" verb here used to be a GET, an edit and a PUT, which is a
-    /// read-modify-write in a client and therefore a race the operator got
-    /// shown as a 409. A patch is one call with three lines of body, and the
-    /// server does the compare-and-swap against the version IT just read.
+    /// Send a merge patch; the server applies it against its current resource version.
     pub async fn patch(&self, path: &str, body: serde_json::Value) -> Result<Bytes> {
         self.request_with(
             Method::PATCH,
@@ -232,18 +191,8 @@ impl Client {
     }
 }
 
-/// `set` (`k=v`) and `rm` (`k`) as the label half of a merge patch.
-///
-/// The edit half of `meister ... label`, written once because a node label and
-/// a cluster label are the same act against two inventories. Set before
-/// remove, so `--rm k k=v` is not an order-dependent riddle: naming a key in
-/// both means it goes.
-///
-/// A removal is `null`, which is what RFC 7386 says removal is — and it is
-/// why this is a patch and no longer a read-modify-write. The old shape had
-/// to read the whole label map to put one key in it; this says only what
-/// changes, so two operators labelling the same node with different keys both
-/// win instead of one of them losing a compare-and-swap.
+/// Build a label merge patch from `key=value` assignments and removals.
+/// Removal uses JSON null and wins if a key appears in both lists.
 pub fn labels_patch(set: &[String], rm: &[String]) -> Result<serde_json::Value> {
     let mut labels = serde_json::Map::new();
     for pair in set {
@@ -342,10 +291,7 @@ impl Client {
                         .with_context(|| {
                             format!("connecting to {authority} - is the controller running?")
                         })?;
-                    // The other end of the same measurement: a handshake is
-                    // several small writes and a request follows immediately,
-                    // which is exactly the shape Nagle plus delayed ACK turns
-                    // into a 40ms stall. See controller_api::rest::serve.
+                    // Avoid Nagle delays during the TLS handshake and first request.
                     let _ = stream.set_nodelay(true);
                     let server_name =
                         tokio_rustls::rustls::pki_types::ServerName::try_from(host.clone())
@@ -375,10 +321,7 @@ impl Client {
                 .method(method)
                 .uri(&path)
                 .header("Host", host_header)
-                // Every request carries a trace context, so the trace starts
-                // where the operator did rather than at the API edge — and
-                // `meister vm create` can print the id the whole
-                // chain will be found under.
+                // Start trace propagation at the CLI request.
                 .header("traceparent", traceparent.to_string())
                 .header("Accept", "application/json");
             if has_body {
@@ -406,14 +349,8 @@ impl Client {
     }
 }
 
-/// A 409 from an API server, carrying the machine-readable `reason` the body
-/// named: `AlreadyExists`, `Conflict`, `Terminating`.
-///
-/// The reason and not the sentence, because there is exactly one caller that
-/// has to tell two 409s apart — `apply`, which turns `AlreadyExists` into a
-/// replace and lets everything else through — and matching on a sentence
-/// somebody may reword is not a contract. The status has to survive the trip
-/// through anyhow for the same reason.
+/// Machine-readable reason from an HTTP 409 response. `apply` distinguishes
+/// AlreadyExists from conflicts that must be returned to the caller.
 #[derive(Debug)]
 pub struct Conflict(pub String);
 
@@ -432,14 +369,7 @@ pub fn conflict_reason(e: &anyhow::Error) -> Option<String> {
         .map(|c| c.0.clone())
 }
 
-/// A refusal from this API: the `Status` object, in the two fields a client
-/// has any use for.
-///
-/// Only the new shape is read. The old `{"error": ...}` body was this API's
-/// own and nobody else ever wrote one, so a parser that accepted both would
-/// be a parser carrying a shape that no longer exists anywhere — and the
-/// fallback below already handles a body this does not understand, including
-/// one from something that is not this API at all.
+/// Fields used from an API Status error; unknown response formats fall back to text.
 #[derive(Default, serde::Deserialize)]
 struct ErrBody {
     #[serde(default)]
@@ -463,9 +393,7 @@ fn describe_error(status: StatusCode, body: &Bytes, path: &str) -> (String, Stri
 mod tests {
     use super::*;
 
-    /// The name a certificate is checked against is the host, not the
-    /// address and not the port — getting that wrong makes every handshake
-    /// fail with a name mismatch nobody can read.
+    /// TLS verification uses the endpoint host without its port.
     #[test]
     fn an_https_endpoint_yields_the_host_the_certificate_is_checked_against() {
         let Transport::Https { authority, host } =
@@ -483,10 +411,7 @@ mod tests {
         assert_eq!(host, "10.128.1.103");
     }
 
-    /// A bracketed IPv6 literal has colons of its own. Cutting at the last one
-    /// used to leave ":" as the server name, so `https://[::1]` failed at the
-    /// handshake with a message about an unusable name instead of connecting.
-    /// With a port it happened to work, which is why the lab never saw it.
+    /// Preserve bracketed IPv6 hosts with and without explicit ports.
     #[test]
     fn a_bracketed_ipv6_endpoint_keeps_its_address_with_and_without_a_port() {
         for (endpoint, expected_authority) in [
@@ -526,9 +451,7 @@ mod tests {
         assert!(transport_for("https://").is_err());
     }
 
-    /// The edit half of `meister ... label`, now as the patch body it sends.
-    /// Set wins over nothing, remove wins over set, and a removal is `null`
-    /// — which is what makes this one call instead of a read-modify-write.
+    /// Removals win over assignments and are encoded as JSON null.
     #[test]
     fn labels_become_a_merge_patch_in_which_a_removal_is_null() {
         let patch = labels_patch(&["zone=a".into(), "disk=nvme".into()], &[]).unwrap();
@@ -539,15 +462,13 @@ mod tests {
         let patch = labels_patch(&["zone=c".into()], &["zone".into()]).unwrap();
         assert!(patch["spec"]["labels"]["zone"].is_null());
 
-        // A removal on its own says nothing about the keys it does not name,
-        // which is the whole reason this is a patch.
+        // Unmentioned labels must remain unchanged.
         let patch = labels_patch(&[], &["disk".into()]).unwrap();
         assert!(patch["spec"]["labels"]["disk"].is_null());
         assert_eq!(patch["spec"]["labels"].as_object().unwrap().len(), 1);
     }
 
-    /// The one line an operator sees when the server says no, out of the
-    /// `Status` object the server now sends.
+    /// Read human-readable messages and machine-readable reasons from API errors.
     #[test]
     fn a_refusal_is_read_out_of_the_status_object() {
         let status = |code: u16, reason: &str, message: &str| {
@@ -603,8 +524,7 @@ mod tests {
         assert!(line.ends_with("/apis/meister.io/v1/vms/web-1"), "{line}");
     }
 
-    /// A pair that is not one is refused with the shape it should have had,
-    /// rather than silently becoming a label named after the whole argument.
+    /// Reject malformed labels instead of inventing a key.
     #[test]
     fn a_pair_without_an_equals_sign_is_refused_and_says_what_was_wanted() {
         let e = labels_patch(&["zone".into()], &[]).unwrap_err().to_string();

@@ -29,9 +29,7 @@ pub(super) struct UserStatus {
     certificates: Vec<IssuedCertificate>,
 }
 
-/// Only what the table shows. The fingerprint and the serial are on the
-/// object and come out of `-o json`; a column 71 characters wide, repeated
-/// per certificate, is not a table.
+/// Keep certificate expiry for the table; raw output retains other certificate fields.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct IssuedCertificate {
@@ -39,8 +37,7 @@ pub(super) struct IssuedCertificate {
 }
 
 pub(super) fn user_row(u: User, now: DateTime<Utc>) -> Vec<String> {
-    // Live ones only: an expired fingerprint is history, not a credential
-    // somebody holds.
+    // Count only unexpired certificates.
     let live: Vec<&IssuedCertificate> = u
         .status
         .certificates
@@ -112,7 +109,7 @@ pub async fn user(ctx: &Ctx<'_>, cmd: &UserCmd) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// An expired certificate is history, not a credential somebody holds.
+    /// Expired certificates must not count as current credentials.
     #[test]
     fn only_live_certificates_are_counted() {
         let now = Utc::now();

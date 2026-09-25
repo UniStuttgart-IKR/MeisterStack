@@ -27,8 +27,7 @@ pub(super) struct TenantSpec {
     quota: TenantQuota,
 }
 
-/// Every field absent = unlimited, which is what a tenant from before quotas
-/// existed says and therefore what it goes on meaning.
+/// An absent quota dimension is unlimited.
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TenantQuota {
@@ -40,8 +39,7 @@ pub(super) struct TenantQuota {
     max_mem_mib: Option<u64>,
 }
 
-/// What the server computed this tenant is holding. Never stored anywhere —
-/// the read that hands the object out is what fills it in.
+/// Usage computed by the server when reading the tenant.
 #[derive(Deserialize, Default)]
 pub(super) struct TenantStatus {
     #[serde(default)]
@@ -59,12 +57,7 @@ pub(super) struct TenantUsage {
     mem_mib: u64,
 }
 
-/// `used/limit`, or just the number when there is no limit.
-///
-/// One cell rather than two columns per dimension: what an operator asks of
-/// `tenant ls` is "how close is this tenant to its ceiling", and the answer is
-/// a fraction. A tenant with no quota shows the count alone, because `4/-`
-/// reads like a limit somebody forgot to set rather than one nobody wanted.
+/// Render used/limit, or usage alone when unlimited.
 pub(super) fn used_of(used: u64, limit: Option<u64>) -> String {
     match limit {
         Some(limit) => format!("{used}/{limit}"),
@@ -72,11 +65,7 @@ pub(super) fn used_of(used: u64, limit: Option<u64>) -> String {
     }
 }
 
-/// The quota column: what each tenant was granted here, `tenant=n` per entry.
-///
-/// One line per object and no raw spaces in a value, which is the house rule
-/// — the map is what makes a public pool auditable at a glance, and a column
-/// that wrapped would make `floatingpool ls | grep` useless.
+/// Format per-tenant limits in one comma-separated cell.
 pub(super) fn quota_column(quota: &std::collections::BTreeMap<String, u32>) -> String {
     if quota.is_empty() {
         return "-".to_string();
@@ -106,12 +95,7 @@ pub(super) fn tenant_row(t: Tenant) -> Vec<String> {
     ]
 }
 
-// --- the sugar: a create, and the verbs that set one field ------------------
-//
-// Every "set" verb below is ONE merge patch. They used to be a GET, an edit
-// and a PUT — a read-modify-write in a client, which is a race the operator
-// was shown as a 409 and could do nothing about. What the server now
-// compares is the version it read itself, half a millisecond earlier.
+// Convenience commands use merge patches for individual spec fields.
 
 pub async fn tenant(ctx: &Ctx<'_>, cmd: &TenantCmd) -> Result<()> {
     match cmd {
@@ -140,10 +124,7 @@ pub async fn tenant(ctx: &Ctx<'_>, cmd: &TenantCmd) -> Result<()> {
             if !named && !*unlimited {
                 bail!("name at least one of --max-vms, --max-vcpus, --max-mem-mib, or --unlimited");
             }
-            // `--unlimited` is `null` on each key, which is what a merge patch
-            // says removal with — and the whole reason a quota can now be
-            // taken off without reading the object first. A named limit is
-            // set and an unnamed one is not mentioned, so it stays.
+            // Null removes a quota key; unspecified limits otherwise remain unchanged.
             let value = |v: Option<serde_json::Value>| {
                 if *unlimited {
                     serde_json::Value::Null
@@ -158,8 +139,7 @@ pub async fn tenant(ctx: &Ctx<'_>, cmd: &TenantCmd) -> Result<()> {
                 ("maxMemMib", max_mem_mib.map(|v| json!(v))),
             ] {
                 let v = value(v);
-                // An unnamed limit under --unlimited is still nulled: that is
-                // what "take the whole quota off" means.
+                // --unlimited removes every limit.
                 if *unlimited || !v.is_null() {
                     quota.insert(key.to_string(), v);
                 }

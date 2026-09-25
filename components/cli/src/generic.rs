@@ -2,18 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What the CLI can do without knowing anything about a resource.
-//!
-//! `ls`, `get`, `rm` and `apply` have no code per resource and that is the
-//! whole point of this file. The endpoint says what it serves
-//! (`GET /apis/meister.io/v1`), the document says the path segment and the
-//! kind, and the kind picks a table. Adding a resource to the control plane
-//! adds a row to that document and a `ls` that works.
-//!
-//! What is left over is the sugar — `vm start`, `node cordon`, the creates —
-//! and those are in the modules beside this one. The split is deliberate: a
-//! verb that is one PATCH with three lines of body belongs where its nouns
-//! are, and everything that is the same for every noun belongs here.
+//! Resource discovery and generic list, get, delete and apply commands.
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -31,8 +20,7 @@ pub const DISCOVERY: &str = "/apis/meister.io/v1";
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Discovery {
-    /// `cloud` or `cluster`. The one word that used to be a key in every
-    /// profile, now a fact the server states about itself.
+    /// Server tier: `cloud` or `cluster`.
     #[serde(default)]
     pub tier: String,
     /// The authenticator links this endpoint has, comma-joined, or `none`.
@@ -70,20 +58,8 @@ impl Discovery {
         }
     }
 
-    /// The row for this resource, and a sentence when the endpoint serves it
-    /// but not under `verb`.
-    ///
-    /// The half `resource` alone could not answer once a tier grew a resource
-    /// it serves PARTLY. `vmmigrations` at a cloud is the first: create is
-    /// forwarded down the cluster's session and nothing is stored here, so
-    /// there is a row and there is no listing (D-P9). Without this, `vmmigration
-    /// ls` there traded a sentence that says where the records live for a bare
-    /// 405 from axum.
-    ///
-    /// An endpoint that names NO verbs is one that did not say, and nothing is
-    /// refused on a silence: `verbs` is `#[serde(default)]`, and a client that
-    /// treated an old server's empty list as "serves nothing" would refuse
-    /// every command it used to run.
+    /// Require the advertised verb. An empty verbs list preserves compatibility
+    /// with servers that did not publish per-resource capabilities.
     pub fn offering(&self, name: &str, verb: &str) -> Result<&ApiResource> {
         let found = self.resource(name)?;
         if found.verbs.is_empty() || found.verbs.iter().any(|v| v == verb) {
@@ -132,14 +108,7 @@ impl Discovery {
     }
 }
 
-/// Everything a command needs after the profile is resolved: the client, the
-/// endpoint's own account of itself, and the two strings a confirmation
-/// prompt names.
-///
-/// One value rather than five parameters on every verb, because they are one
-/// fact — "this endpoint, and who we are to it" — and a verb that took four
-/// of the five would be a verb that had quietly stopped asking the discovery
-/// anything.
+/// Resolved client, discovery and output/confirmation context.
 pub struct Ctx<'a> {
     pub client: Client,
     pub global: &'a GlobalArgs,
@@ -181,12 +150,7 @@ impl Ctx<'_> {
     }
 }
 
-/// Where a resource this endpoint does not serve does live.
-///
-/// A tiny table that exists for ONE error message and for nothing else. The
-/// alternative is a refusal that says only "no such resource", and an
-/// operator who has pointed a cloud command at a cluster is exactly the
-/// person who needs the second half of the sentence.
+/// Resource homes used to explain unsupported endpoint operations.
 fn lives_at(resource: &str) -> Option<&'static str> {
     Some(match resource {
         "tenants"
@@ -197,11 +161,7 @@ fn lives_at(resource: &str) -> Option<&'static str> {
         | "floatingips"
         | "routedsubnets"
         | "clusters" => "cloud",
-        // Both true and, at the cloud, the whole of what can be said today: a
-        // live migration is a record of a guest moving between two MACHINES,
-        // and machines are a cluster's nouns. The cloud has no command for
-        // one to travel down its session, so `vm migrate` there says which
-        // cluster to ask rather than pretending — see `vm::migrate`.
+        // Migration records live at the cluster; the cloud forwards creation requests.
         "nodes" | "vmmigrations" => "cluster",
         _ => return None,
     })
@@ -209,13 +169,7 @@ fn lives_at(resource: &str) -> Option<&'static str> {
 
 // --- the four verbs that need no code per resource --------------------------
 
-/// `<resource> ls`.
-///
-/// Both filters are the SERVER's: `-l` becomes `?labelSelector=` and `-t`
-/// becomes `?tenant=`. Filtering here would have been a lie in two
-/// directions — a listing narrowed on `spec.tenant` in the client shows
-/// nothing at all for a resource that has no tenant (a cluster, a node, a
-/// pool), and it would still have carried every row over the wire first.
+/// List resources with server-side tenant and label filters.
 pub async fn list(ctx: &Ctx<'_>, resource: &str, selector: Option<&str>) -> Result<()> {
     let kind = ctx.disc.offering(resource, "list")?.kind.clone();
     let path = format!(
@@ -234,12 +188,7 @@ pub async fn list(ctx: &Ctx<'_>, resource: &str, selector: Option<&str>) -> Resu
     })
 }
 
-/// `<resource> get NAME`.
-///
-/// Under `-o json` the object as the server wrote it; under `-o table` every
-/// leaf of it as `field  value`, which is what the old `inspect` was reached
-/// for and could not do — it printed json either way, so "which node is this
-/// on" meant reading a screen of it.
+/// Print the JSON object or flatten its scalar fields into a table.
 pub async fn get(ctx: &Ctx<'_>, resource: &str, name: &str) -> Result<()> {
     ctx.disc.offering(resource, "get")?;
     let body = ctx.client.get(&ctx.path(resource, Some(name))?).await?;
@@ -255,9 +204,7 @@ pub async fn remove(ctx: &Ctx<'_>, resource: &str, name: &str) -> Result<()> {
     let kind = ctx.disc.offering(resource, "delete")?.kind.to_lowercase();
     ctx.confirm("delete", &kind, name)?;
     let body = ctx.client.delete(&ctx.path(resource, Some(name))?).await?;
-    // Not `emit_line`: a delete that only QUEUED the object answers with a
-    // sentence saying so, and printing the name alone made "marked for
-    // release, data intact" look exactly like "gone". See `emit_removal`.
+    // Preserve the distinction between queued deletion and completed removal.
     output::emit_removal(ctx.global, &body, name)
 }
 
@@ -276,16 +223,8 @@ struct EnvelopeMeta {
     name: String,
 }
 
-/// `apply -f FILE...`.
-///
-/// POST, and on `AlreadyExists` a GET and a PUT with the resourceVersion that
-/// GET returned. A file does not carry one — it is a document somebody wrote,
-/// not an object somebody read — so the compare-and-swap is against what is
-/// there now, which is what "apply this file" means.
-///
-/// Documents are applied in the order they are written and the first failure
-/// stops the run, naming the document that failed. Half a file applied and a
-/// clear sentence beats a whole file applied around a hole.
+/// Apply JSON documents in order, stopping at the first error.
+/// Create with POST; on AlreadyExists, GET the resource version and replace with PUT.
 pub async fn apply(ctx: &Ctx<'_>, files: &[std::path::PathBuf]) -> Result<()> {
     let mut applied: Vec<String> = Vec::new();
     for file in files {
@@ -343,8 +282,7 @@ async fn apply_one(ctx: &Ctx<'_>, mut document: serde_json::Value) -> Result<Str
             let current = ctx.client.get(&object).await?;
             let current: serde_json::Value =
                 serde_json::from_slice(&current).context("parsing the object as it stands")?;
-            // The one thing the file cannot know, and the one thing a PUT
-            // needs: which version this replaces.
+            // Use the version read from the server for the replacement CAS.
             let version = current
                 .get("metadata")
                 .and_then(|m| m.get("resourceVersion"))
@@ -386,14 +324,7 @@ pub fn api_resources(ctx: &Ctx<'_>, raw: &Bytes) -> Result<()> {
     })
 }
 
-/// `events`, narrowed at the SERVER.
-///
-/// `--for vm/web-1` is one object; a bare `--for web-1` is that name whatever
-/// kind it is, which is what somebody who typed a VM name meant. `--since` is
-/// a duration in the shape everybody already types (`1h`, `30m`, `2d`) or an
-/// instant — and it becomes an instant here, before it is sent, because "the
-/// last hour" is a question about THIS clock and a server that answered it
-/// would answer with its own.
+/// Query server-side event filters. Relative durations are resolved using the CLI clock.
 pub async fn events(ctx: &Ctx<'_>, args: &crate::EventsArgs) -> Result<()> {
     let mut narrow: Vec<String> = Vec::new();
     if let Some(about) = args
@@ -436,11 +367,7 @@ pub async fn events(ctx: &Ctx<'_>, args: &crate::EventsArgs) -> Result<()> {
     })
 }
 
-/// `1h` and `2026-09-09T06:00:00Z` both become an RFC 3339 instant.
-///
-/// Suffixes only, and only four of them: a duration grammar with more in it
-/// is a grammar somebody has to look up, and these are the four a person
-/// types without thinking.
+/// Convert a duration in s/m/h/d or an RFC 3339 timestamp to an instant.
 pub fn instant(since: &str) -> Result<String> {
     let (count, unit) = since.split_at(since.len().saturating_sub(1));
     let seconds = match (count.parse::<i64>(), unit) {
@@ -449,9 +376,7 @@ pub fn instant(since: &str) -> Result<String> {
         (Ok(n), "h") => n * 3600,
         (Ok(n), "d") => n * 86_400,
         _ => {
-            // Not a duration, so it has to be an instant already — checked
-            // here rather than sent and refused, because a typo should not
-            // cost a round trip to find out.
+            // Validate timestamps locally before sending the query.
             return match chrono::DateTime::parse_from_rfc3339(since) {
                 Ok(_) => Ok(since.to_string()),
                 Err(e) => bail!(
@@ -465,13 +390,7 @@ pub fn instant(since: &str) -> Result<String> {
     Ok(floor.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
-/// `whoami` — the one question this CLI used to answer out of its own config.
-///
-/// The name in `meister login`'s output is what the profile says; this is
-/// what the SERVER says, which is the only one worth printing when somebody
-/// is trying to work out why a request was refused. A cluster endpoint keeps
-/// no directory and answers no role and no tenant, and the table shows the
-/// two rows as `-` rather than inventing them.
+/// Display the server-reported identity, role, tenant and groups.
 pub async fn whoami(ctx: &Ctx<'_>) -> Result<()> {
     let body = ctx
         .client
@@ -507,9 +426,7 @@ fn dash(value: Option<String>) -> String {
 #[derive(Debug, Deserialize)]
 struct Whoami {
     name: String,
-    /// Absent at a tier with no directory, which is a different statement
-    /// from "no tenant". The table prints a dash for both and the json says
-    /// which.
+    /// Absent when the endpoint has no tenant directory.
     #[serde(default)]
     tenant: Option<String>,
     #[serde(default)]
@@ -521,10 +438,7 @@ struct Whoami {
 
 // --- the two things that read a server's answer without knowing the kind ----
 
-/// The query string a listing carries.
-///
-/// Empty when the caller asked for neither, which is what every listing sent
-/// before this and what an endpoint that ignores both still answers.
+/// Encode optional tenant and label-selector filters.
 pub fn query(global: &GlobalArgs, selector: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(selector) = selector.map(str::trim).filter(|s| !s.is_empty()) {
@@ -539,12 +453,7 @@ pub fn query(global: &GlobalArgs, selector: Option<&str>) -> String {
     format!("?{}", parts.join("&"))
 }
 
-/// Percent-encode everything that is not unreserved.
-///
-/// A selector is `key=value` pairs and `=` and `,` are its own punctuation,
-/// so both are encoded rather than left to mean something to a url parser on
-/// the way. Written out because it is nine lines and the alternative is a
-/// crate for nine lines.
+/// Percent-encode all bytes outside the URL unreserved set.
 fn escaped(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for byte in raw.bytes() {
@@ -558,12 +467,8 @@ fn escaped(raw: &str) -> String {
     out
 }
 
-/// Every leaf of an object as `dotted.path` and a value.
-///
-/// Server order, not sorted: the object is written apiVersion, kind, metadata,
-/// spec, status, and reading it in that order is reading it the way it was
-/// meant. Empty objects and arrays are left out — a key with nothing under it
-/// is a line that says nothing.
+/// Flatten scalar leaves to dotted paths; omit nulls and empty containers.
+/// Traversal follows the JSON map order.
 pub fn flatten(value: &serde_json::Value) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     walk("", value, &mut out);
@@ -645,8 +550,7 @@ mod tests {
         // And the other direction, for the nouns that live downwards.
         let e = cloudish().path("nodes", None).unwrap_err().to_string();
         assert!(e.contains("nodes live at the cluster"), "{e}");
-        // D-P9: `vmmigration ls` at a cloud used to end in the short sentence,
-        // which named what the endpoint has not and nothing else.
+        // The unsupported resource error should identify the owning tier.
         let e = cloudish()
             .path("vmmigrations", None)
             .unwrap_err()
@@ -668,9 +572,7 @@ mod tests {
         assert!(e.contains("serves no kind \"Widget\""), "{e}");
     }
 
-    /// Both filters are the server's, and both travel as a query. Nothing
-    /// is narrowed in the client any more: a client-side filter on
-    /// `spec.tenant` showed NOTHING for a resource that has no tenant.
+    /// Send tenant and selector filters to the server.
     #[test]
     fn what_the_caller_asked_to_see_travels_as_a_query() {
         let mut global = crate::GlobalArgs::for_tests();
@@ -764,14 +666,7 @@ mod tests {
         assert!(err.contains("1h, 30m, 2d"), "{err}");
     }
 
-    /// A resource an endpoint serves PARTLY: the verb it has works, and the
-    /// ones it has not say where the objects are.
-    ///
-    /// D-P9's client half. A cloud now serves `vmmigrations` with `create` and
-    /// nothing else — the ask travels down the cluster's own session and no
-    /// object is stored here — so `vm migrate` there works, and `vmmigration
-    /// ls` there must not turn a sentence that names the cluster into a bare
-    /// 405 from the router.
+    /// Respect advertised verbs, retaining compatibility with missing verb lists.
     #[test]
     fn an_endpoint_that_serves_one_verb_of_a_resource_says_so_for_the_others() {
         let cloud = discovery(
@@ -799,9 +694,7 @@ mod tests {
         assert!(e.contains("cannot list"), "{e}");
         assert!(e.contains("live at the cluster"), "{e}");
 
-        // An endpoint that names no verbs at all did not say, and nothing is
-        // refused on a silence: a client that read an old server's empty list
-        // as "serves nothing" would refuse every command it used to run.
+        // An absent verbs list preserves compatibility with older discovery documents.
         let old = discovery("cloud", r#"[{"name":"vms","kind":"Vm"}]"#);
         assert!(old.offering("vms", "delete").is_ok());
 

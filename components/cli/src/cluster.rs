@@ -2,20 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The two machine nouns: a node, and the cluster a node is in.
-//!
-//! They are one act against two inventories. Draining stops NEW placements
-//! and nothing else — the VMs already there go on running, go on being
-//! reconciled, and are neither evicted nor migrated — and labelling writes
-//! what a VM's selector selects against. That is true of a node and of a
-//! cluster, one word apart, so the verbs are written once.
-//!
-//! A node is the one noun whose PATH depends on which endpoint answered, and
-//! that is the tiering showing through rather than a special case: a cluster
-//! has its own nodes and serves them at `/nodes`, and a cloud has none of its
-//! own and serves somebody else's at `/clusters/{c}/nodes`. The discovery
-//! document decides which, and `--cluster` is required at one and refused at
-//! the other.
+//! Node and cluster inventory commands.
+//! Discovery selects direct node routes or cloud routes under a named cluster.
+//! Cordon blocks new placement; drain also requests supported evacuation.
 
 use anyhow::{Result, bail};
 use bytes::Bytes;
@@ -27,14 +16,8 @@ use crate::generic::{Ctx, DISCOVERY};
 use crate::output::{self, View, age, joined, mem, or_dash, readiness};
 use crate::{ClusterCmd, NodeCmd};
 
-/// A node, as either endpoint serves it.
-///
-/// One struct for two documents on purpose: the cluster serves the stored
-/// `Node` object and the cloud serves what the cluster last reported, and the
-/// cloud's route dresses its report in the same envelope so that one table
-/// renders both and `-o json` reads the same at either. What the cloud's copy
-/// does not have is a uid, a resourceVersion and a heartbeat — it is
-/// evidence, and evidence has no version.
+/// Decode either a stored cluster Node or the cloud's reported node inventory.
+/// Fields absent from reports use defaults.
 #[derive(Clone, Deserialize)]
 struct Node {
     metadata: Meta,
@@ -87,10 +70,7 @@ struct NodeStatus {
     last_heartbeat: Option<DateTime<Utc>>,
     #[serde(default)]
     capacity: Capacity,
-    /// Which replica of this cluster holds this node's session, when the
-    /// cluster is running more than one. Empty everywhere else, and never
-    /// shown by the cloud: which replica holds a node is the cluster's own
-    /// business and nobody above it decides anything with it.
+    /// The cluster replica holding this session; omitted from cloud reports.
     #[serde(default)]
     session_endpoint: Option<String>,
     /// What the drain of this node has done so far. `None` on a node nobody
@@ -127,10 +107,7 @@ struct Draining {
     staying: u32,
     #[serde(default)]
     complete: bool,
-    /// What the drain has actually got off the machine so far. `leaving` is
-    /// a fact about now and goes to zero when the work is done, so without
-    /// this a finished drain read `0 leaving, 2 staying (done)` and looked
-    /// like one that had done nothing.
+    /// Cumulative moves, retained after the current leaving count reaches zero.
     #[serde(default)]
     moved_total: u32,
 }
@@ -142,25 +119,12 @@ struct Capacity {
     vcpus: u32,
     #[serde(default)]
     mem_mib: u64,
-    // The alias is the mixed-version case, not tidiness: a controller that
-    // predates the rename still sends `gpuProfiles`, and without this the
-    // column would come out empty against every node in a fleet that has not
-    // been rolled out yet.
+    // Accept the old catalogue field during rolling upgrades.
     #[serde(default, alias = "gpuProfiles")]
     capabilities: Vec<String>,
 }
 
-/// Which columns this listing has: the ones the endpoint that answered can
-/// actually fill in.
-///
-/// Two of them are conditional, and for the same reason rather than as a
-/// convenience. A cloud's copy of a node carries no heartbeat — it is what
-/// the cluster last REPORTED, and the cluster is what watches the clock — so
-/// a heartbeat column there would read `never` under every node and mean
-/// "this endpoint does not know", which is not what `never` says. And a
-/// session endpoint exists only where a cluster runs more than one replica.
-/// A column nobody can fill is worse than a missing one: it invites an answer
-/// that is not there.
+/// Show heartbeat only at cluster endpoints and session ownership when available.
 #[derive(Clone, Copy)]
 struct NodeColumns {
     heartbeat: bool,
@@ -293,12 +257,7 @@ fn label_column(labels: &std::collections::BTreeMap<String, String>) -> String {
         .join(",")
 }
 
-/// Where this endpoint keeps nodes.
-///
-/// The discovery document decides, not a flag default and not a profile: a
-/// cluster serves its own at `/nodes`, and a cloud serves a cluster's under
-/// the cluster that has them. Getting `--cluster` wrong is therefore a
-/// sentence about this endpoint rather than a 404 from it.
+/// Select the node path from discovery and validate the --cluster argument.
 pub fn node_path(ctx: &Ctx<'_>, cluster: Option<&str>, name: Option<&str>) -> Result<String> {
     if ctx.disc.is_cloud() {
         let Some(cluster) = cluster else {
@@ -389,13 +348,7 @@ async fn cordon(ctx: &Ctx<'_>, cluster: Option<&str>, name: &str, schedulable: b
     )
 }
 
-/// Say what this machine takes. An empty list takes everything back.
-///
-/// Sent whole rather than as an add or a remove, and that is the shape of the
-/// statement: what a machine accepts is one decision an operator reads off
-/// one line, not a set somebody accumulates a class at a time. `node accepts
-/// gw-1` with nothing after it is therefore the way back, and it is the same
-/// request with an empty list rather than a verb of its own.
+/// Replace accepted VM classes; an empty list accepts every class.
 async fn accepts(
     ctx: &Ctx<'_>,
     cluster: Option<&str>,

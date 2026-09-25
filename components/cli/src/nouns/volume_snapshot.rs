@@ -71,9 +71,7 @@ pub async fn volume_snapshot(ctx: &Ctx<'_>, cmd: &VolumeSnapshotCmd) -> Result<(
             "description": description.clone().unwrap_or_default(),
         },
     });
-    // The tenant follows the VOLUME at the server, so this is only what a
-    // member's `-t` would have said; sending it as null would be a different
-    // request from not sending it at all.
+    // The server derives the tenant from the volume; omit an unspecified client tenant.
     if let Some(tenant) = &ctx.global.tenant {
         object["spec"]["tenant"] = json!(tenant);
     }

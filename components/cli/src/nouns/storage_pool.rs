@@ -6,7 +6,7 @@
 
 use super::*;
 
-// --- storage: two nouns this CLI never had, and the tables for them ---------
+// Storage pool display and mutation.
 
 #[derive(Deserialize)]
 pub(super) struct StoragePool {
@@ -48,27 +48,17 @@ pub(super) fn storage_pool_row(p: StoragePool) -> Vec<String> {
     vec![
         p.metadata.name,
         p.spec.driver,
-        // The API has always been honest here and the table was not: a pool
-        // whose driver no node offers is `Pending`, and without this column
-        // it stood in the listing looking exactly like a `Ready` one. `-`
-        // for a pool nobody has decided about yet, which is the state
-        // between the create and the first pass.
+        // Show readiness separately from backend configuration.
         or_dash(phase),
-        // Absent is "the nodes have not said", which is a different fact from
-        // any of the three values and must not be printed as one of them. A
-        // pool that is Failed says so here instead, because a locality nobody
-        // agrees on is worse than no locality at all.
+        // Missing locality is unknown; Failed pools display a conflict.
         match p.status.phase.as_deref() {
             Some("Failed") => "conflict".to_string(),
             _ => or_dash(p.status.locality),
         },
-        // At the cloud the pool points at a cluster; at the cluster tier
-        // there is none, and a dash is the honest reading of that.
+        // Only cloud pools name a cluster.
         or_dash(Some(p.spec.cluster).filter(|c| !c.is_empty())),
         if p.spec.default { "yes" } else { "-" }.to_string(),
-        // Empty means every node can reach it, which is a different fact from
-        // "no node can" and has to read differently. At the cloud the list an
-        // admin wrote is empty and the mirrored one is what to show.
+        // Prefer configured nodes, then reported nodes; otherwise display all.
         match (p.spec.nodes.is_empty(), p.status.nodes.is_empty()) {
             (false, _) => joined(&p.spec.nodes),
             (true, false) => joined(&p.status.nodes),
@@ -79,17 +69,8 @@ pub(super) fn storage_pool_row(p: StoragePool) -> Vec<String> {
     ]
 }
 
-/// Every volume backend this endpoint's fleet claims, sorted and once each.
-///
-/// Out of the catalogue and nowhere else: a node publishes `volume/<driver>`
-/// beside `network/vxlan` and `nvrm/4q`, a cluster publishes the union of its
-/// ready nodes', and both spellings are read here so that the answer is the
-/// same word at either tier.
-///
-/// Empty on anything that goes wrong -- a caller who may not list nodes, an
-/// endpoint that answers nothing, a fleet nobody has dialled into. This is a
-/// note beside a create that has already happened, and a note that could fail
-/// a create would be worse than no note.
+/// Read unique volume backend names from node or cluster capabilities.
+/// Lookup failures suppress the optional post-create advisory.
 async fn volume_drivers(ctx: &Ctx<'_>) -> Vec<String> {
     let (resource, path) = if ctx.disc.is_cloud() {
         ("clusters", ["status", "capacity"])
@@ -116,8 +97,7 @@ async fn volume_drivers(ctx: &Ctx<'_>) -> Vec<String> {
             for step in path {
                 at = at.get(step).unwrap_or(&serde_json::Value::Null);
             }
-            // The cloud's list is one level deeper: a cluster publishes its
-            // union under `status.capacity.capabilities`.
+            // Cloud capabilities are nested under status.capacity.
             let entries = at
                 .get("capabilities")
                 .or(Some(at))
@@ -143,12 +123,7 @@ fn volume_backend(capability: &str) -> Option<&str> {
         .filter(|d| !d.is_empty() && !d.contains('/'))
 }
 
-/// The sentence for a driver the fleet does not claim, or nothing.
-///
-/// Nothing when the fleet claims it, and nothing when the fleet claimed
-/// NOTHING: an empty catalogue means the question could not be asked, and a
-/// note reading "this fleet offers none" would turn a failed lookup into a
-/// statement about the machines.
+/// Warn only when a nonempty catalogue lacks the requested backend.
 fn unknown_driver(driver: &str, offered: &[String]) -> Option<String> {
     if offered.is_empty() || offered.iter().any(|d| d == driver) {
         return None;
@@ -160,14 +135,7 @@ fn unknown_driver(driver: &str, offered: &[String]) -> Option<String> {
     ))
 }
 
-/// `tenant=n` per entry, comma-joined — the same shape the floating pool's
-/// quota column has, and for the same reason: one line per object, and no raw
-/// space in a value.
-///
-/// `*=100Gi` is the ceiling for every tenant nobody named, and it is a row
-/// like any other because that is what it is in the object: since D-P11 the
-/// server states it on every read, so this column shows the number a create
-/// is actually refused against instead of a dash.
+/// Format per-tenant GiB limits; * is the default limit.
 pub(super) fn gib_quota(quota: &std::collections::BTreeMap<String, u64>) -> String {
     if quota.is_empty() {
         return "-".to_string();
@@ -201,31 +169,16 @@ pub async fn storage_pool(ctx: &Ctx<'_>, cmd: &StoragePoolCmd) -> Result<()> {
                     "description": description.clone().unwrap_or_default(),
                 },
             });
-            // Only when given: the cluster tier has no such field and would
-            // refuse an empty one as a written statement rather than as
-            // silence.
+            // Omit the cloud-only cluster field unless supplied.
             if let Some(cluster) = cluster {
                 object["spec"]["cluster"] = json!(cluster);
             }
-            // Handed to the driver untouched. This control plane routes on
-            // `driver` and reads nothing else in here, so what it has to be
-            // is valid json and the backend's business after that.
+            // Parse backend parameters as JSON; the storage driver interprets them.
             if let Some(params) = params {
                 object["spec"]["params"] = serde_json::from_str(params)
                     .with_context(|| format!("--params is not valid json: {params}"))?;
             }
-            // D-P8: what backends exist is a fact about the FLEET, and the
-            // help text used to answer it out of a list that was already
-            // wrong -- `nvmeof-import` has worked since the storage
-            // milestone and was never in it. So the answer comes out of the
-            // catalogue the nodes publish, at create time, where it is right
-            // by construction.
-            //
-            // A note and not a refusal: a pool whose driver nobody offers is
-            // accepted on purpose (it stands `Pending`, which is what lets an
-            // operator declare a pool before the machine that serves it comes
-            // up), and the phase column says so afterwards. What was missing
-            // was anybody saying it at the moment it can still be a typo.
+            // Look up advertised backends for an advisory; pools may precede their serving nodes.
             let offered = volume_drivers(ctx).await;
             let body = ctx.post("storagepools", object).await?;
             match unknown_driver(driver, &offered) {
@@ -259,14 +212,7 @@ mod tests {
         serde_json::from_str(json).expect("a pool")
     }
 
-    /// D14: the one column that says a pool is unusable.
-    ///
-    /// `storagepool create mc-thin --driver lvm-thin` on a fleet where no
-    /// node offers lvm-thin is accepted without complaint and stands
-    /// `Pending` in the API for ever. The table showed driver, locality,
-    /// cluster, default, nodes and quota — everything except the field that
-    /// says the pool will never serve a disk — so it read exactly like the
-    /// healthy one beside it.
+    /// Pending and failed pools must be distinguishable from ready pools.
     #[test]
     fn a_pool_that_will_never_serve_a_disk_says_so_in_the_table() {
         let pending = storage_pool_row(pool(
@@ -283,16 +229,13 @@ mod tests {
         assert_eq!(ready[2], "Ready");
         assert_eq!(ready[3], "node-local", "the locality column is unchanged");
 
-        // A pool nobody has decided about yet — the window between the create
-        // and the first pass — is a dash and not a guess.
+        // Missing phase remains unknown.
         let fresh = storage_pool_row(pool(
             r#"{"metadata":{"name":"mc-new"},"spec":{"driver":"nfs"},"status":{}}"#,
         ));
         assert_eq!(fresh[2], "-");
 
-        // And the `Failed` reading of the locality column stays where it was:
-        // a locality the nodes disagree about is worse than none, and the
-        // phase column beside it now says the same thing in its own word.
+        // A failed pool keeps the locality conflict indicator.
         let conflicted = storage_pool_row(pool(
             r#"{"metadata":{"name":"mc-nfs"},"spec":{"driver":"nfs"},
                 "status":{"phase":"Failed","locality":"shared"}}"#,
@@ -301,8 +244,7 @@ mod tests {
         assert_eq!(conflicted[3], "conflict");
     }
 
-    /// The header and the row have to be the same width, in the same order.
-    /// An off-by-one here is a table whose `quota` column holds a description.
+    /// Keep the row width aligned with its headers.
     #[test]
     fn a_pool_row_is_the_same_width_as_its_header() {
         let row = storage_pool_row(pool(
@@ -315,13 +257,10 @@ mod tests {
         );
     }
 
-    /// D-P8: the help for `--driver` named `lvm-thin | filesystem | nfs`, a
-    /// list that stopped being true when `nvmeof-import` started working. A
-    /// list in a help string is a list nobody updates; the catalogue is not.
+    /// Derive backend names from capabilities rather than a fixed help list.
     #[test]
     fn what_a_fleet_offers_comes_out_of_its_catalogue_and_not_out_of_a_list() {
-        // A node's catalogue is one flat list with devices and networks in
-        // it, and only the volume half is a backend.
+        // Ignore non-volume capabilities.
         assert_eq!(
             volume_backend("volume/nvmeof-import"),
             Some("nvmeof-import")
@@ -329,9 +268,7 @@ mod tests {
         assert_eq!(volume_backend("nvrm/4q"), None);
         assert_eq!(volume_backend("network/vxlan"), None);
         assert_eq!(volume_backend("volume/"), None);
-        // `volume/lvm-thin/thin` is not a backend name; a driver resolves no
-        // profiles here and a second slash means the entry is about
-        // something else.
+        // Reject extra path segments.
         assert_eq!(volume_backend("volume/a/b"), None);
 
         let offered = ["filesystem".to_string(), "nvmeof-import".to_string()];
@@ -350,14 +287,11 @@ mod tests {
             "a note and not a refusal, because the create is legitimate: {said}"
         );
 
-        // A catalogue nobody could read says nothing at all, rather than
-        // turning a failed lookup into a statement about the machines.
+        // A failed or empty lookup must not claim the fleet offers no storage.
         assert_eq!(unknown_driver("lvm-thin", &[]), None);
     }
 
-    /// D-P11: a pool's ceiling was a constant in the server's source. The
-    /// table said `QUOTA -` and a refused create said "its quota there is
-    /// 100 GiB", and there was nowhere to look it up.
+    /// Display the default quota alongside tenant overrides.
     #[test]
     fn the_quota_column_shows_the_ceiling_a_create_is_refused_against() {
         let row = storage_pool_row(pool(
@@ -369,8 +303,7 @@ mod tests {
             "the row for everybody nobody named, first because it sorts first"
         );
 
-        // A member sees their own and the one for everybody, which is what
-        // the server redacts down to -- and never another tenant's.
+        // The server filters other tenants' quota entries.
         let row = storage_pool_row(pool(
             r#"{"metadata":{"name":"nvme"},"spec":{"driver":"nvmeof-import",
                 "quota":{"*":100}},"status":{}}"#,

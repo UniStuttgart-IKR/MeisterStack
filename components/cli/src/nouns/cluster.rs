@@ -60,10 +60,7 @@ pub(super) struct Capacity {
     vcpus: u32,
     #[serde(default)]
     mem_mib: u64,
-    // The alias is the mixed-version case, not tidiness: a controller that
-    // predates the rename still sends `gpuProfiles`, and without this the
-    // column would come out empty against every node in a fleet that has not
-    // been rolled out yet.
+    // Accept the old catalogue field during rolling upgrades.
     #[serde(default, alias = "gpuProfiles")]
     capabilities: Vec<String>,
 }

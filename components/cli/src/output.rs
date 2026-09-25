@@ -2,20 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Everything this CLI puts on a terminal, and the one question it asks back.
-//!
-//! Every verb answers the same two ways, and that is decided here rather than
-//! thirty times over: `-o json` prints the server's own object, whole and
-//! unedited, and `-o table` prints columns a person reads and `awk` can cut
-//! up. Three rules come with it, and they only hold because there is one
-//! place left to hold them in:
-//!
-//! * the answer goes to stdout and nothing else does — notes, prompts and
-//!   complaints are stderr, so a pipeline gets the value and a person still
-//!   gets told what happened;
-//! * an empty list is a note on stderr, never headers printed over nothing;
-//! * no cell but the one in the last column may carry a raw space, because a
-//!   space in a middle column shifts every `awk` field behind it.
+//! Table and JSON output plus destructive-operation confirmation.
+//! Results go to stdout; prompts and notes go to stderr. Empty tables print
+//! only a note. Cell helpers avoid spaces in intermediate columns.
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -35,28 +24,16 @@ pub struct List<T> {
 
 /// What a command has to say once the server has answered.
 pub enum View {
-    /// One token on stdout — the id, the name, the state now in force — and
-    /// optionally a caveat on stderr. stdout stays pipeable either way.
-    ///
-    /// The caveat is an owned `String` rather than a `&'static str` because
-    /// one of them names an object the server told us about: `volume rm` on a
-    /// disk somebody is holding says WHO holds it, and that is the whole
-    /// value of the sentence.
+    /// One stdout token with an optional stderr note.
     Line(String, Option<String>),
     Table(Table),
-    /// Lines of somebody else's text — a guest's console, and nothing else so
-    /// far. Its own variant rather than a `Line` with newlines in it because
-    /// the two have opposite rules: a token is one word this CLI chose and is
-    /// safe to put in a cell, and this is arbitrary bytes a guest emitted,
-    /// which no table can hold and which must reach stdout unchanged.
+    /// Unstructured text, printed without table formatting or an added newline.
     Text(String),
 }
 
 /// Columns, rows, and what to say when there are no rows.
 pub struct Table {
-    /// Owned rather than borrowed since a listing's columns stopped being
-    /// fixed: `node ls` grows a `drain` column only where something is being
-    /// drained, and a column nobody can fill is worse than a missing one.
+    /// Columns may be selected at runtime, for example the optional drain column.
     headers: Vec<&'static str>,
     rows: Vec<Vec<String>>,
     empty_note: &'static str,
@@ -73,8 +50,7 @@ impl View {
         Self::Line(token.into(), Some(note.to_string()))
     }
 
-    /// The same, where the sentence had to be built from what the server
-    /// said rather than written here.
+    /// A token with a dynamically constructed stderr note.
     pub fn note_owned(token: impl Into<String>, note: String) -> Self {
         Self::Line(token.into(), Some(note))
     }
@@ -114,9 +90,7 @@ impl View {
                 }
             }
             Self::Table(table) => table.print(),
-            // Printed as it stands. The server already ended it with a
-            // newline per stream, and adding another would put a blank line
-            // under every `vm logs`.
+            // Preserve existing line endings.
             Self::Text(body) => print!("{body}"),
         }
     }
@@ -169,11 +143,7 @@ impl Table {
     }
 }
 
-/// The one place a server's answer turns into output.
-///
-/// The table view is built lazily and only when it is asked for: a body the
-/// table side cannot parse still comes out under `-o json`, which is exactly
-/// where an operator looks when the table gave up.
+/// Select JSON or a lazily constructed table view.
 pub fn emit(
     global: &GlobalArgs,
     body: &Bytes,
@@ -197,31 +167,12 @@ pub fn emit_note(global: &GlobalArgs, body: &Bytes, token: &str, note: &'static 
     emit(global, body, |_| Ok(View::note(token, note)))
 }
 
-/// The same, for a note that was worked out rather than written down: what
-/// this fleet's nodes claim, which is not a sentence anybody could have typed
-/// into the source. `View::note_owned` has taken one since `volume rm`.
+/// Emit a token with a dynamically constructed note.
 pub fn emit_note_owned(global: &GlobalArgs, body: &Bytes, token: &str, note: String) -> Result<()> {
     emit(global, body, |_| Ok(View::note_owned(token, note.clone())))
 }
 
-/// A DELETE answered, with the server's own sentence when the object is not
-/// actually gone.
-///
-/// D4: `volume rm` on a disk a running VM holds printed the name and exited
-/// 0 — the same output a successful delete gives — while the object stayed
-/// `Releasing` with its data intact. The behaviour was right and the report
-/// was not, and an operator who cannot tell "deleted" from "queued behind
-/// somebody" will go looking for the disk that is still there.
-///
-/// The API has been answering this all along: a DELETE that did not finish
-/// comes back `202` with `reason: "Deleting"` and a message the handler
-/// wrote — "volume mc-vol-a is attached to vm mc-vm-a; its data stays until
-/// that vm lets go". The CLI threw the whole document away and printed the
-/// name. So the sentence is the server's, not one invented here: the tier
-/// that refused knows why, and a CLI guessing would eventually guess wrong.
-///
-/// stderr, like every other note, so `volume rm x --yes | ...` still pipes
-/// the token alone.
+/// Show the server's explanation when deletion is queued rather than complete.
 pub fn emit_removal(global: &GlobalArgs, body: &Bytes, token: &str) -> Result<()> {
     match removal_note(body) {
         Some(note) => emit(global, body, |_| Ok(View::note_owned(token, note))),
@@ -229,12 +180,7 @@ pub fn emit_removal(global: &GlobalArgs, body: &Bytes, token: &str) -> Result<()
     }
 }
 
-/// The sentence a DELETE that did not finish came back with, or `None`.
-///
-/// `None` for a delete that IS finished (`reason: "Deleted"`), and for a body
-/// of any other shape — an endpoint that answers something else says nothing,
-/// and nothing is what gets printed. Pure, so the reading can be argued
-/// without a server.
+/// Return the message from a Status response with reason Deleting.
 pub fn removal_note(body: &[u8]) -> Option<String> {
     let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
     if doc.get("reason")?.as_str()? != "Deleting" {
@@ -244,12 +190,7 @@ pub fn removal_note(body: &[u8]) -> Option<String> {
     (!said.is_empty()).then(|| said.to_string())
 }
 
-/// The items of a `{"items": [...]}` listing, without a table around them.
-///
-/// The half `table_of` is written in terms of, exposed because one listing in
-/// this CLI needs the rows before it can build them: `volume ls` counts the
-/// snapshots standing on each disk, and the count comes from a second
-/// request.
+/// Decode the items in a controller List response.
 pub fn items<T: DeserializeOwned>(body: &Bytes, parsing: &'static str) -> Result<Vec<T>> {
     let list: List<T> = serde_json::from_slice(body).context(parsing)?;
     Ok(list.items)
@@ -299,15 +240,8 @@ pub fn print_json(bytes: &Bytes) {
     }
 }
 
-/// The guard in front of the two verbs that can lose something: `rm`, and an
-/// `apply` that replaces an object that is already there.
-///
-/// One helper and one sentence, because the alternative is what this replaced:
-/// a prompt on `vm destroy` and nothing at all on the seven `rm`s beside it,
-/// one of which cascades. `--yes` is the way to mean it, and a pipe with no
-/// tty is refused rather than answered for. The prompt names the endpoint and
-/// the profile as well as the object, because the mistake this is here to
-/// catch is usually about which of those two an operator is talking to.
+/// Confirm deletion or replacement, naming the endpoint and profile.
+/// Without --yes, non-interactive input is refused.
 pub fn confirm(
     global: &GlobalArgs,
     endpoint: &str,
@@ -344,29 +278,8 @@ fn ask(prompt: &str) -> Result<bool> {
 // How a scalar becomes a column. Shared by all three tiers, and none of them
 // may produce a raw space: see the module header.
 
-/// Drained is worth its own word: the node is up and reporting, the
-/// scheduler just will not place anything new on it.
-/// The `ready` column of a machine listing, which now has to say three
-/// things with one word.
-///
-/// `draining` outranks `cordoned`, because it is the one an operator is
-/// waiting on: a drain implies the cordon, so a machine being emptied is
-/// always also unschedulable, and reporting the quieter of the two would
-/// hide the loud one. The old spelling for a cordon was `drained`, and it was
-/// wrong the day the real verb arrived — a cordoned machine has not been
-/// drained of anything.
-/// `conditions` is what the MACHINE said about itself, and it outranks
-/// `yes` for the reason the whole condition exists: a node that is up,
-/// uncordoned and unable to act read `yes` in this column for three hours
-/// during the mini-chaos run while every command it was given failed. It does
-/// NOT outrank `draining` or `cordoned` — those are what an operator decided,
-/// and a decision an operator made is the thing they are looking for in this
-/// column.
-///
-/// The short spellings — `pressure`, `store`, `cgroup` — and a comma between
-/// them, because `node ls` is piped into `awk` and a cell may not carry a raw
-/// space. A word this CLI does not know travels through as it came: an agent
-/// newer than its CLI is still telling the truth.
+/// Readiness display priority: unavailable, draining, cordoned, conditions, ready.
+/// Condition names are shortened to fit a space-free table cell.
 pub fn readiness(ready: bool, schedulable: bool, draining: bool, conditions: &[&str]) -> String {
     match (ready, draining, schedulable) {
         (false, _, _) => "no".to_string(),
@@ -381,11 +294,7 @@ pub fn readiness(ready: bool, schedulable: bool, draining: bool, conditions: &[&
     }
 }
 
-/// The one word a READY cell has room for, per condition type.
-///
-/// Unknown words pass through untouched rather than becoming "unknown": the
-/// CLI is the oldest thing in a rollout and an agent that has learned a new
-/// condition should not have it swallowed by the client that prints it.
+/// Shorten known conditions; preserve unfamiliar ones for newer agents.
 fn short_condition(condition: &str) -> String {
     match condition {
         "DiskPressure" => "pressure".to_string(),
@@ -473,9 +382,7 @@ mod tests {
         }
     }
 
-    /// Headers shout, columns line up on the widest cell, and the last one is
-    /// not padded — a trailing run of spaces is invisible to a person and
-    /// noise to everything else.
+    /// Align columns and omit trailing padding.
     #[test]
     fn columns_line_up_and_the_last_one_is_not_padded() {
         let rendered = table(vec![
@@ -494,9 +401,7 @@ mod tests {
         );
     }
 
-    /// A short row must not make the next column start early: every field
-    /// after a missing cell would shift, which is the whole reason the table
-    /// is padded rather than tab-separated.
+    /// Short rows must preserve column alignment.
     #[test]
     fn a_row_shorter_than_the_header_still_lines_up() {
         let rendered = table(vec![row(&["alpha", "Running"])]).render();
@@ -532,10 +437,7 @@ mod tests {
         assert_eq!(age_until(now - chrono::Duration::days(1), now), "expired");
     }
 
-    /// Three states in one word, and the ranking is the point: a drain
-    /// implies the cordon, so a machine being emptied is always also
-    /// unschedulable, and reporting the quieter of the two would hide the one
-    /// the operator is waiting on.
+    /// A drain takes display priority over a cordon.
     #[test]
     fn a_machine_being_emptied_says_so_and_not_merely_that_it_is_cordoned() {
         assert_eq!(readiness(true, true, false, &[]), "yes");
@@ -550,9 +452,7 @@ mod tests {
         assert_eq!(readiness(false, false, true, &[]), "no");
     }
 
-    /// D8's other half, in the column an operator actually reads: a node that
-    /// is up and uncordoned and has said it cannot act must not read `yes`.
-    /// The mini-chaos run had one reading `yes` for three hours.
+    /// Reported node conditions must remain visible on otherwise ready nodes.
     #[test]
     fn a_wedged_node_does_not_read_yes() {
         assert_eq!(readiness(true, true, false, &["StoreUnhealthy"]), "store");
@@ -578,13 +478,7 @@ mod tests {
         assert_eq!(readiness(false, true, true, &["StoreUnhealthy"]), "no");
     }
 
-    /// D4: a delete that only queued the object says so, and one that
-    /// finished says nothing extra.
-    ///
-    /// `volume rm` on a disk a running VM held printed the name and exited 0
-    /// — byte for byte what a successful delete prints — while the volume
-    /// stayed `Releasing` with its data intact. The API had been answering
-    /// with the sentence all along; the CLI threw the document away.
+    /// Distinguish queued deletion from completed deletion.
     #[test]
     fn a_delete_that_did_not_finish_carries_the_servers_own_sentence() {
         let deleting = br#"{"kind":"Status","status":"Success","code":202,"reason":"Deleting",
@@ -595,8 +489,7 @@ mod tests {
             Some("volume mc-vol-a is attached to vm mc-vm-a; its data stays until that vm lets go")
         );
 
-        // A delete that IS finished says nothing extra: the name is the whole
-        // answer, and a note there would be noise on every `rm` in the CLI.
+        // Completed deletion needs no pending-removal note.
         let gone = br#"{"kind":"Status","status":"Success","code":200,"reason":"Deleted",
             "message":"Tenant acme deleted","details":{"kind":"Tenant","name":"acme"}}"#;
         assert_eq!(removal_note(gone), None);
@@ -681,11 +574,7 @@ mod tests {
         out
     }
 
-    /// The house rule, kept by a test rather than by everybody remembering
-    /// it: a comment may carry an umlaut, a string literal may not. What is
-    /// in a literal ends up in somebody's terminal, their journal and their
-    /// grep, and an em-dash there is a character none of those three agree
-    /// on.
+    /// Require ASCII in output literals covered by this source scan.
     #[test]
     fn no_output_string_carries_a_non_ascii_character() {
         let sources = [

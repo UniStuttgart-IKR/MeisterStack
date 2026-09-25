@@ -2,14 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `meister agent vm …` — the node itself, over its own socket.
-//!
-//! A different api and not a third tier of the same one: there is no
-//! discovery here, no objects, no names — ids are the node's — listings are
-//! bare arrays, and `observe` and `reconcile` exist here and nowhere above
-//! because they are questions about one machine's processes. So the CLI never
-//! asks a unix endpoint what group-version it serves; a unix endpoint IS a
-//! node, by definition, and pointing anything else at one is a sentence.
+//! Local agent commands over its Unix socket.
+//! The node API uses VM IDs and bare lists, without controller discovery.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -46,10 +40,7 @@ struct Observed {
     tracked: bool,
     vmm_alive: bool,
     socket_responsive: bool,
-    /// Every backend process the VM has — device and volume alike. Renamed
-    /// with the agent's field: `serde(default)` means a mismatch here shows
-    /// a confident `false` rather than an error, so the two names have to be
-    /// kept in step by hand.
+    /// Device and volume backend health; keep this field aligned with the agent response.
     #[serde(default)]
     backends_alive: bool,
     #[serde(default)]
@@ -66,13 +57,7 @@ struct CreatedResponse {
     id: String,
 }
 
-/// What the NODE thinks it holds, which is a different question from what the
-/// `Volume` objects say — and the one worth asking when the two disagree.
-///
-/// Read-only by construction: there are no write routes at the socket for
-/// volumes, so there are no verbs here for them either. `Gone` rows are shown
-/// rather than filtered: a volume the node has just deprovisioned is exactly
-/// the one somebody is looking for.
+/// List local volume records, including Gone records, for comparison with controller status.
 async fn volume(target: &Target, cmd: &AgentVolumeCmd, global: &GlobalArgs) -> Result<()> {
     let client = Client::new(target)?;
     match cmd {
@@ -215,10 +200,7 @@ pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result
             Ok(())
         }
 
-        // What the node sees against what it was asked for, and what it would
-        // do about the difference. There is no such verb one tier up because
-        // there is nothing there to look at: a controller knows what a node
-        // reported, not what its processes are doing.
+        // Compare desired state with local processes and show the proposed reconciliation.
         AgentVmCmd::Observe { id } => {
             let body = client.get(&format!("/vms/{id}/observe")).await?;
             output::emit(global, &body, |body| {
@@ -263,11 +245,7 @@ pub async fn run(target: &Target, cmd: &AgentCmd, global: &GlobalArgs) -> Result
     }
 }
 
-/// What the guest printed, straight off this node's own ring.
-///
-/// The same document the two tiers above serve, one hop instead of two — and
-/// printed as text rather than as a table, because a console is lines and a
-/// table cell with a kernel oops in it is a table nobody can read.
+/// Read local guest log rings and use the shared CLI renderer.
 async fn logs(
     client: &Client,
     global: &GlobalArgs,

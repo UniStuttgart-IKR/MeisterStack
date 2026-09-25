@@ -7,12 +7,7 @@
 
 use super::*;
 
-/// `secret create`, and `--replace` is the same body under PUT.
-///
-/// One verb for both because the resource has one rule: a spec is replaced
-/// whole, never merged. A client cannot READ a secret, so it cannot
-/// round-trip one either, and a merge would leave somebody unable to say
-/// "this key goes".
+/// Create or replace the complete secret spec. Secret values cannot be read back.
 pub async fn secret(ctx: &Ctx<'_>, cmd: &SecretCmd) -> Result<()> {
     let SecretCmd::Create {
         name,
@@ -68,11 +63,7 @@ pub async fn secret(ctx: &Ctx<'_>, cmd: &SecretCmd) -> Result<()> {
     output::emit_line(ctx.global, &body, name)
 }
 
-/// One key, refused rather than silently overwritten.
-///
-/// `--from-literal k=a --from-file k=b` is a command whose author believes
-/// one of them, and picking a winner by argument order would be the kind of
-/// answer nobody can debug from the shell history.
+/// Reject duplicate keys across file and literal arguments.
 pub(super) fn insert_key(
     data: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,

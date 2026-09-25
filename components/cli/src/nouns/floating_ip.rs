@@ -40,10 +40,7 @@ pub(super) fn floating_ip_row(ip: FloatingIp) -> Vec<String> {
         ip.spec.address,
         ip.spec.tenant,
         ip.spec.pool,
-        // One column for both roads, because a reservation only ever takes
-        // one: a vm holds the address itself, or a router translates it to an
-        // address inside the overlay. `-` is a reservation nothing points at
-        // yet, which is a real and useful state.
+        // Show the VM assignment or the router translation; a dash means unassigned.
         match (ip.spec.vm, ip.spec.router.as_str()) {
             (Some(vm), _) => vm,
             (None, "") => "-".to_string(),

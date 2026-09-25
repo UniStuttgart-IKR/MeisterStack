@@ -2,33 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `meister vm connect` — the guest's serial line, in this terminal.
-//!
-//! ## Why this does not go through `Client`
-//!
-//! Every other verb in this tree is a request and an answer, and `Client` is
-//! built for exactly that: it hands back a body. A console is neither — it is
-//! one HTTP request that stops being HTTP, and after the `101` the connection
-//! is a byte stream in both directions for as long as somebody is typing. So
-//! this opens the transport itself, writes the upgrade by hand, and keeps the
-//! socket.
-//!
-//! Raw bytes and not WebSocket frames, at every tier: a console already is a
-//! byte stream, and framing it would cost a header per keystroke. The party
-//! that needs frames is a browser, which is a wrapper around this route and
-//! not the shape a terminal wants.
-//!
-//! ## The terminal
-//!
-//! Raw mode, or the shell at the other end never sees a key until Enter and
-//! never sees Ctrl-C at all. Restored by `RawMode`'s `Drop`, which is the
-//! whole reason it is a type: a client that exits by panic, by signal handler
-//! or by the far end hanging up must not leave a terminal that does not echo.
-//!
-//! Detaching is **Ctrl-]**, the same key telnet has used for forty years, and
-//! it is deliberately not a character a shell wants: `~.` needs to track
-//! whether it is at the start of a line, and a console that guessed wrong
-//! would swallow somebody's text.
+//! Serial-console client using an HTTP upgrade to a bidirectional byte stream.
+//! It owns the connection after the handshake. Ctrl-] detaches; RawMode restores
+//! the terminal on normal scope exit or unwinding.
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -39,9 +15,7 @@ use crate::generic::Ctx;
 /// What ends a session from this side. `0x1d` is Ctrl-].
 const DETACH: u8 = 0x1d;
 
-/// The protocol name both edges answer with. Checked rather than assumed: a
-/// proxy that upgraded us to something else would otherwise look like a guest
-/// saying nothing.
+/// Requested HTTP upgrade protocol.
 const CONSOLE_PROTOCOL: &str = "meister-console";
 
 /// Attach to a VM's serial line.
@@ -70,9 +44,7 @@ pub async fn connect(ctx: &Ctx<'_>, name: &str) -> Result<()> {
 
     let (status, body) = read_head(&mut stream).await?;
     if status != 101 {
-        // The server's own sentence, out of the `Status` object every refusal
-        // of this API wears. Printed rather than swallowed: "409" alone does
-        // not tell somebody that a colleague is already attached.
+        // Include the API error message when the refusal body supplies one.
         bail!("{}", refusal(status, &body));
     }
 
@@ -84,11 +56,7 @@ pub async fn connect(ctx: &Ctx<'_>, name: &str) -> Result<()> {
     outcome
 }
 
-/// Open whichever transport the endpoint names.
-///
-/// Boxed because the three are different types and everything after this
-/// point treats them identically — a console is the same byte stream over a
-/// unix socket, a tcp connection and a TLS one.
+/// Open the configured Unix, TCP or TLS transport for the console stream.
 async fn dial(
     transport: &Transport,
     tls: Option<std::sync::Arc<tokio_rustls::rustls::ClientConfig>>,
@@ -134,11 +102,7 @@ async fn dial(
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
-/// Read the response head, and whatever body came with it.
-///
-/// By hand because the connection has to survive: a parser that owned the
-/// stream would hand back a body and keep the socket, which is the one thing
-/// this needs to keep.
+/// Read through the response headers without consuming subsequent console bytes.
 async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u16, Vec<u8>)> {
     let mut buf = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
@@ -232,12 +196,7 @@ async fn pump<S: AsyncReadWrite + Unpin>(stream: S) -> Result<()> {
     }
 }
 
-/// The terminal, put into raw mode and put back.
-///
-/// A type and not two calls, because the putting back is the part that must
-/// not be forgettable: an early return, a `?`, or a panic all run `Drop`, and
-/// a terminal left in raw mode is one that no longer echoes what somebody
-/// types into their own shell.
+/// Restore the terminal on scope exit or unwinding. Process termination can bypass Drop.
 struct RawMode {
     original: Option<nix::sys::termios::Termios>,
 }
@@ -246,9 +205,7 @@ impl RawMode {
     fn enter() -> Result<Self> {
         use nix::sys::termios;
         let stdin = std::io::stdin();
-        // Not a terminal — a pipe, a test, a script. Nothing to set and
-        // nothing to restore, and refusing would make `connect` unusable from
-        // anything that is not a person.
+        // Leave pipes and redirected input unchanged.
         if !nix::unistd::isatty(&stdin).unwrap_or(false) {
             return Ok(Self { original: None });
         }
@@ -292,8 +249,7 @@ mod tests {
         assert_eq!(refusal(404, b""), "404 and nothing more");
     }
 
-    /// The head is read a byte at a time so the socket survives; this is the
-    /// part that has to stop at the right place.
+    /// Header parsing must preserve the guest's first bytes.
     #[tokio::test]
     async fn the_head_is_read_without_eating_the_stream() {
         let wire = b"HTTP/1.1 101 Switching Protocols\r\nupgrade: meister-console\r\n\r\nGUEST";

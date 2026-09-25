@@ -36,10 +36,7 @@ pub(super) struct CsrCondition {
     by: String,
 }
 
-/// The server decides this too, and the two have to agree — the table is
-/// worthless if it says Pending about a request that has a certificate on it.
-/// Same precedence as `CsrStatus::phase` in controller-api: a denial outranks
-/// an approval that produced nothing, a certificate outranks its approval.
+/// Match CsrStatus::phase: denial, failure, certificate, approval, then pending.
 pub(super) fn csr_phase(status: &CsrStatus) -> &'static str {
     let has = |k: &str| status.conditions.iter().any(|c| c.kind == k);
     if has("Denied") {
@@ -72,10 +69,7 @@ pub(super) fn csr_row(c: Csr) -> Vec<String> {
 }
 
 pub async fn csr(ctx: &Ctx<'_>, cmd: &CsrCmd) -> Result<()> {
-    // Deliberately still a PUT on a subresource and not a patch: approving is
-    // its own verb in this API (`auth::Verb::Approve`), because it is the one
-    // write that hands out a credential and must not be reachable through a
-    // generic write.
+    // Use the approval subresource, which has its own authorization verb.
     let (name, decision, said) = match cmd {
         CsrCmd::Approve { name } => (name, json!({ "approved": true }), "Approved"),
         CsrCmd::Deny { name, reason } => (

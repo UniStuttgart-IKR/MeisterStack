@@ -32,14 +32,7 @@ pub enum CredentialSource {
         cert: PathBuf,
         key: PathBuf,
     },
-    /// A person, logged in at an identity provider.
-    ///
-    /// The two paths of this file are the whole difference from the shapes
-    /// above it: `issuer` and `client_id` say WHO issues tokens, and
-    /// `tokens` says where the ones this machine holds are kept. Nothing
-    /// secret is in here -- the same rule the token file and the certificate
-    /// follow -- and the file `tokens` names is written at 0600 by
-    /// `meister login --oidc`.
+    /// OIDC provider settings and the path to the local session file.
     Oidc {
         issuer: String,
         client_id: String,
@@ -47,26 +40,16 @@ pub enum CredentialSource {
         /// `<config dir>/oidc/<profile>.json`.
         #[serde(default)]
         tokens: Option<PathBuf>,
-        /// The CA that signed the provider, for one that is not on the
-        /// public internet. Absent = the platform's own roots.
+        /// Private CA for the identity provider; otherwise use the built-in public roots.
         #[serde(default)]
         ca_cert: Option<PathBuf>,
-        /// What to ask the provider for. Defaults to
-        /// `openid profile email offline_access` -- and `offline_access` is
-        /// the part that matters, because it is what makes a refresh token
-        /// appear. Without one a person logs in again every few minutes,
-        /// which they will not do; they will use the static token instead.
+        /// Requested scopes. Defaults to `openid profile email offline_access`.
         #[serde(default)]
         scope: Option<String>,
     },
 }
 
-/// Everything `meister login --oidc` and the refresh need, resolved.
-///
-/// It travels on the `Target` rather than only inside the credential
-/// because it is needed exactly when there is no credential yet: the whole
-/// job of `meister login --oidc` is to create the file the credential would
-/// have been read from.
+/// Resolved OIDC settings, available even before a session exists.
 #[derive(Debug, Clone)]
 pub struct OidcSource {
     pub tokens: PathBuf,
@@ -76,18 +59,8 @@ pub struct OidcSource {
     pub scope: Option<String>,
 }
 
-/// One endpoint under a name: where it is, how to trust it, who we are to it.
-///
-/// There is no `tier` key any more, and its absence is the whole point of
-/// this milestone. A tier was a thing the OPERATOR had to know and keep in
-/// step with the endpoint, and getting it wrong was a refusal from the CLI
-/// about its own config rather than an answer from the server. What is here
-/// now is a server that says what it is (`GET /apis/meister.io/v1`) and a CLI
-/// that asks.
-///
-/// `deny_unknown_fields` therefore turns an old profile into a parse error
-/// naming `tier`, which is wanted: a profile that still carries one was
-/// written against a CLI that checked it, and saying so beats ignoring it.
+/// Named endpoint, trust roots and credentials. The server advertises its tier
+/// through discovery; obsolete profile keys such as `tier` are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -115,19 +88,12 @@ pub struct Config {
     pub dir: Option<PathBuf>,
 }
 
-/// The config a machine ships for everybody on it: what a single node
-/// (nix/single-node.nix) writes, so that `meister agent vm ls` works on it
-/// without anybody writing a profile first.
+/// System profile file, used when no user configuration exists.
 pub const SYSTEM_CONFIG: &str = "/etc/meisterstack/cli.toml";
 
-/// Default config Paths are $MEISTER_CONFIG >> $XDG_CONFIG_HOME/meisterstack/config.toml >>
-/// ~/.config/meisterstack/config.toml >> /etc/meisterstack/cli.toml.
-///
-/// The last one is the machine's, and it is only a FALLBACK: a person's own
-/// file wins by existing, and `MEISTER_CONFIG` wins over both. When neither
-/// the person's nor the machine's file is there, the person's path is the
-/// answer — that is where a `meister login` would write, and the error a
-/// missing profile produces should name it.
+/// Config lookup: MEISTER_CONFIG, existing user config, existing system config.
+/// The user path uses XDG_CONFIG_HOME, falling back to ~/.config; it is also
+/// returned when neither configuration file exists.
 pub fn default_config_path() -> Result<PathBuf> {
     let base = match std::env::var("XDG_CONFIG_HOME") {
         Ok(p) if !p.is_empty() => PathBuf::from(p),
@@ -145,9 +111,7 @@ pub fn default_config_path() -> Result<PathBuf> {
     ))
 }
 
-/// The choice above, without the environment: the override, else the
-/// person's file if it exists, else the machine's if that exists, else the
-/// person's path.
+/// Select the override, user file, system file, or default user path, in that order.
 fn pick_config_path(
     env_override: Option<PathBuf>,
     user: PathBuf,
@@ -167,14 +131,8 @@ fn pick_config_path(
 }
 
 impl Config {
-    /// The certificate and key a profile DECLARES, whether or not they exist
-    /// and whatever credential this particular call ended up resolving to.
-    ///
-    /// `meister login` needs the declaration rather than the resolution, and
-    /// the difference is exactly the bootstrap case: the first login is made
-    /// with a bearer token — `MEISTER_TOKEN` wins over the profile — and the
-    /// resolved credential is then a token, while the two paths the
-    /// certificate belongs in are still the profile's.
+    /// Resolve the profile's declared certificate paths even when a bearer token
+    /// overrides authentication during certificate enrollment.
     pub fn declared_mtls(&self, profile: &str) -> Option<(PathBuf, PathBuf)> {
         match &self.profiles.get(profile)?.credential {
             CredentialSource::Mtls { cert, key } => Some((
@@ -203,35 +161,19 @@ impl Config {
 pub struct Overrides {
     pub profile: Option<String>,
     pub endpoint: Option<String>,
-    /// `meister login` sets this, and only it.
-    ///
-    /// A profile that names an mtls credential whose files do not exist yet
-    /// is the normal state before the first login — the whole point of the
-    /// command is to create them. Refusing to resolve such a profile would
-    /// mean the one command that fills it in could never be run against it.
-    /// Every other command still fails, loudly, because for them a missing
-    /// certificate is exactly the problem it looks like.
+    /// Allow enrollment before the profile's certificate or OIDC session exists.
     pub tolerate_missing_credential: bool,
 }
 
 #[derive(Debug)]
-/// A resolved target: what the client needs and nothing else.
-///
-/// `tier` is not here and is not anywhere any more: what an endpoint is, is
-/// something the endpoint says. `ca_cert` is the CA an `https://` endpoint is
-/// verified against, and it is required for one — a lab CA is in nobody's
-/// system trust store, so falling back to those would only turn a clear error
-/// into an obscure handshake failure.
+/// Resolved endpoint and credentials. HTTPS requires an explicit controller CA.
 pub struct Target {
     pub profile_name: String,
     pub endpoint: String,
     pub ca_cert: Option<PathBuf>,
     pub credential: Credential,
     pub timeout_secs: u64,
-    /// The identity provider this profile logs in at, if it names one.
-    ///
-    /// Present whether or not there is a session yet: `meister login --oidc`
-    /// needs it precisely when there is none.
+    /// OIDC settings, retained when login has not created a session yet.
     pub oidc: Option<OidcSource>,
 }
 
@@ -242,14 +184,7 @@ pub enum Credential {
         cert: PathBuf,
         key: PathBuf,
     },
-    /// An OIDC session whose access token has run out.
-    ///
-    /// Its own state rather than "no credential" because the two need
-    /// different things done about them: this one is renewed silently from
-    /// the refresh token, and that renewal is a network call, so it cannot
-    /// happen where the credential is read. `oidc::freshen` is the one thing
-    /// that turns this into a `Bearer`, and `Client::new` refuses to send a
-    /// request that still holds one.
+    /// Expired OIDC session. `oidc::freshen` must renew it before Client construction.
     StaleOidc,
 }
 
@@ -304,12 +239,7 @@ pub fn resolve(config: &Config, ov: &Overrides) -> Result<Target> {
 
     let oidc = profile.and_then(|p| oidc_source(&p.credential, config.dir.as_deref(), &name));
 
-    // The same shape of refusal `Client::new` makes for a client certificate
-    // over plain http, and for a sharper reason. A static lab token over
-    // http is a lab operator's decision about a string they minted. An OIDC
-    // access token is a live credential from somebody else's identity
-    // provider, good for whatever else that provider protects, and putting
-    // one on the wire in clear is not a configuration anybody means.
+    // Do not send OIDC credentials to a plaintext HTTP endpoint.
     if oidc.is_some() && endpoint.starts_with("http://") {
         bail!(
             "profile {name:?} logs in at an identity provider but its endpoint {endpoint} is \
@@ -339,11 +269,7 @@ pub fn resolve(config: &Config, ov: &Overrides) -> Result<Target> {
     })
 }
 
-/// The identity provider a profile names, with every path made absolute.
-///
-/// The default token path hangs off the config file, exactly as the default
-/// certificate path does, so that a config directory and the credentials it
-/// refers to move as one.
+/// Resolve provider settings and session paths relative to the config directory.
 fn oidc_source(src: &CredentialSource, base: Option<&Path>, profile: &str) -> Option<OidcSource> {
     let CredentialSource::Oidc {
         issuer,
@@ -391,10 +317,7 @@ fn load_credential(
             };
             if !oidc.tokens.exists() {
                 if ov.tolerate_missing_credential {
-                    // The state every oidc profile is in before its first
-                    // login, and `meister login --oidc` is the command that
-                    // ends it. Same pass the mtls arm gets, for the same
-                    // reason.
+                    // Enrollment may run before its session file exists.
                     return Ok(Credential::None);
                 }
                 bail!(
@@ -403,8 +326,7 @@ fn load_credential(
                 );
             }
             check_secret_permissions(&oidc.tokens)?;
-            // Whether it is still usable is read here; RENEWING it is not,
-            // because renewing is a network call. See `Credential::StaleOidc`.
+            // Load here; asynchronous renewal belongs to `oidc::freshen`.
             match crate::oidc::Session::load(&oidc.tokens)?.usable_now() {
                 Some(access) => Ok(Credential::Bearer(access)),
                 None => Ok(Credential::StaleOidc),
@@ -454,11 +376,7 @@ fn load_credential(
             let cert = resolve_path(base, cert.clone());
             let key = resolve_path(base, key.clone());
             if ov.tolerate_missing_credential && (!cert.exists() || !key.exists()) {
-                // The state a profile is in before its first login. Going on
-                // without a credential is right: against a controller with no
-                // chain this simply works, and against one with a chain it
-                // earns a 401 that says what is missing — both better answers
-                // than refusing to run the command that would fix it.
+                // Enrollment may authenticate without the certificate it is about to create.
                 return Ok(Credential::None);
             }
             check_secret_permissions(&key)?;
@@ -514,12 +432,7 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// The example, live and commented-out halves both. Same rule as the
-    /// other three: prose is `# text`, a commented-out setting is `#key = …`
-    /// with no space, and an example that does not parse is worse than none.
-    ///
-    /// `Profile` is `deny_unknown_fields`, so this also catches a profile key
-    /// renamed in the code and left behind here.
+    /// Validate active settings and uncommented examples against the current schema.
     #[test]
     fn the_example_config_parses_commented_keys_included() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/examples/cli.toml");
@@ -528,8 +441,7 @@ mod tests {
             toml::from_str(&raw).expect("config/examples/cli.toml parses as written");
         assert_eq!(live.default_profile.as_deref(), Some("lab"));
         assert_eq!(live.profiles.len(), 5);
-        // The mTLS profile is the one an operator copies; if its shape ever
-        // stops being the shape the client accepts, this is where it shows.
+        // The example must provide the CA and client identity required by HTTPS.
         let mtls = &live.profiles["cloud-mtls"];
         assert!(mtls.endpoint.starts_with("https://"));
         assert!(mtls.ca_cert.is_some(), "an https profile needs its CA");
@@ -537,9 +449,7 @@ mod tests {
         let oidc = &live.profiles["cloud-oidc"];
         assert!(matches!(oidc.credential, CredentialSource::Oidc { .. }));
 
-        // The credential shapes at the bottom are prose, deliberately: they
-        // are alternatives for one field, and uncommenting them all at once
-        // would be four values for `credential`. Each is parsed on its own.
+        // Credential alternatives are parsed separately; they cannot all be enabled together.
         for line in raw
             .lines()
             .filter(|l| l.trim_start().starts_with("#   { type ="))
@@ -584,13 +494,7 @@ mod tests {
         }
     }
 
-    /// A profile written for the CLI before this milestone carries `tier`,
-    /// and `deny_unknown_fields` makes that a parse error that NAMES the key.
-    ///
-    /// Loud on purpose. Ignoring it would leave an operator with a config
-    /// that still says something the CLI no longer reads, and the first time
-    /// that mattered would be the first time they wondered why a profile was
-    /// not being checked against a command any more.
+    /// Reject obsolete profile fields instead of silently ignoring them.
     #[test]
     fn a_profile_that_still_carries_a_tier_is_a_parse_error_that_says_so() {
         let doc = "default_profile = \"p\"\n[profiles.p]\ntier = \"cloud\"\n\
@@ -634,9 +538,7 @@ mod tests {
         assert!(t.ca_cert.is_none());
     }
 
-    /// The state every mtls profile is in before its first login. Only
-    /// `meister login` gets this pass; for anything else a missing
-    /// certificate is the problem it looks like.
+    /// Only enrollment may resolve a missing client identity.
     #[test]
     fn login_may_resolve_a_profile_whose_certificate_does_not_exist_yet() {
         let mut cfg = config_with();
@@ -654,8 +556,7 @@ mod tests {
         assert!(matches!(t.credential, Credential::None));
     }
 
-    /// The CA a profile names travels with the target now, resolved against
-    /// the config file so that a config and its pki/ directory move as one.
+    /// Resolve relative CA paths against the config directory.
     #[test]
     fn the_profiles_ca_reaches_the_client_as_an_absolute_path() {
         let mut cfg = config_with();
@@ -687,9 +588,7 @@ mod tests {
         cfg
     }
 
-    /// The session file hangs off the config file by default, exactly as the
-    /// certificate does, so that a config directory and the credentials it
-    /// refers to move as one.
+    /// Default session files live beside the profile configuration.
     #[test]
     fn an_oidc_profile_keeps_its_session_next_to_the_config() {
         let ov = Overrides {
@@ -709,9 +608,7 @@ mod tests {
         );
     }
 
-    /// An access token from somebody else's identity provider is good for
-    /// whatever else that provider protects. It does not go on the wire in
-    /// clear, whatever the profile says.
+    /// Refuse plaintext transport for OIDC profiles.
     #[test]
     fn an_oidc_profile_refuses_a_plain_http_endpoint() {
         let mut cfg = oidc_config(None);
@@ -728,9 +625,7 @@ mod tests {
         assert!(resolve(&cfg, &ov).is_ok());
     }
 
-    /// The state every oidc profile is in before its first login. `meister
-    /// login` gets the same pass the mtls arm gets, because it is the one
-    /// command that can end that state; everything else says what to run.
+    /// Only login may proceed without an OIDC session file.
     #[test]
     fn login_may_resolve_an_oidc_profile_that_has_never_logged_in() {
         let cfg = oidc_config(Some("/nonexistent/session.json"));
@@ -743,19 +638,14 @@ mod tests {
         };
         let t = resolve(&cfg, &ov).unwrap();
         assert!(matches!(t.credential, Credential::None));
-        // And the source is there anyway -- which is the whole reason it is
-        // on the Target: `login --oidc` needs it precisely now.
+        // Login still needs the resolved provider settings.
         assert!(t.oidc.is_some());
     }
 
-    /// A live session is a bearer token; a dead one is its own state, so
-    /// that the one place that may renew it is forced to be a place that
-    /// can await.
+    /// Expired sessions must be renewed before client construction.
     #[test]
     fn a_session_is_a_token_while_it_lasts_and_a_renewal_afterwards() {
-        // A pid is not a unique name: it comes back round, and a crashed run
-        // leaves its directory behind for the process that inherits the
-        // number. `tempfile` is unique and cleans up on a panic too.
+        // Use isolated temporary state for each test.
         let dir = tempfile::tempdir().expect("a directory of our own");
         let path = dir.path().join("s.json");
 
