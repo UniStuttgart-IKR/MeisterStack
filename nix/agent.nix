@@ -81,9 +81,14 @@ let
     # All three together, never a subset: a cert without a ca is a start-up
     # error on purpose (config.rs::session_tls — this node would present its
     # key to whoever answered on that address).
+  } // lib.optionalAttrs (!cfg.singleNode.enable) {
     controller_ca = "${cfg.pki.dir}/ca.crt";
     controller_cert = "${cfg.pki.dir}/identity.crt";
     controller_key = "${cfg.pki.dir}/identity.key";
+  } // {
+    # A single node (nix/single-node.nix) has no session and no CA: none of
+    # the three, so that the file says what the machine is, and the unit
+    # below does not wait for a certificate nobody will push.
 
     # All five are REQUIRED by the binary — [paths] has no defaults — so
     # baking them is not duplication. Two of the five deviate from
@@ -746,7 +751,7 @@ in
               "${cfg.binDir}/meister-agent"
               "${cfg.binDir}/cloud-hypervisor"
             ]
-            ++ [ "${cfg.pki.dir}/ca.crt" ];
+            ++ lib.optional (!cfg.singleNode.enable) "${cfg.pki.dir}/ca.crt";
         } // lib.optionalAttrs (volumes.device != null && volumes.required) {
           # The other half of `volumes.required`: no `nofail` on the mount, and
           # the unit does not start without it.

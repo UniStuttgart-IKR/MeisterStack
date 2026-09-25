@@ -773,13 +773,18 @@ is made over the controller session, never at the socket). A single node's
 disks are the ephemeral ones inside a spec — `volumes[].base_image` and
 `size_bytes` — made with the guest and unmade with it.
 
-The agent needs no change for this. With neither `controller_addr` nor
-`controller_addrs` in its config it logs `no controller configured, running
-standalone`, serves its socket and reports to nobody
+The agent almost needs no change for this. With neither `controller_addr`
+nor `controller_addrs` in its config it logs `no controller configured,
+running standalone`, serves its socket and reports to nobody
 (`components/agent/src/lib.rs`). `meister agent vm …` is that socket's client
 (`components/cli/src/agent.rs`): `ls`, `get`, `create -f spec.json`, `start`,
-`stop`, `pause`, `resume`, `rm`, `logs`, `observe`, `reconcile`. What is new
-is only what a person would otherwise write by hand on every such box: a
+`stop`, `pause`, `resume`, `rm`, `logs`, `observe`, `reconcile`. The one
+change: a guest made or started at the socket gets the recorder on its
+serial line the moment its VMM is up, not on the next periodic pass thirty
+seconds later — a guest boots in under a second, and what it said before a
+recorder was there was lost to `vm logs` but for 278 bytes
+(`Reconciler::record_console`; the controller's road got the same line).
+The rest is what a person would otherwise write by hand on every such box: a
 NixOS profile, and an install script for everything else.
 
 **NixOS: a fleet of one.** `examples/fleet/single-node.toml` is the whole
@@ -794,6 +799,10 @@ the forgotten `controller_group` is the mistake it exists for. The
 
 * refuses a host with any other role, or one whose agent config names a
   controller — two assertions, each with the sentence that says why;
+* bakes none of the session keys (`controller_ca`, `controller_cert`,
+  `controller_key`) into the agent's config and lifts the agent unit's
+  condition on the pushed CA, which a fleet host waits for and a single node
+  never gets (`nix/agent.nix`; `checks.vm-single-node` found this);
 * ships `/etc/meisterstack/cli.toml`: the one profile `local`, endpoint
   `unix:///run/meisterstack/agent/agent.sock`, `credential = { type = "none" }`
   (the socket has no authenticator; its group is the access rule);
@@ -897,7 +906,7 @@ Then:
 meister agent vm create -f gpu.json      # the node assigns the id
 meister agent vm observe <id>            # phase, and what the node sees
 meister agent vm logs <id>
-meister agent vm rm <id>
+meister agent vm rm <id>                 # asks first; a script says --yes
 ```
 
 There is no scheduling in this — the node makes the devices it is told to,

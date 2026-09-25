@@ -517,8 +517,8 @@
               agent=${host.environment.etc."meisterstack/agent.toml".source}
               cli=${host.environment.etc."meisterstack/cli.toml".source}
               grep -q '^node_id = "rig"' "$agent"
-              if grep -q 'controller_addr' "$agent"; then
-                echo "the single node's agent names a controller:"; cat "$agent"; exit 1
+              if grep -q 'controller_' "$agent"; then
+                echo "the single node's agent names a controller, or a session credential:"; cat "$agent"; exit 1
               fi
               grep -q 'socket_group = "meister"' "$agent"
               grep -q 'default_profile = "local"' "$cli"

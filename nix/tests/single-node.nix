@@ -68,8 +68,8 @@ pkgs.testers.runNixOSTest {
 
     # The machine's config is the fallback: nobody here has one of their own.
     rig.fail("test -e /root/.config/meisterstack/config.toml")
-    assert "no vms on this node" in rig.succeed("meister agent vm ls")
-    assert "no vms on this node" in rig.succeed("su tester -c 'meister agent vm ls'")
+    assert "no vms on this node" in rig.succeed("meister agent vm ls 2>&1")
+    assert "no vms on this node" in rig.succeed("su tester -c 'meister agent vm ls' 2>&1")
     # …and the group is the access rule.
     refused = rig.fail("su nobody -s /bin/sh -c 'meister agent vm ls' 2>&1")
     assert "ermission denied" in refused, refused
@@ -77,11 +77,19 @@ pkgs.testers.runNixOSTest {
     # One guest, made at the socket, booted, seen, taken away.
     rig.succeed("install -m 0644 /etc/guest-tiny/bzImage /var/lib/meisterstack/images/bzImage")
     rig.succeed("install -m 0644 /etc/guest-tiny/initrd /var/lib/meisterstack/images/initrd")
+    rig.succeed("test -e /dev/kvm")
     vm = rig.succeed("meister agent vm create -f ${spec}").strip()
     assert vm, "create printed no id"
-    rig.wait_until_succeeds(f"meister agent vm logs {vm} | grep -q '${marker}'", timeout=180)
+    # What the node made of it, before the wait: a guest that never boots
+    # says why here and nowhere else.
+    print(rig.execute(f"meister agent vm observe {vm} 2>&1")[1])
+    # The whole boot, not what a recorder attached thirty seconds later got
+    # out of the VMM's ring: the api attaches it at create
+    # (Reconciler::record_console), which is what makes this line hold.
+    rig.wait_until_succeeds(f"meister agent vm logs {vm} 2>&1 | grep -q '${marker}'", timeout=120)
     assert vm in rig.succeed("meister agent vm ls")
-    rig.succeed(f"meister agent vm rm {vm}")
-    rig.wait_until_succeeds("meister agent vm ls | grep -q 'no vms on this node'", timeout=60)
+    # `--yes`: an rm asks a person first, and a script has no person.
+    rig.succeed(f"meister --yes agent vm rm {vm}")
+    rig.wait_until_succeeds("meister agent vm ls 2>&1 | grep -q 'no vms on this node'", timeout=60)
   '';
 }
