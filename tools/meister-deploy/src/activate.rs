@@ -91,6 +91,16 @@ const SWITCH: Duration = Duration::from_secs(900);
 /// How long the garbage collector may take. It walks the whole store.
 const COLLECT: Duration = Duration::from_secs(3600);
 
+/// How long the deadline waits for an activation that holds the decision
+/// lock (Astra finding MD02, 2026-09-25): the longest the forward path can
+/// take — `nix-env --set` and the switcher at [`SWITCH`] each, and in boot
+/// mode two `bootctl` at [`QUICK`] — and then some. A holder that is still
+/// there after that is a holder something else has to look at.
+const DEADLINE_PATIENCE: Duration = Duration::from_secs(2 * 900 + 4 * 30);
+
+/// How often the waiting deadline asks again.
+const DEADLINE_POLL: Duration = Duration::from_secs(2);
+
 /// Where a managed host keeps its key material (`meisterstack.pki.dir` of
 /// `nix/managed.nix`). The directory is created by that profile's tmpfiles
 /// rules before anything runs; this is the default so that an operator at a
@@ -807,55 +817,98 @@ impl<'a> Helper<'a> {
             changed_at: now,
             retired_by_force: None,
         };
-        self.write_record(&record)?;
-
-        if deadline.is_some()
-            && let Err(e) = self.arm_timer(id, confirm_within)
-        {
-            // Nothing has been touched, so the transaction is closed rather
-            // than left pending for a timer that does not exist. `reverted`
-            // is the state for "the machine is on `previous`", and never
-            // having left it is a case of that.
-            record.state = TxnState::Reverted;
-            record.changed_at = self.clock.now();
-            record.reason = Some(format!("{e:#}"));
+        // Astra finding MD02, 2026-09-25: from the record to the end of the
+        // forward path this process holds the transaction's decision lock,
+        // the one `confirm` and `revert` take. Without it the deadline could
+        // fire in the middle of a long switch — a switch may take up to
+        // `SWITCH`, a confirmation is expected within
+        // `plan::CONFIRM_WITHIN_SWITCH_SECS`, and the second is the shorter
+        // — take the profile back, write `reverted`, and watch the forward
+        // path, which never looked at the record again, run the new
+        // generation's switcher on top of that. The timer that finds this
+        // lock waits for it (`revert`), and the forward path itself decides
+        // what a deadline that passed meanwhile means: it takes the machine
+        // back before it returns, so that nothing is left on a system
+        // nobody could have confirmed in time.
+        self.deciding(id, "activate", || {
             self.write_record(&record)?;
-            return Err(e);
-        }
 
-        match self.go_forward(&record) {
-            Ok(()) => Ok(record),
-            Err(e) => {
-                // The machine may be half way: the profile can have moved
-                // and the switch failed after it. So it is put BACK here
-                // rather than left to a timer that may not have been armed —
-                // and if that fails too, the record says `inconsistent`,
-                // which is what makes a resume stop and ask for a person
-                // ([`crate::receipt::next_step`]).
-                let because = format!("the activation itself failed: {e:#}");
-                match self.revert(id, Some(&because), RevertAsker::Operator) {
-                    Ok(_) => Err(e.context(format!(
-                        "{id} was taken back to {}",
-                        record
-                            .previous
-                            .toplevel
-                            .as_deref()
-                            .unwrap_or("its previous system")
-                    ))),
-                    Err(back) => {
-                        record.state = TxnState::Inconsistent;
-                        record.changed_at = self.clock.now();
-                        record.reason =
-                            Some(format!("{because}; and so did the way back: {back:#}"));
-                        self.write_record(&record)?;
-                        Err(e.context(format!(
-                            "and {id} could not be taken back either ({back:#}); this host \
-                             needs a person"
-                        )))
+            if deadline.is_some()
+                && let Err(e) = self.arm_timer(id, confirm_within)
+            {
+                // Nothing has been touched, so the transaction is closed
+                // rather than left pending for a timer that does not exist.
+                // `reverted` is the state for "the machine is on
+                // `previous`", and never having left it is a case of that.
+                record.state = TxnState::Reverted;
+                record.changed_at = self.clock.now();
+                record.reason = Some(format!("{e:#}"));
+                self.write_record(&record)?;
+                return Err(e);
+            }
+
+            let previous_name = record
+                .previous
+                .toplevel
+                .clone()
+                .unwrap_or_else(|| "its previous system".to_string());
+            match self.go_forward(&record) {
+                Ok(()) => {
+                    let Some(passed) = deadline.filter(|d| self.clock.now() >= *d) else {
+                        return Ok(record);
+                    };
+                    // The switch outlasted the window in which anybody
+                    // could have confirmed it. The timer may be waiting
+                    // outside this lock or may have given up; either way
+                    // the answer is the one it would give, given here.
+                    let because = format!(
+                        "the activation itself took until {} and the deadline for confirming \
+                         it was {}: nobody could have confirmed it in time",
+                        self.clock.now().to_rfc3339(),
+                        passed.to_rfc3339()
+                    );
+                    match self.revert_held(id, Some(&because), RevertAsker::Deadline) {
+                        Ok(_) => bail!("{id} was taken back to {previous_name}: {because}."),
+                        Err(back) => {
+                            record.state = TxnState::Inconsistent;
+                            record.changed_at = self.clock.now();
+                            record.reason =
+                                Some(format!("{because}; and the way back failed: {back:#}"));
+                            self.write_record(&record)?;
+                            bail!(
+                                "{because}, and {id} could not be taken back either ({back:#}); \
+                                 this host needs a person"
+                            )
+                        }
+                    }
+                }
+                Err(e) => {
+                    // The machine may be half way: the profile can have
+                    // moved and the switch failed after it. So it is put
+                    // BACK here rather than left to a timer that may not
+                    // have been armed — and if that fails too, the record
+                    // says `inconsistent`, which is what makes a resume
+                    // stop and ask for a person
+                    // ([`crate::receipt::next_step`]). `revert_held` and not
+                    // `revert`: this process holds the decision already.
+                    let because = format!("the activation itself failed: {e:#}");
+                    match self.revert_held(id, Some(&because), RevertAsker::Operator) {
+                        Ok(_) => Err(e.context(format!("{id} was taken back to {previous_name}"))),
+                        Err(back) => {
+                            record.state = TxnState::Inconsistent;
+                            record.changed_at = self.clock.now();
+                            record.reason =
+                                Some(format!("{because}; and so did the way back: {back:#}"));
+                            self.write_record(&record)?;
+                            Err(e.context(format!(
+                                "and {id} could not be taken back either ({back:#}); this host \
+                                 needs a person"
+                            )))
+                        }
                     }
                 }
             }
-        }
+        })
     }
 
     /// Move the profile, switch, and in boot mode arrange the menu.
@@ -1232,7 +1285,35 @@ impl<'a> Helper<'a> {
     /// `confirming` means ([`RevertAsker`]).
     pub fn revert(&self, id: &str, because: Option<&str>, asked: RevertAsker) -> Result<TxnRecord> {
         check_id(id)?;
-        self.deciding(id, "revert", || self.revert_held(id, because, asked))
+        // Astra finding MD02, 2026-09-25: the deadline waits for a decision
+        // that is being made. The holder it finds is the activation whose
+        // deadline it is (or a confirm, which then decides), and a one-shot
+        // timer that fails on "busy" is a deadline that never fires — the
+        // machine would stay on a system nobody confirmed. An operator and
+        // `apply` are refused at once, as before: they can ask again.
+        let started = self.clock.now();
+        loop {
+            match self.deciding(id, "revert", || self.revert_held(id, because, asked)) {
+                Err(e)
+                    if asked == RevertAsker::Deadline
+                        && e.downcast_ref::<BeingDecided>().is_some() =>
+                {
+                    let waited = self.clock.now() - started;
+                    let patience = TimeDelta::from_std(DEADLINE_PATIENCE)
+                        .unwrap_or_else(|_| TimeDelta::zero());
+                    if waited > patience {
+                        return Err(e.context(format!(
+                            "the deadline of {id} waited {} s for that decision to finish and \
+                             gave up. The machine was left as it is and the record says what it \
+                             said; somebody has to look at what holds the transaction.",
+                            waited.num_seconds()
+                        )));
+                    }
+                    self.clock.sleep(DEADLINE_POLL);
+                }
+                other => return other,
+            }
+        }
     }
 
     fn revert_held(
@@ -4517,5 +4598,190 @@ mod tests {
         );
     }
 
+    // --- Astra finding MD02, 2026-09-25 ---------------------------------
 
+    /// A runner under which one command takes a while.
+    struct Slow<'a> {
+        inner: StrictFake,
+        clock: &'a FakeClock,
+        program: String,
+        by: Duration,
+    }
+
+    impl Runner for Slow<'_> {
+        fn run(&self, cmd: &Cmd) -> Result<Output> {
+            let out = self.inner.run(cmd)?;
+            if cmd.program == self.program {
+                self.clock.advance(self.by);
+            }
+            Ok(out)
+        }
+
+        fn policy(&self) -> Policy {
+            self.inner.policy()
+        }
+    }
+
+    #[test]
+    fn an_activation_that_outlasts_its_deadline_is_taken_back_before_it_returns() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(valid(TOP), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemd-run", ["--on-active=300"]),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(
+                    "nix-env",
+                    ["-p", "/nix/var/nix/profiles/system", "--set", TOP],
+                ),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(&format!("{TOP}/bin/switch-to-configuration"), ["switch"]),
+                Output::stdout(""),
+            )
+            // The way back, by the activation itself and not by a timer.
+            .expect(Matcher::prefix("systemctl", ["stop"]), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemctl", ["is-active"]),
+                Output::failing(3, "inactive"),
+            )
+            .expect(
+                Matcher::exact(
+                    "nix-env",
+                    ["-p", "/nix/var/nix/profiles/system", "--set", PREV],
+                ),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(&format!("{PREV}/bin/switch-to-configuration"), ["switch"]),
+                Output::stdout(""),
+            );
+        let clock = clock();
+        // The switch takes 400 s; the confirmation window is 300 s.
+        let runner = Slow {
+            inner: runner,
+            clock: &clock,
+            program: format!("{TOP}/bin/switch-to-configuration"),
+            by: Duration::from_secs(400),
+        };
+        let helper = helper_with(&runner, &files, &clock);
+        let err = helper
+            .activate("run-1", TOP, Mode::Switch, 300, Some("run-1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("was taken back to"), "{err}");
+        assert!(
+            err.contains("nobody could have confirmed it in time"),
+            "{err}"
+        );
+        let record = helper.record("run-1").unwrap();
+        assert_eq!(record.state, TxnState::Reverted);
+        assert!(
+            record
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("nobody could have confirmed"),
+            "{record:?}"
+        );
+        assert!(
+            !files.exists(&helper.txn_dir().join("run-1.deciding")),
+            "the decision lock is given back"
+        );
+        runner.inner.verify().unwrap();
+    }
+
+    #[test]
+    fn an_activation_holds_the_decision_lock_while_it_moves_the_machine() {
+        let files = host();
+        let runner = StrictFake::new()
+            .expect(valid(TOP), Output::stdout(""))
+            .expect(
+                Matcher::prefix("systemd-run", ["--on-active=300"]),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(
+                    "nix-env",
+                    ["-p", "/nix/var/nix/profiles/system", "--set", TOP],
+                ),
+                Output::stdout(""),
+            )
+            .expect(
+                Matcher::exact(&format!("{TOP}/bin/switch-to-configuration"), ["switch"]),
+                Output::stdout(""),
+            );
+        let clock = clock();
+        let helper = helper(&runner, &files, &clock);
+        helper
+            .activate("run-1", TOP, Mode::Switch, 300, Some("run-1"))
+            .unwrap();
+        runner.verify().unwrap();
+        // The lock was taken before the record was written and given back
+        // after the switch: in the trail of writes, `run-1.deciding` comes
+        // first and its removal last.
+        let attempts = files.attempts();
+        let taken = attempts
+            .iter()
+            .position(|a| a.contains("create_new") && a.contains("run-1.deciding"))
+            .expect("the decision lock was taken");
+        let written = attempts
+            .iter()
+            .position(|a| a.contains("write(0600)") && a.contains("txn/run-1.json"))
+            .expect("the record was written");
+        let given_back = attempts
+            .iter()
+            .rposition(|a| a.contains("remove") && a.contains("run-1.deciding"))
+            .expect("the decision lock was given back");
+        assert!(taken < written && written < given_back, "{attempts:?}");
+        assert!(!files.exists(&helper.txn_dir().join("run-1.deciding")));
+    }
+
+    #[test]
+    fn the_deadline_waits_for_a_running_decision_and_an_operator_does_not() {
+        let files = host();
+        let quiet = StrictFake::new();
+        let clock = clock();
+        let helper = helper(&quiet, &files, &clock);
+        files.create_dir_all(&helper.txn_dir()).unwrap();
+        // pid 1 is init: `kill(1, 0)` answers EPERM, which is "running".
+        files
+            .write_atomic(
+                &helper.txn_dir().join("d1.deciding"),
+                b"activate pid 1 at 2026-09-22 12:00:00 UTC",
+                0o600,
+            )
+            .unwrap();
+
+        // An operator is told at once.
+        let err = helper
+            .revert("d1", Some("a check failed"), RevertAsker::Operator)
+            .unwrap_err();
+        assert!(err.downcast_ref::<BeingDecided>().is_some(), "{err:#}");
+        assert!(
+            clock.slept().is_empty(),
+            "an operator's revert does not wait"
+        );
+
+        // The deadline waits as long as the forward path can take, and then
+        // says that it did.
+        let err = helper
+            .revert("d1", Some("nobody confirmed"), RevertAsker::Deadline)
+            .unwrap_err();
+        assert!(err.downcast_ref::<BeingDecided>().is_some(), "{err:#}");
+        assert!(err.to_string().contains("gave up"), "{err:#}");
+        let slept: Duration = clock.slept().iter().sum();
+        assert!(slept >= DEADLINE_PATIENCE, "{slept:?}");
+        // Nothing ran and nothing was written: the machine is as it was.
+        quiet.verify().unwrap();
+        assert_eq!(
+            files
+                .read_to_string(&helper.txn_dir().join("d1.deciding"))
+                .unwrap(),
+            "activate pid 1 at 2026-09-22 12:00:00 UTC"
+        );
+    }
 }
