@@ -573,9 +573,13 @@ pub enum RouterReason {
     NetnsGone,
     /// It is, and one of the two legs in it is not. `message` names which.
     LegGone,
-    /// The node could not find out: `ip` did not answer, or the state
-    /// directory could not be read. What is NOT said here is that anything is
-    /// broken — this is the reason a reader may not act on.
+    /// The node could not find out: `ip` did not answer, the state
+    /// directory could not be read, or one record in it exists but will not
+    /// parse (Astra finding R3-F07, 2026-09-25 — a torn write, or a format
+    /// an older/newer build wrote). What is NOT said here is that the
+    /// router is gone — this is the reason a reader may not fail one over
+    /// on the strength of it, whether the node could not ask the kernel or
+    /// could not read its own claim on the namespace.
     DriverUnreachable,
 }
 
