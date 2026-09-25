@@ -1606,6 +1606,282 @@ fn a_resume_after_a_completed_reboot_does_not_reboot_again() {
 }
 
 // Astra finding F19, 2026-09-23.
+// Astra finding MD04, 2026-09-25: the journal has the reboot's beginning,
+// with the boot id the step saw, and not its end.
+fn write_reboot_in_flight_journal(fx: &Fixture, run: &str, boot_id_before: Option<&str>) {
+    fx.state
+        .begin_run(&fx.files, run)
+        .expect("the run directory");
+    fx.files
+        .write_atomic(
+            &fx.state.plan_copy_path(run),
+            &fx.plan.to_json().expect("the plan"),
+            0o644,
+        )
+        .expect("the plan copy");
+    let journal = Journal::new(fx.state.journal_path(run), run, &fx.plan.plan_id);
+    let put = |event: JournalEvent| {
+        journal.append(&fx.files, event).expect("a line");
+    };
+    let seq_of = |kind: ActionKind| {
+        fx.plan
+            .actions_for("n1")
+            .into_iter()
+            .find(|a| a.kind == kind)
+            .unwrap_or_else(|| panic!("the plan has a {kind}"))
+            .seq
+    };
+    put(journal
+        .event(EventKind::RunStart, at(NOW))
+        .payload(serde_json::json!({"operator": {"user": "silas", "workstation": "manacor"}})));
+    put(journal
+        .event(EventKind::LockAcquire, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"run_id": run})));
+    for (from, to) in [
+        (HostState::Planned, HostState::Preflight),
+        (HostState::Preflight, HostState::Staged),
+        (HostState::Staged, HostState::MaintenanceReady),
+    ] {
+        put(journal
+            .event(EventKind::HostState, at(NOW))
+            .host("n1")
+            .transition(from, to)
+            .payload(serde_json::json!({})));
+    }
+    let activate = seq_of(ActionKind::Activate);
+    put(journal
+        .event(EventKind::ActionBegin, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate"})));
+    put(journal
+        .event(EventKind::ActionIrreversible, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate", "txn": run})));
+    put(journal
+        .event(EventKind::HostState, at(NOW))
+        .host("n1")
+        .transition(HostState::MaintenanceReady, HostState::Activating)
+        .payload(serde_json::json!({})));
+    put(journal
+        .event(EventKind::ActionEnd, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": activate, "kind": "activate", "result": "ok"})));
+    put(journal
+        .event(EventKind::HostState, at(NOW))
+        .host("n1")
+        .transition(HostState::Activating, HostState::AwaitingReboot)
+        .payload(serde_json::json!({})));
+    let reboot = seq_of(ActionKind::Reboot);
+    let evidence: Vec<String> = boot_id_before
+        .iter()
+        .map(|b| format!("boot_id {b}"))
+        .collect();
+    put(journal
+        .event(EventKind::ActionBegin, at(NOW))
+        .host("n1")
+        .payload(serde_json::json!({"action": reboot, "kind": "reboot", "evidence": evidence})));
+    // And here the workstation died: `systemctl reboot` may or may not have
+    // gone out, and nobody wrote the end.
+}
+
+/// The look of a resume after an in-flight reboot: the target still holds
+/// the pending record, and the machine names its boot.
+fn after_an_in_flight_reboot(fx: &Fixture, phase: Phase, boot_id_now: &str) -> TableLook {
+    let mut look = TableLook::new(fx).carrying(
+        "n1",
+        Txn {
+            id: "run-1".to_string(),
+            state: TxnState::Pending,
+            target_system: Some(fx.top("n1")),
+            deadline: Some(at("2026-09-22T12:05:00Z")),
+            run_id: Some("run-1".to_string()),
+        },
+    );
+    for table in [&mut look.before, &mut look.after] {
+        table.get_mut("n1").expect("n1").boot_id = Some(boot_id_now.to_string());
+    }
+    look.set("n1", phase);
+    look
+}
+
+// Astra finding MD04, 2026-09-25.
+#[test]
+fn a_resume_that_finds_the_machine_went_round_does_not_reboot_again() {
+    let fx = Fixture::changing(&["n1"], true);
+    write_reboot_in_flight_journal(&fx, "run-1", Some("boot-1"));
+    // A different boot id, and the release booted: the reboot happened and
+    // the run died before writing it down.
+    let look = after_an_in_flight_reboot(&fx, Phase::After, "boot-2");
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            .expect(cli("undrain", "n1"), Output::stdout(""))
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["txn", "retire", "--txn", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("every expectation was used");
+    assert_eq!(applied.stopped, None, "{applied:?}");
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+    assert!(
+        !runner
+            .calls()
+            .iter()
+            .any(|c| c.contains("systemctl reboot")),
+        "rebooted a second time: {:?}",
+        runner.calls()
+    );
+    // The journal got the end the run did not live to write.
+    let reboot = applied.receipt.hosts["n1"]
+        .actions
+        .iter()
+        .find(|a| a.kind == ActionKind::Reboot)
+        .expect("the reboot is in the receipt");
+    assert_eq!(reboot.result, Some(ActionResult::Ok));
+    assert!(
+        reboot
+            .evidence
+            .iter()
+            .any(|e| e.contains("found on resume")),
+        "{:?}",
+        reboot.evidence
+    );
+}
+
+// Astra finding MD04, 2026-09-25.
+#[test]
+fn a_resume_that_finds_the_same_boot_still_sends_the_reboot() {
+    let fx = Fixture::changing(&["n1"], true);
+    write_reboot_in_flight_journal(&fx, "run-1", Some("boot-1"));
+    // The same boot id: the machine never went round. (`After` for what it
+    // answers once it has, as the sibling test above does.)
+    let look = after_an_in_flight_reboot(&fx, Phase::After, "boot-1");
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(reboot_of("n1"), Output::stdout(""))
+            .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            .expect(cli("undrain", "n1"), Output::stdout(""))
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["txn", "retire", "--txn", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("the reboot was sent");
+    assert_eq!(applied.stopped, None, "{applied:?}");
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+}
+
+// Astra finding MD04, 2026-09-25.
+#[test]
+fn a_resume_that_finds_the_machine_went_round_onto_the_wrong_system_asks_for_a_person() {
+    let fx = Fixture::changing(&["n1"], true);
+    write_reboot_in_flight_journal(&fx, "run-1", Some("boot-1"));
+    // It went round (a new boot id) and came up on the OLD system: the
+    // one-shot entry is spent. A second reboot would boot that old system
+    // again and call it a rollout.
+    let look = after_an_in_flight_reboot(&fx, Phase::Before, "boot-2");
+    // The run stops in `resume_point`, before n1's own `lock` step would
+    // have asked the host again; what is left is giving back what the
+    // journal says this run holds, in the order the map walks.
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the run ends with a receipt");
+    runner.verify().expect("nothing but the locks");
+    let stopped = applied.stopped.clone().expect("the run stopped");
+    assert!(stopped.contains("went round"), "{stopped}");
+    assert!(stopped.contains("boot-1"), "{stopped}");
+    assert!(stopped.contains("boot-2"), "{stopped}");
+    assert_eq!(
+        applied.receipt.hosts["n1"].outcome,
+        HostOutcome::RecoveryRequired
+    );
+    assert!(
+        !runner
+            .calls()
+            .iter()
+            .any(|c| c.contains("systemctl reboot")),
+        "{:?}",
+        runner.calls()
+    );
+}
+
+// Astra finding MD04, 2026-09-25: a journal from before the boot id was
+// recorded, or a probe that cannot read one, falls back to the booted system.
+#[test]
+fn a_resume_without_a_boot_id_goes_by_what_the_machine_booted() {
+    let fx = Fixture::changing(&["n1"], true);
+    write_reboot_in_flight_journal(&fx, "run-1", None);
+    let look = TableLook::new(&fx).carrying(
+        "n1",
+        Txn {
+            id: "run-1".to_string(),
+            state: TxnState::Pending,
+            target_system: Some(fx.top("n1")),
+            deadline: Some(at("2026-09-22T12:05:00Z")),
+            run_id: Some("run-1".to_string()),
+        },
+    );
+    look.set("n1", Phase::After);
+    let runner = World::new(
+        StrictFake::new()
+            .expect(helper("box", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["lock", "acquire"]), ok())
+            .expect(helper("n1", &["confirm", "--txn", "run-1"]), ok())
+            .expect(cli("undrain", "n1"), Output::stdout(""))
+            .expect(cli("uncordon", "n1"), Output::stdout(""))
+            .expect(helper("n1", &["txn", "retire", "--txn", "run-1"]), ok())
+            .expect(helper("n1", &["lock", "release"]), ok())
+            .expect(helper("box", &["lock", "release"]), ok()),
+        &look,
+    );
+    let mut options = fx.options();
+    options.resume = true;
+    let applied = fx
+        .executor(&runner, &look, options)
+        .run()
+        .expect("the resume runs");
+    runner.verify().expect("every expectation was used");
+    assert_eq!(applied.receipt.hosts["n1"].outcome, HostOutcome::Success);
+    assert!(
+        !runner
+            .calls()
+            .iter()
+            .any(|c| c.contains("systemctl reboot")),
+        "{:?}",
+        runner.calls()
+    );
+}
+
 #[test]
 fn a_resume_of_a_host_that_was_switched_and_never_booted_still_boots_it() {
     // The other side of the same condition, and the reason it is read off

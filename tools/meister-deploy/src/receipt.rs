@@ -432,6 +432,16 @@ pub struct ActionRun {
     pub cmd_refs: Vec<String>,
 }
 
+/// A reboot that began and has no end in the journal (Astra finding MD04).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebootInFlight {
+    pub seq: u32,
+    /// `/proc/sys/kernel/random/boot_id` as the step read it before sending
+    /// the reboot; `None` for a journal from before this was recorded, or a
+    /// machine whose probe could not read it.
+    pub boot_id_before: Option<String>,
+}
+
 /// An irreversible step that began and has no end in the journal. The one
 /// thing a resume may never repeat.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,6 +507,34 @@ impl HostRun {
             .rev()
             .find(|a| a.kind == ActionKind::Reboot)
             .is_some_and(|a| a.result == Some(ActionResult::Ok))
+    }
+
+    /// A reboot this run began and never wrote the end of, with what the
+    /// step wrote down before it sent it.
+    ///
+    /// Astra finding MD04, 2026-09-25: `rebooted` is the reboot that
+    /// finished; this is the one whose outcome the journal does not know,
+    /// because the run died between `systemctl reboot` and the `action.end`
+    /// that `wait_for_boot` writes. The `action.begin` carries the boot id
+    /// the machine had before, and a resume compares the machine's current
+    /// one against it (`Executor::settle_reboot`).
+    pub fn reboot_in_flight(&self) -> Option<RebootInFlight> {
+        let last = self
+            .actions
+            .iter()
+            .rev()
+            .find(|a| a.kind == ActionKind::Reboot)?;
+        if last.result.is_some() {
+            return None;
+        }
+        Some(RebootInFlight {
+            seq: last.seq,
+            boot_id_before: last
+                .evidence
+                .iter()
+                .find_map(|e| e.strip_prefix("boot_id "))
+                .map(str::to_string),
+        })
     }
 
     /// Whether this run gave the host back: the `unlock` step, which retires

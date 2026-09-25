@@ -283,6 +283,12 @@ impl ProbeSpec {
         s.push_str(
             "printf 'booted_system=%s\\n' \"$(readlink -f /run/booted-system 2>/dev/null)\"\n",
         );
+        // A name for this boot (Astra finding MD04): what a resume compares
+        // against the one the reboot step wrote down before it sent the
+        // reboot.
+        s.push_str(
+            "printf 'boot_id=%s\\n' \"$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\"\n",
+        );
         s.push_str(
             "printf 'next_boot_system=%s\\n' \
              \"$(readlink -f /nix/var/nix/profiles/system 2>/dev/null)\"\n",
@@ -651,6 +657,7 @@ pub fn parse_probe(
             "machine_id" => obs.identity.machine_id = some(value),
             "current_system" => obs.current_system = some(value),
             "booted_system" => obs.booted_system = some(value),
+            "boot_id" => obs.boot_id = some(value),
             "next_boot_system" => obs.next_boot_system = some(value),
             "generation" => obs.generation = some(value).and_then(|v| v.parse().ok()),
             "kernel_running" => obs.kernel_running = some(value),

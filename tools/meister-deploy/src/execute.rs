@@ -63,7 +63,7 @@ use crate::plan::{
 };
 use crate::readiness;
 use crate::receipt::{
-    ActionResult, DeploymentReceipt, EventKind, HostState, Operator, Step, TxnView, fold,
+    ActionResult, DeploymentReceipt, EventKind, HostRun, HostState, Operator, Step, TxnView, fold,
     next_step, receipt,
 };
 use crate::release::ReleaseManifest;
@@ -939,7 +939,15 @@ impl<'a> Executor<'a> {
                 }
             }
             ActionKind::Reboot => {
-                self.begin(journal, id, action)?;
+                // Astra finding MD04, 2026-09-25: the machine's boot id goes
+                // into the `action.begin`, so that a resume which finds this
+                // step without its end can ask the machine whether it went
+                // round since (`settle_reboot`). Best effort: a probe that
+                // cannot read it leaves the resume with the booted system
+                // alone, which is what it had before.
+                let before = self.observe_one(id).ok().and_then(|o| o.boot_id);
+                let evidence: Vec<String> = before.iter().map(|b| format!("boot_id {b}")).collect();
+                self.begin_with_evidence(journal, id, action, evidence)?;
                 let refs = self.reboot(id)?;
                 let desired = action
                     .desired
@@ -2414,6 +2422,101 @@ impl<'a> Executor<'a> {
     // resume
     // -----------------------------------------------------------------
 
+    /// Whether this host has been through its reboot, for a resume.
+    ///
+    /// Astra finding MD04, 2026-09-25. The journal knows three shapes: a
+    /// reboot that ended (`rebooted`, the F19 case), no reboot at all, and a
+    /// reboot that BEGAN and has no end, because the run died between
+    /// `systemctl reboot` and the `action.end` that only `wait_for_boot`
+    /// writes. The third shape used to read as "not rebooted", and the
+    /// resume sent the reboot again; in boot mode the one-shot entry was
+    /// spent by the boot that had happened, and the second reboot booted the
+    /// OLD generation.
+    ///
+    /// So the machine is asked. The step wrote the boot id it saw before
+    /// sending the reboot; a different one now is a machine that went round
+    /// since, and what it came up as decides: the release, and the reboot is
+    /// done (the journal gets the end it is missing); anything else, and
+    /// this is a person's problem, because a second reboot would boot the
+    /// fallback and undeploy the host. The same boot id is a machine that
+    /// never went round, and the reboot is still to be sent. Without a boot
+    /// id on either side (a journal from before this, a probe that could not
+    /// read it) the booted system is all there is to go on.
+    fn settle_reboot(
+        &self,
+        journal: &Journal,
+        id: &str,
+        hosts: &mut BTreeMap<String, HostRunState>,
+        run: &HostRun,
+        observed: &HostObservation,
+    ) -> Result<bool> {
+        if run.rebooted() {
+            return Ok(true);
+        }
+        let Some(open) = run.reboot_in_flight() else {
+            return Ok(false);
+        };
+        let desired = self.plan.hosts[id].desired_system.clone();
+        let booted = observed.booted_system.clone().unwrap_or_default();
+        let came_up_right = booted == desired;
+        let ids = (open.boot_id_before.as_deref(), observed.boot_id.as_deref());
+        let went_round = match ids {
+            (Some(before), Some(now)) => Some(before != now),
+            _ => None,
+        };
+        let done = match went_round {
+            Some(false) => false,
+            Some(true) if came_up_right => true,
+            Some(true) => {
+                self.move_to(
+                    journal,
+                    id,
+                    hosts,
+                    HostState::RecoveryRequired,
+                    Some(observed),
+                )?;
+                bail!(
+                    "{id} went round after its reboot step began (boot id {} became {}) and \
+                     came up as {}, not as {desired}. Nothing here reboots it again: the \
+                     one-shot boot entry is spent, so a second reboot would boot the fallback \
+                     and undeploy this host. Look at it, and at `meister-activate txn list` \
+                     on it.",
+                    ids.0.unwrap_or("?"),
+                    ids.1.unwrap_or("?"),
+                    if booted.is_empty() {
+                        "nothing it could name"
+                    } else {
+                        booted.as_str()
+                    }
+                )
+            }
+            None => came_up_right,
+        };
+        if done
+            && let Some(action) = self
+                .plan
+                .actions_for(id)
+                .into_iter()
+                .find(|a| a.kind == ActionKind::Reboot && a.seq == open.seq)
+        {
+            // The end the run did not live to write: the reboot happened,
+            // and from now on the journal says so.
+            let how = match ids {
+                (Some(before), Some(now)) => format!(", boot id {before} became {now}"),
+                _ => String::new(),
+            };
+            self.end(
+                journal,
+                id,
+                action,
+                ActionResult::Ok,
+                vec![format!("booted {booted} (found on resume{how})")],
+                Vec::new(),
+            )?;
+        }
+        Ok(done)
+    }
+
     /// Where a resume picks this host up — the V17 table, asked of the
     /// journal and of the target and of nothing else.
     fn resume_point(
@@ -2500,10 +2603,11 @@ impl<'a> Executor<'a> {
             // decided it — so it belongs in the journal like every other.
             Step::VerifyOnly => {
                 self.entry(hosts, id).txn = run.txn_id.clone();
+                let rebooted = self.settle_reboot(journal, id, hosts, run, &observed)?;
                 self.move_to(journal, id, hosts, HostState::Verifying, Some(&observed))?;
                 Ok(Resume::AfterTheActivation {
                     confirmed: true,
-                    rebooted: run.rebooted(),
+                    rebooted,
                 })
             }
             Step::VerifyAndConfirm => {
@@ -2511,10 +2615,11 @@ impl<'a> Executor<'a> {
                 // for a word. The transaction id comes from the journal,
                 // never from a new one.
                 self.entry(hosts, id).txn = run.txn_id.clone();
+                let rebooted = self.settle_reboot(journal, id, hosts, run, &observed)?;
                 self.move_to(journal, id, hosts, HostState::Verifying, Some(&observed))?;
                 Ok(Resume::AfterTheActivation {
                     confirmed: false,
-                    rebooted: run.rebooted(),
+                    rebooted,
                 })
             }
             // --- end lane 5C ---
@@ -2957,6 +3062,18 @@ impl<'a> Executor<'a> {
     }
 
     fn begin(&self, journal: &Journal, id: &str, action: &Action) -> Result<()> {
+        self.begin_with_evidence(journal, id, action, Vec::new())
+    }
+
+    /// `action.begin` with something the step knew BEFORE it acted, for a
+    /// resume that has to find out what the step did (Astra finding MD04).
+    fn begin_with_evidence(
+        &self,
+        journal: &Journal,
+        id: &str,
+        action: &Action,
+        evidence: Vec<String>,
+    ) -> Result<()> {
         self.write(
             journal,
             EventKind::ActionBegin,
@@ -2967,6 +3084,7 @@ impl<'a> Executor<'a> {
                 "kind": action.kind,
                 "current": action.current,
                 "desired": action.desired,
+                "evidence": evidence,
             }),
         )
     }

@@ -347,6 +347,7 @@ pub fn observed(release: &ReleaseManifest, taken_at: DateTime<Utc>) -> Observati
                 },
                 current_system: Some(system.clone()),
                 booted_system: Some(system.clone()),
+                boot_id: None,
                 next_boot_system: Some(system),
                 generation: Some(42),
                 kernel_running: Some(host.build.boot.kernel_version.clone()),

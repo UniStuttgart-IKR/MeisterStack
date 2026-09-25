@@ -230,6 +230,17 @@ pub struct HostObservation {
     pub current_system: Option<String>,
     /// `/run/booted-system`: what was active when the machine came up.
     pub booted_system: Option<String>,
+    /// `/proc/sys/kernel/random/boot_id`: a name for THIS boot, new on every
+    /// one. Null when it could not be read.
+    ///
+    /// Astra finding MD04, 2026-09-25: `booted_system` says which system
+    /// came up and nothing about whether it came up again since a step
+    /// began. A resume that finds a reboot in the journal without its end
+    /// has to tell "the machine went round and the run died before writing
+    /// it down" from "the run died before the machine went round", and
+    /// only a name for the boot can.
+    #[serde(default)]
+    pub boot_id: Option<String>,
     /// Where the boot loader's default points — the next boot, which is a
     /// third fact and not the same as either of the two above.
     pub next_boot_system: Option<String>,
@@ -308,6 +319,7 @@ impl HostObservation {
             identity: Identity::unknown(),
             current_system: None,
             booted_system: None,
+            boot_id: None,
             next_boot_system: None,
             generation: None,
             kernel_running: None,
