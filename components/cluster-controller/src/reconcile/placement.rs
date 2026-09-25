@@ -7,45 +7,10 @@
 
 use super::*;
 
-/// What is still free on one node: the allowance its reported capacity gives
-/// under the configured overcommit, minus everything already bound to it.
-///
-/// Both halves are things the controller already has in hand — the Node
-/// object and the VM listing this pass made anyway — which is why nothing is
-/// stored. A second copy of this number in etcd would be a number that can be
-/// wrong, and it would be wrong in the direction that fills a node.
-///
-/// Every phase counts, a Pending one included. A VM that has been bound and
-/// not yet started is a claim on this node, and leaving it out is how a node
-/// takes on twice its memory in one burst of creates.
-///
-/// What it does NOT count is a guest on its way here that is still bound to
-/// the machine it is leaving — a live migration's, for the length of the
-/// move. That claim is an object of its own and is taken off by
-/// `controller_api::hold`; see `CapacityReservationSpec` and Astra finding
-/// S07, 2026-09-23. `pub(crate)` for that reason: `migration::confirm` needs
-/// the room a node has BEFORE any promise, which is exactly this number, and
-/// a second function computing it beside this one is two answers to one
-/// question.
-pub(crate) fn free_on(
-    node: &str,
-    capacity: &controller_api::NodeCapacity,
-    vms: &[Vm],
-    overcommit: Overcommit,
-) -> Capacity {
-    let bound = vms
-        .iter()
-        .filter(|v| v.spec.node_name.as_deref() == Some(node))
-        .fold(Capacity::default(), |sum, vm| {
-            sum.plus(Capacity::wanted_by(vm))
-        });
-    overcommit
-        .allowance(Capacity {
-            vcpus: capacity.vcpus,
-            mem_mib: capacity.mem_mib,
-        })
-        .minus(bound)
-}
+// What is still free on one node, `free_on`, lives in `controller_api::
+// scheduler` since Astra finding R3-F05, 2026-09-24: the candidate list here
+// and the confirmation a claim makes against the store both need exactly
+// that number, and the confirmation is shared with the migration road.
 
 /// The label sets of the VMs already bound to `on` — what anti-affinity is
 /// measured against.
@@ -481,23 +446,43 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     // it is not a matter of strategy, and a strategy that chose one of these
     // would produce one refused create per pass for ever.
     let refused = refusing_now(&vm, Utc::now());
+    // A claim this guest already holds, from an attempt that did not reach
+    // the binding — a process killed between the claim and the write, a
+    // confirmation that could not be read. Astra finding R3-F05, 2026-09-24.
+    // `hold` took its room off the candidate list where the list was built,
+    // as it takes every promise off; but this promise is this very guest's,
+    // and measured against a node exactly itself too full the guest would be
+    // refused by its own bookkeeping, every pass, for ever. So its own claim
+    // is given back on the COPY the decision is made from — the copy and
+    // never the shared list, because every other VM of this pass is measured
+    // against the shared list and the room is spoken for until the claim is
+    // used or reaped. The same `give_back` a migration makes for its own
+    // promise.
+    let standing = p.held.iter().find(|r| r.is_placement_of(&vm)).cloned();
     let decision = {
         let mut nodes = p.nodes.lock().unwrap();
         // A COPY of the list, filtered — never `retain` on the shared one.
         // `p.nodes` is the whole pass's candidate list and every VM after
         // this one is measured against it; removing a node here because THIS
         // vm was refused there would hide it from all of them.
-        let candidates: Vec<&Candidate> = nodes
+        let mut candidates: Vec<Candidate> = nodes
             .iter()
             .filter(|c| !refused.contains(&c.name))
+            .cloned()
             .collect();
+        if let Some(ours) = &standing
+            && let Some(c) = candidates.iter_mut().find(|c| c.name == ours.spec.node)
+        {
+            c.free = c.free.plus(ours.spec.size());
+        }
         // Hard first: where a `node-local` volume IS, is where the VM runs.
         // Applied to the candidate list before any strategy sees it, because
         // it is not a matter of strategy — the same argument `feasible` makes.
-        let allowed: Vec<Candidate> = controller_api::feasible_for_volumes(&bindings, candidates)
-            .into_iter()
-            .cloned()
-            .collect();
+        let allowed: Vec<Candidate> =
+            controller_api::feasible_for_volumes(&bindings, candidates.iter().collect())
+                .into_iter()
+                .cloned()
+                .collect();
         // Soft second, and with the fallback that makes it a preference: try
         // the nodes that already hold the data, and if the strategy can place
         // nothing there, try them all. After capacity rather than before it,
@@ -563,11 +548,74 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
             return note_vm_pending(p, &vm, category, reason).await;
         }
     };
+    // Everything above this line is this replica's OPINION: formed from a
+    // snapshot, booked in a process-local mutex, and every sibling replica
+    // has one just like it. Astra finding R3-F05, 2026-09-24: two opinions
+    // about one node's last slot were both written down as bindings — B read
+    // 8 GiB free, A reserved and confirmed 6 for a migration, B bound 6 from
+    // its old snapshot, and the machine carried 12 of 8. From here on the
+    // store is the authority, in the four steps `CapacityReservationSpec`
+    // sets out and the migration road takes in `prepare` and `settle`:
+    // claim, confirm, bind under the claim, release.
+    let mine = match claim(p.store, &vm, &node).await? {
+        Claimed::Fresh(mine) => mine,
+        Claimed::Standing(mine) if mine.spec.node == node => mine,
+        // An earlier attempt, or a sibling in this very step, claimed this
+        // guest onto a different machine. That claim is the one that stands
+        // — one guest, one claim — and this pass does not second-guess it:
+        // the sibling binds within the tick, or the reaper takes the claim
+        // once it has stood for `STALE_PLACEMENT_AFTER_SECS` with the guest
+        // unbound, and the pass after that decides afresh. The room spent on
+        // `node` above stays spent for the rest of this pass, which costs
+        // one VM one tick, as a lost binding always has.
+        Claimed::Standing(mine) => {
+            debug!(node = %node, claimed = %mine.spec.node,
+                   "this guest is already claimed onto another machine; leaving it");
+            return Ok(());
+        }
+        // Given back between the two round trips. Nothing is held, and the
+        // next pass claims again.
+        Claimed::Gone => return Ok(()),
+    };
+    match controller_api::capacity::claim_holds(p.store, &mine, p.overcommit).await {
+        Ok(true) => {}
+        // Somebody wrote a claim on this node's last room before this one
+        // was written — a sibling's placement, a migration's `prepare` — and
+        // in the store's own order theirs stands. Given back at once, and
+        // measured again next pass against a list that has the winner on it.
+        Ok(false) => {
+            controller_api::capacity::release(p.store, &mine).await;
+            telemetry::metrics::scheduling().conflict(telemetry::metrics::TIER_CLUSTER);
+            p.pending.note(PendingReason::NoCapacity);
+            return note_vm_pending(
+                p,
+                &vm,
+                PendingReason::NoCapacity,
+                format!(
+                    "node {node} had room when this pass began and another claim took it \
+                     first; measured again next pass"
+                ),
+            )
+            .await;
+        }
+        // A reading that failed is not a passed check (Astra finding R3-F04).
+        // The claim stands, so the room stays spoken for; the next pass finds
+        // it in `held`, gives it back on its own copy of the list, and if the
+        // scheduler names this node again adopts it and asks again.
+        Err(e) => {
+            return Err(e.context(format!(
+                "vm {}: the room on {node} could not be confirmed; nothing was bound",
+                vm.metadata.name
+            )));
+        }
+    }
     // A plain CAS on the object this pass read, not a read-modify-write:
     // with several replicas scheduling at once the binding is exactly what
     // must NOT be retried onto a newer object — a retry would re-apply this
     // replica's choice over the winner's and move a VM that is already
-    // placed. One write, one winner, and the loser is told.
+    // placed. One write, one winner, and the loser is told. And under the
+    // claim: the same transaction compares the claim's revision, so a claim
+    // the reaper took or a sibling released cannot become a binding.
     let mut bound = vm;
     bound.spec.node_name = Some(node.clone());
     // What the scheduler said about the last pass is answered by the binding
@@ -575,8 +623,15 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     // it could not be placed — and the category with it. Clearing the FACT is
     // all there is to do: `settle_vm` reads it only while the VM is waiting.
     bound.status.placement = None;
-    match p.store.update(&bound).await {
+    match p.store.update_if_standing(&bound, &mine).await {
         Ok(_) => {
+            // The room is given back HERE, in the arm where the binding took,
+            // and not a line earlier. From this write on the guest is counted
+            // on the node by `free_on` like any other VM bound there, and the
+            // claim beside it is the same guest twice — the safe direction,
+            // for the length of one round trip. Before the write, the claim
+            // is the only thing holding the room at all.
+            controller_api::capacity::release(p.store, &mine).await;
             telemetry::metrics::scheduling().placed(telemetry::metrics::TIER_CLUSTER);
             // Inside the arm where the compare-and-swap SUCCEEDED, which is
             // what makes this an event rather than a pass: the replica that
@@ -592,13 +647,65 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
             .await;
             info!(node = %node, "scheduled")
         }
-        Err(StoreError::Conflict(_)) => {
+        // Either the VM moved under this pass — a client editing it, a
+        // sibling that adopted this very claim and bound first — or the claim
+        // did: reaped as stale, or released by a sibling whose confirmation
+        // came out the other way. In both the binding did not happen, which
+        // is what the guard is for. The claim, if it still stands, is given
+        // back so that the next pass starts clean; a sibling that bound with
+        // it releases it itself, and a release that finds nothing costs one
+        // read.
+        Err(StoreError::Conflict(why)) => {
             telemetry::metrics::scheduling().conflict(telemetry::metrics::TIER_CLUSTER);
-            debug!(node = %node, "lost the scheduling race, another writer bound it")
+            debug!(node = %node, %why, "lost the scheduling race; nothing was bound");
+            controller_api::capacity::release(p.store, &mine).await;
         }
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// What `claim` found at the key this guest's placement writes to.
+enum Claimed {
+    /// This pass wrote it. Unique as a KEY, which is not yet the same as
+    /// fitting — see `controller_api::capacity::claim_holds`.
+    Fresh(CapacityReservation),
+    /// A claim for this very guest was already standing: an earlier attempt
+    /// wrote it and the process died before the binding, or a sibling
+    /// replica is in this step for the same guest right now. Its node is
+    /// where the choice was written down.
+    Standing(CapacityReservation),
+    /// The key was taken and then given back between the two round trips.
+    Gone,
+}
+
+/// Step one of the commit: write down, create-only, that this guest is going
+/// to `node` — so that one guest's placement has exactly one claim, on every
+/// replica, and a second replica reaching this step finds the room already
+/// spoken for by this very guest rather than booking it twice.
+///
+/// The key is `place-<vm uid>`, so whatever stands under it and is not this
+/// guest's claim is nothing this control plane wrote; it is refused rather
+/// than adopted, and the reaper — which finds no guest for it — takes it.
+async fn claim(store: &EtcdStore, vm: &Vm, node: &str) -> anyhow::Result<Claimed> {
+    let want = CapacityReservation::for_placement(vm, node);
+    match store.create(&want).await {
+        Ok(mine) => Ok(Claimed::Fresh(mine)),
+        Err(StoreError::AlreadyExists(_)) | Err(StoreError::Terminating(_)) => {
+            match store.get::<CapacityReservation>(&want.metadata.name).await {
+                Ok(standing) if standing.is_placement_of(vm) => Ok(Claimed::Standing(standing)),
+                Ok(other) => anyhow::bail!(
+                    "the claim key {} is held by something that is not this guest's claim \
+                     (vm uid {}); leaving it to the reaper",
+                    want.metadata.name,
+                    other.spec.vm_uid
+                ),
+                Err(StoreError::NotFound(_)) => Ok(Claimed::Gone),
+                Err(e) => Err(e.into()),
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The nodes whose refusal of this VM is still standing at `now`.

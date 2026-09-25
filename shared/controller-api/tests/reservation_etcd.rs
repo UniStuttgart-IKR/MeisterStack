@@ -21,7 +21,7 @@
 //! by the writer and by nobody else.
 
 use meister_controller_api::{
-    CapacityReservation, CapacityReservationSpec, EtcdStore, StoreError, reserved_on,
+    CapacityReservation, CapacityReservationSpec, Claimant, EtcdStore, StoreError, reserved_on,
 };
 
 fn endpoint() -> String {
@@ -42,6 +42,7 @@ fn reservation(migration: &str, migration_uid: &str, node: &str) -> CapacityRese
             node: node.to_string(),
             vm: "web-1".to_string(),
             vm_uid: "vm-uid-1".to_string(),
+            claimant: Claimant::Migration,
             migration: migration.to_string(),
             migration_uid: migration_uid.to_string(),
             vcpus: 4,

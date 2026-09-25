@@ -346,6 +346,57 @@ impl EtcdStore {
         Ok((out, resp.kvs().len()))
     }
 
+    /// Two listings out of ONE revision, in one round trip.
+    ///
+    /// A `list` followed by a `list` is two readings of two moments, and a
+    /// writer that changed both directories between them is seen in neither.
+    /// That is exactly the shape of a placement finishing — it binds its
+    /// guest in `vms` and then releases its claim in `capacityreservations`
+    /// — and a capacity check that read the VMs before the binding and the
+    /// reservations after the release would count that guest nowhere. Astra
+    /// finding R3-F05, 2026-09-24: the check has to see one store, so both
+    /// ranges are read inside one transaction, which etcd serves at one
+    /// revision. Undecodable objects are skipped and logged exactly as `list`
+    /// skips them.
+    pub async fn list2<A: Resource, B: Resource>(&self) -> Result<(Vec<A>, Vec<B>)> {
+        let txn = Txn::new().and_then(vec![
+            TxnOp::get(self.dir(A::RESOURCE), Some(GetOptions::new().with_prefix())),
+            TxnOp::get(self.dir(B::RESOURCE), Some(GetOptions::new().with_prefix())),
+        ]);
+        let resp = timed("list2", self.handle().txn(txn)).await?;
+        observe_revision(resp.header());
+        let mut ranges = resp.op_responses().into_iter().filter_map(|op| match op {
+            etcd_client::TxnOpResponse::Get(r) => Some(r),
+            _ => None,
+        });
+        // Fewer answers than questions is not "empty": an empty directory
+        // comes back as a range with no keys. It is a store that did not do
+        // what it was asked, and the reading is refused rather than read as
+        // a fleet with nothing in it — which is the direction that fills a
+        // node.
+        let (Some(a), Some(b)) = (ranges.next(), ranges.next()) else {
+            return Err(StoreError::Invalid(format!(
+                "etcd answered a read of {} and {} with fewer than two ranges",
+                A::RESOURCE,
+                B::RESOURCE
+            )));
+        };
+        Ok((Self::decode_range(a.kvs()), Self::decode_range(b.kvs())))
+    }
+
+    /// Every object in a range that decodes, the way `list` reads one.
+    fn decode_range<T: Resource>(kvs: &[etcd_client::KeyValue]) -> Vec<T> {
+        let mut out = Vec::with_capacity(kvs.len());
+        for kv in kvs {
+            match Self::decode(kv.value(), kv.mod_revision()) {
+                Ok(obj) => out.push(obj),
+                Err(e) => error!(key = %String::from_utf8_lossy(kv.key()),
+                                 error = format!("{e:#}"), "skipping undecodable object"),
+            }
+        }
+        out
+    }
+
     /// Record that this peer has just spoken, in a key of its own.
     ///
     /// D-C7, and the number behind it is the whole argument: a 20-second
@@ -676,6 +727,87 @@ impl EtcdStore {
                 "resource version conflict on {resource}/{name} (concurrent write)",
                 resource = T::RESOURCE
             )));
+        }
+        self.written(&name, &value, &resp).await
+    }
+
+    /// `update`, and only while `guard` still stands exactly as the caller
+    /// read it — in one transaction, which does not touch the guard.
+    ///
+    /// The binding half of the capacity commit, Astra finding R3-F05,
+    /// 2026-09-24. A placement claims room with a `CapacityReservation`,
+    /// confirms it, and then writes the VM's `nodeName`; what this adds is
+    /// that the third step cannot happen once the first has been undone. The
+    /// reaper takes a claim it reads as abandoned, a sibling releases one it
+    /// found refused, and either of those between the confirmation and the
+    /// binding would otherwise let a binding land on room that has since
+    /// been promised to somebody else. Here the guard's `mod_revision` is
+    /// compared alongside the object's own, so a binding whose claim is gone
+    /// or rewritten is refused as a `Conflict` and the next pass claims
+    /// again.
+    ///
+    /// Unlike `update_fenced` this writes nothing to the guard: a claim is
+    /// released by its own guarded delete, and a binding that moved the claim
+    /// would make that delete fail on the very move that succeeded. The
+    /// conflict says which of the two compares failed, so the log can say
+    /// whether the VM moved under the writer or the claim did.
+    pub async fn update_if_standing<T: Resource, G: Resource>(
+        &self,
+        obj: &T,
+        guard: &G,
+    ) -> Result<T> {
+        let name = obj.metadata().name.clone();
+        Self::check_name(&name, T::NAME_SHAPE)?;
+        let rev: i64 = obj.metadata().resource_version.parse().map_err(|_| {
+            StoreError::Invalid(
+                "invalid object: metadata.resourceVersion must be set for updates".into(),
+            )
+        })?;
+        let guard_name = guard.metadata().name.clone();
+        let guard_rev: i64 = guard.metadata().resource_version.parse().map_err(|_| {
+            StoreError::Invalid(
+                "invalid guard: metadata.resourceVersion must be set for a guarded update".into(),
+            )
+        })?;
+        let key = self.key(T::RESOURCE, &name);
+        let guard_key = self.key(G::RESOURCE, &guard_name);
+        let value = Self::encode(obj, chrono::Utc::now())?;
+        let txn = Txn::new()
+            .when(vec![
+                Compare::mod_revision(key.clone(), CompareOp::Equal, rev),
+                Compare::mod_revision(guard_key.clone(), CompareOp::Equal, guard_rev),
+            ])
+            // The same put `update` makes, lease and all.
+            .and_then(vec![TxnOp::put(
+                key.clone(),
+                value.clone(),
+                Some(PutOptions::new().with_ignore_lease()),
+            )])
+            // Read the guard back only on the branch that failed, to say
+            // which compare it was.
+            .or_else(vec![TxnOp::get(guard_key.clone(), None)]);
+        let resp = timed("update", self.handle().txn(txn)).await?;
+        if !resp.succeeded() {
+            let guard_stands = resp.op_responses().into_iter().any(|op| match op {
+                etcd_client::TxnOpResponse::Get(r) => r
+                    .kvs()
+                    .first()
+                    .is_some_and(|kv| kv.mod_revision() == guard_rev),
+                _ => false,
+            });
+            return Err(StoreError::Conflict(if guard_stands {
+                format!(
+                    "resource version conflict on {resource}/{name} (concurrent write)",
+                    resource = T::RESOURCE
+                )
+            } else {
+                format!(
+                    "{guard}/{guard_name} no longer stands as it was read; \
+                     {resource}/{name} was not written",
+                    guard = G::RESOURCE,
+                    resource = T::RESOURCE
+                )
+            }));
         }
         self.written(&name, &value, &resp).await
     }
