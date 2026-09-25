@@ -35,6 +35,9 @@
 /// source.
 pub const GUEST_NOT_GIVEN_UP: &str = "The guest was not given up";
 
+/// Both endpoints must advertise this before any migration is prepared.
+pub const ATTEMPT_PROTOCOL: &str = "migration/attempt-v2";
+
 /// Whether a failed `MigrateOut` is the source saying the guest stayed here.
 ///
 /// A `contains` and not an equality, because the answer travels wrapped: the

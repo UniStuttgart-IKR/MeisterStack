@@ -100,10 +100,24 @@ pub const COMMAND_PATH: &str = "/apis/meister.io/v1/nodes/{name}/commands";
 pub enum NodeCommand {
     /// Make a VMM that listens for an arriving guest.
     #[serde(rename_all = "camelCase")]
-    PrepareMigration { id: String, spec_json: String },
+    PrepareMigration {
+        id: String,
+        spec_json: String,
+        migration_id: String,
+    },
     /// Send the guest to the address the destination named.
     #[serde(rename_all = "camelCase")]
-    MigrateOut { id: String, peer: String },
+    MigrateOut {
+        id: String,
+        peer: String,
+        migration_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    CleanupMigration {
+        id: String,
+        migration_id: String,
+        source: bool,
+    },
     /// Let go of this VM: the record, the VMM and the volumes it attached.
     #[serde(rename_all = "camelCase")]
     Destroy { id: String },
@@ -152,16 +166,34 @@ impl NodeCommand {
     /// wire.
     pub fn into_op(self) -> command::Op {
         match self {
-            Self::PrepareMigration { id, spec_json } => {
-                command::Op::PrepareMigration(proto::PrepareMigration {
-                    id,
-                    spec_json,
-                    listen: String::new(),
-                })
-            }
-            Self::MigrateOut { id, peer } => {
-                command::Op::MigrateOut(proto::MigrateOut { id, peer })
-            }
+            Self::PrepareMigration {
+                id,
+                spec_json,
+                migration_id,
+            } => command::Op::PrepareMigration(proto::PrepareMigration {
+                id,
+                spec_json,
+                listen: String::new(),
+                migration_id,
+            }),
+            Self::MigrateOut {
+                id,
+                peer,
+                migration_id,
+            } => command::Op::MigrateOut(proto::MigrateOut {
+                id,
+                peer,
+                migration_id,
+            }),
+            Self::CleanupMigration {
+                id,
+                migration_id,
+                source,
+            } => command::Op::CleanupMigration(proto::CleanupMigration {
+                id,
+                migration_id,
+                source,
+            }),
             Self::Destroy { id } => command::Op::Destroy(proto::DestroyInstance { id }),
             Self::ProvisionVolume { id, spec_json } => {
                 command::Op::ProvisionVolume(proto::ProvisionVolume {
@@ -210,6 +242,7 @@ impl NodeCommand {
             Self::PrepareMigration { .. } => "prepare-migration",
             Self::MigrateOut { .. } => "migrate-out",
             Self::Destroy { .. } => "destroy",
+            Self::CleanupMigration { .. } => "cleanup-migration",
             Self::ProvisionVolume { .. } => "provision-volume",
             Self::EnsureRouter { .. } => "ensure-router",
             Self::DestroyRouter { .. } => "destroy-router",
@@ -476,6 +509,7 @@ mod tests {
             .deliver(
                 "agent-1a",
                 NodeCommand::PrepareMigration {
+                    migration_id: "attempt".into(),
                     id: "uid-1".into(),
                     spec_json: "{}".into(),
                 },
@@ -495,6 +529,7 @@ mod tests {
             panic!("the command that arrived is the command that was sent: {op:?}");
         };
         assert_eq!(prepare.id, "uid-1");
+        assert_eq!(prepare.migration_id, "attempt");
         assert_eq!(prepare.listen, "", "the destination picks its own address");
     }
 
@@ -560,13 +595,14 @@ mod tests {
     #[test]
     fn the_commands_travel_as_themselves() {
         let cmd = NodeCommand::MigrateOut {
+            migration_id: "attempt".into(),
             id: "uid-1".into(),
             peer: "10.0.0.7:49000".into(),
         };
         let wire = serde_json::to_string(&cmd).unwrap();
         assert_eq!(
             wire,
-            r#"{"command":"migrateOut","id":"uid-1","peer":"10.0.0.7:49000"}"#
+            r#"{"command":"migrateOut","id":"uid-1","peer":"10.0.0.7:49000","migrationId":"attempt"}"#
         );
         assert_eq!(serde_json::from_str::<NodeCommand>(&wire).unwrap(), cmd);
 

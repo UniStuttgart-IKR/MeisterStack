@@ -65,7 +65,7 @@ impl Agent {
 
         let _guard = self.ops.lock().await;
         self.provisioner
-            .prepare_migration(id, spec, &listen, true)
+            .prepare_migration(id, spec, &listen, true, &c.migration_id)
             .await?;
         // JSON and not the bare string, because `Ack.payload` is bytes with
         // no type on them and a reader a year from now should not have to
@@ -91,10 +91,8 @@ impl Agent {
     /// status road, derived from this node's own record, and the tier above
     /// READS it instead of holding a pass open for it.
     ///
-    /// The task is spawned and nobody awaits it. It dies with the agent, and
-    /// what it leaves behind — a `MigratingOut` marker on the record — is
-    /// what `clear_orphaned_operation` has cleared at start-up since long
-    /// before this. The transfer itself belongs to the VMM and survives both.
+    /// The task is only a watcher. Its durable attempt and repair barrier survive
+    /// restart, and reconciliation resumes observation of the same attempt.
     ///
     /// The lock is NOT taken around any of this: it goes down into
     /// `begin_migrate_out`, which holds it for the moment that touches this
@@ -110,7 +108,7 @@ impl Agent {
         }
         let started = std::time::Instant::now();
         self.provisioner
-            .begin_migrate_out(&id, &c.peer, &self.ops)
+            .begin_migrate_out(&id, &c.peer, &c.migration_id, &self.ops)
             .await?;
 
         let provisioner = self.provisioner.clone();
@@ -119,7 +117,7 @@ impl Agent {
         let report_now = self.report_now.clone();
         tokio::spawn(async move {
             provisioner
-                .finish_migrate_out(&id, &peer, started, &ops)
+                .finish_migrate_out(&id, &peer, &c.migration_id, started, &ops)
                 .await;
             // The outcome is written down; say so now rather than up to ten
             // seconds from now. The tier above is waiting on exactly this

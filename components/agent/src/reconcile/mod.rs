@@ -556,6 +556,20 @@ impl Reconciler {
                 self.clear_orphaned_operation(&id, &mut record)?;
             }
 
+            if matches!(
+                record.operation,
+                Some(crate::types::Operation::MigratingOut { .. })
+            ) {
+                if let Some(attempt) = &record.migration {
+                    self.provisioner
+                        .observe_send(&id, &attempt.id, &self.ops)
+                        .await?;
+                    record = match self.store.get(&id)? {
+                        Some(r) => r,
+                        None => break,
+                    };
+                }
+            }
             let observed = self.observe(&id, &record).await;
             if let Some(fresh) = self.quarantine_if_backend_died(&id, &record, &observed)? {
                 record = fresh;
@@ -594,13 +608,22 @@ impl Reconciler {
         Ok(first_action.unwrap_or(Action::None))
     }
 
-    /// The operation marker a crash left behind, dropped once at startup.
-    ///
-    /// An operation belongs to the task that started it, and that task did
-    /// not survive the restart. `plan` returns `Blocked` for as long as the
-    /// marker stands, so a marker nobody is holding would block this VM for
-    /// ever.
+    /// Clear task-local operations only. VMM transfers survive this process;
+    /// legacy sends without an identity also remain blocked for manual recovery.
     fn clear_orphaned_operation(&self, id: &VmId, record: &mut VmRecord) -> Result<()> {
+        if matches!(
+            record.operation,
+            Some(crate::types::Operation::MigratingOut { .. })
+        ) {
+            return Ok(());
+        }
+        if matches!(
+            record.operation,
+            Some(crate::types::Operation::MigratingIn { .. })
+        ) && record.phase != Phase::Receiving
+        {
+            return Ok(());
+        }
         if let Some(op) = record.operation.take() {
             warn!(?op, "clearing orphaned operation after restart");
             self.store.put(id, record)?;

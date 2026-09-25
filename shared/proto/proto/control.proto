@@ -315,30 +315,21 @@ message StatusReport {
   bool vms_complete = 10;
 }
 
-// What one node has to say about a guest it was told to send away.
-//
-// Three outcomes, one at a time, derived from the node's own record on every
-// heartbeat rather than remembered as an event: the record IS the state, so a
-// report that crossed with an agent restart says the same thing afterwards.
-//
-//   `Sending`     the stream is open and this node is watching its own VMM.
-//   `Gone`        the VMM exited, which is how cloud-hypervisor states that a
-//                 send took. The guest is at the destination.
-//   `StillHere`   v53 gave the guest back and is serving it here, and
-//                 `message` is why. This is the one that used to arrive only
-//                 as a command that never answered, and the tier above then
-//                 waited out its whole transfer timeout to find out.
+// Durable evidence from either endpoint, bound to a VM and migration attempt.
+// Sending: accepted transfer; Unknown: ownership unresolved; Gone: source process
+// absent; StillHere: acknowledged transfer explicitly aborted; Receiving: prepared
+// target; Arrived: target received the guest. Success requires Gone AND Arrived.
 message MigrationReport {
   // The VM's uid, the same one CreateInstance and MigrateOut carry.
   string vm_id = 1;
-  // The address this node was told to send to, verbatim. Empty once the send
-  // is over: it is what the report is ABOUT while it runs, and afterwards the
-  // outcome is the whole of what matters.
+  // Retained for both in-flight and terminal reports.
   string peer = 2;
-  // `Sending` | `Gone` | `StillHere`, spelled exactly like that.
+  // `Sending` | `Unknown` | `Gone` | `StillHere` | `Receiving` | `Arrived`.
   string outcome = 3;
-  // Why, for `StillHere`. Empty for the other two.
+  // Abort or uncertainty details, if available.
   string message = 4;
+  // Required for migration protocol v2. Empty legacy reports are not evidence.
+  string migration_id = 5;
 }
 
 // One snapshot, as the node that took it sees it.
@@ -695,6 +686,7 @@ message Command {
     ForgetVolume forget_volume = 20;
     // Told once, from the cloud, that an image was deleted. See DropImage.
     DropImage drop_image = 21;
+    CleanupMigration cleanup_migration = 22;
   }
 }
 
@@ -862,6 +854,7 @@ message PrepareMigration {
   // is here for a caller that has to pin a port — a firewall with one hole in
   // it — and for nothing else.
   string listen = 3;
+  string migration_id = 4;
 }
 
 // Send this node's running guest to `peer`.
@@ -872,16 +865,23 @@ message PrepareMigration {
 // before it can fail without the guest noticing, which is why a failed
 // migration costs a record and nothing else.
 //
-// The Ack means the guest is GONE from here — the node waits for its own VMM
-// to exit, which is how v53 states that a send succeeded — and the node's
-// record survives as `Migrated` until a DestroyInstance takes it away. An
-// error means the guest is still running here, untouched.
+// Ack means accepted. Errors and lost replies do not prove an abort. The durable
+// attempt remains protected until matching terminal evidence is established.
 message MigrateOut {
   string id = 1;
   // The address the destination answered with, verbatim. Not parsed at any
   // tier between the two nodes: two machines agree on a string and nobody in
   // the middle needs to know what it means.
   string peer = 2;
+  string migration_id = 3;
+}
+
+// Cleanup is conditional on durable attempt ownership. Never falls back to Destroy.
+message CleanupMigration {
+  string id = 1;
+  string migration_id = 2;
+  // True: remove the departed source. False: cancel the prepared destination.
+  bool source = 3;
 }
 
 // Make bytes on this node, or hand back the ones that are already there.

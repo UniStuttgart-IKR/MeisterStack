@@ -1346,6 +1346,7 @@ mod tests {
             stop_deadline: None,
             receive_deadline: None,
             send_failed: None,
+            migration: None,
             unhealthy: None,
             managed_by_controller: true,
             volumes: vec![],

@@ -89,21 +89,24 @@ pub(super) async fn create_vm_migration(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-/// Abandoning the RECORD, never the VM.
-///
-/// There is no finalizer and no cancellation, and both of those are the same
-/// decision: a migration in flight is a stream between two VMMs, and this
-/// tier has no way to stop one halfway that is safer than letting it finish.
-/// What a delete does is throw away the object; the source VM is running
-/// throughout either way, which is the invariant the whole reconciler is
-/// built on.
+/// In-flight records retain operation ownership and capacity reservations.
+/// A version-checked delete prevents racing a pending migration's prepare claim.
 pub(super) async fn delete_vm_migration(
     State(st): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<controller_api::Removed, ApiError> {
-    let _: controller_api::VmMigration = st.store.get(&name).await?;
+    let migration: controller_api::VmMigration = st.store.get(&name).await?;
+    if !migration.status.phase().kind().is_final()
+        && migration.status.phase().kind() != controller_api::VmMigrationPhaseKind::Pending
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "MigrationInFlight",
+            "resolve the migration before deleting its ownership record",
+        ));
+    }
     st.store
-        .delete::<controller_api::VmMigration>(&name)
+        .delete_if::<controller_api::VmMigration>(&name, &migration.metadata.resource_version)
         .await?;
     Ok(controller_api::removed(
         controller_api::VmMigration::KIND,

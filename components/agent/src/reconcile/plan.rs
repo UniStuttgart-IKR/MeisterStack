@@ -233,6 +233,7 @@ pub fn sync_orphans<'a>(
             r.managed_by_controller
                 && r.desired != Desired::Absent
                 && r.phase != Phase::Receiving
+                && !r.migration.as_ref().is_some_and(|m| m.incoming)
                 && !snapshot.contains(id)
         })
         .map(|(id, _)| id)

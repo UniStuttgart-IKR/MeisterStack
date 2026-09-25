@@ -146,22 +146,9 @@ pub(super) async fn ingest_status(
         warn!(node = node_id, error = %format!("{e:#}"), "vm address ingest failed");
     }
 
-    // What the DESTINATION of a live migration says about the guest moving to
-    // it. Its own pass, in its own file, and it exists because `ours` below
-    // refuses a report from a node the vm is not bound to — which is exactly
-    // what a destination is until the migration finishes. It writes on the
-    // migration object and never on the vm.
-    if let Err(e) = crate::migration::ingest_arrivals(store, &vms, node_id, report).await {
-        warn!(node = node_id, error = %format!("{e:#}"), "migration arrival ingest failed");
-    }
-
-    // And what the SOURCE says about the send itself. A different fact from a
-    // VM phase — the guest is `Running` on the source right up to the moment
-    // it is not — and it used to be the answer to `MigrateOut`, which is why
-    // the reconcile pass awaited that answer for the length of a transfer
-    // (D16).
-    if let Err(e) = crate::migration::ingest_departures(store, &vms, node_id, report).await {
-        warn!(node = node_id, error = %format!("{e:#}"), "migration departure ingest failed");
+    // Endpoint evidence is attempt-bound and belongs on the migration object.
+    if let Err(e) = crate::migration::ingest_reports(store, &vms, node_id, report).await {
+        warn!(node = node_id, error = %format!("{e:#}"), "migration report ingest failed");
     }
 
     ingest_phases(store, node_id, &vms, report, ours, at).await;

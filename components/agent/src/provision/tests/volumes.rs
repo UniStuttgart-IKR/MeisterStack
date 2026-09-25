@@ -513,6 +513,7 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
         stop_deadline: None,
         receive_deadline: None,
         send_failed: None,
+        migration: None,
         unhealthy: None,
         managed_by_controller: true,
         volumes: vec![boot, going]
@@ -850,6 +851,7 @@ async fn a_stop_and_then_a_destroy_detach_the_volume_once() {
         stop_deadline: None,
         receive_deadline: None,
         send_failed: None,
+        migration: None,
         unhealthy: None,
         managed_by_controller: true,
         volumes: vec![Volume::attached(
@@ -1033,6 +1035,7 @@ async fn a_failed_detach_is_not_marked_and_is_tried_again() {
         stop_deadline: None,
         receive_deadline: None,
         send_failed: None,
+        migration: None,
         unhealthy: None,
         managed_by_controller: true,
         volumes: vec![Volume::attached(

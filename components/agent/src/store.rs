@@ -20,6 +20,9 @@ use tracing::{error, info, warn};
 
 const VMS: TableDefinition<&str, &[u8]> = TableDefinition::new("vms");
 
+// Permanent command receipts also fence delayed commands after VM cleanup.
+const MIGRATIONS: TableDefinition<&str, bool> = TableDefinition::new("migration_attempts");
+
 /// The volumes this node was told to make, keyed by the control plane's uid.
 ///
 /// A table of its own beside the VMs, and not a field on a VM record, because
@@ -227,6 +230,8 @@ impl Store {
         // Create DB if not already existing
         let tx = db.begin_write().context("initializing tables")?;
         tx.open_table(VMS).context("initializing vms table")?;
+        tx.open_table(MIGRATIONS)
+            .context("initializing migration receipts")?;
         tx.open_table(VOLUMES)
             .context("initializing volumes table")?;
         tx.open_table(SNAPSHOTS)
@@ -419,6 +424,28 @@ impl Store {
             }
             tx.commit().context("commit")?;
             Ok(())
+        })
+    }
+
+    /// Claim once, or cancel even before prepare arrives. Receipts outlive VM rows.
+    pub fn claim_migration(&self, id: &VmId, attempt: &str, cancel: bool) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            !attempt.is_empty(),
+            "migration requires an operation identity"
+        );
+        self.writing(|db| {
+            let key = format!("{id}/{attempt}");
+            let tx = db.begin_write()?;
+            let fresh;
+            {
+                let mut table = tx.open_table(MIGRATIONS)?;
+                fresh = table.get(key.as_str())?.is_none();
+                if fresh || cancel {
+                    table.insert(key.as_str(), cancel)?;
+                }
+            }
+            tx.commit()?;
+            Ok(fresh)
         })
     }
 

@@ -85,6 +85,7 @@ async fn a_vm_is_built_from_the_same_attachments_two_calls_now_produce() {
         stop_deadline: None,
         receive_deadline: None,
         send_failed: None,
+        migration: None,
         unhealthy: None,
         managed_by_controller: false,
         volumes: vec![Volume::attached(handle.clone(), attachment.clone())],

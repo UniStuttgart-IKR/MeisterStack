@@ -61,6 +61,11 @@ Storage and networking are also abstracted on the control plane by Rust traits t
 
 ### Cloud-Controller
 
+### Live migration
+
+The implemented ownership, timeout, restart and upgrade contract is documented in
+[Live migration: ownership, evidence and recovery](MIGRATION.md).
+
 ## Miscellaneous
 
 ## Future Work

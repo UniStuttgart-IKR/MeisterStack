@@ -134,6 +134,18 @@ impl VmMigrationPhaseKind {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct VmMigrationStatus {
+    /// Durable operation identity. Missing on legacy records, which require recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_id: Option<String>,
+    /// VM incarnation captured before prepare; reports must match it as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_uid: Option<String>,
+    /// An unresolved outcome is nonterminal and retains its capacity reservation.
+    #[serde(default)]
+    pub recovery_required: bool,
+    /// Persisted before cleanup so no replica may dispatch a send afterwards.
+    #[serde(default)]
+    pub cancelling: bool,
     /// The phase, with the reason it is that phase and since when.
     ///
     /// Flat on the wire — `phase`, `reason`, `message`, `since` as siblings
@@ -189,47 +201,12 @@ pub struct VmMigrationStatus {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
-    /// The last phase the DESTINATION reported for this VM, in its own
-    /// spelling — and the one piece of evidence the ordinary status ingest
-    /// cannot carry.
-    ///
-    /// A node's word about a VM is taken only where the VM is BOUND, which is
-    /// the rule that stops an agent writing itself into the status of a VM
-    /// nobody placed there. For the whole length of a migration the
-    /// destination is exactly such a node: it has the guest and the binding
-    /// still names the source. So its word lands here, on the migration, and
-    /// never on the VM — and `Running` here is what says the guest arrived
-    /// and lets the binding move.
-    ///
-    /// It is also what a `Failed` record is read for when a transfer timed
-    /// out: "the destination said Provisioning" and "the destination said
-    /// nothing at all" are two different mornings.
-    ///
-    /// `None` before the destination has said anything.
+    /// Attempt-bound destination evidence: `Provisioning` for `Receiving`,
+    /// `Running` for `Arrived`. Ordinary VM status reports do not populate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_reported: Option<String>,
-    /// What the SOURCE last said about the send it was told to make:
-    /// `Sending`, `Gone` or `StillHere`, in the node's own spelling.
-    ///
-    /// The evidence that used to be a command's return value. `MigrateOut`
-    /// answered with the OUTCOME, so the reconcile pass awaited it for the
-    /// length of a guest's memory — 300 ms on a small guest, up to 45 s on a
-    /// large one, and in all of it no other VM in the cluster was placed or
-    /// repaired (D16). The command says "accepted" now, and this is where the
-    /// outcome lands: `MigrationReport` on the status road, taken in by
-    /// `migration::ingest_departures`.
-    ///
-    /// `StillHere` is worth the field on its own. v53 RESUMES the guest on a
-    /// failed send and goes on serving it, which is the good outcome of a bad
-    /// transfer — and until now the tier above learned of it only by a command
-    /// that never answered, after which it waited out its whole transfer
-    /// timeout to work out which machine held the guest. With it, `settle`
-    /// tears the destination down at once and says why, in the source's own
-    /// words.
-    ///
-    /// `None` before the source has said anything, and from every cluster
-    /// whose agents predate `MigrationReport` — which reads as "did not say"
-    /// and leaves the transfer timeout exactly as it was.
+    /// Attempt-bound source evidence: `Sending`, `Unknown`, `Gone`, `StillHere`.
+    /// Missing legacy evidence never establishes an abort or a successful move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_reported: Option<String>,
     /// The sentence that came with a `StillHere`, verbatim from the node.
@@ -249,10 +226,7 @@ pub const SEND_SENDING: &str = "Sending";
 pub const SEND_GONE: &str = "Gone";
 pub const SEND_STILL_HERE: &str = "StillHere";
 
-/// No finalizer, and that is the design rather than an omission: a migration
-/// OWNS nothing. Deleting one while it is in flight abandons the record and
-/// not the VM — the source is still running, which is the invariant — and the
-/// reconciler's next pass finds no object to carry on with.
+/// In-flight records retain ownership and cannot be deleted through the API.
 pub type VmMigration = Object<VmMigrationSpec, VmMigrationStatus>;
 
 /// How far the move got, out of the last word anybody established about it.

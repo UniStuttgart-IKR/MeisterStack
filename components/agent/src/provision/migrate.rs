@@ -16,20 +16,9 @@
 use super::*;
 use tracing::error;
 
-// The two ceilings this file used to hold as constants are `Ceilings` in
-// `provision/mod.rs` now, set from `migrate_out_ceiling_secs` and
-// `receive_ceiling_secs`. The arguments for the numbers are on that type; what
-// is unchanged is that both must be longer than the cluster's own
-// `migration_transfer_secs`, because the tier that ASKED for the migration is
-// the one that decides it has failed.
-
-/// What became of a guest this node was told to send.
-///
-/// Two words rather than a `bool` or an `Option<String>`, because the caller
-/// writes a different record for each and the reader of that call should not
-/// have to work out which way round `true` meant.
+/// Locally established terminal evidence. All other observations remain unknown.
 enum Departure {
-    /// The source VMM is gone, which v53 does only when the send took.
+    /// The source VMM is gone. Success additionally requires destination evidence.
     Gone,
     /// The guest is still being served here, and why that is known.
     StillHere(String),
@@ -61,7 +50,12 @@ impl Provisioner {
         spec: AgentVmSpec,
         listen: &str,
         managed_by_controller: bool,
+        migration_id: &str,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !migration_id.is_empty(),
+            "migration requires an operation identity"
+        );
         match self.store.row(&id)? {
             None => {}
             Some(crate::store::VmRow::Record(..)) => {
@@ -96,6 +90,10 @@ impl Provisioner {
         }
 
         self.check_device_admission(&id, &spec)?;
+        anyhow::ensure!(
+            self.store.claim_migration(&id, migration_id, false)?,
+            "migration attempt was already handled or cancelled"
+        );
 
         let mut record = VmRecord {
             spec,
@@ -114,6 +112,13 @@ impl Provisioner {
             stop_deadline: None,
             receive_deadline: None,
             send_failed: None,
+            migration: Some(crate::types::MigrationAttempt {
+                id: migration_id.into(),
+                peer: listen.into(),
+                incoming: true,
+                accepted: false,
+                unknown: None,
+            }),
             unhealthy: None,
             managed_by_controller,
             volumes: vec![],
@@ -199,8 +204,13 @@ impl Provisioner {
         &self,
         id: &VmId,
         peer: &str,
+        migration_id: &str,
         ops: &tokio::sync::Mutex<()>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !migration_id.is_empty(),
+            "migration requires an operation identity"
+        );
         let hypervisor = self.drivers.hypervisor()?;
         let migratable = hypervisor.as_migratable().ok_or_else(|| {
             anyhow!(
@@ -233,12 +243,24 @@ impl Provisioner {
         // The refusal names the address the guest is already going to,
         // because that is what tells the caller which of the two migrations
         // is the real one.
-        if let Some(Operation::MigratingOut { peer: under_way }) = &record.operation {
+        if let Some(op) = &record.operation {
+            let under_way = format!("{op:?}");
             bail!(
                 "vm {id} is already being sent to {under_way}; a guest is sent to one machine \
                  at a time"
             );
         }
+        anyhow::ensure!(
+            self.store.claim_migration(id, migration_id, false)?,
+            "migration attempt was already handled"
+        );
+        record.migration = Some(crate::types::MigrationAttempt {
+            id: migration_id.into(),
+            peer: peer.into(),
+            incoming: false,
+            accepted: false,
+            unknown: None,
+        });
         // Hands off for the length of the transfer. The guest is paused
         // near the end of it, and a pass that saw a paused guest under a
         // Running record would resume it — into a copy of itself.
@@ -255,157 +277,174 @@ impl Provisioner {
         if let Err(e) =
             timed_driver(HYPERVISOR, "migrate_out", migratable.migrate_out(id, peer)).await
         {
-            record.operation = None;
+            record.migration.as_mut().unwrap().unknown =
+                Some(format!("send acceptance is unknown: {e}"));
             self.store.put(id, &record)?;
             bail!("sending vm {id} to {peer}: {e}");
         }
+        record.migration.as_mut().unwrap().accepted = true;
+        self.store.put(id, &record)?;
         info!("the stream is open; the guest is on its way");
         Ok(())
     }
 
-    /// Watch the send this node started, and write down how it ended.
-    ///
-    /// The half that used to be the second page of `migrate_out`, running in
-    /// a task of its own now. Nothing about it changed except who awaits it:
-    /// the lock is taken for the two short stretches that touch this node and
-    /// dropped for the wait between them, exactly as before.
-    ///
-    /// It answers nothing to anybody. The record is the answer — `Migrated`,
-    /// or `send_failed` with v53's own sentence — and `departure` turns it
-    /// into the line the next heartbeat carries.
-    ///
-    /// A task dies with the agent, and the marker it leaves behind is cleared
-    /// by `clear_orphaned_operation` on the next start, which is what that
-    /// function has always been for. The transfer itself is the VMM's and
-    /// survives both.
-    #[instrument(skip(self, ops), fields(vm_id = %id, peer))]
+    /// Watch a single durable attempt. A deadline ends this task, not ownership.
     pub async fn finish_migrate_out(
         &self,
         id: &VmId,
         peer: &str,
+        migration_id: &str,
         started: std::time::Instant,
         ops: &tokio::sync::Mutex<()>,
     ) {
-        let Ok(hypervisor) = self.drivers.hypervisor() else {
-            return;
-        };
-        let Some(migratable) = hypervisor.as_migratable() else {
-            return;
-        };
-        let departure = self
-            .watch_the_send(id, hypervisor, migratable, started)
-            .await;
+        loop {
+            match self.observe_send(id, migration_id, ops).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(e) => {
+                    error!(error = %e, "cannot observe migration");
+                    return;
+                }
+            }
+            if started.elapsed() >= self.ceilings.migrate_out {
+                let _guard = ops.lock().await;
+                if let Ok(Some(mut record)) = self.store.get(id) {
+                    if record.operation.is_some()
+                        && record
+                            .migration
+                            .as_ref()
+                            .is_some_and(|m| m.id == migration_id && m.peer == peer)
+                    {
+                        record.migration.as_mut().unwrap().unknown =
+                            Some("send deadline elapsed; transfer outcome is unknown".into());
+                        if let Err(e) = self.store.put(id, &record) {
+                            error!(error = %e, "cannot record unknown outcome");
+                        }
+                    }
+                }
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 
-        let _guard = ops.lock().await;
-        let mut record = match self.store.get(id) {
-            Ok(Some(record)) => record,
-            Ok(None) => {
-                warn!("the record went while the vm was being sent; nothing to write");
-                return;
-            }
-            Err(e) => {
-                error!(error = %format!("{e:#}"), "cannot read the record of a vm that was sent");
-                return;
-            }
+    /// One bounded observation, also called by reconciliation after task loss.
+    /// No repair is permitted while this returns an unresolved outcome.
+    pub(crate) async fn observe_send(
+        &self,
+        id: &VmId,
+        migration_id: &str,
+        ops: &tokio::sync::Mutex<()>,
+    ) -> Result<bool> {
+        let Some(snapshot) = self.store.get(id)? else {
+            return Ok(true);
         };
+        if !matches!(snapshot.operation, Some(Operation::MigratingOut { .. })) {
+            return Ok(true);
+        }
+        let Some(attempt) = &snapshot.migration else {
+            return Ok(false);
+        };
+        if attempt.id != migration_id || attempt.incoming {
+            return Ok(true);
+        }
+        let hypervisor = self.drivers.hypervisor()?;
+        let Some(migratable) = hypervisor.as_migratable() else {
+            return Ok(false);
+        };
+        let departure = if hypervisor.probe(id).await {
+            if attempt.accepted {
+                migratable.send_failed(id).await.map(Departure::StillHere)
+            } else {
+                None
+            }
+        } else if snapshot
+            .vmm_pid
+            .is_some_and(|pid| !hypervisor.owns_pid(id, pid))
+        {
+            Some(Departure::Gone)
+        } else {
+            None
+        };
+        let Some(departure) = departure else {
+            return Ok(false);
+        };
+        let _guard = ops.lock().await;
+        let Some(mut record) = self.store.get(id)? else {
+            return Ok(true);
+        };
+        // A watcher from an older attempt must never clear a newer one's guard.
+        if record.migration.as_ref() != Some(attempt)
+            || !matches!(record.operation, Some(Operation::MigratingOut { .. }))
+        {
+            return Ok(true);
+        }
         record.operation = None;
+        record.migration.as_mut().unwrap().unknown = None;
         match departure {
             Departure::Gone => {
                 record.phase = Phase::Migrated;
                 record.vmm_pid = None;
                 record.send_failed = None;
+                // Persist the repair barrier before any detach side effect.
+                self.store.put(id, &record)?;
                 self.detach_volumes(id, &mut record).await;
-                info!(
-                    ms = started.elapsed().as_millis(),
-                    "the guest left for the destination"
-                );
             }
-            // Still here, and that is the invariant this whole path is built
-            // on arriving as news rather than as silence: v53 gives the guest
-            // back on a failed send, so the vm is exactly where it was — and
-            // the tier above is TOLD so, on the next heartbeat, instead of
-            // being left to time out.
-            Departure::StillHere(why) => {
-                let sentence = format!(
-                    "vm {id} is still running here {}s after the send to {peer} started: {why}. \
-                     {}",
-                    started.elapsed().as_secs(),
-                    common::migration::GUEST_NOT_GIVEN_UP
-                );
-                warn!(reason = %why, "the send did not take; this node still has the guest");
-                record.send_failed = Some(sentence);
-            }
+            Departure::StillHere(why) => record.send_failed = Some(why),
         }
-        if let Err(e) = self.store.put(id, &record) {
-            error!(error = %format!("{e:#}"),
-                   "writing down what became of a send failed; the tier above will time out");
-        }
+        self.store.put(id, &record)?;
+        Ok(true)
     }
 
-    /// Watch until the guest has left, or until it is certain it has not.
-    ///
-    /// Two questions per round and they answer different halves. The socket
-    /// going quiet is SUCCESS — v53 exits the source VMM only when the send
-    /// took — and the two cheaper answers to that half are both wrong, as the
-    /// first live run measured: `is_tracked` reads the driver's own map,
-    /// which nothing clears when a VMM exits of its own accord, and a pid
-    /// stays in `/proc` as a zombie until somebody reaps the child, which is
-    /// never, because nothing awaits it. Both said "alive" about a process
-    /// that had finished.
-    ///
-    /// The other half is FAILURE, and until it was asked there was nothing to
-    /// end this wait but the ceiling — ten minutes of a command that answers
-    /// nothing while the guest it was about has been running here all along.
-    ///
-    /// **A quiet socket is the prompt, and the PROCESS is the evidence.**
-    /// `probe` is an API request, and an API request fails for more reasons
-    /// than an exit: a VMM whose API thread is slow under a busy transfer, a
-    /// socket this agent cannot open for a moment. Read as "gone", any of
-    /// them wrote `Migrated`, forgot the pid and let go of the disks of a
-    /// guest that was still running here (F06). So a silent socket is
-    /// followed by the question the observation already asks
-    /// (`Observed::vmm_alive`): is the recorded pid still this VM's VMM?
-    /// `owns_pid` reads the uuid off `/proc/<pid>/cmdline`, which is empty
-    /// for a zombie and foreign for a reused number — both traps above say
-    /// "no" there. Silent and still there is alive-but-unreachable, nothing
-    /// is concluded from it, and the ceiling, if it comes, says so.
-    async fn watch_the_send(
+    /// Attempt-scoped cleanup. Cancellation also fences a delayed prepare.
+    pub(crate) async fn cleanup_migration(
         &self,
         id: &VmId,
-        hypervisor: &std::sync::Arc<dyn agent_api::hypervisor::Hypervisor>,
-        migratable: &dyn agent_api::Migratable,
-        started: std::time::Instant,
-    ) -> Departure {
-        let ceiling = self.ceilings.migrate_out;
-        let deadline = started + ceiling;
-        // The process the send started from. `begin_migrate_out` refuses a
-        // record without one, so `None` is a record somebody changed under
-        // the send — and then nothing can be proved gone, which keeps the
-        // guest here until the ceiling.
-        let vmm = self.store.get(id).ok().flatten().and_then(|r| r.vmm_pid);
-        loop {
-            let silent = if hypervisor.probe(id).await {
-                if let Some(why) = migratable.send_failed(id).await {
-                    return Departure::StillHere(why);
-                }
-                false
-            } else if vmm.is_some_and(|pid| !hypervisor.owns_pid(id, pid)) {
-                return Departure::Gone;
-            } else {
-                true
-            };
-            if std::time::Instant::now() >= deadline {
-                let mut why = format!(
-                    "the transfer has not ended within {}s and this node stopped watching it",
-                    ceiling.as_secs()
-                );
-                if silent {
-                    why.push_str("; the vmm is still running and not answering its api");
-                }
-                return Departure::StillHere(why);
+        migration_id: &str,
+        source: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !migration_id.is_empty(),
+            "migration cleanup requires an operation identity"
+        );
+        // A corrupt VM row is not an absent VM.
+        let record = match self.store.row(id)? {
+            None => None,
+            Some(crate::store::VmRow::Record(_, record)) => Some(record),
+            Some(crate::store::VmRow::Unreadable(_)) => {
+                bail!("cannot verify migration ownership of unreadable vm {id}")
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        if let Some(record) = &record {
+            let attempt = record
+                .migration
+                .as_ref()
+                .ok_or_else(|| anyhow!("legacy migration requires recovery"))?;
+            anyhow::ensure!(
+                attempt.id == migration_id && attempt.incoming != source,
+                "migration cleanup does not own this record"
+            );
+            if source {
+                anyhow::ensure!(
+                    record.phase == Phase::Migrated && record.operation.is_none(),
+                    "source departure has not been established"
+                );
+            } else {
+                anyhow::ensure!(
+                    record.phase != Phase::Provisioned,
+                    "destination already received the guest"
+                );
+                anyhow::ensure!(
+                    !matches!(
+                        self.drivers.hypervisor()?.get_state(id).await,
+                        Ok(agent_api::VmState::Running | agent_api::VmState::Paused)
+                    ),
+                    "destination may hold the guest"
+                );
+            }
         }
+        self.store.claim_migration(id, migration_id, true)?;
+        self.teardown(id).await
     }
 
     /// The guest arrived: a record that was `Receiving` is an ordinary
@@ -489,7 +528,9 @@ impl Provisioner {
             )));
         }
         record.phase = Phase::Receiving;
-        // And the moment this node stops waiting. Written down beside the
+        // An advisory deadline, persisted with the reception. It must never
+        // authorize teardown: the VMM can still be receiving when it expires.
+        // Written down beside the
         // phase rather than held in the task that started it: the task dies
         // with the agent and the record does not, and an agent that came back
         // to a `Receiving` record with nothing to end it is exactly the ghost

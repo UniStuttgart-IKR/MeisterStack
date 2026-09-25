@@ -68,6 +68,16 @@ impl Agent {
             Some(command::Op::ResizeAttachment(v)) => done(self.handle_resize_attachment(v).await),
             Some(command::Op::PrepareMigration(m)) => self.handle_prepare_migration(m).await,
             Some(command::Op::MigrateOut(m)) => done(self.handle_migrate_out(m).await),
+            Some(command::Op::CleanupMigration(c)) => done(
+                async {
+                    let id: VmId = c.id.parse().context("invalid vm id")?;
+                    let _guard = self.ops.lock().await;
+                    self.provisioner
+                        .cleanup_migration(&id, &c.migration_id, c.source)
+                        .await
+                }
+                .await,
+            ),
             Some(command::Op::EnsureRouter(r)) => done(self.handle_ensure_router(r).await),
             Some(command::Op::DestroyRouter(r)) => done(self.handle_destroy_router(r).await),
             Some(command::Op::DropImage(d)) => done(self.handle_drop_image(d).await),

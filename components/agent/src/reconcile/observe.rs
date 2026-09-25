@@ -26,20 +26,8 @@ pub struct Observed {
     /// (passthrough, mdev, a file, a block device) are always "alive".
     pub backends_alive: bool,
     pub guest: Option<VmState>,
-    /// The guest that was on its way to this node is not coming.
-    ///
-    /// One field for the several ways a reception dies, because they have
-    /// one answer. Cloud-hypervisor states three of them itself — the stream
-    /// broke, a component refused its snapshot, the source gave up — and
-    /// writes `migration-receive-failed`; the fourth is a source that never
-    /// dialled at all, which nothing states and which the record's own
-    /// deadline measures. Both are the same fact about the world: this node
-    /// is holding a VMM, a disk connection and a set of taps for a guest
-    /// that another machine is still running.
-    ///
-    /// Never set for a record that is not `Receiving`, and never set on the
-    /// strength of a driver that cannot answer — see
-    /// `Migratable::receive_failed`.
+    /// The driver explicitly established a failed receive. Deadlines alone
+    /// cannot establish this fact.
     pub receive_failed: bool,
 }
 
@@ -777,19 +765,14 @@ pub struct VmReport {
 }
 
 /// What became of a guest this node was told to send away.
-///
-/// The three answers of `MigrationReport`, and they are DERIVED from the
-/// record on every heartbeat rather than remembered as an event. That is what
-/// makes the line survive an agent restart mid-transfer: the record is the
-/// state, the report is a reading of it, and a reading taken twice says the
-/// same thing.
+/// Durable evidence from either endpoint of one migration attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Departure {
-    /// Where to, verbatim. Empty once the send is over — while it runs it is
-    /// what the line is about, and afterwards the outcome is.
+    pub migration_id: String,
+    /// The peer address remains attached to terminal reports.
     pub peer: String,
     pub outcome: DepartureOutcome,
-    /// Why, for `StillHere`, and `None` for the other two.
+    /// An abort reason or the reason the outcome is unknown.
     pub message: Option<String>,
 }
 
@@ -797,6 +780,9 @@ pub struct Departure {
 pub enum DepartureOutcome {
     /// The stream is open and this node is watching its own VMM.
     Sending,
+    Unknown,
+    Receiving,
+    Arrived,
     /// The VMM exited, which is how cloud-hypervisor states that a send took.
     Gone,
     /// v53 gave the guest back and is serving it here.
@@ -808,47 +794,48 @@ impl DepartureOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             DepartureOutcome::Sending => "Sending",
+            DepartureOutcome::Unknown => "Unknown",
+            DepartureOutcome::Receiving => "Receiving",
+            DepartureOutcome::Arrived => "Arrived",
             DepartureOutcome::Gone => "Gone",
             DepartureOutcome::StillHere => "StillHere",
         }
     }
 }
 
-/// What this node says about a send, read off one record.
-///
-/// Pure, and it is the whole of the D16 repair on this side: `MigrateOut`
-/// answers "accepted" the moment the stream is open, and what says how the
-/// transfer ENDED is this line on the next heartbeat. The tier above reads it
-/// instead of holding its reconcile pass open for the length of a guest's
-/// memory.
-///
-/// The order of the three questions is the order of certainty, and it
-/// matters. A record that is `MigratingOut` right now is sending, whatever a
-/// previous attempt left behind; only then is `send_failed` this VM's last
-/// word; and `Migrated` is the record of a guest that is somewhere else.
-///
-/// `None` for every VM nobody asked to move, which is nearly all of them —
-/// so an ordinary node sends an empty list and reads exactly like an agent
-/// from before the field.
+/// Missing legacy identities produce no attempt-bound evidence.
 pub fn departure(record: &VmRecord) -> Option<Departure> {
-    if let Some(crate::types::Operation::MigratingOut { peer }) = &record.operation {
-        return Some(Departure {
-            peer: peer.clone(),
-            outcome: DepartureOutcome::Sending,
-            message: None,
-        });
-    }
-    if let Some(why) = &record.send_failed {
-        return Some(Departure {
-            peer: String::new(),
-            outcome: DepartureOutcome::StillHere,
-            message: Some(why.clone()),
-        });
-    }
-    (record.phase == Phase::Migrated).then(|| Departure {
-        peer: String::new(),
-        outcome: DepartureOutcome::Gone,
-        message: None,
+    let attempt = record.migration.as_ref()?;
+    let outcome = if attempt.incoming {
+        if record.phase == Phase::Provisioned {
+            DepartureOutcome::Arrived
+        } else {
+            DepartureOutcome::Receiving
+        }
+    } else if matches!(
+        record.operation,
+        Some(crate::types::Operation::MigratingOut { .. })
+    ) {
+        if attempt.unknown.is_some() || !attempt.accepted {
+            DepartureOutcome::Unknown
+        } else {
+            DepartureOutcome::Sending
+        }
+    } else if record.send_failed.is_some() {
+        DepartureOutcome::StillHere
+    } else if record.phase == Phase::Migrated {
+        DepartureOutcome::Gone
+    } else {
+        return None;
+    };
+    Some(Departure {
+        migration_id: attempt.id.clone(),
+        peer: attempt.peer.clone(),
+        outcome,
+        message: attempt
+            .unknown
+            .clone()
+            .or_else(|| record.send_failed.clone()),
     })
 }
 
@@ -972,14 +959,7 @@ impl Reconciler {
         }
     }
 
-    /// Whether the guest this node was waiting for is not coming.
-    ///
-    /// Two sources and neither is enough alone. The hypervisor knows every
-    /// way a transfer that STARTED can end, and knows none of them until the
-    /// source has dialled; the deadline knows the one case the hypervisor
-    /// cannot see, which is nobody dialling. A record that is not
-    /// `Receiving` is asked neither question — a failed reception that has
-    /// been given back is not a failure to find again on the next pass.
+    /// Only explicit driver evidence can authorize failed-receive cleanup.
     fn receive_failed(
         &self,
         id: &VmId,
@@ -996,13 +976,7 @@ impl Reconciler {
             warn!(vm_id = %id, reason = %said, "the guest is not coming");
             return true;
         }
-        let Some(deadline) = record.receive_deadline else {
-            return false;
-        };
-        if SystemTime::now() < deadline {
-            return false;
-        }
-        warn!(vm_id = %id, "nothing arrived before the deadline; the guest is not coming");
-        true
+        // A deadline says nothing about whether the stream is still active.
+        false
     }
 }

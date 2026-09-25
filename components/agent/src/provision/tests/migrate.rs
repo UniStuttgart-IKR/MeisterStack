@@ -6,6 +6,45 @@
 
 use super::*;
 
+#[tokio::test]
+async fn restart_keeps_an_unresolved_source_protected() {
+    let (_temp, root) = migration_root("restart-send");
+    let store = Arc::new(crate::store::Store::open(&root.join("src.redb")).unwrap());
+    let hv = Arc::new(MigratingVmm::that_fails_mid_send());
+    let drivers = migrating_drivers(&root, hv.clone());
+    let provisioner = Arc::new(provisioner_over(&root, store.clone(), drivers.clone()));
+    let ops = Arc::new(tokio::sync::Mutex::new(()));
+    let id = VmId::new_v4();
+    let mut record = VmRecord::blank();
+    record.vmm_pid = Some(std::process::id());
+    record.operation = Some(crate::types::Operation::MigratingOut {
+        peer: "tcp:target:49000".into(),
+    });
+    store.put(&id, &record).unwrap();
+    let restarted = crate::reconcile::Reconciler::new(store.clone(), drivers, provisioner, ops);
+    assert_eq!(
+        restarted
+            .reconcile(id, crate::reconcile::Trigger::Startup)
+            .await
+            .unwrap(),
+        crate::reconcile::Action::Blocked
+    );
+    let record = store.get(&id).unwrap().unwrap();
+    for guest in [
+        None,
+        Some(agent_api::VmState::Paused),
+        Some(agent_api::VmState::Running),
+    ] {
+        let mut observed = sending_observation();
+        observed.guest = guest;
+        observed.vmm_alive = guest.is_some();
+        assert_eq!(
+            crate::reconcile::plan(&record, &observed, std::time::SystemTime::now()),
+            crate::reconcile::Action::Blocked
+        );
+    }
+}
+
 /// A hypervisor that can migrate, and records which of the two ends it
 /// was asked for. `create`/`start` are here too so that the SAME driver
 /// serves both exits of `run_chain` — which is what the first test
@@ -48,6 +87,7 @@ struct MigratingVmm {
     /// How many times the api socket has been asked, for the tests that have
     /// to know the watch has gone round without looking at a clock.
     probes: std::sync::atomic::AtomicUsize,
+    guest_override: std::sync::Mutex<Option<agent_api::VmState>>,
 }
 
 impl MigratingVmm {
@@ -63,6 +103,7 @@ impl MigratingVmm {
             send_broke: std::sync::Mutex::new(None),
             vmm_pid: std::sync::Mutex::new(None),
             probes: std::sync::atomic::AtomicUsize::new(0),
+            guest_override: std::sync::Mutex::new(None),
         }
     }
     /// A hypervisor that ACCEPTS the send and then fails it, which is the
@@ -135,7 +176,11 @@ impl agent_api::hypervisor::Hypervisor for MigratingVmm {
         if self.receiving.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(agent_api::hypervisor::VmState::Defined);
         }
-        Ok(agent_api::hypervisor::VmState::Running)
+        Ok(self
+            .guest_override
+            .lock()
+            .unwrap()
+            .unwrap_or(agent_api::hypervisor::VmState::Running))
     }
     async fn adopt(&self, _: &VmId, _: u32) -> agent_api::hypervisor::Result<()> {
         Ok(())
@@ -530,7 +575,13 @@ async fn a_receiver_that_cannot_enter_its_slice_is_not_stored_as_ready() {
 
     let id = VmId::new_v4();
     let err = p
-        .prepare_migration(id, migratable_spec(&store), "127.0.0.1:9000", true)
+        .prepare_migration(
+            id,
+            migratable_spec(&store),
+            "127.0.0.1:9000",
+            true,
+            "attempt-1",
+        )
         .await
         .expect_err("a vmm that cannot enter its slice is not a reception");
     assert!(
@@ -609,7 +660,13 @@ async fn the_chain_ends_two_ways_and_is_the_same_chain_until_it_does() {
     let arriving = VmId::new_v4();
     let recv_spec = migratable_spec(&recv_store);
     receiving
-        .prepare_migration(arriving, recv_spec, "tcp:127.0.0.1:49000", true)
+        .prepare_migration(
+            arriving,
+            recv_spec,
+            "tcp:127.0.0.1:49000",
+            true,
+            "attempt-1",
+        )
         .await
         .expect("the migration exit");
     // No create and no start: v53 refuses to receive into a vm that has
@@ -685,7 +742,7 @@ async fn a_vm_with_an_inline_disk_is_not_received_and_the_refusal_names_the_disk
 
     let id = VmId::new_v4();
     let refused = p
-        .prepare_migration(id, with_disk, "tcp:127.0.0.1:49000", true)
+        .prepare_migration(id, with_disk, "tcp:127.0.0.1:49000", true, "attempt-1")
         .await
         .expect_err("an inline disk does not migrate");
     let said = format!("{refused:#}");
@@ -719,7 +776,7 @@ async fn a_successful_send_leaves_a_record_and_a_failed_one_leaves_the_guest() {
         .await
         .expect("a running vm");
     let ops = tokio::sync::Mutex::new(());
-    p.begin_migrate_out(&id, "tcp:10.0.0.9:49000", &ops)
+    p.begin_migrate_out(&id, "tcp:10.0.0.9:49000", "attempt-1", &ops)
         .await
         .expect("the stream is open");
     // Answering means the stream is open, and the marker is on the record
@@ -738,8 +795,14 @@ async fn a_successful_send_leaves_a_record_and_a_failed_one_leaves_the_guest() {
         "and that is what the heartbeat says while it runs"
     );
 
-    p.finish_migrate_out(&id, "tcp:10.0.0.9:49000", std::time::Instant::now(), &ops)
-        .await;
+    p.finish_migrate_out(
+        &id,
+        "tcp:10.0.0.9:49000",
+        "attempt-1",
+        std::time::Instant::now(),
+        &ops,
+    )
+    .await;
     let record = store.get(&id).expect("a lookup").expect("still a record");
     assert_eq!(record.phase, Phase::Migrated, "the record is not deleted");
     assert!(record.vmm_pid.is_none());
@@ -789,7 +852,12 @@ async fn a_successful_send_leaves_a_record_and_a_failed_one_leaves_the_guest() {
         .await
         .expect("a running vm");
     let refused = p
-        .begin_migrate_out(&id, "tcp:10.0.0.9:49000", &tokio::sync::Mutex::new(()))
+        .begin_migrate_out(
+            &id,
+            "tcp:10.0.0.9:49000",
+            "attempt-1",
+            &tokio::sync::Mutex::new(()),
+        )
         .await
         .expect_err("the peer refused");
     assert!(
@@ -799,10 +867,13 @@ async fn a_successful_send_leaves_a_record_and_a_failed_one_leaves_the_guest() {
     let record = store.get(&id).expect("a lookup").expect("still a record");
     assert_eq!(record.phase, Phase::Provisioned, "the guest is still ours");
     assert!(record.vmm_pid.is_some());
-    assert!(record.operation.is_none(), "the marker came off");
     assert!(
-        crate::reconcile::departure(&record).is_none(),
-        "and nothing is reported about a send that never started"
+        record.operation.is_some(),
+        "an untyped driver error is not an abort proof"
+    );
+    assert_eq!(
+        crate::reconcile::departure(&record).unwrap().outcome,
+        crate::reconcile::DepartureOutcome::Unknown
     );
 }
 
@@ -974,9 +1045,15 @@ async fn a_reception_that_fails_gives_everything_back_and_the_next_one_works() {
     let (dest, reconciler) = migrating_node(&root, store.clone(), hv.clone());
 
     let id = VmId::new_v4();
-    dest.prepare_migration(id, migratable_spec(&store), "tcp:127.0.0.1:49000", true)
-        .await
-        .expect("a listening vmm");
+    dest.prepare_migration(
+        id,
+        migratable_spec(&store),
+        "tcp:127.0.0.1:49000",
+        true,
+        "attempt-1",
+    )
+    .await
+    .expect("a listening vmm");
     let standing = store.get(&id).expect("a record").expect("one");
     assert_eq!(standing.phase, Phase::Receiving);
     assert!(standing.vmm_pid.is_some(), "a vmm is listening");
@@ -1053,9 +1130,15 @@ async fn a_reception_that_fails_gives_everything_back_and_the_next_one_works() {
     // cannot receive it as well" until somebody restarted the agent.
     let again = Arc::new(MigratingVmm::new(true));
     let (dest, _) = migrating_node(&root, store.clone(), again.clone());
-    dest.prepare_migration(id, migratable_spec(&store), "tcp:127.0.0.1:49001", true)
-        .await
-        .expect("the second attempt is an ordinary one");
+    dest.prepare_migration(
+        id,
+        migratable_spec(&store),
+        "tcp:127.0.0.1:49001",
+        true,
+        "attempt-2",
+    )
+    .await
+    .expect("the second attempt is an ordinary one");
     assert_eq!(
         store.get(&id).expect("a record").expect("one").phase,
         Phase::Receiving
@@ -1072,16 +1155,22 @@ async fn a_reception_that_fails_gives_everything_back_and_the_next_one_works() {
 /// on the RECORD rather than in the task that started the reception —
 /// because the ghost of the lab outlived the process that made it.
 #[tokio::test]
-async fn a_source_that_never_comes_is_a_deadline_and_not_a_wait_forever() {
+async fn a_receive_deadline_does_not_authorize_cleanup() {
     let (_temp, root) = migration_root("mig-nobody");
     let store = Arc::new(crate::store::Store::open(&root.join("dest.redb")).expect("a store"));
     let hv = Arc::new(MigratingVmm::new(true));
     let (dest, reconciler) = migrating_node(&root, store.clone(), hv.clone());
 
     let id = VmId::new_v4();
-    dest.prepare_migration(id, migratable_spec(&store), "tcp:127.0.0.1:49000", true)
-        .await
-        .expect("a listening vmm");
+    dest.prepare_migration(
+        id,
+        migratable_spec(&store),
+        "tcp:127.0.0.1:49000",
+        true,
+        "attempt-1",
+    )
+    .await
+    .expect("a listening vmm");
 
     // Before the deadline nothing happens, however many passes run: a
     // transfer may legitimately take longer than a pass, and a
@@ -1103,17 +1192,34 @@ async fn a_source_that_never_comes_is_a_deadline_and_not_a_wait_forever() {
         Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
     store.put(&id, &record).expect("the record");
     assert!(
-        preview(&reconciler, &id).await.observed.receive_failed,
-        "nothing came, and this node stops waiting"
+        !preview(&reconciler, &id).await.observed.receive_failed,
+        "silence is not evidence of an aborted transfer"
     );
     assert_eq!(
         reconciler
             .reconcile(id, crate::reconcile::Trigger::Periodic)
             .await
             .expect("a pass"),
-        crate::reconcile::Action::Teardown
+        crate::reconcile::Action::None
     );
-    assert!(store.get(&id).expect("a lookup").is_none());
+    assert!(store.get(&id).expect("a lookup").is_some());
+    assert_eq!(
+        reconciler
+            .reconcile(id, crate::reconcile::Trigger::Startup)
+            .await
+            .unwrap(),
+        crate::reconcile::Action::None
+    );
+    hv.receiving
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        reconciler
+            .reconcile(id, crate::reconcile::Trigger::Periodic)
+            .await
+            .unwrap(),
+        crate::reconcile::Action::Arrived
+    );
+    assert!(!hv.said().contains(&"destroy".to_string()));
 }
 
 /// D-P4: a send that cloud-hypervisor fails answers, and never holds this
@@ -1150,7 +1256,7 @@ async fn a_failed_send_answers_and_leaves_the_command_path_free() {
 
     let ops = Arc::new(tokio::sync::Mutex::new(()));
     source
-        .begin_migrate_out(&id, "tcp:10.0.0.9:49000", &ops)
+        .begin_migrate_out(&id, "tcp:10.0.0.9:49000", "attempt-1", &ops)
         .await
         .expect("the stream is open, which is now the whole of the answer");
     let sending = tokio::spawn({
@@ -1158,7 +1264,13 @@ async fn a_failed_send_answers_and_leaves_the_command_path_free() {
         let ops = ops.clone();
         async move {
             source
-                .finish_migrate_out(&id, "tcp:10.0.0.9:49000", std::time::Instant::now(), &ops)
+                .finish_migrate_out(
+                    &id,
+                    "tcp:10.0.0.9:49000",
+                    "attempt-1",
+                    std::time::Instant::now(),
+                    &ops,
+                )
                 .await
         }
     });
@@ -1212,8 +1324,6 @@ async fn a_failed_send_answers_and_leaves_the_command_path_free() {
     let line = crate::reconcile::departure(&record).expect("this node says so");
     assert_eq!(line.outcome, crate::reconcile::DepartureOutcome::StillHere);
     let said = line.message.expect("with a reason");
-    assert!(said.contains("still running here"), "{said}");
-    assert!(said.contains("was not given up"), "{said}");
     assert!(
         said.contains("cloud-hypervisor is serving the guest here again"),
         "and it is v53's own sentence, not a summary of one: {said}"
@@ -1253,7 +1363,7 @@ async fn the_send_is_accepted_while_the_transfer_is_still_running() {
     let ops = Arc::new(tokio::sync::Mutex::new(()));
     let accepted = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        p.begin_migrate_out(&id, "tcp:10.0.0.9:49000", &ops),
+        p.begin_migrate_out(&id, "tcp:10.0.0.9:49000", "attempt-1", &ops),
     )
     .await
     .expect("the answer did not wait for the transfer");
@@ -1334,12 +1444,12 @@ async fn a_second_migrate_out_for_a_vm_already_sending_is_refused() {
         .expect("a running vm");
 
     let ops = tokio::sync::Mutex::new(());
-    p.begin_migrate_out(&id, "tcp:10.0.0.9:49000", &ops)
+    p.begin_migrate_out(&id, "tcp:10.0.0.9:49000", "attempt-1", &ops)
         .await
         .expect("the stream is open");
 
     let refused = p
-        .begin_migrate_out(&id, "tcp:10.0.0.11:49000", &ops)
+        .begin_migrate_out(&id, "tcp:10.0.0.11:49000", "attempt-1", &ops)
         .await
         .expect_err("a guest is sent to one machine at a time");
     let why = format!("{refused:#}");
@@ -1386,67 +1496,6 @@ async fn a_second_migrate_out_for_a_vm_already_sending_is_refused() {
 /// that reception once this agent is gone: the task watching it dies with the
 /// process, the cluster's migration times out, and what is left is the ghost
 /// the lab found.
-#[tokio::test]
-async fn a_stopping_agent_gives_back_a_vmm_that_is_waiting_and_keeps_the_ones_serving() {
-    let (_temp, root) = migration_root("mig-goodbye");
-    let store = Arc::new(crate::store::Store::open(&root.join("a.redb")).expect("a store"));
-    let hv = Arc::new(MigratingVmm::new(true));
-    let p = migrating_provisioner(&root, store.clone(), hv.clone());
-
-    // One guest running here, one VMM listening for a guest that is on its
-    // way. The two are the whole of the decision.
-    let serving = VmId::new_v4();
-    p.provision(serving, migratable_spec(&store), Desired::Running, true)
-        .await
-        .expect("a running vm");
-    let arriving = VmId::new_v4();
-    p.prepare_migration(
-        arriving,
-        migratable_spec(&store),
-        "tcp:127.0.0.1:49000",
-        true,
-    )
-    .await
-    .expect("a vmm that is listening");
-    assert_eq!(
-        store
-            .get(&arriving)
-            .expect("a lookup")
-            .expect("a record")
-            .phase,
-        Phase::Receiving
-    );
-
-    // What the stop path selects, which is the whole of the decision: the
-    // reception, and never the guest that is being served.
-    let records = store.list().expect("the records");
-    assert_eq!(
-        crate::half_built(&records),
-        vec![arriving],
-        "a running guest is not something a stopping agent takes with it"
-    );
-
-    // And what it then does to it. The teardown is best effort — this test's
-    // cgroup_root is an ordinary directory, which is D17 and exactly the
-    // configuration the local E2E runs — so what is asserted is that the VMM
-    // was asked to go, which is the part that matters: a process listening on
-    // a port for a guest nobody will hand it.
-    let _ = p.teardown(&arriving).await;
-    assert!(
-        hv.said().contains(&"destroy".to_string()),
-        "the listening vmm was given back: {:?}",
-        hv.said()
-    );
-    let kept = store
-        .get(&serving)
-        .expect("a lookup")
-        .expect("the running guest is still this node's");
-    assert_eq!(kept.phase, Phase::Provisioned);
-    assert!(
-        kept.vmm_pid.is_some(),
-        "and its vmm is untouched: a restart is not an outage"
-    );
-}
 
 /// D18, the start-up half: a VMM this node has no record of is named, and
 /// ended once it has been unmanaged for long enough.
@@ -1556,6 +1605,7 @@ async fn a_reception_that_is_given_back_lets_go_of_the_claim_and_not_the_bytes()
         migratable_spec(&store),
         "tcp:127.0.0.1:49000",
         true,
+        "attempt-1",
     )
     .await
     .expect("a vmm that is listening");
@@ -1691,7 +1741,7 @@ async fn a_vmm_that_stops_answering_has_not_left() {
 
     let ops = Arc::new(tokio::sync::Mutex::new(()));
     source
-        .begin_migrate_out(&id, "tcp:10.0.0.9:49000", &ops)
+        .begin_migrate_out(&id, "tcp:10.0.0.9:49000", "attempt-1", &ops)
         .await
         .expect("the stream is open");
     let asked_before = hv.probes.load(std::sync::atomic::Ordering::SeqCst);
@@ -1700,7 +1750,13 @@ async fn a_vmm_that_stops_answering_has_not_left() {
         let ops = ops.clone();
         async move {
             source
-                .finish_migrate_out(&id, "tcp:10.0.0.9:49000", std::time::Instant::now(), &ops)
+                .finish_migrate_out(
+                    &id,
+                    "tcp:10.0.0.9:49000",
+                    "attempt-1",
+                    std::time::Instant::now(),
+                    &ops,
+                )
                 .await
         }
     });
@@ -1743,7 +1799,7 @@ async fn a_vmm_that_stops_answering_has_not_left() {
 /// watch gives up: the guest, its pid and its disks stay, and the line the
 /// tier above reads says why.
 #[tokio::test]
-async fn a_vmm_that_never_answers_again_is_still_here_at_the_ceiling() {
+async fn a_vmm_that_never_answers_again_is_unknown_at_the_ceiling() {
     let (_temp, root) = migration_root("mig-unreachable-ceiling");
     let store = Arc::new(crate::store::Store::open(&root.join("src.redb")).expect("a store"));
     let id = VmId::new_v4();
@@ -1752,7 +1808,7 @@ async fn a_vmm_that_never_answers_again_is_still_here_at_the_ceiling() {
     *hv.vmm_pid.lock().unwrap() = Some(vmm.pid());
     let source = migrating_provisioner(&root, store.clone(), hv.clone()).with_ceilings(
         crate::provision::Ceilings {
-            migrate_out: std::time::Duration::from_millis(300),
+            migrate_out: std::time::Duration::ZERO,
             receive: std::time::Duration::from_secs(600),
         },
     );
@@ -1762,11 +1818,17 @@ async fn a_vmm_that_never_answers_again_is_still_here_at_the_ceiling() {
         .expect("a running vm");
     let ops = tokio::sync::Mutex::new(());
     source
-        .begin_migrate_out(&id, "tcp:10.0.0.9:49000", &ops)
+        .begin_migrate_out(&id, "tcp:10.0.0.9:49000", "attempt-1", &ops)
         .await
         .expect("the stream is open");
     source
-        .finish_migrate_out(&id, "tcp:10.0.0.9:49000", std::time::Instant::now(), &ops)
+        .finish_migrate_out(
+            &id,
+            "tcp:10.0.0.9:49000",
+            "attempt-1",
+            std::time::Instant::now(),
+            &ops,
+        )
         .await;
 
     let record = store.get(&id).expect("a lookup").expect("a record");
@@ -1774,9 +1836,18 @@ async fn a_vmm_that_never_answers_again_is_still_here_at_the_ceiling() {
     assert_eq!(record.vmm_pid, Some(vmm.pid()));
     assert_eq!(record.volumes.len(), 1);
     let line = crate::reconcile::departure(&record).expect("this node says so");
-    assert_eq!(line.outcome, crate::reconcile::DepartureOutcome::StillHere);
+    assert_eq!(line.outcome, crate::reconcile::DepartureOutcome::Unknown);
     let said = line.message.expect("with a reason");
-    assert!(said.contains("not answering"), "{said}");
+    assert!(said.contains("unknown"), "{said}");
+    assert!(record.operation.is_some());
+    assert_eq!(
+        crate::reconcile::plan(
+            &record,
+            &sending_observation(),
+            std::time::SystemTime::now()
+        ),
+        crate::reconcile::Action::Blocked
+    );
 }
 
 /// F07: a plan made before a migration began is not carried out during it.
@@ -1867,5 +1938,196 @@ async fn a_plan_made_before_a_migration_began_is_not_carried_out_during_it() {
             Some(crate::types::Operation::MigratingOut { .. })
         ),
         "and the send still owns the vm"
+    );
+}
+
+/// Redb, not a task, owns the repair barrier across process lifetimes.
+#[tokio::test]
+async fn persisted_send_recovery_never_provisions_or_resumes_a_second_guest() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for state in [
+        None,
+        Some(agent_api::VmState::Running),
+        Some(agent_api::VmState::Paused),
+    ] {
+        let (_temp, root) = migration_root("restart-contract");
+        let id = VmId::new_v4();
+        let db = root.join("agent.redb");
+        {
+            let store = crate::store::Store::open(&db).unwrap();
+            let mut record = VmRecord::blank();
+            record.vmm_pid = Some(std::process::id());
+            record.operation = Some(crate::types::Operation::MigratingOut {
+                peer: "tcp:target:49000".into(),
+            });
+            record.migration = Some(crate::types::MigrationAttempt {
+                id: "M1".into(),
+                peer: "tcp:target:49000".into(),
+                incoming: false,
+                accepted: true,
+                unknown: Some("agent stopped watching".into()),
+            });
+            store.put(&id, &record).unwrap();
+        }
+        let store = Arc::new(crate::store::Store::open(&db).unwrap());
+        let hv = Arc::new(MigratingVmm::that_fails_mid_send());
+        hv.still_here_after_send.store(state.is_some(), SeqCst);
+        *hv.guest_override.lock().unwrap() = state;
+        let (_, restarted) = migrating_node(&root, store.clone(), hv.clone());
+        let action = restarted
+            .reconcile(id, crate::reconcile::Trigger::Startup)
+            .await
+            .unwrap();
+        assert!(matches!(
+            action,
+            crate::reconcile::Action::Blocked | crate::reconcile::Action::None
+        ));
+        assert!(
+            hv.said().is_empty(),
+            "recovery must not create, start, resume or destroy: {:?}",
+            hv.said()
+        );
+        let record = store.get(&id).unwrap().unwrap();
+        let report = crate::reconcile::departure(&record).unwrap();
+        assert_eq!(report.migration_id, "M1");
+        assert_eq!(
+            report.outcome,
+            if state.is_none() {
+                crate::reconcile::DepartureOutcome::Gone
+            } else {
+                crate::reconcile::DepartureOutcome::Unknown
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn deadline_keeps_ownership_and_later_evidence_resolves_the_same_attempt() {
+    let (_temp, root) = migration_root("late-send-report");
+    let store = Arc::new(crate::store::Store::open(&root.join("a.redb")).unwrap());
+    let hv = Arc::new(MigratingVmm::that_fails_mid_send());
+    let p = migrating_provisioner(&root, store.clone(), hv.clone()).with_ceilings(
+        crate::provision::Ceilings {
+            migrate_out: std::time::Duration::ZERO,
+            receive: std::time::Duration::ZERO,
+        },
+    );
+    let id = VmId::new_v4();
+    p.provision(id, migratable_spec(&store), Desired::Running, true)
+        .await
+        .unwrap();
+    let ops = tokio::sync::Mutex::new(());
+    p.begin_migrate_out(&id, "tcp:target:49000", "M1", &ops)
+        .await
+        .unwrap();
+    p.finish_migrate_out(
+        &id,
+        "tcp:target:49000",
+        "M1",
+        std::time::Instant::now(),
+        &ops,
+    )
+    .await;
+    let unknown = store.get(&id).unwrap().unwrap();
+    assert!(unknown.operation.is_some());
+    assert_eq!(
+        crate::reconcile::departure(&unknown).unwrap().outcome,
+        crate::reconcile::DepartureOutcome::Unknown
+    );
+    hv.the_send_broke("explicit abort observed");
+    assert!(p.observe_send(&id, "M1", &ops).await.unwrap());
+    let ended = store.get(&id).unwrap().unwrap();
+    assert!(ended.operation.is_none());
+    assert_eq!(
+        crate::reconcile::departure(&ended).unwrap().outcome,
+        crate::reconcile::DepartureOutcome::StillHere
+    );
+    hv.send_broke.lock().unwrap().take();
+    p.begin_migrate_out(&id, "tcp:target:49000", "M2", &ops)
+        .await
+        .unwrap();
+    // The old watcher completes after M2 was dispatched.
+    assert!(p.observe_send(&id, "M1", &ops).await.unwrap());
+    let current = store.get(&id).unwrap().unwrap();
+    assert!(current.operation.is_some());
+    assert_eq!(
+        crate::reconcile::departure(&current).unwrap().migration_id,
+        "M2"
+    );
+    hv.the_send_broke("M2 aborted");
+    p.observe_send(&id, "M2", &ops).await.unwrap();
+    assert!(
+        p.begin_migrate_out(&id, "tcp:target:49000", "M1", &ops)
+            .await
+            .is_err(),
+        "an old command cannot replay after a newer attempt ended"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_is_attempt_bound_and_cancel_before_prepare_survives_restart() {
+    let (_temp, root) = migration_root("cleanup-contract");
+    let db = root.join("a.redb");
+    let id = VmId::new_v4();
+    {
+        let store = Arc::new(crate::store::Store::open(&db).unwrap());
+        let p = migrating_provisioner(&root, store, Arc::new(MigratingVmm::new(true)));
+        p.cleanup_migration(&id, "cancelled", false).await.unwrap();
+    }
+    let store = Arc::new(crate::store::Store::open(&db).unwrap());
+    let hv = Arc::new(MigratingVmm::new(true));
+    let p = migrating_provisioner(&root, store.clone(), hv.clone());
+    assert!(
+        p.prepare_migration(
+            id,
+            migratable_spec(&store),
+            "tcp:target:49000",
+            true,
+            "cancelled"
+        )
+        .await
+        .is_err()
+    );
+    assert!(hv.said().is_empty());
+    p.prepare_migration(id, migratable_spec(&store), "tcp:target:49000", true, "M2")
+        .await
+        .unwrap();
+    let before = hv.said();
+    assert!(p.cleanup_migration(&id, "M1", false).await.is_err());
+    assert!(p.cleanup_migration(&id, "M2", true).await.is_err());
+    assert_eq!(hv.said(), before);
+    // The guest arrived, but the agent's phase has not caught up yet.
+    hv.receiving
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(p.cleanup_migration(&id, "M2", false).await.is_err());
+    assert_eq!(hv.said(), before);
+    p.migration_arrived(&id).await.unwrap();
+    let record = store.get(&id).unwrap().unwrap();
+    let report = crate::reconcile::departure(&record).unwrap();
+    assert_eq!(report.outcome, crate::reconcile::DepartureOutcome::Arrived);
+    assert_eq!(report.migration_id, "M2");
+    assert!(
+        crate::reconcile::sync_orphans(&Default::default(), [(id, &record)]).is_empty(),
+        "a reconnect before binding commits must not delete the arrived guest"
+    );
+}
+
+#[test]
+fn legacy_records_load_without_inventing_attempt_evidence() {
+    let mut record = VmRecord::blank();
+    record.operation = Some(crate::types::Operation::MigratingOut {
+        peer: "tcp:target:49000".into(),
+    });
+    let mut json = serde_json::to_value(&record).unwrap();
+    json.as_object_mut().unwrap().remove("migration");
+    let loaded: VmRecord = serde_json::from_value(json).unwrap();
+    assert!(crate::reconcile::departure(&loaded).is_none());
+    assert_eq!(
+        crate::reconcile::plan(
+            &loaded,
+            &sending_observation(),
+            std::time::SystemTime::now()
+        ),
+        crate::reconcile::Action::Blocked
     );
 }

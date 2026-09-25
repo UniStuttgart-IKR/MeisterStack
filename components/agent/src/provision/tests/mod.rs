@@ -128,6 +128,7 @@ fn overlay_vm(vni: u32) -> (VmId, VmRecord) {
             stop_deadline: None,
             receive_deadline: None,
             send_failed: None,
+            migration: None,
             unhealthy: None,
             managed_by_controller: true,
             volumes: Vec::new(),
@@ -155,6 +156,7 @@ fn spec_record() -> VmRecord {
         stop_deadline: None,
         receive_deadline: None,
         send_failed: None,
+        migration: None,
         unhealthy: None,
         managed_by_controller: true,
         volumes: Vec::new(),
@@ -224,7 +226,7 @@ async fn a_corrupt_vm_record_refuses_a_create_and_a_receive() {
     );
 
     let received = provisioner
-        .prepare_migration(id, spec(1, 256, vec![]), "127.0.0.1:0", true)
+        .prepare_migration(id, spec(1, 256, vec![]), "127.0.0.1:0", true, "attempt-1")
         .await
         .expect_err("and neither may a reception");
     assert!(

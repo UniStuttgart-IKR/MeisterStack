@@ -371,6 +371,11 @@ impl Agent {
                 locality: String::new(),
             });
         }
+        drivers.push(DriverInfo {
+            name: common::migration::ATTEMPT_PROTOCOL.into(),
+            profiles: Vec::new(),
+            locality: String::new(),
+        });
         Hello {
             node_id: node_id.to_string(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -459,6 +464,7 @@ impl Agent {
             .iter()
             .filter_map(|r| {
                 r.departure.as_ref().map(|d| proto::MigrationReport {
+                    migration_id: d.migration_id.clone(),
                     vm_id: r.id.to_string(),
                     peer: d.peer.clone(),
                     outcome: d.outcome.as_str().to_string(),
@@ -1232,7 +1238,7 @@ async fn say_goodbye(agent: &Arc<Agent>) {
             "the last report did not get out in time; going anyway"
         );
     }
-    give_back_what_is_half_built(agent).await;
+    // VMM transfers survive agent shutdown; shutdown does not authorize cleanup.
     stop_speaking_for_every_router(agent).await;
 }
 
@@ -1265,61 +1271,6 @@ async fn stop_speaking_for_every_router(agent: &Agent) {
                         "this node's routers could not be silenced; it may still answer for \
                          addresses its cluster has moved"),
     }
-}
-
-/// The one kind of VMM a stopping agent takes with it.
-///
-/// **Running guests survive an agent restart, and that is not negotiable.**
-/// The whole design rests on it: a record on disk, a pid in it, an adoption
-/// on the way back up. An agent that killed its guests on SIGTERM would make
-/// `systemctl restart meister-agent` an outage, and this function is
-/// deliberately not that.
-///
-/// A RECEIVING VMM is the exception, and it is the other half of D18. It has
-/// no guest — it is a process listening on a port for one — and it holds a
-/// cgroup, a set of taps and, on a fabric, a live NVMe/TCP session to
-/// somebody's disk. If this agent goes away, nothing will ever finish that
-/// reception: the task that was watching it dies here, the cluster's
-/// migration will time out, and what is left is the ghost the lab found — a
-/// VMM and an open disk held for a guest that has been running on another
-/// machine for hours. The record's own `receive_deadline` catches it on the
-/// way back up, which is minutes; this catches it now, which is right.
-///
-/// Best effort and bounded by nothing but the teardown itself: a stop that
-/// hangs here is worse than a leak, and the process is going either way.
-/// Every failure is a WARN, because the next start reads the same records and
-/// the same deadline.
-async fn give_back_what_is_half_built(agent: &Agent) {
-    let records = match agent.store.list() {
-        Ok(records) => records,
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), "cannot read the records on the way out");
-            return;
-        }
-    };
-    for id in half_built(&records) {
-        info!(vm_id = %id,
-              "a guest was on its way here and this agent is going; giving the vmm back");
-        if let Err(e) = agent.provisioner.teardown(&id).await {
-            warn!(vm_id = %id, error = %format!("{e:#}"),
-                  "the listening vmm could not be torn down; its receive deadline ends it");
-        }
-    }
-}
-
-/// Which of this node's VMs a stopping agent takes with it: the ones that are
-/// waiting for a guest, and nothing else.
-///
-/// Pure, and separate for the reason every rule in this tree that decides
-/// somebody's guest is: the whole of the decision is the one line below, and
-/// a decision that can only be reached by stopping an agent is a decision
-/// nobody checks. See `give_back_what_is_half_built` for the argument.
-fn half_built(records: &[(agent_api::VmId, types::VmRecord)]) -> Vec<agent_api::VmId> {
-    records
-        .iter()
-        .filter(|(_, record)| record.phase == types::Phase::Receiving)
-        .map(|(id, _)| *id)
-        .collect()
 }
 
 /// One session with one controller endpoint, from the dial to the end of the

@@ -2,31 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Live migration: the cluster's half.
+//! Live migration coordinates two durable endpoint records and one attempt.
 //!
-//! `VmMigration` is the object; this is what makes one happen. It lives in a
-//! file of its own because a migration is the one operation in this tier that
-//! holds both ends of a move at once — two nodes, two records, one guest —
-//! and reading it interleaved with the ordinary lifecycle would bury the one
-//! rule the whole thing is built around:
-//!
-//! > **Nothing is done to the source until the destination has the guest.**
-//!
-//! Everything here follows from that. The destination is built first and
-//! completely; the source is told to send only once there is something to
-//! send to; and every failure path tears down the DESTINATION and leaves the
-//! source exactly as it was. A migration that does not work costs a record
-//! and nothing else.
-//!
-//! # The phases, and what each one has already made true
-//!
-//! | Phase | What is standing | What breaks it |
-//! |---|---|---|
-//! | `Pending` | nothing | nothing to undo |
-//! | `Preparing` | the destination has the disks open and a VMM listening | tear the destination down |
-//! | `Running` | the source has been told to send | the same, and the source resumes its own guest |
-//! | `Succeeded` | `spec.nodeName` names the destination, the source's record is gone | — |
-//! | `Failed` | the source is running, as it was throughout | — |
+//! A timeout is not an abort. Unknown outcomes retain their migration record,
+//! placement and reservation; only matching terminal evidence permits cleanup.
+//! See docs/MIGRATION.md for the protocol, restart and upgrade contracts.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -146,78 +126,57 @@ fn another_attempt_in_flight(all: &[VmMigration], mine: &VmMigration) -> bool {
     })
 }
 
-/// What the DESTINATION says about a guest that is moving to it.
-///
-/// Its own ingest, in its own file, and it exists because `ingest_status`'s
-/// `ours` deliberately refuses a report from a node the VM is not bound to —
-/// which, for the whole length of a migration, is exactly what the
-/// destination is. Without this the cluster would have no way at all to learn
-/// that the guest arrived: the one node that knows is the one node whose word
-/// about that VM is thrown away.
-///
-/// It WRITES ONLY on the migration object and never on the VM. The VM's
-/// status stays the binding's, which is the rule `ingest_status` states at
-/// length and the reason it drops these reports in the first place — a node
-/// that is not the binding must not be able to write itself into a VM's
-/// status.
-pub async fn ingest_arrivals(
-    store: &EtcdStore,
-    vms: &[Vm],
-    node_id: &str,
-    report: &StatusReport,
-) -> anyhow::Result<()> {
-    if report.vms.is_empty() {
-        return Ok(());
+/// Apply only evidence belonging to this VM incarnation and this attempt.
+/// Terminal evidence cannot be replaced by an older in-flight heartbeat.
+fn apply_report(m: &mut VmMigration, vm: &Vm, node: &str, line: &proto::MigrationReport) {
+    let phase = m.status.phase().kind();
+    if m.status.cancelling
+        || !matches!(
+            phase,
+            VmMigrationPhaseKind::Preparing | VmMigrationPhaseKind::Running
+        )
+        || line.migration_id.is_empty()
+        || m.status.migration_id.as_deref() != Some(line.migration_id.as_str())
+        || m.status.vm_uid.as_deref() != Some(vm.metadata.uid.as_str())
+        || line.vm_id != vm.metadata.uid
+        || m.spec.vm != vm.metadata.name
+        || !controller_api::same_tenancy(&m.spec.tenant, vm.spec.tenant.as_deref())
+    {
+        return;
     }
-    let migrations: Vec<VmMigration> = match store.list().await {
-        Ok(m) => m,
-        Err(StoreError::NotFound(_)) => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    for migration in migrations {
-        if migration.status.phase().kind().is_final() {
-            continue;
-        }
-        if migration.status.target_node.as_deref() != Some(node_id) {
-            continue;
-        }
-        let Some(vm) = vms.iter().find(|v| v.metadata.name == migration.spec.vm) else {
-            continue;
-        };
-        let Some(line) = report.vms.iter().find(|r| r.id == vm.metadata.uid) else {
-            continue;
-        };
-        if migration.status.target_reported.as_deref() == Some(line.phase.as_str()) {
-            continue;
-        }
-        let phase = line.phase.clone();
-        store
-            .mutate::<VmMigration, _>(&migration.metadata.name, |m| {
-                m.status.target_reported = Some(phase.clone());
-            })
-            .await?;
-        debug!(migration = %migration.metadata.name, node = node_id, phase = %phase,
-               "the destination said something about the guest");
+    if m.status.source_node.as_deref() == Some(node)
+        && phase == VmMigrationPhaseKind::Running
+        && m.status.peer.as_deref() == Some(line.peer.as_str())
+        && matches!(
+            line.outcome.as_str(),
+            "Sending" | "Unknown" | "Gone" | "StillHere"
+        )
+        && !matches!(
+            m.status.source_reported.as_deref(),
+            Some("Gone" | "StillHere")
+        )
+    {
+        m.status.source_reported = Some(line.outcome.clone());
+        m.status.source_message = (!line.message.is_empty()).then(|| line.message.clone());
     }
-    Ok(())
+    if m.status.target_node.as_deref() == Some(node)
+        && matches!(line.outcome.as_str(), "Receiving" | "Arrived")
+        && m.status.target_reported.as_deref() != Some("Running")
+    {
+        m.status.target_reported = Some(
+            if line.outcome == "Arrived" {
+                "Running"
+            } else {
+                "Provisioning"
+            }
+            .into(),
+        );
+    }
 }
 
-/// What the SOURCE says about a guest it was told to send.
-///
-/// The other half of `ingest_arrivals`, and it exists for a different reason:
-/// the source IS the node the VM is bound to, so its report about the VM's
-/// phase is taken the ordinary way. What that road cannot carry is the
-/// transfer's own outcome — the VM is `Running` on the source right up to the
-/// moment it is not — and that is exactly what a migration has to know.
-///
-/// It used to be the answer to `MigrateOut`, which is why the reconcile pass
-/// awaited that answer for the length of a guest's memory (D16). Now the
-/// command is accepted at once and this is the reading.
-///
-/// **Writes only on the migration**, like `ingest_arrivals` and for the same
-/// rule: a node's word about a VM is the binding's business, and a transfer's
-/// outcome is not a VM phase.
-pub async fn ingest_departures(
+/// Both endpoints use the same attempt-bound report and compare again inside
+/// the CAS retry. Ordinary VM phases and legacy reports are not migration evidence.
+pub async fn ingest_reports(
     store: &EtcdStore,
     vms: &[Vm],
     node_id: &str,
@@ -232,41 +191,25 @@ pub async fn ingest_departures(
         Err(e) => return Err(e.into()),
     };
     for migration in migrations {
-        if migration.status.phase().kind().is_final() {
-            continue;
-        }
-        if migration.status.source_node.as_deref() != Some(node_id) {
-            continue;
-        }
         let Some(vm) = vms.iter().find(|v| v.metadata.name == migration.spec.vm) else {
             continue;
         };
-        let Some(line) = report
-            .migrations
-            .iter()
-            .find(|m| m.vm_id == vm.metadata.uid)
-        else {
-            continue;
-        };
-        let message = (!line.message.is_empty()).then(|| line.message.clone());
-        // Only on a change: a source says the same true thing every ten
-        // seconds for the whole of a transfer, and a write per report would
-        // churn etcd revisions and wake the migration watch while nothing
-        // about the migration happened.
-        if migration.status.source_reported.as_deref() == Some(line.outcome.as_str())
-            && migration.status.source_message == message
-        {
-            continue;
+        for line in &report.migrations {
+            let mut changed = migration.clone();
+            apply_report(&mut changed, vm, node_id, line);
+            if serde_json::to_value(&changed.status)? == serde_json::to_value(&migration.status)? {
+                continue;
+            }
+            store
+                .mutate_if::<VmMigration, _>(
+                    &migration.metadata.name,
+                    &migration.metadata.uid,
+                    |m| {
+                        apply_report(m, vm, node_id, line);
+                    },
+                )
+                .await?;
         }
-        let outcome = line.outcome.clone();
-        store
-            .mutate::<VmMigration, _>(&migration.metadata.name, |m| {
-                m.status.source_reported = Some(outcome.clone());
-                m.status.source_message = message.clone();
-            })
-            .await?;
-        debug!(migration = %migration.metadata.name, node = node_id, outcome = %outcome,
-               "the source said something about the send");
     }
     Ok(())
 }
@@ -644,16 +587,44 @@ async fn step(
         // of a move that did not happen is worth keeping, and it is the only
         // place the reason will ever be written down.
         Err(StoreError::NotFound(_)) => {
-            return fail(
-                store,
-                &migration,
-                format!("vm {} does not exist here any more", migration.spec.vm),
-            )
-            .await;
+            let why = format!(
+                "vm {} no longer exists; migration ownership requires recovery",
+                migration.spec.vm
+            );
+            return if migration.status.phase().kind() == VmMigrationPhaseKind::Pending {
+                fail(store, &migration, why).await
+            } else {
+                unresolved(store, &migration, why).await
+            };
         }
         Err(e) => return Err(e.into()),
     };
 
+    if !migration.status.phase().kind().is_final()
+        && migration.status.phase().kind() != VmMigrationPhaseKind::Pending
+        && (migration.status.migration_id.is_none()
+            || migration.status.vm_uid.as_deref() != Some(vm.metadata.uid.as_str()))
+    {
+        return unresolved(
+            store,
+            &migration,
+            "legacy or replaced VM: migration ownership requires recovery".into(),
+        )
+        .await;
+    }
+    if migration.status.cancelling && !migration.status.phase().kind().is_final() {
+        if let Some(target) = &migration.status.target_node {
+            return abandon(
+                store,
+                dispatch,
+                &migration,
+                &vm,
+                target,
+                "migration cancelled".into(),
+            )
+            .await;
+        }
+    }
     match migration.status.phase().kind() {
         VmMigrationPhaseKind::Pending => {
             prepare(
@@ -819,6 +790,17 @@ async fn prepare(
     // scheduler picked are one `target` by the time this runs, so there is
     // one place where a destination is promised and one place where it is
     // given back.
+    for endpoint in [&source, &target] {
+        if !all.iter().any(|n| {
+            &n.name == endpoint
+                && n.catalogue
+                    .iter()
+                    .any(|c| c == common::migration::ATTEMPT_PROTOCOL)
+        }) {
+            return fail(store, migration, format!("node {endpoint} does not support migration/attempt-v2; upgrade both endpoints before migrating")).await;
+        }
+    }
+
     let mine = match reserve(store, migration, vm, &target).await? {
         Reserved::Fresh(mine) => mine,
         Reserved::Standing(mine) if mine.spec.node == target => mine,
@@ -870,6 +852,8 @@ async fn prepare(
     // migration, and two replicas preparing one migration would build two
     // destinations for one guest.
     let mut claimed = migration.clone();
+    claimed.status.migration_id = Some(migration.metadata.uid.clone());
+    claimed.status.vm_uid = Some(vm.metadata.uid.clone());
     claimed.status.source_node = Some(source.clone());
     claimed.status.target_node = Some(target.clone());
     claimed.status.started_at = Some(Utc::now());
@@ -882,7 +866,9 @@ async fn prepare(
         Utc::now(),
     ));
     match store.update(&claimed).await {
-        Ok(_) => {}
+        Ok(fresh) => {
+            claimed = fresh;
+        }
         Err(StoreError::Conflict(_)) => {
             debug!(migration = %name, "lost the prepare race");
             return Ok(());
@@ -919,6 +905,7 @@ async fn prepare(
         .send(
             &target,
             NodeCommand::PrepareMigration {
+                migration_id: migration.metadata.uid.clone(),
                 id: vm.metadata.uid.clone(),
                 spec_json,
             },
@@ -933,8 +920,11 @@ async fn prepare(
     };
 
     store
-        .mutate::<VmMigration, _>(&name, |m| {
+        .mutate_if::<VmMigration, _>(&name, &migration.metadata.uid, |m| {
             let phase = m.status.phase().kind();
+            if m.status.cancelling || m.status.phase().kind() != VmMigrationPhaseKind::Preparing {
+                return;
+            }
             // The field and the sentence in one write, so that no pass can
             // ever see one without the other. The sentence is what a person
             // reads; the field is what `send` reads — see `peer_of`, and
@@ -1147,12 +1137,22 @@ async fn send(
     migration: &VmMigration,
     vm: &Vm,
 ) -> anyhow::Result<()> {
+    if migration.status.cancelling
+        || migration.status.phase().kind() != VmMigrationPhaseKind::Preparing
+    {
+        return Ok(());
+    }
     let name = migration.metadata.name.clone();
     let (Some(source), Some(target)) = (
         migration.status.source_node.clone(),
         migration.status.target_node.clone(),
     ) else {
-        return fail(store, migration, "this migration has no ends".to_string()).await;
+        return unresolved(
+            store,
+            migration,
+            "migration endpoints are missing; ownership requires recovery".to_string(),
+        )
+        .await;
     };
     let peer = peer_of(&migration.status);
 
@@ -1206,59 +1206,20 @@ async fn send(
         .send(
             &source,
             NodeCommand::MigrateOut {
+                migration_id: migration.status.migration_id.clone().unwrap_or_default(),
                 id: vm.metadata.uid.clone(),
                 peer: peer.clone(),
             },
         )
         .await
     {
-        // **Recorded, and nothing is torn down.** This is the line the first
-        // live run was written to find, and it cost a guest to find it: from
-        // the moment this command has GONE OUT, the destination may be the
-        // only machine that has the guest, and an error here does not say
-        // which side of that moment we are on. A command that timed out is
-        // the sharpest case — the source stopped answering because its VMM
-        // exited, which is what SUCCESS looks like — and the tidy-up that
-        // followed destroyed a guest that had arrived.
-        //
-        // So the phase stays `Running`, the reason goes on the object, and
-        // `settle` decides: if the destination reports the vm Running the
-        // migration finishes, and if nothing ever arrives the transfer
-        // timeout ends it — by then with evidence about which machine holds
-        // what.
-        // ...with ONE exception, and it is the one the source was taught to
-        // say in round 4: cloud-hypervisor gives the guest back on a failed
-        // send, so the source is serving it again and knows it. That answer
-        // is not ambiguous about which machine holds the guest — it names the
-        // machine, and the machine is this one. Ending on it is what the
-        // sentence was added for; without this the answer arrived in seconds
-        // and then sat in `Running` for the whole transfer timeout anyway,
-        // which is what the lab measured.
-        // `abandon` and not `fail`, for the same reason this branch exists at
-        // all: the source names the machine holding the guest and it is the
-        // source, so the destination CANNOT have it, and the tidy-up the
-        // timeout path does only when it is sure is safe here immediately —
-        // the destination is torn down and comes off the volumes' open set.
+        // An error string cannot prove that an accepted transfer was aborted.
+        // Keep ownership and wait for attempt-bound reports from both endpoints.
         let e = format!("{e:#}");
-        if common::migration::guest_stayed(&e) {
-            warn!(migration = %name, node = %source, reason = %e,
-                  "the source kept the guest; the transfer is over");
-            return abandon(store, dispatch, migration, vm, &target, e).await;
-        }
         let why = format!("the source's answer did not come back: {e}");
         warn!(migration = %name, node = %source, reason = %why,
               "the send is unaccounted for; waiting for the destination to say");
-        store
-            .mutate::<VmMigration, _>(&name, |m| {
-                let phase = m.status.phase().kind();
-                m.status.reported = Some(controller_api::VmMigrationReported::here(
-                    phase,
-                    controller_api::VmMigrationReason::Reported,
-                    Some(why.clone()),
-                    Utc::now(),
-                ));
-            })
-            .await?;
+        unresolved(store, migration, why).await?;
     }
     Ok(())
 }
@@ -1309,47 +1270,15 @@ fn still_here(source: &str, target: &str, status: &VmMigrationStatus) -> Option<
     )))
 }
 
-/// The two ways a migration can end on the source's word. Both are failures;
-/// what differs is whether the destination may be tidied up.
+/// A confirmed abort permits cleanup; contradictory evidence requires recovery.
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
     TearDownTheDestination(String),
     TouchNothing(String),
 }
 
-/// What is to be done when the transfer budget is spent and the destination
-/// has still not reported the guest.
-///
-/// The sibling of `still_here` and pure for the same reason: it decides
-/// whether a VMM on another machine is torn down, and a decision that can
-/// only be reached through a store is a decision nobody checks.
-///
-/// Two answers, and the line between them is the one `abandon` draws — a
-/// destination that CANNOT hold the guest may be tidied up, and one that
-/// might hold the only copy may not. Three readings go into it:
-///
-///   * **the source said `Gone`.** It dropped the vmm pid and detached the
-///     volumes when its send finished; no guest is being served there. So
-///     whatever the destination has or has not said yet, the destination is
-///     the only machine that can hold this guest, and nothing here is
-///     touched.
-///   * **the destination has said nothing, or `Provisioning`.** It holds no
-///     guest. That word can be trusted because the agent reports it off the
-///     GUEST rather than off its own bookkeeping: a destination whose VMM
-///     says Running reports Running, whatever its record still says. Tear it
-///     down; the source is serving the guest as it was throughout.
-///   * **anything else.** Both ends may claim the vm. A VMM left standing on
-///     the destination is a leak; a guest destroyed is not something you get
-///     back.
-///
-/// Astra finding S04, 2026-09-23: only the second and third readings were
-/// here, so `SEND_GONE` — written by the source and carried to
-/// `status.sourceReported` by `ingest_departures` — was read nowhere in this
-/// tier. A send that completed while the destination's first report was
-/// still in flight therefore ended in `abandon`: the destination was
-/// destroyed by the VM's uid, and the record said "{source} is running the vm
-/// as before" about a machine that had just let the guest go. That sentence
-/// was true of no machine at all.
+/// Silence and stale progress reports cannot prove an empty destination.
+/// The deadline therefore requests recovery without authorizing destruction.
 fn verdict_on_timeout(
     source: &str,
     target: &str,
@@ -1364,12 +1293,6 @@ fn verdict_on_timeout(
              guest go; the destination last said {said}. {source} is not serving this vm any \
              more, so {target} may hold the only copy and nothing here has been torn down — \
              look at both before deleting anything"
-        ));
-    }
-    if matches!(target_reported, None | Some("Provisioning")) {
-        return Verdict::TearDownTheDestination(format!(
-            "the guest had not arrived on {target} after {over}s; it said {said} and holds no \
-             guest, so it has been torn down and {source} is running the vm as before"
         ));
     }
     Verdict::TouchNothing(format!(
@@ -1399,11 +1322,17 @@ async fn settle(
         migration.status.source_node.clone(),
         migration.status.target_node.clone(),
     ) else {
-        return fail(store, migration, "this migration has no ends".to_string()).await;
+        return unresolved(
+            store,
+            migration,
+            "migration endpoints are missing; ownership requires recovery".to_string(),
+        )
+        .await;
     };
 
-    let arrived =
-        migration.status.target_reported.as_deref() == Some(VmPhaseKind::Running.as_str());
+    let arrived = migration.status.target_reported.as_deref()
+        == Some(VmPhaseKind::Running.as_str())
+        && migration.status.source_reported.as_deref() == Some("Gone");
     if !arrived {
         // The one answer that ends a migration before its timeout does, and
         // the one D16 made available: the SOURCE's own word about the send.
@@ -1413,7 +1342,7 @@ async fn settle(
             Some(Verdict::TearDownTheDestination(why)) => {
                 return abandon(store, dispatch, migration, vm, &target, why).await;
             }
-            Some(Verdict::TouchNothing(why)) => return fail(store, migration, why).await,
+            Some(Verdict::TouchNothing(why)) => return unresolved(store, migration, why).await,
             None => {}
         }
         let Some(over) = overdue(migration, timeouts.prepare + timeouts.transfer) else {
@@ -1433,7 +1362,7 @@ async fn settle(
             Verdict::TearDownTheDestination(why) => {
                 abandon(store, dispatch, migration, vm, &target, why).await
             }
-            Verdict::TouchNothing(why) => fail(store, migration, why).await,
+            Verdict::TouchNothing(why) => unresolved(store, migration, why).await,
         };
     }
 
@@ -1467,7 +1396,9 @@ async fn settle(
     if let Err(e) = dispatch
         .send(
             &source,
-            NodeCommand::Destroy {
+            NodeCommand::CleanupMigration {
+                migration_id: migration.status.migration_id.clone().unwrap_or_default(),
+                source: true,
                 id: vm.metadata.uid.clone(),
             },
         )
@@ -1482,7 +1413,8 @@ async fn settle(
 
     let finished = Utc::now();
     store
-        .mutate::<VmMigration, _>(&name, |m| {
+        .mutate_if::<VmMigration, _>(&name, &migration.metadata.uid, |m| {
+            m.status.recovery_required = false;
             m.status.finished_at = Some(finished);
             // The one resting word here, and the only one that names a
             // machine: what it claims is that a guest is executing on the
@@ -1507,18 +1439,9 @@ async fn settle(
     Ok(())
 }
 
-/// Tear the DESTINATION down and record why, leaving the source untouched.
-///
-/// One function rather than five copies, because forgetting half of it is how
-/// a failed migration turns into a leak: a VMM listening on a port for ever,
-/// and a disk that two machines think they have open.
-///
-/// **Only callable while the source still has the guest**, which means: at
-/// any point up to and including the dispatch of `MigrateOut`, and afterwards
-/// only when the destination has never reported the vm. Past that line the
-/// destination may hold the only copy of a running guest, and a tidy-up would
-/// be a deletion. Both callers past the line check first, and the check is
-/// argued where it is made.
+/// Cancel before dispatch, or after a matching authoritative source abort.
+/// A CAS excludes concurrent dispatch; the agent checks durable attempt ownership.
+/// Capacity is retained until cleanup acknowledges success.
 async fn abandon(
     store: &EtcdStore,
     dispatch: &Dispatch,
@@ -1527,13 +1450,31 @@ async fn abandon(
     target: &str,
     why: String,
 ) -> anyhow::Result<()> {
-    // Best effort, and it has to be: a destination that cannot be reached is
-    // often exactly why this migration is failing. What must not happen is
-    // that the failure goes unrecorded because the tidying did not work.
+    let Some(_) = migration.status.migration_id.as_ref() else {
+        return unresolved(
+            store,
+            migration,
+            "legacy migration requires recovery before cleanup".into(),
+        )
+        .await;
+    };
+    let mut claimed = migration.clone();
+    if !claimed.status.cancelling {
+        claimed.status.cancelling = true;
+        claimed = match store.update(&claimed).await {
+            Ok(m) => m,
+            Err(StoreError::Conflict(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+    }
+    let migration = &claimed;
+    // No acknowledgement means unresolved cleanup, not a released reservation.
     if let Err(e) = dispatch
         .send(
             target,
-            NodeCommand::Destroy {
+            NodeCommand::CleanupMigration {
+                migration_id: migration.status.migration_id.clone().unwrap_or_default(),
+                source: false,
                 id: vm.metadata.uid.clone(),
             },
         )
@@ -1541,39 +1482,55 @@ async fn abandon(
     {
         warn!(migration = %migration.metadata.name, node = target,
               error = %format!("{e:#}"), "the destination could not be torn down");
+        return unresolved(
+            store,
+            migration,
+            format!("cleanup has not been confirmed: {e:#}"),
+        )
+        .await;
     }
     close_volumes_at(vm, target);
     fail(store, migration, why).await
 }
 
-/// Write the ending. `Failed` always carries a sentence — it is the only
-/// thing the object exists to say on the day somebody asks why a machine is
-/// still full.
-///
-/// And the one funnel every failure goes through, which is why the room is
-/// given back here: `abandon` ends in this, every refusal in `prepare` ends
-/// in this, and a release written into each of them separately is a release
-/// somebody forgets. Astra finding S07, 2026-09-23 — a reservation outlives
-/// nothing, and a failed move is the commonest nothing.
-///
-/// Unconditional, including on the paths that ran before anything was ever
-/// promised: giving back a promise that was never made is a read that finds
-/// no key, which costs one round trip and cannot be wrong.
-async fn fail(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow::Result<()> {
-    let name = migration.metadata.name.clone();
-    warn!(migration = %name, vm = %migration.spec.vm, reason = %why, "migration failed");
+/// Unknown is nonterminal: keep placement, operation ownership and reservation.
+async fn unresolved(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow::Result<()> {
     store
-        .mutate::<VmMigration, _>(&name, |m| {
-            let now = Utc::now();
-            m.status.finished_at = Some(now);
+        .mutate_if::<VmMigration, _>(&migration.metadata.name, &migration.metadata.uid, |m| {
+            if m.status.phase().kind().is_final() {
+                return;
+            }
+            m.status.recovery_required = true;
             m.status.reported = Some(controller_api::VmMigrationReported::here(
-                VmMigrationPhaseKind::Failed,
-                controller_api::VmMigrationReason::Abandoned,
+                m.status.phase().kind(),
+                controller_api::VmMigrationReason::Reported,
                 Some(why.clone()),
-                now,
+                Utc::now(),
             ));
         })
         .await?;
+    Ok(())
+}
+
+/// Commit a terminal failure only if the deciding snapshot still owns the revision.
+async fn fail(store: &EtcdStore, migration: &VmMigration, why: String) -> anyhow::Result<()> {
+    let name = migration.metadata.name.clone();
+    warn!(migration = %name, vm = %migration.spec.vm, reason = %why, "migration failed");
+    let mut ended = migration.clone();
+    let now = Utc::now();
+    ended.status.recovery_required = false;
+    ended.status.finished_at = Some(now);
+    ended.status.reported = Some(controller_api::VmMigrationReported::here(
+        VmMigrationPhaseKind::Failed,
+        controller_api::VmMigrationReason::Abandoned,
+        Some(why),
+        now,
+    ));
+    match store.update(&ended).await {
+        Ok(_) => {}
+        Err(StoreError::Conflict(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
     // After the ending and not before it, and the order is the invariant's:
     // a process killed between the two leaves a promise whose migration is
     // FINAL, which is exactly what the reaper takes. The other order would
@@ -1784,6 +1741,97 @@ fn peer_of(status: &VmMigrationStatus) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_completion_reports_never_authorize_timeout_cleanup() {
+        for source in [None, Some("Sending"), Some("Gone"), Some("Unknown")] {
+            for target in [None, Some("Provisioning"), Some("Running")] {
+                assert!(
+                    matches!(
+                        verdict_on_timeout("source", "target", 150, source, target),
+                        Verdict::TouchNothing(_)
+                    ),
+                    "source={source:?}, target={target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn old_reports_cannot_change_a_new_attempt_before_or_after_dispatch() {
+        let mut guest = vm("web");
+        guest.metadata.uid = "vm-incarnation".into();
+        for phase in [
+            VmMigrationPhaseKind::Preparing,
+            VmMigrationPhaseKind::Running,
+        ] {
+            let mut m = migration("web", phase);
+            m.status.migration_id = Some("M2".into());
+            m.status.vm_uid = Some(guest.metadata.uid.clone());
+            m.status.source_node = Some("source".into());
+            m.status.target_node = Some("target".into());
+            m.status.peer = Some("tcp:target:49000".into());
+            for outcome in ["StillHere", "Gone", "Sending", "Arrived"] {
+                let line = proto::MigrationReport {
+                    vm_id: guest.metadata.uid.clone(),
+                    migration_id: "M1".into(),
+                    peer: "tcp:target:49000".into(),
+                    outcome: outcome.into(),
+                    message: "old".into(),
+                };
+                for reporter in ["source", "target"] {
+                    apply_report(&mut m, &guest, reporter, &line);
+                }
+            }
+            assert!(m.status.source_reported.is_none());
+            assert!(m.status.target_reported.is_none());
+            assert!(still_here("source", "target", &m.status).is_none());
+        }
+    }
+
+    #[test]
+    fn reports_check_reporter_peer_phase_and_incarnation_and_survive_roundtrip() {
+        let mut guest = vm("web");
+        guest.metadata.uid = "vm-incarnation".into();
+        let mut m = migration("web", VmMigrationPhaseKind::Running);
+        m.status.migration_id = Some("M2".into());
+        m.status.vm_uid = Some(guest.metadata.uid.clone());
+        m.status.source_node = Some("source".into());
+        m.status.target_node = Some("target".into());
+        m.status.peer = Some("tcp:target:49000".into());
+        let mut line = proto::MigrationReport {
+            vm_id: guest.metadata.uid.clone(),
+            migration_id: "M2".into(),
+            peer: "tcp:target:49000".into(),
+            outcome: "Gone".into(),
+            message: String::new(),
+        };
+        apply_report(&mut m, &guest, "target", &line);
+        assert!(m.status.source_reported.is_none());
+        for field in ["migration_id", "vm_id", "peer"] {
+            let mut invalid = line.clone();
+            match field {
+                "migration_id" => invalid.migration_id.clear(),
+                "vm_id" => invalid.vm_id = "recreated".into(),
+                _ => invalid.peer = "wrong".into(),
+            }
+            apply_report(&mut m, &guest, "source", &invalid);
+            assert!(m.status.source_reported.is_none());
+        }
+        m.status.recovery_required = true;
+        let mut restarted: VmMigration =
+            serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
+        apply_report(&mut restarted, &guest, "source", &line);
+        line.outcome = "Sending".into();
+        apply_report(&mut restarted, &guest, "source", &line);
+        assert_eq!(restarted.status.source_reported.as_deref(), Some("Gone"));
+        line.outcome = "Arrived".into();
+        apply_report(&mut restarted, &guest, "target", &line);
+        line.outcome = "Receiving".into();
+        apply_report(&mut restarted, &guest, "target", &line);
+        assert_eq!(restarted.status.target_reported.as_deref(), Some("Running"));
+        assert!(!restarted.status.phase().kind().is_final());
+    }
     use controller_api::{FirstFit, RunStrategy, VmMigrationSpec, VmSpec};
 
     fn vm(name: &str) -> Vm {
@@ -2238,15 +2286,11 @@ mod tests {
             );
         }
 
-        // The source never said it was gone: silence, or a send still under
-        // way. Then the destination holding no guest is the old reading and
-        // the old tidy-up.
-        for source_said in [None, Some("Sending")] {
-            let Verdict::TearDownTheDestination(why) = verdict(source_said, None) else {
-                panic!("a destination with no guest is tidied up");
-            };
-            assert!(why.contains("nothing at all"), "{why}");
-            assert!(why.contains("agent-1 is running the vm as before"), "{why}");
+        for source_said in [None, Some("Sending"), Some("Unknown")] {
+            assert!(matches!(
+                verdict(source_said, None),
+                Verdict::TouchNothing(_)
+            ));
         }
 
         // And the third reading, unchanged: the destination said something
@@ -2570,6 +2614,74 @@ mod tests {
         EtcdStore::connect(&[endpoint], &prefix)
             .await
             .expect("an etcd to talk to; see the function's note")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs an existing etcd; see test_store"]
+    async fn timeout_retains_reservation_and_accepts_late_completion_reports() {
+        let store = std::sync::Arc::new(test_store().await);
+        let guest = store.create(&vm("late-guest")).await.unwrap();
+        let mut moving = migration("late-guest", VmMigrationPhaseKind::Running);
+        moving.status.migration_id = Some(moving.metadata.uid.clone());
+        moving.status.vm_uid = Some(guest.metadata.uid.clone());
+        moving.status.source_node = Some("source".into());
+        moving.status.target_node = Some("target".into());
+        moving.status.peer = Some("tcp:target:49000".into());
+        moving.status.started_at = Some(Utc::now() - chrono::Duration::seconds(300));
+        moving.status.target_reported = Some("Provisioning".into());
+        let moving = store.create(&moving).await.unwrap();
+        let promise = store
+            .create(&CapacityReservation::of(&moving, &guest, "target"))
+            .await
+            .unwrap();
+        let registry = std::sync::Arc::new(crate::session::SessionRegistry::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        registry.attach("source", &tx);
+        registry.attach("target", &tx);
+        let dispatch = Dispatch::new(
+            registry,
+            store.clone(),
+            std::sync::Arc::new(crate::logs::Forward {
+                cluster: "cluster".into(),
+                sibling: controller_api::forward::Sibling {
+                    serves_tls: false,
+                    tls: None,
+                },
+            }),
+        );
+        tokio::select! {
+            result = settle(&store, &dispatch, Timeouts::default(), &moving, &guest) => result.unwrap(),
+            command = rx.recv() => panic!("timeout dispatched an unauthorized command: {command:?}"),
+        }
+        let unknown: VmMigration = store.get(&moving.metadata.name).await.unwrap();
+        assert!(unknown.status.recovery_required);
+        assert!(!unknown.status.phase().kind().is_final());
+        assert!(unknown.status.finished_at.is_none());
+        let _: CapacityReservation = store.get(&promise.metadata.name).await.unwrap();
+        assert!(controller_api::orphaned_reservations(&[promise], &[unknown]).is_empty());
+        for (node, outcome) in [("source", "Gone"), ("target", "Arrived")] {
+            ingest_reports(
+                &store,
+                std::slice::from_ref(&guest),
+                node,
+                &proto::StatusReport {
+                    migrations: vec![proto::MigrationReport {
+                        vm_id: guest.metadata.uid.clone(),
+                        migration_id: moving.metadata.uid.clone(),
+                        peer: "tcp:target:49000".into(),
+                        outcome: outcome.into(),
+                        message: String::new(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let recovered: VmMigration = store.get(&moving.metadata.name).await.unwrap();
+        assert_eq!(recovered.status.source_reported.as_deref(), Some("Gone"));
+        assert_eq!(recovered.status.target_reported.as_deref(), Some("Running"));
+        assert!(rx.try_recv().is_err());
     }
 
     /// The room goes back when the move ends — through `fail`, which is the

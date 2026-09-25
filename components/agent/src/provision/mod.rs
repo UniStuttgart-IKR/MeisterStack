@@ -308,6 +308,7 @@ impl Provisioner {
             stop_deadline: None,
             receive_deadline: None,
             send_failed: None,
+            migration: None,
             unhealthy: None,
             managed_by_controller,
             volumes: vec![],

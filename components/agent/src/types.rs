@@ -22,13 +22,25 @@ use uuid::Uuid;
 /// Process that requires ownership of the VM.
 /// This is required to let the reconciler know to not start/stop the VM while its in one of these
 /// states.
-/// If one of those actions is found on startup the VM is considered orphaned.
+/// Migration ownership survives startup; task loss does not end a VMM transfer.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Operation {
     Snapshotting { target: String },
     Restoring { source: String },
     MigratingOut { peer: String },
     MigratingIn { peer: String },
+}
+
+/// Durable ownership of a migration, independent of the task watching the VMM.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MigrationAttempt {
+    pub id: String,
+    pub peer: String,
+    pub incoming: bool,
+    /// Only an acknowledged send may subsequently establish `StillHere`.
+    pub accepted: bool,
+    #[serde(default)]
+    pub unknown: Option<String>,
 }
 
 /// Process of the resource creation. Only for journaling.
@@ -127,6 +139,8 @@ pub struct DeviceWithId {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VmRecord {
+    #[serde(default)]
+    pub migration: Option<MigrationAttempt>,
     pub spec: AgentVmSpec,
     #[serde(default)]
     pub desired: Desired,
@@ -136,23 +150,8 @@ pub struct VmRecord {
     /// `time::SystemTime` to make the deadline surrive an agent restart.
     #[serde(default)]
     pub stop_deadline: Option<std::time::SystemTime>,
-    /// When this node stops waiting for a guest that is on its way here.
-    ///
-    /// Set when the VMM starts listening and cleared when the guest arrives,
-    /// and it is the half of a failed reception that no hypervisor can
-    /// report: a source that was killed, or told to send to a port that does
-    /// not answer, never dials at all, and the destination then waits in
-    /// `accept` for as long as it is allowed to. Cloud-hypervisor writes
-    /// `migration-receive-failed` for every OTHER way a transfer ends badly;
-    /// nobody writes anything for a source that simply never came.
-    ///
-    /// A `SystemTime` and on the record for the reason `stop_deadline` is
-    /// one: the agent that started the reception is not necessarily the agent
-    /// that has to end it. The ghost of the lab survived a restart precisely
-    /// because nothing on disk said when to give up.
-    ///
-    /// See `provision::Ceilings::receive` for how long, and why it is
-    /// longer than the cluster's own patience rather than shorter.
+    /// Advisory receive deadline, retained for persisted-record compatibility.
+    /// Expiry does not prove that a receive ended and never authorizes teardown.
     #[serde(default)]
     pub receive_deadline: Option<std::time::SystemTime>,
     /// Why the last send this node was told to make did NOT take the guest
@@ -241,6 +240,7 @@ impl VmRecord {
     /// Three times they were; the fourth is what this exists to prevent.
     pub fn blank() -> Self {
         Self {
+            migration: None,
             spec: AgentVmSpec {
                 vcpus: 1,
                 memory_mib: 256,

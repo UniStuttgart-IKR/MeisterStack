@@ -209,7 +209,7 @@ async fn a_stream_that_breaks_leaves_no_vmm_no_record_and_no_disk_held() {
 
     let id = agent_api::VmId::new_v4();
     let listen = "tcp:127.0.0.1:47311";
-    dest.prepare_migration(id, arriving_vm(&store, &root), listen, true)
+    dest.prepare_migration(id, arriving_vm(&store, &root), listen, true, "attempt-1")
         .await
         .expect("a listening vmm");
 
@@ -299,9 +299,15 @@ async fn a_stream_that_breaks_leaves_no_vmm_no_record_and_no_disk_held() {
 
     // And the second attempt, which is the other half of the same defect:
     // before the fix this answered "this node already has a record of vm …".
-    dest.prepare_migration(id, arriving_vm(&store, &root), "tcp:127.0.0.1:47312", true)
-        .await
-        .expect("the same vm, the same node, no restart in between");
+    dest.prepare_migration(
+        id,
+        arriving_vm(&store, &root),
+        "tcp:127.0.0.1:47312",
+        true,
+        "attempt-2",
+    )
+    .await
+    .expect("the same vm, the same node, no restart in between");
     let again = store.get(&id).expect("a lookup").expect("a record");
     assert_eq!(again.phase, Phase::Receiving);
     println!("and the same vm can be received again, without a restart");
