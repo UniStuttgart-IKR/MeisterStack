@@ -280,6 +280,15 @@ pub struct Executor<'a> {
     pub cancel: Cancel,
 }
 
+/// When a lock is being given back (Astra finding MD05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// The host's own `unlock` step: its step lock goes, the anchor stays.
+    HostStep,
+    /// The end of the run: everything this run still holds goes.
+    RunEnd,
+}
+
 /// The running picture of one host, between the plan and the journal.
 struct HostRunState {
     state: HostState,
@@ -287,6 +296,16 @@ struct HostRunState {
     txn: Option<String>,
     /// Whether this run holds the target's lock.
     locked: bool,
+    /// Whether that lock is the fleet's anchor (D6): taken before the first
+    /// step and given back after the last one, whatever the host's own
+    /// steps do in between.
+    ///
+    /// Astra finding MD05, 2026-09-25: the anchor and a host's step lock
+    /// were one flag, so the host's own `unlock` step gave the anchor back,
+    /// and a bootstrap, which finishes the control-plane hosts first, had
+    /// released every anchor while the agents were still being brought up.
+    /// A second operator on a second checkout was then kept out by nothing.
+    anchored: bool,
     /// Whether THIS run has already moved this host's system.
     ///
     /// Separate from the state rather than derived from it: the state moves
@@ -416,18 +435,23 @@ impl<'a> Executor<'a> {
                     state: run.state,
                     txn: run.txn_id.clone(),
                     locked: run.lock_held,
+                    // The anchor is taken again below (`take_anchor`), which
+                    // is where this becomes true for the hosts it holds.
+                    anchored: false,
                     moved: run.txn_id.is_some(),
                 },
                 None if planned.verdict.blocks() => HostRunState {
                     state: HostState::Blocked,
                     txn: None,
                     locked: false,
+                    anchored: false,
                     moved: false,
                 },
                 None => HostRunState {
                     state: HostState::Planned,
                     txn: None,
                     locked: false,
+                    anchored: false,
                     moved: false,
                 },
             };
@@ -1122,7 +1146,7 @@ impl<'a> Executor<'a> {
                     self.runner.run(&cmd)?;
                     self.entry(hosts, id).txn = None;
                 }
-                if let Some(cmd) = self.unlock_cmd(id, hosts)? {
+                if let Some(cmd) = self.unlock_cmd(id, hosts, Release::HostStep)? {
                     refs.push(cmd.line());
                     self.runner.run(&cmd)?;
                     self.entry(hosts, id).locked = false;
@@ -2735,7 +2759,9 @@ impl<'a> Executor<'a> {
             match self.runner.run(&cmd) {
                 Ok(_) => {
                     if hosts.contains_key(id) {
-                        self.entry(hosts, id).locked = true;
+                        let entry = self.entry(hosts, id);
+                        entry.locked = true;
+                        entry.anchored = true;
                     } else {
                         hosts.insert(
                             id.clone(),
@@ -2743,6 +2769,7 @@ impl<'a> Executor<'a> {
                                 state: HostState::Planned,
                                 txn: None,
                                 locked: true,
+                                anchored: true,
                                 moved: false,
                             },
                         );
@@ -2790,7 +2817,7 @@ impl<'a> Executor<'a> {
             .map(|(id, _)| id.clone())
             .collect();
         for id in held {
-            let Ok(Some(cmd)) = self.unlock_cmd(&id, hosts) else {
+            let Ok(Some(cmd)) = self.unlock_cmd(&id, hosts, Release::RunEnd) else {
                 continue;
             };
             if self.runner.run(&cmd).is_ok() {
@@ -2841,8 +2868,19 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn unlock_cmd(&self, id: &str, hosts: &BTreeMap<String, HostRunState>) -> Result<Option<Cmd>> {
-        if !hosts.get(id).map(|s| s.locked).unwrap_or(false) {
+    /// The command that gives this host's lock back, if this run holds it
+    /// and this is the moment to (Astra finding MD05): a host's own `unlock`
+    /// step does not give back the fleet's anchor, the end of the run does.
+    fn unlock_cmd(
+        &self,
+        id: &str,
+        hosts: &BTreeMap<String, HostRunState>,
+        when: Release,
+    ) -> Result<Option<Cmd>> {
+        let Some(held) = hosts.get(id) else {
+            return Ok(None);
+        };
+        if !held.locked || (when == Release::HostStep && held.anchored) {
             return Ok(None);
         }
         self.helper_cmd(id, &["lock", "release", "--run", &self.options.run_id])
@@ -3062,6 +3100,7 @@ impl<'a> Executor<'a> {
             state: HostState::Planned,
             txn: None,
             locked: false,
+            anchored: false,
             moved: false,
         })
     }

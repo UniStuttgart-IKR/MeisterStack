@@ -729,6 +729,55 @@ fn an_unchanged_host_whose_required_unit_is_down_fails_its_checks() {
     );
 }
 
+// Astra finding MD05, 2026-09-25: the anchor is not a host's step lock.
+#[test]
+fn a_hosts_own_unlock_step_does_not_give_back_the_fleet_anchor() {
+    let fx = Fixture::changing(&["n1"], false);
+    let look = TableLook::new(&fx);
+    let runner = World::new(StrictFake::new(), &look);
+    let executor = fx.executor(&runner, &look, fx.options());
+    let mut hosts: BTreeMap<String, HostRunState> = BTreeMap::new();
+    hosts.insert(
+        "box".to_string(),
+        HostRunState {
+            state: HostState::Planned,
+            txn: None,
+            locked: true,
+            anchored: true,
+            moved: false,
+        },
+    );
+    hosts.insert(
+        "n1".to_string(),
+        HostRunState {
+            state: HostState::Committed,
+            txn: None,
+            locked: true,
+            anchored: false,
+            moved: true,
+        },
+    );
+    // The anchor stays through a host step and goes at the end of the run.
+    assert!(
+        executor
+            .unlock_cmd("box", &hosts, Release::HostStep)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        executor
+            .unlock_cmd("box", &hosts, Release::RunEnd)
+            .unwrap()
+            .is_some()
+    );
+    // A step lock goes with the step.
+    assert!(
+        executor
+            .unlock_cmd("n1", &hosts, Release::HostStep)
+            .unwrap()
+            .is_some()
+    );
+}
 
 #[test]
 fn the_whole_of_one_changed_host_in_the_order_the_plan_wrote() {
