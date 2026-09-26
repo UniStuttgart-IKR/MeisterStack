@@ -7,9 +7,7 @@ authors.workspace = true
 
 [dependencies]
 agent-api = { package = "meister-agent-api", path = "../../shared/agent-api" }
-# The attacher half. A pool whose provider is `nvmeof-import` is attached with
-# `nvmeof`, and until `StoragePool.spec.attacher` exists this crate is what
-# joins the two -- see the module doc.
+# Combine import ownership with the NVMe-oF connection implementation.
 nvmeof-driver = { package = "meister-nvmeof-driver", path = "../nvmeof" }
 async-trait = { workspace = true }
 anyhow = { workspace = true }

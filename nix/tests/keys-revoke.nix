@@ -2,29 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# The exit criterion of lane 5A, in two virtual machines: a certificate that
-# is taken back stops working — at both ports, in a session that is already
-# running, without anything being restarted — and a key is rotated in five
-# phases that survive an interruption.
-#
-# What is real here:
-#
-# * the CA is `tools/meister-ca` with real openssl: a real index, a real
-#   `openssl ca -revoke`, a real signed CRL;
-# * the enforcement is the controllers' own: the reloadable check in
-#   `controller_api::auth` at the one point both ports pass through, and
-#   rustls' list at the REST handshake;
-# * the client is `curl` with a certificate this CA issued — no mock, no
-#   test-only route;
-# * the rotation is `keys rotate` and `apply`, and the interruption is a
-#   `kill -9` of the apply process while the run is in the middle of it;
-# * and what proves the session half is a LOG LINE of the cloud controller
-#   about the cluster that was talking to it a moment ago.
-#
-# What is NOT real is the same one thing as in nix/tests/keys.nix: the
-# EVALUATION. A test VM has no nixpkgs and could not evaluate its own test
-# nodes, so the manifest is built here at build time by `nix/lib/manifest.nix`
-# — the file `lib.mkFleet` uses — and handed over with `resolve --from`.
+# Exercise real certificate revocation, existing-session enforcement, and
+# interrupted key rotation. Manifest evaluation happens at build time;
+# certificates, controller authentication, and SSH operations run in test VMs.
 { nixpkgs, lib, pkgs, system, self }:
 
 let

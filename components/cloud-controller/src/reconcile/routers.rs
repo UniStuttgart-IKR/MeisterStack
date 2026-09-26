@@ -2,26 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The router half of the cloud's pass: which cluster serves a tenant's way
-//! out, which address it holds, and what it translates.
-//!
-//! ## What this tier decides, and what it hands down
-//!
-//! Everything a router needs that is a fact about OBJECTS is resolved here,
-//! because this is where those objects are: the tenant and its VNI, the
-//! provider network and its allocation, the floating addresses pointing at
-//! this router, the routed subnets it announces. The placement inside a
-//! cluster is the cluster's business (decision 4) and this tier does not
-//! second-guess it, exactly as it does not choose which node a VM lands on.
-//!
-//! What travels down is `CreateRouter`: the spec, the resolved address, the
-//! rules, the announced prefixes and the provider network mirrored beside
-//! them. What comes back is `RouterReport` on the cluster's status, which is
-//! the only thing that ever writes `phase`, `nodes` and `activeNode` up here
-//! — see `session::ingest::ingest_routers`. Between the two, this pass writes
-//! only what it decided itself, and it never overwrites an answer with a
-//! guess: a router that has been dispatched and has not been reported on yet
-//! keeps the phase it has.
+//! Resolve router placement, external address, prefixes and rules at cloud scope.
+//! `CreateRouter` carries those facts and the provider network to the cluster,
+//! which selects nodes and the active instance. Cluster reports alone supply
+//! the cloud router's phase, nodes and activeNode; dispatch is not readiness.
 
 use super::*;
 
@@ -138,20 +122,9 @@ struct Estate<'a> {
     sessions: &'a HashSet<String>,
 }
 
-/// Which cluster serves this router: one whose nodes give an interface away
-/// for the physnet it needs.
-///
-/// Decision 4's first half. The evidence is the union catalogue a cluster
-/// reports (`ClusterCapacity.capabilities`, built out of its nodes' own), so
-/// this tier asks the same question the cluster's own planner asks one scope
-/// up: does anybody down there hold this wire. Which of them, and which of
-/// them is active, is the cluster's answer and this tier never has an opinion
-/// about it.
-///
-/// Ties go to the cluster carrying the fewest routers already, and then to
-/// the name — the same determinism the node planner has, and for the same
-/// reason: several leaderless replicas have to reach one answer out of one
-/// store.
+/// Choose a cluster whose capability catalogue includes the required physnet.
+/// Prefer the fewest existing routers, then the cluster name for deterministic
+/// ties. The selected cluster chooses its own router nodes and active instance.
 pub(crate) fn cluster_for<'a>(
     physnet: &str,
     clusters: &'a [Cluster],
@@ -249,16 +222,9 @@ async fn reconcile_router(
             .await?;
     }
 
-    // The address: cut once and kept for life, and asked about on every pass.
-    //
-    // Astra finding S09, 2026-09-23: this tier cut out of `estate.held` -- a
-    // listing taken before the write -- and then never looked again. Two
-    // replicas reconciling two routers in the same instant both saw the same
-    // free address, both wrote it, and neither of them found out. The check
-    // and the rule are `network::settle_external_addr` now, the same function
-    // the cluster tier asks, so a duplicate resolves the same way in both
-    // tiers: the lowest name of the holders keeps the address and every other
-    // holder gives it back on its own next pass.
+    // Recheck the external address on every pass to resolve concurrent allocation.
+    // The lowest-named holder keeps a duplicate address; other holders release it.
+    // Both tiers use `network::settle_external_addr` for the same rule.
     let mut router = network::settle_external_addr(store, router, network).await?;
 
     // The derived halves: the prefixes this router announces, and the rules
@@ -398,17 +364,9 @@ async fn stamp_floating(
     }
 }
 
-/// The cluster a router is on: the one it is already on while that still
-/// makes sense, and otherwise the one it should go to.
-///
-/// Sticky on purpose, and it is the difference between a decision and a
-/// twitch. `cluster_for` answers "least loaded", which moves the moment
-/// somebody else's router is created — and a router that changes cluster has
-/// its netns torn down on one fleet and built on another, for a tenant whose
-/// traffic was flowing. So the load only ever decides where a router goes the
-/// FIRST time; after that the binding holds until the cluster stops being able
-/// to serve it at all, which is the same rule `spec.clusterName` follows for a
-/// VM one object over.
+/// Keep the current cluster while it remains eligible.
+/// Least-load ranking selects only a new binding; changing an eligible binding
+/// would tear down a working router whenever unrelated load changed.
 fn bound_cluster(router: &Router, physnet: &str, estate: &Estate<'_>) -> Option<String> {
     let held = &router.status.cluster;
     if !held.is_empty()
@@ -615,20 +573,8 @@ mod tests {
         assert!(!carried_down(&other_tenant, &router, &nats));
     }
 
-    /// Astra finding S09, 2026-09-23, this tier's half: the cut is made out
-    /// of a snapshot, so it has to be checked against the listing afterwards.
-    ///
-    /// `reconcile_routers` lists the routers once per router and hands the
-    /// listing down as `estate.held`. Two replicas reconciling two routers in
-    /// the same instant therefore both read the same free address out of two
-    /// snapshots that are both already out of date, both write it, and -- this
-    /// being the tier that made no re-check at all -- both keep it. The
-    /// tenant's way out and somebody else's then answer for one address on
-    /// the provider wire.
-    ///
-    /// The rule is the cluster tier's, out of the same function, so that a
-    /// duplicate cannot be resolved one way up here and another way down
-    /// there: the lowest name of the holders keeps the address.
+    /// Concurrent duplicate external-address claims converge on the lowest-named
+    /// holder, using the same arbitration rule as the cluster tier.
     #[test]
     fn two_routers_that_both_wrote_the_same_external_address_do_not_both_keep_it() {
         use controller_api::network::{AddressClaim, claim_external_addr};

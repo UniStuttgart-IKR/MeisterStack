@@ -1,24 +1,9 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
-# The single node, in a real machine: the agent with nobody above it, the
-# CLI at its socket, a person in the group, and one guest that boots.
-#
-# What docs/DEPLOYMENT.md §20 promises and `checks.example-single-node` only
-# reads off the evaluated host is proved here on a running one:
-#
-#   * the agent runs standalone — its journal says so — and serves its
-#     socket, mode 0660 and owned by the group `meister`;
-#   * `meister agent vm ls` works as root and as the operator the profile
-#     named, with no config of their own: the machine's
-#     /etc/meisterstack/cli.toml is the fallback (components/cli/src/config.rs);
-#   * a user who is NOT in the group is refused at the socket, which is the
-#     whole access rule;
-#   * a guest-tiny made with `meister agent vm create` boots and prints its
-#     marker on the console the agent recorded, and `rm` takes it away.
-#
-# The guest is a real nested VM: this test needs /dev/kvm inside the test
-# machine, like every test of this flake that boots a guest.
+
+# Boot a standalone agent, check socket group permissions and CLI fallback,
+# and run a nested guest. Requires nested KVM on the test host.
 { nixpkgs, lib, pkgs, system, self }:
 let
   marker = "MS-S0-TINY-OK";

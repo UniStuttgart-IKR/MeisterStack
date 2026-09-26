@@ -51,13 +51,7 @@ use types::{AgentVmSpec, Desired, NewVmSpecExt};
 /// has to stay comfortably below that.
 const STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
-/// The command named a vm this node has no record of.
-///
-/// A type of its own and not a `bail!`, because the level the dispatch logs
-/// a failed command at depends on which failure it was, and a string is a
-/// poor thing to decide that on. What it renders is the text the `bail!`
-/// produced before it, so the message that goes back over the wire as the
-/// command's error is unchanged.
+/// Typed command error for an unknown VM, used to choose logging severity.
 #[derive(Debug)]
 struct NoSuchVm(VmId);
 
@@ -69,22 +63,8 @@ impl std::fmt::Display for NoSuchVm {
 
 impl std::error::Error for NoSuchVm {}
 
-/// Whether a failed command is somebody else's to repair.
-///
-/// The level contract keeps ERROR for what an operator has to act on, and a
-/// dispatch that logged every failed command at ERROR broke that twice over.
-/// A vm the controller names but this node never had is repaired by the
-/// controller's next SyncState, and an id this node cannot parse is bad
-/// input from the tier above that no work on this node fixes. Both are
-/// degradations that heal without a human, which is WARN. Everything else —
-/// a driver, the store, the hypervisor — is this node's problem and stays
-/// ERROR.
-/// A refusal that is about this NODE and not about this attempt.
-///
-/// A marker in the error chain, read back out by the dispatcher one function
-/// down and written into `ErrorMsg.reason` as `proto::CANNOT_SERVE`. It
-/// carries the sentence too so that `{e:#}` still reads as it did — the
-/// node's own words are what an operator sees.
+/// Structural refusal marker carried as CANNOT_SERVE on the command result.
+/// The controller may release the binding and choose another node.
 #[derive(Debug)]
 struct CannotServe(String);
 
@@ -96,31 +76,8 @@ impl std::fmt::Display for CannotServe {
 
 impl std::error::Error for CannotServe {}
 
-/// Mark a refusal as being about this NODE rather than about this attempt.
-///
-/// The error keeps its own sentence — the node's word is what an operator
-/// reads — and gains the word the tier above branches on. See
-/// `Refused::cannot_serve`.
-///
-/// **One link, and that is the whole of the change.** This used to hang the
-/// already formatted sentence on the chain as CONTEXT, which left two links
-/// saying the same thing — and `{e:#}` joins a chain with ": ", so every
-/// structural refusal reached the API doubled:
-///
-/// ```text
-/// invalid nic spec: this node has no [network] section …: invalid nic spec: this node has no [network] section …
-/// ```
-///
-/// on `refusedBy[].message`, and in all four catalogues rather than only the
-/// network one. Rendering the chain INTO the marker and making the marker the
-/// error keeps the sentence byte for byte what it was and says it once.
-///
-/// What is given up is the typed causes underneath, and nothing reads them:
-/// `heals_without_an_operator` looks for `NoSuchVm`, a uuid parse error and
-/// the held-volume answer, and none of the three can appear under one of the
-/// four structural checks — those refuse over configuration this node does
-/// not have. Context added ON TOP still finds the marker, which is what `?`
-/// through two call sites produces.
+/// Wrap a structural refusal while preserving its rendered message once.
+/// Underlying typed causes are replaced by the marker; added context retains it.
 fn cannot_serve<T>(r: anyhow::Result<T>) -> anyhow::Result<T> {
     r.map_err(|e| anyhow::Error::new(CannotServe(format!("{e:#}"))))
 }
@@ -129,74 +86,26 @@ fn heals_without_an_operator(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
         cause.is::<NoSuchVm>()
             || cause.is::<uuid::Error>()
-            // "a vm is holding it" is a CORRECT answer about a volume, not a
-            // fault on this node: the controller clears `attachedTo` and asks
-            // again, and nothing here needs an operator.
+            // An ownership refusal is an expected volume condition, not a backend fault.
             || cause.is::<crate::volumes::HeldByVm>()
     })
 }
 
-/// How long the agent waits for its farewell to reach the controller before
-/// it goes anyway.
-///
-/// A stop must stop. This is the one report that is worth a short wait and
-/// nothing is worth a long one: an agent that hung on its own shutdown would
-/// be a unit systemd eventually kills, which is the very ambiguity the
-/// farewell exists to remove.
+/// Maximum wait for the status task to enqueue its stopping report.
 const LAST_WORD: Duration = Duration::from_secs(2);
 
-/// How long this node goes on answering for its routers' addresses after it
-/// has lost every controller.
-///
-/// Astra finding S08, 2026-09-23: `fall_silent` was reachable from exactly
-/// one place, `say_goodbye`, so it ran when somebody stopped the unit and
-/// never when the machine merely lost the control plane. A gateway in that
-/// state keeps its namespace, its external address and its ARP answers while
-/// the cluster, hearing nothing, hands the address to the standby -- and two
-/// machines then answer for one address on the provider wire. The measured
-/// shape of it is in the farewell's own note: manacor answered ARP for
-/// 10.128.1.210 eight seconds after its standby took over.
-///
-/// This is the dead man, and the number is arithmetic rather than taste. The
-/// tier above declares a node gone `HEARTBEAT_TIMEOUT_SECS` = 30s after the
-/// last heartbeat it stamped -- spelled here and not imported, for the reason
-/// `proto::KEEPALIVE_TIMEOUT` gives one crate over: the agent does not depend
-/// on the controller -- and its next router pass then makes a standby active
-/// and shouts for the address. This node has to be silent before that, in
-/// both of the ways a controller can be lost:
-///
-///   * the session ENDS and says so (a replica restarting, a reset). The last
-///     report the controller stamped is at most `STATUS_INTERVAL` = 10s old,
-///     so the earliest promotion is `session end + 30 - 10` = +20s, and
-///     silence at +10s leaves ten seconds.
-///   * the wire goes BLACK and nothing says so. Finding out costs this end
-///     `proto::KEEPALIVE_INTERVAL` + `proto::KEEPALIVE_TIMEOUT` = 15s, and
-///     the controller's own clock started when the wire did, so the earliest
-///     promotion is `black + 30s` and this node is silent at `black + 15 +
-///     10` = +25s. Five seconds, and the check runs between dial attempts,
-///     each of which is bounded by `proto::DIAL_TIMEOUT` = 3s.
-///
-/// Ten seconds is also comfortably more than a redial that finds anybody at
-/// all -- half a second of backoff and a three-second dial -- so a controller
-/// that merely restarted does not cost a tenant its gateway. The other
-/// direction is cheap: `EnsureRouter` is level-triggered, so a node that fell
-/// silent and then got its controller back is told to speak again within one
-/// router pass.
+/// Delay after controller-session loss before attempting to silence routers.
+/// The 10 s delay leaves margin under the configured heartbeat/keepalive
+/// assumptions, but scheduling, blocked commands and failed driver calls mean
+/// this is not a fencing guarantee.
 const ROUTER_DEAD_MAN: Duration = Duration::from_secs(10);
 
-/// Whether this agent is on its way out, and whether it has said so.
-///
-/// The state behind `StatusReport.stopping`. It is set once and never
-/// cleared: an agent that has been asked to stop does not change its mind,
-/// and a flag that could go back would let a stopping node claim to be
-/// staying.
+/// One-way shutdown state and notification that the stopping report was enqueued.
 #[derive(Default)]
 pub struct Shutdown {
     asked: std::sync::atomic::AtomicBool,
-    /// Notified by the status loop once a report carrying `stopping` has gone
-    /// into the session. `Notify` and not a channel because the waiter may
-    /// arrive after the sender: `notify_one` leaves a permit, so the farewell
-    /// cannot be missed by being early.
+    /// Notified after enqueueing a stopping report. `notify_one` retains a permit
+    /// when shutdown begins waiting later; this is not a controller acknowledgement.
     said: tokio::sync::Notify,
 }
 
@@ -243,10 +152,8 @@ pub struct Agent {
     pause_supported: bool,
     /// vCPUs and RAM of this host; neither changes while the agent runs.
     node: NodeStatus,
-    /// What a guest's machine state would be restored INTO here — read once,
-    /// for the same reason: none of it changes under a running agent. See
-    /// `crate::machine`, and `controller_api::live_migration_refusal` for
-    /// what the tier above does with two of them.
+    /// Startup machine profile used for migration compatibility. See
+    /// `crate::machine` and `controller_api::live_migration_refusal`.
     machine: proto::MachineProfile,
     /// What is wrong with this node right now — the half of the heartbeat
     /// that does change. See `crate::conditions`.
@@ -257,42 +164,27 @@ pub struct Agent {
     unprivileged: Arc<crate::privileges::Watch>,
     /// Whether this agent is going away on purpose. See `Shutdown`.
     shutdown: Arc<Shutdown>,
-    /// Wakes the status loop of whichever session is current. On the agent
-    /// rather than inside `run_session`, because the signal handler is
-    /// outside every session and still has to get one last report out.
+    /// Wake the current status loop, including from shutdown handlers outside the session.
     report_now: Arc<tokio::sync::Notify>,
     /// Where a migration stream lands on this node, decided once at start-up.
     /// See `crate::migration`.
     migration: crate::migration::Endpoint,
-    /// The console sessions this node is serving over the controller stream,
-    /// by the session_id the tier above chose. Keyed by that and not by VM,
-    /// because two attempts on the same VM are two sessions — the second is
-    /// refused, and it has to be refused under its OWN id or the refusal
-    /// reaches the wrong client.
+    /// Active console sessions keyed by the controller-selected session ID.
+    /// A competing open for the same VM must be refused under its own ID.
     console_sessions: Mutex<HashMap<String, ConsoleSession>>,
 }
 
 /// One console session as the agent holds it: a way to type into the guest,
 /// and the task that is pumping its output upwards.
 struct ConsoleSession {
-    /// Types into the guest. Holds nothing — the holding is the pump's,
-    /// because when the reader stops the line is free.
+    /// Guest input writer; session ownership remains with the output task.
     writer: crate::attach::ConsoleWriter,
     /// Owns the `Held`, so aborting it releases the line.
     pump: tokio::task::JoinHandle<()>,
 }
 
 impl Agent {
-    /// What this node can serve, in the one list the controller flattens
-    /// into a Node's capacity.
-    ///
-    /// Storage rides in as a single pseudo-driver whose profiles are the
-    /// backend names (`volume` → `[filesystem, lvm-thin, nfs]`, flattened one
-    /// tier up into `volume/lvm-thin` and friends). It is not a separate
-    /// field on the Hello because it does not need one: the catalogue is
-    /// already `<driver>/<profile>` strings on both sides of the sentence,
-    /// and a scheduler that can ask "does this node offer nvrm/4q" can ask
-    /// "does this node offer volume/lvm-thin" without learning anything new.
+    /// Construct Hello capabilities from registered-driver catalogues.
     fn hello(&self, node_id: &str) -> Hello {
         let mut drivers: Vec<DriverInfo> = self
             .catalog
@@ -306,12 +198,7 @@ impl Agent {
                 locality: String::new(),
             })
             .collect();
-        // ONE entry per backend rather than one entry listing them all,
-        // because the entry now carries a second fact and the two backends do
-        // not agree about it: lvm-thin is node-local and nfs is shared. The
-        // flattened catalogue one tier up is byte-identical either way — it
-        // is built per (name, profile) pair — so this costs nothing anybody
-        // downstream has to know about.
+        // Use one volume entry per backend because locality differs between backends.
         drivers.extend(
             self.volumes
                 .localities()
@@ -322,14 +209,7 @@ impl Agent {
                     locality: locality.as_str().to_string(),
                 }),
         );
-        // The snapshot half of the storage claim, in its own entry and with
-        // no locality on it. `volume/<backend>/snapshot` — the same
-        // `<driver>/<profile>` spelling a GPU profile takes, so the tier above
-        // can ask "does this node offer it" with the function it already has,
-        // and a pool whose driver cannot snapshot is a 422 rather than a
-        // Failed object. The empty locality is what keeps the entry out of
-        // `capacity_localities`, which parses the field and skips what it
-        // cannot read.
+        // Snapshot capabilities have no locality; locality belongs to backend entries.
         let snapshots = self.volumes.snapshot_claims();
         if !snapshots.is_empty() {
             drivers.push(DriverInfo {
@@ -338,17 +218,8 @@ impl Agent {
                 locality: String::new(),
             });
         }
-        // Whether this node runs VMs at all, claimed the same way and for a
-        // sharper reason than the rest: a storage node has room, is connected
-        // and is schedulable, so without this entry it is indistinguishable
-        // from a compute node and the first ordinary VM lands on it.
-        //
-        // The `if` is the same one the network half has, and matters more
-        // here: an entry with no profiles flattens to the bare driver name,
-        // and a bare `hypervisor` in the catalogue would answer a bare
-        // request for it — which is exactly the request the FOLLOW-UP step
-        // will introduce. A storage node answering it would undo the whole
-        // point of the entry.
+        // Omit absent hypervisors: an empty-profile entry would still advertise
+        // the bare hypervisor capability.
         let hypervisors = self.hypervisor.inventory();
         if !hypervisors.is_empty() {
             drivers.push(DriverInfo {
@@ -357,12 +228,7 @@ impl Agent {
                 locality: String::new(),
             });
         }
-        // Networking rides in the same way and for the same reason, with one
-        // difference: a node with no overlay claims NOTHING here rather than
-        // an empty `network` entry. An entry with no profiles is the bare
-        // driver name in the flattened catalogue (`vfio` is one), and a bare
-        // `network` would answer a bare request for it — there is no such
-        // request today, and leaving the door shut costs one `if`.
+        // Omit an empty network profile list instead of advertising a bare capability.
         let overlays = self.network.inventory();
         if !overlays.is_empty() {
             drivers.push(DriverInfo {
@@ -380,19 +246,12 @@ impl Agent {
             node_id: node_id.to_string(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             drivers,
-            // Said here and only here: it is a fact about the machine, it does
-            // not change while this agent runs, and the one party that needs
-            // it is the one choosing a live migration's destination.
+            // Send the startup machine profile for migration compatibility checks.
             machine: Some(self.machine.clone()),
         }
     }
 
-    /// Every router this node holds, in the form the session carries.
-    ///
-    /// Straight out of the driver's trait and derived from nothing here: WHAT
-    /// a router is — built, half-gone, active, silent — is the answer of
-    /// whoever built it, and an agent that recomputed it from a spec it kept
-    /// would be a second truth about the same namespace.
+    /// Translate driver router observations into session reports.
     async fn routers(&self) -> Vec<proto::RouterReport> {
         let Some(bridge) = self.reconciler.drivers().bridge.as_ref() else {
             return Vec::new();
@@ -403,20 +262,14 @@ impl Agent {
                 .map(|r| proto::RouterReport {
                     id: r.id.to_string(),
                     phase: r.phase.as_str().to_string(),
-                    // Straight out of the driver, like the phase beside it:
-                    // whether a router is gone, half gone or unaskable is the
-                    // answer of whoever looked, and this agent does not
-                    // recompute it.
+                    // Preserve the driver's observed reason alongside its lifecycle phase.
                     reason: r
                         .reason
                         .map(|reason| reason.as_str().to_string())
                         .unwrap_or_default(),
                     message: r.message,
                     active: r.active,
-                    // Empty on this road, by construction: a node naming
-                    // itself back to the controller that addressed it says
-                    // nothing. The cluster fills both in when it passes the
-                    // report on. See `proto::RouterReport.node`.
+                    // The controller fills placement fields when forwarding this node-local report.
                     node: String::new(),
                     nodes: Vec::new(),
                 })
@@ -428,18 +281,9 @@ impl Agent {
         }
     }
 
-    /// What this node is, and what is wrong with it.
-    ///
-    /// Built per report and not once at start-up, unlike the capacity it
-    /// carries: the conditions are the half that changes, and they are the
-    /// half a controller can act on — a node that cannot write its records is
-    /// one the scheduler has to stop placing on, and until this field existed
-    /// there was nothing on the heartbeat that said so.
+    /// Combine startup capacity measurements with refreshed current conditions.
     fn node_status(&self) -> NodeStatus {
-        // Measured again, here, because this is the sentence that carries it:
-        // a group that was added to the unit, a module that loaded, a udev
-        // rule that arrived late all change what this node can do without
-        // changing anything about the process.
+        // Refresh prerequisite conditions before reporting current node status.
         self.unprivileged.refresh(&self.conditions);
         node_status(&self.node, &self.conditions)
     }
@@ -448,18 +292,13 @@ impl Agent {
     /// observation — see `reconcile::report_status`.
     async fn status_report(&self) -> anyhow::Result<StatusReport> {
         let reported = self.reconciler.report().await?;
-        // The same view the controller gets, published as a gauge. Every
-        // phase every time, zero included, so that a phase nothing is in
-        // stays a flat line rather than a series that vanishes from a panel.
+        // Publish every phase gauge, including zeros, to keep metric series present.
         for phase in crate::reconcile::ReportedPhase::ALL {
             let n = reported.iter().filter(|r| r.phase == phase).count();
             telemetry::metrics::agent().set_vms(phase.as_str(), n as i64);
         }
-        // What this node has to say about the guests it was told to SEND,
-        // lifted out before the VMs so it can be read off the same
-        // observation. Empty on every node with no migration in flight, which
-        // is nearly all of them; see `MigrationReport` in control.proto for
-        // why it travels here and not in the answer to `MigrateOut`.
+        // Build migration reports from the same observations as VM reports.
+        // They carry transfer outcomes independently of command acknowledgements.
         let migrations: Vec<proto::MigrationReport> = reported
             .iter()
             .filter_map(|r| {
@@ -478,35 +317,18 @@ impl Agent {
                 id: r.id.to_string(),
                 phase: r.phase.as_str().to_string(),
                 message: r.message.unwrap_or_default(),
-                // What this node HAS open, so the tier above can tell a
-                // dispatched hot-plug from a finished one.
+                // Report committed attachment IDs separately from requested hotplug operations.
                 attached_volumes: r.volumes.iter().map(uuid::Uuid::to_string).collect(),
-                // Empty on this road by construction: a node reporting its
-                // own name back to the controller that addressed it says
-                // nothing. The field is the CLUSTER's, one tier up, where it
-                // is the one placement fact the cloud cannot derive.
+                // The controller supplies placement when forwarding this report.
                 node: String::new(),
-                // Both empty on this road: `attached_volumes` above is this
-                // tier's answer, by uid, and a node knows nothing about a
-                // placement decision one tier up.
+                // The controller fills placement-specific volume data.
                 volumes: Vec::new(),
-                // The word that says why the phase is what it is, empty for
-                // the three phases that need none. A string because this side
-                // does not know the control plane's enum; see
-                // `reconcile::observe::reason_table`.
+                // Serialize the observed reason independently of human-readable messages.
                 reason: r
                     .reason
                     .map(|reason| reason.as_str().to_string())
                     .unwrap_or_default(),
-                // The taps this node made, with the address the network
-                // driver pinned on each. The one half of
-                // `Vm.status.addresses[]` that has to come from down here —
-                // the other is a floating address, which is the cloud's own
-                // object and needs nobody's report. A tap whose driver knows
-                // no address is left out, and a VM with no taps reports
-                // nothing at all, which reads exactly like an agent from
-                // before the field and is meant to: neither of them is
-                // saying "this VM has no addresses".
+                // Report NIC addresses observed by the driver; omit NICs without an address.
                 nics: r
                     .nics
                     .into_iter()
@@ -517,38 +339,16 @@ impl Agent {
                     .collect(),
             })
             .collect();
-        // Before the report is built and not inside it: what the image half
-        // says is a statement about this node's disk right now. Two looks,
-        // and they answer two different questions — `verify_path_images`
-        // looks at the images the records here NAME (and can therefore say
-        // why one is unusable), `take_inventory` reads the directory (and can
-        // therefore say that a name is not in it at all). See F16.
+        // Refresh named path images and the directory inventory before reporting.
         self.reconciler.verify_path_images().await;
         let images_complete = self.images.take_inventory().await;
         Ok(StatusReport {
             node: Some(self.node_status()),
             vms,
-            // What this node HOLDS, router by router — the same rule the VM
-            // half follows: what is, not what was asked. Empty on every node
-            // with no gateway slot, and on a node whose driver could not be
-            // asked: a report that failed to list routers is a report about
-            // this node's VMs that still has to go out, and the next one is
-            // three seconds away.
+            // Router-list failure is logged and produces an empty router list.
             routers: self.routers().await,
-            // What this node has learned about the base images its records
-            // name — the ones it fetched, and the ones that are somebody
-            // else's file on shared storage.
-            //
-            // F16: a path image was looked at once per reconcile pass and
-            // reported on every beat in between out of that one look, so an
-            // image that had gone missing kept being reported `Ready` for as
-            // long as three reports. The look happens here now, once per
-            // image per report, and `Cache::report` below is a read of what
-            // it found. `verify_path_images` is what bounds the cost: the
-            // names are a set, so forty VMs off three images is three
-            // `stat`s — and a hash only on the report where a path image's
-            // digest was not already bound (Astra finding S02, 2026-09-23,
-            // rest a; see `Cache::verify_path`).
+            // Include explicit image checks and inventory entries. Path checks are
+            // deduplicated by image name; missing digests may require hashing.
             images: self
                 .images
                 .report()
@@ -556,60 +356,35 @@ impl Agent {
                 .map(|(name, state, digest)| proto::ImageStateReport {
                     name,
                     phase: state.phase().to_string(),
-                    // Which of the four ways an image is unusable this is —
-                    // the bytes are not there, the name is a directory, the
-                    // checksum did not match, the fetch did not work. Empty
-                    // for `Ready`.
+                    // Carry the machine-readable image failure reason; Ready has none.
                     reason: state
                         .reason()
                         .map(|reason| reason.as_str().to_string())
                         .unwrap_or_default(),
                     message: state.message().to_string(),
-                    // Empty on this road: the controller addressed this node
-                    // and knows which one it is. It fills the field in on the
-                    // way up, where the cloud does not.
+                    // The controller fills the reporting node identity.
                     node: String::new(),
                     digest: digest.unwrap_or_default(),
                 })
                 .collect(),
-            // Whether the list above is EVERY image under this node's image
-            // directory or only the ones it has an opinion about. See
-            // `Cache::take_inventory`: only a `true` lets the tier above read
-            // a missing name as a missing file, which is what closes F16 for
-            // an image no record here names.
+            // Only a successful directory inventory marks image reporting complete.
             images_complete,
-            // The volumes this node owns on their own. Empty on a node that
-            // was never told to make one, which is every node before this
-            // milestone — and empty is "knows of none", never "they are gone".
+            // Report independent volumes, including deletion tombstones.
             volumes: self.volumes_owned.report(),
-            // And the copies of them. A list of its own rather than a phase
-            // on the volume, because a snapshot outlives its volume — putting
-            // it on the volume would lose it exactly when it is the only one
-            // of the two still there.
+            // Report snapshots independently because they can outlive their source volumes.
             snapshots: self.volumes_owned.report_snapshots(),
             // False on every report but the last one. See `Shutdown`.
             stopping: self.shutdown.stopping(),
             migrations,
-            // True, and it is the whole of this report's claim about the VM
-            // list: `reconciler.report()` walked every row of the store and
-            // this call only exists because it succeeded. The tier above may
-            // therefore read a uid's absence as "this node is not serving
-            // it", which is what `forget_unbound` needs and what the
-            // heartbeat-only report below may never license. Astra finding
-            // S12, 2026-09-23.
+            // The reporting pass succeeded, so this list is marked complete.
+            // Store::list still omits unreadable rows; completeness does not prove that
+            // every persisted VM could be decoded.
             vms_complete: true,
         })
     }
 }
 
-/// Somewhere to write the records, and the list of what is wrong with this
-/// node.
-///
-/// The two that have to exist before anything else can. The condition set is
-/// made here and handed to the store, because the store is the first thing
-/// that can find something wrong with this node; everything else that raises
-/// into it gets the same `Arc`, so what the heartbeat carries is one list and
-/// not three.
+/// Open the store with the shared node-condition set and check cgroupfs.
 fn store_and_conditions(
     cfg: &AgentConfig,
 ) -> anyhow::Result<(Arc<crate::conditions::Conditions>, Arc<Store>)> {
@@ -618,15 +393,7 @@ fn store_and_conditions(
         &cfg.paths.db_path,
         conditions.clone(),
     )?);
-    // Before any VM is provisioned, because it is a fact about this node and
-    // not about a VM: an agent whose `cgroup_root` is an ordinary directory
-    // can start a guest and can never tear one down. It still starts — see
-    // `check_cgroup_root` — and the cluster is told instead.
-    //
-    // The FIRST of many. Every reconcile pass asks the same question, because
-    // a mount can go away while an agent runs; this one is here so that the
-    // answer is in the log of the boot rather than thirty seconds into it,
-    // which is the same argument `catalogues` makes for its three sentences.
+    // Report cgroup filesystem problems at startup and refresh them during reconciliation.
     if crate::conditions::check_cgroup_root(&cfg.paths.cgroup_root, &conditions) {
         info!(cgroup_root = %cfg.paths.cgroup_root.display(),
               "cgroup2 confirmed at the configured root");
@@ -634,11 +401,7 @@ fn store_and_conditions(
     Ok((conditions, store))
 }
 
-/// What this node may be asked for, in the four lists the controller reads.
-///
-/// One value and not four returns, because they are one answer: which
-/// drivers this agent came up with decides all of them, and a node that
-/// claims three of the four is a node that has been half configured.
+/// Admission and advertisement catalogues derived from the constructed drivers.
 struct Catalogues {
     catalog: DeviceCatalog,
     volumes: VolumeCatalog,
@@ -646,12 +409,7 @@ struct Catalogues {
     network: NetworkCatalog,
 }
 
-/// The four catalogues, and the three sentences a node says about itself
-/// when it is missing something.
-///
-/// Said at start-up rather than at the first refusal: "this node runs no
-/// vms" is a fact an operator wants in the log of the boot that made it
-/// true, not in the error of the create that fell over it.
+/// Construct catalogues and log unavailable node roles at startup.
 fn catalogues(cfg: &AgentConfig, drivers: &Drivers) -> Catalogues {
     let catalog = DeviceCatalog::new(&drivers.devices);
     let volumes = VolumeCatalog::new(&drivers.storage);
@@ -659,8 +417,7 @@ fn catalogues(cfg: &AgentConfig, drivers: &Drivers) -> Catalogues {
     if hypervisor.validate().is_err() {
         info!("this node runs no vms and offers storage only; it claims no hypervisor capability");
     }
-    // What the DRIVER built, not what the file says: a physnet the driver
-    // refused a name for never gets here, because such a node does not start.
+    // Advertise provider networks actually constructed by the driver.
     let physnets = drivers
         .bridge
         .as_ref()
@@ -697,28 +454,22 @@ fn catalogues(cfg: &AgentConfig, drivers: &Drivers) -> Catalogues {
     }
 }
 
-/// What a `kill -9` left behind on this node, taken away before the first
-/// reconcile.
-///
-/// Both halves read the same evidence — the records are the truth about what
-/// exists — and both are about the far end of a teardown that was
-/// interrupted: filter chains for taps this node does not hold, and overlay
-/// links no record names.
+/// Sweep stale tap filters, overlays and router resources before reconciliation.
+/// Each sweep uses its own persisted ownership evidence.
 async fn sweep_what_no_record_names(
     cfg: &AgentConfig,
     store: &Store,
     networking: Option<&Arc<dyn agent_api::networking::NicDriver>>,
     bridge: Option<&Arc<dyn agent_api::networking::BridgeDriver>>,
 ) -> anyhow::Result<()> {
-    // Nothing to reap on a node that makes no taps, and nobody to ask.
+    // Sweep taps only when a networking driver exists.
     if let Some(driver) = networking
         && let Some(live_taps) = live_taps_for_sweep(store)?
     {
         driver.reap(&live_taps).await;
     }
 
-    // And the overlays beside them, on the same evidence and at the same
-    // moment. Configurable and on by default; see `sweep_orphans`.
+    // Optionally sweep overlays using persisted ownership evidence.
     if cfg
         .network
         .as_ref()
@@ -728,10 +479,8 @@ async fn sweep_what_no_record_names(
         sweep_orphan_overlays(store, driver.as_ref()).await;
     }
 
-    // The router half of the same sentence, and the one place it differs: a
-    // router is not reference-counted from VM records, so there is no keep
-    // -list to hand over. This driver's own record beside a namespace is the
-    // whole of what says the namespace belongs to a live router.
+    // Router ownership comes from driver records, not VM reference counts.
+    // The driver determines which namespaces can be swept.
     if let Some(driver) = bridge {
         match driver.sweep_routers().await {
             Ok(swept) if swept.is_empty() => {}
@@ -758,18 +507,8 @@ fn live_taps_for_sweep(store: &Store) -> anyhow::Result<Option<Vec<String>>> {
     Ok(Some(taps))
 }
 
-/// Festlegung 1: every provider network this node names gets its bridge, with
-/// the interface in it and no address on the host.
-///
-/// At start-up and once, before the first reconcile and before the session:
-/// a node that claims `network/gateway:<physnet>` in its Hello has to have
-/// made the bridge it would put a router's leg into, or the first router
-/// placed here would be the moment anybody found out.
-///
-/// A failure here fails the START, which is the whole point. The two ways it
-/// fails are an interface that is not there and an interface that still
-/// carries an address, and neither is something the node can fix by trying
-/// again.
+/// Build provider bridges before accepting controller work. Fail startup if
+/// an interface is missing or still has host addresses.
 async fn give_the_interfaces_away(
     cfg: &AgentConfig,
     bridge: Option<&Arc<dyn agent_api::networking::BridgeDriver>>,
@@ -796,25 +535,16 @@ async fn give_the_interfaces_away(
 pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
     let (conditions, store) = store_and_conditions(&cfg)?;
     let drivers = Drivers::from_config(&cfg).await?;
-    // The start-check again, for the half of it that is not a build decision:
-    // what the heartbeat has to keep saying. `screen` is pure — same config,
-    // same rights, same answer — so asking it twice is a second measurement
-    // and not a second authority, and `from_config` keeps owning which
-    // drivers get built. It has already said each sentence once, at WARN.
+    // Build recurring prerequisite watches separately from driver registration.
     let unprivileged = Arc::new(crate::privileges::Watch::new(
         Arc::new(crate::privileges::Host),
         crate::drivers::screen(&cfg, &crate::privileges::Host).watch,
     ));
-    // Raised here and not only on the first heartbeat, for the reason
-    // `store_and_conditions` gives about the cgroup root: the answer belongs
-    // in the log of the boot that made it true, and a node with no
-    // controller configured never sends a heartbeat at all.
+    // Log startup privilege failures even when no controller is configured.
     unprivileged.refresh(&conditions);
     let networking_driver = drivers.networking.clone();
     let bridge_driver = drivers.bridge.clone();
-    // Cloned before the reconciler takes ownership of `drivers`, and for one
-    // question: what this node would restore a guest's machine state INTO.
-    // See `machine_profile`.
+    // Retain the hypervisor for the startup machine-profile probe.
     let hypervisor_driver = drivers.hypervisor.clone();
     let pause_supported = drivers
         .hypervisor
@@ -846,10 +576,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
         )
         .with_ceilings(cfg.migration_ceilings()),
     );
-    // The volume half, over the SAME driver registry the inline path uses.
-    // Built before the reconciler takes ownership of `drivers`, because both
-    // halves route on the same map and a second one would be a second answer
-    // to "which backend owns these bytes".
+    // Independent volumes use the same storage registry as VM provisioning.
     let volumes_owned = Arc::new(crate::volumes::Volumes::new(
         store.clone(),
         drivers.clone(),
@@ -862,14 +589,10 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
         ops.clone(),
     ));
 
-    // Ask every backend whether the volumes this node thinks it has are
-    // really there — the same adoption VMs get, one table over.
+    // Probe persisted volumes against their backends at startup.
     volumes_owned.adopt().await;
 
-    // Festlegung 1, and it is a start-up question: the interface has been
-    // given away or it has not. A node whose provider interface still carries
-    // an address does not come up — see `ensure_physnet` for why that is a
-    // refusal and not a repair.
+    // Provider interfaces must be assigned before reconciliation begins.
     give_the_interfaces_away(&cfg, bridge_driver.as_ref()).await?;
 
     sweep_what_no_record_names(
@@ -881,9 +604,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
     .await?;
 
     if let Err(e) = reconciler.reconcile_all(Trigger::Startup).await {
-        // Warn and not error: the periodic pass hands the same records to the
-        // same code thirty seconds later. A start-up that failed once is a
-        // degradation that heals itself, and the level contract says WARN.
+        // Periodic reconciliation retries this startup failure.
         warn!(
             error = %format!("{e:#}"),
             "startup reconcile failed, continuing degraded"
@@ -923,9 +644,7 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
     let endpoints = cfg.controller_endpoints();
     if endpoints.is_empty() {
         info!("no controller configured, running standalone");
-        // Still stoppable. There is nobody to say goodbye to, but a unit that
-        // ignored SIGTERM would be killed rather than stopped, and having no
-        // controller does not make that better.
+        // Honor shutdown signals even without a controller session.
         a_stop_was_asked_for().await;
         info!("agent stopped");
         return Ok(());
@@ -957,23 +676,14 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
         migration: migration_endpoint,
     });
 
-    // Which replica this agent belongs to is nobody's decision but its own:
-    // the order is hashed from the node id, so the controllers need no
-    // registry of agents and no agreement with each other about who serves
-    // whom. The schedule around the session — walk the order, wait only once
-    // all of it has refused — is `common::redial`, shared with the tier above
-    // because it is the same schedule there.
+    // Derive controller preference from the node ID. `common::redial` tries
+    // each endpoint before waiting, without controller-side assignment state.
     let mut redial = common::redial::Redial::new(&cfg.node_id, &endpoints);
 
-    // Built once, at start-up, so a missing CA or a world-readable key is a
-    // refusal to start rather than a session that never connects. `None` is
-    // the plain dial this agent has used since M1, and the default.
+    // Validate TLS material at startup. No credentials selects plaintext.
     let tls = cfg.session_tls()?;
     if tls.is_some() {
-        // Two different states, and an operator debugging a refused session
-        // needs to know which one they are in: a CA alone is an encrypted
-        // session the controller cannot attribute, and a certificate is what
-        // makes `system:node:<node_id>` mean anything.
+        // Distinguish encryption with a CA from client-certificate node authentication.
         info!(
             node = %cfg.node_id,
             identity = cfg.controller_cert.is_some(),
@@ -990,22 +700,8 @@ pub async fn run_agent(cfg: AgentConfig) -> anyhow::Result<()> {
     }
 }
 
-/// What a guest's machine state would be restored INTO on this node.
-///
-/// Assembled once, at start-up, out of three sources that each know a
-/// different part: `/proc` and `/sys` know the silicon and the kernel, the
-/// hypervisor driver knows its own version and the cpuid profile it hands a
-/// guest, and the CONFIG knows the one thing the machine cannot see about
-/// itself — which physical host it is on when it is a guest.
-///
-/// It travels in the Hello and nowhere else, because none of it changes while
-/// this agent runs; what the tier above does with two of them is
-/// `controller_api::live_migration_refusal`, which is where the rules are
-/// argued.
-///
-/// A node with no hypervisor still sends one. The silicon and the kernel are
-/// true of it either way, and a node that runs no VMs is never the end of a
-/// migration in the first place.
+/// Assemble the startup migration profile from host facts, VMM configuration
+/// and the operator-supplied physical-host identity. Send it in Hello.
 async fn machine_profile(
     cfg: &AgentConfig,
     hypervisor: Option<&Arc<dyn agent_api::hypervisor::Hypervisor>>,
@@ -1026,20 +722,8 @@ async fn machine_profile(
     profile
 }
 
-/// The overlay links on this node that no record names, taken down once.
-///
-/// Nachlese 5. The chaos run left VNI 10003 and 10004 standing on three lab
-/// nodes, and nothing was ever going to remove them: the count that takes an
-/// overlay down is over records, and both wires had lost their last record
-/// while their agent was not running. A leak with no failure mode except
-/// itself — a machine that runs VMs for a living gaining links for ever.
-///
-/// **A row this build cannot read stops the sweep.** The keep-list is every
-/// VNI named by any record here, and a row nobody can read might name any of
-/// them; sweeping on an incomplete list would take a live tenant's wire down.
-/// Two readers of the same table, two directions to be careful in: the
-/// reference count counts the unreadable row as a user, and this declines
-/// altogether. Both keep the overlay up.
+/// Sweep overlays not named by any persisted VM specification. An unreadable
+/// row cancels the sweep because it may own any candidate overlay.
 async fn sweep_orphan_overlays(store: &Store, bridge: &dyn agent_api::networking::BridgeDriver) {
     let rows = match store.list_raw() {
         Ok(rows) => rows,
@@ -1070,12 +754,7 @@ async fn sweep_orphan_overlays(store: &Store, bridge: &dyn agent_api::networking
     }
 }
 
-/// The pass that runs whether anybody asks or not, every thirty seconds, for
-/// as long as this agent does.
-///
-/// Its own task and not part of the session loop: it is the half of the
-/// agent that answers for this node's VMs when no controller is connected at
-/// all, which is the state a node spends every restart of the tier above in.
+/// Reconcile every thirty seconds independently of controller connectivity.
 fn spawn_periodic_reconcile(reconciler: Arc<Reconciler>) {
     tokio::spawn(
         async move {
@@ -1093,13 +772,7 @@ fn spawn_periodic_reconcile(reconciler: Arc<Reconciler>) {
     );
 }
 
-/// Where a migration stream lands here, decided once and never again: an
-/// address a peer can reach and a range of ports somebody opened. Derived
-/// from the route to the controller when the config does not say, which is
-/// by construction an address on the cluster network — and said out loud
-/// either way, because "this node does not receive live migrations" is a
-/// fact an operator should read at start-up rather than in the middle of a
-/// drain.
+/// Resolve the receiver address and port range at startup and log availability.
 fn migration_endpoint(cfg: &AgentConfig, endpoints: &[String]) -> crate::migration::Endpoint {
     let advertise = cfg
         .advertise_addr
@@ -1134,10 +807,8 @@ async fn dial_forever(
     tls: Option<&tonic::transport::ClientTlsConfig>,
     redial: &mut common::redial::Redial,
 ) {
-    // The dead man's clock: the last moment a controller was on the other
-    // end of this stream. It starts now, because a node that has not been
-    // reached since it came up is exactly as silent to the tier above as one
-    // that lost the controller an hour in. See `ROUTER_DEAD_MAN`.
+    // Start the disconnect clock at startup, including before the first
+    // controller session. See `ROUTER_DEAD_MAN`.
     let mut last_up = Instant::now();
     let mut silenced = false;
     loop {
@@ -1152,13 +823,8 @@ async fn dial_forever(
                             "controller session failed"),
         }
         if established {
-            // A session that got as far as a Hello is a controller that has
-            // this node's report again, so the clock starts from the moment
-            // that session ENDED. Nothing is re-ensured from here on purpose:
-            // `EnsureRouter` is level-triggered, and the cluster's next
-            // router pass tells this node what it is -- active or standby --
-            // within a tick. A node that decided for itself to speak again
-            // would be deciding a failover.
+            // Reset the outage clock when an established session ends. Only subsequent
+            // controller EnsureRouter commands reactivate silenced routers.
             last_up = Instant::now();
             silenced = false;
         }
@@ -1170,35 +836,13 @@ async fn dial_forever(
     }
 }
 
-/// Has this node been out of touch long enough to stop answering for its
-/// routers?
-///
-/// Astra finding S08, 2026-09-23. Pure, and its own function for the reason
-/// `classify` is one in the network driver: it is the whole of the decision,
-/// what it decides is whether a tenant's gateway speaks, and it is worth
-/// asserting without a controller, a socket and a clock.
-///
-/// `>=` because a deadline is a deadline, and `saturating_duration_since`
-/// because `Instant` subtraction panics on a reversed order in a debug build
-/// -- a clock that appears to have gone backwards must not take a gateway
-/// down, the same rule `heartbeat::expired` follows one tier up.
+/// Test whether the router-silencing delay has elapsed, tolerating reversed instants.
 fn should_fall_silent(last_seen: Instant, now: Instant, threshold: Duration) -> bool {
     now.saturating_duration_since(last_seen) >= threshold
 }
 
-/// Wait out the redial backoff, and let this node's routers fall silent if
-/// the controller has been gone longer than the dead man allows.
-///
-/// The waiting and the deadline are one function because the backoff climbs
-/// to thirty seconds (`common::redial`), which is longer than
-/// `ROUTER_DEAD_MAN` -- a dead man that is slept through is not one. So the
-/// sleep ends at whichever comes first, and once the routers are silent there
-/// is nothing left to wake up for and the rest of the backoff is slept in one
-/// piece.
-///
-/// It silences ONCE per outage. `dial_forever` clears the flag when a session
-/// says Hello again, which is the only thing that makes this node a candidate
-/// to speak for anything.
+/// Wake at the earlier of redial backoff expiry or router-silencing deadline.
+/// Attempt silencing once per outage; a new established session resets the flag.
 async fn wait_out_the_backoff(
     agent: &Arc<Agent>,
     last_up: Instant,
@@ -1227,25 +871,14 @@ async fn wait_out_the_backoff(
     }
 }
 
-/// A stop that says so.
-///
-/// Without this the controller cannot tell an agent that was stopped from a
-/// machine that died: both are simply a heartbeat that does not arrive, and
-/// the tier above has to wait out the whole watchdog before it may believe
-/// anything. The chaos run found the fleet in exactly that state — an agent
-/// twenty hours dead, eleven VMs still reported Running — and the
-/// controller's half of it (`observed_at` against the clock) is C2. This is
-/// the node's half: say goodbye.
-///
-/// SIGINT alongside SIGTERM because a person stopping an agent by hand in a
-/// terminal is the same event as systemd stopping one.
+/// On SIGINT/SIGTERM, request a stopping report, wait briefly for enqueueing,
+/// and attempt router silencing. Guest VMMs are left running.
 async fn say_goodbye(agent: &Arc<Agent>) {
     a_stop_was_asked_for().await;
     info!("a stop was asked for; telling the controller before going");
     agent.shutdown.begin();
     agent.report_now.notify_one();
-    // Bounded, and short. A controller that is not there to hear it is
-    // the case the watchdog was always for.
+    // Bound the final report wait when the controller is unavailable.
     if tokio::time::timeout(LAST_WORD, agent.shutdown.goodbye_said())
         .await
         .is_err()
@@ -1259,24 +892,9 @@ async fn say_goodbye(agent: &Arc<Agent>) {
     stop_speaking_for_every_router(agent).await;
 }
 
-/// The router half of the farewell: this node stops answering for addresses
-/// its cluster is about to hand to somebody else.
-///
-/// It runs AFTER the goodbye and not before, because the order is the whole
-/// of it: the cluster hears "I am going", makes the standby active, and this
-/// node has already stopped speaking by the time it does. The other order
-/// would be a gap in which nobody answers.
-///
-/// It takes nothing down. A stopping agent's routers stay built for the same
-/// reason its guests stay running — `systemctl restart` is not an outage —
-/// and what is left behind is exactly a standby.
-///
-/// Astra finding S08, 2026-09-23: it has a second caller now. A farewell is
-/// only the orderly way to lose a controller; `wait_out_the_backoff` calls
-/// this for the other way, where nobody said anything and the tier above is
-/// about to promote a standby on a timer. Same call, same result, and
-/// deliberately the same function -- two definitions of "stop speaking" is
-/// how the two of them start disagreeing.
+/// Attempt to silence routers without destroying their namespaces. Called
+/// after the stopping report wait and after controller-session loss. Driver
+/// failure is logged; the ordering does not guarantee silence before promotion.
 async fn stop_speaking_for_every_router(agent: &Agent) {
     let Some(bridge) = agent.reconciler.drivers().bridge.as_ref() else {
         return;
@@ -1290,12 +908,7 @@ async fn stop_speaking_for_every_router(agent: &Agent) {
     }
 }
 
-/// One session with one controller endpoint, from the dial to the end of the
-/// stream: say hello, put the status report on its own task, then pump.
-///
-/// Three steps and no fourth. The farewell is NOT one of them — it is sent by
-/// `run_agent`, out of the shutdown path, because a session that has already
-/// ended is exactly the case in which somebody still has to say goodbye.
+/// Dial, send Hello, run status reporting independently, and process inbound messages.
 #[instrument(skip_all, fields(endpoint = %controller_addr))]
 async fn run_session(
     agent: &Arc<Agent>,
@@ -1305,13 +918,10 @@ async fn run_session(
     established: &mut bool,
 ) -> anyhow::Result<()> {
     let (mut inbound, tx) = dial_and_say_hello(agent, controller_addr, cfg, tls).await?;
-    // From here on this endpoint has answered: whatever ends the session, it
-    // is not "nobody is there", and the caller's backoff should say so.
+    // Record successful connection establishment for redial backoff.
     *established = true;
 
-    // Status goes out on its own task, not from this loop: provisioning a
-    // single VM can take longer than the controller's liveness window, and a
-    // node that is busy is not a node that is gone.
+    // Run status reporting independently so slow provisioning does not delay heartbeats.
     let report_now = agent.report_now.clone();
     let _status = AbortOnDrop(tokio::spawn(
         status_loop(agent.clone(), tx.clone(), report_now.clone())
@@ -1322,13 +932,7 @@ async fn run_session(
     Ok(())
 }
 
-/// Dial the endpoint and put this node's Hello on the wire, first message of
-/// the stream.
-///
-/// The hello goes into the channel BEFORE the call that opens the stream:
-/// `session` takes the receiving half, so a hello queued here is the first
-/// thing the controller reads and the session cannot be established without
-/// this node having introduced itself.
+/// Queue Hello before opening the controller session stream.
 async fn dial_and_say_hello(
     agent: &Arc<Agent>,
     controller_addr: &str,
@@ -1353,12 +957,7 @@ async fn dial_and_say_hello(
     Ok((inbound, tx))
 }
 
-/// Every message the controller sends, in the order it sent them, until the
-/// stream ends or the answering end is gone.
-///
-/// Errors on the stream end the session and are not passed up: a controller
-/// that dropped the connection is the ordinary case, and the caller's job is
-/// to dial again rather than to decide anything about it.
+/// Process controller messages serially until the stream or reply channel ends.
 async fn pump(
     agent: &Arc<Agent>,
     inbound: &mut tonic::Streaming<proto::ControllerMessage>,
@@ -1379,12 +978,7 @@ async fn pump(
     }
 }
 
-/// One message from the controller, done.
-///
-/// `Break` means the sending half is gone — nobody is listening for an answer
-/// any more, so the session is over. Nothing else in here ends it: a command
-/// that fails is a result with a failure in it, and a sync that fails is a
-/// warning and the next report.
+/// Dispatch one inbound message; a closed reply channel ends the session.
 async fn handle(
     agent: &Arc<Agent>,
     msg: proto::ControllerMessage,
@@ -1407,11 +1001,8 @@ async fn handle(
             // instead of letting the controller wait out the interval.
             report_now.notify_one();
         }
-        // Applied inline, not spawned: the snapshot is the ground the
-        // commands behind it stand on, and a Destroy that overtook it
-        // would be deciding about a record the sync has not seen yet.
-        // There is no result to send — a snapshot carries no request_id,
-        // and the status report right after it is the answer.
+        // Apply snapshots inline so later lifecycle commands cannot overtake them.
+        // Snapshots have no request ID; the following status report reflects the result.
         Some(controller_message::Kind::Sync(sync)) => {
             let vms = sync.desired.len();
             match agent.handle_sync_state(sync).await {
@@ -1424,11 +1015,8 @@ async fn handle(
             }
             report_now.notify_one();
         }
-        // The console: `open` takes the line and starts a task that pumps
-        // the guest's output up this same stream; `input` and `close`
-        // reach that task through the map. Spawned and not inline,
-        // because a console session outlives the message that began it —
-        // and because nothing else on this stream may wait for a guest.
+        // Opening starts a background output task. Input and close messages reach
+        // it through the session map; guest output must not block this stream.
         Some(controller_message::Kind::ConsoleOpen(open)) => {
             agent.console_open(open, tx.clone()).await;
         }
@@ -1443,13 +1031,7 @@ async fn handle(
     std::ops::ControlFlow::Continue(())
 }
 
-/// Wait until somebody asks this agent to stop.
-///
-/// SIGINT alongside SIGTERM, because a person stopping an agent by hand in a
-/// terminal is the same event as systemd stopping one. A process that cannot
-/// register the handler waits forever instead: an agent that cannot listen
-/// for SIGTERM still runs VMs, and refusing to start over it would trade a
-/// lost farewell for an outage.
+/// Wait for SIGINT or SIGTERM. Failure to install a handler leaves the task pending.
 async fn a_stop_was_asked_for() {
     let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(term) => term,
@@ -1466,34 +1048,22 @@ async fn a_stop_was_asked_for() {
     }
 }
 
-/// The beat with nothing on it: this node is here, this is what it is, and
-/// this is what is wrong with it.
-///
-/// Sent when the per-VM half could not be read, and the empty lists are the
-/// point — a short list must not be read as a statement, so `vms`, `images`,
-/// `volumes`, `snapshots` and `migrations` all mean "not saying" here rather
-/// than "none".
-/// `stopping` is the exception and travels either way, because a farewell
-/// that only a healthy node could send would be missing on exactly the node
-/// whose farewell matters.
+/// Fallback heartbeat after a report failure. Mark image and VM lists
+/// incomplete; preserve node conditions and the stopping flag.
 fn heartbeat_only(node: NodeStatus, stopping: bool) -> StatusReport {
     StatusReport {
         node: Some(node),
         vms: Vec::new(),
         routers: Vec::new(),
         images: Vec::new(),
-        // "Not saying", like the empty list beside it: this beat did not look
-        // at the disk, so the tier above may not read a missing name as a
-        // missing file.
+        // Shutdown does not inspect images; its empty inventory is incomplete.
         images_complete: false,
         volumes: Vec::new(),
         snapshots: Vec::new(),
         stopping,
         migrations: Vec::new(),
-        // And the same about the VMs, which is the one that cost something:
-        // absence from `vms` is what `forget_unbound` reads as "this node has
-        // let the guest go", and this beat did not look at a single record.
-        // Astra finding S12, 2026-09-23.
+        // Shutdown does not inspect or stop guests. Mark the farewell inventory
+        // incomplete so absence cannot be interpreted as released ownership.
         vms_complete: false,
     }
 }
@@ -1547,12 +1117,7 @@ async fn status_loop(
     }
 }
 
-/// The capacity this node measured once, plus what is wrong with it now.
-///
-/// A free function so the join is testable without an `Agent`: the whole
-/// point of the field is that a fault raised anywhere in this process reaches
-/// the controller on the very next heartbeat, and that is the sentence worth
-/// pinning down.
+/// Combine startup capacity measurements with current node conditions.
 fn node_status(node: &NodeStatus, conditions: &crate::conditions::Conditions) -> NodeStatus {
     NodeStatus {
         conditions: conditions.report(),
@@ -1580,9 +1145,7 @@ fn node_facts() -> NodeStatus {
         .map(|kb| kb / 1024)
         .unwrap_or(0);
     if vcpus == 0 || mem_mib == 0 {
-        // Error and not warn: this is read once at start-up and never again,
-        // so nothing repairs it while the agent runs, and a node reporting
-        // zero capacity is a node the scheduler will never place on.
+        // Capacity is measured only at startup; invalid values need operator attention.
         error!(
             vcpus,
             mem_mib, "could not read node capacity, reporting what was found"
@@ -1592,9 +1155,7 @@ fn node_facts() -> NodeStatus {
     NodeStatus {
         vcpus,
         mem_mib,
-        // Measured, not observed: what is wrong with this node is asked of
-        // `Agent::node_status` on every heartbeat, because it changes and
-        // these two numbers do not.
+        // Node conditions are refreshed separately on each heartbeat.
         conditions: Vec::new(),
     }
 }
@@ -1613,17 +1174,8 @@ impl Drop for AbortOnDrop {
 mod tests {
     use super::*;
 
-    /// Astra finding S08, 2026-09-23: when a node that has lost only the
-    /// control plane has to stop answering for its routers.
-    ///
-    /// The decision is a subtraction and a comparison, and everything that
-    /// makes it correct is in the three numbers it is compared against -- so
-    /// the arithmetic in `ROUTER_DEAD_MAN`'s note is asserted here rather
-    /// than only written down. A change to `STATUS_INTERVAL` or to either of
-    /// the keepalive constants moves the deadline this node needs, and
-    /// without this test it would move silently: the failure is two machines
-    /// answering for one address on a provider wire, which nothing in a
-    /// workspace test could otherwise see.
+    /// Check the nominal router dead-man arithmetic against heartbeat and
+    /// keepalive intervals. This does not exercise real transport or driver timing.
     #[test]
     fn a_node_that_lost_the_controller_falls_silent_before_a_standby_can_be_promoted() {
         let lost = Instant::now();
@@ -1654,10 +1206,8 @@ mod tests {
             ROUTER_DEAD_MAN
         ));
 
-        // The arithmetic. `HEARTBEAT_TIMEOUT_SECS` is 30 in
-        // `controller_api::heartbeat`, and it is spelled out here because the
-        // agent does not depend on the controller -- the same seam
-        // `proto::KEEPALIVE_TIMEOUT` documents.
+        // Mirror the controller's heartbeat timeout without an agent-to-controller
+        // crate dependency; see `proto::KEEPALIVE_TIMEOUT`.
         const CONTROLLER_CALLS_A_NODE_DEAD: Duration = Duration::from_secs(30);
         assert!(
             ROUTER_DEAD_MAN + STATUS_INTERVAL < CONTROLLER_CALLS_A_NODE_DEAD,
@@ -1674,16 +1224,7 @@ mod tests {
         );
     }
 
-    /// The two words a node puts in `RouterReport.phase`, held against the
-    /// constants the tier above matches on.
-    ///
-    /// Here because this is the only crate that has both: the agent's own
-    /// vocabulary (`agent_api::networking::RouterPhase`) and the wire
-    /// constants in `proto`. The cluster reads the wire words and cannot
-    /// depend on the enum, so nothing else in the tree would notice a rename
-    /// — and the failure it would cause is silent: every report from every
-    /// healthy gateway node dropped as "unknown router phase", ten seconds
-    /// apart, with the routers still working.
+    /// Router phase spellings must match the wire constants.
     #[test]
     fn the_two_words_a_node_says_about_a_router_are_the_ones_the_wire_names() {
         use agent_api::networking::RouterPhase;
@@ -1696,14 +1237,7 @@ mod tests {
         );
     }
 
-    /// A node that is going says so, once, on its way out.
-    ///
-    /// D9's node half. The chaos run found manacor's agent twenty hours dead
-    /// with eleven VMs still reported `Running`, and the reason the control
-    /// plane could not know better is that an absent heartbeat means three
-    /// different things — stopped, crashed, unreachable — and looks the same
-    /// for all of them. A clean stop is the one case the node itself can
-    /// resolve, and the whole of the fix is that it says so before it goes.
+    /// A stopping report carries the flag and cannot lose an early notification.
     #[tokio::test]
     async fn a_clean_stop_is_announced_and_an_ordinary_beat_is_not() {
         let node = NodeStatus {
@@ -1738,14 +1272,7 @@ mod tests {
             .expect("the farewell was not missed");
     }
 
-    /// The heartbeat carries what is wrong with this node, for as long as it
-    /// is wrong, and nothing when nothing is.
-    ///
-    /// The defect: a node whose store had taken an I/O error went on saying
-    /// READY with a fresh heartbeat for twenty hours while every command on it
-    /// failed, and the scheduler kept placing VMs there — because capacity and
-    /// liveness were the only two things a node could say about itself. This
-    /// is the third thing.
+    /// Heartbeat conditions change without replacing measured capacity.
     #[test]
     fn the_heartbeat_carries_what_is_wrong_with_this_node() {
         use crate::conditions::{Conditions, DISK_PRESSURE, STORE_UNHEALTHY};
@@ -1771,21 +1298,14 @@ mod tests {
         // node still HAS 32 vCPUs and can do nothing with them.
         assert_eq!((sick.vcpus, sick.mem_mib), (32, 64_000));
 
-        // While it holds, and no longer. The next heartbeat after the repair
-        // is the one that says the node is usable again.
+        // Cleared conditions disappear from the next report.
         conditions.clear(STORE_UNHEALTHY);
         conditions.clear(DISK_PRESSURE);
         assert!(node_status(&measured, &conditions).conditions.is_empty());
     }
 
-    /// The `CannotServe` word, from the node's mouth to the tier that acts on
-    /// it.
-    ///
-    /// It travels as `ErrorMsg.reason` rather than in the sentence, because a
-    /// tier that had to match on prose would change behaviour the day
-    /// somebody rewords a message. And it means one narrow thing: the node
-    /// made no record and never will for this VM, so the binding falls. Every
-    /// other failure stays bare and is answered where it happened.
+    /// Only structural refusals carry `CannotServe` in `ErrorMsg.reason`,
+    /// allowing rescheduling without matching human-readable error text.
     #[test]
     fn only_a_structural_refusal_carries_the_word_that_moves_a_vm() {
         let structural =
@@ -1799,9 +1319,7 @@ mod tests {
             "and the node's own words survive it too: {structural:#}"
         );
 
-        // A boot that did not work is NOT this: it may work next time in the
-        // same place, and moving the VM for it would walk it around the
-        // cluster.
+        // A transient boot failure is not a structural rescheduling refusal.
         let ordinary = anyhow!("the vmm exited with status 1");
         assert!(ordinary.downcast_ref::<CannotServe>().is_none());
 
@@ -1817,30 +1335,14 @@ mod tests {
         assert_eq!(cannot_serve(Ok(7)).unwrap(), 7);
     }
 
-    /// The refusal says its sentence ONCE, and it says it in all four
-    /// catalogues.
-    ///
-    /// The old shape hung the already formatted sentence on the chain as
-    /// context, and `{e:#}` prints every link joined with ": " — so
-    /// `refusedBy[].message` read `"invalid nic spec: this node has no
-    /// [network] section …: invalid nic spec: this node has no [network]
-    /// section …"`. It was found in the network case and it was never a
-    /// network defect: `cannot_serve` is one function and all four structural
-    /// checks go through it.
-    ///
-    /// Asserted as an EQUALITY and not as a substring count, because that is
-    /// the actual contract: marking a refusal structural changes what the
-    /// tier above does with it and changes nothing at all about what it says.
+    /// Structural marking preserves each catalogue's complete rendered message once.
     #[test]
     fn a_structural_refusal_says_its_sentence_once_in_all_four_catalogues() {
         use crate::drivers::{DeviceCatalog, HypervisorCatalog, NetworkCatalog, VolumeCatalog};
         use std::collections::HashMap;
 
-        // Each one built exactly as `handle_create` builds it: the
-        // catalogue's own refusal, the context line that names which of the
-        // four it was, and then the marker.
-        /// One catalogue's refusal, rebuilt on demand: `anyhow::Error` is
-        /// not `Clone`, and the assertion needs the same refusal twice.
+        // Rebuild catalogue errors with their context and `CannotServe` marker.
+        // Factories allow repeated assertions because `anyhow::Error` is not Clone.
         type Refusal = Box<dyn Fn() -> anyhow::Error>;
 
         let cases: Vec<(&str, Refusal)> = vec![
@@ -2026,12 +1528,7 @@ mod sweep_tests {
         );
     }
 
-    /// A row this build cannot read cancels the sweep outright.
-    ///
-    /// The other direction from the reference count, and the same reason: an
-    /// unreadable row may name any VNI, so no overlay on this node is
-    /// PROVABLY orphaned while one is there. The count keeps the wire by
-    /// counting the unknown as a user; the sweep keeps it by not running.
+    /// Unreadable VM rows cancel overlay sweeping because they may reference any VNI.
     #[tokio::test]
     async fn a_record_this_build_cannot_read_cancels_the_sweep() {
         let (_temp, store) = a_store("cancels");
@@ -2055,16 +1552,10 @@ mod sweep_tests {
     }
 }
 
-/// What this construction site's own sources may not contain.
-///
-/// Two rules, both kept by reading the sources rather than by everybody
-/// remembering, and both about mistakes that no test on a behaviour path
-/// could catch: the messages they are about are on paths that need a
-/// hypervisor that cannot do the thing, or a node whose cgroup root is not
-/// one.
+/// Source-text checks for malformed message spacing and fixed test resources.
 #[cfg(test)]
 mod source_rules {
-    /// The five source directories this construction site owns.
+    /// Source directories scanned by these checks.
     const SITE: [&str; 4] = [
         "components/agent/src",
         "drivers",
@@ -2072,21 +1563,8 @@ mod source_rules {
         "shared/common/src",
     ];
 
-    /// No sentence printed from here has a hole in the middle of it.
-    ///
-    /// A message that runs over two source lines needs a backslash at the
-    /// break; without it, the indentation of the second line lands inside the
-    /// sentence and the operator reads "…cannot plug a disk into a running
-    /// vm;                  stop the vm and start it again". Four of these
-    /// were found one at a time, by reading, over three briefs — and the
-    /// fourth was found in a file the third had already been fixed in.
-    ///
-    /// The shape is exact: a run of four or more spaces inside a string
-    /// literal, with the end of a word or a punctuation mark before it and
-    /// the start of a lowercase word after it. That is a broken continuation
-    /// and it is not anything else — a padded FAT label and a captured
-    /// `nvme list` line both have runs of spaces in them, and neither has a
-    /// sentence running through it.
+    /// Flag runs of four spaces between sentence-like bytes in a quoted line.
+    /// This is a source-text heuristic, not a Rust string parser.
     #[test]
     fn no_sentence_of_this_construction_site_is_broken_by_a_missing_backslash() {
         let mut checked = 0usize;
@@ -2107,12 +1585,7 @@ mod source_rules {
         assert!(holes.is_empty(), "{}", holes.join("\n"));
     }
 
-    /// Every `.rs` file of this construction site, recursively.
-    ///
-    /// Rooted at the workspace and not at this crate: `drivers/` and
-    /// `shared/` are as much this site's as `components/agent` is, and a rule
-    /// that only held for one of the three would be a rule the next brief
-    /// breaks in the other two.
+    /// Recursively collect Rust files from the configured workspace directories.
     fn sources() -> Vec<std::path::PathBuf> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -2141,25 +1614,8 @@ mod source_rules {
         out
     }
 
-    /// Nothing here writes where somebody else writes, or binds a port
-    /// somebody else could be holding.
-    ///
-    /// The agent half of the rule the controller half already keeps
-    /// (`no_source_of_this_construction_site_names_a_fixed_temp_path_or_port`
-    /// in `controller-api`), and the numbers that made it worth having were
-    /// always this half's: the flaky run of round 1 was this test binary, at
-    /// 129 tests, with one failure nobody could reproduce.
-    ///
-    /// Two rules. A directory a test writes in comes from `tempfile`, which
-    /// is unique and, unlike a name built from the pid, survives a panic
-    /// without leaving anything behind for the next run to trip over — a pid
-    /// comes back, and thirty-three places here derived a name from one. A
-    /// listener asks for port `0` and reads back what it was given.
-    ///
-    /// An address in a string that nothing binds is not a bind: the migration
-    /// tests hand `tcp:127.0.0.1:49000` to a hypervisor that records it and
-    /// opens nothing, which is the same case as the controller's
-    /// `127.0.0.1:1`.
+    /// Reject direct temp_dir calls and literal nonzero bind ports.
+    /// Variable ports and Unix socket paths are outside this source-text check.
     #[test]
     fn no_source_of_this_construction_site_names_a_fixed_temp_path_or_port() {
         // Split so that this test's own source does not match itself.
@@ -2186,13 +1642,8 @@ mod source_rules {
         assert!(sins.is_empty(), "{}", sins.join("\n"));
     }
 
-    /// The address a `bind(` on this line asks for, if it asks for a literal
-    /// one that is not port 0.
-    ///
-    /// Both shapes this construction site uses: a string with the port in it,
-    /// and the tuple form the migration probe takes. A variable in either
-    /// position is not a literal and is not this rule's business — that is
-    /// what the probe itself does, with a port out of the configured range.
+    /// Extract nonzero literal bind addresses from string or tuple syntax.
+    /// Variable addresses are outside this source check.
     fn bound_address(line: &str) -> Option<&str> {
         let call = concat!("bind", "(");
         let after = line.split_once(call)?.1;

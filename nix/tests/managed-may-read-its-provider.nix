@@ -2,35 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# A managed host may read its provider without becoming an appliance.
-#
-# The shape the lab needed (L2 finding N5, 2026-09-23): a managed NixOS host
-# on an OpenNebula VM. Its config files are a system generation, so it must
-# not have the boot renderer — nix/managed.nix asserts against it. But where
-# the machine was BOOTED is still the provider's to say, and without an
-# address, a route and a resolver nothing reaches it at all.
-#
-# `meisterstack.context.providerScript` used to be declared by the renderer,
-# so `nixosModules.provider-opennebula` could not be imported without it and
-# the combination did not evaluate. The operator's repository carried thirty
-# hand-written lines of unit instead.
-#
-# Three claims, and all three are module-system values rather than a booted
-# machine — which is where the bug was:
-#
-#   1. managed + provider-opennebula evaluates, and every assertion of the
-#      resulting host holds (the renderer is not there, so managed's own
-#      assertion is satisfied).
-#   2. The strict reader's script really lands in a unit of that host.
-#   3. That host renders nothing at boot: no `meister-context.service`.
-#
-# And a fourth, from the lab (L4 finding W1, 2026-09-23): the module answers
-# the ONE-owner question itself. A host that names a static address owns its
-# interface, and a host that names none lets the medium own it. With a flat
-# `network = true` default every managed host that named its address in the
-# inventory — which is every controller of a real fleet — stopped at
-# `resolve` with the assertion below, and an operator repository had to carry
-# a module whose only job was to set a default nobody disagrees with.
+# Evaluate managed hosts with OpenNebula provider initialization and no boot
+# renderer. Check that static interface ownership disables provider networking.
 { nixpkgs, lib, pkgs, system, self }:
 
 let

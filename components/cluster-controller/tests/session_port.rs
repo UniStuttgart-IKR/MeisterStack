@@ -2,15 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! A replica that was told to serve agent sessions and cannot, says so.
+//! A session-port bind failure must terminate the replica instead of leaving
+//! its HTTP readiness endpoint available without an agent listener.
 //!
-//! The session server used to be spawned and forgotten: tonic binds inside
-//! the future, so a port somebody else held came back as one ERROR line from
-//! a task nobody awaited, and the process went on answering `/readyz` 200 off
-//! a healthy store — a replica in rotation that no node could ever dial.
-//!
-//! `#[ignore]` because readiness is only reached through the store, and the
-//! workspace's ordinary run has no etcd. Start one and name it:
+//! Requires an external etcd:
 //!
 //! ```text
 //! MEISTER_TEST_ETCD=http://127.0.0.1:23700 \

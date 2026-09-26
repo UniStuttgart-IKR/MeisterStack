@@ -2,24 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# The other boot mode, end to end: an empty disk becomes a guest that has no
-# boot loader at all, and its hypervisor is what starts it.
-#
-# A `boot = "direct"` host carries no ESP, no systemd-boot and no boot menu.
-# What `meister-deploy build` makes for it instead is a bundle — a kernel, an
-# initrd and a command line with `init=<toplevel>/init` in it — and the thing
-# that loads them is outside the machine. In this test the TEST DRIVER is
-# that thing: it starts the second virtual machine with `-kernel`, `-initrd`
-# and `-append`, which is exactly what a hypervisor does with the bundle and
-# what `lab.py up` will do with it in L2.
-#
-# What it shows: the medium installs without a boot loader and leaves no
-# `/boot` behind; the machine comes up from the bundle and is running the
-# system the `init=` in the command line names; `meister-activate` agrees
-# about what it booted; boot-mode activation is REFUSED there, with the
-# sentence D5 asks for, because there is no boot menu to put a one-shot entry
-# in; and switch-mode activation works unchanged, because that half is
-# userland.
+# Install a direct-boot host, boot the provider bundle, and check system identity.
+# Boot-entry activation must fail without a local loader; userland switching remains usable.
 { nixpkgs, lib, pkgs, system, self, disko }:
 
 let

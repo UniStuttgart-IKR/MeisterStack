@@ -2,155 +2,52 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# Both controller units ship in the appliance image; the context
-# (MEISTER_ROLE) starts the right one. ConditionPathExists keeps a unit
-# quietly skipped until push.sh delivered its binary.
-#
-# On every other host a unit is built only for the role that host carries
-# (`meisterstack.unitsFor`, nix/services.nix): the appliance is the one image
-# that does not know at build time what it will be.
-#
-# Central cluster setup: everything configurable lives in
-# meisterstack.<role>.settings (free-form TOML), merged over the role
-# defaults below, rendered to /etc/meisterstack/<role>.toml and consumed by
-# the binaries via --config. Empty settings = the defaults below and, for
-# every key they do not name, the binaries' own (the lab topology).
+# Configure cloud and cluster services, TLS paths, generated authentication,
+# and process sandboxes. Explicit role settings override generated defaults.
 { lib, pkgs, config, ... }:
 let
   toml = pkgs.formats.toml { };
   cfg = config.meisterstack;
 
-  # What both controller roles get. The rule this list follows is agent.nix's:
-  # bake a key only if the BINARY requires it, or if this image must deviate
-  # from the binary's default — and say why. Everything else is left to the
-  # binary.
-  #
-  #   metrics_listen  The binary defaults to "nothing listens", deliberately:
-  #                   the endpoint is unauthenticated and its series name
-  #                   objects across every tenant, so a controller that does
-  #                   not know where it runs must not open it. This image DOES
-  #                   know where it runs — a lab-internal control-plane VM —
-  #                   and there the scrape target is the point. Its own port
-  #                   and never the API router (that one is authenticated and
-  #                   tenant-scoped, this one is neither): 9100 cloud, 9101
-  #                   cluster, 9102 agent, so that a box running two roles
-  #                   never has two listeners fighting over one port.
-  #
-  # And the PKI. Private keys must never travel in a qcow2 — an image gets
-  # copied, shared and stored in a datastore — so they live beside the
-  # binaries in /opt/meisterstack, which survives an image swap the same way,
-  # and deploy/push.sh puts them there.
-  #
-  # The names are FIXED and the same on every host, which is the whole trick:
-  # a serving certificate and an identity differ per VM, and one template
-  # serves them all. Either the template names per-host paths and the renderer
-  # renders them, or the push decides which file gets the fixed name. The
-  # second: it keeps the template dumb and the decision where the operator is
-  # already thinking per host — and a certificate that landed on the wrong
-  # host then fails at the handshake, with a name in the message, instead of
-  # at rendering time with nothing to look at.
+  # Shared controller defaults cover store, listening addresses, telemetry,
+  # and credential paths. The binary validates the resulting configuration.
   pki = cfg.pki.dir;
 
-  # Both controller roles serve TLS and demand a client certificate for it.
-  # A chain that names a link it cannot build is a start-up error by design
-  # (rest.rs::build_chain), so this list and the keys above travel together.
+  # Configure both controller listeners with a serving certificate and client CA.
   serving = {
     tls_cert = "${pki}/serving.crt";
     tls_key = "${pki}/serving.key";
     client_ca = "${pki}/ca.crt";
   };
 
-  # The cluster tier stays on certificates, and that is a design decision of
-  # this stack rather than a gap: it keeps no user directory, so it could
-  # authenticate a token's name and then permit it nothing. build_chain
-  # refuses `[auth.oidc]` here outright. Machines authenticate with
-  # certificates; people reach the cluster with break-glass or not at all.
+  # The cluster authenticates machines and break-glass operators with certificates.
+  # Ordinary users and OIDC authorization belong to the cloud directory.
   clusterAuth.auth.chain = [ "mtls" ];
 
-  # --- the cloud's [auth] table -------------------------------------------
-  #
-  # NOT baked into cloud.toml, and that is forced rather than chosen. Three
-  # facts collide:
-  #
-  #   1. `auth.chain` naming "oidc" without an `[auth.oidc]` table is a
-  #      start-up error (rest.rs::build_chain), so the two have to appear and
-  #      disappear together.
-  #   2. `OidcConfig.issuer` is a required String. A baked `[auth.oidc]`
-  #      waiting for an issuer is not a quiet no-op, it is a PARSE error on
-  #      every VM that never gets one.
-  #   3. the context renderer APPENDS section overrides, and TOML has no way
-  #      to redefine a `[table]` an append arrives after.
-  #
-  # So the whole table has one owner, and the only owner that knows whether
-  # this deployment has an identity provider is the context renderer, at
-  # boot, holding MEISTER_OIDC_ISSUER. What it gets from here is the rest:
-  # two ready-made fragments, one of which it concatenates onto the rendered
-  # cloud.toml. The values stay in this file, where the cloud's auth lives, and
-  # TOML quoting stays Nix's problem rather than a shell's.
-  #
-  # `[auth.oidc]` is LAST in the oidc fragment (toml.generate orders it so).
-  # Until M5B that mattered to a boot-time renderer, which appended the
-  # single `issuer` line into it; that renderer and its 140-check shell test
-  # went to `~/git/meisterstack-lab/legacy/`. The order is kept because the
-  # fragment is still assembled the same way.
-  #
-  # No ca_cert for the provider: the lab's Keycloak is plain http. That is
-  # THE deviation from the hardened profile in this whole file, and it is
-  # what makes that instance a test instance — a token's signature is checked
-  # against keys fetched over a channel nobody authenticated. A real
-  # deployment sets `auth.oidc.ca_cert` (or has a provider with a public
-  # root) and does not run this comment's setup.
+  # Select cloud authentication from the generated issuer: mTLS alone, or mTLS
+  # and OIDC. Ordinary user authorization is resolved through cloud User objects.
   cloudAuthMtls.auth.chain = [ "mtls" ];
   cloudAuthOidc.auth = {
     chain = [ "mtls" "oidc" ];
     oidc = {
       client_id = "meister-cli";
-      # `audience` is NOT here, and it used to be. It is a property of the
-      # PROVIDER and not of this stack: Keycloak writes only "account" into
-      # `aud` unless an audience mapper says otherwise (the lab's mapper says
-      # "meister"), and Kanidm writes the name of the oauth2 client itself and
-      # has no mapper to say anything else with. So it travels with the issuer
-      # — the renderer takes it from MEISTER_OIDC_AUDIENCE — and defaults to
-      # the "meister" this file used to bake, so that an image swap under the
-      # lab's existing context changes nothing.
-      #
-      # Kanidm's `sub` is a uuid, and a uuid is not a name a directory
-      # entry can be found under. `email` would be the other tempting answer
-      # and is a trap — see OidcConfig::username_claim.
+      # Derive the audience from the configured identity provider instead of fixing
+      # one audience for every deployment.
       username_claim = "preferred_username";
     };
   };
 
   cloudDefaults = serving // {
     metrics_listen = "0.0.0.0:${toString cfg.ports.cloud.metrics}";
-    # The cloud's own client identity — `CN=system:cloud:<cloud_name>`, the
-    # file push.sh gives the fixed name `identity` to. The cluster tier below
-    # has had it since it learned to dial the cloud; this tier needed it the
-    # day it grew SIBLINGS, and did not get it.
-    #
-    # What it costs when it is missing is not a warning. Image 58 turned
-    # `tls_cert` on, so `serves_tls` is true and `Sibling.tls` is None: every
-    # forward between cloud replicas fails with "the replica at ... is https
-    # and this one has no client certificate". Measured in the mini-chaos run
-    # — `vm logs` answered on one of three replicas, the WebSocket console on
-    # the same one, and the uncordon after the run only went through
-    # cloud-b — while the discovery document went on offering
-    # `console.websocket` on all three. The comment in main.rs said "absent =
-    # plain http, which is what a lab runs", and Image 58 is what made that
-    # assumption false.
-    #
-    # Same CA as `client_ca`: one CA signs every tier in this stack, and a
-    # replica asking its sibling is the cloud asking itself.
+    # Cloud replicas need a client identity to forward requests to the replica
+    # holding a cluster session. This identity is distinct from the serving certificate.
     identity_cert = "${pki}/identity.crt";
     identity_key = "${pki}/identity.key";
   };
 
   clusterDefaults = serving // clusterAuth // {
     metrics_listen = "0.0.0.0:${toString cfg.ports.cluster.metrics}";
-    # The other direction, and separate from `serving` because the two
-    # directions are: this is how a cluster DIALS the cloud, and the identity
-    # it presents there is `CN=system:cluster:<name>` — the file push.sh gives
-    # the fixed name `identity` to.
+    # Use a separate client credential for the cluster-to-cloud session.
     cloud_ca = "${pki}/ca.crt";
     cloud_cert = "${pki}/identity.crt";
     cloud_key = "${pki}/identity.key";
@@ -158,47 +55,26 @@ let
 
   controller = name: {
     description = "MeisterStack ${name}-controller";
-    # `meister-context.service` exists only where there IS a boot renderer
-    # (the appliance). Ordering against a unit that is not on this machine is
-    # a no-op in systemd, which is why this line is not behind a condition:
-    # it says "after the renderer, if there is one" and costs nothing where
-    # there is not.
+    # Order after the context renderer only when that renderer is enabled.
     after = [ "etcd.service" "meister-context.service" ];
     wants = [ "etcd.service" ];
-    # The binary, and now also the CA. `client_ca` without `tls_cert`/`tls_key`
-    # is a hard start-up error (rest.rs::server_tls, grpc.rs::server_tls, and
-    # the test `half_a_tls_config_is_refused_rather_than_downgraded`), and a
-    # freshly re-instantiated VM has none of the three until push.sh ran. Not
-    # starting is the honest state: `systemctl status` then says
-    # ConditionPathExists=/opt/meisterstack/pki/ca.crt was not met, which is a
-    # sentence an operator can act on — a restart loop is not.
+    # Gate startup on the configuration and credential files the service needs.
     unitConfig.ConditionPathExists =
       lib.optional (!cfg.binariesInStore) "${cfg.binDir}/meister-${name}-controller"
       ++ [ "${pki}/ca.crt" ];
     serviceConfig = {
-      # Where the config comes from is `meisterstack.configDir`: the boot
-      # renderer's /run copy on an appliance (it appends per-VM values such as
-      # cluster_name from the context), and the complete /etc file that Nix
-      # wrote on a managed host.
+      # Resolve configuration files beneath the selected configDir.
       ExecStart = "${cfg.binDir}/meister-${name}-controller --config ${cfg.configDir}/${name}.toml";
       Restart = "always";
       RestartSec = 2;
       Environment = "RUST_LOG=info";
 
-      # A controller is a network daemon that reads two files and talks to
-      # etcd on loopback. It needs none of the rest of a machine, so it gets
-      # none of it. What it reads it reads as `meister`: the rendered config
-      # (root:meister 0640, nix/context.nix) and its own key (meister 0600,
-      # deploy/push.sh pki).
+      # Run controllers with restricted host access; persistent state lives in etcd.
       User = "meister";
       Group = "meister";
       NoNewPrivileges = true;
 
-      # Nothing on disk is written by these two — the state is in etcd, and
-      # etcd is its own unit running as its own user. ReadWritePaths stays
-      # empty on purpose: should a controller ever want to write (an OTLP
-      # spool, a cache), it fails with EROFS, and that is a design question
-      # to answer rather than a line to add here.
+      # Controllers need no writable host state directories.
       ProtectSystem = "strict";
       ProtectHome = true;
       PrivateTmp = true;
@@ -211,11 +87,7 @@ let
       CapabilityBoundingSet = "";
       SystemCallFilter = "@system-service";
 
-      # TCP, and unix sockets for the journal. NOT AF_NETLINK: the binaries
-      # push.sh ships are musl-static, and musl's resolver does not open a
-      # netlink socket the way glibc's getaddrinfo does. A controller that
-      # cannot resolve a NAME (the lab configures addresses) is the symptom
-      # that would point back at this line.
+      # Allow TCP and Unix sockets; controllers do not program host networking.
       RestrictAddressFamilies = "AF_INET AF_INET6 AF_UNIX";
     };
   };
@@ -326,10 +198,7 @@ in
     };
   };
 
-  # One tier, one gate. A host that is not a cluster carries no
-  # cluster-controller unit and no cluster.toml — where the appliance is
-  # every tier at once because its image does not know yet (nix/services.nix,
-  # `unitsFor`).
+  # Enable only the role selected for this host.
   config = lib.mkMerge [
     (lib.mkIf (builtins.elem "cluster" cfg.unitsFor) {
       meisterstack.cluster.effective = lib.recursiveUpdate
@@ -340,24 +209,8 @@ in
       systemd.services.meister-cluster-controller = controller "cluster";
     })
 
-    # --- lane 3-integration (finding N2 of lane 3B) --------------------
-    #
-    # The mode of a controller's private keys, enforced at every boot.
-    # `nix/agent.nix` has had this for the unprivileged agent since 1A and
-    # the controllers had nothing: a key somebody loosened by hand stayed
-    # loosened on a controller and closed itself again on an agent, and the
-    # loaders of this stack refuse a key with group bits in its mode
-    # (`mode & 0o077 != 0` in shared/pki/src/pem.rs and shared/proto) — so a
-    # host that survived a `chmod 640` was a host whose control plane would
-    # not start after the next reboot.
-    #
-    # `z` and not `d`: the file is put there by a deployment
-    # (`deliver-secret`, lane 3B) and this rule only says what its mode has
-    # to be; on a host where it is not there yet, `z` does nothing.
-    #
-    # The `identity.key` line is left to the agent module where that module
-    # already writes it, because two identical tmpfiles lines for one path
-    # are a duplicate systemd complains about rather than a rule twice.
+    # Set ownership and modes on delivered PEM files so the unprivileged
+    # controller can read them and the shared key loader accepts private keys.
     (lib.mkIf
       (builtins.elem "cluster" cfg.unitsFor || builtins.elem "cloud" cfg.unitsFor)
       {
@@ -366,7 +219,7 @@ in
             "z ${pki}/identity.key 0600 meister meister -"
           ++ [ "z ${pki}/serving.key 0600 meister meister -" ];
       })
-    # --- end lane 3-integration ----------------------------------------
+
 
     (lib.mkIf (builtins.elem "cloud" cfg.unitsFor) {
       meisterstack.cloud.effective = lib.recursiveUpdate
@@ -377,14 +230,7 @@ in
       systemd.services.meister-cloud-controller = controller "cloud";
     })
 
-    # The two halves of the cloud's [auth] table; the boot renderer picks one
-    # and appends it. Fragments and not templates: nothing consumes these on
-    # their own, and a role that does not exist has no config file.
-    #
-    # Only where a renderer exists. A managed host has its whole [auth] table
-    # baked into cloud.toml (`cloud.generated`), and two fragments beside it
-    # that nobody reads would be a second answer to the question "where does
-    # this cloud's auth come from".
+    # Keep mTLS-only and OIDC cloud authentication fragments available to rendering.
     (lib.mkIf (builtins.elem "cloud" cfg.unitsFor && cfg.context.enable) {
       environment.etc."meisterstack/cloud-auth-mtls.toml".source =
         toml.generate "cloud-auth-mtls.toml" cloudAuthMtls;

@@ -68,10 +68,8 @@ impl VfioPciDriver {
         Ok(params.pci_address)
     }
 
-    /// The address a spec asks for, without the inventory and IOMMU checks
-    /// `create` makes. Admission is about which VM may have the device;
-    /// whether the host can hand it over at all is a question for the moment
-    /// it is handed over.
+    /// Parse the requested PCI address for admission. Inventory and IOMMU
+    /// validation occur separately during creation.
     fn requested_address(spec: &DeviceSpec) -> device::Result<PciAddress> {
         let params = spec.params.as_ref().ok_or_else(|| {
             DeviceError::InvalidSpec(
@@ -259,14 +257,9 @@ impl DeviceDriver for VfioPciDriver {
         }
     }
 
-    /// A passthrough device belongs to exactly one VM: it is handed to the
-    /// guest whole, and a second guest given the same address would be
-    /// handed a device the first one is driving. Refused here rather than at
-    /// bind time, where the first VM would already be running on it.
-    ///
-    /// Specs already on the node are read leniently on purpose: one stored
-    /// spec that no longer parses is not a reason to refuse the VM being
-    /// created now, and the address it names is one nothing can be using.
+    /// Reject duplicate PCI addresses within this request or readable stored
+    /// claims. Unparseable stored device specifications are skipped; this check
+    /// does not establish that such a device is unused.
     fn admit(
         &self,
         requested: &[(DeviceId, DeviceSpec)],
@@ -338,8 +331,7 @@ mod tests {
             .expect("a different address is nobody's conflict");
     }
 
-    /// A passthrough device is handed to the guest whole; a second guest given
-    /// the same address would be handed a device the first one is driving.
+    /// Reject PCI devices already held by another VM.
     #[test]
     fn a_device_another_vm_holds_is_refused_by_name() {
         let err = driver()
@@ -365,9 +357,7 @@ mod tests {
         assert!(err.to_string().contains("twice"), "{err}");
     }
 
-    /// An address written in the short form is the same device as the long
-    /// one — the comparison is on parsed addresses, not on strings, which is
-    /// exactly what moving this into the driver bought.
+    /// Compare parsed PCI addresses independently of short or full spelling.
     #[test]
     fn the_conflict_is_on_the_address_not_on_its_spelling() {
         let err = driver()
@@ -376,8 +366,7 @@ mod tests {
         assert!(err.to_string().contains("already assigned"), "{err}");
     }
 
-    /// The message a spec without params has to produce, because it is the
-    /// one an operator sees when they forget the field.
+    /// Reject missing PCI addresses before allocating resources.
     #[test]
     fn a_vfio_device_without_an_address_is_refused_before_anything_is_built() {
         let err = driver().admit(&[dev(1, None)], &[]).unwrap_err();
@@ -400,8 +389,7 @@ mod tests {
         assert!(err.to_string().contains("invalid vfio params"), "{err}");
     }
 
-    /// A stored spec that no longer parses is not a reason to refuse the VM
-    /// being created now: the address it names is one nothing can be using.
+    /// Document current behavior: an unparseable stored claim is skipped.
     #[test]
     fn an_unparseable_stored_spec_does_not_block_a_new_vm() {
         let broken = (

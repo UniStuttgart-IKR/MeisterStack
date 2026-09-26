@@ -4,119 +4,44 @@ SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 -->
 
-# Eine Kiste, vier Knoten
+# One-box deployment
 
-Der Normalfall: eine Bare-Metal-Kiste ist Cloud-Controller,
-Cluster-Controller, Addons (Kanidm, Garage, Prometheus, Loki, Tempo,
-Grafana) **und** Knoten, daneben ein paar Kisten, die nur Knoten sind.
-HA und OpenNebula sind die Option nach oben, nicht der Anfang.
+A one-box fleet combines cloud, cluster, agent, and optional addon roles on one
+machine. Additional agents can join the same cluster. Use the schema-2
+[one-box inventory](../../../examples/fleet/one-box.toml) as a topology example
+and the [operator template](../../../templates/operator/) for the deployment
+repository. See [Deployment](../../../docs/DEPLOYMENT.md) for installation and
+rollout commands and [Nix integration](../../../docs/NIX.md) for module behavior.
 
-Der ganze Aufbau, in zehn Zeilen:
+Set stable host identities, management addresses, the disk layout, persistence,
+SSH fingerprints, trusted binary-cache keys, and host hardware modules. The
+addons role requires a domain whose name matches the identity provider's serving
+certificate and origin. The inventory only configures a management interface
+when `static = true`; otherwise the host or provider supplies its address.
 
-```bash
-meister-deploy init ~/my-fleet              # 1. das eigene Repo: fleet.toml,
-$EDITOR ~/my-fleet/fleet.toml               #    Profile, Hostmodule, Checks
-cd ~/my-fleet                               #    (Adressen, Platten, Domain)
-nix-store --generate-binary-cache-key my-fleet keys/signing.sec signing.pub
-                                            # 2. der Signierschluessel; die
-                                            #    oeffentliche Haelfte wird
-                                            #    committet, keys/ nicht
-git init && git add -A                      #    (ein Flake sieht nur, was in git ist)
-nix flake check                             # 3. Inventar, Konfigurationen, Manifest
-meister-deploy resolve --repo . -o m.json   # 4. das Manifest: welcher Baum,
-                                            #    welches System je Host
-```
+Persistent VM records, volumes, etcd, and addon state need storage that survives
+the intended update or reinstall. Runtime modules mount configured devices but
+do not format them. An optional missing data disk may leave state on the root
+filesystem, so establish and verify the layout before depending on it.
 
-Ab hier geht es mit M2 weiter (`build`, `plan`, `apply`); bis dahin ist der
-Weg auf die Platte der von vorher, mit `legacy` davor und einem Plan in der
-ALTEN Form (`schema` fehlt dort, `[[node]]` statt `[[host]]` —
-`examples/fleet/lab.toml` ist so einer):
+The addon module provisions Kanidm groups, sample accounts, and OAuth2 clients.
+Complete each person's credential setup through Kanidm administration. These
+groups do not create MeisterStack User resources or grant API roles; a cloud
+administrator creates the corresponding users unless controlled OIDC provisioning
+is enabled. The CLI supports authorization code with PKCE and a device-grant
+fallback; see [Configuration](../../../docs/CONFIGURATION.md).
 
-```bash
-meister-deploy legacy -f lab.toml keys init         # CA, Zertifikate, Geheimnisse
-meister-deploy legacy -f lab.toml image all --copy /var/tmp
-sudo dd if=/var/tmp/meisterstack-*-box-*.img of=/dev/nvme0n1 bs=4M status=progress
-meister-deploy legacy -f lab.toml keys push
-meister-deploy legacy -f lab.toml check
-```
-
-Das `legacy` gehoert seit meister-deploy v1 dazu: diese sieben Verben
-lesen den alten Plan weiter, und `plan` meint jetzt eine Datei auf der
-Platte statt der Tabelle auf dem Terminal. `examples/fleet/one-box.toml` ist
-seit 1B Schema 2 und damit die Vorlage fuer den NEUEN Weg.
-
-Das war es. Was danach noch von Hand kommt, steht unten.
-
-## Was in `fleet.toml` geaendert werden muss
-
-| Zeile | warum |
-|---|---|
-| `[fleet] domain` | Kanidm braucht einen **Namen**, keine Adresse: Origin, Issuer, jede Redirect-URL und das Serving-Zertifikat sind derselbe Name. `<knoten>.<domain>` muss auf jeder Maschine aufloesen, die sich anmeldet — DNS-Eintrag oder `/etc/hosts`. |
-| `[fleet] ca` | wo `meister-ca` sein Verzeichnis hat. **Nie im Image**, nie im Repo. |
-| `address` je Knoten | die Adresse, unter der die Kiste erreichbar ist |
-| `disk` je Knoten | die Zielplatte fuer `dd`. `lsblk` **vorher**. |
-| `data` auf der Box | die zweite Platte: etcd und der Zustand der sechs Dienste. Ohne sie leben beide auf der Rootplatte und ein Image-Tausch nimmt sie mit. |
-| `modules` je Knoten | eigene Nix-Dateien: NVIDIA, Mellanox, Kernel-Optionen, eine `hardware-configuration.nix`. Pfade relativ zur Plan-Datei. |
-
-Adressen, `[defaults] prefix` und `gateway` entscheiden, ob die Kisten
-statisch konfiguriert werden oder per DHCP hochkommen. Ohne `prefix`:
-DHCP, und die Adresse im Plan ist die, die reserviert wurde.
-
-## Die zweite Platte, einmal
-
-Der Datenblock wird nicht formatiert — ein Werkzeug, das eine Platte
-formatiert, die es nicht angelegt hat, ist ein Werkzeug, das irgendwann
-die falsche formatiert. Einmal, auf der Box, nach dem ersten Boot:
-
-```bash
-lsblk                                       # welche Platte ist es wirklich
-mkfs.ext4 -L meister-data /dev/nvme1n1      # das LABEL ist der Vertrag
-reboot
-```
-
-Das Label steht **im** Dateisystem, ueberlebt also einen Image-Tausch und
-eine Umsortierung der Geraete — beides ist im Lab schon passiert, und
-beim zweiten Mal lag etcds Zustand still auf der Rootplatte.
-
-## Die vier Konten, einmal
-
-Kanidm legt Gruppen, Konten und die beiden OAuth2-Clients selbst an
-(`nix/addons.nix`). Was es **nicht** kann, ist ein Passwort setzen — dafuer
-gibt es keine API. Also einmal je Mensch, auf der Box:
-
-```bash
-kanidm login -D idm_admin                   # Passwort: /opt/meisterstack/pki/addons-admin
-kanidm person credential create-reset-token silas
-```
-
-Der Link, den das druckt, wird im Browser geoeffnet. Danach:
-
-```bash
-meister login --oidc                        # siehe die Einschraenkung unten
-meister user create silas --tenant ops --role admin
-```
-
-> **Device Grant:** Kanidm 1.10 unterstuetzt RFC 8628 nicht (der Code
-> steht hinter einem Cargo-Feature, das nixpkgs nicht baut, und die
-> Dokumentation kennt ihn nur als Entwurf). Bis die CLI einen zweiten Weg
-> hat — Authorization Code + PKCE mit Redirect auf `localhost` — ist der
-> Weg hinein das Break-Glass-Zertifikat aus `keys init`:
-> `meister --profile root user create ...`.
-
-## Was diese Kiste danach ist
-
-| Dienst | Adresse |
-|---|---|
-| Cloud-API (mTLS, spaeter OIDC) | `https://<box>:3000` |
-| Cluster-API | `https://<box>:3001` |
+| Service | Default endpoint |
+| --- | --- |
+| Cloud API | `https://<box>:3000` |
+| Cluster API | `https://<box>:3001` |
 | Kanidm | `https://<box>.<domain>:8443` |
-| Grafana | `http://<box>:3080` — **nicht** 3000: das ist die Cloud-API, und auf einer Kiste mit beiden Rollen kann nur einer der beiden dort liegen. Grafana ist der, dessen Port nirgends sonst aufgeschrieben steht. |
-| Prometheus / Loki / Tempo | `:9090`, `:3100`, `:4317` |
-| Garage S3 | `:3900`, Admin `:3903` |
+| Grafana | `http://<box>:3080` |
+| Prometheus | `http://<box>:9090` |
+| Loki | `http://<box>:3100` |
+| Tempo OTLP | TCP `4317` / `4318` |
+| Garage S3 / admin | TCP `3900` / `3903` |
 
-## Weiter
-
-- `deploy/README.md` — die vier Formen des Deployments und die
-  Optionstabelle des Moduls
-- `meister-deploy legacy plan` — was die Flotte gerade wirklich ist
-- `meister-deploy legacy push` — der naechste Stand, Gruppe fuer Gruppe
+Restrict internal and unauthenticated endpoints with the host's network policy.
+Combining roles reduces availability to that machine's lifetime; the addon
+example also uses local state and single-node object-store replication.

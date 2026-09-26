@@ -94,15 +94,9 @@ pub(super) async fn ingest_hello(
     // nothing rather than an address that would point at the asker's own
     // loopback.
     let advertise = advertise.map(str::to_string);
-    // What a guest's machine state would be restored INTO on this node. Read
-    // once by the agent and said once here, because none of it changes while
-    // an agent runs — and it is the one thing the party choosing a live
-    // migration's destination could not ask before it had opened a stream.
-    // See `controller_api::live_migration_refusal`.
-    //
-    // An agent that predates the field sends nothing, and nothing is written:
-    // `None` is "did not say", and the comparison refuses only on two values
-    // that are both present.
+    // Store the machine profile reported at Hello for migration compatibility.
+    // Missing fields remain unknown; comparisons reject only values reported by
+    // both source and destination.
     let machine = hello.machine.as_ref().map(machine_profile);
     let apply = |n: &mut Node| {
         n.status.ready = true;
@@ -140,21 +134,9 @@ pub(super) async fn ingest_hello(
     Ok(())
 }
 
-/// A node that has just said Hello is asked about routers again.
-///
-/// `RouterStatus.refused` is evidence about a node that answered "no gateway
-/// slot" — and it was cleared only when somebody changed the router's spec,
-/// which meant a machine that had its provider bridge repaired stayed off
-/// every priority list until an operator noticed and patched an unrelated
-/// object. The comment on the field said as much and called it deliberate,
-/// on the grounds that this tier cannot tell "repaired" from "restarted".
-///
-/// A HELLO can tell. It is not a heartbeat and not a report: it is the agent
-/// stating its whole catalogue at the start of a session, `gateway:<physnet>`
-/// among it. A refusal recorded against the process that has just been
-/// replaced is evidence about something that no longer exists — and the cost
-/// of being wrong is one `EnsureRouter` that is refused again and written
-/// down again.
+/// Clear router refusals when a node starts a new session and republishes its
+/// capabilities. This permits retry after repair; an unchanged defect can be
+/// refused and recorded again.
 async fn forget_router_refusals(store: &EtcdStore, node: &str) {
     let routers = match store.list::<controller_api::Router>().await {
         Ok(routers) => routers,
@@ -200,20 +182,9 @@ pub(super) fn machine_profile(m: &proto::MachineProfile) -> controller_api::Mach
     }
 }
 
-/// The agent's driver catalogue as the flat capacity list NodeCapacity keeps.
-/// The spelling itself is `common::capability::entry` — the same function
-/// FirstFit matches against one tier up, so what a node claims and what a
-/// scheduler looks for cannot be worded differently.
-/// What the node said about where each of its volume backends keeps its bytes.
-///
-/// Only entries that carry one, which is only the volume ones — and only from
-/// an agent new enough to say. Silence is not `node-local`: an old agent and a
-/// node-local backend must not look the same, because the first is "unknown"
-/// and only the second may pin a VM to this machine.
-///
-/// A backend named by two entries that disagree with each other cannot happen
-/// from one agent — the catalogue is a map — so the last one wins here and the
-/// real disagreement, between two NODES, is settled where the pool is.
+/// Extract reported volume-driver locality. Missing or unknown values do not
+/// imply node-local storage. Duplicate entries use the last value; pool logic
+/// separately resolves disagreements between nodes.
 pub(super) fn capacity_localities(drivers: &[DriverInfo]) -> BTreeMap<String, Locality> {
     let mut out = BTreeMap::new();
     for driver in drivers.iter().filter(|d| d.name == capability::VOLUME) {
@@ -275,20 +246,10 @@ pub(super) async fn send_desired_state(
     true
 }
 
-/// Everything this node is supposed to be running, as the CreateInstance
-/// list the agent already knows how to apply — one message instead of a
-/// replay of the history it missed.
-///
-/// VMs on their way out are deliberately absent: they keep going through
-/// Destroy so the finalizer stays the single teardown path, and their
-/// absence from the snapshot is precisely what tells an agent that was
-/// offline to tear them down anyway.
-///
-/// All or nothing, and that is the important part. The agent reads a missing
-/// VM as a deleted one, so a snapshot built from a list with one unreadable
-/// object in it would order the teardown of a VM that is merely unreadable
-/// here. Failing to build one costs the reconnect sweep and nothing else;
-/// sending half of one costs somebody's VM.
+/// Build a complete desired CreateInstance snapshot for reconnect synchronization.
+/// Exclude deleting VMs so an agent that missed teardown can remove them.
+/// Reject incomplete store listings: omitting an unreadable VM would authorize
+/// its destruction. A failed snapshot leaves reconnect cleanup unperformed.
 pub(super) async fn desired_snapshot(
     store: &EtcdStore,
     kek: Option<&controller_api::secrets::Kek>,
@@ -318,16 +279,8 @@ pub(super) async fn desired_snapshot(
         let uids = crate::reconcile::volume_uids(store, &vm)
             .await
             .with_context(|| format!("vm {}", vm.metadata.name))?;
-        // The same resolution the dispatch does, for the same reason the uid
-        // rewrite is repeated here: a snapshot is a replay of the creates
-        // this node would have got anyway, so it has to be the same document
-        // down to the last field.
-        //
-        // A VM whose secret is not resolvable is LEFT OUT of the snapshot,
-        // and that is the wrong answer — a missing VM reads at the agent as a
-        // deleted one. So it fails the whole snapshot instead: the reconnect
-        // sweep is retried, the reconciler says why on the object, and
-        // nobody's VM is torn down because a key file was late.
+        // Resolve cloud-init exactly as normal dispatch does. An unresolved secret
+        // fails the whole snapshot; omitting just that VM would authorize agent teardown.
         let seed = match crate::reconcile::seed_for(store, kek, &vm).await? {
             crate::reconcile::Seed::None => None,
             crate::reconcile::Seed::Ready(plaintext) => Some(plaintext),

@@ -8,19 +8,9 @@
 
 use super::*;
 
-/// A physical network the operator handed over, by the name a node knows it
-/// under.
-///
-/// The first of Silas' seven decisions is what this object records: **every
-/// cluster gives at least one interface away, without an address on it**. The
-/// interface belongs to the provider bridge on the node; the host holds no
-/// address there, no tap hangs off it directly, and management runs wherever
-/// the operator wants it to. So this object never names an interface — it
-/// names a `physnet`, and which interface that is on a given machine is that
-/// machine's own configuration (`[network.provider] physnets = { ext =
-/// "eth1" }`). Two nodes may reach the same wire through differently named
-/// NICs and be the same provider network, which is exactly what a physnet is
-/// for and exactly what a field called `interface` here would have destroyed.
+/// Provider network identified by a physnet name. Each node maps that name to a dedicated
+/// interface without host IP addresses; management uses another interface or network. The
+/// resource does not impose identical interface names across nodes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderNetworkSpec {
@@ -40,16 +30,9 @@ pub struct ProviderNetworkSpec {
     /// needs a default at all.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gateway: String,
-    /// Where a router's own external address is cut from, in the spelling
-    /// `FloatingPoolSpec.cidrs` uses: a CIDR, a single address or an `a-b`
-    /// range per entry, parsed by `common::net::Ipv4Ranges`.
-    ///
-    /// Its own range rather than "anything inside `cidr`", because the two
-    /// are different facts. `cidr` is what the wire IS — it decides
-    /// reachability and it is usually somebody else's to declare — and this
-    /// is the slice of it this control plane may hand out. An operator who
-    /// gave us `198.51.100.0/24` and kept `.1` to `.99` for their own
-    /// hardware says so here and nowhere else.
+    /// Router external-address allocation ranges, expressed as CIDRs, individual IPv4
+    /// addresses, or a-b ranges. They restrict the allocatable subset independently of the
+    /// provider network's reachability CIDR.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allocation: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -146,15 +129,8 @@ pub const CLASS_ROUTER: &str = "router";
 /// [`CLASS_ROUTER`].
 pub const CLASS_VM: &str = "vm";
 
-/// Does a node that `accepts` these classes take a workload of this one?
-///
-/// **Empty accepts everything**, and that is what keeps this additive: every
-/// node ever written carries no list, and a rule that read an empty list as
-/// "nothing" would empty a fleet on upgrade. A node that names classes is
-/// exclusive — Kubernetes' taint and toleration in one word, from the side
-/// where an operator actually thinks about it ("this machine is for routers")
-/// rather than from the side where the workload has to apologise for
-/// existing.
+/// An empty accepts list allows every workload class. A nonempty list is an explicit allowlist,
+/// preserving compatibility for older unrestricted nodes.
 pub fn accepts_class(accepts: &[String], class: &str) -> bool {
     accepts.is_empty() || accepts.iter().any(|a| a == class)
 }
@@ -211,66 +187,23 @@ pub struct RouterSpec {
     /// is of that.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub class: String,
-    /// Translate the tenant's whole overlay behind this router's external
-    /// address.
-    ///
-    /// True by default, because it is what a tenant with private space wants
-    /// and because the object would otherwise do nothing at all on the road
-    /// everybody takes. False is the routed-subnet deployment: the prefixes
-    /// are real, the fabric routes them, and a masquerade in the middle would
-    /// be an active harm — it would hide the tenant's own addresses from the
-    /// network that was told to route to them.
-    ///
-    /// The one field in this tree that defaults to TRUE, which is why
-    /// `RouterSpec` writes its `Default` by hand rather than deriving it:
-    /// a derived one would say `false` and disagree with serde about what a
-    /// router with no opinion does.
+    /// Masquerade the tenant overlay behind the router's external address. Defaults to true in
+    /// both serde and Rust Default. Disable for routed subnets whose original source addresses
+    /// must remain visible.
     #[serde(default = "snat_default")]
     pub snat: bool,
-    /// The tenant's overlay — the wire the router's inside leg lands on.
-    ///
-    /// Exactly the road `NewNic.vxlan_id` travels and for exactly its reason:
-    /// the cloud resolves it out of the `Tenant` object at create, because
-    /// that is where tenants live, and it is set by hand on a standalone
-    /// cluster which has no `Tenant` to resolve. A number and not a tenant
-    /// name, so that by the time this reaches a node it says plainly which
-    /// wire it wants and no agent has to know what a tenant is.
-    ///
-    /// `None` is a router with no overlay leg, which the node refuses.
+    /// Tenant VNI resolved by the cloud or supplied to a standalone cluster. The node needs the
+    /// numeric overlay identity; a missing overlay leg is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vni: Option<u32>,
-    /// The address this router holds on the tenant's overlay, CIDR — the
-    /// default gateway its guests point at.
-    ///
-    /// **Asked for and not derived, because there is no IPAM for a tenant
-    /// overlay in this stack.** A tenant's logical switch is `Tenant.vni` and
-    /// nothing else: there is no `Subnet` object, no DHCP served by the
-    /// control plane and no agent inside a guest, so what addressing a tenant
-    /// runs on its own wire is known to that tenant and to nobody here. The
-    /// honest shape is therefore a field somebody fills in — `10.42.0.1/24`
-    /// beside guests on `10.42.0.0/24` — rather than a number this tier
-    /// invents and half the guests then cannot reach.
-    ///
-    /// It is also what the SNAT rule is about: `NatRule` with an empty
-    /// `logicalIp` means "the whole internal subnet", and the subnet is the
-    /// prefix of this address. Empty here is a router with no overlay leg,
-    /// which the node refuses — see `proto::EnsureRouter.internal_addr`.
+    /// Router gateway address on the tenant overlay, as a CIDR. The operator supplies it
+    /// because this stack has no tenant-overlay IPAM or DHCP. Its prefix also defines
+    /// whole-subnet SNAT; an empty value is refused by the node.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub internal_addr: String,
-    /// The `RoutedSubnet` objects this router announces, by name.
-    ///
-    /// Announced and NOT translated: decision 5's second half. A routed
-    /// subnet's addresses are the addresses, inside and out, so the router's
-    /// job for one is to say where it is — every active router of that subnet
-    /// says it, and whether the fabric turns that into ECMP is the fabric's
-    /// business, which is why nothing here is stateful and nothing here has
-    /// to be a single active hop.
-    ///
-    /// Named rather than derived from the tenant's subnets, because the two
-    /// are different questions: a tenant may hold a subnet that it does not
-    /// want announced from this provider network, and a tenant with two
-    /// routers on two provider networks has to be able to say which announces
-    /// what.
+    /// RoutedSubnet resources this router announces without NAT. Explicit selection allows
+    /// different provider networks to advertise different tenant prefixes. Multiple active
+    /// routers may advertise them; ECMP behavior belongs to the fabric.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routed_subnets: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -311,21 +244,8 @@ impl RouterSpec {
 }
 
 reasons! {
-    /// Why a router is where it is.
-    ///
-    /// One list out of two vocabularies, the shape `VmReason` explains. This
-    /// tier's four are out of the two router reconcilers: the `Pending`
-    /// sentences the cluster planner returns (no provider network, no gateway
-    /// node, every candidate down or drained, the class refused), the
-    /// dispatch the cloud writes when it has told a cluster, the structural
-    /// refusal it remembers in `status.refused`, and the silence `verdict`
-    /// turns into `Unknown` when the node holding an active router stops
-    /// answering.
-    ///
-    /// The three after them are the NODE's (`proto::reasons::ROUTER`), and
-    /// they come from the network driver rather than from the agent —
-    /// `agent_api::networking::RouterReason`, because the driver is what
-    /// looks and a driver may not depend on the agent.
+    /// Router reasons combine placement, dispatch, refusal, and holder-silence decisions with
+    /// network-driver reasons from proto::reasons::ROUTER.
     RouterReason [9] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
@@ -385,18 +305,9 @@ phases! {
         Provisioning { reason, message, since } => "Provisioning",
         /// A node reports it built and active. Packets go.
         Active { message, since } => "Active",
-        /// A node reports it built and NOT active — every standby says this, and
-        /// so does a router whose whole priority list is standby because the
-        /// active node has gone quiet without letting go.
-        ///
-        /// Its own phase rather than `Provisioning`, because the two send an
-        /// operator to different places: `Provisioning` is "wait", this is "the
-        /// thing exists on a machine and is deliberately silent".
-        ///
-        /// No reason slot, and that is the judgement rather than an omission:
-        /// a standby is a RESTING state — the router is built and doing
-        /// exactly what it was asked to do — so there is no category behind
-        /// it. Which node speaks is `status.activeNode`.
+        /// Built but deliberately inactive router, including standby nodes awaiting safe
+        /// activation. This is a resting phase without a reason category; activeNode identifies
+        /// the forwarding node.
         Standby { message, since } => "Standby",
         /// A node refused it, or reports it broken. The sentence is the node's.
         Failed { reason, message, since } => "Failed",
@@ -409,15 +320,8 @@ phases! {
 }
 
 impl RouterPhaseKind {
-    /// The two resting states: a router that is forwarding, and one that is
-    /// built and deliberately silent. Both are doing what they were asked to
-    /// do.
-    ///
-    /// `Failed` and `Unknown` are not ends here for the reason they are not
-    /// ends on a VM — a node that refused a gateway slot may have it
-    /// repaired, and a node that has gone quiet may come back — and a router
-    /// that has been either for a quarter of an hour is a tenant with no way
-    /// out.
+    /// Active and Standby are resting states. Failed and Unknown can still recover and remain
+    /// eligible for stalled-progress diagnostics.
     pub fn is_terminal(self) -> bool {
         matches!(self, RouterPhaseKind::Active | RouterPhaseKind::Standby)
     }
@@ -435,18 +339,9 @@ pub struct RouterStatus {
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
     pub(super) phase: RouterPhase,
-    /// The last word anybody established about this router — the one fact
-    /// `settle_router` derives from.
-    ///
-    /// At the cluster it is the verdict of a pass (`network::realise`'s
-    /// outcome, which is built out of what the nodes answered); at the cloud
-    /// it is what the cluster relayed. This tier's own conclusions — the
-    /// planner finding nowhere to put it, a cluster refusing it, a dispatch
-    /// that went out — are written here too, with an empty `node`, and that
-    /// is what stops either of them from ever being `Active`. See
-    /// `RouterReported`.
-    ///
-    /// `None` between the create and the first pass.
+    /// Router evidence from cluster realization or mirrored cluster reports. Controller-only
+    /// conclusions have an empty node and cannot establish Active or Standby. None precedes the
+    /// first pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported: Option<RouterReported>,
     /// The address this router answers for on the provider network, CIDR.
@@ -520,22 +415,9 @@ pub struct RouterStatus {
 
 pub type Router = Object<RouterSpec, RouterStatus>;
 
-/// What a router IS, out of the last word anybody established about it.
-///
-/// One rule for both tiers. Like a copy's (`settle_volume_snapshot`) this is
-/// a thin derivation, and for the same honest reason: a router's phase really
-/// is "what the pass that looked last found", because the looking is the
-/// interesting part and it happens in `network::realise` against the nodes'
-/// own answers. What the one place buys is the three things seven writers
-/// used to each have to remember:
-///
-/// * **`Active` and `Standby` demand a machine.** They are resting words — a
-///   router that is forwarding, and one that is built and deliberately silent
-///   — and a tier may not conclude either. The word has to name the node it
-///   is about, which it can: the active one, or the first that built it.
-/// * **No phase without a reason.** A router nobody has planned yet is
-///   `Pending { AwaitingNode }` rather than `Pending` with nothing beside it.
-/// * **One `since`,** moving with the word and not with the pass.
+/// Derive router phase from recorded evidence at either tier. Active and Standby require an
+/// identified machine; missing evidence becomes Pending/AwaitingNode. Preserve since while the
+/// reported state is unchanged.
 pub fn settle_router(status: &RouterStatus) -> RouterPhase {
     match status.reported.as_ref().and_then(RouterReported::phase) {
         Some(phase) => phase,

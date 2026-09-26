@@ -2,18 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The driver's tests, verbatim out of `lib.rs`. The module path is unchanged
-//! (`tests`), so every test still answers to the name it had before.
+//! Cloud Hypervisor configuration, event parsing, unplug polling and file-lifecycle tests.
 
-/// The URL form, which is the one thing two machines have to agree on
-/// without sharing anything else — and the one that is easy to get wrong
-/// in a way that fails halfway through a migration.
-///
-/// v53 parses it with `strip_prefix("tcp:")` (`vmm/src/api/mod.rs`), so
-/// `tcp://` is not a tolerated spelling: it makes the host the empty
-/// string and the port `/1.2.3.4:9000`, and the call is refused. The
-/// splitter is `rsplit_once(':')`, which is why an IPv6 literal has to
-/// arrive bracketed.
+/// Use the v53 tcp: prefix and bracket IPv6 literals; tcp:// is a different input.
 #[test]
 fn the_migration_url_is_the_form_cloud_hypervisor_actually_parses() {
     assert_eq!(
@@ -38,9 +29,7 @@ fn the_migration_url_is_the_form_cloud_hypervisor_actually_parses() {
     assert!(!agent_api::migration_url("10.0.0.5", 1).contains("//"));
 }
 
-/// The event file is the only place either outcome of a receive is
-/// stated, so what it is read for is worth pinning: nothing until one of
-/// the two words appears, and the ready mark is separate from both.
+/// Readiness is distinct from receive completion or failure evidence.
 #[test]
 fn a_receive_says_nothing_until_it_has_finished_or_failed() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -53,8 +42,7 @@ fn a_receive_says_nothing_until_it_has_finished_or_failed() {
     assert!(receive_outcome(&path).is_none());
     assert!(!listening(&path));
 
-    // Bound, nobody accepted: this is what `migrate_in` returns on, and
-    // it is deliberately not an outcome.
+    // Readiness permits migrate_in to return but is not a transfer outcome.
     std::fs::write(&path, "{\"event\":\"migration-receive-ready\"}\n\n").expect("write");
     assert!(listening(&path));
     assert!(receive_outcome(&path).is_none());
@@ -74,8 +62,7 @@ fn a_receive_says_nothing_until_it_has_finished_or_failed() {
     std::fs::write(&path, &done).expect("write");
     assert_eq!(receive_outcome(&path), Some(Ok(())));
 
-    // And the other end of it, which is what makes the destination
-    // tearable-down rather than a VMM nobody dares touch.
+    // Explicit failure marks the receiver for cleanup.
     std::fs::write(&path, "{\"event\":\"migration-receive-failed\"}\n\n").expect("write");
     let said = receive_outcome(&path)
         .expect("an outcome")
@@ -86,21 +73,7 @@ use super::fd::writable_files;
 use super::*;
 use agent_api::NicAttachment;
 
-/// A booting VMM is quiet and a receiving one is not, and the difference
-/// is one flag with a whole defect behind it.
-///
-/// D-X1: the destination aborted the state transfer and cloud-hypervisor
-/// would not say which component refused. It cannot — its abort line
-/// prints a `thiserror` variant's own `Display` and drops the `#[source]`
-/// under it, and the error it hands the api caller is
-/// `"Migration was aborted"`. What names the component is the restore
-/// itself at INFO, one line per device in the order they are rebuilt, so
-/// the receiving process is the one process on this node that runs with
-/// `-v`. Into the file `vm logs --stream vmm` already reads and the
-/// reconcile pass already trims.
-///
-/// A booting VMM keeps its silence: everything that can go wrong with a
-/// boot comes back on the api call that caused it.
+/// Enable verbose restore diagnostics for receivers and keep ordinary boot arguments quiet.
 #[test]
 fn the_vmm_that_receives_a_guest_is_the_one_that_is_asked_to_explain_itself() {
     let socket = Path::new("/run/meisterstack/agent/vms/a.sock");
@@ -176,7 +149,7 @@ fn config(spec: &InstanceSpec) -> serde_json::Value {
     .expect("config builds")
 }
 
-/// The same document a VMM that gets its taps as descriptors is handed.
+/// Build VM configuration for descriptor-based NIC handoff.
 fn config_with_tap_fds(spec: &InstanceSpec) -> serde_json::Value {
     build_vm_config(
         spec,
@@ -190,15 +163,7 @@ fn config_with_tap_fds(spec: &InstanceSpec) -> serde_json::Value {
     .expect("config builds")
 }
 
-/// Every disk states an id, and the id is the volume's rather than the
-/// VMM's own count.
-///
-/// This is what hot-plug rests on. CH invents `_disk0`, `_disk1`, … for
-/// disks that name themselves nothing — positional names, so detaching
-/// the second of three disks would renumber the third and every later
-/// `vm.remove-device` or `vm.resize-disk` would address the wrong one.
-/// Stated here and stated the same way at `add_disk`, so a disk plugged
-/// today answers to the same name a year from now.
+/// Volume-derived disk IDs remain stable after hot-unplug changes list positions.
 #[test]
 fn every_disk_answers_to_a_name_derived_from_its_volume_and_not_to_its_position() {
     let mut s = spec(
@@ -219,8 +184,7 @@ fn every_disk_answers_to_a_name_derived_from_its_volume_and_not_to_its_position(
         !disks[0]["id"].as_str().unwrap().starts_with('_'),
         "`_disk0` is CH's own namespace and its own counting"
     );
-    // The seed is the agent's file and not a volume: it has no id to
-    // give, and nothing ever plugs or grows it.
+    // The seed has no volume ID because it does not support hotplug or resize.
     assert!(disks[2]["id"].is_null());
 
     // A share is not a disk, so it takes no disk id and no disk slot.
@@ -228,11 +192,7 @@ fn every_disk_answers_to_a_name_derived_from_its_volume_and_not_to_its_position(
     assert_eq!(config(&shared)["disks"].as_array().map(Vec::len), Some(0));
 }
 
-/// The seed is an ADDITIONAL disk, it is read-only, and it comes last.
-///
-/// All three matter and the last one most: the guest boots off the first
-/// bootable disk, so a seed in front of the boot volume would be a VM
-/// trying to boot a 1 MiB FAT image with no bootloader on it.
+/// Keep the seed read-only and after the boot disk so it does not change boot selection.
 #[test]
 fn the_cloud_init_seed_is_an_extra_read_only_disk_after_the_boot_volume() {
     let boot = VolumeAttachment::Path("/vol/root.raw".into());
@@ -250,8 +210,7 @@ fn the_cloud_init_seed_is_an_extra_read_only_disk_after_the_boot_volume() {
     assert_eq!(disks[1]["readonly"], true);
 }
 
-/// The property this whole feature is judged on: a VM with no cloud-init
-/// block produces the configuration it always did, byte for byte.
+/// Omitting a seed preserves the ordinary VM configuration.
 #[test]
 fn a_vm_without_a_seed_gets_exactly_the_config_it_had_before() {
     let volumes = vec![VolumeAttachment::Path("/vol/root.raw".into())];
@@ -291,10 +250,7 @@ fn nic(mtu: Option<u32>) -> NicAttachment {
     }
 }
 
-/// The last hop of the overlay MTU. The tap and the bridge bound what the
-/// HOST forwards; this is the only thing that tells the GUEST, and
-/// without it an overlay VM emits 1500-byte frames into a 1450-byte path
-/// and they vanish with nothing in any log.
+/// Expose the configured overlay MTU to the guest; omit it when unspecified.
 #[test]
 fn an_overlay_nic_tells_the_guest_its_mtu_and_a_plain_one_says_nothing() {
     let mut overlay = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
@@ -303,8 +259,7 @@ fn an_overlay_nic_tells_the_guest_its_mtu_and_a_plain_one_says_nothing() {
     assert_eq!(cfg["net"][0]["tap"], "msk0000");
     assert_eq!(cfg["net"][0]["mtu"], 1450);
 
-    // And a NIC on the default bridge produces exactly the config it
-    // always did — no `mtu` key at all, not an mtu of null.
+    // Unspecified MTU is omitted rather than serialized as null.
     let mut plain = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
     plain.nics = vec![nic(None)];
     let cfg = config(&plain);
@@ -312,17 +267,8 @@ fn an_overlay_nic_tells_the_guest_its_mtu_and_a_plain_one_says_nothing() {
     assert!(cfg["net"][0].get("mtu").is_none(), "no key, not a null");
 }
 
-/// On the descriptor form the NIC is not in the create document at all, and
-/// the `vm.add-net` body that replaces it names neither the tap, nor an fd,
-/// nor an MTU.
-///
-/// Every one of those absences is a measured failure avoided, and they are
-/// asserted here because the document is the whole of what this driver is
-/// judged on: `tap` would make the VMM open `/dev/net/tun` itself, `fds`
-/// would buy a warning per NIC per boot (v53 ignores body fds), and `mtu`
-/// would make an unprivileged VMM die at boot in `SIOCSIFMTU` — which is
-/// exactly what it did on this machine before the field came out. The guest
-/// still learns the MTU, from the tap, which is why the field can go.
+/// Pass tap descriptors through SCM_RIGHTS. The add-net body omits tap, fds and
+/// mtu so the unprivileged VMM need not open or reconfigure the tap.
 #[test]
 fn the_descriptor_form_names_no_tap_no_fd_and_no_mtu() {
     let mut overlay = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
@@ -349,9 +295,7 @@ fn the_descriptor_form_names_no_tap_no_fd_and_no_mtu() {
     );
 }
 
-/// And the two forms disagree about nothing else. A node that has not asked
-/// for Stufe 3 gets the document it always got — that is the rule the whole
-/// lane is held to — so the only difference between the two is `net`.
+/// Tap-name and descriptor configurations differ only in how NICs are supplied.
 #[test]
 fn the_two_net_forms_differ_in_net_and_in_nothing_else() {
     let mut s = spec(
@@ -372,16 +316,8 @@ fn the_two_net_forms_differ_in_net_and_in_nothing_else() {
     assert_eq!(named, with_fds);
 }
 
-/// Unset means `ImageType::Unknown`, and v53 answers that by detecting the
-/// type, warning that the detection is deprecated, and — on raw — turning
-/// OFF sector 0 writes. A guest writing its own partition table then takes
-/// an I/O error for something it is entitled to do.
-///
-/// The capital R is the point of the second half of this test: CH's
-/// `ImageType` derives `Deserialize` with no rename, so the wire form is
-/// the VARIANT name. `"raw"` is what its `Display` prints into a log, and
-/// sending that would fail the whole `vm.create` body — which is a far
-/// worse failure than the one being fixed.
+/// CH reads the enum spelling Raw. Explicit typing avoids format autodetection
+/// and its write restrictions; vhost-user disks have no file image type.
 #[test]
 fn a_file_backed_disk_states_its_image_type_and_states_it_the_way_ch_reads_it() {
     let cfg = config(&spec(
@@ -390,8 +326,7 @@ fn a_file_backed_disk_states_its_image_type_and_states_it_the_way_ch_reads_it() 
     ));
     assert_eq!(cfg["disks"][0]["image_type"], "Raw");
 
-    // The seed is a FAT12 file and just as raw, and an unstated type there
-    // is the same deprecation warning once per boot.
+    // The FAT12 seed also declares Raw format.
     let mut with_seed = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
     with_seed.cloud_init_seed = Some("/run/seed.img".into());
     let cfg = config(&with_seed);
@@ -409,10 +344,7 @@ fn a_file_backed_disk_states_its_image_type_and_states_it_the_way_ch_reads_it() 
     assert_eq!(cfg["disks"][0].get("image_type"), None);
 }
 
-/// The VMM's own log is bounded like the guest's streams and served like
-/// none of them. Both halves matter: without the first it grows until the
-/// node's disk is gone, and without the second `vm logs` would answer a
-/// question about a guest with hypervisor noise.
+/// Bound VMM diagnostic logs without including them in guest log output.
 #[test]
 fn the_vmm_log_is_bounded_but_never_part_of_the_guests_output() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -452,9 +384,7 @@ fn a_path_volume_is_a_plain_disk_and_needs_nothing_shared() {
     assert_eq!(cfg["memory"]["shared"], false);
 }
 
-/// CH's own DiskConfig fields (`vhost_user` / `vhost_socket`) — the same
-/// pair its upstream vhost_user_block daemon is driven with, so a
-/// Mayastor-style backend needs nothing new on this side.
+/// Encode vhost-user block attachments using Cloud Hypervisor's disk fields.
 #[test]
 fn a_vhost_user_blk_volume_becomes_a_vhost_user_disk() {
     let cfg = config(&spec(
@@ -469,10 +399,7 @@ fn a_vhost_user_blk_volume_becomes_a_vhost_user_disk() {
     assert_eq!(cfg["disks"][0].get("path"), None);
 }
 
-/// The behaviour change this split is for: shared memory is a property of
-/// the VM, not of the device list. A VM whose only vhost-user backend is
-/// a disk used to be built with `shared: false` — and the backend would
-/// have had no guest memory to map.
+/// A vhost-user volume alone requires shared guest memory.
 #[test]
 fn a_vhost_user_volume_alone_turns_shared_memory_on() {
     let cfg = config(&spec(
@@ -529,10 +456,7 @@ fn share() -> VolumeAttachment {
     }
 }
 
-/// A share is a `fs` entry and not a disk. Both halves matter: the guest
-/// mounts it by tag, and a share that leaked into `disks` would be a
-/// DiskConfig with neither a path nor a vhost socket — CH refuses the
-/// whole VM for it, so the boot disk would go down with it.
+/// Encode virtiofs shares as fs entries with tags and exclude them from disks.
 #[test]
 fn a_share_becomes_an_fs_entry_and_leaves_the_disks_alone() {
     let cfg = config(&spec(
@@ -547,9 +471,7 @@ fn a_share_becomes_an_fs_entry_and_leaves_the_disks_alone() {
     assert_eq!(cfg["fs"][0].get("num_queues"), None);
 }
 
-/// virtiofsd maps guest memory like every other vhost-user backend, so a
-/// share alone has to turn shared memory on — the same rule the disk case
-/// already holds, asked of the third form.
+/// A virtiofs share alone requires shared guest memory.
 #[test]
 fn a_share_alone_turns_shared_memory_on() {
     let cfg = config(&spec(
@@ -564,18 +486,14 @@ fn a_share_alone_turns_shared_memory_on() {
     );
 }
 
-/// And a VM with no share has no `fs` key at all, rather than an empty
-/// array: CH's own field is an Option, and an empty list is not what
-/// "no shares" means.
+/// Omit the optional fs field when no shares are present.
 #[test]
 fn a_vm_without_shares_has_no_fs_key() {
     let cfg = config(&spec(vec![VolumeAttachment::Path("/a.raw".into())], vec![]));
     assert_eq!(cfg.get("fs"), None);
 }
 
-/// A vfio device pins memory but maps none of the guest's own into
-/// another process, so it must NOT flip `shared` — that would change how
-/// every passthrough VM in the lab is built.
+/// VFIO pins memory without requiring vhost-user shared mappings.
 #[test]
 fn passthrough_does_not_ask_for_shared_memory() {
     let cfg = config(&spec(
@@ -591,15 +509,7 @@ fn passthrough_does_not_ask_for_shared_memory() {
     );
 }
 
-/// A detach is done when the VMM has let go, and not when it said it
-/// would.
-///
-/// D3, measured against the fleet: `vm.remove-device` answered 200, the
-/// control plane published the volume as free within two seconds, and the
-/// fd was still on `/proc/12801/fd` sixty seconds later. The next VM on
-/// that volume died on cloud hypervisor's write lock. The fake here is
-/// the guest that takes its time — the disk is still listed for two polls
-/// and gone on the third — which has to count as a successful unplug.
+/// An accepted removal is not completed unplug. Poll until absence is observed or time out.
 #[tokio::test]
 async fn a_disk_that_disappears_late_still_counts_as_unplugged() {
     use std::cell::Cell;
@@ -633,10 +543,7 @@ async fn a_disk_that_disappears_late_still_counts_as_unplugged() {
     .expect("the guest let go on the third look");
     assert_eq!(asked.get(), 3, "and it was asked until it did");
 
-    // The other direction, which is the defect: a guest that never
-    // acknowledges is an error with a sentence, not a success. The
-    // caller's detach of the backend never runs, so the fd and the
-    // bookkeeping stay in step.
+    // An unacknowledged unplug must return an error instead of authorizing detach.
     let refused = super::until_the_disk_is_gone(
         "disk-5f8f99ec",
         || async { Ok(info(&["disk-5f8f99ec"])) },
@@ -653,10 +560,7 @@ async fn a_disk_that_disappears_late_still_counts_as_unplugged() {
     );
 }
 
-/// The lab's M2, the second time: the config had dropped the disk within a
-/// millisecond of the request and the fd was still open a minute later. The
-/// config is what the VMM intends; the fd table is what the guest has done,
-/// and only the second one may end the wait.
+/// A removed config entry is insufficient while the VMM still holds the file descriptor.
 #[tokio::test]
 async fn a_disk_the_config_has_dropped_is_not_gone_while_the_vmm_holds_it() {
     use std::cell::Cell;
@@ -717,12 +621,7 @@ fn the_fd_table_says_whether_a_file_is_still_held() {
     );
 }
 
-/// Silence is not evidence.
-///
-/// A `vm.info` this driver cannot read must not be read as "the disk is
-/// gone" — that is the same mistake as trusting the 200, one layer down.
-/// A `config` that lists no disks at all IS an answer, because the VMM
-/// lists what it has.
+/// An unreadable config is unknown; a readable config with no disks is an absence.
 #[test]
 fn a_vm_info_that_does_not_say_is_not_a_yes() {
     use serde_json::json;
@@ -759,18 +658,7 @@ fn a_vm_info_that_does_not_say_is_not_a_yes() {
     );
 }
 
-/// A socket file is a candidate, and the ANSWER is the evidence.
-///
-/// D18's discovery half, and the half where being wrong costs a guest: what
-/// this decides is which processes the agent may end after a grace. A
-/// `<uuid>.sock` on its own proves nothing — a killed VMM leaves one behind,
-/// and `destroy_vm` removing them is the only reason a busy node's run
-/// directory is not full of them — so every candidate is pinged, and a stray
-/// is a socket that talks back.
-///
-/// Read off the filesystem and not off `self.vms`, which is the whole point:
-/// the map is empty after a restart, and a restart is exactly when the
-/// question matters.
+/// A UUID socket filename is only a candidate. Require a responding VMM before stray cleanup.
 #[tokio::test]
 async fn a_socket_nothing_answers_is_not_an_unmanaged_vmm() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -787,8 +675,7 @@ async fn a_socket_nothing_answers_is_not_an_unmanaged_vmm() {
     let known = VmId::new_v4();
     std::fs::write(dir.join(format!("{dead}.sock")), b"").expect("a leftover socket");
     std::fs::write(dir.join(format!("{known}.sock")), b"").expect("a second one");
-    // Things in the same directory that are not a candidate at all: this
-    // driver's own console files and logs live here too.
+    // Ignore non-socket files and socket names without valid VM IDs.
     std::fs::write(dir.join(format!("{dead}.log")), b"").expect("a log");
     std::fs::write(dir.join("not-a-uuid.sock"), b"").expect("somebody else's file");
 
@@ -803,19 +690,7 @@ async fn a_socket_nothing_answers_is_not_an_unmanaged_vmm() {
     );
 }
 
-/// D-P19: what a torn-down VMM said survives long enough to be read.
-///
-/// Two fixes of one round cancelled each other out. `-v` was turned on for
-/// the receiving VMM to get one line out of it — the line that says WHY a
-/// migration's state transfer aborted — and the tidy-up that removes a VM's
-/// files takes that log away the moment the reception is given back. So
-/// `vm logs --streams vmm` could never show a receiving VMM at all, which is
-/// the one case the flag was turned on for; the lab had to catch the line
-/// with a 0.2-second watcher on the file.
-///
-/// Kept, found, and swept: an empty log is still thrown away, because a VMM
-/// that printed nothing leaves nothing worth a filename and one file per VM
-/// id that ever existed is the leak the tidy-up was written to end.
+/// Retain nonempty VMM diagnostics under archived names; discard empty logs.
 #[tokio::test]
 async fn what_a_torn_down_vmm_said_outlives_the_teardown() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -835,9 +710,7 @@ async fn what_a_torn_down_vmm_said_outlives_the_teardown() {
     )
     .expect("a vmm that said something");
 
-    // The tidy-up every teardown runs — the ordinary `destroy`, and the one
-    // that ends a VMM nobody has a record of, which is exactly the shape a
-    // given-back reception has.
+    // Exercise file cleanup shared by ordinary and stray VMM destruction.
     d.remove_files(&id);
 
     assert!(
@@ -855,9 +728,7 @@ async fn what_a_torn_down_vmm_said_outlives_the_teardown() {
     assert!(served.contains(&kept[0]), "{served:?}");
     assert_eq!(served.last(), Some(&d.vmm_log_path(&id)));
 
-    // A VMM that printed nothing leaves nothing. One file per vm id that ever
-    // existed is the leak the tidy-up was written to end, and an empty one
-    // buys nobody anything.
+    // Do not retain empty VMM logs.
     let quiet = VmId::new_v4();
     std::fs::write(d.vmm_log_path(&quiet), b"").expect("an empty log");
     d.remove_files(&quiet);
@@ -867,7 +738,7 @@ async fn what_a_torn_down_vmm_said_outlives_the_teardown() {
     // Twice for one id is two files: a reception that failed and then one
     // that worked must not silently replace the evidence of the first.
     std::fs::write(d.vmm_log_path(&id), b"the second attempt\n").expect("a second log");
-    // A second apart, because the name carries the seconds.
+    // Separate timestamps because retained-log names use whole seconds.
     let earlier = d.kept_log_path(&id, std::time::SystemTime::now() - Duration::from_secs(5));
     std::fs::rename(&kept[0], &earlier).expect("age the first one");
     d.remove_files(&id);
@@ -879,15 +750,7 @@ async fn what_a_torn_down_vmm_said_outlives_the_teardown() {
     );
 }
 
-/// What changes hands when the VMM is somebody else, and what does not.
-///
-/// The disks and the seed do: the VMM opens them for writing and cannot be
-/// given the right to, so it is given the files. The kernel, the initramfs
-/// and the firmware do NOT, and that is the half worth pinning down — they
-/// live in the shared image directory, several VMs read the same bytes, and
-/// chowning one to the VMM user would change a file that is not this VM's.
-/// A vhost-user disk is a socket its backend owns, and a share is
-/// virtiofsd's, which stays the agent.
+/// Hand disk and seed files to the VMM user. Shared boot images and backend sockets keep ownership.
 #[test]
 fn only_the_files_this_vm_writes_change_hands() {
     let mut s = spec(
@@ -919,8 +782,7 @@ fn only_the_files_this_vm_writes_change_hands() {
     );
 }
 
-/// A driver nobody gave a user to hands nothing over and asks nothing of
-/// anybody — which is the rule this whole lane is held to.
+/// Without a VMM user, leave file ownership unchanged.
 #[test]
 fn without_a_vmm_user_nothing_changes_hands() {
     let dir = tempfile::tempdir().unwrap();
@@ -941,12 +803,8 @@ fn without_a_vmm_user_nothing_changes_hands() {
     assert_eq!(ch.net_form(), NetForm::TapName);
 }
 
-/// Landlock turns on with `vmm_user` and its rules cover what cloud
-/// hypervisor cannot know about: what will be attached after `vm.create`.
-///
-/// The three sources are asserted by shape rather than by count, because
-/// each one is a hot-plug that would otherwise come back as Permission
-/// Denied — CH's own documentation says so in as many words.
+/// Landlock must cover configured future hotplug directories at VM creation,
+/// because the rules cannot be widened for a later attachment.
 #[test]
 fn a_sandboxed_vmm_gets_a_rule_for_everything_a_hotplug_could_name() {
     let dir = tempfile::tempdir().unwrap();
@@ -999,8 +857,7 @@ fn a_sandboxed_vmm_gets_a_rule_for_everything_a_hotplug_could_name() {
     assert_eq!(cfg["landlock_rules"][0]["access"], "rw");
 }
 
-/// And a node that has not asked for Stufe 3 gets no `landlock_enable` key
-/// at all — not `false`, which would be a different document.
+/// Without a VMM user, omit Landlock configuration.
 #[test]
 fn without_a_vmm_user_the_document_says_nothing_about_landlock() {
     let s = spec(vec![VolumeAttachment::Path("/vol/a.raw".into())], vec![]);
@@ -1009,12 +866,7 @@ fn without_a_vmm_user_the_document_says_nothing_about_landlock() {
     assert!(cfg.get("landlock_rules").is_none());
 }
 
-/// The VMM's own seccomp filter, said out loud on the command line.
-///
-/// v53's default is `true`, and a default is exactly the thing that changes
-/// upstream without anybody here noticing. This also fixes the shape of the
-/// one thing `--landlock` could NOT be: an argument passed without a VM on
-/// the command line.
+/// Pass the seccomp setting explicitly so a changed upstream default cannot disable it.
 #[test]
 fn every_vmm_is_started_with_its_seccomp_filter_stated() {
     let args = vmm_args(Path::new("/run/vms/x.sock"), None);

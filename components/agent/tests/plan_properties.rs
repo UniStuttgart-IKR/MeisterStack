@@ -2,21 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What must hold across the whole space, not cell by cell.
+//! Planner invariants across the representative space in space/mod.rs.
 //!
-//! The table next door says what every input decides. These say what the
-//! decisions mean together — the four invariants the agent's safety rests on,
-//! each checked by walking the same 179.200 cells rather than by sampling
-//! them. Over a finite space exhaustion is not a weaker proof than a
-//! randomised property runner; it is a stronger one, and it needs no
-//! generator to be trusted.
-//!
-//! Two of the four are statements about a single decision (totality,
-//! Absent never provisions) and fall out of the walk directly. Two are
-//! statements about a sequence of them (quarantine is absorbing, an expired
-//! deadline terminates), and those need a model of what the executor does to
-//! the world between two passes — `model` below, kept deliberately small and
-//! honest about what it assumes.
+//! Most assertions inspect a single decision. Stop-convergence tests use the
+//! small model below and assume its actions succeed; they do not establish
+//! that real drivers terminate or clean up resources under every failure.
 
 mod space;
 
@@ -32,13 +22,8 @@ use space::{Cell, SPACE_SIZE, base_now, describe, walk};
 // 1. Totality
 // ---------------------------------------------------------------------------
 
-/// No input panics, and none of them is undecided. `plan` has no `unwrap` on
-/// a caller's value and no arithmetic on the clock today; this is what says so
-/// tomorrow, when it has.
-///
-/// The clock is swept along with the space rather than held at one instant:
-/// the epoch, the deadline's own second, and a time far enough past any
-/// deadline that a naive `duration_since` would be the interesting case.
+/// Exercise every representative input at the epoch, its deadline, and a later
+/// instant. Each must return a decision without panicking.
 #[test]
 fn every_input_decides_and_none_of_them_panics() {
     let clocks = [
@@ -82,9 +67,7 @@ fn is_a_real_action(action: Action) -> bool {
     }
 }
 
-/// The clock cannot make a decision out of thin air either: a cell without a
-/// deadline decides the same at every instant. Anything else would mean the
-/// pass is reading time it has no business reading.
+/// Without a deadline, planning is independent of the clock.
 #[test]
 fn without_a_deadline_the_clock_changes_nothing() {
     walk(|cell| {
@@ -105,11 +88,8 @@ fn without_a_deadline_the_clock_changes_nothing() {
 // 2. Quarantine is absorbing except for explicit lifecycle intents
 // ---------------------------------------------------------------------------
 
-/// The actions that change the VM in the direction of running again. A
-/// quarantined record must never see one of these from an automatic pass —
-/// that is the entire point of the marker: a dead vhost-user backend cannot
-/// be reconnected, and a reconciler that helpfully re-provisioned would
-/// destroy the state a human is about to look at.
+/// Actions that repair a VM toward running. Quarantined records must never
+/// receive these automatically, preserving state for diagnosis.
 fn is_repair(action: Action) -> bool {
     matches!(
         action,
@@ -132,11 +112,8 @@ fn a_quarantined_record_is_never_repaired_automatically() {
     });
 }
 
-/// The other half of the same rule: quarantine is not a prison. The two
-/// intents a human states to get out of it — destroy and stop — still reach
-/// the VM, and they reach it with exactly the action they would have had
-/// without the marker. `set_desired` clears the marker when the intent is
-/// stated; `plan` must not stand in the way before that.
+/// Quarantine does not alter unblocked Stop or Absent decisions.
+/// set_desired also clears the marker when accepting a lifecycle request.
 #[test]
 fn quarantine_never_blocks_the_maintenance_intents() {
     walk(|cell| {
@@ -157,13 +134,8 @@ fn quarantine_never_blocks_the_maintenance_intents() {
     });
 }
 
-/// Absorbing in the sense that matters operationally: once marked, the
-/// automatic passes cannot un-mark. `plan` never answers anything that would
-/// lead the reconciler to clear `unhealthy` — the only writer of that field
-/// on the clearing side is `set_desired`, and `provisioner::stop`/`resume`,
-/// both of which are reached by a stated intent. So from `plan` alone, a
-/// quarantined VM with a Running or Paused intent stays exactly where it is,
-/// pass after pass, for every observation the world can present.
+/// Without an operation or an explicit maintenance intent, an unhealthy
+/// record remains quarantined for every observation in this test space.
 #[test]
 fn quarantine_is_a_fixpoint_for_every_observation() {
     walk(|cell| {
@@ -185,12 +157,7 @@ fn quarantine_is_a_fixpoint_for_every_observation() {
     });
 }
 
-/// The structural half of quarantine, and the reason the marker is persisted
-/// rather than recomputed: `plan` never reads `backends_alive`. Backend
-/// liveness reaches the decision only through the `unhealthy` field the pass
-/// writes to the store first — so an agent restart cannot silently un-
-/// quarantine a VM by observing a world in which the backend is simply
-/// absent rather than newly dead.
+/// Backend liveness affects planning only through the persisted unhealthy marker.
 #[test]
 fn backend_liveness_reaches_plan_only_through_the_persisted_marker() {
     walk(|cell| {
@@ -205,11 +172,7 @@ fn backend_liveness_reaches_plan_only_through_the_persisted_marker() {
     });
 }
 
-/// The narrowness of the new axis, stated the way `backends_alive`'s is:
-/// a reception that will not finish decides ONE thing, and only where a
-/// reception is what the record is doing. Everywhere else the bit is inert —
-/// which is what lets the destination's give-back sit inside the migration
-/// gate without a single repair path learning about it.
+/// Receive failure affects planning only within the Receiving phase.
 #[test]
 fn a_failed_reception_decides_nothing_outside_the_receiving_phase() {
     walk(|cell| {
@@ -227,18 +190,9 @@ fn a_failed_reception_decides_nothing_outside_the_receiving_phase() {
     });
 }
 
-/// And inside it, the one thing it decides is a give-back — never a repair.
-/// A destination that is holding a VMM for a guest another machine is
-/// running must not be talked into starting it.
-///
-/// The one thing that outranks it is the guest being HERE, and the order is
-/// deliberate rather than incidental. The two cannot both be true of one
-/// reception — v53 writes `migration-receive-finished` or
-/// `migration-receive-failed` and never both — but the space contains the
-/// pair anyway, and the answer to it has to be the safe one: a running guest
-/// on this node is this node's, and tearing down a live VMM on the strength
-/// of a stale line in a file is the one mistake worse than the leak this
-/// whole path exists to end.
+/// Within the receive branch, failure selects teardown unless Running
+/// already establishes arrival. Prefer observed arrival even with a stale
+/// failure bit; higher-priority operation and maintenance guards still apply.
 #[test]
 fn a_failed_reception_only_ever_gives_back() {
     let mut seen = false;
@@ -246,11 +200,8 @@ fn a_failed_reception_only_ever_gives_back() {
         if cell.record.phase != Phase::Receiving || !cell.obs.receive_failed {
             return;
         }
-        // Only where the gate is reached at all. Everything above it is
-        // somebody STATING what should happen to this record — an operation
-        // holding it, a destroy, a stop, a quarantine to be looked at — and
-        // a reception that failed does not outrank any of those, which is
-        // the same placement the arrival has and is argued at the gate.
+        // Operation ownership, explicit lifecycle intent and quarantine take
+        // precedence over the failed-receive branch.
         let action = plan(&cell.record, &cell.obs, cell.now);
         if cell.record.operation.is_some()
             || cell.record.unhealthy.is_some()
@@ -291,10 +242,7 @@ fn a_failed_reception_only_ever_gives_back() {
 // 3. Desired::Absent never provisions
 // ---------------------------------------------------------------------------
 
-/// A VM on its way out is never built up again, whatever the world looks
-/// like: not re-provisioned, not started, not adopted, not resumed. The only
-/// thing that may still happen to it is the teardown itself — or nothing,
-/// while an operation owns it.
+/// Absent intent permits only teardown or waiting for an active operation.
 #[test]
 fn absent_never_builds_anything_up() {
     walk(|cell| {
@@ -310,10 +258,8 @@ fn absent_never_builds_anything_up() {
     });
 }
 
-/// And it gets there from anywhere in one pass. Stating Absent is the
-/// strongest intent there is: it outranks the quarantine gate, every phase,
-/// and every observation — only an in-flight operation may delay it, and that
-/// one is cleared on the next startup pass.
+/// Absent selects teardown once no operation owns the record.
+/// Unresolved migration operations can retain ownership across agent restarts.
 #[test]
 fn absent_reaches_teardown_from_every_state_in_one_pass() {
     walk(|cell| {
@@ -365,16 +311,9 @@ fn every_operation_variant_blocks() {
 // 4. An expired stop deadline forces the vmm down in finitely many steps
 // ---------------------------------------------------------------------------
 
-/// What the executor promises each action does to the world, coarse enough to
-/// be readable and no coarser. This is a MODEL, not the executor: it encodes
-/// the post-conditions `Reconciler::execute` and `Provisioner::stop` are
-/// written to guarantee, and if one of them ever stops guaranteeing them this
-/// model is what has gone stale. Kept to the one branch this property needs —
-/// desired = Stopped — so there is little of it to go stale.
-///
-/// The guest is modelled as uncooperative on purpose: it never acts on the
-/// power button. That is precisely the case the deadline exists for, and a
-/// guest that shuts down politely would make the property vacuous.
+/// Model successful Stop and an ignored power-button request.
+/// This assumes teardown effects succeed; executor error paths require
+/// separate tests and are not proven by this model.
 fn step(record: &mut VmRecord, obs: &mut Observed, action: Action) {
     match action {
         // provisioner::stop: destroy the vmm (kill it if it survives),
@@ -398,11 +337,8 @@ fn step(record: &mut VmRecord, obs: &mut Observed, action: Action) {
     }
 }
 
-/// Every starting point with a Stopped intent, driven with the clock past any
-/// deadline: the pass converges within a bounded number of steps, the vmm is
-/// down when it does, and `Stop` ran exactly where there was something to
-/// stop — no more (a second stop on every pass, forever) and no less (device
-/// backends left running under a vmm that already exited).
+/// Under the successful-stop model, every unblocked Stopped state converges
+/// with the VMM down and at most one Stop action.
 #[test]
 fn an_expired_deadline_brings_the_vmm_down_in_a_bounded_number_of_steps() {
     let mut worst = 0usize;
@@ -417,9 +353,8 @@ fn an_expired_deadline_brings_the_vmm_down_in_a_bounded_number_of_steps() {
         // all and the hard stop is immediate.
         let now = base_now() + Duration::from_secs(3600);
 
-        // What there is to clean up, decided before the first pass: a live
-        // vmm, or a dead one whose Stop path never ran (`vmm_pid` is what
-        // that path clears, and only a provisioned record ever had one).
+        // Cleanup is needed for a live VMM or a provisioned record whose PID
+        // remains after its VMM died.
         let had_work = cell.obs.vmm_alive
             || (cell.record.phase == Phase::Provisioned && cell.record.vmm_pid.is_some());
 
@@ -456,9 +391,7 @@ fn an_expired_deadline_brings_the_vmm_down_in_a_bounded_number_of_steps() {
             describe(cell)
         );
         if stops > 0 {
-            // Stop's own post-conditions: the pid it clears is what keeps the
-            // next pass from stopping the same VM again, and the grace it
-            // disarms has nothing left to wait for.
+            // Successful modeled Stop clears the PID and deadline to prevent repeated stopping.
             assert!(record.vmm_pid.is_none(), "stop left a pid behind");
             assert_eq!(record.stop_deadline, None, "stop left the grace armed");
         }
@@ -476,10 +409,7 @@ fn an_expired_deadline_brings_the_vmm_down_in_a_bounded_number_of_steps() {
     assert_eq!(worst, 1, "the stop path grew a step");
 }
 
-/// The escalation itself, which the test above skips past by starting with
-/// the clock already expired: a guest that ignores the power button is asked
-/// once, and once the grace runs out it is stopped whether it likes it or
-/// not. The deadline is what makes "ask nicely" terminate.
+/// Request guest shutdown once, then select Stop when the grace period expires.
 #[test]
 fn an_ignored_power_button_escalates_when_the_grace_runs_out() {
     let armed = base_now() + Duration::from_secs(30);
@@ -521,10 +451,8 @@ fn an_ignored_power_button_escalates_when_the_grace_runs_out() {
     assert!(!obs.vmm_alive);
 }
 
-/// The grace can only ever run out, never be pushed back: `plan` reads the
-/// deadline, it never writes one, so no number of passes inside the grace can
-/// extend it. (`next_stop_deadline` is the other half of that guarantee and
-/// is tested in reconcile.rs.)
+/// Repeated planning cannot extend the stop deadline. `next_stop_deadline`
+/// separately checks how lifecycle requests update it.
 #[test]
 fn passes_inside_the_grace_cannot_postpone_it() {
     let armed = base_now() + Duration::from_secs(30);
@@ -575,11 +503,7 @@ fn a_vm_that_never_came_up_is_not_stopped_posthumously() {
     }
 }
 
-/// The convergence guarantee the whole level-triggered design rests on,
-/// stated over the space: from any cell, `plan` either says None already or
-/// names an action, and the actions a Stopped intent can name are exactly the
-/// two the model knows how to apply. Nothing else can appear there — which is
-/// what makes the model above a complete one rather than a hopeful one.
+/// Unblocked Stopped states select only actions handled by this model.
 #[test]
 fn a_stopped_intent_only_ever_names_stop_signal_or_nothing() {
     let mut seen: Vec<&'static str> = Vec::new();
@@ -608,20 +532,9 @@ fn a_stopped_intent_only_ever_names_stop_signal_or_nothing() {
 // 5. No phase leaves this node mute
 // ---------------------------------------------------------------------------
 
-/// Every phase this node reports carries a reason, except the three that
-/// explain themselves.
-///
-/// The invariant of the reasons round, on the whole space rather than on the
-/// handful of cases somebody thought of: `Running`, `Stopped` and `Paused` are
-/// states nobody has to act on, and every other phase is a state somebody
-/// does — a `Provisioning` that does not say whether a pass is working or a
-/// backoff is waiting, a `Failed` that does not say what broke and a
-/// `Quarantined` that carries its reason in prose only were the three lines
-/// an operator could read and still not know what to do.
-///
-/// The two backoff dimensions are swept with the space: `failures` decides
-/// between `Working` and `Backoff` and `last_error` decides whether the
-/// sentence can be written, and a report may not fall mute on either.
+/// Each nonsettled reported phase has a reason across the representative
+/// space, failure counts and last-error values. Running, Stopped and Paused
+/// omit reasons.
 #[test]
 fn no_reported_phase_but_a_settled_one_leaves_this_node_without_a_reason() {
     let mut settled = 0usize;
@@ -657,17 +570,9 @@ fn no_reported_phase_but_a_settled_one_leaves_this_node_without_a_reason() {
     });
     assert_eq!(seen, SPACE_SIZE);
     assert!(settled > 0 && explained > 0, "{settled} / {explained}");
-    // And the words that actually occur over the whole space. A reason that
-    // no input can produce is a reason nobody has to read, so the list is
-    // written down rather than counted.
-    //
-    // Two of `VmReason`'s nine are missing here and both for the same
-    // reason: the space carries ONE quarantine marker (`space::all_unhealthy`)
-    // and it is not either of the two constants, so every quarantine in here
-    // is `Unrecorded` — which is itself worth having asserted, because it is
-    // what a record from another build of this agent looks like.
-    // `BackendGone` and `ResumeIneffective` are covered where the constants
-    // are, in `reconcile::tests`. Any OTHER absence here is a word to strike.
+    // Pin the reasons reachable in this input space. Its generic quarantine
+    // marker produces Unrecorded; BackendGone and ResumeIneffective are covered
+    // with their specific markers in `reconcile::tests`.
     words.sort_unstable();
     assert_eq!(
         words,

@@ -6,26 +6,15 @@ use agent_api::{CgroupHandle, ConfinerResult, ResourceConfiner, ResourceLimits};
 use std::path::{Path, PathBuf};
 use tracing::{debug, instrument, warn};
 
-/// The subgroup this process moves itself into when `cgroup_root` is its own
-/// delegated subtree. systemd's own name for it — `CGROUP_DELEGATION.md`
-/// names the pair `supervisor/` and `payload-xyz/` — and the same string
-/// `nix/agent.nix` passes to `DelegateSubgroup=`, so that the two ways of
-/// getting there end in one directory and not in two.
+/// Supervisor subgroup for an agent located at its delegated root.
+/// The name matches `DelegateSubgroup=` in `nix/agent.nix`.
 pub const SUPERVISOR: &str = "supervisor";
 
 /// This driver only supports Linux cgroups_v2
 pub struct CgroupV2 {
     root: PathBuf,
-    /// This process's OWN cgroup, absolute, or `None` when it could not be
-    /// read.
-    ///
-    /// It is what tells a delegated subtree from the mount root: an agent
-    /// whose own cgroup IS `root`, or lies under it, was handed that subtree
-    /// by `Delegate=` in its unit, and everything above it belongs to
-    /// systemd. An agent running as root with
-    /// `cgroup_root = /sys/fs/cgroup/meisterstack` sits in
-    /// `system.slice/meister-agent.service`, which is neither — and for it
-    /// nothing in this file changes.
+    /// This process's absolute cgroup, if readable. It defines the delegation
+    /// boundary above which controller setup must not write.
     own: Option<PathBuf>,
 }
 
@@ -44,43 +33,17 @@ impl CgroupV2 {
         self
     }
 
-    /// Is `dir` at or above this process's own cgroup — a delegation root
-    /// whose parent is not ours to write?
-    ///
-    /// Asked of `dir` and not of `self.root`, because `create_slice` climbs
-    /// from whatever parent it was handed: a nested slice UNDER the root is
-    /// inside the delegated subtree and the climb out of it lands inside it
-    /// too. The one climb that crosses the boundary is the one out of the
-    /// root itself.
+    /// Whether climbing above `dir` would leave this process's delegated subtree.
+    /// Check the current parent, since nested slices may still climb within it.
     fn hands_off_above(&self, dir: &Path) -> bool {
         self.own
             .as_ref()
             .is_some_and(|own| own == dir || own.starts_with(dir))
     }
 
-    /// Move this process into `<root>/supervisor`, so that the root's own
-    /// `cgroup.subtree_control` can be written at all.
-    ///
-    /// cgroup v2 forbids processes in an inner node, and the price is not a
-    /// formality. Measured on this machine (2026-09-16, kernel 7.2.4, in a
-    /// `systemd-run --user -p Delegate=yes --scope`): `+memory` on the
-    /// scope's own `cgroup.subtree_control` while the scope still holds
-    /// processes is **EBUSY**, and until that write succeeds a child has no
-    /// `memory.max` FILE at all — whereupon cgroupfs answers the write with
-    /// **EACCES**, not ENOENT, because a name it does not know cannot be
-    /// created. That is the whole of the report's unexplained finding 5: not
-    /// a permission that was missing, a file that was not there.
-    ///
-    /// Three cases, and only the first one does anything:
-    ///
-    /// * own cgroup IS the root — an agent under `Delegate=` without
-    ///   `DelegateSubgroup=`. It moves, and the caller says so.
-    /// * own cgroup is already BELOW the root — `DelegateSubgroup=supervisor`
-    ///   (systemd 254+) did it, or a test rig did. Nothing to do, and a
-    ///   second subgroup would only be a second place to look.
-    /// * own cgroup is somewhere else entirely — the agent as root with
-    ///   `cgroup_root = /sys/fs/cgroup/meisterstack`. Not its subtree and
-    ///   not its business.
+    /// Move the agent into `<root>/supervisor` when it occupies the root itself.
+    /// This leaves the parent free of processes so cgroup v2 can enable controllers.
+    /// Do nothing when the agent is already below the root or outside it.
     pub fn join_supervisor_subgroup(&mut self) -> std::io::Result<Option<PathBuf>> {
         let Some(own) = self.own.clone() else {
             return Ok(None);
@@ -90,22 +53,15 @@ impl CgroupV2 {
         }
         let sup = self.root.join(SUPERVISOR);
         std::fs::create_dir_all(&sup)?;
-        // The whole process and not one thread: writing a pid into
-        // `cgroup.procs` migrates every thread of it, which is what makes
-        // this safe to do after the runtime has started.
+        // Writing cgroup.procs moves the whole process, including runtime threads.
         std::fs::write(sup.join("cgroup.procs"), std::process::id().to_string())?;
         self.own = Some(sup.clone());
         Ok(Some(sup))
     }
 }
 
-/// This process's cgroup as an absolute path, from `/proc/self/cgroup` and
-/// the cgroup2 mount it is relative to.
-///
-/// `None` on anything unexpected — no unified line, no cgroup2 mount — and
-/// `None` means "claim no delegated subtree", so an unreadable `/proc`
-/// leaves the behaviour this driver has always had rather than guessing at a
-/// new one.
+/// Resolve this process's cgroup using procfs and the cgroup2 mount.
+/// Return None on unreadable or unexpected input, claiming no delegation boundary.
 fn own_cgroup() -> Option<PathBuf> {
     let relative = std::fs::read_to_string("/proc/self/cgroup")
         .ok()?
@@ -115,10 +71,7 @@ fn own_cgroup() -> Option<PathBuf> {
     Some(mount.join(relative.trim().trim_start_matches('/')))
 }
 
-/// Where cgroup2 is mounted. Read and not assumed: `/sys/fs/cgroup` is a
-/// convention, and libvirt says the same thing of itself ("Libvirt will
-/// never attempt to mount any controllers itself, merely detect where they
-/// are mounted").
+/// Discover the existing cgroup2 mount rather than assuming `/sys/fs/cgroup`.
 fn cgroup2_mount() -> Option<PathBuf> {
     let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
     mounts.lines().find_map(|line| {
@@ -145,19 +98,8 @@ impl ResourceConfiner for CgroupV2 {
             .unwrap_or_else(|| self.root.clone());
         std::fs::create_dir_all(&parent_dir).map_err(at(parent_dir.clone()))?;
 
-        // Enabling a controller that the PARENT does not delegate is ENOENT
-        // in cgroup v2 — and right after boot systemd has not filled the
-        // mount root's subtree_control yet (hit on the lab's NixOS agent
-        // VMs: the first create per boot failed, later ones worked). Make
-        // the delegation explicit instead of racing systemd.
-        //
-        // NOT above a delegation root. This one write is the whole of what
-        // an unprivileged agent cannot do: `/sys/fs/cgroup` is not writable
-        // for anybody but root, and the parent of a `Delegate=` unit's
-        // cgroup belongs to systemd — so the climb is EACCES there, and an
-        // EACCES here would mean no VM on such a node could be confined at
-        // all. Inside the handed subtree nothing is missing that this write
-        // could add: what `Delegate=` did not hand over cannot be taken.
+        // Enable missing CPU and memory controllers in the parent when permitted.
+        // Never write above the agent's own delegated subtree.
         let controllers = parent_dir.join("cgroup.controllers");
         let have = std::fs::read_to_string(&controllers).unwrap_or_default();
         let missing = !have.contains("cpu") || !have.contains("memory");
@@ -173,12 +115,7 @@ impl ResourceConfiner for CgroupV2 {
 
         let subtree = parent_dir.join("cgroup.subtree_control");
         std::fs::write(&subtree, "+cpu +memory").map_err(|source| {
-            // The same ENOENT, two causes, and only one of them is something
-            // an operator can act on (the reference study asked for the
-            // distinction, and the measurement of finding 5 is where the
-            // second sentence comes from). Said HERE rather than left to a
-            // bare errno, because this is the one call that knows which of
-            // the two it is looking at.
+            // Report missing delegated controllers separately from a missing cgroup root.
             if missing && self.hands_off_above(&parent_dir) {
                 ConfinerError::Io(std::io::Error::other(format!(
                     "{}: the cpu and memory controllers were never delegated to this agent \
@@ -193,27 +130,11 @@ impl ResourceConfiner for CgroupV2 {
             }
         })?;
 
-        // The CPU pinning is a property of this AGENT, not of one VM, so it
-        // goes on the parent slice: in cgroup v2 a child whose `cpuset.cpus`
-        // is empty runs on whatever its parent's effective set is, which is
-        // exactly the inheritance wanted here. Written on every create rather
-        // than once at start-up because create is the only call that knows
-        // the parent directory exists — and writing the same value again is
-        // what "level-triggered" means everywhere else in this stack.
-        //
-        // `cpuset` has to be delegated from a tier further up before it can
-        // be set here, and it is delegated separately from cpu and memory
-        // (systemd hands out what it was asked for). Best effort in both
-        // places: a host whose root cgroup does not offer cpuset at all is a
-        // host where the pinning cannot work, and refusing to start a VM over
-        // it would turn a lost optimisation into an outage.
+        // Apply the configured CPU set to the parent so VM slices inherit it.
+        // Pinning is best effort: missing cpuset delegation is logged and does not
+        // prevent VM creation. Repeat the write whenever the parent is prepared.
         if let Some(cpus) = &limits.cpuset {
-            // And the same boundary as above: a delegated subtree is not
-            // climbed out of. A `user@.service` never carries cpuset at all
-            // (measured: `user.slice` offers it, `user@1000.service` does
-            // not), which is why the agent's unit is a SYSTEM unit — and
-            // there `Delegate=cpuset` is what puts it in reach, not a write
-            // one tier up.
+            // Respect the same delegation boundary when enabling cpuset.
             if !self.hands_off_above(&parent_dir)
                 && let Some(grandparent) = parent_dir.parent()
             {
@@ -289,9 +210,7 @@ impl ResourceConfiner for CgroupV2 {
         }
     }
 
-    /// The configured `cgroup_root`. This driver is the one that writes
-    /// `cgroup.subtree_control` and `cgroup.kill` into it, so it is the one
-    /// that can say where "it" is.
+    /// Configured root for controller enablement and slice creation.
     fn root(&self) -> Option<&std::path::Path> {
         Some(&self.root)
     }
@@ -302,14 +221,9 @@ mod tests {
     use super::*;
     use agent_api::ResourceLimits;
 
-    /// A directory tree that stands in for cgroupfs: the two pseudo-files
-    /// this driver reads and writes, and a parent above the root so that a
-    /// climb over the boundary would leave a trace.
-    ///
-    /// An ordinary filesystem cannot reproduce the KERNEL's answers (a write
-    /// to `cgroup.subtree_control` here always succeeds, where the real one
-    /// is EBUSY while processes sit in the cgroup). What it reproduces is the
-    /// only thing these tests are about: WHICH file this driver writes.
+    /// Directory fixture with pseudo-file stand-ins and a parent above the root.
+    /// It checks which paths receive writes, not kernel cgroup semantics such as
+    /// EBUSY when enabling controllers in an occupied cgroup.
     fn fake_cgroupfs(controllers: &str) -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().expect("a temp dir");
         let above = temp.path().join("above");
@@ -444,14 +358,8 @@ mod tests {
         assert!(!root.join(SUPERVISOR).exists());
     }
 
-    /// The two causes of one errno, told apart.
-    ///
-    /// The failing write is forced by putting a DIRECTORY where
-    /// `cgroup.subtree_control` belongs, because an ordinary filesystem has
-    /// no way to answer a write the way the kernel does. What is under test
-    /// is the sentence, and the sentence is the whole point of the branch:
-    /// "never delegated" is something an operator fixes in the unit, the
-    /// boot-time race is something that fixes itself.
+    /// Force a failed subtree-control write and verify that missing delegation
+    /// is reported separately from the root-agent controller setup path.
     #[test]
     fn a_controller_that_was_never_delegated_says_so() {
         let (_temp, root) = fake_cgroupfs("memory pids");

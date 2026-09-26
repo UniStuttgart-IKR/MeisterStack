@@ -2,17 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The router half of the pass: plan, carry down, write back.
-//!
-//! Level-triggered like every other loop here — the plan is derived from the
-//! stored objects every time and the same plan twice is one router — and
-//! leaderless like every other loop here, which is the interesting half. A VM
-//! is about ONE machine, so the replica holding that machine's session owns
-//! it and the others leave it alone (`may_reconcile`). A router is
-//! deliberately about SEVERAL: it is built on its whole priority list, and
-//! the failover that decision 7 asks for has to survive the loss of exactly
-//! the machine an ownership rule would have hung it on. So the rule is looser
-//! here and the store arbitrates — see `may_reconcile_router`.
+//! Derive router plans from stored intent and dispatch them across gateway nodes.
+//! Routers span several node sessions, so VM-style single-node ownership cannot
+//! cover failover. `may_reconcile_router` and store arbitration coordinate replicas.
 
 use super::*;
 
@@ -116,38 +108,11 @@ pub(crate) fn plan_router(
         ));
     }
     let active = network::active_node(&nodes, &fit).map(str::to_string);
-    // Whatever held it, is not on the list any more, and can be told so.
-    //
-    // The reachability half is the important one and it is not an
-    // optimisation. A node that fell off the list because it is DOWN still
-    // has the netns and is very probably still forwarding; tearing it down is
-    // neither possible (there is nobody to tell) nor right (it may be the
-    // machine that comes back and takes the router again). A node that is up
-    // and dropped out — cordoned, unhealthy, or simply beaten by a better
-    // candidate — is one this cluster can and should tidy up.
-    //
-    // `alive` and not `connected`, for the reason the whole router path uses
-    // it: whose session a machine hangs off is not a fact about the fleet,
-    // and the commands go through `Dispatch`, which forwards to the replica
-    // holding it. With `connected` the release was silently skipped whenever
-    // the machine belonged to a sibling — which on a three-replica cluster is
-    // most of the time — and then nothing ever told it, because the very same
-    // pass takes the machine off `status.nodes` and the next pass computes
-    // this list out of the list it just shortened.
-    //
-    // `alive` on its own and not `is_alive`: the question here is whether
-    // anybody can be TOLD, not whether the machine is a candidate. A cordoned
-    // or wedged machine is exactly one that dropped off the list, and it is
-    // the one that most needs to hear about it.
-    //
-    // `status.releasing` beside `status.nodes` is the half that was missing,
-    // and it is the one the lab found. A machine that fell off the list while
-    // it was DOWN is not in this list — there is nobody to tell — and the very
-    // same pass takes it off `status.nodes`, so the next pass derives this out
-    // of the list it just shortened and the machine is never told AT ALL. It
-    // comes back with the whole namespace, answering for an address another
-    // node now carries. `status.releasing` remembers the debt; this is where
-    // it is paid, the first pass the machine is reachable again.
+    // Release nodes excluded from the new plan when they are reachable anywhere
+    // in the cluster. Dispatch forwards through sibling-held sessions.
+    // Use `alive`, not scheduling eligibility: cordoned or unhealthy nodes still
+    // need teardown commands. Persist unreachable cleanup in `status.releasing`
+    // so it is retried after the node returns, even after `status.nodes` changes.
     let release: Vec<String> = owed(router)
         .filter(|n| !nodes.contains(n))
         .filter(|n| candidates.iter().any(|c| c.name == **n && c.alive))
@@ -516,15 +481,8 @@ struct Placement<'a> {
     releasing: &'a [String],
 }
 
-/// The cluster's own sink: one `EnsureRouter` or `DestroyRouter` to one node,
-/// wherever in this cluster the session happens to be.
-///
-/// Through `Dispatch` and not through the local session registry, and that is
-/// the same defect one object over that rollout 59 found in the migration
-/// reconciler (D-P2): a router is built on TWO machines whose sessions may
-/// hang off two different replicas, so a reconciler asking its own registry
-/// would build the half it can reach and call the other half unreachable —
-/// on a three-replica cluster, most of the time.
+/// Dispatch router ensure and destroy commands through the session-owning replica.
+/// A router's gateway nodes can be split across several replica registries.
 #[async_trait::async_trait]
 impl RouterSink for crate::dispatch::Dispatch {
     async fn ensure(&self, node: &str, router: proto::EnsureRouter) -> anyhow::Result<()> {

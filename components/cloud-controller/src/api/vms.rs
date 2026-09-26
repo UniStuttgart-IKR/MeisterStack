@@ -8,10 +8,8 @@ use super::*;
 
 // --- vms -------------------------------------------------------------------
 
-/// Every base_image a VM spec names. A volume without one is a blank disk and
-/// references nothing. The boot source resolves against the same node-local
-/// directory but is deliberately not catalogued in v1 — the check covers disk
-/// base images, which is what the design put in the catalogue.
+/// Collect nonempty disk base-image names. Boot sources are resolved separately
+/// and are not image-catalogue references.
 pub(super) fn base_images(vm: &serde_json::Value) -> BTreeSet<String> {
     vm.get("volumes")
         .and_then(|v| v.as_array())
@@ -34,10 +32,8 @@ pub(super) fn check_vm_shape(vm: &serde_json::Value) -> Result<(), ApiError> {
     // function both tiers call rather than two that could drift.
     let as_spec: controller_api::VmSpec = serde_json::from_value(serde_json::json!({ "vm": vm }))
         .unwrap_or_else(|_| {
-            // Unreachable in practice: `vm` is already a Value and every
-            // other field of VmSpec defaults. A malformed one falls through
-            // to the checks below, which is where "is this a VM at all" is
-            // answered anyway.
+            // The VM value and defaulted envelope fields normally deserialize directly.
+            // The empty fallback leaves reference validation with no entries.
             serde_json::from_value(serde_json::json!({ "vm": {} })).expect("an empty spec")
         });
     if let Some(field) = as_spec.malformed_volume_reference() {
@@ -52,19 +48,9 @@ pub(super) fn check_vm_shape(vm: &serde_json::Value) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Fields on a NIC that the control plane owns, refused when a client sends
-/// them.
-///
-/// A tenancy boundary rather than tidiness. `vxlan_id` comes from the VM's
-/// tenant, `floating_ips` and `routed_subnets` from what that tenant was
-/// allocated — and all three injectors deliberately leave a NIC alone that
-/// already carries the field, because a cluster with no cloud above it has to
-/// be able to say these things in the spec itself. At THIS edge the spec is a
-/// member's POST body, so that same skip would let one write another tenant's
-/// VNI into its own NIC and land on their overlay, or name an allowlist wide
-/// enough to source from anywhere (the tap rules are built from these lists).
-/// Nobody needs to set them here: the cloud resolves all three from the
-/// tenant, and refusing is the difference between a rule and a suggestion.
+/// Reject client-supplied VNI and address allowlists at the cloud boundary.
+/// Lower tiers preserve explicit values for standalone operation; accepting them
+/// here would let tenants select another overlay or expand their source allowlist.
 pub(super) fn check_owned_nic_fields(vm: &serde_json::Value) -> Result<(), ApiError> {
     let nics = vm
         .get("nics")
@@ -88,31 +74,13 @@ pub(super) fn check_owned_nic_fields(vm: &serde_json::Value) -> Result<(), ApiEr
     Ok(())
 }
 
-/// Every `Volume` this VM refers to has to exist, be this tenant's, and be
-/// free — asked at the cloud's edge, where a person is still holding the
-/// request.
+/// Validate referenced secrets and volumes within the VM's tenant.
+/// Missing or cross-tenant references return 404 to conceal other tenants' names.
+/// Deleting volumes and volumes held by another VM return 409. A missing secret
+/// key returns 422; a volume that is not Ready yet is accepted.
 ///
-/// The same three words `check_volume_refs` says one tier down, and
-/// deliberately the same function name: a member who names a volume at the
-/// cloud and a member who names one at the cluster are asking the same
-/// question, and two different answers to it would be two different products.
-///
-///   * **404** for a volume in another tenant, and NOT 403. A 403 would
-///     confirm that a volume of that name exists somewhere, which is exactly
-///     what a caller poking at names is trying to find out.
-///   * **409** for one somebody else is already holding, and for one that is
-///     being deleted. `AccessMode` has one variant and it means one consumer.
-///   * nothing at all for a volume that is merely not `Ready` yet. That is
-///     not a refusal — the disk is being made — and the VM waits as Pending
-///     with `VolumeNotReady` on it, put there by `servable_clusters` in the
-///     reconciler. The cloud does not hold a request open for bytes.
-///
-/// The fourth refusal the cluster makes — a node-local disk on a machine this
-/// VM is not running on — has no counterpart here on purpose: this tier never
-/// names a node. Which CLUSTER can serve the volumes is the same question one
-/// scope wider, and `servable_clusters` answers it as placement rather than
-/// as a refusal, because at the cloud a volume on another cluster is a
-/// placement that does not exist yet rather than a request that is wrong.
+/// Volume readiness and cluster reachability constrain placement in
+/// `servable_clusters`; this tier does not select a node.
 pub(super) async fn check_volume_refs(
     st: &ApiState,
     tenant: Option<&str>,
@@ -137,11 +105,8 @@ pub(super) async fn check_volume_refs(
         if !controller_api::same_tenancy(&object.spec.tenant, tenant) {
             return Err(unknown());
         }
-        // The KEY is checked here too, where a person is still holding the
-        // request. It is not a security boundary — the cluster checks it
-        // again at dispatch, and that is the one that cannot be bypassed —
-        // it is the difference between a 422 now and a VM that sits Pending
-        // until somebody reads its message.
+        // Reject missing keys at admission for immediate feedback. Dispatch resolves
+        // the secret again before sending it to a node.
         if !object.spec.data.contains_key(&key) {
             return Err(controller_api::invalid_field(
                 "spec.vm.cloud_init.user_data_from.key",
@@ -188,10 +153,7 @@ pub(super) async fn check_volume_refs(
     Ok(())
 }
 
-/// Everything the cloud can decide about a VM spec on its own — run from POST
-/// and from PUT both. A document that is only checked on the way in is a
-/// document that gets edited afterwards, and it is the edited one that
-/// travels down to the agent.
+/// Validate VM shape and cloud-owned fields on both create and update.
 pub(super) async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result<(), ApiError> {
     check_no_node_name(spec)?;
     if !spec.vm.is_object() {
@@ -202,11 +164,7 @@ pub(super) async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result
             "spec.vm.desired is controller-owned; use spec.runStrategy",
         ));
     }
-    // The node's own create document, deserialised HERE — synchronously,
-    // where the caller is still listening. Before this the cloud answered 201
-    // to any shape and the node said `missing field "boot"` into a status
-    // field some seconds later. First, because a document that is not one
-    // makes every check below it meaningless.
+    // Validate the agent document before checking its cloud-specific constraints.
     controller_api::vm_spec::check(&spec.vm)?;
     check_vm_shape(&spec.vm)?;
     check_owned_nic_fields(&spec.vm)?;
@@ -217,13 +175,8 @@ pub(super) async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result
             "user_data and user_data_from are two starting points; name one",
         ));
     }
-    // The seed's hostname is the control plane's: it comes from the object's
-    // own name one tier down, and a client that could set it would be a
-    // client whose VM calls itself something the API never agreed to.
-    // Everything else in the block — user_data above all — is the client's,
-    // untouched and unread: what is valid cloud-init is cloud-init's
-    // question, and a control plane that validated it would be one that
-    // rejects next year's syntax.
+    // The cluster derives local_hostname from the VM name. Other cloud-init
+    // content remains client-supplied and is interpreted by cloud-init.
     if spec
         .vm
         .get("cloud_init")
@@ -241,17 +194,8 @@ pub(super) async fn validate_vm_spec(store: &EtcdStore, spec: &VmSpec) -> Result
     Ok(())
 }
 
-/// That base image is registered here and is usable.
-///
-/// One function because there are two callers now — a VM's embedded volumes
-/// and a `Volume` object — and two copies of "is this image usable" would be
-/// two answers to give a tenant about the same image.
-///
-/// A Failed image is one a node has already tried and could not use: a
-/// checksum that did not match, a url that did not answer. Refusing here is
-/// the whole point of the phase — the alternative is an object that is
-/// accepted, placed, and then fails at provision on every node it is offered
-/// to.
+/// Require a registered image whose phase is not Failed.
+/// Shared by inline VM disks and Volume objects; readiness is resolved later.
 pub(super) async fn check_base_image(store: &EtcdStore, name: &str) -> Result<(), ApiError> {
     match store.get::<Image>(name).await {
         Ok(image) if image.status.phase().kind() == controller_api::ImagePhaseKind::Failed => {
@@ -267,25 +211,12 @@ pub(super) async fn check_base_image(store: &EtcdStore, name: &str) -> Result<()
     }
 }
 
-/// That this caller may use that base image at all: the read rule `get_image`
-/// applies, asked again where the image is USED.
+/// Require image read permission before exposing its existence or failure state.
+/// Using an image copies its bytes into a tenant-readable disk, so it needs the
+/// same permission as GET. Missing and inaccessible images receive the same error.
 ///
-/// Naming an image in a disk is a way of reading it — its bytes end up on a
-/// disk the naming tenant can read every one of — so a reference must not
-/// reach further than `GET /images/<name>` does. Found by review: a member
-/// who knew the name of another tenant's private image could boot from it,
-/// because the reference was only asked whether the image exists.
-///
-/// The refusal is the one an unknown name gets, and this is asked BEFORE
-/// `check_base_image`: a caller who may not read an image must not learn from
-/// the answer that it exists, nor what a node said about it when it failed.
-///
-/// At the two create edges and only there — a VM's disks, a volume's seed.
-/// An update cannot name a new base image (the boot entry and every inline
-/// disk are frozen by `VM_OWNED`, `spec.baseImage` by `VOLUME_OWNED`), so what
-/// an update carries was asked about when it was bound, by whoever bound it;
-/// asking the updating caller again would lock a member out of a VM an admin
-/// built for them.
+/// Called at VM and volume creation. Updates cannot change the base image and
+/// must remain possible for an owner whose VM was created by an administrator.
 pub(super) async fn check_image_readable(
     store: &EtcdStore,
     who: &Grant,
@@ -309,29 +240,10 @@ fn unknown_base_image(name: &str) -> ApiError {
     ))
 }
 
-/// Fields on a volume that the control plane owns, refused when a client
-/// sends a value of its OWN.
-///
-/// The same boundary `check_owned_nic_fields` guards, one field-list over.
-/// Where a base image is fetched from and what it must hash to come out of
-/// the Image OBJECT, resolved by the cloud — a client that could write them
-/// into its own spec could point a `base_image` name at bytes of its own
-/// choosing while the catalogue entry everybody else reads says something
-/// different.
-///
-/// **Presence is not the offence; disagreement is.** Refusing the field
-/// outright broke read-modify-write on every VM that has a base image, and a
-/// control plane that will not take back the document it just handed out is
-/// one nobody can edit: a PATCH here is a merge onto the STORED object (see
-/// the `patch!` macro), so `vm stop` on a VM with an Ubuntu image arrived
-/// carrying the very url this cloud wrote into it, and was answered with
-/// "spec.vm.volumes[0].base_image_url is control-plane-owned". Found in the
-/// lab, on the first `vm stop` anybody had run against a cloud VM built from
-/// the catalogue.
-///
-/// So `resolved` is what the catalogue says right now, and a value equal to
-/// it is the client giving the object back unchanged. Anything else is
-/// refused with the sentence it always had.
+/// Reject non-null image source fields that disagree with the current catalogue.
+/// The URL, digest and image UID determine which bytes a node uses and caches.
+/// Matching values are accepted so PUT and merged PATCH requests can round-trip
+/// the fields the cloud injected; clients cannot substitute their own source.
 pub(super) fn check_owned_volume_fields(
     vm: &serde_json::Value,
     resolved: &std::collections::BTreeMap<String, CatalogueSource>,
@@ -362,31 +274,16 @@ pub(super) fn check_owned_volume_fields(
                  from the image catalogue"
             )));
         }
-        // `volume` itself is NOT on this list, and that is the difference
-        // between this function and the tenancy check below it.
-        //
-        // It named a door that was shut: until resolution landed, a spec
-        // naming a `Volume` object would have booted the VM on a fresh blank
-        // disk instead of the tenant's data, so the field was refused
-        // outright. Both tiers under this one resolve the name now
-        // (`check_volume_refs` at the cluster, `servable_clusters` here), and
-        // what the refusal's own comment promised has taken its place: the
-        // volume named has to be one this VM's tenant owns, asked in
-        // `check_volume_refs` where the tenant is known. A client MAY write
-        // this field — it is the whole point of the object.
+        // Clients may name a `volume` reference. `check_volume_refs` checks its
+        // tenant ownership separately, once the VM's tenant is known.
     }
     Ok(())
 }
 
-/// What the catalogue says about every base image this spec names: the url
-/// and the checksum, by image name.
-///
-/// Read twice per request and deliberately: once to hold the client's own
-/// copy of these fields against (`check_owned_volume_fields`) and once to
-/// write them in (`resolve_base_images`). An image nobody registered is
-/// simply absent — `validate_vm_spec` has already refused it by name — and a
-/// path-based image has neither field, so its volume keeps the spec it has
-/// always had.
+/// Read URL, digest and UID for each named catalogue image.
+/// Missing or unreadable images and entries without both URL and digest are
+/// omitted. Validation and injection read independently; these reads are not
+/// an atomic catalogue snapshot.
 pub(super) async fn catalogue_sources(
     store: &EtcdStore,
     vm: &serde_json::Value,
@@ -404,12 +301,7 @@ pub(super) async fn catalogue_sources(
     sources
 }
 
-/// What the catalogue says about one base image, at the moment a VM was
-/// created against it.
-///
-/// A struct and not a tuple since S02 added the third field: two strings that
-/// are both hex and both come from the same object are exactly the pair a
-/// positional type gets swapped in.
+/// Resolved source and registration identity for one catalogue image.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CatalogueSource {
     pub(super) url: String,
@@ -420,16 +312,9 @@ pub(super) struct CatalogueSource {
     pub(super) uid: String,
 }
 
-/// Write the catalogue's answer into the spec: where each base image comes
-/// from, and what it must hash to.
-///
-/// At the create edge and once, so the VM keeps the image it was created
-/// against even if somebody re-registers the name later — which is the same
-/// promise the tenant and the VNI make on this object.
-///
-/// Only for images that HAVE a url. A path-based image gets nothing written
-/// into its volume at all, so its spec is byte for byte the spec it has
-/// always been and the node looks the name up locally exactly as before.
+/// Inject the current catalogue URL, digest and UID for URL-backed images.
+/// Called during create and update; immutable-shape checks constrain updates.
+/// Path images retain local name resolution without injected source fields.
 pub(super) async fn resolve_base_images(
     store: &EtcdStore,
     vm: &mut serde_json::Value,
@@ -461,35 +346,11 @@ pub(super) async fn resolve_base_images(
     Ok(())
 }
 
-/// Would this tenant still be inside its quota afterwards?
-///
-/// Run from POST and from PUT both, and that is the half that gets forgotten:
-/// a PUT that raises an existing VM's vCPUs is the same act as creating one
-/// that size, and a control plane that only guards the create is a control
-/// plane whose quota is a suggestion.
-///
-/// A tenant with no quota costs no listing and no arithmetic, which is what
-/// keeps every create in a fleet that has never set one as cheap as it was —
-/// one read of the fence is all it adds. An unscoped VM (an admin's,
-/// belonging to nobody) has no tenant and therefore no ceiling and no fence;
-/// that is the shape every VM had before M5 and the one an admin still gets
-/// by naming none.
-///
-/// `except` is the VM being changed, taken out of the sum so the caller can
-/// put it back at its new size. `None` on a create.
-///
-/// **The yes comes with the tenant's fence, read before anything else**, and
-/// the caller writes through it (`admission::create_under`). Without it this
-/// was a check-then-act: two creates that each listed before the other wrote
-/// each saw room for one, and the tenant held two (F03). Even a tenant with
-/// no quota goes through its fence — a quota set a moment ago must not meet a
-/// create that was waved through without one and a second that did not see
-/// it.
-///
-/// The listing is guarded the way `delete_image`'s is: `list` drops what it
-/// cannot decode, and a VM not seen is usage not counted — which would let a
-/// tenant past its ceiling by exactly the size of whatever failed to parse.
-/// Refusing to answer beats answering from a list that is not all of them.
+/// Check VM quota and return the tenant fence required by the admission write.
+/// `except` excludes an existing VM so updates count its replacement capacity.
+/// Read the fence before usage to detect concurrent admissions or quota changes.
+/// Even tenants without limits return a fence; unscoped VMs return none.
+/// Reject incomplete VM listings rather than undercounting usage.
 pub(super) async fn check_quota(
     st: &ApiState,
     tenant: Option<&str>,
@@ -515,11 +376,8 @@ pub(super) async fn check_quota(
     let Err(why) = quota::check(&object.spec.quota, tenant, after) else {
         return Ok(Some(fence));
     };
-    // On the TENANT and not on a VM: the VM this was about is being refused
-    // and will not exist, so an event pointing at it would point at nothing.
-    // What an operator wants to see is that this tenant has been hitting its
-    // ceiling — which is exactly what the aggregation on (tenant, reason)
-    // gives, one object with a count rather than one per attempt.
+    // Attach quota events to the tenant so rejected creates have a persistent
+    // subject and repeated failures aggregate by tenant and reason.
     events::record(
         &st.store,
         events::Happening {
@@ -556,10 +414,8 @@ pub(super) async fn list_vms(
     ))
 }
 
-/// The edge is where the trace is decided: continue the caller's if it sent a
-/// readable one, start a new one if it did not. The span is built and given
-/// its parent before it starts — see `telemetry::in_trace` — because a parent
-/// attached from inside the body arrives after the trace id has been minted.
+/// Continue a valid caller trace or create a root. Attach the parent before
+/// entering the span so it determines the trace ID.
 pub(super) async fn create_vm(
     State(st): State<ApiState>,
     caller: Caller,
@@ -605,19 +461,9 @@ pub(super) async fn create_vm_traced(
     }
     validate_vm_spec(&st.store, &body.spec).await?;
 
-    // Whose it is, decided before anything is written: named by the client,
-    // or the member's own. A tenant that does not exist is refused here and
-    // not at the cluster, because a VM bound to a tenant nobody created would
-    // be a VM with a network identifier nobody allocated.
-    //
-    // **Required, and that is D-P10's answer to "one rule or two".** A volume,
-    // a floating address and a secret have each refused a create without a
-    // tenant since they existed; a VM did not, so `vm ls` showed `TENANT -`
-    // beside disks that could not have been made that way. The three are the
-    // rule and the VM was the exception, so the VM moves: whose a thing is,
-    // is decided when it is made, and an object nobody owns is one no member
-    // can ever see and no quota ever counts. A member never meets this — the
-    // server fills their own tenant in — and an admin says `-t`.
+    // Require an existing owner before writing. Confined callers default to their
+    // own tenant; administrators must name one. The tenant supplies the VM's VNI
+    // and quota scope.
     let owner = who
         .tenant_for_create(body.spec.tenant.clone())
         .ok_or_else(|| invalid("spec.tenant must name a tenant"))?;
@@ -707,25 +553,10 @@ pub(super) async fn get_vm(
 /// Boot shape and inline disks are immutable; later referenced disks may change
 /// for hot-plug. A binding may only be cleared through the reschedule guards.
 pub(super) const VM_OWNED: &[Owned] = &[
-    // The row storage B rewrote, and the whole of what it says about
-    // volumes: `spec.vm` is immutable in everything EXCEPT `volumes[]` from
-    // its second entry on, and there only the entries that refer to a
-    // `Volume` object. The projection that says it precisely is
-    // `resources::frozen_vm_shape`, and `check_owned` compares through it —
-    // one row, one enforcement point, so no update handler can forget it.
-    //
-    // It cannot be its own row, and the reason is a tier boundary rather than
-    // an oversight: `spec.vm` is another crate's document (see `VmSpec.vm`),
-    // its schema is not published, and `assert_tables_match_schemas` holds
-    // every path in this table to a field that really exists. So the sentence
-    // rides on the row that already covers it, and the `note` — which storage
-    // A used to announce this change — is gone, because it has happened.
-    //
-    // Adding a referenced entry is the attach and leaving one out is the
-    // detach; hot-plug is the reconcile consequence of that edit rather than
-    // a verb of its own (KubeVirt deprecated `addvolume` in 1.6 for the same
-    // reason). `Volume.status.attachedTo` stays derived either way — a Volume
-    // never grows a `spec.vm`.
+    // `vm_shape_unchanged` freezes boot and inline disks while permitting edits
+    // to referenced disks after the boot entry. Adding or removing a reference
+    // drives hot-plug; `Volume.status.attachedTo` remains derived.
+    // The rule covers `spec.vm` because its nested schema belongs to the agent.
     Owned::structural(
         "spec.vm",
         "is immutable except for spec.vm.volumes[] from the second entry on, and there only for \
@@ -741,16 +572,9 @@ pub(super) const VM_OWNED: &[Owned] = &[
         "spec.tenant",
         "is set by the server; whose a vm is, is decided once",
     ),
-    // Server-owned with ONE exception, the same one the cluster tier's
-    // `spec.nodeName` has and for the same reason: a client may set it to
-    // `null`. That is the reschedule, one tier up — the binding falls, the
-    // old cluster is told to destroy the VM, and the cloud scheduler decides
-    // again over `servable_clusters`.
-    //
-    // The predicate opens only the SHAPE of the edit; whether it is allowed
-    // right now depends on the phase and on what disks hang off the VM, and
-    // neither of those is a property of this field. `check_reschedule` asks
-    // the rest.
+    // Clients may clear the cluster binding but cannot choose a replacement.
+    // This predicate checks edit shape; `check_reschedule` separately checks phase,
+    // holder evidence and whether referenced disks can follow the VM.
     Owned::structural(
         "spec.clusterName",
         "is the scheduler's to set; a client may only clear it, and only on a stopped vm",
@@ -764,17 +588,8 @@ pub(super) const VM_OWNED: &[Owned] = &[
     ),
 ];
 
-/// The `Vm` shape this tier publishes: `spec.nodeName` taken out of it.
-///
-/// One `Vm` type serves both tiers, deliberately — the API form is the same on
-/// both, each writes its own binding and ignores the other's. What that left
-/// behind at THIS tier is a field with no meaning: the cloud places on
-/// CLUSTERS, nothing here ever writes `spec.nodeName`, and `/schemas`
-/// published it anyway. A client read it, believed it, set it, and was
-/// ignored (fremdsicht 2). A shape that does not name a field cannot be
-/// believed in, so this tier does not name it — and `check_no_node_name`
-/// below refuses a body that names it anyway, at both write edges, so the two
-/// statements agree.
+/// Publish the shared VM schema without `spec.nodeName`.
+/// Cloud placement chooses clusters; write validation rejects explicit node names.
 pub(super) fn cloud_vm_schema() -> serde_json::Value {
     let mut schema = controller_api::schema_of::<Vm>();
     if let Some(properties) = schema
@@ -788,11 +603,7 @@ pub(super) fn cloud_vm_schema() -> serde_json::Value {
     schema
 }
 
-/// A field this tier does not have is a field a body may not carry.
-///
-/// A 422 and not a silent drop: the client wrote it down because it meant
-/// something by it, and "the cloud placed your vm somewhere else than you
-/// asked" is the one answer it must never get without hearing about it.
+/// Reject explicit node placement with 422; this tier places on clusters.
 pub(super) fn check_no_node_name(spec: &VmSpec) -> Result<(), ApiError> {
     match spec.node_name.is_some() {
         true => Err(controller_api::invalid_field(
@@ -805,32 +616,8 @@ pub(super) fn check_no_node_name(spec: &VmSpec) -> Result<(), ApiError> {
     }
 }
 
-/// A client may let the CLUSTER binding go, and only on a VM that is standing
-/// still and whose disks can follow it.
-///
-/// The cloud half of catalogue 16's third verb. The two phase conditions are
-/// the cluster tier's, word for word — `runStrategy` is the intent, the phase
-/// is the observation, and a VM that has been told to stop and has not
-/// finished stopping satisfies the first and not the second.
-///
-/// What is new one tier up is the DISKS. A node-local volume is bytes on one
-/// machine of one cluster and no amount of scheduling moves them, so the VM
-/// is pinned and the sentence says by what and where — an operator who reads
-/// "pinned by volume data-1 on node agent-1 in cluster-1" knows both what to
-/// delete and where to look. A pool that names only one cluster pins the same
-/// way for a smaller reason: nobody has said the bytes are reachable from
-/// anywhere else.
-///
-/// A pool whose clusters disagree about what it is made of is refused too,
-/// and that one is worth the extra read: `spec.clusters` is an operator's
-/// claim, and the only evidence against it is what each cluster says about
-/// its own pool of that name.
-/// One referenced disk of a VM, reduced to the four facts that decide
-/// whether it can follow the VM to another cluster.
-///
-/// A value rather than four lookups inside the rule, because the rule is the
-/// part worth testing and the lookups need an etcd. Everything here is read
-/// off objects this tier already owns.
+/// Store-derived facts about one referenced disk used by `reschedule_refusal`.
+/// Keeping reads outside the rule allows phase and storage checks without etcd.
 #[derive(Clone, Debug)]
 pub(super) struct DiskFacts {
     pub volume: String,
@@ -849,36 +636,14 @@ pub(super) struct DiskFacts {
     pub disagreement: Option<(String, String)>,
 }
 
-/// Why this VM may not let its cluster binding go — or `None`, meaning it may.
-///
-/// The cloud half of catalogue 16's third verb, as a pure rule. The two phase
-/// conditions are the cluster tier's, word for word: `runStrategy` is the
-/// intent, the phase is the observation, and a VM that has been told to stop
-/// and has not finished stopping satisfies the first and not the second.
-///
-/// What is new one tier up is the DISKS, and there are three ways one holds a
-/// VM back:
-///
-///   * `node-local` — the bytes are on one machine of one cluster and no
-///     amount of scheduling moves them. The sentence names the volume, the
-///     node and the cluster, because an operator who reads it needs to know
-///     both what to delete and where to look.
-///   * a pool naming ONE cluster — the same pin for a smaller reason: nobody
-///     has said the bytes are reachable from anywhere else, and this tier
-///     does not guess that they are.
-///   * a pool naming two clusters that describe it differently — the claim
-///     `spec.clusters` makes, contradicted by what those clusters actually
-///     report about their own pool of that name.
-///
-/// Ephemeral disks are not here at all, and that is the rule rather than an
-/// omission: an inline entry has no `Volume` object, so it is not a
-/// referenced volume, and it is made fresh at the destination. Instance-store
-/// semantics, the same as one tier down.
+/// Return the reason a VM cannot release its cluster binding.
+/// The shared phase rule requires stopped intent and an allowed reported phase.
+/// Referenced disks must not be node-local, must serve at least two clusters,
+/// and must have no reported backend disagreement between those clusters.
+/// Inline ephemeral disks are recreated at the destination and are not checked.
 pub(super) fn reschedule_refusal(current: &Vm, disks: &[DiskFacts]) -> Option<String> {
-    // The rule, and the sentence, from the one place both tiers read them —
-    // see `controller_api::stopped_enough`. `Failed` and `Unknown` are
-    // stopped enough, which is the whole of D12: the phases a wedged VM is
-    // actually in were the phases the call that would rescue it refused.
+    // The shared rule permits Stopped intent with Failed or Unknown reports;
+    // separate holder checks constrain an Unknown release.
     if !controller_api::stopped_enough(current.spec.run_strategy, current.status.phase().kind()) {
         return Some(controller_api::not_stopped_enough(
             current.spec.run_strategy,
@@ -916,19 +681,12 @@ pub(super) fn reschedule_refusal(current: &Vm, disks: &[DiskFacts]) -> Option<St
     None
 }
 
-/// Gather what [`reschedule_refusal`] decides on, and apply it.
-///
-/// The reads are here and the rule is next door, so that the rule can be
-/// exercised without an etcd — which matters, because it is the one function
-/// standing between a client and a VM whose disks are somewhere it is not.
+/// Read storage facts and apply the pure reschedule rule.
 async fn check_reschedule(st: &ApiState, current: &Vm, next: &Vm) -> Result<(), ApiError> {
     let Some(here) = releasing(current, next) else {
         return Ok(());
     };
-    // Before the disks, because it is the cheaper question and the one about
-    // the same evidence the phase is: a cluster that is not talking cannot be
-    // asked to stop the guest first, and no amount of storage makes that
-    // safe.
+    // Check required holder evidence before reading storage constraints.
     check_holder_is_talking(st, current, here).await?;
     let here = here.to_string();
     let mut disks = Vec::new();
@@ -977,13 +735,8 @@ pub(super) fn releasing<'a>(current: &'a Vm, next: &Vm) -> Option<&'a str> {
     }
 }
 
-/// The evidence half of a reschedule: is the cluster that holds this VM
-/// talking?
-///
-/// The rule is in `controller_api` so the two tiers cannot answer it
-/// differently; the read is here, because the fact lives in the store. A
-/// current heartbeat IS the session — it is written by the replica holding it,
-/// every beat — and it is the same fact the pass reads to expire a cluster.
+/// Read the cluster heartbeat lease and apply the shared holder rule.
+/// Unknown guests require a recently reporting holder before binding release.
 async fn check_holder_is_talking(
     st: &ApiState,
     current: &Vm,
@@ -999,12 +752,8 @@ async fn check_holder_is_talking(
     holder_refusal(current, cluster, heard, Utc::now())
 }
 
-/// The rule this tier applies once the heartbeat has been read, as a pure
-/// function: the reads are next door, so the rule can be exercised without an
-/// etcd.
-///
-/// 409 and not 422: nothing about the request is malformed. The state of the
-/// world is what refuses it, and it is a state that ends by itself.
+/// Apply the shared heartbeat rule without store access. A stale holder returns
+/// 409 because cluster state, not request shape, prevents release.
 pub(super) fn holder_refusal(
     current: &Vm,
     cluster: &str,
@@ -1023,12 +772,7 @@ pub(super) fn holder_refusal(
     }
 }
 
-/// Record that a binding was let go while nobody knew what the guest was
-/// doing.
-///
-/// Only for `Unknown`, and only after the write landed. Every other phase is
-/// evidence — the cluster said so — and needs no note beside the `Unbound`
-/// the reconciler already writes.
+/// Record a warning after successfully releasing an Unknown VM binding.
 async fn note_unknown_release(st: &ApiState, current: &Vm, next: &Vm) {
     let Some(message) = release_event(current, next) else {
         return;
@@ -1078,10 +822,8 @@ pub(super) async fn update_vm(
     // last time is not in it.
     resolve_base_images(&st.store, &mut body.spec.vm).await?;
 
-    // Server-owned fields survive the round-trip untouched — the binding
-    // among them. A VM that could be re-pointed at another cluster by editing
-    // a field would leave the running one behind on the old one, with the
-    // teardown going to a cluster that never had it.
+    // Restore server metadata before ownership checks. Binding changes are
+    // validated separately so teardown cannot be redirected to another cluster.
     let current: Vm = st.store.get(&name).await?;
     Grant::new(caller, role, tenant)
         .allows(Scope::of(current.spec.tenant.as_deref()), Verb::Write)?;
@@ -1089,27 +831,16 @@ pub(super) async fn update_vm(
     body.metadata.creation_timestamp = current.metadata.creation_timestamp;
     body.metadata.deletion_timestamp = current.metadata.deletion_timestamp;
     body.metadata.finalizers = current.metadata.finalizers.clone();
-    // The binding, the tenant and the spec itself: refused rather than put
-    // back. The tenant is where the VM's network comes from, and a VM that
-    // changed tenants while running would be one whose NICs were built for a
-    // VNI it no longer belongs to.
+    // Reject forbidden ownership edits. Changing tenant would change the VM
+    // network identity while its existing NICs still use the old VNI.
     check_owned(&current, &body, VM_OWNED)?;
-    // After `check_owned`, which is what makes `current.spec.tenant` the
-    // right tenant to ask about: a PUT that moved the VM to another tenant
-    // was already refused, so the two are the same value here.
-    //
-    // This is the hot-plug edge. `vm_shape_unchanged` lets `spec.vm.volumes`
-    // grow from the second entry on for entries that name a volume, so a PUT
-    // is how a second disk arrives — and a PUT is therefore also where a
-    // member could first name somebody else's.
+    // Check references after immutable tenancy is established. Hot-plug updates
+    // can introduce new volume names and require the same ownership checks as create.
     check_volume_refs(&st, current.spec.tenant.as_deref(), &name, &body.spec).await?;
     check_reschedule(&st, &current, &body).await?;
     body.status = current.status.clone();
-    // The half that gets forgotten. A PUT that raises this VM's vcpus is the
-    // same act as creating one that size, and it goes through the same
-    // arithmetic: the object as it stands comes out of the sum (`except`),
-    // and its new size goes back in — and through the same fence, see
-    // `admission`.
+    // Recalculate replacement usage under the tenant fence for updates as well
+    // as creates, excluding the current VM from the existing total.
     controller_api::carry_generation(&current, &mut body)?;
     let wanted = Capacity::wanted_by_spec(&body.spec.vm);
     let (st_, body_, name_) = (&st, &body, name.as_str());
@@ -1155,12 +886,8 @@ pub(super) async fn delete_vm(
     ))
 }
 
-/// What the caller wants of a console: how much, and which lines.
-///
-/// Raw pairs and not a struct: `hide` and `only` repeat, and the form
-/// encoding behind a typed `Query` cannot spell a repeated key. Nothing here
-/// reads the needles — they travel to the node, which is the only party that
-/// can apply them before `lines` shortens anything.
+/// Requested line count and repeated log filters. Keep raw query pairs to
+/// preserve repeated hide/only values. Nodes filter before applying the line limit.
 pub(super) type LogRequest = (u32, Vec<String>, Vec<String>, Vec<String>);
 
 pub(super) fn log_request(pairs: &[(String, String)]) -> LogRequest {
@@ -1186,26 +913,14 @@ pub(super) fn log_request(pairs: &[(String, String)]) -> LogRequest {
 /// The empty console document, in the shape a node would have sent it.
 pub(super) const NO_STREAMS: &[u8] = b"[]";
 
-/// What the guest printed, fetched through the cluster from the node.
-///
-/// Tenant-scoped exactly as the VM is, and through the same `Grant::allows`
-/// every other object route uses: a console is the most revealing thing a VM
-/// has, and reading somebody else's would be worse than reading their object.
-///
-/// One way and only that — no attach, no input, no follow. See the cluster
-/// tier's twin.
-/// What `forward::holder` says this tier is talking about.
+/// Peer and tier labels for forwarding cloud requests to a cluster-session holder.
 pub(super) const ABOUT: controller_api::forward::About = controller_api::forward::About {
     peer: "cluster",
     tier: "cloud",
 };
 
-/// Where the replica holding this cluster's session says it can be reached,
-/// or `None`.
-///
-/// Off the `Cluster` object, which is where the holder wrote it at Hello. A
-/// cluster that has gone away between the VM read and here is not an error:
-/// it is the same "nobody holds it" the field being empty means.
+/// Read the endpoint advertised by the cluster-session holder. A missing
+/// cluster or unset endpoint yields None.
 pub(super) async fn session_endpoint(
     st: &ApiState,
     cluster: &str,
@@ -1217,10 +932,7 @@ pub(super) async fn session_endpoint(
     }
 }
 
-/// The filter, back on the wire for the one hop that is HTTP.
-///
-/// A sibling that answered the unfiltered console would make the answer
-/// depend on which replica a client happened to reach.
+/// Encode log filters for the HTTP sibling hop so routing preserves the query.
 fn forwarded_query(hide: &[String], only: &[String], streams: &[String]) -> String {
     let mut out = String::new();
     for (key, values) in [("hide", hide), ("only", only), ("streams", streams)] {
@@ -1252,13 +964,8 @@ pub(super) async fn vm_logs(
         // printed. An answer, not a failure.
         return Ok(json_passthrough(NO_STREAMS.to_vec()));
     };
-    // Which replica can answer. A cluster dials ONE cloud replica, so two of
-    // every three requests land somewhere that cannot ask it anything — the
-    // same fact one tier down, and now the same answer: forward once to the
-    // replica that published `Cluster.status.sessionEndpoint`, with this
-    // cloud's own `system:cloud:<name>` identity. Until this position that
-    // identity did not exist and this route simply refused; see the image
-    // report.
+    // Forward once to the advertised cluster-session holder using this cloud
+    // identity when the session is held by a sibling.
     match controller_api::forward::holder(
         ABOUT,
         st.sessions.holds(cluster),
@@ -1318,20 +1025,9 @@ pub(super) async fn vm_logs(
     }
 }
 
-/// Take this VM's serial line, through both tiers, and speak to it.
-///
-/// Mint a ticket for this VM's console.
-///
-/// It exists because a browser opening a `WebSocket` cannot set an
-/// `Authorization` header — the API is `new WebSocket(url)` and that is all
-/// of it. So a page holding a perfectly good token has no way to present it,
-/// and the only thing left that reaches the server is the query string.
-///
-/// What comes back is not a new permission. It is the permission this caller
-/// already has, frozen: `Verb::Write` on this VM, checked here with the
-/// caller's own credential, valid for thirty seconds, for this one path,
-/// once. A ticket can never open a door its holder could not have walked
-/// through themselves.
+/// Mint a single-use console ticket after checking write permission on the VM.
+/// Browser WebSockets cannot set an Authorization header, so the ticket carries
+/// the authenticated grant in a path-bound query credential for thirty seconds.
 pub(super) async fn vm_console_ticket(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -1417,10 +1113,8 @@ pub(super) async fn vm_console(
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let mut events = st.sessions.consoles.expect(&session_id);
-    // To the cluster's speaker, exactly like a command. WHICH replica of that
-    // cluster holds this VM's node is not the cloud's to know — it is a fact
-    // about a gRPC stream, and the tier that owns those streams forwards
-    // among itself. See the cluster's console_open.
+    // Send to the cluster speaker. The cluster resolves and forwards to its
+    // node-session holder; that routing is outside cloud ownership.
     let reached = usize::from(
         st.sessions
             .send_to(
@@ -1440,10 +1134,7 @@ pub(super) async fn vm_console(
     );
     if reached == 0 {
         st.sessions.consoles.forget(&session_id);
-        // This replica has no session to that cluster — the cluster dialled
-        // one of our siblings. Forward there rather than refusing: the same
-        // hop the tier below makes for a node, and the address comes from the
-        // same kind of field, written by whichever replica took the session.
+        // Use the endpoint advertised by the sibling holding the cluster session.
         let endpoint = st
             .store
             .get::<Cluster>(&cluster)
@@ -1451,12 +1142,8 @@ pub(super) async fn vm_console(
             .ok()
             .and_then(|c| c.status.session_endpoint)
             .filter(|e| !e.is_empty());
-        // Never to ourselves, and never twice. `session_endpoint` is written
-        // at Hello and not cleared, so it can still name THIS replica after
-        // its own session has gone stale — and forwarding there would be a
-        // process connecting to itself, once per hop, for ever. The header is
-        // the second guard: every replica reads the same field, so a second
-        // hop could only ever be a mistake.
+        // Reject self-forwarding and a second hop. The advertised endpoint can be
+        // stale after session loss, so it cannot itself establish reachability.
         let forwarded = parts.headers.contains_key(CONSOLE_FORWARDED);
         let mine = st.advertise.as_deref();
         let endpoint = endpoint.filter(|e| Some(e.as_str()) != mine && !forwarded);
@@ -1474,13 +1161,8 @@ pub(super) async fn vm_console(
         return forward_console(&st.sibling, &endpoint, &name, on_upgrade, websocket).await;
     }
 
-    // Waited for BEFORE the upgrade is answered, because a refusal needs a
-    // status code to travel on and there is none left after 101.
-    //
-    // One yes wins; it takes `reached` noes to lose. The replicas that do not
-    // hold this VM's node all refuse, and their refusals are the normal case
-    // rather than the answer — the last one is what a client is told, because
-    // by then nobody had the line.
+    // Wait before HTTP 101 so a refusal can retain an HTTP error status.
+    // One acceptance succeeds; otherwise wait for every reached recipient to refuse.
     await_console_open(&mut events, reached, &session_id, &st.sessions).await?;
 
     info!(vm = %name, cluster = %cluster, session = %session_id,
@@ -1534,11 +1216,8 @@ pub(super) async fn vm_console(
     Ok(switching(websocket))
 }
 
-/// The 101, in whichever protocol the client asked for.
-///
-/// `Sec-WebSocket-Accept` is the whole of the handshake's proof, and its
-/// absence was the defect: a 101 that names another protocol is a 101 a
-/// browser is right to hang up on.
+/// Build the raw-console or WebSocket upgrade response, including the
+/// Sec-WebSocket-Accept value required by the latter.
 pub(super) fn switching(websocket: Option<String>) -> axum::response::Response {
     let response = axum::response::Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -1597,11 +1276,7 @@ pub(super) async fn forward_console(
     };
     let _ = stream.set_nodelay(true);
 
-    // The half the image report left open: which identity a cloud replica
-    // shows its sibling. It shows `system:cloud:<name>`, the same certificate
-    // the log forward uses, and until it existed this hop could only ever go
-    // in plain text — against a sibling that stopped answering plain text
-    // when auth went on.
+    // TLS sibling requests use the cloud system identity, matching log forwarding.
     let mut sibling: Box<dyn Console> = if tls {
         let config = sibling_tls
             .tls
@@ -1652,12 +1327,8 @@ pub(super) async fn forward_console(
         .unwrap_or("?")
         .to_string();
     if status != "101" {
-        // The sibling's own SENTENCE, not just its number. It is the replica
-        // that actually knows why — "somebody else is holding this console"
-        // is an answer a person can act on, and "a replica answered 409" is
-        // not. Read by the content-length the head promised, which is the
-        // only length there is on a connection that was about to become a
-        // console.
+        // Read the sibling status message when a Content-Length body is available,
+        // so the caller receives the cause rather than only the HTTP number.
         let said = read_refusal(&mut sibling, &text).await;
         return Err(conflict(said.unwrap_or_else(|| {
             format!("the replica at {authority} answered {status} to a console open")
@@ -1668,10 +1339,7 @@ pub(super) async fn forward_console(
     tokio::spawn(async move {
         if let Ok(upgraded) = on_upgrade.await {
             let client = hyper_util::rt::TokioIo::new(upgraded);
-            // The hop to the sibling is ALWAYS raw — a replica asking its
-            // sibling is the cloud asking itself, and it should not have to
-            // learn what a browser is. So the frames come off here, and from
-            // there on nothing is translated in either direction.
+            // Sibling transport is raw; unwrap browser WebSocket frames at this edge.
             let mut client: Box<dyn Console> = match framed {
                 true => Box::new(controller_api::websocket::adapt(client)),
                 false => Box::new(client),
@@ -1683,10 +1351,8 @@ pub(super) async fn forward_console(
     Ok(switching(websocket))
 }
 
-/// The sentence behind a sibling's refusal, out of the `Status` body it sent.
-///
-/// `None` when there is nothing to read or nothing to understand — the caller
-/// then falls back to naming the status, which is worse but still true.
+/// Read a nonempty message from a length-delimited sibling Status body.
+/// Return None on absent, malformed or unreadable content for the status fallback.
 pub(super) async fn read_refusal<S>(stream: &mut S, head: &str) -> Option<String>
 where
     S: tokio::io::AsyncRead + Unpin,
@@ -1773,11 +1439,7 @@ pub(super) async fn await_console_open(
     }
 }
 
-/// Give up on this console: forget the route, and answer with the reason.
-///
-/// Every way out of the wait but the good one comes through here, and each of
-/// them has to forget the session — a route nobody will ever open is a route
-/// the next ticket must not find.
+/// Remove a failed console route before returning its error.
 fn gone(sessions: &crate::session::SessionRegistry, session_id: &str, error: ApiError) -> ApiError {
     sessions.consoles.forget(session_id);
     error
@@ -1786,10 +1448,7 @@ fn gone(sessions: &crate::session::SessionRegistry, session_id: &str, error: Api
 /// What this upgrade is called on the wire, at every tier that serves one.
 pub const CONSOLE_PROTOCOL: &str = "meister-console";
 
-/// How long to wait for the tiers below to say whether the line was given.
-///
-/// Two hops and a node, so generous — but bounded, because the alternative is
-/// a client hanging on a `curl` for ever when a node has stopped answering.
+/// Deadline for opening a console through the controller tiers and node.
 pub(super) const CONSOLE_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Both directions of one console session, until either end stops.
@@ -1845,21 +1504,9 @@ pub(super) async fn console_pump<S>(
     }
 }
 
-/// What a cluster's "no" becomes at this edge.
-///
-/// A refusal that crossed the session used to be a 409 whatever it said, and
-/// the comment here called that "an answer about this VM, with nothing to
-/// retry against it". That was true for the refusals anybody had in mind —
-/// no such node, a lost compare-and-swap — and false for the one that turned
-/// out to matter most: with three cloud replicas and three cluster replicas,
-/// "no replica of this cluster is holding this node's session" is what two
-/// out of three console reads got, and it is not a disagreement. It is a
-/// party being out of reach, which is `Unavailable`, and a caller that
-/// retries is right.
-///
-/// The word comes from the cluster now (see `Refusal`). Empty means a peer
-/// that names no reason — every agent today, and every cluster before this —
-/// and empty keeps the old meaning exactly.
+/// Translate cluster refusals into HTTP errors while preserving their messages.
+/// Unavailable and Timeout are retryable 503 responses. Empty and unknown reason
+/// codes retain the legacy 409 response.
 pub(super) fn refused(refusal: controller_api::Refusal) -> ApiError {
     match refusal.reason.as_str() {
         "" | "Conflict" => conflict(refusal.message),
@@ -1904,15 +1551,7 @@ pub(super) fn json_passthrough(payload: Vec<u8>) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
 
-    /// `spec.nodeName` is not a field of a vm at THIS tier, and the two ways
-    /// of saying so have to agree.
-    ///
-    /// One `Vm` type serves both tiers on purpose, and what that left behind
-    /// up here was a field with no meaning: this tier places on clusters and
-    /// never writes it. `/schemas` published it anyway, a client read it,
-    /// believed it, set it and was ignored (fremdsicht 2). The shape does not
-    /// name it any more, and a body that names it is refused rather than
-    /// quietly dropped — otherwise the silence would be back, one layer down.
+    /// The cloud schema omits node placement and validation rejects it explicitly.
     #[test]
     fn the_cloud_publishes_no_node_name_and_refuses_one() {
         let schema = cloud_vm_schema();
@@ -1946,11 +1585,7 @@ mod tests {
     }
     use super::*;
 
-    /// The 101 a browser is willing to keep. Before this, a WebSocket
-    /// handshake got the raw console's answer — `Upgrade: meister-console`
-    /// and no accept header — and the browser hung up, correctly. The route
-    /// worked through both tiers to the node and was reachable from nothing
-    /// with a screen.
+    /// Raw and WebSocket clients receive their respective upgrade headers.
     #[test]
     fn the_upgrade_answer_names_the_protocol_that_was_asked_for() {
         let raw = switching(None);
@@ -1971,10 +1606,8 @@ mod tests {
         assert_eq!(framed.headers()["connection"], "upgrade");
     }
 
-    /// The row itself, and only the shape it opens: clearing, yes; pointing
-    /// at a different cluster, no. What the shape does not say is WHEN, and
-    /// that is deliberate — `reschedule_refusal` asks the phase and the
-    /// disks, because neither is a property of this field.
+    /// Field ownership allows clearing a cluster binding but not replacing it.
+    /// Separate reschedule checks decide when clearing is allowed.
     #[test]
     fn a_client_may_only_clear_the_cluster_binding_never_move_it() {
         let bound = |c: serde_json::Value| json!({"spec": {"clusterName": c}});
@@ -2058,11 +1691,7 @@ mod tests {
         }
     }
 
-    /// Silas' rule at this tier: an `Unknown` binding is let go only while
-    /// the cluster holding it is reporting, and 409 says so when it is not.
-    ///
-    /// The same rule the tier below applies about a node, asked here about a
-    /// cluster and answered out of `controller_api` so the two cannot drift.
+    /// Unknown bindings require a reporting cluster; a silent holder returns 409.
     #[test]
     fn an_unknown_binding_is_only_let_go_while_its_cluster_reports() {
         let at = |secs: i64| chrono::DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap();
@@ -2143,13 +1772,8 @@ mod tests {
         }
     }
 
-    /// D12 at this tier: the phases a VM on an unresponsive node is actually
-    /// in are the ones this call used to refuse.
-    ///
-    /// `mc-r1` in the mini-chaos run sat at `runStrategy Stopped, phase
-    /// Failed` on a machine that executed nothing, and the one API call that
-    /// would have moved it answered "stop it first" — advice to do what had
-    /// already been done, and the only exit was through Silas' hands.
+    /// Failed and Unknown phases allow binding release under stopped intent,
+    /// while referenced-disk restrictions still apply.
     #[test]
     fn a_failed_or_unknown_vm_may_let_its_cluster_binding_go() {
         for phase in [
@@ -2227,17 +1851,8 @@ mod tests {
         assert!(why.contains("cluster-2"), "and which two: {why}");
     }
 
-    /// Where a base image comes from is the catalogue's answer — and a
-    /// reference to a `Volume` object is NOT one of the fields this door
-    /// guards, which is the half that changed.
-    ///
-    /// The refusal that used to stand here said "attaching one to a vm is not
-    /// built yet". It is built, on both tiers, and the sentence had outlived
-    /// its truth: the promise its own comment made — that the door becomes
-    /// the TENANCY check rather than disappearing — is kept by
-    /// `check_volume_refs`, which needs a store and a tenant and therefore
-    /// cannot live in this function. So the assertion here is the negative
-    /// one: naming a volume gets past this door.
+    /// Catalogue source fields reject substitutions. Volume references remain
+    /// allowed here because their tenant ownership is checked separately.
     #[test]
     fn a_client_may_not_name_the_volume_fields_the_cloud_owns() {
         let catalogue = || {
@@ -2250,10 +1865,8 @@ mod tests {
                 },
             )])
         };
-        // `base_image_uid` joined the list with S02: whose registration the
-        // bytes came from is the cloud's answer for the same reason the url
-        // and the checksum are, and a client that could write it could point
-        // a node's cache entry at somebody else's image.
+        // Image registration identity is cloud-owned, just like URL and digest,
+        // because it selects the node cache entry.
         for field in ["base_image_url", "base_image_sha256", "base_image_uid"] {
             let spec = json!({ "volumes": [{}, { "base_image": "noble", field: "x" }] });
             let msg = format!(
@@ -2283,15 +1896,8 @@ mod tests {
         .expect("nothing control-plane-owned here");
     }
 
-    /// The document this cloud handed out, handed back — which is what every
-    /// PATCH on this API is, because a patch is merged onto the STORED object
-    /// before it reaches the PUT that validates it.
-    ///
-    /// Refusing the fields on presence alone made `vm stop` impossible on any
-    /// VM built from the catalogue: the merged document carried the very url
-    /// this cloud had written into it, and was told the field was
-    /// control-plane-owned. Found in the lab on the first `vm stop` anybody
-    /// ran against such a VM.
+    /// Accept catalogue fields round-tripped by PUT or merged PATCH, while rejecting
+    /// any substituted source value.
     #[test]
     fn the_document_the_cloud_wrote_may_be_handed_back_unchanged() {
         let catalogue = std::collections::BTreeMap::from([(
@@ -2330,11 +1936,8 @@ mod tests {
         assert!(msg.contains("base_image_url"), "{msg}");
     }
 
-    /// A member's POST body is not allowed to name its own overlay, its own
-    /// floating addresses or its own allowlist. All three injectors skip a NIC
-    /// that already carries the field — that skip is the standalone road one
-    /// tier down, and at this edge it would be a tenant writing another
-    /// tenant's VNI into its own NIC and landing on their bridge.
+    /// Clients cannot supply overlay or source-allowlist fields that lower-tier
+    /// injectors preserve for standalone use.
     #[test]
     fn a_client_may_not_name_the_fields_the_cloud_owns() {
         for (field, value) in [

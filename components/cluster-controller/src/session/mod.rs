@@ -59,22 +59,9 @@ pub use console::{ConsoleRelay, LocalConsoleEvent};
 use hello::*;
 use ingest::*;
 
-/// What the cluster's nodes have said about base images, by image AND by
-/// node.
-///
-/// In memory beside the session map and not in the store, and that is the
-/// same shape the VM index has: it is a summary of what peers are saying
-/// right now, it is rebuilt from their reports, and a second copy in etcd
-/// would be a number nobody recomputed.
-///
-/// By node since the cloud grew `Image.status.nodes[]`. It used to merge here
-/// — one line per image, Failed winning over Ready — and the merge is right
-/// but it was made one tier too early: from up there a rollout still running
-/// and a checksum that will never match were the same word. The merge moved
-/// to the cloud, which is where both halves are wanted; here each node's line
-/// stands on its own, and the newest line from a node replaces that node's
-/// older one, because a node that re-fetched an image is telling the truth
-/// about it now.
+/// In-memory image observations indexed by image and node, rebuilt from reports.
+/// Each node's latest observation replaces its prior value. Aggregation belongs
+/// to the cloud, which needs both per-node rollout state and overall image status.
 #[derive(Default)]
 pub struct ImageView(std::sync::Mutex<ImageWords>);
 
@@ -112,18 +99,9 @@ struct ImageWord {
 }
 
 impl ImageView {
-    /// Take in one node's opinions, and whether they are all of them.
-    ///
-    /// The two arrive together on purpose: a node that says its list is
-    /// complete is saying it about THAT list, and recording the flag from one
-    /// report against the lines of another would be a completeness claim
-    /// about a list nobody made.
-    ///
-    /// A heartbeat that carries no lists at all (`heartbeat_only`) comes
-    /// through here with `complete = false` and no lines, which takes the
-    /// node out of the complete set — correctly: it has not said anything
-    /// this time, and "the inventory is all of them" must never be a claim
-    /// the tier above keeps after the evidence for it has stopped arriving.
+    /// Record image observations and completeness from the same report under one lock.
+    /// A heartbeat-only or incomplete report clears that node's completeness claim;
+    /// earlier inventory must not remain evidence of current absence.
     pub fn observe(&self, node: &str, reports: &[proto::ImageStateReport], complete: bool) {
         let mut held = self.0.lock().unwrap();
         for report in reports {
@@ -272,15 +250,9 @@ impl SessionRegistry {
         }
     }
 
-    // --- lane 5A: a certificate that was taken back while it talked -------
-    /// End every session whose certificate is on this list.
-    ///
-    /// An error down the stream, and the registry entry is left where it is:
-    /// the stream unwinding is what calls `on_disconnect`, and that is what
-    /// marks the node not ready and takes its console endpoint off the
-    /// object. Removing the entry here would take the teardown away from the
-    /// path that owns it — `disconnect` would then find nothing, decide the
-    /// session was superseded, and leave a revoked node listed as ready.
+    /// End revoked sessions through a stream error, leaving normal disconnect
+    /// handling to remove the registry entry and mark the node unavailable.
+    /// Early map removal would make disconnect mistake it for a superseded session.
     pub async fn drop_revoked(
         &self,
         list: &controller_api::auth::RevocationList,
@@ -347,20 +319,9 @@ impl SessionRegistry {
         self.pending.resolve(request_id, Ok(payload));
     }
 
-    /// Send one command to a node's session and wait for its CommandResult.
-    /// `traceparent` rides on the envelope so the node's work lands in the
-    /// trace of the request that asked for it; empty means "no context", and
-    /// the node then starts its own rather than guessing.
-    /// The payload the agent sent back with its ack — empty for every
-    /// command that only changes something, and the console document for the
-    /// one that asks a question.
-    /// Send one message down a node's session without waiting for anything.
-    ///
-    /// Its own method beside `send_command` because a console frame is not a
-    /// command: there is no request_id, nothing acks it, and a keystroke that
-    /// waited for an answer would be a keystroke that arrives after the next
-    /// one. `false` means the node has no session, which the caller turns
-    /// into the end of that console session.
+    /// Send an unacknowledged message on the node session.
+    /// Console frames have no request ID. Return false if no session can receive it,
+    /// allowing the caller to close the console.
     pub async fn send_to(&self, node_id: &str, msg: ControllerMessage) -> bool {
         let tx = self
             .nodes
@@ -420,23 +381,10 @@ impl SessionRegistry {
     }
 }
 
-/// The VM list a status report needs to turn the uids an agent speaks into
-/// the names the store is keyed by, read once for all the reports that arrive
-/// at the same moment.
-///
-/// Every agent reports every ten seconds, so at fifty nodes this list was
-/// being read five times a second, and every one of those reads returned the
-/// same list. The window is deliberately far shorter than the report interval:
-/// what it coalesces is reports that overlap, never a node's next report.
-///
-/// What a reused list can get wrong is what it does not yet contain, and that
-/// case is the one this tier acts on hardest — an uid no stored VM carries is
-/// dropped as somebody else's VM. So an unknown uid is treated as evidence
-/// that the list is behind: it is re-read once and the report looked at again
-/// (`ingest_status`), which makes the outcome the same as an uncached read
-/// and costs a node that really does run VMs of its own exactly what it cost
-/// before. Everything else a slightly old entry says is corrected by the
-/// write, which is a read-modify-write against the live object.
+/// Cache the VM UID-to-object index briefly to coalesce overlapping reports.
+/// An unknown UID forces one refresh before ingest treats it as unmatched.
+/// Mutation closures must still recheck ownership against the current object;
+/// the cached listing is not authoritative binding evidence.
 #[derive(Default)]
 pub struct VmIndex {
     /// When it was read, and what was read. `None` = never.

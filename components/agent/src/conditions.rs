@@ -2,21 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What is wrong with this node, said out loud on the heartbeat.
-//!
-//! The heartbeat used to carry a liveness signal and nothing else: the
-//! controller learned that the agent's process was up, and read that as "this
-//! node can do things". A chaos run showed what the gap costs. A full root
-//! disk wedged the agent's redb handle, every command failed for hours, and
-//! `node ls`, the session and `check.sh` all said the same word — READY —
-//! while the scheduler kept placing VMs on a machine that could not write a
-//! byte.
-//!
-//! A condition is the node's own statement about a fault it can see and the
-//! tier above cannot. Presence IS the statement: it is raised while the
-//! trouble holds and dropped when it stops, so nothing here keeps a history —
-//! the events one tier up are the history, and a second copy of them would be
-//! the worse one.
+//! Current node faults reported with heartbeats. Conditions are keyed by type;
+//! a change replaces the message and recovery removes the entry. Event history
+//! belongs to the controller.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -24,70 +12,32 @@ use std::sync::Mutex;
 
 use tracing::{debug, info, warn};
 
-/// The root filesystem this node writes volumes and its own database into has
-/// no room. Raised by the store when a write fails with `ENOSPC`.
+/// The filesystem containing the agent store returned ENOSPC.
 pub const DISK_PRESSURE: &str = "DiskPressure";
 
-/// The agent's database cannot be written to. Everything this node is asked
-/// to do ends in a record, so this is "no commands can be served here",
-/// whatever the heartbeat says.
+/// The store could not complete an operation after I/O recovery.
 pub const STORE_UNHEALTHY: &str = "StoreUnhealthy";
 
 /// `cgroup_root` is not a cgroup2 filesystem, so no VM on this node can be
 /// killed or torn down through its slice. See [`check_cgroup_root`].
 pub const CGROUP_UNUSABLE: &str = "CgroupUnusable";
 
-/// This node configured a driver it has no right to build, and left it out.
-/// The message is one sentence per such driver — see [`crate::privileges`].
-///
-/// The counterpart of `CgroupUnusable` for everything that is not a cgroup:
-/// the node comes up, runs what it can and says what it cannot, because the
-/// tier above is the party that can act on it. The scheduler is already kept
-/// away by the catalogues, which follow the drivers that were actually BUILT;
-/// this condition is for the operator who has to find out why a node stopped
-/// taking LVM volumes.
-///
-/// Level-triggered and re-measured on every report, like every other
-/// condition here. The rights of a running process barely change, but the
-/// things they are measured against do: a udev rule that arrives late, a
-/// `/dev/nvme-fabrics` that appears when its module loads.
+/// Configured driver requirements are currently unmet. Refreshed on reports;
+/// driver registration itself happens at startup.
 pub const UNPRIVILEGED: &str = "Unprivileged";
 
-/// A VMM is running here that no record of this agent names.
-///
-/// D18. "The agent adopts what it has a record of" was only half a rule, and
-/// nothing said what became of the other half: a guest whose record went
-/// while its process did not is running on a machine nobody manages — it
-/// answers no command, appears in no report, and holds its disks and its
-/// taps. The lab produced one, a destination whose agent was killed
-/// mid-migration and whose VMM finished the transfer into a process nothing
-/// was watching.
-///
-/// It is a condition and not a silent tidy-up because the tier above is the
-/// party that can act on it: a node with an unmanaged guest is a node whose
-/// free memory is a fiction, and whether to place there is a scheduling
-/// decision. The agent ends the process too, but only after a grace and only
-/// after having said so — see `reconcile::Reconciler::sweep_unmanaged_vmms`.
+/// A VMM has no matching persisted VM row. The reconciler reports it before
+/// cleanup after a grace period; see `sweep_unmanaged_vmms`.
 pub const VMM_UNMANAGED: &str = "VmmUnmanaged";
 
-/// The conditions this node currently holds, by type.
-///
-/// One per type and the newest sentence wins: two ENOSPC failures in a row are
-/// one `DiskPressure`, not two, and the report is a statement about now rather
-/// than a log. A `BTreeMap` and not a `HashMap` so that the reported order is
-/// the same on every heartbeat — a controller diffing two reports should see a
-/// difference only when something actually changed.
+/// Latest message per condition type, ordered for stable reports.
 #[derive(Default)]
 pub struct Conditions {
     held: Mutex<BTreeMap<&'static str, String>>,
 }
 
 impl Conditions {
-    /// Raise a condition, or update the sentence of one already raised.
-    ///
-    /// Logged once per change and not per call: a level-triggered agent says
-    /// the same true thing every few seconds, and a WARN on every repetition
-    /// would bury the run it belongs to.
+    /// Raise or update a condition; log only changes.
     pub fn raise(&self, kind: &'static str, message: impl Into<String>) {
         let message = message.into();
         let mut held = self.held.lock().expect("conditions");
@@ -101,9 +51,7 @@ impl Conditions {
         }
     }
 
-    /// Drop a condition. Idempotent, and silent when it was not held —
-    /// clearing what was never raised is the ordinary case on a healthy node,
-    /// which is every pass of every loop that calls this.
+    /// Clear a condition; log only when it was present.
     pub fn clear(&self, kind: &'static str) {
         let gone = self.held.lock().expect("conditions").remove(kind);
         if gone.is_some() {
@@ -130,40 +78,9 @@ impl Conditions {
     }
 }
 
-/// Is `cgroup_root` a cgroup2 filesystem? Asked at start-up and in every
-/// reconcile pass afterwards. Answers whether it is.
-///
-/// D17, found by the migration E2E and true of any misconfigured agent: on a
-/// plain directory `kill_slice` writes `cgroup.kill` into a file nothing
-/// reads and `destroy_slice` fails with `ENOTEMPTY`, so every teardown hangs,
-/// the record stays, and the VM's way back is refused with "this node already
-/// has a record of that vm". On real cgroupfs those are kernel pseudo-files
-/// and `rmdir` takes them with it — so the difference is invisible until the
-/// first delete, and nobody says it at start-up.
-///
-/// **Not a refusal to start**, deliberately. The local E2E runs exactly like
-/// this, on purpose, and an agent that would not come up over it would trade
-/// a known limitation for an outage. It is a WARN and a condition: the
-/// cluster gets to see that this node cannot tear a VM down, which is what
-/// makes it a scheduling decision one tier up (C1) rather than a surprise
-/// three commands later.
-///
-/// **And it is asked again, every pass.** Once at start-up made it a
-/// statement about the second the agent came up, and a `/sys/fs/cgroup` that
-/// was unmounted, remounted or shadowed while the agent ran was something
-/// nobody said a word about until the first delete hung — the exact shape of
-/// the original defect, with a start-up check in front of it. It is a level
-/// condition like every other one here: raised while the trouble holds,
-/// dropped when it stops, and `Conditions` says either only when it changes,
-/// so a pass every thirty seconds writes no log line at all on a healthy
-/// node. One `statfs` per pass is nothing next to the probe of every VM the
-/// same pass already makes.
-///
-/// The nearest EXISTING ancestor is what gets measured. `cgroup_root` is
-/// created on demand by the first `create_slice`, so on a healthy node it
-/// frequently does not exist yet at start-up — and a filesystem is a property
-/// of the mount, so a directory that will be made under a cgroup2 parent is
-/// cgroup2 too.
+/// Check that the nearest existing ancestor of `cgroup_root` is on cgroup2.
+/// Startup and reconciliation refresh the condition without refusing startup.
+/// This tests the filesystem type, not delegation permissions or controllers.
 pub fn check_cgroup_root(root: &Path, conditions: &Conditions) -> bool {
     let mut measured = root;
     let stat = loop {
@@ -176,11 +93,7 @@ pub fn check_cgroup_root(root: &Path, conditions: &Conditions) -> bool {
             Err(e) => break Err(e),
         }
     };
-    // The raise is the WARN — see `Conditions::raise`, which says it once
-    // per change rather than once per look. The healthy branch is DEBUG for
-    // the same reason, now that this runs every pass: `clear` already says
-    // "node condition cleared" at INFO on the pass that recovers, which is
-    // the only healthy look worth a line.
+    // Condition changes are logged by `raise` and `clear`.
     let unusable = |message: String| {
         conditions.raise(CGROUP_UNUSABLE, message);
         false
@@ -242,14 +155,7 @@ mod tests {
         assert!(c.report().is_empty());
     }
 
-    /// A `cgroup_root` that is not cgroupfs is a node that cannot tear a VM
-    /// down, and the cluster gets told.
-    ///
-    /// D17: on an ordinary directory `cgroup.kill` is a file nobody reads and
-    /// `rmdir` fails with ENOTEMPTY, so every teardown hangs and the record
-    /// stays behind — and the first anybody hears of it is a VM that cannot
-    /// come back. The agent still starts: the local E2E is configured exactly
-    /// this way on purpose.
+    /// An ordinary directory raises CgroupUnusable; a cgroup2 ancestor clears it.
     #[test]
     fn a_cgroup_root_that_is_not_cgroupfs_says_so_at_start_up() {
         let temp = tempfile::tempdir().expect("a temp dir");
@@ -263,16 +169,12 @@ mod tests {
             "the sentence says what will go wrong: {said}"
         );
 
-        // A directory that does not exist YET is measured by its parent: the
-        // first `create_slice` makes it, and a filesystem is a property of the
-        // mount rather than of the directory.
+        // Check the parent filesystem when the configured directory does not yet exist.
         let c = Conditions::default();
         check_cgroup_root(&dir.join("meisterstack"), &c);
         assert!(c.message(CGROUP_UNUSABLE).is_some());
 
-        // And on this machine's real cgroup2 mount, nothing is said. Guarded,
-        // because a test that assumed the host's mounts would be a test about
-        // the host.
+        // Check the host mount only when it is available as cgroup2.
         let host = Path::new("/sys/fs/cgroup");
         let cgroup2 = nix::sys::statfs::statfs(host)
             .map(|s| s.filesystem_type() == nix::sys::statfs::CGROUP2_SUPER_MAGIC)

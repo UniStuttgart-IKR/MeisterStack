@@ -207,20 +207,9 @@ pub(super) async fn get_router(
     Ok(Json(router))
 }
 
-/// Give a tenant a way out.
-///
-/// Everything a router needs that is not a placement is checked here, because
-/// the alternative is a Pending object with a sentence about a name the client
-/// mistyped: the tenant exists, the provider network exists, the routed
-/// subnets named are that tenant's, and no other router of this tenant is
-/// already on this network.
-///
-/// The last one is a real constraint and not tidiness. Two routers of one
-/// tenant on one provider network would both hold a SNAT rule for the same
-/// overlay, both announce, and the tenant's return traffic would land on
-/// whichever the fabric preferred — with conntrack on the other. One way out
-/// per tenant per wire; a tenant that wants two ways out has two provider
-/// networks.
+/// Create a router after validating its tenant, provider network and subnets.
+/// Reject another router for the same tenant and provider network: duplicate
+/// SNAT paths could return traffic through a different conntrack instance.
 pub(super) async fn create_router(
     State(st): State<ApiState>,
     caller: Caller,

@@ -6,20 +6,8 @@
 
 use super::*;
 
-/// The claim this whole refactor is judged on: a VM gets the same
-/// configuration it got before.
-///
-/// It goes through the real thing rather than a stub. A real filesystem
-/// backend provisions a real file and attaches it, the attachment goes
-/// into a real `VmRecord`, and `build_instance_spec` — the one function
-/// that turns a record into what the hypervisor is told — produces the
-/// list. What it must produce is exactly one `Path` volume, which is what
-/// a single `create` produced before there were two calls.
-///
-/// The chain closes below this: `VolumeAttachment` did not change, and
-/// the cloud-hypervisor driver's own tests pin the VMM config it builds
-/// from a `Path`. So an unchanged attachment here IS an unchanged config
-/// there, and the two halves together are the "byte for byte" claim.
+/// A real filesystem provision/attach pair reaches the VMM as one Path attachment
+/// with its volume ID, without shared memory or a storage-process allowance.
 #[tokio::test]
 async fn a_vm_is_built_from_the_same_attachments_two_calls_now_produce() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -111,9 +99,7 @@ async fn a_vm_is_built_from_the_same_attachments_two_calls_now_produce() {
     // The volume's id travels with its attachment, which is what lets the
     // VMM name the disk after the volume rather than after its position.
     assert_eq!(ispec.volumes[0].id, vol_id);
-    // Nothing about the VM grew a backend process, so the slice is not
-    // widened and the guest memory does not have to be shareable —
-    // exactly the three answers a one-call `create` produced.
+    // The seed adds no backend process, memory allowance or shared-memory requirement.
     assert!(
         widen_for_storage_backends(&Provisioner::limits_for(&vm_spec), &record.volumes).is_none()
     );

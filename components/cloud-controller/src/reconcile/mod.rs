@@ -2,26 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The cloud's Vm reconciler: level-triggered like the cluster's — a periodic
-//! pass plus etcd-watch wakeups, every decision derived from the stored object
-//! and from what the bound cluster last said about it.
+//! Level-triggered VM reconciliation from stored intent and cluster reports.
+//! Periodic passes and store watches drive dispatch, teardown and heartbeat expiry.
+//! Absence is usable evidence only from a complete, sufficiently recent report.
 //!
-//! What is dedup one tier down (the phase) is dedup plus evidence here: a VM
-//! is handed to its cluster when that cluster's own status does not name it,
-//! and the cloud object goes away when the status stops naming it. The cluster
-//! tier can ask an agent about one VM; the cloud only ever hears the whole
-//! list, so the list is what it reasons with.
-//!
-//! The same pass expires cluster heartbeats: a session that tears down reports
-//! its cluster down immediately, but one that is killed outright — or one that
-//! died while this controller was restarting — leaves nothing behind except a
-//! heartbeat that stops moving.
-//!
-//! Several cloud replicas run this same pass against one cloud etcd with no
-//! leader between them, exactly as the cluster tier does one floor down: the
-//! session map divides the work (see `may_reconcile`) and everything they
-//! still share — binding an unbound VM, expiring a heartbeat — goes through a
-//! compare-and-swap with the store as the arbiter.
+//! Replicas share etcd without a leader. Local cluster sessions select who acts;
+//! compare-and-swap arbitrates bindings and shared status changes.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -57,32 +43,14 @@ use routers::*;
 pub(crate) use vms::*;
 use volumes::*;
 
-/// Who, of several leaderless cloud replicas, may act on this VM: the one its
-/// cluster is dialled into. The same token as one tier down, one tier up — a
-/// fact the replica observes by itself, and the only replica that could reach
-/// the cluster anyway.
+/// Reconcile a bound VM only where its cluster session is held locally.
+/// Unbound VMs are eligible everywhere, but placement considers locally connected
+/// clusters and the binding CAS selects the winner. A disconnected holder leaves
+/// its VMs waiting, including deletions.
 ///
-/// Exclusive because a cluster's replicas all hash the same `cluster_name` and
-/// so share one preference order, and because each of them keeps re-homing to
-/// the best endpoint that answers (cluster-controller's `REHOME_INTERVAL`) —
-/// order alone would only make them agree on the ranking, not on the entry.
-/// While one of them is still on its way back the cluster has two owners for
-/// up to that interval; both dispatch, which the cluster tier deduplicates by
-/// cloud uid, and both mirror, which is CAS-idempotent. What that window does
-/// cost is the ordering the teardown proof leans on, because the two accounts
-/// arrive on two unrelated streams — so the hard delete may then race rather
-/// than being decided. It is bounded, not absent, and that is the honest
-/// statement of it.
-///
-/// An unbound VM belongs to everybody: any replica may schedule it, but only
-/// onto clusters of its own session map (`Candidate::connected`), so whoever
-/// wins the binding CAS binds the VM to a cluster it already owns and
-/// ownership follows the binding for free.
-///
-/// The edge this leaves open, deliberately and as one floor down: a VM whose
-/// cluster is dialled into no replica at all is reconciled by nobody, a
-/// deleting one included, which waits until the cluster comes back — tearing a
-/// VM down is something only its cluster can do.
+/// Cluster replicas converge on the same cloud endpoint through HRW and periodic
+/// re-homing. During convergence, two cloud replicas can hold sessions and act on
+/// the same objects; separate streams do not provide a common teardown ordering.
 pub fn may_reconcile(vm: &Vm, sessions: &HashSet<String>) -> bool {
     match vm.spec.cluster_name.as_deref() {
         Some(cluster) => sessions.contains(cluster),
@@ -295,39 +263,13 @@ async fn pass(
     Ok(())
 }
 
-/// Every secret this cloud holds, mirrored to every cluster this replica is
-/// talking to.
+/// Mirror sealed secrets to every locally connected cluster before placement.
+/// Both tiers share the sealing key; this pass forwards ciphertext without using it.
+/// Reports acknowledge cloud generations, suppressing unchanged retransmissions.
 ///
-/// EVERY cluster, and that is the difference from a volume. A volume's pool
-/// names one cluster, so a volume has a home; a secret has none — a VM
-/// referring to it can be placed anywhere, and the cluster has to hold it
-/// BEFORE the placement, not after. So the set of clusters is the answer, and
-/// the cost of that is the honest one: a tenant's secret exists on every
-/// cluster of this cloud, sealed, whether a VM there uses it or not.
-///
-/// The values travel as they are stored — sealed — because both tiers hold
-/// the same KEK. No plaintext crosses this session and this pass needs no key
-/// at all.
-///
-/// Level-triggered like everything else here: the pass re-sends what it
-/// cannot confirm, and `handle_create_secret` down there is idempotent for an
-/// unchanged spec. Since `ClusterStatus.secrets` there IS something to
-/// confirm against: a cluster says what it is holding and at which of the
-/// cloud's generations, so a secret it already has at the current one is not
-/// sent again. A cluster that has not spoken to THIS replica yet is remembered
-/// as nothing, and nothing means "send" — which is what every replica did on
-/// every pass before this existed.
-///
-/// The same evidence closes the other half. A deletion cannot be
-/// level-triggered off a list the object has already left, so `delete_secret`
-/// at the edge tells the clusters this replica is talking to and then removes
-/// the object — and a cluster that was OFFLINE for that used to keep its
-/// sealed copy for ever, because nothing afterwards ever mentioned it again.
-/// Now it mentions it itself, every ten seconds: a cloud-managed secret in a
-/// cluster's report that this cloud does not have is a leftover, and it is
-/// told to go. `managed_by_cloud` is what makes that safe — a secret somebody
-/// made at the cluster edge is nobody's business here and is never in the
-/// list.
+/// Reported cloud-managed secrets absent from the cloud are deleted, including
+/// copies whose cluster missed the original deletion command. Cluster-local
+/// secrets are excluded from this cleanup.
 async fn mirror_secrets(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -458,16 +400,9 @@ fn publish_vm_gauges(vms: &[Vm]) {
     }
 }
 
-/// Expire stale heartbeats and hand the scheduler what is left. Both halves
-/// read the same Cluster objects, so a cluster that just expired cannot still
-/// be placed onto in the same pass.
-///
-/// Expiry is every replica's business, not just the owner's: the heartbeat it
-/// judges was written to the shared store by whichever replica holds the
-/// session, and `connected = false` is idempotent under CAS, so two replicas
-/// reaching it at once cost one redundant write. `connected` in the candidate
-/// stays strictly local, though: a cluster dialled in *somewhere* is still not
-/// one this replica can send anything to.
+/// Expire stale heartbeats before constructing candidates from the same objects.
+/// Any replica may perform expiry through CAS. Candidate connectivity remains
+/// local: a session held by another cloud replica cannot dispatch here.
 async fn expire_and_collect_clusters(
     store: &EtcdStore,
     sessions: &HashSet<String>,
@@ -578,16 +513,9 @@ async fn still_connected(
     false
 }
 
-/// Is this status younger than everything we have already done to this VM?
-/// Only then does it describe the VM as it is now.
-///
-/// Both of the decisions below turn on a name being absent from the list, and
-/// a status built before our last command landed is absent of it too — it
-/// describes the VM from before. Read as current, it would have us repeat a
-/// create that already took (and each repeat writes, and each write wakes the
-/// watch, and the pass comes round again) or delete the record of a machine
-/// that is very much alive. The floor is the delete request and the last ack,
-/// whichever is later, because those are the two things we did.
+/// Require status to postdate both deletion intent and the latest command ACK.
+/// An older absence could otherwise repeat a completed create or erase a VM whose
+/// teardown has not completed.
 pub fn status_is_current(vm: &Vm, reported_at: DateTime<Utc>) -> bool {
     controller_api::mirror::is_current(
         vm.metadata.deletion_timestamp,

@@ -2,15 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! `meister-agent --check-config`: does this file parse, and nothing else.
-//!
-//! It exists so that a BUILD host can check a configuration for a node it is
-//! not. That is the whole design constraint, and it is why the check may not
-//! look anything up: a `nix flake check` on a laptop has neither the node's
-//! `meister` group nor its data directory, and a check that needed either
-//! would be a check that only passes where it is not needed.
-//!
-//! These tests run the real binary, because the claim is about the binary.
+//! Run the real --check-config binary and verify parsing without node-specific
+//! lookups or filesystem writes. Build hosts need not have the target node's
+//! users, groups, devices or data directories.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -22,10 +16,7 @@ fn examples() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/examples")
 }
 
-/// Put a line right after a section header, by the header's own line.
-///
-/// A plain `replace` would also hit the section names the file's prose lists,
-/// and the test would be about a comment.
+/// Insert after an exact section-header line without matching prose mentions.
 fn under(text: &str, section: &str, line: &str) -> String {
     let mut out = Vec::new();
     let mut placed = false;
@@ -103,10 +94,7 @@ fn checking_a_config_looks_nothing_up_and_writes_nothing() {
     let home = tempfile::tempdir().unwrap();
     let path = home.path().join("agent.toml");
     let text = std::fs::read_to_string(examples().join("agent.toml")).unwrap();
-    // Two things this machine cannot answer: a group that does not exist
-    // here, and a database directory that cannot be created. `load` would
-    // fail on the first; opening the store would fail on the second. The
-    // check passes, which is the point.
+    // Config checking must not resolve host groups or create database directories.
     let text = under(
         &text,
         "[paths]",

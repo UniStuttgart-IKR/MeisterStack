@@ -71,17 +71,10 @@ struct Args {
 struct FileConfig {
     cluster_name: Option<String>,
     listen_api: Option<String>,
-    /// Where OTHER replicas of this cluster can reach this one's REST API.
-    ///
-    /// `listen_api` is a BIND address and `0.0.0.0` is not one anybody can
-    /// dial, so a replica that binds a wildcard cannot name itself and does
-    /// not try: `Node.status.session_endpoint` stays empty and a console read
-    /// that lands on the wrong replica answers 503 naming this key. Absent
-    /// with a concrete `listen_api`, that address is used.
-    ///
-    /// Host and port, as `listen_api` is; the scheme follows the TLS
-    /// configuration, because a replica dials its sibling the way its sibling
-    /// serves.
+    /// REST address reachable by sibling replicas. A concrete `listen_api` is the
+    /// fallback; wildcard bind addresses cannot be advertised. Without a reachable
+    /// address, requests needing a sibling session return 503.
+    /// Specify host and port; the scheme follows the replica's TLS configuration.
     advertise_api: Option<String>,
     listen_session: Option<String>,
     etcd_endpoints: Option<String>,
@@ -122,15 +115,9 @@ struct FileConfig {
     /// routers are built by the agents with the `linux-network` driver.
     #[serde(default)]
     network: Option<controller_api::NetworkConfig>,
-    /// How long a live migration's TRANSFER may take before it is called
-    /// failed, in seconds. Absent = 120.
-    ///
-    /// Configuration and not a constant, because how long a guest's memory
-    /// takes to cross is a property of the estate and not of the code: half a
-    /// gigabyte over a loopback is a third of a second, thirty-two over a
-    /// busy 10G link is minutes. The other half of a migration — the
-    /// destination getting ready — is local work on one machine and stays a
-    /// constant. See `migration::Timeouts`.
+    /// Migration transfer timeout in seconds; defaults to 120.
+    /// Tune for guest memory and network throughput. Destination preparation uses
+    /// a separate fixed timeout; see `migration::Timeouts`.
     migration_transfer_secs: Option<u64>,
 
     // --- tls and auth. PEM paths, never PEM; relative to this file. ---
@@ -331,15 +318,9 @@ fn main() -> anyhow::Result<()> {
     run(args)
 }
 
-/// Exit 0 and one line on stdout, or exit 1 and the sentence of whichever
-/// checker refused, on stderr.
-///
-/// What this covers is `resolve_config` — the file, the flags, and the
-/// checks it already runs (`RequeueConfig::into_policy`, `Overcommit::check`,
-/// `SchedulerConfig::into_scheduler`, `NetworkConfig::into_backend`) — plus
-/// the half of the authenticator chain that needs no file. What it does not
-/// cover is everything that opens one: the client CA, the bearer token, the
-/// provider's discovery document. See `rest::check_chain`.
+/// Validate resolved configuration and authenticator-chain structure, then exit.
+/// Success prints one line and exits 0; failure prints to stderr and exits 1.
+/// This does not load credentials or contact discovery providers.
 fn check_config(args: &Args) -> ! {
     let verdict = resolve_config(args).and_then(|cfg| {
         let serves_sessions = !cfg.listen_session.trim().is_empty();
@@ -482,15 +463,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     let registry = Arc::new(session::SessionRegistry::new());
 
-    // --- lane 5A: the list, while the process runs ----------------------
-    //
-    // The authenticator reloads on its own, but only when somebody
-    // authenticates — and a controller whose peers are all connected
-    // authenticates nobody for hours. So one task looks at the file on its
-    // own clock, and hands what it finds to the registry: a session that is
-    // already talking on a certificate that has just been taken back is
-    // exactly the case a revocation is for, and nothing else would notice
-    // it until the peer reconnected.
+    // Poll revocations independently of new authentication so long-lived sessions
+    // are closed when their credentials are revoked.
     if let Some(revocations) = revocations.clone() {
         let registry = registry.clone();
         tokio::spawn(async move {
@@ -521,16 +495,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
     // --- end lane 5A ----------------------------------------------------
 
-    // What a console read needs when it lands on the replica that does NOT
-    // hold the node's session: this cluster's own name, which is what the
-    // sibling's permission table lets read, and the credential to present.
-    //
-    // The cluster's own peer certificate — `system:cluster:<name>`, the one
-    // it dials the cloud with — and not the serving pair, because it is that
-    // NAME the sibling admits. Verified against the CA the sibling's serving
-    // certificate chains to, which is `client_ca`: one CA signs both tiers in
-    // this stack, and a replica asking its sibling is the cluster asking
-    // itself. Absent = plain http, which is what a lab runs.
+    // Authenticate sibling requests with the cluster's system identity, not its
+    // hostname-based serving certificate. Verify the sibling against `client_ca`,
+    // the shared CA used for peer and serving certificates.
     let forward = Arc::new(logs::Forward {
         cluster: cfg.cluster_name.clone(),
         // Whether the SIBLING speaks TLS, answered by whether this replica
@@ -592,16 +559,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         None
     };
 
-    // A live migration is about two machines and their sessions can hang off
-    // two replicas, so its commands travel the way a console read does.
-    // Everything else a reconcile pass sends is about one machine and is sent
-    // through the registry directly, because the replica that holds the
-    // object is the replica that holds the session. See `dispatch`.
-    //
-    // Built once, here, and cloned into both the reconcile loop below and the
-    // cloud session: `DropImage` is the one CLOUD command that needs it too
-    // (Astra finding S02, 2026-09-23, rest b) — it reaches every node in the
-    // cluster, not the one object a session-owning replica already holds.
+    // Share forwarding dispatch between reconciliation and cloud commands.
+    // Migration endpoints and image-cache drops can span nodes held by different
+    // replicas; the local session registry alone cannot reach all of them.
     let dispatch = Arc::new(dispatch::Dispatch::new(
         registry.clone(),
         store.clone(),

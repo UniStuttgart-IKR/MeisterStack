@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
-# scripts/meisterstack-install.sh, both shapes, into a scratch root.
-#
-# `--root` is what the script has for a machine it must not touch: every
-# path goes below it, the paths inside the configs too, and no service and
-# no group is made. So the whole of the script's decisions — which files,
-# with what in them, and whether the agent accepts the config it wrote —
-# can be checked in the sandbox against the real binaries.
+
+# Validate installer-generated files in scratch roots with the real config parser.
+# Cover standalone and CLI profiles, repeat runs, forced replacement, and refusals.
 { nixpkgs, lib, pkgs, system, self }:
 pkgs.runCommand "install-script"
 {

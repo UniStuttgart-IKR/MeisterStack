@@ -6,18 +6,8 @@
 
 use super::*;
 
-/// Where volumes come from: a backend, the nodes that can reach it, and how
-/// much of it each tenant may hold.
-///
-/// `nodes` is a list and not a label selector, and that is the honest shape
-/// for what it describes: an LVM volume group is on ONE machine and an NFS
-/// export is reachable from the handful that mount it. Which nodes reach a
-/// pool is a fact an operator knows and writes down; deriving it from labels
-/// would be inferring a physical connection from a piece of metadata.
-///
-/// Empty `nodes` means every node — the compatibility direction, and the one a
-/// single-machine lab wants: a pool nobody restricted is a pool the scheduler
-/// does not use to narrow anything.
+/// Storage backend configuration, reachable nodes, and per-tenant limits. Nodes explicitly
+/// describe physical access; an empty list imposes no node constraint.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoragePoolSpec {
@@ -40,16 +30,8 @@ pub struct StoragePoolSpec {
     /// my disk come out of" a question about ordering.
     #[serde(default, skip_serializing_if = "is_false")]
     pub default: bool,
-    /// Per-tenant ceiling in GiB out of THIS pool, plus the one row that is
-    /// about everybody: [`QUOTA_EVERYONE`].
-    ///
-    /// A tenant named here has that ceiling; one that is not has the `*` row;
-    /// and a pool with neither has [`DEFAULT_QUOTA_STORAGE_GIB`]. The `*` row
-    /// is what made the third case sayable: until runde 4 the hundred GiB was
-    /// a constant in this file and nowhere else, so `storagepool ls` showed
-    /// `QUOTA -` and the refusal ("its quota there is 100 GiB") named a
-    /// number an operator could not find (D-P11). The read paths fill it in
-    /// now, so every pool answers with the ceiling it actually applies.
+    /// Per-tenant quota in GiB. A named tenant overrides the `*` entry, which overrides
+    /// DEFAULT_QUOTA_STORAGE_GIB. Read paths materialize the effective default.
     ///
     /// [`QUOTA_EVERYONE`]: StoragePoolSpec::QUOTA_EVERYONE
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -59,35 +41,19 @@ pub struct StoragePoolSpec {
     /// cluster tier. `served_by` combines this field with `clusters`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cluster: String,
-    /// Additional clusters that reach the same backend. Shared and networked
-    /// storage may span clusters; node-local storage cannot. Shared pools must
-    /// report matching backend parameters. `served_by` combines this list with
-    /// `cluster`, preserving the latter as the home when set.
-    ///
-    /// [`served_by`]: StoragePoolSpec::served_by
+    /// Additional clusters reaching the same backend. Shared and networked storage can span
+    /// clusters when their reported backend settings agree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clusters: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
 }
 
-/// How much a tenant may hold in a pool nobody set a number for.
-///
-/// Not zero, and the difference from `DEFAULT_QUOTA_PUBLIC` next door is the
-/// point: a routable address is something an operator was given by somebody
-/// else and hands out one at a time, while disk is something the machine has.
-/// A hundred GiB is a lab's worth — a few root disks and room to be wrong —
-/// and an admin who wants a ticket per volume sets the number to zero.
+/// Default tenant ceiling when neither a named quota nor the `*` entry is configured.
 pub const DEFAULT_QUOTA_STORAGE_GIB: u64 = 100;
 
 impl StoragePoolSpec {
-    /// The key in `quota` that is about every tenant nobody named.
-    ///
-    /// A reserved name and not a new field, because it is the same statement
-    /// the other rows make and belongs in the same map: one place to read,
-    /// one place to patch, and a table that renders it without being taught
-    /// anything. `*` cannot collide with a tenant — a tenant's name is a DNS
-    /// label, and no label contains a star.
+    /// Quota map key used for tenants without an explicit entry.
     pub const QUOTA_EVERYONE: &'static str = "*";
 
     /// What this tenant may hold here: its own ceiling, the one for everybody
@@ -100,14 +66,8 @@ impl StoragePoolSpec {
             .unwrap_or(DEFAULT_QUOTA_STORAGE_GIB)
     }
 
-    /// Write the ceiling this pool applies to everybody else into the map, so
-    /// that a client reading the object sees the number the server uses.
-    ///
-    /// On the way OUT and not at create, and that is what makes it true for
-    /// the pools that already exist: the hundred GiB has been the answer
-    /// since the field was added, and a pool written last month applies it
-    /// exactly as one written today does. A pool whose operator has said a
-    /// number keeps it — this only ever fills a gap.
+    /// Materialize the effective default quota for API reads without changing a tenant-specific
+    /// ceiling.
     pub fn state_default_quota(&mut self) {
         self.quota
             .entry(Self::QUOTA_EVERYONE.to_string())
@@ -120,14 +80,8 @@ impl StoragePoolSpec {
         self.nodes.is_empty() || self.nodes.iter().any(|n| n == node)
     }
 
-    /// Every cluster that serves this pool, in the operator's own order.
-    ///
-    /// One function so that nothing else in the tree has to know there are
-    /// two spellings: `spec.clusters` when it is a list, `spec.cluster` when
-    /// it is the short form for one, and both when somebody wrote both (the
-    /// short form first, and never twice). Empty is a pool that names no
-    /// cluster at all, which the create edge refuses and which therefore only
-    /// exists on an object somebody edited afterwards.
+    /// All serving clusters in operator order, including the primary cluster without
+    /// duplicates.
     pub fn served_by(&self) -> Vec<&str> {
         let mut out: Vec<&str> = Vec::with_capacity(1 + self.clusters.len());
         if !self.cluster.is_empty() {
@@ -141,13 +95,7 @@ impl StoragePoolSpec {
         out
     }
 
-    /// Where a volume out of this pool is made when nobody has said
-    /// otherwise: the first cluster it names.
-    ///
-    /// A pool spanning clusters still has ONE home, because provisioning
-    /// happens once and somewhere. Which cluster's record holds a given
-    /// volume afterwards is the volume's own answer
-    /// (`VolumeStatus::cluster`), and it is what moves when the VM does.
+    /// Default cluster for a volume unless placement specifies another serving cluster.
     pub fn home(&self) -> Option<&str> {
         self.served_by().first().copied()
     }
@@ -157,17 +105,9 @@ impl StoragePoolSpec {
         self.served_by().contains(&cluster)
     }
 
-    /// Whether the clusters that serve this pool agree about what it IS.
-    ///
-    /// The check behind "a `shared` pool crosses clusters only if both mount
-    /// the same export". It cannot be asked of `spec` — a cloud pool is a
-    /// REFERENCE to a pool that exists on each cluster, and what those two
-    /// pools are made of is written down there — so it is asked of the
-    /// evidence each cluster sends up about its own object.
-    ///
-    /// `None` while fewer than two clusters have reported: silence is not
-    /// disagreement, and a pool nobody has spoken about yet must not be a
-    /// refusal. `Some((a, b))` names the first two that differ.
+    /// Compare the backend evidence reported by serving clusters. Return the first disagreeing
+    /// pair, or None while fewer than two clusters have reported. Missing evidence alone is not
+    /// disagreement.
     pub fn disagreeing(status: &StoragePoolStatus) -> Option<(&str, &str)> {
         let mut seen: Option<&PoolAtCluster> = None;
         for entry in &status.clusters {
@@ -183,15 +123,8 @@ impl StoragePoolSpec {
     }
 }
 
-/// What ONE cluster says about its own pool of this name.
-///
-/// The cloud object is a reference to as many real pools as it names
-/// clusters, and until this there was nowhere to put the second one's answer:
-/// `status.locality` and `status.nodes` are single-valued and were written by
-/// whichever cluster reported last. That was harmless while a pool named one
-/// cluster and is a silent overwrite the moment it names two.
-///
-/// Evidence, whole: each cluster replaces its own entry and no other's.
+/// One cluster's complete pool observation. Each cluster replaces only its own entry,
+/// preserving evidence from other serving clusters.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolAtCluster {
@@ -224,16 +157,8 @@ pub struct PoolAtCluster {
     pub message: Option<String>,
 }
 
-/// Where a pool is, and where its bytes are.
-///
-/// No capacity in it, and honestly so: how much room is left is a question
-/// about the volumes, which are their own objects and are counted when asked.
-/// A number cached here would be a number that is wrong after every create.
-///
-/// What IS here is the one fact an operator cannot look up anywhere else. The
-/// locality is not in `spec` and never will be — it is the DRIVER's answer,
-/// collected from the nodes that run it, and an admin who could type it would
-/// be able to tell the scheduler that an LVM pool is shared.
+/// Observed pool locality and reachability. Capacity usage is computed from volumes; locality
+/// comes from drivers rather than an administrator-supplied spec.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StoragePoolStatus {
@@ -272,36 +197,14 @@ pub struct StoragePoolStatus {
     /// what, and whether the two are describing the same bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clusters: Vec<PoolAtCluster>,
-    /// Two nodes of this pool that say different things about its driver —
-    /// the CLUSTER tier's one way to be `Failed`.
-    ///
-    /// Data and not a sentence, because it is a fact and the sentence is a
-    /// derivation: `settle_storage_pool` writes the prose, so there is one
-    /// wording of it and a test can assert on the four names rather than on a
-    /// string. Locality is compiled into a driver, so this cannot be a
-    /// setting — it is two binaries of different ages on one pool.
-    ///
-    /// `None` on every healthy pool and on every pool at the cloud, which has
-    /// no nodes of its own to compare.
+    /// Node pair reporting conflicting driver locality at the cluster tier. The phase
+    /// derivation formats this evidence. Absent for healthy pools and cloud objects, which have
+    /// no local nodes to compare.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disagreement: Option<PoolDisagreement>,
-    /// Whether the cluster this pointer names has said anything AT ALL — the
-    /// cloud tier's own fact, and the whole of D-C11.
-    ///
-    /// A pool at the cloud is a pointer at a pool an admin made down there,
-    /// and a pointer can be wrong in two ways that look identical from the
-    /// object: the cluster has never connected, or it has and has no pool of
-    /// that name. Both left the object at its birth phase — `Pending`, no
-    /// reason — and the chaos run watched one stand there for six minutes
-    /// without saying which half was missing. `status.clusters` answers the
-    /// second question (an entry exists, or it does not); this answers the
-    /// first.
-    ///
-    /// `None` means no report from the named cluster has ever been ingested.
-    /// It is deliberately NOT cleared when a cluster goes quiet again: a
-    /// mirrored object keeps the last word it was told, like every other
-    /// mirror in this tree, and how long it has stood is what the stuck
-    /// deadline reports (see `stuck`).
+    /// Whether the named cluster has ever reported. This distinguishes an unseen cluster from a
+    /// reporting cluster missing the pool. The value is retained when a cluster goes quiet;
+    /// phase age is handled by stuck detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointer_target: Option<PoolPointer>,
 }
@@ -328,23 +231,9 @@ pub struct PoolPointer {
 }
 
 reasons! {
-    /// Why a pool is what it is.
-    ///
-    /// Four and `Unrecorded`, and this is the one resource with ONE
-    /// vocabulary: a node reports drivers (`DriverInfo`, with their
-    /// locality) and never a pool, so `proto::reasons` has no list for it and
-    /// both tiers derive from these same words. `AwaitingNode` and
-    /// `Disagreement` are the two sentences `reconcile_pools` already writes
-    /// — "nobody has said anything about it yet" and "two binaries of
-    /// different ages on one pool". The two cluster words come from D-C11: a
-    /// pool at the CLOUD is a pointer at one a cluster admin already made,
-    /// and a pointer at nothing stood on `Pending` for six minutes without
-    /// saying which half was missing.
-    ///
-    /// There is no `Reported` any more either, and here the reason is the
-    /// same by a different road: the cluster sends the word it derived from
-    /// this very list, so the cloud parses it back rather than replacing it
-    /// with the name of the road it came down.
+    /// Pool reason categories derived by controllers from driver and cluster observations.
+    /// Nodes report driver locality rather than pool reasons. Preserve the derived category
+    /// when mirroring between controller tiers.
     StoragePoolReason [5] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
@@ -492,14 +381,8 @@ mod tests {
         )
     }
 
-    /// D-C11, both halves. A pool at the cloud is a POINTER, and a pointer
-    /// can be wrong in two ways that looked identical from the object:
-    /// `Pending`, no reason, for six minutes.
-    ///
-    /// They are two different mistakes. `ClusterHasNoPool` is a name somebody
-    /// typed wrongly or a pool nobody made down there, and the fix is at the
-    /// cluster. `ClusterSilent` is a cluster that is not talking to this
-    /// cloud at all, and the fix is a session.
+    /// Cloud pool state distinguishes an unseen cluster from a reporting cluster that lacks the
+    /// named pool.
     #[test]
     fn a_pointer_at_nothing_says_which_half_is_missing() {
         // Nothing has ever reported.

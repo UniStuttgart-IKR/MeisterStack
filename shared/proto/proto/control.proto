@@ -97,11 +97,8 @@ message Hello {
   // profiles each of them resolves. The controller keeps them as the node's
   // capacity so scheduling can look at them without asking the agent.
   repeated DriverInfo drivers = 3;
-  // What a guest's machine state would be restored INTO here.
-  //
-  // Absent from every agent before this field, and absent means "did not
-  // say": nothing is refused on a silence, which is what keeps a rolling
-  // upgrade from turning every live migration into a refusal.
+  // Machine profile for migration compatibility. Absent means unreported;
+  // legacy silence does not itself refuse migration.
   MachineProfile machine = 4;
 }
 
@@ -115,43 +112,24 @@ message MachineProfile {
   // `/proc/cpuinfo` `model name`, verbatim. What an operator reads in the
   // refusal, and what tells two generations of one vendor apart.
   string cpu_model = 2;
-  // The CPU flags this machine offers, sorted and space-separated.
-  //
-  // Carried whole rather than as a digest: a difference is only useful if the
-  // sentence can name WHICH flag, and a fleet of forty nodes is a few
-  // kilobytes once per Hello.
+  // Sorted, space-separated CPU flags, retained individually for diagnostics.
   string cpu_flags = 3;
-  // This node is itself a guest. `/proc/cpuinfo` says so with the
-  // `hypervisor` flag, and nothing else has to be asked.
-  //
-  // It is the field D-X1 turns on: a nested machine's saved state carries its
-  // own host's nested-virtualisation state, and that is what does not cross.
+  // Whether /proc/cpuinfo reports the hypervisor flag. Used by nested
+  // migration compatibility checks.
   bool nested = 4;
   // Which hypervisor this node runs under, when it is nested — the DMI vendor
   // (`KVM`, `QEMU`, `VMware`). Empty on bare metal and empty when it cannot
   // be read.
   string hypervisor = 5;
-  // The CPUID profile the VMM gives a guest: `Host` in v53, which is that
-  // enum's only variant. The field is here because the day it has a second
-  // one, a fleet that pins the same profile everywhere is a fleet whose
-  // guests can move — and the comparison already reads it.
+  // Guest CPU profile used for migration compatibility, currently Host.
   string cpu_profile = 6;
   // What the hypervisor binary calls itself, e.g. `cloud-hypervisor v53.0`.
   // Two ends on two builds is its own reason a state does not restore.
   string hypervisor_version = 7;
-  // `uname -r`.
-  //
-  // Compared and never refused on by itself: a kernel difference is worth
-  // naming in the sentence beside a refusal somebody else caused, and it is
-  // not on its own a reason a guest cannot move.
+  // Host kernel version for diagnostics; differences alone do not refuse migration.
   string kernel = 8;
-  // The physical machine this node is on, when anybody can say so.
-  //
-  // `[node] physical_host` in the agent's config, or the DMI serial when the
-  // platform publishes one. Empty is the ordinary answer for a nested guest —
-  // a KVM guest cannot see its host — and empty is why the nested rule is
-  // written the way it is: two nested nodes that CANNOT both name a host have
-  // not shown they are on one, and the lab measured what happens then.
+  // Configured physical_host or DMI serial. Empty means unknown, common
+  // for nested guests; it cannot establish that two nodes share a host.
   string host = 9;
 }
 
@@ -178,10 +156,7 @@ message StatusReport {
   // not-yet-provisioned record may be omitted. Gone explicitly acknowledges
   // deprovisioning; readers must not infer it from a missing entry.
   repeated VolumeStateReport volumes = 4;
-  // And the same for the snapshots it was told to take. Its own list rather
-  // than a phase on the volume, because a snapshot outlives the volume it
-  // came from: a report that carried it on the volume would lose it exactly
-  // when the object it belongs to is the only one left.
+  // Snapshot inventory, independent of source-volume lifetime.
   repeated SnapshotStateReport snapshots = 5;
   // The agent is intentionally stopping. Controllers can mark it unavailable
   // without waiting for heartbeat expiry. This does not mean its guests stopped.
@@ -227,16 +202,13 @@ message SnapshotStateReport {
   // VolumeSnapshotPhase -- plus `Gone`, which is this message's own and has
   // no object phase, because an object that reaches it is deleted.
   string phase = 2;
-  // What the BACKEND calls the copy. Empty until there is one.
+  // Provider-reported location or identifier. Empty means unreported,
+  // not deleted; controllers must not guess a backend path.
   string backend = 3;
   // How big the copy came out, in bytes as the node measured it.
   uint64 size_bytes = 4;
   string message = 5;
-  // Why this copy is in the phase above, in one closed word — the same
-  // vocabulary the volume beside it carries, minus the words a copy cannot
-  // be in. See `VmStatusReport.reason` for why it is a string.
-  //
-  // Empty for `Ready` and from every node that predates the field.
+  // Snapshot reason string. Empty for Ready or legacy reporters.
   string reason = 6;
 }
 
@@ -248,22 +220,12 @@ message VolumeStateReport {
   // plane's own VolumePhase spelled exactly; `Gone` is this message's own and
   // has no object phase, because an object that reaches it is deleted.
   string phase = 2;
-  // What the BACKEND calls it -- the path, the device, the resource name.
-  // Empty until there is one, and empty is silence rather than a deletion.
-  // This is the ONLY source of `Volume.status.backend` at either tier: the
-  // control plane cannot derive the string (three drivers, three spellings),
-  // and it stopped guessing one in storage B.
+  // Provider-reported location or identifier. Empty means unreported,
+  // not deleted; controllers must not guess a backend path.
   string backend = 3;
   string message = 4;
-  // How big the volume actually IS, as the node measured it.
-  //
-  // Evidence, and it earns its place with the resize: the spec is the
-  // intent, this is what happened, and `observedGeneration` closes when the
-  // two agree. It also differs from the request by construction on lvm-thin,
-  // which rounds up to the extent size -- so a control plane echoing the
-  // request back would be stating a number no disk has.
-  //
-  // Zero from a node that predates the field, which reads as "did not say".
+  // Measured provider size, including backend rounding. Zero from legacy
+  // reporters means unreported; do not substitute requested size as evidence.
   uint64 size_bytes = 5;
   // Bounded node reason from proto::reasons::VOLUME. Preserve unknown words
   // in diagnostic messages. An empty value supplies no reason.
@@ -305,12 +267,7 @@ message NodeStatus {
   repeated NodeCondition conditions = 3;
 }
 
-// One thing that is wrong with a node, in a word and a sentence.
-//
-// The same pairing every other reason in this stack carries (StayingVm,
-// PendingReason): the word is what a program branches on, the sentence is
-// what an operator reads, and asking a program to match on prose is asking
-// it to break.
+// Node health condition with a stable reason and readable message.
 message NodeCondition {
   // Known types include DiskPressure, StoreUnhealthy and CgroupUnusable.
   // Controllers treat every nonempty condition, including unknown types, as
@@ -349,10 +306,7 @@ message VmStatusReport {
 
 // One tap of a VM and the hardware address on it.
 message NicReport {
-  // Which NIC of the spec this is, as the spec's own way of pointing at one:
-  // `nics[0]`, `nics[1]`. The list of NICs is ordered and unnamed — nothing
-  // in a VM spec gives an interface a name of its own — so the position IS
-  // the name, spelled the way this API's field paths already spell it.
+  // Positional NIC field path, e.g. `nics[0]`; NIC specs have no separate names.
   string name = 1;
   // Lower case, colon-separated, as `MacAddr` prints it.
   string mac = 2;
@@ -380,14 +334,10 @@ message ControllerMessage {
   }
 }
 
-// The complete desired state of one node, sent right after Hello and before
-// anything else. Every entry is the CreateInstance the controller would send
-// anyway (create is idempotent by id), so applying the snapshot needs no
-// second code path. What is NOT in the list is the other half of the
-// message: a managed record the controller no longer knows about is gone and
-// the agent tears it down. VMs on their way out (deletionTimestamp set) are
-// deliberately absent here — they keep going through Destroy so the
-// finalizer stays the single teardown path.
+// Complete managed VM intent sent after Hello. Entries reuse idempotent
+// CreateInstance semantics. Missing managed records enter teardown; local
+// VMs are retained. Deleting controller objects are omitted and continue
+// through the controller finalizer/Destroy path.
 message SyncState {
   repeated CreateInstance desired = 1;
 }
@@ -414,10 +364,8 @@ message Command {
     ResizeAttachment resize_attachment = 15;
     PrepareMigration prepare_migration = 16;
     MigrateOut migrate_out = 17;
-    // 6k Mini-Neutron: a tenant router on a gateway node. The node holds
-    // the provider interface; the controller decides where the router is
-    // active and what it translates. Level-triggered like everything else:
-    // the same EnsureRouter twice is one router.
+    // Idempotent router intent; the controller selects active placement and
+    // translation while the node supplies the provider interface.
     EnsureRouter ensure_router = 18;
     DestroyRouter destroy_router = 19;
     // Let go of a volume's RECORD and keep the bytes. The one command in this
@@ -449,10 +397,8 @@ message DropImage {
   string uid = 2;
 }
 
-// A tenant router as the node builds it: one leg on the provider network
-// (`physnet`, the interface the node gave away, no host address on it), one
-// leg on the tenant's overlay (`vni`), NAT between them, and a BGP word for
-// what this node answers for while `active` is true. Addresses are CIDRs.
+// Router joining a dedicated provider physnet and tenant VNI, with NAT
+// and active-node prefix announcements. Interface addresses use CIDR notation.
 message EnsureRouter {
   string id = 1;
   string physnet = 2;
@@ -477,13 +423,8 @@ message DestroyRouter {
   string id = 1;
 }
 
-// What the node has, router by router — the same rule as VmStatusReport:
-// what IS, not what was asked.
-//
-// One message on both roads, exactly as VmStatusReport is: `id` is the uid
-// the tier above handed out, which one hop down is the controller's and one
-// hop up the cloud's. The two fields below are the ones only the upper road
-// can fill.
+// Observed router state. The ID identifies the commanding tier's object;
+// cluster reports additionally carry placement fields.
 message RouterReport {
   string id = 1;
   string phase = 2;
@@ -492,13 +433,8 @@ message RouterReport {
   // Active node, filled by the cluster; empty on the agent hop. An empty
   // cluster value means no node is currently reported active.
   string node = 5;
-  // The priority list this router was planned onto, in order.
-  //
-  // Empty on the AGENT's road for the same reason as `node`. Filled on the
-  // CLUSTER's road because the list IS the failover promise — a router with
-  // one machine behind it has none — and because `router get` at the cloud
-  // is where a tenant reads it. Evidence: the cloud mirrors it and never
-  // writes into it.
+  // Ordered cluster gateway placement, omitted by agents. Cloud mirrors
+  // this evidence; one placement provides no standby.
   repeated string nodes = 6;
   // Bounded router failure reason, such as NetnsGone or FabricUnhealthy.
   // Unknown words must remain visible in the message; empty supplies no reason.
@@ -506,7 +442,7 @@ message RouterReport {
 }
 
 // Prepare resources and a VMM listener for a migration attempt. Ack.payload
-// returns JSON {"peer": "tcp:<addr>:<port>"}; intermediate tiers carry this
+// returns JSON `{"peer": "tcp:<addr>:<port>"}`; intermediate tiers carry this
 // address unchanged. Disks, taps and paths must match the transferred config.
 // The receiving VMM must not already contain a created guest.
 message PrepareMigration {
@@ -518,10 +454,7 @@ message PrepareMigration {
   // document the source was given, so that the disks, taps and files this
   // node builds are the ones the arriving configuration will name.
   string spec_json = 2;
-  // Where this node should listen, as an address the caller has NO opinion
-  // about: empty means "choose", which is what the cluster always sends. It
-  // is here for a caller that has to pin a port — a firewall with one hole in
-  // it — and for nothing else.
+  // Optional receive listener address. Empty lets the node choose.
   string listen = 3;
   string migration_id = 4;
 }
@@ -546,30 +479,18 @@ message CleanupMigration {
   bool source = 3;
 }
 
-// Make bytes on this node, or hand back the ones that are already there.
-//
-// The command the storage object always implied and never had: until it, a
-// Volume could be placed on a node and nothing would ever tell that node so.
-// Idempotent by id like every create here, and idempotent all the way down —
-// every backend derives its own name from the id, so a provision whose answer
-// was lost finds the volume rather than making a second one.
+// Provision or recover the volume identified by id. Backend names must
+// remain stable across retries after lost replies.
 message ProvisionVolume {
   // The Volume object's metadata.uid, exactly as CreateInstance carries a
   // VM's: a name is what people call a volume and people reuse names, the
   // uid is which volume it is.
   string id = 1;
-  // The agent's own `VolumeSpec` as JSON — `driver` resolved from the pool,
-  // `params` the pool's merged with the volume's, `size_bytes`, `base_image`.
-  // The same document the inline path in a NewVmSpec carries, so one spec
-  // format reaches the driver whichever way the volume was asked for.
+  // Resolved VolumeSpec JSON: driver, merged pool/volume params, size and
+  // base image. Uses the same format as inline VM volume provisioning.
   string spec_json = 2;
-  // A VolumeSnapshot's uid to start from, instead of `spec_json.base_image`.
-  //
-  // Additive, and empty for every provision that came before it: a volume
-  // starts empty, from a catalogue image, or from somebody's own point in
-  // time, and the third is the new one. The two image fields and this one are
-  // mutually exclusive -- refused at the API edge, and refused again at the
-  // node, which is the refusal nobody can go around.
+  // Source snapshot UID, mutually exclusive with base-image fields.
+  // Empty retains ordinary empty/image provisioning for legacy requests.
   string from_snapshot = 3;
 }
 
@@ -588,13 +509,8 @@ message SnapshotVolume {
 // reason -- absence from a node's report is not proof of anything.
 message DropSnapshot { string snapshot_id = 1; }
 
-// Grow the BYTES, on the node that provisioned them.
-//
-// The first of the two halves of a resize, and the two are not symmetric and
-// not reversible. This one always happens -- a volume nothing is holding
-// still grows, and a block device grows here or nowhere, because the VMM
-// half only CHECKS a block device's size. Idempotent: a backend that already
-// has the size is done, not in error.
+// Grow provider data idempotently, even without an attached VM.
+// Guest notification through ResizeAttachment is a separate operation.
 message ResizeVolume {
   // The Volume object's uid.
   string id = 1;
@@ -615,51 +531,31 @@ message ResizeAttachment {
   uint64 size_bytes = 3;
 }
 
-// Destroy the volume AND its data. Idempotent: an id this node has no record
-// of is answered `Gone`, because that is the same outcome.
-//
-// Refused — never silently obeyed — while a VM on this node is holding it.
-// The node is the last defence against data loss, and it is a defence worth
-// having even though the controller is not supposed to send this.
+// Delete the volume and its data, refusing while a local VM holds it.
+// An already-absent local record returns Gone.
 message DeprovisionVolume { string id = 1; }
 
-// The one command that is a QUESTION. Everything else here tells a node to
-// change something and is answered with "done"; this asks for what the guest
-// printed and is answered with it, in Ack.payload.
-//
-// It rides on the same command channel rather than getting a session verb of
-// its own for one reason: the channel already solves the hard part. The
-// controller does not dial the node — the node dialled it — so there is no
-// second direction to open, and Pending already matches a request_id to the
-// result that carries it back.
+// Fetch log bytes through the existing outbound session. The reply
+// uses the correlated command Ack.payload.
 message FetchLogs {
   string id = 1;
   // How many lines from the END. The node keeps a bounded ring per stream
   // and this only shortens what comes out of it; 0 = the node's default.
   uint32 lines = 2;
-  // Which lines the caller wants kept, as plain substrings. Applied at the
-  // NODE, before `lines` shortens anything — so `lines` means "the last N
-  // that matter" rather than "the last N, some of which you then throw away".
-  // A line is dropped if it contains any of `hide`; if `only` is non-empty a
-  // line must contain one of them to survive. Both empty is everything, which
-  // is what a caller that named none meant, and what every caller before this
-  // field said by not having it.
+  // Substring filters applied on the node before the line limit. Any hide
+  // match drops a line; nonempty only requires at least one match. Empty
+  // filters retain all lines.
   repeated string hide = 3;
   repeated string only = 4;
-  // Which streams to read. Empty = the guest's own (`console`, `serial`),
-  // which is what every caller before this field said by not having it. The
-  // driver's own diagnostics are `vmm`, and they come only when named: they
-  // are hypervisor noise in front of somebody reading their guest's boot,
-  // right up until the moment the guest never booted at all.
+  // Streams to read. Empty selects guest console/serial; VMM diagnostics
+  // are returned only when explicitly requested.
   repeated string streams = 5;
 }
 
 message DestroyInstance { string id = 1; }
 
-// The four runtime transitions, same semantics as the agent's own REST
-// endpoints: they set the record's desired state and let the reconciler
-// converge. Derived level-triggered from spec.runStrategy vs status.phase,
-// so the controller repeats them until the phase moves.
+// Set desired runtime state and let agent reconciliation converge.
+// Controllers repeat commands according to desired versus observed state.
 message StartInstance { string id = 1; }
 
 message StopInstance {
@@ -680,21 +576,14 @@ message CommandResult {
   }
 }
 
-// An empty Ack is "done", which is what every command that CHANGES something
-// answers with. `payload` is for the ones that answer a question instead:
-// bytes rather than a typed field, because what is in it is decided by the op
-// that was sent and modelling one message per answer would put the same union
-// in the proto twice. Today there is one such op and it answers JSON.
+// Command acknowledgement with operation-specific optional payload.
+// Its completion meaning belongs to the command contract; it is not
+// a universal proof that the external side effect finished.
 message Ack { bytes payload = 1; }
 message ErrorMsg {
   string message = 1;
-  // The API's own word for WHY, so that a refusal keeps its meaning across a
-  // session. Without it every failure that came back through a session was a
-  // "rejection", and the tier above turned "I could not reach the node" into
-  // "two truths disagree" — a 409 for something a caller should simply try
-  // again. One of the reasons the REST edge uses (`Unavailable`, `NotFound`,
-  // `Conflict`, ...); empty from a peer that predates this field, and empty
-  // means what it always meant.
+  // Typed refusal reason such as Unavailable, NotFound or Conflict.
+  // Legacy peers may leave it empty; callers need a conservative fallback.
   string reason = 2;
 }
 
@@ -707,11 +596,8 @@ message CreateInstance {
   string spec_json = 3;
 }
 
-// ---------------------------------------------------------------------------
-// Cluster -> Cloud: the same session one tier up. The cluster-controller dials
-// out, says which cluster it is, and from then on the stream carries its
-// status upwards and the cloud's VM assignments downwards. No store is ever
-// shared between the tiers; this session is the only place they meet.
+// Cluster-to-cloud bidirectional session: cluster status travels up,
+// cloud assignments down. The tiers do not share their resource namespace.
 
 service ClusterPlane {
   rpc Session(stream ClusterMessage) returns (stream CloudMessage);
@@ -740,52 +626,29 @@ message ClusterStatus {
   uint32 nodes_ready = 1;
   uint32 nodes_total = 2;
   ClusterCapacity capacity = 3;
-  // Only the VMs this cluster holds for the cloud (the ones labelled
-  // meister.io/managed-by=cloud), the ones on their way out included — they
-  // exist until they do not, and the cloud reads their absence as proof of
-  // teardown. VmStatusReport.id is the uid the CLOUD handed out on CreateVm,
-  // exactly as one tier down it is the uid the controller handed the agent:
-  // the name is what people call a VM, the uid is which VM it is.
+  // Cloud-owned VM inventory, including terminating objects. IDs are the
+  // cloud-supplied UIDs; absence needs a complete, current report.
   repeated VmStatusReport vms = 4;
   // The union of what this cluster's nodes said about base images, the same
   // road one tier up. Failed wins over Ready where two nodes disagree: a
   // checksum that did not match is a fact about the bytes and not about the
   // node that read them.
   repeated ImageStateReport images = 6;
-  // False says "this list is not the whole truth" — a cluster that could not
-  // read all of its own objects says so instead of shipping a short list. The
-  // difference matters because absence from this list is what the cloud
-  // accepts as proof that a VM was torn down.
+  // Whether the full managed VM inventory was read. False prohibits
+  // interpreting missing entries as completed deletion.
   bool vms_complete = 5;
-  // The volumes this cluster holds for the cloud, the ones on their way out
-  // included. `VolumeStatusReport.uid` is the uid the CLOUD handed out on
-  // CreateVolume, exactly as one tier down it is the uid the controller handed
-  // the agent.
+  // Cloud-owned volumes, including terminating objects, identified by
+  // the UIDs supplied on CreateVolume.
   repeated VolumeStatusReport volumes = 8;
-  // The same statement `vms_complete` makes, about this list. Absence from a
-  // COMPLETE list is the cloud's proof that a volume was torn down; absence
-  // from an incomplete one is proof of nothing at all.
-  //
-  // Note the difference from the road one tier further down, where absence is
-  // never proof: there the reporter is a NODE, which knows only what it has
-  // been told about; here the reporter is a control plane that owns the
-  // objects and can say whether it read all of them.
+  // Completeness of the cluster-owned volume inventory. Missing entries
+  // from an incomplete list do not establish deletion. Node-local absence
+  // one tier below has different ownership semantics.
   bool volumes_complete = 9;
-  // The storage pools this cluster serves, one entry each. Evidence like
-  // everything else here: a pool's LOCALITY is a fact its driver states and
-  // its nodes report, and the cloud has no way to learn it otherwise — which
-  // it has to, because "which cluster can run a VM that uses this disk"
-  // depends on it. See StoragePoolStatusReport.
+  // Cluster pool observations, including driver-reported locality used
+  // by cloud placement. See StoragePoolStatusReport.
   repeated StoragePoolStatusReport pools = 10;
-  // The nodes this cluster has, one entry each. The aggregate above is what
-  // the cloud PLACES against and stays the granularity of that decision; this
-  // is what an operator READS, because draining a machine is an operator's act
-  // and an operator should not need a second profile at a second tier to
-  // perform it.
-  //
-  // Evidence, travelling upwards, exactly like every other field of this
-  // message — the cloud mirrors it onto the Cluster object and writes nothing
-  // into it itself. Intent travels the other way, as UpdateNode.
+  // Node inventory for cloud visibility and placement filtering. Cloud
+  // mirrors these observations; UpdateNode carries intent in the reverse direction.
   repeated NodeReport nodes = 7;
   // The volume snapshots this cluster holds for the cloud, the ones on their
   // way out included. Same road as `volumes`, one object over.
@@ -796,9 +659,9 @@ message ClusterStatus {
   // are cloud UIDs. The cluster fills active node and candidate nodes so
   // gateway failover is visible at the cloud.
   repeated RouterReport routers = 14;
-  // The same statement `vms_complete` makes, about this list. Absence from a
-  // COMPLETE list is the cloud's proof that a router was torn down; absence
-  // from an incomplete one is proof of nothing at all.
+  // Completeness of the cluster-owned volume inventory. Missing entries
+  // from an incomplete list do not establish deletion. Node-local absence
+  // one tier below has different ownership semantics.
   bool routers_complete = 15;
   // Cloud-managed secret UIDs and generations held by the cluster. The cloud
   // avoids resending unchanged copies and removes mirrors absent upstream.
@@ -811,10 +674,8 @@ message SecretStateReport {
   // The uid the CLOUD handed out on CreateSecret, which is what says WHICH
   // secret this is: a name is a label people reuse.
   string uid = 2;
-  // The cloud object's `metadata.generation` as it stood when this copy was
-  // written — not this cluster's own, which counts different writes. Zero
-  // from a cluster that predates the field, and zero compares unequal to
-  // every real generation, so such a cluster is simply re-sent to as before.
+  // Source cloud generation on the mirrored copy. Legacy zero causes
+  // resending rather than claiming the current generation is present.
   uint64 generation = 3;
 }
 
@@ -833,45 +694,25 @@ message VolumeSnapshotStatusReport {
   // How big the copy turned out to be, in GiB. Zero until measured.
   uint64 size_gib = 5;
   string message = 6;
-  // Why, in the tier's own closed word — `Working` and `DriverRefused` off
-  // the node's record, `SourceGone`, `Undeliverable`, `Dispatched` or
-  // `Requeued` from the cluster's own reconciler.
-  //
-  // The last of the six status roads to grow one, and it grew late for a
-  // dull reason: the copy is the one object whose word from below arrives on
-  // a DIFFERENT message (`SnapshotStateReport`, node to cluster), so the
-  // cluster had somewhere to put it before the cloud did. Empty from a
-  // cluster that predates the field, which reads as `Unrecorded`.
+  // Cluster snapshot reason, derived from node reports or reconciliation.
+  // Legacy empty strings map to Unrecorded.
   string reason = 7;
 }
 
-// One storage pool, as the cluster sees it.
-//
-// The cloud mirrors this onto its OWN StoragePool's status and writes none of
-// it itself. `spec.cluster` up there points at this pool; everything below is
-// what that pool turned out to be.
+// Cluster storage-pool observations mirrored into cloud pool status.
 message StoragePoolStatusReport {
   string name = 1;
   // Pending | Ready | Failed — the cluster's StoragePoolPhase, spelled out.
   string phase = 2;
-  // node-local | shared | networked. EMPTY means the cluster does not know
-  // yet (no node there runs the driver, or every agent predates the field),
-  // and empty must not be read as node-local: the first is "unknown" and only
-  // the second may pin a VM to one machine.
+  // node-local | shared | networked. Empty means unknown and must not
+  // be treated as evidence that data is pinned to one node.
   string locality = 3;
   // The nodes that can reach it, as the pool down there names them. Empty =
   // every node of that cluster, exactly as `StoragePoolSpec.nodes` means it.
   repeated string nodes = 4;
   string message = 5;
-  // `spec.params` of the cluster's OWN pool of this name, as JSON. Empty from
-  // a pool that carries none and from every cluster older than this field.
-  //
-  // It travels because a cloud pool may name more than one cluster, and two
-  // clusters claiming to serve one `shared` pool are only telling the truth
-  // if they mount the same export. The cloud cannot know that from its own
-  // object — its `spec.params` is what an operator wrote once, and each
-  // cluster's pool is a separate object down there. This is the evidence the
-  // comparison is made on.
+  // Cluster pool parameters as JSON, used to compare shared-backend
+  // identity across clusters. Empty includes legacy reporters.
   string params_json = 6;
   // Pool reason supplied by the cluster; agents report driver capabilities
   // instead of pool objects. Distinguishes a missing pool from a silent peer.
@@ -885,19 +726,13 @@ message VolumeStatusReport {
   string uid = 1;
   // One of the control plane's VolumePhase variants, spelled exactly.
   string phase = 2;
-  // The node inside that cluster which holds the bytes. Empty while unplaced.
-  // The cloud does not place volumes and never reads this to decide anything;
-  // it is what an operator READS, and what a cloud-tier candidate filter
-  // compares a VM's volume against.
+  // Volume owner node, empty while unplaced. Used for operator visibility
+  // and node-local volume constraints in cloud placement.
   string node = 3;
   // The VM holding it, by name, inside that cluster. Empty = nobody.
   string attached_to = 4;
   string message = 5;
-  // What the node's backend calls the volume -- a path for every driver in
-  // this tree. Evidence, and it travels for the same reason `node` does: the
-  // cloud cannot derive it (the drivers name volumes three different ways)
-  // and an operator reading a cloud-tier volume would otherwise see nothing
-  // at all. Empty until a node has said it; empty never means "gone".
+  // Node-reported backend identifier. Empty means unreported, not gone.
   string backend = 6;
   // Observed size in GiB after resize processing, independent of requested
   // spec.sizeGib. Zero means unmeasured or omitted by an older peer.
@@ -905,11 +740,7 @@ message VolumeStatusReport {
   // Nodes reporting this volume open. A migration can temporarily name two.
   // An empty list from an older cluster is not proof of closure.
   repeated string open_on = 8;
-  // Why this volume is in the phase above, in one closed word — the same
-  // vocabulary `VolumeStateReport.reason` carries one road further down, and
-  // the cloud mirrors it exactly as it mirrors the phase.
-  //
-  // Empty for `Ready` and from every cluster that predates the field.
+  // Volume reason mirrored from cluster state. Empty for Ready or legacy reporters.
   string reason = 9;
 }
 
@@ -925,10 +756,7 @@ message NodeReport {
   bool schedulable = 3;
   // `spec.labels`, what a vm's nodeSelector selects against.
   map<string, string> labels = 4;
-  // `spec.drain` — this node is being emptied, and every vm on it that can
-  // go is going. Travels for the same reason `schedulable` does: an operator
-  // who asked for the drain from the cloud has to be able to see it from
-  // there.
+  // Node drain intent, mirrored for cloud-side observation.
   bool drain = 9;
   uint32 vcpus = 5;
   uint64 mem_mib = 6;
@@ -937,14 +765,7 @@ message NodeReport {
   repeated string capabilities = 7;
   // VMs the agent reported in its last status.
   uint32 vms = 8;
-  // `status.conditions` — what the NODE said is wrong with itself, relayed
-  // unchanged.
-  //
-  // It travels for the reason `schedulable` and `drain` do: the tier above
-  // places VMs on clusters, and a cluster whose only free machine is wedged
-  // is a cluster this cloud should stop sending work to. Both tiers read the
-  // same list through the same predicate, so "unhealthy" cannot come to mean
-  // two different things one hop apart.
+  // Node-reported health conditions used by both tiers for placement vetoes.
   repeated NodeCondition conditions = 10;
   // Observed drain progress, mirroring controller_api::Draining. Absent means
   // no reported drain; the spec drain flag remains the requested policy.
@@ -1052,31 +873,20 @@ message CreateRouter {
   // placement uses the cloud's network definition.
   string network_name = 4;
   string network_json = 5;
-  // The external address, cut out of that network's allocation, CIDR.
-  //
-  // Cut UP HERE because the allocation is one range shared by every cluster
-  // of a cloud, and two clusters cutting out of their own copies of it would
-  // hand two routers the same address. The cluster takes it as given and its
-  // own cutting pass steps aside for a router that arrives with one.
+  // Cloud-allocated external CIDR. Allocation spans clusters, so the
+  // receiving cluster retains this address instead of allocating independently.
   string external_addr = 6;
-  // The rules, derived where the objects they come from live.
-  //
-  // `FloatingIp` and `RoutedSubnet` are cloud objects — a cluster serves
-  // neither — so a cluster cannot derive these for a cloud router and must
-  // not try: an empty derivation of its own would delete the tenant's DNAT
-  // rules one pass after they arrived. Same road as CreateVm.floating_ips,
-  // and the same reason.
+  // Cloud-resolved floating-IP and routed-subnet NAT rules. Cluster
+  // reconciliation must retain them because it lacks those cloud objects.
   repeated NatRule nats = 7;
-  // The prefixes this router announces, resolved from the RoutedSubnet
-  // objects named in the spec. They travel here AND as `routed` NAT rules,
-  // because the contract one tier down has no other field for them; this one
-  // is what `router get` prints.
+  // Resolved routed prefixes, also carried as routed NAT rules for the
+  // node contract. This field supports placement/status presentation.
   repeated string announced = 8;
 }
 
-// Sets the object's deletionTimestamp at the cluster; the finalizer flow
-// there is unchanged, and the cloud's own object goes only once the cluster
-// stops naming the router in its status. The same promise DestroyVm makes.
+// Mark the cluster snapshot for deletion. Its finalizer performs cleanup;
+// cloud removal waits for cluster absence. DropSnapshot is the separate
+// node command that removes backend data.
 message DeleteRouter {
   string name = 1;
   // Same rule as CreateRouter: only the object carrying this uid is ours to
@@ -1114,34 +924,25 @@ message ReleaseVolume {
   string uid = 2;
 }
 
-// A point in time of a volume, one tier up. The same shape CreateVolume has
-// and the same two rules: idempotent by name, and only the object carrying
-// this uid is ours.
-//
-// No scheduling here either, and for a smaller reason than the volume's: a
-// snapshot is taken where its volume's bytes are, so the node is the volume's
-// node and nobody decides anything.
+// Create the cluster snapshot object idempotently by name and cloud
+// UID. Placement follows the source volume; there is no independent
+// snapshot scheduling decision in this message.
 message CreateSnapshot {
   string name = 1;
   // The cluster tier's `VolumeSnapshotSpec` as JSON — one spec format the
   // whole way down. `spec.volume` names the volume by the name the cloud gave
   // it, which is the name the cluster's own copy carries.
   string spec_json = 2;
-  // The cloud object's metadata.uid. A name is a label people reuse.
+  // Cloud object incarnation. Adoption requires this exact UID, so name
+  // reuse cannot take ownership of an unrelated object.
   string uid = 3;
   // Whose it is, resolved at the cloud because the Tenant object lives there.
   string tenant = 4;
 }
 
-// Sets the object's deletionTimestamp at the cluster; the finalizer flow
-// there is unchanged, and the cloud's own object goes only once the cluster
-// stops naming the snapshot in its status.
-//
-// `DestroySnapshot` and not `DropSnapshot`: that name is taken, one tier
-// down, by the command the CLUSTER sends a NODE — and the two are different
-// acts about the same bytes. This one marks an object; that one removes an
-// LV. Sharing the name in one proto package was never possible and sharing it
-// in prose would be worse.
+// Mark the cluster snapshot for deletion. Its finalizer performs cleanup;
+// cloud removal waits for cluster absence. DropSnapshot is the separate
+// node command that removes backend data.
 message DestroySnapshot {
   string name = 1;
   // Same rule as DestroyVolume: only the object carrying this uid is ours to
@@ -1149,30 +950,23 @@ message DestroySnapshot {
   string uid = 2;
 }
 
-// A volume, one tier up. The same shape CreateVm has and the same two rules:
-// idempotent by name, and only the object carrying this uid is ours.
-//
-// No scheduling happens here. A cloud `StoragePool` NAMES its cluster
-// (`spec.cluster`), so which cluster a volume goes to is written down rather
-// than decided — the cloud has no way to compare two pools on two clusters
-// and no reason to invent one.
+// Create or adopt a cluster volume object by name and matching cloud
+// UID. Cloud pool resolution chooses the cluster before sending this command.
 message CreateVolume {
   string name = 1;
   // The cluster tier's `VolumeSpec` as JSON. One spec format the whole way
   // down, exactly as `CreateVm.spec_json` is.
   string spec_json = 2;
-  // The cloud object's metadata.uid. The cluster keeps it on the object it
-  // writes, and a create only ever adopts an object carrying this exact uid:
-  // a name is a label people reuse, and adopting on the name alone would hand
-  // a new volume somebody else's data.
+  // Cloud object incarnation. Adoption requires this exact UID, so name
+  // reuse cannot take ownership of an unrelated object.
   string uid = 3;
   // Whose it is, resolved at the cloud because the Tenant object lives there.
   string tenant = 4;
 }
 
-// Sets the object's deletionTimestamp at the cluster; the finalizer flow
-// there is unchanged, and the cloud's own object goes only once the cluster
-// stops naming the volume in its status.
+// Mark the cluster snapshot for deletion. Its finalizer performs cleanup;
+// cloud removal waits for cluster absence. DropSnapshot is the separate
+// node command that removes backend data.
 message DestroyVolume {
   string name = 1;
   // Same rule as CreateVolume: only the object carrying this uid is ours to
@@ -1186,10 +980,8 @@ message DestroyVolume {
 message CreateSecret {
   string name = 1;
   string spec_json = 2;
-  // The cloud object's `metadata.generation`, so that the copy can say which
-  // version of the secret it is. Kept as an annotation on the mirrored object
-  // and reported back in `ClusterStatus.secrets`, which is what lets the
-  // cloud stop re-sending an unchanged secret every pass.
+  // Cloud secret generation, persisted as mirror metadata and reported
+  // back so unchanged secrets need not be resent.
   uint64 generation = 5;
   // Same rule as CreateVolume: a name is a label people reuse, and only the
   // object carrying this uid is ours to overwrite.
@@ -1205,24 +997,14 @@ message DeleteSecret {
   string uid = 2;
 }
 
-// Draining or labelling one node, from one tier up.
-//
-// The cloud does not write into its own copy of the node — that copy is
-// evidence and arrives with the next ClusterStatus. This is the intent going
-// down, and the cluster applies it to its OWN Node object through the same
-// path its REST PATCH takes, so there is one write path per object and not
-// two.
+// Node intent forwarded from cloud to the cluster's ordinary update
+// path. Cloud node copies remain report-derived observations.
 message UpdateNode {
   string name = 1;
   // Unset = leave the cordon as it is. Set = this is what it becomes.
   optional bool schedulable = 2;
-  // Unset = leave the drain as it is. Set = this is what it becomes.
-  //
-  // Beside `schedulable` and not folded into it, because the two are the
-  // operator's two separate statements: a cordon says nothing new comes
-  // here, a drain says what is here should leave. `node drain` at the cloud
-  // is this field and nothing else, and `undrain` gives back exactly the
-  // schedulability the operator had asked for.
+  // Unset preserves drain state. Drain and schedulable are independent:
+  // clearing drain must retain the operator's cordon choice.
   optional bool drain = 5;
   // Labels to set, replacing a key that is already there.
   map<string, string> labels = 3;
@@ -1234,12 +1016,8 @@ message UpdateNode {
   AcceptsUpdate accepts = 6;
 }
 
-// The same question one tier up. The cloud names the VM the way it knows it
-// — by name and uid — and the cluster resolves that to the node the VM is
-// bound to and asks IT, so the payload that comes back is the node's,
-// unchanged, through two hops.
-// The classes a machine takes, as an instruction rather than as a fact. See
-// UpdateNode.accepts for why it is a message.
+// Workload-class acceptance update. Wrapper presence distinguishes no
+// change from an explicitly empty acceptance list.
 message AcceptsUpdate {
   // Empty = this machine takes everything again, which is what every machine
   // that was never told otherwise does.
@@ -1253,20 +1031,13 @@ message FetchVmLogs {
   // name is not.
   string uid = 2;
   uint32 lines = 3;
-  // Which lines the caller wants kept, as plain substrings. Applied at the
-  // NODE, before `lines` shortens anything — so `lines` means "the last N
-  // that matter" rather than "the last N, some of which you then throw away".
-  // A line is dropped if it contains any of `hide`; if `only` is non-empty a
-  // line must contain one of them to survive. Both empty is everything, which
-  // is what a caller that named none meant, and what every caller before this
-  // field said by not having it.
+  // Substring filters applied on the node before the line limit. Any hide
+  // match drops a line; nonempty only requires at least one match. Empty
+  // filters retain all lines.
   repeated string hide = 4;
   repeated string only = 5;
-  // Which streams to read. Empty = the guest's own (`console`, `serial`),
-  // which is what every caller before this field said by not having it. The
-  // driver's own diagnostics are `vmm`, and they come only when named: they
-  // are hypervisor noise in front of somebody reading their guest's boot,
-  // right up until the moment the guest never booted at all.
+  // Streams to read. Empty selects guest console/serial; VMM diagnostics
+  // are returned only when explicitly requested.
   repeated string streams = 6;
 }
 
@@ -1278,36 +1049,24 @@ message CreateVm {
   // The cluster tier's VmSpec as JSON: runStrategy plus the agent's NewVmSpec
   // verbatim under `vm`. One spec format the whole way down.
   string spec_json = 2;
-  // The cloud object's metadata.uid. The cluster keeps it on the object it
-  // writes, and a create only ever adopts an object carrying this exact uid:
-  // a name is a label people reuse, and adopting on the name alone would hand
-  // a new VM somebody else's disk.
+  // Cloud object incarnation. Adoption requires this exact UID, so name
+  // reuse cannot take ownership of an unrelated object.
   string uid = 3;
   // Tenant VNI resolved at the cloud and injected by the cluster into NICs
   // without explicit overlay or provider-network settings. Unset supplies no
   // tenant overlay. Explicit standalone NIC VNIs remain unchanged.
   optional uint32 vni = 4;
-  // The floating addresses reserved for this VM, resolved by the cloud
-  // because the FloatingIp objects live there. Same road as `vni` and for the
-  // same reason: the cluster writes them into the NIC entries of the spec
-  // before anything reaches a node, and the node turns them into the one
-  // exception to its "nobody sources from the pool" rule.
-  //
-  // Empty = this VM holds none, which is every VM before this milestone and
-  // every VM whose tenant never asked for an address.
+  // Cloud-resolved floating addresses reserved for this VM. The cluster
+  // injects them into NIC facts for the node source guard. Empty means none.
   repeated string floating_ips = 5;
-  // And its tenant's routed subnets, which is what turns the node's rule from
-  // "not out of the pool" into "these and nothing else": a tenant whose
-  // address space is written down can be held to it, and one whose is not
-  // cannot. Empty = a tenant with no routed subnet, which is the hoster mode
-  // (private space behind the tenant's own NAT appliance) and the shape of
-  // every tenant before Part B.
+  // Cloud-resolved tenant routed prefixes used by NIC source filtering.
+  // Empty means no routed-prefix claim.
   repeated string routed_subnets = 6;
 }
 
-// Sets the object's deletionTimestamp at the cluster; the finalizer flow there
-// is unchanged, and the cloud's own object goes only once the cluster stops
-// naming the VM in its status.
+// Mark the cluster snapshot for deletion. Its finalizer performs cleanup;
+// cloud removal waits for cluster absence. DropSnapshot is the separate
+// node command that removes backend data.
 message DestroyVm {
   string name = 1;
   // Same rule as CreateVm: only the object carrying this uid is ours to stamp.

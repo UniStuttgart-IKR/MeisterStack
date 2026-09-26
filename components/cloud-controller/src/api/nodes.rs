@@ -7,17 +7,9 @@
 
 use super::*;
 
-// --- the nodes of a cluster, read here and drained here ---------------------
-//
-// Draining and labelling a machine are operation, and operation goes to the
-// cloud. Before this there was no counterpart up here at all: an operator
-// needed a second profile at a second tier to cordon a node, which is a
-// second endpoint, a second credential and a second thing to be wrong about.
-//
-// Read is a projection of `Cluster.status.nodes` and write is a command down
-// the session. Nothing here creates a Node object at this tier and nothing
-// here writes into `status.nodes`: intent travels down, evidence travels up,
-// and that is the rule of the whole stack rather than a detail of this route.
+// Cloud node reads project `Cluster.status.nodes`; writes send commands over
+// the cluster session. This tier neither creates Node objects nor edits the
+// reported inventory. Cluster reports supply the resulting state.
 
 /// Render a NodeSummary in the cluster Node envelope. It carries reported facts,
 /// not a UID, resource version or heartbeat suitable for a conditional PUT. Empty
@@ -207,19 +199,9 @@ pub(super) async fn patch_cluster_node(
         return Ok((StatusCode::ACCEPTED, Json(object)));
     }
 
-    // Which replica can send it. This write is the only one at this tier that
-    // does not go into the shared store: it travels down the cluster's gRPC
-    // session, and a cluster dials ONE cloud replica — so two of every three
-    // `node cordon`, `node drain` and `node label` calls used to answer 503
-    // "no active session", and the client had to GUESS which replica to ask.
-    // The uncordon after the mini-chaos run went through exactly one of the
-    // three.
-    //
-    // The same forward `vm logs` takes, and deliberately the same one: two
-    // ends of one idea in two places is how a header name, a timeout and a
-    // loop rule start disagreeing. What differs is that a write has to carry
-    // its body and its ANSWER back whole — a 404 from the sibling is a 404,
-    // not the 503 a read collapses everything into.
+    // Forward to the replica holding the cluster session when necessary.
+    // Preserve the sibling's status and body so a permanent refusal, such as a
+    // missing node, is not converted into a retryable transport error.
     match controller_api::forward::holder(
         super::vms::ABOUT,
         st.sessions.holds(&cluster),
@@ -348,15 +330,8 @@ pub(super) fn node_update(
 mod tests {
     use super::*;
 
-    /// D2, the write half: what the sibling said comes back as it stands.
-    ///
-    /// A node patch at this tier is the one write that cannot be served by
-    /// the replica that was asked — it goes down the cluster's gRPC session,
-    /// and one replica holds that. So the asked replica forwards, and the
-    /// answer has to survive the hop unchanged: a 404 for a node the cluster
-    /// does not report is a 404 wherever it was decided, and collapsing it
-    /// into the 503 a read produces would tell a client to retry something
-    /// that will never work.
+    /// A forwarded node patch preserves the sibling's response status and body,
+    /// including permanent failures such as a missing node.
     #[test]
     fn a_forwarded_node_patch_answers_with_what_the_sibling_said() {
         let accepted = controller_api::forward::Answer {
@@ -494,18 +469,7 @@ mod tests {
         assert!(command.labels.is_empty() && command.remove_labels.is_empty());
     }
 
-    /// What an operator asked for from HERE is readable from here (chaos
-    /// B-C3).
-    ///
-    /// `node drain` at the cloud landed, the cluster carried it out, and the
-    /// cloud's own document of that node said nothing about it: `spec.drain`
-    /// stopped at `NodeSummary` and never reached the object, so `node ls` up
-    /// here had no drain column at all and the person who started the drain
-    /// had to open a second profile at a second tier to see it.
-    ///
-    /// The evidence half — `status.draining`, and `movedTotal` in it — is
-    /// here too now: it travels on `proto::NodeReport.draining`, and the
-    /// document says it exactly when there is a drain to say it about.
+    /// The cloud's node projection includes both drain intent and reported progress.
     #[test]
     fn the_clouds_document_of_a_node_says_whether_it_is_being_drained() {
         let entry = controller_api::NodeSummary {

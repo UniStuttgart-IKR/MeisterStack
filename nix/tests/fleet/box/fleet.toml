@@ -1,16 +1,9 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
-#
-# The fleet of nix/tests/install.nix: one host, one disk, one medium.
-#
-# It is a DIRECTORY in the repository rather than a `builtins.toFile` like
-# the one in nix/tests/update.nix, and that is not a preference: an
-# `install.layout` and a `modules = [ … ]` are paths relative to the
-# inventory FILE, and a file written with `toFile` lives directly in
-# /nix/store — so `disko/single-nvme.nix` beside it would be
-# /nix/store/disko/single-nvme.nix. Inside the flake's own source the
-# relative paths are what they look like.
+
+# Test inventory. Keep layouts and host modules beside this file so relative
+# paths resolve inside the repository. Fingerprints and disks are test fixtures.
 
 schema = 2
 
@@ -22,15 +15,8 @@ domain = "vm.example"
 ssh = { user = "root", port = 22 }
 profiles = [ ]
 rollout = { max_unavailable = 1, reboot = "approve" }
-# Nothing: this test is about a disk becoming a host, and a readiness check
-# about a session would be a check about a bootstrap that has not happened.
 checks = { required = [ ] }
 
-# One host that is the whole control plane, which is the only shape a fleet
-# of one can have: a cloud places guests on clusters and a cluster registers
-# with a cloud, and nix/lib/inventory.nix says so out loud. No `agent` and no
-# `addons`: the first would make this an interruption test and the second
-# would put kanidm, grafana and loki into an ISO that is copied twice.
 [[group]]
 id = "cp"
 kind = "raft"
@@ -43,13 +29,6 @@ roles = ["cloud", "cluster"]
 groups = ["cp"]
 controller_group = "cp"
 site = "vm"
-# `boot = "uefi"` by default: this host has an ESP, systemd-boot and
-# therefore the boot-mode rollback the second half of this test measures.
 networks.management = { address = "192.168.1.2", prefix = 24, interface = "eth1" }
-# 16 GB, which is what the test's qcow2 is created with. The installer
-# compares the two and allows two percent.
 install = { disk = { serial = "MEISTERTEST01", size_gb = 16 }, layout = "disko/single-nvme.nix", preserve = [] }
-# Which disk that serial is, on this transport. qemu's `-device
-# virtio-blk-pci,serial=…` makes /dev/disk/by-id/virtio-<serial> (M0 probe
-# S7), and `meister-install confirm` checks the two against each other.
 modules = ["hosts/box.nix"]

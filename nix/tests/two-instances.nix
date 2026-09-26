@@ -2,31 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# One image, two machines, two identities — V08 and L04.
-#
-# `packages.managed-disk-image` is the generic managed host: no host name of
-# a fleet member, no roles, no addresses and no keys. It is what a lab boots
-# fresh virtual machines from (L2) before `keys enroll` and the first `apply`
-# make each of them a host. The whole idea only works if an image carries NO
-# identity — because an image is copied, and two machines that share a
-# machine id are one machine as far as systemd, etcd and every log line is
-# concerned, while two that share an ssh host key are one machine as far as
-# every operator's `known_hosts` is concerned.
-#
-# So this test does the thing that would expose it: it copies one image
-# twice, boots both copies at once, and asks each of them who it is. And it
-# looks INSIDE the image as well — the untouched file, hot-plugged read-only
-# into the first machine AFTER it has booted — because "the identity is made
-# at first boot" is only true if the image did not carry one to begin with.
-#
-# Why after the boot and not as a second disk from the start: the image's
-# root is `/dev/disk/by-label/nixos`, and a copy of the image next to it
-# carries the SAME label. Stage 1 then mounts whichever of the two udev
-# linked last — measured: under the load of a full `nix flake check` the
-# read-only one won, init exited 1 and the kernel panicked 1.4 s in, while
-# the same test had passed twice on its own. A disk that appears once root
-# is mounted cannot be chosen as root, and the mount below goes by the
-# disk's serial, never by the label.
+# Boot two copies of the generic image and require distinct machine and SSH
+# identities. Inspect the pristine image read-only after boot so its duplicate
+# root label cannot affect initial root-device selection.
 { nixpkgs, lib, pkgs, system, self, disko }:
 
 let

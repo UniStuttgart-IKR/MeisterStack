@@ -2,60 +2,22 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The NoCloud seed: a second, tiny, read-only disk labelled `CIDATA` with
-//! `user-data` and `meta-data` on it.
-//!
-//! This is the standard way a stock cloud image is configured — cloud-init
-//! looks for a filesystem with that label at boot and reads itself out of it
-//! — and therefore the step that makes Ubuntu off the shelf bootable instead
-//! of an image somebody baked.
-//!
-//! ## Written here rather than shelled out
-//!
-//! `mkfs.vfat` plus `mcopy`, or `xorriso`, would be about thirty lines. They
-//! would also be a new runtime dependency on every node, and the recent
-//! history of this repo says what that costs: `nftables` was missing from the
-//! systemd unit's PATH list, the agent refuses to start when it cannot
-//! program nftables, and the whole fleet stopped coming up. A dependency that
-//! is only reached on the path this feature adds fails later and more
-//! quietly, which is worse rather than better.
-//!
-//! So: a FAT12 writer, in full, below. It is about a hundred and fifty lines
-//! because a FAT12 volume is a boot sector, two allocation tables and a root
-//! directory, and none of the three is complicated — what makes real
-//! filesystem code hard is reading arbitrary volumes and mutating them, and
-//! this writes exactly one shape once.
-//!
-//! ## FAT and not ISO9660
-//!
-//! cloud-init takes either. FAT is the smaller of the two to write, and the
-//! one that needs no extension to carry the file names: `user-data` is nine
-//! characters, which is too long for both plain 8.3 and ISO9660 Level 1, so
-//! either format needs its long-name extension (VFAT here, Rock Ridge or
-//! Joliet there). VFAT's is a fixed 32-byte record per thirteen characters
-//! and is the simpler of the two by a wide margin.
+//! Build a NoCloud seed as a FAT12 image labelled `CIDATA`. It contains
+//! `user-data`, `meta-data`, and optional `network-config`. VFAT entries preserve
+//! the required long names. The writer avoids a runtime filesystem-tool dependency.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tracing::debug;
 
-// The seed's own shape moved to `agent-api` with the rest of the create
-// document: `spec.vm.cloud_init` is a field both controllers now deserialise
-// at their edge. What stays here is what writes it onto a disk.
+// The create specification shares the CloudInit type with controllers.
 pub use agent_api::spec::CloudInit;
 
-/// The label cloud-init's NoCloud datasource looks for. Exactly this, in
-/// exactly this case: it is a protocol constant and not a name anybody chose.
+/// Volume label used for the NoCloud seed.
 pub const LABEL: &str = "CIDATA";
 
-/// The meta-data cloud-init needs when nobody wrote one.
-///
-/// Two keys, and both matter. `instance-id` is what cloud-init compares
-/// against what it did last boot — a changed one means "this is a new
-/// machine, run the per-instance modules again" — so it has to be the VM's
-/// identity and not something regenerated per boot. `local-hostname` is what
-/// the guest calls itself.
+/// Default metadata with a stable VM instance ID and optional hostname.
 pub fn meta_data_for(vm_id: &uuid::Uuid, hostname: Option<&str>) -> String {
     let hostname = hostname.unwrap_or(&vm_id.to_string()).to_string();
     format!("instance-id: {vm_id}\nlocal-hostname: {hostname}\n")
@@ -81,9 +43,7 @@ pub fn write_seed(path: &Path, vm_id: &uuid::Uuid, config: &CloudInit) -> Result
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    // Written whole and renamed into place, for the reason the image cache
-    // does it: a half-written seed that a VMM opens is a guest that boots
-    // into a filesystem error.
+    // Publish a complete seed by rename so a VMM cannot open a partially written image.
     let staged = path.with_extension("partial");
     std::fs::write(&staged, &image).with_context(|| format!("writing {}", staged.display()))?;
     std::fs::rename(&staged, path).with_context(|| format!("placing {}", path.display()))?;
@@ -103,18 +63,14 @@ const SECTOR: usize = 512;
 const SECTORS_PER_CLUSTER: usize = 1;
 const RESERVED_SECTORS: usize = 1;
 const FATS: usize = 2;
-/// 512 entries is the conventional floppy-shaped root directory, and it is
-/// one directory entry short of nothing: three files with long names cost
-/// four or five entries each.
+/// Fixed root directory capacity.
 const ROOT_ENTRIES: usize = 512;
 const ROOT_SECTORS: usize = ROOT_ENTRIES * 32 / SECTOR;
-/// The floor, so that the volume is a shape every tool recognises rather than
-/// the smallest one that would technically hold the bytes. Two thousand
-/// clusters is also comfortably under FAT12's 4085-cluster ceiling, which is
-/// what keeps the kernel reading this as FAT12 and not guessing FAT16.
+/// Minimum cluster count. Larger inputs increase this value; the writer does
+/// not currently reject inputs exceeding the FAT12 cluster limit.
 const MIN_CLUSTERS: usize = 2000;
 
-/// A whole FAT12 volume with these files in its root directory.
+/// Build a FAT12 volume with the supplied root-directory files.
 fn fat12(files: &[(&str, &[u8])]) -> Vec<u8> {
     let needed: usize = files
         .iter()
@@ -128,9 +84,7 @@ fn fat12(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut image = vec![0u8; total_sectors * SECTOR];
     boot_sector(&mut image[..SECTOR], total_sectors, fat_sectors);
 
-    // One FAT in memory, copied to both: two identical tables is what the
-    // format is for, and writing it twice from one buffer is how they stay
-    // identical.
+    // Build one FAT buffer for both on-disk copies.
     let mut fat = vec![0u8; fat_sectors * SECTOR];
     // The two reserved entries: the media descriptor, and end-of-chain.
     set_fat(&mut fat, 0, 0xFF8);
@@ -139,10 +93,8 @@ fn fat12(files: &[(&str, &[u8])]) -> Vec<u8> {
     let root_at = (RESERVED_SECTORS + FATS * fat_sectors) * SECTOR;
     let data_at = root_at + ROOT_SECTORS * SECTOR;
     let mut root: Vec<u8> = Vec::new();
-    // The label lives twice: in the boot sector, where a BPB reader looks,
-    // and as a directory entry, which is what the Linux vfat driver and
-    // blkid actually report. Both, because cloud-init finds this volume by
-    // its label and there is no second chance at boot.
+    // Write the label in both the boot sector and a directory entry so BPB
+    // readers, the Linux vfat driver and blkid identify the NoCloud volume.
     root.extend_from_slice(&dir_entry(LABEL, 0x08, 0, 0));
 
     let mut next_cluster = 2usize;
@@ -183,8 +135,8 @@ fn boot_sector(sector: &mut [u8], total_sectors: usize, fat_sectors: usize) {
     sector[14..16].copy_from_slice(&(RESERVED_SECTORS as u16).to_le_bytes());
     sector[16] = FATS as u8;
     sector[17..19].copy_from_slice(&(ROOT_ENTRIES as u16).to_le_bytes());
-    // The 16-bit count where it fits, and zero plus the 32-bit one where it
-    // does not. A seed never comes near 32 MiB, but the rule is the format's.
+    // Use the short sector count when it fits; otherwise populate the large count.
+    // This does not enforce the separate FAT12 cluster-count limit.
     let small = u16::try_from(total_sectors).unwrap_or(0);
     sector[19..21].copy_from_slice(&small.to_le_bytes());
     sector[21] = 0xF8; // fixed disk
@@ -203,8 +155,7 @@ fn boot_sector(sector: &mut [u8], total_sectors: usize, fat_sectors: usize) {
     sector[511] = 0xAA;
 }
 
-/// Write one 12-bit FAT entry. Two entries share three bytes, which is the
-/// whole of what makes FAT12 different from its successors.
+/// Write a packed 12-bit FAT entry; pairs occupy three bytes.
 fn set_fat(fat: &mut [u8], cluster: usize, value: u16) {
     let at = cluster * 3 / 2;
     if cluster % 2 == 0 {
@@ -225,13 +176,7 @@ fn padded(name: &str) -> [u8; 11] {
     out
 }
 
-/// The short name a long-named file hides behind.
-///
-/// Numbered rather than derived from the long name, and that is deliberate:
-/// the short name has to be UNIQUE in the directory and nothing reads it —
-/// every reader that matters follows the long-name entries in front of it —
-/// so deriving one would be a truncation rule with collisions to think about
-/// in exchange for nothing.
+/// Generate a distinct 8.3 alias for each long-named seed file.
 fn short_name(index: usize) -> String {
     format!("SEED{index:04}")
 }
@@ -241,9 +186,7 @@ fn dir_entry(name: &str, attr: u8, first_cluster: u16, size: u32) -> [u8; 32] {
     let mut e = [0u8; 32];
     e[0..11].copy_from_slice(&padded(name));
     e[11] = attr;
-    // 1980-01-01, and fixed rather than "now": a seed is derived from its
-    // spec, so two builds of one VM's seed should be the same bytes. A
-    // timestamp would make them differ for no reason anybody can use.
+    // Use 1980-01-01 for reproducible seed bytes.
     let date = (1u16 << 5) | 1;
     e[16..18].copy_from_slice(&date.to_le_bytes());
     e[18..20].copy_from_slice(&date.to_le_bytes());
@@ -253,12 +196,9 @@ fn dir_entry(name: &str, attr: u8, first_cluster: u16, size: u32) -> [u8; 32] {
     e
 }
 
-/// The VFAT long-name entries that go IN FRONT of a short entry, last first.
-///
-/// Thirteen UTF-16 code units per entry, a sequence number counting up from
-/// one with the highest OR'd with 0x40, and a checksum of the short name in
-/// every one of them — which is how a reader knows the run belongs to the
-/// entry that follows it rather than to a stale one.
+/// Encode VFAT long-name entries before the short entry, in reverse order.
+/// Each carries 13 UTF-16 units and the short-name checksum. Sequence numbers
+/// start at one; the highest also sets 0x40.
 fn long_name_entries(name: &str, short: &str) -> Vec<u8> {
     let checksum = short_checksum(&padded(short));
     let units: Vec<u16> = name.encode_utf16().collect();
@@ -276,16 +216,12 @@ fn long_name_entries(name: &str, short: &str) -> Vec<u8> {
         };
         e[11] = 0x0F; // the attribute combination that marks a long-name entry
         e[13] = checksum;
-        // The name is split across three runs of bytes inside the entry, and
-        // the gaps between them are where the fields a short entry would have
-        // used still sit.
+        // VFAT distributes each name chunk across these UTF-16 slots.
         let slots: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
         for (slot, at) in slots.into_iter().enumerate() {
             let unit = match chunk.get(slot) {
                 Some(u) => *u,
-                // One NUL terminator, then 0xFFFF padding to the end. Both
-                // are the format's, and a reader uses them to find where the
-                // name stops.
+                // Terminate with NUL, then pad unused slots with 0xFFFF.
                 None if slot == chunk.len() => 0x0000,
                 None => 0xFFFF,
             };
@@ -306,9 +242,7 @@ fn short_checksum(name: &[u8; 11]) -> u8 {
     sum
 }
 
-/// Where a VM's seed lives. Under the run directory because that is what it
-/// is: state derived from the spec, rebuilt on every provision, and gone with
-/// the VM.
+/// VM seed path under the run directory; rebuilt from the spec during provisioning.
 pub fn seed_path(run_dir: &Path, vm_id: &uuid::Uuid) -> PathBuf {
     run_dir.join(format!("{vm_id}.cidata.img"))
 }
@@ -321,8 +255,7 @@ mod tests {
         u16::from_le_bytes([b[at], b[at + 1]])
     }
 
-    /// The BPB, field by field, because every one of them is something a
-    /// mounting kernel reads and none of them has a second chance at boot.
+    /// Verify the boot sector and FAT12 geometry for a small seed.
     #[test]
     fn the_boot_sector_describes_the_volume_that_follows_it() {
         let image = fat12(&[("user-data", b"#cloud-config\n")]);
@@ -361,9 +294,7 @@ mod tests {
         assert_eq!(image[root + 11], 0x08, "the volume-label attribute");
     }
 
-    /// The two files are there, under the names cloud-init looks for, with
-    /// the bytes that went in. The long-name entries are what carry those
-    /// names: `user-data` is nine characters and does not fit 8.3 at all.
+    /// Find NoCloud files by their VFAT long names and verify their contents.
     #[test]
     fn the_files_are_findable_by_the_names_cloud_init_uses() {
         let user = b"#cloud-config\nssh_authorized_keys:\n  - ssh-ed25519 AAAA...\n";
@@ -420,8 +351,7 @@ mod tests {
                 units.clear();
                 continue; // the volume label
             }
-            // A short entry ends the run in front of it. The checksum is what
-            // ties the two together.
+            // The short-name checksum associates preceding long-name entries.
             let short: [u8; 11] = e[0..11].try_into().unwrap();
             assert_eq!(
                 short_checksum(&short),
@@ -481,9 +411,7 @@ mod tests {
         assert_eq!(fat, second, "the two fats have drifted apart");
     }
 
-    /// The derived meta-data, and the two keys that have to be in it.
-    /// `instance-id` is what cloud-init compares against the last boot, so it
-    /// is the VM's identity and not something minted per boot.
+    /// Derived metadata uses the VM ID as the stable cloud-init instance-id.
     #[test]
     fn the_derived_meta_data_names_the_vm_and_its_hostname() {
         let id = uuid::Uuid::parse_str("54458d1d-1185-43a8-9672-aa1bd429f3ff").unwrap();
@@ -497,9 +425,7 @@ mod tests {
         assert!(without.contains("local-hostname: 54458d1d-1185-43a8-9672-aa1bd429f3ff"));
     }
 
-    /// A given meta-data is used verbatim, and the third file appears only
-    /// when it was asked for: an empty network-config is not the same thing
-    /// as none, and cloud-init treats the two differently.
+    /// Preserve explicit metadata and distinguish absent from empty network configuration.
     #[test]
     fn what_the_spec_says_is_what_is_written() {
         let temp = tempfile::tempdir().expect("a temp dir");

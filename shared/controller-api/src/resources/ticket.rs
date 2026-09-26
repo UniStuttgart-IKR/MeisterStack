@@ -6,18 +6,9 @@
 
 use super::*;
 
-/// A console ticket, stored.
-///
-/// It is an object for one reason: it has to be redeemable exactly once by a
-/// stack of replicas that share nothing but their etcd (Fremdsicht 6). The
-/// token is `metadata.name`, so redeeming is a keyed take and not a search,
-/// and the thirty seconds are an etcd lease rather than a field anybody has
-/// to sweep.
-///
-/// Nothing serves this kind at REST and nothing ever should: a client that
-/// could LIST tickets could read every outstanding credential of every other
-/// client. Both tiers name it in their `NOT_SERVED` table, which is where a
-/// row of `resources!` says so out loud.
+/// Internal console ticket, keyed by its bearer token in metadata.name. A leased etcd entry
+/// expires after thirty seconds and an atomic take permits one redemption across replicas.
+/// Never expose this resource through REST discovery or listing.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TicketSpec {
@@ -33,11 +24,7 @@ pub struct TicketSpec {
     pub bearer: TicketBearer,
 }
 
-/// Who minted the ticket, in the fields an `Identity` and a role are made of.
-///
-/// Flat and not the `Identity` type itself, because `Identity` is a runtime
-/// value and this is a wire document: a stored shape that follows a type
-/// nothing else serialises is a shape that changes when that type does.
+/// Identity and role captured when the ticket is minted.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TicketBearer {

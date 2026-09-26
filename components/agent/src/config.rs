@@ -37,207 +37,87 @@ use agent_api::types::pci::PciAddress;
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub node_id: String,
-    /// One controller. Kept for the single-controller lab and for the config
-    /// the OpenNebula context still writes; `controller_addrs` supersedes it.
+    /// Single-controller fallback; a nonempty `controller_addrs` takes precedence.
     pub controller_addr: Option<String>,
-    /// The controller replicas to choose between (HA, leaderless). Order here
-    /// is irrelevant — each agent derives its own preference order over the
-    /// list by rendezvous hashing (see `hrw`).
+    /// Controller replicas. Rendezvous hashing derives a node-specific preference
+    /// order independent of list order; see `hrw`.
     #[serde(default)]
     pub controller_addrs: Vec<String>,
     #[serde(default = "default_stop_grace_secs")]
     pub stop_grace_secs: u64,
-    /// How long this node watches a live migration it is SENDING before it
-    /// stops watching. Default 600.
-    ///
-    /// Deliberately longer than the cluster's own transfer timeout (120 s by
-    /// default), and that relation is the whole reason the number exists: the
-    /// tier that ASKED for the migration is the one that decides it has
-    /// failed, and an agent that gave up first would report a failure for a
-    /// transfer still running. This is only the ceiling that keeps a wait from
-    /// being unbounded.
-    ///
-    /// A key rather than a constant because what it has to be longer than is
-    /// configuration one tier up: an estate that raised
-    /// `migration_transfer_secs` for 32 GiB guests over a congested link has
-    /// to raise this with it, and until now that was a recompile.
+    /// Maximum wait for the source send API. Timeout records an unresolved
+    /// outcome; it does not establish that the guest is safe to restart. Default: 600 s.
     #[serde(default = "default_migration_ceiling_secs")]
     pub migrate_out_ceiling_secs: u64,
-    /// How long this node holds a VMM, a set of disks and a set of taps for a
-    /// guest that has not turned up. Default 600.
-    ///
-    /// The same number as `migrate_out_ceiling_secs` and the same argument
-    /// from the other end. It is only ever reached by the one failure nobody
-    /// reports — a source that never dialled — because every transfer that
-    /// STARTED ends with an event in the file, and the pass acts on that the
-    /// moment it appears.
-    ///
-    /// Being wrong downwards is a guest that dies mid-move; being wrong
-    /// upwards is a leak that lasts this long. A fleet that has measured its
-    /// own transfers sets both keys together.
+    /// Advisory destination receive interval persisted with the attempt. Expiry
+    /// alone does not authorize cleanup. Default: 600 s.
     #[serde(default = "default_migration_ceiling_secs")]
     pub receive_ceiling_secs: u64,
-    /// OTLP collector for span export, e.g. "http://127.0.0.1:4317". Absent =
-    /// the fmt subscriber and nothing else, which is how this has always run.
+    /// Optional OTLP collector for span export, for example `http://127.0.0.1:4317`.
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
-    /// How a log line is written: `"human"` (the default) or `"json"`.
-    ///
-    /// File-only and deliberately: which format a node logs in is a property
-    /// of the deployment that collects those logs, not of a run. `RUST_LOG`
-    /// is the per-run knob and it is untouched by this.
+    /// Log output format: `human` by default, or `json`. Filtering uses RUST_LOG.
     #[serde(default)]
     pub log_format: telemetry::LogFormat,
-    /// Where to serve the Prometheus exposition, e.g. "127.0.0.1:9100".
-    /// Absent = nothing listens, which is how every node has run so far.
-    ///
-    /// Its own listener and not the `http-api` one: that socket is the node's
-    /// local admin API, this port is a scrape target, and a node that serves
-    /// metrics should not have to serve mutations to do it. On a box that
-    /// also runs a controller the two need different ports — which is the
-    /// reason there is no single hard default for the whole stack.
+    /// Optional Prometheus listener, separate from the local admin socket.
     #[serde(default)]
     pub metrics_listen: Option<String>,
-    /// The address other NODES should reach this one at, for a live
-    /// migration stream.
-    ///
-    /// A new key rather than a reuse of anything above, because nothing above
-    /// answers the question: `controller_addrs` is where this agent DIALS,
-    /// `metrics_listen` is where a scraper comes from, and neither is "the
-    /// address a peer on the cluster network can open a TCP connection to me
-    /// on".
-    ///
-    /// Absent = derived, and the derivation is the honest one: the local
-    /// address of the socket this agent used to reach the controller it
-    /// chose. That is by construction an address that carries traffic on the
-    /// cluster network, which is what a migration needs; it is wrong only on
-    /// a node whose route to the controller and whose route to its peers go
-    /// out of different interfaces, and such a node sets this key.
+    /// Migration address reachable by peer nodes. When absent, derive an IPv4
+    /// source address from a route to a configured controller endpoint. Set this
+    /// explicitly when controller and peer traffic use different interfaces.
     #[serde(default)]
     pub advertise_addr: Option<String>,
-    /// The physical machine this node is on, when somebody outside can see
-    /// what the machine itself cannot.
-    ///
-    /// A nested node — an agent in a VM, which is what a lab is — cannot ask
-    /// its host who it is. The platform's own DMI says `QEMU` and a serial
-    /// that belongs to the guest, and that is the whole of what a guest may
-    /// know. So this is written from outside, by whoever placed the VM.
-    ///
-    /// It exists for exactly one decision, and D-X1 is why: nested KVM state
-    /// does not restore on a different physical host, measured twice on this
-    /// lab's own hardware. Two nested nodes that both name the same host may
-    /// migrate live between each other; two that cannot both name one are
-    /// refused, because "we cannot tell" is not "it is fine" and the lab's
-    /// answer to "we cannot tell" was two nights.
-    ///
-    /// Absent on bare metal, where it is not needed at all: an unnested node
-    /// is never subject to that rule.
+    /// Operator-supplied physical host identity for nested nodes. Migration
+    /// compatibility uses it to restrict nested transfers to a known shared host.
     #[serde(default)]
     pub physical_host: Option<String>,
-    /// The system user the hypervisor and its vhost-user backends run as.
-    ///
-    /// Absent — the default, and the whole fleet today — means they run as the
-    /// agent, exactly as they always have. Set, it is Stufe 3 of
-    /// `design/privilege-separation.md`: the agent stays the privileged side
-    /// and prepares what needs rights (taps, cgroups, device nodes, file
-    /// ownership), and the processes that run guest code get descriptors
-    /// instead. `nvrm`, `input` and `crosvm-gpu` change with the VMM and not
-    /// after it, because vhost-user is not a boundary between them.
-    ///
-    /// The user has to exist before the agent starts; the deployment makes
-    /// it, and it must NOT be in the agent's `socket_group`.
-    ///
-    /// no-root-Lane: Start-Check prueft CAP_SETUID/SETGID dafuer.
+    /// Optional user for the VMM and supported vhost-user backends. The agent
+    /// prepares privileged resources before dropping backend identity. The user
+    /// must exist and must not belong to the agent socket group.
     #[serde(default)]
     pub vmm_user: Option<String>,
 
-    // --- the session credential. PEM paths, never PEM. -----------------------
-    //
-    // All three unset — the default — is the plain gRPC session this agent has
-    // opened since M1, and the lab still runs that way. Relative paths resolve
-    // against THIS file, so a config and its pki/ directory travel as one unit,
-    // exactly as [paths] does and exactly as the controllers' configs do.
-    /// The CA the controller's serving certificate must chain to. Set on its
-    /// own it is one-way TLS: encrypted, and the controller learns nothing
-    /// about who this is.
+    // Optional controller TLS credentials. Relative PEM paths resolve against
+    // the config directory; no credentials selects plaintext gRPC.
     #[serde(default)]
     pub controller_ca: Option<PathBuf>,
-    /// This node's own identity, `CN=system:node:<node_id>`. The controller
-    /// matches that name against the node_id in the Hello, so one node's key
-    /// cannot report as another node — which is the whole reason for putting
-    /// a certificate on a session that is already encrypted.
+    /// Client certificate identity `CN=system:node:<node_id>`, checked against Hello.
     #[serde(default)]
     pub controller_cert: Option<PathBuf>,
     #[serde(default)]
     pub controller_key: Option<PathBuf>,
 
-    // --- what this node says it has, when the truth needs a ceiling ---------
-    //
-    // Two agents pinned to two NUMA nodes of one host are two nodes to the
-    // controller and one machine to the kernel: each of them reads the WHOLE
-    // host's CPUs and memory out of /proc, and the cluster would then schedule
-    // against twice the hardware that exists. These are the ceiling. Unset =
-    // report what was measured, which is what every config written so far says.
+    // Optional ceilings on measured host capacity, useful for multiple agents
+    // on one host. These affect advertisements, not guest CPU affinity.
     #[serde(default)]
     pub capacity_vcpus: Option<u32>,
     #[serde(default)]
     pub capacity_mem_mib: Option<u64>,
-    /// `cpuset.cpus` for the slice every VM of this agent lands under, e.g.
-    /// "0-15,32-47". The other half of the same recipe: the ceiling is what
-    /// this agent CLAIMS, and this is what its VMs actually get.
+    /// `cpuset.cpus` for the agent VM slice, for example `0-15,32-47`.
+    /// Capacity ceilings limit advertised resources; this setting restricts CPU placement.
     #[serde(default)]
     pub cgroup_cpuset: Option<String>,
 
-    // --- the addresses no tap may source from --------------------------------
-    //
-    // The union of every floating pool's ranges, in the same spelling the cloud
-    // writes them: a cidr, a single address, or `a-b`. The driver turns them
-    // into one nftables set and drops any frame or ARP claiming a source
-    // address inside it — on EVERY tap, with an exception only for the
-    // addresses the tap's own VM holds a reservation for.
-    //
-    // Empty, which is every config written before M5.1, means the guard has
-    // nothing to guard: taps still get their mac pinned (that needs no
-    // configuration and never did) and no address rule is written at all.
-    //
-    // Deliberate duplication of what the cloud holds in FloatingPool objects,
-    // documented as such in the example. TOP-LEVEL and not under `[network]`
-    // on purpose: the lab's context rendering prepends top-level keys in front
-    // of the config template, and a prepended `[network]` table would be a
-    // duplicate of the template's own.
-    //
-    // REFACTOR, not built here: push the pools down the session the way the
-    // vni is pushed down, and this becomes a fallback. See the field doc on
-    // `nftables::NftConfig::guarded`.
+    // Guarded IPv4 ranges shared with the cloud floating pools. Tap rules permit
+    // only the addresses assigned to that NIC within these ranges. Empty ranges
+    // leave MAC pinning active. This duplicated configuration must be kept in sync.
     #[serde(default)]
     pub guarded_ranges: Vec<String>,
-    /// Where `nft` is. Unset = PATH, which is right on a NixOS node — the same
-    /// default the lvm-thin driver takes for `lvs`.
+    /// Path to `nft`; defaults to PATH.
     #[serde(default)]
     pub nft: Option<String>,
 
     pub paths: PathsConfig,
-    /// `[hypervisor.*]` — at most one, keyed by driver name exactly as
-    /// `[volume.*]` and `[device.*]` are. Optional in full: a node that names
-    /// none runs no VMs, which is half of what a storage node is. Every
-    /// config written so far names `cloud-hypervisor` and parses byte for
-    /// byte the same — the section was an enum variant and is now a table
-    /// key, and both spell `[hypervisor.cloud-hypervisor]`.
+    /// Optional hypervisor sections; at most one registered driver is allowed.
     #[serde(default)]
     pub hypervisor: Sections,
-    /// `[network]` — this node makes taps and bridges. Absent means it does
-    /// not, which is the other half: no VMs, so no NICs. Present is every
-    /// config written so far.
+    /// Optional tap and bridge configuration. Without it, NIC requests are refused.
     #[serde(default)]
     pub network: Option<NetworkConfig>,
-    /// `[device.*]` — one section per device backend. Optional: a GPU-less
-    /// agent (lab VM) has no device section at all.
+    /// Optional `[device.*]` sections, one per device backend.
     #[serde(default)]
     pub device: Sections,
-    /// `[volume.*]` — storage backends, keyed by driver name exactly as
-    /// `[device.*]` is. Optional in full: a node that names none still gets
-    /// `filesystem` from `[paths]`, which is what every config written so
-    /// far says.
+    /// Storage driver sections. Filesystem is registered by default from `[paths]`.
     #[serde(default)]
     pub volume: Sections,
 }
@@ -246,10 +126,7 @@ fn default_stop_grace_secs() -> u64 {
     30
 }
 
-/// 600 s — what `MIGRATE_OUT_CEILING` and `RECEIVE_CEILING` were as
-/// constants. One function for both, because the two numbers are one
-/// argument seen from the two ends of a transfer, and a fleet that changes
-/// one without the other has an asymmetry nobody meant.
+/// Default migration observation interval in seconds.
 fn default_migration_ceiling_secs() -> u64 {
     600
 }
@@ -262,70 +139,30 @@ pub struct PathsConfig {
     pub image_dir: PathBuf,
     pub volume_dir: PathBuf,
     pub cgroup_root: PathBuf,
-    /// Who else may talk to the agent's unix socket.
-    ///
-    /// Absent — every config written so far — is `run_dir` 0700 and the socket
-    /// 0600, so the answer is "root and nobody else" and every `meister agent`
-    /// command on the node needs sudo. Named, the socket becomes 0660 and the
-    /// directory 0750, both owned by that group: its members get the node's
-    /// local admin API without becoming root for it.
-    ///
-    /// The group is a *unix* group and not an authorization decision this
-    /// stack makes. There is no authenticator on this socket — it is the
-    /// node's own admin surface, reachable only by somebody already on the
-    /// node — so the group IS the whole access rule, and it should be one
-    /// somebody was deliberately put into.
+    /// Optional Unix group granted local admin access: directory/socket modes
+    /// 0750/0660 instead of owner-only 0700/0600. Filesystem permissions are the
+    /// socket's access control; there is no separate API authenticator.
     #[serde(default)]
     pub socket_group: Option<String>,
 }
 
-/// `[hypervisor.cloud-hypervisor]`. Was an enum variant; the two keys under
-/// it are unchanged, and `deny_unknown_fields` still catches a typo INSIDE
-/// the section while `drivers::register` catches one in the section NAME —
-/// and, unlike the enum, can say which hypervisors this agent actually has.
+/// Cloud Hypervisor executable and operation settings.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloudHypervisorConfig {
     pub binary: PathBuf,
     pub timeout_ms: u64,
-    /// `migration_ports = "49000-49099"` — the range a receiving VMM may
-    /// listen on, inclusive at both ends.
-    ///
-    /// A RANGE and not one port, because a node can be receiving more than
-    /// one guest at a time and each stream is its own listener; a range and
-    /// not "any free port", because the ports have to be open between the
-    /// nodes and an operator has to be able to write that firewall rule down.
-    ///
-    /// Absent = this node does not receive live migrations. It can still SEND
-    /// one, which is not asymmetry for its own sake: sending needs no port of
-    /// one's own, and a node being emptied is exactly the node whose operator
-    /// may not have got round to this key.
+    /// Inclusive receiver port range, for example `49000-49099`. Absence disables
+    /// receiving; sending does not require a local receiver port.
     #[serde(default)]
     pub migration_ports: Option<String>,
-    /// How long a hot-unplug may take before this driver stops believing in
-    /// it. Default 30.
-    ///
-    /// A key rather than a constant because it is a number about GUESTS and
-    /// not about this stack: virtio unplug is cooperative, and how long a
-    /// kernel takes to let go of a device is a property of the images a fleet
-    /// runs. The deadline is not the guest's response time — it is the point
-    /// at which "the guest is thinking about it" becomes "the guest is never
-    /// going to do it", and being wrong in the fast direction is what D3 was:
-    /// the control plane reported a volume free while the VMM still held the
-    /// fd, and the next VM to use it died on cloud-hypervisor's write lock.
-    ///
-    /// So a fleet whose guests need forty seconds turns this up rather than
-    /// living with a detach that reports a failure over a device that did in
-    /// fact go. Zero is read as the default, the same way `ports()` reads a
-    /// zero: a zero in a config file is almost always a key somebody meant to
-    /// fill in.
+    /// Wait for guest-cooperative hot unplug before returning an error. Default:
+    /// 30 s; zero also selects the default. Timeout leaves ownership unresolved.
     #[serde(default = "default_unplug_timeout_secs")]
     pub unplug_timeout_secs: u64,
 }
 
-/// The driver's own default, read from the driver rather than written out a
-/// second time: two literals for one number is how an option table and the
-/// code it describes start disagreeing.
+/// Use the driver default to keep config and runtime timeout values aligned.
 fn default_unplug_timeout_secs() -> u64 {
     cloud_hypervisor_driver::DEFAULT_UNPLUG_TIMEOUT.as_secs()
 }
@@ -339,14 +176,7 @@ impl CloudHypervisorConfig {
         }
     }
 
-    /// The migration port range as two numbers, or a sentence saying what is
-    /// wrong with what was written.
-    ///
-    /// Parsed at start-up rather than at the first migration, and that is the
-    /// whole reason it is a function: a typo here would otherwise be found by
-    /// an operator who is draining a node at the moment they can least afford
-    /// to read a parse error. `None` = the key was not set, which is a node
-    /// that does not receive migrations and not a mistake.
+    /// Parse the inclusive migration port range. Reject zero and reversed ranges.
     pub fn ports(&self) -> Result<Option<(u16, u16)>, String> {
         let Some(raw) = self.migration_ports.as_deref() else {
             return Ok(None);
@@ -379,44 +209,18 @@ pub struct NetworkConfig {
     pub default_bridge: String,
     #[serde(default)]
     pub bridge_addr: Option<String>,
-    /// `[network.vxlan]` — this node can carry tenant overlays. Absent, which
-    /// is every config written before M5, means it cannot: a VM whose spec
-    /// names a `vxlan_id` is refused here rather than quietly put on the
-    /// default bridge, and the scheduler keeps such VMs away in the first
-    /// place because the node claims no `network/vxlan` entry.
+    /// Optional tenant VXLAN support; overlay NICs require it.
     #[serde(default)]
     pub vxlan: Option<VxlanNetworkConfig>,
-    /// `[network.bgp]` — this node speaks BGP to somebody, and announces the
-    /// floating addresses of the VMs running on it. Absent, which is every
-    /// config written before M5.1, means it does not: the addresses are still
-    /// reserved, still enforced at the tap, and reachable by whatever static
-    /// route or appliance the environment provides.
+    /// Optional FRR route announcements. Without this, reachability requires
+    /// external routing; tap address guards still apply.
     #[serde(default)]
     pub bgp: Option<BgpNetworkConfig>,
-    /// `[network.provider]` — this node gives one or more interfaces away to
-    /// provider networks, and is therefore a candidate for a tenant router.
-    /// Absent, which is every config before 6k, means it is not: the node
-    /// still runs VMs and still carries overlays, it just holds no gateway
-    /// slot and claims no `network/gateway:*`.
+    /// Optional provider interfaces for tenant routers and direct provider NICs.
     #[serde(default)]
     pub provider: Option<ProviderNetworkConfig>,
-    /// Take down overlay links no record on this node names, once, at
-    /// start-up.
-    ///
-    /// On by default, and the default answers a leak that was measured: the
-    /// chaos run left VNI 10003 and 10004 standing on three nodes for good.
-    /// The reference count that removes an overlay hangs on records, and a VM
-    /// whose record went while its agent was not running takes its wire's
-    /// last counter with it — after which nobody counts again.
-    ///
-    /// It runs ONCE, before the first reconcile, and only when the whole
-    /// record table could be read. That is what makes it something other than
-    /// the timer this driver's own doc argues against: at that moment no VM
-    /// is being provisioned here, so "is another VM for this tenant arriving
-    /// in the next second?" has an answer.
-    ///
-    /// Off is for a node whose overlay links somebody else administers. Then
-    /// they leak, and that is the operator's trade to make.
+    /// Sweep unreferenced overlays once at startup when all VM rows are readable.
+    /// Disable when overlay links are administered outside this agent.
     #[serde(default = "default_sweep_orphans")]
     pub sweep_orphans: bool,
 }
@@ -425,88 +229,39 @@ fn default_sweep_orphans() -> bool {
     true
 }
 
-/// `[network.provider]`. Config-keyed exactly as `[network.vxlan]` is: the
-/// section is what turns the capability on.
-///
-/// What it turns on is Festlegung 2 — the gateway is a capability out of the
-/// config, not an agent of its own and not a compile feature. A node that
-/// names a physnet builds the provider bridge for it at start-up, claims
-/// `network/gateway:<physnet>` in its Hello, and may be given routers; a node
-/// that names none is no candidate for any.
+/// Provider interface mappings used to construct gateway capability claims.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderNetworkConfig {
-    /// The interfaces this node gives away, by the name of the provider
-    /// network each of them reaches: `physnets = { ext = "eth1" }`.
-    ///
-    /// A map and not a list, because the NAME is the thing the tier above
-    /// schedules on — two nodes saying `ext` mean the same network, and which
-    /// interface each of them uses to reach it is nobody else's business.
-    /// Sorted, because it is a `BTreeMap`: the Hello a node sends must not
-    /// depend on hash order.
-    ///
-    /// The interface must carry NO address. See `ensure_physnet`: an address
-    /// there is somebody still using the interface, and a router placed on it
-    /// would answer for a network the host is also on.
+    /// Provider-network name to host-interface mapping, sorted for stable claims.
+    /// The interface must have no addresses when assigned to the provider bridge.
     pub physnets: BTreeMap<String, String>,
-    /// Where `ip` is. Unset = PATH, the same default `nft` takes.
-    ///
-    /// `iproute2` and not netlink for the namespace half, for the reason this
-    /// stack shells out to `nft`, `vtysh` and `nvme`: `ip netns` pins a
-    /// namespace under `/var/run/netns`, which is what makes
-    /// `ip netns exec meister-rt-<id> ip a` work for an operator standing at
-    /// the node. A netlink implementation would build the same namespace and
-    /// leave nobody a way to look into it.
+    /// Path to iproute2 `ip`; defaults to PATH. Router namespaces use named netns.
     #[serde(default)]
     pub ip: Option<String>,
-    /// Where `arping` is. Unset = PATH, as `ip` above.
-    ///
-    /// One use: the gratuitous ARP a router sends the moment it becomes the
-    /// active one. A node without it keeps every other property of a failover
-    /// and pays the neighbour's ARP cache — measured at 5,2 s in the lab.
+    /// Path to `arping` for gratuitous ARP on router activation; defaults to PATH.
     #[serde(default)]
     pub arping: Option<String>,
 }
 
-/// `[network.bgp]`. Config-keyed like every other capability in this file:
-/// the section is what turns it on.
-///
-/// What it turns on is a renderer and a `vtysh` call — FRR does the protocol,
-/// out of nixpkgs, exactly as virtiofsd does the filesystem on the storage
-/// side. A section here without a running FRR is a hard start-up error, for
-/// the same reason a `[volume.lvm-thin]` without its pool is: the node would
-/// claim to announce its addresses and announce nothing.
+/// FRR session configuration. Startup requires a responsive vtysh connection.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BgpNetworkConfig {
-    /// This node's autonomous system number. A private ASN (64512-65534, or
-    /// the 32-bit block) unless somebody has given the lab a real one.
+    /// This node's autonomous system number.
     pub asn: u32,
-    /// The BGP identifier, dotted. Set explicitly: FRR would otherwise take
-    /// the highest address on the box, which on a node full of bridges and
-    /// taps is whatever the last VM created.
+    /// Explicit dotted BGP router ID, independent of changing interface addresses.
     pub router_id: String,
-    /// The peers. Address plus their ASN — the rack switch, or a route
-    /// reflector, or in the lab an FRR in a namespace.
-    ///
-    /// Unnumbered eBGP (`neighbor <interface> interface remote-as external`,
-    /// which needs no addresses at all and is what a modern fabric uses) is
-    /// the obvious next shape and is NOT built: it needs IPv6 link-local
-    /// next-hops to carry IPv4 routes (RFC 5549), which is a second code path
-    /// through everything below and buys nothing in a lab whose switch has a
-    /// management address anyway.
+    /// Addressed BGP peers and their ASNs. Unnumbered peers are not supported.
     #[serde(default)]
     pub neighbors: Vec<BgpNeighborConfig>,
-    /// Where `vtysh` is. Unset = PATH.
+    /// Path to `vtysh`; defaults to PATH.
     #[serde(default)]
     pub vtysh: Option<PathBuf>,
-    /// FRR's vty socket directory, for an FRR that is not at the default
-    /// `/var/run/frr` — a second agent on one host, or an FRR in a namespace.
+    /// Override FRR's default vty socket directory (`/var/run/frr`).
     #[serde(default)]
     pub vty_socket: Option<PathBuf>,
-    /// Where the rendered fragment is written before vtysh reads it. Unset =
-    /// `<run_dir>/meister-bgp.conf`, kept flat in run_dir like everything
-    /// else there.
+    /// Rendered configuration fragment; defaults to `<run_dir>/meister-bgp.conf`.
     #[serde(default)]
     pub fragment: Option<PathBuf>,
 }
@@ -518,21 +273,18 @@ pub struct BgpNeighborConfig {
     pub remote_asn: u32,
 }
 
-/// `[network.vxlan]`. Config-keyed exactly as `[volume.*]` and `[device.*]`
-/// are: the section is what turns the capability on.
+/// Tenant VXLAN support, enabled by the presence of `[network.vxlan]`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VxlanNetworkConfig {
-    /// The interface encapsulated frames leave by.
+    /// Host interface used to transmit encapsulated frames.
     pub uplink: String,
-    /// MTU for the tenant bridge, its VXLAN device and the taps on it. The
-    /// driver's own number, not this file's: see
-    /// linux_network_driver::DEFAULT_VXLAN_MTU.
+    /// MTU for the tenant bridge, VXLAN device and taps. Defaults to
+    /// `linux_network_driver::DEFAULT_VXLAN_MTU`.
     #[serde(default = "default_vxlan_mtu")]
     pub mtu: u32,
-    /// Distribute the overlay's MACs over BGP instead of flooding for them.
-    /// Needs `[network.bgp]`; see `linux_network_driver::VxlanConfig::evpn`
-    /// for what it changes and why it is a CLUSTER-wide decision.
+    /// Distribute overlay MACs through BGP EVPN. Requires `[network.bgp]`
+    /// and a consistent cluster setting; see `linux_network_driver::VxlanConfig::evpn`.
     #[serde(default)]
     pub evpn: bool,
 }
@@ -563,28 +315,11 @@ impl NetworkConfig {
     }
 }
 
-/// The raw `[volume]` / `[device]` table: one entry per section, still in
-/// TOML, deserialized by whichever driver owns the key. `[volume.lvm-thin]`
-/// is the entry "lvm-thin", `[[device.managed]]` the entry "managed" with an
-/// array under it — the file on disk is unchanged either way.
-///
-/// Raw rather than a struct with one `Option<…>` field per driver, because
-/// that struct was the second place every new driver had to be edited, and
-/// the easier of the two to forget: forgetting the if-let in `drivers.rs`
-/// only cost you a driver, while forgetting the field cost you a config key
-/// that parsed and then did nothing. The typed structs below are unchanged
-/// and keep their `deny_unknown_fields`, so a typo INSIDE a section still
-/// fails; a typo in a SECTION NAME is caught by `drivers::register`, which
-/// unlike serde can say which drivers this agent actually has.
+/// Driver sections kept as TOML until the owning registry builder deserializes
+/// them. Builders reject unknown fields; registration rejects unknown sections.
 pub type Sections = HashMap<String, toml::Value>;
 
-/// One section of `[volume]`/`[device]`, as the type its driver wants, or
-/// `None` when this node did not configure it.
-///
-/// `what` and `key` are only there to name the section in the error: the
-/// section is parsed out of a `toml::Value` rather than straight out of the
-/// file, so serde's "unknown field" still comes through but its line number
-/// does not.
+/// Deserialize one named driver section, adding its section name to errors.
 pub fn section<T: serde::de::DeserializeOwned>(
     sections: &Sections,
     what: &str,
@@ -600,75 +335,65 @@ pub fn section<T: serde::de::DeserializeOwned>(
     Ok(Some(parsed))
 }
 
-/// `[volume.lvm-thin]`. The pool has to exist on this node — the driver
-/// checks at start-up rather than at the first VM boot.
+/// LVM thin pool configuration. Startup validates that the pool exists.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LvmThinVolumeConfig {
     pub vg: String,
     pub thin_pool: String,
-    /// Refuse a create while the pool is fuller than this. The driver's own
-    /// number, not the config's: see lvm_thin_driver::DEFAULT_MAX_DATA_PERCENT.
+    /// Maximum pool data usage for creation. Defaults to
+    /// `lvm_thin_driver::DEFAULT_MAX_DATA_PERCENT`.
     #[serde(default = "default_max_data_percent")]
     pub max_data_percent: f64,
-    /// Falls back to [paths].image_dir, where base images have always lived.
+    /// Base image directory; defaults to `[paths].image_dir`.
     #[serde(default)]
     pub image_dir: Option<PathBuf>,
-    /// Where lvs/lvcreate/lvremove are. Unset = PATH.
+    /// Directory containing `lvs`, `lvcreate` and `lvremove`; defaults to PATH.
     #[serde(default)]
     pub bin_dir: Option<PathBuf>,
     #[serde(default = "default_qemu_img")]
     pub qemu_img: PathBuf,
 }
 
-/// `[volume.nvmeof]`. The attacher alone: this node can connect to a target
-/// and can provision nothing. Nothing to configure but where `nvme` is —
-/// where the target IS comes from the pool, per volume, because one node
-/// attaches namespaces from several.
+/// NVMe-oF attachment configuration. Targets come from each volume
+/// handle; this driver does not provision namespaces.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NvmeofVolumeConfig {
-    /// Where `nvme` is. Unset = PATH.
+    /// Directory containing `nvme`; defaults to PATH.
     #[serde(default)]
     pub bin_dir: Option<PathBuf>,
 }
 
-/// `[volume.nvmeof-import]`. The provider half: namespaces that already
-/// exist, handed out one per volume.
+/// NVMe-oF provider configuration for assigning existing namespaces to volumes.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NvmeofImportVolumeConfig {
-    /// Where the assignment lives: one claim file per namespace that is
-    /// spoken for. Falls back to a directory beside the agent's own database,
-    /// because it is state of exactly that kind — small, this node's, and
-    /// worthless to anybody else.
+    /// Directory for per-namespace claim files; defaults beside the agent database.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
-    /// Where `nvme` is. Unset = PATH.
+    /// Directory containing `nvme`; defaults to PATH.
     #[serde(default)]
     pub bin_dir: Option<PathBuf>,
 }
 
-/// `[volume.nfs]`. `share_root` is the mounted share everything lives under;
-/// whether the driver is the one mounting it is `manage_mount`.
+/// NFS-backed volumes under `share_root`. `manage_mount` controls mounting.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NfsVolumeConfig {
     pub share_root: PathBuf,
     pub virtiofsd: PathBuf,
-    /// Falls back to [paths].image_dir. Images are the node's; copying them
-    /// onto the share to copy them back off it would be work for nothing.
+    /// Node-local base image directory; defaults to `[paths].image_dir`.
     #[serde(default)]
     pub image_dir: Option<PathBuf>,
-    /// The driver's own number: see nfs_driver::DEFAULT_SOCKET_TIMEOUT_MS.
+    /// Backend socket timeout; defaults to `nfs_driver::DEFAULT_SOCKET_TIMEOUT_MS`.
     #[serde(default = "default_nfs_socket_timeout_ms")]
     pub socket_timeout_ms: u64,
-    /// Extra virtiofsd flags, verbatim and last.
+    /// Extra `virtiofsd` arguments, appended verbatim.
     #[serde(default)]
     pub virtiofsd_args: Vec<String>,
-    /// false (the default): share_root is already mounted by fstab or a
-    /// systemd unit and the driver only checks. true: the driver mounts it
-    /// at start-up, and then it needs server and export.
+    /// Mount the share at startup when true; requires `server` and `export`.
+    /// When false (the default), validate an existing mount.
     #[serde(default)]
     pub manage_mount: bool,
     #[serde(default)]
@@ -677,15 +402,13 @@ pub struct NfsVolumeConfig {
     pub export: Option<String>,
     #[serde(default)]
     pub mount_opts: Option<String>,
-    /// mount(8)'s `-t`. Anything the host can mount can be a share.
+    /// mount(8) filesystem type. The source is still rendered as `server:export`.
     #[serde(default = "default_fs_type")]
     pub fs_type: String,
 }
 
 impl NfsVolumeConfig {
-    /// What to mount, or nothing to mount. `manage_mount = true` without a
-    /// server and an export is a config that cannot be carried out, and the
-    /// driver says so rather than starting half-configured.
+    /// Resolve the requested mount. Managed mounts require both server and export.
     pub fn mount_spec(&self) -> anyhow::Result<Option<nfs_driver::MountSpec>> {
         if !self.manage_mount {
             return Ok(None);
@@ -702,13 +425,7 @@ impl NfsVolumeConfig {
     }
 }
 
-/// `[volume.filesystem]`. Both directories fall back to `[paths]`, which is
-/// where they have always been configured — the section exists so a second
-/// backend has a place to be configured next to, not to move anything.
-///
-/// The default driver is registered with or without this section, because
-/// `driver: None` in a spec has to keep meaning something on every node; see
-/// `drivers::build_filesystem`.
+/// Optional overrides for the always-registered filesystem driver.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemVolumeConfig {
@@ -716,9 +433,7 @@ pub struct FilesystemVolumeConfig {
     pub image_dir: Option<PathBuf>,
     #[serde(default)]
     pub volume_dir: Option<PathBuf>,
-    /// Where `qemu-img` is, for the one case that needs it: a base image that
-    /// is not raw. Unset = PATH, which is right on a NixOS node — the same
-    /// default `[volume.lvm-thin]` takes for the same tool.
+    /// `qemu-img` executable for non-raw base images; defaults to PATH.
     #[serde(default = "default_qemu_img")]
     pub qemu_img: PathBuf,
 }
@@ -728,7 +443,7 @@ pub struct FilesystemVolumeConfig {
 pub struct NvrmConfig {
     pub binary: PathBuf,
     pub vgpuprofile: PathBuf,
-    /// The driver's own number, not the config's: see nvrm_driver::DEFAULT_SOCKET_TIMEOUT_MS.
+    /// Backend socket timeout; defaults to `nvrm_driver::DEFAULT_SOCKET_TIMEOUT_MS`.
     #[serde(default = "default_nvrm_socket_timeout_ms")]
     pub socket_timeout_ms: u64,
     pub vram_budget_mib: Option<u64>,
@@ -743,7 +458,7 @@ pub struct NvrmConfig {
 #[serde(deny_unknown_fields)]
 pub struct InputConfig {
     pub binary: PathBuf,
-    /// The driver's own number, not the config's: see input_driver::DEFAULT_SOCKET_TIMEOUT_MS.
+    /// Backend socket timeout; defaults to `input_driver::DEFAULT_SOCKET_TIMEOUT_MS`.
     #[serde(default = "default_input_socket_timeout_ms")]
     pub socket_timeout_ms: u64,
 }
@@ -775,10 +490,7 @@ pub struct CrosvmGpuConfig {
 }
 
 impl AgentConfig {
-    /// The two migration ceilings this node was configured with, zero read as
-    /// the default in both — a zero in a config file is almost always a key
-    /// somebody meant to fill in, and a ceiling of zero would end every
-    /// transfer before it began.
+    /// Resolve migration intervals; zero selects the default.
     pub fn migration_ceilings(&self) -> crate::provision::Ceilings {
         let default = crate::provision::Ceilings::default();
         crate::provision::Ceilings {
@@ -793,16 +505,9 @@ impl AgentConfig {
         }
     }
 
-    /// Read the file and check everything that can be checked anywhere.
-    ///
-    /// Everything except the one thing that can only be checked HERE: the
-    /// socket group has to exist on the machine that will open the socket,
-    /// and looking it up is what separates this from [`AgentConfig::load`].
-    /// `meister-agent --check-config` runs this and nothing else, so that a
-    /// build host can check a configuration for a node it is not.
-    ///
-    /// No file named by the configuration is opened, and nothing is started:
-    /// paths are resolved against the configuration's directory, not read.
+    /// Parse config, resolve `[paths]` and TLS paths, and check network value
+    /// syntax. Driver section validation and host checks occur separately; this
+    /// method does not open configured resource paths.
     pub fn parse(path: &Path) -> anyhow::Result<Self> {
         let raw = read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
@@ -825,12 +530,7 @@ impl AgentConfig {
             }
         }
 
-        // The three pure readers of this file, run for their refusals and
-        // not for their results. Each of them turns a written value into
-        // something the agent will need later — a firewall range, a BGP
-        // session, a bridge address — and each of them is the only place
-        // that says what is wrong with the value. Running them at start-up
-        // is what keeps a typo from becoming a VM that never gets a network.
+        // Validate network values before startup without opening host resources.
         config.nft_config().context("[network] guarded_ranges")?;
         config.bgp_config().context("[network.bgp]")?;
         config
@@ -840,27 +540,19 @@ impl AgentConfig {
         Ok(config)
     }
 
-    /// [`AgentConfig::parse`], plus the check that only this machine can do.
+    /// Parse configuration and validate the local admin socket group.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let config = AgentConfig::parse(path)?;
 
-        // Resolved here and not where the socket is bound, because that
-        // happens in a spawned task whose error only reaches the log: a group
-        // that does not exist has to stop the agent, and this is the last
-        // place that still can. The gid itself is looked up again at bind
-        // time; what this call buys is the failure.
+        // Fail startup for an unknown group before the spawned socket task can
+        // reduce the error to a log entry. Binding resolves the gid again.
         config.paths.socket_gid()?;
 
         Ok(config)
     }
 
-    /// The tap guard's configuration: where `nft` is, and which addresses no
-    /// tap may source from.
-    ///
-    /// The ranges are parsed HERE and not at the first VM boot, for the same
-    /// reason the lvm-thin driver looks for its pool at start-up: a typo in a
-    /// cidr is a config error, and finding it out when somebody's VM will not
-    /// come up helps nobody.
+    /// Parse guarded address ranges and resolve `nft`. Called during config
+    /// parsing so malformed CIDRs fail before VM provisioning.
     pub fn nft_config(&self) -> anyhow::Result<linux_network_driver::nftables::NftConfig> {
         let guarded =
             common::net::Ipv4Ranges::parse(&self.guarded_ranges).context("guarded_ranges")?;
@@ -873,14 +565,8 @@ impl AgentConfig {
         })
     }
 
-    /// `[network.provider]`, resolved against this node's paths — or nothing,
-    /// which is a node that gave no interface away and holds no gateway slot.
-    ///
-    /// The records go under `run_dir`, and that is a decision rather than a
-    /// convenience: a router is a network namespace, a namespace dies with the
-    /// machine, and a record of it that survived a reboot would be a record of
-    /// something that is gone. The two are lost together, which is what makes
-    /// the start-up sweep able to tell a half-built router from a live one.
+    /// Resolve provider tools and put router state under `<run_dir>/routers`.
+    /// The deployment is responsible for the lifetime of `run_dir`.
     pub fn provider_config(&self) -> Option<linux_network_driver::router::GatewayConfig> {
         let provider = self.network.as_ref()?.provider.as_ref()?;
         Some(linux_network_driver::router::GatewayConfig {
@@ -897,14 +583,8 @@ impl AgentConfig {
         })
     }
 
-    /// `[network.bgp]`, resolved against this node's paths — or nothing,
-    /// which is a node that announces no routes.
-    ///
-    /// `evpn` comes from the VXLAN section and lands here, because that is
-    /// where it is carried out: the overlay decides whether its MACs travel
-    /// over BGP, and this section is only the session they travel on. A node
-    /// that asks for evpn without a BGP peer to send it to is refused here
-    /// rather than at the first tenant VM.
+    /// Resolve FRR settings and carry the VXLAN EVPN flag. EVPN requires a BGP
+    /// section; this check does not require a nonempty neighbor list.
     pub fn bgp_config(&self) -> anyhow::Result<Option<linux_network_driver::frr::BgpConfig>> {
         let Some(network) = &self.network else {
             return Ok(None);
@@ -942,13 +622,7 @@ impl AgentConfig {
         }))
     }
 
-    /// The bridge a NIC lands on when its spec names none.
-    ///
-    /// Empty on a node with no `[network]` section — a node that makes no
-    /// taps, and whose VMs (if it runs any at all) therefore have no NICs to
-    /// give a bridge to. The one caller that would notice, `into_spec`, reads
-    /// it per NIC, and a NIC on such a node is refused one layer down by
-    /// `Drivers::networking` in words rather than landing on `""`.
+    /// Default bridge name, or an empty string without network configuration.
     pub fn default_bridge(&self) -> String {
         self.network
             .as_ref()
@@ -956,8 +630,7 @@ impl AgentConfig {
             .unwrap_or_default()
     }
 
-    /// `[network].bridge_addr`, parsed — or nothing, which is both "no
-    /// address configured" and "no `[network]` section at all".
+    /// Parse the optional bridge address; no network section yields `None`.
     pub fn parsed_bridge_addr(&self) -> anyhow::Result<Option<(IpAddr, u8)>> {
         match &self.network {
             Some(n) => n.parsed_bridge_addr(),
@@ -965,12 +638,8 @@ impl AgentConfig {
         }
     }
 
-    /// The credential for the controller session, if this node has one.
-    ///
-    /// `None` is the plain dial and the default. A certificate without a CA
-    /// is refused rather than quietly ignored: it would authenticate this
-    /// node to whoever answered on that address, which is the one mistake in
-    /// this file worth failing at start-up over.
+    /// Build optional controller TLS configuration. Certificate and key must be
+    /// paired, and client identity requires a configured CA.
     pub fn session_tls(&self) -> anyhow::Result<Option<tonic::transport::ClientTlsConfig>> {
         let identity = match (&self.controller_cert, &self.controller_key) {
             (None, None) => None,
@@ -989,13 +658,7 @@ impl AgentConfig {
         Ok(Some(proto::client_tls(ca, identity)?))
     }
 
-    /// What this node reports as its capacity: what was measured, under the
-    /// ceiling the config names.
-    ///
-    /// A ceiling rather than an override, and the difference matters on the
-    /// day somebody copies a config onto a smaller machine: claiming 64 vCPUs
-    /// on a 16-core box is a scheduler placing VMs that will never fit, and
-    /// the config is the less trustworthy of the two numbers.
+    /// Apply optional ceilings to measured capacity; preserve node conditions.
     pub fn capped(&self, measured: proto::NodeStatus) -> proto::NodeStatus {
         proto::NodeStatus {
             vcpus: self
@@ -1004,15 +667,12 @@ impl AgentConfig {
             mem_mib: self
                 .capacity_mem_mib
                 .map_or(measured.mem_mib, |c| measured.mem_mib.min(c)),
-            // Untouched: a ceiling is about capacity, and no number in a
-            // config makes a fault on this machine go away.
+            // Capacity ceilings do not clear measured node faults.
             conditions: measured.conditions,
         }
     }
 
-    /// Every controller this agent may dial. The list wins when both are set:
-    /// a single `controller_addr` left over from before HA is one replica, and
-    /// a list that names replicas is the newer, more complete statement.
+    /// Configured controller endpoints; a nonempty replica list takes precedence.
     pub fn controller_endpoints(&self) -> Vec<String> {
         if !self.controller_addrs.is_empty() {
             return self.controller_addrs.clone();
@@ -1022,13 +682,7 @@ impl AgentConfig {
 }
 
 impl PathsConfig {
-    /// `socket_group` as a gid, or `None` when the key is absent.
-    ///
-    /// A name no group answers to is an error rather than a fall back to the
-    /// private mode: the key exists to open the socket, and quietly not
-    /// opening it would be found out by somebody who cannot use the CLI and
-    /// has no reason to suspect the config. Resolved at start-up for the same
-    /// reason a cidr is parsed there.
+    /// Resolve the configured Unix group, failing when its name is unknown.
     pub fn socket_gid(&self) -> anyhow::Result<Option<u32>> {
         let Some(name) = &self.socket_group else {
             return Ok(None);
@@ -1059,8 +713,7 @@ impl PathsConfig {
 #[cfg(test)]
 mod tests {
 
-    /// A range an operator has to be able to open in a firewall, and a
-    /// refusal that says what is wrong with what they wrote.
+    /// Validate inclusive migration port ranges and report malformed values.
     #[test]
     fn the_migration_port_range_is_read_at_startup_or_refused_there() {
         let cfg = |ports: Option<&str>| CloudHypervisorConfig {
@@ -1070,11 +723,10 @@ mod tests {
             unplug_timeout_secs: default_unplug_timeout_secs(),
         };
 
-        // Not set is a node that does not receive live migrations, which is
-        // an answer and not a mistake.
+        // An absent range disables receiving.
         assert_eq!(cfg(None).ports(), Ok(None));
         assert_eq!(cfg(Some("49000-49099")).ports(), Ok(Some((49000, 49099))));
-        // One port is a range of one, which is a real thing to want.
+        // A single port is a valid range.
         assert_eq!(cfg(Some("49000-49000")).ports(), Ok(Some((49000, 49000))));
         assert_eq!(
             cfg(Some(" 49000 - 49099 ")).ports(),
@@ -1102,12 +754,7 @@ mod tests {
             .unwrap_or_else(|| panic!("[{what}.{key}] is a real section"))
     }
 
-    /// A misspelled key INSIDE a section still fails, and still says which
-    /// key it was. Moving `[volume]` to a raw table moved this check from
-    /// the whole-file parse to the driver that owns the section, so it is
-    /// worth an assertion of its own: the section keeps its
-    /// `deny_unknown_fields`, and a silently ignored setting here would be a
-    /// node running on a timeout its operator thought they had changed.
+    /// Typed driver sections reject unknown keys and include the key in the error.
     #[test]
     fn a_typo_inside_a_section_is_still_refused_by_name() {
         let cfg = config_with(
@@ -1122,8 +769,7 @@ mod tests {
         assert!(err.contains("[volume.nfs]"), "the section is named: {err}");
     }
 
-    /// The default and every config written before this key existed: root
-    /// talks to the socket, and nobody else.
+    /// Without a socket group, access remains owner-only.
     #[test]
     fn no_socket_group_is_no_group() {
         let cfg = config_with("");
@@ -1131,10 +777,7 @@ mod tests {
         assert_eq!(cfg.paths.socket_gid().unwrap(), None);
     }
 
-    /// A name nothing answers to is refused WITH the name. The alternative is
-    /// a node whose socket is quietly still 0600 while its operator believes
-    /// they opened it, and the person who finds that out is somebody whose
-    /// CLI says "permission denied" for no visible reason.
+    /// Unknown socket groups fail with the requested name in the error.
     #[test]
     fn an_unknown_socket_group_is_an_error_that_names_it() {
         let mut cfg = config_with("");
@@ -1144,15 +787,13 @@ mod tests {
         assert!(err.contains("socket_group"), "{err}");
     }
 
-    /// A group that does exist resolves to its gid. The one group every test
-    /// process is certain to be in is its own.
+    /// Resolve an existing group using the test process's gid.
     #[test]
     fn a_known_socket_group_resolves_to_its_gid() {
         let gid = nix::unistd::getgid();
         let Some(group) = nix::unistd::Group::from_gid(gid).expect("reading the group database")
         else {
-            // A build environment whose own gid has no /etc/group entry can
-            // say nothing about name lookup. Say so rather than pass quietly.
+            // Skip name lookup when this environment has no group entry for its gid.
             eprintln!("gid {gid} has no name here; nothing to look up");
             return;
         };
@@ -1183,10 +824,7 @@ mod tests {
         .expect("config parses")
     }
 
-    /// The gateway slot, in the form a node writes it down: the NAME of the
-    /// provider network on the left and this node's interface for it on the
-    /// right. Two nodes reaching one wire by different NICs is the ordinary
-    /// case and the whole reason it is a map.
+    /// Map provider-network names to local host interfaces.
     #[test]
     fn a_node_names_its_provider_networks_and_the_interface_for_each() {
         let cfg: AgentConfig = from_str(
@@ -1217,25 +855,14 @@ mod tests {
         );
         assert_eq!(gateway.physnets["ext"], "eth1");
         assert_eq!(gateway.ip, "ip", "unset = PATH, the same default nft takes");
-        // The records go under run_dir and nowhere else: a namespace dies with
-        // the machine, and a record of it that outlived a reboot would be a
-        // record of something that is gone.
+        // Router state uses the configured runtime directory.
         assert_eq!(gateway.state_dir, PathBuf::from("/run/ms/routers"));
 
-        // And the ordinary node, which is every node before 6k: no section,
-        // no slot, no claim.
+        // An absent provider section advertises no gateway slot.
         assert!(config_with("").provider_config().is_none());
     }
 
-    /// The three numbers that were constants have keys, and the keys default
-    /// to exactly what the constants were.
-    ///
-    /// That last half is the point of the test. A config key whose default
-    /// differs from the constant it replaced is a silent change of behaviour
-    /// on every fleet that never sets it, and the two migration ceilings are
-    /// the pair where that would be worst: both have to stay longer than the
-    /// cluster's own `migration_transfer_secs`, or a node starts calling a
-    /// transfer failed that the tier above still believes in.
+    /// Migration and unplug settings retain their defaults; zero intervals use defaults.
     #[test]
     fn the_three_waits_are_keys_and_their_defaults_are_the_old_constants() {
         let none = config_with("");
@@ -1255,7 +882,7 @@ mod tests {
             "the config's default IS the driver's, not a second copy of 30"
         );
 
-        // Set, they are what was written.
+        // Explicit settings override defaults.
         let set = config_with(
             r#"migrate_out_ceiling_secs = 1800
                receive_ceiling_secs = 1200"#,
@@ -1266,10 +893,7 @@ mod tests {
         );
         assert_eq!(set.migration_ceilings().receive, Duration::from_secs(1200));
 
-        // And zero is the default rather than "give up at once", the same
-        // rule `ports()` applies to a zero: a zero in a config file is almost
-        // always a key somebody meant to fill in, and a ceiling of zero would
-        // end every transfer before it started.
+        // Zero migration intervals select the default.
         let zero = config_with(
             r#"migrate_out_ceiling_secs = 0
                receive_ceiling_secs = 0"#,
@@ -1290,10 +914,7 @@ mod tests {
         assert!(config_with("").controller_endpoints().is_empty());
     }
 
-    /// The curated example, parsed as it is on disk. An example that does not
-    /// parse is worse than no example: it is a file that looks like an answer.
-    /// `deny_unknown_fields` means this also catches a key renamed in the code
-    /// and left behind here.
+    /// Parse the shipped example, including unknown-key validation.
     #[test]
     fn the_example_config_parses() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/examples/agent.toml");
@@ -1306,21 +927,15 @@ mod tests {
         );
     }
 
-    /// Every commented-out key in the example has to be a key that exists.
-    /// Uncommenting a line in an example is the first thing anyone does with
-    /// one, and a stale key there fails at the worst possible moment — on a
-    /// node, at start-up, with `deny_unknown_fields` and no hint which line.
+    /// Commented example settings must remain valid configuration keys.
     #[test]
     fn every_commented_key_in_the_example_is_a_real_key() {
         let raw = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/examples/agent.toml"),
         )
         .unwrap();
-        // The example's convention, and the reason it is worth having: prose
-        // is `# text`, a commented-out setting is `#key = …` with no space.
-        // So uncommenting the settings and leaving the prose alone is one
-        // rule, and this is what enforces it in both directions — a stale key
-        // fails here, and so does a prose line that forgot its space.
+        // Example prose starts with `# `; disabled settings start with `#key`.
+        // Uncomment only settings, then validate their keys.
         let uncommented: String = raw
             .lines()
             .map(|l| match l.strip_prefix('#') {
@@ -1332,16 +947,9 @@ mod tests {
             .join("\n");
         let cfg: AgentConfig = from_str(&uncommented)
             .expect("every commented key and section in the example is a real one");
-        // The envelope key. It is the one line in the example a fleet really
-        // does uncomment, so a rename here has to fail in this test rather
-        // than on twelve nodes at start-up.
+        // Verify the enabled log format setting.
         assert_eq!(cfg.log_format, telemetry::LogFormat::Json);
-        // Every section is deserialized into its typed struct HERE, and that
-        // is the whole point of this block rather than a `contains_key`:
-        // `[volume]` and `[device]` are raw TOML in the config now, so
-        // `deny_unknown_fields` inside a section only fires when somebody
-        // parses the section — which on a node is `Drivers::from_config`,
-        // and in this test is these six lines.
+        // Deserialize each driver section to exercise its `deny_unknown_fields`.
         let gpu: CrosvmGpuConfig = one(&cfg.device, "device", "crosvm-gpu");
         assert!(gpu.profiles.contains_key("venus"));
         let _: NvrmConfig = one(&cfg.device, "device", "nvrm");
@@ -1351,15 +959,12 @@ mod tests {
         let lvm: LvmThinVolumeConfig = one(&cfg.volume, "volume", "lvm-thin");
         assert_eq!(lvm.vg, "meister");
         let nfs: NfsVolumeConfig = one(&cfg.volume, "volume", "nfs");
-        // manage_mount = true in the example, so the mount it describes has
-        // to be one the driver could actually carry out.
+        // The example enables mounting and must supply a complete mount source.
         assert!(nfs.mount_spec().unwrap().is_some());
         let managed: Vec<ManagedDevice> = one(&cfg.device, "device", "managed");
         assert_eq!(managed.len(), 1);
 
-        // The M5 half of the example: the overlay section and the two-agents
-        // recipe are commented-out KEYS, so uncommenting them has to give a
-        // config that means what the prose above them says.
+        // Validate enabled overlay and capacity settings.
         let network = cfg
             .network
             .as_ref()
@@ -1378,11 +983,7 @@ mod tests {
         assert_eq!(cfg.capacity_vcpus, Some(32));
         assert_eq!(cfg.cgroup_cpuset.as_deref(), Some("0-15,32-47"));
 
-        // The M5.1 half: the guard, the overlay's evpn switch and the bgp
-        // session. Uncommenting them has to give a config that means what the
-        // prose above them says — including that `guarded_ranges` is a
-        // TOP-LEVEL key and not a `[network]` one, which is what keeps the
-        // lab's context rendering from producing a duplicate table.
+        // Validate guard, EVPN and BGP settings, including top-level `guarded_ranges`.
         let guarded = cfg.nft_config().expect("the example's ranges parse");
         assert_eq!(
             guarded.guarded.ranges().len(),
@@ -1410,10 +1011,7 @@ mod tests {
         assert!(bgp.fragment.ends_with("meister-bgp.conf"));
     }
 
-    /// Two keys that only mean something together: evpn is BGP carrying the
-    /// overlay's MAC addresses, so a node asking for it without a peer to
-    /// carry them to would flood into a multicast group it is no longer in —
-    /// silently, which is the worst way for an overlay to be broken.
+    /// EVPN configuration requires a BGP section.
     #[test]
     fn evpn_without_a_bgp_section_is_refused_at_start_up() {
         let orphan = config_with("").network.is_none_or(|n| n.vxlan.is_none());
@@ -1443,8 +1041,7 @@ mod tests {
         assert!(err.contains("[network.bgp]"), "{err}");
     }
 
-    /// The repo's own dev config, parsed as it is on disk — a `[volume]`
-    /// section it does not have must stay a section it does not need.
+    /// The development config does not require an explicit volume section.
     #[test]
     fn the_dev_config_in_the_repo_still_loads() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/agent.dev.toml");
@@ -1456,11 +1053,7 @@ mod tests {
         let _: CrosvmGpuConfig = one(&cfg.device, "device", "crosvm-gpu");
     }
 
-    /// And when there is one, it overrides only what it names — the rest
-    /// stays where it has always been configured, in `[paths]`.
-    /// The two knobs whose default lives in the driver rather than here, so
-    /// that the number is next to the process it is about. A config that says
-    /// nothing about them has to come out the same as one that repeats them.
+    /// Storage sections use the driver defaults when settings are omitted.
     #[test]
     fn the_storage_defaults_come_from_the_drivers() {
         let cfg = config_with(
@@ -1489,9 +1082,7 @@ mod tests {
         assert!(nfs.mount_spec().unwrap().is_none());
     }
 
-    /// A node that says it will mount the share and does not say what has a
-    /// config that cannot be carried out. Better to say so at start-up than
-    /// to run with a storage backend rooted in an empty local directory.
+    /// Managed mounts require a complete source before the driver starts.
     #[test]
     fn managing_a_mount_without_a_source_is_refused() {
         let cfg = config_with(
@@ -1516,18 +1107,13 @@ mod tests {
         assert_eq!(fs.image_dir, None, "unnamed falls back to paths.image_dir");
     }
 
-    /// The default, and the whole compatibility claim of this milestone in
-    /// one assertion: a config that says nothing about certificates dials
-    /// plain, exactly as it has since M1.
+    /// Without TLS credentials, controller sessions use plaintext.
     #[test]
     fn a_config_with_no_certificate_keys_dials_plain() {
         assert!(config_with("").session_tls().unwrap().is_none());
     }
 
-    /// A certificate with no CA to check the SERVER against would present
-    /// this node's key to whoever answered on that address. Half a config is
-    /// refused rather than silently downgraded — the same rule the two
-    /// controllers already apply to their own TLS keys.
+    /// Refuse incomplete client identity or identity without a controller CA.
     #[test]
     fn half_a_session_credential_is_refused() {
         let only_cert = config_with(
@@ -1542,10 +1128,7 @@ mod tests {
         assert!(err.contains("go together"), "{err}");
     }
 
-    /// A ceiling, not an override. Two agents pinned to two NUMA nodes each
-    /// read the whole host out of /proc, and the controller would otherwise
-    /// schedule against twice the hardware that exists — but a config copied
-    /// onto a smaller machine must not be able to claim more than is there.
+    /// Capacity ceilings can reduce measured capacity but cannot increase it.
     #[test]
     fn the_capacity_ceiling_only_ever_lowers_what_was_measured() {
         let measured = proto::NodeStatus {
@@ -1574,10 +1157,7 @@ mod tests {
         );
     }
 
-    /// The guard's config, parsed at start-up rather than at the first VM
-    /// boot — the same fail-fast the lvm-thin driver applies to its pool, and
-    /// for the same reason: a typo in a cidr is a config error, and finding it
-    /// out when somebody's VM will not come up helps nobody.
+    /// Malformed guarded CIDRs fail during config parsing.
     #[test]
     fn the_guarded_ranges_are_parsed_when_the_config_is_read() {
         let cfg = config_with(
@@ -1593,10 +1173,7 @@ mod tests {
         assert!(err.contains("guarded_ranges"), "{err}");
     }
 
-    /// The compatibility invariant in one assertion: a config that says
-    /// nothing about addresses guards nothing. Taps still get their mac
-    /// pinned — that needs no configuration and never did — and no address
-    /// rule is written at all.
+    /// Omitted guarded ranges produce no address rules; MAC pinning is independent.
     #[test]
     fn a_config_with_no_guarded_ranges_guards_nothing() {
         let nft = config_with("").nft_config().unwrap();
@@ -1610,9 +1187,7 @@ mod tests {
         );
     }
 
-    /// The lab's context still writes `controller_addr` into every agent
-    /// config; a list that names the replicas is the newer and more complete
-    /// statement, so it wins rather than being merged into an ambiguity.
+    /// A nonempty controller replica list overrides the single-address fallback.
     #[test]
     fn the_replica_list_wins_over_the_single_address() {
         let cfg = config_with(

@@ -53,16 +53,9 @@ struct NamespacePool {
     allow_local_claims: bool,
 }
 
-/// What a pool says about namespaces, or nothing at all.
-///
-/// A pool whose params are absent, unreadable or namespace-less is not a
-/// namespace pool, and none of this applies to it. Unreadable is deliberately
-/// the same answer as absent: this tier does not validate a driver's options
-/// — the node does, and it says so far better than a controller could.
-/// A pool that says `allow_local_claims` answers `None` here too, and that is
-/// the escape hatch doing its job on this side: an operator who wrote it has
-/// said the nodes may choose, so nothing is assigned and the driver picks as
-/// it always did. Written on both sides or it is written on neither.
+/// Parse centrally assigned namespace pools. Missing, invalid or empty namespace
+/// parameters return None and remain subject to driver validation.
+/// `allow_local_claims` also returns None, delegating allocation to the node.
 fn pool_of(pool: &StoragePool) -> Option<NamespacePool> {
     let params = pool.spec.params.as_ref()?;
     let parsed: NamespacePool = serde_json::from_value(params.clone()).ok()?;
@@ -226,16 +219,9 @@ pub(crate) async fn assign(
     )))
 }
 
-/// Give this volume's namespace back to its pool.
-///
-/// Best effort and never fatal: the volume is going away either way, and a
-/// claim left behind is a namespace that stays out of circulation until
-/// somebody edits the pool — bad, but not as bad as an object that will not
-/// delete. Said with a warning rather than swallowed, which is what makes it
-/// findable.
-///
-/// The DATA on the namespace is untouched, exactly as the driver's release
-/// was: an import provider made none of it and destroys none of it.
+/// Return the volume's namespace claim without touching its data.
+/// Failure is logged but does not block volume deletion; an unreleased claim
+/// can require an operator to free it in the pool.
 pub(crate) async fn give_back(store: &EtcdStore, volume: &Volume) {
     let uid = volume.metadata.uid.clone();
     let released = store
@@ -507,23 +493,19 @@ mod tests {
         );
     }
 
-    /// The whole of it against a real etcd, from two replicas at once — the
-    /// one thing no in-process test can say, because what is being proved is
-    /// that "once" holds across two processes that share nothing but a store.
-    ///
-    /// `#[ignore]` for the reason the ticket test next door is: it needs
-    /// something to talk to. Start one and name it:
+    /// Concurrent namespace claims through shared etcd must allocate distinct entries.
+    /// Run this ignored test with:
     ///
     /// ```text
     /// etcd --data-dir /tmp/ms-runde4-controller-etcd \
-    ///      --listen-client-urls http://127.0.0.1:3790 \
-    ///      --advertise-client-urls http://127.0.0.1:3790 \
-    ///      --listen-peer-urls http://127.0.0.1:3791 \
-    ///      --initial-advertise-peer-urls http://127.0.0.1:3791 \
-    ///      --initial-cluster default=http://127.0.0.1:3791
+    /// --listen-client-urls http://127.0.0.1:3790 \
+    /// --advertise-client-urls http://127.0.0.1:3790 \
+    /// --listen-peer-urls http://127.0.0.1:3791 \
+    /// --initial-advertise-peer-urls http://127.0.0.1:3791 \
+    /// --initial-cluster default=http://127.0.0.1:3791
     ///
     /// MEISTER_TEST_ETCD=http://127.0.0.1:3790 \
-    ///   cargo test -p meister-cluster-controller -- --ignored
+    /// cargo test -p meister-cluster-controller -- --ignored
     /// ```
     #[tokio::test]
     #[ignore = "needs an etcd; see the note above"]

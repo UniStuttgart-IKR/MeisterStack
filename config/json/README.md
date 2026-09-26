@@ -1,29 +1,23 @@
-# config/json — VM spec fixtures
+# VM specification fixtures
 
-These are **not** component configs. Each file is the body of a
-`POST /vms` — a `NewVmSpec` — and what `meister … vm create -f <file>` sends.
+These JSON files contain agent `NewVmSpec` values for local
+`meister agent vm create -f <file>` operations. They are not component TOML
+configuration. Cloud VM creation wraps a VM specification with resource and
+placement information; see [API](../../docs/API.md).
 
-They are fixtures first and samples second. Every `.json` in this directory
-is parsed and validated by `components/agent/src/types.rs`
-(`every_spec_in_the_repo_still_parses`), which is what keeps them honest:
-`NewVmSpec` is `deny_unknown_fields`, so a field renamed in the code breaks
-this directory in CI rather than in somebody's `curl`. That test is also the
-promise every spec here was written under — a spec that meant something
-before a field was added still means exactly that.
+[Agent parser tests](../../components/agent/src/types.rs) enumerate the flat
+directory and validate every JSON file. Keep files parseable and update paths,
+boot arguments, and device selections before using them on another host.
 
-Keep the directory flat and keep every file a valid spec; the test walks it
-without knowing any names.
+| File | Purpose |
+| --- | --- |
+| `plain.json` | Filesystem volume and default bridge. |
+| `example-vm.json` | Explicit bridge and image-specific boot arguments. |
+| `gpu.json` | crosvm GPU backend with the `venus` profile. |
+| `nvrm.json` | NVIDIA mediated backend with the `4q` profile. |
+| `input.json` | virtio-input with an evdev node; backend user needs read access. |
+| `passthrough.json` | Exclusive PCI assignment through `vfio`; the address must appear in `device.managed`. |
 
-| File | What it exercises |
-|------|-------------------|
-| `plain.json` | A VM with nothing special: default bridge, one cloned volume, no devices. |
-| `example-vm.json` | The same, with the bridge named explicitly. |
-| `gpu.json` | A mediated GPU through the `crosvm-gpu` driver, profile `venus`. |
-| `nvrm.json` | A mediated NVIDIA vGPU through the `nvrm` driver, profile `4q`. |
-| `input.json` | Upstream virtio-input. Select a host input node with `profile: "evdev"` and `params.evdev`. The backend user needs read access; each node may belong to one guest. |
-| `passthrough.json` | A whole PCI device through the `vfio` driver. Note the spelling: the driver is `vfio`, while the agent config section that whitelists the address is `[[device.managed]]`. |
-
-The device drivers named here have to be configured on the node the VM lands
-on, or the spec is refused — by the agent at the edge, and by the scheduler
-one tier up, which keeps such a VM away from a node that cannot serve it. See
-`config/examples/agent.toml`.
+Required files and driver profiles must exist on the target node. These fixtures
+validate the specification format; they do not establish hardware availability
+or prove that the embedded guest paths will boot on another installation.

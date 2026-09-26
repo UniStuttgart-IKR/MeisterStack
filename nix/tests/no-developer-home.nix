@@ -2,29 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# Nothing this fleet is made of comes out of a developer's home directory.
-#
-# It used to: the units expected /opt/meisterstack/bin, filled by
-# `deploy/push.sh` from `$HOME/git/Leandro/target/release` and by
-# `get_patched_binaries.sh`, which cloned two repositories into `bin/` and
-# — measured in M0 — wrote a GLOBAL git identity while it was at it. A fleet
-# built that way cannot be rebuilt by anybody else, which is scenario V04.
-# Both went with M5B; this check is what says they cannot come back.
-#
-# Two halves, and the first one is the build itself: this derivation only
-# exists if the example fleet's systems, the rendered configuration files and
-# the packages were all built in the nix sandbox, where there is no home
-# directory to read. The second half is the grep below, because a path can
-# also travel as a STRING in a config file — `inputBackend`, a hypervisor
-# binary, a kernel — and a string like that would only fail on the machine.
-#
-# `/opt/meisterstack/bin` and not `/opt/meisterstack`: the BIN directory is
-# the one a push fills, and a managed host must name nothing in it. The
-# agent's `image_dir = /opt/meisterstack/images` is a state directory that
-# nix/agent.nix creates with tmpfiles on either road — measured here, because
-# the first version of this check refused it — and moving it to /var/lib on a
-# managed host would change every agent's configuration, which is a decision
-# for M2 rather than a grep.
+# Inspect built units and rendered configurations for developer-specific paths
+# and external binary push directories.
 { lib, pkgs, configs }:
 
 let

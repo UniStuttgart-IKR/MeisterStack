@@ -2,10 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-// The create document lives in `agent-api` so that both controllers can
-// deserialise `spec.vm` into it at their REST edge — the refusal a client can
-// still read. What is here is everything that turns that document into this
-// node's record, which is the half that needs a node to be true.
+// Shared create-document types; local types below persist resolved resource IDs.
 pub use agent_api::spec::{BootSourceSpec, Desired, NewDevice, NewNic, NewVmSpec, NewVolume};
 use agent_api::{
     Device, Nic,
@@ -19,9 +16,7 @@ use anyhow::{Context, bail};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-/// Process that requires ownership of the VM.
-/// This is required to let the reconciler know to not start/stop the VM while its in one of these
-/// states.
+/// Exclusive operation marker that suppresses ordinary lifecycle reconciliation.
 /// Migration ownership survives startup; task loss does not end a VMM transfer.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Operation {
@@ -43,9 +38,8 @@ pub struct MigrationAttempt {
     pub unknown: Option<String>,
 }
 
-/// Process of the resource creation. Only for journaling.
-/// For decision-making its only relevant `Provisioned` (finished) or else (not finished).
-/// This is to track the creation phase of a VM.
+/// Persisted provisioning checkpoint, including migration-specific phases.
+/// The planner treats unfinished provisioning and migration phases separately.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Phase {
     Provisioning,
@@ -53,33 +47,11 @@ pub enum Phase {
     NetworkDone,
     DevicesDone,
     Provisioned,
-    /// Everything a guest needs is standing here — cgroup, disks, taps,
-    /// devices, seed — and a VMM is listening for the migration stream. The
-    /// guest is not here yet and may never arrive.
-    ///
-    /// It is the same chain as `Provisioned`, cut one step short: the config
-    /// travels inside the stream, so the destination must NOT create a VM
-    /// (v53 refuses to receive into one) and must have everything that config
-    /// NAMES already in place, at the same paths.
-    ///
-    /// The reconciler does nothing at all to a record in this phase. It is
-    /// the cluster's migration that owns it, on the cluster's timeout, and an
-    /// agent that re-provisioned here would tear down the VMM the guest is
-    /// moving into.
+    /// Destination resources are prepared and a VMM is receiving. Reconciliation
+    /// checks arrival or receiver failure without ordinary provisioning.
     Receiving,
-    /// The guest left this node for another one, and the record is what is
-    /// left of it.
-    ///
-    /// NOT deleted, and that is the whole point: until the destination
-    /// reports the VM Running, the source is the fallback, and a record
-    /// thrown away at `send` would have thrown away the only description of a
-    /// guest that may still have to come back. The cluster removes it with a
-    /// `DestroyInstance` once the destination has the guest — a teardown that
-    /// detaches referenced volumes and deprovisions nothing, which is what it
-    /// already does for a disk that outlives its VM.
-    ///
-    /// The reconciler does nothing here either: there is no VMM to repair and
-    /// nothing to start.
+    /// The send API succeeded. Retain source resource records until the controller
+    /// resolves ownership and requests cleanup; ordinary startup is suppressed.
     Migrated,
 }
 
@@ -91,20 +63,11 @@ pub struct AgentVmSpec {
     pub volumes: Vec<VolumeWithId>,
     pub nics: Vec<NicWithId>,
     pub devices: Vec<DeviceWithId>,
-    /// What the guest configures itself from at first boot. `None` is a VM
-    /// with no seed, which is every VM this stack has booted so far.
+    /// Optional NoCloud seed configuration.
     #[serde(default)]
     pub cloud_init: Option<crate::cloudinit::CloudInit>,
-    /// Where the base images this VM names can be fetched from, if this node
-    /// does not have them yet. Beside the volumes rather than inside their
-    /// specs, and that is the point: a `VolumeSpec` is the contract three
-    /// storage drivers implement, all three resolve `base_image` by joining
-    /// the name onto their own image_dir, and none of them has to learn what
-    /// a URL is for this to work. The agent puts the bytes there first.
-    ///
-    /// Empty for every spec written before this existed, and empty for every
-    /// path-based image afterwards — so a record written yesterday loads
-    /// unchanged and behaves unchanged.
+    /// Fetch sources resolved before provisioning. Drivers use local catalogue
+    /// paths; path-only images and legacy records leave this list empty.
     #[serde(default)]
     pub images: Vec<crate::images::Source>,
 }
@@ -113,14 +76,9 @@ pub struct AgentVmSpec {
 pub struct VolumeWithId {
     pub id: VolumeId,
     pub spec: VolumeSpec,
-    /// True when the id is a `Volume` object's uid rather than one this node
-    /// minted, and the disk is therefore attached rather than made.
-    ///
-    /// On the SPEC and not derived from the volume table, deliberately. The
-    /// teardown path asks this to decide between `detach` and `deprovision`,
-    /// and the difference is somebody's data — so the answer has to live on
-    /// the VM's own record, where it was written when the VM was created, and
-    /// not depend on a second table still having a row.
+    /// The volume is externally owned: VM teardown detaches it without deleting
+    /// its data. Persist ownership on this record so deletion does not depend on
+    /// the presence of another table row.
     #[serde(default)]
     pub referenced: bool,
 }
@@ -147,7 +105,7 @@ pub struct VmRecord {
     pub phase: Phase,
     #[serde(default)]
     pub operation: Option<Operation>,
-    /// `time::SystemTime` to make the deadline surrive an agent restart.
+    /// Wall-clock shutdown deadline retained across agent restart.
     #[serde(default)]
     pub stop_deadline: Option<std::time::SystemTime>,
     /// Advisory receive deadline, retained for persisted-record compatibility.
@@ -159,28 +117,14 @@ pub struct VmRecord {
     /// It belongs to `migration.id` and is cleared before the next attempt.
     #[serde(default)]
     pub send_failed: Option<String>,
-    /// Set by the reconciler when it detects a condition it must not repair
-    /// automatically. While set, the reconciler quarantines the VM: no
-    /// automatic Provision/Start. Cleared by explicit lifecycle actions
-    /// (start/stop/destroy via API) or by a successful re-provision.
-    ///
-    /// **One condition writes this today, and a killed VMM is not it.** The
-    /// condition is a backend process that died while the VMM went on running
-    /// — a live guest doing IO into a socket nobody is serving, where an
-    /// automatic restart would reboot a working machine on the strength of
-    /// something nobody has looked at. A VMM that was killed takes its
-    /// backends with it and leaves a record with no processes behind it;
-    /// that VM is re-provisioned, deliberately and in fifteen seconds, and
-    /// `reconcile::backend_died_under_vmm` is where the line between the two
-    /// is drawn and argued.
+    /// Persisted quarantine reason that suppresses automatic lifecycle repair.
+    /// Backend loss under a live VMM and repeated ineffective resumes can set it.
+    /// Explicit desired-state changes clear it.
     #[serde(default)]
     pub unhealthy: Option<String>,
-    /// True when this record came into being over the controller session.
-    /// Only these may be torn down by a desired-state snapshot: a VM created
-    /// straight on the agent's unix socket belongs to whoever is at that
-    /// socket, is invisible to the controller, and is not the controller's
-    /// to reap. Records written before the marker existed default to false
-    /// and are claimed the first time the controller names one.
+    /// Controller-owned records may be reaped by desired-state snapshots.
+    /// Local and legacy records default to false; the controller claims a record
+    /// when it first names it.
     #[serde(default)]
     pub managed_by_controller: bool,
     pub volumes: Vec<Volume>,
@@ -192,37 +136,14 @@ pub struct VmRecord {
     pub devices: Vec<Device>,
     #[serde(default)]
     pub vmm_pid: Option<u32>,
-    /// Which bridge each of this VM's overlays actually got, by VNI, as the
-    /// driver that built it named it.
-    ///
-    /// `ensure_overlay` has always answered with the name and the answer was
-    /// logged and thrown away; the teardown then rebuilt it from the VNI
-    /// inside the driver. That is only the same string while ONE driver
-    /// builds overlays on a node — and `destroy_overlay(vni)` reaching a
-    /// driver with another naming convention would take down the wrong link
-    /// or none. So the name is written down where it was learned, and the
-    /// teardown hands it back to the driver to check against its own.
-    ///
-    /// Missing for a VNI — and empty on every record written before this
-    /// existed — means "nobody wrote it down", which is not the same as "it
-    /// has none": the driver then answers for its own naming as it did
-    /// before, and the record says nothing either way.
+    /// Bridge names returned by overlay creation, keyed by VNI. Teardown passes
+    /// them back for driver validation; legacy records may lack these names.
     #[serde(default)]
     pub overlay_bridges: BTreeMap<u32, String>,
 }
 
 impl VmRecord {
-    /// A record with nothing interesting in it: one vCPU, 256 MiB, firmware
-    /// boot, nothing attached, running and provisioned. A test that is about
-    /// one field dresses this up and says only what it is about.
-    ///
-    /// Public, and not behind `#[cfg(test)]`, because the two kinds of test
-    /// that need it cannot share anything that is: the reconciler's own tests
-    /// live inside the crate, and `tests/space` — the exhaustive walk over
-    /// `plan`'s input space — links against it from outside. So it was
-    /// written out twice, in `reconcile.rs` and in `tests/space/mod.rs`, and
-    /// both copies had to be extended every time this struct gained a field.
-    /// Three times they were; the fourth is what this exists to prevent.
+    /// Minimal provisioned record for internal and integration test fixtures.
     pub fn blank() -> Self {
         Self {
             migration: None,
@@ -256,48 +177,27 @@ impl VmRecord {
     }
 }
 
-/// What this node remembers about a volume it owns, with no consumer implied.
-///
-/// The record the `Volume` object one tier up always needed and never had.
-/// It survives a restart, which is the whole point: bytes on a disk outlive
-/// the process that made them, and an agent that forgot about them would be
-/// an agent that cannot be asked to delete them.
-///
-/// `handle` is `None` between "told to make it" and "made it" — the window a
-/// crash can land in, and the reason `provision` is idempotent by contract:
-/// a record without a handle is picked up again and the backend hands back
-/// the volume that is already there rather than a second one.
+/// Independent volume ownership record. `handle` is absent while provisioning
+/// is pending or incomplete; retry/probe uses the same volume ID.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VolumeRecord {
     pub spec: agent_api::storage::VolumeSpec,
     #[serde(default)]
     pub handle: Option<agent_api::storage::VolumeHandle>,
     pub phase: VolumeRecordPhase,
-    /// Why that phase, in the one word a program may branch on.
-    ///
-    /// On the RECORD and not derived at report time, and that is the whole of
-    /// why it is here: the two `Failed` cases are a provision the backend
-    /// refused and a volume the backend has LOST, the fix for the first is a
-    /// retry and the fix for the second is somebody's backup, and by the time
-    /// anybody reads the report the only thing that told them apart was the
-    /// driver's own prose. The pass that asked the driver is what knows, so
-    /// the pass writes it down.
-    ///
-    /// `None` on a record from a build before this field — read as
-    /// `VolumeReason::Unrecorded`, whose `message` is untouched — and on
-    /// `Ready`, which needs no reason.
+    /// Machine-readable cause persisted by the operation that observed it.
+    /// Absent for Ready and legacy records without a recorded reason.
     #[serde(default)]
     pub reason: Option<crate::reconcile::VolumeReason>,
     #[serde(default)]
     pub message: Option<String>,
-    /// When this record became a tombstone, if it did. See
-    /// [`VolumeRecordPhase::Gone`].
+    /// Deletion timestamp used for tombstone expiry; see [`VolumeRecordPhase::Gone`].
     #[serde(default)]
     pub gone_at: Option<std::time::SystemTime>,
 }
 
 impl VolumeRecord {
-    /// The name the backend knows it by, or empty while there is none.
+    /// Backend name, or an empty string before a handle exists.
     pub fn backend(&self) -> &str {
         self.handle
             .as_ref()
@@ -306,37 +206,25 @@ impl VolumeRecord {
     }
 }
 
-/// What this node remembers about a snapshot it took.
-///
-/// The volume's id is on it, and that is not redundancy: a snapshot outlives
-/// its volume, so once the volume's record is gone this is the only place
-/// that says what the copy is OF — and an operator reading `agent snapshot
-/// ls` on a node is asking exactly that.
+/// Snapshot record retaining source identity independently of the volume row.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotRecord {
-    /// The `Volume` this is a copy of.
+    /// Source volume ID.
     pub volume: agent_api::storage::VolumeId,
-    /// The backend's name for the copy. `None` between "told to take it" and
-    /// "took it" — the same window a volume record has, and the same reason:
-    /// the record is written first so a crash leaves a trace.
+    /// Snapshot handle, absent until creation succeeds. Persisting the record
+    /// first preserves the operation identity across a crash.
     #[serde(default)]
     pub handle: Option<agent_api::storage::VolumeHandle>,
-    /// Which backend made it. Kept beside the handle because the volume's own
-    /// record may be gone by the time this has to be dropped.
+    /// Owning driver, retained independently of the source volume row.
     pub driver: String,
     pub phase: SnapshotRecordPhase,
-    /// Why that phase, in the one word a program may branch on. On the record
-    /// and written by the pass that asked the driver — see
-    /// [`VolumeRecord::reason`], which is here for the same reasons.
-    ///
-    /// `None` on a record from a build before this field (read as
-    /// `SnapshotReason::Unrecorded`) and on `Ready`, which needs no reason.
+    /// Machine-readable cause persisted by the operation that observed it.
+    /// Absent for Ready and legacy records without a recorded reason.
     #[serde(default)]
     pub reason: Option<crate::reconcile::SnapshotReason>,
     #[serde(default)]
     pub message: Option<String>,
-    /// When this record became a tombstone, if it did. Same mechanism, same
-    /// TTL and same argument as [`VolumeRecordPhase::Gone`].
+    /// Deletion timestamp using the volume tombstone expiry policy.
     #[serde(default)]
     pub gone_at: Option<std::time::SystemTime>,
 }
@@ -354,17 +242,13 @@ impl SnapshotRecord {
     }
 }
 
-/// Where a snapshot is, as the NODE sees it. The volume's four, one word
-/// different: a copy is `Creating` rather than `Provisioning`, because that
-/// is what the object above it says and two spellings of one state is how a
-/// parser starts guessing.
+/// Node-local snapshot lifecycle phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SnapshotRecordPhase {
     Creating,
     Ready,
     Failed,
-    /// Dropped. Kept as a tombstone for the reason `VolumeRecordPhase::Gone`
-    /// gives at length: absence from a report is "this node does not know".
+    /// Explicit deletion evidence retained until tombstone expiry.
     Gone,
 }
 
@@ -379,27 +263,18 @@ impl SnapshotRecordPhase {
     }
 }
 
-/// Where a volume is, as the NODE sees it.
-///
-/// Four values and not the control plane's five: `Pending` is a phase of the
-/// object before any node was told about it, so a node can never be in it —
-/// being told is what creates the record. `Releasing` likewise belongs to the
-/// object's finalizer and not to any bytes.
+/// Node-local volume lifecycle phase; control-plane scheduling and finalization
+/// phases are represented separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VolumeRecordPhase {
-    /// Told to make it; no handle yet, or the last attempt is still running.
+    /// Creation requested; no committed handle yet.
     Provisioning,
-    /// The data exists. Attached or not — that is a VM record's business.
+    /// Data exists; attachment state is held by VM records.
     Ready,
-    /// The backend refused, and said why in `message`. The tier above
-    /// requeues, and the kick is another Provision, which is idempotent.
+    /// Creation failed with details in `message`; a repeated Provision retries it.
     Failed,
-    /// Deprovisioned. The record is KEPT as a tombstone rather than deleted,
-    /// because absence from a status report means "this node does not know",
-    /// and the tier above may only release a volume on an explicit `Gone`.
-    /// Swept once it is old enough that nobody can still be waiting for it —
-    /// and a Deprovision for an id this node has never heard of makes a fresh
-    /// tombstone, so the sweep can never strand the tier above.
+    /// Explicit deletion evidence retained until tombstone expiry. A repeated
+    /// deprovision request for an unknown ID can create a fresh tombstone.
     Gone,
 }
 
@@ -445,10 +320,7 @@ impl TryFrom<proto::VmSpec> for AgentVmSpec {
                 .map(TryInto::try_into)
                 .collect::<Result<Vec<_>, _>>()
                 .context("invalid nic spec")?,
-            // The proto path carries neither a fetchable image nor a seed,
-            // the same way it carries neither driver nor params: the
-            // controller sends spec_json (control-plane.md §6), and that is
-            // where anything beyond the four original fields travels.
+            // The legacy typed proto omits image-fetch and seed fields; JSON carries them.
             cloud_init: None,
             images: Vec::new(),
             devices: p
@@ -466,13 +338,7 @@ impl TryFrom<proto::VolumeSpec> for VolumeWithId {
     fn try_from(p: proto::VolumeSpec) -> Result<Self, Self::Error> {
         Ok(Self {
             id: parse_uuid(&p.id).context("volume id")?,
-            // The proto path carries neither driver nor params; the
-            // controller sends spec_json (see control-plane.md §6), and that
-            // is where a routed volume travels. Same TODO the device
-            // conversion below carries, and it will be closed the same way.
-            // The typed proto path never carries a reference: a reference
-            // is a field of the JSON spec, and the controller has sent
-            // spec_json for every VM since long before this.
+            // The legacy typed proto omits driver routing, params and volume references.
             referenced: false,
             spec: VolumeSpec {
                 base_image: non_empty(p.base_image),
@@ -491,17 +357,12 @@ impl TryFrom<proto::NicSpec> for NicWithId {
             id: parse_uuid(&p.id).context("nic id")?,
             spec: NicSpec {
                 bridge: non_empty(p.bridge).context("bridge must be set")?, // controller
-                // sends explicit
-                // bridges
                 mac: p
                     .mac
                     .parse::<MacAddr>()
                     .map_err(|e| anyhow::anyhow!("invalid mac {:?}: {e}", p.mac))?,
-                // The proto NicSpec carries neither the overlay nor the
-                // addresses nor the provider network: the controller sends
-                // spec_json (control-plane.md §6) and that is where a
-                // tenant-bound NIC travels. Same reason the volume conversion
-                // above carries no driver.
+                // The typed proto omits overlay, address and provider fields.
+                // Tenant NICs carry these through `spec_json`.
                 vxlan_id: None,
                 physnet: None,
                 floating_ips: Vec::new(),
@@ -524,21 +385,11 @@ impl TryFrom<proto::DeviceSpec> for DeviceWithId {
             .transpose()
             .context("device params_json")?;
         let driver = non_empty(p.driver_name).unwrap_or_else(default_device_driver);
-        // The same split the REST document goes through. A controller is not
-        // a tenant, but what it forwards came from one, and this is the other
-        // door into the driver. See `refuse_operator_only_device_params`.
+        // Controller-forwarded device parameters have the same restrictions as REST input.
         refuse_operator_only_device_params(&driver, params.as_ref())?;
         Ok(Self {
             id: parse_uuid(&p.id).context("device id")?,
-            // `driver_name` IS in the proto and is honoured here: routing a
-            // device to the driver the controller named is the whole point of
-            // the field, and silently sending every device to the node's
-            // default was a lie the record then remembered forever.
-            // An empty string is proto3's "unset" and keeps the old meaning,
-            // so a controller that does not fill the field changes nothing.
-            //
-            // TODO(proto): `profile` still has no field; extend control.proto
-            // when the controller learns to pick one.
+            // Honor the requested driver; empty means default. The typed proto has no profile field.
             spec: DeviceSpec {
                 driver,
                 partition,
@@ -549,10 +400,7 @@ impl TryFrom<proto::DeviceSpec> for DeviceWithId {
     }
 }
 
-/// `NewVmSpec::into_spec`, as an extension trait because the type now belongs
-/// to `agent-api` and the record it builds belongs here. One method, one
-/// implementor: this is the tier boundary written as a trait rather than a
-/// second copy of the document on this side of it.
+/// Convert the shared create document into this node's persisted specification.
 pub trait NewVmSpecExt {
     fn into_spec(self, default_bridge: &str) -> anyhow::Result<(VmId, AgentVmSpec, Desired)>;
 }
@@ -580,10 +428,7 @@ impl NewVmSpecExt for NewVmSpec {
     }
 }
 
-/// The three ways a create document is not a VM at all.
-///
-/// Read off the document alone: none of the three needs a node, a driver or
-/// a store to answer, so they are answered before anything is built.
+/// Reject invalid VM dimensions before accessing drivers or storage.
 fn refuse_what_cannot_be_a_vm(spec: &NewVmSpec) -> anyhow::Result<()> {
     if spec.vcpus == 0 {
         bail!("vcpus must be greater than zero");
@@ -597,7 +442,7 @@ fn refuse_what_cannot_be_a_vm(spec: &NewVmSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether a volume entry says anything about the bytes behind it.
+/// Whether the entry specifies volume data or provisioning options.
 fn describes_its_own_bytes(v: &NewVolume) -> bool {
     v.size_bytes != 0
         || v.base_image.is_some()
@@ -606,21 +451,12 @@ fn describes_its_own_bytes(v: &NewVolume) -> bool {
         || v.driver.is_some()
 }
 
-/// A volume entry describes a disk to be made, or names one that exists —
-/// never both, and never neither.
-///
-/// A referenced volume has its size and its image already. Refused here
-/// rather than quietly ignored: a spec that says both is a spec whose author
-/// believes one of the two, and the wrong belief is the one where a 10 GiB
-/// disk silently stays 1 GiB.
+/// Require exactly one of an inline disk description or an existing volume ID.
+/// References may supply attach options but cannot redefine the stored data.
 fn refuse_a_volume_entry_that_says_two_things(volumes: &[NewVolume]) -> anyhow::Result<()> {
     for v in volumes {
         if v.volume.is_none() {
-            // An inline entry describes a disk to be made, and a disk of
-            // no size is not one. Said here rather than left to serde,
-            // which is what carried this refusal before the field could
-            // default: a missing field is a sentence about a document and
-            // this is a sentence about a disk.
+            // Inline volumes require a nonzero size even when the document omits it.
             if v.size_bytes == 0 {
                 bail!("an inline volume needs a size_bytes greater than zero");
             }
@@ -633,8 +469,7 @@ fn refuse_a_volume_entry_that_says_two_things(volumes: &[NewVolume]) -> anyhow::
     Ok(())
 }
 
-/// The fetchable half, lifted out of the volumes and deduplicated: two
-/// volumes off one base image are one download.
+/// Deduplicate fetch sources shared by multiple volume entries.
 fn images_to_fetch(volumes: &[NewVolume]) -> Vec<crate::images::Source> {
     let mut images: Vec<crate::images::Source> = Vec::new();
     for v in volumes {
@@ -643,10 +478,8 @@ fn images_to_fetch(volumes: &[NewVolume]) -> Vec<crate::images::Source> {
             v.base_image_url.as_deref(),
             v.base_image_sha256.as_deref(),
         ) else {
-            // A url without a checksum, or either without a base_image,
-            // asks for nothing: the create edge refuses that shape, and
-            // here it simply means "look this name up locally", which is
-            // what a path-based image has always meant.
+            // Incomplete fetch metadata is not a download request. Such entries
+            // use local image lookup; the create edge validates fetch metadata.
             continue;
         };
         if !images.iter().any(|s| s.name == name) {
@@ -654,10 +487,7 @@ fn images_to_fetch(volumes: &[NewVolume]) -> Vec<crate::images::Source> {
                 name: name.to_string(),
                 url: url.to_string(),
                 sha256: sha256.to_string(),
-                // Whose registration these bytes are. Written into the spec
-                // by the cloud beside the url and the checksum, and empty on
-                // a standalone cluster that has no catalogue to mint one.
-                // See `images::Source::uid` for what the node does with it.
+                // Cloud catalogue identity; empty without a catalogue. See `images::Source::uid`.
                 uid: v.base_image_uid.clone().unwrap_or_default(),
             });
         }
@@ -665,20 +495,12 @@ fn images_to_fetch(volumes: &[NewVolume]) -> Vec<crate::images::Source> {
     images
 }
 
-/// One id per disk, and the fork the storage half turns on.
-///
-/// An entry that NAMES a volume carries nothing else — the size and the
-/// image belong to the disk that already exists — and an entry that
-/// describes one carries everything.
+/// Preserve referenced volume IDs and allocate IDs for inline disks.
 fn volumes_with_ids(volumes: Vec<NewVolume>) -> anyhow::Result<Vec<VolumeWithId>> {
     volumes
         .into_iter()
         .map(|v| match v.volume {
-            // A referenced volume: the id IS the object's uid, and there
-            // is nothing else in the entry to carry — the size and the
-            // image belong to the disk that already exists, and
-            // `refuse_a_volume_entry_that_says_two_things` refused the
-            // entry before this if it named them.
+            // References reuse the existing ID and carry no provisioning description.
             Some(uid) => {
                 let id: VolumeId = uid
                     .parse()
@@ -689,10 +511,7 @@ fn volumes_with_ids(volumes: Vec<NewVolume>) -> anyhow::Result<Vec<VolumeWithId>
                         base_image: None,
                         size_bytes: 0,
                         driver: None,
-                        // The attach options — a virtiofs tag today. The
-                        // one field a reference may still carry, because
-                        // it is a property of the CONNECTION rather than
-                        // of the bytes.
+                        // Attach options describe the connection, such as a virtiofs tag.
                         params: v.params,
                     },
                     referenced: true,
@@ -712,9 +531,7 @@ fn volumes_with_ids(volumes: Vec<NewVolume>) -> anyhow::Result<Vec<VolumeWithId>
         .collect::<anyhow::Result<Vec<_>>>()
 }
 
-/// One id per nic, and the two things a create document may leave out: the
-/// mac address, derived from that id, and the bridge, which is this node's
-/// default when the document names none.
+/// Allocate NIC IDs and default omitted MAC addresses and bridge names.
 fn nics_with_ids(nics: Vec<NewNic>, default_bridge: &str) -> anyhow::Result<Vec<NicWithId>> {
     nics.into_iter()
         .map(|n| {
@@ -745,26 +562,8 @@ fn nics_with_ids(nics: Vec<NewNic>, default_bridge: &str) -> anyhow::Result<Vec<
         .collect::<anyhow::Result<Vec<_>>>()
 }
 
-/// The device params a SPEC may carry, as opposed to the ones only the node's
-/// own configuration may.
-///
-/// Astra finding S03, 2026-09-23: `params` is a free JSON map and it travelled
-/// from a VM document straight into the driver that reads it. For `nvrm` that
-/// map is the backend's whole configuration — `admin_priv` keeps
-/// `CAP_SYS_ADMIN` in the process, and `env` IS the process environment, over
-/// the top of the very values this node's admission had just counted. Neither
-/// is a tenant's to set, and both are already sayable in `[device.nvrm]` by
-/// whoever runs the node.
-///
-/// Asked here, where the document becomes this node's record, so the answer
-/// reaches the client as a refusal of the create rather than as a VM that
-/// fails to provision. The driver asks the same question again at the point
-/// of use — see `nvrm_driver::refuse_operator_only_params` — because this is
-/// not the only door into it.
-///
-/// One driver has a rule today. The shape is per driver deliberately: what
-/// counts as a tenant's business is a fact about the device the driver
-/// serves, and the driver is where that fact lives.
+/// Reject NVRM operator-only params before creating a record. The driver also
+/// checks them at use time; backend privilege and environment belong to node config.
 fn refuse_operator_only_device_params(
     driver: &str,
     params: Option<&serde_json::Value>,
@@ -779,8 +578,7 @@ fn refuse_operator_only_device_params(
     Ok(())
 }
 
-/// One id per device, and the one word of the document that is not free
-/// text: how the card is partitioned.
+/// Allocate device IDs and parse each partitioning mode.
 fn devices_with_ids(devices: Vec<NewDevice>) -> anyhow::Result<Vec<DeviceWithId>> {
     devices
         .into_iter()
@@ -817,16 +615,7 @@ fn non_empty(s: String) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// A VM document may name the vGPU type it wants and nothing else about
-    /// the backend that serves it.
-    ///
-    /// Astra finding S03, 2026-09-23: `devices[].params` reached the nvrm
-    /// driver unfiltered, so a spec could ask for `admin_priv` — the backend
-    /// keeping `CAP_SYS_ADMIN` — and could set the process's environment,
-    /// including the `LEA_VRAM_*` values this node had just admitted the
-    /// device against. Both belong to `[device.nvrm]` on the node, and the
-    /// refusal is here so a person reads it while they still hold the
-    /// request.
+    /// NVRM specs may select a vGPU type but cannot set backend privilege or environment.
     #[test]
     fn a_vm_document_may_not_configure_the_nvrm_backend() {
         let device = |params: serde_json::Value| NewDevice {
@@ -856,7 +645,7 @@ mod tests {
             );
         }
 
-        // Another driver's params are its own business and are untouched.
+        // Other drivers retain their own parameter validation.
         assert!(
             devices_with_ids(vec![NewDevice {
                 driver: Some("crosvm-gpu".into()),
@@ -867,7 +656,7 @@ mod tests {
             .is_ok()
         );
 
-        // And the road a controller sends a device down is the same road.
+        // Typed controller requests enforce the same restriction.
         let err = DeviceWithId::try_from(proto::DeviceSpec {
             id: Uuid::new_v4().to_string(),
             partition: "mediated".into(),
@@ -878,10 +667,7 @@ mod tests {
         assert!(format!("{err:#}").contains("admin_priv"), "{err:#}");
     }
 
-    /// `DeviceSpec.driver_name` is a real proto field, so a device the
-    /// controller routed to `nvrm` must not land on the node's default
-    /// driver. Unset stays unset: proto3 has no absent string, and an empty
-    /// one still means "whatever this node defaults to".
+    /// Preserve explicit device routing; an empty proto driver selects the node default.
     #[test]
     fn a_device_is_routed_to_the_driver_the_controller_named() {
         let named = DeviceWithId::try_from(proto::DeviceSpec {
@@ -903,10 +689,7 @@ mod tests {
         assert_eq!(unset.spec.driver, default_device_driver());
     }
 
-    /// The controller has no Desired type of its own: it writes the variant
-    /// name into `spec_json` and this serde is what has to accept it. Both
-    /// halves of that contract are spelled by hand, so guard this one here
-    /// and the other in the controller's `build_spec_json` test.
+    /// Accept the desired-state spellings emitted by controller `build_spec_json`.
     #[test]
     fn the_run_strategy_spellings_arrive_as_desired_states() {
         for (spelling, expected) in [
@@ -926,11 +709,7 @@ mod tests {
         }
     }
 
-    /// The cloud-init block: a spec without one is byte for byte the spec it
-    /// always was, and a spec with one carries it through to the agent's own
-    /// type. `NewVmSpec` is `deny_unknown_fields`, so this also holds the
-    /// spelling of every key in it — a rename here would be a spec file that
-    /// stops parsing on a node.
+    /// Preserve optional cloud-init data and accept specs that omit it.
     #[test]
     fn a_cloud_init_block_travels_and_its_absence_changes_nothing() {
         let plain = r#"{"vcpus":1,"memory_mib":256,
@@ -957,9 +736,7 @@ mod tests {
         assert_eq!(config.meta_data, None, "derived, not carried");
     }
 
-    /// A create carrying runStrategy=Stopped provisions the VM without it
-    /// ending up Running: the intent travels in the spec and the reconciler
-    /// takes it from there (see `plan`).
+    /// An omitted desired state defaults to Running.
     #[test]
     fn a_spec_without_a_desired_state_defaults_to_running() {
         let doc = r#"{"vcpus":1,"memory_mib":256,
@@ -969,10 +746,7 @@ mod tests {
         assert_eq!(spec.into_spec("br0").unwrap().2, Desired::Running);
     }
 
-    /// The repo's own spec files, parsed as they are on disk. `NewVmSpec` is
-    /// `deny_unknown_fields`, so this catches a field renamed as well as one
-    /// added — and it is the promise the volume driver/params fields were
-    /// added under: every spec written before them means exactly what it did.
+    /// Parse all shipped specs with unknown-field validation.
     #[test]
     fn every_spec_in_the_repo_still_parses() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/json");
@@ -992,8 +766,7 @@ mod tests {
         assert!(seen >= 3, "only {seen} specs found in {}", dir.display());
     }
 
-    /// A volume that names no driver stays what it was: the default, which
-    /// `Drivers::from_config` always registers.
+    /// An omitted volume driver selects the registered default.
     #[test]
     fn a_volume_without_a_driver_stays_the_default_one() {
         let doc = r#"{"vcpus":1,"memory_mib":256,
@@ -1005,9 +778,7 @@ mod tests {
         assert_eq!(spec.volumes[0].spec.params, None);
     }
 
-    /// And one that does names it, with params the agent hands through
-    /// untouched — the same shape a device request has, so a storage backend
-    /// takes its options the way a gpu backend already does.
+    /// Preserve explicit volume driver names and parameters.
     #[test]
     fn a_volume_may_name_a_driver_and_carry_params_through() {
         let doc = r#"{"vcpus":1,"memory_mib":256,
@@ -1023,11 +794,7 @@ mod tests {
         );
     }
 
-    /// The compatibility invariant of this milestone at the tier that reads
-    /// it: a NIC that says nothing about addresses means what it has always
-    /// meant, and the two new lists come out empty. `deny_unknown_fields` is
-    /// what makes the other direction hold too — a field renamed here fails
-    /// this test and every spec in the repo along with it.
+    /// Omitted NIC address lists default to empty.
     #[test]
     fn a_nic_that_names_no_addresses_gets_none() {
         let doc = r#"{"vcpus":1,"memory_mib":256,
@@ -1041,17 +808,13 @@ mod tests {
         assert!(spec.nics[0].spec.floating_ips.is_empty());
         assert!(spec.nics[0].spec.routed_subnets.is_empty());
 
-        // ... and the record that goes to disk carries neither key, so an
-        // agent from before this milestone reads it back unchanged.
+        // Empty address lists are omitted from persisted records.
         let json = serde_json::to_value(&spec.nics[0].spec).unwrap();
         assert!(json.get("floating_ips").is_none(), "{json}");
         assert!(json.get("routed_subnets").is_none(), "{json}");
     }
 
-    /// The standalone road: a cluster with no cloud above it has no FloatingIp
-    /// objects to resolve, so the addresses go straight in the spec — and the
-    /// same file is what the controller's injection produces, which is why
-    /// there is only one shape to test.
+    /// Standalone specs may supply NIC addresses directly.
     #[test]
     fn a_nic_may_name_its_own_addresses() {
         let doc = r#"{"vcpus":1,"memory_mib":256,
@@ -1096,10 +859,7 @@ mod tests {
         })
     }
 
-    /// The reference reaches the node as a uid and turns into an entry that
-    /// is ATTACHED rather than made. The id is the object's, not one this
-    /// node minted, which is what lets the node find the record it already
-    /// has.
+    /// Referenced volumes retain the supplied object ID and are attached as existing data.
     #[test]
     fn a_referenced_volume_becomes_an_attach_with_the_objects_own_id() {
         let uid = uuid::Uuid::new_v4();
@@ -1113,9 +873,7 @@ mod tests {
         assert!(spec.volumes[0].spec.base_image.is_none());
     }
 
-    /// A referenced volume has its size and its image already, and saying so
-    /// twice is saying it in two places that can disagree. `params` is the
-    /// exception: an attach option is a property of the connection.
+    /// References reject provisioning fields but permit attach parameters.
     #[test]
     fn a_referenced_volume_may_not_also_be_described() {
         let uid = uuid::Uuid::new_v4().to_string();
@@ -1143,8 +901,7 @@ mod tests {
         assert_eq!(spec.volumes[0].spec.params.as_ref().unwrap()["tag"], "d");
     }
 
-    /// An inline entry is unchanged, ephemeral, and gets an id this node
-    /// minted — which is every volume this stack has ever made.
+    /// Inline volumes receive a fresh ID and remain VM-owned.
     #[test]
     fn an_inline_volume_is_still_made_here_and_is_still_ephemeral() {
         let doc = serde_json::json!({
@@ -1160,8 +917,7 @@ mod tests {
         assert_eq!(spec.volumes[0].spec.base_image.as_deref(), Some("tiny.raw"));
     }
 
-    /// A reference that is not a uid is a controller that did not resolve it,
-    /// and the node says so rather than minting an id and making a disk.
+    /// Reject malformed referenced volume IDs before allocating resources.
     #[test]
     fn a_reference_that_is_not_a_uid_is_refused() {
         let spec: NewVmSpec =

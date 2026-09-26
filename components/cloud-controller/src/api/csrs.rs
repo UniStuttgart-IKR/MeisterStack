@@ -150,15 +150,8 @@ pub(super) async fn approve_csr(
     dry: controller_api::DryRun,
     Json(decision): Json<Approval>,
 ) -> Result<Json<CertificateSigningRequest>, ApiError> {
-    // The one write route that answers a dry run with a refusal instead of a
-    // preview, and the reason is what the write PRODUCES: a certificate.
-    //
-    // Everything else here can be shown because showing it costs nothing — no
-    // object exists afterwards either way. An approval signs, and a signature
-    // handed out "as a preview" is a live credential with no record of having
-    // been issued: the thing the CSR object exists to be. Answering with the
-    // condition and no certificate would be a preview of the half that does
-    // not matter.
+    // Approval refuses dry-run: signing would issue a usable credential without
+    // persisting the CSR's issuance record.
     if dry.requested() {
         return Err(invalid(
             "dryRun is not offered on approval; approving signs a certificate, and a signature \
@@ -219,15 +212,9 @@ pub(super) async fn approve_and_sign(
     };
 
     let now = Utc::now();
-    // The role's group goes into the certificate, and since the permission
-    // table it is LABELLING and not a permission. Nothing in the
-    // authorization path reads it any more: the cloud takes the role out of
-    // the directory on every request, and a tier without a directory
-    // authorizes no person at all. It stays because a certificate that says
-    // what it is for is readable by the person holding it — `openssl x509
-    // -subject` is how somebody finds out which of their four credentials
-    // this one is — and because taking it out would change nothing except
-    // that.
+    // The certificate's role group is descriptive. Cloud authorization reads
+    // the current role from the user directory; a tier without that directory
+    // cannot authorize a person from the group alone.
     let subject = pki::ca::Subject {
         common_name: user.metadata.name.clone(),
         organization: Some(user.spec.role.group().to_string()),

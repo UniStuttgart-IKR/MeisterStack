@@ -2,21 +2,10 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# nix/tests/bootstrap.nix's copy of templates/operator/disko/single-nvme.nix:
-# one disk, an EFI system partition of 1G and the rest as the root
-# filesystem.
-#
-# A copy and not an import, because that is what an operator has: the
-# template writes this file into their repository and it becomes theirs. The
-# test uses it the way `lib.mkFleet` uses any layout — imported into the host
-# whose inventory entry names it in `install.layout`.
-#
-# The DEVICE is not in here: hosts/box.nix binds it.
+# UEFI disk fixture: GPT, a 1 GiB ESP, and an ext4 root labelled nixos.
+# The host module supplies the device; inventory selects this layout.
 {
-  # This layout makes an ESP, so a host that uses it boots itself
-  # (`boot = "uefi"` in the inventory). nix/lib/inventory.nix compares the
-  # two and refuses the mismatch rather than installing a boot loader
-  # nowhere.
+  # Declare the ESP for boot-mode validation.
   meisterstack.install.hasEsp = true;
 
   disko.devices.disk.main = {

@@ -2,28 +2,16 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Fuehren des VMM-Prozesses: starten, uebernehmen, umbringen.
-//!
-//! Everything in this file is about the process and the files beside it —
-//! where its socket, its logs and its event file live, how it is started, and
-//! the two ways the driver comes to hold one (spawned here, or found again
-//! after a restart). What it does NOT do is talk to it: that is `api`.
-//!
-//! Moved out of `lib.rs` unchanged.
+//! VMM process ownership, startup, adoption and teardown, including API,
+//! console and event-file paths. Requests use the sibling `api` module.
 
 use super::*;
 
-/// What separates a torn-down VMM's log from the id it belonged to.
-///
-/// A suffix and not a directory, so that one `socket_dir` is still the whole
-/// of what this driver owns and `vm logs` finds these beside the live one.
+/// Suffix for retained guest logs after teardown; files remain beside active logs.
 pub(crate) const KEPT_LOG: &str = ".log.gone-";
 
-/// How long a torn-down VMM's log is kept.
-///
-/// An hour: longer than anybody debugging a migration that did not happen
-/// takes to look, and short enough that a node churning VMs all day carries
-/// nothing. See `sweep_kept_logs`.
+/// Retention age for VMM logs. Expired files are swept during later teardown;
+/// this is not a timer that removes them exactly at the deadline.
 const KEPT_LOG_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 pub(crate) enum VmProcess {
@@ -33,52 +21,16 @@ pub(crate) enum VmProcess {
 
 pub(crate) struct RunningVm {
     pub(crate) process: VmProcess,
-    /// This VMM is receiving a migration, and the API socket is not going to
-    /// answer until it has finished.
-    ///
-    /// `vm.receive-migration` runs the whole protocol INSIDE the request
-    /// handler (v53 `vmm/src/lib.rs`, `vm_receive_migration`), so the
-    /// destination's API is unresponsive for the duration — a `vm.info` on it
-    /// blocks and then times out. Without this flag the agent's reconciler
-    /// would read that timeout as a broken VMM and kill the very process the
-    /// guest is arriving into.
-    ///
-    /// What clears it is the event file, which is why it holds one: cloud
-    /// hypervisor writes `migration-receive-finished` (or `-failed`) to
-    /// `--event-monitor path=...`, and that is the only place either outcome
-    /// is stated. See `receive_outcome`.
+    /// Event path while receiving blocks the VMM API. Observation uses these
+    /// events instead of treating API timeouts as process failure; terminal
+    /// events clear this receiving marker.
     pub(crate) receiving: Option<PathBuf>,
-    /// This VMM's event file, for as long as this VMM lives.
-    ///
-    /// Beside `receiving` and not the same field, because the two are
-    /// cleared by different things and one of them must not be cleared at
-    /// all. `receiving` says "the api will not answer, read the file
-    /// instead" and comes off the moment the file has said anything;
-    /// `events` says where that file IS, and it has to outlive the answer —
-    /// a receive that FAILED is a fact the reconciler asks about on every
-    /// pass afterwards, until it has given the VMM back.
-    ///
-    /// `None` for a VMM that was started without `--event-monitor`, which is
-    /// every VM that boots here.
+    /// Event path retained after reception for later outcome queries, including
+    /// failed-receive cleanup. Locally booted VMMs have no event monitor.
     pub(crate) events: Option<PathBuf>,
-    /// What the blocking `vm.receive-migration` call answered, once it has
-    /// answered at all.
-    ///
-    /// The event file cannot carry this one, and it took a live v53 to find
-    /// out why. `vm_receive_migration` writes `migration-receive-failed` only
-    /// where a COMMAND handler failed; a request it could not read at all —
-    /// which is what a source that dies mid-stream leaves — takes the `?` out
-    /// of the whole function and past the `match state` that writes the
-    /// event. Measured: connect to the port, send something that is not a
-    /// request, hang up, and the file stops at `migration-receive-started`
-    /// for ever while the api call answers
-    /// `["Error receiving migration", …, "received request with unknown
-    /// command"]`.
-    ///
-    /// So the answer to that call is kept, which is the one place every
-    /// failed reception is stated. Shared with the task that makes the call
-    /// rather than written back into this map, because the task outlives the
-    /// borrow that spawned it.
+    /// Stored error from the asynchronous receive request. This currently includes
+    /// transport and timeout errors as well as explicit VMM failures; callers
+    /// cannot distinguish those outcomes through this field.
     pub(crate) receive_answer: std::sync::Arc<Mutex<Option<String>>>,
 }
 
@@ -87,33 +39,18 @@ impl CloudHypervisorDriver {
         self.socket_dir.join(format!("{id}.sock"))
     }
 
-    /// The guest's own two output files, named once. `create` builds the VM
-    /// config from these and `console_paths` hands them to the agent, so
-    /// there is one spelling of where they are rather than two that can drift.
+    /// Shared guest-log path construction for VM configuration and log reporting.
     pub(crate) fn console_path(&self, id: &VmId, stream: ConsoleStream) -> PathBuf {
         self.socket_dir.join(format!("{id}.{}", stream.as_str()))
     }
 
-    /// Where cloud-hypervisor's OWN stdout and stderr go — the VMM's
-    /// diagnostics, not the guest's. Not part of `console_paths`: it is not
-    /// the guest's output and `vm logs` must not mix the two.
+    /// VMM stdout/stderr diagnostics, separate from guest console paths.
     pub(crate) fn vmm_log_path(&self, id: &VmId) -> PathBuf {
         self.socket_dir.join(format!("{id}.log"))
     }
 
-    /// What a torn-down VMM's log is renamed to, so that it survives long
-    /// enough to be read.
-    ///
-    /// D-P19, and it is two fixes of one round cancelling each other out:
-    /// `-v` was turned on for the receiving VMM to get one line out of it,
-    /// and the tidy-up that removes a VM's files takes that log away the
-    /// moment the reception is given back. So `vm logs --streams vmm` could
-    /// never show a receiving VMM at all — the one case the flag was turned
-    /// on for. The lab had to catch it with a 0.2-second watcher on the file.
-    ///
-    /// The seconds are in the name because a VM id can be torn down twice — a
-    /// reception that failed, then one that worked — and the second must not
-    /// silently replace the evidence of the first.
+    /// Retained-log filename with a Unix-seconds suffix. Teardowns within the
+    /// same second share a destination name.
     pub(crate) fn kept_log_path(&self, id: &VmId, at: std::time::SystemTime) -> PathBuf {
         let secs = at
             .duration_since(std::time::UNIX_EPOCH)
@@ -141,16 +78,8 @@ impl CloudHypervisorDriver {
         out
     }
 
-    /// Keep what this VMM said, instead of throwing it away with everything
-    /// else the driver made for it.
-    ///
-    /// An empty log is removed rather than kept: a VMM that printed nothing
-    /// leaves nothing worth a filename, and keeping one per VM id that ever
-    /// existed is the leak the tidy-up was written to end.
-    ///
-    /// The sweep runs here and nowhere else, which is the cheapest honest
-    /// place: one `read_dir` per teardown, and a node that never tears a VM
-    /// down has nothing to sweep.
+    /// Retain a nonempty diagnostic log and sweep expired retained logs.
+    /// Empty logs are removed; all cleanup errors are handled locally.
     fn keep_the_log(&self, id: &VmId) {
         let live = self.vmm_log_path(id);
         match std::fs::metadata(&live) {
@@ -165,8 +94,7 @@ impl CloudHypervisorDriver {
                     }
                 }
             }
-            // Nothing said, or nothing there. Either way there is no evidence
-            // to keep and the file goes as it always did.
+            // Empty or unavailable logs need no retained copy.
             _ => {
                 let _ = std::fs::remove_file(&live);
             }
@@ -174,13 +102,7 @@ impl CloudHypervisorDriver {
         self.sweep_kept_logs();
     }
 
-    /// Kept logs older than [`KEPT_LOG_TTL`], of any VM.
-    ///
-    /// Bounded by time and not by count, because what it is protecting
-    /// against is the same thing every other sweep in this tree is: a
-    /// directory that gains one file per VM id that ever existed. An hour is
-    /// longer than anybody debugging a failed migration takes to look and
-    /// short enough that a node churning VMs all day carries nothing.
+    /// Remove retained logs older than KEPT_LOG_TTL when cleanup runs.
     fn sweep_kept_logs(&self) {
         let Ok(entries) = std::fs::read_dir(&self.socket_dir) else {
             return;
@@ -207,30 +129,10 @@ impl CloudHypervisorDriver {
         }
     }
 
-    /// Let the VMM user's GROUP at the three files the VMM made for itself.
-    ///
-    /// Not a widening for its own sake. cloud-hypervisor sets
-    /// `umask(0o077)` in its own `main` — "Ensure all created files (.e.g
-    /// sockets) are only accessible by this user" — so its api socket and
-    /// serial socket come out `0700` and its console file `0600`, owned by
-    /// the VMM user (measured: exactly those numbers). That is stricter than
-    /// this driver would have asked for, and it is stricter than the AGENT
-    /// can live with: the agent drives the VM over that api socket, and reads
-    /// the console for `vm logs`.
-    ///
-    /// A root agent reaches them anyway. An agent that is NOT root — the
-    /// no-root lane's node — reaches them only through the group, so the
-    /// group bits are put back here. That is the smallest widening that
-    /// works: the group is the VMM user's own, whose only other member is
-    /// whoever the deployment puts there, and it is the reason the direction
-    /// of that membership is "the agent joins the VMM's group" and never the
-    /// reverse (see `agent_api::VmmUser`).
-    ///
-    /// Needs `CAP_FOWNER` — a file owned by somebody else cannot be chmodded
-    /// by its group — so an agent that is not root cannot do this for itself.
-    /// It is not fatal: a root agent does it, and a non-root agent that
-    /// cannot gets a warning and a VM it can still start, because the failure
-    /// only bites the calls that come afterwards.
+    /// Grant the VMM group access to its API socket, serial socket and console
+    /// file. Cloud Hypervisor's umask removes these group permissions. A nonroot
+    /// agent must belong to the VMM group to use them; changing another user's
+    /// file mode requires CAP_FOWNER. Failures are logged and may prevent later access.
     fn relax_to_the_group(&self, id: &VmId) {
         let Some(user) = &self.vmm_user else {
             return;
@@ -251,22 +153,9 @@ impl CloudHypervisorDriver {
         }
     }
 
-    /// Give the run directory to the VMM user, once, so that the VMM can bind
-    /// its own socket in it.
-    ///
-    /// One directory for every VM on the node and not one per VM, and that is
-    /// a decision with a date on it: a per-VM directory would buy isolation
-    /// only if there were a uid per VM, and there is one `vmm_user` for the
-    /// whole node — a second VMM is the SAME user and could open the first
-    /// one's files whatever the directory layout says. What it would buy
-    /// today is a narrower Landlock rule, which is worth having when per-VM
-    /// uids arrive and is not worth restructuring every path in this file
-    /// for before then. See the report.
-    ///
-    /// `0770`: the VMM writes here, and so does the agent. An agent that is
-    /// not root has to be in the VMM's group for the second half of that —
-    /// the direction is deliberate, because the reverse (the VMM in the
-    /// agent's group) would hand it the agent's socket.
+    /// Transfer the shared run directory to the configured VMM user with mode
+    /// 0770. A nonroot agent needs membership in that user's group. All VMMs use
+    /// one node identity; directory layout does not isolate them from each other.
     fn hand_over_run_dir(&self) -> hypervisor::Result<()> {
         let Some(user) = &self.vmm_user else {
             return Ok(());
@@ -279,9 +168,7 @@ impl CloudHypervisorDriver {
         })
     }
 
-    /// Where the serial line listens for the one client that may type into
-    /// it. Beside the file it is recorded into, one suffix apart, so the two
-    /// names cannot drift — the agent derives one from the other.
+    /// Interactive serial socket path, derived beside its recorder log.
     pub(crate) fn serial_socket_path(&self, id: &VmId) -> PathBuf {
         self.socket_dir
             .join(format!("{id}.{}.sock", ConsoleStream::Serial.as_str()))
@@ -316,24 +203,17 @@ impl CloudHypervisorDriver {
         }
     }
 
-    /// Why a guest that was on its way here is not coming, if this VMM's
-    /// event file says so.
-    ///
-    /// Read off the file every time rather than remembered, for the reason
-    /// everything else in the reconcile path is: the file is the only party
-    /// that knows, it survives the answer being read, and it survives the
-    /// agent that read it. `destroy_vm` takes it away with the rest.
+    /// Return a stored receive API error or an explicit failure event for a
+    /// tracked VMM. The current API-error path also includes timeout and transport
+    /// uncertainty. An untracked VMM has no failure observation here.
     pub(crate) fn receive_failure(&self, id: &VmId) -> Option<String> {
         let (answered, events) = {
             let vms = self.vms.lock().unwrap();
             let vm = vms.get(id)?;
             (vm.receive_answer.lock().unwrap().clone(), vm.events.clone())
         };
-        // The call's own answer first: it covers every failure, including the
-        // ones the event file is silent about. The file is asked as well,
-        // because it is the half that survives the agent — an adopted VMM has
-        // no task and no answer, and a `migration-receive-failed` in its file
-        // is the ghost of the lab.
+        // Prefer the receive call's error, including errors without a failure
+        // event. Adopted VMMs have no task result and depend on their event file.
         if let Some(said) = answered {
             return Some(said);
         }
@@ -343,71 +223,22 @@ impl CloudHypervisorDriver {
         }
     }
 
-    /// Where cloud hypervisor writes its structured events for this VM.
-    ///
-    /// Only a receiving VMM is started with `--event-monitor`, and only
-    /// because of what `vm.receive-migration` is: a blocking call whose
-    /// SUCCESS is not the HTTP answer (that comes at the end) but the moment
-    /// it started listening — and whose outcome nothing else on this machine
-    /// states. Every other VM here answers questions over its API socket and
-    /// needs no second channel.
+    /// Receiver event path for readiness and outcome observations while the
+    /// receive API request remains blocked.
     pub(crate) fn event_path(&self, id: &VmId) -> PathBuf {
         self.socket_dir.join(format!("{id}.events"))
     }
 
-    /// Start a VMM process for `id` and wait for its API to answer.
-    ///
-    /// Lifted out of `create` when `migrate_in` needed the same eleven lines
-    /// with one argument different — and the difference matters, because a
-    /// receiving VMM must be started with **no VM at all**: v53 refuses
-    /// `vm.receive-migration` outright when one has been created
-    /// ("Can't receive a migration when a VM is already created"), and builds
-    /// the destination's VM from the config that arrives in the stream.
-    ///
-    /// # Why a receiving VMM runs at INFO and a booting one does not
-    ///
-    /// Because a reception is the one thing v53 refuses to explain when it
-    /// fails, and the lab paid for that twice. Its abort line is
-    ///
-    /// ```text
-    /// Migration aborted as migration command State failed: Failed to
-    /// receive migratable component snapshot
-    /// ```
-    ///
-    /// and that sentence is the whole of a `thiserror` variant's own
-    /// `Display` — the `#[source]` beneath it, which is the anyhow chain
-    /// naming the component that refused, is not printed
-    /// (`vmm/src/lib.rs`, the `warn!` in `vm_receive_migration`; the SEND
-    /// side of the same file does flatten its chain). The error handed back
-    /// to the api caller is worse still: `"Migration was aborted"`.
-    ///
-    /// What DOES name it is the restore itself, at INFO, one line per
-    /// component in the order they are rebuilt — measured on this v53:
-    ///
-    /// ```text
-    /// Creating virtio-block device: DiskConfig { … image_type: Raw … }
-    /// Opening RAW disk file with io_uring backend
-    /// Restoring virtio-block disk0
-    /// Restoring virtio-rng __rng
-    /// Restoring virtio-pci _virtio-pci-disk0 resources
-    /// Acquired Write lock for disk image id=disk0,path=…
-    /// ```
-    ///
-    /// so the last of those before the abort is the answer. One flag on the
-    /// one process that needs it, into the file `vm logs --stream vmm`
-    /// already reads and the reconcile pass already trims. A booting VMM
-    /// stays quiet: its failures come back on the api call that caused them.
+    /// Spawn a VMM without defining a guest and wait for its API. Receiving VMMs
+    /// use an event monitor and verbose logs because restore failures may require
+    /// component-level diagnostics. Ordinary boot failures return through API calls.
     pub(crate) async fn spawn_vmm(
         &self,
         id: &VmId,
         events: Option<&Path>,
     ) -> hypervisor::Result<Child> {
-        // Everything the VMM will need to write in changes hands first, while
-        // the agent still has the rights to give it away. The directory,
-        // because the VMM binds its own api socket and creates its own
-        // console file in it; the log, because the agent opens it and passes
-        // the descriptor, but `vm logs` and a later spawn both come back to
-        // the path.
+        // Transfer the run directory and diagnostic log before spawning under
+        // the VMM identity. Later operations reopen these paths.
         self.hand_over_run_dir()?;
         let log = std::fs::File::create(self.vmm_log_path(id))
             .map_err(|e| HypervisorError::Backend(e.into()))?;
@@ -427,16 +258,9 @@ impl CloudHypervisorDriver {
         let mut command = Command::new(&self.binary);
         command.args(vmm_args(&socket, events));
         if let Some(user) = &self.vmm_user {
-            // The credential change happens in the child, between fork and
-            // exec — the same moment libvirt picked ("immediately before
-            // executing the QEMU binary") and for the same reason: everything
-            // the VMM needs and cannot open for itself has to be ready before
-            // it stops being able to.
-            //
-            // Through `pre_exec` and not `Command::uid`, because the standard
-            // library's version throws away the supplementary groups and
-            // those are the VMM's access to `/dev/kvm`. See
-            // `VmmUser::switch_to`.
+            // Change credentials in pre_exec after preparing privileged resources.
+            // Use `VmmUser::switch_to` to retain configured supplementary groups,
+            // including KVM access, which Command::uid would discard.
             let user = user.clone();
             // SAFETY: `switch_to` is three syscalls on values it already
             // holds; it allocates nothing and opens nothing.
@@ -477,10 +301,7 @@ impl CloudHypervisorDriver {
         )))
     }
 
-    /// A VMM with this VM defined in it, in its slice, not yet booted.
-    ///
-    /// The pid comes back rather than being kept alone, because the record one
-    /// tier up is what survives this process — see `adopt_vm`.
+    /// Create an unbooted VM in its slice and return its PID for durable ownership records.
     pub(crate) async fn create_vm(
         &self,
         id: &VmId,
@@ -495,8 +316,7 @@ impl CloudHypervisorDriver {
         let _ = std::fs::remove_file(&serial_socket);
 
         let config = build_vm_config(spec, &console_path, &serial_socket, &self.vm_form(spec))?;
-        // Before the VMM exists, because it opens its disks while it builds
-        // the VM. See `hand_over_files`.
+        // Transfer writable files before VM creation opens them.
         self.hand_over_files(spec)?;
         // No event monitor: this VM answers every question over its API
         // socket. See `event_path`.
@@ -519,16 +339,9 @@ impl CloudHypervisorDriver {
             return Err(e);
         }
 
-        // The NICs, one `vm.add-net` each, with the tap as a descriptor —
-        // because `vm.create` is the one verb v53 refuses descriptors on
-        // (`http_endpoint.rs`: "For the VmCreate call, we do not accept FDs
-        // from the socket currently."). Between the create and the boot is
-        // exactly where they belong: `vm_add_net` with no VM yet only adds to
-        // the config the boot will read, and it VALIDATES it there, so a
-        // wrong `num_queues` is an error now rather than a dead guest later.
-        //
-        // On the name form this loop does nothing: the NICs are already in
-        // the document above.
+        // Cloud Hypervisor v53 accepts descriptors on vm.add-net, not vm.create.
+        // Add and validate each descriptor-backed NIC before boot. Name-based NICs
+        // are already present in the initial configuration.
         if self.net_form() == NetForm::TapFd {
             for nic in &spec.nics {
                 if let Err(e) = self.add_net_with_fd(id, nic).await {
@@ -538,9 +351,7 @@ impl CloudHypervisorDriver {
             }
         }
 
-        // After `vm.create`, because that is when the console file and the
-        // serial socket exist: v53 makes them in `pre_create_console_devices`
-        // and not at start-up. The api socket has been there since the spawn.
+        // Relax permissions after vm.create creates the console file and serial socket.
         self.relax_to_the_group(id);
 
         self.vms.lock().unwrap().insert(
@@ -572,13 +383,8 @@ impl CloudHypervisorDriver {
             VmProcess::Owned(mut child) => {
                 let _ = child.kill().await;
             }
-            // Not our child: the agent restarted since `create`, and the
-            // recorded pid is the only handle left. It is checked before it
-            // is signalled, and this is the sharpest case in the tree for
-            // why: the record survives the process, the kernel hands the
-            // number out again, and what happens here is a SIGKILL. A VM
-            // whose VMM died and whose pid was reused would take a stranger
-            // with it on the next teardown.
+            // Validate adopted process identity before signalling: a persisted PID
+            // can have been reused since the original VMM exited.
             VmProcess::Adopted { pid } => {
                 if self.owns_pid(id, pid) {
                     let _ = nix::sys::signal::kill(
@@ -598,21 +404,8 @@ impl CloudHypervisorDriver {
         Ok(())
     }
 
-    /// Everything this driver put in the run directory for one VM.
-    ///
-    /// One function and two callers — `destroy_vm` and `end_stray_vm` — so
-    /// that "what a VM leaves behind" is written once. Until the tidy-up
-    /// existed at all, the two console files, the api socket, its lock and
-    /// the VMM's own log stayed behind for ever, one set per vm id that had
-    /// ever run on the node: nothing in the tree read them, nothing rotated
-    /// them and nothing removed them.
-    ///
-    /// The VMM's own log is the exception and is KEPT — see `keep_the_log`,
-    /// and D-P19 for what removing it cost.
-    ///
-    /// Every removal is best effort. A file that is already gone is the
-    /// ordinary case — a VM that never started has none of these — and a
-    /// teardown must not fail over one.
+    /// Best-effort removal of API, console, serial and event files. Retain a
+    /// nonempty VMM diagnostic log temporarily through `keep_the_log`.
     pub(crate) fn remove_files(&self, id: &VmId) {
         let _ = std::fs::remove_file(self.vm_socket_path(id));
         // The lock beside it. Cloud Hypervisor makes it, not this driver, but
@@ -628,21 +421,9 @@ impl CloudHypervisorDriver {
         let _ = std::fs::remove_file(self.event_path(id));
     }
 
-    /// Every VMM answering in this driver's run directory that `known` does
-    /// not name.
-    ///
-    /// The socket file is the candidate and the ANSWER is the evidence. A
-    /// `<uuid>.sock` on its own proves nothing — a killed VMM leaves one
-    /// behind, and `destroy_vm` removing them is the only reason the
-    /// directory is not full of them — so each one is pinged, and a stray is
-    /// a socket that talks back.
-    ///
-    /// Read off the filesystem and not off `self.vms`, which is the whole
-    /// point: the map is empty after a restart, and a restart is when this
-    /// question matters.
-    ///
-    /// Sorted, so two consecutive passes over the same machine produce the
-    /// same list and the sentence on the node's condition does not shuffle.
+    /// Find responsive VMM sockets absent from `known`. Scan disk because the
+    /// in-memory map is empty after restart; a socket file alone is insufficient.
+    /// Sort results for stable condition reporting.
     pub(crate) async fn stray_vms(&self, known: &[VmId]) -> Vec<VmId> {
         let entries = match std::fs::read_dir(&self.socket_dir) {
             Ok(entries) => entries,
@@ -675,22 +456,11 @@ impl CloudHypervisorDriver {
         out
     }
 
-    /// Ask a VMM nobody has a record of to go, and take its files with it.
-    ///
-    /// `vmm.shutdown` and no signal, deliberately. This driver has no pid for
-    /// a stray and must not go looking for one: a pid is not an identity, the
-    /// kernel hands numbers out again, and the act at the end of a wrong
-    /// answer here would be a SIGKILL at a stranger. The socket is the safe
-    /// handle — it reaches, by construction, exactly the process that answers
-    /// for this id in this agent's run directory.
-    ///
-    /// The files go afterwards, the same set `destroy_vm` removes and for the
-    /// same reason: they are this driver's, in this driver's directory, and
-    /// nothing else will ever collect them.
+    /// Request stray shutdown through its API socket, then remove its files.
+    /// No persisted PID identity is available, so this path sends no process signal.
     pub(crate) async fn end_stray_vm(&self, id: &VmId) -> hypervisor::Result<()> {
-        // The files go only AFTER the process has agreed to. A VMM that did
-        // not answer is a VMM that is still there, and removing its socket
-        // would leave a live process nothing can ever reach again.
+        // Remove files only after shutdown is acknowledged; retain the socket on
+        // failure so a surviving VMM remains reachable.
         self.api(id, Method::PUT, "vmm.shutdown", None).await?;
         self.remove_files(id);
         Ok(())
@@ -702,11 +472,8 @@ impl CloudHypervisorDriver {
         if self.vms.lock().unwrap().contains_key(id) {
             return Ok(()); // idempotent, and an Owned entry is never overwritten
         }
-        // Both questions, and they are different questions. The socket says
-        // "something is serving this VM's api"; the pid says "and it is the
-        // process the record names". Adopting on the socket alone would
-        // write a stranger's pid into the driver's map, and `destroy` signals
-        // what is in that map.
+        // Require both socket responsiveness and matching process identity before
+        // adoption; later destroy operations may signal the adopted PID.
         if !self.owns_pid(id, pid) {
             return Err(HypervisorError::Backend(anyhow::anyhow!(
                 "pid {pid} is not this vm's vmm any more, cannot adopt it"
@@ -721,15 +488,11 @@ impl CloudHypervisorDriver {
             *id,
             RunningVm {
                 process: VmProcess::Adopted { pid },
-                // A VMM found again after an agent restart is not receiving
-                // anything: a migration that was in flight died with the
-                // agent, and the guest is either fully arrived or not there.
+                // Adoption requires a responsive API and does not reconstruct the
+                // receiving marker. An in-flight transfer may outlive the agent.
                 receiving: None,
-                // The file, though, is where it always was, and it is the
-                // only description left of a transfer that ran while nobody
-                // was watching. An adopted VMM that has `migration-receive-
-                // failed` in it is exactly the ghost of the lab: a process
-                // holding a disk for a guest that is running elsewhere.
+                // Retain the event path so outcomes recorded while the agent was absent
+                // remain available to observation.
                 events: Some(self.event_path(id)),
                 receive_answer: Default::default(),
             },
@@ -739,21 +502,12 @@ impl CloudHypervisorDriver {
     }
 }
 
-/// The command line a VMM is started with.
-///
-/// Its own function so that the one argument nobody would guess — see
-/// `spawn_vmm` on why a receiving VMM speaks and a booting one does not —
-/// can be asserted without a process to spawn.
+/// Build VMM arguments separately so receiver event-monitor configuration can be tested.
 pub(crate) fn vmm_args(socket: &Path, events: Option<&Path>) -> Vec<String> {
     let mut args = vec![
         "--api-socket".to_string(),
         socket.display().to_string(),
-        // v53's own default, said out loud. `--seccomp` takes `true`, `log`
-        // or `false`, and a VMM whose filter is off is a VMM whose sandbox
-        // silently is not there — this is the one line that makes that
-        // visible in `ps` and impossible to lose to a default changing
-        // upstream. Measured to be accepted without a VM on the command
-        // line, which `--landlock` is not (see `build_vm_config`).
+        // Enable seccomp explicitly instead of relying on an upstream default.
         "--seccomp".to_string(),
         "true".to_string(),
     ];

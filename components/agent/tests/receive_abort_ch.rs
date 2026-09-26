@@ -2,29 +2,16 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The give-back of a failed reception, against a real cloud-hypervisor.
-//!
-//! `#[ignore]` for the reason the etcd tests next door carry it: this one
-//! needs something outside the process, and the workspace's ordinary run has
-//! nothing. Point it at a v53 binary and ask for it by name:
+//! Ignored integration test for explicit receive failure against Cloud Hypervisor v53.
+//! A malformed stream must trigger receiver cleanup while preserving referenced data.
+//! It needs no guest image because the receiver has not created a guest.
 //!
 //! ```text
 //! MEISTER_CH=$PWD/bin/cloud-hypervisor \
 //!   cargo test -p meister-agent --test receive_abort_ch -- --ignored --nocapture
 //! ```
 //!
-//! What it is for is the half the in-process tests cannot state. Those use a
-//! hypervisor of their own making, so they check that the agent acts on
-//! `migration-receive-failed`; they cannot check that cloud-hypervisor writes
-//! it, or that the process this agent believes it ended is really gone. Here
-//! a VMM is really spawned, really listens for a stream, and the stream is
-//! really broken — and afterwards the invariants of the lab's `invariants.py`
-//! are asked of the machine this is running on: no VMM alive for that vm, no
-//! record, no volume held, and the bytes still where they were.
-//!
-//! No guest and no kernel, deliberately. A reception is a VMM with NO VM in
-//! it (v53 refuses to receive into one), so everything this is about happens
-//! before a guest would exist.
+//! The test uses fixed local ports 47311 and 47312; run it without competing listeners.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,15 +38,8 @@ fn rig(name: &str) -> tempfile::TempDir {
         .expect("a directory")
 }
 
-/// A cgroup driver over an ordinary directory tree.
-///
-/// `CgroupV2` writes `memory.max` and `cpu.max` into the slice, which on a
-/// real cgroupfs are files that were already there and on a temp directory
-/// are files it just made — so its `destroy_slice`, a bare `remove_dir`,
-/// cannot take the slice away and the teardown ends with a failure and keeps
-/// the record. The migration report of the previous round wrote this down as
-/// D14 and it is a test artefact then as now: everything under test here is
-/// on the other side of that line, so the tree goes as a tree.
+/// Cgroup test double over ordinary directories. Unlike cgroupfs, these
+/// directories contain regular files, so cleanup removes the tree recursively.
 struct LooseSlices(cgroup_driver::CgroupV2);
 
 impl agent_api::ResourceConfiner for LooseSlices {
@@ -194,11 +174,8 @@ fn alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// A reception that a real cloud-hypervisor fails leaves nothing behind.
-///
-/// The lab's picture, which this reproduces on one machine: a VMM listening
-/// for a guest, a stream that breaks, and — before the fix — a process and a
-/// disk connection held for a guest that another machine went on running.
+/// A malformed stream must end the receiving VMM and release its attachments
+/// without deleting the referenced disk.
 #[tokio::test]
 #[ignore = "needs a cloud-hypervisor v53 binary in MEISTER_CH; see the module note"]
 async fn a_stream_that_breaks_leaves_no_vmm_no_record_and_no_disk_held() {
@@ -220,9 +197,7 @@ async fn a_stream_that_breaks_leaves_no_vmm_no_record_and_no_disk_held() {
     assert_eq!(record.volumes.len(), 1, "and the disk is attached to it");
     println!("listening: pid {pid} on {listen}, record Receiving");
 
-    // D-X1's half of this: a receiving VMM runs at INFO, because its abort
-    // line names no component and its restore does. The proof that the flag
-    // reached the process is the file itself.
+    // Receivers run at INFO so failed-restore diagnostics identify the component.
     let vmm_log = std::fs::read_to_string(root.join("run").join(format!("{id}.log")))
         .expect("the vmm writes its own log");
     assert!(
@@ -234,10 +209,7 @@ async fn a_stream_that_breaks_leaves_no_vmm_no_record_and_no_disk_held() {
         vmm_log.lines().next().unwrap_or("")
     );
 
-    // Break the stream the way a source that dies mid-transfer breaks it:
-    // connect, say nothing that v53 can parse, hang up. `Request::read_from`
-    // then fails and the receive loop aborts — `migration-receive-failed`,
-    // which is the line the whole give-back hangs on.
+    // Send an invalid stream and disconnect to provoke explicit receive-failure evidence.
     {
         use std::io::Write;
         let mut stream =
@@ -275,9 +247,7 @@ async fn a_stream_that_breaks_leaves_no_vmm_no_record_and_no_disk_held() {
         std::net::TcpStream::connect("127.0.0.1:47311").is_err(),
         "something is still listening on the migration port"
     );
-    // The disk was DETACHED and not deprovisioned: it belongs to a `Volume`
-    // the source is still using, and a destination giving back a connection
-    // must never be a destination deleting somebody's data.
+    // Failed-receive cleanup preserves independently owned volume data.
     let volumes = store.list_volumes().expect("the volume table");
     assert_eq!(volumes.len(), 1);
     assert_eq!(
@@ -297,8 +267,7 @@ async fn a_stream_that_breaks_leaves_no_vmm_no_record_and_no_disk_held() {
     );
     println!("all invariants held: no vmm, no record, no listener, the disk is untouched");
 
-    // And the second attempt, which is the other half of the same defect:
-    // before the fix this answered "this node already has a record of vm …".
+    // Retry reception after cleanup removes the failed attempt.
     dest.prepare_migration(
         id,
         arriving_vm(&store, &root),

@@ -1,102 +1,54 @@
 # Architecture
 
-MeisterStack has two control-plane tiers and a node agent. The cloud selects a
-cluster; the cluster selects a node; the agent reconciles Linux resources and VMM
-processes. The CLI can address a controller or the agent's local Unix socket.
+Cloud selects a cluster; cluster selects a node; agent manages host resources.
 
 ```mermaid
 flowchart TB
-    CLI[meister CLI] -->|REST| Cloud[Cloud controller]
-    CLI -->|REST| Cluster[Cluster controller]
-    CLI -->|Local Unix socket| Agent[Node agent]
-    Cluster -->|Outbound bidirectional gRPC session| Cloud
-    Agent -->|Outbound bidirectional gRPC session| Cluster
-    Cloud --- CE[(Cloud etcd namespace)]
-    Cluster --- KE[(Cluster etcd namespace)]
-    Agent --- DB[(Local redb)]
-    Agent --> Drivers[Compiled drivers]
-    Drivers --> Host[Linux resources and VMM processes]
+    CLI[meister CLI] -->|REST| C[Cloud]
+    CLI -->|REST| K[Cluster]
+    CLI -->|Unix socket| A[Agent]
+    K -->|Outbound gRPC session| C
+    A -->|Outbound gRPC session| K
+    C --- CE[(Cloud etcd namespace)]
+    K --- KE[(Cluster etcd namespace)]
+    A --- DB[(Local redb)]
+    A --> D[Compiled drivers]
+    D --> H[Linux resources and VMMs]
 ```
 
-Session arrows show connection initiation. Commands travel back down the same
-streams; reports travel up. Agents also use data-plane listeners, including
-migration receivers. Outbound control sessions do not mean the node has no inbound
-network services.
+- Session arrows show connection initiation. Commands travel down; reports travel up.
+- Migration and storage can require additional inbound dataplane listeners.
+- CLI agent access is administrative; controller APIs apply resource authorization.
 
-## State and ownership
+## State ownership
 
-| Layer | Authoritative local state | Derived or observed state |
+| Layer | Persists | Observes |
 | --- | --- | --- |
-| Cloud | Tenants, users, global resources, full VM intent and cluster binding | Cluster capacity, placement and workload reports |
-| Cluster | Node binding, local desired resources, migrations and reservations | Node inventory, process phases and volume reports |
-| Agent | Local ownership records, handles, process identities and operation receipts | Kernel resources and VMM state |
+| Cloud | Users, tenants, global resources, full VM spec and cluster binding | Cluster capacity, placement and workload reports |
+| Cluster | Node binding, local intent, migrations and capacity reservations | Node inventory and resource state |
+| Agent | Handles, process identities, ownership records and operation receipts | Kernel resources, backend processes and VMM state |
 
-The cloud stores full VM specifications, not just VM stubs. Controllers persist
-resources in etcd and use revision comparisons for competing updates. Cloud and
-cluster namespaces can share a development etcd instance; independent deployments
-can use separate stores. Logical namespace separation does not itself provide
-independent failure domains.
+- Controllers use etcd revision comparisons for competing writes.
+- Tier namespaces may share development etcd; this provides no separate failure domain.
+- Agent redb is durable ownership state. External processes can survive the agent;
+  deleting its database removes evidence needed for adoption and safe cleanup.
 
-The agent's redb database is durable bookkeeping, not a disposable cache. Concrete
-paths, backend handles and migration barriers may exist only there. Losing that
-state can remove the evidence needed to distinguish an owned resource from an
-orphan. External processes can survive the agent that created them.
+## Mechanisms
 
-## Reconciliation
+| Mechanism | Rule | Reference |
+| --- | --- | --- |
+| Reconciliation | Watch, retry, tick or report triggers a fresh state decision; handlers tolerate replay | [Control plane](CONTROL_PLANE.md), [agent](AGENT.md) |
+| Completion | API acceptance records intent; command ACK and observed completion have different meanings | [API](API.md) |
+| Placement | Apply health, class, selectors, capacity, capabilities and locality before choosing a candidate | [Control plane](CONTROL_PLANE.md) |
+| Storage | Provider owns data; attachment owns the consumer connection | [Storage](STORAGE.md), [drivers](DRIVERS.md) |
+| Networking | Reconcile overlays, provider access, allocation and local filtering separately | [Networking](NETWORKING.md) |
+| Migration | Correlate durable source/destination evidence by attempt; unknown outcome retains ownership | [Contract and remaining gaps](MIGRATION.md) |
+| Deletion | Finalizers retain cleanup obligations; locks do not provide distributed fencing | [Resource lifecycle](RESOURCE_LIFECYCLE.md) |
+| Isolation | TLS, peer identity, object authorization and host privileges protect different boundaries | [Security](SECURITY.md) |
 
-```mermaid
-sequenceDiagram
-    participant U as CLI
-    participant C as Cloud
-    participant K as Cluster
-    participant A as Agent
-    participant H as Linux / VMM
-    U->>C: Write desired VM resource
-    C-->>U: Accepted resource
-    C->>K: Assign full desired VM
-    K->>A: Node command / desired-state snapshot
-    A->>H: Provision or reconcile
-    H-->>A: Observed process and resource state
-    A-->>K: Status and operation evidence
-    K-->>C: Cluster report
-    U->>C: Read observed status
-```
+Drivers implement Rust traits selected by Cargo features and startup configuration.
+There is no runtime plugin loader. A new driver needs a rebuild and explicit
+lifecycle, restart and cleanup behavior.
 
-Controllers combine store watches, queued retries, periodic reconciliation and
-session reports. A successful write records intent. Agent acknowledgements usually
-confirm command acceptance; later observations establish completion. Reconnection
-replays desired state and reports, so handlers must tolerate duplicates and stale
-messages. See [control plane](CONTROL_PLANE.md) and [agent](AGENT.md).
-
-## Resource boundaries
-
-- **Placement:** cloud policy chooses a cluster; cluster policy checks node
-  readiness, selectors, capabilities, capacity and resource locality.
-- **Storage:** volume objects express ownership and lifecycle; drivers return local
-  handles. Shared reachability is distinct from exclusive writer ownership.
-- **Networking:** tenant overlays, provider access and public allocation are
-  reconciled separately. Local anti-spoofing protects attached interfaces.
-- **Devices:** driver capabilities participate in scheduling; acquisition returns
-  concrete attachments used by the VMM.
-- **Migration:** a durable attempt binds source and destination evidence. Unknown
-  outcome retains ownership. The receive driver and restart path have unresolved
-  gaps described in [migration](MIGRATION.md).
-- **Deletion:** finalizers retain objects while cleanup is incomplete. Local locks
-  serialize some races but are not distributed fencing.
-
-## Extensibility and isolation
-
-Rust traits define hypervisor, device, network, storage and resource-limit
-boundaries. Driver selection happens at build time through Cargo features and at
-startup through configuration. There is no runtime plugin loader; a new driver
-requires a rebuild and must implement lifecycle, recovery and cleanup contracts.
-
-Controllers do not expose etcd directly to agents. TLS, authenticated sessions and
-resource authorization define trust boundaries; the local agent socket is an
-administrative interface. Details and current exceptions are in
-[security](SECURITY.md).
-
-The hierarchy reduces the amount of node detail required by the cloud, but adds
-replication, asynchronous ownership transfer and recovery work. Low overhead,
-scalability and fault isolation are design goals requiring measurement; the layout
-alone does not prove them.
+Scalability, overhead and fault isolation are evaluation goals; hierarchy alone does
+not establish them. [Motivation](MOTIVATION.md) records the design tradeoffs.

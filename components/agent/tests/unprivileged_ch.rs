@@ -2,12 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! A guest, booted by an agent with no rights at all.
-//!
-//! `#[ignore]` for the reason `input_ch.rs` and `receive_abort_ch.rs` next
-//! door carry it: this needs things from outside the process that the
-//! workspace's ordinary run has none of. It also needs one thing THEY do not
-//! — a delegated cgroup subtree — so it has to be started inside one:
+//! Ignored integration test for a nonroot agent with no effective capabilities.
+//! Requires delegated cpu/memory cgroups, KVM access, curl, an agent binary with
+//! http-api and debug-mutations enabled, Cloud Hypervisor, a kernel and initramfs.
+//! MEISTER_INPUT_BACKEND is optional.
 //!
 //! ```text
 //! systemd-run --user --scope -p Delegate=yes --setenv=RUST_LOG=info \
@@ -15,35 +13,12 @@
 //!       MEISTER_CH=$PWD/bin/cloud-hypervisor \
 //!       MEISTER_KERNEL=$PWD/images/vmlinux.elf \
 //!       MEISTER_INITRD=$PWD/images/initrd \
-//!       MEISTER_INPUT_BACKEND=/path/to/vhost-device-input \
 //!   cargo test -p meister-agent --test unprivileged_ch -- --ignored --nocapture
 //! ```
 //!
-//! `MEISTER_INPUT_BACKEND` is the one that may be left out; everything else
-//! is named or the test says which.
-//!
-//! What it proves, and what none of the unit tests can:
-//!
-//! * The whole chain runs as an ORDINARY USER. No `sudo`, no capability, no
-//!   root: `CapEff` is zero and stays zero for the length of it.
-//! * `cgroup_root` is the agent's own delegated cgroup. The agent hangs
-//!   itself into `<root>/supervisor` (systemd's no-processes-in-inner-nodes
-//!   rule), enables `cpu` and `memory` on the root, and the VM's slice really
-//!   carries a `memory.max` — which is the whole of what the unexplained
-//!   finding 5 was about.
-//! * Four drivers this node CONFIGURED are left out, each with its own
-//!   sentence, and the node still comes up. Two of them (`lvm-thin`,
-//!   `[network]`/`nft`) would otherwise be start-up refusals: both check
-//!   their world in `new()`, which is exactly what the start-check is in
-//!   front of.
-//! * A VM without a NIC boots, over `unix://…/agent.sock` and nothing else,
-//!   reaches `Provisioned`, writes a console, and is torn down leaving no
-//!   process, no slice and no record.
-//!
-//! The guest is the lab's own kernel and initramfs (`deploy/push.sh`,
-//! MEISTER_GUEST_FILES) — not in this repo. All this test asks of it is that
-//! it prints a kernel banner to `console=hvc0`, which cloud-hypervisor writes
-//! to a FILE, so the proof is a read and not a connection.
+//! The test checks prerequisite reporting, a NIC-free guest boot, cgroup membership
+//! and teardown through the local Unix API. Guest files are supplied externally;
+//! either console stream must contain a Linux printk-style timestamp.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,21 +53,10 @@ fn own_cgroup() -> PathBuf {
     mount.join(relative.trim().trim_start_matches('/'))
 }
 
-/// Hand the agent a cgroup of its own inside the delegated subtree, and get
-/// everything else out of the way.
-///
-/// The three moves are the rig's and not the agent's, and each is a
-/// consequence of the same kernel rule. The scope this test runs in holds
-/// cargo and the test binary, so (1) they go into a sibling — while a process
-/// sits in a cgroup, `+memory` on its `cgroup.subtree_control` is EBUSY, and
-/// then no child of it has a `memory.max` at all. (2) The controllers are
-/// switched on for the scope's children, because `Delegate=` hands a subtree
-/// over and enables nothing (systemd: "you have to do that manually by
-/// writing to cgroup.subtree_control"). (3) The agent's own directory is
-/// made, and `pre_exec` below puts the agent in it before it runs — so that
-/// the agent's `cgroup_root` really IS its own cgroup, which is the shape a
-/// `Delegate=` unit has and the only shape that exercises the move the agent
-/// makes for itself.
+/// Prepare a delegated cgroup subtree for the agent. Move the test processes
+/// to a sibling before enabling controllers, satisfying the no-internal-process
+/// rule. Then create the agent cgroup; pre_exec moves the agent into it before
+/// startup so its configured root models a delegated service unit.
 fn delegated_subtree() -> PathBuf {
     let scope = own_cgroup();
     let controllers = std::fs::read_to_string(scope.join("cgroup.controllers")).unwrap_or_default();
@@ -120,14 +84,9 @@ fn delegated_subtree() -> PathBuf {
     agent
 }
 
-/// The agent's config: a compute-only node, plus four backends it has no
-/// right to build.
-///
-/// The four are the point. `lvm-thin` and `nfs` want CAP_SYS_ADMIN,
-/// `nvmeof` wants it and a root-owned `/dev/nvme-fabrics`, and `[network]`
-/// wants CAP_NET_ADMIN for the taps and the tap guard. A node that skipped
-/// them silently would be a lie; a node that refused to start over them
-/// could not be run this way at all.
+/// Configure a compute node plus unavailable LVM, NFS, NVMe-oF and network
+/// backends. Startup must report their missing privileges and continue with
+/// the usable hypervisor.
 fn config(root: &Path, cgroup_root: &Path, input_backend: Option<&Path>) -> PathBuf {
     let ch = from_env("MEISTER_CH");
     let device = match input_backend {
@@ -200,13 +159,11 @@ fn wait_for(what: &str, seconds: u64, mut ready: impl FnMut() -> bool) {
     panic!("{what} did not happen within {seconds}s");
 }
 
-/// The whole sentence: an agent with `CapEff=0`, in a delegated cgroup
-/// subtree, boots a guest and says what it cannot do.
+/// A capability-free agent in a delegated cgroup boots a guest and reports unavailable backends.
 #[test]
 #[ignore = "needs a real cloud-hypervisor, kernel and initramfs, and a delegated cgroup subtree; see the module note"]
 fn an_agent_without_any_rights_boots_a_guest_and_says_what_it_cannot_do() {
-    // First, the claim this test is about. If it is ever run by root it
-    // proves nothing at all, so it refuses instead.
+    // Require CapEff=0 so privileged execution cannot invalidate the test premise.
     let status = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
     let effective = status
         .lines()
@@ -388,28 +345,10 @@ fn an_agent_without_any_rights_boots_a_guest_and_says_what_it_cannot_do() {
         "and the vmm is really in it"
     );
 
-    // The console, which is the guest's own voice.
-    // Where `build_cloud_hypervisor` puts the driver's socket directory —
-    // `run_dir/vms` — and the guest's own two output files in it.
-    //
-    // BOTH of them, because which one a guest speaks on is the guest's
-    // decision and not this test's: `console=hvc0` is virtio-console and
-    // lands in `<id>.console`, a kernel without it falls back to the
-    // 16550A UART and lands in `<id>.serial` (which the agent records from
-    // the socket — see `attach`). The proof is that the guest booted, not
-    // which device it printed on.
+    // Read the driver's virtio-console file and the agent's recorded serial file.
     let vms = root.join("run").join("vms");
-    // What counts as "a guest booted here": a printk line. Not a banner and
-    // not a distribution's name — this test is run against whatever kernel
-    // and initramfs are on the machine, and the one thing every Linux guest
-    // writes to its console is `[    0.123456] something`. The very first
-    // lines of a boot can go to an earlycon nobody is reading, so the
-    // timestamp and not the banner is the marker.
-    //
-    // Both files, because which device the guest speaks on is the guest's
-    // decision: `console=hvc0` is virtio-console and lands in
-    // `<id>.console`, a kernel without it falls back to the UART and lands
-    // in `<id>.serial`, which the agent records from the socket (`attach`).
+    // Accept a printk-style timestamp from either stream; this avoids depending
+    // on a distribution banner or on which console driver the kernel provides.
     let booted = || {
         [
             vms.join(format!("{id}.console")),
@@ -431,9 +370,7 @@ fn an_agent_without_any_rights_boots_a_guest_and_says_what_it_cannot_do() {
         std::thread::sleep(Duration::from_millis(200));
     }
     if !booted() {
-        // Everything the VMM left behind. A guest that says nothing is
-        // either not booted or booted onto a device nobody is reading, and
-        // from here those look the same.
+        // Collect VMM files when guest output is absent to aid boot and console diagnosis.
         let files: Vec<String> = std::fs::read_dir(&vms)
             .expect("the vmm's directory")
             .filter_map(Result::ok)

@@ -2,21 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The passed-through hardware: who may have it, and how it is handed over.
-//!
-//! Admission is the driver's judgement and never this file's — only the agent
-//! can read the store and say what the other VMs on this node already claim,
-//! and only the driver knows what a conflict is. See
-//! `check_device_admission`.
-//!
-//! Moved out of `provision.rs` unchanged.
+//! Device admission and creation. The agent gathers persisted claims; each
+//! driver decides which requests conflict.
 
 use super::*;
 
-/// Which driver created this device, read back off the spec the record was
-/// built from. The fallback is the spec default rather than a literal: a
-/// record whose device is not in its own spec should not be routed to
-/// whichever driver happened to be default the day this line was written.
+/// Resolve the creating driver from the persisted device spec. Missing entries
+/// use the spec default rather than a separately maintained driver name.
 pub(crate) fn device_driver_name(record: &VmRecord, id: &DeviceId) -> String {
     record
         .spec
@@ -28,19 +20,8 @@ pub(crate) fn device_driver_name(record: &VmRecord, id: &DeviceId) -> String {
 }
 
 impl Provisioner {
-    /// Ask every driver this spec names whether it can serve the request
-    /// alongside what the other VMs on this node already claim from it.
-    ///
-    /// The agent supplies the facts and the driver supplies the judgement:
-    /// only this side can read the store, and only the driver knows what a
-    /// conflict is — which param names the resource, whether two VMs may
-    /// share it, what to say when they may not. Before this, the agent
-    /// carried a second parser for vfio's `params.pci_address` next to the
-    /// one the vfio driver already had.
-    ///
-    /// A driver the spec names but the node does not have is passed over
-    /// here; `run_chain` is where that becomes an error, with the message
-    /// that names the configured drivers.
+    /// Ask configured drivers to admit this request alongside other persisted VM
+    /// specifications. Missing drivers are reported when the chain creates devices.
     pub(super) fn check_device_admission(&self, id: &VmId, spec: &AgentVmSpec) -> Result<()> {
         if spec.devices.is_empty() {
             return Ok(());

@@ -2,21 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The Vm reconciler: level-triggered like the agent's — a periodic pass
-//! plus etcd-watch wakeups, every decision derived from the stored object.
-//! Phase is the dedup: Pending → schedule + create, Provisioning+ → the
-//! agent owns it and its status reports carry the phase from there.
+//! Level-triggered VM reconciliation driven by periodic passes and store watches.
+//! Stored intent selects actions; agent reports supply runtime evidence. The pass
+//! also expires stale heartbeats after agents or controllers disappear.
 //!
-//! The same pass expires node heartbeats: a session that tears down reports
-//! its node down immediately, but an agent that is killed outright — or one
-//! that died while this controller was restarting — leaves nothing behind
-//! except a heartbeat that stops moving.
-//!
-//! Several replicas run this same pass against the same etcd, with no leader
-//! between them, and the session map is what divides the work (see
-//! `may_reconcile`). Everything they still do share — binding an unbound VM,
-//! expiring a heartbeat — goes through a compare-and-swap, and the store is
-//! the arbiter: one writer wins, the loser sees a Conflict and drops it.
+//! Replicas share etcd without a leader. Node sessions divide bound-object work;
+//! compare-and-swap arbitrates bindings and shared status changes.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -314,15 +305,9 @@ async fn pass(
     if let Err(e) = take_snapshots(&pass).await {
         warn!(error = format!("{e:#}"), "snapshot reconcile pass failed");
     }
-    // After the VM loop, because the drain reads VM state and writes marks
-    // that the NEXT pass acts on. One tick of latency, which is what
-    // level-triggered means: nothing here is a request that has to return.
-    // The live migrations, after the VMs and before the drain. After, because
-    // a migration reads the same candidate list the VM loop has been spending
-    // from and must be measured against what is actually left; before,
-    // because a drain that finds a live-capable VM CREATES a migration, and
-    // the one it made should be picked up by the next pass rather than by
-    // this one, half-decided.
+    // Run migrations after VM placement so they see remaining candidate capacity.
+    // Run drains afterward: their new evacuation marks and migration objects are
+    // processed on the next pass.
     if let Err(e) = crate::migration::reconcile_migrations(
         store,
         dispatch,

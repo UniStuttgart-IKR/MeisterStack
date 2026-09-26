@@ -758,15 +758,8 @@ pub(super) enum Release<'a> {
     /// stays, because an object removed while its LV is still in the volume
     /// group is a volume nobody will ever find again.
     WaitingForNode(&'a str),
-    /// No consumer and no node: nothing anywhere is holding bytes for this
-    /// volume, so there is nothing to lose and the object goes.
-    ///
-    /// Two ways to get here and the rule is the same for both. A volume that
-    /// was never placed had no node from the start. A volume whose node
-    /// reported `Gone` had its node cleared by that report — the bytes are
-    /// not there any more, so the object does not name a place they are. The
-    /// second is what completes a delete, and it completes it through the
-    /// rule the first one already needed.
+    /// Drop an unclaimed volume with no node: it was either never placed or its
+    /// node reported Gone and cleared the binding. No backend command remains.
     Drop,
 }
 
@@ -931,16 +924,8 @@ pub(super) async fn place_volume(
 
     let mut bound = volume;
     bound.status.node = Some(node.clone());
-    // Still Pending, and that is the correction this position makes. Placing
-    // a volume used to write `Provisioning` — a phase that said a node was
-    // making it while nothing had told any node anything, so every standalone
-    // volume sat in it for ever. The phase moves when the COMMAND goes, one
-    // pass later, and `Pending` in between is exactly true: chosen, not yet
-    // asked.
-    // Nothing said about the bytes any more: whatever a previous pass
-    // concluded — unplaceable, a failed provision, a record following a vm —
-    // is answered by this placement. `Pending { AwaitingNode }` follows, with
-    // the sentence naming the machine that was chosen.
+    // Placement alone is not provisioning evidence. Clear prior runtime reports
+    // and retain Pending/AwaitingNode until dispatch and node reports advance it.
     bound.status.reported = None;
     match p.store.update(&bound).await {
         Ok(_) => info!(volume = %name, node = %node, pool = %bound.spec.pool,

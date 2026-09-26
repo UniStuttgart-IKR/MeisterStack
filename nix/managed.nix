@@ -2,40 +2,16 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# A host `meister-deploy` deploys to.
-#
-# The difference to nix/appliance.nix is one sentence: here the configuration
-# IS the system generation. Nothing is rendered while the machine boots, so
-# there is nothing a rollback cannot take back — the config files, the etcd
-# membership and the [auth] table of the cloud are all written by Nix, out of
-# the same `meisterstack.context.defaults` the boot renderer would have read,
-# through nix/lib/render.nix. Until M5B there was a second renderer that did
-# it at BOOT, and `checks.render-parity` held the two to each other; that one
-# went to the lab repository with the appliance image it belonged to. What is
-# left is the one that runs at build time. It used to be that both ran over the same
-# input and compares the parsed TOML, because two renderers is one too many.
-#
-# What this profile does NOT decide, on purpose: dhcp, firewall,
-# `system.stateVersion`, the bootloader, the filesystems. A managed host is
-# somebody's own NixOS host with a plan attached, and those are the lines
-# their repository owns. What it does decide is what deploying REQUIRES: nix
-# stays on and takes signed closures only, the keys live outside the store,
-# and there are directories for the transaction records the helper writes.
-#
-# resolvconf used to be on that first list and is now the one exception,
-# under a condition: see the lane 5C block below. A file with two authors is
-# a file that breaks an activation AND its rollback, and the lab measured
-# exactly that.
+# Managed NixOS profile: binaries and complete role configurations come from
+# the system generation; credentials remain writable files outside the store.
+# Configure signed closure transport and deployment state, and reject a
+# boot-time renderer that could overwrite the generated configuration.
 { lib, config, ... }:
 let
   cfg = config.meisterstack.managed;
   ms = config.meisterstack;
 
-  # The same variables the boot renderer would have sourced, plus the one it
-  # reads off the machine instead: `node_id` is the hostname there
-  # (`cat /proc/sys/kernel/hostname`), and here it is the hostname Nix knows.
-  # Written as an ordinary context variable so that the function stays a
-  # function of its context and of nothing else.
+  # Render inventory context defaults with the roles selected for this host.
   env = { MEISTER_NODE_ID = config.networking.hostName; } // ms.context.defaults;
 
   rendered = import ./lib/render.nix {
@@ -45,19 +21,7 @@ let
 
   deployDir = "/var/lib/meisterstack/deploy";
 
-  # MEISTER_HOSTS = "10.0.0.10 box.lab.example", several of them separated by
-  # commas: the /etc/hosts lines a fleet without a dns has to be told. It is
-  # the one context value that is not a config key, which is why it is here
-  # and not in nix/lib/render.nix.
-  #
-  # nix/fleet.nix calls it a CONTEXT value on purpose, because on an appliance
-  # /etc/hosts has exactly one owner — the renderer, the same one resolv.conf
-  # has — and a fleet can be re-pointed at a new addons box without rebuilding
-  # an image. A managed host has no renderer, so the owner here is
-  # `networking.hosts`, and re-pointing it is a new generation. Without this
-  # the cloud of such a host could not resolve the issuer in the token it is
-  # verifying (nix/addons.nix: origin, issuer, redirect and certificate are
-  # one and the same NAME).
+  # Turn MEISTER_HOSTS entries into host-file mappings for local name resolution.
   hostEntries =
     let
       fields = entry: lib.filter (x: x != "")
@@ -75,20 +39,8 @@ in
 {
   imports = [ ./services.nix ];
 
-  # What the LAYOUT knows and nobody else does.
-  #
-  # `install.layout` in the inventory names a disko module, and that module
-  # is the one file that decides whether this machine has an EFI system
-  # partition — it either makes an EF00 partition or it does not.
-  # nix/lib/inventory.nix compares the answer against `boot` (uefi needs one,
-  # direct must not have one), which is a comparison somebody has to be able
-  # to make without parsing a partition table. So the layout says it out
-  # loud, here, in one line.
-  #
-  # Declared outside `config` and outside the `managed.enable` gate on
-  # purpose: a layout is imported into a host by lib.mkFleet whether or not
-  # that host is managed, and an option that only exists sometimes is an
-  # option a layout cannot set.
+  # Disk layouts declare whether they create an ESP; inventory validates that
+  # against the selected boot mode.
   options.meisterstack.install.hasEsp = lib.mkOption {
     type = lib.types.bool;
     default = false;
@@ -194,49 +146,23 @@ in
       }
     ];
 
-    # The binaries are part of the system, out of the store, and that is the
-    # whole difference to an appliance: no push, no `.new` file left behind
-    # by an interrupted rsync, no question which tree they were built from.
-    # `meisterstack.runtime` (nix/services.nix) is the one directory the
-    # agent's unit can name both of its programs in; `mkDefault` because an
-    # operator who builds their own may say so.
+    # Use the runtime package as the service binary directory.
     meisterstack.binDir = lib.mkDefault "${ms.runtime}/bin";
 
-    # The config files are complete and in /etc, so that is where the units
-    # read them — and that is what makes the configuration a generation
-    # rather than a thing that happens at boot.
+    # Install complete role configurations under /etc.
     meisterstack.configDir = "/etc/meisterstack";
 
-    # Under /var/lib rather than /opt: nothing pushes into this host's
-    # filesystem by hand any more, and the FHS answer for state a service
-    # owns is /var/lib. Still outside the nix store, because a private key
-    # must not be world-readable, and still `meister:meister 0600` — the
-    # loaders refuse anything wider (M0 probe S11 measured what
-    # LoadCredential hands a unit instead).
+    # Keep writable keys and image assets under /var/lib.
     meisterstack.pki.dir = lib.mkDefault "/var/lib/meisterstack/pki";
 
-    # --- lane 4C ---
-    # And the guest images, for the same reason and into the same place.
-    # /opt/meisterstack is what `legacy context-push` writes into, and a
-    # managed host has no push; the volume records and the keys are already
-    # under /var/lib/meisterstack, so the image cache being somewhere else
-    # was inconsistent rather than wrong (lane 1B, open point 6). The
-    # appliance keeps its own answer, which is what `checks.render-parity`
-    # holds both sides to.
+    # Keep guest image assets in managed persistent storage.
     meisterstack.agent.imageDir = lib.mkDefault "/var/lib/meisterstack/images";
-    # --- end lane 4C ---
-
-    # The three roles' per-machine keys, from the same context the renderer
-    # would have read. This is the whole point of the profile: node_id, the
-    # controller addresses, the advertise addresses, the telemetry keys and
-    # the cloud's [auth] table are values at build time here.
+    # Render role TOML from module defaults and inventory settings.
     meisterstack.cloud.generated = rendered.cloud;
     meisterstack.cluster.generated = rendered.cluster;
     meisterstack.agent.generated = rendered.agent;
 
-    # And the etcd membership as options rather than as an env file: there is
-    # no renderer to write /run/meisterstack/etcd.env, and `peers` has been
-    # the build-time road since nix/etcd.nix learned to cluster.
+    # Configure etcd membership directly through NixOS options.
     meisterstack.etcd = lib.mkIf (rendered.etcd.peers != { }) ({
       peers = rendered.etcd.peers;
       clusterToken = rendered.etcd.clusterToken;
@@ -244,66 +170,21 @@ in
       member = rendered.etcd.member;
     });
 
-    # The names this machine must resolve without a dns, from the same
-    # context. Merged with what NixOS puts there anyway (localhost), never
-    # replacing it.
+    # Install names derived from the fleet inventory.
     networking.hosts = hostEntries;
 
-    # --- lane 5C: one author for /etc/resolv.conf -------------------------
-    #
-    # Measured in the lab on 2026-09-23, on a managed host that reads an
-    # OpenNebula CONTEXT cd: the strict reader writes ETH0_DNS straight into
-    # /etc/resolv.conf, NixOS' resolvconf owns that file, and it refuses one
-    # it did not sign —
-    #
-    #   network-setup-start: .resolvconf-wrapped: signature mismatch:
-    #   /etc/resolv.conf
-    #   network-setup.service: Failed with result 'exit-code'
-    #
-    # In the middle of `switch-to-configuration` that is exit 4, so the
-    # ACTIVATION failed; and because the way back is the same command, the
-    # ROLLBACK failed with the same sentence and the host ended in
-    # `recovery-required`. nix/appliance.nix has carried
-    # `resolvconf.enable = false` since 2026-09-08 for exactly this reason,
-    # and the managed profile did not.
-    #
-    # Conditional, not flat, because the condition IS the finding: two
-    # authors for one file. Where a provider script writes the resolver, it
-    # is the author and resolvconf steps aside. Where there is none — the
-    # ordinary managed host, with a static address or a dhcp lease — this
-    # profile decides nothing, which is the promise at the top of this file.
-    # `mkDefault` on top of that: an operator who runs a resolver of their
-    # own says so and wins.
+    # When a provider script writes resolv.conf, disable resolvconf by default
+    # to prevent competing writers during activation and rollback.
     networking.resolvconf.enable =
       lib.mkIf (ms.context.providerScript != "") (lib.mkDefault false);
-    # --- end lane 5C ------------------------------------------------------
-
-    # The collector stays off, and this is a gap rather than a decision: its
-    # config is not TOML, the boot renderer writes it from MEISTER_LOKI_URL,
-    # and baking it is work this lane did not do. A unit whose
-    # ConditionPathExists can never be met would be worse — it would look
-    # like a collector that is merely idle.
+    # Start the provider unit when configured, without enabling a boot renderer.
     meisterstack.observability.enable = lib.mkDefault false;
 
-    # The two programs a deployment TYPES on this host, as opposed to the
-    # ones its units exec.
-    #
-    # `meisterstack.binDir` is what an ExecStart names, and an ExecStart is
-    # not a PATH. Both halves of M2 reach this host over ssh and type a bare
-    # word: `meister-activate status --json` is how the observation asks what
-    # is open here and `meister-activate activate` is how a rollout moves the
-    # profile (D5), and the read-only probe finds it with
-    # `command -v meister-activate` (tools/meister-deploy/src/observe.rs). The
-    # same probe counts this node's guests with `meister --endpoint
-    # unix://<socket> agent vm ls`, which is the drain check D7 stands on. So
-    # the package that carries both goes on the system path — the hypervisor
-    # does not, because nobody types that one.
+    # Include deployment helpers used remotely over SSH, in addition to the
+    # role daemons named by service units.
     environment.systemPackages = [ ms.package ];
 
-    # What starts at boot. On an appliance the renderer starts the units it
-    # was told to (`systemctl start` per MEISTER_ROLE); here the roles are
-    # known at build time, so the units say so themselves — and a host that
-    # is a cloud has no stopped agent unit to explain.
+    # Enable selected role units at boot; credentials can still gate their startup.
     systemd.services = lib.mkMerge (map
       (role:
         lib.mkIf (builtins.elem role ms.unitsFor) {
@@ -312,16 +193,13 @@ in
         })
       [ "cloud" "cluster" "agent" ]);
 
-    # --- nix, because deploying is copying a closure in ---------------------
+    # Signed closure transport and local deployment support.
     nix.enable = true;
     nix.settings = {
-      # A build that reaches the network or the host's own /etc is a build
-      # whose result is not the function of its inputs it claims to be.
+      # Keep local builds sandboxed.
       sandbox = true;
 
-      # The line the whole transport stands on (M0 probe S12). Never
-      # `--no-check-sigs`, and never the legacy `ssh://` store: both take an
-      # unsigned closure, which is the guarantee this option exists for.
+      # Require signatures for imported and substituted store paths.
       require-sigs = true;
 
       trusted-users = [ "root" ];
@@ -330,29 +208,18 @@ in
       inherit (cfg) substituters;
       trusted-public-keys = cfg.trustedPublicKeys;
 
-      # `nix copy` and `nix path-info --json` are both nix-command, on the
-      # operator AND on the target — without this the target answers
-      # "experimental Nix feature 'nix-command' is disabled", which is an
-      # hour nobody gets back (M0 probe S12).
+      # Enable the commands used by closure transport and inspection.
       experimental-features = [ "nix-command" ];
     };
 
-    # Never automatically, and that is the point: the generation this host
-    # would roll back to is a generation somebody has to be able to roll back
-    # TO. `meisterstack.managed.keepGenerations` is the number, and
-    # `meister-activate gc` is what will act on it.
+    # Disable automatic garbage collection so rollback generations remain available.
     nix.gc.automatic = false;
 
-    # The way in for the operator. mkDefault throughout: a host with its own
-    # sshd configuration keeps it, and this is the minimum that makes
-    # `nix copy --to ssh-ng://` and the activation helper reachable at all.
+    # Default to key-authenticated root SSH for deployment; host modules may override it.
     services.openssh.enable = lib.mkDefault true;
     services.openssh.settings.PermitRootLogin = lib.mkDefault "prohibit-password";
 
-    # Where the helper keeps what it must not lose across a reboot: the
-    # transaction record of an activation that has not been confirmed yet,
-    # and the lock that says who is deploying. 0700 root, because a
-    # transaction record is what decides whether a machine rolls back.
+    # Persist transaction records and locks across reboots with root-only access.
     systemd.tmpfiles.rules = [
       "d /var/lib/meisterstack 0755 root root -"
       "d ${ms.pki.dir} 0755 root root -"

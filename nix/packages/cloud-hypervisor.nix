@@ -2,21 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# cloud-hypervisor v53.0 with this repository's patch series.
-#
-# Not nixpkgs' `cloud-hypervisor`: that one is whichever version the pinned
-# nixpkgs ships, and `patches/0001-generic-vhost-user-shmem.patch` is written
-# against exactly v53.0 — the generic vhost-user device learns SHARED MEMORY
-# REGIONS there, which is what every RM mapping into a guest runs over.
-# Without the series the device comes up, ioctls work, and there is no
-# host-visible window, hence no CUDA in a guest.
-#
-# The recipe is ~/git/Leandro/nix/packages/cloud-hypervisor.nix, unchanged
-# except for the two defaults: `patches` is WHICHEVER patches/*.patch exist,
-# sorted, rather than a list repeated here — the series has grown twice and a
-# second list would have gone stale both times. Built and measured in M0
-# probe S3: 123 s, `cloud-hypervisor v53.0.0`, 49 MiB closure, both hashes
-# still valid and `diff -r patches ~/git/Leandro/patches` identical.
+# Build Cloud Hypervisor v53.0 with the repository's sorted patch series.
+# Generic vhost-user shared-memory regions are required by the GPU backends.
 { lib
 , rustPlatform
 , fetchFromGitHub
@@ -39,9 +26,7 @@ rustPlatform.buildRustPackage {
   cargoHash = "sha256-+RbW/9ap/69MyODUk/bHBlH6ZuqYYIyKaarYSMQ2G7w=";
   patches = lib.sort lib.lessThan (lib.filter (p: lib.hasSuffix ".patch" (toString p))
     (lib.filesystem.listFilesRecursive patchDir));
-  # Counter-check on the patched tree: the series brings exactly ONE
-  # capability, and without it there is no window. A silently dropped patch
-  # would otherwise be discovered by a guest that has no GPU memory.
+  # Check that the shared-memory patch marker remains in the source.
   postPatch = ''
     grep -q get_shmem_config virtio-devices/src/vhost_user/generic_vhost_user.rs \
       || { echo "patch marker (SHMEM) missing from the source"; exit 1; }
@@ -50,22 +35,9 @@ rustPlatform.buildRustPackage {
   buildInputs = [ openssl zstd ];
   env.OPENSSL_NO_VENDOR = true;
   env.ZSTD_SYS_USE_PKG_CONFIG = true;
-  # Both binaries of the workspace, and the second one is not a convenience.
-  #
-  # `ch-remote` is how anything outside a running VMM talks to it: shutdown,
-  # pause, resume, `info`, hot-plug. The agent itself uses the VMM's HTTP api
-  # over the per-VM socket, so it needs neither — but a verification suite
-  # that has to stop a guest it started, and an operator on a node looking at
-  # why one will not die, both reach for `ch-remote`, and the alternative was
-  # curl against a unix socket by hand (lane 1B, open point 5; M4B's
-  # `vm-lifecycle` is the caller).
-  #
-  # `--bin` twice and not `--bins`: the workspace also builds test helpers,
-  # and a package that shipped whatever the upstream Cargo.toml grows next is
-  # a package whose closure changes without anybody deciding it.
+  # Build the VMM and its ch-remote management client explicitly.
   cargoBuildFlags = [ "--bin" "cloud-hypervisor" "--bin" "ch-remote" ];
-  # The test suite wants /dev/kvm, /dev/net/tun and io_uring; none of it is
-  # available in the sandbox and none of it is ours.
+  # Upstream tests require host facilities unavailable in the build sandbox.
   doCheck = false;
   meta = {
     description = "cloud-hypervisor ${chVersion} with MeisterStack's generic-vhost-user SHMEM patches";

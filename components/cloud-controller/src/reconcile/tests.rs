@@ -85,15 +85,8 @@ fn a_floating_address_becomes_a_line_of_the_vms_status() {
     assert!(addresses_of(&held, &orphan).is_empty());
 }
 
-/// Two writers, one list, and neither may undo the other.
-///
-/// `ingest_placements` writes the MAC lines out of the cluster's report and
-/// `stamp_vm_addresses` writes the floating lines out of this cloud's own
-/// objects, both every ten seconds and neither aware of the other. This walks
-/// them in both orders and asserts a FIXPOINT — which is a statement about
-/// the ORDER of the list as much as its content: an agreement on content with
-/// a disagreement on order is two passes rewriting each other's document for
-/// ever, and the etcd revisions to prove it.
+/// MAC and floating-address writers converge in either order, including list
+/// ordering, so repeated reconciliation does not produce spurious revisions.
 #[test]
 fn the_mac_writer_and_the_floating_writer_reach_the_same_list_from_either_side() {
     let reservation = |addr: &str| {
@@ -274,16 +267,8 @@ fn the_owners_evacuation_answer_travels_down_with_the_spec() {
     );
 }
 
-/// The stop that a cluster drain sends, and the one thing about it that
-/// must never leak upwards: the owner's `runStrategy` does not change.
-///
-/// This tier sends no lifecycle commands — it sends a spec, and the
-/// cluster derives the lifecycle from it — so the only way to stop a
-/// guest from here is to say `Stopped` in the DISPATCH while saying
-/// nothing different on the object. That is what makes the VM come back
-/// Running on the new cluster with nobody having to remember to restore
-/// anything, and what makes a lost mark fail in the safe direction: the
-/// next dispatch carries the real strategy and the guest starts.
+/// Drain dispatch overrides runStrategy to Stopped without changing owner intent.
+/// The destination therefore receives the original strategy after evacuation.
 #[test]
 fn a_cluster_drain_stops_a_vm_in_the_dispatch_and_not_on_the_object() {
     let strategy = |v: &Vm| -> String {

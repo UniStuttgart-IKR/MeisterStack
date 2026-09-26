@@ -957,15 +957,9 @@ fn the_requeue_timeline() {
     );
 }
 
-// ---- the joint cross product ------------------------------------------
-//
-// `lifecycle_command` and `requeue_decision` are the two pure decisions
-// `reconcile_vm` takes about a VM, and it takes them both in the same
-// pass, about the same object. Each has its own table above; what neither
-// can say alone is what the pair does together — and that is the thing
-// that can go wrong, because both of them can end in a message to the
-// node. The cross product below is every combination of their inputs,
-// with the joint answer.
+// Exercise lifecycle and requeue decisions together over their input product.
+// Both can produce node commands in one pass, so isolated decision tables do
+// not establish that their combined actions are compatible.
 
 /// The requeue side's whole input, spread over every dimension it reads.
 /// `elapsed` is seconds since `last_requeue`; -5 is a clock that went
@@ -1605,15 +1599,8 @@ fn a_node_local_volume_pins_a_vm_to_the_machine_that_holds_it() {
     assert!(!binding(Some(Locality::Shared), Some("agent-1"), vec![]).pins_elsewhere("agent-9"));
 }
 
-/// Whether a guest has to stand still is the NODE's answer, not a table
-/// here. It used to be a driver-name comparison against `lvm-thin`, and
-/// that was true until `filesystem` learned to reflink: the same driver
-/// copies on ext4 and clones on XFS, and only the node that probed its
-/// own pool knows which.
-///
-/// `None` — nothing learned — must fall through to the pause. A node from
-/// before the claim sends only the bare entry, and reading that as
-/// "atomic" would tear a copy on every one of them.
+/// Only a node-reported Atomic consistency claim permits skipping writer pause.
+/// Missing or legacy claims must take the conservative pause path.
 #[test]
 fn the_catalogue_says_whether_a_copy_needs_a_standstill() {
     use common::capability::{SnapshotConsistency, snapshot_claim};
@@ -1981,20 +1968,8 @@ fn ready_router(name: &str) -> controller_api::Router {
     r
 }
 
-/// Astra finding S09, 2026-09-23: one address, two routers, and only one of
-/// them keeps it.
-///
-/// The interleaving that used to survive: `acme-a` and `acme-b` both cut
-/// `.10` out of the same stale listing. `acme-b` writes first and finds no
-/// conflict, `acme-a` writes second, sees `acme-b`, and keeps the address
-/// because it sorts lower -- which is the right answer for `acme-a`. Nothing
-/// ever asks `acme-b` again, because the old `ensure_external_addr` returned
-/// the moment `status.external_addr` was set, so two routers answered for one
-/// address on the provider wire until somebody deleted one of them.
-///
-/// Both halves are asserted here: the pass for the lower name keeps the
-/// address, and the pass for the higher name -- the one that used to be an
-/// early return -- gives it back.
+/// Recheck duplicate router addresses even when already assigned. The lower
+/// name keeps the address and the higher name releases it on its next pass.
 #[test]
 fn two_routers_that_both_wrote_the_same_external_address_do_not_both_keep_it() {
     use controller_api::network::{AddressClaim, claim_external_addr};
@@ -2114,15 +2089,8 @@ fn a_node_that_is_up_and_fell_off_the_list_is_told_to_let_go() {
     );
 }
 
-/// D-B3: the machine that was away when it fell off the list is told the
-/// moment it is back, and not one pass later.
-///
-/// This is the hole the second half of the test above left. A node that is
-/// down is not told — there is nobody to tell — and the SAME pass takes it off
-/// `status.nodes`, so the next pass derives the release list out of the list it
-/// has just shortened and the machine is never told at all. On manacor it came
-/// back holding a whole namespace for an address another node was carrying by
-/// then. `status.releasing` is the debt, written down.
+/// Persist release intent for an offline former gateway and dispatch teardown
+/// on the first pass after it becomes reachable.
 #[test]
 fn a_machine_that_was_away_when_it_fell_off_is_told_when_it_comes_back() {
     let mut router = ready_router("acme-out");
@@ -2358,18 +2326,8 @@ fn a_create_the_node_refused_is_written_over_whatever_a_report_left_behind() {
     assert_eq!(vms::create_answer(said(), VmPhaseKind::Quarantined), None);
 }
 
-/// A router is planned onto the machines the FLEET has, not onto the ones
-/// this process happens to hold a session for.
-///
-/// The lab's finding, and the reason `Candidate::alive` exists. cluster-1 has
-/// three replicas and two gateway nodes; the sessions landed on two different
-/// replicas, and every replica then planned the router onto the one machine
-/// it could see and around the other. The router came up with a priority list
-/// of one — a standby that does not exist — and no failover behind it.
-///
-/// Sending is not the same question and is already answered: a router's
-/// commands go through `Dispatch`, which forwards to the replica holding the
-/// session.
+/// Router plans use fleet-wide liveness, including sibling-held node sessions.
+/// Dispatch reaches those sessions; local connectivity must not remove standbys.
 #[test]
 fn a_routers_list_is_the_fleets_and_not_one_replicas_reach() {
     let router = ready_router("r");
@@ -2410,22 +2368,8 @@ fn a_routers_list_is_the_fleets_and_not_one_replicas_reach() {
     assert_eq!(plan.active.as_deref(), Some("gw-2"));
 }
 
-/// Whose machines a replica may SPEAK about, which is not whose it may
-/// command.
-///
-/// Every replica runs the placement pass for an unbound VM and each sees only
-/// the machines whose sessions it holds, so the three took turns writing
-/// their own view onto one object: "no connected candidate offers
-/// [network/vxlan]" from the replica that holds no machine with an overlay,
-/// then the real reason, then the first one again. Seen in the lab while
-/// proving the class refusal, and it is what a tenant reads.
-///
-/// The rule: a replica that cannot reach a suitable machine asks the Node
-/// objects whether ANYBODY holds one. If somebody does, it says nothing —
-/// the replica with the session places it, and it is the only one that may.
-/// Only when nobody anywhere can take the VM is the sentence written, and
-/// then it is the same sentence everywhere because it comes out of the same
-/// store.
+/// Publish a Pending refusal only when no replica has a feasible node.
+/// A replica without a local candidate must defer to a suitable sibling.
 #[test]
 fn a_replica_speaks_about_a_pending_vm_only_when_nobody_anywhere_can_take_it() {
     let node = |name: &str, ready: bool, held: bool| {
@@ -2466,27 +2410,9 @@ fn a_replica_speaks_about_a_pending_vm_only_when_nobody_anywhere_can_take_it() {
     assert!(!nobodys[0].connected);
 }
 
-/// Who gets told to let a router go, and who has to keep it — the three cases
-/// `7df0fb4` turns on.
-///
-/// **(a) The router is really gone.** Its object is deleted outright at this
-/// tier (`handle_delete_router`; the kind carries no finalizer), so nothing
-/// stores it, and the machines that still hold it say so in their next status
-/// report. That is the one thing swept from the ingest path, and the delay is
-/// one report — see `session::tests::a_router_the_list_does_not_name_this_
-/// second_is_not_an_orphan`.
-///
-/// **(b) The list is short for one pass.** A heartbeat that has just expired,
-/// a cordon somebody is about to take back: the object is still stored, so
-/// the ingest says nothing at all and the netns stays. Same test.
-///
-/// **(c) A machine really dropped off the list.** That is this test: the
-/// RECONCILER names it, out of a plan it has just computed — and it names it
-/// whether or not this replica holds its session, because the commands go
-/// through `Dispatch`. Before, the filter was `connected`, so on a
-/// three-replica cluster the release was silently skipped most of the time
-/// and the machine was never told: the same pass shortens `status.nodes`, and
-/// the next pass builds this list out of the list it just shortened.
+/// Release a node removed from the router plan even when a sibling holds its
+/// session. Ingest orphan cleanup handles absent router objects separately;
+/// temporary omission from `status.nodes` alone does not authorize that cleanup.
 #[test]
 fn a_machine_that_dropped_off_a_routers_list_is_told_wherever_its_session_is() {
     let mut router = ready_router("r");
@@ -2556,16 +2482,9 @@ fn the_machine_a_router_forwards_on_is_news_of_its_own() {
     );
 }
 
-/// D4, end to end as a rule: the quittance of a `DestroyInstance` does not
-/// let go of a disk, and the claim that is still standing is why a second
-/// guest waits instead of taking it.
-///
-/// The three steps are the three facts, in the order a teardown produces
-/// them. What used to happen between the first and the third is the defect:
-/// `release_volumes` cleared `attachedTo` as the command went out, so for one
-/// command's round trip the object said nobody held a disk a VMM still had
-/// open — and `release_action` reads exactly that field to decide a
-/// deprovision may go.
+/// DestroyInstance acknowledgement does not release a volume claim.
+/// The claim persists until claimant removal and reported closed handles agree,
+/// preventing another VM or deletion from using the disk prematurely.
 #[test]
 fn a_destroy_that_has_been_quittanced_has_not_let_go_of_the_disk() {
     let none: [String; 0] = [];

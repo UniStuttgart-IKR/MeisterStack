@@ -224,16 +224,9 @@ async fn every_row_of_the_discovery_table_is_a_path_this_router_serves() {
     assert!(!serves("/apis/meister.io/v1/widgets").await);
 }
 
-/// The other half of the same promise. A feature name is a client's only
-/// way to tell a server that HAS a behaviour from one that silently drops
-/// the parameter — which is exactly what `?dryRun=All` did before it was
-/// built, and why a client that trusted the convention created real
-/// objects while it believed it was previewing.
-///
-/// So each name that is a ROUTE is held to its route. `dryRun`,
-/// `labelSelector` and `tenantFilter` are query parameters on routes the
-/// table above already checks, and their own tests are beside the
-/// handlers that read them.
+/// Advertised route features must have matching endpoints.
+/// Query features are tested at their handlers; an ignored parameter must not
+/// be advertised as supported, especially when it changes dry-run semantics.
 #[tokio::test]
 async fn every_feature_this_endpoint_names_is_one_it_has() {
     use controller_api::rest::features;
@@ -443,17 +436,8 @@ fn a_viewer_and_a_member_are_confined_to_their_tenant_and_an_operator_is_not() {
     );
 }
 
-/// D-P10: one rule for whose an object is, and the VM was the exception.
-///
-/// A volume, a floating address and a secret each refuse a create that ends
-/// up with no tenant; a VM did not, so `vm ls` showed `TENANT -` beside disks
-/// that could not have been made that way. The three are the rule.
-///
-/// What the rule IS, in one place, because the reference now says it: the
-/// tenant is what the client named, or the caller's own when they are
-/// confined to one, and a create that ends with neither is refused. So a
-/// member never meets the refusal (their own is filled in), and an admin —
-/// who is confined to nothing — says which tenant.
+/// Every tenant-scoped create requires an owner: the requested tenant or the
+/// caller's tenant. Unconfined callers must name one explicitly.
 #[test]
 fn a_create_with_no_tenant_at_all_is_refused_for_every_tenant_scoped_kind() {
     let grant = |role: Option<Role>, tenant: Option<&str>| {
@@ -549,18 +533,8 @@ fn asking_about_another_tenants_objects_is_an_empty_list_and_not_a_refusal() {
     assert!(!elsewhere.keeps(Some("acme")), "not its own either");
 }
 
-/// The other half of the promise: a resource this control plane has is
-/// either served here or written down as one this tier does not serve. A
-/// new row in `controller_api::resources` fails this test until somebody
-/// decides which of the two it is.
-/// The tables this tier really enforces, held to the schemas it really
-/// publishes.
-///
-/// Not a copy of either: `RESOURCES` names the same `const` the update
-/// handlers hand to `check_owned`, and the schema comes from the type
-/// serde deserialises. So this fails the day somebody renames a spec
-/// field and forgets the table — which is the failure the prose version
-/// of this table could never catch.
+/// Validate the handlers' mutability tables against the published schemas so
+/// field renames cannot silently leave stale ownership rules.
 #[test]
 fn every_mutability_table_names_fields_that_exist() {
     controller_api::assert_tables_match_schemas(RESOURCES);

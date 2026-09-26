@@ -1,29 +1,29 @@
-# LOCAL DEV CONFIG — not a template. See config/README.md.
-#
-# The profiles this repository is driven with by hand: the agent on the
-# socket agent.dev.toml creates under /tmp, the lab cloud over plain http,
-# and one https/token cluster kept as a live check that the TLS path is
-# still wired. The paths in it (data/, token) are relative to THIS file and
-# so to this checkout. A profile is an ENDPOINT and a credential and nothing
-# else -- what a given endpoint is, it says itself, and the CLI asks it.
-#
-# Nothing here is a shape to copy onto a workstation — the file to copy is
-# config/examples/cli.toml, or, for a control plane that asks who you are,
-# config/examples/hardened/cli.toml.
-#
-# Point the CLI at it with MEISTER_CONFIG=config/cli.dev.toml.
+# MeisterStack cli configuration. Checkout-only development fixture; do not deploy it. See config/README.md.
+# Relative paths resolve against this file's directory. See docs/CONFIGURATION.md.
+# Prose uses "# "; optional settings use "#key". Keep top-level settings above tables.
+# Lookup: --config / MEISTER_CONFIG, user config.toml, then /etc/meisterstack/cli.toml.
 
+# Used unless --profile or MEISTER_PROFILE selects another profile. An endpoint
+# override changes the address while retaining selected profile credentials.
+# MEISTER_TOKEN overrides the profile credential.
 default_profile = "lab"
 
+# Local agent administration over a Unix socket; access is controlled by
+# filesystem permissions. Use the agent command tree.
 [profiles.lab]
 endpoint = "unix:///tmp/run/meisterstack/agent.sock"
 credential = { type = "none" }
 
+# Cluster operator endpoint. Ordinary cloud User identities are refused here.
 [profiles.cluster-a]
 endpoint = "https://cluster-a.lab.internal:8443"
+
+# CA certificate and key for signing approved CSRs. Without the signer,
+# requests can be recorded but certificate issuance is unavailable.
 ca_cert = "data/meisterstack/ca.pem"
 credential = { type = "token_file", path = "token" }
 
+# Cloud API profile used by ordinary users and operators.
 [profiles.cloud]
 endpoint = "http://10.128.1.103:3000"
 credential = { type = "none" }

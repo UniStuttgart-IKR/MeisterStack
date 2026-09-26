@@ -2,27 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# What `meister-activate` does to a real machine, in a real machine.
-#
-# Every other test of the helper is a command line a fake runner recorded.
-# This one moves an actual system profile, runs an actual
-# `switch-to-configuration`, and waits for an actual systemd timer to fire —
-# because the one guarantee M2 exists to give is "a host that nobody
-# confirms comes back by itself", and a guarantee about a timer is worth
-# exactly as much as the machine it has run on.
-#
-# Two systems, A and B, and they are two NODES of this test rather than two
-# hand-built closures. The reason is the test driver: it talks to the
-# machine through `backdoor.service`, and a system that did not carry that
-# unit would be a system the driver cannot reach after the switch. Both
-# nodes are full test machines that differ in one `environment.etc` entry,
-# so the switch between them changes a file and no unit at all.
-#
-# What this test does NOT prove is the boot-mode fallback: this VM boots
-# with `-kernel` and has no ESP, so there is no `bootctl` to set a one-shot
-# entry with. What it proves instead is that the helper REFUSES boot mode
-# there, with the sentence D5 asks for. nix/tests/activate-boot.nix is the
-# other half.
+# Exercise system-profile changes, confirmation, timer rollback, interrupted
+# transactions, and refusal of boot mode without an ESP. Both generations retain
+# the test backdoor. UEFI boot fallback is covered by install.nix.
 { nixpkgs, lib, pkgs, system, self }:
 
 let

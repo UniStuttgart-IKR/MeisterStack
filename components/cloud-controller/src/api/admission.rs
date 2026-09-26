@@ -2,16 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! How a write that makes a tenant hold more gets in: look, decide, and write
-//! only if nobody else got in since the looking began.
+//! Quota admission with a per-tenant fence.
 //!
-//! The quota checks (`check_quota`, `check_storage_quota`) read the fence
-//! first and hand it back with their yes; the write then goes through
-//! `create_fenced`/`update_fenced`, which refuses it if the fence moved. A
-//! refusal of that kind is not an answer for the client — it is "somebody
-//! else was admitted meanwhile" — so the whole decision is made again, from a
-//! store that now includes them. See `controller_api::store::Fence` for why
-//! a per-object compare-and-swap could not say this (F03).
+//! Read the fence before checking usage, then create or update only if it is
+//! unchanged. A competing admission invalidates the fence and retries the whole
+//! decision. Per-object compare-and-swap cannot serialize usage across objects.
 
 use super::*;
 

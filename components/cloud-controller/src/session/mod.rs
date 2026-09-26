@@ -2,21 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Cluster sessions: cluster-controllers dial in (gRPC bidi
-//! `ClusterPlane.Session`), say Hello with their name and then execute
-//! commands. The registry holds one entry per connection and correlates
-//! CommandResults by request_id, so the reconciler can await an ack without
-//! owning the stream. One tier down the agents do exactly this; the shape is
-//! the same on purpose.
+//! Bidirectional cluster sessions carrying commands, results and status.
+//! Hello registers the cluster; subsequent status messages refresh its heartbeat
+//! and report cloud-managed resources. Results correlate by request ID.
 //!
-//! The session is also the only way status travels upwards: Hello creates or
-//! refreshes the cluster's Cluster object, every ClusterStatus is its heartbeat
-//! and carries the phase of each VM the cluster holds for the cloud.
-//!
-//! A cluster is several controller replicas now, and they all dial here — the
-//! same name gives them the same HRW favourite, so a group arrives together.
-//! The entry is therefore per connection and the cluster name only groups
-//! them, because keying by the name let the second replica evict the first.
+//! Each cluster replica has a separate connection entry. Cluster names group
+//! connections for speaker selection without evicting sibling replicas.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -238,29 +229,11 @@ impl SessionRegistry {
             .collect()
     }
 
-    /// The one session of a group the cloud talks to and listens to: the
-    /// newest Hello that is still talking, ties broken by id so the choice is
-    /// total.
-    ///
-    /// Picking one rather than any is not tidiness, it is the M4 teardown
-    /// proof. What that proof needs is that a status which *arrived* after a
-    /// command's ack was also *built* after it, and the only thing that
-    /// guarantees it is the cluster building both on one task and this side
-    /// reading one stream in order. Two replicas of a cluster share no such
-    /// order: the other one's status can be built before our command landed
-    /// and arrive after the ack, and absence from that list is precisely what
-    /// this tier reads as "torn down".
-    ///
-    /// Silence disqualifies, and that half is what keeps one wedged replica
-    /// from taking its cluster down with it. A cluster-controller that cannot
-    /// read its own store — the minority side of an etcd partition, precisely
-    /// the case this design promises to survive — keeps its session open and
-    /// sends nothing (`send_status` refuses to ship a hollow status). Without
-    /// this, that replica would hold the voice for as long as it lived while
-    /// its healthy siblings kept the heartbeat fresh, and every VM of the
-    /// cluster would wait on evidence that was never coming. A session that
-    /// has not spoken within `MUTE_AFTER_SECS` therefore yields to one that
-    /// has; if none has, the newest Hello holds it and the wait is honest.
+    /// Select the newest recently reporting session, breaking Hello ties by ID.
+    /// Commands and accepted status use this one stream so arrival order can support
+    /// the ACK/status freshness check; independent streams cannot provide that order.
+    /// A session silent beyond `MUTE_AFTER_SECS` yields to a reporting sibling.
+    /// If all are silent, retain the newest Hello and await evidence.
     fn speaker(sessions: &HashMap<u64, Session>, cluster: &str, now: DateTime<Utc>) -> Option<u64> {
         let mine = || sessions.iter().filter(|(_, s)| s.cluster == cluster);
         let talking = |s: &Session| {
@@ -335,18 +308,9 @@ impl SessionRegistry {
         id
     }
 
-    // --- lane 5A: a certificate that was taken back while it talked -------
-    /// End every session whose certificate is on this list.
-    ///
-    /// The sessions are ended the way a refused Hello is ended — an error
-    /// down the stream — and NOT by taking the entry out of the map: the
-    /// stream unwinding is what runs `closed`, and `closed` is what marks
-    /// the cluster gone. Removing the entry here would take the teardown
-    /// away from the path that owns it, and the cloud would keep a cluster
-    /// listed that nobody can talk to.
-    ///
-    /// Returns what was ended, for the log line: a revocation nobody can see
-    /// in a journal is a revocation nobody can prove.
+    /// End revoked sessions by sending a stream error. Let stream teardown run
+    /// `closed` and update cluster connectivity; removing the map entry here would
+    /// bypass that lifecycle. Return affected identities for logging.
     pub async fn drop_revoked(
         &self,
         list: &controller_api::auth::RevocationList,
@@ -445,15 +409,8 @@ impl SessionRegistry {
         Some(gone.cluster)
     }
 
-    /// Send one command to a cluster's session and wait for its CommandResult.
-    ///
-    /// The speaker's session, and only its: a command answered on a stream
-    /// other than the one the cloud reads its evidence from would break the
-    /// ordering the teardown proof rests on (see `speaker`).
-    /// Send one message down a cluster's session without waiting.
-    ///
-    /// Beside `send_command` for the same reason the tier below has one: a
-    /// console frame carries no request_id and nothing acks it.
+    /// Send an unacknowledged message to the cluster's selected speaker.
+    /// Console frames have no request ID and do not produce CommandResults.
     pub async fn send_to(&self, cluster: &str, msg: proto::CloudMessage) -> bool {
         let tx = {
             let sessions = self.sessions.lock().unwrap();
@@ -542,15 +499,8 @@ enum Step {
     Stop,
 }
 
-/// One dialled-in cluster-controller, for as long as its stream lives: what it
-/// may write to, what it may be sent down, and who its certificate said it is.
-///
-/// The handler used to hold all of this in the locals of one spawned block,
-/// with the three message kinds inlined into the match arms — one function
-/// that was the connection state machine, the identity check, the hello, the
-/// status ingest and the teardown at once. Split into named steps, each of
-/// them is a paragraph that can be read on its own, and the loop below says
-/// only what the loop actually decides: read, dispatch, stop or go on.
+/// State and handlers for one cluster-controller connection, including identity,
+/// message dispatch and teardown.
 struct Connection {
     registry: std::sync::Arc<SessionRegistry>,
     store: std::sync::Arc<EtcdStore>,

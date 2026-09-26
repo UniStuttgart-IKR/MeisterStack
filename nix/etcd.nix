@@ -2,27 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# The tier's etcd. Single-member and loopback-only by default: the controller
-# on the same VM is the only client (Oakestra-style — each tier's etcd is
-# private to its controller).
-#
-# `meisterstack.etcd.peers` turns the same module into one member of a static
-# three-member cluster, which is what the leaderless HA of the design needs:
-# one logical etcd per tier, a member next to every controller replica, Raft
-# between them, and every controller still talking to its own 127.0.0.1. Only
-# peer traffic goes over the VM IP. Empty peers = exactly the single member of
-# before, so the existing image is unchanged until someone sets the option.
-#
-# Static bootstrap on purpose: the members are known when the lab is laid out,
-# so `initial-cluster` names all three and nothing has to discover anything.
-# The price is that the peer set is build-time — this member's name must be
-# `member` (default: the hostname baked into the image), which means one
-# nixosConfiguration per control-plane VM rather than the one role-agnostic
-# image the single-member lab shares today.
-#
-# Optional persistence: attach a second disk in OpenNebula, mkfs.ext4 once,
-# and /var/lib/etcd survives image updates; without it the mount is skipped
-# (nofail) and etcd lives on the root disk.
+# Run a local etcd member for controller roles. Clients use loopback; optional
+# static peers use the configured management addresses. Data can live on a
+# separate filesystem. This module does not configure peer TLS.
 { lib, pkgs, config, ... }:
 let
   cfg = config.meisterstack.etcd;
@@ -79,12 +61,7 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # etcdctl on the box, for the same reason `alloy` is in
-    # nix/observability.nix: the first question about a control plane that is
-    # not answering is what its database says, and `deploy/check.sh` and
-    # `meister-deploy` both ask it over ssh. It travelled in nix/base.nix
-    # until M1, which made it a property of the IMAGE rather than of the
-    # database it talks to.
+    # Provide etcdctl for local health and membership inspection.
     environment.systemPackages = [ pkgs.etcd ];
 
     assertions = [
@@ -99,30 +76,11 @@ in
 
     services.etcd = {
       enable = true;
-      # Clients stay local in both shapes: the controller next to this member
-      # is the only one, and a replica that loses quorum should stall on its
-      # own member rather than quietly write through a healthy neighbour.
+      # Keep client access local even when peer replication spans hosts.
       listenClientUrls = [ "http://127.0.0.1:2379" ];
       advertiseClientUrls = [ "http://127.0.0.1:2379" ];
-      # Keep an hour of history and no more.
-      #
-      # etcd keeps EVERY revision until somebody compacts, and nothing in
-      # this stack was that somebody. A control plane writes a revision per
-      # heartbeat per node per pass — the lab writes some hundreds a minute
-      # doing nothing at all — so the store grows without bound and stops at
-      # the 2 GiB default quota with `mvcc: database space exceeded`. Then
-      # NOTHING can be written: no vm create, no delete, no phase, and the
-      # only symptom above is that objects stop moving. That is where a day
-      # of chaos runs put this lab on 2026-09-10, and getting out of it was
-      # compact, restart (to drop the failed defrag's temp file, which had
-      # itself filled the disk), defrag, disarm — three times.
-      #
-      # An hour is the same order as the objects it protects: nothing here
-      # reads a revision older than the pass that wrote it, and the one thing
-      # that would — a watch that reconnects with an old revision — falls back
-      # to a fresh list. Periodic and not revision-based, because the number
-      # of revisions per hour is a property of the fleet's size and the
-      # retention should not be.
+      # Compact revision history after one hour to bound retained watch history.
+      # Consumers must recover from compacted watch revisions by relisting.
       extraConf = {
         AUTO_COMPACTION_MODE = "periodic";
         AUTO_COMPACTION_RETENTION = "1h";
@@ -136,71 +94,19 @@ in
       initialClusterToken = cfg.clusterToken;
     };
 
-    # --- lane L4: a member of a cluster that does not exist yet is still up.
-    #
-    # nixpkgs' unit is `Type = "notify"`, and etcd notifies readiness only
-    # once the cluster has a LEADER. A three-member cluster with
-    # `initial-cluster-state = new` has no leader until a majority of its
-    # members is running, so the FIRST member to be activated can never
-    # become ready on its own: systemd's start timeout kills it, and with it
-    # `switch-to-configuration`.
-    #
-    # Measured in the lab on 2026-09-23 (lane L4), on the first activation of
-    # a three-member raft:
-    #
-    #   prober detected unhealthy status … dial tcp 10.128.1.120:2380:
-    #     connect: connection refused
-    #   etcd.service: start operation timed out. Terminating.
-    #   switch-to-configuration switch exited 4 … the following units
-    #     failed: etcd.service
-    #
-    # and `meister-deploy` — correctly — took the host back and stopped the
-    # rollout. It could not have been anything else: the rollout moves ONE
-    # member of a raft group per wave (D8, and that is right for a group that
-    # is SERVING), so the second member is by definition not there yet when
-    # the first one activates. A fresh raft could therefore not be
-    # bootstrapped at all.
-    #
-    # `exec` is the honest readiness for this unit: the claim it makes is
-    # "the process is up and listening", which is exactly as much as a single
-    # member of a forming cluster can claim. Whether the cluster FORMED is a
-    # different question, it is asked by a different thing
-    # (`etcdctl endpoint health`, which is `meister-deploy`'s `etcd` check
-    # and the D8 arithmetic), and answering it here would mean an activation
-    # that depends on a machine somebody else has not activated yet.
-    #
-    # `Restart = "always"` stays what nixpkgs sets, so a member that dies
-    # because it never found its peers comes back and keeps trying.
-
-    # By label, not by device name: which slot the datablock lands in depends
-    # on the OS image's DEV_PREFIX and the attach order — /dev/vdb silently
-    # became sda+vda twice in the lab, and etcd silently lived on the root
-    # disk. The label is IN the filesystem (mkfs.ext4 -L etcd-data, or
-    # e2label once), so it survives image swaps and bus surprises alike.
-    #
-    # Only in the historical shape. `meisterstack.data.label = "meister-data"`
-    # (nix/data.nix) mounts ONE block for etcd and the addons together and
-    # points etcd at a subdirectory of it instead; two fileSystems entries for
-    # one mount point would be a conflict rather than a choice.
+    # Use process startup as systemd readiness. Waiting for a Raft leader would
+    # block the first member of a new multi-member group and prevent sequential
+    # bootstrap. Deployment health checks separately require a working quorum.
+    # Keep automatic restart so early members continue trying as peers arrive.
     fileSystems."/var/lib/etcd" = lib.mkIf (config.meisterstack.data.label == "etcd-data") {
       device = "/dev/disk/by-label/etcd-data";
       fsType = "ext4";
       options = [ "nofail" "x-systemd.device-timeout=5s" ];
     };
 
-    # The runtime twin of `peers`: the context renderer writes ETCD_* into
-    # this file from MEISTER_ETCD_PEERS/_MEMBER/_TOKEN. EnvironmentFile
-    # overrides the module's Environment=, so a context-driven lab clusters
-    # the SAME role-agnostic image that build-time `peers` clusters for
-    # NixOS-first deployments. Absent file (the `-`) = exactly the baked
-    # behaviour.
-    #
-    # Only where a renderer exists. A managed host sets `peers`, `member` and
-    # `clusterToken` above — Nix knows them at build time — and a second
-    # author of the same three values at boot is how two halves start
-    # disagreeing about who is in the Raft.
+    # Allow an optional runtime environment file to supply context-based membership.
     systemd.services.etcd = lib.mkMerge [
-      # --- lane L4: see the block above `services.etcd` ---
+      # Apply the same process-readiness policy to this unit variant.
       { serviceConfig.Type = lib.mkForce "exec"; }
       (lib.mkIf config.meisterstack.context.enable {
         after = [ "meister-context.service" ];

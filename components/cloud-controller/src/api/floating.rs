@@ -7,19 +7,13 @@
 
 use super::*;
 
-// --- floating pools, reservations, routed subnets ---------------------------
+// Administrators define address pools and routed subnets; tenants reserve
+// floating addresses within their quotas. Middleware checks resource verbs;
+// these handlers check ownership and allocation.
 //
-// Three resources and one rule that runs through all of them: what EXISTS is
-// an administrator's decision, and taking one address out of what exists is
-// self-service inside a quota. The middleware already enforces the verb half
-// of that (`floatingips` is tenant-scoped and writable by a member, the other
-// two are not), so what is left here is the object half and the arithmetic.
-//
-// Nothing in this section routes a packet. A reservation is a statement about
-// ownership; the node turns it into an nftables rule and, with `[network.bgp]`,
-// into a /32 announcement. How the address gets from the outside world to a
-// host is the environment's business — a static route towards the nodes, or
-// the BGP session Part C opens.
+// These objects do not route packets themselves. Nodes install the rules and,
+// when BGP is configured, announce addresses. The fabric must route traffic to
+// those nodes.
 
 /// A member sees its own tenant's reservations. Same filter and same reason as
 /// `list_vms`: the addresses somebody holds are an inventory.
@@ -41,15 +35,9 @@ pub(super) async fn list_floating_ips(
     ))
 }
 
-/// Reserve an address.
-///
-/// The object's name is the address and the server sets it, which is why the
-/// request body carries no useful `metadata.name`: an address a client could
-/// name into existence is an address two clients could name into existence.
-/// The explicit wish travels in `spec.address` instead, and is either granted
-/// or refused with the reason — never quietly replaced by another address,
-/// because a caller who asked for `203.0.113.7` asked for the one their DNS
-/// already points at.
+/// Reserve the requested address, or allocate one when `spec.address` is empty.
+/// The server names the object after its address so competing reservations
+/// collide on the same store key. An explicit address is never substituted.
 pub(super) async fn create_floating_ip(
     State(st): State<ApiState>,
     caller: Caller,
@@ -283,27 +271,10 @@ pub(super) async fn check_pool(
     Ok(())
 }
 
-// --- claiming address space, and the race the store cannot arbitrate --------
-//
-// `check_pool` and `create_routed_subnet` both read the store, decide, and
-// then write — and between the read and the write a second request can do the
-// whole of the same thing. One resource over, `floating::allocate` has no such
-// window, and the reason is worth naming: there the object's NAME is the
-// address, so two allocators racing for one gap write the same key and etcd's
-// own create is the compare-and-swap. Here the name is whatever an admin
-// called the pool or the subnet, so two claims on one range are two writes to
-// two different keys and both of them succeed. The store cannot arbitrate what
-// it cannot see as a collision.
-//
-// The cleanest fix would be to give the range a key of its own — a reservation
-// object whose name IS the canonical CIDR, exactly the trick the floating side
-// plays — so that etcd arbitrates this the way it arbitrates an address. That
-// needs a new resource in `controller-api` and is not built here.
-//
-// What is built here instead: repeat the check once the object IS in the
-// store, where a concurrent claim is finally visible, and have the loser take
-// itself back. The tie is broken on the one total order both sides agree about
-// without talking to each other — etcd's revision.
+// Range claims use administrator-chosen names, so overlapping ranges can
+// be created under different keys after concurrent checks. Recheck after
+// creation and roll back the later etcd revision. Floating addresses instead
+// use the address as their key, making store creation arbitrate the race.
 
 /// One thing already in the store that a claim collides with: what to call it
 /// in the refusal, and the revision of the write that put it there.
@@ -571,15 +542,9 @@ mod tests {
         }
     }
 
-    /// The race the store cannot arbitrate, settled after both writes landed.
-    ///
-    /// Two POSTs a millisecond apart both read a store without the other in it
-    /// and both created their object, because the key is a name an admin chose
-    /// and not the range. So the verdict is reached afterwards, and it has to
-    /// come out the same on both sides without them talking: the later etcd
-    /// revision is the one that takes itself back. Two keepers would be two
-    /// tenants routed the same addresses; two yielders only cost a retry,
-    /// which is why an unreadable revision yields.
+    /// Concurrent overlapping claims keep the earlier etcd revision.
+    /// An unreadable revision yields conservatively: an extra retry is preferable
+    /// to retaining conflicting allocations.
     #[test]
     fn of_two_claims_on_one_range_exactly_one_takes_itself_back() {
         let first = collided("routed subnet a (tenant one)", "100");

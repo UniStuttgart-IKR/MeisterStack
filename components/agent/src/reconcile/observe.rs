@@ -2,43 +2,31 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What IS: the node as this pass can see it, and the same picture as the
-//! controller is told it.
+//! Observe host resources and derive VM status reports from persisted records.
 //!
-//! Every field of `Observed` is measured and none is remembered. Two of them
-//! are deliberately two questions about one number — see `observe` — because
-//! a pid is reused and a cgroup slice outlives the crash that left it behind,
-//! and either alone eventually reports a stranger as this VM's hypervisor.
-//!
-//! Moved out of `reconcile.rs` unchanged.
+//! Process identity, cgroup membership, socket responsiveness and guest state are
+//! separate observations. A socket response alone does not prove guest liveness.
 
 use super::*;
 
-// Copy because it is a plain observation value and the exhaustive net in
-// tests/ builds tens of thousands of them.
+// Observation values are copied throughout finite-space planner tests.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Observed {
     pub tracked: bool,
     pub vmm_alive: bool,
     pub socket_responsive: bool,
-    /// Every backend process this VM has — device and volume alike — is
-    /// still in its cgroup slice. Attachments with no process behind them
-    /// (passthrough, mdev, a file, a block device) are always "alive".
+    /// Whether all device and volume backend processes remain in the VM slice.
+    /// Attachments without a process impose no liveness check.
     pub backends_alive: bool,
     pub guest: Option<VmState>,
-    /// The driver explicitly established a failed receive. Deadlines alone
-    /// cannot establish this fact.
+    /// Driver-reported receive failure. Deadlines in the VM record do not set
+    /// this field; the current CH adapter also reports uncertain API errors here.
     pub receive_failed: bool,
 }
 
-/// Every backend process this VM has, device and volume alike.
-///
-/// Both halves of the spec, one question. A virtiofsd serving a share is as
-/// much a backend as a vhost-user GPU is, and a VM that lost one is in the
-/// same condition either way — so the attachments answer `backend_pid` and
-/// this walks both lists rather than each being matched on at the one place
-/// that asks. Attachments with no process behind them (passthrough, mdev, a
-/// file, a block device) contribute nothing and are never "dead".
+/// Backend PIDs from device and volume attachments.
+/// Attachments without a process contribute nothing; recorded detached
+/// volume attachments are still present in this iterator.
 pub(crate) fn backend_pids(record: &VmRecord) -> impl Iterator<Item = u32> + '_ {
     record
         .devices
@@ -61,38 +49,11 @@ pub(crate) fn backend_pids(record: &VmRecord) -> impl Iterator<Item = u32> + '_ 
 pub const BACKEND_DIED_REASON: &str = "backend process died while the vmm is running, automatic restart \
      is disabled - use start/stop/destroy to repair";
 
-/// A backend died while the VMM kept running — the condition the
-/// reconciler marks unhealthy and refuses to repair automatically. Shared
-/// between the marking in `reconcile` and the preview in `dry_run`, so
-/// `observe` shows the same decision a real pass would make.
+/// Detect a missing backend while the VMM remains alive. Both reconciliation
+/// and dry-run use this condition to predict quarantine.
 ///
-/// # `obs.vmm_alive` is a guard and not a detail
-///
-/// A DEAD VMM is not this condition, and the chaos run made the difference
-/// worth writing down: killing a VMM was expected to quarantine and instead
-/// went `Running -> Provisioning -> Running` in fifteen seconds. The code is
-/// right and the expectation was wrong.
-///
-/// Recovering is the better answer because a dead VMM leaves nothing to
-/// diagnose in place: the backends exit when their VMM hangs up — that is
-/// how they are built, see `meister-backend`'s module doc — so by the next
-/// pass the VM is a record and no processes, and the only two things that can
-/// happen to it are "build it again" or "leave it broken until a person
-/// notices". Rebuilding is idempotent by design (a re-provision finds the
-/// same volumes and reattaches them), and the alternative is an outage that
-/// lasts until somebody reads a dashboard.
-///
-/// The quarantine keeps the case it was built for and only that one: a
-/// backend that died UNDER a live VMM. There the VM is still running, still
-/// serving, and half its hardware is gone — a guest whose disk backend
-/// vanished is a guest doing IO into nothing. Restarting it automatically
-/// would be a reboot of a live machine on the strength of a condition nobody
-/// has looked at, and the repair almost always has to happen on the host
-/// first. So: dead VMM, no guest, rebuild; live VMM, dead backend, stop and
-/// wait for a person.
-///
-/// The test that keeps the two apart is
-/// `a_killed_vmm_recovers_and_a_backend_that_dies_under_a_live_one_does_not`.
+/// A dead VMM instead follows normal reprovisioning. A live VMM with a lost
+/// backend requires intervention because its device cannot be reconnected safely.
 pub fn backend_died_under_vmm(record: &VmRecord, obs: &Observed) -> bool {
     record.phase == Phase::Provisioned
         && matches!(record.desired, Desired::Running | Desired::Paused)
@@ -114,10 +75,7 @@ pub enum ReportedPhase {
 }
 
 impl ReportedPhase {
-    /// Every variant, in declaration order. What the status report walks to
-    /// publish a zero for the phases nothing is in — a phase that stops being
-    /// written looks, in a dashboard, exactly like an agent that stopped
-    /// reporting.
+    /// All phases in declaration order, including zero-count metric series.
     pub const ALL: [ReportedPhase; 6] = [
         ReportedPhase::Provisioning,
         ReportedPhase::Running,
@@ -140,85 +98,38 @@ impl ReportedPhase {
 }
 
 // ---------------------------------------------------------------------------
-// Why, and not only what.
-//
-// A phase this node sends upwards used to be one word and, at best, a
-// sentence beside it. The word is what a program branches on and the sentence
-// is what a person reads, and for four of the six phases below there was no
-// word for WHY at all: `Provisioning` did not say whether a pass was working
-// or a backoff was waiting, `Failed` did not say what had broken, and
-// `Quarantined` carried its reason in prose only.
-//
-// So: one enum per resource this node reports, `Copy`, with `as_str`, `parse`
-// and `ALL`, exactly as `RunStrategy` and `PendingReason` are built. The
-// strings are what goes on the wire (`control.proto`: `reason` on
-// VmStatusReport, VolumeStateReport, ImageStateReport, RouterReport) and they
-// are STRINGS on purpose: this agent does not depend on `controller-api` —
-// see `proto::CANNOT_SERVE` for the same decision about `ErrorMsg.reason` —
-// so it cannot name the control plane's variants, and a shared crate just for
-// these words would be the dependency the split exists to avoid.
-//
-// Every reason here comes from a place in this tree that already writes the
-// same fact into `message`; `reason_table` gathers them and one test holds
-// that table against the list in the round's report, so a word cannot be
-// added, renamed or dropped in silence.
-// ---------------------------------------------------------------------------
+// Reason enums supply stable wire values separately from operator messages.
+// The agent avoids a controller-api dependency; tests compare this vocabulary
+// with proto::reasons, which both sides of the connection share.
 
-/// Why a VM is in the phase this node reports for it.
-///
-/// `None` is correct for `Running`, `Stopped` and `Paused`: those three say
-/// everything there is to say. Every other phase carries one of these, which
-/// is what `no_vm_phase_but_a_settled_one_leaves_this_node_without_a_reason`
-/// keeps true.
+/// Reason for a reported VM phase. Running, Stopped and Paused omit a reason;
+/// other phases explain whether the VM is waiting, failing or quarantined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmReason {
     /// `Provisioning`: a pass is building this VM and the last attempt did
     /// not fail. The ordinary road up to `Running`.
     Working,
-    /// `Provisioning`: the last attempt DID fail and the retry schedule is
-    /// waiting. The message is that attempt's error, which is the half of
-    /// this state nobody could see — the count alone says a VM is not coming
-    /// up and never says what stopped it.
+    /// `Provisioning`: waiting to retry a failed attempt; the message retains its error.
     Backoff,
-    /// `Provisioning`: this node is a live migration's destination and the
-    /// guest has not arrived. Which machine to look at is the whole content
-    /// of the line; see `report_status`.
+    /// `Provisioning`: the migration destination has not observed guest arrival.
     AwaitingGuest,
     /// `Provisioning`: this node WAS a live migration's source and the guest
     /// is on the other machine now.
     GuestLeft,
-    /// `Failed`: the reception did not finish and this node is giving back
-    /// the VMM, the disks and the taps it made. The guest is still running
-    /// where it was — see [`RECEIVE_FAILED_REASON`].
+    /// `Failed`: receiver failure was reported and cleanup is pending.
+    /// This observation alone does not establish source-side guest liveness.
     ReceiveFailed,
-    /// `Failed`: the VMM this record names is gone or does not answer its
-    /// socket, and the passes that tried to rebuild it keep failing. The
-    /// first of the three failure classes `plan` distinguishes.
+    /// `Failed`: the VMM is absent or unresponsive and recovery attempts failed.
     VmmGone,
-    /// `Quarantined`: a backend process died while the VMM went on running —
-    /// the second class, and the one no pass may repair by itself. See
-    /// [`BACKEND_DIED_REASON`] and `backend_died_under_vmm`.
+    /// `Quarantined`: a backend died under a live VMM; automatic repair is blocked.
     BackendGone,
     /// `Quarantined`: the guest did not come back from a pause however often
     /// it was resumed. See `act::RESUME_INEFFECTIVE_REASON`.
     ResumeIneffective,
-    /// `Provisioning`: the intent for this VM is `Absent` and this node has
-    /// not finished taking it apart. Its VMM may still be running and its
-    /// disks may still be open.
-    ///
-    /// The word exists because the report used to LEAVE such a record out —
-    /// `report` skipped every `Desired::Absent` row, so the guest vanished
-    /// from this node's report the moment the intent was written, hours
-    /// before the last driver call. One tier up that absence is read as "the
-    /// node has let go" (`session::ingest::forget_unbound`), and a VM can be
-    /// placed on another machine while this one's VMM still holds the
-    /// volumes. `volumes.rs` documents the same hazard from the disk's side.
-    /// Astra finding S12, 2026-09-23.
+    /// Deletion is requested but teardown has not finished. Keep reporting the
+    /// VM and its referenced volumes until the record is removed.
     Stopping,
-    /// A marker this build does not recognise — a record written by another
-    /// version of this agent. The sentence it carries travels on unchanged,
-    /// because an agent that has drifted has to be visible rather than
-    /// silent (the same rule the controller reads unknown words by).
+    /// An unknown persisted marker. Preserve its message so version drift remains visible.
     Unrecorded,
 }
 
@@ -257,13 +168,8 @@ impl VmReason {
     }
 }
 
-/// Why a volume of this node is in the phase it reports.
-///
-/// It rides on the RECORD (`types::VolumeRecord::reason`) and not on the
-/// report, and that is the difference between this and the VM half: a VM's
-/// phase is derived on every heartbeat from a fresh observation, and a
-/// volume's is what the pass that asked a driver wrote down. The party that
-/// knows why is that pass, an hour before anybody asks.
+/// Reason persisted by the last volume operation. Unlike VM status, this
+/// report is not recomputed from a fresh backend observation each heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VolumeReason {
     /// `Provisioning`: the record is written and the driver has been asked,
@@ -271,17 +177,12 @@ pub enum VolumeReason {
     Working,
     /// `Failed`: the backend said no. `message` is what it said.
     DriverRefused,
-    /// `Failed`: the backend has no volume of that name any more, and it did
-    /// when this node last wrote the record. Its own word and not
-    /// [`VolumeReason::DriverRefused`], because the operator fix is not a
-    /// retry: this is somebody's data missing, found by `Volumes::adopt` at
-    /// start-up.
+    /// Startup adoption could not find previously recorded data on the backend.
+    /// This differs from a driver refusing a new provisioning request.
     NotOnBackend,
-    /// `Gone`: this node was told to deprovision and has. The tombstone the
-    /// tier above may release a volume on — see `VolumeRecordPhase::Gone`.
+    /// `Gone`: explicit completed deprovision evidence retained as a tombstone.
     Deprovisioned,
-    /// A record from another build of this agent, which had no reason on it.
-    /// Its `message` is unchanged.
+    /// Legacy record without a reason; preserve its message.
     Unrecorded,
 }
 
@@ -309,14 +210,8 @@ impl VolumeReason {
     }
 }
 
-/// Why a snapshot of this node is in the phase it reports.
-///
-/// The volume's words minus the ones a copy cannot be in, and on the record
-/// for the same reason (`SnapshotRecord::reason`): the pass that asked the
-/// driver is the one that knows. Three and a fallback — a copy has fewer ways
-/// to go wrong than the disk it came from, because nothing ever attaches one:
-/// there is no `NotOnBackend` here, since only `adopt` finds that condition
-/// and it walks volumes.
+/// Reason persisted by the last snapshot operation. Startup adoption currently
+/// checks volumes only, so there is no snapshot NotOnBackend reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SnapshotReason {
     /// `Creating`: the record is written and the driver has been asked, or is
@@ -324,11 +219,9 @@ pub enum SnapshotReason {
     Working,
     /// `Failed`: the backend said no. `message` is what it said.
     DriverRefused,
-    /// `Gone`: this node was told to drop it and has. The tombstone the tier
-    /// above may forget a `VolumeSnapshot` on — see `SnapshotRecordPhase`.
+    /// `Gone`: explicit completed snapshot-drop evidence retained as a tombstone.
     Dropped,
-    /// A record from another build of this agent, which had no reason on it.
-    /// Its `message` is unchanged.
+    /// Legacy record without a reason; preserve its message.
     Unrecorded,
 }
 
@@ -354,28 +247,18 @@ impl SnapshotReason {
     }
 }
 
-/// Why a base image is not usable on this node.
-///
-/// No `Unrecorded` here, and the absence is the point: this table is held in
-/// memory and re-derived from the disk (`images::Cache`), so there is no
-/// stored opinion from an older build for one to come out of.
+/// Failure reason held in the in-memory image cache; there are no legacy
+/// persisted reasons requiring an Unrecorded variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageReason {
-    /// `Failed`: a path image whose bytes are not at the path this node
-    /// looks at. The F16 word — a catalogue entry pointing at nothing used to
-    /// read `Ready` because no node had ever said anything about it.
+    /// `Failed`: the configured local image path is absent.
     NotFound,
     /// `Failed`: something IS at that path and it is a directory. Saying
     /// `Ready` about one would hand a storage driver a path it cannot open.
     NotAFile,
-    /// `Failed`: a url image arrived and hashes to something else than the
-    /// spec said. Its own word because the fix is a different one — the
-    /// bytes at the url changed, or the checksum in the spec is wrong — and
-    /// because a checksum that stopped being checked is how D-H4 happened.
+    /// `Failed`: downloaded image bytes do not match the specified checksum.
     ChecksumMismatch,
-    /// `Failed`: the bytes did not arrive at all, or could not be put in
-    /// place. The url did not answer, `curl` is not on the PATH, the cache
-    /// could not be written.
+    /// `Failed`: image transfer or publication failed.
     FetchFailed,
 }
 
@@ -401,19 +284,9 @@ impl ImageReason {
     }
 }
 
-/// Every word this node may put in a `reason`, resource by resource.
-///
-/// One list so that there IS one list: the four enums live where the party
-/// that writes them lives — three here, the router's in `agent-api` beside
-/// `RouterPhase`, because the network driver is what looks and the driver
-/// cannot depend on this crate — and a vocabulary spread over two crates is
-/// one nobody can read off in one place. The test below holds it against
-/// `proto::reasons`, which is the same list the CONTROLLER parses these words
-/// with; `proto` is the one crate both ends of that wire share.
-///
-/// Storage pools are deliberately absent, and they are the only thing that
-/// is: a node reports DRIVERS (`DriverInfo`, with their locality) and never a
-/// pool, so the pool's `reason` is filled one tier up.
+/// Collect the VM, volume, snapshot, image and router reason vocabulary.
+/// Tests compare it with proto::reasons. Storage-pool reasons belong to the
+/// controller because the agent reports drivers and volumes, not pool objects.
 pub fn reason_table() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         ("Vm", VmReason::ALL.iter().map(|r| r.as_str()).collect()),
@@ -439,21 +312,10 @@ pub fn reason_table() -> Vec<(&'static str, Vec<&'static str>)> {
     ]
 }
 
-/// What this node says about one VM: the phase, the word that says WHY it is
-/// in that phase, and the sentence an operator reads.
-///
-/// A struct and not the triple, and the reason is the diff this round is
-/// about: `message` used to be the second slot. Putting the reason in the
-/// middle of a tuple would have left every existing `.1` compiling and
-/// silently reading the other field — a phase that lies about itself is
-/// exactly the shape of failure this round exists to remove, and reproducing
-/// it in the fix would be a poor start.
+/// Derived phase, stable reason and operator message for a VM.
 pub struct Reported {
     pub phase: ReportedPhase,
-    /// `None` for `Running`, `Stopped` and `Paused`, and for nothing else.
-    /// Those three say everything there is to say; every other phase this
-    /// node reports is a state somebody has to act on, and one that does not
-    /// say what it is waiting for or what broke cannot be acted on.
+    /// Absent only for Running, Stopped and Paused; other phases carry a reason.
     pub reason: Option<VmReason>,
     pub message: Option<String>,
 }
@@ -468,9 +330,7 @@ impl Reported {
         }
     }
 
-    /// Every other phase. There is no constructor without a reason, which is
-    /// how "no phase but a settled one leaves this node mute" is kept by the
-    /// type rather than by everybody remembering.
+    /// Construct a non-settled phase with a required machine-readable reason.
     fn because(phase: ReportedPhase, reason: VmReason, message: Option<String>) -> Self {
         Self {
             phase,
@@ -480,14 +340,8 @@ impl Reported {
     }
 }
 
-/// Which quarantine this is, from the marker the reconciler left.
-///
-/// The marker is a sentence and the sentences are constants, so this is a
-/// comparison against the two that exist rather than a reading of prose.
-/// Anything else is a record written by another build of this agent: its
-/// sentence travels on unchanged under [`VmReason::Unrecorded`], because an
-/// agent that has drifted has to be visible and dropping the line would hide
-/// exactly the VM a person has to look at.
+/// Map known persisted quarantine messages to stable reasons. Preserve unknown
+/// messages as Unrecorded rather than guessing their meaning.
 fn quarantine_reason(marker: &str) -> VmReason {
     match marker {
         BACKEND_DIED_REASON => VmReason::BackendGone,
@@ -496,27 +350,9 @@ fn quarantine_reason(marker: &str) -> VmReason {
     }
 }
 
-/// What the controller should show, from the same record and observation
-/// `plan` decides on — the report is a view of the reconciler's world, not a
-/// second one. `failures` is the consecutive-failure count of the backoff
-/// (0 = the last pass was fine), which is what separates "the agent is
-/// working on it" from "the agent keeps failing at it", and `last_error` is
-/// what that last failed pass said.
-///
-/// `last_error` travels because a count is not a diagnosis. A VM stuck in
-/// `Provisioning` for ten minutes used to report the number of attempts and
-/// nothing about what stopped them; the sentence was in the node's log, which
-/// is the one place the person reading the API cannot see.
-///
-/// `Desired::Absent` is not a phase: those records are on their way out and
-/// the caller drops them from the report instead.
-/// The `Volume` objects this record currently HOLDS, by uid.
-///
-/// Joined across the two halves of the record on purpose: `record.volumes` is
-/// what the drivers actually made or attached, and `record.spec.volumes` is
-/// what says which of those belong to an object one tier up. Neither alone is
-/// the answer — the spec would report a disk the attach failed on, and the
-/// held list would report an inline disk under an id nobody up there knows.
+/// IDs present in both the recorded attachments and referenced-volume spec.
+/// This list excludes inline disks but retains recorded detached attachments;
+/// VolumeStateReport.open is derived separately.
 pub fn attached_volumes(record: &VmRecord) -> Vec<agent_api::VolumeId> {
     record
         .volumes
@@ -532,20 +368,8 @@ pub fn attached_volumes(record: &VmRecord) -> Vec<agent_api::VolumeId> {
         .collect()
 }
 
-/// The taps this node actually MADE for a VM, and the address on each.
-///
-/// Read off `record.nics` and never off `record.spec.nics`, which is the same
-/// distinction `attached_volumes` above draws and it matters for the same
-/// reason: the spec is what the controller asked for, the record is what the
-/// driver came back with. A NIC whose tap was never made has no entry here,
-/// and neither has one whose driver does not know an address — no `mac`, no
-/// line, rather than a line with an empty address in it.
-///
-/// The name is the position, because a VM spec's NICs are an ordered list and
-/// nothing gives one a name of its own. `record.nics` is filled by walking
-/// `spec.nics` in order, so index `i` here is `spec.nics[i]` up there — the
-/// same correspondence the hypervisor spec already rides on (see
-/// `provision::seed`).
+/// Report recorded NICs with known MACs. Positions follow the record
+/// list; requested NICs without a recorded attachment contribute no entry.
 pub fn reported_nics(record: &VmRecord) -> Vec<ReportedNic> {
     record
         .nics
@@ -560,7 +384,7 @@ pub fn reported_nics(record: &VmRecord) -> Vec<ReportedNic> {
         .collect()
 }
 
-/// One tap of a VM, as the tier above should read it.
+/// NIC identity and addresses included in a VM status report.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReportedNic {
     /// `nics[0]`, `nics[1]` — the spec's own way of pointing at a NIC.
@@ -569,15 +393,11 @@ pub struct ReportedNic {
     pub mac: String,
 }
 
-/// What a destination says about a reception that will not finish. One
-/// string for the report and the log, for the reason `BACKEND_DIED_REASON`
-/// is one.
+/// Shared report and log message for failed-receive cleanup.
 pub const RECEIVE_FAILED_REASON: &str = "the guest did not arrive; this node is giving back the vmm, the disks and the taps it \
      made for it, and the vm is still running where it was";
 
-/// What a node says about a VM it has been told to take apart and has not
-/// finished taking apart. One string for the report and the log, for the
-/// reason the two above are one.
+/// Shared report and log message for incomplete VM teardown.
 pub const STOPPING_REASON: &str = "the intent for this vm is gone and this node has not finished taking it apart; its \
      vmm and its disks may still be here";
 
@@ -599,39 +419,15 @@ pub fn report_status(
     if record.desired == Desired::Stopped && !obs.vmm_alive {
         return Reported::settled(ReportedPhase::Stopped);
     }
-    // The two migration phases report `Provisioning` with a sentence, and
-    // both choices are deliberate.
-    //
-    // `Provisioning` because that is the tier above's word for "in flight,
-    // nothing here to act on", and neither end of a migration is anything
-    // else: the destination has no guest yet, the source has just given one
-    // up. `Running` from either would be a claim that a guest is being served
-    // here, and `Stopped` from the source would flip the vm's phase at the
-    // cluster in the middle of a migration that is going well.
-    //
-    // The sentence is the half that matters: a phase that says "in flight"
-    // and nothing else is the state an operator cannot act on, and these two
-    // are the states where knowing WHICH machine to look at is the whole
-    // question.
+    // Report migration progress separately from ordinary stopped state.
+    // Observed Running can establish destination arrival before the phase updates.
     match record.phase {
         Phase::Receiving => {
-            // The GUEST decides, not the phase. The phase flips on the next
-            // reconcile pass — thirty seconds away at worst — and the report
-            // goes out every ten, so a report that waited for it would tell
-            // the tier above that this node is empty while a guest is running
-            // on it. That window is not academic: it is exactly the one in
-            // which a migration's transfer timeout fires, and the tier above
-            // decides what may be torn down by reading this line.
+            // Report observed arrival immediately rather than waiting for the next
+            // reconcile pass to change Receiving to Provisioned.
             return match obs.guest {
                 Some(VmState::Running) => Reported::settled(ReportedPhase::Running),
-                // And the third answer, which used to be the second one's
-                // silence: the guest is not coming and this node is giving
-                // back what it built for it. `Failed` and not `Provisioning`,
-                // because a destination is never the node a VM is BOUND to —
-                // its word about this VM reaches nothing but the migration's
-                // own arrival check — so the only reader of this line is a
-                // person asking why a move did not happen, and "in flight"
-                // would be the wrong thing to tell them.
+                // Report an explicit receive failure while cleanup is pending.
                 _ if obs.receive_failed => Reported::because(
                     ReportedPhase::Failed,
                     VmReason::ReceiveFailed,
@@ -657,14 +453,8 @@ pub fn report_status(
         return building(failures, last_error);
     }
     if !obs.vmm_alive || !obs.socket_responsive {
-        // The next pass re-provisions; only a run of failed attempts turns
-        // that from "in flight" into something a human has to look at. When
-        // it has, the word is the failure class and not the schedule: what a
-        // person is being told is that the VMM this record names is not
-        // there, which is the first of the three classes `plan` separates
-        // (the other two are a backend that died under a live VMM —
-        // `backend_died_under_vmm`, quarantined — and a driver that refuses a
-        // create outright, which leaves no record and therefore no line).
+        // A missing VMM initially reports Provisioning; repeated failed repairs
+        // report Failed with the last error and VmmGone reason.
         return if failures > 0 {
             Reported::because(
                 ReportedPhase::Failed,
@@ -693,15 +483,7 @@ pub fn report_status(
     }
 }
 
-/// A VM on its way up, and which of the two that is.
-///
-/// One function for the two places that reach it — a record short of
-/// `Provisioned`, and a VMM whose state cannot be read — because the question
-/// they ask is the same one: is a pass working on this, or is the retry
-/// schedule waiting? The distinction is the whole value of the word.
-/// `Working` is the ordinary road and says "come back in a moment"; `Backoff`
-/// says the last attempt failed, and carries its sentence, which is the half
-/// that never used to leave the node at all.
+/// Distinguish ongoing work from retry backoff and include the last failure message.
 fn building(failures: u32, last_error: Option<&str>) -> Reported {
     if failures == 0 {
         return Reported::because(ReportedPhase::Provisioning, VmReason::Working, None);
@@ -715,21 +497,9 @@ fn building(failures: u32, last_error: Option<&str>) -> Reported {
     )
 }
 
-/// The host routes a set of records asks the world to send it.
-///
-/// Its own function and not a loop inside the caller, because WHICH addresses
-/// end up announced is the whole of the failover semantics and is worth
-/// asserting: a VM that is not running contributes nothing, so a stop, a
-/// teardown and a move to another node all withdraw by the same mechanism —
-/// the address stops being in this set, and the next pass says so.
-///
-/// Only `/32`s, ever. A routed subnet spans hosts and is nobody's to announce
-/// FROM A VM RECORD — a per-node announcement of one would be every node
-/// claiming the whole prefix. 6k gives the prefix a party that may announce
-/// it (a router, which is the thing traffic for the subnet arrives at), and
-/// that set comes out of the network driver beside this one rather than out
-/// of here; see `reconcile::announce_prefixes` and
-/// `linux_network_driver::router::router_prefixes`.
+/// Collect IPv4 floating host routes from records selected by the caller.
+/// The caller filters for running guests. Routed subnet advertisements come
+/// from the router driver, not individual VM records.
 pub fn floating_prefixes<'a>(
     running: impl Iterator<Item = &'a VmRecord>,
 ) -> std::collections::BTreeSet<String> {
@@ -744,20 +514,14 @@ pub fn floating_prefixes<'a>(
 pub struct VmReport {
     pub id: VmId,
     pub phase: ReportedPhase,
-    /// Why that phase, in the one word the wire carries. See [`Reported`].
+    /// Machine-readable phase reason; see `Reported`.
     pub reason: Option<VmReason>,
     pub message: Option<String>,
-    /// The referenced volumes this node has ATTACHED to the VM right now,
-    /// read off the record rather than off the spec.
-    ///
-    /// The difference is the whole value of the field: the spec is what the
-    /// controller asked for and the record is what happened, and a hot-plug
-    /// is finished exactly when the two agree. Inline disks are left out —
-    /// their ids are this node's own and name no object up there.
+    /// Referenced-volume IDs recorded on the VM, excluding inline disks.
+    /// Compare with the requested list to track attachment changes; this field
+    /// does not independently establish that a backend connection remains open.
     pub volumes: Vec<agent_api::VolumeId>,
-    /// The taps this node made for the VM, and the address on each. See
-    /// `reported_nics`: an empty list is "this node knows of none", and the
-    /// tier above reads nothing at all out of one.
+    /// NICs known from this VM's record. An empty list alone is not deletion evidence.
     pub nics: Vec<ReportedNic>,
     /// What this node has to say about a guest it was told to SEND, if it was
     /// told to send this one. See [`departure`].
@@ -840,35 +604,15 @@ pub fn departure(record: &VmRecord) -> Option<Departure> {
 }
 
 impl Reconciler {
-    /// Every tracked VM as the controller should see it. Same observation
-    /// and same unhealthy detection a real pass performs, nothing persisted —
-    /// `dry_run` for the whole node, without the per-VM plumbing.
+    /// Observe readable VM records and derive reports without persisting preview
+    /// quarantine markers. Uses the same observation logic as reconciliation.
     #[instrument(level = "debug", skip_all)]
     pub async fn report(&self) -> Result<Vec<VmReport>> {
         let mut out = Vec::new();
         for (id, mut record) in self.store.list()? {
-            // A record whose intent is `Absent` is still NAMED, and that is
-            // Astra finding S12, 2026-09-23. This used to `continue`: the
-            // guest vanished from this node's report the moment the intent
-            // was written, which is hours before the last driver call on a
-            // node that is busy or wedged. One tier up, a uid this node does
-            // not name is read as a node that has let it go
-            // (`session::ingest::forget_unbound`), so the binding was
-            // released and the VM could be placed on another machine while
-            // this VMM still had the volumes open — the hazard
-            // `volumes::open_here` documents from the disk's side.
-            //
-            // The record IS the proof: `teardown` removes it last and only
-            // when everything before it succeeded, so a row that is still
-            // here is a teardown that has not finished.
-            //
-            // `Provisioning` and not a word of its own, because the control
-            // plane's phases are a closed set with no `Stopping` in it and
-            // `Provisioning` is its word for "in flight, nothing here to act
-            // on" — see the migration arms below, which report the same thing
-            // for the same reason. The REASON is what distinguishes this one,
-            // and `attached_volumes` travels with it so the tier above can
-            // see which disks are still open.
+            // Retain deleting VMs in reports until teardown removes their records.
+            // Omitting them early could release their controller binding while
+            // the VMM or its storage connections still exist.
             if record.desired == Desired::Absent {
                 out.push(VmReport {
                     id,
@@ -905,10 +649,7 @@ impl Reconciler {
     }
 
     pub(super) async fn observe(&self, id: &VmId, record: &VmRecord) -> Observed {
-        // A node with no hypervisor tracks nothing, answers no socket and has
-        // no guest to ask — which is what these three already mean when the
-        // VMM is gone, so the record converges the way it does after a crash
-        // rather than through a path of its own.
+        // Without a hypervisor, observe no tracked process, responsive socket or guest.
         let hypervisor = self.drivers.hypervisor.as_ref();
         let tracked = hypervisor.is_some_and(|h| h.is_tracked(id));
 
@@ -918,13 +659,8 @@ impl Reconciler {
             .pids_in_slice(&id.to_string())
             .unwrap_or_default();
 
-        // Two questions about one number, and a VM is alive only if both
-        // answer yes. The slice says the pid is one of THIS VM's processes;
-        // `owns_pid` says the process at that pid is still the VMM the record
-        // named. A pid is reused, a slice is reused after a crash that left
-        // it behind, and either alone eventually reports a stranger as this
-        // VM's hypervisor — which is the observation the whole plan below is
-        // built on.
+        // Require cgroup membership and process identity before treating the
+        // recorded PID as this VM's live VMM.
         let vmm_alive = match (record.vmm_pid, hypervisor) {
             (Some(pid), Some(h)) => slice_pids.contains(&pid) && h.owns_pid(id, pid),
             _ => false,
@@ -942,11 +678,7 @@ impl Reconciler {
             None => None,
         };
 
-        // Asked after the state and not before it: the cloud-hypervisor
-        // driver learns a reception is over by reading the event file, and
-        // `get_state` is the call that reads it. Asking first would be right
-        // one pass later, which for a VMM holding somebody's disk is a pass
-        // too many.
+        // Read receive failure after get_state, which may inspect receive events.
         let receive_failed = self.receive_failed(id, record, hypervisor);
 
         Observed {

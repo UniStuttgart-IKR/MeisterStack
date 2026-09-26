@@ -24,7 +24,7 @@ pub struct GpuParams {
     pub vulkan: bool,
     pub context_types: String,
     pub external_blob: bool,
-    pub pci_bar_size: u64, // basically VRAM
+    pub pci_bar_size: u64, // Guest-visible PCI aperture size; not a host VRAM reservation.
     pub implicit_render_server: bool,
 }
 
@@ -60,16 +60,14 @@ pub struct CrosvmGpuDriverConfig {
     pub defaults: GpuParams,
     pub profiles: HashMap<String, serde_json::Value>,
     pub socket_timeout: Duration,
-    /// Who the backend runs as. `None` is the agent, which is every node that
-    /// has ever run this. See `InputDriverConfig::vmm_user`.
+    /// Optional backend identity; None retains the agent's identity.
     pub vmm_user: Option<agent_api::VmmUser>,
 }
 
 pub struct CrosvmGpuDriver {
     config: CrosvmGpuDriverConfig,
-    /// crosvm is spawned as a plain child of the agent, in the agent's own
-    /// process group — so it is signalled as a single process, and NOT as a
-    /// group the way the detached backends are. See `BackendKind::child`.
+    /// Signal crosvm as a plain child, not the agent's process group;
+    /// see `BackendKind::child`.
     process: BackendKind,
     children: Mutex<HashMap<DeviceId, Backend>>,
 }
@@ -241,9 +239,7 @@ impl DeviceDriver for CrosvmGpuDriver {
 
         match child {
             Some(child) => self.process.stop(child).await,
-            // Not our child: the agent restarted since create, so the record's
-            // pid is the only handle on the backend. Ignoring it would leave a
-            // crosvm running for a VM that is gone.
+            // After restart, verify and stop the backend referenced by the stored attachment.
             None => {
                 if let DeviceAttachment::VhostUser { socket, pid, .. } = attachment {
                     self.process.stop_adopted(*pid, socket);
@@ -267,13 +263,8 @@ impl DeviceDriver for CrosvmGpuDriver {
                 attachment: Self::attachment(self.socket_path(id), running.pid().unwrap_or(0)),
             });
         }
-        // Not in the map: either the backend died, or the AGENT restarted and
-        // this one outlived it. Only the record can tell the two apart, and
-        // getting it wrong quarantines a VM whose GPU is working — the whole
-        // point of adopting a VM after a restart is that its devices come with
-        // it. Liveness comes from the pid AND the socket recorded with it, as
-        // it does for nvrm: this node runs one crosvm per GPU, so the process
-        // name alone says "a gpu backend" and not "this one".
+        // After restart, identify a surviving backend by process name and the
+        // recorded socket argument before treating it as this device.
         let DeviceAttachment::VhostUser { socket, pid, .. } = attachment else {
             return Err(DeviceError::NotFound(*id));
         };

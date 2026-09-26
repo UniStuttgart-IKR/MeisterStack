@@ -20,33 +20,15 @@ pub struct VmMigrationSpec {
     pub tenant: String,
     /// The VM to move, by name, in the same tenant.
     pub vm: String,
-    /// Where to. `None` = let the scheduler choose, which is what a drain
-    /// asks for and what an operator usually wants.
-    ///
-    /// A HARD requirement when it is set — not a preference. Somebody who
-    /// names a node is answering a question about that node ("get off this
-    /// machine and onto that one"), and quietly using a different one would
-    /// answer a question they did not ask.
+    /// Requested destination node. None lets placement choose, as used by a drain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_node: Option<String>,
 }
 
 reasons! {
-    /// Why a migration is where it is.
-    ///
-    /// Five, all of them sentences the migration reconciler already writes:
-    /// "preparing <target>", "sending to <target> at <peer>", the abandon
-    /// path's `why`, and the two outcomes a source reports — `StillHere` is
-    /// the good outcome of a bad transfer and has always had a field of its
-    /// own (`status.sourceReported`).
-    ///
-    /// The one enum in this file that keeps a `Reported`, and the reason is
-    /// that there is nothing for it to be replaced BY: a migration's word
-    /// from below is `MigrationReport.outcome`, a typed enum
-    /// (`DepartureOutcome`) that already travels in a field of its own, and
-    /// `proto::reasons` has no list for migrations because no node writes a
-    /// reason string about one. Here `Reported` names the field to read, and
-    /// that is a different thing from naming the road it came down.
+    /// Migration reason categories for controller progress and source outcomes. Reported refers
+    /// to the typed DepartureOutcome retained separately in sourceReported; nodes do not send
+    /// migration reason strings.
     VmMigrationReason [5] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
@@ -65,14 +47,8 @@ reasons! {
 }
 
 phases! {
-    /// How far a migration got.
-    ///
-    /// Five phases and the two ends are terminal: nothing retries a `Failed`
-    /// migration by itself, because the thing that failed was an operation
-    /// somebody asked for and asking again is somebody's decision. `Succeeded`
-    /// and `Failed` are both worth keeping — the record of a move that did not
-    /// work is the most useful object in this file on the day somebody asks why
-    /// a machine is still full.
+    /// Migration progress. Succeeded and Failed are terminal operation results; a later attempt
+    /// uses another migration resource.
     VmMigrationPhase / VmMigrationPhaseKind / VmMigrationReason / VmMigrationPhaseWire / VmMigrationReported [5] {
         /// Accepted, nothing done. No target chosen yet.
         Pending { reason, message, since } => "Pending",
@@ -101,14 +77,8 @@ impl VmMigrationPhaseKind {
         )
     }
 
-    /// The same question, under the name `crate::stuck` asks it by — and the
-    /// only enum here where `Failed` is an end: a migration that failed was
-    /// an operation somebody ASKED for, and asking again is somebody's
-    /// decision rather than a curve's.
-    ///
-    /// Two names for one answer, and the older one stays because the
-    /// migration reconciler reads it on every pass and "is this record
-    /// finished" is the sentence that belongs there.
+    /// Whether stuck detection expects further progress. Failed and Succeeded both end this
+    /// operation.
     pub fn is_terminal(self) -> bool {
         self.is_final()
     }
@@ -136,18 +106,9 @@ pub struct VmMigrationStatus {
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
     pub(super) phase: VmMigrationPhase,
-    /// The last word anybody established about the move — the one fact
-    /// `settle_vm_migration` derives from.
-    ///
-    /// Nearly all of them are this tier's own, because a migration is an
-    /// operation this tier RUNS: it chose the target, it made the
-    /// destination ready, it told the source to send. Those words carry no
-    /// node, which is what keeps any of them from being `Succeeded` —
-    /// the one resting word here, and the only one that needs a machine's
-    /// say-so. See `VmMigrationReported`.
-    ///
-    /// `None` on a record nothing has been decided about, which is every
-    /// record for the moment between the request and the first pass.
+    /// Evidence consumed by settle_vm_migration. Controller progress records have no node
+    /// identity and cannot establish Succeeded; successful completion requires a machine
+    /// report. Absent before the first decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported: Option<VmMigrationReported>,
     /// The same field, with the same meaning, that every other object here
@@ -162,22 +123,9 @@ pub struct VmMigrationStatus {
     /// migration with `spec.targetNode` is immediately.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_node: Option<String>,
-    /// The address the DESTINATION is listening at for the stream, in the
-    /// node's own spelling (`tcp:10.0.0.5:49000`). Written when the
-    /// destination answered `PrepareMigration`, and the one thing the source
-    /// has to be told.
-    ///
-    /// Astra finding S05, 2026-09-23: it used to live only inside the
-    /// `Preparing` message — "{target} is listening at {peer}" — and the send
-    /// step scraped it back out with `rsplit_once(" at ")`. A sentence is for
-    /// a person to read; a field is what another step reads. Scraping made
-    /// the address depend on the wording, and it gave a replica that saw the
-    /// migration one write earlier no way to tell "no address yet" from "no
-    /// address ever".
-    ///
-    /// `None` on a migration whose destination has not answered yet, and on
-    /// every record written before this field existed — `peer_of` falls back
-    /// to the sentence for those.
+    /// Destination listener returned by PrepareMigration, such as tcp:10.0.0.5:49000. The
+    /// source uses this address to send the stream. None means no answer yet or an older
+    /// record; peer_of supports the older message-based encoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -198,13 +146,8 @@ pub struct VmMigrationStatus {
     pub source_message: Option<String>,
 }
 
-/// The three things a source says about a send, spelled as `MigrationReport`
-/// spells them.
-///
-/// Constants and not an enum, because this tier only ever compares: the words
-/// are the node's, they travel as strings, and an enum here would be a parse
-/// that can fail over a spelling a newer agent invented. `settle` acts on
-/// `SEND_STILL_HERE` and nothing else.
+/// Typed source report: departure, confirmed local retention, or uncertainty. Keep the report
+/// as evidence rather than inferring it from transport success.
 pub const SEND_SENDING: &str = "Sending";
 pub const SEND_GONE: &str = "Gone";
 pub const SEND_STILL_HERE: &str = "StillHere";

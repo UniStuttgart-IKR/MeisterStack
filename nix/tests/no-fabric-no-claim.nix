@@ -2,19 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# A node that says it has no NVMe fabric does not claim one.
-#
-# Measured in the lab (L2 finding N9, 2026-09-23):
-# `meisterstack.agent.nvmeTcp.enable = false` took the kernel module out of
-# the boot and left `[volume.nvmeof]` and `[volume.nvmeof-import]` in the
-# rendered agent.toml. The agent then built the attacher, the attacher needs
-# /dev/nvme-fabrics, and `meister node ls` said `READY Unprivileged` for
-# ever — which is not "no fabric volumes here" but "place NOTHING on this
-# node", not even a guest with a plain filesystem volume. It is what blocked
-# L12.
-#
-# Both directions, because the default matters as much as the switch: an
-# agent node that says nothing still carries both sections.
+# Check that disabling NVMe/TCP removes both backend sections while preserving
+# an ordinary agent configuration. Also check the enabled default.
 { nixpkgs, lib, pkgs, system, self }:
 
 let

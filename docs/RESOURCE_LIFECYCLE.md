@@ -1,127 +1,89 @@
-# Resource cleanup: ownership and incomplete work
+# Resource ownership and cleanup
 
-This document describes local cleanup checks implemented for overlays, local
-anti-spoofing rules and VM volumes. Migration has a separate
-[ownership and recovery contract](MIGRATION.md). These guarantees are local to an
-agent; they do not establish distributed fencing for shared storage.
+Local guards preserve ownership through incomplete work. They do not provide
+shared-storage leases or distributed fencing. Migration has a separate
+[contract](MIGRATION.md).
 
-## Network ownership
+## Network cleanup
 
-An empty VM inventory alone does not establish that an overlay is unused. An
-overlay can belong to a router even when no VM on this node uses it. Both explicit
-last-VM cleanup and startup sweeping therefore pass through the same Linux driver
-guard before deleting a VXLAN device or its bridge:
+Overlay deletion requires all three checks:
 
-1. The agent checks VM ownership. Unreadable VM records prevent overlay sweeping.
-2. The driver reads persisted router records from the configured gateway state
-   directory. A router's VNI protects its overlay across driver and agent restarts.
-   An unreadable router record or failed directory read refuses deletion.
-3. The driver reads the bridge's kernel ports. Any port except this overlay's own
-   VXLAN tunnel prevents deletion, including router veths, VM taps and unknown ports.
+1. VM inventory is readable and no VM owns the overlay.
+2. Persisted router inventory is readable and no router owns its VNI.
+3. Kernel bridge ports contain no consumer other than the overlay's VXLAN tunnel.
 
-The port check also protects a partially created router whose record has not yet
-been committed. Router commands and VM teardown share the agent operations lock;
-startup sweeping runs before the command service. External link manipulation does
-not participate in that lock. There is no atomic kernel transaction spanning the
-inventory check and both link deletions, so this is not fencing against an external
-network manager. Conservative retention can leave unused overlays until a later
-sweep or explicit operator action.
+- Router records preserve ownership across agent/driver restart.
+- Port checks retain partly created routers before their record is committed.
+- VM/router commands share the operations lock; startup sweeps precede command service.
+- External network managers do not take that lock. Inventory and link deletion are
+  not one kernel transaction; conservative retention can leave unused overlays.
+- Tap-filter reaping uses raw VM rows. Any undecodable row skips reaping; read errors
+  propagate. A partial inventory must not remove a live guest's source guard.
 
-Anti-spoofing cleanup has a similar completeness requirement. The startup tap list
-is built from every raw VM row. If any row cannot be decoded, the agent skips the
-filter reaper entirely. It must not present a partial list as a complete inventory:
-the omitted row might describe a running guest whose rules still protect the host.
-Readable records retain the normal cleanup behavior. A storage read error propagates
-instead of authorizing removal.
+Sources: [Linux driver](../drivers/linux-network/src/lib.rs),
+[router ownership](../drivers/linux-network/src/router.rs),
+[agent startup](../components/agent/src/lib.rs).
 
-## Volume deletion versus attachment
+## Volume deletion and attachment
 
-`Volumes::deprovision` and `Volumes::forget` acquire the same `ops` mutex used by
-local VM creation, controller VM commands and reconciliation. They hold it across
-the holder check, backend call and final record update. The lock belongs inside
-these methods so that callers cannot accidentally separate the check from the
-destructive operation.
+`Volumes::deprovision` and `forget` hold the shared `ops` mutex across holder check,
+backend operation and record update.
 
-If attachment wins the lock, it commits the VM record before deletion can inspect
-holders. Deletion then refuses. If deletion wins, it leaves a handle-free `Gone`
-record, or removes the record for `forget`. A later referenced attach refuses the
-missing handle or missing record. Unreadable VM rows continue to count as possible
-holders, as do recorded inline handles awaiting attachment.
+| Lock winner | Result |
+| --- | --- |
+| Attach | Persisted VM holder causes later deletion to refuse |
+| Deprovision | Handle-free Gone record causes later referenced attach to refuse |
+| Forget | Missing local record causes later referenced attach to refuse |
+| Unreadable VM row / unattached inline handle | Treat as possible ownership; do not authorize deletion |
 
-This serializes operations within the running agent. It does not introduce a
-distributed storage lease or a durable deletion protocol for a backend operation
-that can outlive an agent crash. Long backend calls can hold the existing global
-VM operations lock for their duration.
+This protects operations in one agent process. Backend work surviving a crash needs
+separate recovery evidence; long calls also hold the global operations lock.
+Source: [volume operations](../components/agent/src/volumes.rs).
 
-## Inline volume acquisition and rollback
-
-The persisted VM specification records which inline disks the VM intends to own.
-The runtime record now also has `unattached_volumes`, a list of volume handles:
+## Inline provisioning recovery
 
 ```text
-persist VM specification
-    -> provision inline disk
-    -> persist returned handle in unattached_volumes
-    -> attach disk
-    -> atomically record attachment and remove unattached handle
+persist VM spec → provision disk → persist unattached handle → attach
+                → persist attachment and remove unattached handle
 ```
 
-Each successful attachment is committed separately. An error on a later disk must
-not hide attachments already acquired. A retry reuses a saved unattached handle
-instead of provisioning another disk.
+- Commit each attachment separately; a later failure must retain earlier handles.
+- Retry reuses `unattached_volumes` instead of provisioning a second disk.
+- Cleanup removes a saved handle only after successful deprovision.
+- Crash before handle persistence: probe by persisted disk ID/spec, save the recovered
+  handle, then delete. Probe failure retains ownership.
+- Referenced disks are excluded: the VM does not own their data.
+- Driver probe/idempotence and failed-attach cleanup remain required contracts.
 
-Teardown deprovisions saved unattached handles and only removes them from the record
-after success. A failed delete retains the VM row and handle for another attempt,
-including after reopening the redb store. If a crash interrupted provision before
-the handle was committed, teardown probes the inline disk by its persisted ID and
-specification. A found handle is saved before deletion; a failed probe retains the
-record. Referenced disks are excluded from this recovery path because the VM does
-not own their bytes.
+Sources: [provision volumes](../components/agent/src/provision/volumes.rs),
+[teardown](../components/agent/src/provision/teardown.rs),
+[record types](../components/agent/src/types.rs).
 
-This relies on the storage driver's `probe` and idempotent `deprovision` contracts.
-It does not make an arbitrary driver's partially successful `attach` transactional.
-The driver remains responsible for failed attachment side effects, and teardown's
-existing process termination behavior remains relevant.
+## Compatibility and open gaps
 
-## Persistence compatibility
+- `unattached_volumes` defaults empty for legacy JSON. No protobuf change is required.
+- Older agents ignore this field. Resolve incomplete cleanup before downgrade and
+  retain the driver/backend namespace needed to interpret existing handles.
+- Current teardown can delete inline data after detach/process-stop failure.
+- Adopted backend stop can return after SIGTERM without waiting for exit.
+- Controller router listing can skip corrupt records and misclassify reported
+  routers as orphans. Local overlay guards do not repair that upstream decision.
 
-The new JSON field defaults to an empty list, so records from older agents remain
-readable. Persisted specifications allow the new cleanup path to probe an older
-incomplete inline provisioning attempt. No protobuf or storage schema migration is
-required for this field. Router ownership uses the existing router record format.
+See [agent](AGENT.md), [drivers](DRIVERS.md) and [networking](NETWORKING.md).
+These defects are documented for later fixes.
 
-Older agents ignore `unattached_volumes` and do not implement the recovery path.
-Resolve incomplete provisioning and cleanup before downgrading; decoding JSON
-successfully is not a guarantee that an older binary preserves the same ownership
-contract. Configuration must continue to provide the driver and backend namespace
-that created the resource.
+## Regression map
 
-## Executable evidence and limits
-
-| Property | Deterministic regression test |
+| Property | Test |
 | --- | --- |
-| Persisted router ownership and corrupt router inventory | `router_ownership_preserves_an_overlay_across_driver_restart` |
-| Remaining bridge consumers | `any_remaining_router_or_vm_port_blocks_overlay_removal` |
+| Router ownership / corrupt inventory | `router_ownership_preserves_an_overlay_across_driver_restart` |
+| Remaining bridge users | `any_remaining_router_or_vm_port_blocks_overlay_removal` |
 | Incomplete tap inventory | `a_corrupt_vm_record_cannot_remove_its_anti_spoofing_rules` |
-| Attachment wins against delete and forget | `deletion_rechecks_holders_after_waiting_for_vm_creation` |
-| Attach failure, restart, failed cleanup, restart, successful retry | `an_inline_attach_failure_remains_reclaimable_after_restart` |
-| Missing handle and failed backend probe | `a_crash_before_inline_handle_commit_is_recovered_by_probe` |
-| Restarted attachment reuses the original disk | `a_restarted_attach_reuses_the_persisted_inline_handle` |
+| Attach/delete interleaving | `deletion_rechecks_holders_after_waiting_for_vm_creation` |
+| Attach failure + restart + cleanup retry | `an_inline_attach_failure_remains_reclaimable_after_restart` |
+| Crash before handle save | `a_crash_before_inline_handle_commit_is_recovered_by_probe` |
+| Reuse saved handle | `a_restarted_attach_reuses_the_persisted_inline_handle` |
 
-Network tests use persisted router fixtures and synthetic netlink attributes; they
-do not demonstrate live namespace connectivity. Volume tests use real temporary
-redb files, explicit future polling for the lock ordering, and injected backend
-failures. Reopening a database tests process restart semantics, not power-loss
-durability. For thesis evaluation, report these limits separately from live network,
-VMM and storage experiments.
-
-## Remaining cleanup gaps
-
-The review found that some teardown paths continue to inline-volume deletion after
-failed detach or process termination. Adopted backend termination can acknowledge
-SIGTERM without waiting for exit. These paths must not be treated as proof that all
-writers stopped. Controller router inventory handling can also mistake undecodable
-records for absence and request removal; the local overlay guards above do not
-repair that upstream decision. See [agent](AGENT.md), [storage](STORAGE.md) and
-[networking](NETWORKING.md) for the affected mechanisms. No fixes to those paths
-are part of this documentation revision.
+Tests use persisted fixtures, synthetic netlink attributes, temporary redb and
+injected driver results. They do not establish live connectivity, process-exit
+semantics or power-loss durability. See [testing](TESTING.md).

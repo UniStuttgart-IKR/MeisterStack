@@ -1,113 +1,83 @@
 # Observability
 
-Logs explain individual decisions, traces connect work across tiers, metrics show
-aggregate behavior, and resource status records the current controller view.
-None substitutes for durable migration or deletion evidence.
+Logs, traces, metrics, status, and Events support diagnosis; they do not authorize
+migration or deletion cleanup.
 
 ## Logs and traces
 
-Components initialize telemetry once with a service name, default filter, log
-format and optional OTLP endpoint. `RUST_LOG` overrides the default filter. Human
-format is the default; JSON flattens event fields into the top-level object and
-includes the current span under `span`. It omits the full ancestor span list.
-When a span carries `trace_id`, that is where JSON consumers can find it. Components
-can enable span-close events to report elapsed work.
-
-Without an OTLP endpoint, the subscriber emits logs only. With one, it also exports
-batched spans with a three-second export timeout. Shutdown flushes the provider.
-Each component uses its own service name so a trace can cross cloud, cluster and
-agent without merging their identities.
-
-Trace context uses W3C version-00 `traceparent`. Invalid values create a new root;
-valid values retain trace ID and sampling flags when creating a child span. IDs
-must be nonzero. Context is stored in the `meister.io/traceparent` object annotation
-and carried explicitly in commands, since later reconcile passes cannot inherit
-the original request's task-local span. Outgoing context prefers the active OTLP
-span and otherwise uses the explicit fallback. Trace IDs remain useful in logs
-when exporting is disabled.
+| Setting / mechanism | Behavior |
+| --- | --- |
+| Initialization | Once per component, with service name, filter, format, optional OTLP. `RUST_LOG` overrides filtering. |
+| Format | Human default. JSON flattens event fields, includes current `span`, omits ancestor list. Trace ID is under `span.trace_id`. Optional span-close events record elapsed work. |
+| OTLP absent | Logs only; explicit trace IDs remain usable. |
+| OTLP enabled | Batched spans, three-second export timeout, shutdown flush; distinct component service names. |
+| `traceparent` | W3C version 00; nonzero IDs. Valid parent retains trace ID/sampling; invalid input creates a root. |
+| Propagation | `meister.io/traceparent` object annotation and command fields connect later reconcile work. Outgoing context prefers active OTLP, then explicit fallback. |
 
 ```mermaid
 flowchart LR
-    R[REST request] --> A[Object trace annotation]
-    A --> C[Later reconcile span]
+    R[REST] --> A[Object annotation]
+    A --> C[Reconcile span]
     C --> M[Command traceparent]
-    M --> N[Agent command span]
-    C --> L[Logs and optional OTLP]
+    M --> N[Agent span]
+    C --> L[Logs / optional OTLP]
     N --> L
 ```
 
-Sources: [subscriber setup](../shared/telemetry/src/lib.rs),
-[trace context](../shared/telemetry/src/traceparent.rs),
-[object annotations](../shared/controller-api/src/object.rs),
+Sources: [subscriber](../shared/telemetry/src/lib.rs),
+[context](../shared/telemetry/src/traceparent.rs),
+[annotations](../shared/controller-api/src/object.rs),
 [session fields](../shared/proto/proto/control.proto).
 
 ## Metrics
 
-The metrics listener serves Prometheus text at `/metrics` on its own configured
-address. An absent or empty address disables it. It is separate from the tenant
-API and does not use its authentication middleware; bind and expose it according
-to the monitoring network. One process-wide registry owns the metric families.
+Separate unauthenticated `/metrics` listener; absent/empty address disables it.
+One process-wide registry. Names below have prefix `meister_`; histograms also
+expose bucket/sum/count series.
 
-All names below have the `meister_` prefix. Histogram families also expose their
-usual bucket, sum and count series.
-
-| Name suffix | Labels | Use |
+| Suffix | Labels | Measures |
 | --- | --- | --- |
-| `reconcile_pass_duration_seconds` | tier, kind | Pass duration. |
-| `reconcile_errors_total` | tier, kind | Failed passes. |
-| `reconcile_last_success_timestamp_seconds` | tier, kind | Last successful pass. |
-| `objects` | kind | Stored object counts. |
-| `vms` | phase | Controller VM inventory by phase. |
-| `phase_stuck` | kind, phase, reason | Resources past their phase budget. |
-| `scheduler_placements_total` | tier | Successful placements. |
-| `scheduler_conflicts_total` | tier | Lost binding CAS attempts. |
-| `scheduler_pending_vms` | tier, reason | Placement blockers. |
-| `sessions` | kind | Connected peers. |
-| `heartbeat_age_seconds` | kind, peer | Time since the last peer heartbeat. |
-| `etcd_operation_duration_seconds` | operation | Store latency. |
-| `etcd_errors_total` | operation, result | Store failures by bounded category. |
-| `etcd_observed_revision` | — | Revision observed by this process. |
-| `agent_vms` | phase | Local agent VM records. |
-| `agent_driver_operation_duration_seconds` | driver, operation | Driver latency. |
-| `agent_quarantines_total` | — | Entries into quarantine. |
+| `reconcile_pass_duration_seconds` | tier, kind | Pass duration |
+| `reconcile_errors_total` | tier, kind | Failed passes |
+| `reconcile_last_success_timestamp_seconds` | tier, kind | Last success |
+| `objects` | kind | Stored objects |
+| `vms` | phase | Controller VM inventory |
+| `phase_stuck` | kind, phase, reason | Overdue resources |
+| `scheduler_placements_total` | tier | Placements |
+| `scheduler_conflicts_total` | tier | Lost binding CAS |
+| `scheduler_pending_vms` | tier, reason | Placement blockers |
+| `sessions` | kind | Connected peers |
+| `heartbeat_age_seconds` | kind, peer | Heartbeat age |
+| `etcd_operation_duration_seconds` | operation | Store latency |
+| `etcd_errors_total` | operation, result | Store failures |
+| `etcd_observed_revision` | — | Observed revision |
+| `agent_vms` | phase | Agent records |
+| `agent_driver_operation_duration_seconds` | driver, operation | Driver latency |
+| `agent_quarantines_total` | — | Quarantine entries |
 
-Labels use bounded categories and configured peers rather than VM IDs, object
-paths or error messages. Inventory collectors reset or explicitly zero series so
-removed peers and resolved failures do not remain as stale observations. A CAS
-conflict alone is not a failed operation: another replica may have completed the
-same work.
+Labels use bounded categories/configured peers, excluding VM IDs, paths, and error
+text. Collectors reset/zero stale series. CAS conflicts can indicate another
+replica completed the work, rather than failure.
 
-Source: [metric definitions and listener](../shared/telemetry/src/metrics.rs).
+Source: [metrics and listener](../shared/telemetry/src/metrics.rs).
 
 ## Status, events and deadlines
 
-Phase `since` measures time in the current kind. An unchanged report preserves it;
-a Running VM with an old timestamp can be healthy. Heartbeat timestamps answer the
-separate freshness question. The shared heartbeat timeout is 30 seconds. Lost
-contact means unknown runtime state, not permission to create a replacement guest.
+| Signal | Contract |
+| --- | --- |
+| Phase `since` | Age of current kind; unchanged reports preserve it. Old Running timestamps can be healthy. |
+| Heartbeat | Separate freshness signal; shared timeout 30 s. Silence means unknown state, not replacement authority. |
+| Events | Aggregate by object UID/reason; count and last-seen advance. One-hour creation lease is retained, not renewed. Best effort; no durable audit/cleanup authority. |
+| Stuck budgets | Pending 5 min; Provisioning/Creating/Preparing/Releasing/Receiving 15 min; Unknown 10 min. |
+| Exclusions | Resource-specific terminal phases, unlisted phases, future timestamps. |
+| Stuck output | Current gauge and event near deadline crossing; controller downtime can miss the event window. No phase change or teardown. |
 
-Events aggregate by involved object UID and reason, incrementing a count and last
-seen time. They use a one-hour etcd lease established at creation; later aggregation
-updates preserve that lease rather than extending retention. Recording is best
-effort, with failures logged. Events are a diagnostic history, not a durable audit
-trail or a source of cleanup authority.
+Diagnosis order: generation/observedGeneration → phase/reason/message → heartbeat
+freshness → scheduler blockers/store latency. Distinguish recreated objects by UID.
+For migrations, inspect durable attempt evidence; acknowledgments, timeouts, and
+error strings are insufficient ownership evidence.
 
-The stuck-phase helper uses budgets of five minutes for Pending, fifteen minutes
-for Provisioning, Creating, Preparing, Releasing and Receiving, and ten minutes for
-Unknown. Resource-specific terminal phases are excluded; unlisted phases have no
-budget. Timestamps in the future are not treated as overdue. The gauge reflects
-current overdue objects; a PhaseStuck event is emitted around the deadline crossing,
-so it is not guaranteed to be emitted after a controller was offline across that
-window. These checks produce observations, never phase transitions or teardown.
-
-For diagnosis, compare the requested generation with observed generation, inspect
-phase reason and message, then correlate peer freshness, scheduler blockers and
-store latency. Use the object UID to distinguish recreation under the same name.
-For an unresolved migration, follow its attempt evidence rather than interpreting
-an acknowledgement, timeout or error string as an ownership verdict.
-
-Sources: [events](../shared/controller-api/src/events.rs),
-[phase deadlines](../shared/controller-api/src/stuck.rs),
+Sources: [Events](../shared/controller-api/src/events.rs),
+[deadlines](../shared/controller-api/src/stuck.rs),
 [heartbeats](../shared/controller-api/src/heartbeat.rs),
-[phase model](../shared/controller-api/src/resources/phase.rs),
-[migration recovery](MIGRATION.md).
+[phases](../shared/controller-api/src/resources/phase.rs), [Migration](MIGRATION.md).

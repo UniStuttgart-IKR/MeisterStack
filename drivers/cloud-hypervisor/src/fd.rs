@@ -2,41 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Handing the VMM a descriptor instead of a right.
+//! Transfer open tap descriptors over the VMM API with SCM_RIGHTS.
 //!
-//! This is the whole of Stufe 3's network half: the agent opens the tap it
-//! made and passes the OPEN FILE to cloud hypervisor over the API socket as
-//! ancillary data, so the VMM never needs `/dev/net/tun` and never needs
-//! `CAP_NET_ADMIN`. It is the mechanism every comparable stack uses —
-//! libvirt inherits `tapfd` into QEMU, `qemu-bridge-helper` sends one back
-//! over its own socket, Incus opens the tap and QEMU drops to a user
-//! afterwards — and cloud hypervisor v53 accepts it on exactly two verbs,
-//! `vm.add-net` and `vm.add-device` (`vmm/src/api/http/http_endpoint.rs`,
-//! module note: "passes file descriptors (FDs) via _ancillary_ messages -
-//! specifically using the `SCM_RIGHTS` mechanism").
+//! Create the guest without NICs, add each NIC with its descriptor, then boot.
+//! The supported VMM accepts descriptors on `vm.add-net`, not `vm.create`.
 //!
-//! It does NOT accept them on `vm.create`: the same file says so twice
-//! (`// For the VmCreate call, we do not accept FDs from the socket
-//! currently.`) and nulls every fd in `net` and `devices`. So a VM with a
-//! NIC is three calls and not one — create without `net`, one `add-net` per
-//! NIC, then boot — and that ordering is why this module exists rather than
-//! a flag on the existing client.
-//!
-//! # Why the request is written by hand here
-//!
-//! `ch_api` speaks HTTP through hyper, and hyper owns the socket: there is no
-//! seam at which a `sendmsg` with a control message can be put on the first
-//! write. The request that carries an fd is one line, three headers and a
-//! small JSON body, sent once and answered once, so writing those bytes
-//! directly is less machinery than teaching hyper to pass descriptors — and
-//! it is the only place in this driver that needs it.
-//!
-//! One `sendmsg` for the whole request is enough, and that is a property of
-//! the SERVER: `micro_http` accumulates the descriptors it has received on a
-//! connection and attaches them to the request that completes next
-//! (`connection.rs`, `pending_request.files = self.files.drain(..)`). The
-//! descriptors therefore have to arrive no later than the last byte of the
-//! request, which one `sendmsg` guarantees.
+//! This path writes a small HTTP request directly because it must attach
+//! ancillary data to the send. The blocking socket work runs on a blocking task.
 
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -45,15 +17,9 @@ use std::time::Duration;
 
 use super::*;
 
-/// The flags cloud hypervisor's own `Tap::from_tap_fd` sets on a descriptor
-/// it is handed.
-///
-/// It re-issues `TUNSETIFF` on the fd it receives and forgives only `EEXIST`
-/// (`net_util/src/tap.rs`), so a tap opened with different flags would take
-/// the VMM down at boot. `IFF_VNET_HDR` is the one that is easy to miss:
-/// `linux-network` creates the persistent device without it, because a
-/// device's flags and a descriptor's flags are not the same thing, and it is
-/// the descriptor that must match.
+/// Match Cloud Hypervisor's `Tap::from_tap_fd` flags, including IFF_VNET_HDR.
+/// It repeats TUNSETIFF and tolerates only EEXIST; descriptor flags must match
+/// even when the persistent tap was created with different flags.
 const TAP_FLAGS: libc::c_short =
     (libc::IFF_TAP | libc::IFF_NO_PI | libc::IFF_VNET_HDR) as libc::c_short;
 
@@ -63,19 +29,9 @@ nix::ioctl_write_ptr_bad!(
     libc::ifreq
 );
 
-/// Open the tap the network driver already made, by name.
-///
-/// Opening is all this does. The device exists, it is in its bridge, it is UP
-/// and it carries its MTU — `linux-network`'s `create` did all of that with
-/// the agent's own rights, before this is called — and none of it can be done
-/// through this descriptor by an unprivileged VMM. That division is the whole
-/// design: the privileged side configures, the unprivileged side gets a
-/// descriptor.
-///
-/// Needs no capability of its own when the tap belongs to the caller or to
-/// the caller's group (`drivers/net/tun.c`, `tun_not_capable`: owner OR group
-/// match is enough, otherwise `CAP_NET_ADMIN`), which is why the same code
-/// works for an agent that is root and for one that is not.
+/// Open an existing, configured tap without changing its bridge, state or MTU.
+/// The caller needs tap owner/group access or CAP_NET_ADMIN; the descriptor
+/// then lets an unprivileged VMM use the device.
 pub(crate) fn open_tap(name: &str) -> anyhow::Result<OwnedFd> {
     if name.len() >= libc::IFNAMSIZ {
         bail!("tap name too long: {name}");
@@ -98,19 +54,9 @@ pub(crate) fn open_tap(name: &str) -> anyhow::Result<OwnedFd> {
     Ok(OwnedFd::from(tun))
 }
 
-/// One request that carries descriptors: connect, `sendmsg` with
-/// `SCM_RIGHTS`, read the answer, drop.
-///
-/// Blocking, and run on a blocking thread by the caller. The alternative is
-/// an async `sendmsg` with ancillary data, which tokio's `UnixStream` does
-/// not offer without reaching for the raw fd anyway — and the call is one
-/// round trip on a local socket.
-///
-/// The descriptors are borrowed, never consumed: the kernel `dup`s them into
-/// the VMM (`cmsg(3)`), and CH `dup`s again in `from_tap_fds` ("Duplicate so
-/// that it can survive reboots"). What this side holds afterwards is its own
-/// copy, and closing it is the caller's business — see `create_vm`, which
-/// closes it as soon as the VMM has its own.
+/// Send one blocking HTTP request with SCM_RIGHTS and read the response.
+/// The caller runs this on a blocking thread. Descriptors are borrowed: the
+/// kernel duplicates them for the receiver, leaving local closure to the caller.
 fn request_with_fds(
     socket: &Path,
     method: &str,
@@ -140,10 +86,8 @@ fn request_with_fds(
     let iov = [std::io::IoSlice::new(&request)];
     let sent = sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
         .with_context(|| format!("sendmsg {endpoint} with {} fd(s)", raw.len()))?;
-    // A short write would leave the request half-sent and the descriptors
-    // already across, which the server would attach to whatever request
-    // completes next. A request of this size does not short-write on a unix
-    // stream socket; saying so out loud is cheaper than the bug it prevents.
+    // Reject a short send because the peer may already hold the descriptors
+    // without a complete request. Closing this connection ends that exchange.
     if sent != request.len() {
         bail!(
             "ch {endpoint}: only {sent} of {} bytes went out",
@@ -161,12 +105,9 @@ fn request_with_fds(
     Ok(body)
 }
 
-/// The status line and the body of one HTTP/1.1 answer.
-///
-/// Reads headers up to the blank line, then exactly `Content-Length` bytes.
-/// Cloud hypervisor answers 204 with no body for a call that only changes
-/// configuration and 200 with a small JSON document for one that returns
-/// something, and it never chunks — so this is the whole parser this needs.
+/// Read an HTTP status and a Content-Length body; chunked encoding is not
+/// supported. The current parser returns partial bytes if EOF precedes the
+/// declared body length.
 fn read_answer(stream: &UnixStream) -> anyhow::Result<(u16, Vec<u8>)> {
     let mut stream = stream;
     let mut buf = Vec::with_capacity(1024);
@@ -218,14 +159,8 @@ fn find_headers_end(buf: &[u8]) -> Option<usize> {
 }
 
 impl CloudHypervisorDriver {
-    /// `vm.add-net` for one NIC, with the tap as a descriptor.
-    ///
-    /// The same call before and after boot, which is what makes hot-plug free:
-    /// v53 routes it by whether it owns a VM yet — `VmOwnership::None` only
-    /// updates the config it will boot from (`vmm/src/lib.rs`, `vm_add_net`),
-    /// `Owned` builds the device and answers with its PCI address. Both
-    /// validate first, so a wrong `num_queues` is refused at create time and
-    /// not at boot time.
+    /// Add one NIC through descriptor handoff. Cloud Hypervisor v53 accepts
+    /// vm.add-net before boot and during hotplug, validating the request in both cases.
     pub(crate) async fn add_net_with_fd(
         &self,
         id: &VmId,
@@ -237,10 +172,7 @@ impl CloudHypervisorDriver {
         let timeout = self.ch_timeout;
         tokio::task::spawn_blocking(move || {
             let fd = open_tap(&tap)?;
-            // Dropped at the end of this closure, which is the moment the VMM
-            // has its own copy: the descriptor this side holds is not the one
-            // the guest's NIC is built on, and keeping it would only mean an
-            // fd per NIC in the agent for the life of the VM.
+            // Drop the local descriptor after the VMM receives its own copy.
             request_with_fds(&socket, "PUT", "vm.add-net", &body, &[fd.as_fd()], timeout)
                 .map(|_| ())
         })
@@ -250,18 +182,9 @@ impl CloudHypervisorDriver {
     }
 }
 
-/// Every file this VM's VMM will open for writing, out of its own spec.
-///
-/// The disks and the cloud-init seed, and deliberately not the kernel, the
-/// initramfs or the firmware: those are shared, read-only and live in the
-/// image directory, so handing one to the VMM user would change a file
-/// several VMs read. Read access to them is an ordinary `0644` and a Landlock
-/// rule, not an ownership question.
-///
-/// A vhost-user disk is a socket and not a file, and the socket belongs to
-/// the backend — which already runs as the same user. A share is virtiofsd's
-/// and virtiofsd stays the agent. So both are absent, and `disk_config` is
-/// where the same split is made for the VMM's config document.
+/// Writable disk paths and the cloud-init seed requiring VMM-user ownership.
+/// Exclude shared read-only boot images and socket-backed storage; backend
+/// processes own their sockets.
 pub(crate) fn writable_files(spec: &InstanceSpec) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = spec
         .volumes
@@ -278,15 +201,7 @@ pub(crate) fn writable_files(spec: &InstanceSpec) -> Vec<PathBuf> {
 }
 
 impl CloudHypervisorDriver {
-    /// Hand this VM's writable files to the VMM user, libvirt's
-    /// `dynamic_ownership` in one call.
-    ///
-    /// Before `vm.create` and not after: the VMM opens its disks while it is
-    /// building the VM, and a disk it cannot open is a create that fails with
-    /// CH's own errno rather than with a sentence about ownership.
-    ///
-    /// An error here is fatal on purpose. The alternative — carry on and let
-    /// the VMM fail — turns one clear message into two unclear ones.
+    /// Transfer writable files before vm.create opens them. Ownership errors abort creation.
     pub(crate) fn hand_over_files(&self, spec: &InstanceSpec) -> hypervisor::Result<()> {
         let Some(user) = &self.vmm_user else {
             return Ok(());
@@ -302,16 +217,8 @@ impl CloudHypervisorDriver {
         Ok(())
     }
 
-    /// Take the files back, which is the other half of the same idea.
-    ///
-    /// The paths come off `vm.info` rather than off a record, and that is
-    /// what makes this work for a VMM this agent did not start: an adopted
-    /// VM has no spec here, and the VMM lists what it holds. Asked BEFORE the
-    /// shutdown, because a VMM that has exited answers nothing.
-    ///
-    /// Best effort, unlike the handover. A teardown that failed over a chown
-    /// would leave the VM in the records for ever; a volume left owned by the
-    /// VMM user is untidy and is corrected the next time it is attached.
+    /// Best-effort ownership restoration before VMM shutdown. Discover paths
+    /// through vm.info so adopted VMMs work without an in-memory creation spec.
     pub(crate) async fn take_files_back(&self, id: &VmId) {
         if self.vmm_user.is_none() {
             return;
@@ -349,8 +256,7 @@ mod tests {
         assert_eq!(find_headers_end(b"HTTP/1.1 204 \r\n"), None);
     }
 
-    /// The answer parser against the two shapes v53 actually sends: a 204
-    /// with no body, and a 200 with a JSON document whose length is stated.
+    /// Parse v53 empty 204 responses and length-delimited JSON 200 responses.
     #[test]
     fn an_answer_is_a_status_and_exactly_content_length_bytes() {
         let (ours, theirs) = UnixStream::pair().unwrap();

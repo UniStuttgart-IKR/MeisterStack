@@ -2,28 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# A member of a raft cluster that does not exist yet still starts.
-#
-# Measured in the lab on 2026-09-23 (lane L4), on the very first activation
-# of a three-member control plane. nixpkgs' etcd unit is `Type = "notify"`,
-# and etcd notifies readiness only once the cluster has a LEADER. With
-# `initial-cluster-state = new` and three peers, the first member to be
-# activated has no majority to elect one:
-#
-#   prober detected unhealthy status … dial tcp 10.128.1.120:2380:
-#     connect: connection refused
-#   etcd.service: start operation timed out. Terminating.
-#   switch-to-configuration switch exited 4 … the following units failed:
-#     etcd.service
-#
-# `meister-deploy` then did exactly the right thing — took the host back and
-# stopped the rollout — and a fresh three-member raft could not be
-# bootstrapped at all, because the rollout moves ONE member of a raft group
-# per wave (D8) and the second member is by definition not there yet.
-#
-# So this check is over one property: the readiness of THIS unit is "the
-# process is up", not "the cluster formed". Whether it formed is asked by
-# `etcdctl endpoint health`, which is `meister-deploy`'s own `etcd` check.
+# Check that etcd systemd readiness does not require a Raft leader, allowing
+# the first member of a new group to start. Automatic restart remains required.
 { nixpkgs, lib, pkgs, system, self }:
 
 let

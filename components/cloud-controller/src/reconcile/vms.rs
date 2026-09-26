@@ -41,19 +41,9 @@ pub(super) async fn reconcile_vm(
     .await
 }
 
-/// The trace a pass belongs to.
-///
-/// The object's context covers the VM's BIRTH and stops there: while it is
-/// still Pending or Provisioning, this pass is part of the request that asked
-/// for it. Once the phase is stable — or Failed, or Quarantined — the pass
-/// gets a root of its own.
-///
-/// Without that cut the trace never ends. Level-triggered means a pass runs
-/// every tick forever, and a first version of this attached all of them: one
-/// VM, thirty seconds, twelve spans hanging off a `POST /vms` that had long
-/// since returned. The annotation stays on the object either way — it is the
-/// record of where the VM came from, which is worth keeping whether or not
-/// anything is still tracing against it.
+/// Continue the create trace only while the VM is Pending or Provisioning.
+/// Later passes start new traces so periodic reconciliation does not extend the
+/// creation trace indefinitely. The origin annotation remains on the object.
 pub(super) fn birth_trace(vm: &Vm) -> Option<telemetry::TraceParent> {
     if !matches!(
         vm.status.phase().kind(),
@@ -283,29 +273,9 @@ async fn bind(store: &EtcdStore, vm: Vm, pick: String) -> anyhow::Result<()> {
     }
 }
 
-/// Hand the spec down to the bound cluster, if anything down there is behind
-/// what is written here.
-///
-/// Three reasons to hand the spec down, and all three are level conditions
-/// rather than events: the cluster does not have this VM, it has it under
-/// an intent that no longer matches, or it has an older SPEC than the one
-/// written here. None of them needs a memory of what was sent — when the
-/// condition is gone, so is the command.
-///
-/// The third arrived with the volume reference, and it is the reason a
-/// hot-plug at this tier now happens at all. Until the edge accepted
-/// `spec.vm.volumes[].volume`, the spec of a bound VM could not change
-/// here: everything on `VM_OWNED` is immutable or server-owned, so a
-/// create was the only spec that ever travelled. `vm_shape_unchanged`
-/// opened exactly one door — volume entries appended from the second on —
-/// and without this line an attach at the cloud was accepted, bumped
-/// `metadata.generation`, and stopped: the object said two disks and the
-/// cluster had one, for ever.
-///
-/// `status.observedGeneration` is what this tier has SENT (it is written
-/// by `dispatch_create` and by nothing else, deliberately), so the
-/// comparison is "there is a generation here the cluster has never been
-/// told about" and not a guess about what the cluster did with it.
+/// Dispatch when the cluster lacks the VM, has different intent, or has not
+/// received the current spec generation. Generation changes include disk hot-plug.
+/// `observedGeneration` records acknowledged dispatch, not guest readiness.
 async fn hand_down(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -603,24 +573,10 @@ pub(super) async fn pinning_disk(
     Ok(None)
 }
 
-/// The binding fell: tell the old cluster to destroy the VM, and wait.
-///
-/// The first half of a cross-cluster reschedule, and the half with something
-/// at stake. What follows is NOT a placement — `status.clusterName` still
-/// names the old cluster, so this pass runs again every tick until that
-/// cluster's complete VM list stops naming the uid, and `session` is what
-/// clears it. Placing before then would be two clusters for one VM.
-///
-/// `DestroyVm` is the same command a delete sends, and the cluster's own
-/// finalizer flow does the rest: the node is told to destroy the instance,
-/// which detaches referenced volumes and deprovisions inline ones. So an
-/// instance store does not survive a cross-cluster move either — it was made
-/// with the VM on that machine — while the disks that have objects of their
-/// own stay exactly where their bytes are and change owner afterwards
-/// (`move_volumes`).
-///
-/// Idempotent: the destroy is idempotent at the cluster, and a cluster that
-/// has already let go simply keeps not naming the VM.
+/// Destroy the instance on the old cluster and wait for reported absence.
+/// `status.clusterName` blocks replacement placement until a complete report
+/// clears the old owner. Teardown detaches referenced volumes and removes inline
+/// disks; only referenced storage survives. Repeated destroy requests are safe.
 pub(super) async fn unbind(
     registry: &SessionRegistry,
     vm: &Vm,
@@ -641,16 +597,9 @@ pub(super) async fn unbind(
     Ok(())
 }
 
-/// Carry a move-by-restart one step further, or finish it — the cloud's half
-/// of the same two-step machine the cluster runs one scope down.
-///
-/// The one thing that differs is HOW the guest is stopped. This tier sends no
-/// lifecycle commands; it sends a spec, and the cluster derives the lifecycle
-/// from it. So the stop is `build_spec_json` putting `Stopped` in the
-/// dispatch while the mark is in its Stopping step — the cloud's instruction
-/// to that cluster really is "stop it", and the owner's `runStrategy` up here
-/// never changes, which is what makes the guest come back Running on the new
-/// cluster with nobody having to restore anything.
+/// Advance move-by-restart evacuation without changing the owner's runStrategy.
+/// During Stopping, `build_spec_json` sends a Stopped override to the old cluster;
+/// subsequent placement receives the original strategy.
 pub(super) async fn evacuate(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -885,18 +834,9 @@ pub(super) async fn teardown(
     Ok(())
 }
 
-/// The tenant's network, looked up where the Tenant object lives.
-///
-/// The cloud resolves it and the CLUSTER writes it into the NIC entries —
-/// that split is the design's, and it is what keeps the cluster from needing
-/// a copy of the tenant directory to schedule a VM. A tenant that has no VNI
-/// (one created before overlays existed) resolves to nothing and its VMs go
-/// on landing on the default bridge, which is what they did yesterday.
-///
-/// A tenant that has been DELETED out from under a running VM is a warning
-/// and not a failed dispatch: refusing to hand the VM down would leave it
-/// stuck at the cloud with no way back, and the honest degradation is the
-/// same one an old tenant gets.
+/// Resolve the tenant VNI for injection by the cluster, which has no directory.
+/// Missing VNIs preserve default-bridge behavior. A missing tenant logs a warning
+/// and also resolves to no VNI rather than blocking dispatch.
 pub(super) async fn tenant_vni(
     store: &EtcdStore,
     tenant: Option<&str>,
@@ -934,18 +874,10 @@ pub(crate) fn build_spec_json(vm: &Vm) -> anyhow::Result<String> {
         RunStrategy::Stopped => "Stopped",
         RunStrategy::Paused => "Paused",
     };
-    // The one moment this tier sends down something other than what the spec
-    // says, and it is not a lie about the spec: what travels here is the
-    // cloud's DISPATCH, and while a cluster drain has this VM in its Stopping
-    // step the cloud's instruction to that cluster really is "stop it". The
-    // owner's `runStrategy` up here never changes — which is what makes the
-    // guest come back Running by itself, on the new cluster, without anybody
-    // having to remember to restore anything.
-    //
-    // If this controller dies in the middle, the mark is on the object and
-    // the next pass sends the same thing again; if the MARK is lost the next
-    // dispatch carries the real strategy and the VM starts where it stands,
-    // which is the safe direction to fail in.
+    // During evacuation's Stopping step, override only the dispatched strategy.
+    // The durable mark survives controller restart and owner intent remains intact.
+    // If the mark disappears, dispatch resumes the owner's strategy at the current
+    // placement; it does not reconstruct an unfinished evacuation.
     let strategy = match &vm.status.evacuating {
         Some(mark)
             if controller_api::EvacuationStep::parse(&mark.step)
@@ -957,15 +889,8 @@ pub(crate) fn build_spec_json(vm: &Vm) -> anyhow::Result<String> {
     };
     Ok(serde_json::to_string(&serde_json::json!({
         "runStrategy": strategy,
-        // What a DRAIN one tier down may do to this vm, which is the owner's
-        // answer and travels because the tier that acts on it is the one
-        // below. Without it the cluster's drain table read `never` for every
-        // cloud-managed vm — the safe direction, and still wrong: a `node
-        // drain` would have listed a vm whose owner had explicitly agreed to
-        // a reboot as one that will not move. Found in the position-2 e2e.
-        //
-        // The cluster's own copy is not editable by hand (a cloud-owned
-        // object answers 409 there), so this is the only road it has.
+        // Forward the owner's evacuation policy for node drains. Cloud-managed VMs
+        // cannot set it through the cluster API.
         "evacuation": vm.spec.evacuation.as_str(),
         "tenant": vm.spec.tenant,
         "vm": vm.spec.vm,

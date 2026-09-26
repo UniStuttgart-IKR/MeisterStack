@@ -37,16 +37,8 @@ impl RunStrategy {
     }
 }
 
-/// How far a drain may go to move this VM off its machine.
-///
-/// Two words and deliberately not three. There is no `live` variant, because
-/// live migration is not something an owner OPTS INTO — it is something the
-/// stack does when it can (no passthrough device, no node-local disk) and
-/// cannot promise otherwise. What an owner decides is whether a reboot is an
-/// acceptable price, and that is the whole of the question this answers.
-///
-/// The thesis sentence behind it: moving a GPU VM costs a reboot, and the
-/// stack says so instead of pretending otherwise.
+/// Drain policy controls whether the owner permits a reboot to relocate the VM. Live migration
+/// is selected separately when its capabilities and storage allow it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Evacuation {
@@ -56,13 +48,8 @@ pub enum Evacuation {
     /// anything must not be rebooted by an operator's drain.
     #[default]
     Never,
-    /// Stop it, place it again, start it — one operation, and the guest sees
-    /// a reboot.
-    ///
-    /// The GPU case: a VM with a device can never move live, and the choice
-    /// is between a reboot and staying put. It is also the answer for a VM
-    /// that could move live but whose owner would rather not wait for a
-    /// migration to converge.
+    /// Permit stop, replacement, and start as one relocation operation; the guest experiences a
+    /// reboot.
     Restart,
 }
 
@@ -94,23 +81,10 @@ reasons! {
     /// must match `proto::reasons::VM`. Messages retain detailed context such as
     /// candidate counts and missing capabilities.
     VmReason [18] {
-        /// Nobody recorded one.
-        ///
-        /// Not a failure of this enum but the honest value in two cases: a
-        /// phase stored before struktur 4, and a writer that genuinely has
-        /// nothing categorical to say. The next pass replaces it — which is
-        /// decision 6 of the brief, and the reason there is no migration
-        /// code anywhere in this change.
+        /// No reason was recorded. This serializes as an absent reason for compatibility.
         #[default]
         Unrecorded => "Unrecorded",
-        /// Nobody has looked yet, or nobody has been told yet: the moment
-        /// between the create and the first scheduler pass, and the moment
-        /// between the binding and the create going out.
-        ///
-        /// Not `Unplaced`, which is the scheduler having LOOKED and found
-        /// nowhere. Spelled as the image's, the pool's, the copy's, the
-        /// volume's and the router's are, so that "nobody has said anything
-        /// yet" is one word across this crate.
+        /// No placement or progress decision has established another reason yet.
         AwaitingNode => "AwaitingNode",
         /// The scheduler found nowhere to put it: nothing is a candidate,
         /// nothing has room, or nothing carries what the VM asks for. A WALL
@@ -122,17 +96,9 @@ reasons! {
         /// `Unplaced` sends somebody to the fleet, this one sends them
         /// nowhere at all.
         NotReady => "NotReady",
-        /// A disk this VM refers to exists and is somebody else's: the claim
-        /// on it names another guest, or a node still reports it open.
-        ///
-        /// Not `NotReady`, and the difference is who has to act. `NotReady`
-        /// is a wait on this control plane — the bytes are being made and
-        /// will arrive. This is a wait on a PERSON: nothing here will ever
-        /// take a disk off the guest holding it. It is also the phase that
-        /// makes D4 safe to read: the claim now falls when the last holder
-        /// has gone AND no node reports the bytes open, so the window in
-        /// between is a VM that says who has its disk instead of one that
-        /// says "not ready" for ever.
+        /// A referenced volume is claimed by another VM or still reported open by a node.
+        /// Requeue cannot take it from its holder; the claim falls only after the last
+        /// reference and open handle are gone.
         VolumeHeld => "VolumeHeld",
         /// The tier below let the binding go: the VM is nowhere, and it is
         /// waiting to be placed again. `session::ingest`, both tiers.
@@ -145,11 +111,8 @@ reasons! {
         /// cluster, a refused create at the cloud. Structural: the same
         /// answer comes back next pass, which is why it is remembered.
         Refused => "Refused",
-        /// Nobody has heard from the machine holding it for longer than the
-        /// heartbeat allows — a node at the cluster, a cluster at the cloud.
-        /// ONE word for both, and the sentence says which ("node X last
-        /// reported …"). The brief asks for two; there are eight slots and
-        /// this is the pair whose difference is already in the sentence.
+        /// The holder has not reported within its deadline. The message identifies the silent
+        /// node or cluster.
         Silent => "Silent",
 
         // ------------------------------------------------------------------
@@ -188,16 +151,9 @@ reasons! {
         /// `Quarantined`: the guest did not come back from a pause however
         /// often it was resumed.
         ResumeIneffective => "ResumeIneffective",
-        /// `Provisioning`: the node was told the VM is to be `Absent` and has
-        /// not finished taking it apart. Its VMM may still be running and its
-        /// disks may still be open.
-        ///
-        /// The one word here that says "do NOT act yet". A node used to stop
-        /// naming such a VM the moment the intent was written, and absence
-        /// from a node's report is what `session::ingest::forget_unbound`
-        /// reads as "that node has let go" — so a VM could be placed
-        /// elsewhere while the first node's VMM still held its volumes.
-        /// Astra finding S12, 2026-09-23.
+        /// The node is removing a VM whose desired state is Absent. Its VMM or disks may still
+        /// be active. Keep reporting it until teardown completes so another placement cannot
+        /// treat it as released.
         Stopping => "Stopping",
     }
 }
@@ -223,16 +179,8 @@ phases! {
 }
 
 impl VmPhaseKind {
-    /// The three phases that have come to rest. Everything else means a pass
-    /// is in flight (Pending, Provisioning), the agent's own backoff is
-    /// working (Failed), the VM is deliberately nobody's to touch
-    /// (Quarantined), or nobody knows (Unknown) — and nothing automatic
-    /// argues with any of those.
-    ///
-    /// `Unknown` is emphatically not stable, and it is the one that would be
-    /// tempting: it looks settled, and it is the opposite. A lifecycle
-    /// command derived from it would be a Stop or a Start sent at a guest
-    /// nobody has looked at, down a session that does not exist.
+    /// Whether lifecycle commands can be derived from a resting guest state. Unknown, in-flight
+    /// work, retrying failure, and quarantine do not qualify.
     pub fn is_stable(self) -> bool {
         matches!(
             self,
@@ -240,16 +188,8 @@ impl VmPhaseKind {
         )
     }
 
-    /// Nothing in this stack is going to move this phase on its own, so it
-    /// cannot be late for anything (see `crate::stuck`).
-    ///
-    /// The three resting states, and `Quarantined` beside them: a quarantined
-    /// VM is deliberately nobody's to touch, which is exactly "nothing will
-    /// move it". `Failed` is NOT here — the requeue curve acts on it, so it
-    /// is a wait rather than an end, and it gets no second deadline over the
-    /// top of a backoff. `Unknown` is emphatically not here either, and that
-    /// is the whole of D-C1: a silence that could not be late is a silence
-    /// nobody is ever told about.
+    /// Whether no automatic phase progress is expected. Resting states and Quarantined are
+    /// terminal for stuck detection; retrying Failed and uncertain Unknown are not.
     pub fn is_terminal(self) -> bool {
         self.is_stable() || matches!(self, VmPhaseKind::Quarantined)
     }
@@ -269,18 +209,8 @@ pub struct VmSpec {
     pub cluster_name: Option<String>,
     #[serde(default)]
     pub run_strategy: RunStrategy,
-    /// What may be done to this VM to get it off a machine that is being
-    /// emptied.
-    ///
-    /// Additive, mutable, `Never` by default — so a drain goes on meaning
-    /// exactly what it meant before for every VM ever written, and an
-    /// operator opts a VM in rather than discovering that one moved.
-    ///
-    /// Not the same question as `runStrategy`, and that is why it is its own
-    /// field: `runStrategy` is what the owner wants the VM to be DOING, and
-    /// this is what the owner will TOLERATE having done to it. A VM that must
-    /// keep running through a drain and a VM that may be rebooted to get out
-    /// of the way have the same runStrategy and different answers here.
+    /// Mutable drain tolerance, defaulting to Never for existing VMs. This limits permitted
+    /// disruption independently of runStrategy, which describes the desired guest state.
     #[serde(default, skip_serializing_if = "Evacuation::is_never")]
     pub evacuation: Evacuation,
     /// Whose VM this is. Absent = unscoped, which is every VM written before
@@ -293,30 +223,12 @@ pub struct VmSpec {
     /// cluster is where the tenant's VNI is injected into the NIC specs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
-    /// The scheduler class this VM asks for.
-    ///
-    /// Decision 6 of 6k, the workload half: a node may declare that it takes
-    /// only certain classes (`NodeSpec.accepts`), and this is what a VM
-    /// answers with. Kubernetes' taint and toleration in one word.
-    ///
-    /// Empty is the ordinary case and it means [`CLASS_VM`] — read through
-    /// [`VmSpec::class`] and never off the field. Storing the empty string
-    /// rather than filling in `"vm"` at the edge is what keeps this additive
-    /// in the direction that matters: every VM ever written carries no class,
-    /// its `spec` is byte-identical to what it was, and the shape comparisons
-    /// that guard an update (`vm_shape_unchanged`) see no change at all.
+    /// Workload class matched against NodeSpec.accepts. Read through VmSpec::class: empty means
+    /// CLASS_VM. Retaining the empty stored value preserves structural-update compatibility.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub class: String,
-    /// Which clusters this VM may go to: every pair must be present in the
-    /// cluster's `spec.labels`. Empty — the default and every VM written
-    /// before this — means no constraint at all.
-    ///
-    /// Two selectors and not one, because a selector names properties of a
-    /// MACHINE and those differ by tier: `disk=nvme` is a node's business and
-    /// `region=stuttgart` a cluster's. One field matched at both ends would
-    /// make a node label into something the cloud tier has to carry, which is
-    /// the union-catalogue problem this stack already has once and does not
-    /// need twice.
+    /// Required cluster labels. Empty imposes no constraint. This selector is separate from
+    /// node selection because the two tiers describe different placement properties.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub cluster_selector: BTreeMap<String, String>,
     /// The same, one tier down, against `NodeSpec.labels`.
@@ -476,35 +388,15 @@ pub fn vm_shape_unchanged(current: &serde_json::Value, next: &serde_json::Value)
     frozen_vm_shape(current) == frozen_vm_shape(next)
 }
 
-/// Whether a binding change is one a CLIENT may make: none at all, or
-/// letting it go.
-///
-/// The predicate behind `Vm.spec.nodeName` at the cluster and
-/// `spec.clusterName` at the cloud. Both are server-owned — the scheduler
-/// writes them — with one exception, and this is it: a client may set the
-/// field to `null`, which means "place this somewhere else".
-///
-/// It cannot check WHETHER that is allowed right now, because a predicate
-/// sees one field and the rule is about the VM's phase. The handler asks the
-/// rest (`reschedule needs a stopped vm`); what this opens is only the shape
-/// of the edit. That split is deliberate: the table says what KIND of change
-/// this field admits, and a condition that depends on another field is not a
-/// property of the field.
+/// Allow clients to leave a server-owned binding unchanged or clear it to null for
+/// rescheduling. The handler separately checks whether the VM state permits that operation;
+/// this predicate validates only the edit shape.
 pub fn unbind_only(current: &serde_json::Value, next: &serde_json::Value) -> bool {
     current == next || next.is_null()
 }
 
-/// Whether a number only went UP (or stayed).
-///
-/// The predicate behind `Volume.spec.sizeGib`, and the reason
-/// `Owned::structural` takes a PAIR rather than a projection: "may only grow"
-/// is a fact about two numbers together, and no projection of one of them can
-/// state it.
-///
-/// A value that is not a number on either side falls back to equality —
-/// absent, `null`, a string a client sent by mistake. That is the same
-/// direction every other unknown takes in this file: silence never widens a
-/// rule.
+/// Accept numeric equality or growth for volume size. If either value is nonnumeric, require
+/// equality rather than widening the rule.
 pub fn grows_only(current: &serde_json::Value, next: &serde_json::Value) -> bool {
     match (current.as_u64(), next.as_u64()) {
         (Some(was), Some(now)) => now >= was,
@@ -581,57 +473,23 @@ pub struct VmStatus {
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
     pub(super) phase: VmPhase,
-    /// The last word the tier below said about the guest — a node's at the
-    /// cluster, a cluster's at the cloud — and this tier's own conclusions
-    /// beside it (a create that went out, a machine that refused, a holder
-    /// that let go).
-    ///
-    /// **The same type and the same derivation at both altitudes**, which is
-    /// what keeps `Running` from meaning two things one hop apart. An empty
-    /// `node` on it is this tier's own word and can never make the VM
-    /// `Running`, `Stopped` or `Paused`: only a machine that has the guest
-    /// may say what it is doing. See `VmReported`.
-    ///
-    /// `None` on a VM nobody has said anything about — a fresh one, and one
-    /// whose binding has just been let go.
+    /// Guest evidence shared by both controller tiers. An empty node identifies a controller
+    /// conclusion and cannot establish Running, Stopped, or Paused. None means no retained
+    /// report, including after releasing a binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported: Option<VmReported>,
-    /// That the machine or cluster holding this VM has stopped answering, as
-    /// a reconcile pass saw it.
-    ///
-    /// The fact behind `Unknown`, and the one D-C1 is about: a node fell out
-    /// of the lab and nothing anywhere said so. The pass that reads the lease
-    /// is the only party that knows, so it writes this down; `settle` turns
-    /// it into `Unknown { Silent }` and NOTHING turns that into anything else
-    /// (`unknown_needs_its_holder`). One report from the holder clears it.
-    ///
-    /// It is also what the stuck deadline measures: `Unknown` since four and
-    /// a half days is a number in Prometheus because this field says when.
+    /// Holder silence recorded by the reconcile pass that checks its lease. Derivation maps it
+    /// to Unknown/Silent; a report from that holder clears it. The timestamp also supports
+    /// stuck detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub silence: Option<VmSilence>,
-    /// What the scheduler last said about a VM it could not place.
-    ///
-    /// Its own fact and not part of `reported`, because it answers a
-    /// different question and must not answer the first one: this pass says
-    /// WHY a VM is waiting, it does not decide what the VM is doing. A
-    /// running guest whose newly added disk is not ready yet is still
-    /// running.
-    ///
-    /// Cleared by the binding: a VM that has been placed must not go on
-    /// carrying the sentence that said it could not be.
+    /// Latest placement refusal, cleared after binding. It explains an existing wait and cannot
+    /// replace observed guest state, such as Running while a new disk is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<VmPlacement>,
-    /// The last `metadata.generation` this object's controller ACTED on.
-    ///
-    /// Kubernetes' half of the pair, and the whole of what it says is:
-    /// `observedGeneration < generation` means the spec was changed after the
-    /// controller last did something about it. It is not "the change has
-    /// taken effect" — nothing here can promise that — it is "the change has
-    /// been picked up", which is the honest thing a control plane knows about
-    /// itself.
-    ///
-    /// `0` on an object nothing has been dispatched for yet, and on every
-    /// object written before this field existed.
+    /// Last metadata.generation the controller acted on. A smaller value means newer intent has
+    /// not been picked up; equality does not prove completion. Defaults to zero before dispatch
+    /// and on older records.
     #[serde(default)]
     pub observed_generation: u64,
 
@@ -652,44 +510,18 @@ pub struct VmStatus {
     /// discovered. The list can be empty until a node reports.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<VmAddress>,
-    /// The referenced volumes of this VM's spec, and whether the NODE says it
-    /// has each one open.
-    ///
-    /// The evidence half of hot-plug. `spec.vm.volumes[]` is the intent, this
-    /// is the observation, and `observedGeneration` closes only when the two
-    /// agree — which is why the two are separate fields rather than one
-    /// boolean: an operator watching an attach wants to know WHICH disk is
-    /// not there yet, and "generation 3, observed 2" does not say.
-    ///
-    /// One entry per referenced entry of the spec, in spec order. Empty for a
-    /// VM with only inline disks, which is every VM before this milestone —
-    /// there is nothing to observe about an instance store that was made with
-    /// the VM.
+    /// Observed open state for referenced volumes, in spec order. Generation acknowledgment
+    /// waits for desired and observed attachments to agree. Inline instance disks have no
+    /// entries here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeAttachmentStatus>,
-    /// How often this VM has been placed again after a client let its binding
-    /// go.
-    ///
-    /// Bookkeeping an operator reads and nothing decides on: a reschedule
-    /// leaves no other trace once it is done — the VM is simply somewhere
-    /// else — and "did this move, or was it always here" is the first
-    /// question somebody asks of a VM that is not where they left it.
-    ///
-    /// Zero on every VM that has never moved, which is every VM before this
-    /// milestone.
+    /// Count of completed placements after a client cleared the binding. Informational only; no
+    /// scheduling decision depends on it.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub reschedules: u32,
-    /// Nodes that refused to serve this VM at all, and until when they are
-    /// not candidates for it.
-    ///
-    /// A node that answered `CannotServe` will answer it again — the refusal
-    /// is about the node's configuration, not about the attempt — so placing
-    /// the VM there again would be a loop of one create per pass. Recorded
-    /// with an EXPIRY rather than for ever, because the answer can change:
-    /// an operator adds the driver, the agent is rolled out, and the node
-    /// becomes a candidate again without anybody having to clear a field.
-    ///
-    /// Empty for almost every VM, which is why it is skipped when it is.
+    /// Nodes that returned CannotServe, excluded until their recorded expiry. Temporary
+    /// exclusion avoids repeated configuration failures while allowing repaired nodes to become
+    /// candidates again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused_by: Vec<Refusal>,
     /// Requeue bookkeeping (see `requeue`): how often the reconciler has
@@ -699,22 +531,9 @@ pub struct VmStatus {
     pub requeue_attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_requeue: Option<DateTime<Utc>>,
-    /// A move by restart that is in flight, and how far it has got.
-    ///
-    /// The mark the drain sets, and the reason it is on `status` rather than
-    /// being a field of `spec`: a drain is not a change to what the OWNER
-    /// asked for. `runStrategy` stays `Running` for the whole of it — the VM
-    /// is meant to be running, it is simply not running right now — and
-    /// without this mark the ordinary level-triggered lifecycle would read
-    /// "wants Running, is Stopped" and start the VM again on the very machine
-    /// being emptied, one pass after the drain stopped it.
-    ///
-    /// It also has to survive a controller restart, because the middle of
-    /// this operation is a VM that is deliberately off. A replica that came
-    /// back without it would start that VM where it stood.
-    ///
-    /// `None` for every VM that is not being moved, which is nearly all of
-    /// them and every VM written before this field.
+    /// Persisted drain relocation progress. runStrategy remains unchanged while the guest is
+    /// deliberately stopped; this marker prevents normal lifecycle reconciliation from
+    /// restarting it on the source after a pass or controller restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evacuating: Option<Evacuating>,
 }
@@ -733,14 +552,7 @@ pub struct Evacuating {
     pub since: DateTime<Utc>,
 }
 
-/// The two halves of a move by restart.
-///
-/// Two and not four, because the second half is not this operation's work:
-/// once the binding has fallen, the reschedule that already exists does the
-/// destroying, the waiting and the placing, and the ordinary lifecycle starts
-/// the VM because `runStrategy` never stopped saying Running. So the mark
-/// only has to say "do not start it yet", and then "we are waiting for a new
-/// binding".
+/// Stop/release and rebind/start stages of relocation by restart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum EvacuationStep {

@@ -1,220 +1,124 @@
-# Live migration: ownership, evidence and recovery
+# Live migration
 
-This document describes the migration design contract and its implementation.
-Two receive-side gaps found in the source review mean the contract is not yet
-satisfied end to end. It is not a formal proof or a hardware test report. The implementation coordinates a cluster-controller
-record in etcd with durable endpoint records in each agent's redb database. The VMM
-owns the actual transfer and can outlive either agent process.
+Cluster etcd records coordinate agent redb ownership with a VMM transfer that can
+outlive either agent. **The receive adapter and restart path still violate parts
+of the intended contract; see the gaps below.**
 
-## Required safety properties
+## Safety contract
 
-1. Missing reports, a lost command reply and an expired deadline do not establish
-   failure. They never authorize destination destruction or automatic source repair.
-2. Every migration command and report identifies both the VM incarnation and the
-   migration attempt. Evidence from one attempt cannot settle another attempt.
-3. The source's `MigratingOut` repair barrier survives agent restarts and watcher
-   deadlines. Only established terminal evidence releases it.
-4. An unresolved controller operation is nonterminal. Its placement and destination
-   capacity reservation remain in place, and its ownership record cannot be deleted
-   through the cluster API.
-5. Cancellation is committed before destination cleanup. A competing send must lose
-   the etcd revision comparison. Cleanup is conditional on the agent's matching
-   attempt, and missing cleanup acknowledgement keeps the reservation.
+- Timeout, lost reply and missing report mean unknown outcome, not failure.
+- Commands/evidence identify both VM incarnation and migration attempt.
+- The source `MigratingOut` repair barrier survives restart and watcher deadlines.
+- Unresolved operations retain placement, destination capacity and their record.
+- Commit cancellation before cleanup; concurrent send must lose the revision check.
+- Cleanup requires matching attempt/role; missing ACK retains the reservation.
+- Source repair while transfer ownership is unknown can create two writable guests.
 
-These requirements prefer retaining an unresolved operation over
-restarting a potentially duplicated guest. In particular, a transfer pause is not
-permission to resume the source. This matters when both nodes can access writable
-storage: automatic source repair could introduce two writers.
+## Identity and protocol
 
-## Identity and messages
+The migration resource UID becomes `status.migrationId`. Persist it with `vmUid`,
+source, destination and start time before preparing the target. VM names, peer
+addresses and VM UID alone cannot distinguish successive attempts.
 
-The controller uses the migration resource's immutable `metadata.uid` as the attempt
-ID. Before preparing the destination it persists that ID as `status.migrationId`,
-together with `status.vmUid`, source, destination and the start time. The VM UID
-identifies an incarnation; it cannot distinguish repeated migrations of that same VM.
-Resource names and peer addresses are also insufficient as attempt identities.
-
-| Message | Identity | Meaning |
+| Message | Required identity | Meaning |
 | --- | --- | --- |
-| `PrepareMigration` | VM UID, migration ID | Build a receiving endpoint; reply with its address. |
-| `MigrateOut` | VM UID, migration ID, peer | Start sending. An acknowledgement means accepted. |
-| `MigrationReport` | VM UID, migration ID, peer | Repeat durable evidence from either endpoint. |
-| `CleanupMigration` | VM UID, migration ID, endpoint role | Conditionally remove the cancelled destination or departed source. |
+| `PrepareMigration` | VM UID + attempt | Prepare receiver; return address |
+| `MigrateOut` | VM UID + attempt + peer | Submit transfer; ACK means accepted |
+| `MigrationReport` | VM UID + attempt + peer | Repeat durable endpoint evidence |
+| `CleanupMigration` | VM UID + attempt + endpoint role | Conditionally clean cancelled target or departed source |
 
-A `MigrateOut` error string is never an abort certificate. The controller no longer
-interprets the historical sentence `The guest was not given up` as authority to
-clean up. An untyped driver error can mean that the request failed before delivery
-or that its reply was lost after delivery; the source retains its barrier in either
-case.
+Reports must match operation UID, VM UID, reporter, phase and source peer, including
+inside CAS retries. Older progress cannot overwrite terminal evidence. Ordinary VM
+phases and legacy error text are not migration evidence.
 
-Reports are checked against the current operation, VM incarnation, expected node,
-phase and, for source reports, peer address. The checks run again inside the etcd
-mutation retry and include the migration resource UID. Terminal endpoint evidence
-is not overwritten by an older progress report. Ordinary `VmStatusReport` phases
-and reports with no migration ID are not migration evidence.
+## Controller decisions
 
-## State transitions
-
-The existing public phases remain `Pending`, `Preparing`, `Running`, `Succeeded`
-and `Failed`. Unknown outcome is represented by `recoveryRequired: true` on a
-nonterminal operation, together with its diagnostic message. It is not encoded as
-`Failed`, because that would release ownership and admit a replacement operation.
-`cancelling: true` records the irreversible decision not to dispatch this attempt.
+Public phases: Pending, Preparing, Running, Succeeded, Failed.
+`recoveryRequired` keeps uncertainty nonterminal; `cancelling` records no further dispatch.
 
 ```mermaid
 stateDiagram-v2
     Pending --> Preparing: persist identity and reservation
     Preparing --> Running: CAS claim before send
-    Preparing --> Preparing: cancellation pending cleanup acknowledgement
-    Preparing --> Failed: cancelled destination cleanup acknowledged
-    Running --> Running: timeout or ambiguous reply, recoveryRequired
-    Running --> Running: contradictory endpoint evidence, recoveryRequired
-    Running --> Failed: matching StillHere and destination cleanup acknowledged
-    Running --> Succeeded: matching Gone and Arrived, then move binding
+    Preparing --> Failed: cancellation committed, cleanup acknowledged
+    Running --> Running: unknown or contradictory evidence
+    Running --> Failed: StillHere, target cleanup acknowledged
+    Running --> Succeeded: Gone and Arrived, binding moved
 ```
 
-| Evidence | Controller action |
+| Evidence | Action |
 | --- | --- |
-| No report, `Sending`, `Unknown`, or old `Receiving` | Keep waiting; after the budget mark recovery required. |
-| Source `Gone`, destination not yet `Arrived` | Retain both operation and destination reservation. |
-| Source `StillHere`, destination not reporting a guest | Commit cancellation and request attempt-scoped destination cleanup. |
-| Source `StillHere`, destination reporting a guest | Retain both endpoints and request recovery. |
-| Source `Gone` and destination `Arrived` | Move the VM binding by CAS, release the reservation, clean up the departed source. |
+| Missing, Sending, Unknown, old Receiving | Wait; mark recovery required after budget |
+| Gone without Arrived | Retain operation and reservation |
+| StillHere without target guest | Cancel; request matching target cleanup |
+| StillHere plus target guest | Retain both; require recovery |
+| Gone plus Arrived | CAS-move VM binding; release reservation; clean departed source |
 
-`Gone` means the recorded source VMM process is absent. It is not, by itself, proof
-that the destination received the guest: the process could also have died. Success
-requires independent destination evidence for the same attempt.
+- Gone establishes recorded source-process absence, not successful delivery.
+- An arrived target retains its incoming attempt so an old reconnect snapshot cannot
+  classify it as orphaned. Explicit lifecycle deletion is a separate path.
+- Volume-home settlement remains best effort before Succeeded; failure can leave
+  volume routing stale without a terminal-operation retry.
 
-A destination that has received the guest remains protected from desired-state
-orphan cleanup while the controller's old binding can still omit it. The incoming
-attempt is retained on that record. Explicit lifecycle deletion still exists;
-absence from a reconnect snapshot alone is insufficient authorization.
+## Persistence and restart
 
-## Persistence and restart windows
-
-The source writes its attempt and `MigratingOut` barrier before calling the driver.
-It persists `accepted: true` only after the driver acknowledges the send. The
-background watcher is an optimization for prompt reporting; periodic and startup
-reconciliation also observe the durable attempt.
-
-| Interruption point | Recovery behavior |
+| State/window | Behavior |
 | --- | --- |
-| Before any VMM send | A persisted but unacknowledged attempt stays protected. |
-| During send / while source is paused | Preserve the marker; do not provision, start or resume. |
-| After source exit, before outcome persistence | Observe recorded process absence; persist `Migrated` before detaching volumes. |
-| After watcher deadline | Keep the marker and report `Unknown`; later reconciliation can consume terminal evidence. |
-| During target reception | Shutdown retains the VMM, but receiver adoption after restart is incomplete; see the receive-side gaps below. |
-| After target arrival, before binding update | Report the durable attempt and protect it from reconnect orphan cleanup. |
-| After controller cancellation, before cleanup acknowledgement | Retry the same conditional cleanup; retain capacity meanwhile. |
+| Before send | Persist source attempt and barrier; write accepted only after driver ACK |
+| Unacknowledged send / paused source | Keep barrier; no automatic provision/start/resume |
+| Source exits before outcome save | Persist Migrated before detaching volumes |
+| Watcher deadline | Retain barrier and report Unknown; later evidence may resolve it |
+| Target receiving | Shutdown retains process; restart adoption is currently incomplete |
+| Target arrived before binding moves | Persist/report attempt; protect from snapshot orphan cleanup |
+| Cancellation awaiting cleanup ACK | Retry conditional cleanup; retain capacity |
 
-The `migration_attempts` redb table records command receipts keyed by VM UID and
-attempt ID. Receipts are written before VMM side effects, survive deletion of the
-VM row, and are not garbage-collected. Cancellation can write a receipt even before
-the matching prepare arrives. Thus delayed prepares cannot recreate a cancelled
-receiver, and delayed sends cannot restart a previously handled attempt. A duplicate
-command is refused; retrying a command is not permission to repeat its side effect.
-A crash after a receipt is written but before the VM operation is persisted can
-leave a conservative refusal requiring recovery.
+`migration_attempts` receipts are keyed by VM UID + attempt, written before side
+effects, retained after VM-row deletion and never garbage-collected. They reject
+replayed sends/prepares; a cancellation receipt can precede a delayed prepare.
+A crash between receipt and VM-operation persistence can require manual recovery.
 
-On the source, `StillHere` requires an acknowledged send and explicit driver
-evidence that the VMM owns the guest again. The cloud-hypervisor driver currently
-uses the availability of `vm.counters` for that distinction. A failed probe while
-the recorded process still belongs to the VM proves neither success nor failure.
-If send acceptance was never durably acknowledged, a responsive source alone does
-not release the barrier.
+StillHere requires durable send acceptance plus explicit source ownership evidence;
+the current driver probes `vm.counters`. An unsuccessful probe proves no outcome.
+Record-level receive deadlines are advisory; explicit cleanup also checks for an
+already received guest.
 
-Receive deadlines are retained in records for compatibility, but are advisory.
-The planner uses the driver receive-failure signal to authorize local cleanup.
-The Cloud Hypervisor adapter currently also sets that signal on API timeouts;
-therefore this signal is not sufficient terminal evidence.
-Agent shutdown no longer tears down receiving VMMs. The controller's conditional
-cleanup also refuses a destination whose phase or observed guest state says that
-it already received the guest.
+## Unresolved implementation gaps
 
-## Known receive-side gaps
-
-The September 2026 review identified two paths outside the existing deterministic
-regression coverage:
-
-1. **Driver API timeout becomes failure.**
-   `drivers/cloud-hypervisor/src/api.rs::receive_migration` stores an API error,
-   including its request timeout, in `receive_answer`. `process.rs::receive_failure`
-   exposes it; agent observation marks `receive_failed`; the planner can tear down
-   the receiver. The VMM can continue receiving after the API request times out.
-   A future fix must distinguish lost or delayed replies from established aborts.
-2. **Receiving VMM is not adopted after restart.** The driver begins with an empty
-   in-memory VM map. Agent observation queries guest state only for tracked,
-   responsive VMMs. A persisted `Receiving` record has no adoption action in that
-   state, so the surviving receiver can remain untracked and fail to report arrival.
-   Retaining the process is not sufficient recovery.
-
-Both findings are source-confirmed; live VMM reproductions were not performed in
-this review. Required regressions must exercise the real adapter timeout mapping
-and an empty driver registry with a surviving receiving process. Mock planner tests
-alone cannot establish either property. No receive-side fix is included in this
-comments-and-documentation change.
-
-A separate completion gap exists after ownership transfer: `settle` performs
-best-effort volume-home updates and source record forgetting, then commits
-`Succeeded` even when a home update failed. If forgetting succeeds, later volume
-operations can still route to the old node. The terminal migration does not retry
-that update.
-Success of VM transfer therefore does not establish converged volume metadata.
-
-## Version compatibility and upgrades
-
-The additive protobuf fields use previously unused field numbers; missing IDs decode
-to empty strings. New agents reject migration commands without an ID. New controllers
-require the `migration/attempt-v2` capability on both endpoints before reserving or
-preparing a new migration. The capability travels through the existing Hello driver
-catalogue. Inter-controller command forwarding carries the same ID; a forwarding
-path that drops it results in a refusal, not a legacy fallback.
-
-New persisted JSON fields have defaults. Old ordinary VM records remain readable.
-Legacy `MigratingOut` records with no attempt ID remain blocked after startup and
-produce no fabricated attempt evidence. Old nonterminal controller migrations with
-no attempt identity are retained as recovery-required; their old status strings
-cannot safely be assigned a new identity retroactively.
-
-**Operational upgrade requirement:** quiesce migration admission and settle existing
-migrations before changing protocol versions. Upgrade the agents and all controller
-replicas before admitting new migrations. A mixed fleet can continue ordinary VM
-operations, but safe migration requires all participating components to implement
-this contract. Do not downgrade agents or controllers while migrations or unresolved
-ownership records exist. Older binaries may ignore the new persisted fields, clear
-legacy operation markers, or apply the old timeout policy. Additive wire decoding
-does not make those older semantics safe.
-
-There is no automatic fencing service or force-recovery API in this change. For an
-unresolved legacy or unacknowledged attempt, an operator must establish the actual
-VMM ownership and ensure that no transfer or competing writer can resume before
-changing persisted state. Merely increasing a timeout, deleting a migration record
-or clearing a source marker is not a recovery procedure.
-
-## Implementation and evaluation map
-
-| Concern | Implementation | Regression evidence |
+| Finding | Source path | Consequence / required regression |
 | --- | --- | --- |
-| Timeout safety | `cluster-controller/src/migration.rs`: `verdict_on_timeout`, `unresolved`, `settle` | `delayed_completion_reports_never_authorize_timeout_cleanup` |
-| Attempt validation | Same module: `apply_report`, `ingest_reports` | `old_reports_cannot_change_a_new_attempt_before_or_after_dispatch`; `reports_check_reporter_peer_phase_and_incarnation_and_survive_roundtrip` |
-| Durable source barrier | `agent/src/provision/migrate.rs`: `begin_migrate_out`, `observe_send`, `finish_migrate_out`; startup reconcile | `restart_keeps_an_unresolved_source_protected`; `persisted_send_recovery_never_provisions_or_resumes_a_second_guest` |
-| Late completion after deadline | Same source watcher and reconciler | `deadline_keeps_ownership_and_later_evidence_resolves_the_same_attempt` |
-| Conditional cleanup and replay | `agent/src/store.rs`: `claim_migration`; provisioner's `cleanup_migration` | `cleanup_is_attempt_bound_and_cancel_before_prepare_survives_restart` |
-| Planner receive deadline | `agent/src/reconcile/observe.rs`, `plan.rs` | `a_receive_deadline_does_not_authorize_cleanup`; does not cover driver API timeout or receiver adoption |
-| Legacy persistence | `agent/src/types.rs`, controller migration status | `legacy_records_load_without_inventing_attempt_evidence` |
-| Real etcd mutation / reservation path | Controller migration reconciler and ingest | `timeout_retains_reservation_and_accepts_late_completion_reports` (requires an existing etcd) |
+| AD-M1: receive API error becomes failed receive | [API](../drivers/cloud-hypervisor/src/api.rs) `receive_migration` → [process](../drivers/cloud-hypervisor/src/process.rs) `receive_failure` → planner | Timeout/transport loss can authorize teardown while VMM work continues. Test delayed/lost reply with a live receiver. |
+| AD-M2: Receiving bypasses adoption | [observe](../components/agent/src/reconcile/observe.rs), [plan](../components/agent/src/reconcile/plan.rs) | Fresh driver map cannot observe surviving receiver arrival. Test reopened store + new driver + existing receiver. |
+| CT10: best-effort volume-home update | [controller migration](../components/cluster-controller/src/migration.rs) `settle` | Succeeded can retain stale volume home. Inject home-write failure before source forgetting. |
 
-Paths in this table are relative to `components/` unless otherwise specified.
-The deterministic agent tests use driver doubles, explicit state transitions and
-real temporary redb files. They test orchestration and persistence, not the actual
-VMM migration protocol. Existing privileged cloud-hypervisor tests and etcd tests
-have external prerequisites and are ignored in an ordinary Cargo test run. A green
-ordinary suite must not be described as a successful live migration experiment.
+These are source findings; no live migration reproduction or fix belongs to this
+comment/documentation change. Planner fakes do not validate adapter evidence semantics.
 
-For thesis evaluation, distinguish the design argument above, executable regression
-evidence, and integration measurements. No formal verification, live cluster
-experiment, packet-loss campaign or power-loss durability experiment is implied.
-Remaining limits include indefinite recovery when evidence is unavailable,
-unbounded receipt-table growth, reliance on the driver's terminal-evidence semantics,
-and the absence of automatic fencing. Capacity admission races outside migration
-outcome handling are separate concerns.
+## Version compatibility
+
+- New commands require nonempty attempt IDs; controllers require
+  `migration/attempt-v2` on both endpoints before reservation/preparation.
+- Additive protobuf fields decode missing IDs as empty. Forwarding must preserve IDs;
+  there is no fallback to legacy migration semantics.
+- JSON defaults preserve ordinary records. Legacy source barriers remain blocked;
+  old nonterminal controller attempts require recovery instead of invented identity.
+- Settle attempts and pause admission before upgrading participating agents and all
+  controller replicas. Do not downgrade with unresolved ownership records.
+- Older binaries may ignore new fields or apply old timeout rules. Decoding
+  compatibility does not establish safe mixed-version migration.
+- No automatic fencing or force-recovery API exists. Establish actual VMM/writer
+  ownership before changing records; deleting a marker is not a recovery procedure.
+
+## Tests and source map
+
+| Concern | Source / regression |
+| --- | --- |
+| Timeout, identity, late reports | [controller migration](../components/cluster-controller/src/migration.rs): `delayed_completion_reports_never_authorize_timeout_cleanup`, `old_reports_cannot_change_a_new_attempt_before_or_after_dispatch` |
+| Source barrier, restart, late completion | [agent migration](../components/agent/src/provision/migrate.rs), [tests](../components/agent/src/provision/tests/migrate.rs): `restart_keeps_an_unresolved_source_protected`, `deadline_keeps_ownership_and_later_evidence_resolves_the_same_attempt` |
+| Replay and cleanup | [store](../components/agent/src/store.rs), [migration tests](../components/agent/src/provision/tests/migrate.rs): `cleanup_is_attempt_bound_and_cancel_before_prepare_survives_restart` |
+| Advisory receive deadline | [planner tests](../components/agent/src/reconcile/tests.rs): `a_receive_deadline_does_not_authorize_cleanup`; excludes AD-M1/M2 |
+| Legacy decoding | [record types](../components/agent/src/types.rs), [migration tests](../components/agent/src/provision/tests/migrate.rs): `legacy_records_load_without_inventing_attempt_evidence` |
+| Real etcd | [controller tests](../components/cluster-controller/src/migration.rs): `timeout_retains_reservation_and_accepts_late_completion_reports`; requires etcd |
+
+Temporary redb and driver doubles test orchestration/process restart, not power loss
+or live VMM transfer. Remaining limits include indefinite uncertainty, unbounded
+receipts and no distributed fencing. See [testing](TESTING.md).

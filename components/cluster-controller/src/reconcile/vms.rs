@@ -8,45 +8,18 @@
 
 use super::*;
 
-/// What the watchdog has to say about one VM on one node, as a value.
-///
-/// D10: a VM on a node that stopped talking kept `phase: Running` for ever,
-/// at both tiers. Three minutes measured in the mini-chaos run, and the lab's
-/// standing inventory showed it over days — eleven guests on manacor reported
-/// `Running` while the agent that would know had been dead for twenty hours.
-/// The guests really were running, which is precisely the point: the control
-/// plane had no evidence either way and was asserting one of them.
-///
-/// `Unknown` and not `Failed`. Nothing is proven broken — an agent that is
-/// killed leaves its VMMs standing, deliberately — and `Failed` is the phase
-/// the requeue curve acts on, so claiming it would have this tier repairing
-/// something it cannot see.
-///
-/// Only for the phases that CLAIM something about a guest. `Pending` claims
-/// nothing has been dispatched, `Stopped` and `Failed` are already the phases
-/// where nothing is expected to be running, and `Quarantined` is deliberately
-/// nobody's to touch. Overwriting any of those would replace a fact this tier
-/// established with an absence of one.
-///
-/// Pure, and the clock comes in as an argument: this is the rule, and a rule
-/// that reads `Utc::now()` is a rule that can only be exercised by waiting.
+/// Detect expired node evidence for phases that claim a live guest, or legacy
+/// Unknown status without a silence fact. Silence means Unknown, not Failed:
+/// an agent can disappear while its VMMs continue running, and failure recovery
+/// must not restart a guest whose state is unobserved. The caller supplies time.
 pub(crate) fn silent(vm: &Vm, last_heartbeat: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     vm.spec.node_name.is_some()
         && (claims_a_guest(vm.status.phase().kind()) || unexplained_unknown(&vm.status))
         && heartbeat_expired(last_heartbeat, now)
 }
 
-/// An `Unknown` with nothing behind it: the word is on the object and no
-/// silence FACT says why.
-///
-/// A binary from before struktur 4 wrote the word directly, and the lab had
-/// fourteen of them the night the derivation shipped — every guest of
-/// manacor, `Unknown` since the tenth. `Unknown` is this watchdog's own
-/// verdict and nobody else's (no node ever reports it), so an unexplained one
-/// is its to explain: without this, such an object is never written again,
-/// `settle` never runs on it, and the stuck deadline that D-C1 was about
-/// never sees it. Once the fact is on it the watchdog is done with it, which
-/// is what keeps the level-triggered pass from writing every tick.
+/// Recognize legacy Unknown status without a silence fact so the watchdog can
+/// populate derivation evidence once, without rewriting it on every pass.
 fn unexplained_unknown(status: &controller_api::VmStatus) -> bool {
     status.phase().kind() == VmPhaseKind::Unknown && status.silence.is_none()
 }
@@ -60,19 +33,9 @@ fn claims_a_guest(phase: VmPhaseKind) -> bool {
     )
 }
 
-/// Write that verdict on every VM of one silent node.
-///
-/// Level-triggered and not edge-triggered, which is what the manacor case
-/// forces: the node had been down for twenty hours before this code existed,
-/// so `ready` was already false and there was no transition left to fire on.
-/// Every pass asks the same question of every node, and the write only
-/// happens where the phase still claims a guest or is an `Unknown` nobody has
-/// explained — so the event fires once and the store sees nothing after that.
-///
-/// Every replica's business, exactly as the heartbeat expiry beside it is:
-/// the verdict is idempotent under CAS, and a VM whose node talks to nobody
-/// is a VM `may_reconcile` gives to nobody — so gating this on ownership
-/// would leave the one case it exists for unanswered.
+/// Mark affected VMs Unknown whenever their node evidence expires.
+/// Any replica may apply this idempotently through CAS: gating on session
+/// ownership would exclude precisely the disconnected nodes that need it.
 pub(super) async fn expire_vm_reports(
     store: &EtcdStore,
     vms: &[Vm],
@@ -241,19 +204,8 @@ pub(super) async fn reconcile_vm(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     telemetry::in_trace(span, &context, reconcile_vm_traced(p, vm, context)).await
 }
 
-/// The trace a pass belongs to.
-///
-/// The object's context covers the VM's BIRTH and stops there: while it is
-/// still Pending or Provisioning, this pass is part of the request that asked
-/// for it. Once the phase is stable — or Failed, or Quarantined — the pass
-/// gets a root of its own.
-///
-/// Without that cut the trace never ends. Level-triggered means a pass runs
-/// every tick forever, and a first version of this attached all of them: one
-/// VM, thirty seconds, twelve spans hanging off a `POST /vms` that had long
-/// since returned. The annotation stays on the object either way — it is the
-/// record of where the VM came from, which is worth keeping whether or not
-/// anything is still tracing against it.
+/// Continue the creation trace only while Pending or Provisioning.
+/// Later passes start independent traces; the origin annotation remains stored.
 pub(super) fn birth_trace(vm: &Vm) -> Option<telemetry::TraceParent> {
     if !matches!(
         vm.status.phase().kind(),
@@ -264,20 +216,10 @@ pub(super) fn birth_trace(vm: &Vm) -> Option<telemetry::TraceParent> {
     telemetry::TraceParent::parse(vm.metadata.traceparent().unwrap_or_default())
 }
 
-/// One VM, as the ordered sequence of concerns it actually is. Each step
-/// below is one of them and does nothing else; the order they stand in here
-/// is the whole of the control flow, and it is not free to change:
-///
-/// ownership gate -> teardown -> placement -> create dispatch -> lifecycle
-/// drift -> requeue.
-///
-/// Ownership comes first because every step after it writes or sends.
-/// Teardown comes before placement because a deleting VM is not a VM to
-/// place. Placement ends the pass because there is nothing to send to a node
-/// that was picked a microsecond ago and has not seen the object yet — the
-/// next pass reads the binding back out of the store and goes on from there.
-/// Everything after it needs a bound VM, which is why the node is resolved
-/// once, right here, instead of being unwrapped in three places.
+/// Reconcile in dependency order: ownership, teardown, placement, create,
+/// lifecycle drift, then requeue. No mutation precedes the ownership gate.
+/// Teardown excludes new placement, and a newly written binding ends this pass
+/// so subsequent work reads the committed node on the next one.
 pub(super) async fn reconcile_vm_traced(
     p: &Pass<'_>,
     vm: Vm,
@@ -331,26 +273,11 @@ pub(super) async fn reconcile_vm_traced(
     heal_if_failed(p, &vm, &node, &outgoing).await
 }
 
-/// Carry a move-by-restart one step further, or finish it.
-///
-/// The whole of what the mark does, and it is deliberately small: two steps,
-/// and the second one is somebody else's work.
-///
-///   * **Stopping** — the guest is asked to power off with the node's grace
-///     period, every pass until the phase says it is off. Then the binding is
-///     let go, and that single write hands the VM to the reschedule that has
-///     existed since storage B: `unbind` tells the old node, `forget_unbound`
-///     waits for its report to stop naming the VM, `place` decides again.
-///   * **Moving** — nothing to do but watch. The mark's only remaining job is
-///     to be cleared, and the condition for that is the one thing that means
-///     the move landed: the VM is bound somewhere ELSE. Once it is cleared,
-///     `runStrategy` still says Running and the ordinary lifecycle starts the
-///     guest on the new machine without this function being involved at all.
-///
-/// A restart of this controller in the middle is survivable because the mark
-/// is on the object: the replica that comes back reads which step it was in
-/// and carries on. Without it, the middle of the operation — a VM that is
-/// deliberately off — would be read as drift and started where it stood.
+/// Advance durable move-by-restart evacuation without changing owner intent.
+/// Stopping requests shutdown, then clears the binding once the phase permits it.
+/// Ordinary unbind and placement handle the move. Moving clears the mark after
+/// the VM binds to another node, allowing its original runStrategy to resume.
+/// Persisting the step prevents restart from treating the intentional stop as drift.
 pub(super) async fn evacuate(
     p: &Pass<'_>,
     vm: &Vm,
@@ -439,24 +366,10 @@ pub(super) async fn evacuate(
     }
 }
 
-/// The binding fell: tell the old node to destroy the instance, and let go of
-/// what this VM was holding.
-///
-/// The first half of a reschedule, and the half with something at stake.
-/// What follows is NOT a placement — `status.nodeName` still names the old
-/// node, so this pass runs again every tick until that node's report stops
-/// naming the VM, and `session::forget_unbound` is what clears it. Placing
-/// before then would be two nodes for one VM.
-///
-/// **A referenced volume is detached and an inline one is deprovisioned**,
-/// and neither of those is decided here: `DestroyInstance` is the same
-/// command a delete sends, and the node has read that fork off the VM's own
-/// spec since storage A. So an instance store does not survive a reschedule
-/// — it was made with the VM on that machine and goes with it — which is
-/// exactly what an instance store is, and the guide says so.
-///
-/// Idempotent: the destroy is idempotent at the node, and the release only
-/// ever clears a claim naming THIS VM.
+/// Destroy the old instance after binding release and await reported absence.
+/// `status.nodeName` blocks replacement placement until `forget_unbound` clears it.
+/// The node detaches referenced storage and deprovisions inline disks, so inline
+/// data does not survive rescheduling. Volume claims await separate close evidence.
 pub(super) async fn unbind(p: &Pass<'_>, vm: &Vm, old: &str, outgoing: &str) -> anyhow::Result<()> {
     let name = vm.metadata.name.clone();
     debug!(vm = %name, node = old, "the binding fell; telling the old node");
@@ -477,21 +390,10 @@ pub(super) async fn unbind(p: &Pass<'_>, vm: &Vm, old: &str, outgoing: &str) -> 
     Ok(())
 }
 
-/// Take the binding back because the node said it cannot serve this VM at
-/// all, and remember that it said so.
-///
-/// The second half of `OPEN-ITEMS` §2, and the distinction it rests on is the
-/// node's: a create that failed AFTER a record exists is a boot that may work
-/// next time, and it stays where it is on the requeue curve. A create the
-/// node refused STRUCTURALLY leaves no record and will never work there,
-/// however often it is asked — so the binding falls and the scheduler decides
-/// again.
-///
-/// The node is remembered as a non-candidate with an EXPIRY. Without the
-/// memory the scheduler would very likely choose it again — nothing else
-/// about it changed — and the VM would walk a loop of one create per pass.
-/// With a permanent memory an operator who fixes the node would have to clear
-/// a field nobody told them about.
+/// Clear a binding after structural CannotServe refusal and temporarily exclude
+/// that node. Ordinary boot failures retain their binding for requeue.
+/// Expiring exclusions avoid repeatedly selecting the same unsuitable node while
+/// allowing a repaired node to become eligible again.
 pub(super) async fn unbind_refused(
     p: &Pass<'_>,
     vm: &Vm,
@@ -535,15 +437,8 @@ pub(super) async fn unbind_refused(
     Ok(())
 }
 
-/// How long a node that said `CannotServe` stays off this VM's candidate
-/// list.
-///
-/// One curve, in the sense the requeue policy uses the word: long enough that
-/// a VM does not walk a loop while the scheduler keeps choosing the same
-/// node, short enough that an operator who installs the missing driver does
-/// not have to wait out a shift. Nothing depends on the exact number — a
-/// refusal that expires early is answered by the node refusing again, which
-/// writes a fresh one.
+/// Lifetime of a per-VM CannotServe exclusion. Expiry permits retry after repair;
+/// an unchanged incompatibility produces another refusal and renews the exclusion.
 pub(super) const REFUSAL_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Finalizer flow: tear down on the bound node (idempotent at the agent),
@@ -576,29 +471,10 @@ pub(super) async fn tear_down(p: &Pass<'_>, vm: &Vm, outgoing: &str) -> anyhow::
     Ok(())
 }
 
-/// What the spec asks for against what the node says it has: the disks to
-/// plug in, and the ones to let go.
-///
-/// `None` when the two agree, which is the ordinary state of every VM and the
-/// only state a VM with no referenced disks can be in.
-///
-/// Read off `status.volumes` and NOT off `observedGeneration`, and that is
-/// the whole reason this is level-triggered rather than edge-triggered: a
-/// generation says a spec was written, and what has to be answered here is
-/// whether the bytes are open. An agent restart, a node that lost a record, a
-/// command that was acked and then failed inside the node — all three leave
-/// the generation satisfied and the disk missing, and all three are the same
-/// drift as a fresh attach.
-///
-/// A VM whose node runs an agent from before `attached_volumes` existed
-/// reports an empty list, so every referenced disk reads as not attached and
-/// this asks for a re-create every pass. Idempotent at the node and visible
-/// in the log, which is the honest failure mode for a version skew that has
-/// to end with a rollout anyway.
-// `pub(crate)`, not `pub(super)`: the session ingest test for Astra finding
-// S18 (2026-09-23) asserts through this function, from `session` rather than
-// from `reconcile`, that a vm whose last volume left the spec settles with
-// nothing left to release.
+/// Compare desired referenced disks with node-reported attachments.
+/// `observedGeneration` alone cannot prove that disks remain open after restart
+/// or failed attachment. Legacy agents reporting no attachments cause repeated
+/// idempotent create dispatches for VMs with references until upgraded.
 pub(crate) fn volume_drift(vm: &Vm) -> Option<Drift> {
     // Only where a node has a record to diff against. A Pending VM is handled
     // by the create path above; a Failed one is on the requeue curve, which
@@ -645,26 +521,10 @@ pub(crate) struct Drift {
     pub(crate) release: Vec<String>,
 }
 
-/// Make the node's disks match the spec: hold the new ones, re-send the spec,
-/// let the gone ones go.
-///
-/// One idempotent `CreateInstance` and no new verb, which is the whole shape
-/// of declarative hot-plug: the node already takes a re-sent create for a VM
-/// it knows and now diffs its volume list against it. A second command would
-/// be a second way to say the same thing, and the two would drift.
-///
-/// **The order is the rule, and it is the same one storage A wrote down for
-/// the create path.** A volume is HELD before the node is told to open it —
-/// the reverse leaves a window in which a node has the disk open while the
-/// object says nobody holds it, and `Release::HeldBy` reads that object. It
-/// is let go only AFTER the node has been told to drop it, for the mirror
-/// reason: a volume released while a guest still has it open is a volume a
-/// delete would take the bytes of.
-///
-/// `observedGeneration` is deliberately NOT written here. See
-/// `session::ingest_attachments`: for a spec that changed `volumes[]` it
-/// closes when the node reports the set, because an attach can fail inside
-/// the node long after the command was acked.
+/// Claim newly referenced volumes before resending CreateInstance for hot-plug.
+/// Claims must precede opening disks so deletion cannot see an unowned open disk.
+/// Release follows separate close evidence. Attachment reports, not this ACK,
+/// advance `observedGeneration` for disk changes.
 pub(super) async fn hot_plug(
     p: &Pass<'_>,
     vm: &Vm,
@@ -710,26 +570,9 @@ pub(super) async fn hot_plug(
     Ok(())
 }
 
-/// Take hold of every volume this VM refers to, by name, before the node is
-/// told anything.
-///
-/// A compare-and-swap per volume, and the order is the point: the claim is
-/// written BEFORE the create is dispatched, so a volume that is held is held
-/// from the first moment anybody could be using it. The reverse order has a
-/// window in which the node has the disk open and the object says nobody
-/// does — and `Release::HeldBy` reads that object.
-///
-/// Point a volume's record at the node its vm is on, to be re-opened there.
-///
-/// Pure and named for one reason: the node has to be WRITTEN and not cleared,
-/// and a `None` here reads so much like "let somebody decide" that it was
-/// written that way and shipped. `place_volume` is that somebody — it takes
-/// the first feasible node of the pool and knows nothing about a vm waiting
-/// on another one — so a cleared node came back as the node the volume had
-/// just left, and the two passes took turns every five seconds: "the record
-/// follows the vm", "volume ns-b is being re-opened on agent-1b", with the vm
-/// `Pending` for as long as anybody watched. `next_for` is the other half of
-/// this rule and says the same thing from the volume's side.
+/// Point a volume record at the VM's chosen node and mark it awaiting reopen.
+/// Keep that explicit destination: clearing it would let independent volume
+/// placement choose another node and repeatedly undo the VM's placement.
 pub(super) fn follow_vm(v: &mut Volume, vm: &str, node: &str) {
     v.status.node = Some(node.to_string());
     v.status.reported = Some(controller_api::VolumeReported::here(
@@ -767,35 +610,10 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
             info!(volume = %name, from = %from, to = node,
                   "the vm's node already has the volume open; the record moves with it");
         }
-        // The RECORD follows the vm, and only ever within a pool that says
-        // the bytes are reachable from where it is going.
-        //
-        // A volume's `status.node` is the machine that has it OPEN, and until
-        // a vm could move it was also the machine that made it, so the two
-        // were the same fact and nothing distinguished them. A drain
-        // separates them: the vm is placed on another node of the same
-        // `shared` pool — legitimately, `volume_bindings` allowed exactly
-        // that — and the node it lands on has never been told about the
-        // volume. The create then dies with the agent's own sentence, "this
-        // node has no record of volume <uid>", and the vm sits Failed with
-        // its disk one machine away.
-        //
-        // Re-pointing it is enough because the bytes do not move: every
-        // backend derives its name from the volume's uid, `provision` adopts
-        // an existing file rather than making a second one, and the pool has
-        // already said both machines can reach it. The record is pointed AT
-        // the vm's node, not cleared: `place_volume` takes the first feasible
-        // node of the pool and has no idea a vm is waiting on the other one,
-        // so a cleared `node` came straight back as the node the volume had
-        // just left. Round 4's e2e watched the two passes take turns every
-        // five seconds — "the record follows the vm" and then "volume ns-b is
-        // being re-opened on agent-1b", for as long as anybody looked, with
-        // the vm `Pending` throughout. A destination this pass already knows
-        // must not be re-derived by a pass that does not.
-        //
-        // NOT done for a `node-local` pool, and the guard is the same one the
-        // scheduler used to get here: such a vm was never placed anywhere but
-        // on the machine holding its bytes.
+        // For reachable shared storage, move the record to the VM's destination so
+        // the agent reopens the existing UID-derived backend. Preserve that explicit
+        // node to prevent volume placement from selecting elsewhere. Node-local bytes
+        // cannot follow the VM through this path.
         if volume.status.node.as_deref().is_some_and(|n| n != node) {
             let pool: Option<StoragePool> = match p.store.get(&volume.spec.pool).await {
                 Ok(pool) => Some(pool),
@@ -816,18 +634,9 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
                 anyhow::bail!("volume {name} is being re-opened on {node}");
             }
         }
-        // Not ready HERE, yet. The gate exists because a bound VM's create is
-        // no longer preceded by `place`, which is where "is this disk ready"
-        // used to be asked: a vm that is REBOUND — by a reschedule, by a
-        // drain, by the record above following it — is dispatched straight
-        // from `reconcile_vm_traced`, and the node it lands on may not have
-        // been told about the volume yet.
-        //
-        // Seen in the position-2 e2e as a `Failed` vm carrying the agent's
-        // own sentence, "this node has no record of volume <uid>", one pass
-        // before the provision reached that node. It healed itself on the
-        // requeue, which is the worst kind of bug: correct in the end, and a
-        // red phase in between that nothing explains.
+        // Wait for volume readiness at the bound node before VM dispatch.
+        // A rebound VM bypasses initial placement checks and may arrive before its
+        // volume record has been opened there.
         if volume.status.phase().kind() != VolumePhaseKind::Ready {
             anyhow::bail!(
                 "volume {name} is {} on {node}; the vm waits for it",
@@ -891,17 +700,8 @@ pub(super) async fn hold_volumes(p: &Pass<'_>, vm: &Vm, node: &str) -> anyhow::R
     Ok(())
 }
 
-/// Say that this VM is waiting for a disk somebody else holds.
-///
-/// Its own word (`VolumeHeld`) and not `NotReady`, because the two send
-/// different people to different places: `NotReady` is a wait on this control
-/// plane — the bytes are being made and will arrive — and this is a wait on a
-/// PERSON. Nothing here will ever take a disk off the guest holding it.
-///
-/// It is also what makes D4 safe to read. The claim now falls only when the
-/// last holder has gone AND no machine reports the bytes open, so the window
-/// in between is a VM that says who has its disk instead of one that says
-/// "not ready" for as long as anybody watches.
+/// Record VolumeHeld separately from VolumeNotReady: another VM's claim must
+/// be released, not displaced by this request. Close evidence can lag teardown.
 async fn note_vm_held(p: &Pass<'_>, vm: &Vm, volume: &str, holder: &str) -> anyhow::Result<()> {
     let said = format!("volume {volume} is still held by {holder}");
     if vm
@@ -946,23 +746,9 @@ pub(super) async fn release_named_volumes(p: &Pass<'_>, vm: &Vm, names: &[String
             .store
             .mutate::<Volume, _>(name, |v| {
                 if v.status.attached_to.as_deref() == Some(vm.metadata.name.as_str()) {
-                    // **The claim is not cleared here any anymore, and that is
-                    // D4.** It used to fall as the `DestroyInstance` was
-                    // dispatched, which is one command's round trip too
-                    // early: between the dispatch and the node's `detach`
-                    // there was an object saying nobody held the disk while a
-                    // VMM still had it open, and that is exactly the window
-                    // in which a DELETE takes somebody's data —
-                    // `Release::HeldBy` reads this field, finds nothing, and
-                    // lets the deprovision go.
-                    //
-                    // What is written instead is the FACT this pass knows:
-                    // the VM that held it is on its way out. The claim falls
-                    // in `settle` when that fact and an empty `openOn` agree
-                    // (`volume_claim_holds`), which is when the bytes really
-                    // are nobody's. A reschedule of the same VM keeps it: the
-                    // name is the same name, so the volume pass finds the
-                    // object again and clears this.
+                    // Record claimant departure without releasing the claim yet. `settle`
+                    // requires both this fact and empty `openOn` before freeing it. Destroy ACKs
+                    // alone cannot prove handles closed. Rescheduling the same VM retains its claim.
                     v.status.claimant_gone = true;
                 }
             })
@@ -1034,18 +820,9 @@ pub(super) async fn dispatch_create(
     let settles_here = volume_drift(vm).is_none();
     p.store
         .mutate::<Vm, _>(&vm.metadata.name, |v| {
-            // The generation the node was actually told about, and only
-            // when the telling worked: a create that never left the process
-            // is not a spec anybody has acted on.
-            //
-            // AND only when this dispatch settles the spec on its own. A
-            // create that changes `volumes[]` on a VM that already has a
-            // record does not: the command is acked the moment the node has
-            // it, and the attach can still fail inside the node. That one
-            // closes when the report names the disks — see
-            // `session::ingest_attachments`, which is the only other writer
-            // of this field and the reason it is guarded here rather than
-            // simply not written.
+            // Advance the acknowledged generation only when this dispatch settles it.
+            // For changed attachments, `ingest_attachments` instead waits for the reported
+            // disk set; command acknowledgement alone is insufficient evidence.
             if outcome.is_ok() && settles_here {
                 v.status.observed_generation = v.status.observed_generation.max(dispatched);
             }
@@ -1083,29 +860,10 @@ pub(super) async fn dispatch_create(
     Ok(())
 }
 
-/// What a create's answer says about the object, and whether it may be
-/// written over what is already there.
-///
-/// Two answers and two different kinds of thing, which is the whole of this
-/// function. An ACK is a guess about the future: the node has the spec and
-/// will try. The agent acks a create and reports the booted VM over the same
-/// session, so its first status report can land before this write — and
-/// anticipation must never overwrite observation, so an ack moves only a VM
-/// nobody has reported on yet.
-///
-/// A REFUSAL is an observation. The node ANSWERED, the answer is that this
-/// create did not happen, and a node that refuses a create keeps no record of
-/// the VM — so no further report is ever coming to correct whatever phase an
-/// earlier report left behind. Gating the refusal on Pending as well is what
-/// made a VM vanish into Provisioning for ever: seen in the lab, a guest
-/// whose kernel was on the node and whose initramfs was not reported
-/// Provisioning, failed inside cloud-hypervisor a heartbeat later, lost its
-/// record, and then sat there with no message and nothing retrying. Written
-/// whatever the object says now, so that `heal_if_failed` — right at the end
-/// of the same pass, and it re-sends the whole create — can see it.
-///
-/// `Quarantined` is the one phase a refusal may not overwrite: it is an
-/// operator's word about a VM and it outranks a machine's.
+/// Apply a create ACK only before runtime evidence has advanced the phase.
+/// A later status report must not be overwritten by an earlier acknowledgement.
+/// Refusals can update other phases so recovery sees them, but never override
+/// operator quarantine.
 pub(crate) fn create_answer(
     refusal: Option<String>,
     current: VmPhaseKind,

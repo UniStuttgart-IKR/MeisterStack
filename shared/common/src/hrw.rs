@@ -20,12 +20,8 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Finalizer (MurmurHash3's fmix64), and it is not decoration. FNV-1a folds
-/// the last byte in as `(h ^ b) * prime`, so inputs that differ only at the
-/// end differ only in the low bits of the product — and endpoints that differ
-/// only in a port digit are exactly that case. Sorting on the raw value put
-/// half the nodes on one replica (the test below is what caught it); mixing
-/// the bits back over the whole word is what makes the spread a spread.
+/// MurmurHash3 fmix64 finalization spreads FNV-1a scores for similar
+/// endpoint strings, such as addresses differing only in a port digit.
 fn mix(mut h: u64) -> u64 {
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
@@ -46,10 +42,8 @@ fn score(id: &str, endpoint: &str) -> u64 {
     mix(fnv1a(&buf))
 }
 
-/// The endpoints this id prefers, best first — the argmax of the HRW score
-/// leads, the rest is the failover order behind it. A tie (a collision, or the
-/// same endpoint configured twice) falls back to the endpoint string so the
-/// order stays total and reproducible.
+/// Sort endpoints by descending HRW score, then endpoint text for ties.
+/// The remaining entries form a deterministic failover order.
 pub fn preference_order(id: &str, endpoints: &[String]) -> Vec<String> {
     let mut scored: Vec<(u64, &String)> = endpoints.iter().map(|e| (score(id, e), e)).collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));

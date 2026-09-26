@@ -2,26 +2,10 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# `fleet.toml` of schema 2, read by Nix — and the ONLY place a deployment
-# value is derived from it.
-#
-# Until v1 this file had a twin: `tools/meister-deploy/src/fleet.rs` derived
-# the same etcd peer set, the same controller addresses and the same seventeen
-# MEISTER_* variables in Rust, and a shell script (`scripts/check-fleet.sh`)
-# compared the two. Two derivations of one fact are two facts waiting to
-# disagree, so there is one now: Nix derives, and Rust reads the inventory for
-# its SHAPE only (`tools/meister-deploy/src/inventory.rs`, and
-# `tests/inventory_derives_nothing.rs` holds it to that). What the two still
-# share is precedence — defaults < group < host — and `checks.inventory-parity`
-# compares their answers for the same file rather than trusting this comment.
-#
-# The three roads out of here:
-#
-#   hostModule <id>       the NixOS module a host of this fleet is
-#   contextEnv <id>       the MEISTER_* variables, for nix/lib/render.nix
-#                         (build time) and nix/context.nix (boot time)
-#   manifestInventory     the cheap half of `meisterDeployment`, which is
-#                         `meister-deploy`'s `nix-manifest/1` contract
+# Read schema-2 fleet inventories, validate topology and inheritance, and derive
+# host modules, renderer inputs, and manifest inventory. Scalar precedence is
+# defaults < group < host; equal-rank group conflicts are errors. Lists accumulate
+# in declaration order. inventory-parity.py checks the shared precedence contract.
 { lib }:
 
 let
@@ -30,48 +14,17 @@ let
   knownReboot = [ "auto" "approve" "never" ];
   knownDeployments = [ "nixos" "context" ];
 
-  # How a machine of this fleet gets its kernel.
-  #
-  # `uefi` is a machine that boots itself: an ESP, systemd-boot, and with it
-  # the boot-mode rollback of `meister-activate` (`bootctl set-oneshot`, D5).
-  # `direct` is a machine whose kernel, initrd and command line are handed to
-  # it from OUTSIDE — a hypervisor's direct kernel boot — so it carries no
-  # boot loader at all and has no boot-mode rollback; what it keeps is the
-  # switch rollback, which is userland and works unchanged.
-  #
-  # --- lane 5C ---
-  # `grub` is the third: a machine that boots ITSELF out of a loader this
-  # flake did not install and cannot drive. Every VM made from
-  # `packages.managed-disk-image` is one — legacy MBR, grub, no ESP — and
-  # the lab found (L2, 2026-09-23) that there was no word for it: calling
-  # such a host `uefi` made `apply` hand the helper `--mode boot`, and the
-  # helper refused, correctly, with "bootctl says systemd-boot is not
-  # installed". Every release that changed the kernel then stopped there,
-  # so such a host was not deployable at all.
-  #
-  # What `grub` keeps is the switch rollback, which is userland; what it
-  # does not have is the boot rollback, because `bootctl set-oneshot` is
-  # what one is made of. D5 called that a documented limit and this is the
-  # word that documents it. It is NOT a mode this flake installs — the
-  # assertion below says so — because installing a loader whose rollback
-  # this tool cannot arrange would be a guarantee it cannot keep.
-  #
-  # `bios` is deliberately not a value: it describes firmware, and the
-  # question here is who wrote the boot menu.
+  # Boot ownership: uefi uses systemd-boot; direct receives its kernel from the
+  # provider; grub keeps an existing loader. Only uefi supports boot-entry rollback.
+  # This fleet can install uefi and direct hosts; grub hosts must already be installed.
   knownBootModes = [ "uefi" "direct" "grub" ];
-  # --- end lane 5C ---
-
-  # The order roles are DEPLOYED in, and therefore the order they are written
-  # in: the bottom tier first, so that a controller never issues a command the
-  # tier below it does not understand yet.
+  # Deploy roles from the agent toward the cloud so lower tiers are updated first.
   roleRank = { agent = 0; cluster = 1; cloud = 2; addons = 3; };
   sortRoles = rs: builtins.sort
     (a: b: (roleRank.${a} or 99) < (roleRank.${b} or 99))
     (lib.unique rs);
 
-  # The ports, once, and the same numbers nix/services.nix publishes as
-  # `meisterstack.ports`. They are here because the addresses in a context
-  # are derived from them.
+  # Ports used to derive session and API addresses; keep aligned with services.nix.
   ports = {
     cloudApi = 3000;
     cloudSession = 50050;
@@ -83,11 +36,7 @@ let
     metrics = { cloud = 9100; cluster = 9101; agent = 9102; };
   };
 
-  # A disk's size is written in GB in the inventory and in BYTES in the
-  # manifest, because `lsblk -J` answers in bytes and the comparison in
-  # `meister-install confirm` (M3) is against that answer. GB is the decimal
-  # unit every disk is sold in (10^9) and not 2^30: reading "960 GB" as GiB
-  # would call the same disk 894 and the comparison would never match.
+  # Inventory disk sizes use decimal GB; installer comparisons use bytes.
   gb = 1000000000;
 
   isLabel = s:
@@ -95,9 +44,7 @@ let
     && builtins.match "[a-z0-9]([a-z0-9-]*[a-z0-9])?" s != null
     && builtins.stringLength s <= 63;
 
-  # A host ID is not a DNS label: it is what a plan refers to, it may carry
-  # an underscore or a capital, and it never has to resolve. Same rule as
-  # `inventory.rs::check_identifier`.
+  # Host IDs identify plan entries and need not be DNS labels.
   isIdent = s:
     builtins.isString s
     && builtins.match "[A-Za-z0-9][A-Za-z0-9_-]*" s != null
@@ -111,9 +58,7 @@ let
       where = toString file;
       planDir = builtins.dirOf file;
 
-      # The schema first and on its own: a schema 1 file is the pre-v1 plan,
-      # and saying so is one sentence — not a sentence about thirty missing
-      # keys.
+      # Check the schema before reporting missing schema-2 fields.
       schema =
         if !(raw ? schema) then
           throw ("${where}: no `schema` key. An inventory of this tool says `schema = 2` "
@@ -126,17 +71,7 @@ let
             + "a deployment and the groups of every host.")
         else 2;
 
-      # --- lane 5B: a table nobody declared ---------------------------------
-      #
-      # `deny_unknown_fields` on the Rust side has refused an unknown table
-      # since 1C (`inventory.rs`), and this is its twin: two readers of one
-      # file that disagree about what is IN the file are two readers, and
-      # `checks.inventory-parity` exists to keep them one.
-      #
-      # `[opennebula]` gets its own sentence because it is the one that was
-      # really there: the pre-v1 plan carried `frontend` and `image`, Nix
-      # and Rust both parsed them, and NOTHING read them. The provider lives
-      # in the lab repository now, and so does that table.
+      # Reject unknown top-level tables, including obsolete provider configuration.
       knownTop = [ "schema" "fleet" "defaults" "operator" "group" "host" "service" ];
       unknownTop = lib.filter (k: !(lib.elem k knownTop)) (builtins.attrNames raw);
       checkedRaw =
@@ -173,12 +108,7 @@ let
 
       dups = ids: lib.length (lib.unique ids) != lib.length ids;
 
-      # --- precedence: defaults < group < host -----------------------------
-      #
-      # One function, and the only place precedence is spelled out. The twin
-      # is `inventory.rs::settle`/`one_of`, and the group order is the order
-      # the HOST wrote its groups in, so that the sentence about a conflict
-      # names them the way the operator sees them.
+      # Scalar precedence: defaults < groups < host. Equal-rank groups must agree.
       groupsOf = h: map (g: groupsRaw.${g}) (lib.filter (g: groupsRaw ? ${g}) (h.groups or [ ]));
 
       settle = h: key: get: fallback:
@@ -207,9 +137,7 @@ let
         else if fromDefaults != null then fromDefaults
         else fallback;
 
-      # Lists ACCUMULATE, in precedence order, first mention winning: a
-      # profile list is an import order, and a group that adds a check makes
-      # its members stricter rather than replacing what they had.
+      # Accumulate lists in declaration order, keeping each value once.
       accumulate = h: get:
         lib.unique (get defaults ++ lib.concatMap get (groupsOf h) ++ get h);
 
@@ -217,21 +145,16 @@ let
         ssh = {
           user = settle h "ssh.user" (x: (x.ssh or { }).user or null) "root";
           port = settle h "ssh.port" (x: (x.ssh or { }).port or null) 22;
-          # No `host_key` in defaults or in a group, on purpose: a key shared
-          # by several machines is not an identity.
+          # SSH host fingerprints belong to individual hosts and are never inherited.
           host_key = (h.ssh or { }).host_key or null;
         };
         profiles = accumulate h (x: x.profiles or [ ]);
-        # How this machine is booted. `uefi` by default, because a machine
-        # that boots itself is the only one that can take a boot back by
-        # itself (D5); `direct` is the deliberate other answer for a guest
-        # whose hypervisor loads the kernel.
+        # Default to a host-managed UEFI boot; direct and existing grub are explicit.
         boot = settle h "boot" (x: x.boot or null) "uefi";
         rollout = {
           max_unavailable =
             settle h "rollout.max_unavailable" (x: (x.rollout or { }).max_unavailable or null) 1;
-          # The conservative end of the three: a reboot nobody approved is the
-          # failure this whole tool exists to prevent.
+          # Require approval for reboots unless the inventory specifies another policy.
           reboot = settle h "rollout.reboot" (x: (x.rollout or { }).reboot or null) "approve";
           canary = settle h "rollout.canary" (x: (x.rollout or { }).canary or null) null;
         };
@@ -239,18 +162,8 @@ let
           required = accumulate h (x: (x.checks or { }).required or [ ]);
           functional = accumulate h (x: (x.checks or { }).functional or [ ]);
         };
-        # The binary caches this host may FETCH from, in the order nix tries
-        # them. Accumulated rather than settled, for the same reason
-        # `profiles` is: a list of substituters is an order, and a group that
-        # adds a regional mirror is adding one rather than replacing what the
-        # fleet already had.
-        #
-        # Empty is the default and is a host that is only ever pushed to —
-        # the whole closure comes over ssh and nothing a third party put in a
-        # cache can surprise it. What makes a cache safe once it is named is
-        # `meisterstack.managed.trustedPublicKeys`: a substituted path is
-        # held to `require-sigs = true` exactly like a pushed one, so the
-        # fleet's own signing key is what makes its own cache usable.
+        # Accumulate substituters in lookup order. An empty list uses pushed closures.
+        # Managed hosts require signatures from their configured trusted keys.
         substituters = accumulate h (x: (x.managed or { }).substituters or [ ]);
       };
 
@@ -264,9 +177,7 @@ let
         in
         rec {
           id = h.id;
-          # What the machine calls itself. The node ID is what a plan refers
-          # to; the two are allowed to differ, and `MEISTER_NODE_ID` carries
-          # the id (see `contextEnv`).
+          # The hostname may differ from the stable host ID used as MEISTER_NODE_ID.
           name = h.name or (throw "${where}: host ${h.id} has no name");
           deployment = h.deployment or (throw
             ("${where}: host ${h.id} has no `deployment`. It is `nixos` (this flake builds its "
@@ -282,10 +193,7 @@ let
             if management != null then management.address
             else throw ("${where}: host ${h.id} has no networks.management, so nothing knows "
               + "which address to reach it at");
-          # The operator's own files, relative to the inventory. Almost every
-          # real box needs one — a driver, a firmware, a kernel option, its
-          # own hardware-configuration.nix — and none of that is something
-          # this stack should be trying to describe.
+          # Resolve operator modules relative to the inventory file.
           modules = h.modules or [ ];
           modulePaths = map (m: planDir + "/${m}") (h.modules or [ ]);
           capabilities = h.capabilities or [ ];
@@ -300,9 +208,7 @@ let
           checks = eff.checks;
           substituters = eff.substituters;
           has = role: builtins.elem role roles;
-          # The raft group this host is a member of, if any: the group whose
-          # kind says its members form a quorum. A host in two of them would
-          # be a member of two rafts, which is why it is refused below.
+          # A host may belong to at most one Raft group.
           raftGroups = lib.filter (g: (groupsRaw.${g}.kind or null) == "raft")
             (lib.filter (g: groupsRaw ? ${g}) groups);
           raftGroup = if raftGroups == [ ] then null else builtins.head raftGroups;
@@ -316,22 +222,13 @@ let
       clusterHostsOf = gid: lib.filter (h: h.has "cluster") (membersOf gid);
       addonsHosts = lib.filter (h: h.has "addons") (lib.attrValues hosts');
       addonsHost = if addonsHosts == [ ] then null else builtins.head addonsHosts;
-      # Kanidm is reached under a NAME: its origin is an https url, its
-      # certificate has to match it, and its `domain` is an `iname` that
-      # refuses anything starting with a digit — so an address is not one
-      # (D-P6: a fleet without a domain built an image that came up dead on
-      # its first boot and said so nowhere earlier).
+      # The addons identity provider requires a domain for its origin and certificates.
       addonsFqdn =
         if addonsHost == null then null
         else if domain != null then "${addonsHost.name}.${domain}"
         else null;
 
-      # --- everything that is wrong with this inventory, each with a sentence
-      #
-      # `seq schema` first, and that is not decoration: a schema 1 file has
-      # `[[node]]` and no `[[host]]`, so without it the first complaint would
-      # be "no [[host]]; there is nothing to deploy" — true, and the wrong
-      # sentence entirely for somebody holding the pre-v1 plan (measured).
+      # Force the schema check before host validation to report incompatible input clearly.
       errors = builtins.seq schema (
         (lib.optional (hostList == [ ])
           "${where}: no [[host]]; there is nothing to deploy")
@@ -378,9 +275,7 @@ let
             ++ (lib.optional (!(builtins.elem h.rollout.reboot knownReboot))
               ("${where}: host ${h.id} has rollout.reboot = ${h.rollout.reboot}; it is "
                 + lib.concatStringsSep ", " knownReboot))
-            # The sentence for `bios` is its own, because it is the answer
-            # somebody will try and the reason it is refused is not obvious
-            # from a list of two words.
+            # Explain that BIOS firmware does not identify the installed bootloader.
             ++ (lib.optional (h.boot == "bios")
               ("${where}: host ${h.id} asks for boot = \"bios\". This flake installs uefi or "
                 + "direct, and it deploys to a machine that already has grub — that value is "
@@ -390,25 +285,14 @@ let
             ++ (lib.optional (h.boot != "bios" && !(builtins.elem h.boot knownBootModes))
               ("${where}: host ${h.id} has boot = ${builtins.toJSON h.boot}; a host of this "
                 + "fleet boots " + lib.concatStringsSep " or " knownBootModes))
-            # --- lane 5C ---
-            # A grub host is one this flake DEPLOYS TO and never installs:
-            # `meister-install` writes systemd-boot (uefi) or no loader at
-            # all (direct), and installing a loader whose rollback this tool
-            # cannot arrange would be a guarantee it cannot keep. `grub` is
-            # for a machine that is already bootable — a guest from
-            # packages.managed-disk-image, or a box somebody installed by
-            # hand — and such a machine has no install table.
-            #
-            # Here and not in `assertions` below, because this is a fact
-            # about the inventory and needs no host to be evaluated: the
-            # sentence has to reach somebody running `validate`, not
-            # somebody building a system.
+            # Existing grub hosts are deployment targets, but this installer cannot create
+            # or roll back their boot menu. Reject install tables during inventory validation.
             ++ (lib.optional (h.boot == "grub" && h.install != null)
               ("${where}: host ${h.id} has boot = \"grub\" AND an install table. This flake "
                 + "installs uefi (systemd-boot) or direct (no loader at all); a grub host "
                 + "brings its own loader, which is why it has no boot fallback. Drop the "
                 + "install table, or set boot = \"uefi\" and give the layout an ESP."))
-            # --- end lane 5C ---
+
             ++ (lib.optional (h.install != null && !(h.install ? layout))
               ("${where}: host ${h.id} has an install table without a layout. The layout is "
                 + "the disko module that decides the partition table, named relative to this "
@@ -445,16 +329,8 @@ let
                   ("${where}: host ${h.id} keeps ${p.path} across a reinstall but "
                     + "install.preserve does not list it")))
               h.persistence)
-            # An agent has to know which cluster it reports to.
-            # `controller_group` is the answer; a raft group it is itself a
-            # member of is the one-box case.
-            #
-            # Unless there is no cluster to report to at all: a fleet without
-            # a single cluster role is one or more SINGLE NODES
-            # (nix/single-node.nix), and their agents run standalone by
-            # design. The rule keeps catching the forgotten controller_group
-            # in a fleet that has a cluster, which is the mistake it exists
-            # for.
+            # Agents need a controller group when the fleet contains clusters.
+            # An agent-only fleet may run standalone.
             ++ (lib.optional
               (h.has "agent" && h.controllerGroup == null
                 && !(builtins.any (g: clusterHostsOf g != [ ]) h.groups)
@@ -465,8 +341,7 @@ let
               ("${where}: cluster ${h.id} has no cloud to register with; add a host with the "
                 + "cloud role")))
           (lib.attrValues hosts'))
-        # A raft group tolerates a loss only at an odd size; an even one costs
-        # a box and buys nothing.
+        # Supported Raft group sizes are one, three, or five members.
         ++ (lib.concatMap
           (g:
             let m = membersOf g.id; in
@@ -499,20 +374,10 @@ let
                 + "the two is wrong.")))
           serviceList));
 
-      # Forced by every consumer below, so a broken inventory fails at
-      # EVALUATION — `nix flake check`, `nix build .#…` and `meister-deploy
-      # resolve` alike — rather than producing a system nobody can use.
+      # Every consumer forces validation before emitting deployment values.
       hosts = if errors == [ ] then hosts' else throw (builtins.head errors);
 
-      # --- the derivations, which live here and nowhere else ---------------
-      # A session address carries its scheme. The tier that dials builds a
-      # tonic endpoint out of the string (shared/proto/src/lib.rs
-      # `session_endpoint`), and tonic refuses a url without one at connect
-      # time ("invalid URL, scheme is missing" -- measured in
-      # nix/tests/keys.nix, in a loop every 30 s, with a cluster that never
-      # reached its cloud). The lab's hand-written context has always said
-      # `https://`; this derivation has to say it too, and it is `https`
-      # because the session ports speak mTLS and nothing else.
+      # Session URLs include https because generated sessions use mTLS.
       sessionUrl = c: port: "https://${c.address}:${toString port}";
 
       controllerAddrsOf = h:
@@ -522,16 +387,14 @@ let
 
       cloudAddrsOf = _: map (c: sessionUrl c ports.cloudSession) cloudHosts;
 
-      # `id=ip,…` for a member of a raft group of more than one, and nothing
-      # at all for a group of one: an empty peer set IS the loopback single
-      # member nix/etcd.nix bakes, which is what a one-box lab has always run.
+      # Use explicit peer membership for multi-member Raft groups; an empty set
+      # selects the loopback single-member configuration in etcd.nix.
       etcdPeersOf = h:
         let m = if h.raftGroup == null then [ ] else membersOf h.raftGroup; in
         if lib.length m < 2 then null
         else lib.concatStringsSep "," (map (p: "${p.id}=${p.address}") m);
 
-      # One port per host AND ROLE: a box with two roles has two listeners
-      # (9100 cloud, 9101 cluster, 9102 agent).
+      # Allocate one metrics port per role: cloud 9100, cluster 9101, agent 9102.
       scrapeTargets = lib.concatMap
         (h: lib.concatMap
           (r: lib.optional (r != "addons") "${h.address}:${toString ports.metrics.${r}}")
@@ -542,11 +405,7 @@ let
         let h = hosts.${id}; in
         {
           MEISTER_ROLE = lib.concatStringsSep "," h.roles;
-          # The node id is the PLAN's identity and not the hostname: a plan
-          # refers to `id`, a machine calls itself `name`, and the two are
-          # allowed to differ. nix/context.nix falls back to the hostname
-          # where nobody said otherwise, which is how a context VM with no
-          # plan still has an id.
+          # Use the inventory ID for node identity, independently of the hostname.
           MEISTER_NODE_ID = h.id;
         }
         // (lib.optionalAttrs (h.has "cloud") {
@@ -565,125 +424,66 @@ let
         // (lib.optionalAttrs (etcdPeersOf h != null) {
           MEISTER_ETCD_PEERS = etcdPeersOf h;
           MEISTER_ETCD_MEMBER = h.id;
-          # Two tiers bootstrapping on one network must not share a token: it
-          # is what keeps a cloud member out of a cluster's raft.
+          # Scope the bootstrap token to the fleet and Raft group.
           MEISTER_ETCD_TOKEN = "${header.name}-${h.raftGroup}";
         })
-        # A fleet with an addons host points every host at it, the addons
-        # host included. A fleet without one says nothing, and a fleet that
-        # says nothing exports nothing.
+        # An addons host supplies telemetry endpoints for the entire fleet.
         // (lib.optionalAttrs (addonsHost != null) ({
           MEISTER_OTLP_ENDPOINT = "http://${addonsHost.address}:${toString ports.otlp}";
           MEISTER_LOKI_URL =
             "http://${addonsHost.address}:${toString ports.loki}/loki/api/v1/push";
           MEISTER_LOG_FORMAT = "json";
-          # The name in the certificate, the origin and every redirect are
-          # that same name, so a fleet with no dns has to be told it — and
-          # told it everywhere, because the addons host's own origin is the
-          # name as well.
+          # Distribute the addons FQDN for certificate, origin, and redirect resolution.
           MEISTER_HOSTS = "${addonsHost.address} ${addonsFqdn}";
         } // lib.optionalAttrs (h.has "cloud") {
-          # Kanidm publishes one issuer per oauth2 client, and the cloud's
-          # client is the cli's.
+          # Kanidm exposes an issuer for each OAuth2 client.
           MEISTER_OIDC_ISSUER =
             "https://${addonsFqdn}:${toString ports.kanidm}/oauth2/openid/meister-cli";
-          # Kanidm writes the NAME OF THE CLIENT into `aud` and has no
-          # audience mapper to say anything else with.
+          # Kanidm uses the OAuth2 client name as the token audience.
           MEISTER_OIDC_AUDIENCE = "meister-cli";
         }));
 
-      # --- the module a host of this fleet is ------------------------------
-      #
-      # Expressed only through the options a foreign host has too, so that
-      # there is one road into these modules and the inventory is a caller of
-      # it. What it does NOT set: `stateVersion`, the firewall, resolvconf,
-      # the filesystems — those are the operator's own answers, which is what
-      # `templates/operator/profiles/base.nix` is for.
+      # Express inventory values through public module options. Host profiles own
+      # stateVersion, firewall policy, filesystems, and other machine configuration.
       hostModule = id:
         let h = hosts.${id}; in
         { config, lib, ... }: {
           meisterstack.roles = h.roles;
-          # Without MEISTER_ROLE: `meisterstack.roles` above derives it
-          # (nix/roles.nix), and two owners for one variable is a conflict
-          # waiting for the day they disagree.
+          # roles.nix derives MEISTER_ROLE; do not define it twice.
           meisterstack.context.defaults =
             removeAttrs (contextEnv id) [ "MEISTER_ROLE" ]
-            # The OIDC trust anchor is a PATH, and only this module knows
-            # where this host keeps its keys.
+            # Resolve the OIDC trust path against this host's PKI directory.
             // lib.optionalAttrs (addonsHost != null && h.has "cloud") {
               MEISTER_OIDC_CA = "${config.meisterstack.pki.dir}/ca.crt";
             };
 
-          # The addons role is build time (nix/addons.nix says why), so its
-          # two deployment values come from the inventory as options rather
-          # than as context variables.
+          # Addons configuration is fixed when the system is evaluated.
           meisterstack.addons.fqdn = lib.mkIf (h.has "addons") addonsFqdn;
           meisterstack.addons.scrapeTargets = lib.mkIf (h.has "addons") scrapeTargets;
 
-          # A host that keeps state on a second block device says so in
-          # `persistence`, and one of those labels is the one nix/data.nix
-          # mounts.
+          # Map the declared data device into the runtime data mount.
           meisterstack.data.label = lib.mkIf
             (builtins.any (p: p.device == "label:meister-data") h.persistence)
             "meister-data";
 
-          # --- lane 4B: a card is a fact about a machine ----------------
-          #
-          # A host whose inventory declares an RDMA nic gets the fabric
-          # tools `verify --suite rdma` drives (nix/rdma.nix). Gated on the
-          # agent role as well: a controller with a storage card is not a
-          # machine this suite measures between, and a closure carries what
-          # it is used for.
+          # Enable RDMA tools only on agents whose inventory declares an RDMA NIC.
           meisterstack.agent.rdma.enable =
             h.has "agent"
             && builtins.any (n: n.rdma or false) (h.hardware.nics or [ ]);
-          # --- end lane 4B ----------------------------------------------
-
-          # Per-host overrides, in one named place, so that a review can list
-          # the hosts that are not like the others by grepping for one word.
+          # Apply named per-host deviations after generated role settings.
           meisterstack.cloud.settings = (h.deviations.settings or { }).cloud or { };
           meisterstack.cluster.settings = (h.deviations.settings or { }).cluster or { };
           meisterstack.agent.settings = (h.deviations.settings or { }).agent or { };
 
-          # The bootloader of a host this tool installs, and it follows from
-          # `boot` and from nothing else.
-          #
-          # `uefi`: systemd-boot, because the boot-mode rollback of
-          # `meister-activate` (M2) is `bootctl set-oneshot` and grub has no
-          # equivalent (gate M0 (b)).
-          #
-          # `direct`: no loader at all. The hypervisor holds the kernel, the
-          # initrd and the command line, so a loader inside the guest would
-          # be a menu nothing ever reads — and `canTouchEfiVariables` would
-          # be an install-time failure on a machine that has no efivarfs.
-          # What such a host loses is named rather than hidden:
-          # `activate --mode boot` refuses there (D5, measured in
-          # nix/tests/activate.nix), and the way forward for a new kernel is
-          # the provider (`provider-reboot`, M3 integration).
-          #
-          # mkDefault throughout: a host module may say something else and
-          # answer for it — a BIOS box keeps grub that way, and then it has
-          # no boot-mode rollback either.
-          #
-          # --- lane 5C ---
-          # `grub`: nothing, and that is the whole value. The loader is
-          # already on the machine — a legacy-MBR guest image, or a box
-          # somebody installed by hand — and this flake neither writes it
-          # nor drives it. `boot.loader.grub.enable` stays at the mkDefault
-          # below so that the image module or the host module that OWNS
-          # that loader is the one that says so, with a `grub.device` this
-          # inventory cannot know.
-          # --- end lane 5C ---
+          # UEFI uses systemd-boot; direct disables local loaders; grub retains the
+          # operator's loader. Defaults remain overridable by host modules. Direct and
+          # grub hosts support userland switch rollback, but no boot-entry rollback.
           boot.loader.systemd-boot.enable = lib.mkDefault (h.boot == "uefi");
           boot.loader.efi.canTouchEfiVariables = lib.mkDefault (h.boot == "uefi");
           boot.loader.grub.enable = lib.mkDefault false;
 
-          # And the two halves of the install have to agree about the ESP.
-          # The layout is the one that knows — it is the file that either
-          # makes an EF00 partition or does not — so it says so
-          # (`meisterstack.install.hasEsp`, nix/managed.nix) and this is
-          # where the two are compared. Only for a host this tool installs: a
-          # machine somebody else partitioned has no layout to ask.
+          # For installable hosts, require the boot mode and disk layout to agree on
+          # whether an EFI system partition exists.
           assertions = lib.optionals (h.install != null) [
             {
               assertion = h.boot != "uefi" || config.meisterstack.install.hasEsp;
@@ -704,15 +504,8 @@ let
             }
           ];
 
-          # NO `fileSystems`, and that is the change from schema 1: where the
-          # disk is partitioned is disko's answer (M3) or the operator's host
-          # module, and a `fileSystems."/"` from the inventory would be a
-          # second author for it.
-
-          # The network belongs to the host unless the inventory says
-          # otherwise. `networks.management.static = true` is that saying:
-          # then this address comes from the plan and nothing else may own
-          # the interface.
+          # Filesystems belong to disko or host modules. Configure the management
+          # interface only when the inventory explicitly sets static = true.
           networking = lib.mkMerge [
             { hostName = h.name; }
             (lib.mkIf (h.management != null && (h.management.static or false)) (
@@ -729,13 +522,7 @@ let
           ];
         };
 
-      # --- the manifest: the cheap half of `meisterDeployment` -------------
-      #
-      # This is `meister-deploy`'s `nix-manifest/1` contract
-      # (tools/meister-deploy/src/manifest.rs). Every field is required and
-      # the empty ones are `null` or `[ ]` rather than absent, so a key
-      # nobody filled in is an error here and not a value quietly dropped on
-      # the way to a receipt.
+      # Emit the inventory half of the manifest with explicit null or empty fields.
       network = n:
         if n == null then null else {
           address = n.address;
@@ -782,23 +569,13 @@ let
             };
             layout = h.install.layout;
             preserve = h.install.preserve or [ ];
-            # PUBLIC keys, and the list is what decides whether the installer
-            # medium has an sshd at all (nix/install.nix). Empty means the
-            # console is the only way in, which is the right default for a
-            # medium that is carried to a machine by hand.
+            # Installer SSH access uses public keys; an empty list leaves console access only.
             authorized_keys = h.install.authorized_keys or [ ];
           };
       };
 
-      # The manifest describes the hosts this flake BUILDS A SYSTEM FOR, and
-      # a `context` host is not one of them: it has no closure, no toplevel
-      # and no `build` — it is a VM somebody else instantiated, and the push
-      # in the lab repository serves it. So
-      # it is left out of both halves, of the group memberships and of the
-      # services that name it, exactly as `resolve --hosts` narrows a
-      # manifest to a sub-fleet. `meister-deploy inventory` still lists it
-      # (that verb reads the file, not the evaluation), and
-      # `checks.inventory-parity` compares the hosts both halves describe.
+      # Only nixos hosts have system closures. Filter context hosts out of manifest
+      # hosts, group membership, and service topology; keep them in inventory inspection.
       managedIds = lib.attrNames (lib.filterAttrs (_: h: h.deployment == "nixos") hosts);
       isManaged = id: builtins.elem id managedIds;
 
@@ -807,9 +584,7 @@ let
         members = lib.filter isManaged (map (h: h.id) (membersOf g.id));
         quorum = if g.kind == "raft" then { size = lib.length (membersOf g.id); } else null;
         profiles = g.profiles or [ ];
-        # A group's rollout is the GROUP's words with the fleet's defaults
-        # behind them — not a host's effective rollout, which is a per-host
-        # answer and lives in `hosts.<id>.rollout`.
+        # Group rollout policy inherits fleet defaults independently of host overrides.
         rollout = {
           canary_class = (g.rollout or { }).canary or ((defaults.rollout or { }).canary or null);
           max_unavailable = (g.rollout or { }).max_unavailable
@@ -838,21 +613,14 @@ let
     in
     {
       inherit schema where planDir ports;
-      # The digest of the FILE this evaluation read. `meister-deploy resolve`
-      # compares it with the file `-f` names: a flake that evaluates
-      # `other.toml` while the workstation reads `fleet.toml` would otherwise
-      # write a manifest whose `source.inventory_path` points at a file nobody
-      # evaluated — measured in the lab (L4 finding W3: `keys issue` fell back
-      # to that path and created a CA under the wrong `ca_dir`).
+      # Hash the inventory file so consumers can verify which input was evaluated.
       sha256 = builtins.hashFile "sha256" file;
       fleet = { name = header.name; inherit domain schema; };
       inherit operator hosts defaults;
       groups = groupsRaw;
       services = servicesRaw;
       hostIds = lib.attrNames hosts;
-      # The hosts this flake builds a system for. A `context` host is a VM
-      # somebody else instantiated: it has no nixosConfiguration, and the
-      # pre-v1 push serves it until L3.
+      # Expose the hosts for which this flake builds NixOS systems.
       nixosHostIds = lib.attrNames (lib.filterAttrs (_: h: h.deployment == "nixos") hosts);
       inherit scrapeTargets addonsFqdn addonsHost;
       inherit contextEnv hostModule effective;

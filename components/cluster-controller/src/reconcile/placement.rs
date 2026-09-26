@@ -355,18 +355,9 @@ async fn fleet_verdict(
 }
 
 pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
-    // Decide and SPEND under one lock, and let go before anything awaits: the
-    // room this VM takes has to be gone before the next VM of the same pass
-    // is measured against the node, or two creates in one breath would both
-    // be told there is space for them, and no VM that must stay away from
-    // them would be told they are empty. See `controller_api::spend`.
-    //
-    // An API-edge check cannot do this and that is why it is not the
-    // authority: the objects it would have to count do not exist yet when it
-    // runs. The edge may still refuse early — it just never decides.
-    // What this VM's referenced volumes demand of the node it runs on, read
-    // before the lock because it reads etcd. A VM with only inline disks asks
-    // nothing and this is empty, which is every VM before this milestone.
+    // Read volume constraints before locking candidates, since these reads await
+    // etcd. Placement later chooses and spends capacity under one lock so other
+    // VMs in this pass see the updated capacity and anti-affinity occupancy.
     let bindings = match volume_bindings(p.store, &vm).await? {
         Bindings::Ready(bindings) => bindings,
         // A disk that is still being made is not a refusal, it is a wait —
@@ -421,28 +412,10 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
     let node = match decision {
         Ok(node) => node,
         Err((known, here)) => {
-            // Nothing THIS replica can reach — which is not the same as
-            // nothing at all, and the difference is what a tenant reads.
-            //
-            // Every replica runs this pass for an unbound VM, and each sees
-            // only the machines whose sessions it holds (`Candidate::
-            // connected`). So on a three-replica cluster the three took turns
-            // writing their own view onto one object: "no connected candidate
-            // offers [network/vxlan]" from the replica that holds no machine
-            // with an overlay, then the real reason, then the first one
-            // again. Seen in the lab while proving the class refusal.
-            //
-            // So the second opinion is fleet-wide, out of the Node objects
-            // (`status.sessionEndpoint`, the same evidence `migration.rs::
-            // reaches` reads): if ANY replica holds a machine that would take
-            // this VM, this one says nothing at all and leaves the object
-            // alone — the replica with the session will place it, and it is
-            // the only one that may. The placement and the `free` it spends
-            // stay exactly where they were.
-            //
-            // Only when nobody anywhere can take it does the sentence get
-            // written — and then it is the same sentence on every replica,
-            // because it is derived from the same store.
+            // A replica with no local candidate must not overwrite a valid sibling's view.
+            // Check fleet-wide node evidence before publishing a refusal. If another replica
+            // can place the VM, leave it alone; only the session owner allocates and spends
+            // capacity. Otherwise publish the shared fleet-wide reason.
             let Some((category, reason)) = fleet_verdict(p, &vm, &bindings, &refused, here).await?
             else {
                 debug!(
@@ -451,15 +424,8 @@ pub(super) async fn place(p: &Pass<'_>, vm: Vm) -> anyhow::Result<()> {
                 );
                 return Ok(());
             };
-            // Say WHY on the object, not only in this process's debug log. A
-            // Pending VM was a dead end for anybody holding the API: `vm ls` and
-            // `vm inspect` both showed the phase and nothing else, while the one
-            // explanation lived in a `debug!` line inside whichever replica
-            // happened to run the pass.
-            //
-            // The sentence goes on the object and the CATEGORY goes in the
-            // tally: the sentence counts candidates and names capabilities, and
-            // is exactly the string that must never become a metric label.
+            // Store the detailed Pending explanation for API readers, but use only its
+            // bounded category as a metric label.
             p.pending.note(category);
             debug!(known, "no schedulable node anywhere, staying pending");
             return note_vm_pending(p, &vm, category, reason).await;

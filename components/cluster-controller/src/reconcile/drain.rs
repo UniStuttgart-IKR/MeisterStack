@@ -130,16 +130,8 @@ pub(super) async fn drain_node(p: &Pass<'_>, node: &str, vms: &[Vm]) -> anyhow::
                 leaving.push(name);
                 settled = false;
             }
-            // The owner said their guest must not be interrupted, and a live
-            // migration does not interrupt it. So the drain makes a
-            // `VmMigration` and the reconciler in `migration.rs` carries it —
-            // the same object an operator makes by hand with `vm migrate`,
-            // and the same reconciler, which is the whole reason a migration
-            // is a resource rather than a verb.
-            //
-            // One per vm at a time: a migration already in flight is this
-            // drain's own work from an earlier pass, and making a second
-            // would be two destinations for one guest.
+            // Create live-migration intent for the migration reconciler to execute.
+            // Reuse an in-flight migration for the VM instead of creating competing moves.
             controller_api::drain::Verdict::Live => {
                 if let Err(e) = crate::migration::start_for_drain(p.store, vm, node).await {
                     warn!(vm = %name, node, error = %format!("{e:#}"),

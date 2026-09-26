@@ -2,49 +2,23 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# OpenNebula, and nothing else in this repository knows that word.
-#
-# A VM the lab starts gets a CONTEXT cd: an iso with a `context.sh` on it,
-# written by the front end out of the VM template. This module is the only
-# code that mounts it, and it hands what it finds to the provider-neutral
-# renderer (nix/context.nix) as `meisterstack.context.providerScript`.
-#
-# It is NOT part of `nixosModules.default`. A renderer that knows how to
-# mount a CONTEXT cd is a renderer nobody else can use, and the whole reason
-# for the split in M1 was that fifty-three lines of OpenNebula had taken five
-# hundred lines of rendering hostage.
-#
-# Two readers, and the difference between them is the point:
-#
-#   strict (the default)  `context.sh` is DATA. One line at a time, matched
-#                         against `KEY='value'`, checked against an allowlist
-#                         of six keys, and every value validated before it is
-#                         used. Nothing is sourced, nothing is eval'd, and no
-#                         MEISTER_* variable comes off the medium at all: what
-#                         this machine IS comes from its plan.
-#   legacy                `. "$mnt/context.sh"` — the medium runs as root,
-#                         before the network is up. It is what the twelve VMs
-#                         of the context fleet boot through today, it is
-#                         `meisterstack.appliance.legacyContext`, and it goes
-#                         out with them (L3).
+# Read OpenNebula CONTEXT media through an optional provider module.
+# The default strict reader accepts six validated data keys and never sources
+# the file or imports MEISTER_* values. Legacy mode executes the context as root.
+# Managed hosts can use this provider without a boot-time configuration renderer.
 { lib, config, ... }:
 let
   cfg = config.meisterstack.provider.opennebula;
 
-  # Does this host already own the interface the provider would configure?
-  # `networking.interfaces.<if>.ipv4.addresses` is somebody saying "this
-  # address is mine"; the provider writing another one on top is two owners
-  # for one interface, which is the exact shape of the resolv.conf bug of
-  # 2026-09-08 (nix/appliance.nix tells that story).
+  # Detect a statically configured IPv4 address before letting the provider
+  # configure the same interface.
   staticAddresses =
     let ifs = config.networking.interfaces; in
     if ifs ? ${cfg.interface} then ifs.${cfg.interface}.ipv4.addresses else [ ];
   hostOwnsInterface = staticAddresses != [ ];
 
-  # What the module tells the script, and the ONLY interpolation in either of
-  # them. Both scripts below are plain shell with no Nix in them, which is
-  # what lets scripts/check-context.sh cut them out of this file and run them
-  # against a fixture — the test sets these four variables itself.
+  # Pass provider settings through shell variables; keep the extracted reader
+  # bodies free of Nix interpolation for scripts/check-context.sh.
   preamble = ''
     meister_one_device=${lib.escapeShellArg cfg.device}
     meister_one_interface=${lib.escapeShellArg cfg.interface}
@@ -52,10 +26,7 @@ let
     meister_one_wait=${toString cfg.waitSeconds}
   '';
 
-  # --- the strict reader ---------------------------------------------------
-  #
-  # Cut out of this file and run by scripts/check-context.sh, section N. Keep
-  # it free of Nix interpolation.
+  # Strict data reader, also exercised by scripts/check-context.sh.
   strictScript = ''
     # --- OpenNebula CONTEXT, READ rather than sourced --------------------
     #
@@ -260,12 +231,8 @@ let
     fi
   '';
 
-  # --- the legacy reader ---------------------------------------------------
-  #
-  # Verbatim what nix/one-context.nix:130-185 did, comments and all, and it
-  # stays verbatim: it is the code twelve running VMs boot through, and the
-  # plan for it is removal (L3) rather than improvement. The one change is
-  # its name.
+  # Legacy reader: execute the provider context as root. Retained for
+  # compatibility with context-based deployments.
   legacyScript = ''
     dev=/dev/disk/by-label/CONTEXT
     # Waiting for a cd is for a machine that expects one. A plan node knows
@@ -372,17 +339,8 @@ in
 
     network = lib.mkOption {
       type = lib.types.bool;
-      # The module answers its own question. `hostOwnsInterface` is the
-      # reading of what this host already SAYS: a host that names a static
-      # address for the interface owns it, and one that names none (the
-      # generic managed image, and every VM at its first boot) lets the
-      # medium own it. With a flat `true` default, every managed host on a
-      # provider that also names its address in the inventory stopped at
-      # `resolve` with the assertion below and had to be told, by hand, per
-      # host, what the option's own description already says. Measured in
-      # the lab on 2026-09-23 (lane L4, finding W1): three controllers with
-      # static addresses, one sentence each, and an operator repository that
-      # had to carry a module to set a default nobody disagrees with.
+      # Let the provider configure networking only when the host has no static
+      # address for this interface.
       default = !hostOwnsInterface;
       defaultText = lib.literalMD
         "false if this host names a static address for the interface, true otherwise";

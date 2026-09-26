@@ -27,15 +27,8 @@ pub(super) async fn ingest_status(
     ingest_cluster_facts(store, cluster, status, at).await?;
     ingest_inventory(store, cluster, status, at).await;
 
-    // The cluster speaks the uids this cloud handed out on CreateVm, while the
-    // store is keyed by name, so the list doubles as the index — the same
-    // trade the cluster tier makes with the agent's reports, and the reason
-    // both read their reports through `controller_api::mirror`.
-    //
-    // Listed BEFORE the empty-list shortcut below, because the one decision
-    // that reads an empty list is the one that matters: a cluster that has
-    // just let go of the last VM it had names none, and that is precisely the
-    // proof `forget_unbound` waits for.
+    // Index cloud VMs by the UIDs used in cluster reports. Read before handling
+    // an empty inventory: absence of the final VM can complete an unbind.
     let known = store.list::<Vm>().await?;
     forget_unbound(store, &known, cluster, status, at).await?;
     ingest_routers(store, cluster, status).await;
@@ -53,19 +46,9 @@ pub(super) async fn ingest_status(
     Ok(())
 }
 
-/// What the cluster says about the routers it carries for this cloud, onto
-/// the objects up here.
-///
-/// The one place that writes a router's `phase`, `nodes` and `activeNode` —
-/// the cloud's own pass decides the cluster, the address and the rules and
-/// stops there, because where a router actually IS is a fact only the fleet
-/// holding it has. Which makes this the road a failover travels: the active
-/// machine dies, the cluster makes the next one active, and ten seconds later
-/// `router get` at the cloud names the new one.
-///
-/// Listed OUTSIDE the vms shortcut in `ingest_status` for the reason
-/// `forget_unbound` is: a cluster holding routers and no VMs at all is an
-/// ordinary state, and its routers still have to be read.
+/// Mirror reported router phase, nodes and activeNode into cloud objects.
+/// The cloud reconciler owns placement and rules; cluster reports own runtime
+/// evidence. Process router reports even when the cluster has no VMs.
 pub(super) async fn ingest_routers(store: &EtcdStore, cluster: &str, status: &ClusterStatus) {
     if status.routers.is_empty() {
         return;
@@ -426,16 +409,8 @@ pub(super) async fn ingest_placements(
             continue;
         };
         let addresses = controller_api::addresses_with(&vm.status.addresses, &reported.nics);
-        // Both clear, and that is deliberate for each: a placement can be
-        // given up and a disk can be detached. What an EMPTY list may not do
-        // is clear a list that a cluster too old to send one never filled —
-        // and it cannot, because such a cluster's VMs never had one either.
-        //
-        // The WORD is not relayed here any more, and that is one duplicate
-        // writer fewer: the cluster's reason arrives on the same report and
-        // travels through `ingest_phases`, which is where a word about a VM
-        // belongs. Two roads writing one field is the shape D-B2 came out of,
-        // and this was the second of them.
+        // Allow reports to clear placement and attached-volume lists.
+        // Phase and reason are written separately by `ingest_phases`.
         let unchanged = vm.status.node_name == node
             && vm.status.volumes == volumes
             && vm.status.addresses == addresses;

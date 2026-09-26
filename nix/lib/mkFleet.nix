@@ -2,69 +2,33 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# `lib.mkFleet` — the whole of what an operator's flake calls.
-#
-#   outputs = { nixpkgs, meisterstack, disko, ... }:
-#     meisterstack.lib.mkFleet { inherit nixpkgs disko; meisterstack = meisterstack; } {
-#       inventory = ./fleet.toml;
-#       profiles = import ./profiles.nix;
-#     };
-#
-# What comes back is a flake's worth of outputs: one `nixosConfigurations.<id>`
-# per host the inventory calls `nixos`, the images beside them, the checks
-# that hold the inventory to the tool that reads it, and
-# `meisterDeployment` — the attribute `meister-deploy resolve` evaluates.
-#
-# Two rules this file exists to keep:
-#
-# * **One derivation.** Everything a host ends up being comes out of
-#   nix/lib/inventory.nix. mkFleet arranges modules and outputs; it derives
-#   no address, no peer set and no port of its own.
-# * **One road into the modules.** A host of a fleet is
-#   `nixosModules.services` + `nixosModules.managed` + what the inventory says
-#   + the operator's own profiles — the same options a foreign flake uses
-#   (examples/fleet/foreign-flake is that flake, and it takes its module from
-#   right here).
+# Compose a fleet from schema-2 inventory, public service and managed modules,
+# and operator profiles. Return host configurations, images, checks, and
+# meisterDeployment. inventory.nix owns address and topology derivation.
 { nixpkgs
 , meisterstack
-  # The partition tables. A host with an `install` table names a layout, and
-  # THIS is where that layout is imported — together with disko's own module,
-  # which is what turns `disko.devices` into `fileSystems`. From then on
-  # disko is the only author of that host's mounts, which is why the
-  # operator's own profiles set none (templates/operator/profiles/base.nix
-  # says so where somebody will read it).
-  #
-  # Null is allowed and is a fleet that installs nothing: a host with an
-  # `install` table then gets a sentence rather than a partition table
-  # nobody imported.
+  # Import disko for hosts with install layouts. Fleets without install tables
+  # may omit this input; layouts and filesystems then belong to host modules.
 , disko ? null
-  # The pre-v1 image generator. Only needed where a format has not been
-  # measured against the native `system.build.images` yet.
+  # Optional image generator for formats not using the native NixOS builder.
 , nixos-generators ? null
-  # The GPU stack. Null for a CPU-only fleet, which is what keeps this
-  # buildable in a sandbox with no developer home (L01/V04).
+  # Optional GPU stack; CPU fleets need no leandro input.
 , leandro ? null
 }:
 
 { inventory
-  # attrs: profile name -> NixOS module. The operator's half: stateVersion,
-  # filesystems, firewall, sshd. A host gets the profiles its inventory entry
-  # names, in precedence order (defaults, then its groups, then itself).
+  # Map profile names to NixOS modules. Inventory determines profile import order.
 , profiles ? { }
-  # attrs: host id -> module (or list of modules), for anything that has no
-  # place in a profile. `modules = [ … ]` in the inventory is the other road
-  # and takes paths relative to the inventory file.
+  # Additional modules keyed by host ID. Inventory module paths are another
+  # input and resolve relative to the inventory file.
 , hostModules ? { }
   # Modules every host of this fleet gets.
 , extraModules ? [ ]
 , system ? "x86_64-linux"
   # Overlays on top of ours, for an operator who builds their own agent.
 , pkgsOverlays ? [ ]
-  # Which generator each image format comes from. `native` is
-  # `config.system.build.images.<format>`; `nixos-generators` is the pre-v1
-  # road and needs that input. For the installer the two were measured
-  # byte-for-byte equal in M0 (probe S4), which is why `native` is the
-  # default here.
+  # Select native system.build.images or the optional nixos-generators input
+  # for each image format.
 , images ? { }
 }:
 
@@ -93,23 +57,10 @@ let
     let m = hostModules.${id} or [ ]; in
     if builtins.isList m then m else [ m ];
 
-  # `system` and the overlay, in one place. `nixpkgs.pkgs` rather than
-  # `nixpkgs.overlays`: the `pkgs` above is already instantiated with the
-  # overlay and reusing it means one nixpkgs per fleet instead of one per
-  # host, which on seventy hosts is the difference between minutes and an
-  # afternoon.
+  # Reuse one instantiated package set across the fleet.
   platform = { nixpkgs.pkgs = pkgs; };
 
-  # The partition table of a host this fleet installs, plus the module that
-  # turns it into filesystems.
-  #
-  # Only for a host with an `install` table: a machine somebody else
-  # partitioned has no layout to import, and disko's module on such a host
-  # would add an activation script that formats nothing and a `fileSystems`
-  # set that is empty — a second author with nothing to say. The path is
-  # relative to the INVENTORY file (the same rule as `modules = [ … ]`), so
-  # that a layout is a file of the operator's repository and not a name this
-  # flake has to know.
+  # Import the selected layout and disko only for hosts with an install table.
   layoutFor = id:
     let h = inv.hosts.${id}; in
     if h.install == null then [ ]
@@ -129,38 +80,16 @@ let
       ../services.nix
       ../managed.nix
       {
-        # A host the inventory calls `nixos` IS a deployment target: its
-        # closure is copied in, staged, activated and confirmed from the
-        # outside, and that is what this profile means.
+        # Every nixos inventory host uses managed deployment.
         meisterstack.managed.enable = true;
 
-        # And where it may FETCH a closure from, as the inventory said it.
-        # One list, one place: `meister-deploy build --cache <store>` pushes
-        # a release into a store and this is what lets a host pull out of
-        # one, and having the second half live in an operator's profile
-        # while the first is a flag would make "does this fleet use its
-        # cache" a question no single file answers.
-        #
-        # HERE and not in `inv.hostModule`, which is the module a host of
-        # this fleet is expressed as through the options a FOREIGN host has
-        # too: `meisterstack.managed.*` only exists where nix/managed.nix is
-        # imported, and that is exactly this list.
-        #
-        # mkDefault, so a host module that knows better — a machine behind a
-        # slow link, a machine that must never fetch — keeps its own answer.
+        # Apply inherited cache configuration here, where managed options are available.
+        # Host modules can override these defaults.
         meisterstack.managed.substituters = lib.mkDefault inv.hosts.${id}.substituters;
       }
       (inv.hostModule id)
-      # The installer MEDIUM of this host, which is a medium and not this
-      # host: nix/install.nix says what is in it and why. It lives in
-      # `image.modules.iso-installer` — the sub-evaluation the image is built
-      # in — because `isoImage.*` set on a host is an option that does not
-      # exist (M0 finding A10).
-      #
-      # `{ config, ... }:` and not `configs.${id}`: reading the evaluated
-      # host out of the attribute set this list BUILDS would be a recursion
-      # that only laziness keeps from closing. The module argument is the
-      # same value with none of that.
+      # Configure the installer in its image sub-evaluation, where isoImage options
+      # exist. Use the module argument to avoid recursion through configs.
       ({ config, ... }: lib.mkIf (inv.hosts.${id}.install != null) {
         image.modules.iso-installer = import ../install.nix {
           inherit id;
@@ -169,34 +98,14 @@ let
           fleet = inv.fleet;
         };
 
-        # And the disk IMAGE brings its own partition table, so the host's
-        # layout has to step aside inside it.
-        #
-        # A `<id>-disk-image` is a prebuilt filesystem somebody writes to a
-        # disk or registers with a provider; the image builder decides where
-        # its root is (`/dev/disk/by-label/nixos`, nixos/modules/
-        # virtualisation/disk-image.nix) and it says so without a priority.
-        # disko says the same thing about the partition table it would
-        # CREATE, also without a priority, and two unprioritised definitions
-        # of one `device` is an evaluation error — measured, the moment the
-        # layout started being imported. Turning disko's config off inside
-        # the image is the honest reading: nothing partitions anything here,
-        # so the layout has nothing to say.
-        #
-        # Inside the `install` condition, and that is not tidiness either: a
-        # host with no install table never imported disko, so setting one of
-        # its options there is an option that does not exist — measured, on
-        # the ha example, which has no install tables at all.
+        # Disable the host's disko layout inside a prebuilt disk image: the image
+        # builder supplies its own partition table and filesystem definitions.
         image.modules.raw-efi = { ... }: { disko.enableConfig = false; };
         image.modules.qemu = { ... }: { disko.enableConfig = false; };
       })
       {
-        # A host with no `install` table is never installed by this tool, so
-        # its medium carries no target and settles only the one option the
-        # two profiles disagree about: nixpkgs' installation-device profile
-        # says `PermitRootLogin = "yes"` and nix/managed.nix says
-        # `"prohibit-password"`, both as defaults, which is a conflict rather
-        # than a precedence.
+        # Hosts without install tables get no installer target. Resolve the SSH
+        # root-login default shared by the image and managed profiles.
         image.modules.iso-installer = { lib, ... }: {
           services.openssh.settings.PermitRootLogin = lib.mkForce "prohibit-password";
         };
@@ -227,16 +136,8 @@ let
       })
     else configs.${id}.system.build.images.iso-installer;
 
-  # A prebuilt disk for a host that boots itself.
-  #
-  # Only for a `uefi` host, and that is not a gap: `raw-efi` IS an EFI image
-  # — it makes an ESP and installs systemd-boot into it — so an image of that
-  # format for a machine that has no boot loader would be an image that
-  # contradicts its own host (measured: the two `mkDefault`s for
-  # `boot.loader.systemd-boot.enable` are a conflict, which is the module
-  # system saying exactly this). A direct-boot host's road is the installer
-  # medium plus the bundle `<id>-direct-boot`, which is the pair its provider
-  # loads.
+  # Build raw-efi images for hosts with a local loader. Direct hosts instead
+  # receive an installer and a separate kernel/initrd/command-line bundle.
   diskImageFor = id:
     if imageSource "disk" == "nixos-generators" then
       (if nixos-generators == null
@@ -249,42 +150,22 @@ let
       })
     else configs.${id}.system.build.images.raw-efi;
 
-  # The kernel, the initrd and the command line of a host that boots
-  # `direct`, in one directory for the provider to take. Only for those
-  # hosts: a uefi host reads its own boot menu, and a bundle for it would be
-  # a directory nothing ever loads — which is why `packages.<id>-direct-boot`
-  # does not exist for one.
+  # Build provider bundles only for direct-boot hosts.
   directHostIds = lib.filter (id: inv.hosts.${id}.boot == "direct") ids;
   directBootFor = id: directBoot.bundleOf pkgs id configs.${id};
 
-  # A managed host with NO identity: no host name of a fleet member, no
-  # roles, no keys. It is what a lab boots two or three fresh VMs from (L2)
-  # before `keys enroll` and the first `apply` make each of them a host —
-  # which is the whole point of a managed host, since everything that makes
-  # it one arrives in a closure.
+  # Build a generic managed image without a fleet member's identity or roles.
   genericManaged = nixpkgs.lib.nixosSystem {
     modules = [
       platform
       ../services.nix
       ../managed.nix
       { meisterstack.managed.enable = true; }
-      # It IS a qemu image — `system.build.images.qemu` — and a qcow2 whose
-      # initrd has no virtio driver is a qcow2 that boots a kernel, waits
-      # twenty-two seconds for a root filesystem no driver can see, and
-      # panics with "Attempted to kill init". Measured, in
-      # `checks.vm-two-instances-same-image`, on both copies at once.
-      #
-      # This is the one hardware statement this flake makes, and it makes it
-      # because the format already did: a host of a fleet gets its drivers
-      # from its own module (that is what a `hardware-configuration.nix`
-      # is), and this image has no host.
+      # The generic QEMU image needs virtio drivers in its initrd. Host-specific
+      # images obtain their hardware drivers from operator modules.
       "${nixpkgs}/nixos/modules/profiles/qemu-guest.nix"
     ]
-    # The fleet's DEFAULT profiles — `[defaults] profiles` — and not one
-    # host's: this image is every host and none of them. Taking the first
-    # host's list would have made the image depend on which host happens to
-    # sort first, and `builtins.head` on a fleet with no nixos host would
-    # have thrown where a sentence belongs.
+    # Use fleet default profiles for the generic image, independent of host order.
     ++ map (profileFor "managed-disk-image") (inv.defaults.profiles or [ ])
     ++ extraModules;
   };
@@ -310,36 +191,21 @@ let
       guestTiny = pkgs.guest-tiny;
       leandro = if leandro == null then null else leandro.packages.${system}.vhost-user-nvrm;
       patchDir = ../../patches;
-      # Which MeisterStack these binaries come from. A git flake knows its
-      # revision; a dirty one knows only that it is dirty, and saying
-      # "unknown" is better than naming a revision nobody could check out.
+      # Record the source revision when available; dirty trees have no clean revision.
       srcRev = meisterstack.rev or (meisterstack.dirtyRev or "unknown");
     };
   };
 
-  # The manifest as a FILE, for the check below — and without its string
-  # context, which is the whole point of this line.
-  #
-  # `meisterDeployment` is full of store paths: `toplevel_out` is an
-  # `outPath`, `toplevel_drv` and the two image derivations are `drvPath`s.
-  # Written into a derivation, each of those strings carries a dependency
-  # with it, so `nix build` of this text file builds the systems AND the
-  # disk images of every host — measured: a `nix flake check` of the example
-  # fleet started building `nixos-disk-image` and ate the disk. A manifest is
-  # a DESCRIPTION: `meister-deploy resolve` produces it with `nix eval`, which
-  # builds nothing, and the check that validates its SHAPE must not build a
-  # fleet either. What the paths mean is checked elsewhere and later — the
-  # RELEASE (M2) is what records that a path exists and what its nar hash is.
+  # Discard string context before writing manifest JSON. Otherwise store paths
+  # in the description make its validation build every referenced system and image.
   manifestJson = pkgs.writeText "meister-deployment.json"
     (builtins.unsafeDiscardStringContext (builtins.toJSON meisterDeployment));
 
   # --- checks -----------------------------------------------------------
   binaryOf = role: if role == "agent" then "meister-agent" else "meister-${role}-controller";
 
-  # The real parsers, on a host that is not the host: `--check-config` reads
-  # the file, runs every pure check and starts nothing — no listener, no
-  # database, no group lookup (D12, lane 1C position 7). So a build machine
-  # can say whether a config is a config.
+  # Run the real binaries' pure --check-config validation on rendered files.
+  # These checks do not open runtime listeners, databases, or host devices.
   configCheck = id:
     let cfg = configs.${id}; in
     pkgs.runCommand "config-${id}" { } (''
@@ -356,11 +222,7 @@ let
       touch $out
     '');
 
-  # What Nix derived and what the tool that reads the same file says about
-  # it, side by side. This is the check that replaced scripts/check-fleet.sh:
-  # there the comparison was between two DERIVATIONS (and a shell script
-  # measured it); here there is one derivation, and what is compared is the
-  # one thing both halves still do — precedence.
+  # Compare Nix and CLI inventory precedence using the same input file.
   inventoryParity =
     let
       nixSide = pkgs.writeText "inventory-nix.json" (builtins.toJSON
@@ -390,11 +252,10 @@ let
   '';
 in
 {
-  # The inventory as Nix read it, for an operator who wants to look.
+  # Expose the parsed inventory for inspection.
   inventory = inv;
 
-  # The module list of a host, for a flake that wants the host without the
-  # fleet: examples/fleet/foreign-flake imports exactly this.
+  # Expose host module lists for callers that do not need the fleet outputs.
   hostModules = builtins.listToAttrs (map (id: lib.nameValuePair id (modulesFor id)) ids);
 
   nixosConfigurations = systems;

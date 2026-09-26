@@ -2,34 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `nvmeof` ATTACHER: a kernel NVMe-oF initiator, and the first consumer
-//! of the `networked` locality axis.
-//!
-//! ## What it is for
-//!
-//! Every backend in this tree until now put the bytes on the node — an LV, a
-//! file, an NFS mount. This one does not: the namespace lives on a storage
-//! target, and what an attach does is make it appear as a block device HERE.
-//! That is what `Locality::Networked` has always meant on the axis Storage A
-//! built, and until this driver nothing claimed it — the arm in
-//! `VolumeBinding::required` said so in a comment and named this position.
-//!
-//! ## The split, and why there are two crates
-//!
-//! A namespace is provisioned by whoever owns the target (`nvmeof-import`
-//! next door, for namespaces that already exist) and attached by whichever
-//! compute node runs the VM. Two roles, two crates, because they run in
-//! different places: the catalogue says so and the lab proves the degenerate
-//! case, where both happen to be the same machine.
-//!
-//! ## Why `nvme-cli` and not a library
-//!
-//! The same argument `lvm-thin` makes about LVM: the kernel's fabrics
-//! interface is `/dev/nvme-fabrics` and a line of `key=value` pairs, and
-//! `nvme-cli` is the thing that has been getting that line right for a
-//! decade. What is left here is parsing `nvme list-subsys -o json`, which is
-//! what the tests below are about — a misread path name is a VM handed
-//! somebody else's disk.
+//! Connect NVMe-oF targets through nvme-cli and return a local block-device
+//! path. Provisioning belongs to a provider such as nvmeof-import; this driver
+//! implements only connection operations. Targets may use TCP or RDMA.
 
 use std::path::{Path, PathBuf};
 
@@ -40,17 +15,7 @@ use agent_api::storage::{
 };
 use tracing::{debug, info, instrument, warn};
 
-/// How long to wait for the kernel to publish the block device after a
-/// successful connect.
-///
-/// `nvme connect` returns when the controller is created, and the namespace
-/// scan that turns it into `/dev/nvmeXnY` finishes a moment later. Polling is
-/// the honest answer — the alternative is a udev settle, which needs udev to
-/// be the thing that made the node, and it is not on every host this runs on.
-///
-/// Five seconds: a healthy connect on this fabric publishes in milliseconds,
-/// and anything past five seconds is a target that took the connection and
-/// then did not answer the identify.
+/// Maximum wait for the kernel namespace device after a successful connect.
 const SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -58,13 +23,8 @@ const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100)
 /// no RDMA, whatever a pool asks for.
 const INFINIBAND: &str = "/sys/class/infiniband";
 
-/// The one port this driver refuses outright.
-///
-/// 4420 is the IANA default and, in this lab, the DPU's own target
-/// (`dpu-nvmet.service` on magaluf, loop devices out of `/opt`). Connecting a
-/// tenant's VM to it would be a VM reading a device nobody meant to export to
-/// it — and the mistake is one keystroke away from the ports that are ours.
-/// A refusal with a sentence beats a disk that is silently the wrong disk.
+/// Port 4420 is reserved for the lab DPU target and rejected by this driver.
+/// This deployment restriction also prevents using NVMe-oF's default port.
 pub const RESERVED_PORT: u16 = 4420;
 
 /// What a pool says about where its namespaces live, and how to speak to it.
@@ -84,12 +44,8 @@ impl Transport {
     }
 }
 
-/// The connection an attach makes, carried on the handle because the
-/// attacher is given a handle and nothing else.
-///
-/// The provider puts it there (`nvmeof-import`), and an operator can put it
-/// there by hand for a namespace this control plane did not provision — which
-/// is the whole shape of an import.
+/// NVMe-oF target parameters carried on a volume handle for attachment.
+/// Supplied by the import provider or an operator-created handle.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NvmeofTarget {
@@ -100,10 +56,7 @@ pub struct NvmeofTarget {
 }
 
 impl NvmeofTarget {
-    /// Read the target off a handle's `params`.
-    ///
-    /// A handle with none is not this driver's, and saying so by name is the
-    /// difference between a clear refusal and a connect to nowhere.
+    /// Parse required target parameters from the handle.
     pub fn of(handle: &VolumeHandle) -> agent_api::storage::Result<Self> {
         let params = handle.params.clone().ok_or_else(|| {
             StorageError::InvalidSpec(format!(
@@ -136,9 +89,7 @@ impl NvmeofTarget {
 }
 
 pub struct NvmeofAttacherConfig {
-    /// Where `nvme` lives. `None` = whatever PATH says, which is right on a
-    /// NixOS node and wrong nowhere in particular — the same escape
-    /// `lvm-thin` has.
+    /// Directory containing nvme; None resolves it through PATH.
     pub bin_dir: Option<PathBuf>,
 }
 
@@ -187,18 +138,8 @@ impl NvmeofAttacher {
     }
 }
 
-/// Which block device a subsystem's controller is, out of
-/// `nvme list-subsys -o json`.
-///
-/// A free function so that the shape of that document — the one thing that
-/// can change under us on a distribution upgrade — is testable against
-/// captured output with no target, no root and no kernel module.
-///
-/// Namespace 1, and only namespace 1. An imported namespace is exported as a
-/// subsystem of its own by every target in this lab, so `nvmeXn1` is the
-/// whole of it; a subsystem with several namespaces is a shape this driver
-/// does not claim to handle, and picking the first of them silently would be
-/// the wrong kind of guess about somebody's data.
+/// Find a controller matching the NQN in nvme-cli JSON, then assume namespace
+/// 1 at `/dev/<controller>n1`. The parser does not verify namespace inventory.
 pub fn device_in_listing(json: &str, nqn: &str) -> Option<PathBuf> {
     let doc: serde_json::Value = serde_json::from_str(json).ok()?;
     // Two shapes in the wild: nvme-cli 2.x wraps the subsystems in a
@@ -220,9 +161,7 @@ pub fn device_in_listing(json: &str, nqn: &str) -> Option<PathBuf> {
                 .and_then(|p| p.as_array())
                 .cloned()
                 .unwrap_or_default();
-            // A live path, and never a dead one: a subsystem can carry a
-            // controller that is `connecting` or `deleting`, and handing a
-            // VMM the device of one is handing it a disk that answers EIO.
+            // Return only live controller paths, excluding connecting or deleting controllers.
             for path in paths {
                 let live = path
                     .get("State")
@@ -240,12 +179,7 @@ pub fn device_in_listing(json: &str, nqn: &str) -> Option<PathBuf> {
     None
 }
 
-/// Whether this host has an RDMA device at all.
-///
-/// Checked before the connect and not after, because the failure without it
-/// is `nvme connect` returning ENODEV — a number, for a fact an operator can
-/// read off a directory. Out of a VM without a VF there is only `tcp`, and
-/// that is the sentence to give.
+/// Check for an RDMA device before connecting so missing hardware produces a clear refusal.
 pub fn has_rdma(sysfs: &Path) -> bool {
     std::fs::read_dir(sysfs).is_ok_and(|mut entries| entries.next().is_some())
 }
@@ -258,11 +192,8 @@ impl VolumeAttacher for NvmeofAttacher {
         handle: &VolumeHandle,
         _cgroup: Option<&CgroupHandle>,
     ) -> agent_api::storage::Result<VolumeAttachment> {
-        // No cgroup, and that is a statement rather than an omission: there
-        // is no backend PROCESS here. The initiator is the kernel, the disk
-        // is a block device, and cloud-hypervisor opens it itself — exactly
-        // as it opens an LV. What a cgroup confines is a process somebody
-        // spawned, and nobody spawned one.
+        // The kernel initiator exposes a block device; there is no backend
+        // process to place in the consumer cgroup.
         let target = NvmeofTarget::of(handle)?;
         if target.transport == Transport::Rdma && !has_rdma(Path::new(INFINIBAND)) {
             return Err(StorageError::Backend(anyhow::anyhow!(
@@ -272,11 +203,8 @@ impl VolumeAttacher for NvmeofAttacher {
             )));
         }
 
-        // Idempotent, and it has to be: a re-sent create, a reconnect after a
-        // controller restart, two VMs on one node using two namespaces of one
-        // subsystem. `nvme connect` says "already connected" and exits
-        // non-zero on some builds, so the state is asked FIRST and the
-        // command is only run when there is nothing there.
+        // Reuse existing connections before invoking nvme connect, whose
+        // already-connected exit status varies between tool versions.
         if let Some(device) = self.device_of(&target.nqn).await? {
             debug!(nqn = %target.nqn, device = %device.display(), "already connected");
             return Ok(VolumeAttachment::Path(device));
@@ -326,19 +254,15 @@ impl VolumeAttacher for NvmeofAttacher {
         _attachment: &VolumeAttachment,
     ) -> agent_api::storage::Result<()> {
         let target = NvmeofTarget::of(handle)?;
-        // Idempotent by the same argument attach is: `nvme disconnect` of a
-        // subsystem that is not connected removes zero controllers and
-        // succeeds, and a detach that failed because there was nothing to
-        // detach would make every second teardown an error.
+        // Disconnect is idempotent for an absent subsystem. Errors below are
+        // logged but currently still return success.
         match self.run(&["disconnect", "-n", &target.nqn]).await {
             Ok(out) => {
                 info!(nqn = %target.nqn, answer = out.trim(), "namespace detached");
                 Ok(())
             }
-            // Warn and succeed: the bytes are on the target and are not this
-            // node's to lose. A connection this node could not take down is
-            // an operator's problem and not a reason to keep a VM's teardown
-            // from finishing.
+            // Current behavior reports success after a disconnect error. The kernel
+            // connection may still be active, so this is not proof of writer closure.
             Err(e) => {
                 warn!(nqn = %target.nqn, error = %format!("{e:#}"),
                       "disconnect failed; the connection may still be up on this node");
@@ -358,9 +282,7 @@ impl VolumeAttacher for NvmeofAttacher {
             ));
         };
         let target = NvmeofTarget::of(handle)?;
-        // The CONNECTION and not the data: a subsystem that has gone away
-        // takes its device with it, and that is exactly the difference
-        // between this question and the provider's `describe`.
+        // Stat checks the local connection; provider describe concerns the underlying data.
         if self.device_of(&target.nqn).await?.is_none() {
             return Err(StorageError::NotFound(handle.id));
         }
@@ -377,13 +299,8 @@ impl VolumeAttacher for NvmeofAttacher {
     }
 }
 
-/// The namespace's size in bytes, out of `nvme id-ns -o json`.
-///
-/// `nsze` is in LOGICAL BLOCKS and the block size is in the LBA format the
-/// namespace is formatted with — `flbas`' low nibble selects the entry, and
-/// `ds` is its base-2 exponent. Multiplying by 512 because that is the usual
-/// answer would be right on most namespaces and quietly wrong by 8x on a 4k
-/// one, which is the size an operator then sees on a disk that is fine.
+/// Compute namespace bytes from nsze logical blocks and the selected LBA
+/// format. The low flbas nibble selects ds, a base-2 block-size exponent.
 pub fn size_in_id_ns(json: &str) -> Option<u64> {
     let doc: serde_json::Value = serde_json::from_str(json).ok()?;
     let blocks = doc.get("nsze")?.as_u64()?;
@@ -403,18 +320,8 @@ pub fn size_in_id_ns(json: &str) -> Option<u64> {
     (9..=16).contains(&exponent).then(|| blocks << exponent)
 }
 
-/// The provider half, which this driver does not have.
-///
-/// It exists because the agent's registry hands back one `Arc<dyn
-/// VolumeDriver>` per row and that trait is the two halves together — the
-/// degenerate case every backend in this tree has been so far. This is the
-/// first one that is genuinely half a driver, and the honest way to say so is
-/// `Unsupported` on every provider verb rather than a `provision` that makes
-/// something.
-///
-/// `locality` is the exception and is answered for real: it is what the
-/// scheduler reads to know that a node with this claim can reach bytes that
-/// are not on it, and it is the whole reason the axis exists.
+/// Provider methods are unsupported. Registering the combined trait permits
+/// this attacher to share the storage registry; it does not create target data.
 #[async_trait::async_trait]
 impl VolumeProvider for NvmeofAttacher {
     async fn provision(
@@ -441,9 +348,7 @@ impl VolumeProvider for NvmeofAttacher {
         ))
     }
 
-    /// The same refusal `provision` and `describe` give, one question over:
-    /// this half attaches namespaces and owns none, so it cannot say what is
-    /// held under a volume's id. Astra finding S13, 2026-09-23.
+    /// The attacher has no volume-ID ownership inventory and cannot implement provider probing.
     async fn probe(
         &self,
         _id: &VolumeId,
@@ -463,10 +368,7 @@ impl VolumeProvider for NvmeofAttacher {
 mod tests {
     use super::*;
 
-    /// The document `nvme list-subsys -o json` really produces, captured from
-    /// the target this position was written against. The parsing is the one
-    /// thing that can change under us on a distribution upgrade, and a
-    /// misread path name is a VM handed somebody else's disk.
+    /// Captured nvme list-subsys JSON fixture for device-path parsing.
     const LISTING: &str = r#"[{
       "HostNQN": "nqn.2014-08.org.nvmexpress:uuid:ce9cf739",
       "Subsystems": [
@@ -526,9 +428,7 @@ mod tests {
         ));
     }
 
-    /// Rubbish is refused rather than panicking: this is the output of a
-    /// program on the host, and a distribution upgrade is exactly the moment
-    /// it changes shape.
+    /// Malformed tool output returns no device without panicking.
     #[test]
     fn an_unreadable_listing_is_no_device_rather_than_a_panic() {
         for bad in ["", "not json", "{}", "[]", r#"[{"Subsystems":"nope"}]"#] {
@@ -550,8 +450,7 @@ mod tests {
             size_in_id_ns(&id_ns(12, 26_214_400)),
             Some(100 * 1024 * 1024 * 1024)
         );
-        // The same block count at 512 bytes is an eighth of that, and reading
-        // one as the other is the defect this guards.
+        // Verify block-size-dependent capacity for the same logical block count.
         assert_eq!(
             size_in_id_ns(&id_ns(9, 26_214_400)),
             Some(100 * 1024 * 1024 * 1024 / 8)
@@ -587,7 +486,7 @@ mod tests {
         assert!(format!("{refused}").contains("4420"), "{refused}");
         assert!(format!("{refused}").contains("DPU"), "{refused}");
 
-        // And the two fields without which there is nothing to dial.
+        // Reject missing connection fields.
         let mut empty = target(4422);
         empty.addr = String::new();
         assert!(empty.check().is_err());
@@ -607,7 +506,7 @@ mod tests {
             format!("{refused}").contains("nvmeof-import"),
             "it says whose handle this should have been: {refused}"
         );
-        // Params that are somebody else's shape.
+        // Reject unrelated driver parameter shapes.
         assert!(
             NvmeofTarget::of(&handle(Some(serde_json::json!({ "pool": "vg0/thin" })))).is_err()
         );

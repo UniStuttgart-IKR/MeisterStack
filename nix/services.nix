@@ -2,36 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# What MeisterStack IS on a machine: the units, their config files, their
-# users and their state directories — and nothing about the machine itself.
-#
-# This module is the one a foreign host imports. It is therefore the module
-# that must not decide anything host-global: no `system.stateVersion`, no
-# firewall, no DHCP, no resolvconf, no bootloader, no `fileSystems."/"`, no
-# `nix.enable`, no console. Somebody else's NixOS host has answers to all of
-# those already, and a module that overrides them is a module nobody can
-# import twice. `checks.services-are-pure` in flake.nix holds this file to it
-# by evaluating a minimal host with and without these modules and comparing
-# exactly those attributes.
-#
-# What DOES decide host-global things is the profile beside this file:
-#
-#   nix/managed.nix    a host `meister-deploy` deploys to: nix stays on, the
-#                      config files are complete at build time, and there is
-#                      no renderer at boot.
-#
-# There was a second one until M5B — `nix/appliance.nix`, the image the
-# twelve OpenNebula VMs of the lab boot, with a renderer that wrote the
-# config files AT BOOT out of a context (`nix/context.nix`,
-# `nix/provider-opennebula.nix`). It went to `~/git/meisterstack-lab/
-# legacy/nix/`, which is where the fleet that boots it lives. Comments in
-# these modules that name those three files mean the copies there.
-#
-# The gate every service hangs on is `meisterstack.unitsFor`, which is
-# `meisterstack.roles` for everybody except the appliance: that image ships
-# every unit and lets the context decide at boot which of them starts, so it
-# sets the list to all three and the role list keeps meaning "what this
-# machine is".
+# Public runtime module: role services, accounts, helpers, and optional storage.
+# Host profiles retain control of boot, firewall, DHCP, resolver, and stateVersion.
+# Managed deployment adds immutable package and configuration paths separately.
 { lib, pkgs, config, ... }:
 let
   cfg = config.meisterstack;
@@ -43,9 +16,9 @@ in
     ./controllers.nix
     ./agent.nix
     ./single-node.nix
-    # --- lane 4B: the fabric tools of a host with an RDMA card ---
+    # Import optional RDMA tools.
     ./rdma.nix
-    # --- end lane 4B ---
+
     ./addons.nix
     ./data.nix
     ./observability.nix
@@ -236,22 +209,9 @@ in
   };
 
   config = {
-    # The service account both controllers run as, and the group that reaches
-    # the agent's socket. Stage 1 of privilege separation, and only that: no
-    # shell, no home, no login — an identity to drop to and a group to put an
-    # operator into, nothing else.
-    #
-    # The AGENT stays root by default, deliberately: it programs nftables,
-    # makes taps and bridges, opens /dev/kvm and hands VFIO devices to guests.
-    # What it gives away instead is its socket — `[paths] socket_group =
-    # "meister"` in agent.nix — so that `meister agent vm ls` on a node needs
-    # a group membership rather than sudo.
-    #
-    # Unconditional, and not behind a role: `socket_group` names this group in
-    # every rendered config, the key files under `pki.dir` are owned by this
-    # user on every host of this stack, and a `z` line in tmpfiles that names
-    # a user who does not exist is a boot-time error rather than a no-op. It
-    # is a system user with no shell; it decides nothing about the machine.
+    # Controllers share the meister service account. The meister group also grants
+    # access to the agent socket; membership permits local VM administration.
+    # Keep supplementary device groups on the agent unit, not the shared account.
     users.groups.meister = { };
     users.users.meister = {
       isSystemUser = true;
@@ -260,28 +220,9 @@ in
       shell = "${pkgs.shadow}/bin/nologin";
     };
 
-    # The account a base image is converted in, and the only thing it is for.
-    #
-    # Astra finding S01, 2026-09-23: `qemu-img` parses a file this node did
-    # not write -- a qcow2 is a tree of tables that name each other -- and it
-    # ran as the agent, which on a node with `meisterstack.agent.unprivileged
-    # = false` (the default) is root. It runs in a transient systemd unit now
-    # (`systemd-run`, built in shared/agent-api/src/base_image.rs), and this
-    # is the account that unit runs as: no shell, no home, no group but its
-    # own, in no other group, owning nothing on this machine. For the length
-    # of one conversion the agent hands it the ONE destination that
-    # conversion writes -- a `<id>.tmp` file, or an LV's device node -- and
-    # takes it back when the unit is gone.
-    #
-    # `DynamicUser = yes` would be the obvious answer and cannot work here:
-    # its uid is allocated when the unit starts, and the destination has to
-    # be given away before that. base_image.rs argues the rest of it.
-    #
-    # Behind the agent role, because only a node that provisions volumes
-    # converts an image. It is a system user with no shell and it decides
-    # nothing about the machine, so `checks.services-are-pure` is unaffected
-    # -- that check compares dhcp, firewall, resolvconf, bootloader and
-    # stateVersion, and an account is none of them.
+    # Run base-image conversion in a transient systemd unit as meister-convert.
+    # This account has no device groups, protecting host devices and VM state from
+    # untrusted image parsers. Its transient unit receives only the required paths.
     users.groups.meister-convert =
       lib.mkIf (builtins.elem "agent" cfg.unitsFor) { };
     users.users.meister-convert =
@@ -292,52 +233,26 @@ in
         shell = "${pkgs.shadow}/bin/nologin";
       };
 
-    # --- lane 5C: the provider, on a host that has no renderer -------------
-    #
-    # A managed NixOS host on somebody's hypervisor: its config files are a
-    # system generation (nix/managed.nix), so it must NOT have the boot
-    # renderer — that module asserts against exactly this combination. But
-    # there is still one thing only the provider knows, and it is the thing
-    # the machine cannot be reached without: where it was booted. Address,
-    # route, resolver, hostname, the operator's key.
-    #
-    # Until this unit existed, `meisterstack.context.providerScript` was
-    # declared by the renderer, so `nixosModules.provider-opennebula` could
-    # only be imported together with it — and the lab paid for that with
-    # thirty hand-written lines of unit in the operator's own repository
-    # (L2 finding N5, 2026-09-23).
-    #
-    # It does ONLY the provider's part. No template is copied, no config
-    # file is rendered, no unit is started by role: on this road all of
-    # that is Nix's, at build time. `mkIf` on the script being non-empty AND
-    # on there being no renderer, so a host with neither has no unit at all
-    # and an appliance keeps exactly the one it had — two authors for one
-    # medium is the mistake this whole split exists to avoid.
-    #
-    # `checks.services-are-pure` is unaffected: it compares what this module
-    # decides about the MACHINE (dhcp, firewall, resolvconf, bootloader,
-    # stateVersion), and a unit that only exists when somebody sets an
-    # option is not one of those.
+    # Run provider initialization independently of the configuration renderer.
+    # Managed hosts can obtain network and hostname information from a provider
+    # while their role configurations remain part of the system generation.
     systemd.services.meister-provider-context =
       lib.mkIf (cfg.context.providerScript != "" && !cfg.context.enable) {
         description = "Read this machine's context from its provider";
         wantedBy = [ "multi-user.target" ];
-        # Before anything that needs an address or a name: the whole point
-        # of this unit is that the machine can be reached at all.
+        # Run provider initialization before services that need network configuration.
         before = [ "network-online.target" "sshd.service" ];
         after = [ "local-fs.target" ];
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          # A context that goes wrong has to be readable from a serial
-          # console, because a machine whose address is wrong is a machine
-          # nothing else reaches.
+          # Send provider diagnostics to both the journal and serial console.
           StandardOutput = "journal+console";
           StandardError = "journal+console";
         };
         path = with pkgs; [ iproute2 util-linux coreutils gnugrep gawk systemd ];
         script = cfg.context.providerScript;
       };
-    # --- end lane 5C -------------------------------------------------------
+
   };
 }

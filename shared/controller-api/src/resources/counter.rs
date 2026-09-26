@@ -6,17 +6,8 @@
 
 use super::*;
 
-/// A number the server hands out, kept in the store so that handing it out is
-/// a compare-and-swap rather than a hope.
-///
-/// It is an ordinary object with an ordinary `resourceVersion`, which is the
-/// entire point: the store's CAS on that field is the allocator. Nothing else
-/// had to be built, and nothing about it is specific to VNIs — the next
-/// counter this stack needs takes another name under the same resource.
-///
-/// No REST route serves it. It is not something anybody creates, lists or
-/// edits, and a counter an operator could PUT is a counter two tenants can be
-/// given the same value from.
+/// Internal monotonic allocator stored as a resource. resourceVersion CAS serializes updates.
+/// No REST route exposes the counter, preventing clients from resetting allocation state.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CounterSpec {

@@ -7,10 +7,8 @@
 
 use super::*;
 
-/// The teardown fork, as a value: a referenced entry is detached and its
-/// data stays, an inline one is deprovisioned with the VM. Read off the
-/// VM's own spec, because the difference between the two is somebody's
-/// data and the answer must not depend on a second table.
+/// Read volume ownership from the persisted VM spec: retain referenced data
+/// and deprovision inline disks during teardown.
 #[test]
 fn teardown_reads_which_disks_were_this_vms_to_unmake() {
     let referenced = VolumeId::new_v4();
@@ -74,18 +72,8 @@ fn teardown_reads_which_disks_were_this_vms_to_unmake() {
     assert!(!volume_is_referenced(&record, &referenced));
 }
 
-/// Which DRIVER tears a referenced volume down — the other half of the
-/// same fork, and the one that was wrong.
-///
-/// A referenced entry carries no driver: the VM's spec says
-/// `{"volume": "<uid>"}` and nothing else, because the disk is not this
-/// VM's to describe. The teardown read that entry anyway and fell through
-/// to `filesystem`, whose `detach` does nothing — so nothing noticed
-/// while every backend's detach was a no-op for a plain path.
-///
-/// The first driver whose detach MATTERS found it: an NVMe-oF session
-/// stayed connected on the node after its VM was gone. An nfs virtiofsd
-/// would have too.
+/// Resolve referenced-volume drivers from the standalone volume table.
+/// A missing row currently falls back to the default driver, which can miss connection cleanup.
 #[test]
 fn a_referenced_volume_is_torn_down_by_the_driver_that_made_it() {
     let referenced = VolumeId::new_v4();
@@ -95,8 +83,7 @@ fn a_referenced_volume_is_torn_down_by_the_driver_that_made_it() {
         spec: agent_api::storage::VolumeSpec {
             base_image: None,
             size_bytes: 0,
-            // Neither entry names one, which is the whole point: an
-            // inline entry may, a referenced one never does.
+            // Leave driver names unset to exercise persisted ownership lookup.
             driver: None,
             params: None,
         },
@@ -165,28 +152,16 @@ fn a_referenced_volume_is_torn_down_by_the_driver_that_made_it() {
         volume_driver_name(&store, &record, &inline),
         default_volume_driver()
     );
-    // And a referenced volume this node has no row for falls back rather
-    // than failing: a teardown must finish even when the table has lost
-    // its row, and the worst that then happens is a no-op detach.
+    // The current fallback for a missing row is filesystem. That can leave
+    // a connection open if the missing row named a driver with active cleanup.
     assert_eq!(
         volume_driver_name(&store, &record, &VolumeId::new_v4()),
         default_volume_driver()
     );
 }
 
-/// A live process whose command line carries `marker` — a stand-in for a
-/// VMM started with a socket named after its VM.
-///
-/// A LOOP and not a `sleep`, and the difference is the whole reason this
-/// helper has a comment: `sh -c 'sleep 30 …'` is a single command, and
-/// every shell worth the name execs it in place rather than forking —
-/// which replaces the command line with `sleep 30` and takes the marker
-/// with it. A loop cannot be exec'd away, so the `sh` stays and so does
-/// its argv. The marker rides as `$0`, which is argv[3] and is never
-/// rewritten.
-///
-/// It does not return until `/proc` agrees, so nothing downstream races
-/// the exec.
+/// Start a shell loop with the VM marker as argv[0] and wait for /proc to show it.
+/// The loop prevents the shell from replacing itself with sleep and losing the marker.
 fn a_process_carrying(marker: &str) -> std::process::Child {
     let mut child = std::process::Command::new("sh")
         .arg("-c")
@@ -214,15 +189,7 @@ fn still_alive(child: &mut std::process::Child) -> bool {
     matches!(child.try_wait(), Ok(None))
 }
 
-/// A recorded pid that now belongs to somebody else is not signalled.
-///
-/// The cgroup slice is REAL here — the file the confiner reads is written
-/// with the foreign process's pid in it — because the slice was the whole
-/// of the old guard and the point is that it is not enough. A slice
-/// outlives the crash that failed to remove it, a pid outlives the
-/// process it named, and between the record and a SIGKILL there was
-/// nothing else. Without the identity check this test kills a process
-/// that has nothing to do with MeisterStack.
+/// Cgroup membership alone cannot identify a reused PID. Require the VM identity too.
 #[tokio::test]
 async fn the_teardown_kill_asks_whose_process_it_is_before_signalling() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -250,9 +217,7 @@ async fn the_teardown_kill_asks_whose_process_it_is_before_signalling() {
         None,
     );
 
-    // The two cases, run through the same path: a process this VM's
-    // record could plausibly name, and a process that merely holds the
-    // number now.
+    // Compare a matching VMM identity with an unrelated process using the recorded PID.
     for (name, carries_the_id, expect_alive) in [
         ("a stranger on a reused pid", false, true),
         ("this vm's own vmm", true, false),
@@ -294,19 +259,8 @@ async fn the_teardown_kill_asks_whose_process_it_is_before_signalling() {
     }
 }
 
-/// A VM on its way out is still this node's, and the report says so for the
-/// whole of the teardown.
-///
-/// Astra finding S12, 2026-09-23. `Reconciler::report` skipped every record
-/// whose intent is `Absent`, so a guest dropped out of this node's report the
-/// moment the intent was WRITTEN — which on a busy or wedged node is a long
-/// way before the last driver call. One tier up, a uid a node does not name
-/// is read as a node that has let it go (`session::ingest::forget_unbound`),
-/// and the VM may then be placed on another machine while this VMM is still
-/// executing the guest and holding its disks.
-///
-/// A real process stands in for the VMM, because "the teardown has not
-/// happened yet" is the premise and a record alone cannot show it.
+/// Desired Absent must remain reported until teardown removes the record;
+/// omitting a live source could permit placement of another guest.
 #[tokio::test]
 async fn a_vm_on_its_way_out_is_still_named_while_its_vmm_runs() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -353,8 +307,7 @@ async fn a_vm_on_its_way_out_is_still_named_while_its_vmm_runs() {
     // running and the disk is open.
     record.desired = Desired::Absent;
     record.vmm_pid = Some(vmm.id());
-    // Referenced, because that is the entry whose bytes outlive the VM and
-    // therefore the one the tier above has to know is still open.
+    // Referenced storage remains independently owned after VM cleanup.
     record.spec.volumes = vec![crate::types::VolumeWithId {
         id: disk,
         spec: agent_api::storage::VolumeSpec {
@@ -391,8 +344,7 @@ async fn a_vm_on_its_way_out_is_still_named_while_its_vmm_runs() {
         "the premise: the vmm is still serving the guest"
     );
 
-    // And once the teardown has taken the record away, the node says nothing
-    // about it — which is the absence one tier up is allowed to act on.
+    // Deleted VM records no longer appear in node reports.
     store.delete(&vm).expect("the record goes");
     assert!(reconciler.report().await.expect("a report").is_empty());
 
@@ -400,9 +352,7 @@ async fn a_vm_on_its_way_out_is_still_named_while_its_vmm_runs() {
     let _ = vmm.wait();
 }
 
-/// The default `Hypervisor::owns_pid` reads the VM's uuid off the
-/// process's command line, which is the contract every driver in this
-/// tree meets: one process per VM, given a socket named after that VM.
+/// The default owns_pid requires the VM UUID in the process command line.
 #[test]
 fn a_recorded_pid_is_this_vms_vmm_only_while_it_carries_the_vms_name() {
     use agent_api::hypervisor::Hypervisor;
@@ -415,9 +365,7 @@ fn a_recorded_pid_is_this_vms_vmm_only_while_it_carries_the_vms_name() {
     let mut stranger = a_process_carrying("not-a-vm-of-this-node");
 
     assert!(hv.owns_pid(&vm, mine.id()));
-    // The same live process, asked about a DIFFERENT vm: a record whose
-    // pid was recycled by another VM's vmm is the likeliest reuse of all
-    // on a node that runs vms for a living.
+    // A live process carrying another VM's identity must not match.
     assert!(!hv.owns_pid(&other, mine.id()));
     assert!(!hv.owns_pid(&vm, stranger.id()));
 

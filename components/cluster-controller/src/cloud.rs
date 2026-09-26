@@ -2,20 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The cloud session: this cluster dials out to the cloud-controller and from
-//! then on the stream carries its status upwards and the cloud's VM
-//! assignments downwards. Exactly the shape the agent uses towards this
-//! controller — dial-out, Hello, a status every ten seconds and after every
-//! batch of commands, commands answered with a CommandResult — one tier up.
-//!
-//! The cloud may be several replicas behind one etcd, and which of them this
-//! cluster dials is nobody's decision but its own: `hash(cluster_name ++
-//! endpoint)` gives a preference order over the configured list, failover
-//! walks down it, and the cloud replicas keep no registry of who serves whom.
-//! Same mechanism as the agent one tier down, same shared `hrw`.
-//!
-//! A cloud address is optional. Without one the cluster is standalone, which
-//! is how it ran before M4 and how it goes on running when the cloud is away.
+//! Outbound cloud session carrying cluster status and assigned resource intent.
+//! HRW over the cluster name ranks configured cloud endpoints; failover follows
+//! that order and periodic probes restore a preferred endpoint. Commands receive
+//! results, with status sent periodically and after command batches.
+//! Without cloud endpoints the cluster operates standalone.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -45,21 +36,10 @@ use crate::session::SessionRegistry;
 /// to stay comfortably below that.
 const STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How often a cluster that is NOT on its favourite looks whether a better
-/// endpoint has come back.
-///
-/// This is the one place where copying the agent's loop is not enough, and the
-/// reason is that the id being hashed is shared here. One tier down the id is a
-/// node id and exactly one process owns it, so an agent drifting a position
-/// down its order only moves load. Up here every replica of a cluster hashes
-/// the same `cluster_name`, and the cloud's ownership guard is exclusive only
-/// while they all land on the SAME entry of that shared order — a replica whose
-/// stream broke alone would otherwise sit one position down for as long as that
-/// session stayed healthy, and its cluster would have two owners in the cloud,
-/// each dispatching to it and each mirroring status onto the same objects.
-///
-/// Probed rather than assumed: a healthy session is given up only when there is
-/// something better to give it up for.
+/// Probe for a better-ranked cloud endpoint while connected elsewhere.
+/// Cluster replicas hash the same name and must converge on one cloud replica;
+/// otherwise several cloud replicas can reconcile the cluster concurrently.
+/// Leave a healthy session only after a better endpoint answers.
 const REHOME_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How many commands one wake-up of the inbound branch may execute before the
@@ -218,17 +198,9 @@ async fn session(
     *established = true;
     info!("cloud session established");
 
-    // Status and commands share one task on purpose, and this is the reason:
-    // the cloud stamps a status when it arrives and then treats a status
-    // younger than its own last command as evidence about the VMs named in
-    // it. That only holds if a status *sent* after a command was also *built*
-    // after it. A separate status task would read the store, lose the race to
-    // a command landing, and ship a snapshot from before it — and a snapshot
-    // that does not name a VM is how this protocol says "torn down".
-    //
-    // The price is that a command which cannot complete also stops the
-    // heartbeat. That is the right price: a cluster that cannot do work is
-    // not a cluster that is merely busy.
+    // Build status and execute commands in one task. A status sent after a command
+    // must be built after it, since the cloud uses ACK/status arrival order when
+    // interpreting absence. A blocked command also delays heartbeats.
     let mut tick = tokio::time::interval(STATUS_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Not from now: a session that has just been opened has just failed to
@@ -331,16 +303,9 @@ where
     false
 }
 
-/// The commands of a batch, in arrival order. Anything else the cloud says
-/// changes nothing about this cluster and therefore owes it no status — which
-/// is why the caller reads "did we act" off this list and not off the batch.
-/// Route this batch's console frames to the nodes that serve them, and hand
-/// back everything that was not one.
-///
-/// This tier reads no console bytes. What it does is the one thing only it
-/// can: turn a `session_id` into a node. `ConsoleOpen` names a VM, so the
-/// route is made here from the object; `input` and `close` name only the
-/// session, so they follow the route that open left behind.
+/// Relay console frames and return non-console messages for command handling.
+/// Open resolves a VM into a node route; input and close follow that session ID.
+/// Console bytes remain opaque to this tier.
 async fn relay_consoles(
     batch: Vec<proto::CloudMessage>,
     store: &EtcdStore,
@@ -491,17 +456,9 @@ async fn console_open(store: &EtcdStore, registry: &SessionRegistry, open: proto
     }
 }
 
-/// Hand a whole console session to the replica that holds the node.
-///
-/// The same hop `vm logs` makes and a different shape, because a console does
-/// not end with one answer: this opens the sibling's own console route, which
-/// is the REST edge of this very tier, and then pipes — the sibling's bytes
-/// up the cloud session, the cloud's keystrokes down the socket.
-///
-/// One hop only, and it needs no header to say so: a forward asks the SIBLING
-/// tier's REST route, and that route serves only nodes the answering replica
-/// holds. A replica that does not hold it refuses rather than forwarding
-/// again.
+/// Proxy a console through the sibling holding the node session.
+/// The sibling REST route refuses nodes it does not hold, bounding this path to
+/// one hop. This helper currently uses plaintext HTTP without sibling credentials.
 async fn forward_console(
     registry: &SessionRegistry,
     endpoint: &str,
@@ -744,26 +701,10 @@ async fn dispatch_traced(
     }
 }
 
-/// Everything the cloud resolved, written into the NIC entries of the spec
-/// before the object is stored.
-///
-/// One place, three facts, and the same argument for all three: the tenant,
-/// its addresses and its subnets are control-plane truths, the objects that
-/// hold them live one tier up, and by the time a spec reaches a node it should
-/// say plainly which wire this VM is on and which addresses it may source
-/// from. From here down nothing knows what a tenant is.
-///
-/// Before the object is written and therefore before the scheduler reads it,
-/// which matters for `vxlan_id`: it is what says the VM needs a node with an
-/// overlay. The two address lists constrain no placement — every node enforces
-/// them, so there is nothing to schedule around — and they are here because
-/// this is where the spec is made whole.
-///
-/// All three are read at create time and become part of the spec the node
-/// stores, which is immutable once it has it: a VM created after an assignment
-/// has it, and an existing one picks it up when it is RECREATED. A live
-/// re-home is a documented nice-to-have and not this milestone's job; see
-/// `controller_api::floating::inject_nic_list`.
+/// Inject cloud-resolved VNI and source-address allowlists before storing the VM.
+/// VNI affects overlay placement; address lists configure tap enforcement.
+/// Injectors preserve explicit NIC fields for standalone use, so the cloud API
+/// must reject client-owned values at its tenant boundary.
 fn bind_nics(c: &proto::CreateVm, vm_spec: &mut serde_json::Value) {
     if let Some(vni) = c.vni {
         let touched = controller_api::vni::inject_vxlan_id(vm_spec, vni);
@@ -786,21 +727,9 @@ fn bind_nics(c: &proto::CreateVm, vm_spec: &mut serde_json::Value) {
     }
 }
 
-/// A cloud VM becomes an ordinary cluster VM carrying the cloud's marks: from
-/// here on the cluster's own reconciler schedules it, dispatches it and tears
-/// it down like any other, and the marks are only there to say whose it is.
-///
-/// Acked after the store write, never after the boot — the phase makes its own
-/// way back up through ClusterStatus, exactly as the agent's phase makes its
-/// way up to here.
-/// The cloud asked what a VM printed; the node is what has it.
-///
-/// The uid guard is the same one `handle_create` and `handle_destroy` carry
-/// and for the same reason: a name is a label people reuse, and answering
-/// about a cluster-local VM that happens to share one would hand the cloud
-/// somebody else's console. A VM that is not placed yet, or one this cluster
-/// does not have at all, answers with an empty document rather than an error
-/// — there is genuinely nothing to show, and that is not a failure.
+/// Fetch guest logs only when the cloud UID owns the named cluster VM.
+/// Names alone are reusable and could expose a cluster-local guest's logs.
+/// A missing or unplaced VM returns an empty log document.
 async fn handle_logs(
     store: &EtcdStore,
     registry: &SessionRegistry,
@@ -940,25 +869,9 @@ fn refuse_unless_ours(current: &Vm, c: &proto::CreateVm) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether `spec.vm` differs from the stored one — and, if it does, whether
-/// it differs in the one way that is allowed to.
-///
-/// The spec was immutable once a node had it, and storage B carved one door
-/// out of that rule: `spec.vm.volumes[]` grows from its second entry on, and
-/// there only for entries that NAME a `Volume` object. The agent takes such a
-/// re-sent spec (`handle_create` there syncs the volumes), this tier's own
-/// REST edge permits exactly that change (`Owned::structural("spec.vm", …)`),
-/// and since the cloud's edge stopped refusing volume references outright,
-/// the cloud has it too. Only this path still said no — so an attach at the
-/// cloud was accepted, was dispatched, and died here in silence: the cloud
-/// object named two disks and this one named one, for ever.
-///
-/// The gate is `vm_shape_unchanged`, which is the same function both REST
-/// edges gate on. Anything else in `spec.vm` is still fixed for the life of
-/// the VM, and a command carrying such a change is refused rather than
-/// half-applied — the cloud's `check_owned` makes it unreachable, and a
-/// silent acceptance of a spec this tier did not store would be the one
-/// failure worth failing loudly for.
+/// Detect spec changes and allow only referenced-disk hot-plug after the boot
+/// entry, using the same shape rule as both REST APIs. Reject other changes
+/// rather than acknowledging a spec this tier did not store.
 fn shape_moved(current: &Vm, spec: &VmSpec, name: &str) -> anyhow::Result<bool> {
     let moved = current.spec.vm != spec.vm;
     if moved && !controller_api::vm_shape_unchanged(&current.spec.vm, &spec.vm) {
@@ -1002,32 +915,10 @@ fn note_drift(name: &str, spec: &VmSpec, shape_moved: bool, evacuation_moved: bo
     }
 }
 
-/// The cloud's delete becomes this tier's delete: a deletionTimestamp, and the
-/// existing finalizer flow does the rest. Nothing new tears anything down.
-/// A volume the cloud owns, written as this tier's own object.
-///
-/// The same three rules `handle_create` follows and for the same reasons,
-/// with a sharper edge on the third: idempotent for the object this uid
-/// created, refused for anything else, and the refusal matters more here than
-/// it does for a VM — adopting a volume on the name alone would hand a tenant
-/// somebody else's data rather than somebody else's disk to boot from.
-///
-/// The pool is NOT created here. A cloud pool points at a cluster pool that
-/// an admin (or the cluster's configuration) made; if it is missing the
-/// volume stays Pending with the sentence `place_volume` already writes,
-/// which is a thing an operator can read.
-/// A tenant's secret, mirrored down so that a VM here can be given its
-/// cloud-init.
-///
-/// The values arrive SEALED and are written sealed: both tiers hold the same
-/// KEK, so nothing has to be re-encrypted and no plaintext crosses this
-/// session. It also means this handler needs no key at all — the tier that
-/// needs one is the dispatch, and a cluster with no `secrets_key` still
-/// stores the object and still says something useful when a VM asks for it.
-///
-/// Unlike a volume's, a secret's spec is MUTABLE: a password is a thing that
-/// gets rotated, so a repeat is an update rather than a no-op, and the
-/// mirrored copy follows the cloud's object for as long as it exists.
+/// Mirror a cloud-owned secret, preserving its sealed values.
+/// Both tiers share the KEK, so this handler needs no decryption key; dispatch
+/// needs it when resolving cloud-init. Repeated creates update mutable secret
+/// data while retaining cloud ownership checks.
 async fn handle_create_secret(store: &EtcdStore, c: proto::CreateSecret) -> anyhow::Result<()> {
     if c.uid.is_empty() {
         bail!("create without a cloud uid");
@@ -1117,20 +1008,10 @@ async fn handle_delete_secret(store: &EtcdStore, d: proto::DeleteSecret) -> anyh
     Ok(())
 }
 
-/// The cloud's router, as this tier's own objects.
-///
-/// Two writes and in this order, because the second is planned against the
-/// first: the provider network the router goes out over, mirrored down beside
-/// it, and then the router itself. See `proto::CreateRouter.network_name` for
-/// why the wire travels with the router rather than as an object somebody
-/// declares twice.
-///
-/// Idempotent by uid with the same guard the volume half carries, and level
-/// triggered on top of it: the three resolved halves — the external address,
-/// the rules and the announced prefixes — are re-stamped every time the
-/// command arrives, because they are what CHANGES up there while the router
-/// stands still down here. A tenant pointing a floating address at their
-/// router is a new `dnat_and_snat` rule one dispatch later and nothing else.
+/// Mirror the provider network before creating or updating its router.
+/// Cloud UID checks prevent adoption by name alone. Each command refreshes the
+/// resolved external address, rules and prefixes, which can change independently
+/// of router placement.
 async fn handle_create_router(store: &EtcdStore, c: proto::CreateRouter) -> anyhow::Result<()> {
     if c.uid.is_empty() {
         bail!("create without a cloud uid");
@@ -1212,16 +1093,9 @@ fn cloud_nats(c: &proto::CreateRouter) -> anyhow::Result<Vec<controller_api::Nat
         .collect()
 }
 
-/// The wire, mirrored down beside the router that goes out over it.
-///
-/// Evidence flows upward everywhere else in this file and this is the one
-/// place intent flows down onto an object nobody at this tier wrote — so it
-/// is marked as the cloud's, and a network of that name somebody made HERE is
-/// left exactly as it is. A cluster-local provider network is a real thing
-/// (the standalone mode this tier keeps) and the cloud is not entitled to
-/// overwrite one just because the names collide; the router then plans
-/// against what is there, and if the two disagree about the physnet the
-/// gateway candidates come out empty and the Pending sentence says so.
+/// Mirror cloud network intent without overwriting a cluster-local network
+/// of the same name. Router planning uses the retained local definition, so a
+/// physnet mismatch can leave the router Pending.
 async fn mirror_network(store: &EtcdStore, c: &proto::CreateRouter) -> anyhow::Result<()> {
     if c.network_name.is_empty() {
         return Ok(());
@@ -1253,16 +1127,10 @@ async fn mirror_network(store: &EtcdStore, c: &proto::CreateRouter) -> anyhow::R
     Ok(())
 }
 
-/// A hard delete, and it is the one teardown in this file that does not set a
-/// deletionTimestamp.
-///
-/// The `Router` kind carries no finalizer here, on purpose and stated where
-/// it is implemented (`session::ingest::sweep_routers`): a node that holds a
-/// netns nothing names says so in its very next status report and is told to
-/// let it go. So the object going away IS the teardown, it works while the
-/// gateway node is down — which a finalizer walk would not — and it is what
-/// makes the router leave this cluster's status, which is the proof the cloud
-/// waits for before dropping its own copy.
+/// Delete the router record without a finalizer.
+/// Nodes report remaining namespaces and `sweep_routers` removes those without
+/// an owner. Record absence also removes the router from cloud-facing inventory;
+/// it does not itself prove node teardown completed.
 async fn handle_delete_router(store: &EtcdStore, d: proto::DeleteRouter) -> anyhow::Result<()> {
     let current: Router = match store.get(&d.name).await {
         Ok(r) => r,
@@ -1319,28 +1187,10 @@ async fn handle_create_volume(store: &EtcdStore, c: proto::CreateVolume) -> anyh
     spec.tenant = c.tenant.clone();
     let mut volume = new_volume(&c.name, spec);
     volume.metadata.mark_managed_by_cloud(&c.uid);
-    // And the object takes the CLOUD's uid as its own, which is the one place
-    // in this file where the two tiers deliberately share an identity.
-    //
-    // The reason is the bytes. Every storage backend in this tree derives its
-    // volume's name from the id it is handed — `<id>.raw`, `vm-<id>` — and
-    // the id it is handed is THIS object's uid. So a volume whose record
-    // moves to another cluster (a stopped vm rescheduled across one, on a
-    // pool both clusters serve) would arrive with a fresh uid, the driver
-    // would derive a name nothing has ever written to, and `provision` would
-    // adopt-on-exists its way into making a SECOND file beside the first.
-    // The data would still be on the export and the guest would boot off an
-    // empty disk — which is the worst of the available outcomes, because
-    // nothing anywhere reports an error.
-    //
-    // Seen exactly that way in the position-1 e2e before this line existed:
-    // `1e793684-….raw` left standing on the share and `6ed5650a-….raw` made
-    // beside it.
-    //
-    // A cluster-local volume still mints its own uid, and so does every
-    // volume written before this: those keep the identity their bytes are
-    // named after, which is the only safe direction for an object that
-    // already exists.
+    // Use the cloud UID for a newly mirrored volume: backend names derive from it.
+    // Moving a shared volume record between clusters must reopen the same bytes,
+    // not provision a new disk under a fresh UID. Existing and cluster-local
+    // volumes retain their own identities.
     if !c.uid.is_empty() {
         volume.metadata.uid = c.uid.clone();
     }
@@ -1382,19 +1232,9 @@ async fn handle_create_volume(store: &EtcdStore, c: proto::CreateVolume) -> anyh
     Ok(())
 }
 
-/// Take the cloud's size for a volume this tier already holds, if it is
-/// larger; say whether anything changed.
-///
-/// A maximum and not an assignment, which is what makes the road safe to
-/// repeat and to reorder: two cloud replicas can each send a create for the
-/// same volume around a speaker change, and the older of the two arriving
-/// last must not take the size back down — the bytes past the old end would
-/// be data. The generation moves with the spec, as `carry_generation` moves
-/// it at a REST edge, so `observedGeneration` still means what it says.
-///
-/// Found by review: this used to be "nothing to change — a volume's spec is
-/// immutable", which stopped being true when `sizeGib` became growable, and
-/// a cloud volume grown after the cluster had seen it was never grown here.
+/// Apply only a larger cloud volume size and advance the local generation.
+/// Taking the maximum makes repeated or reordered commands unable to shrink
+/// storage after a newer growth request.
 pub(crate) fn grow_to_cloud_size(volume: &mut Volume, cloud: &controller_api::VolumeSpec) -> bool {
     if cloud.size_gib <= volume.spec.size_gib {
         return false;
@@ -1404,15 +1244,9 @@ pub(crate) fn grow_to_cloud_size(volume: &mut Volume, cloud: &controller_api::Vo
     true
 }
 
-/// The cloud asked for a copy. Idempotent by name with the same uid guard the
-/// volume half carries: a name is a label people reuse, and adopting on the
-/// name alone would hand a new snapshot somebody else's bytes.
-///
-/// Whether the pool can snapshot at all is NOT re-asked here — this tier's own
-/// REST edge asks it, because a person typing the request should hear it at
-/// once, and the cloud has no catalogue to ask. A cloud-requested copy of a
-/// volume on a backend that cannot take one becomes a Failed object with the
-/// node's own sentence, which travels back up as evidence.
+/// Create a snapshot with cloud UID ownership checks to prevent adopting another
+/// snapshot's bytes by name. This path does not check backend capability upfront;
+/// unsupported snapshots fail asynchronously through node evidence.
 async fn handle_create_snapshot(store: &EtcdStore, c: proto::CreateSnapshot) -> anyhow::Result<()> {
     if c.uid.is_empty() {
         bail!("create without a cloud uid");
@@ -1504,22 +1338,10 @@ async fn handle_destroy_volume(store: &EtcdStore, d: proto::DestroyVolume) -> an
     Ok(())
 }
 
-/// Let go of the object and tell no node anything.
-///
-/// The half of a cross-cluster reschedule that has data on the other side of
-/// it, so it is worth being exact about what it does NOT do: it does not set
-/// a deletionTimestamp, it does not walk the release finalizer, and it never
-/// reaches `deprovision_volume`. The bytes are on an export or a target that
-/// this cluster does not own, the cloud is about to hand the same uid to
-/// another cluster, and a deprovision here would destroy what that create is
-/// meant to find.
-///
-/// The finalizer is taken off explicitly rather than left to the normal flow,
-/// because the normal flow is exactly the thing being skipped.
-///
-/// Idempotent: a volume that is already gone is what a release wants, and a
-/// name held by somebody else's volume is acked untouched — the same uid
-/// guard `handle_destroy_volume` carries, for the same reason.
+/// Forget a volume record during cross-cluster rescheduling without deleting data.
+/// Remove its finalizer explicitly and bypass deprovisioning so the destination
+/// can reopen the same backend identity. Missing or differently owned records
+/// are acknowledged without mutation.
 async fn handle_release_volume(store: &EtcdStore, r: proto::ReleaseVolume) -> anyhow::Result<()> {
     let current: Volume = match store.get(&r.name).await {
         Ok(v) => v,
@@ -1750,17 +1572,9 @@ async fn build_status(
     })
 }
 
-/// Draining or labelling a node, asked for one tier up.
-///
-/// Translated into the very merge patch this tier's own REST PATCH takes and
-/// applied through the same function. There is one write path for a node's
-/// spec and it does not care which door the intent came through — which is
-/// what keeps `meister node cordon` against the cloud and the same command
-/// against the cluster from being two different acts.
-///
-/// `null` is how a merge patch says "remove", so `remove_labels` becomes
-/// exactly that, applied after the sets: naming a key in both means it goes,
-/// the rule `meister node label --rm` has always had.
+/// Apply cloud node updates through the same merge-patch path as the local API.
+/// Label removals become null values after label additions, so removal wins if
+/// a key occurs in both sets.
 async fn handle_update_node(store: &EtcdStore, u: proto::UpdateNode) -> anyhow::Result<()> {
     // Nothing to do is not success: a command that says nothing is a bug one
     // tier up, and the cloud shows the sentence.
@@ -1956,29 +1770,11 @@ fn report_cloud_vms(vms: &[Vm], complete: &mut bool) -> Vec<VmStatusReport> {
                         attached: v.attached,
                     })
                     .collect(),
-                // And why it is not placed, which stopped at this tier for
-                // the same reason: a Pending VM at the cloud was a dead end
-                // for anybody holding only that API.
-                // The category, in the vocabulary the object stores it in
-                // since struktur 4. `Unrecorded` travels as an empty field,
-                // which is what an absent `pendingReason` has always been.
-                //
-                // It is the object's word and therefore sometimes the NODE's,
-                // relayed unchanged: a `VmmGone` that came up from an agent
-                // reaches the cloud as `VmmGone`. That is decision 1 — one
-                // list per resource, so the same word means the same thing at
-                // both altitudes and neither tier has to invent one for the
-                // road it came down.
+                // Relay the stored phase reason unchanged, including node-originated reasons.
+                // `Unrecorded` is encoded as an empty field.
                 reason: vm.status.phase().reason_word().to_string(),
-                // The MAC half of `status.addresses[]`, relayed. It comes off
-                // the object rather than out of a node's report, because this
-                // tier has already written the nodes' reports onto the object
-                // and the cloud asks the tier, not the machine.
-                //
-                // Only the MAC lines: the floating half of the same list is
-                // the CLOUD's own object, and a cluster sending it back up
-                // would be a cluster answering a question it was never asked
-                // — with an older copy of the asker's own answer.
+                // Relay only node-derived MAC addresses. Floating addresses belong to cloud
+                // objects and must not be overwritten by this tier's older copy.
                 nics: vm
                     .status
                     .addresses
@@ -2132,15 +1928,8 @@ fn report_cloud_routers(routers: &[Router], complete: &mut bool) -> Vec<proto::R
 #[cfg(test)]
 mod tests {
 
-    /// The identity the BYTES are named after, and why the two tiers share it
-    /// for a volume and for nothing else.
-    ///
-    /// Every storage backend here derives its file's name from the id it is
-    /// handed, and that id is the cluster object's uid. A volume whose record
-    /// moves to another cluster would otherwise arrive with a fresh one, and
-    /// `provision` — which adopts an existing file and makes one when there is
-    /// none — would make a second file beside the data. No error anywhere,
-    /// and a guest booting off an empty disk.
+    /// A mirrored volume keeps the cloud UID so another cluster reopens the same
+    /// backend bytes instead of provisioning a disk under a new identity.
     #[tokio::test]
     async fn a_cloud_volume_is_named_after_the_uid_the_cloud_handed_down() {
         let create = |uid: &str| proto::CreateVolume {
@@ -2800,16 +2589,7 @@ mod tests {
         );
     }
 
-    /// D5: the evidence half of hot-plug, and the reason a VM is Pending,
-    /// both travel.
-    ///
-    /// Measured in the mini-chaos run: the cluster answered
-    /// `[{"attached":true,"name":"mc-vol-b"},{"attached":true,"name":"mc-vol-hp"}]`
-    /// for a VM that had just taken a disk in flight, and the cloud answered
-    /// nothing at all. A tenant reads their VM at the cloud and nowhere else,
-    /// so what they could see was the intent in `spec.vm.volumes[]` and never
-    /// the observation — and a Pending VM up there had no reason on it at
-    /// all.
+    /// Report observed disk attachments and Pending reasons to the cloud.
     #[test]
     fn the_disks_a_node_really_has_open_travel_up_with_the_phase() {
         let mut hot_plugged = vm("mc-vm-c", Some("cloud-uid-1"), VmPhaseKind::Running);
@@ -2979,15 +2759,8 @@ mod tests {
         assert!(report.is_empty());
         assert!(!complete, "absence must not be read as teardown here");
     }
-    /// The ask a cloud sends, and the one rule in it worth writing down.
-    ///
-    /// D-P9's other half. `vm migrate` against a cloud used to end in "this
-    /// endpoint is a cloud and has no \"vmmigrations\"" — true, and a dead end
-    /// for somebody whose credential works at exactly one endpoint. The cloud
-    /// forwards it now, and what arrives here is an ask with no destination
-    /// decision in it: this tier's own reconciler chooses where, opens the
-    /// disks and sequences the transfer, exactly as it does for a migration an
-    /// operator made by hand.
+    /// A cloud migration request creates local migration intent; this cluster's
+    /// reconciler selects the target and drives the same transfer workflow.
     #[tokio::test]
     async fn a_migration_asked_for_at_the_cloud_arrives_as_the_object_it_would_have_been() {
         let ask = |target: &str| proto::CreateVmMigration {
@@ -3032,11 +2805,8 @@ mod tests {
         assert!(why.contains("vm to move"), "{why}");
     }
 
-    /// The road itself, against a real etcd: the same create, twice, the
-    /// second one with the size the cloud grew the volume to.
-    ///
-    /// `#[ignore]` for the reason `two_replicas_assigning_at_once_hand_out_two_namespaces`
-    /// is: it needs something to talk to.
+    /// Repeated cloud creation updates an existing volume to the larger size.
+    /// Requires an external etcd:
     ///
     /// ```text
     /// MEISTER_TEST_ETCD=http://127.0.0.1:23700 \

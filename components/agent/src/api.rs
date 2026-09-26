@@ -47,9 +47,7 @@ pub struct ApiState {
     pub hypervisor: HypervisorCatalog,
     pub network: NetworkCatalog,
     pub default_bridge: String,
-    /// The volumes this node owns on their own. Read-only from here: a
-    /// volume is created and destroyed over the controller session and
-    /// nowhere else, so this socket can SHOW one and cannot make one.
+    /// Independent volume ownership, exposed read-only through the local API.
     pub volumes_owned: Arc<crate::volumes::Volumes>,
 }
 
@@ -157,10 +155,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/vms/{id}/stop", post(stop_vm))
         .route("/vms/{id}/pause", post(pause_vm))
         .route("/vms/{id}/resume", post(resume_vm))
-        // Read-only, deliberately. Provision and deprovision arrive over the
-        // controller session because the LIFECYCLE of a volume belongs to the
-        // object one tier up; a write route here would be a second owner of
-        // somebody's data, reachable by anybody in the socket group.
+        // Volume lifecycle belongs to the controller; the local API exposes inspection only.
         .route("/volumes", get(list_volumes))
         .route("/volumes/{id}", get(get_volume));
 
@@ -172,17 +167,9 @@ pub fn router(state: ApiState) -> Router {
     router.with_state(state)
 }
 
-/// The socket and the directory it lives in, with the access rule on them.
-///
-/// `group` is `[paths] socket_group` resolved to a gid (`PathsConfig::
-/// socket_gid`). `None` is 0700/0600 and root only, which is how every node
-/// has run so far. `Some` is 0750/0660 owned by that group, so its members
-/// reach the node's local admin API without sudo.
-///
-/// chmod before chown, in that order and never the other way round: between
-/// the two calls the mode is already the narrow one, so the widening step is
-/// the last thing that happens and the socket is never both group-owned and
-/// group-writable to a group that was not meant to have it.
+/// Bind the local admin socket. Without a group, use directory/socket modes
+/// 0700/0600 for the agent owner; with a group, use 0750/0660 and set its GID.
+/// Permissions are applied before ownership changes.
 fn bind_socket(socket_path: &std::path::Path, group: Option<u32>) -> anyhow::Result<UnixListener> {
     let (dir_mode, socket_mode) = match group {
         Some(_) => (0o750, 0o660),
@@ -255,11 +242,7 @@ struct VmListEntry {
     readable: bool,
 }
 
-/// One volume as this node holds it, for `meister agent volume ls|get`.
-///
-/// Flat rather than the record verbatim: `backend` is the one field of the
-/// handle an operator reads, and a whole `VolumeHandle` in the answer would
-/// publish a shape that is the driver's business.
+/// Local volume summary. Expose the backend name without publishing the driver-specific handle.
 #[derive(Serialize)]
 struct VolumeEntry {
     id: String,
@@ -273,8 +256,7 @@ struct VolumeEntry {
     base_image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
-    /// The VM on this node holding it, if one is. Asked of the VM records,
-    /// because the attachment belongs to the consumer.
+    /// VM holding this volume according to persisted attachment records.
     #[serde(skip_serializing_if = "Option::is_none")]
     attached_to: Option<String>,
 }
@@ -419,12 +401,7 @@ struct LogStream {
     text: String,
 }
 
-/// What the caller wants of a console: how much, and which lines.
-///
-/// Read as raw pairs rather than a struct because `hide` and `only` repeat —
-/// `?hide=a&hide=b` — and the form encoding behind a typed `Query` has no way
-/// to spell a repeated key. Pairs are what the wire actually carries, so this
-/// parses what is there rather than what a struct wishes were there.
+/// Parse repeated substring filters and stream selectors from query pairs.
 fn log_request(
     pairs: &[(String, String)],
 ) -> (usize, crate::console::LogFilter, Vec<ConsoleStream>) {
@@ -433,15 +410,11 @@ fn log_request(
     let mut wanted: Vec<ConsoleStream> = Vec::new();
     for (key, value) in pairs {
         match key.as_str() {
-            // A `lines` that is not a number keeps the default rather than
-            // refusing: this is a read, and answering with a screenful is a
-            // better answer than a 422 about a typo.
+            // Invalid line counts retain the default.
             "lines" => lines = value.parse().unwrap_or(lines),
             "hide" if !value.is_empty() => keep.hide.push(value.clone()),
             "only" if !value.is_empty() => keep.only.push(value.clone()),
-            // Repeatable AND comma-separated, because both spellings are
-            // what people try. A word this node does not serve is skipped
-            // rather than refused — see `ConsoleStream::parse`.
+            // Accept repeated and comma-separated stream filters; ignore unknown names.
             "streams" => wanted.extend(value.split(',').filter_map(ConsoleStream::parse)),
             _ => {}
         }
@@ -454,17 +427,8 @@ fn log_request(
     (lines, keep, wanted)
 }
 
-/// What the guest printed before anything inside it was reachable.
-///
-/// One way, and deliberately only that: no input channel, no attach, no
-/// follow. An interactive console is a different feature with different
-/// questions — exactly one attach at a time, a controller that pipes without
-/// storing, an audit line per session — and none of them are answered by a
-/// read of a ring buffer.
-///
-/// A VM with no output at all answers with an empty list rather than a 404:
-/// "it printed nothing" is the commonest true answer there is, and it is not
-/// an error. A vm id this node has no record of still is.
+/// Read retained console output for a persisted VM. Missing streams are omitted;
+/// an unknown VM ID returns 404.
 #[instrument(level = "debug", skip_all, fields(vm_id = %id))]
 async fn vm_logs(
     State(st): State<ApiState>,
@@ -516,9 +480,8 @@ async fn vm_state(
     observe_vm(State(st), Path(id)).await
 }
 
-/// Every lifecycle endpoint is the reconciler's one transition plus the HTTP
-/// shape around it; the semantics live in `Reconciler::set_desired`, shared
-/// with the controller session.
+/// Apply the reconciler's lifecycle transition through HTTP, sharing semantics
+/// with controller commands.
 async fn set_desired_and_reconcile(
     st: &ApiState,
     id: &str,
@@ -694,22 +657,9 @@ async fn destroy_vm(
     }))
 }
 
-/// Take this VM's serial line and speak to it.
-///
-/// An HTTP upgrade to a RAW byte stream in both directions, and not a
-/// WebSocket: a console already is a byte stream, framing would add a header
-/// per keystroke, and the one party that needs frames is a browser — which
-/// never reaches this socket. The tier a browser does reach can wrap this;
-/// here the honest shape is the one the guest already speaks.
-///
-/// Three answers rather than two, because they are three different problems:
-/// no such VM is 404, a VM whose line is not being recorded is 409 (it is not
-/// running, or the recorder has not caught up), and a line somebody else
-/// holds is 409 with different words. A client that cannot tell them apart
-/// cannot say anything useful to a person.
-///
-/// Reading is untouched: `vm logs` works while somebody holds the line, for
-/// as many readers as ask, because reading is the file.
+/// Upgrade HTTP to an unframed bidirectional serial stream. Acquire the holder
+/// before answering the upgrade so busy/unavailable consoles can return 409.
+/// Log readers remain independent of the interactive holder.
 #[instrument(level = "debug", skip_all, fields(vm_id = %id))]
 async fn vm_console(
     State(st): State<ApiState>,
@@ -729,9 +679,7 @@ async fn vm_console(
         ));
     };
 
-    // Taken BEFORE the upgrade is answered, so that a second client learns it
-    // cannot have the line while it is still speaking HTTP and can be told
-    // why. After the upgrade there is no status code left to say it with.
+    // Acquire the console before upgrading so a competing client receives an HTTP error.
     let held = match st.reconciler.consoles.attach(&vm_id) {
         None => {
             return Err(ApiError::conflict(format!(
@@ -760,16 +708,10 @@ async fn vm_console(
         .expect("a fixed response"))
 }
 
-/// What this upgrade is called on the wire. Named rather than borrowed from
-/// something else, because it is not WebSocket and a client that assumed so
-/// would frame every keystroke.
+/// HTTP upgrade protocol for the unframed console byte stream.
 pub const CONSOLE_PROTOCOL: &str = "meister-console";
 
-/// Both directions of one console session, until either end stops.
-///
-/// `select!` and not two tasks: when one direction ends the other has nothing
-/// left to serve, and two tasks would need a way to tell each other so —
-/// exactly the bookkeeping a session that owns both halves does not need.
+/// Forward console bytes until a direction ends or a write fails.
 async fn pump<S>(stream: S, mut held: crate::attach::Held)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -813,16 +755,7 @@ mod tests {
         std::fs::metadata(path).expect("stat").gid()
     }
 
-    /// A fresh directory per test: bind_socket creates and chmods the parent,
-    /// so it must not find one somebody else's modes are already on.
-    ///
-    /// The guard comes back with the path and the caller binds it. It is what
-    /// makes "fresh" true — a name derived from the pid is a name that comes
-    /// back, and a run that crashed leaves its modes on the directory for
-    /// whoever gets that pid next.
-    ///
-    /// `bind_socket` makes the directory itself, so what is handed over is a
-    /// path INSIDE the temp directory that does not exist yet.
+    /// Use a fresh parent path so socket permission tests are isolated.
     fn scratch(name: &str) -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::Builder::new()
             .prefix(&format!("meister-socket-{name}-"))
@@ -832,10 +765,7 @@ mod tests {
         (temp, path)
     }
 
-    /// No group: the socket and its directory belong to the user running the
-    /// agent and to nobody else. This is how every node has run so far, and
-    /// changing it silently would be the kind of change nobody notices until
-    /// it is a finding.
+    /// Without a group, the socket and directory are owner-only.
     #[tokio::test]
     async fn without_a_group_the_socket_stays_private() {
         let (_temp, sock) = scratch("private");
@@ -845,10 +775,8 @@ mod tests {
         assert_eq!(mode_of(&sock), 0o600);
     }
 
-    /// With a group: 0750 on the directory and 0660 on the socket, both owned
-    /// by it — the traversal bit is on the directory, the write bit on the
-    /// socket, and neither on anything else. The only group a test can chown
-    /// to without privileges is one it is already in, so it uses its own.
+    /// Group access requires directory mode 0750 and socket mode 0660.
+    /// Use the test process's group so chown does not require extra privileges.
     #[tokio::test]
     async fn a_group_reaches_the_socket_without_becoming_root() {
         let gid = nix::unistd::getgid().as_raw();
@@ -862,9 +790,7 @@ mod tests {
         assert_eq!(gid_of(&sock), gid);
     }
 
-    /// The socket of a killed agent is in the way of the next one, and has
-    /// been swept since long before this change. The sweep has to keep
-    /// working now that the mode is decided a step earlier.
+    /// Replacing a stale socket reapplies the configured permissions.
     #[tokio::test]
     async fn a_stale_socket_is_swept_and_the_mode_is_set_again() {
         let (_temp, sock) = scratch("stale");

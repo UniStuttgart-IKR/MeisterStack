@@ -150,20 +150,9 @@ pub(super) async fn create_image(
         },
     );
     image.metadata.labels = body.metadata.labels;
-    // Nothing is stamped here any more, and that is F16.
-    //
-    // A path image used to be `Ready` the moment it was registered — the
-    // argument was that a catalogue entry over storage somebody else filled
-    // is not this control plane's to check. But `Ready` is not "we make no
-    // claim", it is a claim, and the chaos run found an entry pointing at
-    // nothing wearing it for as long as anybody looked. A VM booting from it
-    // failed at the node with the storage driver's own words.
-    //
-    // The phase is derived now (`settle_image`), out of `status.nodes[]` and
-    // nothing else, so a fresh image of either kind is
-    // `Pending { AwaitingNode }` until a node has said something about the
-    // bytes. `dry.preview` sees the same value a create would store, because
-    // the derivation runs on the object and not in the store.
+    // Derive phase from node evidence, including for path images.
+    // A new image remains Pending/AwaitingNode until a node reports its bytes;
+    // dry-run and stored creates use the same derivation.
     image.settle(chrono::Utc::now());
     let created = match dry.preview(&image) {
         Some(preview) => preview,
@@ -245,22 +234,11 @@ pub(super) async fn delete_image(
         return Err(conflict(format!("image {name} is still used by: {detail}")));
     }
 
-    // The nodes are told next, exactly the way a deleted secret's mirrored
-    // copies are (`delete_secret`): every cluster this replica is talking to,
-    // one command each, and a cluster that does not answer is logged and
-    // left. Astra finding S02, 2026-09-23 (rest b).
-    //
-    // `status.nodes[]` would name fewer clusters — only the ones this image
-    // has been SEEN on — but that list is only ever as fresh as the last
-    // heartbeat that changed it, and a cluster whose report is running behind
-    // is exactly the one this must not skip. A cluster the image was never on
-    // gets a command its nodes answer with nothing to do.
-    //
-    // Before the store delete and not after: what this loses on a crash
-    // between the two is a broadcast the object is still there to retry (an
-    // operator can delete again, or a retry loop can). The other order would
-    // lose the ability to tell the nodes at all, which is the defect this
-    // closes.
+    // Ask every locally connected cluster to drop cached copies before deleting
+    // the catalogue object. `status.nodes` can lag behind actual cache use.
+    // Failures are logged; disconnected clusters receive no durable deletion intent.
+    // Keeping the object until after this broadcast permits an operator retry if
+    // the process crashes before the store delete.
     for cluster in st.sessions.connected() {
         let op = cloud_command::Op::DropImage(proto::DropImage {
             name: name.clone(),

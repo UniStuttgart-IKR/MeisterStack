@@ -2,26 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# /etc/resolv.conf has one author, and on a managed host with a provider
-# script that author is the provider.
-#
-# Why this is a check and not a comment (lab lane L2, 2026-09-23): a managed
-# host reading an OpenNebula CONTEXT cd wrote ETH0_DNS into
-# /etc/resolv.conf, resolvconf refused the file it had not signed
-# ("signature mismatch"), `network-setup.service` failed, and the
-# `switch-to-configuration` around it exited 4 — which failed the ACTIVATION
-# and then failed its ROLLBACK with the same sentence. The host ended in
-# `recovery-required`. nix/appliance.nix has had `resolvconf.enable = false`
-# since 2026-09-08 for the same reason; nix/managed.nix did not.
-#
-# Two probes, because the fix has two halves and both are promises:
-#
-#   with a provider script     resolvconf steps aside (false)
-#   without one                managed decides nothing, and the value is
-#                              whatever the bare machine had
-#
-# Evaluation only: nothing is built, no VM is started. What is asserted is a
-# module-system value, and that is where the bug was.
+# Evaluate resolver ownership: provider scripts disable resolvconf by default;
+# without a provider the managed module leaves the host's choice unchanged.
 { nixpkgs, lib, pkgs, system, self }:
 
 let

@@ -28,14 +28,8 @@ pub struct Redial {
 }
 
 impl Redial {
-    /// The preference order for `id` over `endpoints`, by rendezvous hashing:
-    /// every dialler derives its own, so the replicas need no registry of who
-    /// serves whom and no agreement with each other about it. Computed once —
-    /// the list does not change while the process runs.
-    ///
-    /// Panics on an empty endpoint list: a loop with nowhere to dial is a
-    /// configuration error the caller has to catch before starting one (both
-    /// callers do — the agent runs standalone, the cluster skips the task).
+    /// Compute a stable rendezvous-hash endpoint order for this identity.
+    /// Panics on an empty list; callers must handle standalone/no-peer mode first.
     pub fn new(id: &str, endpoints: &[String]) -> Self {
         assert!(
             !endpoints.is_empty(),
@@ -66,18 +60,9 @@ impl Redial {
         &self.order[..self.position]
     }
 
-    /// A session ended. `established` is whether it got as far as a Hello.
-    ///
-    /// Returns how long to wait before the next dial; `None` means dial the
-    /// next endpoint at once. A replica that is merely dead should cost one
-    /// redial, not a backoff — the whole point of knowing the others is not
-    /// waiting for the one that died. Once the whole order has refused,
-    /// nobody is there and waiting is the right answer.
-    ///
-    /// The reset is on `established` and not on a clean end, because the
-    /// backoff is about not finding anybody: a session that said Hello found
-    /// somebody, and however it ended afterwards, the next outage should not
-    /// start on the delay the last one climbed to.
+    /// Advance after a session ends. None means try the next endpoint
+    /// immediately; back off only after an unsuccessful endpoint round.
+    /// A completed Hello resets the backoff, even if that session later fails.
     pub fn ended(&mut self, established: bool) -> Option<Duration> {
         if established {
             self.backoff = BASE_BACKOFF;
@@ -92,12 +77,8 @@ impl Redial {
         Some(wait)
     }
 
-    /// Back to the top of the order, without a wait and without advancing:
-    /// a better-ranked replica answered and the session is being given up
-    /// FOR it, not because of it.
-    ///
-    /// Resets the backoff for the same reason `ended(true)` does, and more
-    /// plainly: a rehome only happens because a probe reached somebody.
+    /// Restart from the preferred endpoint without waiting or advancing.
+    /// A successful rehome probe also resets the failure backoff.
     pub fn rehome(&mut self) {
         self.position = 0;
         self.backoff = BASE_BACKOFF;

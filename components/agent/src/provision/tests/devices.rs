@@ -35,15 +35,7 @@ fn vfio_pinning_gets_extra_headroom() {
     assert_eq!(l.memory_max, Some((2048 + 112 + 512 + 256) * 1024 * 1024));
 }
 
-/// The wiring of `DeviceDriver::admit`, which the input driver is the first
-/// driver in this tree to implement.
-///
-/// Worth its own test for exactly that reason: the trait had a default that
-/// said yes to everything, so the road from the store through
-/// `check_device_admission` into a driver's refusal had never carried a `no`.
-/// Here it does — the OTHER records in the store become the claim list, and
-/// the refusal stops the provision before a cgroup, a disk or a backend
-/// exists.
+/// Device admission receives other VMs' persisted claims before allocating resources.
 #[test]
 fn a_host_input_node_another_vm_holds_is_refused_before_anything_is_built() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -96,11 +88,8 @@ fn a_host_input_node_another_vm_holds_is_refused_before_anything_is_built() {
         },
     };
 
-    // Two character devices that exist on every Linux, a build sandbox
-    // included. The driver asks for a character device and tells two of them
-    // apart by their device number, so these stand in for two evdev nodes —
-    // and the test no longer reads whatever /dev/input/event0 happens to be on
-    // the machine that runs it, or fails on one that has none.
+    // Use distinct, universally available character devices as evdev stand-ins.
+    // Admission checks device numbers without requiring host input hardware.
     const NODE_A: &str = "/dev/null";
     const NODE_B: &str = "/dev/zero";
 
@@ -114,8 +103,7 @@ fn a_host_input_node_another_vm_holds_is_refused_before_anything_is_built() {
     let err = provisioner
         .check_device_admission(&VmId::new_v4(), &spec(1, 256, vec![evdev(NODE_A)]))
         .expect_err("the node is taken");
-    // The whole chain: anyhow's outermost message is the context the
-    // provisioner adds, and the driver's sentence is under it.
+    // Inspect the full error chain, including the underlying driver refusal.
     let err = format!("{err:#}");
     assert!(err.contains(NODE_A), "{err}");
     assert!(err.contains(&holder.to_string()), "{err}");
@@ -125,10 +113,7 @@ fn a_host_input_node_another_vm_holds_is_refused_before_anything_is_built() {
     provisioner
         .check_device_admission(&VmId::new_v4(), &spec(1, 256, vec![evdev(NODE_B)]))
         .expect("another node is not this node");
-    // And an input device that names no host node is not a claim on nothing:
-    // since the driver hands every guest an upstream vhost-device-input there
-    // is no fifo profile left, so admission refuses it, in words, before
-    // anything is built.
+    // Input admission requires a host device path.
     let err = provisioner
         .check_device_admission(
             &VmId::new_v4(),

@@ -97,35 +97,14 @@ pub struct FloatingIpSpec {
     /// is a second, reversible decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<String>,
-    /// Which `Router` carries the 1:1 translation for this address.
-    ///
-    /// Empty — the default and every reservation written before 6k — is the
-    /// road this stack has always taken: the address lives IN the guest, the
-    /// node lets that one source address past its pool guard, and FRR
-    /// announces a /32 from the compute node. Distributed, no gateway in the
-    /// path, and it works exactly as long as the address is routable to the
-    /// node.
-    ///
-    /// Naming a router is the other road, and it is the one a tenant behind
-    /// SNAT needs: the address never reaches the guest at all, and the router
-    /// translates it to [`FloatingIpSpec::internal_address`] and back —
-    /// OVN's `dnat_and_snat`. See `Router.status.nats`.
+    /// Router providing optional one-to-one NAT to internal_address. Without a router, the
+    /// guest owns the floating address and the compute node permits and may announce it. With a
+    /// router, the external address stays on the router.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub router: String,
-    /// The address the guest holds on its own overlay — the inside half of
-    /// the 1:1 pair.
-    ///
-    /// The half this control plane cannot learn, and the field exists because
-    /// of that rather than in spite of it. There is no IPAM for a tenant
-    /// overlay here (see `RouterSpec.internal_addr`), no DHCP served by this
-    /// tier and no agent in the guest; `Vm.status.addresses` carries the MACs
-    /// a node reported and deliberately no addresses, because "the address a
-    /// guest gave itself is known to the guest and to nobody here".
-    ///
-    /// Empty with a `router` named is a reservation nothing can be derived
-    /// from: no `dnat_and_snat` rule is written, and `router get` shows the
-    /// address missing from `status.nats`, which is the visible form of the
-    /// question "what is it supposed to translate to".
+    /// Guest address on the tenant overlay, supplied by the caller because the control plane
+    /// does not manage guest IP assignment. A router binding without this address produces no
+    /// one-to-one NAT rule.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub internal_address: String,
 }
@@ -133,35 +112,18 @@ pub struct FloatingIpSpec {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FloatingIpStatus {
-    /// The last `metadata.generation` this reservation was carried down on.
-    ///
-    /// Kubernetes' half of the pair, and the whole of what it says is:
-    /// `observedGeneration < generation` means the spec was changed after the
-    /// controller last did something about it. For an address that is what
-    /// `meister floatingip ls` prints as `APPLIED`: an assign takes effect
-    /// when the VM is next created, and until then the cloud has not yet put
-    /// this address into a `CreateVm`.
-    ///
-    /// `0` on an object nothing has been dispatched for yet, and on every
-    /// object written before this field existed.
+    /// Last metadata.generation dispatched with the VM. Assignment reaches a node through
+    /// CreateVm, so acknowledgment can wait for recreation. Zero means no recorded dispatch,
+    /// including older objects.
     #[serde(default)]
     pub observed_generation: u64,
 }
 
 pub type FloatingIp = Object<FloatingIpSpec, FloatingIpStatus>;
 
-/// A real subnet a tenant owns, routed rather than translated.
-///
-/// The other half of the network story and the one the lab wants: a tenant
-/// with a routed subnet needs no NAT and no gateway appliance to be reachable
-/// — the addresses inside its overlay ARE the addresses outside it. The
-/// hoster's mode is the same stack without this object: a tenant with no
-/// routed subnet gets whatever private space it likes behind its own NAT
-/// appliance, and this control plane never learns those addresses.
-///
-/// It also completes the anti-spoofing. A tenant whose address space is
-/// UNKNOWN can only be told "not out of the floating pool"; a tenant whose
-/// address space is written down here can be told "these and nothing else".
+/// Tenant-owned routed prefix, preserving guest source addresses across the external network.
+/// It also supplies an explicit source-address allowlist at taps; reachability still requires
+/// upstream routing.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RoutedSubnetSpec {
@@ -190,15 +152,8 @@ pub const DEFAULT_ROUTED_PREFIX_LEN: u32 = 24;
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutedSubnetStatus {
-    /// The last `metadata.generation` this subnet was carried down on.
-    ///
-    /// Kubernetes' half of the pair, and the whole of what it says is:
-    /// `observedGeneration < generation` means the spec was changed after the
-    /// controller last did something about it. Same meaning as on a floating address: the subnet reaches a node inside a
-    /// `CreateVm`, so it lands when the tenant's VMs are next created.
-    ///
-    /// `0` on an object nothing has been dispatched for yet, and on every
-    /// object written before this field existed.
+    /// Last metadata.generation dispatched with a tenant VM. Subnet policy reaches nodes
+    /// through CreateVm; zero means no recorded dispatch, including older objects.
     #[serde(default)]
     pub observed_generation: u64,
 }

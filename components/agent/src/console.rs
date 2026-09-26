@@ -2,41 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The guest's one-way output, bounded and readable.
+//! Bound and read guest console log files.
 //!
-//! Cloud Hypervisor is configured with `console` and `serial` in `mode:
-//! "File"` and writes both to `<run>/<id>.console` and `<id>.serial`. Nothing
-//! in this tree ever read, bounded, rotated or removed them, and both
-//! consequences of that are real: a guest in a boot loop or with a kernel log
-//! storm fills the node's disk and takes the agent down with it, and every vm
-//! id that ever existed leaves two files behind for good. `destroy` in the
-//! hypervisor driver now removes them; this module is the other half.
-//!
-//! ## Why a hole and not a rotation
-//!
-//! The writer is a live process that holds an open fd with an offset into the
-//! file, and that rules out every ordinary way of shortening a log:
-//!
-//! - Renaming it away leaves cloud-hypervisor writing into an unlinked inode.
-//!   Its output then goes nowhere anybody can read, and the blocks stay
-//!   allocated until the VMM exits — the exact opposite of the intent.
-//! - `ftruncate` to zero does not move the writer's offset. Its next write
-//!   lands where it always would, and the file comes back the same apparent
-//!   size with a hole in front of it, minus the tail we wanted to keep.
-//! - A pipe or a socket would put the agent in the path of the guest's
-//!   output, and a pipe whose reader goes away kills the writer: an agent
-//!   restart would then take every VM on the node with it. That trade is not
-//!   worth a log file.
-//!
-//! `fallocate(PUNCH_HOLE)` is the one operation that does what is wanted: it
-//! frees the blocks of the HEAD of the file and leaves everything else —
-//! including the writer's offset and the bytes it has yet to write — exactly
-//! as it was. The file's apparent length goes on growing and its disk usage
-//! does not, which is the trade being made and the reason `ls -l` will show a
-//! large number for a chatty guest while `du` shows [`RING_BYTES`].
-//!
-//! The reader is the same rule from the other end: the last [`RING_BYTES`],
-//! which is precisely the region a punch is guaranteed to have left alone.
+//! The VMM writes the console file; the serial recorder writes the serial file.
+//! Hole punching releases old blocks without changing open writers' offsets or
+//! apparent file length. Readers use the last `RING_BYTES` bytes. Trimming is
+//! periodic and best effort; unsupported filesystems can leave logs unbounded.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -44,21 +15,11 @@ use std::path::Path;
 use agent_api::ConsoleStream;
 use tracing::{debug, warn};
 
-/// How much of each stream is kept. One wants the END of a console log
-/// essentially always — a panic, an emergency shell, the last thing before it
-/// stopped — so this is a tail and not a sample.
-///
-/// 256 KiB is a few thousand lines of kernel output, which is more than the
-/// whole of a boot, and it is small enough that a node running a hundred VMs
-/// spends 50 MiB on all of them together.
+/// Target retained tail per stream after a successful trim.
 pub const RING_BYTES: u64 = 256 * 1024;
 
-/// Bound one file, if it has outgrown the ring.
-///
-/// Cheap enough to call on every reconcile pass: a `stat` for a file that is
-/// still small, one `fallocate` for one that is not. Never an error a pass
-/// has to handle — an output file that cannot be bounded is a degradation,
-/// not a reason to stop reconciling the VM it belongs to.
+/// Punch out bytes before the retained tail. Missing files are ignored;
+/// other failures are logged without interrupting reconciliation.
 pub fn trim(path: &Path) {
     let file = match std::fs::OpenOptions::new().write(true).open(path) {
         Ok(f) => f,
@@ -85,49 +46,27 @@ pub fn trim(path: &Path) {
     };
 
     use nix::fcntl::{FallocateFlags, fallocate};
-    // KEEP_SIZE as well as PUNCH_HOLE: the apparent length must not change,
-    // because the writer's offset is measured against it and shortening the
-    // file under a live writer is the whole class of mistake this avoids.
+    // Preserve apparent length so hole punching does not invalidate a live writer's offset.
     let flags = FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE;
     match fallocate(&file, flags, 0, head as i64) {
         Ok(()) => debug!(path = %path.display(), freed_bytes = head,
                          "punched the head out of the console file"),
-        // Degraded, and it heals by itself if the node is ever moved to a
-        // filesystem that can do this. WARN and not ERROR for that reason —
-        // but it IS the case where the disk can still fill, so it is not a
-        // debug line either.
+        // Warn because failed trimming leaves disk usage unbounded; later passes can retry.
         Err(e) => warn!(path = %path.display(), error = %e,
                         "cannot punch a hole in the console file; it stays as large as the \
                          guest makes it"),
     }
 }
 
-/// Bound every stream of one VM. What a reconcile pass calls.
-///
-/// Takes the paths rather than the hypervisor: the driver is the only party
-/// that knows WHERE they are and this module is the only one that knows what
-/// to do with them, and keeping the trait out of here is what makes both
-/// halves testable against a file on disk.
+/// Trim the paths supplied by the hypervisor driver.
 pub fn trim_all(paths: &[(ConsoleStream, std::path::PathBuf)]) {
     for (_, path) in paths {
         trim(path);
     }
 }
 
-/// Which of a console's lines a caller wants to see.
-///
-/// Applied HERE, at the ring, and that placement is the whole point: the
-/// truncation to `lines` happens at the same place, and a filter that ran
-/// afterwards could only narrow what was already the last N lines. On a
-/// chatty guest that is nothing at all — ask for the last five lines of a VM
-/// whose init prints a heartbeat every ten seconds and every one of the five
-/// is the heartbeat. Filtering first makes `lines` mean "the last N lines
-/// that matter", which is what somebody asking for it meant.
-///
-/// Plain substring and not a regex, deliberately. It is what a person reaches
-/// for, it cannot be made to backtrack, and a pattern language a NODE runs on
-/// behalf of a remote caller is an attack surface a reading aid has not
-/// earned. A client that wants more can still pipe the answer.
+/// Substring filters applied before the line limit, so the limit counts
+/// matching lines within the retained byte window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogFilter {
     /// Drop a line containing any of these.
@@ -146,23 +85,15 @@ impl LogFilter {
         self.hide.is_empty() && self.only.is_empty()
     }
 
-    /// `only` narrows first, then `hide` narrows again — so naming both is
-    /// two cuts rather than a contradiction: "only the lines about the disk,
-    /// and not the ones that are just polling it" is one sentence a person
-    /// can mean.
+    /// Apply the inclusion filter, then exclude any hidden substrings.
     pub fn keeps(&self, line: &str) -> bool {
         let wanted = self.only.is_empty() || self.only.iter().any(|n| line.contains(n));
         wanted && !self.hide.iter().any(|n| line.contains(n))
     }
 }
 
-/// The end of one stream, at most `lines` lines of it.
-///
-/// Reads the last [`RING_BYTES`] and nothing more, whatever the file's
-/// apparent length says: that window is exactly the part a punch leaves
-/// alone, and reading further back would be reading a hole. `None` for a file
-/// that is not there — a VM that has never started — which the caller renders
-/// as empty rather than as an error.
+/// Read at most `RING_BYTES`, filter, and keep the last `lines` matches.
+/// Return `None` on open, metadata, seek, or read failure.
 pub fn tail(path: &Path, lines: usize, keep: &LogFilter) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -171,21 +102,13 @@ pub fn tail(path: &Path, lines: usize, keep: &LogFilter) -> Option<String> {
     let mut bytes = Vec::with_capacity(RING_BYTES as usize);
     file.take(RING_BYTES).read_to_end(&mut bytes).ok()?;
 
-    // A punch reads back as zeros, and the window can overlap one when the
-    // file grew between the trim and this read. They are not output and no
-    // console ever emits them, so dropping them costs nothing and saves the
-    // reader a screenful of NULs.
+    // Discard NUL bytes, including any hole exposed by concurrent trimming.
     bytes.retain(|b| *b != 0);
 
-    // Lossy, deliberately: a console carries whatever the guest put on the
-    // wire, half a UTF-8 sequence at the window boundary included, and a
-    // `vm logs` that refuses to print because byte 3 is not valid UTF-8 is
-    // useless exactly when it is needed.
+    // Accept arbitrary guest bytes and partial UTF-8 at the window boundary.
     let text = String::from_utf8_lossy(&bytes);
-    // The first line of the window is very likely a fragment — the window
-    // starts at a byte offset, not at a newline — so it is dropped once
-    // there is more than one line and the read did not start at the file's
-    // beginning.
+    // A byte-offset window can begin mid-line. Drop that fragment when
+    // reading beyond the file start and another line is available.
     let mut out: Vec<&str> = text.lines().collect();
     if from > 0 && out.len() > 1 {
         out.remove(0);
@@ -201,12 +124,8 @@ pub fn tail(path: &Path, lines: usize, keep: &LogFilter) -> Option<String> {
     Some(out.join("\n"))
 }
 
-/// Both streams of one VM, in the shape the API hands out: one entry per
-/// stream that has anything, `console` first.
-///
-/// A VM with no output at all comes back as an empty list and not as an
-/// error: "it printed nothing" is an answer, and the commonest one for a VM
-/// that has just been created.
+/// Read selected streams in input order. Omit streams whose files cannot be
+/// read; readable empty files remain present with empty output.
 pub fn read_all(
     paths: Vec<(ConsoleStream, std::path::PathBuf)>,
     lines: usize,
@@ -220,8 +139,7 @@ pub fn read_all(
         .collect()
 }
 
-/// How many lines a caller gets when it asks for none. A screenful and a bit:
-/// enough to see a panic without paging the whole ring over a session.
+/// Default maximum number of returned lines.
 pub const DEFAULT_LINES: usize = 200;
 
 #[cfg(test)]
@@ -230,12 +148,7 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
 
-    /// A file of this test's own, in a directory of its own.
-    ///
-    /// The guard comes back with the path and the caller binds it: the file
-    /// used to live in one directory shared by every test of this module and
-    /// by every run on the machine, which is only safe for as long as no two
-    /// of them ever pick the same name.
+    /// Keep each test's file in a separate temporary directory.
     fn scratch(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::Builder::new()
             .prefix("meister-console-")
@@ -245,12 +158,7 @@ mod tests {
         (temp, path)
     }
 
-    /// The whole point of the module, with a writer that behaves the way
-    /// cloud-hypervisor's does: one open fd, appending, never reopening.
-    ///
-    /// A guest that prints far more than the ring holds must not make the
-    /// file cost more than the ring, and must still be readable — with the
-    /// END of what it printed, which is the half anybody ever wants.
+    /// Hole punching preserves an open writer's offset and retains its latest output.
     #[test]
     fn a_guest_that_outtalks_the_ring_neither_grows_it_nor_loses_its_tail() {
         let (_temp, path) = scratch("loop.console");
@@ -272,9 +180,7 @@ mod tests {
         assert!(printed > 4 * RING_BYTES, "the test has to outrun the ring");
 
         let meta = std::fs::metadata(&path).unwrap();
-        // What the file COSTS is bounded. What it claims to be is not, and
-        // that is the documented trade: a punched hole keeps the writer's
-        // offset valid, which is the only reason this works at all.
+        // Allocated blocks are bounded while apparent length preserves the writer's offset.
         let on_disk = meta.blocks() * 512;
         assert!(
             on_disk <= (RING_BYTES + RING_BYTES / 2) as i64 as u64,
@@ -294,13 +200,7 @@ mod tests {
         assert!(!text.contains('\0'));
     }
 
-    /// The whole reason the filter lives HERE: it runs before `lines`, so
-    /// `lines` means "the last N that matter".
-    ///
-    /// Filtered afterwards — which is where this started, in the client — the
-    /// same request answers with nothing at all: the last five lines of a
-    /// guest whose init prints a heartbeat every ten seconds are five
-    /// heartbeats, and hiding them leaves an empty screen.
+    /// Filtering precedes the line limit.
     #[test]
     fn the_filter_runs_before_the_truncation_and_not_after() {
         let (_temp, path) = scratch("chatty.console");
@@ -316,14 +216,12 @@ mod tests {
         assert_eq!(raw.lines().count(), 5);
         assert!(raw.lines().all(|l| l.contains("alive t=")));
 
-        // Filtered first, the same five-line window finds the one line that
-        // was ever worth reading.
+        // Filter before selecting the requested line window.
         let quiet = LogFilter::new(vec!["alive t=".into()], Vec::new());
         assert_eq!(tail(&path, 5, &quiet).unwrap(), "something went wrong");
     }
 
-    /// `only` narrows, `hide` narrows again, and naming both is two cuts
-    /// rather than a contradiction.
+    /// Inclusion and exclusion filters compose.
     #[test]
     fn only_and_hide_narrow_in_that_order() {
         let (_temp, path) = scratch("mixed.console");
@@ -355,9 +253,7 @@ mod tests {
         assert_eq!(tail(&path, 100, &nothing).unwrap(), "");
     }
 
-    /// An empty needle is dropped at the edge rather than sent, because an
-    /// empty `only` matches every line and would make the flag mean its own
-    /// opposite. Here: a filter nobody filled in changes nothing.
+    /// An empty filter leaves output unchanged.
     #[test]
     fn a_filter_nobody_asked_for_leaves_the_console_exactly_as_it_was() {
         let (_temp, path) = scratch("untouched.console");
@@ -385,9 +281,7 @@ mod tests {
         assert_eq!(tail(&path, 2, &LogFilter::default()).unwrap(), "two\nthree");
     }
 
-    /// A VM that has printed nothing, and one that has never started: empty
-    /// and absent, and neither is an error. `read_all` renders both as
-    /// "nothing to show", which is an answer.
+    /// An empty file yields empty output; a missing file yields `None`.
     #[test]
     fn no_output_at_all_is_an_answer_and_not_a_failure() {
         let (_temp, empty) = scratch("empty.console");
@@ -400,11 +294,7 @@ mod tests {
         trim(&missing); // no file, no warning, no panic
     }
 
-    /// Both streams of one VM, as the API hands them out. A stream whose
-    /// file does not exist is left OUT rather than reported as empty: a
-    /// direct-kernel boot writes only `console`, and a `serial: ""` beside it
-    /// would be a claim that the firmware said nothing when there was no
-    /// firmware.
+    /// Return readable streams and omit missing files.
     #[test]
     fn a_vm_answers_with_the_streams_it_actually_has() {
         let (_temp, console) = scratch("both.console");
@@ -458,9 +348,7 @@ mod tests {
         trim_all(&nothing); // and bounding it is a no-op, not a panic
     }
 
-    /// Trimming twice in a row is trimming once: the second pass finds a file
-    /// that is already inside the ring and does nothing. A reconcile pass
-    /// runs every few seconds, so this is the normal case and not an edge.
+    /// Repeating a trim preserves allocated size, though apparent length is unchanged.
     #[test]
     fn trimming_is_idempotent() {
         let (_temp, path) = scratch("twice.console");

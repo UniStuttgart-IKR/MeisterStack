@@ -2,19 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The verbs about a volume this node owns on its own, and the one about a
-//! volume a guest already has.
+//! Independent volume operations and guest attachment resizing.
 
 use super::*;
 
 impl Agent {
-    /// Make bytes for a volume the control plane owns.
-    ///
-    /// No `ops` lock, and that is deliberate: the lock serialises work on ONE
-    /// VM's devices and slices, and a volume with no consumer touches neither.
-    /// Two provisions of the same volume at once are safe by the driver
-    /// contract — every backend derives its name from the id and hands the
-    /// same volume back.
+    /// Provision an independent volume without taking the VM operations lock.
+    /// Backend identity is derived from the volume ID for retry recovery.
     pub(super) async fn handle_provision_volume(
         &self,
         v: proto::ProvisionVolume,
@@ -24,19 +18,12 @@ impl Agent {
         self.volumes
             .validate_driver(spec.driver.as_deref())
             .context("invalid volume spec")?;
-        // Three ways a volume starts, and the third is new: empty, from a
-        // catalogue image, or from a snapshot this node holds. The last one
-        // is a different driver call and not a flag on the same one, which is
-        // the cut the trait makes and the reason it is a branch here.
+        // Snapshot-based creation uses a separate driver operation from empty or base-image creation.
         match v.from_snapshot.as_str() {
             "" => self.volumes_owned.provision(id, spec).await,
             named => {
                 if spec.base_image.is_some() {
-                    // Refused at the API edge too, where a person can read
-                    // it. Said again here because this is the refusal nobody
-                    // can go around, and because a spec that reached a node
-                    // with both would otherwise get whichever the code
-                    // happened to try first.
+                    // Recheck mutually exclusive source fields at the node boundary.
                     bail!(
                         "a volume starts from a base image or from a snapshot, not both; \
                          drop one"
@@ -58,22 +45,14 @@ impl Agent {
         self.volumes_owned.deprovision(id).await
     }
 
-    /// Stop being a node that holds a volume, and keep every byte of it.
-    ///
-    /// The sibling of the one above, and the distance between the two is
-    /// somebody's data: that one destroys an LV and unlinks a file, this one
-    /// removes a record. See `Volumes::forget`.
+    /// Remove node-local volume ownership while preserving data; see `Volumes::forget`.
     pub(super) async fn handle_forget_volume(&self, v: proto::ForgetVolume) -> anyhow::Result<()> {
         let id: VolumeId = v.id.parse().context("invalid volume id")?;
         self.volumes_owned.forget(id).await
     }
 
-    /// Freeze what a volume holds right now.
-    ///
-    /// No `ops` lock, for the reason `handle_provision_volume` gives: the
-    /// lock serialises work on one VM's devices and slices, and a snapshot
-    /// touches neither. If the VM had to be paused for this, it was paused by
-    /// the tier that sent the command — see `SnapshotVolume` in the proto.
+    /// Request a backend snapshot without taking the VM operations lock or
+    /// pausing a guest. Required writer coordination belongs to the controller.
     pub(super) async fn handle_snapshot_volume(
         &self,
         v: proto::SnapshotVolume,
@@ -90,16 +69,8 @@ impl Agent {
         self.volumes_owned.resize(id, v.size_bytes).await
     }
 
-    /// Tell a guest that its disk has grown. The second half, and it changes
-    /// no data at all.
-    ///
-    /// Under the `ops` lock, unlike the first half: this touches a running
-    /// VM's device model, and that is exactly what the lock serialises.
-    ///
-    /// A hypervisor that cannot do it is an error and not a silent success —
-    /// the tier above puts the sentence on the object, and "the backend grew
-    /// and the guest was not told" is a state an operator has to be able to
-    /// read.
+    /// Notify the guest of a grown disk under the VM operations lock.
+    /// This does not resize backend data. Unsupported hypervisors return an error.
     pub(super) async fn handle_resize_attachment(
         &self,
         v: proto::ResizeAttachment,

@@ -25,14 +25,11 @@ toml = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 axum = { workspace = true, optional = true} 
-# For the console upgrade: axum hands the raw connection over through
-# hyper's OnUpgrade, and TokioIo adapts it back to tokio's traits. Both are
-# already in this workspace and neither is a new supply-chain surface.
+# Adapt Hyper's upgraded console connection to Tokio I/O.
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 nix = { workspace = true }
-# Hashing a fetched base image while it streams past. Already in the tree as
-# the pki crate's dependency, so it costs nothing to build.
+# Hash downloaded base images while streaming.
 sha2 = { workspace = true }
 tonic = { workspace = true }
 

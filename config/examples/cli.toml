@@ -1,92 +1,51 @@
-# meister — the CLI's profiles.
-#
-# Looked for at $MEISTER_CONFIG, else ~/.config/meisterstack/config.toml. A
-# profile bundles "which endpoint, which credential" under a name;
-# `--profile` picks one, `--endpoint` bypasses them entirely, and
-# MEISTER_PROFILE / MEISTER_ENDPOINT / MEISTER_TOKEN do the same from the
-# environment.
-#
-# There is no `tier` key. What an endpoint is -- a cloud, a cluster -- is
-# something the endpoint says (`meister api-resources`), not something an
-# operator has to keep in step with it here. A profile that still carries one
-# is a parse error naming the key, which is the point: it was written against
-# a CLI that checked it.
-#
-# For the client side of a locked-down control plane — mTLS everywhere, an
-# SSH tunnel to the cluster tier, and why the bearer shapes at the bottom of
-# this file stop working there — see hardened/cli.toml.
+# MeisterStack cli configuration. Edit addresses, paths, and identities before use.
+# Relative paths resolve against this file's directory. See docs/CONFIGURATION.md.
+# Prose uses "# "; optional settings use "#key". Keep top-level settings above tables.
+# Lookup: --config / MEISTER_CONFIG, user config.toml, then /etc/meisterstack/cli.toml.
 
-# Used when neither --profile nor --endpoint says otherwise.
+# Used unless --profile or MEISTER_PROFILE selects another profile. An endpoint
+# override changes the address while retaining selected profile credentials.
+# MEISTER_TOKEN overrides the profile credential.
 default_profile = "lab"
 
-# The agent's own unix socket. A unix endpoint IS a node's own API, by
-# definition -- so this profile serves `meister agent vm …`, and any other
-# command against it is refused with a sentence saying which tree it is.
+# Local agent administration over a Unix socket; access is controlled by
+# filesystem permissions. Use the agent command tree.
 [profiles.lab]
 endpoint   = "unix:///run/meisterstack/agent.sock"
 credential = { type = "none" }
 
-# A cluster's sub-API. Plain http is the lab-internal shape and still the
-# default one; an https endpoint works too and needs a ca_cert (below).
+# Cluster operator endpoint. Ordinary cloud User identities are refused here.
 [profiles.cluster-a]
 endpoint   = "http://10.128.1.104:3001"
-# How long one request may take before the CLI gives up.
+
+# Per-request deadline; default 30 seconds.
 timeout_secs = 30
-# The token is read from this file at call time, not stored here. Relative
-# paths resolve against this config file's directory.
 credential = { type = "token_file", path = "token" }
 
-# The public tier.
+# Cloud API profile used by ordinary users and operators.
 [profiles.cloud]
 endpoint   = "http://10.128.1.103:3000"
 credential = { type = "none" }
 
-# The same tier with TLS and a client certificate — what a controller
-# configured with tls_cert/client_ca expects, and what `tools/meister-ca` and
-# `meister login` produce between them.
-#
-# `ca_cert` is required for an https endpoint and is not optional the way it
-# looks: a lab CA is in nobody's system trust store, so falling back to those
-# would turn a config mistake into an opaque handshake failure.
-#
-# `meister login --profile cloud-mtls` writes a fresh key and certificate to
-# exactly the two paths named here and never edits this file. Running it
-# again is a renewal in place.
+# HTTPS requires an explicit controller CA. Login writes or renews the named
+# key and certificate; first enrollment needs an accepted bootstrap credential.
 [profiles.cloud-mtls]
 endpoint   = "https://10.128.1.103:3000"
+
+# CA certificate and key for signing approved CSRs. Without the signer,
+# requests can be recorded but certificate issuance is unavailable.
 ca_cert    = "pki/ca.crt"
 credential = { type = "mtls", cert = "pki/cloud-mtls.crt", key = "pki/cloud-mtls.key" }
 
-# The same tier again, for a person rather than a machine.
-#
-# `meister login --oidc --profile cloud-oidc` prints a code and a url, waits
-# for somebody to approve it in a browser -- on any device, which is the
-# point of the device grant over a redirect to localhost -- and writes the
-# session to `oidc/cloud-oidc.json` at 0600. Every command after that renews
-# the access token from the refresh token without asking.
-#
-# A token settles WHO you are and nothing else. What you may do is the
-# cloud's user directory's answer: if it does not know the name in the token,
-# every command is a 403 until an administrator runs
-# `meister user create`.
-#
-# `tokens` defaults to `<config dir>/oidc/<profile>.json` and `scope` to
-# "openid profile email offline_access". Keep `offline_access` in whatever
-# you set: it is what makes a refresh token appear, and without one this
-# profile needs a fresh browser login every few minutes.
+# OIDC login uses authorization code with PKCE when discovery supports it,
+# otherwise the device grant. Access tokens are refreshed from the saved session.
+# Default tokens path: <config directory>/oidc/<profile>.json. For user login,
+# keep this profile in a writable per-user config or set a private tokens path.
+# The cloud still requires a User record unless provisioning is enabled.
 [profiles.cloud-oidc]
 endpoint   = "https://10.128.1.103:3000"
+
+# CA certificate and key for signing approved CSRs. Without the signer,
+# requests can be recorded but certificate issuance is unavailable.
 ca_cert    = "pki/ca.crt"
 credential = { type = "oidc", issuer = "https://idp.example.org/realms/lab", client_id = "meisterstack" }
-
-# The other credential shapes:
-#
-#   { type = "env",     var = "MEISTER_TOKEN" }
-#   { type = "command", command = ["pass", "show", "meisterstack/token"] }
-#   { type = "mtls",    cert = "client.pem", key = "client-key.pem" }
-#   { type = "oidc",    issuer = "https://idp.example.org", client_id = "meisterstack", tokens = "oidc/p.json", ca_cert = "pki/idp-ca.crt", scope = "openid offline_access" }
-#
-# A bearer token authenticates against the controller's `[auth]` chain — the
-# development path, one static string, and the way a brand new user gets far
-# enough to ask for a certificate. A client certificate over a plain http
-# endpoint is refused at construction rather than silently unsent.

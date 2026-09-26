@@ -77,32 +77,13 @@ pub struct NodeStatus {
     /// `None` on a node nobody asked to empty, which is nearly all of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draining: Option<Draining>,
-    /// What the NODE says is wrong with itself — the half of "is this machine /// usable" that a heartbeat cannot carry.
-    ///
-    /// `ready` answers "is the agent there", and the mini-chaos run showed
-    /// what that leaves out: a node whose store had taken one I/O error said
-    /// `ready`, held its session, passed check.sh and refused every command
-    /// for three hours, and the scheduler kept placing on it. So this is the
-    /// second question, asked of the only party that can answer it: the node
-    /// itself. It arrives on the status road (control.proto,
-    /// `StatusReport.conditions`) and is replaced wholesale by every report,
-    /// because it is a statement about NOW and not a log.
-    ///
-    /// Empty is the ordinary answer and it says "nothing is wrong". It is also
-    /// what an agent that predates the field says, so an empty list is never
-    /// evidence that a condition was ruled out — which is why the scheduler
-    /// reads it as a veto and never as a permission.
+    /// Current agent-reported conditions, replaced by each StatusReport. They complement
+    /// session readiness and veto placement. An empty list is compatible with older agents and
+    /// does not prove that every condition was checked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<NodeCondition>,
-    /// What a guest's machine state would be restored INTO on this node.
-    ///
-    /// Said once at Hello, because none of it changes while an agent runs, and
-    /// held here so that the party choosing a destination can compare BEFORE
-    /// it opens a stream. See [`MachineProfile`].
-    ///
-    /// `None` on every node whose agent predates the field, and `None` is
-    /// never evidence: a comparison that refused on a silence would turn a
-    /// rolling upgrade into a fleet that cannot migrate.
+    /// Machine state compatibility reported at Hello and used before migration setup. Absent on
+    /// older agents; missing evidence alone does not establish an incompatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<MachineProfile>,
 }
@@ -160,12 +141,7 @@ impl MachineProfile {
         *self != Self::default()
     }
 
-    /// A one-line description for the sentence beside a refusal.
-    ///
-    /// The three things that decide, in the order they decide: what the CPU
-    /// is, whether the machine is itself a guest, and which host it is on
-    /// when that is knowable. Not the flags — a refusal names the flag that
-    /// differs, and a hundred that do not would bury it.
+    /// Short description used when explaining a migration refusal.
     pub fn describe(&self) -> String {
         let cpu = match (self.cpu_model.as_str(), self.cpu_vendor.as_str()) {
             ("", "") => "an unnamed cpu".to_string(),
@@ -257,11 +233,7 @@ fn same_physical_host(a: &MachineProfile, b: &MachineProfile) -> bool {
     !a.host.is_empty() && a.host == b.host
 }
 
-/// One thing a node says is wrong with itself, in a word and a sentence.
-///
-/// The pairing every other reason in this tree carries — see `StayingVm` —
-/// and for the same reason: an operator reads the sentence, a program
-/// branches on the word.
+/// An agent-reported condition with a bounded category and explanatory message.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeCondition {
@@ -274,13 +246,7 @@ pub struct NodeCondition {
     pub message: String,
 }
 
-/// The conditions an agent can raise, as this tier spells them.
-///
-/// A closed set with an open door: the controller half branches on the LIST
-/// being non-empty, never on the individual variant, so a word from a newer
-/// agent still takes its node out of the running. What the enum is for is the
-/// short spelling in a table and the fact that the three names exist in one
-/// place rather than as literals in five.
+/// Known agent condition categories. Preserve the protocol spelling when ingesting reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeConditionType {
     /// The disk the node stores on has no room left.
@@ -330,31 +296,15 @@ impl NodeConditionType {
     }
 }
 
-/// The evidence a drain leaves: how much moved, what stayed, and one sentence
-/// per thing that stayed.
-///
-/// A drain is not a request that returns — it is a level condition a
-/// reconciler works at — so "is it done" has to be readable off the object
-/// rather than waited for on a connection. That is what `complete` is: no VM
-/// on this machine is still on its way anywhere, and everything left is left
-/// for a reason no amount of waiting changes.
+/// Current drain progress: VMs leaving, VMs staying, and their reasons.
 // `Eq` because `NodeSummary` is: a cluster's report of a node is compared
 // whole against the one the cloud stored, and every field of this one is a
 // number, a string or a bool.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Draining {
-    /// VMs that are still on this machine and on their way off it.
-    ///
-    /// A SNAPSHOT, and named for it. It was called `moved`, which read like a
-    /// total and was not one: a VM that has arrived somewhere else is neither
-    /// here nor leaving, so it left the count — and a finished drain reported
-    /// `0 moved, 1 staying (done)` after moving two machines' worth of VMs
-    /// (migration D4, seen in the E2E). A cumulative counter would be the
-    /// other honest answer and it would need a lifecycle: something has to
-    /// reset it on `undrain`, and then it is a counter with a lifetime rather
-    /// than a fact about now. This is the fact about now, and it is the same
-    /// thing `staying` beside it already is.
+    /// Snapshot count of VMs still on this node and currently leaving. Successfully moved VMs
+    /// leave this count; it is not a cumulative drain total.
     #[serde(default)]
     pub leaving: u32,
     /// One entry per leaving VM, by name — the same pairing `staying` and
@@ -370,12 +320,7 @@ pub struct Draining {
     /// VMs that are still here and are not going.
     #[serde(default)]
     pub staying: u32,
-    /// One entry per staying VM, naming it and why.
-    ///
-    /// The sentence and the category both, for the reason every other pair
-    /// like it in this tree carries both: the sentence is what an operator
-    /// reads and the category is what a client branches on, and asking a
-    /// program to match on prose is asking it to break.
+    /// One reason per VM that remains on the drained node.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<StayingVm>,
     /// Nothing is on its way any more. What is left is left.

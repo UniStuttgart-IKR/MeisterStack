@@ -2,23 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# `meisterDeployment` — what `meister-deploy resolve` reads.
-#
-# The contract is `tools/meister-deploy/src/manifest.rs`
-# (`meister-deploy/nix-manifest/1`), and it is a contract rather than a
-# suggestion: EVERY field is required, the empty ones are `null` or `[ ]`
-# rather than absent, and every struct is `deny_unknown_fields`. So a key that
-# is forgotten here is an error on the Rust side and not a value quietly
-# dropped on the way to a receipt — `meister-deploy schema nix-manifest`
-# prints the machine-readable shape, and `checks.manifest-json` pipes what
-# this file produces into `meister-deploy validate --manifest -`.
-#
-# Two halves, and the split is about COST: `inventory` is a pure function of
-# `fleet.toml` (nix/lib/inventory.nix, no module evaluation), while `hosts`
-# forces the real `nixosConfigurations.<id>.config` of each host — which is
-# also what makes a host's assertions fire at `resolve` time rather than at
-# somebody's first `nix build`. `resolve --hosts a,b` narrows the expensive
-# half; the cheap half is always whole.
+# Build meisterDeployment from inventory and evaluated NixOS configurations.
+# The inventory half is inexpensive; host details force system assertions and
+# derivation paths. manifest-json checks the emitted JSON against the tool schema.
 { lib }:
 
 { inventory
@@ -35,10 +21,7 @@ let
 
   directBoot = import ./direct-boot.nix { inherit lib; };
 
-  # Only the hosts this flake builds a system for. A `context` host has no
-  # closure to name, and nix/lib/inventory.nix leaves it out of the inventory
-  # half for the same reason, so the two key sets stay equal — which
-  # `manifest::resolve` requires.
+  # Context hosts have no system closure and are excluded from both manifest halves.
   ids = inventory.nixosHostIds;
 
   # --- what a host runs -------------------------------------------------
@@ -53,26 +36,14 @@ let
     let cfg = configs.${id}; in
     if !cfg.meisterstack.etcd.enable then null else {
       name = cfg.services.etcd.name;
-      # --- lane 4A ---
-      # A STRING and not the list the NixOS option holds, because the
-      # string is what etcd is given: the module writes
-      # `ETCD_INITIAL_CLUSTER = concatStringsSep "," initialCluster`, and
-      # the topology check of D8 compares the membership etcd REPORTS
-      # against the membership this fleet CONFIGURED. Written as a list it
-      # was a json array, the planner asked it for a string, got nothing,
-      # and fell back to comparing member names — half the check, quietly,
-      # on every real manifest. (The hand-written fixture had it as a
-      # string all along, which is why no test saw it.)
+      # Record etcd's comma-separated membership string for topology comparisons.
       initial_cluster = lib.concatStringsSep "," cfg.services.etcd.initialCluster;
-      # --- end lane 4A ---
+
       initial_cluster_token = cfg.services.etcd.initialClusterToken;
       data_dir = cfg.services.etcd.dataDir;
     };
 
-  # The collector is OFF on a managed host today: its configuration is not
-  # TOML, the boot renderer writes it from MEISTER_LOKI_URL, and baking it is
-  # work M1 did not do (lane 1A §8, point 2). `null` says that, where an
-  # empty attrset would have claimed there was nothing to say.
+  # No managed Alloy configuration is emitted here; represent its absence as null.
   observabilityOf = id:
     let cfg = configs.${id}; in
     if !cfg.meisterstack.observability.enable then null else {
@@ -87,22 +58,14 @@ let
     {
       kernel_out = "${cfg.system.build.kernel}/${cfg.system.boot.loader.kernelFile}";
       initrd_out = "${cfg.system.build.initialRamdisk}/${cfg.system.boot.loader.initrdFile}";
-      # The command line changes without any store path changing — a new
-      # `console=`, a new `nvme_core.io_timeout` — and a changed command line
-      # is a reboot. So it is hashed rather than compared as a list.
+      # Hash kernel parameters because changing them can require a reboot even
+      # when the kernel and initrd store paths are unchanged.
       kernel_params_sha256 =
         builtins.hashString "sha256" (lib.concatStringsSep " " cfg.boot.kernelParams);
       kernel_version = cfg.boot.kernelPackages.kernel.version;
-      # Who decides which of the three above this machine actually starts.
-      # `uefi` means the machine does, out of its own boot menu, and a plan
-      # can say "it will boot this" by reading the system profile. `direct`
-      # means the PROVIDER does, from outside, and then the next boot is not
-      # a fact about the guest at all — which is why the mode travels with
-      # the boot block rather than sitting in the inventory half only.
+      # Record who owns the next boot: the host loader or an external provider.
       inherit mode;
-      # …and for a direct host, the exact string that provider is handed.
-      # Null for a uefi host, because there is nothing outside it to hand
-      # anything to.
+      # Direct-boot hosts also expose the command line passed to the provider.
       cmdline = if mode == "direct" then directBoot.cmdlineOf cfg else null;
     };
 
@@ -112,19 +75,13 @@ let
       img = images.${id} or { };
     in
     {
-      # `.drvPath` and not a build: a manifest is produced by `nix eval`, and
-      # forcing the derivation is also what makes this host's assertions fire
-      # here — with the host's name in the message — rather than during
-      # somebody's first `nix build`.
+      # Derivation evaluation forces host assertions without building the system.
       toplevel_drv = cfg.system.build.toplevel.drvPath;
-      # Still only a promise at manifest time; the RELEASE (M2) is what
-      # records that the path exists and what its nar hash is.
+      # The manifest names outputs; release construction records their realized hashes.
       toplevel_out = cfg.system.build.toplevel.outPath;
       installer_drv = img.installerDrv or null;
       disk_image_drv = img.diskImageDrv or null;
-      # The kernel, the initrd and the command line in one directory, for a
-      # host whose hypervisor loads them. Null for a uefi host, which has no
-      # such hypervisor.
+      # Expose a provider bundle only for direct-boot hosts.
       direct_boot_drv = img.directBootDrv or null;
       boot = bootOf id;
     };
@@ -136,36 +93,17 @@ let
         cfg.environment.etc."meisterstack/${role}.toml".source.outPath)
       cfg.meisterstack.unitsFor);
 
-  # Every unit this host's system generation carries, by name.
-  #
-  # The NAMES and not the units: a name is a string that costs nothing to
-  # produce (`systemd.units` is already forced by the toplevel beside it),
-  # while the unit texts would put a megabyte of shell into a manifest that
-  # is read, committed and diffed. What a plan does with them is say what an
-  # operator's OWN modules brought onto a host: a unit this stack does not
-  # name is a unit whose disruption nobody here can predict, which is the
-  # `unknowns[]` of D-C (lane 4A). So the list has to be the whole list —
-  # sorted, because `builtins.attrNames` is and a manifest that reordered
-  # itself would change its own id for nothing.
+  # List all systemd unit names, including operator modules, in stable order.
+  # Consumers use unfamiliar units to identify disruption they cannot classify.
   unitNames = id: builtins.attrNames configs.${id}.systemd.units;
 
-  # --- the key material a host needs ------------------------------------
-  #
-  # Derived from the files the rendered configuration NAMES, not from a list
-  # kept beside it: every path under `meisterstack.pki.dir` that appears in a
-  # role's own config is something that role opens, so a key that is added to
-  # a template shows up here without anybody remembering to.
-  #
-  # One entry per file AND per unit that reads it. `SecretRef.reload` is one
-  # unit (the contract), a file on a four-role box is read by three, and the
-  # delivery is keyed by `target_path` — so `keys deliver` (M3B) writes each
-  # path once and pokes each unit named. The alternative would have been to
-  # name one unit and leave the others stale.
+  # Derive credential references from PKI paths in rendered role configurations.
+  # Emit one reference per file and consuming unit so delivery can deduplicate
+  # paths while reloading every reader.
   unitOf = role: if role == "agent" then "meister-agent.service"
   else "meister-${role}-controller.service";
 
-  # `[operator] ca_dir` is a REFERENCE into the operator's own repository, and
-  # never a secret: what lives there is the CA this fleet trusts.
+  # Record the operator's CA directory reference without embedding its contents.
   caDir = (inventory.operator or { }).ca_dir or "pki";
 
   secretKinds = {
@@ -206,9 +144,7 @@ let
                   + "file this stack opens is a file `keys deliver` has to know about."));
             in
             {
-              # The id is what a receipt refers to, so it names the file AND
-              # the unit: one file read by three units is three things to
-              # poke and one thing to write.
+              # Identify both the file and the consuming unit.
               id = "${lib.replaceStrings [ "." ] [ "-" ] file}-${role}";
               inherit (spec) kind owner mode;
               source = {
@@ -219,10 +155,8 @@ let
                   else spec.ref;
               };
               target_path = path;
-              # Always a file, never a systemd credential: `LoadCredential`
-              # hands the unit a `root:root 0440` file with an ACL, and all
-              # three of this project's key loaders refuse a mode with group
-              # bits in it (measured in a VM, M0 probe S11).
+              # Use ordinary files: the key loaders reject systemd credential modes
+              # that include group permissions.
               delivery = "file";
               reload = { unit = unitOf role; action = "restart"; };
             })
@@ -267,7 +201,7 @@ in
   schema = "meister-deploy/nix-manifest/1";
 
   inventory = inventory.manifestInventory;
-  # Which FILE the inventory half came from, by content (nix/lib/inventory.nix).
+  # Identify the evaluated inventory by content.
   inventory_sha256 = inventory.sha256;
 
   hosts = builtins.listToAttrs (map (id: lib.nameValuePair id (manifestHost id)) ids);
@@ -281,13 +215,10 @@ in
     cloud_hypervisor = {
       drv = packages.cloudHypervisor.drvPath;
       version = packages.cloudHypervisor.version;
-      # One digest per patch, in the order they are applied: a reordered
-      # series is a different hypervisor, and the series has grown twice.
+      # Hash patches in application order.
       patches_sha256 = map (p: builtins.hashFile "sha256" p) patchFiles;
     };
-    # Null for a fleet that declares no `leandro` input. A CPU-only fleet
-    # builds without it, which is what keeps this flake buildable in a
-    # sandbox without anybody's home directory (L01/V04).
+    # The optional GPU stack remains null for fleets without a leandro input.
     leandro =
       if packages.leandro == null then null
       else { drv = packages.leandro.drvPath; version = packages.leandro.version; };

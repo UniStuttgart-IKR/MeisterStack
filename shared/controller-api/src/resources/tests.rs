@@ -140,14 +140,8 @@ fn two_clusters_disagree_unless_both_describe_the_same_backend() {
     );
 }
 
-/// Two phases, one spelling. A client that asks "is this thing ready"
-/// should not need to know which kind of thing it is holding — the lab
-/// found `Running` beside `provisioning` and had to compare twice.
-///
-/// And the second half, which is what makes it worth a test: the category
-/// behind a pending VM now reaches the API, in the same words the metric
-/// label uses, so a dashboard and a client cannot disagree about what
-/// happened.
+/// Phase spelling and pending-reason categories remain consistent across resource types and
+/// API/metric representations.
 #[test]
 fn the_phases_are_spelled_alike_and_the_pending_category_reaches_the_api() {
     assert_eq!(
@@ -314,14 +308,7 @@ fn a_nat_kind_is_spelled_ovns_way_in_the_object_and_on_the_wire() {
     assert_eq!(NatKind::parse("dnat-and-snat"), None);
 }
 
-/// A router with no opinion translates its whole tenant, and the two
-/// roads to that answer agree.
-///
-/// `snat` is the one field in this tree that defaults to TRUE, so the
-/// derived `Default` would have said `false` and disagreed with serde:
-/// a router created through the API would masquerade and one built in a
-/// reconciler would not, which is the kind of split nothing catches until
-/// a tenant cannot reach anything.
+/// Rust Default and serde both default router SNAT to true.
 #[test]
 fn a_router_that_says_nothing_translates_its_whole_tenant() {
     assert!(RouterSpec::default().snat);
@@ -684,16 +671,8 @@ fn a_volume_object_cannot_be_declared_ephemeral() {
     );
 }
 
-/// The projection the hot-plug rule is written as, on its own.
-///
-/// Three statements, and each is a different reason: the boot entry never
-/// moves because a guest does not survive having its root disk swapped;
-/// an inline entry never moves because it is an instance store that came
-/// into being with the VM; everything outside `volumes[]` never moves
-/// because it was decided when the node took the spec, once.
-///
-/// Two specs that project the same are two specs an update may go
-/// between — which is exactly the comparison `check_owned` makes.
+/// Hot-plug projection preserves boot disks, inline instance disks, and fields outside volumes.
+/// Only supported referenced-volume changes may compare equal.
 #[test]
 fn the_frozen_shape_of_a_vm_is_everything_but_its_pluggable_disks() {
     let boot = serde_json::json!({"volume": "root-1"});
@@ -927,16 +906,8 @@ fn a_reference_that_also_describes_the_disk_is_named_field_by_field() {
     );
 }
 
-/// `status.availableOn` is gone, and gone rather than left empty.
-///
-/// It meant "not tracked" from v1 on and nothing ever wrote it; since
-/// `status.nodes[]` exists, the question it pretended to answer has a
-/// real answer beside it. A client that read the empty list and concluded
-/// "no cluster has this image" was reading a field, not a fact
-/// (fremdsicht 4). Both halves are asserted: the key is not written, and
-/// a document that still carries it is refused rather than silently
-/// dropped — so an old client hears about it instead of believing the
-/// server kept its value.
+/// Reject removed status.availableOn input and omit it from output; availability is represented
+/// by node observations.
 #[test]
 fn an_image_status_neither_writes_nor_accepts_available_on() {
     let written = serde_json::to_value(ImageStatus::default()).expect("serialises");
@@ -949,15 +920,8 @@ fn an_image_status_neither_writes_nor_accepts_available_on() {
     assert!(refusal.contains("unknown field `availableOn`"), "{refusal}");
 }
 
-/// A drain says what is LEAVING, which is what it can honestly count.
-///
-/// The field was called `moved` and read like a total. It never was one:
-/// what it counted was VMs still on the machine and on their way off it,
-/// so a VM that had arrived somewhere else left the count — and a
-/// finished drain reported `0 moved, 1 staying (done)` after two VMs had
-/// moved (migration D4, seen in the E2E). Now it is named for the
-/// snapshot it is, and it carries the names beside the number, the same
-/// way `staying` carries `reasons`.
+/// Drain leaving fields describe the current snapshot and include VM names; they are not
+/// cumulative moved totals.
 #[test]
 fn a_drain_counts_what_is_leaving_and_names_it() {
     let leaving = Draining {
@@ -1007,15 +971,7 @@ fn a_drain_counts_what_is_leaving_and_names_it() {
     );
 }
 
-/// A typo on the ENVELOPE, asked of every kind in the table.
-///
-/// `deny_unknown_fields` at every spec type closed the INSIDE of the
-/// document and left the outside open: `metdata` was a key nobody
-/// claimed, it fell away in silence, and what came back was a complaint
-/// about the name being missing. True, and about the wrong thing — the
-/// client is left believing the server read a name it never saw. Asked of
-/// every kind because the rule is on the generic envelope, and a rule on
-/// the envelope is a rule about every resource that wears one.
+/// Reject unknown envelope fields for every registered resource kind.
 #[test]
 fn a_typo_in_the_envelope_is_named_and_not_swallowed_for_any_kind() {
     fn refusal<T: serde::de::DeserializeOwned>(kind: &str) -> String {
@@ -1083,15 +1039,8 @@ fn a_typo_in_the_envelope_is_named_and_not_swallowed_for_any_kind() {
     }
 }
 
-/// The envelope's one rule about `status`, asked of every kind in the
-/// table — because `skip_serializing_if` on a generic field is a change
-/// to every resource and not to the one that made it worth doing.
-///
-/// `Secret` and `Event` have no status at all (`St = ()`), and both used
-/// to answer every GET with `"status": null` — honest, and still a field
-/// a client has to learn to ignore. They are now simply absent. Every
-/// other kind keeps its status even when it is entirely default, because
-/// `{}` is a status that exists and is empty, which is a different thing.
+/// Omit unit status for kinds without status, while retaining default status objects for kinds
+/// that have one.
 #[test]
 fn only_a_kind_with_no_status_at_all_leaves_the_field_out() {
     fn status_of<St: Serialize + Default>() -> Option<serde_json::Value> {
@@ -1148,22 +1097,8 @@ fn only_a_kind_with_no_status_at_all_leaves_the_field_out() {
     }
 }
 
-/// A typo in a spec field used to be a setting that does not exist.
-///
-/// `POST /tenants` with `spec.quota = {"vms": 10, ...}` answered 201 and
-/// stored `{"vni": 10000}` — the quota simply gone, because the fields
-/// are called `maxVms`, `maxVcpus`, `maxMemMib`. Nothing was wrong until
-/// a limit did not bite. A form checking against `/schemas` catches it; a
-/// `curl` never does.
-///
-/// So: `deny_unknown_fields` on every spec type in this file and on every
-/// type nested inside one, and one line here per type. A new spec type
-/// that forgets it fails this test the first time somebody adds a row.
-///
-/// The one document that is NOT covered by a derive here is `spec.vm`: it
-/// is another crate's, it stays a `Value` on the way through, and it is
-/// deserialised into `agent_api::spec::NewVmSpec` at the edge instead —
-/// which is `deny_unknown_fields` too. See `crate::vm_spec`.
+/// Reject unknown fields in resource specs and nested typed values. The opaque spec.vm payload
+/// is validated separately as agent_api::spec::NewVmSpec at the API edge.
 #[test]
 fn a_typo_in_a_spec_field_is_a_refusal_and_not_a_setting() {
     fn refuses<T: serde::de::DeserializeOwned>(kind: &str) {
@@ -1265,19 +1200,8 @@ fn a_node_condition_is_spelled_type_and_message_and_vanishes_when_empty() {
     // short spelling in a table.
     assert_eq!(NodeConditionType::parse("FanFailure"), None);
 }
-/// The pre-flight check, as a table.
-///
-/// A live migration does not move a program, it moves a MACHINE STATE — vCPU
-/// registers, MSRs, the nested-virtualisation state — and cloud-hypervisor
-/// v53 checks the CPUID before a transfer and nothing else. So a mismatch is
-/// discovered two milliseconds after the destination's vCPUs are made, in a
-/// log line the control plane never reads, after the stream is open and the
-/// guest is paused. The lab spent two nights on that (D-X1).
-///
-/// This is the question asked BEFORE anything is opened. Being wrong in the
-/// refusing direction costs nothing — the guest keeps running and a drain
-/// moves it by reboot — and being wrong the other way costs a transfer that
-/// cannot succeed.
+/// Check migration compatibility before opening a transfer, including machine properties beyond
+/// the hypervisor's CPUID check.
 #[test]
 fn a_machine_state_is_only_moved_where_it_can_be_restored() {
     use crate::MachineProfile;
@@ -1385,14 +1309,8 @@ fn a_machine_state_is_only_moved_where_it_can_be_restored() {
     assert_eq!(refusal(&metal(), &newer), None);
 }
 
-/// The flat wire form of all seven phases, in one place.
-///
-/// The whole of decision 1 of struktur 4, and the reason it is one test
-/// rather than seven: what a client reads is `status.phase` as a STRING with
-/// `reason`, `message` and `since` beside it, and the seven resources must
-/// not drift apart about that. The CLI, Tofu, the UI and the chaos harness
-/// all read it this way; a tagged enum would have made every one of them read
-/// `status.phase.Pending.reason` instead.
+/// All phase-bearing resources serialize phase as a string with reason, message, and since as
+/// sibling status fields.
 #[test]
 fn every_status_wears_its_phase_flat() {
     let at = DateTime::from_timestamp(1_800_000_000, 0).expect("an instant");

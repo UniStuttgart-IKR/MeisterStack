@@ -1,158 +1,81 @@
-# meister-cloud-controller — the hardened profile.
-#
-# /etc/meisterstack/cloud.toml. This is the ONE component of the stack with a
-# public port, so it is the one whose configuration is worth reading twice.
-# See ./README.md for the profile as a whole; see ../cloud.toml for what every
-# key means when it is not being hardened.
-#
-# Same comment convention as the plain examples: prose is a hash and a space,
-# a commented-out setting is a hash and the key with no space between.
+# MeisterStack cloud configuration. Edit addresses, paths, and identities before use.
+# Relative paths resolve against this file's directory. See docs/CONFIGURATION.md.
+# Prose uses "# "; optional settings use "#key". Keep top-level settings above tables.
+# mTLS exposure example; network and backend access still require site configuration.
 
-# --- the two ports ---------------------------------------------------------
-#
-# The public edge, and the only one in the stack. It terminates TLS (tls_cert
-# below) and asks every caller for a client certificate. Bind it to the
-# interface that faces users and to nothing else; 0.0.0.0 is right on a host
-# whose only other addresses are already private, and wrong on a host that
-# also carries the node network.
+# REST API bind address. Use a reachable advertise_api for replica forwarding.
 listen_api = "0.0.0.0:3000"
 
-# Where the cluster-controllers dial in. NOT public: this carries a control
-# plane talking to itself, so it belongs on the address the clusters reach and
-# on no other. An explicit address rather than 0.0.0.0 is the whole hardening
-# here — the port is mTLS either way, but a port that is not bound to the
-# public interface cannot be probed from it.
+# Internal gRPC session bind address; permit the peer tier to reach it.
 listen_session = "10.128.1.103:50050"
 
-# --- the store -------------------------------------------------------------
-#
-# Loopback, and this is not a hardening decision so much as the design: each
-# tier's etcd is private to its controller, and in the HA shape every replica
-# talks to its own local member while Raft carries the rest between them over
-# the members' own peer port. Nothing outside this box speaks to this etcd.
+# Comma-separated etcd client endpoints. The NixOS deployment uses local members.
 etcd_endpoints = "http://127.0.0.1:2379"
+
+# Isolate this controller tier in its own etcd key prefix.
 etcd_prefix = "/cloud"
 
-# --- tls: the serving certificate ------------------------------------------
-#
-# PEM paths, never PEM — a key that can be pasted into a TOML file is a key
-# that ends up in a git history. Relative to THIS file, so the config and its
-# pki/ directory travel as one unit.
-#
-# One certificate serves BOTH ports, so its SANs have to cover both the public
-# name users dial and the internal address the clusters dial:
-#
-#   tools/meister-ca --cloud meister-cloud:cloud.example.net,10.128.1.103
-#
-# Set both or neither. A certificate without its key is refused at start-up
-# rather than quietly downgraded to plain http, because that is precisely the
-# mistake that leaves a public API server open while its operator believes the
-# opposite.
+# Serving certificate and private key for both REST and session listeners.
+# Configure both together; SANs must cover every address clients dial.
 tls_cert = "pki/meister-cloud.crt"
 tls_key = "pki/meister-cloud.key"
 
-# The CA that client certificates must chain to. Setting it makes both ports
-# ASK for a certificate and puts the mTLS authenticator in the chain below.
-#
-# Asking rather than requiring is deliberate and stays deliberate here: a
-# caller with no certificate has to get far enough to be told 401 in words.
-# What makes this profile hard is not the TLS layer refusing the handshake, it
-# is `auth.chain` at the bottom of this file having no second link.
+# Trust anchor for client certificates. TLS requests a certificate; the
+# authenticator chain decides whether missing credentials are acceptable.
 client_ca = "pki/ca.crt"
 
-# --- tls: the CA this controller signs with --------------------------------
-#
-# Usually the same file as client_ca, because it is the same CA. Named
-# separately because a deployment may verify against a bundle and sign with
-# one member of it.
-#
-# The key is the crown jewel of the deployment: whoever holds it can mint an
-# identity in any group, `system:masters` included. It belongs on this host
-# only, mode 0600, and ideally on a controller that is not also the public
-# API — the two roles are separate keys in this file precisely so they can one
-# day be separate hosts.
+# CA certificate and key for signing approved CSRs. Without the signer,
+# requests can be recorded but certificate issuance is unavailable.
 ca_cert = "pki/ca.crt"
 ca_key = "pki/ca.key"
 
-# How long an issued client certificate lives. Ninety days is the default and
-# a reasonable hardened value in both directions: short enough that a
-# forgotten certificate expires on its own, long enough that renewal is a
-# routine rather than an emergency. `meister login` run again is a renewal in
-# place, so shortening this is cheap.
+# Lifetime of certificates issued through the CSR API.
 cert_ttl_days = 90
 
-# Signing every request the moment it arrives, with no human in the loop.
-# LEFT OFF, and spelled out rather than omitted so that nobody has to check
-# whether it was forgotten: with it on, the only thing between a caller and a
-# certificate is the authenticator chain. An administrator runs
-# `meister csr approve <name>` instead, which is a person looking at a
-# name before it becomes an identity.
+# Approve eligible CSR requests immediately when true; otherwise an admin
+# approves them explicitly. Disabled by default.
 #csr_auto_approve = false
 
-# --- everything else is unchanged ------------------------------------------
-#
-# Tenants, VNIs, floating pools and routed subnets are not part of the
-# exposure profile: a pool is an object created with a verb, not a key here,
-# and the VNI floor is a numbering choice. See ../cloud.toml for all of them.
-# The two that are worth carrying over into a real deployment:
+# Lower bound for monotonic tenant VNI allocation. Increasing it advances future
+# allocation; lowering it does not reclaim identifiers. Maximum: 99999.
 #vni_base = 10000
+
+# Super-pools for automatic routed-subnet allocation. Explicit CIDRs remain
+# possible without pools. Upstream routing is configured outside MeisterStack.
 #routed_pools = ["10.7.0.0/16"]
 
-# Which strategy binds an unbound VM to a cluster. One value today.
+# Placement strategy; currently first-fit. Unknown names fail startup.
 #scheduler = "first-fit"
 
-# Where to send spans. A collector endpoint is a place this controller talks
-# to, so on a hardened host it is one more outbound permit — worth naming
-# rather than leaving to be discovered when traces do not arrive.
+# Optional OTLP/gRPC trace collector. Logging remains enabled without it.
 #otlp_endpoint = "http://127.0.0.1:4317"
 
-# How a line is written: "human" (the default) or "json". The envelope only —
-# no level, no filter and no field changes with it. "json" is for a host whose
-# logs are SHIPPED: the collector reads keys instead of guessing at a regex,
-# and the trace id becomes a key (`span_trace_id` after Loki's `| json`) that
-# joins a log line to its trace. Which also says the quiet part: with a
-# shipper configured, these lines leave this host.
+# Log output format: human (default) or JSON. See docs/OBSERVABILITY.md.
 #log_format = "json"
 
-# --- the authenticator chain -----------------------------------------------
-#
-# One link, and that is the hardening. The default chain is
 # ["mtls", "bearer"], where "bearer" contributes nothing unless a token file
-# is configured — but naming only "mtls" says it rather than relying on it,
-# and a chain that NAMES a link it cannot build is refused at start-up. So
-# this line is also an assertion: if client_ca above ever goes missing, this
-# controller does not come up anonymous, it does not come up at all.
-#
-# The price is the bootstrap. There is no way to earn a first certificate over
-# an API that requires one, so the first administrator identity is issued out
-# of band:
-#
-#   tools/meister-ca --admin root
-#
-# and copied to the operator by hand. Once. Every user after that goes through
-# `meister login` against the certificate that admin holds.
+
+# Authenticators are ordered and stop on rejection. Explicit chains require their
+# credentials; session-serving controllers require mTLS in the chain. Without
+# configured authenticators the controller accepts anonymous unrestricted access.
 [auth]
+
+# Put OIDC before a static bearer authenticator because both read Authorization.
 chain = ["mtls"]
-# The development bearer token — one static string, no expiry, no rotation.
-# It exists for the bootstrap above and it is exactly what this profile is
-# doing without. Left here, commented, because an operator debugging a locked
-# out control plane will want to know it is a deliberate absence and not an
-# oversight. Treat any leak of one as permanent.
+
+# Development or bootstrap bearer token, read from a file at startup.
+# The default system:masters group bypasses ordinary user-directory authorization.
 #bearer_token_file = "pki/dev-token"
 #bearer_identity = "dev-admin"
 #bearer_groups = ["system:masters"]
 
-# The identity provider, for a profile that has people in it as well as
-# machines. `chain = ["mtls", "oidc"]` above is what turns it on, and the
-# order is the security-relevant part: with a static token link configured it
-# has to come LAST, because both read the same header and the chain stops at
-# the first hard no.
-#
-# What stays true with it on: the role is read off the User object on every
-# request and never out of a claim, a token for a name the directory does not
-# know may do nothing, and no token may name itself `system:*`. See
-# config/examples/cloud.toml for the whole table with its reasoning.
+# Cloud-only OIDC authentication. User objects supply roles and tenant membership;
+# token claims cannot grant roles or machine identities.
 #[auth.oidc]
+
+# Exact HTTPS issuer from provider discovery. Configure the matching public client.
 #issuer = "https://idp.example.org/realms/lab"
 #client_id = "meisterstack"
+
+# Explicit asymmetric signature algorithms accepted by this API.
 #allowed_algorithms = ["RS256", "ES256"]

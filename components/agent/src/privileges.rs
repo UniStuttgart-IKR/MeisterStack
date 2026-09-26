@@ -2,64 +2,27 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What this agent may do on this host, measured rather than assumed.
-//!
-//! The agent has always been root, and every driver in it was written on that
-//! assumption: `lvs` works, `mount` works, a tap can be created, `nft` can be
-//! programmed. Run the same binary as an ordinary user and it comes up
-//! claiming all of it and fails at the first VM that needs any of it — a node
-//! the scheduler keeps placing on, which is the shape of defect the node
-//! conditions exist to end.
-//!
-//! The form is Incus'. Its VM driver answers `Info()` with a `Features` map
-//! and one `Error` sentence in plain words (`driver_qemu.go`: "KVM support is
-//! missing (no /dev/kvm)"), and the client never has to guess. The content is
-//! Podman's: `podman info` publishes the PRIMITIVES — `host.security.
-//! capabilities`, `host.cgroupControllers`, `host.idMappings` — and lets the
-//! reader draw the conclusion. Both are here: one sentence per driver this
-//! node configured and cannot build, and one line of primitives to check the
-//! sentences against.
-//!
-//! Every number in the needs below was MEASURED on 2026-09-16 with a
-//! throw-away probe, three times: as an ordinary user with `CapEff=0`, then
-//! under `AmbientCapabilities=CAP_NET_ADMIN`, then under `CAP_SYS_ADMIN`,
-//! each in a unit with its own network and mount namespace so that a success
-//! left nothing behind. Two of the results contradicted what the code had
-//! been read to mean, and both are in the table: a router needs
-//! `CAP_SYS_ADMIN` and not `CAP_NET_ADMIN`, and device-mapper needs
-//! `CAP_DAC_OVERRIDE` beside `CAP_SYS_ADMIN`.
-//!
-//! What is deliberately NOT here: a build-time switch. No reference does it
-//! that way — Docker, Podman, Incus and libvirt ship one binary and decide at
-//! run time — and a node whose capabilities depend on how it was compiled is
-//! a node whose Hello nobody can predict.
+//! Screen configured drivers against host capabilities and device access.
+//! Requirements are checked before construction and refreshed as a node
+//! condition on reports. These probes are prerequisites, not a complete test
+//! of each driver's runtime operations or backend sandbox.
 
 use std::path::Path;
 use std::sync::Arc;
 
-/// The capabilities this stack's drivers actually need. Three, and not the
-/// whole of `capabilities(7)`: what is not in this list is not needed by
-/// anything the agent builds, and adding a fourth should be a measurement
-/// rather than a guess.
+/// Linux capabilities represented by the driver prerequisite table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Capability {
     /// Taps, bridges, VXLAN, and the nftables tap guard.
     NetAdmin,
-    /// `mount(2)`, device-mapper ioctls, `unshare(CLONE_NEWNET)`, the vfio
-    /// sysfs bind. capabilities(7) on this one: "It can plausibly be called
-    /// 'the new root'".
+    /// Mounts, device-mapper ioctls, network namespace creation, and VFIO setup.
     SysAdmin,
-    /// The file permissions in front of those: `/dev/mapper/control` is 0600
-    /// root:root and `/run/lock/lvm` is root-only, so `CAP_SYS_ADMIN` alone
-    /// gets EACCES before it ever reaches an ioctl (measured).
+    /// Bypass filesystem access checks on privileged control paths.
     DacOverride,
 }
 
 impl Capability {
-    /// The bit in `CapEff`/`CapAmb`, from `linux/capability.h` — and checked
-    /// against the measurement: a unit with `AmbientCapabilities=
-    /// CAP_NET_ADMIN` showed `CapEff: 0000000000001000`, one with
-    /// `CAP_SYS_ADMIN` `0000000000200000`.
+    /// Bit position from the Linux capability definitions.
     const fn bit(self) -> u64 {
         match self {
             Self::DacOverride => 1 << 1,
@@ -77,38 +40,25 @@ impl Capability {
     }
 }
 
-/// Why a device node cannot be used — and it matters which, because the two
-/// produce the SAME errno at the driver that shells out to a tool.
+/// Distinguish missing device nodes from denied access.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Denial {
-    /// The node is not there at all. On a Linux host that almost always means
-    /// a module nobody loaded (`/dev/nvme-fabrics` without `nvme_tcp`), and
-    /// the fix is `boot.kernelModules`, not a permission.
+    /// Device node absent, potentially because its kernel module is not loaded.
     Absent,
     /// It is there and this process may not open it. The fix is a group.
     Refused(String),
 }
 
-/// What a driver needs from the host before it is worth registering.
-///
-/// `'static` and a table entry rather than a method on the driver, for the
-/// reason `DriverEntry` exists at all: a need that lived in the driver would
-/// have to be asked by building the driver, and building is the thing that
-/// fails.
+/// Prerequisites available before constructing a driver.
 #[derive(Debug)]
 pub struct Needs {
     /// All of them, not any of them.
     pub caps: &'static [Capability],
-    /// Openable read/write. A trailing `*` is a glob over one directory —
-    /// `/dev/dri/renderD*` is a node whose number nobody can write down in
-    /// advance.
+    /// Required read/write device access. A trailing * matches within one directory.
     pub devices: &'static [&'static str],
-    /// The half sentence after "needs", in the voice of Incus' `Error`
-    /// field: "CAP_SYS_ADMIN for device-mapper".
+    /// Description included in a missing-prerequisite message.
     pub what: &'static str,
-    /// What this node LOSES when the driver is left out — set only where
-    /// that is a promise somebody made and not just a feature nobody gets.
-    /// See `TAPS`.
+    /// Optional explanation of the features unavailable without this prerequisite.
     pub then: Option<&'static str>,
 }
 
@@ -136,10 +86,8 @@ impl Needs {
         for device in self.devices {
             match rights.opens(device) {
                 Ok(()) => {}
-                // The two causes of one symptom, told apart. A driver that
-                // shells out to `nvme` or `lvs` reports both as the same
-                // ENOENT from the tool, which is how "the module is not
-                // loaded" gets read as "wrong permissions" for an hour.
+                // Distinguish a missing device from denied access; external tools may
+                // otherwise collapse both into an unhelpful failure.
                 Err(Denial::Absent) => {
                     let mut said = format!(
                         "{driver}: needs {device}, which does not exist on this node; \
@@ -163,11 +111,8 @@ impl Needs {
     }
 }
 
-/// A driver that needs nothing of the host: `filesystem` (files and
-/// `qemu-img`), `nvmeof-import` (files in its state directory), `input`
-/// (whose `fifo` profile is a named pipe the driver makes itself — the
-/// `evdev` profile needs `/dev/input/eventN` and that is a property of the
-/// profile, not of the driver; see the report).
+/// No driver-wide capability or device prerequisites. Per-profile and runtime
+/// checks may still fail, such as an inaccessible input evdev path.
 pub static NOTHING: Needs = Needs {
     caps: &[],
     devices: &[],
@@ -175,10 +120,7 @@ pub static NOTHING: Needs = Needs {
     then: None,
 };
 
-/// Measured: `open("/dev/kvm", O_RDWR)` as an ordinary user with `CapEff=0`
-/// succeeds — here the node is 0666 root:kvm. On a node where it is 0660 the
-/// group `kvm` decides, which is why the unit carries
-/// `SupplementaryGroups=kvm` and not a capability.
+/// KVM requires read/write access to `/dev/kvm`.
 pub static KVM: Needs = Needs {
     caps: &[],
     devices: &["/dev/kvm"],
@@ -186,16 +128,7 @@ pub static KVM: Needs = Needs {
     then: None,
 };
 
-/// Measured: `TUNSETIFF` on a new name is EPERM as an ordinary user and
-/// succeeds under `CAP_NET_ADMIN` alone; so does `RTM_NEWLINK` for a vxlan
-/// link, and so does `nft -f -`. Under `CAP_SYS_ADMIN` all three are EPERM —
-/// the capability is exactly the right one and exactly enough.
-///
-/// `then` is the security sentence, and it is the reason this row has one:
-/// the mac-pinning and anti-spoofing guard is promised for every VM this
-/// stack boots (`drivers/linux-network/src/nftables.rs`), and a node that
-/// cannot write those rules is a node where the promise does not hold. It is
-/// said out loud rather than quietly dropped.
+/// Tap, bridge, VXLAN and nftables setup requires network administration.
 pub static TAPS: Needs = Needs {
     caps: &[Capability::NetAdmin],
     devices: &["/dev/net/tun"],
@@ -203,13 +136,7 @@ pub static TAPS: Needs = Needs {
     then: Some("tap guard off: guests on this node are not filtered"),
 };
 
-/// The router half of the same driver, and NOT a driver of its own — which is
-/// why it is screened separately (see `drivers::screen`).
-///
-/// Measured, and it corrects the halt report: `unshare(CLONE_NEWNET)` is
-/// EPERM under `CAP_NET_ADMIN` and succeeds under `CAP_SYS_ADMIN`. A node
-/// with `CAP_NET_ADMIN` makes every tap, bridge and overlay it ever made —
-/// and cannot hold a tenant router.
+/// Router namespace setup has additional requirements beyond tap creation.
 pub static ROUTER: Needs = Needs {
     caps: &[Capability::SysAdmin],
     devices: &[],
@@ -217,10 +144,7 @@ pub static ROUTER: Needs = Needs {
     then: Some("no tenant router can run here, though this node claims network/gateway"),
 };
 
-/// Measured: `open("/dev/mapper/control", O_RDWR)` is EACCES as an ordinary
-/// user AND under `CAP_SYS_ADMIN` alone (the node is 0600 root:root); with
-/// `CAP_SYS_ADMIN CAP_DAC_OVERRIDE` it opens and `lvs` returns 0. Two
-/// capabilities, not one.
+/// Device-mapper requires administrative ioctls and access to LVM control paths.
 pub static DEVICE_MAPPER: Needs = Needs {
     caps: &[Capability::SysAdmin, Capability::DacOverride],
     devices: &[],
@@ -228,10 +152,7 @@ pub static DEVICE_MAPPER: Needs = Needs {
     then: None,
 };
 
-/// Measured: `mount(2)` of a tmpfs is EPERM as an ordinary user and under
-/// `CAP_NET_ADMIN`, and succeeds under `CAP_SYS_ADMIN`. The driver shells out
-/// to `mount(8)` rather than calling `mount(2)`, which changes nothing about
-/// the capability the kernel asks for.
+/// Managed mounts require CAP_SYS_ADMIN.
 pub static MOUNT: Needs = Needs {
     caps: &[Capability::SysAdmin],
     devices: &[],
@@ -239,10 +160,7 @@ pub static MOUNT: Needs = Needs {
     then: None,
 };
 
-/// `nvme connect` writes to `/dev/nvme-fabrics`, which is 0600 root:root on a
-/// node that has it — so both halves are needed. Measured here only as
-/// `Absent`: this machine has no `nvme_tcp` loaded, which is precisely the
-/// case `Denial::Absent` exists to name.
+/// NVMe-oF connection setup requires administrative rights and fabrics-device access.
 pub static NVME_FABRICS: Needs = Needs {
     caps: &[Capability::SysAdmin, Capability::DacOverride],
     devices: &["/dev/nvme-fabrics"],
@@ -250,11 +168,7 @@ pub static NVME_FABRICS: Needs = Needs {
     then: None,
 };
 
-/// Measured: `/dev/vfio/vfio` is 0666 and opens for anybody — the kernel
-/// wants it that way ("/dev/vfio/vfio provides no capabilities on its own and
-/// is therefore expected to be set to mode 0666"). What does not work is the
-/// BIND: `access("/sys/bus/pci/drivers_probe", W_OK)` is EACCES as a user,
-/// under `CAP_NET_ADMIN` and under `CAP_SYS_ADMIN` alone.
+/// VFIO binding also needs write access to PCI sysfs control paths.
 pub static VFIO_BIND: Needs = Needs {
     caps: &[Capability::SysAdmin, Capability::DacOverride],
     devices: &["/dev/vfio/vfio"],
@@ -262,9 +176,7 @@ pub static VFIO_BIND: Needs = Needs {
     then: None,
 };
 
-/// Measured: `open("/dev/dri/renderD128", O_RDWR)` succeeds as an ordinary
-/// user here (0666 root:render). On a node where it is 0660 the group
-/// `render` decides.
+/// Require access to a DRM render node and KVM.
 pub static RENDER_NODE: Needs = Needs {
     caps: &[],
     devices: &["/dev/dri/renderD*", "/dev/kvm"],
@@ -272,10 +184,7 @@ pub static RENDER_NODE: Needs = Needs {
     then: None,
 };
 
-/// The GPU nodes. `/dev/nvidiactl` opened as an ordinary user here; the mdev
-/// half of this driver writes sysfs and therefore needs what `VFIO_BIND`
-/// needs, which is NOT screened because this machine has no card to measure
-/// it on (see the report's "Offen").
+/// Probe NVIDIA control-device access. This does not verify mdev sysfs rights.
 pub static NVIDIA: Needs = Needs {
     caps: &[],
     devices: &["/dev/nvidiactl"],
@@ -283,32 +192,21 @@ pub static NVIDIA: Needs = Needs {
     then: None,
 };
 
-/// The rights this process holds, asked one question at a time.
-///
-/// A trait and not a struct of measurements, so that a test can lie: every
-/// interesting case here — an agent with `CAP_NET_ADMIN` and no
-/// `CAP_SYS_ADMIN`, a `/dev/kvm` that is there and not openable — is one this
-/// machine cannot be put into for the length of a test.
+/// Host prerequisite probes, replaceable in tests.
 pub trait Probe: Send + Sync {
-    /// The effective uid. In the sentences only, and on purpose: `euid == 0`
-    /// is not what decides anything here. A root agent holds every
-    /// capability and passes every check by holding it, not by being root.
+    /// Effective UID for diagnostics; capability checks do not special-case root.
     fn euid(&self) -> u32;
 
-    /// Effective OR ambient. Ambient counts because it is what a child of
-    /// this process inherits — and the drivers that need capabilities all
-    /// work by shelling out to `lvs`, `mount`, `nft`, `nvme`.
+    /// Count effective or ambient capabilities; ambient capabilities survive into tool subprocesses.
     fn holds(&self, cap: Capability) -> bool;
 
     fn opens(&self, device: &str) -> Result<(), Denial>;
 
-    /// The primitives, in Podman's `info` spirit: not the verdict, the
-    /// numbers the verdict was drawn from. One line at start-up, and an empty
-    /// field in it is a statement too.
+    /// Render measured capabilities, groups and cgroup access for diagnostics.
     fn primitives(&self, cgroup_root: &Path) -> String;
 }
 
-/// The real one.
+/// Probes of the running agent process.
 pub struct Host;
 
 impl Probe for Host {
@@ -350,10 +248,8 @@ impl Probe for Host {
                     .join(",")
             })
             .unwrap_or_default();
-        // The cgroup half of the same line. `cgroup.controllers` of the
-        // configured root is the one primitive that says whether a delegated
-        // subtree is usable at all — an empty field there is a node that can
-        // make slices and limit nothing in them.
+        // An empty `cgroup.controllers` means this subtree cannot enforce the
+        // resource limits, even if it permits directory creation.
         let controllers = std::fs::read_to_string(cgroup_root.join("cgroup.controllers"))
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
@@ -367,11 +263,7 @@ impl Probe for Host {
     }
 }
 
-/// `CapEff` and `CapAmb` out of `/proc/self/status`.
-///
-/// Read there and not through `capget(2)`, because that is where an operator
-/// reads them too: a sentence this agent says about its own rights has to be
-/// checkable with `grep Cap /proc/<pid>/status` and nothing else.
+/// Read effective and ambient capability masks from `/proc/self/status`.
 fn cap_sets() -> (u64, u64) {
     let mut effective = 0;
     let mut ambient = 0;
@@ -388,11 +280,7 @@ fn cap_sets() -> (u64, u64) {
     (effective, ambient)
 }
 
-/// A device path, with a trailing `*` resolved against its directory.
-///
-/// `/dev/dri/renderD*` is the honest spelling: which number the render node
-/// has is a property of the host's boot order, and a config that had to name
-/// it would be wrong on the next machine.
+/// Resolve a trailing `*` to the first sorted directory entry with that prefix.
 fn resolve(device: &str) -> Option<std::path::PathBuf> {
     let Some(prefix) = device.strip_suffix('*') else {
         return Some(std::path::PathBuf::from(device));
@@ -409,30 +297,19 @@ fn resolve(device: &str) -> Option<std::path::PathBuf> {
                 .is_some_and(|name| name.starts_with(stem))
         })
         .collect();
-    // Sorted, so that a host with two render nodes gets the same answer on
-    // every start rather than whatever the directory happened to list first.
+    // Choose deterministically when several device paths match.
     matches.sort();
     matches.into_iter().next()
 }
 
-/// One driver this node configured, and what it needs — kept so that the
-/// heartbeat can ask the same question again.
+/// Configured driver prerequisites retained for heartbeat rechecks.
 pub struct Watched {
     pub driver: &'static str,
     pub needs: &'static Needs,
 }
 
-/// The `Unprivileged` condition, re-measured on every report.
-///
-/// Level-triggered, like every other condition in this agent: a condition
-/// here is a statement about NOW and not a log of what was once true
-/// (`conditions.rs`, and the controller's `ingest.rs` reads them that way).
-/// The rights of a running process barely change — but the things they are
-/// measured against do: a udev rule that arrives late, a `/dev/nvme-fabrics`
-/// that appears when the module loads, a group added to the unit and a
-/// restart that has not happened yet. Measuring once at start-up would make
-/// the report a statement about the second the agent came up, which is the
-/// exact defect `check_cgroup_root` was moved into the reconcile loop to fix.
+/// Refresh Unprivileged against current prerequisites. This does not construct
+/// a driver omitted during startup; restarting is required to register it.
 pub struct Watch {
     rights: Arc<dyn Probe>,
     watched: Vec<Watched>,
@@ -453,9 +330,7 @@ impl Watch {
         if gaps.is_empty() {
             conditions.clear(crate::conditions::UNPRIVILEGED);
         } else {
-            // One condition, the sentences joined: the controller gets ONE
-            // statement per type (`conditions.rs`), and a node missing three
-            // drivers is one unprivileged node and not three conditions.
+            // Combine all missing prerequisites into one condition of this type.
             conditions.raise(crate::conditions::UNPRIVILEGED, gaps.join(" | "));
         }
     }
@@ -558,8 +433,7 @@ mod tests {
         assert!(DEVICE_MAPPER.missing("lvm-thin", &both).is_none());
     }
 
-    /// The network driver's sentence carries the security statement, because
-    /// what is lost with it is a promise and not a feature.
+    /// Missing network privileges report the unavailable tap guard.
     #[test]
     fn the_tap_guard_says_what_falls_with_it() {
         let said = TAPS
@@ -610,8 +484,7 @@ mod tests {
         assert!(said.contains("group that owns the node"), "{said}");
     }
 
-    /// The hypervisor needs no capability at all — only a device. That is the
-    /// whole reason a node without root can run a guest.
+    /// Hypervisor prerequisites require KVM device access without extra capabilities.
     #[test]
     fn a_guest_needs_a_device_and_not_a_capability() {
         assert!(
@@ -671,8 +544,7 @@ mod tests {
             "three missing drivers are one unprivileged node"
         );
 
-        // The same node, with everything: the condition goes away rather
-        // than staying as a history of what was once wrong.
+        // Clear the condition after all prerequisites recover.
         Watch::new(Arc::new(Fake::root()), watched()).refresh(&conditions);
         assert!(conditions.report().is_empty());
     }

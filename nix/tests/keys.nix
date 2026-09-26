@@ -2,29 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# The exit criterion of lane 3B, in two virtual machines: a host nobody has
-# ever spoken to gets an identity, and the control plane on it authenticates
-# with a certificate this fleet's own CA issued over a key that never left
-# the machine.
-#
-# What is real here:
-#
-# * the host key is read off the TARGET's console (the test plays the person
-#   at the console) and `keys enroll` compares it with what `ssh-keyscan`
-#   answers; a fingerprint that is not the one is refused;
-# * the private key is generated ON `box` by `meister-activate keygen` and
-#   only the certificate request travels;
-# * `tools/meister-ca --sign-csr` is the real script with real openssl, and
-#   its CA key never leaves the operator VM;
-# * the delivery is the plan's own action, carried out by `apply` over ssh;
-# * and what proves it at the end is not a file's mode but a SESSION: the
-#   cluster controller registers with the cloud controller over mTLS, and it
-#   comes back after a restart and after a reboot.
-#
-# What is NOT real is the same one thing as in nix/tests/update.nix: the
-# EVALUATION. A test VM has no nixpkgs and could not evaluate its own test
-# nodes, so the manifest is built here at build time by `nix/lib/manifest.nix`
-# — the file `lib.mkFleet` uses — and handed over with `resolve --from`.
+# Enroll a target fingerprint, generate its private key locally, issue and
+# deliver its certificate, and verify mTLS sessions across restart and reboot.
+# The manifest is evaluated at build time.
 { nixpkgs, lib, pkgs, system, self }:
 
 let

@@ -35,11 +35,8 @@ pub type OtlpEndpoint = Option<String>;
 /// that stops answering must not become a component that stops working.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How a log line is written. `log_format` in a component's TOML.
-///
-/// `Human` is the default and stays it: the lab habit is `journalctl` on a
-/// box, and a person reads the other format badly. `Json` is what a collector
-/// reads — see `fmt_layer` for exactly which keys it produces and why those.
+/// Configured log format. Human is the default; JSON provides structured
+/// fields for collectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
@@ -163,17 +160,8 @@ pub fn shutdown() {
     }
 }
 
-/// The context to send onwards from here.
-///
-/// With an exporter attached this is the CURRENT span's real context, so the
-/// next hop's `attach_parent` makes a genuine parent-child edge and the trace
-/// is a chain. Without one there is no current context to read, and the
-/// answer is `fallback` — the context this work was started under — which
-/// keeps every hop on the same trace id even though the shape is flat.
-///
-/// Minting a synthetic child instead would be worse than either: the next hop
-/// would attach to a span id nothing ever emitted, and the trace would come
-/// out with a dangling reference in it.
+/// Use the active exported span context when available; otherwise keep
+/// the supplied fallback trace. Do not invent a child span that was never emitted.
 pub fn outgoing(fallback: &TraceParent) -> TraceParent {
     use opentelemetry::trace::TraceContextExt;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -190,20 +178,9 @@ pub fn outgoing(fallback: &TraceParent) -> TraceParent {
     }
 }
 
-/// Continue `parent` in the given span.
-///
-/// The span must NOT have started yet. tracing-opentelemetry mints a span's
-/// trace id when its builder is consumed, and refuses `set_parent` on a span
-/// that is already running — so a parent attached from inside the span's own
-/// body arrives too late and is dropped. That is exactly how the first
-/// version of this produced three unrelated traces that each looked fine on
-/// its own, which is why `AlreadyStarted` is a warning here and not a `let
-/// _ =`. Use `in_trace`, which cannot get the order wrong.
-///
-/// A no-op without an exporter, and deliberately so: the trace id is already
-/// on the span as a field, so the fmt logs of all three components carry the
-/// same id whether or not anything is collecting them. This is what turns
-/// that id into a real parent-child edge when something is.
+/// Attach parent context before the span starts. `in_trace` preserves
+/// that order; warn if the exporter reports an already-started span.
+/// Without an exporter, explicit trace fields still correlate logs.
 pub fn attach_parent(span: &tracing::Span, parent: &TraceParent) {
     use opentelemetry::trace::{
         SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
@@ -229,10 +206,7 @@ pub fn attach_parent(span: &tracing::Span, parent: &TraceParent) {
     }
 }
 
-/// Run `work` inside `span`, continuing `parent`.
-///
-/// The one correct order, in one place: attach, then start. Every hop that
-/// receives a context uses this rather than building the sequence by hand.
+/// Attach parent context before entering the span, then run work within it.
 pub async fn in_trace<F: std::future::Future>(
     span: tracing::Span,
     parent: &TraceParent,
@@ -299,11 +273,8 @@ mod tests {
         String::from_utf8(raw).expect("the subscriber writes utf-8")
     }
 
-    /// The claim `log_format` makes: the same line, the same fields, two
-    /// envelopes. In json the trace id is a KEY — which is what lets Loki
-    /// filter on it without a regex, and what a Grafana derived field points
-    /// at — and in human it is in the text, which is where a person reading
-    /// `journalctl` on a box has always found it.
+    /// Both formats retain event and trace fields; JSON exposes structured
+    /// keys while human output renders them as text.
     #[test]
     fn json_makes_the_trace_id_a_key_and_human_leaves_it_in_the_text() {
         let json = one_line(LogFormat::Json);

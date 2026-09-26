@@ -6,26 +6,10 @@
 
 use super::*;
 
-// --- the storage a tenant may claim ------------------------------------------
-//
-// The same section the floating pools have, one noun over, and the rule runs
-// through both: what EXISTS is an administrator's decision and taking room out
-// of it is self-service inside a quota. Reading the block above is reading this
-// one with different words.
-//
-// What is different is what a mistake costs. At the end of a confused address
-// is a tenant that cannot be reached; at the end of a confused volume is data
-// that is gone. Two rules carry the difference and both live here:
-//
-//   * the backend name is DERIVED from the object's uid, never allocated, so a
-//     provision whose handle is lost finds its volume instead of making a
-//     second one nobody knows about;
-//   * a volume somebody is holding is not deleted. DELETE marks it Releasing
-//     and the finalizer keeps the object until the consumer lets go.
-//
-// Nothing here provisions anything. What comes out is a RESERVATION — who owns
-// how much room in which pool — and choosing the node that makes it real is
-// the reconciler's, through the same `feasible()` a VM goes through.
+// Administrators define pools; tenants reserve volumes within their quotas.
+// Provisioning is reconciled separately. Drivers derive backend identity from
+// the volume UID so retries recover the same disk. Deletion retains the object
+// and finalizer until its consumer releases the volume.
 
 /// The pools, with one thing hidden: a member sees its own quota and not
 /// everybody else's. The mirror of `redact_quota` next door, and the same
@@ -99,15 +83,8 @@ pub(super) async fn check_storage_pool(
             "spec.driver must name a storage backend, e.g. \"lvm-thin\"",
         ));
     }
-    // A cloud pool is a cluster pool seen from above, so it has to say which
-    // cluster. Without one there is nothing to dispatch a volume to, and a
-    // volume reserved out of it would be an object nothing could ever make
-    // bytes for.
-    //
-    // The cluster does not have to EXIST yet: a pool written before the
-    // cluster dials in for the first time is an ordinary order of operations,
-    // and the volumes in it stay Pending until it does — which is a sentence
-    // an operator can read, unlike a 422 at three in the morning.
+    // A pool must name a serving cluster so volumes have a dispatch target.
+    // The cluster may register later; its absence leaves volumes Pending.
     if pool.spec.served_by().is_empty() {
         return Err(invalid(
             "spec.cluster must name the cluster that serves this pool (or spec.clusters, if more \
@@ -186,18 +163,9 @@ pub(super) const STORAGE_POOL_OWNED: &[Owned] = &[
         "spec.cluster",
         "is immutable; the volumes in this pool have their bytes on it",
     ),
-    // `spec.clusters` is deliberately NOT in this table, and the difference
-    // from `spec.cluster` above is which direction the edit goes. Re-pointing
-    // a pool at a different cluster moves nothing and leaves the volumes
-    // behind; ADDING a cluster to the list is an operator writing down a fact
-    // about the wiring — this target is dialled from over there too, this
-    // export is mounted on both sides — and it is the only way a stopped VM's
-    // disks can follow it across a cluster boundary. Nothing about the bytes
-    // changes either way, so it is an ordinary mutable field.
-    //
-    // Taking one back OFF is refused where the narrowing of `spec.nodes` is,
-    // and for the same reason: a volume whose record is on a cluster the pool
-    // no longer names is a volume nothing can dispatch.
+    // `spec.clusters` may expand to describe additional access to the same bytes;
+    // editing it does not move data. Removing a serving cluster is checked below,
+    // alongside node narrowing, to avoid stranding existing volume records.
 ];
 
 pub(super) async fn update_storage_pool(
@@ -364,20 +332,9 @@ pub(super) async fn all_volumes(st: &ApiState) -> Result<Vec<Volume>, ApiError> 
     Ok(volumes)
 }
 
-/// Would this tenant still be inside its ceiling in `pool` with a volume of
-/// `gib` in it?
-///
-/// One rejection path, and it is the one in `controller_api::quota`. A
-/// second sum computed here would be a second answer to "is this tenant over
-/// its limit", and the wrong one is whichever an operator is not looking at.
-/// Asked by the create and by the resize, and `except` is the difference
-/// between them: the volume being resized comes out of the sum so that its
-/// new size can go back in. `None` on a create.
-///
-/// The yes comes with the tenant's fence, read before the volumes are, and
-/// the caller writes through it — the same door `check_quota` hands out, and
-/// for the same reason (F03): two volumes that each saw the room for one
-/// were two writes to two keys, and nothing arbitrated them.
+/// Check storage quota for creation or growth and return the tenant's fence.
+/// `except` excludes the old volume during a resize. Read the fence before usage;
+/// the caller must write through it so competing reservations trigger a retry.
 pub(super) async fn check_storage_quota(
     st: &ApiState,
     pool: &StoragePool,
@@ -537,19 +494,8 @@ pub(super) fn check_owned_volume_status(volume: &Volume) -> Result<(), ApiError>
 /// Volume identity, ownership, pool, and seed are immutable.
 /// Size may grow; the reconciler grows the backend before notifying the guest.
 pub(super) const VOLUME_OWNED: &[Owned] = &[
-    // The row storage B changed, and the `note` storage A left the space for.
-    //
-    // Upwards only, and the projection says it exactly: a resize compares the
-    // two numbers, so growing passes and shrinking is refused with the
-    // sentence. It cannot be an ordinary immutable row any more (that refused
-    // both directions) and it must not be a free field (that would accept
-    // both), which is what `Mutability::Structural` is for.
-    //
-    // Shrinking is not "not built yet": a filesystem does not know which
-    // bytes past the new end were free, so taking them is taking data, and no
-    // later pass gets it back. The way to a smaller disk is a new one and a
-    // copy, which is a thing a tenant does and not a thing a control plane
-    // does behind one.
+    // Allow growth only. Shrinking could discard allocated filesystem data;
+    // moving to a smaller disk requires an explicit copy into a new volume.
     Owned::structural(
         "spec.sizeGib",
         "may only grow: shrinking a volume is not supported, because the bytes past the new end \
@@ -694,18 +640,10 @@ pub(super) const VOLUME_SNAPSHOT_OWNED: &[Owned] = &[
     ),
 ];
 
-// --- the point in time a tenant keeps ---------------------------------------
-//
-// Storage B built snapshots at the cluster, where the nodes that hold the
-// bytes are. This is the cloud half, and it is the same road `Volume` took in
-// nightshift 0a: routes here, a `CloudCommand` pair down, evidence back up in
-// `ClusterStatus.snapshots`, and a mirror that finishes the delete when the
-// cluster stops naming it.
-//
-// There is nothing to schedule and that is not a shortcut: a snapshot is
-// taken where its volume's bytes are, so the cluster is the volume's cluster
-// and the node is the volume's node. What the cloud adds is the DIRECTORY —
-// whose snapshot it is, and whether the volume it names is one of theirs.
+// Snapshot requests authorize source-volume ownership and create intent.
+// Commands travel to a cluster, whose reports update snapshot state and complete
+// deletion. Dispatch currently uses the pool's legacy cluster field; see the
+// snapshot routing limits in docs/STORAGE.md.
 
 pub(super) async fn list_volume_snapshots(
     State(st): State<ApiState>,
@@ -738,18 +676,9 @@ pub(super) async fn get_volume_snapshot(
     Ok(Json(snapshot))
 }
 
-/// Ask for a copy of a disk.
-///
-/// Nothing is copied here and nothing is decided here. The volume has to be
-/// one this caller may see — **404 and never 403** for one that is not, the
-/// same argument `get_volume` makes: a 403 would confirm that a volume of
-/// that name exists in somebody else's tenant.
-///
-/// Whether the POOL can snapshot at all is the cluster's refusal and stays
-/// there: the answer is in a node's capability catalogue, which this tier does
-/// not keep. So the cloud can say "not your volume" synchronously and "that
-/// backend cannot" arrives as a Failed phase with the cluster's own sentence
-/// — which is the tier line this whole road is drawn along.
+/// Request a snapshot of a readable volume. Cross-tenant sources return 404
+/// to conceal their existence. Backend snapshot capability is checked by the
+/// cluster and reported asynchronously as snapshot status.
 pub(super) async fn create_volume_snapshot(
     State(st): State<ApiState>,
     caller: Caller,
@@ -794,15 +723,9 @@ pub(super) async fn create_volume_snapshot(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-/// The snapshot a volume says it starts from has to be one this caller has.
-///
-/// **404 and not 403** for a snapshot in another tenant, the same argument
-/// `readable_volume` makes: a 403 would confirm that a snapshot of that name
-/// exists somewhere.
-///
-/// A snapshot that is merely not `Ready` yet is NOT refused — the copy is on
-/// its way and the volume waits for it, exactly as a VM waits for its disk.
-/// One being DELETED is, because that is a wait that never ends.
+/// Require a readable snapshot seed, returning 404 across tenant boundaries.
+/// A seed being deleted is refused; one not yet Ready is accepted so the volume
+/// can wait for its completion.
 async fn check_snapshot_seeds(st: &ApiState, who: &Grant, named: &str) -> Result<(), ApiError> {
     let missing = || {
         ApiError::new(
@@ -1089,20 +1012,8 @@ mod tests {
         assert_eq!(p.spec.driver, "lvm-thin");
     }
 
-    /// Storage A's first defect, as a test.
-    ///
-    /// `status.backend` used to be filled in right here at create with a
-    /// derived `vol-<uid>` — a name no backend in this tree ever gives a
-    /// volume — and replaced by the real one on the node's first report. In
-    /// between, the object named a path that existed nowhere, and an operator
-    /// who looked in that window looked for the wrong file. So: a created
-    /// volume says nothing about a backend, because nothing has made one.
-    ///
-    /// What the deletion did NOT cost is the rule the derived name was there
-    /// to serve: a provision whose handle is lost must find its volume rather
-    /// than make a second one. That rule lives on `metadata.uid`, which every
-    /// backend derives its own name from, and it never needed a second copy
-    /// of the answer up here.
+    /// A new volume has no backend handle until a node reports provisioning.
+    /// Drivers derive stable backend names from the UID, independently of this field.
     #[test]
     fn a_created_volume_says_nothing_about_a_backend_until_a_node_does() {
         let fresh = new_volume("data", controller_api::VolumeSpec::default());

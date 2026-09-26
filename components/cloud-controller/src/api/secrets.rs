@@ -205,16 +205,11 @@ pub(super) async fn delete_secret(
     let current: controller_api::Secret = st.store.get(&name).await?;
     Grant::new(caller, role, tenant)
         .allows(Scope::of(Some(current.spec.tenant.as_str())), Verb::Write)?;
-    // A VM still naming it is NOT a refusal, and that is a decision. A secret
-    // is read at dispatch and not held open: a running VM has its seed on its
-    // node already, and deleting the object is how somebody makes the next
-    // boot fail on purpose. Refusing would mean a tenant cannot revoke.
-    //
-    // The mirrored copies go FIRST, and from here rather than from the
-    // reconcile pass: a deletion cannot be derived from a list the object has
-    // already left. Every cluster this replica is talking to, one command
-    // each, and a cluster that does not answer is logged and left — the
-    // sealed copy it keeps is the one hole in this, and the report says so.
+    // Allow deletion while VMs reference the secret: existing guests retain their
+    // seed, while later dispatches must resolve the secret again.
+    // Delete mirrored copies before the source object, which otherwise leaves no
+    // deletion evidence to reconcile. Only locally connected clusters are contacted;
+    // a failed or disconnected cluster can retain its sealed copy.
     for cluster in st.sessions.connected() {
         let op = cloud_command::Op::DeleteSecret(proto::DeleteSecret {
             name: name.clone(),

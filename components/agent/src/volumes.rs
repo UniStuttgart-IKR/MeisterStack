@@ -2,29 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Volumes this node owns on their own, with no VM implied.
-//!
-//! The other half of `provision.rs`. That file makes a disk FOR a VM and
-//! unmakes it WITH the VM — an instance store, and the only kind of disk this
-//! node could make until now. This one makes a disk because the control plane
-//! said to, keeps a record of it that survives a restart, and unmakes it only
-//! when told. The difference is entirely in who deletes it, and that is the
-//! whole of what a `Volume` object is for.
-//!
-//! # One registry
-//!
-//! `Drivers::storage` is the same map both halves route through — `spec.driver`
-//! picks the backend here exactly as it does inline. Two registries would be
-//! two answers to "which backend owns these bytes", and the second one would
-//! be wrong the first time somebody changed a configuration.
-//!
-//! # Why the node refuses
-//!
-//! [`Volumes::deprovision`] rejects a volume a VM on this node is holding. The
-//! controller is not supposed to send that — it clears `attachedTo` first —
-//! but the node is the last thing between a mistake and somebody's data, and
-//! a defence that only exists one tier up is a defence that a bug one tier up
-//! removes.
+//! Manage volumes and snapshots independently of VM lifetime. Storage routing
+//! uses the same registry as inline VM disks. Destructive volume operations
+//! check persisted VM attachments under the local operations lock; cross-node
+//! coordination remains the controller's responsibility.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -39,18 +20,7 @@ use crate::reconcile::{SnapshotReason, VolumeReason};
 use crate::store::Store;
 use crate::types::{SnapshotRecord, SnapshotRecordPhase, VolumeRecord, VolumeRecordPhase};
 
-/// The word that goes out beside a volume's phase.
-///
-/// Almost always what the pass that wrote the record put there. Two arms
-/// besides:
-///
-/// * `Ready` needs no reason, and an old record that has one — written before
-///   the reason was cleared with the phase — must not send it.
-/// * a record from a build before the field has none, and a phase that needs
-///   one may not go out mute. It goes out as `Unrecorded` with its own
-///   message untouched, which is what makes a fleet mid-upgrade readable
-///   rather than half-silent (round decision 6: no migration code, the next
-///   pass overwrites it).
+/// Report no reason for Ready; use Unrecorded for legacy non-Ready rows.
 fn reported_reason(record: &VolumeRecord) -> Option<VolumeReason> {
     match record.phase {
         VolumeRecordPhase::Ready => None,
@@ -68,21 +38,11 @@ fn reported_snapshot_reason(record: &SnapshotRecord) -> Option<SnapshotReason> {
     }
 }
 
-/// How long a `Gone` tombstone is kept.
-///
-/// Long enough that a controller which asked for the deprovision has seen the
-/// answer many times over — it reads status every ten seconds — and short
-/// enough that a node deleting volumes all day does not carry the list for
-/// ever. Nothing depends on the exact number: a Deprovision for an id this
-/// node no longer has makes a fresh tombstone, so a sweep that ran too early
-/// costs one more round trip and never a stranded object.
+/// Retention for explicit deletion evidence. A later delete of an unknown ID
+/// creates another tombstone if the controller still needs acknowledgement.
 const TOMBSTONE_TTL: Duration = Duration::from_secs(3600);
 
-/// A refusal that is about the data rather than about this node.
-///
-/// Its own type so the dispatch can tell it apart from a driver that broke:
-/// "a VM is holding it" is a correct answer that the tier above has to act
-/// on, and logging it at ERROR beside a dead backend would be wrong.
+/// Volume ownership refusal, distinct from a driver failure for dispatch and logging.
 #[derive(Debug)]
 pub struct HeldByVm {
     pub volume: VolumeId,
@@ -97,18 +57,7 @@ impl std::fmt::Display for HeldByVm {
 
 impl std::error::Error for HeldByVm {}
 
-/// The same refusal about a VM record this build cannot read.
-///
-/// Astra finding S11, 2026-09-23: `holder` asked `Store::list`, which passes
-/// over a row it cannot deserialise, so one corrupt record was the difference
-/// between "a vm is holding this disk" and "nobody is" — and at the end of
-/// that answer the driver destroys bytes a live VMM has open. The guard now
-/// counts an unreadable row as a holder, and this is what it says.
-///
-/// Its own type beside [`HeldByVm`] rather than a variant of it, because the
-/// two need opposite treatment one tier up: a held volume is a CORRECT answer
-/// the control plane acts on by itself (`heals_without_an_operator`), and a
-/// record nobody can read is a node somebody has to look at.
+/// Deletion is blocked by a VM row whose contents cannot be checked for holders.
 #[derive(Debug)]
 pub struct HeldByUnreadable {
     pub volume: VolumeId,
@@ -128,11 +77,7 @@ impl std::fmt::Display for HeldByUnreadable {
 
 impl std::error::Error for HeldByUnreadable {}
 
-/// What stands between a volume on this node and its deletion.
-///
-/// Three answers and not two, which is the whole of S11: a VM has it open, a
-/// row here cannot be read and therefore nobody can say it has not, or
-/// nobody.
+/// A known or possible local consumer that blocks deletion.
 enum Holder {
     Vm(agent_api::VmId),
     Unreadable(String),
@@ -156,7 +101,7 @@ impl Holder {
     }
 }
 
-/// The node's volume half: a store, the one driver registry, and four verbs.
+/// Independent volume and snapshot operations using the agent store and drivers.
 pub struct Volumes {
     store: Arc<Store>,
     drivers: Drivers,
@@ -172,24 +117,8 @@ impl Volumes {
         }
     }
 
-    /// Make the volume, or hand back the one that is already there.
-    ///
-    /// Idempotent twice over, and both are load-bearing. A record that
-    /// already has a handle is done and the driver is not called at all; a
-    /// record without one is picked up again, and the backend finds the
-    /// volume it made before the crash because every backend derives its name
-    /// from the id. The two together are what make it safe for the tier above
-    /// to be level-triggered and simply keep asking.
-    /// Make the volume from a SNAPSHOT this node holds.
-    ///
-    /// Beside `provision` rather than a flag on it, mirroring the trait cut:
-    /// the two start from different things, and a caller that had to pass
-    /// `None` for the snapshot on every ordinary provision would be a caller
-    /// reading a parameter that means nothing to it.
-    ///
-    /// Everything else is `provision`'s: the record before the driver call,
-    /// the idempotence, the `Failed` on the record AND the error to the
-    /// caller. Said once by delegating the write path rather than twice.
+    /// Provision from a stored snapshot handle. Persist intent before calling the
+    /// provider; an existing volume handle makes a repeated request a no-op.
     #[instrument(skip_all, fields(volume_id = %id, snapshot_id = %snapshot, driver, backend))]
     pub async fn provision_from(
         &self,
@@ -203,12 +132,8 @@ impl Volumes {
             debug!(backend = %existing.backend(), "volume already provisioned");
             return Ok(());
         }
-        // Resolved before the record is written, because a snapshot this node
-        // does not have is not something a later pass fixes: the tier above
-        // sent the volume to the node the snapshot is on, so being here
-        // without it means the two disagree, and making an EMPTY disk on the
-        // strength of that would hand somebody a blank volume where they
-        // asked for their data.
+        // Resolve the snapshot before writing a volume record. A missing source
+        // must fail creation rather than fall back to an empty disk.
         let from = self
             .snapshot_handle(&snapshot)?
             .ok_or_else(|| anyhow!("this node has no snapshot {snapshot} to make a volume from"))?;
@@ -282,19 +207,14 @@ impl Volumes {
         if let Some(existing) = self.store.get_volume(&id)?
             && let Some(handle) = &existing.handle
         {
-            // Already made. Not even a `describe`: the record is this node's
-            // own statement about bytes it wrote, and asking the backend on
-            // every repeat would turn a level-triggered pass into a poll of
-            // the disk.
+            // A committed handle makes repeated provisioning idempotent without probing the backend.
             debug!(backend = %handle.backend, "volume already provisioned");
             if existing.phase != VolumeRecordPhase::Ready {
                 self.write(
                     id,
                     VolumeRecord {
                         phase: VolumeRecordPhase::Ready,
-                        // Both cleared with the phase they explained: a
-                        // `Ready` volume carrying the reason its last failed
-                        // attempt had would be a line that contradicts itself.
+                        // Clear stale failure details when returning to Ready.
                         reason: None,
                         message: None,
                         ..existing
@@ -313,10 +233,7 @@ impl Volumes {
                 anyhow!("volume driver {driver_name:?} is not configured on this node")
             })?;
 
-        // Written down BEFORE the driver runs, so that a crash in the middle
-        // leaves a record without a handle rather than nothing at all. That
-        // record is what the next pass picks up; without it the volume would
-        // exist on the backend with nobody on this node aware of it.
+        // Persist intent before calling the driver so interrupted creation can retry with the same ID.
         self.write(
             id,
             VolumeRecord {
@@ -349,10 +266,7 @@ impl Volumes {
             Err(e) => {
                 let message = format!("{e:#}");
                 warn!(error = %message, "volume provision failed");
-                // Failed on the record AND an error to the caller: the first
-                // is what the tier above reads off the status road and turns
-                // into `Volume.status.message`, the second is what makes the
-                // command a failed command rather than a silent one.
+                // Persist the failure for status reports and return it to the command caller.
                 self.write(
                     id,
                     VolumeRecord {
@@ -369,21 +283,15 @@ impl Volumes {
         }
     }
 
-    /// Destroy the volume and its data, or say who is holding it.
-    ///
-    /// Idempotent, including for an id this node has never heard of: that is
-    /// the same outcome, and answering it with a tombstone rather than with
-    /// silence is what keeps the tier above from waiting for ever. See
-    /// [`VolumeRecordPhase::Gone`].
+    /// Delete volume data unless a VM holds it. Unknown IDs also receive a Gone
+    /// tombstone so repeated deletion has an explicit acknowledgement.
     #[instrument(skip_all, fields(volume_id = %id))]
     pub async fn deprovision(&self, id: VolumeId) -> anyhow::Result<()> {
         // Hold the VM operations lock through the holder check and backend call.
         // A local create must not attach after the check but before deletion.
         let _guard = self.ops.lock().await;
         if let Some(holder) = self.holder(&id)? {
-            // The last defence. The controller clears `attachedTo` before it
-            // sends this, so reaching here means the controller is wrong, and
-            // at the end of obeying it anyway is somebody's data.
+            // Persisted VM ownership blocks destructive volume cleanup.
             warn!(vm = %holder.said(), "refusing to deprovision a volume a vm is holding");
             return Err(holder.refusal(id));
         }
@@ -410,16 +318,8 @@ impl Volumes {
                 anyhow!("volume driver {driver_name:?} is not configured on this node")
             })?;
 
-        // A record with no handle is NOT a record of a volume that was never
-        // made. The intent is written before the driver call and a failed
-        // provision leaves the same shape behind, so the bytes may be on the
-        // pool with nothing on this node naming them; "no handle, nothing was
-        // ever made" tombstoned them, and a `Gone` releases the object one
-        // tier up. So the backend is asked. Astra finding S13, 2026-09-23.
-        //
-        // The probe's own failure is an error and not a tombstone: a backend
-        // that could not be asked has not said the bytes are absent, and the
-        // tier above is level-triggered and simply asks again.
+        // A crash can leave backend data without a persisted handle. Probe before
+        // publishing Gone; a failed probe retains the record for retry.
         let handle = match record.handle.clone() {
             Some(handle) => handle,
             None => {
@@ -448,35 +348,9 @@ impl Volumes {
         self.tombstone(id, Some(record.spec), None)
     }
 
-    /// Stop being a node that holds this volume. **The bytes stay.**
-    ///
-    /// The other end of a live migration's bookkeeping. When a guest moves,
-    /// the destination opens the disk before the source lets go, and
-    /// afterwards the object's home moves with the guest — leaving this node
-    /// with a record for a disk it has no business with. It went on reporting
-    /// that volume on every heartbeat, and the cluster dropped every one of
-    /// those reports because this node is neither the volume's home nor a
-    /// holder of it: one line per node per report, for ever (D8/D20).
-    ///
-    /// **No tombstone**, and that is the difference from `deprovision` that
-    /// matters most. `Gone` means "the bytes are not on this node", and from
-    /// a node the control plane still believes is the home — a
-    /// `move_volume_home` that lost a race, a forget that arrived first —
-    /// that word clears `status.node` and strands the volume. The record is
-    /// simply removed, so this node says nothing about the volume at all;
-    /// absence up there means "does not know", which is exactly what has
-    /// become true.
-    ///
-    /// The backend is asked to let go of what it holds PER NODE and nothing
-    /// else — `VolumeProvider::forget`, which for everything but
-    /// `nvmeof-import` does nothing. Its failure is a WARN and not an error:
-    /// what must happen here is that this node stops speaking for the volume,
-    /// and a claim file that could not be removed is a leak on one machine,
-    /// not a reason to keep reporting a disk that has moved.
-    ///
-    /// Idempotent for an id this node has never heard of, and refused while a
-    /// VM here still holds the disk — the same last defence `deprovision`
-    /// has, and reaching it means the tier above is wrong.
+    /// Forget local ownership without deleting data or emitting Gone. Refuse while
+    /// a local VM may hold the volume. Provider forget errors are logged, but the
+    /// local volume row is removed even when that cleanup fails.
     #[instrument(skip_all, fields(volume_id = %id))]
     pub async fn forget(&self, id: VolumeId) -> anyhow::Result<()> {
         let _guard = self.ops.lock().await;
@@ -516,17 +390,9 @@ impl Volumes {
         Ok(())
     }
 
-    /// Freeze what a volume holds right now, under the snapshot's own id.
-    ///
-    /// Idempotent twice over, exactly as `provision` is and for the same two
-    /// reasons: a record that already carries a handle is done without asking
-    /// the backend, and a record without one is picked up again because every
-    /// backend derives the copy's name from the id.
-    ///
-    /// Nothing here pauses anything. Whether the VM has to stand still is the
-    /// DRIVER's answer and the CLUSTER's to act on — the VM may be on another
-    /// machine under a `shared` pool, and only the tier that can see both ends
-    /// can sequence a pause around a call to a second node.
+    /// Create a snapshot under its stable ID, persisting intent first. This method
+    /// does not pause writers or hold the VM operations lock; the controller must
+    /// coordinate consistency across consumers before requesting the copy.
     #[instrument(skip_all, fields(volume_id = %volume, snapshot_id = %id, driver, backend))]
     pub async fn snapshot(&self, id: SnapshotId, volume: VolumeId) -> anyhow::Result<()> {
         if let Some(existing) = self.store.get_snapshot(&id)?
@@ -538,9 +404,7 @@ impl Volumes {
                     &id,
                     &SnapshotRecord {
                         phase: SnapshotRecordPhase::Ready,
-                        // Both cleared with the phase they explained, as on a
-                        // volume: a `Ready` copy carrying the reason of its
-                        // last failed attempt contradicts itself.
+                        // Clear stale snapshot failure details when returning to Ready.
                         reason: None,
                         message: None,
                         ..existing
@@ -565,9 +429,7 @@ impl Volumes {
         tracing::Span::current().record("driver", driver_name.as_str());
         let driver = self.driver(&driver_name)?;
 
-        // The record before the driver call, for the reason `provision` gives
-        // in full: a crash in the middle leaves a record without a handle
-        // rather than nothing at all, and the next pass picks it up.
+        // Persist snapshot intent before the driver call so interrupted creation can retry.
         let pending = SnapshotRecord {
             volume,
             handle: None,
@@ -610,16 +472,8 @@ impl Volumes {
         }
     }
 
-    /// Grow the bytes of a volume this node owns.
-    ///
-    /// The first of the two halves of a resize, and the only one that touches
-    /// data. Always the driver, even when a VM has the disk open and the VMM
-    /// could grow a file itself: a block device grows here or nowhere, and a
-    /// volume nothing is holding has no VMM to ask.
-    ///
-    /// The handle on the record takes the size the BACKEND came out at rather
-    /// than the one asked for — lvm rounds up to the extent size — so the
-    /// status road carries a measurement and not an echo.
+    /// Resize through the provider and persist the returned size, which may exceed
+    /// the request due to backend allocation granularity.
     #[instrument(skip_all, fields(volume_id = %id, size_bytes))]
     pub async fn resize(&self, id: VolumeId, size_bytes: u64) -> anyhow::Result<()> {
         let record = self
@@ -649,12 +503,8 @@ impl Volumes {
         )
     }
 
-    /// Destroy a snapshot and its data.
-    ///
-    /// No holder check, and the absence is the point: nothing attaches a
-    /// snapshot. What holds it is an OBJECT one tier up, and that is where a
-    /// `HeldBy` belongs — the node's own last-defence argument
-    /// (`deprovision`) is about a live attachment, and there is none here.
+    /// Delete a snapshot through its provider. There is no local holder check;
+    /// snapshot use by other operations requires external coordination.
     #[instrument(skip_all, fields(snapshot_id = %id))]
     pub async fn drop_snapshot(&self, id: SnapshotId) -> anyhow::Result<()> {
         let Some(record) = self.store.get_snapshot(&id)? else {
@@ -666,17 +516,9 @@ impl Volumes {
         }
         let driver = self.driver(&record.driver)?;
 
-        // The volume half's argument, one object over: the intent is written
-        // before `snapshot` runs, so a record with no handle may sit in front
-        // of a copy that IS on the pool, and a tombstone over it releases the
-        // object one tier up while the bytes go on filling the volume's own
-        // room (D6 is what a stranded copy costs). Astra finding S13,
-        // 2026-09-23.
-        //
-        // The volume's handle comes along because `lvm-thin` needs it: a
-        // snapshot LV is in the volume's group and a snapshot record does not
-        // carry one. `None` is what a driver that needs it refuses on, and
-        // the refusal keeps the record rather than tombstoning it.
+        // Probe for a snapshot whose creation may have outlived its handle write.
+        // LVM needs the origin handle to locate the snapshot VG; missing evidence
+        // or a probe failure retains the record rather than publishing Gone.
         let handle = match record.handle.clone() {
             Some(handle) => handle,
             None => {
@@ -717,11 +559,7 @@ impl Volumes {
         self.snapshot_tombstone(id, Some(record))
     }
 
-    /// A snapshot record that says the bytes are not here any more.
-    ///
-    /// The mirror of `tombstone` one object over, and the same rule: absence
-    /// from a report is "this node does not know", so the end of a drop has
-    /// to be something the node SAYS.
+    /// Persist explicit snapshot deletion evidence; absence from a report is inconclusive.
     fn snapshot_tombstone(
         &self,
         id: SnapshotId,
@@ -803,27 +641,9 @@ impl Volumes {
             .ok_or_else(|| anyhow!("volume driver {name:?} is not configured on this node"))
     }
 
-    /// Every volume this node has OPEN right now, by uid.
-    ///
-    /// Asked of the VM records and of nothing else, for the reason `holder`
-    /// below is: the attachment belongs to the consumer, and a VM's record is
-    /// what names the volumes it has open. Two things make this the honest
-    /// answer where the union of the VM REPORTS was not:
-    ///
-    /// * every record counts, whatever its own state. A record with
-    ///   `desired = Absent` is gone from the VM half of the report the moment
-    ///   the intent is written (`observe::report` skips it), and its VMM is
-    ///   still holding the disk until a pass has torn it down — with a
-    ///   snapshot or a migration owning the record, until the pass after that.
-    /// * `detached` is what ends it. A stop, a hot-unplug and a teardown all
-    ///   write it after the driver's `detach` came back, so the moment the fd
-    ///   is really closed is the moment this set shrinks.
-    ///
-    /// A record this build cannot read is not counted and does not stop the
-    /// answer — the same rule the rest of this file follows. It is the
-    /// conservative direction here by luck rather than by design, and the
-    /// alternative (refusing to answer at all) would leave the tier above
-    /// with no statement instead of a nearly complete one.
+    /// Collect undetached attachments from readable VM records, regardless of
+    /// desired state. This is persisted attachment evidence, not a probe of open
+    /// file descriptors. Undecodable rows are omitted, so the set can be incomplete.
     fn open_here(&self) -> anyhow::Result<std::collections::BTreeSet<VolumeId>> {
         let mut open = std::collections::BTreeSet::new();
         for (_, record) in self.store.list()? {
@@ -834,22 +654,8 @@ impl Volumes {
         Ok(open)
     }
 
-    /// Which VM on this node is holding this volume, if any.
-    ///
-    /// Asked of the VM records rather than of the volume record, because the
-    /// attachment belongs to the consumer: a VM's record is what names the
-    /// volumes it has open, and that stays true whether the volume was made
-    /// inline or handed over as an object.
-    ///
-    /// **A row this build cannot read counts as a holder.** `Store::rows` and
-    /// not `Store::list`, for the reason `provision::network::overlay_users`
-    /// gives one file over and that this guard needed at least as badly:
-    /// `list` passes over a damaged record, and the caller here is the last
-    /// thing between a mistake one tier up and somebody's data. An unreadable
-    /// row may name this volume — nothing can say it does not — so the
-    /// deprovision is refused, the node leaks a disk instead of destroying a
-    /// live one, and an operator is told which key to look at. Astra finding
-    /// S11, 2026-09-23.
+    /// Find a local attachment or unreadable VM row that prevents proving the
+    /// volume unused. Unlike reporting, deletion checks retain unreadable rows.
     fn holder(&self, id: &VolumeId) -> anyhow::Result<Option<Holder>> {
         for row in self.store.rows()? {
             match row {
@@ -868,12 +674,7 @@ impl Volumes {
         Ok(None)
     }
 
-    /// What this node has to say about its volumes, for the status report.
-    ///
-    /// Tombstones included and swept on the way past: this is the one pass
-    /// that runs on every heartbeat, so it is where the sweep costs nothing
-    /// extra. A record that is too old to matter is removed AND left out,
-    /// which is the same statement a fresh node makes about it.
+    /// Report volumes and remove expired tombstones during the heartbeat inventory pass.
     pub fn report(&self) -> Vec<proto::VolumeStateReport> {
         let records = match self.store.list_volumes() {
             Ok(records) => records,
@@ -882,16 +683,9 @@ impl Volumes {
                 return Vec::new();
             }
         };
-        // One walk of the VM records for the whole report rather than one
-        // per volume: a node with forty VMs and forty disks would otherwise
-        // read the same table forty times every ten seconds.
-        //
-        // A read that fails leaves the set empty, and an empty set says "open
-        // nowhere" about every line below. That is the direction this has to
-        // fail in: the alternative is to claim a disk is open because the
-        // records could not be read, and a claim like that never expires by
-        // itself. The tier above sees a node that stopped saying `open`, and
-        // the store failure is a NodeCondition of its own (`StoreUnhealthy`).
+        // Read VM attachments once for this report. Currently an inventory error
+        // falls back to an empty set, and Store::list skips undecodable rows.
+        // Thus open=false can reflect missing evidence rather than a closed writer.
         let open = self.open_here().unwrap_or_else(|e| {
             error!(error = %format!("{e:#}"), "reading the vm records for the open set failed");
             Default::default()
@@ -918,25 +712,18 @@ impl Volumes {
                 reason: reported_reason(&record)
                     .map(|reason| reason.as_str().to_string())
                     .unwrap_or_default(),
-                // Whether anything on this node is holding it, from the VM
-                // records. See `open_here`: this is the statement `openOn` is
-                // derived from, so it has to be true while the fd is, and not
-                // while the object it belongs to happens to be reported.
+                // Derive open ownership from readable VM records; see `open_here` for limitations.
                 open: open.contains(&id),
                 message: record.message.clone().unwrap_or_default(),
-                // What the handle says the volume IS, which after a resize is
-                // not what the spec asked for: lvm rounds up to the extent
-                // size. Zero while there is no handle, which reads up there
-                // as "not measured".
+                // Report measured handle size, including backend rounding after resize.
+                // Zero means no handle measurement is available.
                 size_bytes: record.handle.as_ref().map(|h| h.size_bytes).unwrap_or(0),
             });
         }
         out
     }
 
-    /// Every volume record, for `meister agent volume ls`. Tombstones and all
-    /// — an operator asking what this node holds wants the one that was just
-    /// deleted in the list too.
+    /// List all local volume records, including deletion tombstones.
     pub fn list(&self) -> anyhow::Result<Vec<(VolumeId, VolumeRecord)>> {
         self.store.list_volumes()
     }
@@ -945,13 +732,8 @@ impl Volumes {
         self.store.get_volume(id)
     }
 
-    /// Ask every backend whether the volumes this node thinks it has are
-    /// really there. Run once, at start-up, the way VMs are adopted.
-    ///
-    /// A volume the backend has never heard of is `Failed` and not silently
-    /// re-made: the tier above owns that decision, its requeue is what kicks,
-    /// and the kick is another Provision — which is idempotent, so the repair
-    /// path is the ordinary path and there is no second one to get wrong.
+    /// Probe stored volumes once at startup. Missing backend data becomes Failed;
+    /// recreation requires a subsequent Provision command.
     pub async fn adopt(&self) {
         let records = match self.store.list_volumes() {
             Ok(records) => records,
@@ -991,11 +773,7 @@ impl Volumes {
                         VolumeRecord {
                             handle: None,
                             phase: VolumeRecordPhase::Failed,
-                            // Not `DriverRefused`: nothing refused anything.
-                            // The bytes this node wrote a record about are
-                            // not on the backend any more, and the tier above
-                            // has to be able to tell that from a provision
-                            // that did not work.
+                            // Distinguish lost backend data from a driver refusing a provisioning request.
                             reason: Some(VolumeReason::NotOnBackend),
                             message: Some(message),
                             ..record
@@ -1005,10 +783,8 @@ impl Volumes {
                               "marking the volume failed did not stick");
                     }
                 }
-                // A backend that could not be asked is not a backend that
-                // said no. The record stays Ready and the next start-up asks
-                // again — an unreachable export must not turn into "the data
-                // is gone".
+                // Probe errors leave the record unchanged; an unreachable backend does
+                // not establish that its data is absent.
                 Err(e) => warn!(volume_id = %id, error = %format!("{e:#}"),
                                 "could not ask the backend about a stored volume"),
             }
@@ -1045,11 +821,7 @@ impl Volumes {
     }
 }
 
-/// Parse the spec a `ProvisionVolume` carries.
-///
-/// Its own function so the error names the field rather than the crate: a
-/// controller that sends something this node cannot read gets a sentence
-/// about the document, not a serde path.
+/// Deserialize a ProvisionVolume spec with field-specific error context.
 pub fn parse_spec(spec_json: &str) -> anyhow::Result<VolumeSpec> {
     if spec_json.is_empty() {
         bail!("provision volume without a spec");
@@ -1063,9 +835,7 @@ mod tests {
     use agent_api::storage::{VolumeAttachment, VolumeHandle};
     use std::collections::HashMap;
 
-    /// A real `filesystem` backend over a temp directory, and a store beside
-    /// it. No hypervisor anywhere: the whole point of the volume half is that
-    /// it needs no consumer, so these tests need no VM either.
+    /// Filesystem-backed independent-volume fixture with a local store and no hypervisor.
     fn node(tag: &str) -> (tempfile::TempDir, Volumes, Arc<Store>, std::path::PathBuf) {
         let temp = tempfile::Builder::new()
             .prefix(&format!("meister-vol-{tag}-"))
@@ -1126,10 +896,7 @@ mod tests {
             .ino()
     }
 
-    /// The contract the whole level-triggered tier above rests on: asking
-    /// twice makes one volume. The inode is the proof — a second provision
-    /// that re-created the file would be a second inode, and somebody's data
-    /// would be the thing that had been replaced.
+    /// Repeated provisioning preserves the volume inode and its data.
     #[tokio::test]
     async fn provisioning_twice_makes_one_volume_and_keeps_its_inode() {
         let (_temp, volumes, _, dir) = node("idempotent");
@@ -1152,9 +919,7 @@ mod tests {
         assert_eq!(records[0].1.backend(), path.to_string_lossy());
     }
 
-    /// The record is what makes bytes survive the process that made them.
-    /// Without it a restarted agent could not be asked to delete anything it
-    /// had ever made.
+    /// Volume ownership records survive reopening the store.
     #[tokio::test]
     async fn a_record_survives_the_store_being_reopened() {
         let (_temp, volumes, store, dir) = node("restart");
@@ -1173,8 +938,7 @@ mod tests {
         assert_eq!(record.backend(), backend);
     }
 
-    /// A status report carries the volume with its phase and the name its
-    /// backend knows it by — the same road a VM phase takes.
+    /// Report each volume with its lifecycle phase and backend name.
     #[tokio::test]
     async fn the_status_report_carries_the_volume_with_its_phase() {
         let (_temp, volumes, _, _) = node("report");
@@ -1189,13 +953,7 @@ mod tests {
         assert!(report[0].message.is_empty());
     }
 
-    /// Every volume line but a `Ready` one says WHICH kind of trouble it is.
-    ///
-    /// Four words over four paths, and the pair that earns the field is
-    /// `DriverRefused` against `NotOnBackend`: a provision the backend said no
-    /// to is retried by the tier above and costs nothing, and a volume the
-    /// backend has LOST is somebody's data gone. Both were `Failed` plus a
-    /// driver's sentence, and a program cannot branch on a sentence.
+    /// Failure reasons distinguish a refused operation, missing data and completed deletion.
     #[tokio::test]
     async fn a_volume_line_says_which_kind_of_trouble_it_is() {
         let (_temp, volumes, store, dir) = node("reasons");
@@ -1207,8 +965,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("a line for {id}"))
         };
 
-        // The backend refuses: the base image this spec names is on no disk
-        // here. A retry after somebody puts it there is the whole fix.
+        // An absent base image makes provisioning fail until the image appears.
         let refused = VolumeId::new_v4();
         let mut asks_for_an_image = spec(4096);
         asks_for_an_image.base_image = Some("not-on-this-node.raw".into());
@@ -1238,7 +995,7 @@ mod tests {
         assert_eq!(line(&lost).phase, "Failed");
         assert_eq!(line(&lost).reason, "NotOnBackend");
 
-        // The tombstone the tier above may release a volume on.
+        // Verify explicit deletion evidence in the report.
         let gone = VolumeId::new_v4();
         volumes.provision(gone, spec(4096)).await.expect("made");
         volumes.deprovision(gone).await.expect("deprovisioned");
@@ -1266,12 +1023,7 @@ mod tests {
         assert_eq!(line(&older).message, "what an older build wrote");
     }
 
-    /// A copy says which kind of trouble it is, on the same three roads the
-    /// disk does.
-    ///
-    /// The snapshot half of the reasons round. A copy outlives the volume it
-    /// came from, so its line is the only thing left saying anything about it
-    /// — and `Failed` plus a driver's sentence was all it said.
+    /// Snapshot reports distinguish driver failure, completed deletion and legacy missing reasons.
     #[tokio::test]
     async fn a_snapshot_line_says_which_kind_of_trouble_it_is() {
         let (_temp, volumes, store, dir) = node("snap-reasons");
@@ -1307,8 +1059,7 @@ mod tests {
             "and it says what it said"
         );
 
-        // A drop for a copy this node never had: the same outcome, and a
-        // tombstone rather than silence, exactly as a volume's deprovision is.
+        // Dropping an unknown snapshot produces a Gone tombstone.
         let never = SnapshotId::new_v4();
         volumes.drop_snapshot(never).await.expect("already gone");
         assert_eq!(line(&never).phase, "Gone");
@@ -1334,10 +1085,7 @@ mod tests {
         assert_eq!(line(&older).message, "what an older build wrote");
     }
 
-    /// The node is the last defence. The controller clears `attachedTo`
-    /// before it sends a deprovision, so this can only fire when the tier
-    /// above is wrong — and at the end of obeying it anyway is somebody's
-    /// data.
+    /// Refuse destructive cleanup while persisted VM ownership remains.
     #[tokio::test]
     async fn deprovisioning_a_volume_a_vm_holds_is_refused_and_keeps_the_bytes() {
         let (_temp, volumes, store, dir) = node("held");
@@ -1453,9 +1201,7 @@ mod tests {
         }
     }
 
-    /// Deprovision removes the data and leaves a tombstone, because absence
-    /// from a report means "does not know" and only an explicit `Gone` may
-    /// release the object one tier up.
+    /// Deletion removes volume data and emits explicit Gone evidence.
     #[tokio::test]
     async fn deprovision_removes_the_data_and_answers_gone_afterwards() {
         let (_temp, volumes, _, dir) = node("gone");
@@ -1471,15 +1217,12 @@ mod tests {
         assert_eq!(report.len(), 1, "the tombstone is still reported");
         assert_eq!(report[0].phase, "Gone");
 
-        // Idempotent: the second one is the same answer, not an error.
+        // Repeated deletion retains the Gone result.
         volumes.deprovision(id).await.expect("again");
         assert_eq!(volumes.report()[0].phase, "Gone");
     }
 
-    /// A deprovision for an id this node has never heard of is the same
-    /// outcome and gets the same answer. Without this the tombstone sweep
-    /// could strand the tier above: it would ask, hear nothing, and wait for
-    /// ever on a volume that does not exist.
+    /// Unknown-volume deletion emits a Gone tombstone, including after an older tombstone expires.
     #[tokio::test]
     async fn deprovisioning_an_unknown_volume_answers_gone_rather_than_silence() {
         let (_temp, volumes, _, _) = node("unknown");
@@ -1491,10 +1234,7 @@ mod tests {
         assert_eq!(report[0].phase, "Gone");
     }
 
-    /// A backend that has lost the volume is `Failed` and not silently
-    /// re-made: the decision belongs to the tier above, and its kick is
-    /// another Provision — which is idempotent, so the repair path is the
-    /// ordinary path.
+    /// Adoption marks missing backend data Failed without recreating it.
     #[tokio::test]
     async fn a_volume_the_backend_lost_is_adopted_as_failed() {
         let (_temp, volumes, _, dir) = node("adopt");
@@ -1515,8 +1255,7 @@ mod tests {
         );
     }
 
-    /// A volume that is really there stays Ready, and adoption says nothing
-    /// about it — the ordinary case, and the one a restart must not disturb.
+    /// Adoption preserves existing Ready volumes.
     #[tokio::test]
     async fn a_volume_that_is_there_survives_adoption_untouched() {
         let (_temp, volumes, _, _) = node("adopt-ok");
@@ -1529,9 +1268,7 @@ mod tests {
         assert_eq!(after.backend(), before.backend());
     }
 
-    /// A spec naming a backend this node does not have is a refused command,
-    /// and the record must not be left behind as a Failed volume nobody asked
-    /// for.
+    /// Unsupported drivers fail before a volume record is written.
     #[tokio::test]
     async fn a_spec_naming_an_unknown_backend_is_refused() {
         let (_temp, volumes, _, _) = node("unknown-driver");
@@ -1649,10 +1386,7 @@ mod tests {
         let back = proto::StatusReport::decode(report.encode_to_vec().as_slice()).unwrap();
         assert_eq!(back.volumes[0].phase, "Ready");
         assert_eq!(back.volumes[0].backend, "/var/lib/meister/volumes/x.raw");
-        // The word `openOn` is derived from, over the wire: a `true` has to
-        // arrive as one, and a node from before the field sends nothing —
-        // which decodes `false`, the value the tier above may not read as
-        // evidence of anything.
+        // Preserve the open flag on the wire. Older senders omit it, decoding to false.
         assert!(back.volumes[0].open);
 
         // A report from an agent that predates the field carries none, and
@@ -1676,21 +1410,8 @@ mod tests {
                 .is_empty()
         );
     }
-    /// Forgetting removes the record and keeps every byte.
-    ///
-    /// The whole of D20, and the whole of what makes it safe to send: the
-    /// source of a finished live migration has a record for a disk whose home
-    /// has moved, and the only two commands that could take it away before
-    /// this one were `Destroy` (which is about a VM) and `DeprovisionVolume`
-    /// (which unlinks the file). So the record stayed, the node reported the
-    /// volume on every heartbeat for ever, and the cluster dropped every
-    /// report because that node is neither the volume's home nor a holder of
-    /// it.
-    ///
-    /// Absence and not a tombstone, which is the difference that matters
-    /// most: `Gone` says "the bytes are not on this node", and from a node the
-    /// control plane still believes is the home that word clears
-    /// `status.node` and strands the volume.
+
+    /// Forget removes local ownership without deleting data or emitting a Gone tombstone.
     #[tokio::test]
     async fn forgetting_a_volume_takes_the_record_and_leaves_the_data() {
         let (_temp, volumes, store, dir) = node("forget");
@@ -1739,8 +1460,7 @@ mod tests {
             .expect("forgetting nothing is done");
         volumes.forget(id).await.expect("and twice is once");
 
-        // The last defence, the same one a deprovision has: a volume a VM
-        // here is holding is not forgotten, whoever asked.
+        // Persisted VM ownership also blocks forgetting the volume.
         let held = VolumeId::new_v4();
         volumes
             .provision(held, spec(1024 * 1024))
@@ -1771,12 +1491,8 @@ mod tests {
         );
     }
 
-    /// Every destructive call of the `filesystem` backend, counted.
-    ///
-    /// A guard that refuses is only half of what has to be proven; the other
-    /// half is that the driver was never reached, and a real backend cannot
-    /// say that about itself. Everything else is delegated, so a volume made
-    /// through this one is a volume on the disk.
+    /// Count destructive calls while delegating to the filesystem backend.
+    /// A refusal must also prove that the destructive driver method was not called.
     struct Counting {
         inner: Arc<dyn agent_api::storage::VolumeDriver>,
         deprovisions: std::sync::atomic::AtomicUsize,
@@ -1883,7 +1599,7 @@ mod tests {
         }
     }
 
-    /// `node`, with the one backend wrapped in [`Counting`].
+    /// Volume fixture with destructive calls instrumented by `Counting`.
     fn counted_node(
         tag: &str,
     ) -> (
@@ -1921,16 +1637,7 @@ mod tests {
         )
     }
 
-    /// A VM record nobody can read is a VM that may be holding the disk, and
-    /// the node answers accordingly.
-    ///
-    /// Astra finding S11, 2026-09-23. `holder` walked `Store::list`, which
-    /// logs a row it cannot deserialise and passes over it — so one torn
-    /// write turned "a live VMM has this disk open" into "nobody is holding
-    /// it", and the backend was then told to destroy the bytes. The guard
-    /// counts the unreadable row, and the proof that it did is a fake backend
-    /// that saw no call at all: the real one would make the same file either
-    /// way and this test would stay green while the rule was broken.
+    /// An unreadable VM row may own any volume. Count backend calls to prove deletion was refused.
     #[tokio::test]
     async fn a_corrupt_vm_record_still_blocks_a_deprovision() {
         let (_temp, volumes, store, dir, driver) = counted_node("corrupt-holder");
@@ -1939,9 +1646,7 @@ mod tests {
         let path = dir.join(format!("{id}.raw"));
         assert!(path.exists());
 
-        // Garbage under a VM key: a torn write, or a record from a build
-        // whose struct this one cannot read. It is the VM that holds the
-        // disk, and nothing here can find that out.
+        // An unreadable VM row may hold this disk, so ownership is unknown.
         let vm = agent_api::VmId::new_v4();
         store
             .put_raw(&vm.to_string(), b"{\"spec\":")
@@ -1971,8 +1676,7 @@ mod tests {
             "and the record did not move"
         );
 
-        // The same row stops a `forget`, which is the other verb that walks
-        // past a holder.
+        // The unreadable row also blocks forget.
         let refused = volumes
             .forget(id)
             .await
@@ -1980,19 +1684,7 @@ mod tests {
         assert!(refused.chain().any(|c| c.is::<HeldByUnreadable>()));
     }
 
-    /// A record with no handle is asked about before it is called `Gone`.
-    ///
-    /// Astra finding S13, 2026-09-23. The intent is written BEFORE the driver
-    /// runs and a failed provision leaves the same shape behind, so a
-    /// handle-less record is not proof that nothing was made — and the
-    /// deprovision answered one with a tombstone and no driver call at all.
-    /// `Gone` is the one word that releases the object one tier up, so the
-    /// volume was deleted from the control plane while its data stayed on the
-    /// pool, with nothing left pointing at it.
-    ///
-    /// Both directions, because only the pair is the rule: bytes that are
-    /// there are removed first, and a backend that really holds nothing still
-    /// gets its tombstone rather than an error.
+    /// A crash can lose the handle after creation. Probe before publishing a deletion tombstone.
     #[tokio::test]
     async fn a_record_with_no_handle_is_probed_before_it_is_called_gone() {
         let (_temp, volumes, store, dir) = node("probe-before-gone");
@@ -2028,9 +1720,7 @@ mod tests {
             VolumeRecordPhase::Gone
         );
 
-        // And one the backend really has nothing for: the same tombstone, no
-        // error, because the guard may not turn a clean absence into a
-        // volume that never converges.
+        // Confirmed backend absence permits a Gone tombstone.
         let never = VolumeId::new_v4();
         store
             .put_volume(
@@ -2051,8 +1741,7 @@ mod tests {
             VolumeRecordPhase::Gone
         );
 
-        // The snapshot half, the same way round: a copy on the pool under a
-        // record that never got its handle.
+        // Recover a backend snapshot whose pending record lacks its handle.
         let volume = VolumeId::new_v4();
         volumes.provision(volume, spec(4096)).await.expect("made");
         let snapshot = SnapshotId::new_v4();

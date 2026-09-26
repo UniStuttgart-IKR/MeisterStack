@@ -2,31 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# What a private key on a managed host has to look like, measured on one.
-#
-# M0's probe S11 measured the other road and closed it: `LoadCredential`
-# hands a unit a `root:root 0440` file behind a POSIX ACL, and all three key
-# loaders of this codebase refuse a mode with group bits in it. The decision
-# that followed (Gate M0, D1 changed) is that identity keys are ordinary
-# files, `meister:meister 0600`, under `meisterstack.pki.dir` — and this test
-# is what holds the three halves of that to a running machine:
-#
-# * the unit takes no systemd credential at all;
-# * a key at 0600 owned by the user that reads it gets PAST the loader —
-#   what stops the agent afterwards is the content of a certificate nobody
-#   signed, which is a different sentence and a different milestone;
-# * a key at 0640 is refused with the loader's own words, and refused by the
-#   loader rather than by a comment;
-# * and the mode survives a reboot, because the tmpfiles rule of
-#   nix/agent.nix enforces it rather than merely creating it.
-#
-# **What this does NOT show, and why.** V09 also asks for a real mTLS
-# session: the agent logging in at a cluster controller, a restart, a
-# reboot, and the session coming back each time. That needs a CA that has
-# signed both ends — `keys issue`, `keys deliver` and `tools/meister-ca`,
-# all of which are M3B. The certificate here is self-signed and nobody
-# trusts it. So the session half is **not proven**, it is named as missing,
-# and M3's `vm-bootstrap-fleet` is where it belongs.
+# Check ordinary key files, ownership, restrictive modes, and reboot enforcement.
+# This test uses an untrusted certificate to distinguish file-access checks from
+# TLS validation; keys.nix covers successful authenticated sessions.
 { nixpkgs, lib, pkgs, system, self }:
 
 pkgs.testers.runNixOSTest {

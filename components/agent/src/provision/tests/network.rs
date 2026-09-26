@@ -7,10 +7,7 @@
 
 use super::*;
 
-/// A network driver that makes nothing and remembers everything asked of
-/// it. The taps and the overlay both, because the two halves are one
-/// driver on a real node and the teardown's order between them is part of
-/// what is being proven.
+/// Record NIC and overlay operations together to verify cross-resource teardown order.
 #[derive(Default)]
 struct RecordingNet {
     taps_destroyed: std::sync::Mutex<Vec<agent_api::networking::NicId>>,
@@ -31,9 +28,7 @@ impl agent_api::networking::NicDriver for RecordingNet {
             id: *id,
             tap_name: format!("tap{id}"),
             mtu: None,
-            // A driver that makes nothing still says which address it would
-            // have pinned, because that is what a real one hands back and
-            // what the status report reads.
+            // Preserve the requested MAC in the fake attachment for status reporting.
             mac: Some(spec.mac),
         })
     }
@@ -87,14 +82,7 @@ impl agent_api::networking::BridgeDriver for RecordingNet {
     }
 }
 
-/// Two VMs on one tenant wire: the first to go leaves the overlay
-/// standing, the second takes it with it — and an agent restart between
-/// the two changes nothing, because the count is read off the records and
-/// the records are what a restart brings back.
-///
-/// The restart is real and not simulated: the store is dropped and
-/// reopened on the same file, and a second `Provisioner` is built over it
-/// the way `main` builds the first one.
+/// Overlay users are derived from persisted records, including after reopening the store.
 #[tokio::test]
 async fn an_overlay_goes_when_its_last_vm_does_and_a_restart_does_not_confuse_the_count() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -170,7 +158,7 @@ async fn an_overlay_goes_when_its_last_vm_does_and_a_restart_does_not_confuse_th
         "the last vm on the wire took the overlay with it, and only that one"
     );
 
-    // And the wire nobody left is still up.
+    // Remaining references keep the overlay alive.
     {
         let store = Arc::new(crate::store::Store::open(&db).expect("the store, again"));
         assert!(store.get(&other_id).expect("a read").is_some());
@@ -211,19 +199,7 @@ fn a_vm_that_has_not_made_its_tap_yet_still_counts_as_a_user() {
     );
 }
 
-/// The teardown asks the driver about the bridge the RECORD names.
-///
-/// Nachlese 4: `ensure_overlay` has always answered with the name of the
-/// bridge it built, and the answer was logged and dropped. The teardown then
-/// asked for the VNI alone and whichever network driver the agent held
-/// rebuilt the name from it — the same string only while one driver builds
-/// overlays on a node. Now the name is written on the record where it was
-/// learned, and it is handed back at the teardown, where a driver that names
-/// its links differently can refuse instead of removing somebody else's.
-///
-/// Both halves are asserted here, because a record from before this existed
-/// has to go on working: a VM whose record names its bridge hands the name
-/// over, and a VM whose record does not hands `None`.
+/// Pass the persisted bridge name to cleanup; legacy records supply None.
 #[tokio::test]
 async fn the_teardown_names_the_bridge_the_record_says_the_overlay_got() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -279,15 +255,7 @@ async fn the_teardown_names_the_bridge_the_record_says_the_overlay_got() {
     );
 }
 
-/// A row this build cannot read holds every wire open.
-///
-/// The count is the one reader of the record table that must not pass over a
-/// damaged row. `Store::list` logs one and goes on, which is right for
-/// everybody else — not knowing of a VM is not the same as it not being
-/// there — and here it would mean reaching zero while a guest is still on the
-/// wire and taking its bridge out from under it. So an unreadable row counts
-/// as a user: the node leaks a bridge instead of breaking a VM, and the WARN
-/// says which row.
+/// An unreadable row conservatively counts as a user of every overlay.
 #[test]
 fn a_record_this_build_cannot_read_still_holds_the_wire_open() {
     let temp = tempfile::tempdir().expect("a temp dir");

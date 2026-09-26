@@ -6,13 +6,8 @@
 
 use super::*;
 
-/// Capacity held before a migration destination is prepared, while ordinary
-/// VM bindings do not yet account for the arriving guest. The migration name
-/// is the create-only key; VM and migration UIDs identify the incarnations.
-///
-/// Release must follow the migration ownership protocol. An unresolved attempt
-/// retains its reservation; elapsed time or a lost reply does not free capacity.
-/// The stored resource amounts keep accounting independent of later VM edits.
+/// Capacity claim held while preparing a migration destination. It competes with ordinary VM
+/// placement and belongs to one migration name/UID pair.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapacityReservationSpec {
@@ -31,19 +26,11 @@ pub struct CapacityReservationSpec {
     /// The migration this promise belongs to, by name.
     #[serde(default)]
     pub migration: String,
-    /// And WHICH migration of that name. A migration is named for a vm and a
-    /// moment, and a record can be removed and one made again under the same
-    /// name; without this, releasing a reservation would be a delete by name
-    /// alone — the ABA hole S19 closed for secrets, in a place where the cost
-    /// of getting it wrong is a node carrying twice its memory.
+    /// Migration UID, preventing a later resource with the same name from inheriting the claim.
     #[serde(default)]
     pub migration_uid: String,
-    /// What the guest asks for, read by `Capacity::wanted_by` off the very
-    /// spec the agent will be handed. Stored rather than looked up, because
-    /// the whole point of this object is to be readable by a replica that
-    /// cannot see the VM's future: a reservation whose size had to be derived
-    /// from the VM would stop meaning anything the moment the VM was resized
-    /// or removed mid-flight.
+    /// Serialized VM requirements read by Capacity::wanted_by using the same accounting as
+    /// ordinary placement.
     #[serde(default)]
     pub vcpus: u32,
     #[serde(default)]
@@ -63,12 +50,7 @@ impl CapacityReservationSpec {
 pub type CapacityReservation = Object<CapacityReservationSpec, ()>;
 
 impl CapacityReservation {
-    /// The reservation one migration would make at `node` for `vm`.
-    ///
-    /// One constructor, called by the one place that reserves, so the name
-    /// and the uid pair can never be filled in two different ways — the whole
-    /// of the release and the whole of the reaper are a comparison against
-    /// what this wrote.
+    /// Construct the destination reservation for one migration and VM identity.
     pub fn of(migration: &VmMigration, vm: &Vm, node: &str) -> Self {
         Self::declare(
             &migration.metadata.name,
@@ -84,32 +66,16 @@ impl CapacityReservation {
         )
     }
 
-    /// Is this reservation the one `migration` made?
-    ///
-    /// Name AND uid, which is the whole point of carrying the uid: a record
-    /// removed and made again under the same name is a different move, and a
-    /// reservation held for the first of them is capacity nobody is coming
-    /// for.
+    /// Match both migration name and UID so recreated operations cannot adopt old reservations.
     pub fn belongs_to(&self, migration: &VmMigration) -> bool {
         self.spec.migration == migration.metadata.name
             && self.spec.migration_uid == migration.metadata.uid
     }
 }
 
-/// The reservations nobody is coming for: the reaper's whole decision, as a
-/// function that needs no store.
-///
-/// A reservation is live exactly while a migration of its own name and uid is
-/// still being carried — not final, and not on its way out. Everything else
-/// is an orphan, and the four ways to become one are the four ways this
-/// comparison fails: the migration finished, it failed, it was deleted, or
-/// its name was taken by a later record.
-///
-/// This is the invariant on the [`CapacityReservation`] type with a store
-/// behind it: a reservation outlives nothing. A controller that died between
-/// the reservation and the migration's last phase would otherwise hold a
-/// machine's room for ever, and nothing in the fleet could say why the node
-/// was full.
+/// A reservation is live only while its matching migration name and UID exists, is nonterminal,
+/// and is not deleting. Finished, failed, deleted, or recreated migrations leave orphan
+/// reservations for the reaper.
 pub fn orphaned_reservations<'a>(
     held: &'a [CapacityReservation],
     migrations: &[VmMigration],

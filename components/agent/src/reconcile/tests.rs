@@ -2,9 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The reconciler's tests, verbatim out of `reconcile.rs`. The module path is
-//! unchanged (`reconcile::tests`), so every test still answers to the name it
-//! had before.
+//! Planner, status-report and reconciliation tests using deterministic observations
+//! and fake drivers; selected cases also inspect local files and processes.
 
 use super::*;
 use crate::types::VmRecord;
@@ -34,11 +33,7 @@ fn now() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
 }
 
-/// The one line that decides whether a dead virtiofsd quarantines a VM.
-/// A share's backend has to be counted exactly as a gpu backend is, and
-/// the things with no process behind them must not be counted at all —
-/// a passthrough device or a plain disk contributing a phantom pid would
-/// quarantine every VM that has one.
+/// Only attachments with backend processes contribute to backend-liveness checks.
 #[test]
 fn every_backend_process_counts_and_nothing_else_does() {
     use agent_api::device::Device;
@@ -108,16 +103,7 @@ fn dead_vmm_reprovisions_when_running_desired() {
     );
 }
 
-/// The decision the chaos run put a question mark over, nailed down so it
-/// cannot drift into a quarantine by accident.
-///
-/// The observed behaviour was `Running -> Provisioning -> Running` in
-/// fifteen seconds where the expectation said `Quarantined`, and the code
-/// is the half that is right: a dead VMM takes its backends with it, so
-/// nothing is left standing to diagnose and rebuilding is strictly better
-/// than waiting for a person. What the quarantine is FOR is the other
-/// shape, and both halves are asserted here — the same VM, the same
-/// record, and only `vmm_alive` between them.
+/// A dead VMM selects reprovision; a backend lost under a live VMM persists quarantine.
 #[test]
 fn a_killed_vmm_recovers_and_a_backend_that_dies_under_a_live_one_does_not() {
     use agent_api::storage::{Volume, VolumeAttachment, VolumeHandle};
@@ -141,9 +127,7 @@ fn a_killed_vmm_recovers_and_a_backend_that_dies_under_a_live_one_does_not() {
     )];
     assert_eq!(backend_pids(&r).count(), 1, "there is a backend to lose");
 
-    // `kill -9` on the VMM. The backend hangs up with it, so BOTH are
-    // gone by the next pass — which is exactly the shape that must not
-    // read as "a backend died".
+    // A dead VMM and its dead backend require normal recovery, not backend-loss quarantine.
     let killed = obs(false, false, false, None);
     assert!(
         !backend_died_under_vmm(&r, &killed),
@@ -173,17 +157,13 @@ fn a_killed_vmm_recovers_and_a_backend_that_dies_under_a_live_one_does_not() {
         Action::Quarantined,
         "no automatic repair of a live vm with half its hardware gone"
     );
-    // And the tier above is told WHICH quarantine this is, out of the marker
-    // rather than out of the sentence: the two quarantines this agent has
-    // want different things done about them.
+    // Report the specific quarantine reason from its persisted marker.
     assert_eq!(
         report_status(&r, &orphaned, 0, None).reason,
         Some(VmReason::BackendGone)
     );
 
-    // And a VM without the marker in the same world is not quarantined by
-    // the observation alone: the record is what the gate reads, so the
-    // marking and the gate cannot disagree.
+    // Observation alone does not activate the persisted quarantine gate.
     r.unhealthy = None;
     assert_eq!(plan(&r, &orphaned, now()), Action::None);
 }
@@ -223,8 +203,7 @@ fn stopping_runs_stop_posthumously_exactly_once() {
 
 #[test]
 fn stopping_a_paused_guest_does_not_wait_out_the_grace() {
-    // A paused guest cannot act on a power button, so the deadline would
-    // only ever expire unused.
+    // Paused guests cannot process a shutdown request; select Stop without waiting.
     let mut r = record(Desired::Stopped, Phase::Provisioned);
     r.stop_deadline = Some(now() + Duration::from_secs(30));
     assert_eq!(
@@ -367,9 +346,7 @@ fn unhealthy_reports_quarantined_with_its_reason() {
     let reported = report_status(&r, &obs(true, true, false, Some(VmState::Running)), 0, None);
     assert_eq!(reported.phase.as_str(), "Quarantined");
     assert_eq!(reported.message.as_deref(), Some("backend died"));
-    // A marker no build of this agent writes: the sentence travels on and the
-    // word says that nothing here recognised it, rather than the line being
-    // dropped or a wrong class being guessed.
+    // Unknown markers retain their message and report Unrecorded.
     assert_eq!(reported.reason, Some(VmReason::Unrecorded));
 }
 
@@ -392,10 +369,7 @@ fn managed(desired: Desired) -> VmRecord {
     r
 }
 
-/// The failover, asserted at the only place it is decided: an address is
-/// announced because its VM is running HERE. Stop it, tear it down or move
-/// it, and the same mechanism withdraws — the record stops contributing to
-/// this set.
+/// Announce host routes only for guests observed running on this node.
 #[test]
 fn only_the_addresses_of_running_vms_are_announced_and_only_as_host_routes() {
     let mut holder = record(Desired::Running, Phase::Provisioned);
@@ -417,8 +391,7 @@ fn only_the_addresses_of_running_vms_are_announced_and_only_as_host_routes() {
         announced,
         ["10.255.0.7/32".to_string(), "203.0.113.9/32".to_string()].into()
     );
-    // The routed subnet is NOT in there. A subnet spans hosts, so a
-    // per-host announcement would be every node claiming the whole prefix.
+    // Do not announce a tenant subnet from every host; advertise local host routes only.
     assert!(
         !announced.iter().any(|p| p.contains("10.7.1")),
         "{announced:?}"
@@ -450,13 +423,8 @@ fn a_snapshot_never_touches_a_locally_created_vm() {
     assert!(sync_orphans(&HashSet::new(), [(local, &r)]).is_empty());
 }
 
-/// A migration in flight survives a snapshot, and the reason is the one
-/// the E2E paid for: the snapshot lists the vms BOUND to this node, and
-/// for the whole of a live migration the destination is not one of them.
-///
-/// Only the DESTINATION, though: a migrated record holds no guest, and
-/// the reap is the second way out it needs when its explicit destroy was
-/// lost.
+/// Receiving records survive a desired-state snapshot before destination binding commits.
+/// Migrated source records may be reaped after losing their binding.
 #[test]
 fn a_snapshot_does_not_reap_a_migration_in_flight() {
     let arriving = uuid::Uuid::from_u128(5);
@@ -464,11 +432,7 @@ fn a_snapshot_does_not_reap_a_migration_in_flight() {
     receiving.phase = Phase::Receiving;
     assert!(sync_orphans(&HashSet::new(), [(arriving, &receiving)]).is_empty());
 
-    // A MIGRATED record IS reaped, which is the other half of the rule:
-    // its guest is on another machine and its vmm is gone, so the reap
-    // detaches disks that outlive it and destroys nothing. Left in the
-    // exception it would sit there for ever after one lost destroy,
-    // refusing the guest's way back.
+    // Migrated source records remain eligible for snapshot-driven cleanup.
     let left = uuid::Uuid::from_u128(6);
     let mut migrated = managed(Desired::Running);
     migrated.phase = Phase::Migrated;
@@ -521,22 +485,14 @@ fn lifecycle_transitions() {
     );
 }
 
-/// A resume the guest never obeys says so, and stops being repeated.
-///
-/// D7, from the chaos run: a snapshot failed after the quiesce pause, the
-/// resume behind it was issued and did not work, and the agent went on
-/// issuing it every five seconds — no WARN, no event, no escalation —
-/// while `spec.runStrategy` said Running and the guest stayed Paused. The
-/// fake here is that hypervisor: it accepts every resume and its guest
-/// never comes back.
+/// An accepted resume is insufficient: repeated failure to observe Running must quarantine.
 #[tokio::test]
 async fn a_resume_that_does_not_take_is_not_repeated_in_silence() {
     use agent_api::hypervisor::InstanceSpec;
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
 
-    /// A hypervisor that takes the request and leaves the guest where it
-    /// was — until somebody sets `guest`, which is the repair.
+    /// Fake hypervisor accepting resume without changing guest state until the test updates it.
     struct Deaf {
         guest: StdMutex<VmState>,
         resumes: StdMutex<u32>,
@@ -589,8 +545,7 @@ async fn a_resume_that_does_not_take_is_not_repeated_in_silence() {
         async fn pause(&self, _: &VmId) -> agent_api::hypervisor::Result<()> {
             Ok(())
         }
-        /// Answered, and that is all it ever was: the API says it took the
-        /// request, not that the guest is running.
+        /// Acknowledge the request without claiming the guest resumed.
         async fn resume(&self, _: &VmId) -> agent_api::hypervisor::Result<()> {
             *self.resumes.lock().unwrap() += 1;
             Ok(())
@@ -676,8 +631,7 @@ async fn a_resume_that_does_not_take_is_not_repeated_in_silence() {
         Action::Quarantined,
         "and no pass resumes a quarantined vm"
     );
-    // What the tier above reads: the phase and the sentence that becomes
-    // the event.
+    // Verify the reported phase and event message.
     let reported = report_status(
         &marked,
         &obs(true, true, true, Some(VmState::Paused)),
@@ -704,13 +658,7 @@ async fn a_resume_that_does_not_take_is_not_repeated_in_silence() {
     );
 }
 
-/// The MAC half of `Vm.status.addresses[]` starts here, and this is the line
-/// that decides what "the node HAS" means: the record, not the spec.
-///
-/// A NIC the controller asked for and whose tap was never made has no entry
-/// in `record.nics`, so it has no entry in the report either — and one whose
-/// driver does not know an address (a liveness-only `get`, a record from
-/// before the field) is left out rather than reported with an empty one.
+/// Report recorded NICs with known MACs; omit requested NICs that were never created.
 #[test]
 fn a_node_reports_the_taps_it_made_and_the_addresses_it_put_on_them() {
     let nic = |mac: Option<&str>| agent_api::networking::Nic {
@@ -748,26 +696,15 @@ fn a_node_reports_the_taps_it_made_and_the_addresses_it_put_on_them() {
     assert_eq!(out[0].name, "nics[1]");
 }
 
-/// Every pass asks whether this node can still tear a guest down.
-///
-/// `check_cgroup_root` ran exactly once, at start-up, which made it a
-/// statement about the second the agent came up: `/sys/fs/cgroup` unmounted,
-/// remounted or shadowed while the agent ran was something nobody said a word
-/// about until the first delete hung — the original defect with a start-up
-/// check in front of it.
-///
-/// The pass is where it belongs, because the pass is the one loop that runs
-/// whether anybody asks or not. The condition is level like every other one:
-/// raised while the trouble holds, and gone the pass after it stops.
+/// Refresh the cgroup condition on each pass so mount failures and recovery are reported.
 #[tokio::test]
 async fn a_cgroup_root_that_stops_being_one_is_noticed_by_the_next_pass() {
     let temp = tempfile::tempdir().expect("a temp dir");
     let root = temp.path().to_path_buf();
     let store = Arc::new(Store::open(&root.join("a.redb")).expect("a store"));
 
-    // An ordinary directory, which is exactly what a wrong `cgroup_root` is:
-    // `cgroup.kill` becomes a file nothing reads and `rmdir` fails with
-    // ENOTEMPTY, so no VM here can ever be torn down.
+    // An ordinary directory cannot implement cgroup kill; created pseudo-files
+    // also make remove_dir fail with ENOTEMPTY.
     let ordinary = root.join("not-a-cgroup");
     std::fs::create_dir_all(&ordinary).expect("a plain directory");
     let drivers = |confiner: Arc<dyn agent_api::ResourceConfiner>| Drivers {
@@ -856,9 +793,7 @@ async fn a_cgroup_root_that_stops_being_one_is_noticed_by_the_next_pass() {
         "a confiner with no directory is not a node with a broken one"
     );
 
-    // And the other direction, on this machine's real mount: a condition that
-    // was raised goes away the pass after the trouble does. Guarded, because a
-    // test that assumed the host's mounts would be a test about the host.
+    // When available, use the host cgroup2 mount to verify condition recovery.
     let host = Path::new("/sys/fs/cgroup");
     let cgroup2 = nix::sys::statfs::statfs(host)
         .map(|s| s.filesystem_type() == nix::sys::statfs::CGROUP2_SUPER_MAGIC)
@@ -880,11 +815,7 @@ async fn a_cgroup_root_that_stops_being_one_is_noticed_by_the_next_pass() {
     }
 }
 
-/// Which base images in a spec nobody is going to fetch.
-///
-/// The complement of `spec.images` and not a second derivation of it: an
-/// image cannot be both stated by a fetch and re-stated by a `stat`, and two
-/// disks off one base image are one image.
+/// Deduplicate base-image names and exclude images with explicit fetch sources.
 #[test]
 fn a_path_image_is_the_one_no_source_entry_names() {
     let volume = |base: Option<&str>| crate::types::VolumeWithId {
@@ -918,16 +849,7 @@ fn a_path_image_is_the_one_no_source_entry_names() {
     );
 }
 
-/// Every pass says again whether the base images this node's records name are
-/// still on its disk.
-///
-/// The level half of D-P7. A provision states it once, and once is not
-/// something a control plane can rely on: an image that vanished from shared
-/// storage after the VM was made would be reported `Ready` for ever, and one
-/// RESTORED after somebody fixed it would be reported `Failed` until the next
-/// create. The chain above this — `ImageStateReport`, `ImageView`,
-/// `Image.status.nodes[]`, `Image.status.phase` — was complete; this is the
-/// first line of it.
+/// Each pass refreshes file presence, including recovery after an image is restored.
 #[tokio::test]
 async fn a_pass_says_again_whether_the_path_images_of_its_records_are_here() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -936,9 +858,7 @@ async fn a_pass_says_again_whether_the_path_images_of_its_records_are_here() {
     let image_dir = root.join("images");
     std::fs::create_dir_all(&image_dir).expect("an image dir");
 
-    // One record, one disk, one base image with no url — the catalogue entry
-    // over storage somebody else filled, and the shape no node ever spoke
-    // about.
+    // Record a path-only base image with no fetch source.
     let mut r = record(Desired::Running, Phase::Provisioned);
     r.spec.volumes = vec![crate::types::VolumeWithId {
         id: agent_api::storage::VolumeId::new_v4(),
@@ -1003,23 +923,8 @@ async fn a_pass_says_again_whether_the_path_images_of_its_records_are_here() {
     assert_eq!(images.report()[0].1.phase(), "Ready");
 }
 
-/// A disk stays open until the teardown has really detached it — whatever
-/// the VM's own line says, and whether or not the VM has one at all.
-///
-/// The gap this closes was found by reading the destroy path for struktur 4's
-/// A4 and is the one `openOn` is derived from. `DestroyInstance` writes
-/// `desired = Absent`, and from that instant the VM is gone from the VM half
-/// of the status report (`observe::report` skips it) — while its VMM, its
-/// backends and its disk connections are all still there. In the ordinary
-/// case the teardown runs inside the command and closes them before the
-/// receipt goes out. When something else owns the record — a snapshot, a
-/// migration — `plan` answers `Blocked`, nothing is torn down, and the tier
-/// above was left deriving "nobody here is using this disk" from a VM it
-/// could no longer see. The fd was open for at least another pass.
-///
-/// So the node says it about the DISK: `VolumeStateReport.open`, out of the
-/// VM records rather than the VM reports, and it turns false at the moment
-/// `detach` came back and not before.
+/// Recorded attachments remain open during a blocked teardown. A successful detach
+/// clears that evidence even if another teardown step retains the VM record.
 #[tokio::test]
 async fn a_disk_stays_open_until_the_teardown_has_really_detached_it() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -1041,9 +946,7 @@ async fn a_disk_stays_open_until_the_teardown_has_really_detached_it() {
     storage.insert("filesystem".to_string(), Arc::new(block));
     let drivers = Drivers {
         confiner: Arc::new(cgroup_driver::CgroupV2::new(root.join("cgroup"))),
-        // No hypervisor on purpose: the teardown below then FAILS and keeps
-        // its record, which is the state this test is about — the disk has to
-        // be closed although the record is still standing.
+        // Omit the hypervisor so teardown fails after closing the disk and retains its record.
         hypervisor: None,
         hypervisor_name: None,
         storage,
@@ -1058,8 +961,7 @@ async fn a_disk_stays_open_until_the_teardown_has_really_detached_it() {
         Arc::new(tokio::sync::Mutex::new(())),
     );
 
-    // A volume this node owns, and a VM holding it as a REFERENCED disk: the
-    // shape that outlives its VM, and the one `openOn` is kept for.
+    // Create an independent volume referenced by the VM.
     let disk = agent_api::storage::VolumeId::new_v4();
     let disk_spec = agent_api::storage::VolumeSpec {
         base_image: None,
@@ -1119,16 +1021,7 @@ async fn a_disk_stays_open_until_the_teardown_has_really_detached_it() {
             .expect("a line for this node's own volume")
     };
 
-    // The premise: the VM half NAMES this VM, and says which disk it still
-    // has open.
-    //
-    // This assertion used to be the opposite — "a vm on its way out is not in
-    // the vm half of the report" — and that was Astra finding S12,
-    // 2026-09-23: one tier up, a uid a node does not name is read as a node
-    // that has let it go, so a record that dropped out of the report the
-    // moment the intent was written let the VM be placed on another machine
-    // while this VMM still held the disk. That is the same window the rest of
-    // this test measures, seen from the other half of the report.
+    // The VM report retains a deleting VM and its referenced disk until cleanup.
     let said = reconciler.report().await.expect("a report");
     assert_eq!(said.len(), 1, "a vm on its way out is still this node's");
     assert_eq!(said[0].phase, ReportedPhase::Provisioning);
@@ -1138,7 +1031,7 @@ async fn a_disk_stays_open_until_the_teardown_has_really_detached_it() {
         vec![disk],
         "and it names the disk it is still holding"
     );
-    // And the disk is open, because it is.
+    // The attachment is still reported open.
     assert!(line().open, "the vmm is still holding it");
 
     // A pass, and it changes nothing: the operation outranks the teardown.
@@ -1155,8 +1048,7 @@ async fn a_disk_stays_open_until_the_teardown_has_really_detached_it() {
          openOn used to go empty in"
     );
 
-    // The operation ends. Now the teardown runs — and fails, because there is
-    // no hypervisor to destroy anything with, so the record stays.
+    // Releasing the operation allows teardown, whose missing-hypervisor failure keeps the record.
     store
         .mutate(&vm, |r| r.operation = None)
         .expect("the marker goes");
@@ -1185,18 +1077,7 @@ async fn a_disk_stays_open_until_the_teardown_has_really_detached_it() {
     );
 }
 
-/// The other way this node hears of a path image: a `Volume` object made
-/// from one.
-///
-/// F16's second half. A standalone volume's spec names a base image by
-/// catalogue name and carries no url — `ProvisionVolume` has no source half,
-/// by construction — so a node whose only use of an image was a volume said
-/// nothing at all about that image, and the cloud went on calling a
-/// catalogue entry pointing at nothing `Ready`. The look is the same one the
-/// VM half gets, and it is the whole of what the agent can do: an image no
-/// record here names is one this node has no evidence about.
-///
-/// A directory with the file NOT in it, which is the case the fleet was in.
+/// Standalone volume records also identify path images; Gone tombstones do not.
 #[tokio::test]
 async fn a_volume_record_is_the_other_way_this_node_hears_of_a_path_image() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -1278,9 +1159,7 @@ async fn a_volume_record_is_the_other_way_this_node_hears_of_a_path_image() {
     provisioner.verify_path_images().await;
     assert_eq!(images.report()[0].1.phase(), "Ready");
 
-    // And a tombstone names bytes that are gone on purpose: nothing about
-    // its base image is evidence about anything any more, so the look drops
-    // it rather than carrying a dead volume's image for the tombstone's TTL.
+    // Gone volume tombstones do not contribute path-image verification requests.
     store
         .put_volume(
             &volume,
@@ -1309,15 +1188,7 @@ async fn a_volume_record_is_the_other_way_this_node_hears_of_a_path_image() {
     );
 }
 
-/// A VMM this node has no record of is said out loud, every pass, until it is
-/// not one any more.
-///
-/// The other half of D18. The condition is what the tier above acts on: a node
-/// with an unmanaged guest is a node whose free memory is a fiction, and
-/// whether to place there is a scheduling decision rather than a surprise
-/// three commands later. Ending the process is the agent's own half and comes
-/// only after `STRAY_GRACE` — what that grace buys is the difference between a
-/// race this agent lost and a mistake it is about to make.
+/// Report an unmanaged VMM immediately and allow a grace period before ending it.
 #[tokio::test]
 async fn a_vmm_nobody_has_a_record_of_is_reported_every_pass_and_not_killed_at_once() {
     struct Ghost {
@@ -1447,20 +1318,7 @@ async fn a_vmm_nobody_has_a_record_of_is_reported_every_pass_and_not_killed_at_o
     assert!(vmm.ended.lock().unwrap().is_empty());
 }
 
-/// The vocabulary on the wire is the vocabulary in the round's report.
-///
-/// The list is `proto::reasons` and no longer a copy in this file, which is
-/// the derivation lane's half of the same guard. Two directions, one
-/// assertion: a word added to an enum here without being added there fails,
-/// and a word taken out there without being taken out here fails too.
-///
-/// It used to hold code against a DOCUMENT, and it earned that while the
-/// vocabulary existed nowhere else. It does now: the tier above parses these
-/// strings into its own enums, and `controller-api`'s
-/// `every_word_a_node_can_say_parses_into_the_reason_of_its_resource` holds
-/// the very same lists from the other side. A word that only one end knows
-/// is a phase that arrives as `Unrecorded`, which is exactly the silence the
-/// round exists to end — so it fails a build instead.
+/// Agent reason enums must match the shared wire vocabulary and parse their own spelling.
 #[test]
 fn the_reason_table_is_the_list_in_the_round_report() {
     let written: Vec<(&str, Vec<&str>)> = proto::reasons::ALL
@@ -1469,9 +1327,7 @@ fn the_reason_table_is_the_list_in_the_round_report() {
         .collect();
     assert_eq!(reason_table(), written);
 
-    // And every word parses back to the variant it came from: the tier above
-    // reads these off a wire, and a spelling that only goes one way would be
-    // found there rather than here.
+    // Each wire reason spelling round-trips to its enum variant.
     for reason in VmReason::ALL {
         assert_eq!(VmReason::parse(reason.as_str()), Some(reason));
     }

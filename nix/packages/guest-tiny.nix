@@ -2,34 +2,10 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# A guest small enough to be a test and reproducible enough to be evidence.
-#
-# The verification suites of M4 need a guest that boots, says one thing and
-# goes away again. Until now that guest was four files in
-# /mnt/vmstore/MeisterStack/images — `vmlinux.elf`, `tiny-initrd`,
-# `tiny-volume.raw`, `m51-initrd` — built by hand, carried by
-# `deploy/push.sh` out of `MEISTER_GUEST_ASSETS`, and reproducible by nobody:
-# M0 probe S14 looked for a build script and found exactly one, for a
-# different guest (`claude/input-e2e-guest/{init.c,build.sh}` in the journal,
-# which is the template for the initramfs below). A release that names a
-# guest kernel it cannot rebuild is a release whose `guest_artifacts` mean
-# nothing, so this package is the answer to that and nothing more.
-#
-# Two decisions worth reading before changing it:
-#
-# * **The console is the SERIAL port, not virtio-console.** 8250 is built
-#   into the pinned nixpkgs kernel; virtio_console is a MODULE there (as are
-#   all the virtio drivers), so a guest that talks over virtio has to insmod
-#   before it can say anything — and then a broken insmod looks exactly like
-#   a guest that did not boot. `--serial tty --console off` and the marker is
-#   the first thing on the wire.
-# * **Poweroff is honoured, and how is visible.** The ACPI power button
-#   reaches userspace as an input event, so busybox' acpid plus `evdev.ko`
-#   out of the same kernel is what turns a power button press into a clean
-#   shutdown — and in the pinned nixpkgs kernel evdev is built in, so no
-#   module is needed at all. Either way init SAYS on the console whether it
-#   can hear the button, instead of looking like a guest that ignores a
-#   shutdown.
+# Build a minimal BusyBox guest for boot and lifecycle tests. The serial
+# console exposes fixed markers without depending on virtio-console modules.
+# The initramfs includes input and ACPI modules from the same kernel so the
+# hypervisor's power button can trigger a clean shutdown.
 { lib
 , stdenvNoCC
 , runCommand
@@ -43,14 +19,11 @@
 
 let
   kernel = linuxPackages.kernel;
-  # nixpkgs splits a kernel into three outputs, and the modules are not in
-  # the one that holds the bzImage.
+  # Kernel modules may be in a separate output from bzImage.
   modules = kernel.modules or kernel;
   busybox = pkgsStatic.busybox;
 
-  # The line the suites wait for. One string, in one place: the agent's own
-  # console contract is `MS-S0-*` (components/agent/tests/stufe3_ch.rs), and
-  # this guest keeps that prefix so a suite can grep for one family of lines.
+  # Shared console marker consumed by guest boot tests.
   marker = "MS-S0-TINY-OK";
 
   init = writeText "guest-tiny-init" ''
@@ -107,12 +80,8 @@ let
     while true; do /bin/busybox sleep 3600; done
   '';
 
-  # busybox' acpid with `-c CONFDIR` looks for ONE path per event:
-  # `<confdir>/<device>/<code>`. Measured with `ms_tiny=debug`, which is why
-  # that switch exists: a press arrives as `acpid: PWRF/00000080`, and
-  # anything else in the directory is never looked at. The classic
-  # `event=`/`action=` rule files are the OTHER acpid's format and are
-  # silently ignored here.
+  # BusyBox acpid looks up <config>/<device>/<code>, rather than event/action
+  # rule files used by other acpid implementations.
   powerHandler = writeText "guest-tiny-power" ''
     #!/bin/sh
     echo "MS-S0-POWEROFF"

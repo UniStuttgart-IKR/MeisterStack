@@ -7,16 +7,9 @@
 
 use super::*;
 
-/// What is still free on one cluster: the allowance its reported capacity
-/// gives under the configured overcommit, minus everything already bound to
-/// it.
-///
-/// The aggregate the cluster reports is the sum over its READY nodes and is
-/// deliberately coarse — which node inside it ends up carrying a VM is the
-/// cluster's own decision, and the check one tier down is the exact one. What
-/// this prevents is the coarse mistake: handing a cluster more than it has at
-/// all, and then watching every one of those VMs sit Pending down there with
-/// nobody up here able to see why.
+/// Subtract bound VM demand from aggregate Ready-node capacity, with overcommit.
+/// This bounds cluster-wide demand; the cluster's node scheduler performs the
+/// more precise per-node feasibility check.
 pub(super) fn free_on(
     cluster: &str,
     capacity: &controller_api::ClusterCapacity,
@@ -50,22 +43,10 @@ pub(super) fn hosted_on(
         .collect()
 }
 
-/// The cloud's half of `?dryRun=All` on `POST /vms`: which CLUSTER, or why
-/// none.
-///
-/// The same shape the cluster tier's `would_place` has one scope down, and
-/// through the same two functions the pass uses — `servable_clusters` for the
-/// volume-and-selector narrowing, then `assign` over what is left. Nothing is
-/// spent and nothing is written.
-///
-/// Read-only where the pass is not: `collect_clusters` marks a cluster whose
-/// heartbeat ran out as disconnected as a side effect of counting it, and a
-/// request that asked to be SHOWN something must not change the cloud's
-/// opinion of a cluster. So an expired heartbeat is read as not-connected
-/// here without the object being touched, and `connected` comes from
-/// `status.connected` — the shared fact — rather than from this replica's own
-/// session set, which would make the same preview differ by which replica
-/// answered it.
+/// Preview cluster placement using the same volume and selector constraints
+/// as reconciliation, without mutating objects or reserving capacity.
+/// Read shared connection and heartbeat state so the answer does not depend on
+/// which replica handles the request; expired heartbeats are ignored, not written.
 pub(crate) async fn would_place(
     store: &EtcdStore,
     scheduler: &dyn controller_api::Scheduler,
@@ -183,21 +164,9 @@ pub(super) enum Servable {
 
 pub(super) use Servable::Sentence;
 
-/// Which clusters could actually run this VM, asked of their NODES.
-///
-/// Two facts are read here that a `Candidate` cannot carry, because a
-/// candidate is a cluster summed up and both of these are about individual
-/// machines:
-///
-///   * the `nodeSelector`, which until now was checked one tier down and
-///     therefore AFTER the binding — a VM no node matched went Pending on a
-///     cluster it should never have been sent to (image report, open finding);
-///   * where a referenced volume's bytes are, which for a `node-local` pool
-///     is one machine of one cluster.
-///
-/// They are one question and this asks it once. A VM that refers to no volume
-/// and selects no labels demands nothing, and every connected cluster is
-/// servable — which is every VM before this milestone.
+/// Narrow cluster candidates using node selectors and referenced-volume locality.
+/// These constraints require node-level facts that aggregate cluster capacity
+/// cannot express. With neither constraint, all connected clusters are eligible.
 pub(super) async fn servable_clusters(store: &EtcdStore, vm: &Vm) -> anyhow::Result<Servable> {
     let names = vm.spec.referenced_volumes();
     if names.is_empty() && vm.spec.node_selector.is_empty() {
@@ -211,15 +180,8 @@ pub(super) async fn servable_clusters(store: &EtcdStore, vm: &Vm) -> anyhow::Res
         ));
     }
 
-    // The volumes decide WHICH clusters (through their pool) and which nodes
-    // in them (through the pool's locality).
-    //
-    // A SET and no longer a single name, because a pool may name more than
-    // one cluster: an import provider pointing at a target both dial, or one
-    // export both mount. Narrowed by intersection across the VM's volumes,
-    // which is the same rule `narrow_allowed` applies to nodes one level
-    // down — two disks on two pools may be reachable from the intersection of
-    // their clusters and from nowhere else.
+    // Intersect the clusters serving every referenced volume, then apply node
+    // locality. Multiple pools must share at least one reachable placement.
     let mut wanted: Option<Vec<String>> = None;
     let mut allowed: Option<Vec<String>> = None;
     for name in &names {

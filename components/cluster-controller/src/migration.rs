@@ -426,22 +426,11 @@ async fn release(store: &EtcdStore, migration: &VmMigration) {
     }
 }
 
-/// Is this promise one the destination can still carry, counting every
-/// promise written BEFORE it?
-///
-/// The confirmation a create-only write cannot give. A unique key says
-/// nothing about a sum: two replicas preparing two migrations onto one node
-/// in the same millisecond each read the reservations, each saw room, and
-/// each then wrote a key of its own — both creates succeed, and the node is
-/// overcommitted by exactly the guest the second one is sending. So the
-/// writer looks again and asks where in the queue it stands, in etcd's own
-/// revision order, which every replica derives the same way. See
-/// `controller_api::reservation_holds`.
-///
-/// `None` is "could not be established" and NEVER "does not fit": a store
-/// that did not answer must not be the reason a migration is refused, and the
-/// promise standing is the safe side of that — it makes the node look fuller
-/// than it is until the move is over.
+/// Confirm capacity against reservations ordered by etcd revision.
+/// Different reservation keys can be created concurrently after the same usage
+/// check, so creation alone does not prove their total fits.
+/// `None` means the result could not be established; retain the reservation
+/// conservatively rather than interpreting unavailable evidence as rejection.
 async fn confirm(
     store: &EtcdStore,
     mine: &CapacityReservation,
@@ -621,22 +610,10 @@ async fn prepare(
         Err(why) => return fail(store, migration, why).await,
     };
 
-    // One guest is moved once. Astra finding S06, 2026-09-23: the claim CAS
-    // below is per MIGRATION, and two migration OBJECTS for one VM each win
-    // their own — `create_vm_migration` mints a record per name and refuses
-    // nothing, and the "at most one in flight" rule existed only inside
-    // `start_for_drain`. What the second attempt then did was not a second
-    // wasted preparation: the destination's agent refuses a VM it already has
-    // a record of (`prepare_migration`), this tier reads that refusal as "the
-    // destination could not open the disks", and `abandon` sends `Destroy`
-    // BY THE VM's UID — to the node that is holding the first migration's
-    // receiving VMM. The first move loses its destination to the second
-    // attempt's tidy-up.
-    //
-    // Read immediately before the claim, so that the window between the
-    // question and the answer is as short as this tier can make it, and
-    // `fail` rather than a quiet return: an operator who asked twice is owed
-    // a record saying which record is carrying the move.
+    // Check for another active migration of this VM before claiming a target.
+    // Otherwise a competing attempt's cleanup could destroy the first attempt's
+    // receiving VMM, since teardown addresses the VM UID. Record a refusal rather
+    // than silently leaving the duplicate request Pending.
     let siblings: Vec<VmMigration> = match store.list().await {
         Ok(m) => m,
         Err(StoreError::NotFound(_)) => Vec::new(),
@@ -655,29 +632,11 @@ async fn prepare(
         .await;
     }
 
-    // The room at the destination, written down before ANYTHING is built
-    // there — before the disks are opened, before the VMM, before the claim
-    // that says this replica is carrying the move.
-    //
-    // Astra finding S07, 2026-09-23: a guest in flight is bound to the
-    // machine it is LEAVING until `settle` moves the binding, so for the
-    // whole length of a migration the destination is carrying a guest that no
-    // sum over the VM objects can see. N migrations aimed at one node all
-    // measured themselves against the same numbers and all passed, and so did
-    // an ordinary create in the same window. This is that guest, written
-    // where every replica can read it.
-    //
-    // Before the claim and not after, because the claim is what the next pass
-    // reads as "this move is being carried": a crash in between would
-    // otherwise leave a `Preparing` migration whose room nobody is holding,
-    // which is the very gap this closes. In the other order the crash leaves
-    // a promise for a migration that is still Pending — and the next pass
-    // finds it, adopts it, and carries on.
-    //
-    // Both roads through the same write: a node somebody NAMED and a node the
-    // scheduler picked are one `target` by the time this runs, so there is
-    // one place where a destination is promised and one place where it is
-    // given back.
+    // Reserve destination capacity before preparation and before claiming the move.
+    // The VM remains bound to its source until settlement, so bound-VM usage alone
+    // does not account for destination demand. A crash before the claim leaves a
+    // recoverable reservation for a Pending migration rather than unaccounted work.
+    // Named and scheduler-selected targets use the same reservation path.
     for endpoint in [&source, &target] {
         if !all.iter().any(|n| {
             &n.name == endpoint
@@ -764,16 +723,9 @@ async fn prepare(
         Err(e) => return Err(e.into()),
     }
 
-    // The disks, at the destination, BEFORE the VMM: the configuration that
-    // will arrive in the stream names them by path, so a path that is not
-    // open here is a guest arriving into nothing. `ProvisionVolume` is
-    // idempotent by contract — every backend derives its name from the uid
-    // and adopts what is already there — so this makes no second copy of
-    // anything; what it makes is a record on this node.
-    //
-    // The destination reports its volume handles through `openOn`, which
-    // is the whole reason that field exists: for the length of this migration
-    // two machines legitimately have the same disk open.
+    // Open referenced volumes at the destination before preparing its VMM; the
+    // incoming configuration contains their paths. UID-derived provisioning reopens
+    // existing bytes. `openOn` records the temporary overlap between both nodes.
     if let Err(e) = open_volumes_at(store, dispatch, vm, &target).await {
         let why = format!("the destination could not open the disks: {e:#}");
         return abandon(store, dispatch, &claimed, vm, &target, why).await;
@@ -900,21 +852,8 @@ fn choose_target(
     let elsewhere: Vec<Candidate> = all.iter().filter(|c| c.name != source).cloned().collect();
     match named {
         Some(named) => {
-            // `feasible` and not a list of its own. Astra finding S07,
-            // 2026-09-23: this branch used to ask four questions —
-            // connected, schedulable, offers a hypervisor, not the source —
-            // where the scheduler's own admission asks ten. So a node that
-            // was up and willing took a guest it had no room for, or that
-            // its labels did not select, or that a required anti-affinity
-            // term forbade, or that had said itself it was wedged. What the
-            // guest met on arrival was the agent refusing it, after the
-            // disks had been opened there and a VMM built. One predicate for
-            // both roads is what keeps "can this node take this vm" from
-            // meaning two things depending on who asked.
-            //
-            // The hypervisor is still in it: every VM's `DevicePolicy` asks
-            // for one, so `feasible` answers that question too, and a
-            // storage-only node is refused by name exactly as before.
+            // Apply the scheduler's full feasibility predicate to named targets too,
+            // including capacity, selectors, affinity, health and hypervisor capability.
             let Some(candidate) = controller_api::feasible(vm, &elsewhere)
                 .into_iter()
                 .find(|c| c.name == named)
@@ -989,15 +928,9 @@ async fn send(
     };
     let peer = peer_of(&migration.status);
 
-    // The budget first, and the missing address only after it. Astra finding
-    // S05, 2026-09-23: this was the other way round, and there is no leader
-    // here — `prepare` writes `Preparing` by CAS BEFORE it opens the disks at
-    // the destination and blocks on `PrepareMigration`, and the address
-    // reaches the record seconds later. Every other replica passes through
-    // this function once per TICK (5 s) meanwhile, read "no address" as "the
-    // controller died between the command and the write", and tore down a
-    // destination that was being built correctly. A prepare that still has
-    // time is a prepare in progress, whatever it has managed to write down.
+    // Wait for the preparation budget before treating a missing address as failure.
+    // Another replica can observe Preparing while the owner is still opening disks
+    // or awaiting PrepareMigration; absence during that interval is expected.
     if let Some(over) = overdue(migration, timeouts.prepare) {
         let why = match &peer {
             Some(_) => format!("the destination was not ready after {over}s"),
@@ -1463,20 +1396,8 @@ fn peer_from(payload: &[u8]) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("the destination named no address to send to"))
 }
 
-/// The address to send to, off the migration's own status — or `None` while
-/// the destination has not named one.
-///
-/// Pure, because it is what `send` decides on and `send` needs a store.
-///
-/// Two readings, and the field wins. Astra finding S05, 2026-09-23: the
-/// address used to exist only inside the `Preparing` sentence, scraped back
-/// out with `rsplit_once(" at ")` — so a reader depended on the wording of a
-/// message written for a person, and "preparing agent-2" (the sentence
-/// `prepare` writes at its CAS, before the destination has been asked
-/// anything) read as an address of "agent-2" for any target whose name
-/// happened to contain " at ". `status.peer` is the field; the sentence stays
-/// as the fallback for records written before it existed, and for nothing
-/// else.
+/// Read the destination address from `status.peer`, falling back to the legacy
+/// Preparing message only for older records without that field.
 fn peer_of(status: &VmMigrationStatus) -> Option<String> {
     if let Some(peer) = status.peer.as_deref().filter(|p| !p.is_empty()) {
         return Some(peer.to_string());
@@ -1646,15 +1567,8 @@ mod tests {
         }
     }
 
-    /// Astra finding S06, 2026-09-23: a second record for one guest is
-    /// refused before it claims a destination.
-    ///
-    /// `create_vm_migration` mints a record per NAME and says nothing about
-    /// how many name one vm, so two of them reach `prepare`. The second one's
-    /// destination refuses the vm it already has a record of, this tier reads
-    /// that as "the destination could not open the disks", and `abandon`
-    /// destroys BY THE VM's UID — on the node that is holding the first
-    /// migration's receiving VMM.
+    /// Refuse a second active migration of the same VM before preparing a target;
+    /// its cleanup must not destroy the first migration's receiving VMM.
     #[test]
     fn a_second_record_for_one_guest_never_reaches_a_destination() {
         let mine = migration("web-1", VmMigrationPhaseKind::Pending);
@@ -1745,16 +1659,8 @@ mod tests {
         n
     }
 
-    /// A destination another replica holds the session with is reachable.
-    ///
-    /// D-P2 moved the SENDING of a migration's commands onto `Dispatch`,
-    /// which forwards to the replica that holds the node's session — and left
-    /// the CHOOSING of the node reading a `connected` that is still strictly
-    /// this replica's. So the coin toss the fix removed came back one step
-    /// earlier: the e2e had all three agents' sessions on 10.128.1.104, and
-    /// `vm migrate fabric-probe --to agent-1b` failed with "node agent-1b
-    /// cannot take this vm: it must be connected, schedulable, running a
-    /// hypervisor..." every time another replica won the object.
+    /// A destination held by a sibling replica remains eligible through Dispatch;
+    /// local session absence alone must not reject it.
     #[test]
     fn a_node_another_replica_holds_the_session_with_can_take_a_guest() {
         let mut elsewhere = node("agent-1b");
@@ -1818,15 +1724,7 @@ mod tests {
         assert!(why.contains("agent-1"), "{why}");
     }
 
-    /// Astra finding S07, 2026-09-23: "checked" means the same thing for a
-    /// node somebody named as for a node the scheduler would have picked.
-    ///
-    /// The branch above used to ask four questions where `feasible` asks ten,
-    /// so `--to agent-3` sent a guest to a machine with no room for it, or
-    /// one whose labels the vm does not select, or one that had said itself
-    /// it was wedged. Each of those was found out on ARRIVAL — after the
-    /// disks were opened at the destination and a VMM was built there — and
-    /// each is now a sentence about agent-3 before anything is built.
+    /// Named targets must satisfy the same full feasibility checks as scheduled ones.
     #[test]
     fn a_named_node_must_also_be_feasible() {
         let mut big = vm("web-1");
@@ -1937,18 +1835,9 @@ mod tests {
             default.transfer
         );
     }
-    /// The source's own word about the send, and what it lets this tier do.
-    ///
-    /// D16's payoff. `MigrateOut` answered with the OUTCOME, so a failed
-    /// transfer reached the cluster as a command that never came back, and the
-    /// pass then waited out its whole transfer timeout — 120 s by default — to
-    /// work out which machine held the guest. v53 resumes a guest whose send
-    /// failed and goes on serving it, so the source knew within milliseconds;
-    /// now it says so on the next heartbeat.
-    ///
-    /// The line between the two verdicts is the one `abandon` draws, and it is
-    /// the only line here worth arguing about: a destination that holds no
-    /// guest may be torn down, and one that might hold the only copy may not.
+    /// Source failure evidence can end a transfer before its timeout when the source
+    /// still owns the guest. Cleanup must preserve a destination that might hold the
+    /// only remaining copy.
     #[test]
     fn a_source_that_still_has_the_guest_ends_the_migration_without_a_timeout() {
         // Field by field and not a struct literal: `status.phase` is private
@@ -1962,15 +1851,8 @@ mod tests {
             status
         };
 
-        // Nothing said, and the two words that are not a failure: this
-        // function has no opinion and the timeout below it is still the rule.
-        //
-        // `Gone` stays in this list after Astra finding S04, 2026-09-23, and
-        // for the reason it was always here: `still_here` answers ONE
-        // question — did the source keep the guest — and a source that let it
-        // go did not. What changed is that "the timeout below it" no longer
-        // ignores the word: `verdict_on_timeout` reads it, and the test below
-        // is where `Gone` is now argued.
+        // Absent, Sending and Gone reports do not prove the source kept the guest.
+        // Gone is handled separately by the timeout verdict to protect the destination.
         for said in [None, Some("Sending"), Some("Gone")] {
             assert_eq!(still_here("agent-1", "agent-2", &status(said, None)), None);
         }
@@ -2005,18 +1887,8 @@ mod tests {
         assert!(why.contains("Running"), "and what each of them said: {why}");
     }
 
-    /// Astra finding S04, 2026-09-23: a source that said `Gone` has let the
-    /// guest go, so the destination is the only machine that can still hold
-    /// it — whatever it has managed to report by the time the budget runs
-    /// out.
-    ///
-    /// The word travelled this far already: the agent writes it after
-    /// `finish_migrate_out` has dropped the vmm pid and detached the volumes,
-    /// and `ingest_departures` puts it on `status.sourceReported`. Nothing
-    /// read it. So a send that completed while the destination's first report
-    /// was still in flight was tidied up by uid — and the record said
-    /// "agent-1 is running the vm as before" about a machine that was not
-    /// running it.
+    /// Source Gone evidence prevents destination cleanup on transfer timeout, even
+    /// before the destination has reported: it may hold the only remaining guest.
     #[test]
     fn a_source_that_let_the_guest_go_leaves_the_destination_alone() {
         let verdict = |source_said: Option<&str>, target_said: Option<&str>| {
@@ -2095,16 +1967,8 @@ mod tests {
         assert_eq!(peer_of(&both), Some("tcp:10.0.0.9:49000".to_string()));
     }
 
-    /// Astra finding S05, 2026-09-23: a prepare that is still inside its
-    /// budget is left alone, whatever it has managed to write down.
-    ///
-    /// There is no leader in this tier (`dispatch.rs`) and TICK is 5 s, so
-    /// every replica reaches `send` for this migration while the prepare it
-    /// did not start is still opening disks at the destination and blocking
-    /// on `PrepareMigration`. Reading "no address" as "the address was lost"
-    /// made each of those passes tear down a destination that was being
-    /// built correctly — and the vm here is two seconds old against a thirty
-    /// second budget.
+    /// A Preparing migration without an address retains its full preparation budget,
+    /// including when another replica observes the in-progress command.
     #[tokio::test]
     async fn a_prepare_that_has_not_named_its_address_yet_is_given_its_budget() {
         // The source is dialled into this replica, so a command for it would
@@ -2165,19 +2029,8 @@ mod tests {
         guest
     }
 
-    /// Astra finding S07, second half, 2026-09-23: two migrations aimed at
-    /// one node with room for one used to BOTH pass.
-    ///
-    /// Nothing held the room between `prepare` and the guest's arrival:
-    /// `Candidate::free` is a sum over the VMs BOUND to a node, and a guest
-    /// in flight stays bound to the machine it is leaving until `settle`
-    /// moves it. So the second migration of a pass measured itself against a
-    /// node the first had already filled, found it empty, opened the disks
-    /// there and built a second VMM — and what the guest met on arrival was
-    /// the machine carrying twice its memory.
-    ///
-    /// Both roads, because both go through the same promise: the node the
-    /// scheduler picks and the node somebody NAMED with `--to`.
+    /// Destination reservations prevent two migrations from consuming the same free
+    /// capacity, for both named and scheduler-selected targets.
     #[test]
     fn two_migrations_to_a_node_with_room_for_one_do_not_both_pass() {
         let first = whole_machine("web-1");
@@ -2221,16 +2074,8 @@ mod tests {
         );
     }
 
-    /// A record's own promise is not a reason to refuse that record's own
-    /// move — and it would be, without `give_back`.
-    ///
-    /// The case is a real one: `prepare` writes the promise BEFORE the claim
-    /// that says this replica is carrying the move, so a process killed
-    /// between the two leaves a promise for a migration that is still
-    /// Pending. The next pass builds its candidate list with that promise
-    /// taken off, finds the destination exactly this guest too full, and
-    /// would fail the move by its own bookkeeping — every pass, for ever,
-    /// since every pass writes the same promise down again.
+    /// Exclude a migration's own reservation when reconsidering its target after
+    /// a crash between reservation and claim, avoiding double-counted demand.
     #[test]
     fn a_records_own_reservation_does_not_refuse_its_own_move() {
         let guest = whole_machine("web-1");

@@ -2,15 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# rust-vmm's virtio-input backend, which the agent starts for an evdev guest
-# (`meisterstack.agent.inputBackend`, nix/agent.nix).
-#
-# Its own derivation because the pinned nixpkgs has no `vhost-device` at all
-# — measured in M0: `nix eval nixpkgs#vhost-device.version` answers "does not
-# provide attribute". The recipe is ~/git/Leandro/nix/packages/
-# vhost-device-input.nix, unchanged: same revision, same two hashes, same
-# `preCheck` (the upstream test registers stdin with epoll and /dev/null is
-# not pollable).
+# Build the rust-vmm evdev backend selected by meisterstack.agent.inputBackend.
+# Its test setup supplies pollable stdin for the upstream epoll mock.
 { lib, rustPlatform, fetchFromGitHub }:
 rustPlatform.buildRustPackage {
   pname = "vhost-device-input";

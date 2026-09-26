@@ -118,15 +118,10 @@ pub(super) async fn write_node_spec(
     Ok(updated)
 }
 
-/// The one route at this tier that is not a client's: a sibling replica
-/// asking this one to say something to a node it holds the session for.
-///
-/// A live migration is about two machines, and their sessions can hang off
-/// two replicas — see `crate::dispatch` for why that is the one object no
-/// ownership rule can carry. Everything that makes this narrow is beside the
-/// rule it applies: the body is a closed enum, the caller has to hold this
-/// cluster's own `system:cluster:<name>` certificate (the permission table),
-/// and the request has to BE a forward.
+/// Forward a migration command to the replica holding the target node session.
+/// Source and destination sessions may belong to different replicas. The route
+/// accepts only its closed command enum, requires the forwarded header, and is
+/// restricted by middleware to this cluster's system identity.
 pub(super) async fn node_command(
     State(st): State<ApiState>,
     Path(name): Path<String>,

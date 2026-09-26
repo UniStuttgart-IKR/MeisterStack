@@ -2,20 +2,10 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Every cell of `plan`'s input space, against the table it is the
-//! implementation of.
+//! Compare the finite planner space with a prioritized decision table.
 //!
-//! The nine hand-written cases in `reconcile.rs` say what the interesting
-//! corners mean. This says what ALL of it means: 179.200 cells, each with an
-//! expected action, checked on every `cargo test`. What it buys is the thing
-//! the interesting corners cannot buy — that reordering two `if`s, or adding
-//! a variant to `Desired`, cannot quietly change an answer nobody happened to
-//! write a test for.
-//!
-//! The oracle is deliberately not shaped like `plan`. `plan` is nested
-//! control flow; the table below is a flat priority list of named guards,
-//! first match wins. A table that mirrored the implementation line for line
-//! would only restate it, and this file would prove nothing.
+//! The table, action counts and lifecycle pairs check changes to guard ordering.
+//! Coverage is limited to the representative inputs defined in space/mod.rs.
 
 mod space;
 
@@ -38,8 +28,7 @@ struct Row {
     then: fn(&Cell) -> Action,
 }
 
-/// The agent's whole decision, in priority order. Read top to bottom: the
-/// first guard that holds is the answer.
+/// Prioritized planner model: the first matching guard selects the action.
 const TABLE: &[Row] = &[
     Row {
         why: "an operation owns the vm; the reconciler keeps its hands off until it is done",
@@ -103,11 +92,8 @@ const TABLE: &[Row] = &[
         when: |c| c.record.desired == Desired::Halted,
         then: |_| Action::None,
     },
-    // ---- the two migration phases -----------------------------------------
-    // Below every INTENT above and above every REPAIR below, which is the
-    // whole of the authority a migration has over a record: a destroy, a stop
-    // and a quarantine all still reach it, and the reconciler's own idea of
-    // what to fix does not.
+    // Migration phases suppress ordinary repair after operation, maintenance,
+    // quarantine and Halted handling.
     Row {
         why: "the guest arrived: a receiving record becomes an ordinary provisioned vm",
         when: |c| c.record.phase == Phase::Receiving && c.obs.guest == Some(VmState::Running),
@@ -130,14 +116,8 @@ const TABLE: &[Row] = &[
         then: |_| Action::Provision,
     },
     Row {
-        // Provision and NOT Quarantined, and the chaos run is the reason it
-        // is written out here: a killed VMM was expected to quarantine and
-        // recovers instead. It recovers on purpose. A dead VMM takes its
-        // backends with it, so there is nothing left in place to diagnose and
-        // the only two answers are "build it again" or "stay down until a
-        // person looks". The quarantine is for the other shape — a backend
-        // that died under a LIVE vmm — and `reconcile::backend_died_under_vmm`
-        // holds the argument.
+        // Missing VMM or socket responsiveness selects reprovision. Backend loss
+        // under a live VMM is handled through the persisted quarantine marker.
         why: "provisioned, but there is no live vmm answering its socket",
         when: |c| !c.obs.vmm_alive || !c.obs.socket_responsive,
         then: |_| Action::Provision,
@@ -207,9 +187,7 @@ fn every_cell_of_the_input_space_decides_what_the_table_says() {
         let (expected, why) = expect(cell);
         let got = plan(&cell.record, &cell.obs, cell.now);
         if got != expected {
-            // Collected, not asserted one by one: a change of behaviour is
-            // usually a whole region of the space moving at once, and the
-            // shape of that region is what says which rule moved.
+            // Collect mismatches to show the full input region affected by a rule change.
             mismatches.push(format!(
                 "  {}\n    expected {expected:?} - {why}\n    got      {got:?}",
                 describe(cell)
@@ -253,14 +231,8 @@ fn label(action: Action) -> &'static str {
     }
 }
 
-/// How much of the space each action owns. Every number below is derived from
-/// the guards by hand, independently of both `plan` and the table above — so
-/// this test agreeing is three derivations of the same function meeting, and
-/// their sum being exactly `SPACE_SIZE` is the proof that the partition has
-/// no hole in it.
-///
-/// It is also the tripwire with the widest reach in this file: any change to
-/// `plan` that the table happens to follow still has to move a number here.
+/// Check the expected number of cells selecting each action. Counts provide
+/// a second check on the decision table; they do not prove executor behavior.
 #[test]
 fn each_action_owns_the_share_of_the_space_the_guards_give_it() {
     use std::collections::BTreeMap;
@@ -272,10 +244,7 @@ fn each_action_owns_the_share_of_the_space_the_guards_give_it() {
     });
     assert_eq!(seen, SPACE_SIZE);
 
-    // Every share below is twice what it was before `receive_failed` joined
-    // the space — the axis is read at exactly one place, so every other guard
-    // simply claims both halves of each cell it claimed before. The two that
-    // are not a doubling are the two the new guard moved, and they are marked.
+    // Counts include receive_failed on every cell, including phases where it is inert.
     let expected: BTreeMap<&'static str, usize> = BTreeMap::from([
         // An operation blocks regardless of everything else: exactly half.
         ("Blocked", 89_600),
@@ -325,13 +294,8 @@ fn each_action_owns_the_share_of_the_space_the_guards_give_it() {
     );
 }
 
-/// Below the Stopped branch only Running and Paused survive, so the final
-/// catch-all arm of `plan`'s lifecycle match is unreachable — every
-/// (desired, guest) pair that gets there is named explicitly. The half of
-/// that which can be seen from outside is asserted here: the three actions
-/// only that match produces belong to exactly the six pairs the table names,
-/// and no other intent ever yields one. The day a sixth `Desired` slips past
-/// the gates above, this set grows and says so.
+/// Only Running and Paused reach lifecycle transitions after earlier guards.
+/// Check every action-producing desired/guest pair.
 #[test]
 fn only_running_and_paused_ever_reach_the_lifecycle_match() {
     use std::collections::BTreeSet;

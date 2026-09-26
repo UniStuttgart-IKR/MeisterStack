@@ -17,71 +17,23 @@ use std::time::Duration;
 
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-/// `ErrorMsg.reason` for a refusal that is about the NODE rather than about
-/// the attempt.
-///
-/// Here — beside the message it is a field of — because it is a wire value
-/// and both ends of the wire need the same string, and because the two ends
-/// are deliberately not allowed to share anything else: the agent does not
-/// depend on `controller-api`, on purpose, so a constant in there could not
-/// be the one the agent writes.
-///
-/// What it means: a create the node refused STRUCTURALLY — no hypervisor, a
-/// driver it does not have, a backend a volume names and it lacks — leaving
-/// no record behind. It will never work on this node, however often it is
-/// asked, so the tier above answers it by taking the binding back and placing
-/// the VM somewhere else. A failure AFTER the record exists is the opposite:
-/// a boot that did not work may work next time in the same place, and that is
-/// a `Failed` VM with a requeue where it is.
-///
-/// Empty from an agent that predates it, which reads as the second — the
-/// conservative one, because re-placing a VM that merely failed to boot would
-/// walk it around the cluster.
+/// Wire reason for structural node refusal before creating a VM record.
+/// Controllers may then release placement and choose another node. An
+/// empty legacy reason retains the conservative same-node failure path.
 pub const CANNOT_SERVE: &str = "CannotServe";
 
-/// `RouterReport.phase` as a NODE spells it, and the whole vocabulary of that
-/// road: the namespace and its two legs are there, or they are not.
-///
-/// Here for the reason [`CANNOT_SERVE`] is here — a wire value both ends need
-/// and the two ends deliberately share nothing else — and because these two
-/// words are NOT the tier above's `RouterPhase`. That one is about a router
-/// living on several machines at once (`Active`, `Standby`, `Pending`,
-/// `Unknown`, …) and a node knows none of that: whether a healthy node means
-/// Active or Standby depends on which of them the CONTROLLER made active, and
-/// the controller is what joins the two vocabularies (see the cluster's
-/// `observed_phase`). Reading the node's word as the tier's own was a bug
-/// with a very quiet shape: `Ready` parsed as nothing, so every report from
-/// every healthy gateway node was dropped with a warning, and the only thing
-/// a node could tell the tier above was that something had broken.
+/// Node router readiness vocabulary, distinct from the controller's
+/// Active/Standby/Unknown placement phases. Controllers combine readiness
+/// with their active-node decision.
 pub const ROUTER_READY: &str = "Ready";
 
 /// `RouterReport.phase` for a router this node cannot serve right now: the
 /// namespace is gone, or a leg of it is. See [`ROUTER_READY`].
 pub const ROUTER_FAILED: &str = "Failed";
 
-/// Every word a NODE may put in a `reason`, resource by resource.
-///
-/// One list, in the crate both ends already share, and that is the whole
-/// point of it being here. The words are the agent's: they are declared as
-/// enums where the party that writes them lives (`agent::reconcile::observe`
-/// for VMs, volumes, snapshots and images, `agent_api::networking` for the
-/// router, because the network driver is what looks and a driver may not
-/// depend on the agent). The words are the CONTROLLER's too: a phase that
-/// came from a node carries the node's own word on the wire, so
-/// `VmReason::parse("VmmGone")` has to answer.
-///
-/// Two guards run against exactly these lists, which is why they are lists
-/// and not prose in a report: `reason_table_is_the_vocabulary_in_proto` in
-/// the agent holds each enum's `ALL` against its list here, and
-/// `every_word_a_node_can_say_parses_into_the_reason_of_its_resource` in
-/// `controller-api` holds each list against the tier's own enum. A word
-/// added on one side and not the other fails both ends of the build rather
-/// than arriving at a controller as `Unrecorded` in the lab.
-///
-/// Storage pools are deliberately absent and are the only thing that is: a
-/// node reports DRIVERS (`DriverInfo`, with their locality) and never a pool,
-/// so a pool's reason is derived one tier up and `StoragePoolStatusReport`'s
-/// `reason` is filled by the cluster out of its own vocabulary.
+/// Node reason vocabulary shared across the wire. Tests compare agent
+/// enums with these lists and require controller reason enums to parse them.
+/// Storage-pool reasons are derived by the cluster from driver reports.
 pub mod reasons {
     /// `VmStatusReport.reason`. Derived fresh on every heartbeat out of what
     /// `observe` sees, so `Unrecorded` here means a RECORD from another build
@@ -118,10 +70,7 @@ pub mod reasons {
     /// opinion from an older build for one to come out of.
     pub const IMAGE: &[&str] = &["NotFound", "NotAFile", "ChecksumMismatch", "FetchFailed"];
 
-    /// `RouterReport.reason`. Three, and `DriverUnreachable` is the one that
-    /// earns its place: it says this node could not FIND OUT, which is not
-    /// the same as the namespace being gone — and a tier that read it as the
-    /// latter would swing a router away from an `ip` that merely timed out.
+    /// Router failure reasons distinguish missing state from an unsuccessful probe.
     pub const ROUTER: &[&str] = &["NetnsGone", "LegGone", "DriverUnreachable"];
 
     /// The five lists with the name of the resource each belongs to, for a
@@ -135,56 +84,21 @@ pub mod reasons {
     ];
 }
 
-/// How long a session dial may spend getting a connection.
-///
-/// Both tiers dial down a preference order (HRW) and walk to the next entry
-/// when one refuses. A refusal is instant; a blackholed endpoint — fenced
-/// host, dropped SYN, a route that goes nowhere — says nothing at all, and
-/// the kernel's own give-up is `tcp_syn_retries` deep: six retries, about
-/// two minutes. For those two minutes the caller is stuck on a replica it
-/// will never reach while the next one in its order sits there answering.
-///
-/// Three seconds is far above any real handshake on a lab network and far
-/// below the point where failover stops being failover.
+/// Connection deadline before trying the next preferred endpoint.
+/// Bounds blackholed connections that would otherwise wait for TCP retries.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How often a session asks the other end whether it is still there.
-///
-/// A dial has a timeout and an ESTABLISHED session had none, and those are
-/// two different questions. A connection that is blackholed after it was
-/// made — a fenced host, a route that changed under it, the source address
-/// of the machine moving — accepts everything written to it, answers
-/// nothing, and reports nothing: the kernel's socket is open, so
-/// `tx.send` succeeds, the reconcile loop keeps running, and the read side
-/// simply never wakes. Measured on manacor on 2026-09-10: the agent kept
-/// working for **five minutes** while the controller counted it as gone
-/// after thirty seconds, and only a restart of the unit ended it.
-///
-/// An HTTP/2 PING is the echo that answers it. No ping back within
-/// [`KEEPALIVE_TIMEOUT`] and the connection is broken from below: the
-/// stream ends with an error, the session loop falls out of its pump, and
-/// the redial order is walked from the top — which is the behaviour both
-/// tiers already have for every other way a session can end.
+/// HTTP/2 keepalive interval for established sessions. A missing reply
+/// within KEEPALIVE_TIMEOUT ends the transport and allows redial.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How long a session waits for the echo before it calls the connection dead.
-///
-/// [`KEEPALIVE_INTERVAL`] plus this is the worst case from "the wire went
-/// black" to "this end knows", and it has to fit inside the liveness window
-/// of the tier above — 30s, `controller_api::heartbeat::HEARTBEAT_TIMEOUT_SECS`,
-/// spelled there and deliberately not shared with this crate, because the
-/// agent does not depend on the controller. 15s of the 30 leaves the other
-/// half for the redial to land somewhere and say Hello, so a black session
-/// costs a node its heartbeat at worst once.
+/// HTTP/2 ping-response deadline. The configured interval plus this
+/// deadline is below the controller heartbeat window; scheduling and
+/// reconnection time can still delay recovery.
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The settings every session endpoint in this stack takes, applied in one
-/// place because all three tiers that dial out are the same loop.
-///
-/// `keep_alive_while_idle`: a session stream is open the whole time, so the
-/// connection is never idle in HTTP/2's sense — but a session that has just
-/// been dialled and not yet answered is, and that is exactly the window in
-/// which the endpoint being black matters most.
+/// Apply shared dial and keepalive settings. Idle keepalive also covers
+/// the interval before an established connection starts its session stream.
 fn session_endpoint(addr: &str) -> Result<Endpoint, tonic::transport::Error> {
     Ok(Endpoint::from_shared(addr.to_string())?
         .connect_timeout(DIAL_TIMEOUT)
@@ -193,21 +107,12 @@ fn session_endpoint(addr: &str) -> Result<Endpoint, tonic::transport::Error> {
         .keep_alive_while_idle(true))
 }
 
-/// Open a plain channel to a session endpoint, bounded by `DIAL_TIMEOUT`.
-///
-/// Here rather than in each component because the two session loops are the
-/// same loop one tier apart, and this is the one line of it that has nothing
-/// to do with which messages travel over the result.
+/// Open a plain session channel within DIAL_TIMEOUT.
 pub async fn dial(addr: &str) -> Result<Channel, tonic::transport::Error> {
     session_endpoint(addr)?.connect().await
 }
 
-/// The same dial with a credential, when there is one.
-///
-/// `None` is the plain dial above and the default: every session in this
-/// stack ran that way for five milestones and the lab still does. It lives
-/// here for the same reason `dial` does — all three tiers that dial out are
-/// the same loop, and by M5 all three of them can carry a certificate.
+/// Open a session channel with optional TLS; None selects plain transport.
 pub async fn dial_tls(addr: &str, tls: Option<&ClientTlsConfig>) -> anyhow::Result<Channel> {
     let mut endpoint = session_endpoint(addr)?;
     if let Some(tls) = tls {
@@ -216,19 +121,9 @@ pub async fn dial_tls(addr: &str, tls: Option<&ClientTlsConfig>) -> anyhow::Resu
     Ok(endpoint.connect().await?)
 }
 
-/// Whom to trust on the other end, and who we are.
-///
-/// The CA is required and the identity is not: a peer that only verifies the
-/// server still gets an encrypted session, and a peer with a certificate but
-/// no CA to check the server against would authenticate itself to whoever
-/// answered — which is why THAT combination is an error rather than a
-/// half-configuration.
-///
-/// Reads PEM and nothing else. The permission check on the key is here
-/// because this is the one function in this crate that opens a secret, and a
-/// key the group can read is a key that has left the machine already —
-/// same rule and same message as `pki::load_private_key`, which the tiers
-/// that depend on `pki` go through instead.
+/// Load a required server CA and optional client identity from PEM.
+/// Reject private keys with group/world permissions. A client certificate
+/// without server verification is not a supported partial configuration.
 pub fn client_tls(ca: &Path, identity: Option<(&Path, &Path)>) -> anyhow::Result<ClientTlsConfig> {
     // tonic's tls-ring path asks for the process-wide default provider and
     // panics without one. Idempotent, and the first gRPC handshake is a bad
@@ -275,14 +170,8 @@ mod tests {
     use super::*;
     use prost::Message;
 
-    /// D-B1: a session that goes black has to be noticed before the tier above
-    /// gives up on this node, and that is arithmetic rather than a feeling.
-    ///
-    /// The window is `controller_api::heartbeat::HEARTBEAT_TIMEOUT_SECS`, 30
-    /// seconds, spelled here as a number for the reason `CANNOT_SERVE` is
-    /// spelled here as a string: the agent does not depend on the controller,
-    /// on purpose, so the constant cannot be shared. If that number ever moves,
-    /// this test is what says these two have to move with it.
+    /// Keep configured ping timing below the 30-second controller heartbeat
+    /// window. This checks constants, not runtime failure-detection latency.
     #[test]
     fn a_black_session_is_noticed_with_time_to_spare_before_the_node_expires() {
         const LIVENESS_WINDOW: Duration = Duration::from_secs(30);
@@ -304,10 +193,7 @@ mod tests {
         );
     }
 
-    /// The settings are on BOTH ways of dialling, because the difference
-    /// between them is a certificate and nothing else. A session that was
-    /// given TLS and no keepalive would be the lab's exact case — the agent
-    /// there dials with a certificate.
+    /// Plain and TLS dial paths use the same keepalive configuration.
     #[test]
     fn both_dials_build_the_same_endpoint() {
         assert!(session_endpoint("http://10.0.8.21:9443").is_ok());
@@ -317,15 +203,8 @@ mod tests {
         );
     }
 
-    /// The VM half of a status report over the wire and back, with the two
-    /// lists a node fills in it.
-    ///
-    /// `nics` is the one that needs saying: it is `repeated`, so an old peer
-    /// sends no bytes for it at all and a new peer decodes that as the empty
-    /// list — which is exactly the shape the controllers read as "this peer
-    /// said nothing", never as "this VM has no addresses". The test asserts
-    /// both directions of that: a report WITH taps survives whole, and a
-    /// report encoded without the field decodes empty rather than failing.
+    /// Round-trip VM NIC reports and verify omitted repeated fields decode
+    /// as empty for legacy senders. Empty reports must not invent address evidence.
     #[test]
     fn a_vm_status_report_carries_its_taps_over_the_wire() {
         let report = VmStatusReport {
@@ -376,11 +255,8 @@ mod tests {
         assert_eq!(back.vms, vec![report]);
     }
 
-    /// The two messages the node half of the cloud tier is made of, over the
-    /// wire and back. A map and an `optional bool` are the two shapes prost
-    /// treats differently from everything else here, and both carry meaning:
-    /// unset `schedulable` is "leave the drain as it is", which is not the
-    /// same as `false`.
+    /// Round-trip node control fields. Missing schedulable means unchanged,
+    /// not false; optional presence must survive encoding.
     #[test]
     fn a_node_report_and_an_update_survive_the_wire() {
         let report = NodeReport {
@@ -426,11 +302,7 @@ mod tests {
         let back = NodeReport::decode(report.encode_to_vec().as_slice()).unwrap();
         assert_eq!(back, report);
 
-        // A cluster from before the field, and a machine nobody is emptying,
-        // put the same thing on the wire: nothing. It has to decode as absent
-        // rather than as a zeroed report, or the cloud would grow a drain
-        // column reading `0 moved, 0 leaving, 0 staying` for every node in
-        // the fleet.
+        // Missing legacy drain fields remain absent rather than a zeroed report.
         let quiet = NodeReport {
             draining: None,
             ..report.clone()
@@ -531,11 +403,7 @@ mod tests {
         let back = CloudCommand::decode(command.encode_to_vec().as_slice()).unwrap();
         assert_eq!(back.op, Some(cloud_command::Op::CreateRouter(create)));
 
-        // And the report comes back with the machine on it. `node` and
-        // `nodes` are what the road one tier down leaves empty — a node
-        // naming itself to the controller that addressed it says nothing —
-        // so a report from an AGENT has to decode with both empty and still
-        // carry its phase.
+        // Agent reports omit cluster placement fields while retaining router phase.
         let report = RouterReport {
             id: "u-7".into(),
             phase: "Active".into(),
@@ -567,12 +435,8 @@ mod tests {
         assert!(back.routers_complete);
     }
 
-    /// `DropImage` travels both hops unchanged — cloud to cluster inside a
-    /// `CloudCommand`, cluster to agent inside a `Command` — carrying the
-    /// same `name` and `uid` either way. Astra finding S02, 2026-09-23 (rest
-    /// b): there is exactly one message for both hops because neither tier
-    /// keeps an id space of its own for an image; see the type's own doc in
-    /// control.proto.
+    /// Image deletion carries the same registration name and UID through
+    /// cloud-to-cluster and cluster-to-agent command envelopes.
     #[test]
     fn a_dropped_image_names_the_same_uid_on_both_hops() {
         let drop = DropImage {
@@ -597,10 +461,8 @@ mod tests {
         assert_eq!(back.op, Some(command::Op::DropImage(drop)));
     }
 
-    /// A url image reports no digest — its checksum is `spec.sha256`, already
-    /// checked at fetch — and a node older than the field decodes the same
-    /// way: empty, never a claim about the bytes. Astra finding S02,
-    /// 2026-09-23 (rest a).
+    /// URL image reports and older senders can omit the digest. Empty is
+    /// missing evidence; fetched URL images use the configured checksum.
     #[test]
     fn an_images_digest_is_empty_unless_a_node_bound_one() {
         let image = ImageStateReport {
@@ -621,19 +483,8 @@ mod tests {
         assert!(back.digest.is_empty());
     }
 
-    /// `reason` on all five reports, both directions, and what a reporter
-    /// from before the field looks like.
-    ///
-    /// The word is a STRING on the wire and not an enum, so the compatibility
-    /// question is not "does it parse" but "does an empty one read as
-    /// silence": every phase that needs no reason sends nothing at all, and so
-    /// does every agent and every cluster built before this round. Both have
-    /// to decode as the empty string and never as an error, because one old
-    /// reporter in a fleet may not break a list.
-    ///
-    /// The five are the five that carry a phase upwards. `reason` sits beside
-    /// `message` on each and replaces nothing: the message is the sentence an
-    /// operator reads, this is the word a program branches on.
+    /// Round-trip reason strings on all phase-bearing reports. Missing
+    /// legacy fields decode empty; messages remain separate operator details.
     #[test]
     fn every_report_carries_its_reason_and_an_empty_one_is_silence() {
         let vm = VmStatusReport {

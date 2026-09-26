@@ -2,14 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What the VMM is handed: the cloud-init seed, and the instance spec that
-//! names it alongside every disk, tap and device the chain just built.
-//!
-//! The seed is state derived from the spec and rebuilt on every provision, so
-//! nothing about it has to be remembered — which is what lets a re-provision
-//! after a dead VMM produce the same bytes.
-//!
-//! Moved out of `provision.rs` unchanged.
+//! Build the instance configuration from acquired resources and generate its
+//! optional cloud-init seed. The seed can be regenerated from the stored spec.
 
 use super::*;
 
@@ -17,10 +11,7 @@ impl Provisioner {
     /// The fourth link of the chain: this VM's cloud-init seed, or nothing at
     /// all for a VM that has no cloud-init block.
     pub(super) fn write_seed(&self, id: &VmId, spec: &AgentVmSpec) -> Result<()> {
-        // The seed, written before the VMM is created and rebuilt every time
-        // this chain runs: it is derived from the spec, so a re-provision
-        // after a dead VMM produces the same bytes and nothing has to be
-        // remembered about it.
+        // Generate the seed before creating the VMM.
         if let Some(config) = &spec.cloud_init {
             let seed = crate::cloudinit::seed_path(&self.run_dir, id);
             crate::cloudinit::write_seed(&seed, id, config)
@@ -30,9 +21,7 @@ impl Provisioner {
         Ok(())
     }
 
-    /// Where this VM's seed lives, and `None` for a VM that has no
-    /// cloud-init block — which is what keeps such a VM's hypervisor config
-    /// byte for byte what it was.
+    /// Return the seed path only when cloud-init is configured.
     fn seed_path(&self, id: &VmId, spec: &AgentVmSpec) -> Option<PathBuf> {
         spec.cloud_init
             .as_ref()

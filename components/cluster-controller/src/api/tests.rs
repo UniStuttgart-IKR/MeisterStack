@@ -7,15 +7,8 @@
 
 use super::*;
 
-/// An instance store is as node-local as bytes get, and it has no
-/// `Volume` object to be caught by.
-///
-/// The refusal beside this one reads the VM's REFERENCED volumes, so an
-/// inline disk went straight through a check written for exactly its kind
-/// of problem (migration D6). Unreachable while the migration reconciler
-/// is missing, and that is the only reason it never bit: a `POST
-/// /vmmigrations` would have been accepted and had to fail later, or —
-/// worse — arrive somewhere the file does not exist.
+/// Inline disks are node-local even without a Volume object, so live migration
+/// must reject them explicitly.
 #[test]
 fn an_inline_disk_is_named_as_the_reason_a_vm_cannot_move_live() {
     let running = |volumes: serde_json::Value| {
@@ -62,16 +55,8 @@ fn an_inline_disk_is_named_as_the_reason_a_vm_cannot_move_live() {
     assert_eq!(migration_refusal(&referenced, &somewhere_to_go, None), None);
 }
 
-/// A browser's handshake gets an answer a browser understands, at this
-/// tier too.
-///
-/// The cloud learned this in fremdsicht 6: a WebSocket client that gets
-/// `Upgrade: meister-console` and no `Sec-WebSocket-Accept` throws the
-/// connection away without a word. The cluster kept answering every
-/// client the raw form (fremdsicht 7) although the handshake and the
-/// framing sit in `controller-api` and are shared. What is still only the
-/// cloud's is the ticket, and that is why this tier goes on naming
-/// `console` and not `console.websocket`.
+/// Return the requested raw or WebSocket handshake. Console tickets remain a
+/// cloud feature; cluster discovery advertises the console route without tickets.
 #[test]
 fn the_upgrade_answers_in_the_dialect_it_was_asked_in() {
     let raw = switching(None);
@@ -505,16 +490,8 @@ fn a_cloud_owned_vm_is_refused_here_whichever_way_it_is_written() {
     assert!(said.contains("managed by the cloud"), "{said}");
 }
 
-/// The other half of the promise: a resource this control plane has is
-/// either served here or written down as one this tier does not serve. A
-/// new row in `controller_api::resources` fails this test until somebody
-/// decides which of the two it is.
-/// The cluster tier's own table, and the label rule beside it.
-///
-/// A PATCH never meets any of this — it is merged onto the stored object
-/// first, so an unmentioned field is already the stored value — which is
-/// what makes the same handler safe for both verbs. The test says so by
-/// running a real merge patch through and expecting it to pass.
+/// Bound VM shape and ownership labels cannot change. A merged PATCH retains
+/// unmentioned stored fields and must pass the same update checks.
 #[test]
 fn a_bound_vm_refuses_a_moved_spec_and_takes_a_patch_that_says_nothing_about_it() {
     let stored = |vcpus: u32| {
@@ -572,17 +549,8 @@ fn a_bound_vm_refuses_a_moved_spec_and_takes_a_patch_that_says_nothing_about_it(
         .expect("a three-line patch names none of the owned fields");
 }
 
-/// The row storage B rewrote: `spec.vm` is immutable in everything except
-/// `volumes[]` from its SECOND entry on, and there only for entries that
-/// name a `Volume` object.
-///
-/// Six edits, and each one is a different sentence about the same field.
-/// The three that pass are the whole of declarative hot-plug — attach is
-/// an entry appearing, detach is one disappearing, and neither is a verb.
-/// The three that are refused are the ones where saying yes would cost
-/// somebody something they cannot get back: a guest's root disk swapped
-/// underneath it, an instance store nobody agreed to make, and the rest
-/// of a booted VM's document.
+/// Allow referenced-disk hot-plug after the boot entry, while preserving the
+/// boot disk, every inline disk and the remaining VM shape.
 #[test]
 fn a_vm_takes_a_second_disk_and_refuses_everything_else_about_its_spec() {
     let vm = |volumes: serde_json::Value, vcpus: u32| {

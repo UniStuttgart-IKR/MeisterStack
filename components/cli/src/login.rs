@@ -154,7 +154,7 @@ pub async fn run(
     Ok(())
 }
 
-/// Choose --out, declared mTLS paths, or <config dir>/pki/<profile>.{key,crt}.
+/// Choose `--out`, declared mTLS paths, or `<config dir>/pki/<profile>.{key,crt}`.
 /// Enrollment writes credential files without rewriting the TOML profile.
 fn destination(
     config: &Config,

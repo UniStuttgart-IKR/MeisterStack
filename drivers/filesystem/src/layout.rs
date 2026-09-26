@@ -2,14 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! What a pool directory looks like from the outside.
-//!
-//! What each file in it is called, how much room it has, and how bytes get
-//! into it. None of it needs a driver: a pool is a directory, and every
-//! question here is answered from the directory and the id. That is why they
-//! are functions and not a second type — a driver with two classes is not a
-//! driver, and the answer to `FilesystemBlockDriver`'s low cohesion is that
-//! half its methods never looked at it.
+//! File naming, space reservations and copy helpers for directory-backed pools.
 
 use agent_api::base_image::{BaseImage, Destination, Sandbox};
 use agent_api::storage;
@@ -28,54 +21,20 @@ pub(crate) fn tmp_path(dir: &Path, id: &VolumeId) -> PathBuf {
     dir.join(format!("{id}.tmp"))
 }
 
-/// Where a snapshot lives: beside the volumes, under the SNAPSHOT's id
-/// and a suffix of its own.
-///
-/// A separate suffix and not a separate directory, so that one
-/// `volume_dir` is still the whole of what this backend owns and a node's
-/// configuration does not grow a second path to get wrong. The id is the
-/// snapshot's, which is what makes `snapshot` idempotent: asked twice,
-/// the second call finds the file the first one made.
+/// Snapshot path beside the volumes, keyed by snapshot ID.
 pub(crate) fn snapshot_path(dir: &Path, id: &SnapshotId) -> PathBuf {
     dir.join(format!("{id}.snap"))
 }
 
-/// The room this pool has already promised to copies that have not finished.
-///
-/// `statvfs` answers "how much is free NOW", and a snapshot takes as long as
-/// its bytes take. Two 30 GiB snapshots asked for at once in a pool with
-/// 40 GiB free both measured 40, both were let through, and the second one
-/// took the filesystem to zero — which on this stack is never only a failed
-/// snapshot: the agent's database is on that filesystem, and a full one wedges
-/// every command the node has. The measurement was right and it was a
-/// snapshot of a moment that had already passed by the time it was used.
-///
-/// So the check RESERVES what it approves, and gives it back when the copy is
-/// over — whichever way it ended, because a copy that failed left nothing
-/// behind (the error path removes its `.snap.tmp`) and a copy that succeeded
-/// is already counted by the next `statvfs`.
-///
-/// The reservation is deliberately the full size and not what is left to
-/// write. It is the upper bound, it is what the measurement WOULD have said
-/// had the copy already finished, and a promise that shrank as a copy ran
-/// would let a second one in on the strength of bytes the first one is about
-/// to write.
-///
-/// In memory and per driver, which is per pool per agent. It knows nothing
-/// about a second writer on a shared filesystem and never claimed to:
-/// `statvfs` is still what says how much room there is, and this only
-/// subtracts the copies this node started and has not finished.
+/// Space reserved for in-flight copies by this driver instance. Subtract the
+/// full promised size from statvfs availability until the guard is dropped.
+/// Other processes and nodes do not share these reservations.
 #[derive(Debug, Default)]
 pub(crate) struct Room {
     promised: std::sync::Mutex<u64>,
 }
 
-/// Room this pool has set aside, given back when this is dropped.
-///
-/// A guard and not a pair of calls, because the giving back has to happen on
-/// every path out of a copy — the failure, the panic in the blocking task,
-/// the early return — and "release it afterwards" is the kind of instruction
-/// that survives exactly until somebody adds a `?`.
+/// Release this reservation when its guard is dropped.
 #[derive(Debug)]
 pub(crate) struct Reserved<'a> {
     room: &'a Room,
@@ -85,28 +44,14 @@ pub(crate) struct Reserved<'a> {
 impl Drop for Reserved<'_> {
     fn drop(&mut self) {
         let mut promised = self.room.promised.lock().expect("this pool's reservations");
-        // Saturating, so a lock that was poisoned and remade — or any future
-        // bookkeeping mistake — cannot underflow into a pool that believes it
-        // has promised sixteen exabytes and refuses every snapshot for ever.
+        // Avoid arithmetic underflow if reservation bookkeeping becomes inconsistent.
         *promised = promised.saturating_sub(self.bytes);
     }
 }
 
 impl Room {
-    /// Refuse a copy this pool has no room for, before a byte of it is
-    /// written — and hold the room until the copy is done.
-    ///
-    /// The failure this prevents is the one that keeps itself alive: a
-    /// snapshot that runs out of space leaves a partial copy of exactly the
-    /// size that was left, the requeue tries again into a pool that is now
-    /// even fuller, and the node's own root filesystem — the same one its
-    /// database is on — goes to zero. That is how a chaos run turned one
-    /// failed snapshot into a node that could not serve a single command.
-    ///
-    /// The lock is taken BEFORE the measurement and not after, which is the
-    /// whole of what makes two callers at once safe: two threads that each
-    /// measured first would both have read the same free space and both have
-    /// decided they fit.
+    /// Measure free space and reserve under one lock so concurrent calls on this
+    /// instance cannot both spend the same measured capacity.
     pub(crate) fn reserve(&self, dir: &Path, needed: u64) -> storage::Result<Reserved<'_>> {
         let mut promised = self.promised.lock().expect("this pool's reservations");
         let stat = nix::sys::statvfs::statvfs(dir).map_err(|e| {
@@ -124,10 +69,7 @@ impl Room {
                 bytes: needed,
             });
         }
-        // The promised half is named only when there is one. On an idle pool
-        // it is zero and saying so would put a number in front of an operator
-        // that explains nothing; when it is not zero it is the entire reason
-        // this refusal happened while `df` says there is room.
+        // Include concurrent reservations when they contribute to the capacity refusal.
         let held = match *promised {
             0 => String::new(),
             other => format!(
@@ -143,20 +85,7 @@ impl Room {
     }
 }
 
-/// Write a non-raw base image out as raw. `qemu-img convert` and not a
-/// copy, because what this backend hands the VMM is a raw file and a
-/// copied qcow2 is not one.
-///
-/// The format is passed in and not detected here: it is what
-/// `agent_api::base_image::probe` already judged, and a second detection at
-/// convert time would be a second decision about a file nothing checked
-/// again. Astra finding S01, 2026-09-23.
-///
-/// And it happens in a transient systemd unit rather than in this process,
-/// which is the other half of the same finding: this pool's agent is root
-/// by default, and `qemu-img` is a parser for a file somebody else wrote.
-/// `agent_api::base_image` says what the unit holds and why there is no
-/// road that runs the converter here instead.
+/// Convert a previously probed image to raw in the configured sandbox.
 pub(crate) fn convert_to_raw(
     sandbox: &Sandbox,
     qemu_img: &Path,
@@ -164,13 +93,7 @@ pub(crate) fn convert_to_raw(
     src: &Path,
     dst: &Path,
 ) -> std::io::Result<()> {
-    // The tmp file is created HERE and not by qemu-img. It is what the unit
-    // is given a bind mount of and what the converter is given ownership of
-    // for the length of the conversion, and neither can be done to a file
-    // that does not exist yet. `qemu-img convert` opens its destination with
-    // O_CREAT|O_TRUNC, so an empty file in front of it changes nothing about
-    // what it writes — and the file is made by the agent, with the agent's
-    // umask, so the volume keeps the mode it has always had.
+    // Create the destination before the sandbox binds it and transfers ownership.
     std::fs::File::create(dst)?;
     // Only for the sentence a person reads. The catalogue name is the file
     // name in this pool's image directory.
@@ -189,7 +112,8 @@ pub(crate) fn convert_to_raw(
     )
 }
 
-/// Reflink if the filesystem can, copy if it cannot.
+/// Copy with copy_file_range, falling back to a byte copy on an unsupported
+/// first call. This does not force a single atomic FICLONE operation.
 pub(crate) fn clone_or_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
     use nix::errno::Errno;
     use nix::fcntl::copy_file_range;
@@ -226,13 +150,8 @@ pub(crate) fn clone_or_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-/// Make the file a volume is: its bytes, then its size, then its name.
-///
-/// The order is the whole of it. The bytes are written under a tmp name, the
-/// file is grown to what the spec asked for, it is fsynced, and only then is
-/// it renamed into place — so a volume that exists under its own name is a
-/// volume that is finished, and an interrupted provision leaves a `.tmp`
-/// that `deprovision` removes with the volume.
+/// Write under a temporary name, set the requested size, sync the file, then
+/// rename to the final name. The containing directory is not synced here.
 pub(crate) fn write_volume_file(
     src: Option<(PathBuf, Option<BaseImage>)>,
     sandbox: &Sandbox,

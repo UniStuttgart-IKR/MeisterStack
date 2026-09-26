@@ -2,50 +2,27 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Doing it: the one place in the pass that changes anything.
+//! Execute planned actions under the operations lock.
 //!
-//! `execute` is a match over the action `plan` returned and nothing else —
-//! no second decision, no re-reading of the record, no error handling that
-//! could turn into one. What it cannot do is decide, and that is the point of
-//! the split: every reason lives next door in `plan`, where it can be walked.
-//!
-//! Moved out of `reconcile.rs` unchanged.
+//! Revalidate the plan against the current record before applying side effects;
+//! observations and the planning instant are reused from the caller.
 
 use super::*;
 
-/// How many resumes may fail to take before the VM is quarantined.
-///
-/// Three, and the reason for a number rather than one is a race: the guest
-/// state is asked immediately after the resume, and a hypervisor that has
-/// answered the call but not yet flipped its own state would look like a
-/// failure once. It cannot look like one three times over three passes.
+/// Consecutive accepted resumes without an observed Running state before quarantine.
+/// The allowance accommodates delayed guest-state updates after the API reply.
 pub(crate) const RESUME_ATTEMPTS: u32 = 3;
 
-/// Why a VM whose resume never takes is quarantined. One string for the
-/// marking, the report and the operator, for the reason `BACKEND_DIED_REASON`
-/// is one.
+/// Shared quarantine reason for an accepted resume that repeatedly fails to run the guest.
 pub const RESUME_INEFFECTIVE_REASON: &str = "the hypervisor accepted three resumes and the guest is still not running; it needs a look \
      - use start/stop/destroy to repair";
 
 impl Reconciler {
-    /// The marker a backend that died under a live VMM leaves behind.
+    /// Quarantine a live VMM whose vhost-user backend died. Automatic repair
+    /// cannot reconnect that backend; a lifecycle command must clear the marker.
     ///
-    /// Cloud Hypervisor cannot reconnect a vhost-user backend — not a gpu,
-    /// not a virtiofs share — and restarting the VM automatically is not
-    /// wanted here: the VM is marked and quarantined until a human acts
-    /// (start/stop/destroy clears the marker).
-    ///
-    /// Error and not warn: quarantine is the one state no pass ever leaves on
-    /// its own. The reason string says as much — only start/stop/destroy
-    /// clears the marker, and all three need a human.
-    ///
-    /// Through `mutate` and NOT `put`: the caller's `observe` awaited a probe
-    /// of the VMM's socket, so the record in hand is a snapshot from before
-    /// that wait. Writing the whole thing back would drop anything that
-    /// landed meanwhile — a Stop from the controller most of all, whose
-    /// `set_desired` writes the same record from another task. Only the
-    /// marker is ours to set, and the fresh record is handed back so the
-    /// caller can go on with what the store now holds.
+    /// Mutate only the marker because observation may have awaited I/O while
+    /// another task updated the persisted record.
     pub(super) fn quarantine_if_backend_died(
         &self,
         id: &VmId,
@@ -56,33 +33,17 @@ impl Reconciler {
             return Ok(None);
         }
         error!(reason = BACKEND_DIED_REASON, "marking vm unhealthy");
-        // Counted where the marker is SET and not where it is reported: the
-        // report repeats the same quarantine every ten seconds, and a counter
-        // fed from there would measure the reporting interval rather than the
-        // events.
+        // Count a new quarantine once, rather than on each status report.
         telemetry::metrics::agent().quarantined();
         self.store
             .mutate(id, |r| r.unhealthy = Some(BACKEND_DIED_REASON.to_string()))
     }
 
-    /// Carry out `action` — if it is still the action.
+    /// Execute only if the current record still produces the planned action.
     ///
-    /// The plan was made without the node's lock and this takes it, so the
-    /// record can have moved in between, and one of the ways it moves is a
-    /// MIGRATION: `begin_migrate_out` writes `operation = MigratingOut` under
-    /// this very lock, and neither the phase nor the intent moves with it. A
-    /// check of those two alone let a stop decided a moment before a send
-    /// began kill the source VMM in the middle of the transfer (F07).
-    ///
-    /// So the question is asked again, whole: `plan`, over the record as it
-    /// is NOW, the same observation and the same instant. `plan` is pure, so
-    /// asking again costs nothing and cannot disagree with itself — whatever
-    /// it reads (operation, quarantine, pid, phase, intent) is covered, and a
-    /// field it does not read cannot change the answer. What is NOT asked
-    /// again is the world: observing under the lock would hold every command
-    /// on this node for the length of a probe, and the actions are built to
-    /// meet a world that moved (a stop of a VMM that is gone, a start of one
-    /// that is running).
+    /// The operations lock serializes this check with migration ownership changes.
+    /// Reusing the observation avoids holding the lock during a probe; driver
+    /// actions must tolerate host state changing after that observation.
     pub(super) async fn execute(
         &self,
         id: &VmId,
@@ -175,23 +136,8 @@ impl Reconciler {
         }
     }
 
-    /// Did the resume take? Asked of the guest, not of the call.
-    ///
-    /// D7: a snapshot failed after the quiesce pause, the resume behind it was
-    /// issued, it did not work, and the agent went on issuing it every five
-    /// seconds without a WARN, an event or an escalation. The guest stayed
-    /// `Paused` under `runStrategy = Running`, and nothing anywhere said so.
-    ///
-    /// The hypervisor's answer to `vm.resume` is that it took the REQUEST.
-    /// What this asks is `vm.info`, which is the only thing that knows whether
-    /// the guest is running — the same distinction the detach path had to
-    /// learn, one verb over.
-    ///
-    /// Three of these in a row is not a race any more, and the marker is the
-    /// quarantine this stack already has for "a human has to look at this":
-    /// the VM reports `Quarantined` with the sentence, which is what becomes
-    /// the event one tier up, and no further pass will resume it until
-    /// start/stop/destroy clears the marker.
+    /// Confirm Running after an accepted resume. Repeated unsuccessful observations
+    /// quarantine the VM until a lifecycle command clears the marker.
     async fn confirm_resume(&self, id: &VmId) -> Result<()> {
         let seen = self.drivers.hypervisor()?.get_state(id).await;
         if let Ok(VmState::Running) = seen {

@@ -2,26 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# V14 against a real raft: three etcd members, one of them stopped, and a
-# rollout that refuses to take a second one down.
-#
-# Everything about the quorum here is real. The three members bootstrap a
-# static three-member cluster over their peer urls, `etcdctl member list` and
-# `endpoint health` are asked by the tool's own read-only probe over ssh, and
-# what stops the second interruption is the arithmetic of D8 — floor((n-1)/2)
-# minus whoever is already down — applied to what those commands answered.
-# Nothing is mocked but the evaluation, which a test VM cannot do (see
-# nix/tests/update.nix for why) and which `resolve --from` therefore receives
-# as the file `nix/lib/manifest.nix` writes.
-#
-# In order: a healthy group of three plans as three waves with one member
-# allowed down; a member is stopped and the same plan is refused with the
-# quorum sentence; an `apply` of a plan made BEFORE the outage stops in
-# `validate_against` and touches nobody; the member comes back and the plan
-# goes through; the rollout runs, and while the first member is mid-
-# activation the other two answer healthy; and a manifest whose etcd
-# membership is not the one etcd reports blocks the whole group (D8's
-# topology half).
+# Exercise real three-member etcd health and membership checks. A degraded
+# group must refuse another interruption, including when applying an older plan.
+# Manifest evaluation happens at build time.
 { nixpkgs, lib, pkgs, system, self }:
 
 let

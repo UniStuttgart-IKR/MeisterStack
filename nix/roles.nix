@@ -2,32 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# What this machine is, and the values it would otherwise have been handed at
-# boot. Two roads reach the context renderer (nix/context.nix), and this
-# module is the second one.
-#
-# The lab's VMs are told what they are by their provider's CONTEXT:
-# MEISTER_ROLE and a dozen MEISTER_* variables, read from a cd at boot. A box
-# installed from this flake — a plan node, or somebody else's NixOS host that
-# imports `nixosModules.default` — has no cd and no provider, and it should
-# not need a second renderer for that. So the same variables are BAKED into
-# /etc/meisterstack/context.env, and the renderer sources that file before it
-# lets a provider speak: the plan supplies the defaults, a real context
-# overrides them, and there is exactly one piece of code that turns a
-# variable into a config file.
-#
-# The THIRD road is `nix/managed.nix`: there the same variables are read by
-# `nix/lib/render.nix` at build time and the config files are complete before
-# the machine boots. Same input, same keys, no renderer — and
-# Until M5B a second, boot-time renderer read the same variables and
-# `checks.render-parity` held the two to each other; that renderer went to
-# `~/git/meisterstack-lab/legacy/nix/` with the appliance image.
-#
-#   imports = [ meisterstack.nixosModules.default ];
-#   meisterstack.roles = [ "cloud" "cluster" ];
-#   meisterstack.cloud.settings = { ... };
-#
-# is therefore a complete MeisterStack host, with no image and no meister-deploy.
+# Declare runtime roles and shared context inputs. Role selection controls
+# which units are available; provider initialization is independent of optional
+# configuration rendering.
 { lib, config, ... }:
 let
   cfg = config.meisterstack;
@@ -70,25 +47,8 @@ in
       '';
     };
 
-    # --- lane 5C ---
-    # Declared HERE and not in nix/context.nix, which is where it used to
-    # live and where it is still read.
-    #
-    # The reason is a host the lab built: a managed NixOS host on an
-    # OpenNebula VM. It needs the strict reader
-    # (`nixosModules.provider-opennebula`) to learn its address, its
-    # hostname and its resolver off the CONTEXT cd, and it must NOT have
-    # the boot renderer, because nix/managed.nix asserts against it — a
-    # machine whose config files are a system generation may not have a
-    # second author for them at boot. The reader sets this option, the
-    # renderer declared it, and nix/managed.nix forbids the renderer: the
-    # combination did not evaluate at all, and the lab paid for it with
-    # thirty hand-written lines of unit in the operator's own repository
-    # (L2 finding N5, 2026-09-23).
-    #
-    # A declaration decides nothing, so moving it into the module every
-    # host imports costs nothing either: `checks.services-are-pure` is
-    # about what nix/services.nix SETS, and this sets nothing.
+    # Declare provider initialization here so managed hosts can use it without
+    # importing a boot-time configuration renderer.
     context.providerScript = lib.mkOption {
       type = lib.types.lines;
       default = "";
@@ -116,7 +76,7 @@ in
         interface it owns. What it must not do is render a config file.
       '';
     };
-    # --- end lane 5C ---
+
 
     context.defaults = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
@@ -143,20 +103,12 @@ in
   };
 
   config = {
-    # Disjoint from what a plan writes into `context.defaults`, on purpose:
-    # two definitions of one variable would be a conflict rather than a
-    # precedence, and MEISTER_ROLE has exactly one owner here.
+    # Derive the role variable separately from inventory context defaults.
     meisterstack.context.defaults = lib.mkIf (cfg.roles != [ ]) {
       MEISTER_ROLE = lib.concatStringsSep "," cfg.roles;
     };
 
-    # Shell, because the file is sourced by a shell — the same shell the
-    # renderer runs in, so that both roads arrive there in the same shape.
-    # Quoted through escapeShellArg: a Loki url with a `&` in it is a value,
-    # not a job control character.
-    # No defaults, no file — and the renderer reads exactly that: the generic
-    # image, which is told everything at boot, carries nothing it would have
-    # to be told to ignore.
+    # Escape values for the shell environment file consumed by context-based hosts.
     environment.etc."meisterstack/context.env" = lib.mkIf (cfg.context.defaults != { }) {
       text =
         lib.concatStringsSep "\n"

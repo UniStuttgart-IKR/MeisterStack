@@ -2,25 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The pass: look, decide, act — in that order, once per VM, over and over.
+//! Reconcile each VM by observing host state, planning a deterministic action,
+//! and revalidating it under the operations lock before execution.
 //!
-//! Level-triggered and stateless between passes. Nothing here remembers what
-//! the last pass did; every decision is derived again from the record and
-//! from what the node can be seen to be doing, which is what lets a restart,
-//! a crash or a missed message end up in the same place as a quiet minute.
-//!
-//! The three steps have a file each, and they are the whole of the pass:
-//!
-//! * `observe` — what IS: the VMM, its socket, the backend processes, the
-//!   guest state, and the same picture rendered for the controller
-//! * `plan` — what WOULD be done: one pure function from record plus
-//!   observation to an `Action`, with no clock but the one it is handed and
-//!   no way to touch the world
-//! * `act` — doing it, and the marker a dead backend leaves behind
-//!
-//! `plan` is pure so that the whole of it can be enumerated: `tests/space`
-//! walks all 89 600 cells of its input space, which is only possible because
-//! the function takes values and returns one.
+//! Records persist intent and ownership. Retry schedules, resume counters and
+//! stray-process grace periods are held in memory and reset on agent restart.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -54,20 +40,15 @@ pub enum Trigger {
     Manual,
 }
 
-/// What an action was decided from: the record as the pass read it, what it
-/// saw, and the instant it decided at. Handed to `execute`, which asks `plan`
-/// the same question again under the node's lock — see there, and F07.
+/// Record, observation and planning time passed to execution for revalidation
+/// under the operations lock.
 pub(super) struct Planned<'a> {
     pub(super) record: &'a VmRecord,
     pub(super) observed: &'a Observed,
     pub(super) at: SystemTime,
 }
 
-/// What a pass WOULD do, without doing it: the record's stated intent, where
-/// its resources got to, whether it is quarantined, what the world looks
-/// like, and the action those three add up to. A struct and not a tuple
-/// because the REST `observe` endpoint is where an operator reads it, and
-/// five positional fields is how the wrong two get swapped.
+/// Dry-run view of the persisted record, current observation and planned action.
 pub struct DryRun {
     pub desired: Desired,
     pub phase: Phase,
@@ -104,17 +85,8 @@ impl ReconcileSummary {
 struct FailureState {
     failures: u32,
     next_attempt: Instant,
-    /// What the last failed attempt said.
-    ///
-    /// Kept beside the count because the count alone is not a diagnosis: a VM
-    /// that has been `Provisioning` for ten minutes used to report how often
-    /// a pass had failed and nothing about what stopped it, and the sentence
-    /// was in this node's log — the one place the person reading the API
-    /// cannot see. It goes out with the phase now (`VmReason::Backoff`).
-    ///
-    /// In memory like the schedule it belongs to, and gone with it: a restart
-    /// forgets both, and the first pass after one either works or says why
-    /// again.
+    /// Last failed attempt, reported with the in-memory backoff state.
+    /// Both the diagnostic and retry schedule reset on restart.
     last_error: String,
 }
 
@@ -129,39 +101,20 @@ pub struct Reconciler {
     provisioner: Arc<Provisioner>,
     ops: Arc<tokio::sync::Mutex<()>>,
     failures: Mutex<HashMap<VmId, FailureState>>,
-    /// How many resumes in a row this node has issued for a VM without the
-    /// guest coming back. Its own counter and not `failures`, because the two
-    /// are cleared by different things: `failures` is the retry schedule and a
-    /// new intent wipes it, while the controller's repeated Resume IS the
-    /// retry here — a counter that a repeat reset could never reach three.
+    /// Consecutive accepted resumes without an observed Running state.
+    /// Kept separate from ordinary backoff so repeated intent updates cannot
+    /// reset the ineffective-resume threshold.
     resume_failures: Mutex<HashMap<VmId, u32>>,
-    /// The guest serial lines this node records, and who holds them. Level
-    /// -triggered like everything else here: the pass below asks for a
-    /// recorder every time and the map answers "already" almost always.
+    /// Guest serial recorders and interactive holders, ensured on each reconciliation pass.
     pub consoles: Arc<crate::attach::Consoles>,
-    /// When each VMM that no record names was first seen by a pass.
-    ///
-    /// In memory and not on disk, and that is the conservative direction: a
-    /// restart forgets the clock and the grace starts again, so an agent that
-    /// keeps restarting never ends anything. The alternative — a deadline on
-    /// disk for a VM there is no record of — would be a record, which is
-    /// precisely what this is about the absence of.
+    /// First observation of an unmanaged VMM. Kept in memory so a restart
+    /// restarts the grace period rather than ending a process immediately.
     strays: Mutex<HashMap<VmId, Instant>>,
 }
 
-/// How long a VMM nobody has a record of is left alone before it is ended.
-///
-/// Long, and the length is the argument. Every honest reason for a stray is
-/// a race this agent lost and will not win by hurrying: a `destroy` that
-/// removed the record and failed at the process, a crash between a spawn and
-/// a write. Ten minutes is longer than any of them and longer than an
-/// operator needs to see the condition and look, and being wrong in the other
-/// direction is a guest killed on the strength of a row that could not be
-/// read.
-///
-/// The same order as `Ceilings::receive`, and not by coincidence: a
-/// destination that was killed mid-transfer is the case both numbers are
-/// about, from the two sides of the same minute.
+/// Grace period before terminating a discovered VMM without a stored VM ID.
+/// Unreadable rows still protect their IDs; store-read failure skips the sweep.
+/// The in-memory clock restarts after an agent restart.
 const STRAY_GRACE: Duration = Duration::from_secs(600);
 
 impl Reconciler {
@@ -183,23 +136,12 @@ impl Reconciler {
         }
     }
 
-    /// The driver table this node came up with.
-    ///
-    /// On the reconciler because the reconciler is what holds it, exactly as
-    /// `console` below is here because the hypervisor driver is. The one
-    /// caller outside this module is the router half of the command table:
-    /// the gateway slot is a driver's, and the agent only ever calls the
-    /// trait.
+    /// Read the startup driver registry, including its optional gateway capability.
     pub fn drivers(&self) -> &Drivers {
         &self.drivers
     }
 
-    /// The end of this VM's one-way output, both streams of it.
-    ///
-    /// On the reconciler because the reconciler is what holds the drivers,
-    /// and the hypervisor driver is the only party that knows where its
-    /// console files are. Read-only in every sense: no attach, no input, no
-    /// follow — see `crate::console`.
+    /// Read recorded console tails through paths supplied by the hypervisor.
     pub fn console(
         &self,
         id: &VmId,
@@ -210,9 +152,7 @@ impl Reconciler {
         let Some(hypervisor) = &self.drivers.hypervisor else {
             return Vec::new();
         };
-        // The guest's streams and, only when it was asked for by name, the
-        // driver's own. `diagnostic_paths` is a plain list of files with no
-        // stream attached, because until now nothing served it.
+        // Include guest streams and explicitly requested VMM diagnostics.
         let mut paths = hypervisor.console_paths(id);
         if wanted.contains(&ConsoleStream::Vmm) {
             paths.extend(
@@ -229,10 +169,8 @@ impl Reconciler {
     pub async fn reconcile_all(&self, trigger: Trigger) -> Result<ReconcileSummary> {
         let clock = telemetry::metrics::Timer::start();
         let outcome = self.reconcile_all_inner(trigger).await;
-        // "Vm" spelled out rather than taken from a constant: the agent does
-        // not depend on controller-api, and the kind is the wire contract
-        // either way (control.proto). Same series as the two tiers above, so
-        // one panel shows all three.
+        // Use the shared wire kind without a controller-api dependency so metrics
+        // from each tier appear in the same series.
         telemetry::metrics::reconcile().pass(
             telemetry::metrics::TIER_AGENT,
             "Vm",
@@ -244,11 +182,7 @@ impl Reconciler {
 
     async fn reconcile_all_inner(&self, trigger: Trigger) -> Result<ReconcileSummary> {
         let mut summary = ReconcileSummary::default();
-        // Before the VMs, and about none of them in particular: whether this
-        // node can still tear a guest down at all, and whether the base images
-        // its records name are still on its disk. Both are facts about the
-        // NODE that only a pass can keep saying — see `check_the_cgroup_root`
-        // and `Provisioner::verify_path_images`.
+        // Refresh node-wide cgroup and path-image conditions before reconciling VMs.
         self.check_the_cgroup_root();
         self.provisioner.verify_path_images().await;
         self.sweep_unmanaged_vmms().await;
@@ -256,26 +190,15 @@ impl Reconciler {
         summary.total = vms.len();
 
         for (id, _) in vms {
-            // Level-triggered, like everything else in this pass: the guest's
-            // output files are bounded here because this is the one loop that
-            // runs over every VM this node has, whatever else is happening to
-            // them. A VM that is converged still prints, and a boot loop is
-            // precisely the case where nothing else in this pass would fire.
+            // Trim guest and VMM output on every pass, including for converged VMs.
             if let Some(hypervisor) = &self.drivers.hypervisor {
-                // The serial line is a socket now, so somebody has to be
-                // reading it for `<id>.serial` to exist at all. Asked for
-                // here, beside the trim, for the same reason the trim is
-                // here: this is the one loop that runs over every VM whatever
-                // else is happening to them, so a recorder that ended is made
-                // again without anything having to notice that it ended.
+                // Ensure a recorder exists for the serial socket; restart it if its task ended.
                 if let Some(socket) = hypervisor.console_socket(&id) {
                     self.consoles.ensure(&id, &socket).await;
                 }
                 crate::console::trim_all(&hypervisor.console_paths(&id));
-                // The VMM's own log is bounded here too and read nowhere: it is
-                // the driver's diagnostics, not the guest's output, and `vm logs`
-                // must not mix them. `destroy` removes it; without this nothing
-                // stopped it growing while the VM lived.
+                // Bound VMM diagnostics separately from guest logs. The driver removes
+                // these files on destroy; the guest logs API does not expose them.
                 for path in hypervisor.diagnostic_paths(&id) {
                     crate::console::trim(&path);
                 }
@@ -292,10 +215,7 @@ impl Reconciler {
             }
         }
 
-        // Level-triggered, at the end of the pass: which addresses live on
-        // this node right now. `right now` is why it observes again instead
-        // of reusing what the loop above saw — see `announce_prefixes`. See
-        // also `announcements`.
+        // Reobserve running guests after actions before updating announced prefixes.
         self.announce_prefixes().await;
 
         if matches!(trigger, Trigger::Startup) || summary.had_events() {
@@ -319,59 +239,17 @@ impl Reconciler {
         Ok(summary)
     }
 
-    /// Is this node's `cgroup_root` still a cgroup2 filesystem?
-    ///
-    /// Asked here, once per pass, and it is about the NODE rather than about
-    /// any VM — which is why it sits beside the loop and not inside it. The
-    /// check ran exactly once, at start-up, and that made it a statement about
-    /// the second the agent came up: a `/sys/fs/cgroup` that was unmounted,
-    /// remounted or shadowed afterwards went unmentioned until the first
-    /// delete hung, which is the original defect with a start-up check in
-    /// front of it.
-    ///
-    /// The path comes from the confiner and not from a copy of the config,
-    /// because the confiner is the party that WRITES into that directory —
-    /// see `ResourceConfiner::root`. A confiner with no directory (every fake
-    /// in these tests) is asked nothing and claims nothing.
-    ///
-    /// The conditions are the store's, which are the node's: one `Arc` is
-    /// made in `store_and_conditions` and handed to everything that raises
-    /// into it, so what the heartbeat carries is one list.
+    /// Recheck the configured confiner root each pass and update the shared node
+    /// condition. A confiner without a filesystem root needs no check.
     fn check_the_cgroup_root(&self) {
         if let Some(root) = self.drivers.confiner.root() {
             crate::conditions::check_cgroup_root(root, self.store.conditions());
         }
     }
 
-    /// VMMs running here that no record of this agent names: say so, and end
-    /// them once they have been saying so for long enough.
-    ///
-    /// D18. "The agent adopts what it has a record of" was only half a rule,
-    /// and the other half went unwritten: a guest whose record went while its
-    /// process did not runs on a machine nobody manages. It answers no
-    /// command, appears in no report, holds its disks and its taps, and the
-    /// first anybody hears of it is a second guest dying on a write lock over
-    /// the same volume. The lab made one — a destination whose agent was
-    /// killed mid-migration, whose VMM finished the transfer, and whose guest
-    /// then ran for hours while the control plane called the migration failed.
-    ///
-    /// **The known set is `list_raw`, not `list`.** The question is whether a
-    /// RECORD EXISTS, not whether this build can read it: a row that cannot be
-    /// deserialised is a VM this agent cannot manage, and killing its guest
-    /// over that would be the worst possible reading of a bad row. A row that
-    /// cannot be read at all — the whole table unreadable — declines the sweep
-    /// outright, the same way the overlay sweep does and for the same reason.
-    ///
-    /// **Said before it is done, and done only after a grace.** The condition
-    /// is what the tier above acts on: a node with an unmanaged guest is a
-    /// node whose free memory is a fiction. The grace is `STRAY_GRACE`, and
-    /// what it buys is the difference between a race this agent lost and a
-    /// mistake it is about to make.
-    ///
-    /// Level-triggered like the rest of the pass: the map holds only what
-    /// this pass saw, so a stray that goes away — adopted, ended by somebody,
-    /// or given a record — takes its deadline with it and the condition
-    /// clears by itself.
+    /// Report unmanaged VMMs and end them after STRAY_GRACE. Read raw row keys
+    /// so corrupt records still protect their VM IDs; a failed table read skips
+    /// the sweep. Remove grace entries when the driver no longer reports them.
     async fn sweep_unmanaged_vmms(&self) {
         let Some(hypervisor) = &self.drivers.hypervisor else {
             return;
@@ -434,33 +312,9 @@ impl Reconciler {
         }
     }
 
-    /// Tell the announcer which addresses this node answers for.
-    ///
-    /// Level-triggered in the strict sense: the whole set is recomputed from
-    /// the reconciler's own observation and handed over as a whole, every
-    /// pass. Nothing here remembers what changed, nothing here reacts to an
-    /// event, and a missed transition is not a stuck route — it is a route the
-    /// next pass corrects. Which is also why the announcer swallows its own
-    /// failures: the same set arrives again in thirty seconds.
-    ///
-    /// A node with no `[network.bgp]` section does not even observe: the whole
-    /// thing is one `is_none` check, and the pass costs exactly what it cost
-    /// before this milestone. A node with a section but neither floating
-    /// addresses nor routers hands over the empty set, which is a session
-    /// that stays up and says nothing.
-    ///
-    /// On a node that DOES announce, this is a second observation of every VM
-    /// on top of the one the pass just made, and that is deliberate. The
-    /// pass's own observations are taken BEFORE it acts: `reconcile` observes,
-    /// plans, executes — and on the paths that leave the converge loop right
-    /// after executing (`Teardown`, `SignalShutdown`, the step limit, any
-    /// error) nothing observes again afterwards. Reusing those would announce
-    /// the node as it was before the pass, which for a VM the pass just tore
-    /// down means a /32 pointing at a host that no longer runs it: a
-    /// blackhole, held until the next pass. The records are stale in the same
-    /// way — the pass writes phases and the unhealthy marker while it runs,
-    /// and `report` re-reads them. Two probes per VM per thirty seconds is a
-    /// few hundred microseconds of unix-socket traffic; a blackholed tenant
+    /// Recompute route announcements after VM actions, using fresh observations.
+    /// A VM report failure leaves existing announcements unchanged; a router-list
+    /// failure excludes router prefixes from the new set. The next pass retries.
 
     #[instrument(level = "debug", skip_all)]
     async fn announce_prefixes(&self) {
@@ -482,17 +336,8 @@ impl Reconciler {
             .collect();
         let mut want = floating_prefixes(running.iter());
 
-        // 6k, N-A4: the second sort of address this node answers for, and it
-        // is the SAME mechanism — one set, handed over whole, every pass. The
-        // routers' half comes out of the driver rather than out of a spec
-        // this tier kept, because whether a router is standing is the
-        // driver's answer and a standby announces nothing whatever it was
-        // asked to be.
-        //
-        // A failure here leaves the routers' prefixes out of the set and
-        // therefore WITHDRAWS them, which is the safe direction: an agent
-        // that cannot see its own routers must not go on telling the fabric
-        // to send them traffic. The next pass is thirty seconds away.
+        // Add prefixes from the driver's observed active routers. If router
+        // inventory fails, omit its prefixes so the announcer withdraws them.
         if let Some(bridge) = &self.drivers.bridge {
             match bridge.list_routers().await {
                 Ok(routers) => want.extend(routers.into_iter().flat_map(|r| r.announce)),
@@ -503,31 +348,8 @@ impl Reconciler {
         announcer.announce(want).await;
     }
 
-    /// One VM, from what it is to what it should be, up to four times.
-    ///
-    /// Four steps and not one: an action moves the record one phase along,
-    /// and the next observation of the same VM is a different one — a
-    /// provision that finished wants a start, a start that took wants
-    /// nothing. Converging here rather than waiting for the next pass is what
-    /// makes a create feel like a create instead of like four ticks.
-    ///
-    /// The loop is the same three lines every time: observe, plan, execute.
-    /// Everything else in it is the bookkeeping around those three — the
-    /// backoff that keeps a broken VM from eating the pass, the marker a dead
-    /// backend leaves, and the two ways the loop ends early.
-    /// Attach the recorder to this VM's serial line now, rather than on the
-    /// next periodic pass.
-    ///
-    /// The pass runs every thirty seconds and attaches recorders as it goes
-    /// (`reconcile_all`). A guest made or started at the node's socket boots
-    /// in well under a second, and what it said before a recorder was there
-    /// is only what the VMM's ring replays — measured at 278 bytes of a
-    /// 20 750-byte boot (tools/meister-deploy/src/verify.rs, `read_console`),
-    /// so the marker a booted guest prints was never in `vm logs` for a guest
-    /// a person made by hand at the socket (`checks.vm-single-node` found
-    /// it). The api calls this the moment the VMM has its socket. Idempotent:
-    /// `ensure` is what the pass calls too, and a recorder that is there
-    /// stays.
+    /// Attach an idempotent serial recorder immediately after create or start
+    /// so boot output does not wait for the periodic reconcile pass.
     pub async fn record_console(&self, id: &VmId) {
         if let Some(hypervisor) = &self.drivers.hypervisor
             && let Some(socket) = hypervisor.console_socket(id)
@@ -539,8 +361,7 @@ impl Reconciler {
     #[instrument(skip_all, fields(vm_id = %id, ?trigger))]
     pub async fn reconcile(&self, id: VmId, trigger: Trigger) -> Result<Action> {
         if self.in_backoff(&id) {
-            // Debug and not trace: the pass did not converge this vm and the
-            // level contract puts the reason a thing was skipped at DEBUG.
+            // Backoff skips are diagnostic, not converged passes.
             debug!("in backoff, skipping this pass");
             return Ok(Action::None);
         }
@@ -631,14 +452,9 @@ impl Reconciler {
         Ok(())
     }
 
-    /// The one lifecycle transition the agent has: state the intent, drop the
-    /// quarantine marker a deliberate action clears, converge once. The local
-    /// REST API and the controller session both come through here, so a
-    /// `vm stop` over the unix socket and a Stop off the session cannot end
-    /// up meaning two different things.
-    ///
-    /// `Ok(None)` means there is no such record — what that is worth is the
-    /// caller's business (404 locally, a no-op for a destroy).
+    /// Persist the new intent, clear quarantine and reconcile once.
+    /// Both local API and controller lifecycle commands use this path.
+    /// Ok(None) means the record does not exist.
     #[instrument(skip(self), fields(vm_id = %id, ?desired))]
     pub async fn set_desired(
         &self,
@@ -669,15 +485,7 @@ impl Reconciler {
         self.reconcile(id, Trigger::Manual).await.map(Some)
     }
 
-    /// Look again at every path image the records here name. See
-    /// [`Provisioner::verify_path_images`].
-    ///
-    /// On the reconciler because the status report reaches the provisioner
-    /// through it and through nothing else, exactly as it reaches `report`
-    /// and `drivers` that way. The report calls this before it reads the
-    /// image table: a report is the only thing that carries the answer
-    /// upwards, so a report that went out between two passes was carrying the
-    /// previous pass's look at the disk.
+    /// Refresh path-image observations before constructing a status report.
     pub async fn verify_path_images(&self) {
         self.provisioner.verify_path_images().await;
     }
@@ -747,19 +555,14 @@ impl Reconciler {
     }
 }
 
-/// What the pass saw and what it decided, each at the level the contract
-/// gives it: a converged pass is TRACE because there are thousands of them,
-/// a pass that will act is INFO because there are few. The two notes before
-/// the decision are about a READING and not about it — one says the guest
-/// could not be asked, the other that the intent is a reserved one.
+/// Log converged decisions at TRACE and actions at INFO. Report unreadable
+/// guest state and reserved intent separately from the selected action.
 fn log_decision(step: usize, record: &VmRecord, observed: &Observed, action: Action) {
     if observed.tracked && observed.socket_responsive && observed.guest.is_none() {
         warn!("vmm responsive but guest state unreadable, waiting");
     }
     if record.desired == Desired::Halted {
-        // Debug and not warn: nothing is degraded, the pass simply
-        // declines to act, and warning about it once every thirty
-        // seconds for the life of the record teaches nobody anything.
+        // Reserved Halted intent selects no action; avoid repeated warnings.
         debug!(
             desired = ?Desired::Halted,
             "reserved desired state is not implemented, treating as no-op"

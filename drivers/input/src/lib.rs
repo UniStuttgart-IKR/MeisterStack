@@ -243,9 +243,8 @@ impl DeviceDriver for InputDriver {
         claimed: &[(agent_api::VmId, DeviceSpec)],
     ) -> device::Result<()> {
         for (index, (id, spec)) in requested.iter().enumerate() {
-            // The path is what the operator typed and the only name they can
-            // look up on the host; the device number is what decides, because
-            // it also catches an alias made with mknod. A refusal says both.
+            // Detect ownership by device number, including mknod aliases; report
+            // both that number and the requested path.
             let path = Self::source(spec)?;
             let Some(node) = Self::claimed_node(spec) else {
                 continue;

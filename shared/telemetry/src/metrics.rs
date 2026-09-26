@@ -20,10 +20,8 @@ use prometheus::{
 };
 use tracing::{info, warn};
 
-/// The address the exposition listener takes when it is switched on without
-/// one being named. Loopback, because a port that answers every question
-/// about every tenant's topology should be reachable from the node's own
-/// scraper and not from the lab.
+/// Default metrics bind address when explicitly enabled without an
+/// address. Loopback limits exposure of unauthenticated infrastructure data.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:9090";
 
 /// Every metric this stack publishes starts with this.
@@ -66,12 +64,8 @@ impl Reconcile {
     }
 }
 
-/// How many objects there are, and — for VMs — in what phase.
-///
-/// Set from the listings a reconcile pass already makes, and deliberately not
-/// from listings of its own: a gauge that costs an etcd round trip per kind
-/// per tick would be a monitoring feature that changes the thing it monitors.
-/// So the kinds that appear here are the kinds a pass reads.
+/// Object and VM-phase gauges filled from existing reconcile inventories,
+/// without extra store listings solely for metrics.
 pub struct Objects {
     count: IntGaugeVec,
     vms: IntGaugeVec,
@@ -83,28 +77,14 @@ impl Objects {
         self.count.with_label_values(&[kind]).set(n);
     }
 
-    /// How many objects are past the deadline for the phase they are in.
-    ///
-    /// D-C1 as a number. A node fell out of the lab and the VMs on it stood
-    /// at `Unknown { Silent }` for four and a half days with nothing anywhere
-    /// distinguishing them from a VM that went `Unknown` nine seconds ago —
-    /// see `controller_api::stuck`, which owns the budgets. **Nothing is
-    /// promoted by it**: this gauge and one event are all a deadline buys.
-    ///
-    /// Every label is a closed set — the kind from the resource table, the
-    /// phase from an `XPhaseKind`, the reason from an `XReason` — so the
-    /// series count is bounded by the code and not by the fleet.
+    /// Set the current overdue count for bounded kind/phase/reason labels.
+    /// This is diagnostic only; deadlines do not promote or clean up resources.
     pub fn set_stuck(&self, kind: &str, phase: &str, reason: &str, n: i64) {
         self.stuck.with_label_values(&[kind, phase, reason]).set(n);
     }
 
-    /// Forget every stuck series before a pass sets the ones it found.
-    ///
-    /// Rebuilt per pass rather than decremented, for the reason
-    /// `Sessions::reset_heartbeats` is: an object that has come unstuck — or
-    /// been deleted — has to LOSE its series rather than keep the last value
-    /// for ever, and a pass cannot know which cells it is about to stop
-    /// filling.
+    /// Clear overdue series before publishing the current pass, removing
+    /// objects that recovered or disappeared from the inventory.
     pub fn reset_stuck(&self) {
         self.stuck.reset();
     }
@@ -117,11 +97,7 @@ impl Objects {
     }
 }
 
-/// What the scheduler did, and what it could not do.
-///
-/// `pending` is the row worth the most: `reason` is the bounded CATEGORY of
-/// the sentence that goes on the object, which is what makes a pending VM a
-/// time series instead of a string somebody has to read.
+/// Placement counters and pending gauges with bounded reason categories.
 pub struct Scheduling {
     placements: IntCounterVec,
     conflicts: IntCounterVec,
@@ -157,13 +133,8 @@ impl Sessions {
         self.connected.with_label_values(&[kind]).set(n);
     }
 
-    /// Drop every per-peer series before a pass re-sets them.
-    ///
-    /// The peer name is a label — bounded by the fleet, and the rule allows
-    /// it — but a node that is removed from the inventory would otherwise
-    /// leave its last age behind for ever, frozen, looking like a node whose
-    /// heartbeat simply stopped. The pass that knows the whole list is the
-    /// only place that can tell those apart.
+    /// Clear heartbeat series before repopulating the current peer inventory,
+    /// so removed peers do not retain frozen ages.
     pub fn reset_heartbeats(&self) {
         self.heartbeat_age.reset();
     }
@@ -293,14 +264,8 @@ pub fn render() -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Bind the exposition listener and serve it, or do nothing.
-///
-/// `None` is off, and off is the default everywhere: this port is
-/// unauthenticated and its series name objects across every tenant. Binding
-/// failure is an error at start-up rather than a warning, for the reason half
-/// a TLS config is one — an operator who asked for a port and did not get one
-/// should be told by the thing that failed, not by a scrape that never
-/// arrives.
+/// Serve metrics when configured; None disables the listener. Propagate
+/// bind failure to startup. This endpoint has no API authentication.
 pub async fn serve(listen: Option<&str>) -> anyhow::Result<()> {
     let Some(addr) = listen.filter(|a| !a.is_empty()) else {
         return Ok(());
@@ -558,11 +523,8 @@ mod tests {
         m.agent.quarantined();
     }
 
-    /// The rule, held rather than written down: every label VALUE this stack
-    /// can produce comes out of a bounded set, so every label NAME has to be
-    /// one of the names that are bounded. A vm id, an address, a socket path
-    /// or an error text as a label is what takes a Prometheus down months
-    /// after the commit that added it.
+    /// Check label names against the bounded vocabulary. This source guard
+    /// does not independently prove all supplied label values are bounded.
     #[test]
     fn the_label_names_are_the_ones_that_are_bounded() {
         // tier: three components. kind: the resource table, or the two peer
@@ -595,10 +557,7 @@ mod tests {
         }
     }
 
-    /// The other half of "a stock Grafana with no glue": the names. Every
-    /// series carries the prefix, every counter ends in `_total`, and
-    /// everything measured in seconds says so in its name rather than in a
-    /// unit field nothing reads.
+    /// Metric names use the common prefix, counter suffix and explicit units.
     #[test]
     fn the_names_follow_the_convention_a_dashboard_expects() {
         use prometheus::proto::MetricType;
@@ -639,11 +598,7 @@ mod tests {
             ),
             "{body}"
         );
-        // D7's gauge, and it is here rather than in a test of its own for
-        // the reason it is here at all: it was BUILT, given labels and set by
-        // a pass, and simply never added to the collector list — so it went
-        // through the whole of one lane's tests and one local stack invisible.
-        // A series that is not in the exposition is a series nobody has.
+        // Require the overdue gauge in actual exposition, not just registry setup.
         assert!(
             body.contains(r#"meister_phase_stuck{kind="Vm",phase="Unknown",reason="Silent"} 1"#),
             "{body}"

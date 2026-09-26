@@ -6,14 +6,7 @@
 
 use super::*;
 
-/// What a volume IS, from the guest's side. Two products, not one setting.
-///
-/// A block device and a mounted directory are different things to ask for and
-/// different things to attach: "attach" means `Path`/`VhostUserBlk` for the
-/// first and `FsShare` for the second, and the guest either boots from it or
-/// mounts it by tag. Naming it on the object is what stops "attach this
-/// volume" from being a sentence whose meaning depends on which backend
-/// happened to serve it.
+/// Guest-visible volume kind: a block disk or a shared filesystem directory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum VolumeMode {
@@ -36,12 +29,7 @@ impl VolumeMode {
     }
 }
 
-/// How many consumers a volume admits at once.
-///
-/// One, and it is written down rather than left to be discovered. Multi-attach
-/// needs reference counting at detach — without it the one VM that stops tears
-/// the device out from under the other — and a field with one variant is what
-/// says the second one was considered and refused, rather than forgotten.
+/// Maximum concurrent consumers permitted by the volume access mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum AccessMode {
@@ -51,34 +39,15 @@ pub enum AccessMode {
 }
 
 reasons! {
-    /// Why a volume is what it is.
-    ///
-    /// One list out of two vocabularies, the shape `VmReason` explains. This
-    /// tier's own seven are each a sentence the reconcilers already write:
-    /// `Unplaced` is `storage_pending_reason`, `Following` is "following
-    /// <vm> to <node>" and its cloud twin "moving to <cluster> with its vm",
-    /// `Dispatched` is the claim written before `ProvisionVolume` goes out,
-    /// `Undeliverable` is "provision could not be delivered", `SourceMissing`
-    /// is "snapshot <s> does not exist here any more", `HeldBy` is the
-    /// `Releasing` a DELETE leaves behind while a consumer still holds the
-    /// bytes.
-    ///
-    /// The four after them are the NODE's (`proto::reasons::VOLUME`). The
-    /// pair that earns the change is `DriverRefused` against `NotOnBackend`:
-    /// a refused provision costs a requeue, a volume the backend has LOST
-    /// costs somebody their data, and under the old `Reported` both were one
-    /// word with the driver's prose beside it.
+    /// Volume reason categories combine placement, dispatch, source, and release decisions with
+    /// node observations. Preserve DriverRefused separately from NotOnBackend: a rejected
+    /// provision and lost backend data require different recovery.
     VolumeReason [12] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
         Unrecorded => "Unrecorded",
-        /// Nobody has been asked yet: the volume is written down, and either
-        /// no pass has placed it or the placed node has not been told.
-        ///
-        /// Not `Unplaced`, which is the planner having LOOKED and found
-        /// nowhere. Spelled as the image's, the pool's, the copy's and the
-        /// router's are, so that "nobody has said anything yet" is one word
-        /// across this crate.
+        /// No provision has been dispatched yet, or placement is waiting for a usable
+        /// destination.
         AwaitingNode => "AwaitingNode",
         /// No node that could provision it is a candidate: none runs the
         /// driver, none is up, or none has the room.
@@ -124,14 +93,8 @@ reasons! {
 }
 
 phases! {
-    /// Where a volume is in its own life. Its OWN phase, and that is the whole
-    /// point of the object: a volume is Ready with no VM anywhere near it, and a
-    /// VM being torn down does not move it.
-    ///
-    /// Spelled like `VmPhaseKind` and not camelCase, which is what it was until
-    /// the lab pointed out that a client then needs two comparisons for the same
-    /// question. Free to change today because no volume object has ever been
-    /// stored outside a test; it would not be free tomorrow.
+    /// Volume lifecycle independent of a consuming VM. Ready requires evidence that the bytes
+    /// exist; release waits for consumers and backend cleanup.
     VolumePhase / VolumePhaseKind / VolumeReason / VolumePhaseWire / VolumeReported [5] {
         /// Reserved, not yet placed on a node that can provision it.
         Pending { reason, message, since } => "Pending",
@@ -216,22 +179,9 @@ pub fn settle_volume(deleting: bool, status: &VolumeStatus) -> VolumePhase {
     )
 }
 
-/// A volume a tenant holds: a size, a pool, a kind, and a life of its own.
-///
-/// The object the whole brief is about. Everything a `VmSpec`'s embedded
-/// volume entry says is about a disk that is made for one VM and unmade with
-/// it; this says the same things about something that exists on its own, and
-/// the difference is entirely in who deletes it.
-///
-/// # Persistent, and why that needs no field
-///
-/// A `Volume` object is PERSISTENT by being one. The ephemeral case is the
-/// inline entry in `spec.vm.volumes[]` — made with the VM, gone with it — and
-/// the two are told apart by where the disk is written down rather than by a
-/// flag on either. There is deliberately no `ephemeral: true` here: it would
-/// be a second way of saying what the shape already says, and a second way of
-/// saying something is a way for the two to disagree. Somebody who wants
-/// scratch space writes it inline and gets it.
+/// Persistent tenant volume with its own lifecycle. Referenced Volume objects survive VM
+/// deletion; inline spec.vm.volumes entries are instance storage created and removed with their
+/// VM.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VolumeSpec {
@@ -259,20 +209,9 @@ pub struct VolumeSpec {
     /// volume, which is what a data disk is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_image: Option<String>,
-    /// A `VolumeSnapshot` in the same tenant to start from, by name.
-    ///
-    /// The third and last thing a new volume can start from — empty, a
-    /// catalogue image, or somebody's own point in time — and it EXCLUDES
-    /// `baseImage`: two starting points is a spec whose author believes one
-    /// of them, and a silent winner would hand somebody a disk they did not
-    /// ask for. 422 when both are set.
-    ///
-    /// Immutable like everything else on this spec: where a volume came from
-    /// is decided once, and re-pointing it afterwards would be a field whose
-    /// value the data has stopped matching.
-    ///
-    /// Absent on every volume ever written before snapshots existed, which is
-    /// what makes the field additive.
+    /// Immutable source snapshot name in the same tenant. Mutually exclusive with baseImage;
+    /// specifying both is rejected. Absence represents an empty or image-backed volume and
+    /// preserves older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_snapshot: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -294,60 +233,24 @@ pub struct VolumeStatus {
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
     pub(super) phase: VolumePhase,
-    /// The last word anybody established about the bytes — a node's on the
-    /// status road, a cluster's one tier up, or this tier's own (a dispatch
-    /// that went out, a source that is missing, a command that could not be
-    /// delivered).
-    ///
-    /// The first of the facts `settle_volume` reads. An empty `node` on it is
-    /// this tier's own conclusion and cannot make the volume `Ready`: only a
-    /// machine that made the bytes may say they exist. See `VolumeReported`.
-    ///
-    /// `None` on a volume nobody has said anything about — a fresh one, and
-    /// one whose node has just reported the bytes gone.
+    /// Observation used by settle_volume. Node and mirrored cluster reports establish backend
+    /// state; controller conclusions have an empty node and cannot establish Ready. None means
+    /// no retained observation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported: Option<VolumeReported>,
-    /// What still holds the bytes of a volume that is being released, as a
-    /// sentence naming it.
-    ///
-    /// Written by the release pass, which is the only party that can know:
-    /// the holder may be a VM (`attachedTo`, on this object) or a
-    /// `VolumeSnapshot` (another object entirely, listed once per pass). The
-    /// derivation may not read that second one — `settle` sees this object
-    /// and nothing else — so the pass that lists them writes down the answer.
-    ///
-    /// `None` on every volume nothing holds, which is nearly all of them.
+    /// Release blocker recorded by the pass that lists consumers, including VMs and snapshots.
+    /// settle sees only this object, so the external relationship must be recorded here. None
+    /// means no known blocker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder: Option<String>,
-    /// That no `Vm` object names this volume any more — the VM was deleted,
-    /// or its spec stopped referring to it.
-    ///
-    /// The half of D4 that the derivation cannot see: `attachedTo` is a NAME,
-    /// and whether an object of that name still exists is a question about
-    /// another object. So the pass that lists the VMs writes the answer down,
-    /// every pass, and `volume_claim_holds` reads it beside `openOn`.
-    ///
-    /// False on a volume nothing ever claimed, which is also the honest
-    /// default: a claim is only ever dropped on evidence, and "nobody has
-    /// looked" is not evidence.
+    /// Evidence that no VM object refers to the volume. The listing pass refreshes it and
+    /// volume_claim_holds combines it with openOn. The default false does not authorize
+    /// dropping a claim before inspection.
     #[serde(default, skip_serializing_if = "is_false")]
     pub claimant_gone: bool,
-    /// The name the BACKEND knows this volume by — `/tmp/vols/<uid>.raw`,
-    /// `/dev/vg0/vm-<uid>`, an export directory.
-    ///
-    /// EVIDENCE FROM THE NODE, and empty until the node has said it. The same
-    /// rule every other field of a status obeys, and it took a defect to get
-    /// it here: this used to be filled in at create with `vol-<uid>`, a name
-    /// no backend in this tree ever gives a volume (`filesystem` says
-    /// `<uid>.raw`, `lvm-thin` says `vm-<uid>`), and it was then replaced by
-    /// the real one on the first report. Between those two moments the object
-    /// named a path that did not exist anywhere, and an operator who looked
-    /// in that window went looking for the wrong file.
-    ///
-    /// The identity that must not be allocated is `metadata.uid`, and it is
-    /// not: every backend derives its own name from it, so a provision whose
-    /// handle is lost finds its volume again rather than making a second one.
-    /// That rule never needed a second copy of the answer up here.
+    /// Backend-reported volume identifier, empty until observed. Backends derive stable names
+    /// from metadata.uid, so retrying provision can rediscover the same storage without a
+    /// controller-invented path.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub backend: String,
     /// The node that provisioned it. `None` while Pending.
@@ -359,78 +262,26 @@ pub struct VolumeStatus {
     /// An empty list on older records means no observation, not verified closure.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_on: Vec<String>,
-    /// Which CLUSTER's record holds this volume — at the cloud tier only.
-    ///
-    /// Empty at the cluster, always, exactly as `Vm.status.clusterName` is:
-    /// a cluster is what that process IS.
-    ///
-    /// It exists because a pool may name more than one cluster, and then
-    /// "which cluster is this volume's" stops being derivable from the pool.
-    /// Written where the cloud DISPATCHES — the same statement
-    /// `Vm.status.clusterName` makes, and for the same reason: it is the one
-    /// thing this tier knows rather than guesses, because it is what it sent.
-    /// It moves when a stopped VM's binding moves and the disk follows.
-    ///
-    /// `None` on every volume written before the field, which reads as "its
-    /// pool's home" and is what such a volume's cluster has always been.
+    /// Owning cluster recorded by cloud dispatch and updated when a stopped VM's disk follows
+    /// its new placement. Empty at the cluster tier. Older records without this field fall back
+    /// to the pool's home cluster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<String>,
-    /// The VM holding it, by name, inside the same tenant. `None` = nobody
-    /// is, which is a perfectly good state and the one the whole object
-    /// exists to make possible.
-    ///
-    /// Singular because `AccessMode` has one variant. The day it has two,
-    /// this becomes a list AND detach starts counting — both together or
-    /// neither.
+    /// VM holding the volume within its tenant, or None when unclaimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_to: Option<String>,
-    /// How big the volume actually IS, in GiB, as the node measured it.
-    ///
-    /// The evidence half of `spec.sizeGib`, which is the intent. Two fields
-    /// and not one because a resize is not instantaneous and can half-happen:
-    /// the backend grows and the guest is told, in that order and on
-    /// possibly two different machines, and between the two the spec says 2
-    /// and this says 1 — which is exactly what an operator needs to see.
-    ///
-    /// Rounded UP from the node's byte count, because a number beside
-    /// `sizeGib` has to be comparable to it and a 1.5 GiB LV reported as 1
-    /// would read as smaller than the disk it is.
-    ///
-    /// Zero on every volume written before this field existed and on every
-    /// one no node has reported yet, which reads as "not measured".
+    /// Observed backend size in GiB, rounded up from bytes. Zero means unmeasured. This can lag
+    /// requested spec.sizeGib while a resize is in progress.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub size_gib: u64,
-    /// A size, in GiB, that the running guest holding this volume has not
-    /// been told about yet. Zero = nothing to tell.
-    ///
-    /// The second of a resize's two progress states, and it has to be written
-    /// down because the first cannot stand in for it. `sizeGib` above is what
-    /// the NODE measured, and it says 20 the moment the backend has grown —
-    /// whether or not the guest was told. Read alone, a failed notification
-    /// turned into a settled volume on the node's very next report, and the
-    /// guest went on with its old size until somebody restarted it (F05).
-    ///
-    /// Written by the cluster's resize BEFORE the backend is asked, so that
-    /// losing the controller between the two halves loses nothing; cleared
-    /// when the guest has been told, or when no running guest holds the
-    /// volume — a guest that starts later opens the disk at its new size.
-    /// Always zero at the cloud, which runs no resize.
+    /// Resize size still awaiting guest notification; zero means none. Persisted before
+    /// resizing the backend, then cleared after notification or when no running guest holds the
+    /// volume. Cloud objects keep zero because that tier does not execute resize.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub untold_gib: u64,
-    /// The last `metadata.generation` this object's controller ACTED on —
-    /// the same field, with the same meaning, that `Vm`, `FloatingIp` and
-    /// `RoutedSubnet` carry.
-    ///
-    /// It is here because a client could not tell "the child does not report
-    /// it" from "the child is behind": a console that showed
-    /// `generation 1, observed 0` on every volume in the estate was showing
-    /// the first and meaning the second. Set where the tier dispatches — the
-    /// cloud when the cluster acked the command it sent, the cluster when a
-    /// node did — so what it says is "the change has been picked up", which
-    /// is the honest thing a control plane knows about itself.
-    ///
-    /// `0` on every volume written before this field existed, whose
-    /// `generation` is `0` too: the pair reads "in sync", which is true.
+    /// Last metadata.generation acknowledged by the next tier after dispatch. It records that
+    /// the change was picked up, not that all effects are complete. Older records default to
+    /// zero.
     #[serde(default)]
     pub observed_generation: u64,
     /// When the node's word about this volume was observed.
@@ -495,19 +346,9 @@ impl VolumeStatus {
     }
 }
 
-/// May a volume be open on a SECOND node right now?
-///
-/// The single exception to `AccessMode`, in one function so that the rule can
-/// be tested without a store and cannot be spelled two ways in two files.
-/// Yes exactly while a live migration of the VM holding it is in flight —
-/// `Preparing` (the destination is opening the disk) or `Running` (the stream
-/// is in the air and the source still owns the guest). `Pending` is not
-/// enough: nothing has been made ready yet, so a second open at that point is
-/// a second open. `Succeeded` and `Failed` are not enough either: one side
-/// has let go by then, and a list that still names two is a leak rather than
-/// a migration.
-///
-/// `None` — no migration at all — is the ordinary answer, and it is no.
+/// Permit a second-node open only during Preparing or Running migration of the holding VM.
+/// Pending, terminal migrations, and absent migrations do not provide this exception to
+/// AccessMode.
 pub fn second_open_is_a_migration(phase: Option<VmMigrationPhaseKind>) -> bool {
     matches!(
         phase,
@@ -515,15 +356,8 @@ pub fn second_open_is_a_migration(phase: Option<VmMigrationPhaseKind>) -> bool {
     )
 }
 
-/// A volume, with the finalizer that makes "detach before delete" the one
-/// path out.
-///
-/// The same shape `new_vm` has and for a sharper reason. A DELETE on a volume
-/// somebody is holding must not take the data: it marks the object
-/// `Releasing`, the consumer lets go in its own time, and the deprovision
-/// happens then. At the end of getting this wrong for a floating address is a
-/// tenant that cannot be reached; at the end of getting it wrong here is data
-/// that is gone.
+/// Construct a volume with its detach-before-delete finalizer. Deletion requests enter release;
+/// deprovision waits until consumers let go.
 pub fn new_volume(name: &str, spec: VolumeSpec) -> Volume {
     let mut volume = Volume::declare(name, spec);
     volume
@@ -563,15 +397,8 @@ pub struct VolumeSnapshotSpec {
 }
 
 reasons! {
-    /// Why a snapshot is what it is.
-    ///
-    /// One list out of two vocabularies, the shape `VmReason` explains. This
-    /// tier's five are in the snapshot reconciler: `AwaitingNode` is the
-    /// moment between the request and the dispatch, `Dispatched` is the claim
-    /// written before `TakeSnapshot` goes out, `Requeued` is the failed-copy
-    /// kick, `SourceGone` is a volume or a copy that is not there any more,
-    /// and `Undeliverable` is a dispatch that never reached a node. The
-    /// node's three are `proto::reasons::SNAPSHOT`.
+    /// Snapshot reasons combine controller dispatch, requeue, and source checks with the node
+    /// reason vocabulary in proto::reasons::SNAPSHOT.
     VolumeSnapshotReason [9] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
@@ -645,18 +472,9 @@ pub struct VolumeSnapshotStatus {
     /// goes on reading it as a string. See `resources::phase`.
     #[serde(flatten)]
     pub(super) phase: VolumeSnapshotPhase,
-    /// The last word anybody established about this copy — the one fact
-    /// `settle_volume_snapshot` derives from.
-    ///
-    /// A node's word arrives on the status road; this tier's own conclusions
-    /// (the dispatch that went out, the volume that is not there any more,
-    /// the command that could not be delivered, the requeue) are written here
-    /// too, with an empty `node`. That is not a blurring of the two: the
-    /// empty `node` is what stops this tier from writing `Ready`, which only
-    /// a machine holding the bytes may say. See `VolumeSnapshotReported`.
-    ///
-    /// `None` on a copy nobody has said anything about, which is every copy
-    /// for the moment between the request and the dispatch.
+    /// Snapshot evidence consumed by settle_volume_snapshot. Controller conclusions use an
+    /// empty node and cannot establish Ready; completion requires an identified machine
+    /// observation. None precedes the first decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported: Option<VolumeSnapshotReported>,
     /// The node that took it — the volume's provisioning node, which under a

@@ -2,23 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# `nixosModules.services` decides nothing about the machine, and this is what
-# holds it to that.
-#
-# A minimal host is evaluated three times — without our modules, with them and
-# no role, and with them and the agent role — and the attributes below have to
-# come out the same. They are not a taste: each one is a decision somebody
-# else's NixOS configuration has already made. A module that sets
-# `stateVersion`, turns a firewall off or names a bootloader cannot be
-# imported into a host that is not ours, and `nixosModules.default` is exactly
-# that import.
-#
-# With no role the list is longer, because a machine that carries no unit of
-# ours should carry no etcd, no collector, no routing daemon, no kernel module
-# and no mount of ours either.
-#
-# Lane 1A wrote this check; 1B moved it out of flake.nix unchanged, so that
-# the flake reads as a list of outputs rather than as a test suite.
+# Compare a bare host with role-free and agent-role imports. Runtime modules
+# must preserve host-global boot and network policy; role-free imports also
+# leave optional daemons, kernel modules, and mounts unchanged.
 { nixpkgs, lib, pkgs, system, self }:
 
   let

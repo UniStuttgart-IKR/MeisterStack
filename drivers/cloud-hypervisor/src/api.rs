@@ -2,16 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Sprechen mit dem VMM: der HTTP-Client auf dem Unix-Socket, und die zwei
-//! Stellen, an denen die Antwort nicht die Wahrheit ist.
-//!
-//! Two of the calls here do not mean what their status code says, and both
-//! cost a lab run to find out. A hot-unplug answers 200 when the guest has
-//! merely been ASKED (`until_the_disk_is_gone`), and a receive-migration
-//! blocks inside the request handler and states its outcome in the event file
-//! instead (`receive_outcome`). Everything else is one request, one answer.
-//!
-//! Moved out of `lib.rs` unchanged.
+//! HTTP requests over each VMM's Unix socket, plus migration and unplug
+//! observations. API acknowledgement is distinct from completed device removal
+//! or transfer; those operations require additional evidence.
 
 use super::*;
 
@@ -32,11 +25,8 @@ impl CloudHypervisorDriver {
     /// What state the guest is in, as this VMM answers it.
     pub(crate) async fn state(&self, id: &VmId) -> hypervisor::Result<VmState> {
         self.vm_known(id)?;
-        // A VMM in the middle of receiving a migration will not answer, and
-        // asking it anyway is how the agent would decide its VMM is broken
-        // and kill the process the guest is arriving into. So the event file
-        // is asked instead, and the honest answer until it says otherwise is
-        // `Defined`: the VM exists here and is not running here yet.
+        // The receive operation blocks the API socket. Use events until it ends;
+        // without completion evidence, report Defined rather than a running guest.
         if let Some(events) = self.receiving_events(id) {
             match receive_outcome(&events) {
                 None => return Ok(VmState::Defined),
@@ -45,10 +35,8 @@ impl CloudHypervisorDriver {
                     info!("migration received; the guest is ours");
                 }
                 Some(Err(said)) => {
-                    // The stream failed. The source is still running — that
-                    // is v53's own behaviour on a failed send — so this VMM
-                    // holds nothing and saying so is what lets the tier above
-                    // tear it down.
+                    // The event reports receive failure. It does not independently establish
+                    // whether the source still owns a running guest.
                     self.arrived(id);
                     return Err(HypervisorError::Backend(anyhow::anyhow!(
                         "receiving the migration failed: {said}"
@@ -71,13 +59,10 @@ impl CloudHypervisorDriver {
         }
     }
 
-    /// Stand up a VMM that is listening for a guest on its way, and return
-    /// its pid once it says it is listening. The trait method is where this
-    /// is argued.
+    /// Start a receiver and return its PID after the readiness event.
     pub(crate) async fn receive_migration(&self, id: &VmId, peer: &str) -> hypervisor::Result<u32> {
-        // The path the arriving config will name, derived the same way the
-        // source derived it — which is only the same string if both nodes
-        // have the same run_dir, and that is the requirement above.
+        // Remove the serial socket path expected by the incoming config.
+        // Source and destination must use compatible run-directory paths.
         let _ = std::fs::remove_file(self.serial_socket_path(id));
         let events = self.event_path(id);
         let process = self.spawn_vmm(id, Some(&events)).await?;
@@ -95,12 +80,10 @@ impl CloudHypervisorDriver {
             },
         );
 
-        // Into a task, because the answer does not come back until the whole
-        // migration has run. Nothing WAITS on the handle — this call returns
-        // as soon as the listener is up — but the answer is kept, because it
-        // is the only statement of a reception that ended badly that always
-        // exists. See `RunningVm::receive_answer`: the event file has one
-        // hole in it and this is what covers it.
+        // The receive HTTP call completes after the transfer, while this method
+        // returns when listening is reported. Retain API errors for later observation.
+        // Currently transport failures and timeouts are stored like explicit
+        // receive errors; they do not independently prove the receiver has stopped.
         let socket = self.vm_socket_path(id);
         let body = serde_json::json!({ "receiver_url": peer });
         let timeout = self.ch_timeout;
@@ -129,27 +112,18 @@ impl CloudHypervisorDriver {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        // Never became ready. The VMM is torn down by the caller's error
-        // path; leaving a process listening on a port nobody will dial is
-        // worse than the failure itself.
+        // The caller tears down a receiver that never reports readiness.
         Err(HypervisorError::Backend(anyhow::anyhow!(
             "cloud-hypervisor never reported migration-receive-ready on {peer}"
         )))
     }
 }
 
-/// How often `vm.info` is asked in the meantime. The whole answer arrives in
-/// one small JSON document over a unix socket, so this is cheap enough to be
-/// frequent and slow enough not to be a spin.
+/// Interval between hot-unplug completion probes.
 pub(crate) const UNPLUG_POLL: Duration = Duration::from_millis(200);
 
-/// Whether this `vm.info` document still lists `disk_id`.
-///
-/// `None` = the document does not say, which is not the same as "gone" and is
-/// the one answer that must not be read as success. A `vm.info` without a
-/// `config` object is a cloud hypervisor this driver does not understand, and
-/// treating silence as evidence is precisely the mistake being repaired here.
-/// A `config` with no `disks` at all IS evidence: the VMM lists what it has.
+/// Read disk presence from `vm.info`. Missing config yields None, which
+/// cannot establish removal; config without a disks list means no disks.
 pub(crate) fn disk_gone(info: &serde_json::Value, disk_id: &str) -> Option<bool> {
     let config = info.get("config")?;
     match config.get("disks") {
@@ -163,13 +137,8 @@ pub(crate) fn disk_gone(info: &serde_json::Value, disk_id: &str) -> Option<bool>
     }
 }
 
-/// Ask until the disk is gone, or until the deadline says it is not going to
-/// be.
-///
-/// Takes the question rather than the socket so that the waiting is testable
-/// without a VMM: what is worth pinning down is that a disk which disappears
-/// late still counts as removed, and that one which never disappears is an
-/// error with a sentence instead of a success.
+/// Poll until the disk is absent from config and no available fd witness
+/// reports it open. Expiry returns an error; it does not establish future failure.
 pub(crate) async fn until_the_disk_is_gone<F, Fut, H>(
     disk_id: &str,
     mut info: F,
@@ -188,10 +157,8 @@ where
         asked += 1;
         let seen = info().await?;
         match disk_gone(&seen, disk_id) {
-            // The config has dropped it — which the VMM does the moment it
-            // accepts the request. Only the fd table knows whether the guest
-            // has followed; `None` is a disk nobody can ask that about, and
-            // then the config is all there is.
+            // Configuration removal can precede guest release. Use the fd witness
+            // when available; otherwise only the configuration check is possible.
             Some(true) => match held()? {
                 Some(true) => {}
                 _ => {
@@ -218,14 +185,8 @@ where
     }
 }
 
-/// Whether the process still has this file open: the one honest witness of
-/// a hot-unplug, read off `/proc/<pid>/fd`.
-///
-/// Compared by the file's real path, because that is what the kernel writes
-/// into the link — a config that named a symlink would otherwise never match.
-/// A process that is gone holds nothing, and says so as `false` rather than
-/// as an error: the VMM exiting under a detach is a different problem, and
-/// not one that should keep a volume attached for ever.
+/// Check `/proc/<pid>/fd` for the disk's canonical path, resolving symlinks.
+/// A missing process holds no descriptors and returns false.
 pub(crate) fn vmm_holds(pid: u32, path: &Path) -> hypervisor::Result<bool> {
     let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let table = PathBuf::from(format!("/proc/{pid}/fd"));
@@ -253,11 +214,8 @@ pub(crate) fn vmm_holds(pid: u32, path: &Path) -> hypervisor::Result<bool> {
 }
 
 impl CloudHypervisorDriver {
-    /// The backend path of a disk, as the VMM's config names it right now.
-    ///
-    /// `None` for a disk the config does not list — already asked to go, or
-    /// never there — and for one that is not a file (vhost-user names a
-    /// socket, and a socket is not what the fd table would show).
+    /// Current file-backed disk path from `vm.info`. Missing disks and
+    /// socket-backed attachments return None.
     pub(crate) async fn disk_path(
         &self,
         id: &VmId,
@@ -281,13 +239,9 @@ impl CloudHypervisorDriver {
     }
 }
 
-/// What the event file says about a receive, if it has said anything.
-///
-/// `None` = still going. The three states are exactly the three events v53
-/// writes around `vm_receive_migration`, and the file is append-only with
-/// `\n\n` between JSON blobs, so a substring search is the whole parser this
-/// needs — and is robust against a partially written last blob, which a
-/// `serde_json` pass over the file would not be.
+/// Read receive completion or failure markers from the append-only event file.
+/// No recognized marker yields None. Substring matching tolerates a partially
+/// written trailing JSON event.
 pub(crate) fn receive_outcome(events: &Path) -> Option<Result<(), String>> {
     let text = std::fs::read_to_string(events).unwrap_or_default();
     if text.contains("migration-receive-finished") {
@@ -301,34 +255,16 @@ pub(crate) fn receive_outcome(events: &Path) -> Option<Result<(), String>> {
     None
 }
 
-/// Whether the listener is up yet, asked the only way that does not consume
-/// the connection the source is about to make.
-///
-/// `migration-receive-ready` is emitted immediately BEFORE `listener.accept()`
-/// (v53 `vmm/src/lib.rs`), so it is precisely "the port is bound and nobody
-/// has been accepted". Probing the port instead would work exactly once and
-/// then eat the source's connection.
+/// Read the readiness event emitted before accept. Connecting to probe the
+/// port would consume the single connection intended for the migration source.
 pub(crate) fn listening(events: &Path) -> bool {
     std::fs::read_to_string(events)
         .unwrap_or_default()
         .contains("migration-receive-ready")
 }
 
-/// One request, one connection: connect, handshake, send, read, drop.
-///
-/// Deliberately not pooled. A pooled connection would outlive the VMM it
-/// points at — `destroy` unlinks the socket and a re-provisioned VM binds a
-/// new one at the same path — and `probe` would then answer "alive" out of a
-/// half-open connection to a process that is gone, which is the one question
-/// it exists to answer. Statelessness is what makes it a liveness check.
-///
-/// The price was measured rather than guessed: 60 us per call in a release
-/// build over a unix socket (the HTTP/1 handshake does no round trip, it only
-/// allocates). A converged VM costs about 20 calls a minute — two probes and
-/// two state reads per 30 s reconcile pass, two more per 10 s status report —
-/// so a node with a hundred VMs spends roughly 0.2 % of one core here.
-/// Pooling could take back half of that. It is not worth the stale socket.
-// tracing here via ENV: RUST_LOG=cloud_hypervisor_driver=trace
+/// Use a fresh connection for each request so probes do not reuse a socket
+/// connection to an earlier VMM instance at the same path.
 #[instrument(level = "trace", skip(socket, body, ch_timeout), fields(%endpoint))]
 async fn ch_api(
     socket: &Path,
@@ -375,18 +311,9 @@ async fn ch_api(
 }
 
 impl CloudHypervisorDriver {
-    /// Whether this VMM holds a NIC it was handed as a descriptor.
-    ///
-    /// Asked of the VMM and not of the record, because the VMM is the party
-    /// that knows: `vm.info` reports `fds` for exactly the network devices
-    /// that were built from descriptors, whatever the agent believes it sent.
-    /// That matters for an ADOPTED VM — one whose VMM outlived the agent that
-    /// configured it, possibly under a different configuration.
-    ///
-    /// A VM with no NICs answers `false`, and so does a VM whose `vm.info`
-    /// this driver cannot read as a document — the caller uses this to REFUSE
-    /// something, and refusing on an unreadable answer would be a node that
-    /// cannot drain.
+    /// Inspect current VMM config for descriptor-backed NICs, including adopted
+    /// VMs started under an earlier agent configuration. Absent NICs or unreadable
+    /// JSON return false; API request errors propagate.
     pub(crate) async fn has_fd_nic(&self, id: &VmId) -> hypervisor::Result<bool> {
         let bytes = self.api(id, Method::GET, "vm.info", None).await?;
         let info: serde_json::Value = match serde_json::from_slice(&bytes) {

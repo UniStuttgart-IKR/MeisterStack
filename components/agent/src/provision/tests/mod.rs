@@ -2,10 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The provisioner's tests, cut along the links of the chain. This file
-//! holds what more than one link needs — the three builders, the empty
-//! hypervisor, an overlay VM, a bare record — and the one test of
-//! `limits_for`, which lives in `provision/mod.rs` beside it.
+//! Provisioner tests grouped by resource family. Shared fixtures and the
+//! `limits_for` test live here.
 
 use super::*;
 use crate::types::{AgentVmSpec, BootSourceSpec, DeviceWithId};
@@ -59,9 +57,7 @@ fn volume(attachment: VolumeAttachment) -> Volume {
     }
 }
 
-/// A hypervisor that has nothing to destroy and says so, so that a
-/// teardown in a test reaches its end and deletes the record — which is
-/// the state the NEXT teardown counts against.
+/// Hypervisor fixture with successful no-op destruction so teardown can remove records.
 struct EmptyHypervisor;
 
 #[async_trait::async_trait]
@@ -146,8 +142,7 @@ fn overlay_vm(vni: u32) -> (VmId, VmRecord) {
     )
 }
 
-/// A record with nothing in it but what the two tests that ask for one
-/// need — the teardown's kill and the route announcement.
+/// Minimal record for teardown identity and route-announcement tests.
 fn spec_record() -> VmRecord {
     VmRecord {
         spec: spec(1, 256, vec![]),
@@ -177,15 +172,7 @@ fn plain_vm_gets_vmm_overhead_only() {
     assert_eq!(l.cpu_quota, Some(250));
 }
 
-/// Neither entrance of the chain builds over a row this node cannot read.
-///
-/// Astra finding S11, 2026-09-23. Both admission checks asked `Store::get`,
-/// which answers "unknown" for bytes it cannot deserialise — so a torn record
-/// read exactly like an absent one, and the node would build a second VMM and
-/// a second set of disks on top of whatever the row described, with nothing
-/// left naming the first. The row is present or it is not; whether this build
-/// can read it is a different question, and only one of the two belongs in
-/// front of somebody's guest.
+/// An unreadable row is occupied. Both entry points must refuse it without replacing its bytes.
 #[tokio::test]
 async fn a_corrupt_vm_record_refuses_a_create_and_a_receive() {
     let temp = tempfile::Builder::new()
@@ -236,8 +223,7 @@ async fn a_corrupt_vm_record_refuses_a_create_and_a_receive() {
         "{received:#}"
     );
 
-    // Untouched, both times. A refusal that had rewritten the row would have
-    // destroyed the one thing an operator still has to look at.
+    // Refused operations preserve the unreadable row byte for byte.
     assert_eq!(
         store.get_raw(&id).expect("a read").as_deref(),
         Some(&bytes[..])

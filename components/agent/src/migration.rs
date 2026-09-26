@@ -2,26 +2,15 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Where a migration stream lands on this node.
-//!
-//! One question, and it is the node's alone to answer: **which address and
-//! which port should the source dial?** No tier above can answer it — the
-//! controller does not know which of a node's interfaces carries cluster
-//! traffic, and it must not know which ports are free — so the answer travels
-//! back up in `Ack.payload` and then straight across to the other node,
-//! unopened.
+//! Choose this node's advertised migration address and an available port.
+//! The receive acknowledgement carries the resulting URL to the source.
 
 use std::net::{IpAddr, TcpListener, UdpSocket};
 
 use anyhow::{Result, anyhow};
 
-/// This node's end of a live migration, decided once at start-up.
-///
-/// Both halves may be absent, and absent means the same thing in both cases:
-/// this node does not receive live migrations. That is a configuration, not a
-/// fault — a node with no `migration_ports` has an operator who has not
-/// opened the firewall, and receiving a stream into a port nobody can reach
-/// would fail later and less clearly.
+/// Migration receiver settings resolved at startup. Both address and port
+/// range are required to receive a migration.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     /// The address a peer on the cluster network can open a connection to
@@ -43,21 +32,9 @@ impl Endpoint {
         self.advertise.is_some() && self.ports.is_some()
     }
 
-    /// An address to listen on, in cloud-hypervisor's own spelling.
-    ///
-    /// The port is found by BINDING it and letting the binding go, which is
-    /// the same small race every port allocator in this position has: between
-    /// the drop and the VMM's own bind, somebody else could take it. It is
-    /// bounded rather than eliminated because the alternative — holding the
-    /// listener and handing the fd over — is not something the VMM's API
-    /// accepts. What makes it acceptable is the failure mode: a port that was
-    /// taken in between fails the receive loudly, before the source has been
-    /// told anything, and the migration is retried by the tier that asked for
-    /// it.
-    ///
-    /// The range is walked in order rather than sampled, so that a node
-    /// receiving two guests at once uses two adjacent ports and an operator
-    /// reading `ss` sees a block rather than a scatter.
+    /// Choose the first bindable port and render a Cloud Hypervisor TCP URL.
+    /// The test listener is immediately dropped; another process can acquire the
+    /// port before the VMM binds it.
     pub fn listen_url(&self) -> Result<String> {
         let advertise = self.advertise.as_deref().ok_or_else(|| {
             anyhow!(
@@ -73,9 +50,8 @@ impl Endpoint {
             )
         })?;
         for port in from..=to {
-            // Bound to the wildcard and not to `advertise`: the VMM will bind
-            // it the same way, and a node whose advertised address is a
-            // floating one may not hold it at this instant.
+            // Probe wildcard binding as the VMM will; the advertised address may
+            // not currently be assigned locally.
             if TcpListener::bind(("0.0.0.0", port)).is_ok() {
                 return Ok(agent_api::migration_url(advertise, port));
             }
@@ -87,19 +63,9 @@ impl Endpoint {
     }
 }
 
-/// The address of the socket this agent would use to reach its controller.
-///
-/// The honest derivation of "where can a peer reach me": the kernel is asked
-/// which source address it would pick for a route to the controller, and
-/// that address is by construction one that carries traffic on the cluster
-/// network. No packet is sent — a connected UDP socket only fixes the route.
-///
-/// It is wrong on exactly one shape of node: one whose route to the
-/// controller and whose route to its peers leave by different interfaces.
-/// Such a node sets `advertise_addr` itself, which is what the key is for.
-///
-/// `None` when there is nothing to derive from, and then a node without an
-/// explicit `advertise_addr` simply does not receive migrations.
+/// Derive an advertised address from the route to a controller endpoint using
+/// an IPv4 UDP socket. No packet is sent. Configure `advertise_addr` explicitly
+/// when peers need a different interface or this derivation cannot reach them.
 pub fn derive_advertise(endpoints: &[String]) -> Option<String> {
     for endpoint in endpoints {
         let Some(target) = socket_target(endpoint) else {
@@ -112,11 +78,7 @@ pub fn derive_advertise(endpoints: &[String]) -> Option<String> {
             continue;
         }
         match socket.local_addr().map(|a| a.ip()) {
-            // A loopback source is not a lie — it is what a peer on this
-            // machine would use, and the local end-to-end test is exactly
-            // that. It is passed on rather than rejected; a node whose only
-            // route to its controller is loopback has a controller on the
-            // same machine, and its operator knows it.
+            // Allow loopback addresses for peers on this host.
             Ok(ip) => return Some(render(ip)),
             Err(_) => continue,
         }
@@ -124,9 +86,8 @@ pub fn derive_advertise(endpoints: &[String]) -> Option<String> {
     None
 }
 
-/// `http://host:port` or `host:port` -> `host:port`, which is what a UDP
-/// connect wants. A URL with no port gets the scheme's, because a route is
-/// picked by address and any port will do.
+/// Extract `host:port` from a controller endpoint, defaulting to port 443
+/// when absent. The port is used only to select a route.
 fn socket_target(endpoint: &str) -> Option<String> {
     let rest = endpoint
         .split_once("://")
@@ -136,9 +97,7 @@ fn socket_target(endpoint: &str) -> Option<String> {
     if rest.is_empty() {
         return None;
     }
-    // An IPv6 literal keeps its brackets, and the port is what follows the
-    // closing one — the same rule `migration_url` states, and for the same
-    // reason: the last colon is not the separator in an IPv6 address.
+    // For bracketed IPv6 literals, only a suffix after the closing bracket can be a port.
     let has_port = match rest.rsplit_once(']') {
         Some((_, after)) => after.starts_with(':'),
         None => rest.matches(':').count() == 1,
@@ -162,9 +121,7 @@ fn render(ip: IpAddr) -> String {
 mod tests {
     use super::*;
 
-    /// A node that was not told where it is, or which ports are open, says so
-    /// — with the key to set. Both sentences name a config key, because
-    /// "cannot receive" is not something an operator can act on.
+    /// Missing receiver configuration names the relevant config key.
     #[test]
     fn a_node_that_cannot_receive_says_which_key_is_missing() {
         let no_addr = Endpoint::new(None, Some((49_000, 49_001)));
@@ -195,8 +152,7 @@ mod tests {
         assert!((49_000..=49_099).contains(&port), "{url}");
     }
 
-    /// A range with nothing free in it is a refusal with a sentence, and not
-    /// a wrap-around to a port outside it.
+    /// An exhausted range is refused without selecting an outside port.
     #[test]
     fn a_full_range_refuses_rather_than_going_outside_it() {
         let held = TcpListener::bind(("0.0.0.0", 0)).expect("a port");
@@ -206,9 +162,7 @@ mod tests {
         assert!(said.contains(&port.to_string()), "{said}");
     }
 
-    /// The endpoint list is parsed the way a route lookup needs it, and an
-    /// IPv6 literal keeps its brackets — the same rule the migration url
-    /// obeys, because the last colon is not a separator there.
+    /// Controller endpoints retain explicit ports and IPv6 brackets.
     #[test]
     fn a_controller_endpoint_becomes_something_a_route_can_be_asked_about() {
         assert_eq!(
@@ -234,8 +188,7 @@ mod tests {
         assert_eq!(socket_target(""), None);
     }
 
-    /// And the derivation itself, against a listener on this machine: the
-    /// answer is an address, and it is one this node really has.
+    /// A loopback controller selects the loopback source address.
     #[test]
     fn the_advertised_address_is_the_one_the_kernel_would_use() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("a port");

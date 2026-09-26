@@ -2,28 +2,22 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The admission edge against a real etcd: what a caller may USE, and how
-//! much of it a tenant may hold.
-//!
-//! `#[ignore]` for the reason `tickets_etcd` is: the handlers read and write
-//! the store, and the workspace's ordinary run has nothing to talk to. Start
-//! one and name it:
+//! Admission tests against external etcd. Run the ignored tests with:
 //!
 //! ```text
 //! etcd --data-dir /tmp/ms-admission-etcd \
-//!      --listen-client-urls http://127.0.0.1:23700 \
-//!      --advertise-client-urls http://127.0.0.1:23700 \
-//!      --listen-peer-urls http://127.0.0.1:23701 \
-//!      --initial-advertise-peer-urls http://127.0.0.1:23701 \
-//!      --initial-cluster default=http://127.0.0.1:23701
+//! --listen-client-urls http://127.0.0.1:23700 \
+//! --advertise-client-urls http://127.0.0.1:23700 \
+//! --listen-peer-urls http://127.0.0.1:23701 \
+//! --initial-advertise-peer-urls http://127.0.0.1:23701 \
+//! --initial-cluster default=http://127.0.0.1:23701
 //!
 //! MEISTER_TEST_ETCD=http://127.0.0.1:23700 \
-//!   cargo test -p meister-cloud-controller admission -- --ignored
+//! cargo test -p meister-cloud-controller admission -- --ignored
 //! ```
 //!
-//! The handlers are called directly, with the extractor values the guard
-//! would have produced: what is under test is the object half of the policy
-//! and the arithmetic, not the middleware in front of them.
+//! Handlers are called directly with extracted grants; these tests cover object
+//! authorization and quota admission, not authentication middleware.
 
 use super::*;
 use controller_api::auth::{GROUP_ADMINS, GROUP_MEMBERS, Identity, Role};
@@ -196,15 +190,9 @@ async fn create_volume_as(
 
 // --- F01: an image is used on the terms it is read on ---------------------
 
-/// A private image is somebody's, and naming it in a disk is a way of READING
-/// it: the bytes end up on the new disk, where the tenant who named it can
-/// read every one of them. So using one has to need what reading one needs.
-///
-/// The direct read was always refused; the reference was only asked whether
-/// the image exists and has not failed. This holds the two together: a member
-/// of `b` who knows the name of `a`'s private image gets exactly as far
-/// through a VM or a volume as through `GET /images/<name>` — and a public
-/// image, which is what sharing one means, goes on working for everybody.
+/// Using an image requires the same read permission as fetching its object.
+/// Cross-tenant private images are rejected for VM and volume creation;
+/// public images remain usable across tenants.
 #[tokio::test]
 #[ignore = "needs an etcd; see the module note"]
 async fn an_image_is_used_on_the_terms_it_is_read_on() {
@@ -372,15 +360,9 @@ async fn growing_a_volume_is_held_to_the_ceiling_creating_it_would_be() {
 
 // --- F03: one slot is one admission, however the requests interleave ------
 
-/// Admissions that are held, per tenant, between "may this tenant have it"
-/// and "write it", until `parties` of them have got that far.
-///
-/// The one door the concurrency tests need into the handlers: what they
-/// prove is about the interleaving where BOTH requests have looked before
-/// EITHER has written, and without a hook that is a race a test can only
-/// hope for. Keyed by tenant so that tests running side by side, each with a
-/// tenant of its own, never hold each other up; used up after `parties`
-/// passes, so a request that goes round again is not held a second time.
+/// Pause the first `parties` admissions after quota checks and before writes.
+/// This forces competing requests to observe the same initial usage. Gates are
+/// tenant-scoped so parallel tests do not interfere; retries pass through.
 static GATES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Gate>>> =
     std::sync::LazyLock::new(Default::default);
 

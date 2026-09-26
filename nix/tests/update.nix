@@ -2,29 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# The exit criterion of M2, in two virtual machines: a host is changed and
-# verifiably brought back.
-#
-# An operator workstation and a managed host. Everything between them is the
-# real thing — `nix copy --to ssh-ng://` against a store with
-# `require-sigs = true`, `nix path-info --store ssh-ng://` for what arrived,
-# `meister-activate` over ssh, the journal on the workstation and the
-# transaction record on the target. No shim, no fake runner.
-#
-# The one thing that is NOT the real thing is the evaluation. A test VM
-# cannot evaluate the operator's flake — it has no nixpkgs and the systems it
-# would have to produce are these test nodes, which carry the driver's own
-# instrumentation. So the EVALUATION is done here, at build time, by
-# `nix/lib/manifest.nix` — the same file `lib.mkFleet` uses — and handed to
-# the workstation as a `nix-manifest/1` file, which `resolve --from` reads
-# instead of calling `nix eval`. Everything after that is the tool's own
-# road: resolve -> build -> plan -> apply.
-#
-# What this test shows, in order: V10 (a fleet that already runs the release
-# is two steps and no commands), the change, the way back, V18 (a host
-# somebody else holds), a release that was edited after it was built, and
-# V17 (a workstation that dies after the irreversible step, and a resume
-# that asks the target instead of repeating it).
+# Exercise signed closure transfer, planning, update, rollback, locking, and
+# resume after interruption. Build-time manifests replace evaluation inside
+# the operator VM; target activation and transport are real.
 { nixpkgs, lib, pkgs, system, self }:
 
 let
@@ -149,7 +129,7 @@ let
     # host module IS the inventory, because this test hands `resolve` a
     # manifest rather than evaluating a flake.
     meisterstack.managed.substituters = [ "http://192.168.1.1:8080" ];
-    # --- end lane 4C ---
+
     nix.extraOptions = ''
       !include /etc/nix/extra-keys.conf
     '';
@@ -230,7 +210,7 @@ pkgs.testers.runNixOSTest {
         # path in the node that names it, so the target's database does
         # not have it and the only road into that database is the cache.
         notSigned
-        # --- end lane 5C ---
+
       ];
       environment.etc."vm-fleet/fleet.toml".source = fleetToml;
       # A manifest says what its inputs were locked to. This repository has

@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
-#
-# The fleet of nix/tests/install-direct.nix: one host whose hypervisor hands
-# it its kernel.
-#
-# The same shape as nix/tests/fleet/box, and one word different: `boot =
-# "direct"`. That word takes the boot loader out of the guest, takes the ESP
-# out of the layout, and makes `<id>-direct-boot` — a kernel, an initrd and a
-# command line — the thing a provider is handed.
+
+# Test inventory. Keep layouts and host modules beside this file so relative
+# paths resolve inside the repository. Fingerprints and disks are test fixtures.
 
 schema = 2
 
@@ -26,11 +21,6 @@ checks = { required = [ ] }
 id = "cp"
 kind = "raft"
 
-# Roles cloud+cluster and not `agent`, for the same reason as the box fleet:
-# a fleet of one host has to be a whole control plane (a cloud places guests
-# on clusters, a cluster registers with a cloud), and what is under test here
-# is the boot mode and not the role. An agent that boots direct is the lab's
-# ordinary case and lives in the integration test.
 [[host]]
 id = "n1"
 name = "n1"

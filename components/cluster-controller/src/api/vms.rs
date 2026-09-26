@@ -150,21 +150,9 @@ pub(super) async fn create_vm_traced(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-/// Every `Volume` this VM refers to has to exist, be this tenant's, and be
-/// free — checked at the edge, where a person is still holding the request.
-///
-/// Three refusals and each one is a different word on purpose:
-///
-///   * **404** for a volume in another tenant, and NOT 403. A 403 would
-///     confirm that a volume of that name exists somewhere, which is exactly
-///     what a caller poking at names is trying to find out. To this tenant
-///     the volume does not exist, and that is what it is told.
-///   * **409** for one somebody is already holding. `AccessMode` has one
-///     variant and it means one consumer, so a second is a conflict rather
-///     than something to queue behind.
-///   * nothing at all for a volume that merely is not `Ready` yet. That is
-///     not a refusal — the disk is being made — and the VM waits as Pending
-///     with `VolumeNotReady` on it, the same way it waits for a node.
+/// Require referenced volumes to exist in the VM's tenant and be attachable.
+/// Cross-tenant names return 404 to conceal existence; another consumer returns
+/// 409. Volumes not yet Ready are accepted and constrain later placement.
 pub(super) async fn check_volume_refs(st: &ApiState, vm: &Vm) -> Result<(), ApiError> {
     // The shape first, and it needs no store: an entry that both names a
     // volume and describes one is refused here so that a PERSON sees it while
@@ -202,17 +190,9 @@ pub(super) async fn check_volume_refs(st: &ApiState, vm: &Vm) -> Result<(), ApiE
         {
             return Err(conflict(format!("volume {name} is held by {holder}")));
         }
-        // And the fourth, which only a hot-plug can meet: a node-local disk
-        // on a machine this VM is not running on.
-        //
-        // At create there is no binding yet — `spec.nodeName` is the
-        // scheduler's and the locality axis is what it schedules BY, so the
-        // VM lands where its disks are. On an update the VM is already
-        // somewhere, and an attach is not a move: telling the node to open a
-        // path that is on another machine would be a Failed VM, and moving
-        // the VM to the disk would be a reschedule nobody asked for.
-        //
-        // 422 and not a wait, because nothing about waiting changes it.
+        // Reject attaching a node-local disk from another node to a bound VM.
+        // Initial placement can follow disk locality; hot-plug cannot move the guest.
+        // Return 422 because waiting cannot make that path local.
         if let Some(node) = &vm.spec.node_name
             && let Some(elsewhere) = locality_conflict(st, &volume, node).await?
         {
@@ -276,17 +256,9 @@ pub(super) fn log_request(pairs: &[(String, String)]) -> (u32, crate::logs::Keep
     (lines, crate::logs::Keep::from_pairs(pairs))
 }
 
-/// What the guest printed, from the node that has it.
-///
-/// One way and only that: no attach, no input channel, no follow. The
-/// interactive console is a separate feature with separate questions — one
-/// attach at a time, a controller that pipes without storing, an audit line
-/// per session — and none of them are answered by reading a ring buffer.
-///
-/// The node's document is served through unopened. A VM that has printed
-/// nothing, and one that is not placed yet, both answer with an empty list
-/// and a 200: "nothing to show" is an answer. A node that cannot be reached
-/// is a 503, because that is a different sentence.
+/// Fetch buffered guest logs without opening an interactive console.
+/// Return the node's JSON unchanged. An unplaced VM or empty log returns 200
+/// with an empty list; an unreachable node returns 503.
 pub(super) async fn vm_logs(
     State(st): State<ApiState>,
     Path(name): Path<String>,
@@ -333,25 +305,10 @@ pub(super) async fn vm_logs(
 /// Frozen placement/spec fields and the supported exceptions: referenced data-disk
 /// changes and clearing a binding after lifecycle checks. Run strategy remains editable.
 pub(super) const VM_OWNED: &[Owned] = &[
-    // The row storage B rewrote, and the whole of what it says about
-    // volumes: `spec.vm` is immutable in everything EXCEPT `volumes[]` from
-    // its second entry on, and there only the entries that refer to a
-    // `Volume` object. The projection that says it precisely is
-    // `resources::frozen_vm_shape`, and `check_owned` compares through it —
-    // one row, one enforcement point, so no update handler can forget it.
-    //
-    // It cannot be its own row, and the reason is a tier boundary rather than
-    // an oversight: `spec.vm` is another crate's document (see `VmSpec.vm`),
-    // its schema is not published, and `assert_tables_match_schemas` holds
-    // every path in this table to a field that really exists. So the sentence
-    // rides on the row that already covers it, and the `note` — which storage
-    // A used to announce this change — is gone, because it has happened.
-    //
-    // Adding a referenced entry is the attach and leaving one out is the
-    // detach; hot-plug is the reconcile consequence of that edit rather than
-    // a verb of its own (KubeVirt deprecated `addvolume` in 1.6 for the same
-    // reason). `Volume.status.attachedTo` stays derived either way — a Volume
-    // never grows a `spec.vm`.
+    // Freeze boot and inline disks while allowing referenced-disk edits after
+    // the boot entry. `vm_shape_unchanged` implements this projection over `spec.vm`,
+    // whose nested schema belongs to the agent. Reference edits drive hot-plug;
+    // `Volume.status.attachedTo` remains derived.
     Owned::structural(
         "spec.vm",
         "is immutable except for spec.vm.volumes[] from the second entry on, and there only for \
@@ -383,16 +340,9 @@ pub(super) const VM_OWNED: &[Owned] = &[
     Owned::server_owned("spec.clusterName", "is the cloud's to set, not this tier's"),
 ];
 
-/// The two labels that say which cloud owns a cluster-local object.
-///
-/// Not in a `*_OWNED` table because they are not spec fields and their keys
-/// have dots in them, so they cannot be named as a dotted path. Same rule,
-/// said once in the one place it applies: a client that could write these
-/// could adopt an object into a cloud, or orphan one out of it.
-///
-/// Over the METADATA and not over a `Vm`, because a VM is no longer the only
-/// cloud-owned object at this tier — a `Router` wears the same pair, and the
-/// rule about them is a rule about the envelope rather than about VMs.
+/// Protect the two cloud-owner labels on VM and Router metadata.
+/// They cannot appear in dotted spec-field tables because their keys contain
+/// dots. Allowing edits would let a client adopt or orphan cloud-owned objects.
 pub(super) fn check_owner_labels(
     current: &controller_api::Metadata,
     body: &controller_api::Metadata,
@@ -539,21 +489,10 @@ pub(super) fn release_event(current: &Vm, next: &Vm) -> Option<String> {
     ))
 }
 
-/// A client may let a binding go, and only on a VM that is standing still.
-///
-/// The one exception to `spec.nodeName` being the scheduler's, and the whole
-/// of what "reschedule" is here: no live migration, no restart of anything
-/// running, no `spec.evacuation`. The binding falls, the old node is told to
-/// destroy the instance, and the scheduler decides again.
-///
-/// **Two conditions and not one.** `runStrategy` is the INTENT and the phase
-/// is the OBSERVATION, and a VM that has been told to stop and has not
-/// finished stopping satisfies the first and not the second. Moving that one
-/// would be moving something that is still running, which is exactly what
-/// this position is not.
-///
-/// The sentence names the phase, because that is the half a person can act
-/// on: they asked for a stop a second ago and it has not landed yet.
+/// Allow node-binding release only under the shared stopped-state rule.
+/// Check both requested strategy and reported phase; a stop request alone does
+/// not prove it completed. This triggers teardown and replacement placement,
+/// not live migration.
 pub(super) fn check_reschedule(current: &Vm, next: &Vm) -> Result<(), ApiError> {
     let letting_go = current.spec.node_name.is_some() && next.spec.node_name.is_none();
     if !letting_go {
@@ -594,18 +533,9 @@ pub(super) async fn delete_vm(
     ))
 }
 
-// --- storage, cluster-local -------------------------------------------------
-//
-// The same two objects the cloud tier keeps, at the tier that has NODES —
-// which is the tier that can answer "who provisions this". A cluster with no
-// cloud above it declares its own pools and holds its own volumes, exactly as
-// it creates its own VMs; a cluster under a cloud will be handed them down the
-// session, and that hop is the step after this one.
-//
-// No tenancy here, and that is the design rule rather than an omission: this
-// tier keeps no user directory (one directory, and it is the cloud's), so
-// `spec.tenant` is carried and never enforced — the same thing a
-// cluster-local VM does with the field.
+// Cluster APIs serve both standalone and cloud-managed resources.
+// This tier has no user directory: tenant metadata is carried between resources,
+// but is not a person-authorization boundary.
 
 /// Read events for this VM. This tier has no user directory; tenant filtering is
 /// not an authorization boundary here.

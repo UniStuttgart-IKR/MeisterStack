@@ -2,16 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Stufe 3 against a real cloud-hypervisor: the tap arrives as a descriptor,
-//! and the VMM that gets it has no rights of its own.
-//!
-//! `#[ignore]` for the reason `receive_abort_ch.rs` next door carries it:
-//! these need a VMM binary, a kernel, an initramfs and a tap that somebody
-//! privileged prepared, and the workspace's ordinary run has none of them.
+//! Ignored integration tests for descriptor-based tap handoff to Cloud Hypervisor.
+//! Requires a VMM binary, kernel, initramfs and a preconfigured tap.
 //!
 //! ```text
-//! # once, as root — the agent's own job on a real node, and the one part of
-//! # it these tests do not do themselves:
+//! # Prepare the tap once with privileges:
 //! sudo ip tuntap add dev s0tap0 mode tap user $USER
 //! sudo ip link set s0tap0 up mtu 1450
 //! sudo ip addr add 10.77.0.1/24 dev s0tap0
@@ -24,7 +19,7 @@
 //!   cargo test -p meister-agent --test stufe3_ch -- --ignored --nocapture
 //! ```
 //!
-//! and for the user switch, which needs the right to make one:
+//! The user-switch test also requires permission to change credentials:
 //!
 //! ```text
 //! sudo useradd -r -M -s /usr/sbin/nologin -G kvm meister-vmm
@@ -33,26 +28,13 @@
 //!   cargo test -p meister-agent --test stufe3_ch -- --ignored --nocapture
 //! ```
 //!
-//! # What the guest has to say
+//! Supply an external initramfs that writes these markers to the serial console:
+//! * `MS-S0-NICS: <names>` from `/sys/class/net`.
+//! * `MS-S0-MAC: <addr>` and `MS-S0-MTU: <n>` from the guest interface.
+//! * `MS-S0-PING-OK` or `MS-S0-PING-FAIL` after pinging `MEISTER_HOST_IP`.
 //!
-//! The initramfs is not part of this repo, for the reason `tiny-initrd` is
-//! not (`deploy/push.sh`, `MEISTER_GUEST_FILES`). What these tests need of it
-//! is a contract of four lines on the serial console:
-//!
-//! * `MS-S0-NICS: <names>` — what `/sys/class/net` holds. This alone is the
-//!   proof when a guest has no NIC: the line is there and `eth0` is not.
-//! * `MS-S0-MAC: <addr>` and `MS-S0-MTU: <n>` — read off the interface. The
-//!   MTU is the interesting one: the agent set it on the TAP and the
-//!   `vm.add-net` body never mentioned it, so a correct number here is the
-//!   whole argument for leaving the field out (see `config::net_config`).
-//! * `MS-S0-PING-OK` or `MS-S0-PING-FAIL` — an ICMP echo to `MEISTER_HOST_IP`.
-//!   Frames really crossing the tap, in both directions.
-//!
-//! The kernel is booted with `console=ttyS0`, which is the UART — emulated
-//! by the VMM itself and needing no driver in the guest, so a guest whose
-//! virtio-console is a module still speaks. The driver gives that line a
-//! socket (see `config.rs` on why a device has one mode), so these tests do
-//! what the agent does with it: connect and write the transcript down.
+//! The guest boots with `console=ttyS0`. The test records the UART socket, as
+//! the agent does, independently of the guest's virtio-console driver.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -77,11 +59,7 @@ fn host_ip() -> String {
     std::env::var("MEISTER_HOST_IP").unwrap_or_else(|_| "10.77.0.1".to_string())
 }
 
-/// Everything this test writes, under one directory that goes at the end.
-///
-/// Short on purpose: the VMM's API socket lives in here and an `AF_UNIX` path
-/// is 108 bytes, which a `tempfile` prefix under a deep target directory can
-/// exhaust on its own. That cost a run.
+/// Use a short temporary path to keep VMM socket names within the AF_UNIX path limit.
 fn rig(name: &str) -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix(&format!("ms3-{name}-"))
@@ -113,14 +91,8 @@ fn spec(mtu: Option<u32>) -> InstanceSpec {
     }
 }
 
-/// Copy the guest's serial line off the VMM's socket into a file.
-///
-/// Exactly what the agent itself does with that socket, and for the same
-/// reason: cloud-hypervisor's serial device has one mode, it is a socket
-/// because a socket is the only form somebody can type into, and the side
-/// that wants a transcript writes one. v53 holds a 1 MiB ring while nobody
-/// is connected and replays it on connect, so nothing said before this task
-/// gets there is lost.
+/// Copy the VMM serial socket to a transcript file. Cloud Hypervisor v53
+/// replays its bounded ring buffer when a reader connects.
 fn tail_serial(socket: PathBuf, into: PathBuf) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
@@ -182,9 +154,7 @@ fn ours(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The user the VMM and its backends should run as, when the run was given
-/// one. `None` means "as whoever is running this test", which is what a
-/// machine with no `meister-vmm` and no way to make one gets.
+/// Optional VMM identity from the environment; absence retains the test process identity.
 fn vmm_user() -> Option<agent_api::VmmUser> {
     let name = std::env::var("MEISTER_VMM_USER").unwrap_or_default();
     if name.is_empty() {
@@ -204,25 +174,12 @@ fn driver(dir: &Path) -> CloudHypervisorDriver {
     .expect("the driver builds")
     .with_tap_fds(true)
     .with_vmm_user(user)
-    // The rig's own directory stands in for the node's image and volume
-    // directories: the kernel and initramfs come from outside it, and CH
-    // covers those itself because they are in the create document.
+    // Allow hotplug paths under the fixture root. Cloud Hypervisor derives
+    // initial kernel and initramfs rules from the create document.
     .with_landlock_paths(vec![dir.to_path_buf()])
 }
 
-/// S1: the tap crosses as a descriptor and the guest gets a working NIC.
-///
-/// This is the whole of Stufe 3's network half in one test, and every line of
-/// it was a separate failure first:
-///
-/// * `vm.create` carries no `net` — v53 nulls every fd in it and says so in
-///   its own source twice.
-/// * `vm.add-net` carries the open tap as `SCM_RIGHTS` and `num_queues: 2` —
-///   one descriptor, two queues, or the call is refused by name.
-/// * the body carries no `mtu` — `set_mtu` is `SIOCSIFMTU` and this VMM is
-///   not allowed to; the guest is told 1450 anyway, off the tap.
-/// * the VMM opens `/dev/net/tun` never. It could not: the test runs as an
-///   ordinary user with no capabilities at all.
+/// Verify tap-descriptor delivery with guest-reported MAC, MTU and host reachability.
 #[tokio::test]
 #[ignore = "needs a real cloud-hypervisor, kernel, initramfs and a prepared tap; see the module note"]
 async fn a_guest_gets_its_nic_as_a_file_descriptor_and_reaches_the_host() {
@@ -253,9 +210,7 @@ async fn a_guest_gets_its_nic_as_a_file_descriptor_and_reaches_the_host() {
             .any(|l| l.contains("MS-S0-MAC: 02:00:00:aa:bb:01")),
         "the mac in the add-net body did not reach the guest: {lines:#?}"
     );
-    // The MTU the agent set on the tap, which the body never named. If this
-    // is 1500 the guest fell back to the Ethernet default and an overlay VM
-    // would be silently dropping frames.
+    // Verify the guest sees the tap's 1450-byte MTU through descriptor handoff.
     assert!(
         lines.iter().any(|l| l.contains("MS-S0-MTU: 1450")),
         "the guest did not learn the tap's mtu: {lines:#?}"
@@ -274,14 +229,7 @@ async fn a_guest_gets_its_nic_as_a_file_descriptor_and_reaches_the_host() {
     );
 }
 
-/// S1, the other half: a NIC plugged into a guest that is already running
-/// goes the same way.
-///
-/// The same call, and that is the point — v53 routes `vm.add-net` by whether
-/// it owns a VM yet, so the driver has one path for both and nothing here is
-/// a second mechanism. What this adds over the test above is the answer:
-/// a running VMM replies with the PCI address it put the device at, and the
-/// guest sees a second interface.
+/// Verify the same add-net path exposes a second NIC to a running guest.
 #[tokio::test]
 #[ignore = "needs a real cloud-hypervisor, kernel, initramfs and a prepared tap; see the module note"]
 async fn a_nic_plugged_into_a_running_guest_goes_the_same_way() {
@@ -326,20 +274,8 @@ async fn a_nic_plugged_into_a_running_guest_goes_the_same_way() {
     tail.abort();
 }
 
-/// S3: the sandbox is on, and it bites the one thing it is documented to
-/// bite.
-///
-/// Landlock is applied at `vm_create`, so the ruleset is closed before the
-/// guest exists and cannot be widened afterwards — "the process cannot access
-/// any resources outside of the ruleset during its lifetime, even if it were
-/// compromised", which is the point and also the cost. CH's own note is
-/// explicit: "Hotplugging any new file-backed resources to above guest will
-/// result in Permission Denied error."
-///
-/// So this asserts both halves. A disk hot-plugged out of a directory the
-/// rules name goes in; one out of a directory nothing names is refused, by
-/// the kernel, not by this stack. A test that only showed the refusal would
-/// pass just as well against a ruleset that denied everything.
+/// With MEISTER_VMM_USER set, Landlock allows a disk in a configured directory
+/// and refuses one outside it. Both files receive identical ownership first.
 #[tokio::test]
 #[ignore = "needs a real cloud-hypervisor, kernel, initramfs and a prepared tap; see the module note"]
 async fn landlock_lets_a_hotplug_from_a_named_directory_in_and_keeps_the_rest_out() {
@@ -355,9 +291,7 @@ async fn landlock_lets_a_hotplug_from_a_named_directory_in_and_keeps_the_rest_ou
     let denied = elsewhere.path().join("extra.raw");
     std::fs::write(&denied, vec![0u8; 8 * 1024 * 1024]).expect("a disk");
     if let Some(user) = vmm_user() {
-        // Ownership is NOT what this test is about, so both files are handed
-        // over up front: a refusal that turned out to be `EACCES` from the
-        // mode would prove nothing about Landlock.
+        // Grant ordinary file access first so only Landlock distinguishes the paths.
         user.take(&allowed).expect("chown");
         user.take(&denied).expect("chown");
     }
@@ -412,12 +346,8 @@ fn ps(pid: u32, field: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Whether this process holds an open descriptor on `target`.
-///
-/// The proof that a tap arrived as a descriptor rather than by name: the
-/// entry is in the VMM's fd table and the VMM is a process that could not
-/// have opened it — unprivileged, and Landlocked without a rule for
-/// `/dev/net/tun`.
+/// Inspect the process fd table. A tap descriptor in an unprivileged,
+/// Landlocked VMM demonstrates handoff without opening `/dev/net/tun` there.
 fn holds(pid: u32, target: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
         return false;
@@ -429,21 +359,8 @@ fn holds(pid: u32, target: &str) -> bool {
     })
 }
 
-/// S4: the whole of Stufe 3 on one machine, in one test.
-///
-/// Every assertion here is a sentence from the brief, and together they are
-/// the claim: a guest running on this node is one process away from nothing,
-/// not one process away from root.
-///
-/// * `ps -o user` says the VMM is `MEISTER_VMM_USER` — or says it is the
-///   user running the test, when the run was given no switch to make, and
-///   then this test states that rather than pretending.
-/// * the VMM holds a `/dev/net/tun` descriptor it could not have opened.
-/// * `CapEff` is empty: not "fewer capabilities", none.
-/// * the guest boots and reaches the host.
-/// * the teardown leaves no process and no file.
-/// * and the agent's own socket is closed to the VMM user, shown by trying
-///   it from a process that IS that user.
+/// Check VMM credentials, tap descriptors, guest connectivity and cleanup.
+/// Credential-switch and socket-permission assertions require MEISTER_VMM_USER.
 #[tokio::test]
 #[ignore = "needs a real cloud-hypervisor, kernel, initramfs, a prepared tap and (for the switch) root; see the module note"]
 async fn the_vmm_runs_as_somebody_else_and_cannot_reach_the_agent() {
@@ -479,9 +396,7 @@ async fn the_vmm_runs_as_somebody_else_and_cannot_reach_the_agent() {
         );
     }
 
-    // The tap. It is in the VMM's fd table, and the VMM is Landlocked with
-    // no rule for /dev/net/tun and (with a switch) has no capability at all
-    // — so it did not open this itself.
+    // Verify descriptor handoff to a VMM without permission to open the tap itself.
     assert!(
         holds(pid, "/dev/net/tun"),
         "the vmm holds no tap descriptor, so the tap did not arrive as one"
@@ -502,22 +417,8 @@ async fn the_vmm_runs_as_somebody_else_and_cannot_reach_the_agent() {
             cap_eff.ends_with("0000000000000000"),
             "a vmm that changed user should hold no capabilities: {cap_eff}"
         );
-        // The supplementary groups, and this is the sharpest field in
-        // `/proc/<pid>/status` for this lane — for two opposite reasons at
-        // once.
-        //
-        // Too many is a hole: `setgid` alone leaves the agent's inherited
-        // list in place, including group 0 for a root agent, and a VMM
-        // carrying group 0 reaches every `0660 root:root` file on the node —
-        // the agent's own socket first among them. Measured exactly that way
-        // while building this test.
-        //
-        // Too few is a node that cannot boot a guest: `/dev/kvm` is
-        // `root:kvm` on anything that has not loosened it, and `render`,
-        // `video` and `input` are how the other devices arrive. So what is
-        // asserted is neither "empty" nor "anything": it is EXACTLY the
-        // user's own list, which is what `VmmUser::switch_to` sets and what
-        // `Command::uid` would have thrown away.
+        // Require the VMM user's configured supplementary groups. Inherited root
+        // groups could expose agent files; dropping every group could deny device access.
         let mut seen: Vec<u32> = groups
             .trim_start_matches("Groups:")
             .split_whitespace()
@@ -544,12 +445,8 @@ async fn the_vmm_runs_as_somebody_else_and_cannot_reach_the_agent() {
         host_ip()
     );
 
-    // The three files the VMM made for itself. Owned by it, and closed to
-    // the world: the api socket is a control channel — CH's own threat model
-    // calls its API "trusted" and says Landlock does not protect it, "it does
-    // not prevent access to AF_UNIX sockets" — so the permissions on it are
-    // this stack's job and not the VMM's. The console is what the guest
-    // printed.
+    // Check permissions on VMM-created files. Its trusted API socket requires
+    // filesystem access control because Landlock does not restrict AF_UNIX connections.
     if let Some(user) = &user {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
@@ -635,12 +532,8 @@ fn whoami() -> String {
         .unwrap_or_else(|| uid.to_string())
 }
 
-/// The VMM's pid, off the one place this test can read it without the
-/// driver's private map: `fuser`-style, by who holds the api socket.
-///
-/// The driver knows, but does not publish it — and it should not: a pid is
-/// not an identity, and the driver says so at length. For a test on one
-/// machine the process holding the socket IS the VMM.
+/// Find the process whose command line names this test VM's API socket.
+/// This scans argv, not socket ownership, and is only a test lookup.
 fn vmm_pid(dir: &Path, id: &VmId) -> u32 {
     let socket = dir.join("vms").join(format!("{id}.sock"));
     let target = socket.to_string_lossy().to_string();
@@ -661,27 +554,13 @@ fn vmm_pid(dir: &Path, id: &VmId) -> u32 {
     panic!("no process names {target}");
 }
 
-/// A `connect_as` child that could not become the user it was asked to.
-/// Its own code, so that a failed switch can never be read as a successful
-/// connect — which it was, for one run, and the test passed nothing.
+/// Distinct child status for a failed user switch, separate from connect success.
 const COULD_NOT_SWITCH: i32 = 111;
 
-/// Try to connect to `socket` as `user`, and answer with the errno.
-///
-/// A forked child rather than a spawned helper, because the question is
-/// about a uid and not about a program: no interpreter has to be on this
-/// machine for the answer to be true. The child does the two things the
-/// kernel cares about — group before user, which is the order that cannot be
-/// undone — and exits with the errno as its status.
-///
-/// The credential change goes through the raw syscalls and not through
-/// `nix`, and that is the difference between this test working and not.
-/// glibc's `setuid` is `__nptl_setxid`: it broadcasts to every thread of the
-/// process and waits for them. This child is the fork of a tokio runtime, so
-/// glibc's idea of the thread list is stale, the broadcast fails, and the
-/// call comes back as an error — after which a connect as the ORIGINAL user
-/// succeeds and looks like a hole in the permissions. The syscall changes
-/// the calling thread only, which in a forked child is the whole process.
+/// Connect as another user in a forked child and return errno through its exit status.
+/// Set groups before dropping the UID. Use raw credential syscalls: glibc
+/// setxid broadcasts to threads, whose bookkeeping is stale after forking
+/// the Tokio runtime; the raw calls affect only the surviving child thread.
 fn connect_as(user: &agent_api::VmmUser, socket: &Path) -> i32 {
     use nix::unistd::{ForkResult, fork};
     // SAFETY: the child calls only socket syscalls before `_exit` and never
@@ -691,19 +570,9 @@ fn connect_as(user: &agent_api::VmmUser, socket: &Path) -> i32 {
             let code = (|| -> i32 {
                 // SAFETY: FFI calls with scalar arguments.
                 unsafe {
-                    // The supplementary groups FIRST, and this is the line
-                    // that cost a run. `setgid` replaces the primary group
-                    // and leaves the inherited list alone — so a child of a
-                    // root process keeps group 0 in it, and a socket that is
-                    // `0660 root:root` is then reachable through its GROUP
-                    // bits by a process whose uid is 907. Measured exactly
-                    // that way: `0660` let the probe in and `0600` did not.
-                    //
-                    // `std::process::Command::uid` does this for us in the
-                    // real spawn — it documents "a call to `setgroups(0,
-                    // NULL)` in the child process if no groups have been
-                    // specified" — so the probe has to, or it is not asking
-                    // the same question the VMM answers.
+                    // Drop inherited supplementary groups before switching gid and uid.
+                    // This probe checks primary-user access; unlike the real VMM launcher,
+                    // it does not install the target user's supplementary groups.
                     if nix::libc::syscall(nix::libc::SYS_setgroups, 0, std::ptr::null::<u32>()) != 0
                     {
                         return COULD_NOT_SWITCH;
@@ -723,9 +592,8 @@ fn connect_as(user: &agent_api::VmmUser, socket: &Path) -> i32 {
                     Err(e) => e.raw_os_error().unwrap_or(0),
                 }
             })();
-            // `_exit` and not `std::process::exit`: running atexit handlers
-            // in the fork of a tokio runtime would run the runtime's.
-            // SAFETY: FFI call that does not return.
+            // Avoid inherited atexit handlers after forking the Tokio runtime.
+            // SAFETY: _exit terminates without returning or running those handlers.
             unsafe { nix::libc::_exit(code) }
         }
         ForkResult::Parent { child } => {
@@ -737,22 +605,8 @@ fn connect_as(user: &agent_api::VmmUser, socket: &Path) -> i32 {
     }
 }
 
-/// S4, the other half: the vhost-user backend is the same unprivileged user,
-/// and the socket it makes is not readable by the node.
-///
-/// This is the half that decides whether Stufe 3 buys anything for a display
-/// VM, and the argument is not ours. QEMU: "There is not considered to be
-/// security boundary between QEMU and the vhost-user & vfio-user backends."
-/// Cloud Hypervisor: "Cloud Hypervisor gives vhost-user devices complete
-/// control over the guest." A root backend beside an unprivileged VMM is a
-/// root VMM with extra steps.
-///
-/// `input` and not `nvrm`, and that is a property of this machine rather than
-/// a choice: the card here is a GeForce RTX 2070 with no vGPU, so there is no
-/// mdev device for `nvrm` to serve. The seam is the same one either way —
-/// `drivers/backend` spawns all three — and Leandro's nvrm backend is built
-/// to run unprivileged already: its own `settle_admin_privilege` DROPS
-/// `CAP_SYS_ADMIN` unless `LEA_ADMIN_PRIV=1` asks for it.
+/// Check input-backend credentials and socket permissions through the shared
+/// backend launcher. The credential assertions require MEISTER_VMM_USER.
 #[tokio::test]
 #[ignore = "needs MEISTER_INPUT_BACKEND, MEISTER_INPUT_DEVICE readable by the VMM user, and root"]
 async fn a_vhost_user_backend_runs_as_the_same_user_as_the_vmm() {
@@ -802,16 +656,9 @@ async fn a_vhost_user_backend_runs_as_the_same_user_as_the_vmm() {
         "the backend runs as {who:?} and not as {expected:?}"
     );
 
-    // And the socket the VMM will connect to is the backend's own, with
-    // nothing for the world: the VMM is the same user, so nothing wider is
-    // needed, and what a guest sends through its input device is nobody
-    // else's business.
-    //
-    // `0770` and not `0660`, which is worth knowing rather than asserting
-    // loosely: a socket's base mode is `0777` where a regular file's is
-    // `0666`, so the same `umask 007` produces different numbers for the
-    // console FILE and for the sockets beside it. The execute bit means
-    // nothing on a socket; the bits that matter are the last three.
+    // The backend socket must deny world access. Umask 007 yields socket mode
+    // 0770 from base mode 0777, unlike regular files (0660 from 0666). Socket
+    // execute bits are irrelevant to connection access.
     {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;

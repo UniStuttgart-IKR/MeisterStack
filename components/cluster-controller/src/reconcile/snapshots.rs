@@ -224,18 +224,9 @@ pub(super) async fn snapshot_needs_quiesce(
         }
         Err(e) => return Err(e.into()),
     };
-    // The catalogue carries the consistency now, so it is asked instead of
-    // the driver's NAME being compared with a constant. The name was never
-    // the question: `filesystem` copies on ext4 and REFLINKS on XFS and
-    // btrfs, and it finds that out by probing its own pool rather than by
-    // being told — so a node is the only thing that knows, and a table here
-    // would be a second answer that drifts.
-    //
-    // `None` means nothing was learned — a node from before the claim, a
-    // pool no node has reported on, a backend that says only that it can.
-    // Nothing learned is NOT "atomic": it falls through to the pause, which
-    // is the direction where being wrong costs milliseconds instead of a
-    // torn copy.
+    // Choose whether to request a writer pause from node-reported consistency.
+    // Driver names alone cannot describe per-pool behavior. Only an explicit Atomic
+    // claim skips the pause; absent or legacy claims take the pause path.
     if snapshot_consistency(p, volume, &pool.spec.driver).await?
         == Some(common::capability::SnapshotConsistency::Atomic)
     {

@@ -2,19 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# An inventory that cannot be deployed cannot be BUILT either.
-#
-# Every rule in nix/lib/inventory.nix throws at evaluation, and this check is
-# the counter-proof that they do: six broken inventories under
-# examples/fleet/broken/, each evaluated through `builtins.tryEval`, each
-# required to fail. A rule that stopped firing would show up here as a
-# success, which is the one outcome this file treats as an error.
-#
-# What it does NOT check is the WORDING, and that is a limit of `tryEval`: it
-# reports whether an evaluation failed and never what it said. The sentences
-# are held to their shape on the Rust side, where the same rules are tested
-# against the same words (`tools/meister-deploy/src/inventory.rs`), and the
-# report of this lane quotes each one from a real `nix eval`.
+# Force inventory validation for malformed fixtures and require rejection.
+# tryEval checks failure, not diagnostic wording.
 { lib, pkgs, inventoryLib }:
 
 let
@@ -36,7 +25,7 @@ let
     # an undeclared table; this is the one that was really in the lab's
     # inventory, so it gets its own sentence and its own case.
     opennebula-table = ../../examples/fleet/broken/opennebula-table.toml;
-    # --- end lane 5B ---
+
   };
 
   # `deepSeq` because the rules are lazy on purpose: what forces them is a

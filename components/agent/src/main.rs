@@ -28,9 +28,8 @@ fn main() -> anyhow::Result<()> {
     run(args)
 }
 
-/// Exit 0 and one line on stdout, or exit 1 and the parser's own sentence on
-/// stderr. Nothing else: this is what a Nix check calls, and its whole job is
-/// to turn a configuration file into a number.
+/// Validate configuration for build checks: success prints to stdout and
+/// exits 0; failure prints the parser error to stderr and exits 1.
 fn check_config(path: &Path) -> ! {
     match AgentConfig::parse(path) {
         Ok(_) => {

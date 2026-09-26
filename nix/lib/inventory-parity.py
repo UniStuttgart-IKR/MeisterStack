@@ -1,18 +1,8 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
-#
-# Two readers of one inventory, and the one thing they both still do.
-#
-# Nix derives the deployment (addresses, peer sets, context variables); Rust
-# reads the file for its shape. What both apply is PRECEDENCE — defaults <
-# group < host, scalars overriding and lists accumulating — because
-# `meister-deploy inventory` has to be able to show an operator what a host
-# inherited without evaluating a flake. Two implementations of one rule is
-# what scripts/check-fleet.sh used to measure; this is its replacement, and
-# it compares the answers rather than the code.
-#
-#   inventory-parity.py <rust inventory --json> <nix side json>
+# Compare selected inherited fields from CLI and Nix inventory views.
+# Usage: inventory-parity.py <CLI inventory JSON> <Nix effective-host JSON>
 
 import json
 import sys
@@ -52,10 +42,7 @@ for host in sorted(set(rust_hosts) & set(nix)):
         if a["checks"].get(key) != b["checks"].get(key):
             bad.append("  %s checks.%s: tool %r, flake %r"
                        % (host, key, a["checks"].get(key), b["checks"].get(key)))
-    # An accumulating list like `profiles`, and it decides where a machine
-    # may fetch a closure from: the two halves disagreeing here would mean a
-    # host substitutes from a cache `meister-deploy inventory` never showed
-    # the operator.
+    # Preserve cache lookup order across both inventory readers.
     if a["substituters"] != b["substituters"]:
         bad.append("  %s substituters: tool %r, flake %r"
                    % (host, a["substituters"], b["substituters"]))

@@ -2,21 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# The GPU profile of the template, both ways round.
-#
-# `templates/operator/profiles/compute-gpu-pro6000.nix` is the one file of
-# this repository whose second half depends on an input nobody declares:
-# `leandro`, the GPU stack. A CPU-only fleet has to build without it (L01/V04
-# — nothing here may need somebody's home directory), and a fleet that HAS it
-# has to end up with an agent configuration the agent accepts.
-#
-# Both halves are evaluated here, and the second one without fetching
-# anything: `leandro` is an argument, so a stub shaped like that flake —
-# `packages.<system>.{vhost-user-nvrm,leandro}` — measures what the profile
-# does with it. What this check therefore does NOT claim is that the real
-# GPU stack builds or that a card works; it claims that the profile's two
-# branches produce a configuration the real parser accepts, which is the part
-# that used to be two comments.
+# Evaluate the optional GPU profile with and without a stub leandro input.
+# Validate both rendered configurations with the real agent parser. This does
+# not test the actual GPU package build or hardware.
 { nixpkgs, lib, pkgs, system, self }:
 let
   profileOf = leandro:

@@ -2,38 +2,10 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# Two empty disks become a fleet, and then that fleet is taken forward twice.
-#
-# This is the exit criterion of M3, and the one test in this repository that
-# walks the whole contract in one go: `plan --kind install` -> a medium ->
-# `meister-install confirm` on a blank disk -> a machine that boots itself ->
-# `keys enroll` against the fingerprint its console printed -> `keys csr` /
-# `keys issue` -> `plan --kind bootstrap` -> `apply` -> `check` -> an update
-# over the same verbs -> a kernel change that stops in front of a provider.
-#
-# THREE machines, and only one of them is a node of the test framework:
-#
-#  * `operator` is a node — it needs a store with the closures in it, and
-#    that is what `virtualisation.additionalPaths` is;
-#  * `box` (uefi, cloud+cluster) and `n1` (direct, agent) are built by hand
-#    with `create_machine`, because a node is a machine with no firmware, no
-#    boot menu and a filesystem the framework declares — and what is under
-#    test here is exactly those three things. They are wired onto the
-#    framework's own vlan 1 (`QEMU_VDE_SOCKET_1`), which is how the operator
-#    reaches them over ssh at the addresses the INVENTORY gives them.
-#
-# What is real: the mediums are the ISOs `lib.mkFleet` builds, the disks are
-# empty qcow2 files with serials qemu hands the guests, the CA is
-# `tools/meister-ca` with real openssl, the closures travel with
-# `nix copy --to ssh-ng://` against a store with `require-sigs = true`, the
-# cordon and the drain go through the operator's own `meister` cli against
-# the control plane this test just installed (D7, first real run), and the
-# provider of `n1` is the test driver starting a qemu with `-kernel`.
-#
-# What is NOT real is the same one thing as in every other VM test here: the
-# EVALUATION. A test VM has no nixpkgs, so the four manifests are produced at
-# build time by `lib.mkFleet` itself (`packages.manifest`, the file
-# `meister-deploy resolve` would write) and handed over with `resolve --from`.
+# Install a UEFI controller and direct-boot agent, enroll their identities,
+# bootstrap the fleet, update it, and exercise a provider-managed kernel change.
+# Manifests are evaluated at build time; target machines use real closures,
+# certificates, SSH transport, and nested virtualization.
 { nixpkgs, lib, pkgs, system, self, disko }:
 
 let

@@ -28,23 +28,10 @@ pub(super) async fn get_vm_migration(
     Ok(Json(st.store.get(&name).await?))
 }
 
-/// Ask for this VM to move while it runs.
-///
-/// Nothing moves here. What this writes down is that somebody wants it; the
-/// reconciler chooses a target, prepares it, tells the source to send, and
-/// the object walks its phases. What DOES happen here is the refusing, and
-/// that is the point of doing it at the edge: every one of these answers is
-/// something no amount of waiting fixes, and hearing it as a 422 while a
-/// person is still at the keyboard is worth more than finding it twenty
-/// seconds later as a `Failed` object nobody is watching.
-///
-/// The refusals are [`migration_refusal`], which is where they are written
-/// down and argued. One that is deliberately NOT here: `evacuation: never`.
-/// A drain honours it — the owner said their guest must not be interrupted
-/// and a drain is nobody asking — but an explicit `POST` is an operator
-/// saying "move this one, now", and there is nothing left for the flag to
-/// protect them from. It is the same distinction `vm reschedule` draws
-/// against the scheduler.
+/// Create migration intent after synchronous eligibility checks.
+/// The reconciler selects and prepares the target, then drives the transfer.
+/// An explicit migration ignores `evacuation: never`: that policy controls
+/// automatic drains, while this request explicitly authorizes moving the VM.
 pub(super) async fn create_vm_migration(
     State(st): State<ApiState>,
     dry: controller_api::DryRun,
@@ -277,15 +264,8 @@ pub(crate) fn migration_refusal(
         }
         _ => {}
     }
-    // And the last one, which is not about this VM at all but about the two
-    // MACHINES: can the guest's saved state be restored over there?
-    //
-    // Asked here so that an operator hears it as a refusal to their command
-    // rather than as a migration that fails a minute later — cloud-hypervisor
-    // finds out two milliseconds after the destination's vCPUs are made, in a
-    // log line no tier of this stack ever reads. The rules are
-    // `controller_api::live_migration_refusal` and the lab that paid for them
-    // is D-X1.
+    // Check source/target machine compatibility before starting the migration,
+    // using the shared live-migration rules rather than waiting for restore failure.
     let here = facts.source_machine.as_ref()?;
     let fits = |name: &String| -> Option<String> {
         let there = facts.machines.get(name)?.as_ref()?;

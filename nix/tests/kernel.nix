@@ -2,30 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# V15 on a machine with a real boot loader: a release whose kernel command
-# line is different is a REBOOT, a reboot needs an approval, and without one
-# nothing reboots.
-#
-# The evidence is the machine's own boot id. It is read before and after
-# every step, and the whole test turns on it changing exactly once — at the
-# one activation somebody approved. A plan that says "no reboot" proves
-# nothing about a tool that reboots anyway; `/proc/sys/kernel/random/boot_id`
-# does.
-#
-# The target boots itself: `virtualisation.useBootLoader` with
-# `useEFIBoot`, so there is a real ESP, systemd-boot is really installed,
-# `meister-activate activate --mode boot` really writes a loader entry, and
-# the reboot the tool triggers over ssh really goes through the boot menu.
-# That is the difference between this and nix/tests/update.nix, which never
-# leaves userland.
-#
-# In order: a kernel command line changes, the plan says `reboot_required`
-# and asks for the class `reboot`; an `apply` without that approval is
-# refused and the boot id does not move; with it, the machine is switched in
-# boot mode, rebooted, and comes back running the release it booted; a third
-# release that changes no kernel is an ordinary switch and the boot id does
-# not move again; and a host whose inventory says `reboot = never` is
-# blocked with the sentence rather than rebooted.
+# Check reboot approval for changed kernel parameters using boot IDs. Exercise
+# UEFI boot activation, a later userland-only update, and reboot=never refusal.
 { nixpkgs, lib, pkgs, system, self }:
 
 let

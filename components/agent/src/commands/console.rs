@@ -2,18 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The guest's serial line, as the tier above borrows it: take it, type
-//! into it, give it back.
+//! Controller commands for acquiring, writing and releasing guest serial sessions.
 
 use super::*;
 
 impl Agent {
-    /// Take a VM's serial line for the tier above, and start sending it up.
-    ///
-    /// Answered with `ConsoleOpened` either way — a refusal is an answer, and
-    /// a client that got silence could not tell "busy" from "the stream is
-    /// broken". The error text is the one `attach` wrote, because it is the
-    /// one that names which of the two refusals this is.
+    /// Open a serial session and forward its output. Always answer with
+    /// `ConsoleOpened`, carrying the attach error when the session is refused.
     pub(crate) async fn console_open(
         &self,
         open: proto::ConsoleOpen,
@@ -54,9 +49,7 @@ impl Agent {
             return;
         }
 
-        // The output pump OWNS the handle, so the line is released the moment
-        // this task ends — whether it was aborted, the stream dropped, or the
-        // guest's line closed. Nothing has to notice that a client went away.
+        // The output task owns the holder and releases it whenever the task ends.
         let writer = held.writer();
         let mut mine = held;
         let up = session_id.clone();
@@ -92,12 +85,7 @@ impl Agent {
             .insert(session_id, ConsoleSession { writer, pump });
     }
 
-    /// Keystrokes from the tier above.
-    ///
-    /// A write that fails ends the session rather than being reported: the
-    /// only reasons it can fail are the guest being gone and the caller
-    /// sending more than a burst, and neither is something the next keystroke
-    /// would fix.
+    /// Forward console input. Close the session if writing fails, including queue overflow.
     pub(crate) async fn console_input(&self, data: proto::ConsoleData) {
         let writer = {
             let sessions = self.console_sessions.lock().expect("console sessions");

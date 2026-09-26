@@ -2,15 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The verbs about a VM itself — create it, stop it, pause it, destroy it
-//! — and the three steps they share: claim it, write the desired state,
-//! answer if there was nothing to write it on.
+//! VM creation and lifecycle commands, with controller ownership and desired-state updates.
 
 use super::*;
 
 impl Agent {
-    /// Create is idempotent by id: the controller sends it once for a new VM
-    /// and repeats the whole set as a SyncState on every reconnect.
+    /// Create idempotently by ID, including replay through reconnect snapshots.
     pub(super) async fn handle_create(&self, c: proto::CreateInstance) -> anyhow::Result<()> {
         let id: VmId = c.id.parse().context("invalid vm id")?;
         // spec_json wins: same format and same serde as the local REST API.
@@ -26,17 +23,8 @@ impl Agent {
         };
 
         if self.store.get(&id)?.is_some() {
-            // Known already, and since storage B a re-sent spec can differ
-            // from the one on record in exactly one way: `volumes[]` from its
-            // second entry on, and there only entries that name a `Volume`
-            // object. Everything else is refused a tier up
-            // (`Owned::structural("spec.vm", …)`), so the diff is the whole
-            // of what a re-create can mean besides the intent.
-            //
-            // The intent still goes through the lifecycle path a command
-            // takes, so a create that means "stop" gets its grace period —
-            // that was always true and stays true. What is new is the line
-            // above it.
+            // For known VMs, synchronize secondary referenced volumes and apply the
+            // desired state through the lifecycle path, including stop grace handling.
             self.claim(&id).await?;
             {
                 let _guard = self.ops.lock().await;
@@ -45,17 +33,9 @@ impl Agent {
             return self.set_desired(id, desired).await.map(|_| ());
         }
 
-        // The four structural questions, and what makes them structural is
-        // that they are all about THIS NODE rather than about this attempt: a
-        // node with no hypervisor, without the driver a device names, without
-        // the backend a volume names, without the overlay a NIC names will
-        // never be able to serve this VM, however often it is asked.
-        //
-        // So the refusal carries `CannotServe`, and no record is made. The
-        // tier above answers it by taking the binding back and placing the VM
-        // somewhere else — which is the one thing it must NOT do for a
-        // failure after the record exists, because a boot that did not work
-        // may work next time in the same place.
+        // Refuse unsupported node capabilities before creating a record. The typed
+        // CannotServe error lets the controller distinguish placement incompatibility
+        // from a failed operation on resources already owned here.
         cannot_serve(
             self.hypervisor
                 .validate()
@@ -77,23 +57,9 @@ impl Agent {
                 .context("invalid nic spec"),
         )?;
 
-        // Astra finding S15, 2026-09-23: the base images are fetched HERE,
-        // before the lock, and not where they are used.
-        //
-        // The lock is the node's one `ops` mutex and `pump` handles one
-        // controller command at a time, so everything held across a create is
-        // held across every other command the node has. `provision` reaches
-        // `images::Cache::ensure` several links down its chain, which meant
-        // one download — of a file measured in gigabytes, from a url this
-        // node does not control — sat between the controller and every other
-        // VM on the machine. The transfer is bounded now (`images::Bounds`),
-        // and that bound is a ceiling rather than an excuse: a node should
-        // not be deaf for it at all.
-        //
-        // The same call, the same errors and the same registry: `ensure` is
-        // idempotent and its second run inside the chain is one `stat`. It is
-        // after the four structural questions on purpose — a node that cannot
-        // run this VM at all must refuse it without fetching anything first.
+        // Fetch missing images before acquiring the operations lock. The later
+        // ensure inside provisioning reuses the cache. Controller command dispatch
+        // remains sequential while this handler awaits the fetch.
         for source in &spec.images {
             self.images
                 .ensure(source)
@@ -110,10 +76,8 @@ impl Agent {
         Ok(())
     }
 
-    /// The controller only ever names VMs it owns, so a record it sends is
-    /// the controller's by definition. This is also the migration path:
-    /// records written before the marker existed default to unmanaged and
-    /// would otherwise stay outside every desired-state snapshot forever.
+    /// Mark controller-named records as managed, including legacy records
+    /// that defaulted to unmanaged.
     async fn claim(&self, id: &VmId) -> anyhow::Result<()> {
         let _guard = self.ops.lock().await;
         let Some(mut record) = self.store.get(id)? else {
@@ -127,10 +91,8 @@ impl Agent {
         self.store.put(id, &record)
     }
 
-    /// A desired state off the wire, with the grace a stop needs; whether the
-    /// deadline is actually armed is `set_desired`'s call. `Ok(false)` means
-    /// the record was gone — for a destroy that is the asked-for outcome, for
-    /// a lifecycle command it is not.
+    /// Apply a desired state with stop grace. `set_desired` decides whether to
+    /// arm the deadline; `Ok(false)` means the record no longer exists.
     pub(super) async fn set_desired(&self, id: VmId, desired: Desired) -> anyhow::Result<bool> {
         let deadline = (desired == Desired::Stopped).then(|| SystemTime::now() + self.stop_grace);
         Ok(self
@@ -140,9 +102,7 @@ impl Agent {
             .is_some())
     }
 
-    /// A lifecycle command names a VM the controller believes is here. If it
-    /// is not, say so rather than acking a no-op: the controller's picture of
-    /// this node is wrong, and its next SyncState is what repairs it.
+    /// Report unknown lifecycle targets so the controller can repair its inventory.
     pub(super) async fn lifecycle(&self, raw_id: &str, desired: Desired) -> anyhow::Result<()> {
         let id: VmId = raw_id.parse().context("invalid vm id")?;
         if !self.set_desired(id, desired).await? {

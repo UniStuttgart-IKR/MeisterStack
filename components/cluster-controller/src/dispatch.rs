@@ -307,17 +307,9 @@ fn said(body: &bytes::Bytes) -> String {
     }
 }
 
-/// Serve a command that a sibling replica forwarded here.
-///
-/// The route's whole body, so that the rule it applies is beside the rule the
-/// sender applies: this end passes `forwarded = true`, which is what makes a
-/// second hop impossible.
-///
-/// `forwarded` is the header and not a credential — the caller still has to
-/// present this cluster's own `system:cluster:<name>` certificate, which the
-/// permission table checks before this runs. What the header does is make a
-/// direct call refusable: nothing but a forward has any business here, and a
-/// request without it is answered rather than served.
+/// Serve a sibling-forwarded command with second-hop forwarding disabled.
+/// The header marks routing state, not identity. Middleware must authenticate
+/// this cluster's system certificate; a request without the header is refused.
 pub async fn serve_forwarded(
     registry: &SessionRegistry,
     node: &str,

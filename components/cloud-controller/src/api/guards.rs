@@ -33,18 +33,9 @@ impl Grant {
         }
     }
 
-    /// May this caller do `verb` to an object in `scope`?
-    ///
-    /// The middleware has already said yes to the KIND of request; this is
-    /// the half that needs the object, and it runs in every handler that
-    /// touches one. Anonymous mode says yes to everything, here as it does
-    /// everywhere else — that is the mode the lab has run in since M1.
-    ///
-    /// A refusal is 403 and not 404 in both directions, which is K8s' own
-    /// answer and its own trade: a name's existence is inferable from the
-    /// difference, and a 404 on a write would send an admin debugging the
-    /// wrong thing. Listings still filter, so an inventory is never handed
-    /// out wholesale — but a guessed name gets an honest "not yours".
+    /// Check object-level authorization after middleware checks the resource verb.
+    /// Anonymous mode allows all requests. Denials return 403, which reveals that
+    /// a guessed object name exists; listing handlers separately filter inventory.
     pub(super) fn allows(&self, scope: Scope<'_>, verb: Verb) -> Result<(), ApiError> {
         let Some(identity) = &self.caller.0 else {
             return Ok(());
@@ -59,15 +50,8 @@ impl Grant {
         )))
     }
 
-    /// Is this caller confined to one tenant? An admin, an operator, a system
-    /// identity and anonymous are not, and get their objects exactly as they
-    /// always did.
-    ///
-    /// The line is `Operator`, not `Member`: an operator's job is the estate,
-    /// and an estate you can only see one tenant's share of is not one you
-    /// can run. Below it — member and viewer — a listing is filtered to the
-    /// caller's own tenant, which is what makes a viewer a viewer of its own
-    /// room and not of the whole cloud.
+    /// Members and viewers are confined to their tenant's inventory.
+    /// Administrators, operators, system identities and anonymous callers are not.
     pub(super) fn confined_to(&self) -> Option<&str> {
         let identity = self.caller.0.as_ref()?;
         if identity.is_system() {
@@ -79,16 +63,8 @@ impl Grant {
         }
     }
 
-    /// Which tenant's objects a listing shows, given what the client asked
-    /// for with `?tenant=`.
-    ///
-    /// Two filters and one answer, because the two can disagree. A member is
-    /// confined to its own tenant; a member ASKING for another's must see
-    /// nothing — not its own objects, and not a 403 either. The refusal was
-    /// already made once, by the confinement, and what is left is a filter:
-    /// a filter that finds nothing says so with an empty list, which is what
-    /// this endpoint has always answered somebody asking about a room they
-    /// are not in.
+    /// Intersect an optional tenant query with the caller's allowed inventory.
+    /// A confined caller requesting another tenant receives an empty list.
     pub(super) fn listing(&self, asked: Option<&str>) -> TenantFilter {
         match (self.confined_to(), asked) {
             (None, None) => TenantFilter::All,
@@ -150,15 +126,10 @@ pub(super) async fn check_vm_of_tenant(
 
 // --- shared checks ---------------------------------------------------------
 
-/// `system:` is the stack's own namespace and is not for people.
-///
-/// Not cosmetic. `Identity::is_system` reads the prefix off the certificate's
-/// common name, and the signer writes the user object's name into that common
-/// name — so a user called `system:anything` would be issued a certificate
-/// that skips the directory lookup and every authorization check with it.
-/// Creating one takes an admin, which makes this a way to keep access rather
-/// than to gain it; that is exactly the kind of door worth not leaving open.
-/// Kubernetes reserves the same prefix for the same reason.
+/// Reserve the `system:` prefix for stack identities.
+/// Certificate common names come from user names, and this prefix bypasses
+/// person-directory authorization. Allowing it would let an administrator
+/// create a credential that survives removal from the directory.
 pub(super) fn check_user_name(name: &str) -> Result<(), ApiError> {
     if name.starts_with(controller_api::auth::SYSTEM_PREFIX) {
         return Err(invalid(format!(

@@ -43,14 +43,8 @@ macro_rules! phase_value {
     };
 }
 
-/// Does this variant's field list carry a reason?
-///
-/// By ARITY, and the bindings are passed in rather than spelled here: a
-/// `macro_rules` body writes identifiers in its own hygiene context, so a
-/// bare `reason` in here would not be the `reason` the pattern at the
-/// expansion site bound. Three fields is a reasoned variant, two is a
-/// resting one, and any other number is a compile error — which is the check
-/// this is for.
+/// Extract a reason by variant arity: three fields include reason, two are resting states, and
+/// other shapes fail compilation. Pass bindings explicitly to preserve macro hygiene.
 macro_rules! phase_reason_of {
     ($reason:ident, $message:ident, $since:ident) => {
         Some(*$reason)
@@ -176,14 +170,8 @@ macro_rules! phases {
                 match self { $( $phase::$variant { since, .. } => *since, )* }
             }
 
-            /// The category behind the phase, or `None` on a variant that
-            /// carries none (the resting states).
-            ///
-            /// The pattern binds every field of the variant, because it is the
-            /// ARITY of that list that says which of the two shapes this
-            /// variant is — see `phase_reason_of`. On a resting variant the
-            /// bindings are then unused, which is the allow below and not a
-            /// mistake.
+            /// Optional category for reason-bearing variants. Bind all fields so
+            /// phase_reason_of can distinguish variants by arity.
             #[allow(unused_variables)]
             pub fn reason(&self) -> Option<$reason> {
                 match self {
@@ -191,17 +179,9 @@ macro_rules! phases {
                 }
             }
 
-            /// The reason as it goes on a WIRE: the word, or the empty
-            /// string for a variant that carries none and for `Unrecorded`.
-            ///
-            /// One function because the rule is one rule and it is applied in
-            /// two dozen places: a relay to the tier above, the flat wire
-            /// form, a metric label. `Unrecorded` travels as ABSENT — an
-            /// object nobody recorded a reason for looks exactly as it did
-            /// before the field existed, and reads back as `Unrecorded`,
-            /// which is the same value. A tier that sent the word instead
-            /// would turn "nobody said" into something a reader could match
-            /// on.
+            /// Wire reason, or an empty string for resting variants and Unrecorded. Keeping
+            /// Unrecorded absent preserves the representation of older objects and is shared by
+            /// relays, serialization, and metrics.
             pub fn reason_word(&self) -> &'static str {
                 match self.reason() {
                     Some(reason) if reason != <$reason>::Unrecorded => reason.as_str(),
@@ -227,15 +207,8 @@ macro_rules! phases {
             }
         }
 
-        /// The flat form on the wire: `phase`, `reason`, `message` and
-        /// `since` as SIBLINGS in the status, exactly where `phase` and
-        /// `message` have always been.
-        ///
-        /// That is decision 1 of the brief and it is serde rather than a
-        /// design concession: the CLI, Tofu, the UI and the chaos harness read
-        /// `status.phase` as a string, and a tagged enum would have made every
-        /// one of them read `status.phase.Pending.reason` instead. The status
-        /// struct carries this through `#[serde(flatten)]`.
+        /// Flat status wire representation: phase, reason, message, and since are sibling
+        /// fields. Phase remains a string rather than an externally tagged enum.
         #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
         pub struct $wire {
             #[serde(default)]
@@ -264,23 +237,10 @@ macro_rules! phases {
             }
         }
 
-        /// One party's WORD about this object, as a fact on its status.
-        ///
-        /// The input side of a derivation. `settle` may read the spec and the
-        /// status and nothing else — no store, no other object — so
-        /// everything that used to reach a phase from somewhere else has to
-        /// be written down here first, by whichever pass knew it. This is the
-        /// shape that statement takes: what it is, why, when, and **who said
-        /// so**.
-        ///
-        /// `node` is the load-bearing field and the reason this is not just
-        /// the phase over again. An empty `node` means THIS tier concluded
-        /// it — a dispatch that went out, a source that has gone, a command
-        /// that could not be delivered — and a tier may not conclude that
-        /// something is `Ready`. Only a machine that has the bytes may say
-        /// that, and `settle` refuses a resting word that names nobody. That
-        /// is F16's rule (`Ready` demands an observation) enforced by the
-        /// derivation rather than by every writer remembering it.
+        /// Recorded evidence used by pure phase derivation. An empty node identifies a
+        /// controller conclusion; resting states that assert observed guest or storage state
+        /// require a machine identity. Reconcile passes record external facts before settle
+        /// reads them.
         #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         pub struct $said {
@@ -293,15 +253,8 @@ macro_rules! phases {
             pub reason: $reason,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             pub message: Option<String>,
-            /// When this word was ESTABLISHED — the instant of the report
-            /// that first said it.
-            ///
-            /// It does not move under a report that says the same thing
-            /// again, and that is deliberate for the reason `since` does not:
-            /// a peer reports every ten seconds, and a field that advanced
-            /// per report would make every one of them an etcd revision to
-            /// record that nothing happened (D-C7). `same_word` is what the
-            /// writers compare, and it leaves this out.
+            /// Time this observation was first established. Repeated equivalent reports retain
+            /// it; same_word excludes this timestamp to avoid needless store updates.
             pub at: DateTime<Utc>,
             /// The machine or cluster whose word this is, and empty for this
             /// tier's own conclusion. See the type's own doc.
@@ -359,13 +312,8 @@ macro_rules! phases {
         }
 
         impl From<$wire> for $phase {
-            /// Reading is TOTAL and that is the whole of decision 6: one
-            /// object written before this field existed must not break
-            /// `list()`. A missing reason reads as `Unrecorded`, a reason
-            /// this binary does not know reads as `Unrecorded` WITH the word
-            /// kept at the front of the sentence (decision 2 of the
-            /// derivation lane), a missing `since` reads as the moment of the
-            /// read.
+            /// Decode older or unfamiliar wire states without failing resource reads. Preserve
+            /// unrecognized text in the message while mapping to a known fallback.
             fn from(wire: $wire) -> Self {
                 // A word this binary does not know is not dropped: it goes to
                 // the front of the sentence. See `read` — the same reader the
@@ -491,18 +439,9 @@ macro_rules! reasons {
     )* };
 }
 
-/// The one read path and the one write path for a stored phase.
-///
-/// Seven status structs, the same two methods, so they are generated here
-/// beside the phase they hand out rather than seven times over.
-///
-/// `assign` used to be the third, and its deletion is the proof the round
-/// asked for: it was `#[deprecated]` from the day it was written, every one
-/// of the eighty places that stamped a phase out of what its own code path
-/// happened to know carried an `#[allow(deprecated)]`, and the compiler kept
-/// that list honest. There are none left, and nothing outside this module can
-/// put a word on an object any more — `stamp` is `pub(super)` and only the
-/// `Resource::settle` implementations beside the resource table call it.
+/// Generate status phase access and restricted stamping methods. Resource::settle
+/// implementations own phase writes; callers record evidence instead of assigning phases
+/// directly.
 macro_rules! phased {
     ($( $status:ident / $phase:ident; )*) => { $(
         impl $status {
@@ -512,15 +451,9 @@ macro_rules! phased {
                 &self.phase
             }
 
-            /// The four things a deadline needs to know about this object,
-            /// out of the phase and nothing else.
-            ///
-            /// Generated here so that one pass can ask the same question of
-            /// seven kinds without knowing which it is holding — see
-            /// `crate::stuck::Late`. `terminal` is the judgement each
-            /// `XPhaseKind` makes for itself, because `Failed` is an end for
-            /// an `Image` and a backoff for a `Vm` out of the same five
-            /// letters.
+            /// Expose phase kind, reason, age, and terminal status for common stuck detection.
+            /// Each resource defines terminal semantics, including whether Failed is final or
+            /// retryable.
             pub fn standing(&self) -> crate::stuck::Standing {
                 crate::stuck::Standing {
                     word: self.phase.kind().as_str(),
@@ -561,14 +494,8 @@ phased! {
     VmMigrationStatus / VmMigrationPhase;
 }
 
-/// The instant a phase nobody has stamped carries.
-///
-/// A `DateTime<Utc>` has no `Default`, and a phase has to have one — every
-/// status struct derives `Default` and the store decodes an absent status
-/// into it. The epoch is the value that cannot be mistaken for an
-/// observation, and it is SKIPPED on the way out: an object whose phase has
-/// never been assigned carries no `since` at all rather than a 1970 nobody
-/// can read.
+/// Epoch sentinel for an unstamped phase. Default status decoding uses it, and serialization
+/// omits it so an unobserved object has no transition timestamp.
 pub const UNSTAMPED: DateTime<Utc> = DateTime::<Utc>::UNIX_EPOCH;
 
 #[cfg(test)]
@@ -754,13 +681,8 @@ mod tests {
         assert!(wire.get("since").is_none(), "{wire}");
     }
 
-    /// `since` belongs to the WORD, and this is the rule that says so.
-    ///
-    /// It is the anti-churn rule, and the cost of getting it wrong is the
-    /// defect this whole round also fixes one field over (D-C7): a status
-    /// report arrives every ten seconds saying what it said last time, and a
-    /// stamp taken per write would turn "Running since" into "last heard
-    /// from" and make every one of those reports an etcd revision.
+    /// Equivalent evidence must retain its established timestamp and avoid redundant status
+    /// writes.
     #[test]
     fn a_write_that_does_not_change_the_word_does_not_move_the_stamp() {
         let mut status = VmStatus::default();
@@ -825,22 +747,9 @@ mod tests {
         }
     }
 
-    /// Every word a node can put on the wire is a word this tier can name —
-    /// the other end of the agent's own
-    /// `the_reason_table_is_the_list_in_the_round_report`, against the very
-    /// same lists.
-    ///
-    /// This is the guard behind decision 1 of the derivation lane: there is
-    /// ONE reason list per resource, and a phase that came up from a node
-    /// carries the NODE's word rather than a generic "Reported". That only
-    /// holds while both ends spell the words alike, and the failure mode
-    /// without a test is quiet — the word parses as nothing, the object reads
-    /// `Unrecorded`, and the only place it shows is a lab.
-    ///
-    /// Storage pools and migrations are absent from `proto::reasons` on
-    /// purpose and so are absent here: a node reports drivers and never a
-    /// pool, and a migration's word from below is a typed outcome in a field
-    /// of its own.
+    /// Require controller reason enums to accept every node wire reason. Pools have
+    /// controller-derived reasons and migrations carry typed outcomes, so neither has a proto
+    /// reason list.
     #[test]
     fn every_word_a_node_can_say_parses_into_the_reason_of_its_resource() {
         macro_rules! assert_speaks {

@@ -30,23 +30,10 @@ pub(super) struct Addresses {
     pub(super) carried: Vec<(&'static str, String, u64)>,
 }
 
-/// Both registries, read once and then asked about per VM.
-///
-/// A dispatch used to list them for itself, and the note that stood here said
-/// so on purpose: a cached answer would be a VM booting with the addresses
-/// somebody held an hour ago. That reason is kept and its scope is made exact
-/// — the book lives for ONE reconcile pass and is thrown away with it, so the
-/// oldest answer it can give is milliseconds old.
-///
-/// What that buys is the amplification, which the old note underestimated:
-/// `missing` and `drifted` are level conditions, so a pass after a cluster
-/// restart dispatches EVERY VM it holds, and each of those did two listings
-/// and two counts of its own — four etcd round trips per VM, all of them
-/// serialized behind the one store client, for two answers that are identical
-/// across the whole pass.
-///
-/// Filled lazily (see `pass`), which is what keeps the common case free: a
-/// pass that dispatches nothing still reads nothing.
+/// Address and router inventory cached for one reconcile pass.
+/// Load lazily on the first dispatch to avoid repeated store listings for each
+/// VM after a cluster restart. Discard at the end of the pass; subsequent passes
+/// must observe allocation changes.
 pub(super) struct AddressBook {
     pub(super) reservations: Vec<controller_api::FloatingIp>,
     pub(super) subnets: Vec<controller_api::RoutedSubnet>,
@@ -112,20 +99,8 @@ impl AddressBook {
             .filter(|s| s.spec.tenant == tenant)
             .map(|s| s.spec.cidr.clone())
             .collect();
-        // And the private prefix behind this tenant's router.
-        //
-        // The node turns this list into "these addresses and nothing else"
-        // for the tap, so a list that names only the ROUTED subnets fences a
-        // tenant out of its own overlay: the guests on the router's inside
-        // wire — the ordinary ones, the whole point of `snat` — source from a
-        // prefix nobody wrote down, and every packet they send is dropped by
-        // `src-ip`. Seen in the lab the moment a tenant had both: the guest
-        // with a routed address got through and the guest behind SNAT beside
-        // it had 57 packets dropped on its own tap.
-        //
-        // It is the same statement the routed subnets make — where this
-        // tenant's addresses are — and it comes from the same place the rest
-        // of the router's facts do.
+        // Include router inside prefixes in the tap's source allowlist; guests using
+        // SNAT need these private addresses even when the tenant also has routed subnets.
         routed_subnets.extend(
             self.routers
                 .iter()
@@ -207,21 +182,9 @@ pub(super) async fn stamp_addresses(store: &EtcdStore, carried: &[(&'static str,
     }
 }
 
-/// Write down what this cloud knows about reaching each VM.
-///
-/// Its own small pass rather than a field the status ingest watches, and for
-/// the same reason the node pass above it is one: the facts come from
-/// somewhere else than a cluster's report, and a matcher that compared them
-/// against one would call every report a change.
-///
-/// The floating half is complete — an assignment is this cloud's own object
-/// and needs nobody's word for it. The MAC half belongs to the other writer
-/// of this same list: it starts at a node's tap and arrives through
-/// `session::ingest_placements`. So `Mac` lines are never written here and
-/// never removed here, and the two passes agree on the ORDER as well as the
-/// content — this one keeps what it does not own and appends its own after
-/// it, and the MAC writer does the mirror image (`mirror::addresses_with`).
-/// Two passes that disagreed would rewrite each other's document for ever.
+/// Stamp cloud-owned floating addresses while preserving node-reported MACs.
+/// `session::ingest_placements` owns the MAC entries. Both writers use
+/// `mirror::addresses_with` ordering to avoid rewriting each other's output.
 pub(super) async fn stamp_vm_addresses(store: &EtcdStore, vms: &[Vm]) -> anyhow::Result<()> {
     let reservations = controller_api::floating::all_reservations(store).await?;
     for vm in vms {

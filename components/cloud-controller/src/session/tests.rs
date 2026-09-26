@@ -476,18 +476,9 @@ fn a_second_cluster_report_that_says_the_same_thing_writes_no_revision() {
     assert!(!cluster_facts_are_news(&status, 2, 2, 3, &nodes, None));
 }
 
-/// F16's second half, at the seam where it is decided: a node that has listed
-/// EVERY file under its image directory and not named this one has said the
-/// file is not there.
-///
-/// It is the only evidence that ever exists for a path image nothing uses.
-/// There is no command that asks a node about an image — `SyncState` carries
-/// VMs — so such an entry got silence, and silence used to read `Ready`.
-///
-/// The asymmetry is the whole of the guard: an INCOMPLETE report contributes
-/// nothing at all, because an agent from before the field, a directory that
-/// could not be read and a heartbeat with no lists are all silence, and
-/// reading any of them as "the file is gone" would fail a working image.
+/// Only a complete image inventory can prove that a path image is absent.
+/// Older peers, unreadable directories and reports without inventories contribute
+/// no negative evidence.
 #[test]
 fn a_complete_inventory_that_does_not_name_an_image_says_the_file_is_not_there() {
     let complete = |name: &str, images_complete: bool| proto::NodeReport {

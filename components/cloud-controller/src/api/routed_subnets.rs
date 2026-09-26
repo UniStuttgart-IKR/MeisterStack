@@ -40,16 +40,9 @@ pub(super) async fn get_routed_subnet(
     Ok(Json(subnet))
 }
 
-/// Which block this subnet gets, decided against the store as it reads right
-/// now.
-///
-/// Two roads in, and both end at the same check. An admin names the CIDR —
-/// which is what a lab with an address plan does — or leaves it empty and gets
-/// the first free aligned block out of the cloud's `routed_pools`. Either way
-/// it may overlap nothing: not another tenant's subnet, and not a floating
-/// pool, because a subnet containing a pool address would put that address on
-/// its tenant's allowlist and punch a hole in the pool guard the size of the
-/// subnet.
+/// Choose an explicit CIDR or the first free aligned block in `routed_pools`.
+/// Reject overlap with routed subnets and floating pools. Otherwise a tenant's
+/// source allowlist could include floating addresses it does not own.
 pub(super) async fn choose_subnet_cidr(
     st: &ApiState,
     spec: &controller_api::RoutedSubnetSpec,
@@ -91,20 +84,9 @@ fn prefix_of(range: &common::net::Ipv4Range) -> Option<u32> {
     range.to_cidr()?.rsplit_once('/')?.1.parse().ok()
 }
 
-/// Give a tenant a real subnet.
-///
-/// The block is chosen against the store, written, and then checked AGAINST
-/// THE STORE AGAIN — see the section head above `arrived_after`. The object's
-/// name is an admin's word and not the CIDR, so etcd's create arbitrates
-/// nothing here, and without the second look two POSTs a millisecond apart
-/// would both be handed the same free block and two tenants would be routed
-/// the same addresses.
-///
-/// What the loser does depends on which road it came in by. A cut block has
-/// somewhere else to go, so it takes its object back and scans again — the
-/// same retry `floating::allocate` runs for the same reason. A named CIDR has
-/// nowhere else to go and is refused, which is what an admin who wrote an
-/// address plan wants to hear.
+/// Create a subnet and recheck overlap after the write, since different object
+/// names do not arbitrate competing CIDR claims. The later revision rolls back.
+/// Automatic allocation retries with another block; an explicit CIDR is refused.
 pub(super) async fn create_routed_subnet(
     State(st): State<ApiState>,
     dry: controller_api::DryRun,

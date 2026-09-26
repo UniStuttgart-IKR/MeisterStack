@@ -2,16 +2,8 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The other half of the proof: the same node, with one capability.
-//!
-//! `unprivileged_ch.rs` shows what an agent with NO rights does. This one
-//! shows that the single capability the unit grants by default buys exactly
-//! what it is supposed to and nothing else — the taps, the bridges and the
-//! nftables tap guard come back, and the CAP_SYS_ADMIN backends stay out.
-//!
-//! It cannot be run by `cargo test` on its own, because a test process does
-//! not get to give itself a capability. It needs a unit, so it is `#[ignore]`
-//! and started as one:
+//! Ignored prerequisite test with CAP_NET_ADMIN and no CAP_SYS_ADMIN.
+//! Network drivers should build, while LVM remains unavailable.
 //!
 //! ```text
 //! cargo test -p meister-agent --test unprivileged_caps --no-run
@@ -22,15 +14,8 @@
 //!   ./target/debug/deps/unprivileged_caps-<hash> --ignored --nocapture
 //! ```
 //!
-//! `PrivateNetwork=yes` is not politeness, it is what makes this safe to run
-//! on somebody's workstation: building the network driver PROGRAMS nftables
-//! (`Nft::new` writes `add table netdev meister`, deliberately, because
-//! anything less would prove the binary exists rather than that this process
-//! may use it). In a unit with its own network namespace that table dies
-//! with the unit, and the host keeps none of it.
-//!
-//! A system unit and not a user one, for the reason `nix/agent.nix` gives:
-//! `user@.service` never carries `cpuset`.
+//! Use a private network namespace: driver construction programs an nftables table.
+//! A system unit supplies the delegated controllers required by the agent configuration.
 
 use std::path::PathBuf;
 
@@ -123,10 +108,7 @@ async fn one_capability_buys_the_taps_and_nothing_else() {
         println!("still missing: {gap}");
     }
 
-    // And the drivers, built for real. The network row going through here is
-    // the whole point: `Nft::new` programs a table, so this succeeding is a
-    // measurement and not a claim — with CAP_NET_ADMIN the node is exactly
-    // what it is as root.
+    // Construct the network driver to exercise real nftables setup with CAP_NET_ADMIN.
     let drivers = meister_agent::drivers::Drivers::from_config(&cfg)
         .await
         .expect("a node with CAP_NET_ADMIN comes up");

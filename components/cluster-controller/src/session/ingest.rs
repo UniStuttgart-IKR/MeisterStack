@@ -52,20 +52,9 @@ pub(super) async fn on_status(
     }
 }
 
-/// Tell a node to let go of the routers nothing names any more.
-///
-/// The `Router` kind carries no finalizer, and this is why it does not need
-/// one: a router deleted while its node was away leaves a netns on that
-/// machine, and the machine says so in its very next status report. Exactly
-/// the shape `SyncState` gives a VM at Hello — what is not in the list is
-/// gone — one object over and continuously rather than once.
-///
-/// Sent and NOT waited for, and that is the whole of the second lesson the
-/// lab taught here: this runs inside the reading of one status report, a
-/// command is answered or times out after a minute, and a report that takes
-/// a minute to read is a node whose heartbeat expires while it is talking.
-/// The ack buys nothing anyway — the proof that the netns is gone is the
-/// node's next report, which is where this decision is made again.
+/// Send teardown for router UIDs classified as orphaned by ingest.
+/// Do not await results in the report reader: a slow command would delay
+/// heartbeats. Later reports provide removal evidence and trigger retries.
 fn sweep_routers(session: &Session, node_id: &str, orphans: &[String]) {
     for id in orphans {
         info!(node = node_id, router_id = %id, "router nothing names; letting it go");
@@ -190,30 +179,10 @@ pub(super) async fn ingest_routers(
             orphans.push(line.id.clone());
             continue;
         };
-        // A router this node holds that the list does not name right now.
-        //
-        // NOT an orphan, and the lab is why. It looks like one and it is not:
-        // `status.nodes` is rewritten by every pass, so a machine can be off
-        // the list for one pass — a heartbeat that expired a second ago, a
-        // cordon somebody is about to take back — and a destroy ordered from
-        // here would then fight the very next `EnsureRouter`. It did: a
-        // chaos run left this firing once a minute against a machine that WAS
-        // on the list, and because the send is awaited with the command
-        // timeout, it held this node's whole status ingest for sixty seconds
-        // each time. That starved the node's heartbeat, which took it off the
-        // list for real, which made the next report look like an orphan
-        // again. A loop with nobody outside it.
-        //
-        // Letting a machine go is the RECONCILER's to order, out of a plan
-        // it just computed: `RouterPlan.release`, which names the machines
-        // that dropped off the list and can be reached (see `plan_router`).
-        // The case that path could not reach — a machine that was away while
-        // it was dropped — is remembered there now as `status.releasing` and
-        // paid the first pass the machine is back. It used to be argued away
-        // with `run_dir` being a tmpfs, and that argument was half right: a
-        // machine that REBOOTED comes back with no netns and no record, but a
-        // machine whose AGENT was restarted comes back with both, and manacor
-        // was the second kind on 2026-09-10.
+        // A stored router omitted from `status.nodes` is not an ingest orphan.
+        // The reconciler releases nodes from its current plan and persists offline
+        // cleanup in `status.releasing`. Destroying here could fight EnsureRouter and
+        // destabilize heartbeat-driven placement.
         if !router.status.nodes.iter().any(|n| n == node_id) {
             debug!(router = %router.metadata.name, node = node_id,
                    "this node is not on the router's list; the reconciler releases it");
@@ -339,15 +308,9 @@ pub(super) async fn beat_node(
     // `Copy`.
     let facts = report.node.as_ref();
     let count = report.vms.len() as u32;
-    // Replaced wholesale by every beat and never merged: a condition is a
-    // statement about NOW, and a node that has been given its disk space back
-    // says so by not naming `DiskPressure` any more. Merged, a condition
-    // would be something only a restart clears.
-    //
-    // A report with no `node` at all says nothing about health either, so it
-    // leaves the list alone: that shape is the heartbeat-only report an agent
-    // sends when it could not read its own state, and reading it as "nothing
-    // is wrong" would clear a veto on the strength of a failure.
+    // Replace conditions when node facts are present so cleared conditions vanish.
+    // A heartbeat without node facts preserves prior health evidence; failed
+    // observation must not be interpreted as an empty, healthy condition set.
     let conditions: Option<Vec<controller_api::NodeCondition>> = facts.map(|f| {
         f.conditions
             .iter()
@@ -398,18 +361,8 @@ pub(super) async fn beat_node(
     Ok(())
 }
 
-/// The VM objects every step below is measured against.
-///
-/// NOT short-circuited on an empty report, and that took an E2E to find:
-/// a node that has just let go of its last VM reports exactly zero of
-/// them, and the pass that has to notice is `forget_unbound`. The
-/// listing is cached for a second (`VmIndex`), so what an empty report
-/// costs is one shared read per ten seconds per node.
-///
-/// The agent speaks uids — that is the id it was handed on CreateInstance —
-/// while the store is keyed by name, so the list doubles as the index. The
-/// cloud tier reads its clusters' reports the same way, through
-/// `controller_api::mirror`.
+/// Load the UID-to-object index even for an empty VM report: absence of the
+/// last VM can complete an unbind. `VmIndex` coalesces nearby reports' store reads.
 pub(super) async fn vm_listing(
     store: &EtcdStore,
     index: &VmIndex,
@@ -427,17 +380,9 @@ pub(super) async fn vm_listing(
     }
 }
 
-/// Write what a node said about its volumes onto the `Volume` objects.
-///
-/// The uid is the key, exactly as it is for VMs: the node was handed
-/// `metadata.uid` on ProvisionVolume and speaks it back. A uid no stored
-/// volume carries is somebody else's or one that has just been deleted, and
-/// is dropped without a word — unlike the VM half, where an unknown uid is
-/// worth a line, because a node cannot create a volume of its own.
-///
-/// `Gone` is written onto the object like any other phase and acted on by the
-/// reconciler, not here. This function observes; deciding that an object may
-/// now be deleted is a lifecycle question and lives in one place.
+/// Match volume reports by UID and update their observed state.
+/// Unknown UIDs are ignored. Gone is recorded here; the volume reconciler owns
+/// the resulting deletion decision.
 pub(super) async fn ingest_volumes(
     store: &EtcdStore,
     node_id: &str,
@@ -454,22 +399,9 @@ pub(super) async fn ingest_volumes(
         let Some(volume) = volumes.iter().find(|v| v.metadata.uid == reported.id) else {
             continue;
         };
-        // A node that is neither this volume's HOME nor one of the machines
-        // holding it OPEN has no word about it.
-        //
-        // Two fields and not one, because a live migration separates them:
-        // `status.node` is where the bytes were made, `status.openOn` is who
-        // has them attached, and for the length of a migration those are two
-        // different machines. A destination whose report was dropped here
-        // would look to this tier like a node that never got the volume.
-        //
-        // DEBUG and not WARN for the rest, because the ordinary way to get
-        // here is not a fault: after a record moves with its VM the OLD node
-        // still holds a record of its own and goes on reporting the volume,
-        // for ever — one warning per node per report, over minutes in the E2E
-        // (migration D8). The honest repair is a `ForgetVolume` command to the
-        // old node, which is a storage decision and not this one; until then
-        // the line says what it is instead of shouting it.
+        // Accept volume reports from its home or an `openOn` node, including a live
+        // migration destination. Other nodes may retain stale records after a move;
+        // ignore those reports and leave record cleanup to the storage workflow.
         let home = volume.status.node.as_deref() == Some(node_id);
         let holds = volume.status.open_on.iter().any(|n| n == node_id);
         if !home && !holds {
@@ -615,18 +547,9 @@ pub(super) fn note_open(volume: &mut Volume, node: &str, open: bool) {
     }
 }
 
-/// Write what a node said about the disks it has OPEN onto the VM objects.
-///
-/// The evidence half of hot-plug, and the reason it is a pass of its own:
-/// `spec.vm.volumes[]` is what a client asked for and this is what happened,
-/// and the two move independently. A disk finishes attaching while the VM
-/// stays exactly as Running as it was, so the phase loop — which writes only
-/// on a change of phase or message — would see nothing to do.
-///
-/// Names and not uids on the object, because a person reads this field; uids
-/// are what travel on the wire. The map between them costs one listing of the
-/// volumes, and only for a report that mentions a VM with referenced disks —
-/// which is no report at all on a cluster that has none.
+/// Mirror observed attachments independently of VM phase changes.
+/// Translate wire UIDs into volume names using a listing only when needed.
+/// A disk can attach while the VM remains Running.
 pub(super) async fn ingest_attachments(
     store: &EtcdStore,
     vms: &[Vm],
@@ -669,17 +592,9 @@ pub(super) async fn ingest_attachments(
             .iter()
             .filter_map(|uid| by_uid.get(uid).map(String::as_str))
             .collect();
-        // `openOn` is NOT written here any more, and that is D4. This list
-        // is the union of what every VM on this node reports as attached, and
-        // a VM with `desired = Absent` drops out of that report the instant
-        // the record is written — so the set went empty while the VMM still
-        // had the disk open. Deriving one set from two sources is the shape
-        // D-B2 came out of; the node says it directly now
-        // (`VolumeStateReport.open`, see `note_open`).
-        //
-        // What this pass still answers is the question it was made for: which
-        // of the SPEC's disks this VM has. That is a statement about the VM
-        // and not about the machine, and it is the evidence half of hot-plug.
+        // Do not derive `openOn` from VM attachment lists: a deleting VM can leave
+        // that inventory before its disk is detached. VolumeStateReport.open supplies
+        // node-level handle evidence; this pass updates only per-VM attachments.
         let observed = observed_attachments(vm, &held);
         if vm.status.volumes == observed {
             continue;
@@ -708,18 +623,9 @@ pub(super) async fn ingest_attachments(
     Ok(())
 }
 
-/// Write the hardware addresses a node reported onto the VM objects.
-///
-/// The MAC half of `Vm.status.addresses[]`. Its own pass, next door to the
-/// attachment half and for the same reason: a tap is made once and then says
-/// the same thing for the life of the VM, so the phase loop — which writes
-/// only when the phase or the message changed — would carry it exactly never.
-///
-/// The merge itself is `mirror::addresses_with`, shared with the tier above
-/// because both apply it and the two have to agree exactly. What is decided
-/// HERE is only which reports get that far: a node may speak for a VM the
-/// binding gives it, and a report that names no tap at all is skipped before
-/// anything is read or written.
+/// Mirror MAC addresses independently of VM phase changes, preserving entries
+/// owned by other writers through `mirror::addresses_with`. Accept only reports
+/// from the bound node and skip reports without tap addresses.
 pub(super) async fn ingest_addresses(
     store: &EtcdStore,
     vms: &[Vm],

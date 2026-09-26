@@ -42,20 +42,8 @@ fn line(uid: &str) -> proto::VmStatusReport {
     }
 }
 
-/// A report that makes no statement about VMs lets go of nothing.
-///
-/// Astra finding S12, 2026-09-23. `forget_unbound` reads a uid's absence from
-/// `report.vms` as "the node has stopped serving it", and clears the binding
-/// so the scheduler may place the guest again. That reading was only ever
-/// true of the report a healthy agent builds: a beat whose per-VM half could
-/// not be read sends the node's facts and EMPTY LISTS (`heartbeat_only`), and
-/// on that beat every unbound VM on the node was declared let-go — while its
-/// VMM went on serving the guest and holding its disks. One bad read was
-/// enough to place a running guest on a second machine.
-///
-/// So the node says which of the two an empty list is, and the decision is
-/// asked as a value here rather than through the store: what it decides is
-/// that somebody's guest may be started somewhere else.
+/// Incomplete reports cannot release old VM bindings: empty heartbeat-only
+/// lists do not prove teardown, and replacement placement could duplicate a guest.
 #[test]
 fn an_incomplete_report_lets_go_of_nothing() {
     // The shape `forget_unbound` is for: a client cleared `spec.nodeName`,
@@ -376,18 +364,8 @@ fn a_hot_plug_closes_when_the_node_reports_the_disks_and_not_when_it_is_told() {
     assert!(observed_attachments(&vm(&[]), &[]).is_empty());
 }
 
-/// Astra finding S18, 2026-09-23: a spec that stops referencing any volume
-/// used to drop the vm out of `ingest_attachments` entirely —
-/// `!vm.spec.referenced_volumes().is_empty()` was the one condition that let
-/// a vm through — so the LAST report before the spec was cleared never got
-/// rewritten and stayed on `status.volumes` forever.
-/// `reconcile::vms::volume_drift` reads that field and disagrees with the
-/// now-empty spec for ever: one release (hot_plug/CreateInstance) every
-/// tick, never converging. `observed_attachments` already answers `[]` for
-/// an empty spec — the fix is letting the vm THROUGH to receive that answer.
-///
-/// `#[ignore]`: the ingest writes the store, and the workspace's ordinary run
-/// has no etcd. See `two_replicas_assigning_at_once_hand_out_two_namespaces`.
+/// Removing the final referenced disk clears attachment status and converges
+/// hot-plug reconciliation. Requires external etcd; see the namespace test setup.
 #[tokio::test]
 #[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
 async fn the_last_volume_removed_from_the_spec_clears_the_status() {
@@ -446,21 +424,8 @@ async fn the_last_volume_removed_from_the_spec_clears_the_status() {
     );
 }
 
-/// A destination that tore a failed migration down comes off `openOn`.
-///
-/// The books said `openOn: ["agent-1a","agent-1b"]` while agent-1b held no
-/// vmm, no record and no `nvme list-subsys` entry — the teardown was right
-/// and nothing ever told the volume object about it.
-///
-/// The answer used to be two statements read out of one report: "I still have
-/// this disk" and "nothing here is using it", the second derived from the
-/// union of every VM's `attached_volumes`. **D4 took that pass out.** The
-/// union is wrong in a window nothing could see — a VM with `desired =
-/// Absent` drops out of a node's report the instant the record is written, so
-/// the set went empty while the VMM still had the disk, and a DELETE in that
-/// window takes somebody's data. The node answers it directly now
-/// (`VolumeStateReport.open`, true until the `detach` has really run), and
-/// this test holds the one writer that reads it.
+/// Explicit VolumeStateReport.open=false removes a node from `openOn`.
+/// An empty VM attachment inventory alone cannot prove detach completed.
 #[test]
 fn a_node_that_still_has_the_disk_and_no_guest_on_it_has_let_go() {
     let mut volume =
@@ -571,21 +536,8 @@ fn a_healthy_node_says_ready_and_the_tier_above_knows_which_kind_of_ready() {
     assert_eq!(super::ingest::observed_phase("Active", true), None);
 }
 
-/// A node that reports a router the list does not name RIGHT NOW is not an
-/// orphan, and the difference is not academic.
-///
-/// `status.nodes` is rewritten by every pass, so a machine is off it for one
-/// pass whenever a heartbeat has just expired or a cordon is about to be
-/// taken back. Ordering a destroy from the reading of a status report then
-/// fights the very next `EnsureRouter` — and because that send is answered
-/// or times out after a minute, it holds the node's whole status ingest for
-/// that minute, which starves the heartbeat, which takes the machine off the
-/// list for real. A chaos run walked into exactly that loop and two agents
-/// stopped answering any command at all.
-///
-/// Letting a machine go is the reconciler's, out of a plan it just computed
-/// (`RouterPlan.release`). What is swept from here is only what NOBODY
-/// stores.
+/// A router omitted from its current node list remains owned while its object
+/// exists. Ingest sweeps absent objects; planned node release belongs to reconcile.
 #[tokio::test]
 async fn a_router_the_list_does_not_name_this_second_is_not_an_orphan() {
     let report = |id: &str| StatusReport {
@@ -632,19 +584,8 @@ async fn a_router_the_list_does_not_name_this_second_is_not_an_orphan() {
     assert!(mine.routers[0].nodes.is_empty());
 }
 
-/// D-C7: two heartbeats that say the same thing are ONE write, and it is the
-/// lease.
-///
-/// The number that made this a defect: twelve PUTs in a twenty-second watch
-/// on a lab where nobody was doing anything, every one of them a whole `Node`
-/// object — `machine.cpuFlags` and all, about 1.5 kB — rewritten because
-/// `lastHeartbeat` had moved 108 ms. 1.13 etcd revisions a second at idle,
-/// 8.3 MB an hour, and a fleet that fills its own quota in six days.
-///
-/// So this is the rule in one assertion: what decides whether the OBJECT is
-/// written is `ready`, `capacity`, `vms` and `conditions` — and never the
-/// beat. The beat is a key of its own (`store.beat`), written every time,
-/// about sixty bytes.
+/// Unchanged node facts produce no new Node revision. Each heartbeat updates
+/// the separate lease key instead of rewriting the full object.
 #[test]
 fn a_second_heartbeat_that_says_the_same_thing_writes_no_node_revision() {
     use super::ingest::{NodeFacts, node_facts_are_news};
@@ -718,17 +659,8 @@ fn a_second_heartbeat_that_says_the_same_thing_writes_no_node_revision() {
     );
 }
 
-/// F08: once a node's session has been replaced, what arrives on the old one
-/// is no longer the node speaking.
-///
-/// `disconnect` always knew this — an old stream unwinding must not take the
-/// newer session's entry with it — and the status road did not: a report
-/// still buffered on the superseded stream was ingested after the new
-/// session's, stamped with the time it was READ, and the node's capacity,
-/// conditions, heartbeat and VM phases went back to what they had been.
-///
-/// `#[ignore]`: the ingest writes the store, and the workspace's ordinary run
-/// has no etcd. See `two_replicas_assigning_at_once_hand_out_two_namespaces`.
+/// Reports buffered on a superseded session cannot overwrite current node or
+/// VM evidence. Requires external etcd; see the namespace test setup.
 #[tokio::test]
 #[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
 async fn a_report_on_a_superseded_session_changes_nothing() {
@@ -823,16 +755,9 @@ async fn a_report_on_a_superseded_session_changes_nothing() {
     assert_eq!(now.status.capacity.vcpus, 32);
 }
 
-/// Astra finding S20, 2026-09-23: `ingest_phases` is handed a VM listing that
-/// can be seconds stale (`VmIndex`), and it checks the binding — whether the
-/// reporting node still speaks for the vm — against THAT snapshot. Between
-/// the snapshot and the write, the vm can be rebound to a different node, and
-/// a delayed report from the old one must not land on it: `mutate_if`'s
-/// closure re-checks the binding against the object it just re-read, not
-/// against the stale snapshot `changed()` matched the report to.
-///
-/// `#[ignore]`: the ingest writes the store, and the workspace's ordinary run
-/// has no etcd. See `two_replicas_assigning_at_once_hand_out_two_namespaces`.
+/// Ingest mutation rechecks the live binding even when its cached VM index is
+/// stale, rejecting an old node's report after rebinding. Requires external etcd;
+/// see the namespace test setup.
 #[tokio::test]
 #[ignore = "needs an etcd; see two_replicas_assigning_at_once_hand_out_two_namespaces"]
 async fn a_report_from_the_old_node_does_not_land_after_the_vm_was_rebound() {

@@ -65,10 +65,8 @@ impl TraceParent {
         self.flags & FLAG_SAMPLED != 0
     }
 
-    /// Parse a header value. `None` for anything malformed — an unreadable
-    /// context is treated as no context, which starts a new trace rather than
-    /// silently attaching this work to whatever the bytes happened to decode
-    /// to.
+    /// Parse a valid traceparent; malformed input returns None so callers
+    /// start a new trace rather than attach to invalid context.
     pub fn parse(s: &str) -> Option<Self> {
         let mut parts = s.trim().split('-');
         let (version, trace, span, flags) =
@@ -124,14 +122,8 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Hex-decode, over BYTES rather than chars.
-///
-/// The length checks in `parse` are byte lengths, so a header field can be the
-/// right number of bytes and still hold a multi-byte character — and slicing
-/// `&s[i..i + 2]` through the middle of one panics. The input is a remote
-/// header, so that panic is reachable from outside; refusing anything
-/// non-ASCII up front is both the fix and the truth about the format (a
-/// traceparent is hex digits).
+/// Decode ASCII hex bytes without slicing UTF-8 strings at arbitrary
+/// byte boundaries. Reject malformed remote input instead of panicking.
 fn unhex(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(2) || !s.is_ascii() {
@@ -208,10 +200,7 @@ mod tests {
         assert!(TraceParent::parse_or_root(None).sampled());
     }
 
-    /// The length checks count BYTES, so a field can be the right length and
-    /// still hold a multi-byte character — and hex-decoding it by byte index
-    /// used to slice through the middle of one and panic. This header comes off
-    /// the wire, so that panic was reachable from outside.
+    /// Reject correctly sized multibyte input without UTF-8 slicing panics.
     #[test]
     fn a_header_with_multibyte_characters_is_refused_and_does_not_panic() {
         // 3-byte euro sign + 29 ascii = 32 BYTES, the length a trace id needs.

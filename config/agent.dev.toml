@@ -1,38 +1,61 @@
-# LOCAL DEV CONFIG — not a template. See config/README.md.
-#
-# This is what the repository runs against ITSELF: paths point into this
-# checkout (../data, ../images, ./bin), the socket lands under /tmp, and
-# there is no controller, no TLS and no credential anywhere in it. Copying it
-# onto a node gives an agent whose database is two directories above wherever
-# you put it.
-#
-# It is loaded by a test (agent config::tests::the_dev_config_in_the_repo_
-# still_loads) and named by scripts/smoke.sh, so it keeps this path and this
-# name. The file to copy is config/examples/agent.toml — or, for anything
-# reachable from outside a lab, config/examples/hardened/agent.toml.
+# MeisterStack agent configuration. Checkout-only development fixture; do not deploy it. See config/README.md.
+# Relative paths resolve against this file's directory. See docs/CONFIGURATION.md.
+# Prose uses "# "; optional settings use "#key". Keep top-level settings above tables.
 
+# Stable node identity, unique within the cluster. Its session certificate
+# uses CN=system:node:<node_id>. Duplicate identities replace sessions.
 node_id = "manacor"
+
+# Optional controller session. A nonempty controller_addrs list takes precedence.
+# Without either address the agent runs standalone.
 #controller_addr = "http://127.0.0.1:50051"
 
+# Persistent records and disks must survive together. Runtime sockets can use tmpfs.
 [paths]
+
+# Agent VM and volume records used for reconciliation and restart adoption.
 db_path = "../data/lib/meisterstack/agent.redb"
+
+# Local administration socket and per-VM runtime files. The socket defaults to
+# 0600; configuring socket_group grants its members full local administration.
 run_dir = "/tmp/run/meisterstack"
+
+# Base-image directory. Files must be available on each selected node; a shared
+# mount can provide the same namespace across nodes.
 image_dir = "../images"
+
+# Directory for filesystem-backed volumes.
 volume_dir = "../data/lib/meisterstack/volumes"
+
+# Delegated or privileged cgroup-v2 subtree for VMMs and backend processes.
 cgroup_root = "/sys/fs/cgroup/meisterstack"
 
+# Patched Cloud Hypervisor build; see nix/packages/cloud-hypervisor.nix.
 [hypervisor.cloud-hypervisor]
+
+# Backend executable path.
 binary = "./bin/cloud-hypervisor"
+
+# Deadline for a local Cloud Hypervisor API call, in milliseconds.
 timeout_ms = 5000
 
+# Default guest bridge; tenant overlays use separate per-VNI bridges.
 [network]
 default_bridge = "meister_br0"
-bridge_addr = "192.168.100.1/24" # optional, only required when no cntroller is active, overridden by controller
 
+# Optional address installed on the default bridge, with or without a controller.
+bridge_addr = "192.168.100.1/24" # applied to the default bridge with or without a controller
+
+# Configure the crosvm GPU backend only on nodes that provide it.
 [device.crosvm-gpu]
+
+# Backend executable path.
 binary = "./bin/crosvm"
+
+# Deadline for the backend's Unix socket to appear.
 socket_timeout_ms = 5000
 
+# Merge device settings in order: defaults < named profile < VM parameters.
 [device.crosvm-gpu.defaults]
 backend = "virglrenderer"
 vulkan = true
@@ -42,6 +65,7 @@ pci_bar_size = 2147483648 # in bytes 2048 * 1024 * 1024
 implicit_render_server = true
 # render_device = "/dev/dri/renderD128" //TODO multi-gpu support? scheduling over multiple GPUs is not supported atm
 
+# Profiles are advertised as driver/profile capabilities for placement.
 [device.crosvm-gpu.profiles.venus]
 context_types = "venus"
 
@@ -49,9 +73,15 @@ context_types = "venus"
 backend = "gfxstream"
 context_types = "gfxstream-vulkan"
 
+# NVIDIA mediated backend. vgpuprofile resolves profile limits against the card.
 [device.nvrm]
+
+# Backend executable path.
 binary = "./bin/vhost-user-nvrm"       # symlink to ~/git/Leandro/target/release
 vgpuprofile = "./bin/vgpuprofile"
+
+# Optional hard VRAM admission budget. Per-type max_instance is enforced
+# independently; without a budget, VRAM overcommit is warned about.
 # vram_budget_mib = 8192               # optional hard admission; unset = warn-only (Leandro overprovisions by design)
 
 [device.nvrm.profiles.2q]
@@ -63,6 +93,8 @@ vgpu_type = "RTX2070-4Q"
 [device.nvrm.profiles.8q]
 vgpu_type = "RTX2070-8Q"
 
+# Allowlist complete PCI devices for the vfio driver. Only these addresses
+# may be assigned; keep management devices out of this list.
 [[device.managed]]
 kind = "nic-sriov"
 pci_address = "0000:23:00.0"

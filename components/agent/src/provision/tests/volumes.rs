@@ -2,15 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Volumes: the widening they ask of the slice, the fork between
-//! referenced and inline, the hot-plug order, and the one detach per
-//! attachment.
+//! Volume cgroup allowances, persisted ownership, hotplug order and detach accounting.
 
 use super::*;
 
-/// The gap this closes: an `[volume.nfs]` share is a virtiofsd in the
-/// VM's own slice, and before the widening it had no allowance at all —
-/// the slice was sized for the VMM and the devices only.
+/// Storage backend processes need cgroup headroom; plain paths do not.
 #[test]
 fn a_volume_backend_widens_the_slice_and_a_plain_path_does_not() {
     let base = Provisioner::limits_for(&spec(2, 2048, vec![]));
@@ -75,13 +71,8 @@ fn widening_keeps_every_limit_it_is_not_about() {
     assert_eq!(widened.cpu_quota, base.cpu_quota);
 }
 
-/// The rule the whole position exists for, counted rather than argued: a
-/// referenced volume is ATTACHED and never provisioned, and a destroy
-/// detaches it and leaves the data — and the record — standing.
-///
-/// A fake backend that counts its calls, because what is being proven is
-/// which calls happened. The `filesystem` driver would make the same
-/// bytes either way and the test would pass while the rule was broken.
+/// Resolve a referenced volume without provisioning. The fake counts calls that a
+/// filesystem backend's idempotence could otherwise hide.
 #[tokio::test]
 async fn a_referenced_volume_is_attached_and_never_provisioned() {
     use agent_api::storage::{
@@ -217,8 +208,7 @@ async fn a_referenced_volume_is_attached_and_never_provisioned() {
         None,
     );
 
-    // The reference resolves to the stored handle, with no provision in
-    // sight — which is the whole claim.
+    // Resolve references without provisioning new data.
     let (driver, resolved) = provisioner.reference(&volume_id, None).expect("resolved");
     assert_eq!(driver, "filesystem");
     assert_eq!(resolved.backend, handle.backend);
@@ -231,9 +221,7 @@ async fn a_referenced_volume_is_attached_and_never_provisioned() {
         .expect("resolved");
     assert_eq!(tagged.params.unwrap()["tag"], "data");
 
-    // And a reference to a volume this node does not have is a refusal
-    // rather than a fresh disk: the two pictures disagree, and making
-    // bytes on the strength of that would be the wrong repair.
+    // Missing referenced volumes fail instead of creating replacement disks.
     let err = provisioner
         .reference(&VolumeId::new_v4(), None)
         .expect_err("no record here");
@@ -244,22 +232,8 @@ async fn a_referenced_volume_is_attached_and_never_provisioned() {
     assert_eq!(counting.provisions.load(Ordering::SeqCst), 0);
 }
 
-/// The whole of the agent's half of hot-plug, counted and ordered.
-///
-/// What a fake buys here that a real driver cannot: `filesystem` would
-/// make the same bytes whichever order the calls came in, and the test
-/// would stay green while the rule was broken. What is being proven is
-/// which calls happened and in what order —
-///
-///   * **attach before add-disk.** A VMM told about a path that does not
-///     exist yet is an error the guest sees.
-///   * **remove-device before detach.** Pulling a backend out from under
-///     a live virtio device gives a guest I/O errors instead of an unplug.
-///
-/// And two things that must NOT happen: no provision (the volume was
-/// already there) and no deprovision (it outlives this VM by definition —
-/// a detach that took the bytes would be the whole reason the object
-/// exists, undone).
+/// Attach before add-disk; confirm guest unplug before backend detach.
+/// Referenced-volume changes must never provision or delete their data.
 #[tokio::test]
 async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
     use agent_api::hypervisor::{ConsoleStream, InstanceSpec, VmState};
@@ -337,12 +311,8 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
         }
     }
 
-    /// A hypervisor that is running the VM and can plug disks. Only the
-    /// three methods this path touches do anything.
-    ///
-    /// The flag is the guest that will not let go: cloud hypervisor's own
-    /// driver waits for `vm.info` to stop listing the disk and fails when
-    /// it never does, and this is that failure without a VMM in the room.
+    /// Fake running hypervisor with disk hotplug. The flag simulates a guest
+    /// that never completes unplug, causing removal to fail.
     struct Vmm(Log, Arc<std::sync::atomic::AtomicBool>);
 
     #[async_trait::async_trait]
@@ -432,8 +402,7 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
     let log: Log = Arc::new(StdMutex::new(Vec::new()));
     let deaf_guest = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Three volumes this node already owns: the boot disk, the one that
-    // is attached now, and the one that will be plugged in.
+    // Prepare boot, currently attached and replacement volume records.
     let mut ids = Vec::new();
     for _ in 0..3 {
         let id = VolumeId::new_v4();
@@ -562,8 +531,7 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
         record.spec.volumes.iter().map(|v| v.id).collect::<Vec<_>>(),
         vec![boot, arriving]
     );
-    // The bytes of a detached volume are NOT touched, which is the whole
-    // reason a `Volume` object exists.
+    // Changing referenced attachments must not provision or delete their data.
     assert!(!calls.iter().any(|c| c.starts_with("deprovision")));
     assert!(!calls.iter().any(|c| c.starts_with("provision")));
 
@@ -571,11 +539,7 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
     // VM by id, the way a command from the controller does.
     store.put(&vm, &record).expect("stored");
 
-    // And the second half of a resize, against the same fake: the guest
-    // is told by the disk's NAME and with the size the backend already
-    // grew to. What this proves is the name — a positional one would have
-    // moved under the detach two lines up, and the guest would have been
-    // told about somebody else's disk.
+    // Notify resize by stable disk ID after detach changes attachment ordering.
     log.lock().unwrap().clear();
     provisioner
         .resize_attachment(&vm, &arriving, 2 << 30)
@@ -589,9 +553,7 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
             2u64 << 30
         )]
     );
-    // A disk this VM does not have is a refusal and not a quiet success:
-    // the tier above has to be able to tell "the guest has the room" from
-    // "the guest will have it after a restart".
+    // Refuse resize notification for a disk no longer attached to this VM.
     let err = provisioner
         .resize_attachment(&vm, &going, 2 << 30)
         .await
@@ -601,8 +563,7 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
         "{err:#}"
     );
 
-    // A second pass over the same spec is a no-op: the diff is by id, so
-    // there is nothing left to differ.
+    // Reapplying an unchanged volume list makes no driver calls.
     log.lock().unwrap().clear();
     provisioner
         .apply_volume_diff(&vm, &mut record, &with(vec![boot, arriving]))
@@ -610,11 +571,7 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
         .expect("idempotent");
     assert!(log.lock().unwrap().is_empty(), "nothing drifted");
 
-    // And the half D3 was missing: an unplug the guest never carried out
-    // stops the sequence where it stands. The backend is NOT detached —
-    // pulling it out from under a device the VMM still holds open is the
-    // I/O error this order exists to prevent — and the record still says
-    // the volume is here, because it is.
+    // Failed guest unplug stops before backend detach and retains the attachment.
     deaf_guest.store(true, std::sync::atomic::Ordering::Relaxed);
     log.lock().unwrap().clear();
     let refused = provisioner
@@ -639,12 +596,8 @@ async fn a_hot_plug_attaches_before_it_tells_the_guest_and_detaches_after() {
     deaf_guest.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The boot entry and the inline entries are invisible to the diff, on
-/// this side of the wire as well as at the API edge.
-///
-/// Said twice on purpose. The 422 is what a person meets; this is what a
-/// second client at the agent's own unix socket meets, and a rule that
-/// lived only at the edge would be a rule that socket does not have.
+/// The agent diff excludes the boot position and inline disks.
+/// Validation of an attempted boot-disk replacement belongs to the API boundary.
 #[test]
 fn the_diff_never_touches_the_boot_entry_or_an_inline_disk() {
     let entry = |referenced: bool| {
@@ -673,9 +626,7 @@ fn the_diff_never_touches_the_boot_entry_or_an_inline_disk() {
         s
     };
 
-    // A different boot disk is not a plug and not an unplug: index 0 is
-    // skipped on both sides, so the diff is empty and the API's 422 is
-    // the only thing standing between a client and that edit.
+    // The diff excludes index zero; API validation must reject boot-disk replacement.
     let (attach, detach) = volume_diff(&with(vec![boot.clone()]), &with(vec![other_boot.clone()]));
     assert!(attach.is_empty() && detach.is_empty());
 
@@ -686,7 +637,7 @@ fn the_diff_never_touches_the_boot_entry_or_an_inline_disk() {
     );
     assert!(attach.is_empty() && detach.is_empty());
 
-    // And the one edit that IS a plug.
+    // Adding a secondary reference requires attachment.
     let (attach, detach) = volume_diff(
         &with(vec![boot.clone(), inline.clone()]),
         &with(vec![boot, inline, data]),
@@ -698,10 +649,7 @@ fn the_diff_never_touches_the_boot_entry_or_an_inline_disk() {
     assert!(detach.is_empty());
 }
 
-/// A volume driver that counts the calls it gets. What is being proven is
-/// how MANY times each verb happens, so a real driver — whose second
-/// detach looks exactly like its first from the outside — would let the
-/// defect through.
+/// Count driver operations to detect duplicate detach and cleanup calls.
 #[derive(Default)]
 struct CountingVolume {
     probe_has_bytes: std::sync::atomic::AtomicBool,
@@ -817,14 +765,7 @@ impl agent_api::storage::VolumeAttacher for CountingVolume {
     }
 }
 
-/// `stop` then `destroy` is the ordinary way a VM ends, and it used to
-/// detach twice. The second call is the dangerous one: the driver's map
-/// lost its entry with the first, so the fallback reaches for the pid on
-/// the record — a number the kernel hands out again.
-///
-/// The mark travels through the store and not through a variable: the
-/// agent may restart between the two commands, and a restart is exactly
-/// when the driver's map is empty and the pid is all that is left.
+/// Persist completed detaches so teardown after a restart does not reuse stale backend PIDs.
 #[tokio::test]
 async fn a_stop_and_then_a_destroy_detach_the_volume_once() {
     let temp = tempfile::tempdir().expect("a temp dir");
@@ -917,8 +858,7 @@ async fn a_stop_and_then_a_destroy_detach_the_volume_once() {
         "the stop gave the connection back"
     );
 
-    // The agent restarts between the two commands — the window in which
-    // the driver's map is empty and the recorded pid is the only handle.
+    // Reopen the store to model a restart with an empty driver process map.
     {
         let store = Arc::new(crate::store::Store::open(&db).expect("the store, reopened"));
         let held = store.get(&vm).expect("a read").expect("still there");
@@ -943,9 +883,7 @@ async fn a_stop_and_then_a_destroy_detach_the_volume_once() {
     );
 }
 
-/// A detach that FAILED is not written down, so the teardown after it
-/// tries again. The mark says "this connection was given back", not "we
-/// asked once".
+/// Failed detach is not committed as closed and must be retried during teardown.
 #[tokio::test]
 async fn a_failed_detach_is_not_marked_and_is_tried_again() {
     #[derive(Default)]

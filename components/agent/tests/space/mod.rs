@@ -2,19 +2,12 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The whole input space of `reconcile::plan`, as one walkable set.
+//! Finite planner inputs shared by decision-table and property tests.
 //!
-//! `plan` is the agent's only decision: everything the reconciler does to a
-//! VM it does because this function said so. It is pure and its inputs are
-//! finite, so it can be checked not by sampling but by exhaustion — every
-//! cell, every pass. This module is the enumerator both nets share; the
-//! answers live next door (`plan_enumeration.rs` tables them,
-//! `plan_properties.rs` states what must hold across all of them).
-//!
-//! The dimensions are the ones `plan` can see, plus the one it deliberately
-//! cannot: `backends_alive` is in the space so that its absence from every
-//! decision is a checked fact rather than an assumption (see
-//! `plan_properties.rs`).
+//! The walk covers representative values for every current decision dimension,
+//! including inconsistent observations. It does not model all record contents,
+//! I/O failures or executor behavior. Backend liveness is included to verify
+//! that it affects planning only through the persisted unhealthy marker.
 
 #![allow(dead_code)] // each test binary uses a different part of this module
 
@@ -32,20 +25,16 @@ pub struct Cell {
     pub now: SystemTime,
 }
 
-/// The clock the space is written against. Fixed, so a failing cell is the
-/// same cell tomorrow.
+/// Fixed planning clock for reproducible failure cells.
 pub fn base_now() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
 }
 
-/// The pid a record carries when it has one — any value does, `plan` only
-/// ever passes it through into `Adopt`.
+/// Representative recorded PID, passed through into Adopt without interpretation.
 pub const PID: u32 = 4242;
 
-/// Every `Desired`, guarded against silently shrinking: the `match` turns a
-/// new variant into a compile error right here, so the decision table has to
-/// be told what the variant means before this net closes again. Same trick in
-/// `all_phases` and `all_guests`.
+/// Enumerate Desired variants. The exhaustive match forces review when a new
+/// variant is added; the length assertions also guard the current list.
 pub fn all_desired() -> Vec<Desired> {
     let all = [
         Desired::Running,
@@ -106,9 +95,8 @@ pub fn all_guests() -> Vec<Option<VmState>> {
     all.to_vec()
 }
 
-/// The four deadlines that matter, `now` itself among them: `plan` compares
-/// with `<`, so the instant the deadline names is already expired, and that
-/// boundary is worth a cell of its own rather than an argument.
+/// Cover absent, earlier, exact and later deadlines. Equality is expired because
+/// the planner compares with <.
 pub fn all_deadlines() -> Vec<Option<SystemTime>> {
     vec![
         None,
@@ -118,35 +106,20 @@ pub fn all_deadlines() -> Vec<Option<SystemTime>> {
     ]
 }
 
-/// Present or absent. Which operation it is does not reach `plan` — that all
-/// four variants block is checked separately, in `plan_properties.rs`, rather
-/// than paid for five times over in every other dimension.
+/// Represent operation presence with one variant; separate property tests
+/// check that every variant blocks planning.
 pub fn all_operations() -> Vec<Option<Operation>> {
     vec![None, Some(Operation::Snapshotting { target: "t".into() })]
 }
 
-/// Present or absent, likewise: the reason string is carried to the operator,
-/// never read for a decision.
+/// Only unhealthy-marker presence affects planning, not its message.
 pub fn all_unhealthy() -> Vec<Option<String>> {
     vec![None, Some("backend died".to_string())]
 }
 
-/// 2 · 5 · 7 · 4 · 2 · 2 · 2 · 2 · 2 · 2 · 5 · 2 — operation, desired, phase,
-/// stop_deadline, unhealthy, vmm_pid, tracked, vmm_alive, socket_responsive,
-/// backends_alive, guest, receive_failed. Asserted by the walk, so the space
-/// cannot shrink behind a passing test.
-///
-/// The phase axis grew from five to seven with live migration, and the two
-/// new values are deliberately IN the space rather than beside it: a phase
-/// that `plan` returns early for is exactly the kind of thing that has to be
-/// enumerated, because the claim being made about it is that nothing below
-/// the early return can reach it.
-///
-/// `receive_failed` doubled it again, and it is carried on every cell rather
-/// than only on the receiving ones for the reason `backends_alive` is: the
-/// claim is that a reception that will not finish decides EXACTLY one thing
-/// and decides it nowhere else, and a dimension enumerated only where it is
-/// expected to matter cannot say that.
+/// Number of combinations across operation presence, desired state, phase,
+/// stop deadline, unhealthy marker, PID presence and observation dimensions.
+/// The tests check the product so an accidental reduction cannot pass silently.
 pub const SPACE_SIZE: usize = 179_200;
 
 /// A record with nothing interesting in it; the walk dresses it up per cell,
@@ -208,9 +181,7 @@ pub fn walk(mut visit: impl FnMut(&Cell)) -> usize {
     seen
 }
 
-/// One cell in one line, so a failure names the input instead of describing
-/// it. Deadlines are printed relative to `now` — "+30s" is what the reader
-/// needs, "1970-01-12T13:46:40Z" is not.
+/// Render a failing cell on one line with deadlines relative to the planning time.
 pub fn describe(cell: &Cell) -> String {
     let deadline = match cell.record.stop_deadline {
         None => "none".to_string(),

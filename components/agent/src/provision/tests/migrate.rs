@@ -45,44 +45,28 @@ async fn restart_keeps_an_unresolved_source_protected() {
     }
 }
 
-/// A hypervisor that can migrate, and records which of the two ends it
-/// was asked for. `create`/`start` are here too so that the SAME driver
-/// serves both exits of `run_chain` — which is what the first test
-/// compares.
+/// Fake hypervisor recording boot and receive calls through the same provisioning chain.
 #[derive(Default)]
 struct MigratingVmm {
     log: std::sync::Mutex<Vec<String>>,
     /// What `migrate_out` answers. `false` = the send was refused, which
     /// is the case where the guest never leaves.
     can_send: bool,
-    /// Whether `is_tracked` says the VMM is still there after a send.
-    /// The source VMM exits on a successful send, and that is how the
-    /// agent finds out it worked.
+    /// Whether the fake source VMM remains tracked after a send.
     still_here_after_send: std::sync::atomic::AtomicBool,
-    /// What the event file of a receiving VMM would say. `Some` is
-    /// `migration-receive-failed` and its reason; the VMM goes on
-    /// answering, which is exactly what makes the case hard to see.
+    /// Explicit receiver-failure evidence while the VMM remains responsive.
     receive_broke: std::sync::Mutex<Option<String>>,
-    /// Whether this VMM was started to receive rather than to boot. v53
-    /// has no VM in it until the stream builds one, so `vm.info` says
-    /// `Created` — `Defined` here — for the whole of a reception.
+    /// A receiving fixture reports Defined until the stream supplies a guest.
     receiving: std::sync::atomic::AtomicBool,
-    /// The VMM processes this fake is serving, by vm id — what a real
-    /// driver discovers by walking its run directory and pinging each
-    /// socket. A process outlives the RECORD of it, which is the whole
-    /// subject of `strays`.
+    /// Live fake VMMs, tracked independently of persisted records for stray-process tests.
     live: std::sync::Mutex<std::collections::BTreeSet<VmId>>,
-    /// Whether an accepted send lets the process go. v53 exits the source
-    /// VMM only when the transfer TOOK; one that starts and then fails
-    /// resumes the guest and goes on serving it, which is the case that
-    /// used to hold this node's command path for ten minutes.
+    /// Whether an accepted send removes the source process or leaves it serving the guest.
     send_leaves: bool,
     /// What `send_failed` answers: `Some` is the VMM serving its guest
     /// again, which after a send has started can only mean it failed.
     send_broke: std::sync::Mutex<Option<String>>,
-    /// The pid `create` hands back. `None` is this test process, which never
-    /// carries a VM's uuid on its command line and so is never "that VMM" —
-    /// the right stand-in for every test that is not about the process.
+    /// Created PID override. By default use this test process, which does not
+    /// match VM command-line identity checks.
     vmm_pid: std::sync::Mutex<Option<u32>>,
     /// How many times the api socket has been asked, for the tests that have
     /// to know the watch has gone round without looking at a clock.
@@ -106,9 +90,8 @@ impl MigratingVmm {
             guest_override: std::sync::Mutex::new(None),
         }
     }
-    /// A hypervisor that ACCEPTS the send and then fails it, which is the
-    /// only shape D-P4 has: 204 on the call, a worker that breaks, and a
-    /// process that stays and serves.
+    /// Accept submission while retaining the source process until the test
+    /// supplies an explicit abort observation.
     fn that_fails_mid_send() -> Self {
         let mut vmm = Self::new(true);
         vmm.send_leaves = false;
@@ -185,9 +168,7 @@ impl agent_api::hypervisor::Hypervisor for MigratingVmm {
     async fn adopt(&self, _: &VmId, _: u32) -> agent_api::hypervisor::Result<()> {
         Ok(())
     }
-    /// The api socket, which is what `migrate_out` waits on: v53 exits
-    /// the source VMM when a send succeeds, and the socket going quiet is
-    /// how that is knowable from the outside.
+    /// Simulate source API responsiveness independently of the send acknowledgement.
     async fn probe(&self, _: &VmId) -> bool {
         self.probes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -201,8 +182,7 @@ impl agent_api::hypervisor::Hypervisor for MigratingVmm {
     fn as_migratable(&self) -> Option<&dyn agent_api::Migratable> {
         Some(self)
     }
-    /// What the real driver reads off its run directory: the processes that
-    /// are here, minus the ones somebody has a row for.
+    /// Return fake live processes with no corresponding record.
     async fn strays(&self, known: &[VmId]) -> Vec<VmId> {
         self.live
             .lock()
@@ -233,9 +213,7 @@ impl agent_api::Migratable for MigratingVmm {
         if !self.can_send {
             return Err(HypervisorError::Backend(anyhow!("the peer refused")));
         }
-        // v53 shuts the guest down and the source VMM exits. This is that,
-        // and `send_leaves` is the other case: a send that started and has
-        // not ended yet.
+        // Optionally simulate the source process exiting after transfer.
         if self.send_leaves {
             self.still_here_after_send
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -250,18 +228,12 @@ impl agent_api::Migratable for MigratingVmm {
     }
 }
 
-/// A disk that is a path, which is what every live-migratable volume in
-/// this tree is: the config that travels in the migration stream names
-/// files, and a file is what both nodes have to be able to open.
+/// Path-backed migration disk fixture; both endpoints must resolve its path.
 #[derive(Default)]
 struct PlainDisk {
-    /// The volumes this node was told to LET GO of — record and per-node
-    /// claim, bytes untouched. Recorded because the difference between this
-    /// and `deprovision` is somebody's data, and a test that could not tell
-    /// the two apart would be no test at all.
+    /// Record forget calls separately from destructive deprovision calls.
     forgotten: std::sync::Mutex<Vec<VolumeId>>,
-    /// And the ones it was told to destroy, for the same reason from the
-    /// other side.
+    /// Record destructive deprovision requests.
     deprovisioned: std::sync::Mutex<Vec<VolumeId>>,
 }
 
@@ -338,9 +310,7 @@ impl agent_api::storage::VolumeAttacher for PlainDisk {
     }
 }
 
-/// A spec with one REFERENCED disk, which is the only shape a live
-/// migration accepts — and the record for it, in the store the node
-/// would already have.
+/// Migratable fixture with one referenced volume and its independent store record.
 fn migratable_spec(store: &crate::store::Store) -> AgentVmSpec {
     let id = VolumeId::new_v4();
     store
@@ -380,12 +350,8 @@ fn migratable_spec(store: &crate::store::Store) -> AgentVmSpec {
     spec
 }
 
-/// The provisioner and a reconciler over the same store and the same
-/// drivers — one node, both halves.
-///
-/// The give-back of a failed reception is a decision the RECONCILER makes,
-/// so a test of it that only held a provisioner would be testing the wrong
-/// object: the whole defect was that no pass ever looked.
+/// Provisioner and reconciler sharing one node's store and drivers.
+/// Failed-receive cleanup is driven by reconciliation.
 fn migrating_node(
     root: &std::path::Path,
     store: Arc<crate::store::Store>,
@@ -399,14 +365,8 @@ fn migrating_node(
     (provisioner, reconciler)
 }
 
-/// A cgroup driver over an ordinary directory tree.
-///
-/// `CgroupV2` writes `memory.max` and `cpu.max` into the slice, which on a
-/// real cgroupfs are files that were already there and on a temp directory
-/// are files it just made — so its `destroy_slice`, which is a bare
-/// `remove_dir`, cannot take the slice away again and the teardown ends
-/// with a failure and keeps the record. Everything this test is about is
-/// on the other side of that line, so the tree goes as a tree.
+/// Cgroup fixture backed by ordinary directories. Remove the whole directory
+/// tree because files created for limit writes are not cgroup pseudo-files.
 struct LooseSlices(cgroup_driver::CgroupV2);
 
 impl agent_api::ResourceConfiner for LooseSlices {
@@ -433,8 +393,7 @@ impl agent_api::ResourceConfiner for LooseSlices {
     }
 }
 
-/// What a pass would see and decide, without doing it — the same view an
-/// operator gets from the node's `observe` endpoint.
+/// Observe and plan without executing, as the local observe endpoint does.
 async fn preview(reconciler: &crate::reconcile::Reconciler, id: &VmId) -> crate::reconcile::DryRun {
     reconciler
         .dry_run(id)
@@ -486,8 +445,7 @@ fn migrating_provisioner(
     migrating_provisioner_over(root, store, hv, Arc::new(PlainDisk::default()))
 }
 
-/// The same, with the disk handed in, for the one test that has to ask the
-/// backend afterwards what it was told.
+/// Build a provisioner with a supplied disk fixture for operation assertions.
 fn migrating_provisioner_over(
     root: &std::path::Path,
     store: Arc<crate::store::Store>,
@@ -518,13 +476,8 @@ fn migrating_provisioner_over(
     )
 }
 
-/// A confiner whose slices are not where it says they are.
-///
-/// `create_slice` hands back a handle naming a directory nothing ever made,
-/// so `attach_pid` fails with ENOENT — which is what a cgroup2 root that was
-/// unmounted or shadowed under a running agent looks like from up here, and
-/// the only way to reach that arm: the real `CgroupV2` under a temp directory
-/// makes ordinary directories, and a write into one of those succeeds.
+/// Return nonexistent slice paths so `attach_pid` fails with ENOENT,
+/// modeling a lost or shadowed cgroup root.
 struct SlicelessConfiner(std::path::PathBuf);
 
 impl agent_api::ResourceConfiner for SlicelessConfiner {
@@ -552,18 +505,7 @@ impl agent_api::ResourceConfiner for SlicelessConfiner {
     }
 }
 
-/// A reception that cannot put its VMM in the guest's slice ends the VMM and
-/// says so, rather than storing a record that says it is listening.
-///
-/// Astra finding S17, 2026-09-23. The attach failure was a WARN, and the
-/// record then went to `Receiving` with a VMM outside the guest's allowance —
-/// the whole of a migrating guest's memory arrives at once, into a process
-/// the node's accounting does not cover. Worse, the pid is not on the record
-/// at that point, so nothing left behind could have repaired it: a teardown
-/// would have given back the disks, the taps and the record and left a
-/// listening VMM nobody had a row for. `create` has always killed the process
-/// and returned the error (`process.rs`, `create_vm`), and this is the same
-/// shape.
+/// Failure to attach a receiving VMM to its cgroup must stop preparation and end that VMM.
 #[tokio::test]
 async fn a_receiver_that_cannot_enter_its_slice_is_not_stored_as_ready() {
     let (_temp, root) = migration_root("mig-no-slice");
@@ -601,9 +543,7 @@ async fn a_receiver_that_cannot_enter_its_slice_is_not_stored_as_ready() {
         "and nothing of it is left running"
     );
 
-    // And nothing on the store says this node is waiting for a guest. The
-    // teardown removes the record outright; a record that survived one would
-    // still have to be neither `Receiving` nor carrying a pid.
+    // Failed preparation must leave no active receiving marker or PID.
     if let Some(record) = store.get(&id).expect("a read") {
         assert_ne!(record.phase, Phase::Receiving, "{record:?}");
         assert_eq!(record.vmm_pid, None, "{record:?}");
@@ -611,11 +551,7 @@ async fn a_receiver_that_cannot_enter_its_slice_is_not_stored_as_ready() {
     }
 }
 
-/// A directory of this test's own, and the guard that removes it again.
-///
-/// The guard comes back with the path and every caller binds it: it owns the
-/// directory for as long as the binding lives, and a caller that dropped it
-/// would be provisioning into a directory that is already gone.
+/// Return a temporary resource root and its lifetime guard; callers must retain both.
 fn migration_root(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let temp = tempfile::Builder::new()
         .prefix(&format!("meister-{name}-"))
@@ -625,13 +561,8 @@ fn migration_root(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     (temp, root)
 }
 
-/// The same chain, twice, and the only difference is the last step.
-///
-/// This is the whole claim of the second exit: a vm that ARRIVES on a
-/// node is built here exactly as one that boots here, right up to the
-/// point where one calls `create` + `start` and the other calls
-/// `migrate_in` — because the configuration of a migrating guest travels
-/// inside the stream and names this node's things.
+/// Boot and receive share resource preparation; only boot calls create/start.
+/// Receive waits for an observed Running guest before advancing the phase.
 #[tokio::test]
 async fn the_chain_ends_two_ways_and_is_the_same_chain_until_it_does() {
     let (_temp, root) = migration_root("mig-chain");
@@ -677,8 +608,7 @@ async fn the_chain_ends_two_ways_and_is_the_same_chain_until_it_does() {
     assert!(record.vmm_pid.is_some(), "a vmm is listening");
     assert!(record.operation.is_none(), "the marker came off");
 
-    // And the reconciler does nothing to either of the two migration
-    // phases until the guest is actually here.
+    // Without arrival or failure evidence, migration phases do not trigger ordinary repair.
     let waiting = crate::reconcile::Observed {
         vmm_alive: true,
         socket_responsive: true,
@@ -714,12 +644,7 @@ async fn the_chain_ends_two_ways_and_is_the_same_chain_until_it_does() {
     );
 }
 
-/// An inline disk is refused, by name, and nothing is built.
-///
-/// The refusal the first migration report asked for (D6): a disk written
-/// straight into the vm's spec has no `Volume` object behind it and is
-/// node-local by definition, so the config that would arrive in the
-/// stream names a file this node would have to invent.
+/// Migration requires referenced disks whose ownership outlives the source VM.
 #[tokio::test]
 async fn a_vm_with_an_inline_disk_is_not_received_and_the_refusal_names_the_disk() {
     let (_temp, root) = migration_root("mig-inline");
@@ -752,16 +677,8 @@ async fn a_vm_with_an_inline_disk_is_not_received_and_the_refusal_names_the_disk
     assert!(store.get(&id).expect("a lookup").is_none(), "no record");
 }
 
-/// The source gives the guest up only when the guest is gone — and the
-/// record stays behind, because until the destination says it is Running
-/// the source is the only description of it there is.
-///
-/// Both halves are now written down rather than answered: `begin_migrate_out`
-/// opens the stream and returns, and `finish_migrate_out` records the outcome
-/// on the record, where `departure` reads it into the heartbeat. That is D16
-/// — the tier above no longer holds a reconcile pass open for the length of a
-/// guest's memory — and it is why the failing half below is not an `Err` any
-/// more but a sentence on `send_failed`.
+/// Successful departure retains a Migrated record. An untyped send error
+/// retains the operation barrier because it does not prove an abort.
 #[tokio::test]
 async fn a_successful_send_leaves_a_record_and_a_failed_one_leaves_the_guest() {
     let (_temp, root) = migration_root("mig-out");
@@ -779,9 +696,7 @@ async fn a_successful_send_leaves_a_record_and_a_failed_one_leaves_the_guest() {
     p.begin_migrate_out(&id, "tcp:10.0.0.9:49000", "attempt-1", &ops)
         .await
         .expect("the stream is open");
-    // Answering means the stream is open, and the marker is on the record
-    // BEFORE the answer — a pass one millisecond later must not touch a vm
-    // whose guest is being paused.
+    // Persist the operation marker before acknowledging submission so reconciliation cannot interfere.
     let sending = store.get(&id).expect("a lookup").expect("a record");
     assert!(matches!(
         sending.operation,
@@ -835,14 +750,8 @@ async fn a_successful_send_leaves_a_record_and_a_failed_one_leaves_the_guest() {
         "a migrated record is not a vm to start"
     );
 
-    // The bad end, and it is the invariant: a send that did not happen
-    // leaves the source exactly as it was.
-    //
-    // This is the half that is still SYNCHRONOUS after D16, and deliberately:
-    // v53 refusing `vm.send-migration` outright is a fault in the request,
-    // not an outcome of a transfer. Nothing has been done to the guest, the
-    // answer costs a unix socket round trip, and the tier above should hear
-    // it as a rejection rather than have to read it off a heartbeat.
+    // An untyped submission error does not establish abort. The source guest
+    // and disk remain recorded, with Unknown outcome and an operation barrier.
     let store = Arc::new(crate::store::Store::open(&root.join("no.redb")).expect("a store"));
     let hv = Arc::new(MigratingVmm::new(false));
     let p = migrating_provisioner(&root, store.clone(), hv.clone());
@@ -877,18 +786,7 @@ async fn a_successful_send_leaves_a_record_and_a_failed_one_leaves_the_guest() {
     );
 }
 
-/// The overlay's user count carries a migration by itself, and the reason
-/// is that it is COUNTED off the records rather than kept.
-///
-/// A destination gets a record — with its NIC's vni on the spec — at
-/// `PrepareMigration`, before there is a guest and before there is a tap,
-/// so from that moment the wire has one more user. The source's record
-/// goes when the cluster destroys it, and the wire has one fewer. Neither
-/// end has to remember anything, and an agent that restarted in the
-/// middle counts the same numbers afterwards.
-///
-/// The window that matters is the middle one: while both ends have a
-/// record, neither can take the tenant's bridge down under the other.
+/// Receiving and migrated records retain overlay ownership until their rows are removed.
 #[test]
 fn a_migration_carries_the_overlay_count_without_anybody_keeping_it() {
     let (_temp, root) = migration_root("mig-overlay");
@@ -897,9 +795,7 @@ fn a_migration_carries_the_overlay_count_without_anybody_keeping_it() {
     let vni = 10_042;
     let (source_id, mut source) = overlay_vm(vni);
     let (target_id, mut target) = overlay_vm(vni);
-    // The same guest, arriving on the other machine. In a real migration
-    // these are two agents with two stores; one store here is what lets
-    // the counting rule be exercised at all, and the rule is per node.
+    // Use one fixture store to test per-node reference counting across both migration records.
     source.phase = Phase::Provisioned;
     store.put(&source_id, &source).expect("the source");
     assert_eq!(
@@ -932,22 +828,13 @@ fn a_migration_carries_the_overlay_count_without_anybody_keeping_it() {
         "and the source is a user of it until its record goes"
     );
 
-    // The cluster destroys the source's record. Now the destination is
-    // alone on the wire, which is what it was before the migration — one
-    // machine, one user.
+    // After source-record removal, only the destination reference remains.
     store.delete(&source_id).expect("the source lets go");
     assert_eq!(overlay_users(&store, vni, &target_id).expect("a count"), 0);
 }
 
-/// FRR follows the guest without a line of migration code, because what
-/// is announced is derived from the vms that are RUNNING here — and
-/// neither end of a migration is running one until it is.
-///
-/// The destination announces nothing while it is only listening; the
-/// source stops announcing the moment its guest has left; and the
-/// announcement moves in the one direction that is safe if the two
-/// overlap, because the destination only starts once the source has
-/// already stopped.
+/// Receiving records contribute a running phase only after observing Running;
+/// a migrated record cannot contribute one even if its observation is stale.
 #[test]
 fn the_route_announcement_follows_the_guest_and_never_leads_it() {
     let obs = crate::reconcile::Observed {
@@ -964,11 +851,8 @@ fn the_route_announcement_follows_the_guest_and_never_leads_it() {
         record.phase = phase;
         crate::reconcile::report_status(&record, &obs, 0, None).phase
     };
-    // Listening for a guest that is not here: nothing to announce, and
-    // the sentence says which of the two machines to look at. The guest
-    // and not the phase decides — a receiving record whose VMM says
-    // Running IS running one, and the tier above reads this line to
-    // decide what it may tear down.
+    // Guest observation determines arrival, independently of the persisted phase.
+    // A Defined receiver has no running guest to announce.
     let waiting = crate::reconcile::Observed {
         guest: Some(agent_api::hypervisor::VmState::Defined),
         ..obs
@@ -997,8 +881,7 @@ fn the_route_announcement_follows_the_guest_and_never_leads_it() {
         crate::reconcile::ReportedPhase::Running
     );
 
-    // Both in-flight states carry a sentence, because "in flight"
-    // without one is the state an operator cannot act on.
+    // Both in-flight phases include a diagnostic message.
     record.phase = Phase::Receiving;
     assert!(
         crate::reconcile::report_status(&record, &waiting, 0, None)
@@ -1015,28 +898,8 @@ fn the_route_announcement_follows_the_guest_and_never_leads_it() {
     );
 }
 
-/// D-P5 and D-P3, which are one defect: a reception that fails gives
-/// everything back, and the next attempt therefore works.
-///
-/// What the lab found, on the first run of the invariant checker:
-///
-/// ```text
-/// FAIL I1  vmm for 3d4a0f5b-… alive on ['agent-1a', 'agent-1b']
-/// ```
-///
-/// Two cloud-hypervisor processes for one VM uid and two `live` NVMe/TCP
-/// sessions to one 100-GiB block — the source running the guest, the
-/// destination holding a VMM that had been told a guest was coming and
-/// never learned that it was not. It survived every pass (the reconciler
-/// read "still waiting"), it survived a restart (the marker was cleared
-/// and the phase was not), and it survived `vm rm` (that reached the
-/// source). Only `systemctl stop`, `pkill`, `nvme disconnect` and deleting
-/// the database got rid of it.
-///
-/// The whole of the fix is that the reception has an end. The
-/// hypervisor's own `migration-receive-failed` is one way to reach it and
-/// the record's deadline is the other, and both arrive here as the same
-/// observation.
+/// An explicit receive failure releases the receiver without deleting referenced data.
+/// A later attempt can reuse the VM ID.
 #[tokio::test]
 async fn a_reception_that_fails_gives_everything_back_and_the_next_one_works() {
     let (_temp, root) = migration_root("mig-abort");
@@ -1073,9 +936,7 @@ async fn a_reception_that_fails_gives_everything_back_and_the_next_one_works() {
         "a guest still on its way is nobody's to tear down"
     );
 
-    // And now the transfer dies. The VMM goes on answering — that is the
-    // whole difficulty of the case — and the event file is the only place
-    // that says the guest is not coming.
+    // Record explicit receive failure while keeping the VMM responsive.
     hv.the_stream_broke("Failed to receive migratable component snapshot");
     let broken = preview(&reconciler, &id).await;
     assert!(broken.observed.receive_failed, "the node can see it now");
@@ -1113,10 +974,7 @@ async fn a_reception_that_fails_gives_everything_back_and_the_next_one_works() {
         store.get(&id).expect("a lookup").is_none(),
         "and the record went with it"
     );
-    // The volume it was holding is DETACHED and not deprovisioned: a
-    // migration's disk belongs to a `Volume` object the source is still
-    // using, and the destination giving back a connection must never be
-    // the destination deleting somebody's data.
+    // Failed-receive cleanup detaches referenced storage without deleting its data.
     let volumes = store.list_volumes().expect("the volume table");
     assert_eq!(volumes.len(), 1, "the volume object outlived the reception");
     assert_eq!(
@@ -1125,9 +983,7 @@ async fn a_reception_that_fails_gives_everything_back_and_the_next_one_works() {
         "and it is untouched"
     );
 
-    // D-P3: the same vm, the same node, a second time — and this is the
-    // one that used to answer "this node already has a record of vm …; it
-    // cannot receive it as well" until somebody restarted the agent.
+    // A second attempt can receive the same VM ID after the failed one is cleaned up.
     let again = Arc::new(MigratingVmm::new(true));
     let (dest, _) = migrating_node(&root, store.clone(), again.clone());
     dest.prepare_migration(
@@ -1145,15 +1001,8 @@ async fn a_reception_that_fails_gives_everything_back_and_the_next_one_works() {
     );
 }
 
-/// The other way a reception ends badly, and the only one no hypervisor
-/// can report: nobody dials at all.
-///
-/// A source that is killed between `PrepareMigration` and `MigrateOut`, or
-/// told to send to a port that does not answer, leaves the destination in
-/// `accept` with an event file that says `migration-receive-ready` and
-/// nothing more. The deadline is what turns that into an answer, and it is
-/// on the RECORD rather than in the task that started the reception —
-/// because the ghost of the lab outlived the process that made it.
+/// A receive deadline is not proof of failure. Preserve the attempt across startup
+/// and accept a later observed arrival without destroying the receiver.
 #[tokio::test]
 async fn a_receive_deadline_does_not_authorize_cleanup() {
     let (_temp, root) = migration_root("mig-nobody");
@@ -1172,10 +1021,7 @@ async fn a_receive_deadline_does_not_authorize_cleanup() {
     .await
     .expect("a listening vmm");
 
-    // Before the deadline nothing happens, however many passes run: a
-    // transfer may legitimately take longer than a pass, and a
-    // destination that gave up first would tear down the VMM a guest is
-    // arriving into.
+    // Repeated passes must not disrupt an active receiver before the advisory deadline.
     let mut record = store.get(&id).expect("a record").expect("one");
     assert!(!preview(&reconciler, &id).await.observed.receive_failed);
     assert_eq!(
@@ -1222,26 +1068,8 @@ async fn a_receive_deadline_does_not_authorize_cleanup() {
     assert!(!hv.said().contains(&"destroy".to_string()));
 }
 
-/// D-P4: a send that cloud-hypervisor fails answers, and never holds this
-/// node's command path while it waits.
-///
-/// What the lab saw was not a migration problem at all:
-///
-/// ```text
-/// $ meister vm create plain-probe -f ...
-/// status: {"phase":"Failed","message":"agent agent-1a did not answer within 60s"}
-/// ```
-///
-/// EVERY command to agent-1a ran into the sixty-second timeout, while the
-/// agent reconciled happily and `node ls` showed it `ready` with a five-
-/// second heartbeat. That is the expensive kind of fault — the session looks
-/// healthy — and the cause was one lock: the send held the operation mutex
-/// that every other command needs, waiting ten minutes for a process that
-/// had gone back to serving its guest and was never going to exit.
-///
-/// Two claims, and they are the two halves of the fix: the lock is free
-/// while the transfer runs, and the transfer's failure is knowable before
-/// the ceiling.
+/// The send watcher releases the global operations lock while awaiting an outcome.
+/// Explicit abort evidence clears the per-VM barrier and reports StillHere.
 #[tokio::test]
 async fn a_failed_send_answers_and_leaves_the_command_path_free() {
     let (_temp, root) = migration_root("mig-blocked");
@@ -1275,9 +1103,7 @@ async fn a_failed_send_answers_and_leaves_the_command_path_free() {
         }
     });
 
-    // The send has started, and the guest's memory is going over a wire.
-    // This is the whole window D-P4 lived in — and in it, every other
-    // command on this node has to be servable.
+    // Verify that other commands can acquire the operations lock during the send.
     let mut free = false;
     for _ in 0..200 {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1290,9 +1116,7 @@ async fn a_failed_send_answers_and_leaves_the_command_path_free() {
         free,
         "the node's operation lock was held for the length of the transfer"
     );
-    // And the record says who owns the vm meanwhile, which is the exclusion
-    // that DOES belong to a migration: per vm, on the record, read by the
-    // reconciler.
+    // The persisted operation marker excludes this VM from reconciliation.
     let inflight = store.get(&id).expect("a lookup").expect("a record");
     assert!(
         matches!(
@@ -1318,9 +1142,7 @@ async fn a_failed_send_answers_and_leaves_the_command_path_free() {
     assert!(record.operation.is_none(), "the marker came off");
     assert_eq!(record.volumes.len(), 1, "and it kept its disk");
 
-    // The news is on the record and therefore on the next heartbeat. It used
-    // to be the error of a command the cluster was still awaiting, which is
-    // what made that command's duration the pass's duration (D16).
+    // The outcome is persisted for the next heartbeat.
     let line = crate::reconcile::departure(&record).expect("this node says so");
     assert_eq!(line.outcome, crate::reconcile::DepartureOutcome::StillHere);
     let said = line.message.expect("with a reason");
@@ -1334,19 +1156,8 @@ async fn a_failed_send_answers_and_leaves_the_command_path_free() {
     assert!(ops.try_lock().is_ok(), "the lock outlived the send");
 }
 
-/// D16: the command answers while the guest's memory is still on the wire.
-///
-/// `MigrateOut` used to answer with the OUTCOME, and the cluster's reconcile
-/// pass awaited it: 300 ms of pass time on a small guest, up to 45 s on a
-/// large one, and for all of that no other VM in that cluster was placed or
-/// repaired. An operation measured in a network's throughput has no business
-/// being a command's answer.
-///
-/// Two claims, and together they are the fix. The answer comes back while the
-/// transfer is still running — measured against a VMM that has neither exited
-/// nor given the guest back, which is exactly "still sending". And the marker
-/// is already on the record when it does, so a reconcile pass one millisecond
-/// later does not touch a VM whose guest is being paused.
+/// Persist the per-VM migration barrier before returning acceptance;
+/// transfer completion is reported later.
 #[tokio::test]
 async fn the_send_is_accepted_while_the_transfer_is_still_running() {
     let (_temp, root) = migration_root("mig-accepted");
@@ -1369,8 +1180,7 @@ async fn the_send_is_accepted_while_the_transfer_is_still_running() {
     .expect("the answer did not wait for the transfer");
     accepted.expect("accepted");
 
-    // The transfer has NOT ended: the VMM is still there and has said nothing
-    // about failing. This is the whole of what the old answer was waiting for.
+    // The source remains alive with no terminal failure evidence.
     use agent_api::Migratable as _;
     use agent_api::hypervisor::Hypervisor as _;
     assert!(hv.probe(&id).await, "the source vmm is still running");
@@ -1379,18 +1189,15 @@ async fn the_send_is_accepted_while_the_transfer_is_still_running() {
         "and it has not given the guest back either"
     );
 
-    // What the tier above sees meanwhile: a line that says a send is under
-    // way, and the peer it is going to.
+    // Report the in-flight send and its destination peer.
     let record = store.get(&id).expect("a lookup").expect("a record");
     let line = crate::reconcile::departure(&record).expect("a line");
     assert_eq!(line.outcome, crate::reconcile::DepartureOutcome::Sending);
     assert_eq!(line.peer, "tcp:10.0.0.9:49000");
     assert!(line.message.is_none());
 
-    // And the exclusion that keeps a pass off this VM is on the record BEFORE
-    // the answer, not after it: a guest is paused near the end of a transfer,
-    // and a pass that saw a paused guest under a Running record would resume
-    // it into a copy of itself.
+    // Persist the repair barrier before returning so reconciliation cannot
+    // resume a source paused during transfer.
     assert!(matches!(
         record.operation,
         Some(crate::types::Operation::MigratingOut { .. })
@@ -1419,17 +1226,7 @@ fn sending_observation() -> crate::reconcile::Observed {
     }
 }
 
-/// Astra finding S06, 2026-09-23: a guest that is already being sent is not
-/// sent again.
-///
-/// Two migration RECORDS for one vm reach the cluster's `prepare` —
-/// `create_vm_migration` mints one per name and refuses nothing — so the
-/// second one dispatches `MigrateOut` for a guest whose transfer is already
-/// in the air. The marker was written over whatever was there, so the record
-/// then named the SECOND address while the first transfer was still running
-/// to the first: `finish_migrate_out` would have written its outcome against
-/// an address the guest never went to, and cloud-hypervisor would have been
-/// asked to send one guest to two machines at once.
+/// A second send must neither replace the first peer nor call the VMM again.
 #[tokio::test]
 async fn a_second_migrate_out_for_a_vm_already_sending_is_refused() {
     let (_temp, root) = migration_root("mig-twice");
@@ -1458,8 +1255,7 @@ async fn a_second_migrate_out_for_a_vm_already_sending_is_refused() {
         "and the refusal names the transfer that is running: {why}"
     );
 
-    // The peer is unchanged. It is what the watcher of the first send writes
-    // its outcome against, and what the tier above reads off the heartbeat.
+    // Retain the first attempt's peer for its watcher and status reports.
     let record = store.get(&id).expect("a lookup").expect("a record");
     assert!(
         matches!(
@@ -1482,32 +1278,7 @@ async fn a_second_migrate_out_for_a_vm_already_sending_is_refused() {
     );
 }
 
-/// D18, the shutdown half: a stopping agent gives back a VMM that is waiting
-/// for a guest — and keeps the ones that are running one.
-///
-/// Running guests survive an agent restart, and that is not negotiable: a
-/// record on disk, a pid in it, an adoption on the way back up. An agent that
-/// killed its guests on SIGTERM would make `systemctl restart meister-agent`
-/// an outage.
-///
-/// A RECEIVING VMM is the exception. It has no guest — it is a process
-/// listening on a port for one — and it holds a cgroup, a set of taps and, on
-/// a fabric, a live NVMe/TCP session to somebody's disk. Nothing will finish
-/// that reception once this agent is gone: the task watching it dies with the
-/// process, the cluster's migration times out, and what is left is the ghost
-/// the lab found.
-
-/// D18, the start-up half: a VMM this node has no record of is named, and
-/// ended once it has been unmanaged for long enough.
-///
-/// "The agent adopts what it has a record of" was only half a rule. A guest
-/// whose record went while its process did not answers no command, appears in
-/// no report, and holds its disks and its taps — and the first anybody hears
-/// of it is a second guest dying on a write lock over the same volume.
-///
-/// The known set is every ROW, readable or not: a record this build cannot
-/// deserialise is a VM this agent cannot manage, and killing its guest over
-/// that would be the worst possible reading of a bad row.
+/// Raw row keys protect guests whose records cannot be decoded from stray-process cleanup.
 #[tokio::test]
 async fn a_vmm_with_no_record_is_named_and_a_corrupt_row_still_counts_as_one() {
     let (_temp, root) = migration_root("mig-stray");
@@ -1519,17 +1290,8 @@ async fn a_vmm_with_no_record_is_named_and_a_corrupt_row_still_counts_as_one() {
     p.provision(managed, migratable_spec(&store), Desired::Running, true)
         .await
         .expect("a running vm");
-    // A second guest whose record cannot be read. The row exists, so this vm
-    // is somebody's — this build simply cannot say whose.
-    //
-    // Built first and broken afterwards, where this used to write the garbage
-    // over an empty table and provision on top of it. That order stopped
-    // being possible with Astra finding S11, 2026-09-23: a create over a row
-    // this build cannot read is refused now, because reading a torn record as
-    // an absence is what let a second VMM land on the first one's disks. The
-    // state under test is unchanged — a live guest with an unreadable row —
-    // and keeping the old order would test the admission check instead of the
-    // sweep.
+    // Create a live guest, then corrupt its row. Admission would correctly
+    // refuse creating a guest over an already unreadable row.
     let unreadable = VmId::new_v4();
     p.provision(unreadable, migratable_spec(&store), Desired::Running, true)
         .await
@@ -1567,9 +1329,7 @@ async fn a_vmm_with_no_record_is_named_and_a_corrupt_row_still_counts_as_one() {
     let strays = hv.strays(&known).await;
     assert_eq!(strays, vec![managed], "and now it is nobody's");
 
-    // Ended over the socket and not by a signal: there is no pid to check,
-    // and the act at the end of a wrong answer would be a SIGKILL at a
-    // stranger.
+    // End strays through their socket because no persisted PID identity is available.
     hv.end_stray(&managed).await.expect("it goes");
     assert!(
         hv.said().iter().any(|l| l.contains("end_stray")),
@@ -1578,19 +1338,7 @@ async fn a_vmm_with_no_record_is_named_and_a_corrupt_row_still_counts_as_one() {
     );
 }
 
-/// D-P20: a reception that is given back gives the node-local note back too,
-/// and never the bytes.
-///
-/// A guest that never arrived left this node holding a claim over a namespace
-/// somebody else owns: `teardown` detaches a referenced volume and nothing
-/// more, which is right for the DATA — the disk belongs to a guest that is
-/// running elsewhere — and wrong for the note, which is per node and which
-/// `detach` does not touch. agent-1b carried two of them after the lab run,
-/// for volumes it never held.
-///
-/// `forget` is the narrow verb: everything this node holds ABOUT the volume
-/// goes, everything the volume IS stays. For every backend but
-/// `nvmeof-import` it does nothing at all.
+/// Failed-receiver cleanup forgets local import claims while preserving shared data.
 #[tokio::test]
 async fn a_reception_that_is_given_back_lets_go_of_the_claim_and_not_the_bytes() {
     let (_temp, root) = migration_root("mig-claim");
@@ -1633,13 +1381,7 @@ async fn a_reception_that_is_given_back_lets_go_of_the_claim_and_not_the_bytes()
     );
 }
 
-/// And the ordinary teardown does NOT: a guest that really ran here has a
-/// disk this node is still the home of.
-///
-/// The counter-proof to the one above, and the line the fix must not cross.
-/// A `forget` here would take a live volume's record off the node that owns
-/// it, and the cluster would then hear nothing at all about a disk it is
-/// still using.
+/// Ordinary VM teardown detaches referenced volumes and retains local provider ownership.
 #[tokio::test]
 async fn tearing_down_a_guest_that_ran_here_keeps_the_volume_this_node_owns() {
     let (_temp, root) = migration_root("mig-noclaim");
@@ -1664,18 +1406,14 @@ async fn tearing_down_a_guest_that_ran_here_keeps_the_volume_this_node_owns() {
     );
 }
 
-/// A process that is, by every test the agent has, this VM's VMM: alive, and
-/// carrying the VM's uuid on its command line the way cloud-hypervisor
-/// carries `--api-socket <run_dir>/<uuid>.sock`. Killed when dropped.
+/// Live process carrying the VM UUID in its argv for identity checks. Killed on drop.
 struct StandInVmm(std::process::Child);
 
 impl StandInVmm {
     fn for_vm(id: &VmId) -> Self {
         use std::os::unix::process::CommandExt as _;
-        // ONE process, carrying the uuid as its argv[0]. Not `sh -c`: a
-        // shell's `sleep` is a second process, which the kill below does not
-        // reach, and which held the test's stdout open for its whole ten
-        // minutes. Nothing inherited, for the same reason.
+        // Spawn one process with the VM ID in argv and no inherited streams.
+        // Avoid a shell child that could survive cleanup and hold stdout open.
         let child = std::process::Command::new("sleep")
             .arg0(format!("stand-in-vmm --api-socket=/run/meister/{id}.sock"))
             .arg("600")
@@ -1702,19 +1440,8 @@ impl Drop for StandInVmm {
     }
 }
 
-/// F06: a source VMM that stops ANSWERING has not thereby LEFT.
-///
-/// The watch took a failed `vmm.ping` as proof that the guest had gone —
-/// "v53 exits the source VMM only when the send took" — and on that proof
-/// wrote `Migrated`, forgot the pid and let go of the disks. But a ping fails
-/// for more reasons than an exit: a VMM whose API thread is slow under a
-/// busy transfer, a socket the agent cannot open for a moment. An unreachable
-/// VMM with a live guest in it, told it has migrated, is a guest whose disks
-/// were just detached underneath it.
-///
-/// Here the socket is silent from the moment the send starts and the
-/// process is demonstrably alive: the watch goes round and round, and nothing
-/// about the source moves until the process really is gone.
+/// An unresponsive API socket does not prove process exit.
+/// Keep the source record and attachments until the process is confirmed gone.
 #[tokio::test]
 async fn a_vmm_that_stops_answering_has_not_left() {
     let (_temp, root) = migration_root("mig-unreachable");
@@ -1795,9 +1522,8 @@ async fn a_vmm_that_stops_answering_has_not_left() {
     assert!(record.vmm_pid.is_none());
 }
 
-/// And one that never answers again and never exits is still here when the
-/// watch gives up: the guest, its pid and its disks stay, and the line the
-/// tier above reads says why.
+/// An unresponsive source that remains alive has an unknown outcome at the ceiling;
+/// retain its PID, guest ownership and disks.
 #[tokio::test]
 async fn a_vmm_that_never_answers_again_is_unknown_at_the_ceiling() {
     let (_temp, root) = migration_root("mig-unreachable-ceiling");
@@ -1850,20 +1576,8 @@ async fn a_vmm_that_never_answers_again_is_unknown_at_the_ceiling() {
     );
 }
 
-/// F07: a plan made before a migration began is not carried out during it.
-///
-/// A pass reads the record, looks at the VMM and decides — all without the
-/// node's lock — and only `execute` takes it. `begin_migrate_out` takes the
-/// same lock and writes `operation = MigratingOut` under it. So a pass can
-/// decide from a record with no operation, wait at the lock while the send
-/// begins, and then act: `execute` used to compare the phase and the intent
-/// and nothing else, and neither of those moves when a send starts. Here the
-/// pass has decided to stop the VM, and a stop carried out into a running
-/// send kills the source VMM in the middle of the transfer.
-///
-/// The interleaving is forced, not hoped for: the test holds the node's lock
-/// the way the send does, lets the pass read and look, writes the marker the
-/// way the send writes it, and only then lets go.
+/// Force a plan-before-lock interleaving: the operation barrier written while
+/// the pass waits must prevent execution of its stale Stop action.
 #[tokio::test]
 async fn a_plan_made_before_a_migration_began_is_not_carried_out_during_it() {
     let (_temp, root) = migration_root("stale-plan");
@@ -1883,8 +1597,7 @@ async fn a_plan_made_before_a_migration_began_is_not_carried_out_during_it() {
         .provision(id, migratable_spec(&store), Desired::Running, true)
         .await
         .expect("a running vm");
-    // An operator's stop, written the way `set_desired` writes it — without
-    // the pass `set_desired` runs afterwards, which is the one under test.
+    // Set stop intent without running reconciliation; the following pass is under test.
     store
         .mutate(&id, |r| r.desired = Desired::Stopped)
         .expect("the intent");
@@ -1900,9 +1613,8 @@ async fn a_plan_made_before_a_migration_began_is_not_carried_out_during_it() {
                 .await
         }
     });
-    // The pass has read the record and is looking at the VMM: whatever it
-    // decides, it decides from a record with no operation on it. From here
-    // to `execute` nothing is awaited but the lock.
+    // Wait until observation has read the record without an operation marker.
+    // Execution must then revalidate after acquiring the lock.
     while hv.probes.load(std::sync::atomic::Ordering::SeqCst) == asked {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }

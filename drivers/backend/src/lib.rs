@@ -2,25 +2,11 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The helper process the vhost-user drivers all run, in one place.
+//! Process lifecycle helpers for vhost-user device and storage backends.
 //!
-//! `nvrm`, `crosvm-gpu` and `nfs` each start a process that serves exactly one
-//! VM over a unix socket, and each of them carried its own copy of the same
-//! mechanics: spawn it with the right process hygiene, do not come back until
-//! it is listening, keep a log and quote its tail when the thing dies, tear it
-//! down with SIGTERM-then-SIGKILL, and recognise a backend adopted from a
-//! previous agent by its `comm` and by the socket on its command line. That is
-//! what lives here.
-//!
-//! What a backend IS stays with the driver: which binary, which arguments,
-//! which environment, what it hands back as an attachment, what it admits.
-//! Those are the parts the three drivers genuinely disagree about, and
-//! flattening them would be the wrong kind of sharing.
-//!
-//! A backend is never reused across a death. They exit when their VMM hangs
-//! up, by design, and handing that corpse to the next boot would produce a VM
-//! whose device is a socket nobody is listening on: a dead backend is replaced
-//! by Teardown then Provision.
+//! Drivers choose commands and attachment formats. This crate handles process
+//! setup, socket-file readiness, logging, identity checks and termination.
+//! Reusing an owned backend requires both a live child and an existing socket.
 
 use std::path::Path;
 use std::time::Duration;
@@ -44,13 +30,10 @@ const COMM_LEN: usize = 15;
 /// How much of a dead backend's log to hang on the error that reports it.
 const TAIL_CHARS: usize = 800;
 
-/// What went wrong with a backend process, in the two shapes every driver
-/// needs: the process is gone, or the machinery around it failed.
+/// Backend process failure or surrounding I/O failure.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
-    /// The backend exited, or never came up. Carries the log tail, because
-    /// the message is the only thing between an operator and a file whose
-    /// name they do not know.
+    /// Backend startup or exit failure, including its diagnostic log tail.
     #[error("{0}")]
     Died(String),
     #[error(transparent)]
@@ -59,9 +42,7 @@ pub enum BackendError {
 
 pub type Result<T> = std::result::Result<T, BackendError>;
 
-/// The device and storage halves of the agent API keep their own error enums,
-/// and both have exactly these two variants for a backend. Converting here
-/// rather than at every call site is what lets a driver write `?`.
+/// Map shared backend failures into the device API error vocabulary.
 impl From<BackendError> for DeviceError {
     fn from(e: BackendError) -> Self {
         match e {
@@ -80,11 +61,7 @@ impl From<BackendError> for StorageError {
     }
 }
 
-/// What kind of process one driver's backend is: how it is spawned, how it is
-/// signalled, and how it is recognised once it is no longer our child.
-///
-/// A driver builds one of these at construction time and keeps it; it is the
-/// only place the three drivers' deliberate differences are written down.
+/// Spawn, signal and restart-identity policy shared by one driver's backends.
 #[derive(Clone, Debug)]
 pub struct BackendKind {
     /// Names the process in errors and logs. The binary's own name, so a
@@ -99,27 +76,14 @@ pub struct BackendKind {
     nofile_limit: Option<u64>,
     /// `/dev/null` on stdin, so a detached daemon cannot read the agent's.
     stdin_null: bool,
-    /// Who this backend runs as, when that is not the agent.
-    ///
-    /// Beside the VMM and not behind it, because vhost-user is not a
-    /// boundary: the backend maps the guest's memory and CH says so
-    /// ("Cloud Hypervisor gives vhost-user devices complete control over the
-    /// guest"). A root backend beside an unprivileged VMM leaves the guest
-    /// exactly one process away from root, which is what Stufe 3 is for.
-    /// `None` is every node that has ever run this.
+    /// Optional backend identity. A vhost-user backend can map guest memory,
+    /// so its host privileges remain part of the VM's isolation boundary.
     vmm_user: Option<agent_api::VmmUser>,
 }
 
 impl BackendKind {
-    /// A backend that gets a session of its own.
-    ///
-    /// setsid(2) buys three things at once: it never dies with the shell that
-    /// happened to start the agent, it becomes its own process group leader so
-    /// teardown can signal the GROUP and not orphan anything it forked, and
-    /// its pid is also its pgid, which is what makes signalling an adopted
-    /// backend by its recorded pid correct. It also gets `nofile_limit`
-    /// descriptors, because one desktop guest can hold hundreds of files open
-    /// at once and the backend needs one host descriptor for each.
+    /// Create a separate session so the backend can be signalled as a process
+    /// group. Its PID is also its process-group ID. Apply the requested fd limit.
     pub fn detached(label: &'static str, comm: &str, nofile_limit: u64) -> Self {
         Self {
             label,
@@ -131,13 +95,8 @@ impl BackendKind {
         }
     }
 
-    /// A backend that stays a plain child in the agent's own session, and is
-    /// therefore signalled as a single PROCESS.
-    ///
-    /// The asymmetry with `detached` is deliberate and load-bearing: killpg(2)
-    /// on a process that never called setsid(2) addresses the group it
-    /// inherited, which is the agent's own — teardown would take the agent
-    /// down with the backend.
+    /// Keep the backend in the agent's session and signal only its PID. Group
+    /// signalling is reserved for backends started in their own session.
     pub fn child(label: &'static str, comm: &str) -> Self {
         Self {
             label,
@@ -149,28 +108,15 @@ impl BackendKind {
         }
     }
 
-    /// Run this backend as somebody else.
-    ///
-    /// One builder for all four backends, which is the whole reason this
-    /// crate exists: `nvrm`, `input`, `crosvm-gpu` and `virtiofsd` had four
-    /// copies of the same spawn and now have one, so "the backends run as the
-    /// VMM user" is a single seam rather than four.
-    ///
-    /// Which of them actually gets one is the driver's decision and not this
-    /// crate's. `virtiofsd` is the exception in the tree today: it changes
-    /// file ownership inside the share on the guest's behalf, so it stays the
-    /// agent and is sandboxed differently (`--sandbox=namespace`).
+    /// Choose a backend identity. Drivers decide whether identity switching is
+    /// compatible with their workload; virtiofsd keeps the agent identity.
     pub fn as_user(mut self, user: Option<agent_api::VmmUser>) -> Self {
         self.vmm_user = user;
         self
     }
 
-    /// Start `cmd` and do not come back until the backend is listening.
-    ///
-    /// The caller owns the command line — binary, arguments, environment —
-    /// and this owns everything downstream of it. Waiting for the socket is
-    /// not optional: the VMM connects to it during `vm.create`, and a socket
-    /// that is not there yet is a failed VM.
+    /// Spawn the caller's command and wait for the socket path to appear.
+    /// This readiness check does not connect to or validate the socket protocol.
     pub async fn spawn(
         &self,
         mut cmd: tokio::process::Command,
@@ -184,16 +130,12 @@ impl BackendKind {
             span,
         } = io;
 
-        // A socket left behind by a previous backend would make the wait below
-        // succeed instantly, on a socket nobody is listening on.
+        // Remove stale sockets before readiness polling.
         let _ = tokio::fs::remove_file(socket).await;
 
         let log_file = std::fs::File::create(log).map_err(|e| BackendError::Failed(e.into()))?;
-        // The directory the backend will bind its socket in, and its own log,
-        // change hands while the agent still can give them away. The log is
-        // handed over as well as passed as a descriptor, because a driver
-        // that quotes the tail of a dead backend's log comes back to the
-        // PATH — see `tail_log`.
+        // Transfer the socket directory and log before dropping backend identity.
+        // The log path remains readable when failure reporting reopens it.
         if let Some(user) = &self.vmm_user {
             if let Some(dir) = socket.parent() {
                 user.take(dir)
@@ -210,19 +152,14 @@ impl BackendKind {
             cmd.stdin(std::process::Stdio::null());
         }
 
-        // The backend's socket is what the VMM connects to, so it has to be
-        // openable by the VMM — which is the same user, so the backend's own
-        // group is exactly right and world-reachable is not. The socket is
-        // made by the BACKEND, so a umask is the only way to say that from
-        // here; it comes out `0770`, because a socket's base mode is `0777`
-        // and not a file's `0666`.
+        // Umask 007 keeps backend-created sockets accessible to the VMM user and
+        // group while denying world access. Socket base mode 0777 yields 0770.
         let (own_session, nofile_limit) = (self.own_session, self.nofile_limit);
         // Cloned into the closure: `pre_exec` outlives this call.
         let user = self.vmm_user.clone();
         if own_session || nofile_limit.is_some() || user.is_some() {
-            // SAFETY: setsid, setrlimit, umask and `switch_to` are syscalls
-            // on values the closure owns — nothing here allocates, opens a
-            // file or takes a lock, which is what a forked child may not do.
+            // SAFETY: pre_exec uses owned values and syscalls without allocation,
+            // file opening or locking in the forked child.
             unsafe {
                 cmd.pre_exec(move || {
                     if own_session {
@@ -251,16 +188,10 @@ impl BackendKind {
             Some(user) => BackendError::Died(format!("{} {}", self.label, user.cannot_switch(&e))),
             None => BackendError::Failed(e.into()),
         })?;
-        // Every exit from here to the `Ok` below goes through `abandon`, and
-        // nothing between them may use `?`. Astra finding S16, 2026-09-23:
-        // the cgroup attach did, and a `tokio::process::Child` that is
-        // DROPPED sends no signal and reaps nothing — there is no
-        // `kill_on_drop` anywhere in this tree — so a backend whose slice
-        // could not be written went on running, holding the socket path the
-        // next attempt binds, with nobody left who knew its pid.
+        // Every early return after spawn must kill and reap the child through
+        // `abandon`; dropping a Tokio Child alone does not stop it.
         let Some(pid) = child.id() else {
-            // Already gone, so there is nothing to signal; `abandon` still
-            // runs, because "exited" and "reaped" are not the same thing.
+            // Run cleanup for the exited child to ensure it is reaped.
             self.abandon(&mut child).await;
             return Err(BackendError::Died(format!(
                 "{} exited before pid could be read",
@@ -280,10 +211,7 @@ impl BackendKind {
             return Err(BackendError::Failed(anyhow::anyhow!("cgroup attach: {e}")));
         }
 
-        // Waiting for the socket is where a backend spawn actually spends its
-        // time — seconds, on a cold GPU — so it gets a span of its own rather
-        // than disappearing into the create it is 90% of. The span comes from
-        // the caller because only the driver knows what its id is called.
+        // Measure socket readiness separately; cold backend startup can dominate creation time.
         let label = self.label;
         let waited = async {
             let deadline = tokio::time::Instant::now() + timeout;
@@ -309,10 +237,8 @@ impl BackendKind {
         }
         .instrument(span)
         .await;
-        // The deadline arm used to `start_kill` here and go; the reap was
-        // nobody's. Both arms come through the one guard now — the exited one
-        // too, because `try_wait` collecting a status is exactly what makes
-        // the second kill a no-op and costs nothing.
+        // Kill and reap failed startups, including socket timeouts. An already
+        // collected child makes cleanup a no-op.
         if let Err(e) = waited {
             self.abandon(&mut child).await;
             return Err(e);
@@ -321,17 +247,8 @@ impl BackendKind {
         Ok((pid, Backend { child }))
     }
 
-    /// SIGKILL and reap a child this spawn is giving up on.
-    ///
-    /// The whole of the guard S16 asked for, and it is a function rather than
-    /// a `Drop` because the kill has to be AWAITED: `Child::kill` is a signal
-    /// followed by a `wait`, and a destructor cannot wait. So every early
-    /// return between `Command::spawn` and the `Backend` the caller gets
-    /// calls this by hand, and the rule is written down where they are.
-    ///
-    /// Idempotent and quiet about a child that is already gone: `start_kill`
-    /// on a reaped process is an error this deliberately ignores, because
-    /// "already dead" is the outcome being asked for.
+    /// Kill and reap a child after failed startup. Cleanup is explicit because
+    /// a synchronous destructor cannot await the child's exit.
     async fn abandon(&self, child: &mut tokio::process::Child) {
         if let Some(pid) = child.id() {
             warn!(
@@ -340,16 +257,12 @@ impl BackendKind {
                 "giving up on a spawned backend; killing it"
             );
         }
-        // SIGKILL and not SIGTERM: this backend never began serving, so
-        // there is nothing for it to shut down gracefully, and `stop`'s
-        // two-second grace would be two seconds added to a create that has
-        // already failed.
+        // Kill and reap immediately: this backend never reached socket readiness.
         let _ = child.kill().await;
     }
 
-    /// Stop a backend that is still our child: SIGTERM, then SIGKILL if it is
-    /// ignored. Whether the signal goes to the process or to its group is the
-    /// difference `detached` and `child` exist to record.
+    /// Stop an owned child with SIGTERM, then SIGKILL after grace. Detached
+    /// backends receive group signals; plain children receive process signals.
     pub async fn stop(&self, mut backend: Backend) {
         if let Some(pid) = backend.child.id() {
             debug!(
@@ -372,15 +285,8 @@ impl BackendKind {
         }
     }
 
-    /// Stop a backend adopted from a previous agent.
-    ///
-    /// It is no longer our child, so the pid on the record is the only handle
-    /// on it. Ignoring it would leave a backend running for a VM that is gone
-    /// — the driver silently failing exactly the promise a teardown makes.
-    ///
-    /// `socket` is the unix socket THIS consumer's backend was spawned with,
-    /// off the attachment the record holds, and it is what makes the signal
-    /// safe: see `is_ours`.
+    /// Send SIGTERM to an identity-checked backend from a previous agent.
+    /// This path does not wait for exit or escalate to SIGKILL.
     pub fn stop_adopted(&self, pid: u32, socket: &Path) {
         if !self.is_ours(pid, socket) {
             return;
@@ -390,29 +296,9 @@ impl BackendKind {
         self.signal(pid, Signal::SIGTERM);
     }
 
-    /// Is `pid` still the backend we wrote down — this one, and not another
-    /// of the same kind?
-    ///
-    /// The question comes up after an agent restart, when the backend is no
-    /// longer our child and the recorded pid is all we have. Two checks,
-    /// because one is not enough:
-    ///
-    /// - `comm` says the process is a backend of this kind. That much was
-    ///   here before, and on its own it is exactly the wrong amount of
-    ///   certainty: a node runs one `virtiofsd` per share and one
-    ///   `vhost-user-nvrm` per GPU, so `comm` matching means "some backend of
-    ///   this kind", and a recycled pid on a busy node is most likely to be
-    ///   recycled by the same busy thing. A teardown that trusted `comm`
-    ///   alone would eventually `killpg` a LIVE VM's backend — and killpg,
-    ///   because these get a session of their own, takes the whole group.
-    /// - `/proc/<pid>/cmdline` contains the socket this consumer's backend
-    ///   was spawned with. Every backend here is spawned with its socket path
-    ///   on the command line, the path carries the consumer's uuid, and no
-    ///   two consumers share one. That is identity and not a family
-    ///   resemblance.
-    ///
-    /// A dead pid has no `comm` and no `cmdline` to read, so this subsumes
-    /// liveness, which is what the two `get`/`stat` callers rely on.
+    /// Match the expected process name and recorded socket bytes in its command
+    /// line. Both checks are needed because PIDs can be reused by another backend
+    /// of the same kind. An unreadable or absent process fails the check.
     pub fn is_ours(&self, pid: u32, socket: &Path) -> bool {
         if self.comm.is_empty() {
             return false;
@@ -423,10 +309,7 @@ impl BackendKind {
         if !comm_matches {
             return false;
         }
-        // NUL-separated, so the needle is looked for in the raw bytes rather
-        // than in a rendered string: an argument boundary is a NUL and never
-        // a space, and joining with spaces first would let a path with a
-        // space in it match across two arguments.
+        // Match NUL-delimited arguments directly so spaces cannot merge argument boundaries.
         let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
             return false;
         };
@@ -449,8 +332,7 @@ impl BackendKind {
 
 /// Where one backend's files live and how long it gets to come up.
 pub struct BackendIo<'a> {
-    /// The socket the backend is expected to listen on. Also the readiness
-    /// signal: the backend creates it when, and only when, it is serving.
+    /// Socket path whose presence is used as the startup readiness signal.
     pub socket: &'a Path,
     pub log: &'a Path,
     pub timeout: Duration,
@@ -477,11 +359,7 @@ impl Backend {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// May this backend be handed to another create for the same device?
-    ///
-    /// Only when it is verifiably alive AND its socket is still there. A dead
-    /// one has to be respawned, never handed back as an attachment carrying a
-    /// stale pid.
+    /// Reuse only a live child whose socket still exists.
     pub fn is_reusable(&mut self, socket: &Path) -> bool {
         self.is_running() && socket.exists()
     }
@@ -524,9 +402,7 @@ fn truncate_comm(comm: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A binary whose name is longer than the kernel's `comm` field would
-    /// never match its own process, so the expectation is cut to the same
-    /// length the kernel cuts the real thing to.
+    /// Truncate expected comm names to the kernel limit.
     #[test]
     fn the_expected_comm_is_cut_where_the_kernel_cuts_it() {
         let long = BackendKind::child("crosvm", "an-extremely-long-binary-name");
@@ -545,10 +421,7 @@ mod tests {
         );
     }
 
-    /// The first argument of this test binary, which is its own path, and
-    /// therefore a string `/proc/self/cmdline` is guaranteed to contain.
-    /// Stands in for a backend's socket path, which is what the real callers
-    /// pass.
+    /// Use this test binary's argv[0] as an argument known to exist in its cmdline.
     fn own_cmdline_argument() -> std::path::PathBuf {
         let raw = std::fs::read(format!("/proc/{}/cmdline", std::process::id())).expect("linux");
         let first = raw.split(|b| *b == 0).next().expect("argv[0]");
@@ -577,12 +450,7 @@ mod tests {
         assert!(!BackendKind::child("test", "definitely-not-me").is_ours(std::process::id(), &arg));
     }
 
-    /// The half `comm` alone could never see, and the reason this position
-    /// exists: a node runs one `virtiofsd` per share and one crosvm per GPU,
-    /// so "the process at this pid is a backend of this kind" is true of
-    /// every OTHER consumer's backend too. The socket on the command line is
-    /// what tells this one from its siblings — and killpg on a sibling would
-    /// take a live VM's whole backend group down.
+    /// Distinguish sibling backends by socket argument as well as process name.
     #[test]
     fn a_sibling_backend_of_the_same_kind_is_not_this_one() {
         let me =
@@ -593,8 +461,7 @@ mod tests {
         // Same kind, same pid, right socket: ours.
         assert!(kind.is_ours(pid, &own_cmdline_argument()));
 
-        // Same kind, same pid, ANOTHER consumer's socket: not ours, and this
-        // is the case that used to come back true.
+        // The same process with another consumer's socket must not match.
         let sibling =
             std::path::Path::new("/run/meisterstack/nfs/2f3a4b5c-0000-0000-0000-000000000000.sock");
         assert!(!kind.is_ours(pid, sibling));
@@ -607,9 +474,8 @@ mod tests {
     #[test]
     fn liveness_of_a_pid_that_cannot_exist() {
         assert!(pid_is_alive(std::process::id()));
-        // Above any `pid_max` Linux will hand out, so there is nothing there
-        // to answer. Not `u32::MAX`: that is -1 to kill(2), which means
-        // "every process I may signal" and always succeeds.
+        // Use an impossible positive PID. u32::MAX becomes -1 for kill(2),
+        // which addresses every permitted process instead of an absent one.
         assert!(!pid_is_alive(i32::MAX as u32));
     }
 
@@ -618,22 +484,8 @@ mod tests {
         assert_eq!(tail_log(Path::new("/nonexistent/backend.log")), "<no log>");
     }
 
-    /// A spawn that gives up takes its process with it, dead AND reaped.
-    ///
-    /// Astra finding S16, 2026-09-23. The cgroup attach failed with a `?`
-    /// after `Command::spawn` and before the `Backend` the caller owns, so
-    /// the `tokio::process::Child` was dropped — which sends no signal and
-    /// collects no status, there being no `kill_on_drop` anywhere in this
-    /// tree. What was left was a live backend holding the socket path the
-    /// next attempt binds, with nobody who knew its pid: not the driver,
-    /// which never got a handle, and not the VM's record, which is written
-    /// from the attachment this call never returned.
-    ///
-    /// `sleep` stands in for the backend because what is under test is the
-    /// process hygiene and not the program: it is harmless, it outlives the
-    /// test by minutes if nothing kills it, and it never creates the socket —
-    /// so a spawn that reached the wait would sit there until the deadline
-    /// instead of failing at the attach.
+    /// A failed cgroup attachment must kill and reap the spawned process.
+    /// A sleeping child exercises process cleanup without requiring a backend.
     #[tokio::test]
     async fn a_backend_whose_slice_cannot_be_written_is_killed_and_reaped() {
         let temp = tempfile::tempdir().expect("a temp dir");
@@ -643,9 +495,7 @@ mod tests {
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("600");
 
-        // A slice whose directory nothing made: the write into
-        // `<path>/cgroup.procs` is ENOENT, which is what a cgroup2 root that
-        // was unmounted under a running agent looks like from here.
+        // A missing slice causes cgroup.procs writes to fail with ENOENT.
         let cgroup = CgroupHandle {
             path: temp.path().join("no-such-slice"),
         };
@@ -670,10 +520,7 @@ mod tests {
             "the error names what failed: {err}"
         );
 
-        // The process is gone AND collected. `kill` is SIGKILL followed by
-        // `wait`, so by the time the error came back there is no `/proc`
-        // entry left — a zombie would still have one, and a zombie is what a
-        // bare `start_kill` leaves.
+        // Verify failed startups are killed and reaped, leaving no zombie in `/proc`.
         let mut left = Vec::new();
         for line in std::fs::read_dir("/proc").expect("linux") {
             let Ok(entry) = line else { continue };
@@ -684,10 +531,7 @@ mod tests {
             let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
                 continue;
             };
-            // Our own `sleep 600` and nobody else's: the argument is exact
-            // and a stranger's `sleep` would have to have been started with
-            // the same one to be caught here, which a NUL-separated match
-            // makes an equality rather than a substring.
+            // Match the exact NUL-delimited fixture argument to exclude unrelated sleep processes.
             if cmdline
                 .split(|b| *b == 0)
                 .eq([&b"sleep"[..], &b"600"[..], &b""[..]])

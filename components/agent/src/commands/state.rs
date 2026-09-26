@@ -2,25 +2,19 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The verbs that are about the controller's picture of this node rather
-//! than about one VM: the whole desired state at once, and what a guest has
-//! printed.
+//! Controller state snapshots and guest log retrieval.
 
 use super::*;
 
 impl Agent {
-    /// The whole desired state of this node in one message. Every entry is an
-    /// idempotent create; what is *missing* is the other half of the message —
-    /// a managed record the controller no longer lists was deleted while this
-    /// agent was away, and the reconciler tears it down.
+    /// Apply idempotent creates from a controller snapshot and mark eligible
+    /// managed records absent from it for teardown.
     #[instrument(skip_all, fields(vms = sync.desired.len()))]
     pub(crate) async fn handle_sync_state(&self, sync: proto::SyncState) -> anyhow::Result<()> {
         let mut snapshot: HashSet<VmId> = HashSet::new();
         let mut failures: Vec<String> = Vec::new();
 
-        // An unparsable id is noted and skipped rather than nested around
-        // the work: it cannot go into the snapshot, so letting it fall
-        // through would put an id nobody can name into the orphan sweep.
+        // Log and skip malformed IDs before constructing the desired-state snapshot.
         for create in sync.desired {
             let raw = create.id.clone();
             let id = match raw.parse::<VmId>() {
@@ -57,17 +51,8 @@ impl Agent {
         }
     }
 
-    /// The end of a VM's one-way output, as the JSON the whole way up.
-    ///
-    /// The same document the node's own REST API serves, passed through the
-    /// cluster and the cloud without either of them opening it: what a
-    /// console printed is the node's answer, and a tier that reformatted it
-    /// would be a tier that could get it wrong.
-    ///
-    /// A vm this node has no record of is `NoSuchVm` — the same error every
-    /// other command gives for the same thing, so it is logged at the same
-    /// level and repaired by the same SyncState. A vm that has simply printed
-    /// nothing answers with an empty list.
+    /// Return the local logs JSON unchanged through the controller.
+    /// Unknown VM IDs return `NoSuchVm`; an empty log returns an empty list.
     pub(super) fn handle_logs(&self, cmd: proto::FetchLogs) -> anyhow::Result<Vec<u8>> {
         let id: VmId = cmd.id.parse().context("invalid vm id")?;
         if self.store.get(&id)?.is_none() {

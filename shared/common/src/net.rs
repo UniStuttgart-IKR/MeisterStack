@@ -89,12 +89,9 @@ impl Ipv4Range {
         false
     }
 
-    /// The addresses that may be HANDED OUT, which is not the same set as the
-    /// ones that are guarded: a `/16` written by an operator has a network
-    /// address and a broadcast address at its ends, and a guest given either
-    /// of them is a guest whose neighbours answer for it. A single address, a
-    /// `/32`, a `/31` and a bare `a-b` range are used whole — somebody who
-    /// wrote down exactly those addresses meant exactly those addresses.
+    /// Allocatable addresses exclude network/broadcast endpoints for CIDRs
+    /// wider than /31. Single addresses, /31, /32 and explicit ranges use
+    /// their entire specified set.
     pub fn allocatable(&self) -> impl Iterator<Item = Ipv4Addr> {
         let (from, to) = if self.edges_reserved {
             (self.start + 1, self.end - 1)
@@ -104,13 +101,8 @@ impl Ipv4Range {
         (from..=to).map(Ipv4Addr::from)
     }
 
-    /// Is this one of the addresses that may be handed out?
-    ///
-    /// `contains` is the GUARD's question and this is the ALLOCATOR's, and
-    /// the two differ by exactly the ends of a CIDR that has them. Both exist
-    /// because both are asked: a node's nftables set covers the whole range,
-    /// and an allocator that handed out the network or the broadcast address
-    /// would give a guest an address its neighbours answer for.
+    /// Check the allocator set, excluding CIDR endpoints where applicable.
+    /// `contains` instead checks the full range used for packet guarding.
     pub fn is_allocatable(&self, addr: Ipv4Addr) -> bool {
         if !self.contains(addr) {
             return false;
@@ -126,12 +118,8 @@ impl Ipv4Range {
         self.to_string()
     }
 
-    /// `a.b.c.d/n` when the range IS a prefix, and nothing when it is not.
-    ///
-    /// A routed subnet is stored in this form and only this form, because it
-    /// is what a routing table takes — and storing the canonical spelling is
-    /// what makes two admins who wrote `10.7.1.0/24` and `10.7.1.7/24` end up
-    /// with one object rather than an argument.
+    /// Canonical CIDR for a prefix-shaped range, otherwise None. Masking
+    /// input host bits gives equivalent routed-subnet requests one spelling.
     pub fn to_cidr(&self) -> Option<String> {
         let size = u64::from(self.end - self.start) + 1;
         if !size.is_power_of_two() {
@@ -216,13 +204,8 @@ fn parse_addr(part: &str, whole: &str) -> Result<Ipv4Addr, RangeError> {
         .map_err(|_| RangeError::Malformed(whole.to_string()))
 }
 
-/// Several ranges read as one address space: a pool's `cidrs`, or the union
-/// of every guarded range on a node.
-///
-/// Kept as the ranges the operator wrote and not merged into a canonical form,
-/// because the list is also what gets printed back and what an nftables set
-/// is built from — and an operator who wrote four public addresses wants to
-/// see four public addresses.
+/// Address space composed of configured ranges, retained in input form
+/// for display and nftables rendering rather than merged.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ipv4Ranges(Vec<Ipv4Range>);
 
@@ -263,16 +246,8 @@ impl Ipv4Ranges {
         self.0.iter().map(Ipv4Range::len).sum()
     }
 
-    /// The first allocatable address nobody holds, scanning the entries in
-    /// the order they were written.
-    ///
-    /// A linear gap scan and not a high-water mark, and the difference is the
-    /// point: a floating address released by one tenant has to become
-    /// available to the next one, and a counter that only ever moves forward
-    /// would exhaust a pool of four public addresses after four releases.
-    /// The cost is one pass over the pool per allocation, which for the
-    /// biggest pool anybody writes down is a few tens of thousands of u32
-    /// comparisons.
+    /// Return the first free address in configured entry order. Scanning gaps
+    /// allows released addresses to be reused instead of exhausting a counter.
     pub fn first_free(&self, taken: &std::collections::BTreeSet<Ipv4Addr>) -> Option<Ipv4Addr> {
         self.0
             .iter()
@@ -280,11 +255,8 @@ impl Ipv4Ranges {
             .find(|a| !taken.contains(a))
     }
 
-    /// Allocatable in ANY of the entries — the same set `first_free` walks,
-    /// asked about one address instead of scanned for the first free one.
-    /// Any, and not all, because the entries are what an operator wrote:
-    /// somebody who listed `10.0.0.0` next to `10.0.0.0/24` wrote down that
-    /// address on purpose, and the single-address entry means exactly it.
+    /// An address is allocatable if any entry permits it. An explicit
+    /// single-address entry can include another entry's network endpoint.
     pub fn is_allocatable(&self, addr: Ipv4Addr) -> bool {
         self.0.iter().any(|r| r.is_allocatable(addr))
     }
@@ -336,10 +308,7 @@ mod tests {
         assert!(!span.contains(ip("203.0.113.12")));
     }
 
-    /// A CIDR is masked to its base, so `10.255.0.5/16` means the same as
-    /// `10.255.0.0/16` — which is what every other tool does with it, and a
-    /// pool that silently meant something narrower would be a pool with a
-    /// hole in its guard.
+    /// CIDR input host bits are masked to the network base.
     #[test]
     fn a_cidr_is_masked_to_its_own_base() {
         assert_eq!(r("10.255.0.5/16"), r("10.255.0.0/16"));
@@ -368,11 +337,7 @@ mod tests {
         assert_eq!(r("192.0.2.0-192.0.2.7").allocatable().count(), 8);
     }
 
-    /// The same set, asked about ONE address. It exists because the allocator
-    /// has both questions to ask: the scan takes the first address out of
-    /// `allocatable`, and a caller who NAMES an address has to be measured
-    /// against the same set or the two paths disagree about what a pool can
-    /// hand out.
+    /// Requested-address validation and first-free scanning use the same set.
     #[test]
     fn one_address_is_asked_the_same_question_the_scan_asks() {
         let subnet = r("192.0.2.0/29");

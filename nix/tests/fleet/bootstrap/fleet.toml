@@ -1,23 +1,9 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
-#
-# The fleet of nix/tests/bootstrap.nix: two empty disks that become a control
-# plane and a node.
-#
-# A DIRECTORY in the repository and not a `builtins.toFile`, for the reason
-# nix/tests/fleet/box says: `install.layout` and `modules` are paths relative
-# to the inventory FILE, and a file written with `toFile` lives directly in
-# /nix/store.
-#
-# The two hosts are the smallest fleet that is a fleet: a control plane (a
-# cloud places guests on clusters, a cluster registers with a cloud — the
-# inventory insists on both) and ONE agent that reports to it. The agent is
-# what makes this test different from every test before it: it is the host
-# that carries guests, so it is the host a rollout has to cordon and drain
-# through the operator's own cli (D7), and it is the host that boots
-# `direct` — its kernel comes from outside, which is why `provider-reboot`
-# exists.
+
+# Test inventory. Keep layouts and host modules beside this file so relative
+# paths resolve inside the repository. Fingerprints and disks are test fixtures.
 
 schema = 2
 
@@ -26,9 +12,6 @@ name = "vm-bootstrap"
 domain = "vm.example"
 
 [operator]
-# References, not secrets. The CA directory lives OUTSIDE the repository
-# (`keys issue` refuses one inside the committed tree); the cli config is
-# what a cordon and a drain go through (D7).
 ca_dir = "../ca"
 cli_config = "cli.toml"
 cli_profile = "cloud"
@@ -37,11 +20,6 @@ cli_profile = "cloud"
 ssh = { user = "root", port = 22 }
 profiles = [ ]
 rollout = { max_unavailable = 1, reboot = "approve" }
-# The units, and the three that are required whatever this says (identity,
-# enrolled, system). Not `booted`: this fleet has a host whose kernel is
-# loaded by its provider, and between its switch and that provider's reboot
-# it runs the release and has booted the one before it — the planner refuses
-# such a host outright when `booted` is required, and says so.
 checks = { required = [ "units" ] }
 
 [[group]]
@@ -56,13 +34,6 @@ roles = ["cloud", "cluster"]
 groups = ["cp"]
 controller_group = "cp"
 site = "vm"
-# `boot = "uefi"` by default: an ESP, systemd-boot, and therefore the reboot
-# the helper arranges itself.
-#
-# `static = true`: this address comes from the plan, because the machine is
-# not a node of the test framework and nothing else would give it one. The
-# interface is `eth0` because the host module turns predictable names off and
-# the machine has exactly one NIC.
 networks.management = { address = "192.168.1.2", prefix = 24, interface = "eth0", static = true }
 ssh.host_key = "SHA256:PLACEHOLDER-THE-TEST-FILLS-IN-BOX"
 install = { disk = { serial = "MEISTERBOX01", size_gb = 16 }, layout = "disko/single-nvme.nix", preserve = [] }
@@ -75,8 +46,6 @@ deployment = "nixos"
 roles = ["agent"]
 controller_group = "cp"
 site = "vm"
-# No boot loader at all: the hypervisor is handed a kernel, an initrd and a
-# command line, and `meister-deploy build` makes that bundle.
 boot = "direct"
 networks.management = { address = "192.168.1.3", prefix = 24, interface = "eth0", static = true }
 ssh.host_key = "SHA256:PLACEHOLDER-THE-TEST-FILLS-IN-N1"

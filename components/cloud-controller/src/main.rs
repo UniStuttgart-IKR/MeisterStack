@@ -2,15 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Cloud-controller: the K8s-style END API of the whole stack. Owns the cloud
-//! etcd prefix, serves the REST API, accepts cluster sessions (ClusterPlane
-//! gRPC) and reconciles Vm objects onto clusters.
-//!
-//! Structurally this is the cluster-controller one tier up, deliberately so:
-//! same config shape, same API shape, same session-plus-reconciler split, same
-//! level-triggered reconcile. What differs is only what the objects mean —
-//! a placement is a cluster instead of a node, and a status arrives already
-//! aggregated. Design: docs/design/control-plane.md.
+//! Cloud API, cluster sessions and reconciliation over the cloud etcd prefix.
+//! The cloud schedules VMs onto clusters; cluster reports supply aggregated state.
+//! The API/session/reconciler split matches the cluster controller one tier below.
 
 mod api;
 mod reconcile;
@@ -110,16 +104,10 @@ struct FileConfig {
     /// The CA client certificates must chain to. Set = mTLS is offered and
     /// the mTLS authenticator joins the chain.
     client_ca: Option<PathBuf>,
-    /// This replica's own client identity — `CN=system:cloud:<cloud_name>`,
-    /// `O=system:clouds`, from `tools/meister-ca --cloud <name>`.
-    ///
-    /// What it is FOR: asking a sibling replica for a console or a log. The
-    /// serving pair cannot do it — its CN is a hostname, and the sibling's
-    /// permission table admits a NAME — which is exactly the decision the
-    /// image report left open ("welche Identitaet zeigt eine Cloud-Replica
-    /// ihrer Schwester?"). Absent = the forward goes in plain http, which is
-    /// what a lab runs, or fails with a sentence naming these keys when the
-    /// sibling is https.
+    /// Client identity for sibling log and console requests:
+    /// `CN=system:cloud:<cloud_name>`, `O=system:clouds`.
+    /// The hostname-based serving certificate is not this authorization identity.
+    /// TLS forwarding requires this certificate and its key.
     identity_cert: Option<PathBuf>,
     identity_key: Option<PathBuf>,
     /// The key a `Secret`'s values are sealed with — 32 bytes, mode 0600,
@@ -349,15 +337,9 @@ fn main() -> anyhow::Result<()> {
     run(args)
 }
 
-/// Exit 0 and one line on stdout, or exit 1 and the sentence of whichever
-/// checker refused, on stderr.
-///
-/// What this covers is `resolve_config` — the file, the flags, and the
-/// checks it already runs (`RequeueConfig::into_policy`, `Overcommit::check`,
-/// `SchedulerConfig::into_scheduler`, `NetworkConfig::into_backend`) — plus
-/// the half of the authenticator chain that needs no file. What it does not
-/// cover is everything that opens one: the client CA, the bearer token, the
-/// provider's discovery document. See `rest::check_chain`.
+/// Validate resolved configuration and authenticator-chain structure, then exit.
+/// Success prints one line and exits 0; validation failure prints to stderr and
+/// exits 1. This does not load credentials or contact discovery providers.
 fn check_config(args: &Args) -> ! {
     let verdict = resolve_config(args).and_then(|cfg| {
         let serves_sessions = !cfg.listen_session.trim().is_empty();
@@ -492,15 +474,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     let registry = Arc::new(session::SessionRegistry::new());
 
-    // --- lane 5A: the list, while the process runs ----------------------
-    //
-    // The authenticator reloads on its own, but only when somebody
-    // authenticates — and a controller whose peers are all connected
-    // authenticates nobody for hours. So one task looks at the file on its
-    // own clock, and hands what it finds to the registry: a session that is
-    // already talking on a certificate that has just been taken back is
-    // exactly the case a revocation is for, and nothing else would notice
-    // it until the peer reconnected.
+    // Poll revocations independently of authentication. Established sessions may
+    // remain open for hours, so request-time reload alone would not revoke them.
     if let Some(revocations) = revocations.clone() {
         let registry = registry.clone();
         tokio::spawn(async move {

@@ -2,36 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# An empty virtual disk becomes a host that boots itself — and a second
-# medium refuses to do it again.
-#
-# This is the exit criterion of M3's first half (V06 part 1 and V07), and it
-# is a test with no `nodes` at all: every machine in it is built by hand with
-# `create_machine`, because what is being measured is exactly the thing the
-# test framework's node machinery takes away. A node boots with `-kernel`,
-# has no firmware, no boot menu and a filesystem the framework declares.
-# Here:
-#
-#  * the MEDIUM is the real ISO `lib.mkFleet` builds, booted from a virtual
-#    CD under OVMF — so `nixos-install` can write EFI variables, which is
-#    what a uefi host's installation actually does;
-#  * the DISK is an empty qcow2 with a serial qemu hands the guest
-#    (`-device virtio-blk-pci,serial=…`, M0 probe S7), so the serial check in
-#    `meister-install confirm` is checked against a real kernel's answer;
-#  * the installed machine is started AGAIN from that disk, with the same
-#    OVMF variable store, so that systemd-boot is what boots it and
-#    `bootctl set-oneshot` is a boot entry somebody can watch not being
-#    taken twice.
-#
-# What it shows, in order: a medium that refuses a serial that is not there
-# and a serial two disks carry; an install of a blank disk; a machine that
-# comes up from it with the host key whose fingerprint the medium printed,
-# with `meister-activate` working and its units waiting for a certificate
-# nobody has delivered yet (`unenrolled`, and not a crash); the boot-mode
-# rollback on a real ESP — the second generation is booted exactly once and
-# the machine comes back by itself; and then the same medium a second time,
-# refusing to install over the mark it left, leaving the disk byte for byte
-# as it was, until `--reinstall` says otherwise and a NEW host key comes out.
+# Install a blank disk under UEFI, verify host identity and boot-entry fallback,
+# and require explicit reinstall before replacing an existing installation.
+# Machines are created with firmware rather than the test framework's direct boot.
 { nixpkgs, lib, pkgs, system, self, disko }:
 
 let

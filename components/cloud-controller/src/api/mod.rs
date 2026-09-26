@@ -519,25 +519,11 @@ async fn readyz(State(st): State<ApiState>) -> axum::response::Response {
     controller_api::readiness(&st.store).await
 }
 
-/// PATCH on an object route: read what is stored, merge the patch into it,
-/// and hand the result to the handler a PUT would have reached.
+/// Apply a merge patch to the stored object and call its PUT handler, preserving
+/// the same ownership, validation and mutation checks. The helper retries conflicts
+/// when the client did not supply a version; explicit versions remain conditional.
 ///
-/// A macro rather than one copy per resource, because what is worth reading
-/// is that every one of them is the SAME four lines. PATCH here is a PUT with
-/// a server-filled body and not a second write path: every check the update
-/// handler makes — whose the object is, which fields it keeps, the sentence
-/// it refuses with — is made for a patch too, because it IS that handler.
-///
-/// The object is read twice, once here and once inside the update. That is
-/// what a patch costs: it has to be applied to something. The
-/// compare-and-swap the update does is what makes the gap between the two
-/// reads safe — a writer that slips in wins, and this one is told, or, when
-/// the client named no version to be told against, the whole of it happens
-/// again. See `controller_api::patch_with_retry`.
-///
-/// Two arms, for the two extractor sets the update handlers have: the
-/// tenant-scoped ones take the caller's grant and check it against the
-/// object, the rest leave the whole question to the middleware.
+/// The two arms support handlers with and without tenant authorization extractors.
 macro_rules! patch_object {
     ($name:ident -> $put:ident, $object:ty, $body:ty) => {
         async fn $name(

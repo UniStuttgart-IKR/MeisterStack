@@ -59,18 +59,9 @@ pub use user::*;
 pub use vm::*;
 pub use volume::*;
 
-/// The resource table: every kind this control plane stores, with the
-/// directory it lives in and the `kind` its envelope wears. One place, so that
-/// adding a resource is adding a row rather than remembering to add a pair of
-/// constants, a constructor and an entry in whatever else went by the name.
-///
-/// The store reads both off the type (`crate::object::Resource`), which is why
-/// nothing outside this table ever spells a resource name again.
-/// A row may also carry a `{ ... }` block of extra associated items, which is
-/// where `Resource::settle` lives: the derivation is a statement about ONE
-/// resource, so it is written beside that resource's row and reads as part of
-/// it. A row without a block keeps the trait's no-op — the resources with no
-/// phase at all (`Node`, `Secret`, `Ticket`, …) have nothing to derive.
+/// Register each stored resource's directory, envelope kind, constructor, and optional
+/// associated items. Per-resource settle implementations live beside their registrations;
+/// resources without phases keep the trait default.
 macro_rules! resources {
     ($(
         $(#[$about:meta])*
@@ -166,14 +157,8 @@ resources! {
     /// A volume with a life of its own — the object that lets a disk outlive
     /// the VM that was using it. See `VolumeSpec`.
     Volume => "volumes", "Volume" {
-        /// The claim, and then the phase. See [`volume_claim_holds`] and
-        /// [`settle_volume`].
-        ///
-        /// The one derivation that changes a field other than the phase, and
-        /// it earns that: `attachedTo` is a claim on somebody's DATA, so the
-        /// moment it may be given up is a rule with as much at stake as the
-        /// phase itself — and a rule nothing else may write is a rule nothing
-        /// else can get wrong. See D4.
+        /// Recompute the volume claim before deriving its phase. Clearing a claim requires
+        /// evidence that the last holder is gone and no node reports the volume open.
         fn settle(&mut self, now: DateTime<Utc>) {
             if !volume_claim_holds(&self.status) {
                 self.status.attached_to = None;
@@ -229,23 +214,9 @@ pub const MANAGED_BY_CLOUD: &str = "cloud";
 /// what people call VMs and people reuse names; this is which VM it is.
 pub const LABEL_CLOUD_UID: &str = "meister.io/cloud-uid";
 
-/// May something owned by `mine` name a tenant-scoped object whose
-/// `spec.tenant` is `theirs`?
-///
-/// A tenant is what a name is scoped BY: two tenants may both have a volume
-/// called `data-1`, and each of them has exactly one. So this is not a
-/// permission question — `permits_object` answers that — but a NAMING one,
-/// and the two are asked at different moments. By the time a VM spec names a
-/// volume, the caller has already been allowed to write in this tenant; what
-/// is left is whether the name they wrote means anything here.
-///
-/// One function because two tiers ask it about the same pair of objects, and
-/// the empty-vs-absent seam is where a second copy would drift: a `Volume`
-/// spells "nobody's" as `""` and a `Vm` spells it as `None`, and the admin's
-/// own unscoped estate — both sides nobody's — has to match. An
-/// implementation that compared `Some("")` against `None` would refuse an
-/// admin their own disks, and one that let an empty tenant match a named one
-/// would hand every tenant the admin's.
+/// Check tenant-scoped reference compatibility after authorization. Normalize None and the
+/// empty string as unscoped: two unscoped objects match, but an unscoped object never matches a
+/// named tenant.
 pub fn same_tenancy(theirs: &str, mine: Option<&str>) -> bool {
     match mine.filter(|t| !t.is_empty()) {
         Some(mine) => theirs == mine,
@@ -276,12 +247,7 @@ impl Metadata {
     }
 }
 
-/// A new object of this resource, wearing the envelope its own type carries.
-///
-/// This replaced nine `new_*` helpers that were the same line each, and every
-/// one of them was a place where a resource could be created wearing another
-/// resource's kind. A VM keeps a constructor of its own because it is more
-/// than an envelope — see `new_vm`.
+/// Construct a resource with its typed metadata, spec, and status envelope.
 impl<S, St: Default> Object<S, St>
 where
     Self: Resource,

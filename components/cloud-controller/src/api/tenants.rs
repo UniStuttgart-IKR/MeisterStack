@@ -87,16 +87,9 @@ pub(super) async fn update_tenant(
     }
     let current: Tenant = st.store.get(&name).await?;
     keep_server_owned(&mut body.metadata, &current.metadata);
-    // `spec.quota` is the operator's and travels through untouched. Who may
-    // write it is not decided here and does not have to be: `tenants` is not
-    // among the resources a member may write (auth::TENANT_SCOPED), so a
-    // member raising its own ceiling never reaches this handler.
-    // Immutable, and not merely server-owned: every node that has ever built
-    // a bridge for this tenant built it for THIS number, and a tenant that
-    // changed VNI would leave its running VMs on the old overlay while new
-    // ones went to a different one. Silently kept rather than refused, the
-    // same way the cluster binding is — a client that round-trips the object
-    // must not have to strip fields it did not write.
+    // Middleware restricts tenant quota edits to privileged callers.
+    // The VNI is immutable: changing it would split existing and new guests across
+    // different overlays. `check_owned` rejects such changes.
     check_owned(&current, &body, TENANT_OWNED)?;
     body.status = current.status.clone();
     controller_api::carry_generation(&current, &mut body)?;

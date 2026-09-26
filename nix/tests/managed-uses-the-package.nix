@@ -2,14 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# A managed host's units name the STORE.
-#
-# The switch is one option — `meisterstack.binDir`, which nix/managed.nix
-# derives from `meisterstack.runtime` — and this check is what holds it: every
-# ExecStart of this stack, the hypervisor path in the agent's config and the
-# conditions that used to wait for a push have to come out of the package. A
-# single /opt/meisterstack/bin left in a unit file would be a host waiting
-# forever for an rsync that is never coming.
+# Check that managed units and hypervisor settings use runtime store paths,
+# while startup conditions wait only for external configuration or credentials.
 { nixpkgs, lib, pkgs, system, self }:
 
   let

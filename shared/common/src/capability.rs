@@ -8,64 +8,21 @@
 //! same claims. Storage claims use a `volume/` namespace to avoid colliding with
 //! device names. Locality and snapshot consistency travel with backend claims.
 
-/// The catalogue driver every STORAGE backend is a profile of: a node with
-/// the LVM-thin driver claims `volume/lvm-thin`, and a VM whose spec names
-/// that driver only fits where the claim is.
-///
-/// A prefix and not a bare `lvm-thin`, because this catalogue is one flat
-/// list shared with the device half — a bare backend name in it would answer
-/// a DEVICE request for a driver of that name, and the VM would bind to a
-/// node that cannot serve it. Here rather than in either crate because both
-/// halves of the sentence need it: the agent builds the entry, the scheduler
-/// looks for it.
+/// Storage capability namespace, e.g. `volume/lvm-thin`. The prefix
+/// keeps storage profiles distinct from device-driver profiles.
 pub const VOLUME: &str = "volume";
 
-/// The second segment a volume backend that can take point-in-time copies
-/// claims: `volume/lvm-thin/snapshot` beside `volume/lvm-thin`.
-///
-/// Nested inside the profile rather than a driver of its own, and the reason
-/// is that the catalogue is a flat list of `<driver>/<profile>` strings: the
-/// claim has to say WHICH backend can do it, because a node may serve two and
-/// disagree with itself (lvm-thin can, an nfs share cannot). `volume/snapshot`
-/// would say only that something on this node can, which is not a question
-/// anybody asks.
-///
-/// Here rather than in either crate for the reason `VOLUME` gives: the agent
-/// builds the entry and the API edge looks for it.
+/// Snapshot capability suffix, emitted beside the backend capability as
+/// `volume/<backend>/snapshot`. Each backend advertises its own support.
 pub const SNAPSHOT: &str = "snapshot";
 
-/// The backend whose snapshot was atomic BY NAME, and the reason the name is
-/// no longer how anybody should ask.
-///
-/// It used to be the whole mechanism: `SnapshotConsistency` was a driver's
-/// answer and did not travel, so the tier deciding whether to pause a guest
-/// read the pool's DRIVER and compared it with this string. The old comment
-/// here named its own expiry date — "the day a second atomic backend arrives
-/// this is a list, or the consistency starts travelling with the claim" — and
-/// that day came from below: `filesystem` reflinks on XFS and btrfs, and it
-/// finds that out by probing rather than by being told.
-///
-/// So the consistency travels now: see [`snapshot_claim`] and
-/// [`parse_snapshot_claim`]. The constant stays because the driver's NAME is
-/// still a name — it routes a pool to a backend — and because a reader that
-/// still compares against it is wrong in the safe direction, quiescing a
-/// backend that did not need it.
+/// LVM-thin driver name. Determine snapshot consistency from capability
+/// claims, not from a backend-name comparison.
 pub const LVM_THIN: &str = "lvm-thin";
 
-/// What a backend has to be given for its snapshot to be worth anything.
-///
-/// Here rather than in `agent-api` for exactly the reason [`Locality`] is
-/// here: the tier that STATES the fact is a driver and the tier that ACTS on
-/// it is a controller, and no controller depends on `agent-api`.
-/// `agent_api::storage` re-exports it, so a driver names it where a driver
-/// lives.
-///
-/// Neither value promises a consistent GUEST. Both are crash-consistent —
-/// what a snapshot holds is what the disk held at that instant, which is what
-/// the guest would have found after losing power. There is no guest agent
-/// here and no `fsfreeze`, exactly as EBS without one, and the difference the
-/// two variants name is only whether the HOST needs the writes to stop while
-/// it works.
+/// Writer coordination required by a backend snapshot. Neither variant
+/// provides application consistency or flushes guest buffers. Atomic captures
+/// a storage instant; NeedsQuiesce requires host writes to stop during copying.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SnapshotConsistency {
@@ -97,24 +54,13 @@ impl SnapshotConsistency {
     }
 }
 
-/// What separates a snapshot claim from the consistency written on it.
-///
-/// A colon and not another slash: the catalogue is split on `/` into
-/// `<driver>/<profile>` by everything that reads it, and a third segment
-/// would turn `volume/filesystem/snapshot` into an entry those splitters
-/// count differently. Inside the profile, after a character `offers` never
-/// looks at, the claim is invisible to every existing reader.
+/// Separator between a snapshot profile and its consistency qualifier.
+/// Keep `/` for the existing driver/profile structure.
 pub const CONSISTENCY_SEP: char = ':';
 
-/// The profile a snapshotting backend claims, WITH what it needs:
-/// `filesystem/snapshot:atomic`, flattening one tier up into
-/// `volume/filesystem/snapshot:atomic`.
-///
-/// Claimed BESIDE the bare `<backend>/snapshot` and never instead of it. The
-/// bare entry is what every reader built so far matches on, and a node that
-/// stopped emitting it would have its pools refused by a cluster one release
-/// older — the same mixed-version trap `HYPERVISOR` describes, and the same
-/// answer: claiming is additive and safe, replacing is not.
+/// Qualified snapshot profile, e.g. `filesystem/snapshot:atomic`. Emit
+/// this in addition to the legacy `<backend>/snapshot` claim so older
+/// controllers still recognize snapshot support.
 pub fn snapshot_claim(backend: &str, consistency: SnapshotConsistency) -> String {
     format!(
         "{backend}/{SNAPSHOT}{CONSISTENCY_SEP}{}",
@@ -122,17 +68,9 @@ pub fn snapshot_claim(backend: &str, consistency: SnapshotConsistency) -> String
     )
 }
 
-/// The inverse, total: the backend and what its snapshot needs, out of one
-/// catalogue profile.
-///
-/// `None` for the bare `<backend>/snapshot` as well as for anything that is
-/// not a snapshot claim at all — a caller that gets `None` has learned
-/// nothing and must fall back to quiescing, which is the direction where
-/// being wrong costs milliseconds instead of a torn copy.
-///
-/// Takes the PROFILE (`filesystem/snapshot:atomic`) and not the flattened
-/// catalogue entry, because that is what a `DriverInfo` carries and what the
-/// tier above splits `volume/` off to get.
+/// Parse a qualified profile without its `volume/` prefix. Bare legacy
+/// claims and malformed profiles return None; callers must conservatively
+/// require quiescence when consistency is unknown.
 pub fn parse_snapshot_claim(profile: &str) -> Option<(&str, SnapshotConsistency)> {
     let (head, consistency) = profile.split_once(CONSISTENCY_SEP)?;
     let backend = head.strip_suffix(SNAPSHOT)?.strip_suffix('/')?;
@@ -147,29 +85,16 @@ pub fn parse_snapshot_claim(profile: &str) -> Option<(&str, SnapshotConsistency)
 /// nodes cannot receive VMs. An agent omitting the claim is not VM-eligible.
 pub const HYPERVISOR: &str = "hypervisor";
 
-/// The catalogue driver every NETWORK capability is a profile of. A node
-/// with a `[network.vxlan]` section claims `network/vxlan`, and a VM whose
-/// spec puts a `vxlan_id` on any NIC only fits where that claim is.
-///
-/// Same prefix trick and same reason as `VOLUME`: one flat list is shared
-/// with the device half, and a bare `vxlan` in it would answer a DEVICE
-/// request for a driver of that name.
+/// Network capability namespace, e.g. `network/vxlan`, distinct from
+/// device-driver profiles in the shared catalogue.
 pub const NETWORK: &str = "network";
 /// The one network capability there is so far. Named here rather than in the
 /// driver because both halves of the sentence need the same string: the agent
 /// builds the entry, the scheduler looks for it.
 pub const VXLAN: &str = "vxlan";
-/// The overlay's second flavour: the same VXLAN wire, with its MAC addresses
-/// distributed by BGP instead of learned from flooded frames.
-///
-/// A second entry BESIDE `vxlan` and never instead of it — a node with EVPN on
-/// still claims `network/vxlan`, because that is what a VM asks for and what
-/// the scheduler matches. This entry is what `meister node ls` shows an
-/// operator, and it exists for exactly that: EVPN is a cluster-wide decision
-/// (two nodes of one overlay disagreeing about it never learn each other's
-/// MACs), so an operator has to be able to SEE which nodes are on which side
-/// of it. There is deliberately no scheduling request for it — a VM asks for
-/// an overlay, not for how the overlay finds its peers.
+/// EVPN capability, emitted alongside VXLAN for operator visibility.
+/// Scheduling still requests VXLAN. All participating overlay nodes need
+/// compatible discovery/routing configuration.
 pub const EVPN: &str = "evpn";
 
 /// Gateway profile for one configured provider network, such as `gateway:ext`
@@ -183,25 +108,15 @@ pub fn gateway_claim(physnet: &str) -> String {
     format!("{GATEWAY}{CONSISTENCY_SEP}{physnet}")
 }
 
-/// The inverse, total: the physnet out of one catalogue PROFILE, or `None`
-/// for a profile that is not a gateway claim at all.
-///
-/// Takes the profile (`gateway:ext`) rather than the flattened entry
-/// (`network/gateway:ext`), for the reason [`parse_snapshot_claim`] does: a
-/// `DriverInfo` carries the profile, and the tier above splits `network/` off
-/// to get here.
+/// Parse a gateway profile such as `gateway:ext`, without the flattened
+/// `network/` prefix. Return None for other profile shapes.
 pub fn parse_gateway_claim(profile: &str) -> Option<&str> {
     let (head, physnet) = profile.split_once(CONSISTENCY_SEP)?;
     (head == GATEWAY && !physnet.is_empty()).then_some(physnet)
 }
 
-/// Every provider network this catalogue says the node holds an interface
-/// for, in the order it claimed them.
-///
-/// The scheduling question a router asks, and it is asked of a FLATTENED
-/// catalogue (`NodeCapacity.capabilities`) because that is what a controller
-/// has in hand — a `Candidate` never sees the `DriverInfo` list it was built
-/// from.
+/// Read provider physnets from flattened capability entries, preserving
+/// advertisement order.
 pub fn gateway_physnets(catalogue: &[String]) -> Vec<&str> {
     catalogue
         .iter()
@@ -210,15 +125,9 @@ pub fn gateway_physnets(catalogue: &[String]) -> Vec<&str> {
         .collect()
 }
 
-/// The storage backend a volume gets when its spec names none.
-///
-/// It is in this module for one reason, and the reason is a scheduling rule:
-/// every node registers this backend whether or not it is configured, so a
-/// volume that asks for it (by name or by saying nothing) constrains nothing
-/// and must produce no request at all. Emitting one would strand such a VM on
-/// any node whose agent predates the volume catalogue — it claims no
-/// `volume/*` entries, and a VM with a plain disk would never be placed
-/// there again. `agent_api::default_volume_driver` returns this string.
+/// Default storage backend. Requests for this implicit backend do not
+/// require a catalogue entry, preserving placement on older agents that
+/// provide filesystem storage without advertising volume profiles.
 pub const DEFAULT_VOLUME_DRIVER: &str = "filesystem";
 
 /// Backend locality shared by agents and schedulers. It is reported by the
@@ -240,18 +149,14 @@ pub const DEFAULT_VOLUME_DRIVER: &str = "filesystem";
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum Locality {
-    /// The bytes are on exactly one node and reachable from nowhere else.
-    /// `filesystem` and `lvm-thin`. The default because it is the weakest
-    /// claim: a backend nobody asked stays pinned to the node that made it,
-    /// which is the safe direction to be wrong in.
+    /// Data accessible only on its owning node, as for filesystem and
+    /// LVM-thin. The default avoids assuming remote accessibility.
     #[default]
     NodeLocal,
     /// Every node in the pool sees the SAME bytes at the same time. `nfs`.
     Shared,
-    /// The bytes live somewhere else and reach a node over the network, one
-    /// consumer at a time. No driver claims it yet — NVMe-oF does, and the
-    /// value is here so the axis is complete before the driver arrives
-    /// rather than after.
+    /// Remote data reached over the network by one consumer at a time,
+    /// as with NVMe-oF.
     Networked,
 }
 
@@ -268,11 +173,8 @@ impl Locality {
         }
     }
 
-    /// The inverse, total: `None` for anything that is not one of the three.
-    ///
-    /// An empty string is one of those, and it is the ordinary case rather
-    /// than an error — a `DriverInfo` for a device driver carries no
-    /// locality, and so does one from an agent that predates the field.
+    /// Parse known locality names. Empty or unknown strings return None,
+    /// including device reports and legacy agents without locality metadata.
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|l| l.as_str() == s)
     }
@@ -288,14 +190,8 @@ pub fn entry(driver: &str, profile: Option<&str>) -> String {
     }
 }
 
-/// Whether a catalogue serves a request.
-///
-/// A profiled request needs its exact entry — asking for `nvrm/4q` on a node
-/// that only resolves `nvrm/2q` is not a fit, and pretending otherwise would
-/// bind the VM somewhere it cannot start. A bare request is content with the
-/// bare driver name or with any profile of it: "give me a vfio device" is
-/// answered by a node offering vfio, and "give me an nvrm device" by a node
-/// offering any nvrm profile, because the node picks in that case.
+/// Match an exact profile, or for a bare request accept the driver name
+/// or any of its profiles. A different profile never satisfies a named request.
 pub fn offers(catalogue: &[String], driver: &str, profile: Option<&str>) -> bool {
     match profile {
         Some(_) => {
@@ -360,10 +256,7 @@ mod tests {
         assert!(!offers(&[entry("vfio", None)], "vfio", Some("anything")));
     }
 
-    /// The prefix is `driver/` and not `driver`: a node offering `nvrm-next`
-    /// does not answer a request for `nvrm`. Cheap to get wrong with
-    /// `starts_with(driver)`, and it would place a VM on a node that cannot
-    /// start it.
+    /// Driver-prefix matching requires the slash boundary; nvrm-next is not nvrm.
     #[test]
     fn a_driver_name_that_merely_starts_the_same_is_not_a_match() {
         let catalogue = vec![entry("nvrm-next", Some("4q"))];
@@ -389,10 +282,7 @@ mod tests {
         assert!(!offers(&catalogue, "lvm-thin", None));
     }
 
-    /// And the hypervisor half, through the same two functions again. Four
-    /// kinds of capability now, one spelling — which is the whole reason
-    /// there is no second catalogue: nothing had to learn a new rule to
-    /// carry the entry that says a node runs VMs at all.
+    /// Hypervisor capabilities use the common catalogue matching rules.
     #[test]
     fn a_hypervisor_is_a_profile_of_the_hypervisor_driver() {
         let catalogue = vec![entry(HYPERVISOR, Some("cloud-hypervisor"))];
@@ -421,11 +311,7 @@ mod tests {
         assert!(!offers(&catalogue, VXLAN, None));
     }
 
-    /// The gateway half, through the same two functions once more — and the
-    /// round trip is what the two baustellen of 6k agree on: the agent
-    /// BUILDS the claim out of its `[network.provider]` section, the
-    /// controller MATCHES a router's provider network against it, and
-    /// neither writes the string itself.
+    /// Gateway construction and matching share one physnet claim format.
     #[test]
     fn a_gateway_is_a_profile_of_the_network_driver_carrying_its_physnet() {
         let catalogue = vec![
@@ -443,10 +329,7 @@ mod tests {
         assert!(gateway_physnets(&[]).is_empty());
     }
 
-    /// The claim parses only as itself. A physnet called `gateway` and a
-    /// profile that merely starts the same way are both refused, because a
-    /// wrong answer here places a tenant's way out on a machine that holds
-    /// no interface for it.
+    /// Reject bare or partial gateway claim names.
     #[test]
     fn nothing_but_a_gateway_claim_parses_as_one() {
         assert_eq!(parse_gateway_claim("gateway:ext"), Some("ext"));
@@ -460,10 +343,7 @@ mod tests {
         assert_eq!(parse_snapshot_claim("gateway:ext"), None);
     }
 
-    /// EVPN is a second entry beside `vxlan`, never instead of it: a VM asks
-    /// for an overlay and the scheduler matches `network/vxlan`, so a node
-    /// that dropped that entry when it turned evpn on would stop being a
-    /// candidate for the very VMs it serves best.
+    /// EVPN advertisement retains VXLAN, which VM scheduling requires.
     #[test]
     fn an_evpn_node_still_answers_a_request_for_an_overlay() {
         let catalogue = vec![entry(NETWORK, Some(VXLAN)), entry(NETWORK, Some(EVPN))];
@@ -474,10 +354,7 @@ mod tests {
         assert!(!offers(&[entry(NETWORK, Some(VXLAN))], NETWORK, Some(EVPN)));
     }
 
-    /// The gateway claim, both directions. The physnet is IN the profile
-    /// because a router names the provider network it needs: a bare
-    /// `gateway` would put a router on a node that gave away a different
-    /// interface, in a different rack, to a different network.
+    /// Gateway claims round-trip the exact provider physnet.
     #[test]
     fn a_gateway_claim_names_the_provider_network_it_is_about() {
         let catalogue = vec![

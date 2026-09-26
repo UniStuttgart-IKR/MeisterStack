@@ -2,30 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 # SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-# The fabric tools a host with an RDMA card needs, and nothing else.
-#
-# `meister-deploy verify --suite rdma` runs three measurements between two
-# hosts that DECLARE an RDMA nic on the same storage network: a round trip
-# (`rping`), a latency (`ib_send_lat`) and a bandwidth (`ib_write_bw`). All
-# three are server-on-A, client-on-B, and all three need the binary to be
-# there — so the closure of a host with such a card carries them, and a host
-# without one carries nothing new at all.
-#
-# Three things worth reading before changing this:
-#
-# * **It is role- and hardware-gated, twice.** The option defaults to `false`,
-#   and `nix/lib/inventory.nix` turns it on for a host whose
-#   `hardware.nics[].rdma` is true AND which has the agent role. A service
-#   module that put fabric tools on every machine would be a service module
-#   deciding something about the machine, which is exactly what
-#   `checks.services-are-pure` exists to refuse.
-# * **`environment.systemPackages` and not a unit.** Nothing here runs on its
-#   own. The suite reaches the binaries over ssh, as a person would, and a
-#   daemon that existed only to be measured would be a daemon to keep alive.
-# * **`perftest` is built by this repository** (nix/packages/perftest.nix):
-#   the pinned nixpkgs has `rdma-core` and no `perftest`, measured. The
-#   package option below is the way out for an operator who has their
-#   vendor's build — Mellanox ships one — without patching this file.
+# Install RDMA diagnostic and benchmark tools on enabled agents. Inventory
+# enables them for declared RDMA NICs. No daemon is started; operators can
+# replace the package list with a compatible vendor toolchain.
 { lib, pkgs, config, ... }:
 let
   cfg = config.meisterstack;

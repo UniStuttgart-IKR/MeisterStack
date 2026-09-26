@@ -18,13 +18,8 @@ pub enum ImageFormat {
     Qcow2,
 }
 
-/// The image catalogue — a cloud resource from the start, because an image is
-/// the one thing every tier below has to agree on by name.
-///
-/// v1 is a catalogue and a reference check, nothing else. `source` says where
-/// the bytes already are (a path on shared storage, later a URL); no blob ever
-/// travels through the control plane, and which machines hold a copy is
-/// `status.nodes[]`, reported by the nodes themselves.
+/// Cloud image catalogue entry. Nodes report availability; the catalogue does not itself
+/// distribute image bytes.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageSpec {
@@ -62,19 +57,9 @@ pub struct ImageSpec {
 }
 
 reasons! {
-    /// Why an image is what it is.
-    ///
-    /// One list out of two vocabularies, the shape `VmReason` explains. This
-    /// tier has two words of its own — `AwaitingNode`, the wait before
-    /// anybody has looked, and `DigestMismatch`, this tier's own comparison
-    /// against `status.digest` — and the four after them are the NODE's
-    /// (`proto::reasons::IMAGE`). They are the whole of F16 in a closed set:
-    /// `NotFound` is a catalogue entry pointing at bytes that are not there,
-    /// `NotAFile` is a directory under the name, `ChecksumMismatch` is bytes
-    /// that arrived and hash to something else, `FetchFailed` is bytes that
-    /// did not arrive. All four used to be one word — `Reported` — with the
-    /// node's prose beside it, so "roll-out still running" and "this will
-    /// never work" were the same value.
+    /// Image reason categories combine controller decisions with node failures. AwaitingNode
+    /// precedes any observation; DigestMismatch compares path-image digests. Node reasons
+    /// distinguish missing files, non-files, checksum failures, and fetch failures.
     ImageReason [7] {
         /// Nobody recorded one — see `VmReason::Unrecorded`.
         #[default]
@@ -113,15 +98,7 @@ reasons! {
         // fact only the tier that HOLDS `status.digest` can state.
         // --------------------------------------------------------------
 
-        /// A `Ready` node's digest disagrees with `status.digest`, the first
-        /// one this catalogue entry was bound to.
-        ///
-        /// Astra finding S02, 2026-09-23 (rest a). `check_source_kind` keeps
-        /// a member from adopting a file that is already on the nodes, but an
-        /// operator's own path registration had no checksum to bind it to
-        /// bytes at all — so a swap of the file after the fact, or two
-        /// registrations that were never the same file to begin with, went
-        /// unnoticed. See `settle_image` and `first_bound_digest`.
+        /// A Ready observation disagrees with the digest already bound to this catalogue entry.
         DigestMismatch => "DigestMismatch",
     }
 }
@@ -146,48 +123,26 @@ impl ImagePhaseKind {
     }
 }
 
-/// One node's word about one image.
-///
-/// The detail behind `ImageStatus::phase`, which is the UNION and therefore
-/// says "Failed" the moment any node cannot use the bytes — true, and not
-/// enough to act on: a rollout in progress and a checksum that will never
-/// match look the same from up there, and the first is a wait while the
-/// second is a mistake.
+/// One node's image observation, qualified by cluster because node names are cluster-scoped.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageNodeState {
     /// The node, as the cluster holding it calls it.
     pub name: String,
-    /// And which cluster that is. Not decoration: node names are scoped to a
-    /// cluster, so two clusters can each have a `node-1`, and a list keyed by
-    /// the bare name would let one cluster's report overwrite another's. It
-    /// is also what makes replacing this cluster's lines on every report a
-    /// well-defined act.
+    /// Cluster containing this node; node names are not globally unique.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cluster: String,
     /// `Ready` or `Failed`. A node never says `Pending`: an image it has no
     /// opinion about is simply not in its report, and therefore not here.
     pub phase: ImagePhaseKind,
-    /// WHY, in the node's own closed word — the fact `settle` derives the
-    /// image's phase from.
-    ///
-    /// `Unrecorded` (absent on the wire) for a `Ready` line and for a cluster
-    /// older than the field. It is the difference between a roll-out still
-    /// running and bytes that will never be right: `FetchFailed` on one node
-    /// is a node's problem, `ChecksumMismatch` anywhere is the image's.
+    /// Node reason used directly by image phase derivation.
     #[serde(default, skip_serializing_if = "is_unrecorded_image_reason")]
     pub reason: ImageReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    /// The sha256 this node bound a PATH image's bytes to, if it is a `Ready`
-    /// line and the node has one.
-    ///
-    /// Astra finding S02, 2026-09-23 (rest a). `None` for every `Failed` line
-    /// (nothing to hash), for a url image (its checksum is `spec.sha256` and
-    /// this field would only repeat it), and for a node or a cluster older
-    /// than the field. `first_bound_digest` reads the first one of these that
-    /// shows up as `ImageStatus.digest`, and `settle_image` holds every later
-    /// `Ready` line to it.
+    /// SHA-256 reported for a Ready path image. Absent for failures, URL images bound by
+    /// spec.sha256, and older reporters. The first reported digest binds the catalogue;
+    /// subsequent reports must match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
 }
@@ -196,16 +151,8 @@ fn is_unrecorded_image_reason(reason: &ImageReason) -> bool {
     *reason == ImageReason::Unrecorded
 }
 
-/// `deny_unknown_fields` is off here and on every other spec and status in
-/// this file, and the reason is `#[serde(flatten)]` below: serde cannot do
-/// both, because a flattened field is exactly the thing that collects the
-/// keys the outer struct does not know. The looseness is the same looseness
-/// every status now reads with — one object stored before this change must
-/// not break `list()` (decision 6) — and a status is server-written, so
-/// there is no client typo for it to have caught.
-///
-/// The ONE key that was worth refusing is still refused, by name: see
-/// `available_on`.
+/// Server-written image status permits unknown fields for flattened phase compatibility. The
+/// removed availableOn field is explicitly rejected rather than silently discarded.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 // The private unit field below is not the `_priv: ()` non-exhaustive trick
@@ -229,36 +176,13 @@ pub struct ImageStatus {
     /// older than the field — not "no nodes have it".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<ImageNodeState>,
-    /// The sha256 this catalogue entry is bound to, once a node's report
-    /// binds it.
-    ///
-    /// Astra finding S02, 2026-09-23 (rest a). A path registration has no
-    /// checksum by construction — that is `check_source_kind`'s TODO, closed
-    /// here — so nothing bound the catalogue name to particular bytes until
-    /// this existed. Set once, from `first_bound_digest`, and never moved:
-    /// `settle_image` fails the image the moment a LATER `Ready` line
-    /// disagrees with it, which is the whole point of pinning it rather than
-    /// tracking whatever the newest report says.
-    ///
-    /// `None` for a url image (bound by `spec.sha256` from creation, which
-    /// this would only repeat) and for one nobody has looked at yet.
+    /// Digest pinned once from the first Ready path-image observation. Later disagreement fails
+    /// the image. URL images instead use spec.sha256; unobserved path images remain unbound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
-    /// `status.availableOn`, which is gone — declared here so that it can go
-    /// on being REFUSED rather than silently dropped.
-    ///
-    /// It meant "not tracked" from v1 on and nothing ever wrote it; since
-    /// `status.nodes[]` exists, the question it pretended to answer has a
-    /// real answer beside it. A client that read the empty list and concluded
-    /// "no cluster has this image" was reading a field, not a fact
-    /// (fremdsicht 4), so an old client that still sends it has to hear about
-    /// it instead of believing the server kept its value.
-    ///
-    /// `deny_unknown_fields` used to carry that and cannot any more — see the
-    /// type's own comment. A named field can, and is better in one way: it
-    /// says WHICH key is refused and why, right here, instead of leaving the
-    /// answer to an attribute somebody would remove without knowing what it
-    /// was holding up.
+    /// Compatibility rejection for the removed status.availableOn field. Availability is
+    /// represented by status.nodes; this field must neither serialize nor silently accept
+    /// client input.
     #[serde(
         default,
         rename = "availableOn",
@@ -359,19 +283,9 @@ pub fn settle_image(spec: &ImageSpec, status: &ImageStatus) -> ImagePhase {
     )
 }
 
-/// The digest a catalogue entry binds to, the first time any `Ready` line
-/// carries one.
-///
-/// Astra finding S02, 2026-09-23 (rest a). Pure, and read once — the ingest
-/// that mirrors a cluster's report calls this only while `status.digest` is
-/// still `None`, so ONE report from ONE node decides it and nothing after
-/// that reopens the question; see `settle_image`'s rule 2b for what happens
-/// once it is set.
-///
-/// `nodes` is read in order and the first match wins, which is deterministic
-/// because the ingest sorts it by `(cluster, name)` before this runs — two
-/// clusters racing to report first pick the same answer wherever the choice
-/// is actually made.
+/// Return the first digest on a Ready observation. Ingest calls this only while status.digest
+/// is absent and sorts observations by (cluster, name) before choosing. Once bound,
+/// settle_image rejects disagreement.
 pub fn first_bound_digest(nodes: &[ImageNodeState]) -> Option<String> {
     nodes
         .iter()
@@ -581,13 +495,8 @@ mod tests {
         );
     }
 
-    /// F16 at the create edge: a path image is not `Ready` because it was
-    /// registered. It used to be, and the chaos run found one over a file
-    /// nobody had ever looked at wearing the word.
-    ///
-    /// The sentence differs by kind because the WAIT differs: a url image is
-    /// waiting for a fetch, a path image for somebody to look at a file that
-    /// is supposed to be there already.
+    /// New catalogue entries remain pending until a node reports the bytes. The initial message
+    /// distinguishes local availability from an outstanding URL fetch.
     #[test]
     fn a_freshly_registered_image_waits_for_a_node_whichever_kind_it_is() {
         let mut path = image(None, vec![]);

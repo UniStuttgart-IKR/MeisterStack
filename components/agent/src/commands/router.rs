@@ -2,44 +2,17 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The two verbs about a tenant router, and the translation in front of them.
-//!
-//! Everything here is either a refusal or one call into the network driver's
-//! trait. This file holds no idea of a namespace, a veth or an nft rule —
-//! that is `drivers/linux-network`, and the whole reason the gateway slot is
-//! six trait methods is that a second backend (OVN, a DPU offload) answers
-//! them with a logical router and nothing in this file changes.
-//!
-//! ## What the wire says and what a driver is given
-//!
-//! `EnsureRouter` is protobuf; `RouterSpec` is what a driver takes. The
-//! translation is a pure function so that WHICH spec a message produces can
-//! be asserted without a node — the same shape `NicWithId::try_from` has for
-//! the NIC half.
+//! Translate router commands into the network-driver contract and serialize
+//! router changes with VM resource operations. Unknown NAT kinds are refused.
 
 use super::*;
 use agent_api::networking::{NatKind, NatRule, RouterId, RouterSpec};
 
-/// The `NatRule.kind` that is not a NAT at all.
-///
-/// **What the contract did not have.** Festlegung 5 gives a router two jobs:
-/// translate (`snat`, `dnat_and_snat`) and ANNOUNCE — a routed subnet gets no
-/// NAT, the prefix is simply advertised by every active router of the subnet.
-/// `EnsureRouter` has no field for that list, and `shared/proto` is locked for
-/// both construction sites of 6k, so the prefixes ride in as rules of a third
-/// kind: `logical_ip` is the prefix and `external_ip` is empty.
-///
-/// It is a proposal and not a fact yet — the cluster half has to send it, and
-/// the report says so. The alternative, once the contract may move, is one
-/// `repeated string routed_subnets` on `EnsureRouter`, at which point this
-/// constant becomes a compatibility branch and nothing else.
+/// Wire encoding for routed prefixes: `logical_ip` carries the prefix and
+/// `external_ip` is unused. These entries become announcements, not NAT rules.
 const NAT_ROUTED: &str = "routed";
 
-/// One `EnsureRouter` as a driver takes it.
-///
-/// Refuses rather than drops, everywhere. A NAT kind this build does not know
-/// is a rule that would silently not be applied — the tier above would see a
-/// Ready router that translates nothing — so it is an error naming the string.
+/// Convert a router command to the driver spec, rejecting unknown NAT kinds.
 pub(crate) fn router_spec(r: proto::EnsureRouter) -> anyhow::Result<RouterSpec> {
     let id: RouterId = r.id.parse().context("router id")?;
     let mut nats = Vec::new();
@@ -78,18 +51,8 @@ pub(crate) fn router_spec(r: proto::EnsureRouter) -> anyhow::Result<RouterSpec> 
 }
 
 impl Agent {
-    /// Build the router, or say why this node never can.
-    ///
-    /// Idempotent by id exactly as `Create` is: the controller sends it once
-    /// and repeats it on every reconnect, and the standby's promotion is the
-    /// same message with `active = true`.
-    ///
-    /// The physnet is checked HERE and not in the driver, and the difference
-    /// is the word `CannotServe`: "this node gave no interface away to `ext`"
-    /// is a fact about the node that the next attempt will not change, so the
-    /// cluster has to stop counting this node as a candidate — N-C3 makes it
-    /// a Condition. Everything the driver refuses afterwards is about this
-    /// attempt and is answered where it happened.
+    /// Validate the provider-network capability, then ensure the router under
+    /// the operations lock. Repeated ensure requests also update active/standby state.
     pub(super) async fn handle_ensure_router(&self, r: proto::EnsureRouter) -> anyhow::Result<()> {
         let spec = router_spec(r)?;
         cannot_serve(self.network.validate_router(&spec.physnet))?;
@@ -99,10 +62,7 @@ impl Agent {
                 .bridge()
                 .context("this node cannot build a router"),
         )?;
-        // One lock for the whole build, the same one every other mutating
-        // verb takes: a router's legs join bridges that a VM's provisioning
-        // is also making, and two of those at once on one node is two
-        // netlink conversations about the same link.
+        // Serialize router creation with VM provisioning because both mutate shared bridges.
         let _guard = self.ops.lock().await;
         let state = bridge
             .ensure_router(&spec)
@@ -116,18 +76,14 @@ impl Agent {
         Ok(())
     }
 
-    /// Let the router go. Idempotent by contract: one this node does not hold
-    /// is `Ok`, because a teardown of something that is not there has already
-    /// happened.
+    /// Destroy a router idempotently; an absent router is already removed.
     pub(super) async fn handle_destroy_router(
         &self,
         r: proto::DestroyRouter,
     ) -> anyhow::Result<()> {
         let id: RouterId = r.id.parse().context("router id")?;
         let Some(bridge) = self.reconciler.drivers().bridge.as_ref() else {
-            // No network driver at all: this node built no router and has
-            // none to remove. Saying so as a failure would leave the tier
-            // above retrying a removal for ever.
+            // Without a networking driver, there is no local router to remove.
             return Ok(());
         };
         let _guard = self.ops.lock().await;
@@ -163,7 +119,7 @@ mod tests {
         }
     }
 
-    /// The whole message, field for field, in the form a driver takes.
+    /// Preserve router-command fields in the driver specification.
     #[test]
     fn an_ensure_router_becomes_the_spec_a_driver_is_given() {
         let spec = router_spec(message()).expect("a well-formed message");
@@ -207,9 +163,7 @@ mod tests {
         assert_eq!(spec.nats[0].kind, NatKind::Snat);
     }
 
-    /// A kind this build cannot render is a refusal naming the string, never
-    /// a rule quietly left out: the tier above would otherwise see a Ready
-    /// router that translates nothing.
+    /// Reject unknown NAT kinds and include the invalid value in the error.
     #[test]
     fn a_nat_kind_this_build_does_not_know_is_refused_by_name() {
         let mut m = message();

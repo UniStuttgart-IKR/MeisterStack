@@ -2,38 +2,14 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The share-backed block driver: files on a mounted share, or a directory
-//! handed to the guest whole over virtiofs.
+//! Volumes under a mounted share, exposed as raw disks or virtiofs.
 //!
-//! Named `nfs` because NFS is what it is for in the lab, but nothing below
-//! this line knows what NFS is. The rule it implements is broader: anything
-//! the HOST can mount can be a share. The driver owns the mount (or is told
-//! it is already there), and what the guest sees is either a raw file it
-//! boots from or a virtiofs export it mounts by tag. CephFS, an SMB share,
-//! a second local disk — all of them are `share_root` to this file.
-//!
-//! Two modes, chosen by `params.kind`:
-//!
-//! * `file` (the default) — `<share_root>/volumes/<id>.raw`, created exactly
-//!   as the filesystem driver creates its volumes, because it IS the
-//!   filesystem driver: this one only roots it in the share. Attachment:
-//!   `Path`.
-//! * `share` — `<share_root>/shares/<id>/`, served by one virtiofsd per VM
-//!   attachment. Attachment: `FsShare`.
-//!
-//! Share mode is where the provider/attacher split stops being bookkeeping
-//! and starts being the design: the DIRECTORY is the volume and survives
-//! everything, and the virtiofsd is the connection and lives exactly as long
-//! as one consumer holds it. `provision` makes the directory, `attach`
-//! spawns the process into that consumer's cgroup slice, `detach` kills it
-//! and leaves every byte where it was.
-//!
-//! The virtiofsd half follows the device-backend pattern to the letter (see
-//! `nvrm_driver`): one process per attachment, its own session so it cannot
-//! die with a parent shell, room for a file descriptor per open guest file,
-//! in the VM's cgroup slice so teardown reaps it, and never, ever reused —
-//! a backend that exited when its VMM hung up is replaced by
-//! Teardown→Provision, not handed back to the next boot.
+//! `params.kind = "file"` delegates to the filesystem driver under
+//! `<share_root>/volumes`. `kind = "share"` creates a directory under
+//! `<share_root>/shares` and serves it with a virtiofsd backend at attachment.
+//! Detach preserves data. The driver advertises shared locality; operators
+//! must ensure the configured path reaches the same storage on participating
+//! nodes. Managed mounts render their source as `server:export`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -49,14 +25,10 @@ use filesystem_driver::{FilesystemBlockDriver, FilesystemDriverConfig};
 use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
 
-/// A desktop guest can hold hundreds of files open at once and virtiofsd
-/// needs one host descriptor for each. The same headroom the nvrm backend
-/// gets, for the same kind of reason.
+/// Descriptor headroom for virtiofsd serving many guest files.
 const NOFILE_LIMIT: u64 = 65536;
 
-/// How long to wait for a freshly spawned virtiofsd to put its socket down.
-/// It is a local process opening a local unix socket; anything slower than
-/// this is a virtiofsd that is not going to come up.
+/// Default time allowed for a new virtiofsd socket to become ready.
 pub const DEFAULT_SOCKET_TIMEOUT_MS: u64 = 5000;
 
 /// The tag a share is mounted by when the spec does not name one. A guest
@@ -64,11 +36,7 @@ pub const DEFAULT_SOCKET_TIMEOUT_MS: u64 = 5000;
 /// boots, so there has to be a default worth writing into an image.
 pub const DEFAULT_TAG: &str = "share";
 
-/// mount(8), looked up on PATH. Every other binary this driver runs is named
-/// by config (`virtiofsd`, and lvm-thin's `bin_dir`/`qemu_img` next door);
-/// mount was the one bare name left, and a node with mount somewhere PATH does
-/// not reach had no way to say so. `NfsDriver::with_mount_bin` is that way,
-/// and `new` keeps the behaviour every existing config already has.
+/// Default mount executable; `with_mount_bin` overrides it.
 pub const DEFAULT_MOUNT_BIN: &str = "mount";
 
 /// What a volume on this backend is.
@@ -102,26 +70,22 @@ pub struct NfsDriverConfig {
     pub virtiofsd: PathBuf,
     pub run_dir: PathBuf,
     pub socket_timeout: Duration,
-    /// Extra virtiofsd flags, verbatim and last, so a knob this driver has
-    /// never heard of needs no driver change. `--sandbox=none` is the one
-    /// most nodes end up wanting.
+    /// Additional operator-supplied virtiofsd flags, appended verbatim.
     pub virtiofsd_args: Vec<String>,
-    /// true: mount `share_root` at agent start if it is not mounted already.
-    /// false: `share_root` is somebody else's business (fstab, a systemd
-    /// mount unit, the NixOS module) and the driver only checks it is there.
+    /// Mount share_root at startup when true. Otherwise require an existing
+    /// mount managed by the deployment.
     pub manage_mount: bool,
     pub mount: Option<MountSpec>,
 }
 
-/// What to mount, when the driver is the one mounting.
+/// Source and options for a driver-managed mount.
 #[derive(Clone, Debug)]
 pub struct MountSpec {
     pub server: String,
     pub export: String,
     /// `-o` options, verbatim. Empty = the kernel's defaults.
     pub options: Option<String>,
-    /// `-t`. NFS is the default and the reason for the crate's name; anything
-    /// mount(8) understands works.
+    /// mount(8) filesystem type; the source still uses `server:export` syntax.
     pub fs_type: String,
 }
 
@@ -135,17 +99,12 @@ pub struct NfsDriver {
     /// One virtiofsd per attachment, in a session of its own and signalled as
     /// a process GROUP. See `BackendKind::detached`.
     process: BackendKind,
-    /// File-mode volumes are the filesystem driver's, rooted in the share.
-    /// Delegating rather than copying: "a raw file with a base image cloned
-    /// into it" is one behaviour and it should have one implementation,
-    /// copy_file_range fallback and all.
+    /// Delegate file-mode volumes to the filesystem driver rooted under the share.
     files: FilesystemBlockDriver,
     active: Mutex<HashMap<VolumeId, ActiveBackend>>,
 }
 
-/// Whether `path` is a mount point, read from the kernel rather than guessed.
-/// `/proc/self/mounts` and not `/etc/mtab`: what is actually mounted is the
-/// question, not what somebody meant to mount.
+/// Match the mount-point field from the kernel mount list.
 fn is_mount_point(mounts: &str, path: &Path) -> bool {
     let want = path.to_string_lossy();
     mounts.lines().any(|line| {
@@ -157,8 +116,7 @@ fn is_mount_point(mounts: &str, path: &Path) -> bool {
     })
 }
 
-/// The mount(8) argument list. A function of its own because it is the one
-/// thing here worth testing without a real NFS server in the room.
+/// Build mount(8) arguments independently of running the command.
 fn mount_args(spec: &MountSpec, share_root: &Path) -> Vec<String> {
     let mut args = vec!["-t".to_string(), spec.fs_type.clone()];
     if let Some(opts) = &spec.options
@@ -178,9 +136,7 @@ impl NfsDriver {
         Self::with_mount_bin(config, PathBuf::from(DEFAULT_MOUNT_BIN))
     }
 
-    /// The same driver, told where mount(8) is. Only start-up runs it — the
-    /// share is mounted once and never again — so the path is a parameter
-    /// here rather than a field the driver carries around.
+    /// Construct with a mount executable override used only during startup.
     pub fn with_mount_bin(config: NfsDriverConfig, mount_bin: PathBuf) -> storage::Result<Self> {
         if !config.virtiofsd.exists() {
             return Err(StorageError::Backend(anyhow::anyhow!(
@@ -200,13 +156,9 @@ impl NfsDriver {
         let files = FilesystemBlockDriver::new(FilesystemDriverConfig {
             image_dir: config.image_dir.clone(),
             volume_dir: config.share_root.join("volumes"),
-            // The inner driver reaches for it only when a base image is not
-            // raw; this backend names no path of its own for it, so PATH is
-            // the answer here exactly as it is there.
+            // File-mode qcow2 conversion resolves qemu-img through PATH.
             qemu_img: PathBuf::from("qemu-img"),
-            // And the same sandbox, for the same reason: a volume on a share
-            // is still written from an image this node did not make (Astra
-            // finding S01, 2026-09-23). See `agent_api::base_image`.
+            // Use the same base-image conversion sandbox as the local filesystem driver.
             convert: agent_api::base_image::Sandbox::default(),
         })?;
 
@@ -218,16 +170,9 @@ impl NfsDriver {
         })
     }
 
-    /// Either mount the share or satisfy ourselves that somebody else did.
-    ///
-    /// The asymmetry is deliberate. `manage_mount = true` is a node that has
-    /// nothing else arranging the mount, and the driver failing to mount is a
-    /// hard start-up error — half a storage backend is worse than none.
-    /// `manage_mount = false` is a node where fstab or a systemd unit owns
-    /// it, and then the only honest check is that the directory is there;
-    /// a warning when it is not a mount point at all, because a share_root
-    /// that is quietly a local directory means every "shared" volume is
-    /// private to this node and nothing would say so.
+    /// Create a managed mount or verify the externally managed directory exists.
+    /// An unmanaged path that is not a mount point only warns; mount source identity
+    /// and cross-node reachability are not verified.
     fn ensure_share_root(config: &NfsDriverConfig, mount_bin: &Path) -> storage::Result<()> {
         let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
         let mounted = is_mount_point(&mounts, &config.share_root);
@@ -260,9 +205,7 @@ impl NfsDriver {
         }
         std::fs::create_dir_all(&config.share_root).map_err(|e| StorageError::Backend(e.into()))?;
 
-        // mount(8) and not mount(2): NFS needs the mount.nfs helper to do the
-        // RPC handshake and pick a protocol version, and reimplementing that
-        // to avoid one fork would be a poor trade.
+        // Use mount(8) so its NFS helper handles negotiation and RPC setup.
         let args = mount_args(spec, &config.share_root);
         let out = std::process::Command::new(mount_bin)
             .args(&args)
@@ -294,11 +237,8 @@ impl NfsDriver {
         self.config.share_root.join("shares").join(id.to_string())
     }
 
-    /// Refuse an operation that only means something for a file volume.
-    ///
-    /// Asked of the DISK and not of `params`, for the reason `deprovision`
-    /// gives at length: a record migrated from before handles existed carries
-    /// no params, and the directory that is there is the answer.
+    /// Reject file-only operations when an on-disk share directory exists.
+    /// Inspect storage because legacy handles may omit mode parameters.
     async fn refuse_a_share(&self, handle: &VolumeHandle, verb: &str) -> storage::Result<()> {
         if tokio::fs::metadata(self.share_dir(&handle.id))
             .await
@@ -321,16 +261,12 @@ impl NfsDriver {
         self.config.run_dir.join(format!("{id}.log"))
     }
 
-    /// virtiofsd puts a lock file beside its socket, named for it, and does
-    /// not take it away again. Ours to clean up, or run_dir collects one
-    /// orphan per share volume that ever existed.
+    /// Virtiofsd lock-file path, removed with the attachment socket.
     fn socket_lock_path(&self, id: &VolumeId) -> PathBuf {
         self.config.run_dir.join(format!("{id}.sock.pid"))
     }
 
-    /// Spawn one virtiofsd for one attachment, and do not come back until it
-    /// is listening — cloud-hypervisor connects to this socket during
-    /// `vm.create` and a socket that is not there yet is a failed VM.
+    /// Spawn virtiofsd and wait for socket-file readiness before returning the attachment.
     async fn spawn_virtiofsd(
         &self,
         id: &VolumeId,
@@ -364,18 +300,15 @@ impl NfsDriver {
             .await?)
     }
 
-    /// Stop the backend for one volume, whether it is our child or one we
-    /// adopted from a previous agent. Leaves the shared directory alone.
+    /// Stop a tracked child or signal an identity-checked adopted backend, then
+    /// remove socket paths. Adopted-process exit is not awaited. Preserve share data.
     async fn stop_backend(&self, id: &VolumeId, attachment: &VolumeAttachment) {
         let entry = self.active.lock().await.remove(id);
 
         match entry {
             Some(entry) => self.process.stop(entry.child).await,
-            // Not our child: the agent restarted since the attach, and the
-            // record is the only handle left on the process. The SOCKET goes
-            // with the pid — a `comm` of "virtiofsd" is true of every share
-            // on the node, and a node serving four of them would eventually
-            // killpg one of the other three. See `BackendKind::is_ours`.
+            // For adopted backends, verify both process name and socket argument
+            // before stopping the recorded PID; sibling shares run the same executable.
             None => {
                 if let VolumeAttachment::FsShare { socket, pid, .. } = attachment {
                     self.process.stop_adopted(*pid, socket);
@@ -387,12 +320,8 @@ impl NfsDriver {
         let _ = backend::remove_if_present(&self.socket_lock_path(id)).await;
     }
 
-    /// The same params, read off a handle instead of a spec.
-    ///
-    /// `attach` gets no spec, by design: an attacher has to be usable by
-    /// something that never saw the request. What it needs from the request
-    /// — the virtiofs tag, and which mode this volume is — travels on the
-    /// handle, which is what `VolumeHandle::params` is for.
+    /// Parse attachment mode and virtiofs tag from the handle, which lets an
+    /// attacher operate without the original provisioning spec.
     fn handle_params(handle: &VolumeHandle) -> storage::Result<NfsParams> {
         match &handle.params {
             Some(v) => serde_json::from_value(v.clone())
@@ -401,11 +330,7 @@ impl NfsDriver {
         }
     }
 
-    /// One virtiofsd for one consumer, in that consumer's cgroup slice.
-    ///
-    /// The directory is already there — `provision` made it, and it is the
-    /// volume. This is only the process, which is why it is here and not
-    /// there: it lives as long as the attachment and not a moment longer.
+    /// Start a virtiofsd backend in the consumer's cgroup for an existing share directory.
     async fn attach_share(
         &self,
         handle: &VolumeHandle,
@@ -417,7 +342,7 @@ impl NfsDriver {
             .unwrap_or_else(|| DEFAULT_TAG.to_string());
         let dir = handle.path();
 
-        // A live backend for this volume is reusable; a dead one is not, ever.
+        // Reuse only a live backend with its socket present.
         {
             let mut active = self.active.lock().await;
             if let Some(running) = active.get_mut(id) {
@@ -476,20 +401,9 @@ impl VolumeProvider for NfsDriver {
         }
     }
 
-    /// Both candidates, unconditionally, and neither decided from `params`.
-    ///
-    /// Two directories under `share_root` are named after this volume's id
-    /// and at most one of them exists — `volumes/<id>.raw` in file mode,
-    /// `shares/<id>/` in share mode. Removing both is idempotent, costs one
-    /// extra syscall, and needs nothing remembered about which mode the
-    /// volume was: a record migrated from before handles existed carries no
-    /// params, and a `deprovision` that guessed `file` for it would leave the
-    /// share directory behind forever.
-    ///
-    /// The virtiofsd is NOT stopped here. That is `detach`'s job, and the
-    /// provisioner calls it first — deleting data out from under a live
-    /// backend is exactly the ordering this trait split exists to make
-    /// impossible to get wrong.
+    /// Remove both file and directory candidates by ID, including legacy handles
+    /// without mode params. This does not stop virtiofsd; callers must establish
+    /// that all consumers have closed before deleting data.
     #[instrument(skip_all, fields(volume_id = %handle.id))]
     async fn deprovision(&self, handle: &VolumeHandle) -> storage::Result<()> {
         let id = &handle.id;
@@ -502,24 +416,13 @@ impl VolumeProvider for NfsDriver {
         self.files.deprovision(handle).await
     }
 
-    /// Every node that mounts the export sees the SAME bytes — that is what
-    /// an export IS, and it is why this driver is the one that makes live
-    /// migration possible at all. True in both modes: a raw file under
-    /// `<share_root>/volumes` and a directory under `<share_root>/shares` are
-    /// equally reachable from every node whose `share_root` is that export.
-    ///
-    /// The pool's `nodes` list is what says WHICH nodes those are; this says
-    /// only that they all see one volume rather than one each. An operator
-    /// who lists a node that does not mount the export has said something
-    /// false, and no driver can catch that from here.
+    /// Advertise Shared. Correctness depends on each eligible node mounting the
+    /// same export; this method does not verify that configuration.
     fn locality(&self) -> Locality {
         Locality::Shared
     }
 
-    /// The file half grows; a share has no size to grow.
-    ///
-    /// Delegated to the inner `filesystem` driver, exactly as `provision` is,
-    /// because in file mode this backend IS that one over an export.
+    /// Resize file-mode data through the filesystem driver; shares have no byte size.
     #[instrument(skip_all, fields(volume_id = %handle.id, size_bytes))]
     async fn resize(
         &self,
@@ -530,32 +433,8 @@ impl VolumeProvider for NfsDriver {
         self.files.resize(handle, size_bytes).await
     }
 
-    /// The file half can, the share half cannot, and the claim is the union.
-    ///
-    /// `snapshot_support` is asked of the DRIVER and a driver serving two
-    /// kinds of volume has one answer to give, so it says what it can do for
-    /// SOME volume — and `snapshot` refuses the ones it cannot, by looking at
-    /// what is actually on disk rather than at `params`, exactly as
-    /// `deprovision` and `describe` do.
-    ///
-    /// The alternative — claiming `None` because one mode cannot — would make
-    /// every file-mode NFS pool unsnapshottable, and file mode is the common
-    /// one. The cost of this direction is a 422 that arrives at the volume
-    /// rather than at the pool, and the sentence says which.
-    ///
-    /// Asked of the file half, because the file half IS a
-    /// `FilesystemBlockDriver` over `share_root` — the same
-    /// `copy_file_range`, reflinked where the export's filesystem can and
-    /// copied byte for byte where it cannot.
-    ///
-    /// It used to answer the flat `NeedsQuiesce`, with a comment saying that
-    /// whether a given NFSv4.2 export reflinks is not something this driver
-    /// can find out from here. That stopped being true when `filesystem`
-    /// learned to probe its own pool directory: the inner driver has already
-    /// tried it, on this export, at start-up. Passing its answer through is
-    /// the whole of the fix, and what it is worth is a VM on a
-    /// reflink-capable export that is no longer paused for a copy that takes
-    /// milliseconds.
+    /// Advertise file-mode snapshot support from the inner filesystem driver.
+    /// Share-mode snapshot requests are refused at operation time.
     fn snapshot_support(&self) -> Option<SnapshotConsistency> {
         self.files.snapshot_support()
     }
@@ -582,10 +461,7 @@ impl VolumeProvider for NfsDriver {
         snapshot: &VolumeHandle,
         spec: &VolumeSpec,
     ) -> storage::Result<VolumeHandle> {
-        // A volume made from a snapshot is a FILE, whatever `params.kind`
-        // says: the snapshot is a file, and a share cannot be made out of
-        // one. Refused rather than quietly producing a file volume under a
-        // spec that asked for a share.
+        // Snapshot creation produces file volumes; reject specs requesting a share.
         if Self::params(spec)?.kind == VolumeKind::Share {
             return Err(StorageError::Unsupported(
                 "an nfs share is a directory and cannot be made from a snapshot; \
@@ -598,8 +474,7 @@ impl VolumeProvider for NfsDriver {
 
     #[instrument(level = "trace", skip_all, fields(volume_id = %handle.id))]
     async fn describe(&self, handle: &VolumeHandle) -> storage::Result<VolumeState> {
-        // Asked of the filesystem rather than of `params`, for the reason
-        // `deprovision` gives: the directory that is there is the answer.
+        // Determine share mode from its directory, including handles without params.
         if tokio::fs::metadata(self.share_dir(&handle.id))
             .await
             .is_ok()
@@ -609,9 +484,7 @@ impl VolumeProvider for NfsDriver {
         self.files.describe(handle).await
     }
 
-    /// Both candidates, in the order `deprovision` removes them and for the
-    /// same reason: what is on the export is the answer, not what `params`
-    /// says. Astra finding S13, 2026-09-23.
+    /// Probe share and file locations in deletion order, independently of handle parameters.
     #[instrument(level = "trace", skip_all, fields(volume_id = %id))]
     async fn probe(
         &self,
@@ -630,8 +503,7 @@ impl VolumeProvider for NfsDriver {
         self.files.probe(id, spec).await
     }
 
-    /// A share cannot be snapshotted, so every snapshot this driver ever took
-    /// is a file the inner backend made. Delegated whole.
+    /// Delegate snapshot probing to the filesystem backend; shares do not support snapshots.
     #[instrument(level = "trace", skip_all, fields(snapshot_id = %id))]
     async fn probe_snapshot(
         &self,
@@ -656,10 +528,8 @@ impl VolumeAttacher for NfsDriver {
         }
     }
 
-    /// A stopped VM keeps its share directory and everything in it; what it
-    /// must not keep is a virtiofsd serving a VM that is not running. The
-    /// next start spawns a fresh one, which is the same rule the device
-    /// backends follow.
+    /// Stop the attachment's virtiofsd while preserving its share data. A later
+    /// attachment starts a new backend.
     #[instrument(skip_all, fields(volume_id = %handle.id))]
     async fn detach(
         &self,
@@ -693,11 +563,7 @@ impl VolumeAttacher for NfsDriver {
         {
             return Err(StorageError::NotFound(*id));
         }
-        // And the fallback asks whether the pid is still THIS share's
-        // virtiofsd, not merely whether something answers to it: a bare
-        // `kill(pid, 0)` reports "alive" for whoever holds the number now,
-        // and a share reported healthy because a stranger holds its pid is
-        // the exact state the quarantine exists to catch.
+        // Verify the stored PID still belongs to this share's virtiofsd.
         if !self.process.is_ours(*pid, socket) {
             return Err(StorageError::NotFound(*id));
         }
@@ -709,14 +575,8 @@ impl VolumeAttacher for NfsDriver {
 mod tests {
     use super::*;
 
-    /// A driver over a temp directory, with a `virtiofsd` that exists and is
-    /// never run. Every test below stops short of spawning one — what they
-    /// are about is the half that has no process in it, which is exactly the
-    /// half the provider/attacher split created.
-    ///
-    /// The directory's guard comes back first and every caller binds it: it
-    /// removes the share when the test ends, however it ends, and a caller
-    /// that dropped it would be talking to a driver whose share is gone.
+    /// Temporary driver fixture with an existing virtiofsd path. These storage
+    /// tests do not spawn it. Retain the returned directory guard.
     fn driver(tag: &str) -> (tempfile::TempDir, NfsDriver, PathBuf) {
         let temp = tempfile::Builder::new()
             .prefix(&format!("meister-nfs-{tag}-"))
@@ -751,13 +611,7 @@ mod tests {
         }
     }
 
-    /// The degeneration probe for file mode, and the sentence the brief makes
-    /// about it: no loop device anywhere. The driver puts a raw file on the
-    /// mounted share and hands over a `Path` to it, and cloud-hypervisor
-    /// opens that file directly.
-    ///
-    /// Provision makes the bytes and attach names them — the same two calls
-    /// one `create` used to be, and the same `Path` at the end of it.
+    /// NFS file mode attaches the raw file directly, without a loop device or backend process.
     #[tokio::test]
     async fn a_file_volume_is_a_path_on_the_share_and_nothing_else() {
         let (_temp, d, share) = driver("file");
@@ -787,13 +641,7 @@ mod tests {
         assert!(expected.exists());
     }
 
-    /// The interesting half, and the one the whole split is for: in share
-    /// mode `provision` makes a DIRECTORY and starts no process.
-    ///
-    /// That is the claim. The directory is the volume and outlives every
-    /// consumer; the virtiofsd is the connection and belongs to one. Before
-    /// the split, asking for the volume spawned the process — which is why a
-    /// volume could not exist without a VM to spawn it into.
+    /// Share provisioning creates data only; attach is responsible for starting virtiofsd.
     #[tokio::test]
     async fn provisioning_a_share_makes_a_directory_and_starts_nothing() {
         let (_temp, d, share) = driver("share");
@@ -809,29 +657,20 @@ mod tests {
         assert!(d.active.lock().await.is_empty());
         assert!(!d.socket_path(&id).exists());
 
-        // The attach-time half of the request travels on the handle, because
-        // an attacher never sees a spec.
+        // Preserve attach options on the handle for independent attachers.
         assert_eq!(
             NfsDriver::handle_params(&handle).unwrap().kind,
             VolumeKind::Share
         );
 
-        // And describing it needs no consumer either — asked of the
-        // filesystem, which is what makes it answerable for a volume nobody
-        // is holding.
+        // Describe volume data without requiring a consumer.
         assert_eq!(
             d.describe(&handle).await.expect("it is there"),
             VolumeState { size_bytes: 0 }
         );
     }
 
-    /// Deprovision clears both candidates and asks `params` nothing.
-    ///
-    /// A record migrated from before handles existed carries no params, and a
-    /// deprovision that guessed `file` for it would leave the share directory
-    /// standing forever. Both paths are named after the id, at most one
-    /// exists, and removing both is idempotent — one extra syscall against a
-    /// leak nobody would ever find.
+    /// Deprovision removes either file or directory data according to what exists.
     #[tokio::test]
     async fn deprovision_clears_either_shape_without_being_told_which() {
         let (_temp, d, share) = driver("deprovision");
@@ -863,9 +702,7 @@ mod tests {
         assert!(share.join("shares").is_dir());
     }
 
-    /// A share directory survives its consumer, which is the whole point of
-    /// the object above it: detach decides from the ATTACHMENT (a process is
-    /// what goes) and touches no byte on the share.
+    /// Detach stops the backend without changing share contents.
     #[tokio::test]
     async fn detaching_a_share_leaves_every_byte_where_it_was() {
         let (_temp, d, _) = driver("detach");
@@ -884,9 +721,7 @@ mod tests {
         );
     }
 
-    /// `file` is the default so that a spec that says nothing gets a boot
-    /// disk, which is what a volume has always been. `share` has to be asked
-    /// for by name.
+    /// File mode is the default; shares require an explicit kind.
     #[test]
     fn the_mode_defaults_to_file_and_is_named_to_change_it() {
         let p: NfsParams = serde_json::from_value(serde_json::json!({})).unwrap();
@@ -898,9 +733,7 @@ mod tests {
         assert_eq!(p.kind, VolumeKind::Share);
         assert_eq!(p.tag.as_deref(), Some("data"));
 
-        // A misspelled mode is a rejected spec, not a silent fall back to
-        // file: "kind": "shares" asking for a boot disk would be a surprise
-        // nobody could debug from the outside.
+        // Reject unknown modes rather than defaulting them to file.
         assert!(
             serde_json::from_value::<NfsParams>(serde_json::json!({"kind": "shares"})).is_err()
         );
@@ -954,10 +787,7 @@ mod tests {
         );
     }
 
-    /// No options is no `-o` at all rather than an empty one, which mount(8)
-    /// takes as a syntax error. And the type is not hardcoded: the rule is
-    /// "anything the host can mount", so a CephFS share_root is a config
-    /// change and not a driver change.
+    /// Omit -o when no mount options exist and preserve the configured filesystem type.
     #[test]
     fn no_options_means_no_o_flag_and_the_type_is_not_nfs_by_law() {
         let spec = MountSpec {
@@ -977,9 +807,7 @@ mod tests {
         assert_eq!(mount_args(&empty, Path::new("/srv/share")).len(), 4);
     }
 
-    /// The mount check reads the kernel's own list, and it has to match the
-    /// mount POINT and not any other column — `/srv/share` appearing as some
-    /// other mount's device would otherwise read as mounted.
+    /// Match only the mount-point column, not a device or another field.
     #[test]
     fn a_mount_point_is_the_second_column_and_nothing_else() {
         let mounts = "\
@@ -1006,26 +834,14 @@ tmpfs /run tmpfs rw 0 0
         assert!(is_mount_point(mounts, Path::new("/srv/my share")));
     }
 
-    /// The one backend here whose bytes more than one node can see — which is
-    /// what makes this, and not the other two, the pool a VM can be placed
-    /// anywhere in. The mode does not enter into it: a file under `volumes/`
-    /// and a directory under `shares/` are equally on the export.
+    /// Both file and share modes advertise shared locality.
     #[test]
     fn an_export_is_shared_whichever_mode_it_serves() {
         let (_temp, d, _) = driver("locality");
         assert_eq!(d.locality(), Locality::Shared);
     }
 
-    /// The file half of this backend inherits the filesystem driver's repairs,
-    /// because it IS the filesystem driver.
-    ///
-    /// D6 was found on a `filesystem` pool and it is the same defect here: a
-    /// file-mode volume's snapshot is `self.files.snapshot`, over
-    /// `share_root/volumes`. So the unfinished copy an interrupted snapshot
-    /// left on the share goes when the pool is opened, and it goes for the
-    /// same reason — nothing points at it and it is holding room the next
-    /// attempt needs. Asserted here rather than assumed, because "the same
-    /// line" is only true while the delegation is.
+    /// Opening the pool sweeps abandoned temporary snapshots; concurrent copies are not covered.
     #[test]
     fn an_unfinished_snapshot_on_the_share_goes_when_the_pool_is_opened() {
         let temp = tempfile::tempdir().expect("a temp dir");
@@ -1057,18 +873,7 @@ tmpfs /run tmpfs rw 0 0
         assert!(volume.exists(), "the volumes on the share are not");
     }
 
-    /// What this driver claims about snapshots is what its file half found on
-    /// this export, and never a second opinion.
-    ///
-    /// The mirror of `the_probe_answers_for_the_pool_directory_and_leaves_
-    /// nothing_in_it` in `filesystem`, and for the same reason: this backend's
-    /// file half IS that driver over `share_root`, so the export has already
-    /// been probed by the time anybody asks. It cannot assert WHICH answer —
-    /// the machine running the test decides that, and an export is a
-    /// filesystem like any other — but it can assert that the two agree and
-    /// that neither is a refusal. Before this, the answer here was the flat
-    /// `NeedsQuiesce`, which paused every guest on a reflink-capable export
-    /// for a copy that takes milliseconds.
+    /// File-mode snapshot capability follows the filesystem probe; directory shares cannot snapshot.
     #[test]
     fn what_this_driver_claims_about_snapshots_is_what_the_export_can_do() {
         let (_temp, d, _) = driver("snapshot-claim");

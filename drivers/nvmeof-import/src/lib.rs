@@ -2,64 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! The `nvmeof-import` PROVIDER: a pool of namespaces that already exist.
+//! Assign existing NVMe-oF namespaces without creating or deleting their data.
 //!
-//! ## What it provisions, which is nothing
-//!
-//! Every other provider in this tree makes bytes — an LV, a file, a directory
-//! on an export. This one makes none. An operator writes down the namespaces
-//! a target already exports, and `provision` hands one of them out; the same
-//! shape the NFS share mode has, and the same honesty: what this driver owns
-//! is the ASSIGNMENT, and the bytes were somebody else's before it and stay
-//! somebody else's after.
-//!
-//! `deprovision` therefore does not delete. It releases the assignment and
-//! the data stays exactly where it was, which is the one property of an
-//! import that surprises people and the reason it is the first sentence of
-//! the pool's own documentation. The real provider — one that carves
-//! namespaces out of a target — is Floppy's, and what it replaces is this
-//! file and nothing else: the attacher, the handle contract and the
-//! `networked` axis stay as they are.
-//!
-//! ## Who decides which namespace, and where the answer is written down
-//!
-//! **The tier that owns the pool decides.** A pool of this kind is
-//! cluster-wide — every node that can reach the target can reach every
-//! namespace on it — so the assignment is written into the volume's params as
-//! `namespace`, by the controller, out of a table that is atomic across
-//! replicas. This driver takes the name it is given and does not look for a
-//! free one.
-//!
-//! It used to look for one, and that was the whole of the defect. The
-//! exclusive create of a claim file was called a lock, and it is one — over
-//! the file system of ONE node. Two nodes bound to the same pool never saw
-//! each other's files, so both handed out the first namespace in the list,
-//! and the lab had two `Ready` volumes on one 100-GiB block with a guest
-//! running on one of them. A lock that only locks against the party that
-//! cannot race is not a lock.
-//!
-//! So a node chooses for itself only where there is nobody above it to
-//! choose: `allow_local_claims = true` on the pool, which is off unless
-//! somebody writes it down, and is for a single-node pool or a test. Without
-//! it and without a `namespace` the provision is refused with the sentence
-//! that says who was supposed to have said it.
-//!
-//! What stays is the FILE, and it stopped being the allocator. One per
-//! namespace, in the driver's state directory, holding the volume it belongs
-//! to and who said so (`by`). That is what makes two answers possible that
-//! nothing else on this node can give: a provision whose handle was lost
-//! finds its own namespace again instead of taking a second, and a namespace
-//! this node already holds for ANOTHER volume is a refusal naming both rather
-//! than a second guest on somebody's disk. In `allow_local_claims` the
-//! exclusive create is still the arbitration; under an assignment it is only
-//! the record, and losing it is an error instead of a step to the next
-//! namespace.
-//!
-//! Kept beside the agent's own store rather than in it, and that is a
-//! deviation worth naming: a driver has no handle to that store, and giving
-//! one to it would be a new seam through every backend for the sake of this
-//! one. A file per namespace in a directory the config names does the same
-//! job with the same durability.
+//! The controller supplies `namespace` in the volume params. Local allocation
+//! is allowed only with `allow_local_claims`; its exclusive claim files arbitrate
+//! within one state directory and do not coordinate nodes. Claims record volume
+//! ownership for retries and cleanup. Deprovision releases the claim and leaves
+//! target data intact; separate attacher operations manage the connection.
 
 use std::path::{Path, PathBuf};
 
@@ -76,9 +25,8 @@ use tracing::{info, instrument, warn};
 #[serde(deny_unknown_fields)]
 pub struct Namespace {
     pub nqn: String,
-    /// What the operator says it holds. The TRUTH is `describe`, which asks
-    /// the namespace; this is what a pool can be planned against before
-    /// anything has connected to it.
+    /// Configured namespace capacity used before attachment. The provider
+    /// description currently falls back to this value when it cannot query a device.
     pub size_gib: u64,
 }
 
@@ -91,28 +39,11 @@ pub struct ImportPoolParams {
     pub addr: String,
     pub port: u16,
     pub namespaces: Vec<Namespace>,
-    /// Which namespace THIS volume gets, as the tier that owns the pool
-    /// decided it.
-    ///
-    /// Merged into the volume's params by the controller, out of a claim
-    /// table that is atomic across its replicas — which is where a
-    /// cluster-wide pool's assignment has to be made, and the half this
-    /// driver used to make for itself out of a file only one node could see.
-    ///
-    /// Absent on the pool itself, where there is no volume to speak for: a
-    /// `StoragePool` carries the transport and the list, a provision carries
-    /// this as well.
+    /// Namespace selected by the controller for this volume. Absent on a pool template.
     #[serde(default)]
     pub namespace: Option<String>,
-    /// Whether a node may choose a namespace itself when nobody told it
-    /// which.
-    ///
-    /// Off unless it is written down, and the default is the whole point: a
-    /// pool one node can reach is a pool every node can reach, so a node
-    /// choosing on its own is right exactly where there IS no other node —
-    /// a single-node pool, a driver test. Everywhere else it is the defect
-    /// this flag was introduced to close, and a provision with no assignment
-    /// is refused instead.
+    /// Allow allocation from local claim files when no namespace was assigned.
+    /// Use only where one allocator owns the state directory; this is not a cluster lock.
     #[serde(default)]
     pub allow_local_claims: bool,
 }
@@ -149,9 +80,7 @@ impl ImportPoolParams {
                 return Err(StorageError::InvalidSpec("a namespace needs an nqn".into()));
             }
             if !seen.insert(ns.nqn.as_str()) {
-                // Two entries for one nqn would make the pool look twice as
-                // big as it is, and the second volume out of it would be the
-                // first volume's disk.
+                // Duplicate NQNs would overstate capacity and alias volume ownership.
                 return Err(StorageError::InvalidSpec(format!(
                     "namespace {} is listed twice",
                     ns.nqn
@@ -193,13 +122,8 @@ impl NvmeofImportDriver {
         }
     }
 
-    /// The claim file for one namespace.
-    ///
-    /// An NQN contains `:` and `.` and is not a file name, so it is hashed
-    /// into one. The hash is not a secret and does not have to be: what it
-    /// has to be is stable across restarts and collision-free enough that two
-    /// namespaces of one target never share a file, and the NQN is written
-    /// INSIDE so that a collision would be seen rather than silently taken.
+    /// Claim filename derived by replacing unsupported NQN characters with `_`.
+    /// This normalization is not collision-free; distinct NQNs can share a path.
     fn claim_path(&self, nqn: &str) -> PathBuf {
         self.state_dir.join(format!("{}.claim", stem(nqn)))
     }
@@ -228,13 +152,8 @@ struct Claim {
     by: Assigner,
 }
 
-/// Which tier decided this assignment.
-///
-/// On the file and not derived, because the two are read back for different
-/// reasons and an operator looking at a state directory should be able to see
-/// which of them a node was doing. `Node` is the default so that a file
-/// written before the pool had an owner reads as what it was: a node that
-/// chose for itself.
+/// Record whether the controller or local allocator chose the namespace.
+/// Legacy claims default to local allocation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Assigner {
@@ -264,9 +183,7 @@ impl VolumeProvider for NvmeofImportDriver {
         id: &VolumeId,
         spec: &VolumeSpec,
     ) -> agent_api::storage::Result<VolumeHandle> {
-        // An import has its bytes already, so there is nothing to clone into
-        // and nothing that would make sense to. Refused at the driver as well
-        // as at the edge, because this is the one that cannot be bypassed.
+        // Imported namespaces already contain data; reject base-image initialization.
         if spec.base_image.is_some() {
             return Err(StorageError::InvalidSpec(
                 "an imported namespace has its bytes already; a base_image would have to \
@@ -282,17 +199,10 @@ impl VolumeProvider for NvmeofImportDriver {
             ))
         })?;
 
-        // Idempotent, and the reason is the contract every provider here has:
-        // a provision whose handle was lost must find its namespace again
-        // rather than take a second one. So this node's own records are read
-        // first, whoever wrote them.
+        // Recover an existing claim before allocating so retries reuse the same namespace.
         if let Some(held) = self.held_by(id, &params)? {
-            // An assignment that names a different namespace than the one
-            // this node already holds for this volume is not something to
-            // resolve by picking one: the bytes are on the one it holds, and
-            // taking the other would strand them and leave a namespace that
-            // looks free to the next volume. Both names in the sentence,
-            // because the operator has to decide which of the two is right.
+            // Reject assignment changes that disagree with this volume's existing claim,
+            // preserving ownership of its original data.
             if let Some(assigned) = params.namespace.as_deref()
                 && assigned != held
             {
@@ -307,10 +217,7 @@ impl VolumeProvider for NvmeofImportDriver {
                 .iter()
                 .find(|n| n.nqn == held)
                 .ok_or_else(|| {
-                    // The record outlived the pool entry that justified it.
-                    // Refusing is right: handing back a handle for a
-                    // namespace the pool no longer lists would be a volume
-                    // pointing at something an operator took away.
+                    // Reject a claimed namespace that the current pool no longer lists.
                     StorageError::InvalidSpec(format!(
                         "volume {id} holds {held}, which this pool no longer lists"
                     ))
@@ -321,9 +228,7 @@ impl VolumeProvider for NvmeofImportDriver {
         match params.namespace.as_deref() {
             Some(nqn) => self.take_assigned(id, &params, nqn, spec.size_bytes),
             None if params.allow_local_claims => self.choose_one(id, &params, spec.size_bytes),
-            // The refusal names the two ways out and the tier that owes the
-            // answer, because "no namespace" is not something an operator can
-            // act on and "the controller did not assign one" is.
+            // Require controller assignment unless local claims are explicitly enabled.
             None => Err(StorageError::InvalidSpec(format!(
                 "volume {id} was sent to an nvmeof-import pool with no `namespace` in its \
                  params: the assignment for a cluster-wide pool is the controller's to make, \
@@ -340,14 +245,12 @@ impl VolumeProvider for NvmeofImportDriver {
         let path = self.claim_path(&target.nqn);
         match std::fs::remove_file(&path) {
             Ok(()) => {
-                // Said at info and said plainly, because it is the one thing
-                // about this driver that surprises people: a `volume rm` here
-                // frees a name and destroys nothing.
+                // Report that releasing the claim preserves target data.
                 info!(nqn = %target.nqn,
                       "namespace released; its data is untouched on the target");
                 Ok(())
             }
-            // Already released. Idempotent by the same contract provision is.
+            // An absent claim is already released.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(StorageError::Backend(anyhow::anyhow!(
                 "releasing {}: {e}",
@@ -356,31 +259,14 @@ impl VolumeProvider for NvmeofImportDriver {
         }
     }
 
-    /// Let this node go of the namespace, and touch nothing on the target.
-    ///
-    /// The same act `deprovision` performs, which is not a coincidence and is
-    /// worth stating rather than sharing a body over: for THIS driver a
-    /// deprovision was never a destruction — it releases a reservation and
-    /// the bytes are somebody else's throughout. `forget` is the whole of
-    /// what a deprovision here ever did.
-    ///
-    /// Which is also why this driver is the only one that had to implement
-    /// the verb. Its claim file is per node, and after a live migration the
-    /// source holds one over a namespace that has moved with its guest. Left
-    /// behind, the next volume the cluster assigns that namespace on this
-    /// node is refused over a conflict with a guest that is not here.
+    /// Release the local claim without changing target data, as deprovision does.
     #[instrument(skip_all, fields(volume = %handle.id))]
     async fn forget(&self, handle: &VolumeHandle) -> agent_api::storage::Result<()> {
         self.deprovision(handle).await
     }
 
-    /// How big the namespace actually is, asked of the namespace.
-    ///
-    /// It needs the connection, which is the honest shape for an import: the
-    /// bytes are not here, and nothing on this node knows their size until
-    /// somebody has spoken to the target. A node holding the claim but not
-    /// the connection answers with what the POOL said, which is what an
-    /// operator wrote down and the best statement available without dialling.
+    /// Require a local claim, then attempt stat with an empty device path.
+    /// On query failure, return the configured handle size without connecting.
     async fn describe(&self, handle: &VolumeHandle) -> agent_api::storage::Result<VolumeState> {
         let target = NvmeofTarget::of(handle)?;
         if !self.claim_path(&target.nqn).exists() {
@@ -401,12 +287,8 @@ impl VolumeProvider for NvmeofImportDriver {
         }
     }
 
-    /// Which namespace this node is holding for `id`, if any.
-    ///
-    /// The first branch of `provision`, asked on its own: the claim files
-    /// under the state directory ARE this driver's record of what it holds,
-    /// so it can always be asked for a volume whose handle was never written
-    /// down. Astra finding S13, 2026-09-23.
+    /// Find this volume's recorded namespace, including when its handle was lost.
+    /// Refuse a claim whose namespace is no longer listed by the pool.
     #[instrument(skip_all, fields(volume = %id))]
     async fn probe(
         &self,
@@ -417,10 +299,8 @@ impl VolumeProvider for NvmeofImportDriver {
         let Some(held) = self.held_by(id, &params)? else {
             return Ok(None);
         };
-        // The claim outlived the pool entry that justified it. `Some` with a
-        // handle this pool cannot name is not available, and `None` would
-        // tell the caller to write a tombstone over a namespace this node is
-        // still holding — so the operator is told instead.
+        // A claim absent from the current pool is an error, not evidence that
+        // its namespace was released.
         let ns = params
             .namespaces
             .iter()
@@ -438,21 +318,7 @@ impl VolumeProvider for NvmeofImportDriver {
     }
 }
 
-/// The attacher half, delegated.
-///
-/// Two crates and two roles, and this is the seam between them. The catalogue
-/// wants a pool to name its provider and its attacher separately
-/// (`StoragePool.spec.attacher`) so that a storage node can provision what a
-/// compute node attaches; that field does not exist in this tree yet — Storage
-/// A was expected to land it and did not — so until it does, a pool whose
-/// driver is `nvmeof-import` is attached by the `nvmeof` implementation this
-/// crate holds.
-///
-/// The delegation is not a shortcut around the split: it IS the split, with
-/// the two ends in one process because on this lab's only consumer they are
-/// on one machine. When the field lands, these four methods go and the
-/// registry routes attach to the `nvmeof` row instead. Nothing else changes —
-/// which is what having written it as two crates buys.
+/// Delegate connection operations to the NVMe-oF attacher held by this driver.
 #[async_trait::async_trait]
 impl VolumeAttacher for NvmeofImportDriver {
     async fn attach(
@@ -496,9 +362,7 @@ impl NvmeofImportDriver {
             match serde_json::from_str::<Claim>(&raw) {
                 Ok(claim) if &claim.volume == id => return Ok(Some(claim.nqn)),
                 Ok(_) => {}
-                // A record this driver cannot read is a namespace it must
-                // treat as TAKEN, never as free: the alternative is handing
-                // out somebody's disk because a file got truncated.
+                // Unreadable claims remain occupied; never allocate from uncertain ownership.
                 Err(e) => warn!(path = %path.display(), error = %e,
                                 "unreadable claim; treating the namespace as assigned"),
             }
@@ -506,14 +370,7 @@ impl NvmeofImportDriver {
         Ok(None)
     }
 
-    /// Take the namespace the cluster assigned, or say why this node cannot.
-    ///
-    /// Three refusals and each of them is a different mistake one tier up: a
-    /// name the pool does not list (pool and assignment disagree), a
-    /// namespace too small for what the volume was promised, and a namespace
-    /// this node is already holding for somebody else — the last being the
-    /// one that used to be silent and used to end with two guests on one
-    /// block.
+    /// Claim the controller-assigned namespace locally or report an ownership conflict.
     fn take_assigned(
         &self,
         id: &VolumeId,
@@ -543,10 +400,7 @@ impl NvmeofImportDriver {
             info!(nqn = %ns.nqn, size_gib = ns.size_gib, "namespace assigned by the cluster");
             return Ok(handle_for(id, params, ns));
         }
-        // Lost the create. Either this volume got here twice — handled above
-        // and again here because the two calls can race — or the namespace is
-        // somebody else's on this node, which is the collision the whole fix
-        // exists to make loud.
+        // Resolve a competing claim creation as an idempotent retry or an ownership conflict.
         let holder = std::fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str::<Claim>(&raw).ok());
@@ -566,9 +420,8 @@ impl NvmeofImportDriver {
         }
     }
 
-    /// The first namespace nobody has taken, for a pool that says this node
-    /// may decide. `create_new` IS the arbitration here: two provisions
-    /// racing for the last one both try, and exactly one gets the file.
+    /// Choose an available namespace when local allocation is enabled.
+    /// Exclusive file creation arbitrates competing claims in this state directory.
     fn choose_one(
         &self,
         id: &VolumeId,
@@ -576,10 +429,8 @@ impl NvmeofImportDriver {
         size_bytes: u64,
     ) -> agent_api::storage::Result<VolumeHandle> {
         for ns in &params.namespaces {
-            // A namespace smaller than what was asked for is not a namespace
-            // this volume can have. Bigger is fine and the volume uses all of
-            // it — an import hands out whole namespaces, and carving one down
-            // is the real provider's job.
+            // Assign only namespaces large enough for the request. Imports expose
+            // the whole namespace and do not repartition it.
             if ns.size_gib * 1024 * 1024 * 1024 < size_bytes {
                 continue;
             }
@@ -622,9 +473,7 @@ fn claim(path: &Path, id: &VolumeId, nqn: &str, by: Assigner) -> agent_api::stor
             file.write_all(&body).map_err(|e| {
                 StorageError::Backend(anyhow::anyhow!("writing {}: {e}", path.display()))
             })?;
-            // Durable before the handle is: a claim that is only in the page
-            // cache is a namespace that is free again after a power cut, and
-            // the next volume would be handed the first one's data.
+            // Sync claim contents before returning the handle.
             file.sync_all().map_err(|e| {
                 StorageError::Backend(anyhow::anyhow!("syncing {}: {e}", path.display()))
             })?;
@@ -638,12 +487,8 @@ fn claim(path: &Path, id: &VolumeId, nqn: &str, by: Assigner) -> agent_api::stor
     }
 }
 
-/// The handle an imported namespace gets.
-///
-/// `backend` is the NQN and not a path, which is the case `VolumeHandle`'s
-/// own doc says the field is a `String` for: this backend NAMES its volumes
-/// and does not path them. `params` carries the whole target, because the
-/// attacher is given a handle and nothing else.
+/// Build an imported-volume handle with the NQN as backend name and target
+/// connection parameters for the independent attacher.
 fn handle_for(id: &VolumeId, params: &ImportPoolParams, ns: &Namespace) -> VolumeHandle {
     VolumeHandle {
         id: *id,
@@ -668,9 +513,7 @@ mod tests {
         (temp, dir)
     }
 
-    /// A pool as an operator writes it down, with nobody above it to hand
-    /// out namespaces — which is what the older tests here are about and
-    /// what `allow_local_claims` now has to say out loud.
+    /// Pool fixture permitting node-local allocation.
     fn pool(namespaces: &[(&str, u64)]) -> ImportPoolParams {
         ImportPoolParams {
             allow_local_claims: true,
@@ -678,8 +521,7 @@ mod tests {
         }
     }
 
-    /// The same pool under a controller: no local claims, and the namespace
-    /// arrives with the volume.
+    /// Pool fixture requiring controller-supplied namespace assignment.
     fn cluster_pool(namespaces: &[(&str, u64)]) -> ImportPoolParams {
         ImportPoolParams {
             transport: Transport::Tcp,
@@ -722,8 +564,7 @@ mod tests {
         }
     }
 
-    /// The whole assignment story: one namespace per volume, the same one
-    /// again on a repeat, and a pool that runs out says so.
+    /// Allocate once per volume, reuse on retry and report exhaustion.
     #[tokio::test]
     async fn a_namespace_is_assigned_once_and_found_again() {
         let (_temp, state) = dir();
@@ -794,8 +635,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// Size is a filter and never a carve: a namespace that is too small is
-    /// skipped, and one that is bigger is handed over whole.
+    /// Skip undersized namespaces and expose larger ones in full.
     #[tokio::test]
     async fn a_namespace_that_is_too_small_is_skipped_and_a_bigger_one_is_used_whole() {
         let (_temp, state) = dir();
@@ -824,8 +664,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// An import has its bytes already, so there is nothing a base image
-    /// could do except overwrite somebody's data.
+    /// Imported data cannot be initialized from a base image.
     #[tokio::test]
     async fn a_base_image_is_refused_because_the_bytes_are_already_there() {
         let (_temp, state) = dir();
@@ -871,9 +710,7 @@ mod tests {
         assert!(format!("{}", unnamed.check().unwrap_err()).contains("needs an nqn"));
     }
 
-    /// The claim file's name is derived and its CONTENTS are the truth. Two
-    /// NQNs that differ only in a character the stem flattens must not share
-    /// a claim.
+    /// Check sanitized claim filenames and stored namespace identity.
     #[test]
     fn a_claim_file_is_named_safely_and_says_what_it_holds() {
         assert_eq!(
@@ -910,14 +747,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// D-P1, the driver's half: the namespace comes from the tier that owns
-    /// the pool, and this node takes what it is given.
-    ///
-    /// The defect it closes was measured in the lab: `fabric-disk` on
-    /// agent-1a and `kollision` on agent-1c were both `Ready` on
-    /// `nqn...test1`, because each node walked its own list and its own
-    /// claim directory and neither could see the other's. Every branch here
-    /// is one of the four answers that walk is now replaced by.
+    /// Honor the controller's namespace assignment and reject collisions, invalid
+    /// assignments and attempts to move an existing local claim.
     #[tokio::test]
     async fn the_namespace_comes_from_the_cluster_and_this_node_takes_what_it_is_given() {
         let (_temp, state) = dir();
@@ -926,9 +757,7 @@ mod tests {
         let one = uuid::Uuid::new_v4();
         let two = uuid::Uuid::new_v4();
 
-        // The assignment is honoured verbatim — the SECOND namespace, which
-        // is precisely the one a node walking the list would never have
-        // picked first.
+        // Honor the assigned namespace instead of choosing the first pool entry.
         let handle = d
             .provision(&one, &spec(&assigned(&names, "nqn.test:two"), 1 << 30))
             .await
@@ -941,16 +770,14 @@ mod tests {
         .expect("json");
         assert_eq!(held.by, Assigner::Cluster, "and the node wrote down who");
 
-        // The same volume again finds its own. The contract a lost handle
-        // depends on does not change with who decided.
+        // Repeat assignment returns the existing claim.
         let again = d
             .provision(&one, &spec(&assigned(&names, "nqn.test:two"), 1 << 30))
             .await
             .expect("the same one");
         assert_eq!(again.backend, "nqn.test:two");
 
-        // A SECOND volume assigned the same namespace on this node is the
-        // collision that used to be silent, and it names both volumes.
+        // Conflicting local ownership reports both volume IDs.
         let clash = d
             .provision(&two, &spec(&assigned(&names, "nqn.test:two"), 1 << 30))
             .await
@@ -981,8 +808,7 @@ mod tests {
             "{toosmall}"
         );
 
-        // And a volume that already holds one namespace is not moved to
-        // another by an assignment; that is a decision about somebody's data.
+        // Reject changing an existing claim to another namespace.
         let moved = d
             .provision(&one, &spec(&assigned(&names, "nqn.test:one"), 1 << 30))
             .await
@@ -994,12 +820,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
-    /// No assignment and no permission to choose: a refusal that names the
-    /// tier that owes the answer, and nothing on disk.
-    ///
-    /// This is the branch the lab ran down twice. A node that answers "here,
-    /// have the first one" for a pool every node can reach is not being
-    /// helpful — it is handing out a disk somebody else is already writing.
+    /// Refuse unassigned shared-pool requests unless allow_local_claims explicitly enables local choice.
     #[tokio::test]
     async fn a_node_does_not_choose_a_namespace_for_a_pool_it_does_not_own() {
         let (_temp, state) = dir();
@@ -1021,8 +842,7 @@ mod tests {
             "a refusal takes nothing"
         );
 
-        // The same pool with the flag set is the single-node case, and there
-        // the node still decides — which is what the flag is for.
+        // The opt-in local pool permits node-side allocation.
         let mine = d
             .provision(&id, &spec(&pool(&names), 1 << 30))
             .await

@@ -2,47 +2,13 @@
 // SPDX-FileCopyrightText: 2026 Silas Müller <github@silasmueller.de>
 // SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 
-//! Getting a base image onto this node.
+//! Fetch and report base images on this node.
 //!
-//! `image create --source <path>` was a catalogue over shared storage that
-//! somebody had already filled by hand, and for every new image a person had
-//! to copy something to `/mnt/vmstore`. That is the step an alpha may not
-//! have any more the moment cloud-init makes stock images bootable.
-//!
-//! ## The node fetches, not the controller
-//!
-//! Two models were available. A controller that fetches into the configured
-//! shared path is less code and gives a verified answer before anything is
-//! placed — but it only works where there IS shared storage, and it is the
-//! model that gets thrown away the first time somebody runs a node without
-//! any. The node fetching into a cache of its own works with and without
-//! shared storage, costs one download per node instead of one per fleet, and
-//! is the shape that survives.
-//!
-//! What it costs is that "is this image usable" stops being a question the
-//! cloud can answer by itself. So the node answers it: the outcome of a fetch
-//! travels up in the status report, the same road a VM phase takes, and the
-//! Image object's phase is what the fleet has learned rather than what one
-//! process assumed.
-//!
-//! ## Content-addressed, and why the name is not enough
-//!
-//! The bytes live at `<image_dir>/.cache/<sha256>` and the catalogue name is
-//! a hard link to them. That is what makes "a second use does not fetch
-//! again" a fact rather than a hope: the presence of that file IS the proof
-//! that the right bytes are here, and checking it costs one `stat` instead of
-//! re-hashing gigabytes on every VM create.
-//!
-//! The link is what the volume drivers open. All three of them resolve a
-//! `base_image` by joining the name onto their own `image_dir`, and none of
-//! them has to learn anything about URLs for this to work.
-//!
-//! ## Nothing half-downloaded is ever usable
-//!
-//! Into a temporary file, hashed, and only then renamed into the cache. A
-//! rename within one directory is atomic, so the cache never holds a file
-//! that is not the whole of what its name says it is — and an agent killed
-//! mid-download leaves a `.partial` behind and nothing else.
+//! Verified downloads are published under `.cache/<uid>-<sha256>` and linked
+//! under the catalogue name; legacy sources without a UID use the digest alone.
+//! Volume drivers open that catalogue path. Existing cache entries are trusted
+//! without rehashing. Downloads stage bytes separately before publication;
+//! interrupted downloads can leave unusable partial files.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -56,11 +22,7 @@ use crate::reconcile::ImageReason;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, instrument};
 
-/// What a spec says about where a base image comes from.
-///
-/// Both halves or neither. A URL without a checksum is not a weaker version
-/// of this — it is a different thing, one where somebody else chooses what
-/// this node boots — and the create edge refuses it before it can get here.
+/// Fetch source with paired URL and checksum, validated at the create edge.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Source {
     /// The catalogue name: what `base_image` says and what the volume drivers
@@ -69,35 +31,14 @@ pub struct Source {
     pub url: String,
     /// Lowercase hex, 64 characters.
     pub sha256: String,
-    /// The uid of the `Image` object these bytes were registered as.
-    ///
-    /// Astra finding S02, 2026-09-23: the cache entry was addressed by the
-    /// digest alone and the catalogue NAME is global, so two images that are
-    /// the same file to this node are the same cache entry however many
-    /// tenants registered them and whatever happened to their objects. The
-    /// uid is what makes an entry belong to the registration it was fetched
-    /// for: it is minted once, at the cloud, and never reused.
-    ///
-    /// Empty for a record written before the field existed, and for a
-    /// standalone cluster with no cloud above it to mint one. Then the entry
-    /// is addressed by the digest exactly as it always was — a cache that
-    /// silently stopped matching would re-download every image on the fleet.
+    /// Image registration identity. Empty legacy and standalone sources use a
+    /// digest-only cache key; otherwise the UID separates registrations.
     #[serde(default)]
     pub uid: String,
 }
 
 impl Source {
-    /// What this image is called inside the node's cache.
-    ///
-    /// The uid and the digest, and neither of them alone: the digest is what
-    /// makes the presence of the file proof that these are the right bytes,
-    /// and the uid is what keeps one registration's bytes from answering for
-    /// another's. The NAME is deliberately not in it — that is the namespace
-    /// two tenants share, and sharing it was the finding.
-    ///
-    /// The whole digest and not a prefix of it, because this is a file name
-    /// nobody types: a prefix would buy shorter `ls` output and pay for it
-    /// with a collision nobody would ever debug.
+    /// Cache key combining registration identity and the complete digest.
     fn cache_key(&self) -> String {
         match self.uid.is_empty() {
             true => self.sha256.clone(),
@@ -110,16 +51,10 @@ impl Source {
 /// controller.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
-    /// The bytes are here and they hash to what the spec said.
+    /// The image is present according to a fetch, path check, or inventory.
+    /// Only fetched images necessarily had their expected digest checked.
     Ready,
-    /// They are not, and this is why — in the word a program reads and the
-    /// sentence a person reads. A checksum that did not match is in here, and
-    /// so is a url that did not answer and a path with nothing at it.
-    ///
-    /// The word arrived with the reasons round: the four ways an image is
-    /// unusable want four different things done about them — put the bytes on
-    /// the share, fix the path, fix the checksum, fix the url — and until now
-    /// all four reached the catalogue as `Failed` plus prose.
+    /// A failed check with a machine-readable reason and diagnostic message.
     Failed {
         reason: ImageReason,
         message: String,
@@ -136,8 +71,7 @@ impl State {
         }
     }
 
-    /// The word for `ImageStateReport.reason`. `None` for `Ready`, which
-    /// needs none.
+    /// Machine-readable image reason, absent for Ready.
     pub fn reason(&self) -> Option<ImageReason> {
         match self {
             State::Ready => None,
@@ -153,14 +87,8 @@ impl State {
     }
 }
 
-/// What this node has to say about the images it has been asked for.
-///
-/// Kept in memory and not in the store, and that is the honest shape: it is a
-/// statement about this node's disk, the cache on that disk is the truth, and
-/// an agent that restarts re-derives every `Ready` from a `stat` the first
-/// time each image is used again. A `Failed` is forgotten by a restart, which
-/// is right — a checksum that did not match yesterday is worth trying once
-/// more, and if it still does not match it is said again immediately.
+/// In-memory image observations. Restart clears them; later checks reconstruct
+/// state from the image directory and trusted cache entries.
 #[derive(Default)]
 pub struct Cache {
     dir: PathBuf,
@@ -174,49 +102,22 @@ pub struct Cache {
 
 /// A reading of the image directory, and the mtime it was read at.
 struct Inventory {
-    /// The directory's mtime BEFORE the read. A list taken after this instant
-    /// is never older than it claims to be, which is the direction this has
-    /// to be wrong in.
+    /// Directory mtime sampled before scanning so the cached listing never
+    /// claims freshness beyond its observation.
     at: std::time::SystemTime,
-    /// The bare file names, sorted. These ARE catalogue names: the cloud
-    /// refuses an image whose `metadata.name` is not the file its source
-    /// points at (`check_image_name`), and the volume drivers resolve
-    /// `base_image` by joining the name onto their own image_dir. So nothing
-    /// is translated here, and nothing has to be.
+    /// Sorted catalogue filenames. Drivers resolve these names directly under `image_dir`.
     names: Vec<String>,
 }
 
 /// One image's line in this node's opinion, and where the opinion came from.
 struct Entry {
     state: State,
-    /// This node FETCHED these bytes rather than looked for somebody else's
-    /// file: the entry came from [`Cache::ensure`] and not from
-    /// [`Cache::verify_path`].
-    ///
-    /// It is remembered because a volume record names its base image by
-    /// catalogue name and nothing else — the url half only ever travels in a
-    /// VM spec — so the pass that looks at path images cannot tell the two
-    /// apart from the records alone. Re-stating a fetched image as a path one
-    /// would replace "the checksum did not match" with "it has no url, so
-    /// nothing here fetches it", which is the one sentence that is certainly
-    /// wrong about it.
+    /// Preserve fetch results when a volume record later refers to the same image
+    /// by name alone; a path check must not replace a checksum failure.
     fetched: bool,
-    /// The sha256 of a PATH image's bytes, hashed the first time this entry
-    /// went Ready and remembered from then on.
-    ///
-    /// Astra finding S02, 2026-09-23 (rest a). `None` for a fetched entry
-    /// (its digest is `Source::sha256`, already checked at fetch time and not
-    /// worth a second statement) and for a path entry this process has not
-    /// successfully looked at yet.
-    ///
-    /// Computed ONCE per process lifetime and never again while the entry
-    /// stays Ready: `verify_path` runs on every status report and every
-    /// reconcile pass, and hashing a multi-gigabyte image on that schedule
-    /// would turn a `stat` into the cost `take_inventory`'s own doc comment
-    /// goes out of its way to avoid. The trade this makes is the same one the
-    /// fetch cache already makes for its own digest — trusted between looks,
-    /// re-earned on a restart — so a file swapped on shared storage is caught
-    /// at the next agent restart rather than within one report interval.
+    /// Digest measured for a path image. Reused while checks remain Ready;
+    /// changes to present file contents are not detected until rehashing, normally
+    /// after restart or a failed path check.
     digest: Option<String>,
 }
 
@@ -224,18 +125,9 @@ struct Entry {
 /// the hard link into place stays within one filesystem.
 const CACHE_DIR: &str = ".cache";
 
-/// Why a fetch did not end with the right bytes in place, in the two classes
-/// the catalogue has to tell apart.
-///
-/// A type and not a look at the sentence, for the reason every reason in this
-/// stack is a word: prose is for a person, and a program that matched on it
-/// would break the first time somebody improved the wording. `From` makes
-/// every `?` in `ensure_inner` the second class, so the ONE place that is the
-/// first class is the one place that has to say so.
+/// Separate checksum mismatch from other download or publication failures.
 enum FetchFailure {
-    /// The bytes arrived and are not the bytes the spec named. A different
-    /// thing to fix from everything below — the url's content changed, or the
-    /// checksum in the spec is wrong — and the class D-H4 was about.
+    /// The downloaded digest differs from the requested digest.
     Mismatch(anyhow::Error),
     /// Everything else: the url did not answer, `curl` is not on the PATH,
     /// the cache could not be written, the link could not be made.
@@ -249,9 +141,7 @@ impl From<anyhow::Error> for FetchFailure {
 }
 
 impl FetchFailure {
-    /// The word for the catalogue and the error for the caller. Both, because
-    /// a failed fetch is two statements: `Image.status` learns why, and the
-    /// provision that asked for it still has to fail.
+    /// Separate the status reason from the error returned to the provisioning caller.
     fn split(self) -> (ImageReason, anyhow::Error) {
         match self {
             FetchFailure::Mismatch(e) => (ImageReason::ChecksumMismatch, e),
@@ -270,11 +160,7 @@ impl Cache {
         }
     }
 
-    /// The same cache with different download bounds.
-    ///
-    /// A builder call and not a second argument to `new`, for the reason
-    /// `Provisioner::with_ceilings` is one: `Bounds::default()` is what every
-    /// node runs with, and a caller that says nothing gets it.
+    /// Override download bounds for this cache.
     pub fn with_bounds(mut self, bounds: Bounds) -> Self {
         self.bounds = bounds;
         self
@@ -293,32 +179,9 @@ impl Cache {
         self.dir.join(name)
     }
 
-    /// Read the image directory, unless it has not changed since the last
-    /// reading. `true` when the answer can be trusted as complete.
-    ///
-    /// F16's other half, and the whole of what makes it closable from here:
-    /// the node stops waiting to be asked about an image and says what it
-    /// HAS. Nothing tells a node about an `Image` that no record of its own
-    /// names — `SyncState` carries VMs and there is no image command — so the
-    /// only statement that can cover such an image is one about the
-    /// directory. With `images_complete` set, the tier above may read the
-    /// absence of a name as the absence of the file.
-    ///
-    /// A `readdir` and no more: no download, no checksum, and no `stat` per
-    /// entry either — `read_dir` on Linux answers the file type from the
-    /// directory entry itself, so the whole inventory is one syscall's worth
-    /// of work. It is cached on the directory's own mtime, so a fleet's
-    /// steady state costs one `metadata` call per report.
-    ///
-    /// The cache is deliberately distrusted for one second after the mtime it
-    /// holds: mtimes are coarse, and a file that appears in the same second as
-    /// a reading would leave behind exactly the mtime that reading recorded.
-    /// Re-reading for a second afterwards costs a `readdir` on a directory
-    /// somebody is changing anyway.
-    ///
-    /// `false` on any failure, and then this node says nothing: a directory
-    /// that cannot be read must not become "the file is not there", which is
-    /// the one mistake that would make F16 worse rather than better.
+    /// Inventory regular, non-hidden files, caching by directory mtime once it
+    /// is over one second old. A successful walk permits a complete inventory
+    /// report; metadata or traversal failure invalidates the cached inventory.
     pub async fn take_inventory(&self) -> bool {
         let at = match tokio::fs::metadata(&self.dir)
             .await
@@ -361,19 +224,11 @@ impl Cache {
                 Ok(None) => break,
                 Ok(Some(entry)) => {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    // A name that starts with a dot is not a catalogue name:
-                    // the content-addressed cache is `.cache`, and a fetch
-                    // stages its hard link as `.<digest>.linking.<pid>` right
-                    // here. The cloud cannot mint such a name either — it
-                    // refuses `.` and `..` outright and everything with a
-                    // separator in it.
+                    // Exclude the cache and temporary link names from the catalogue inventory.
                     if name.starts_with('.') {
                         continue;
                     }
-                    // Only regular files. A directory under a catalogue name
-                    // is not an image (`verify_path` says so in a sentence),
-                    // and a `Ready` about one would hand a storage driver a
-                    // path it cannot open.
+                    // Only regular files can satisfy image lookups.
                     if entry.file_type().await.is_ok_and(|t| t.is_file()) {
                         names.push(name);
                     }
@@ -391,21 +246,8 @@ impl Cache {
         true
     }
 
-    /// Every image this node has an opinion about, for the status report.
-    ///
-    /// Two sources, and the order between them is the whole of the merge. An
-    /// entry in `known` is a LOOK at one named image — a fetch, or the
-    /// `verify_path` this node runs for every image its records name — and it
-    /// wins, because it can say things the inventory cannot: a checksum that
-    /// did not match, a directory under the name, a path with nothing at it.
-    /// The inventory adds `Ready` for every file nobody asked about, which is
-    /// the half F16 needed.
-    ///
-    /// The third element is the digest `verify_path` bound, when it has one
-    /// (Astra finding S02, 2026-09-23, rest a). `None` for everything the
-    /// inventory adds on its own: a file nobody's record names is a file this
-    /// node has never been asked to hash, and inventing a look here would
-    /// undo the bound `take_inventory` exists to hold.
+    /// Merge explicit image observations with inventory-only Ready entries.
+    /// Explicit checks win; inventory entries have no measured digest.
     pub fn report(&self) -> Vec<(String, State, Option<String>)> {
         let known = self.known.lock().unwrap();
         let mut out: Vec<(String, State, Option<String>)> = known
@@ -420,8 +262,7 @@ impl Cache {
                     .map(|name| (name.clone(), State::Ready, None)),
             );
         }
-        // Sorted so two consecutive reports of the same facts are the same
-        // message; the tier above compares them.
+        // Sort reports for stable controller comparisons.
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
@@ -436,11 +277,8 @@ impl Cache {
             .is_some_and(|entry| entry.fetched)
     }
 
-    /// The digest already remembered for `name`, if this process has one.
-    ///
-    /// Read before [`remember`] overwrites the entry, so a path image's
-    /// digest survives every look after the first that found one. See
-    /// [`Entry::digest`].
+    /// Read the remembered digest before replacing a path-image observation.
+    /// See `Entry::digest` for its lifetime.
     fn known_digest(&self, name: &str) -> Option<String> {
         self.known
             .lock()
@@ -463,13 +301,7 @@ impl Cache {
                 },
             )
             .map(|entry| entry.state);
-        // ERROR, not WARN: a base image that cannot be used is not a
-        // degradation that heals — every VM naming it fails, every time, until
-        // somebody fixes the url, the checksum or the file.
-        //
-        // Once per CHANGE and not once per look, the same rule `Conditions`
-        // follows: a path image is re-checked on every reconcile pass, and a
-        // line per pass would bury the pass that first found it.
+        // Log state changes only, avoiding repeated errors on each report.
         if previous.as_ref() == Some(&state) {
             return;
         }
@@ -487,48 +319,12 @@ impl Cache {
         }
     }
 
-    /// A base image nobody fetches: say whether the bytes are where this node
-    /// would look for them.
-    ///
-    /// The missing first line of a chain that was otherwise complete. A URL
-    /// image is registered here because this node had to GO AND GET it, and
-    /// from there the fact travels — `ImageStateReport` on the status road,
-    /// `ImageView` at the cluster, `Image.status.nodes[]` and then
-    /// `Image.status.phase` at the cloud. A PATH image was fetched by nobody,
-    /// so no node ever said anything about it, so the cloud had no evidence
-    /// and went on saying `Ready` about a catalogue entry pointing at a file
-    /// that is not there. Measured on the fleet, unchanged since 2026-08-29:
-    /// `image with a nonexistent source sits in phase 'Ready', not Failed`.
-    ///
-    /// A `stat`, on every look but the first that finds the bytes there. What
-    /// this can say without more is the half that was missing and is worth
-    /// everything: the file is there, or it is not and here is the path that
-    /// was looked at.
-    ///
-    /// Level-triggered like everything else this node reports: called on every
-    /// provision that names the image AND once per reconcile pass over the
-    /// records that name it, so an image restored on shared storage goes back
-    /// to `Ready` without anybody creating a VM to prove it.
-    ///
-    /// ## The digest, and why it is not a `stat`'s cost
-    ///
-    /// Astra finding S02, 2026-09-23 (rest a). A path image has no checksum
-    /// by construction — that is what distinguishes it from a URL image —
-    /// so nothing bound the catalogue name to particular bytes until this
-    /// existed. The FIRST look that finds the file hashes it and remembers
-    /// the digest on the entry; every look after that, on the same entry,
-    /// reuses the remembered value rather than hashing again. Re-hashing on
-    /// this schedule — every report and every reconcile pass — would turn a
-    /// `stat` into exactly the cost `take_inventory`'s own doc comment goes
-    /// out of its way to avoid, for a multi-gigabyte image. The cost this
-    /// keeps instead: a file swapped on shared storage after this node's
-    /// first look is not caught until the agent restarts and looks again,
-    /// exactly the trust the content-addressed fetch cache already extends
-    /// between uses of its own.
+    /// Check a local image path and hash it on the first successful observation.
+    /// Reuse a remembered digest while the path remains present; hash failure
+    /// still reports Ready without a digest. Previously fetched entries retain
+    /// their fetch result and are not checked here.
     pub async fn verify_path(&self, name: &str) {
-        // An image this node FETCHED is not a path image, whatever a record
-        // calls it. See `Entry::fetched`: the digest is what verified those
-        // bytes, and a `stat` here could only make the answer vaguer.
+        // Fetched images retain their checksum-verified fetch result; path probing must not replace it.
         if self.was_fetched(name) {
             return;
         }
@@ -558,10 +354,7 @@ impl Cache {
                 None => match hash_local_file(&path, self.bounds.deadline).await {
                     Ok(digest) => Some(digest),
                     Err(e) => {
-                        // Not fatal to the look: the file is there, which is
-                        // what F16 needed, and an unhashable file is worth a
-                        // debug line rather than turning a present image into
-                        // a failed one over a statement nothing requires yet.
+                        // A failed hash leaves a presence-only observation without a digest.
                         debug!(image = %name, error = %e,
                                "the base image could not be hashed; reporting it present \
                                 without a digest");
@@ -574,19 +367,14 @@ impl Cache {
         self.remember(name, state, false, digest);
     }
 
-    /// Make sure this image is on the node, fetching it if it is not.
-    ///
-    /// Idempotent and cheap on the common path: a `stat` of the cache entry,
-    /// and nothing else. The first use of an image pays for the download; no
-    /// later one does, on this node or for any other VM.
+    /// Fetch missing content and publish its catalogue link. Existing cache
+    /// entries are trusted by path; linking may still require a copy.
     #[instrument(skip(self), fields(image = %source.name, sha = %source.sha256))]
     pub async fn ensure(&self, source: &Source) -> Result<()> {
         match self.ensure_inner(source).await {
             Ok(()) => {
-                // No digest here: `source.sha256` already IS the checked
-                // digest of these bytes, so `Image.status.digest` — which
-                // exists to bind a PATH image nothing else checks — has
-                // nothing to add for one that arrived with its own checksum.
+                // Fetched images already carry a verified source checksum; the separate
+                // status digest is used to bind path images.
                 self.remember(&source.name, State::Ready, true, None);
                 Ok(())
             }
@@ -611,9 +399,7 @@ impl Cache {
         check_uid(&source.uid)?;
         let cached = self.cached(&source.cache_key());
         if tokio::fs::metadata(&cached).await.is_ok() {
-            // The presence of a file under its own digest IS the proof that
-            // the right bytes are here: nothing writes into the cache except
-            // through the verify-then-rename below.
+            // Trust existing cache entries without rehashing their contents.
             debug!("already cached");
             return Ok(self.link(source, &cached).await?);
         }
@@ -621,19 +407,14 @@ impl Cache {
             .await
             .with_context(|| format!("creating the image cache {}", self.cache_dir().display()))?;
 
-        // Named after the digest and this process, so two agents on one
-        // shared directory — and two fetches of two images in one agent —
-        // cannot write into each other's partial file.
+        // Stage by cache key and PID. This is not a cross-host or per-request lock.
         let partial = self.cache_dir().join(format!(
             "{}.partial.{}",
             source.cache_key(),
             std::process::id()
         ));
         let fetched = fetch(&source.url, &partial, &self.bounds).await;
-        // Whatever happened, the partial file is this function's to clean up.
-        // An abandoned one is exactly what "a cancelled download leaves
-        // nothing usable" is about, and it is never usable in any case: the
-        // cache is keyed by digest and a partial file is not under one.
+        // Remove the partial after a returned fetch failure. Cancellation may leave it.
         let digest = match fetched {
             Ok(digest) => digest,
             Err(e) => {
@@ -652,32 +433,19 @@ impl Cache {
                 source.url
             )));
         }
-        // Atomic within one directory, and the only way anything gets into
-        // the cache. A second agent that finished the same download first has
-        // already put an identical file there; overwriting it with our own is
-        // the same bytes either way.
+        // Publish verified bytes with a same-directory rename. Concurrent downloads
+        // for this cache key have the same verified content.
         tokio::fs::rename(&partial, &cached)
             .await
             .with_context(|| format!("publishing {} into the image cache", source.name))?;
-        // The size is read BEFORE the log line and not inside it: an await
-        // inside a tracing macro's arguments holds a `format_args` across a
-        // suspension point, and the whole future stops being Send.
+        // Await metadata before entering the tracing macro to keep format_args
+        // out of suspension points and preserve a Send future.
         let bytes = tokio::fs::metadata(&cached).await.map(|m| m.len()).ok();
         info!(?bytes, "base image fetched");
         Ok(self.link(source, &cached).await?)
     }
 
-    /// Put the catalogue name next to the cached bytes.
-    ///
-    /// A hard link rather than a copy: one inode, so a hundred VMs naming the
-    /// same image cost one image, and the volume drivers open a plain file
-    /// path exactly as they always have. A symlink would work too and is
-    /// worse — the drivers hand these paths to backends that run confined,
-    /// and a link that points out of the directory is a different thing to
-    /// reason about.
-    ///
-    /// A filesystem that cannot hard link falls back to a copy: it costs the
-    /// space, and it is better than a node that cannot boot anything.
+    /// Publish a catalogue path via a staged hard link, falling back to a copy.
     async fn link(&self, source: &Source, cached: &Path) -> Result<()> {
         let link = self.linked(&source.name);
         // Same inode already? Then this is a second use and there is nothing
@@ -691,10 +459,8 @@ impl Cache {
                 return Ok(());
             }
         }
-        // The name may already point at older bytes — an image re-registered
-        // under the same name with a new checksum. The new content wins, and
-        // the swap goes through a temporary name so that nothing ever opens a
-        // half-replaced path.
+        // Replace the catalogue link atomically, including when a new checksum
+        // reuses an existing image name.
         let staged = self.dir.join(format!(
             ".{}.linking.{}",
             source.cache_key(),
@@ -715,36 +481,12 @@ impl Cache {
             .with_context(|| format!("putting {} in place at {}", source.name, link.display()))
     }
 
-    /// Remove this node's cache entry for a deleted image, addressed by uid
-    /// and never by name.
-    ///
-    /// Astra finding S02, 2026-09-23 (rest b). `delete_image` at the cloud
-    /// removes the catalogue OBJECT and tells no node anything, so whatever a
-    /// node had fetched for it used to sit in `.cache/` and under its name
-    /// forever — including across a NAME recycled for an unrelated later
-    /// registration, which is exactly the shape a name-keyed removal would
-    /// get wrong. `uid` is what makes a removal safe to run by command
-    /// instead of by inference: the cloud mints it once and never reuses it,
-    /// so a cache entry keyed on it (`Source::cache_key`) can only ever be
-    /// the bytes this one registration fetched.
-    ///
-    /// `name` is read once, before anything is removed, and spent on exactly
-    /// one question: does the CATALOGUE LINK under it still point at the uid
-    /// being dropped? Same-inode is the proof, the same test `link` runs the
-    /// other way to decide a second use needs no work — never a name
-    /// comparison, because the name may already belong to a different
-    /// registration's bytes by the time this command arrives.
-    ///
-    /// A path image has no entry here to begin with — see the module doc — so
-    /// this is a harmless no-op for one: nothing under `.cache/` is ever keyed
-    /// to a path image's uid, and the file its catalogue name points at is
-    /// shared storage this node never wrote to and this command does not
-    /// touch.
+    /// Remove cache files for a registration UID. Remove the catalogue link and
+    /// its remembered observation only when its inode matches the recorded cache
+    /// inode. Copies made by the hard-link fallback do not match this test.
     pub async fn drop_uid(&self, name: &str, uid: &str) {
         if uid.is_empty() {
-            // Nothing to scope a removal to. Sweeping the whole cache on an
-            // empty uid would be exactly the name-keyed mistake this exists
-            // to avoid, just spelled differently.
+            // An empty UID cannot scope a cache removal.
             return;
         }
         let linked = self.linked(name);
@@ -767,11 +509,8 @@ impl Cache {
                 }
             }
         }
-        // The catalogue link and this node's opinion of `name` both go only
-        // when the link provably pointed at the bytes just removed — a
-        // re-registration under this name that this node already fetched
-        // must not lose its link or its `Ready` state to a drop that arrived
-        // late for the OLD registration.
+        // Remove the catalogue link and status only if the link still targets
+        // the dropped registration. A delayed drop must preserve a newer registration.
         if link_place.is_some() && link_place == dropped_place {
             let _ = tokio::fs::remove_file(&linked).await;
             self.known.lock().unwrap().remove(name);
@@ -779,9 +518,7 @@ impl Cache {
     }
 }
 
-/// The `(dev, ino)` pair that proves two paths are the same file, or `None`
-/// if this one could not be looked at. See [`Cache::drop_uid`] and `link`,
-/// which runs the same test the other way.
+/// Read device and inode identity for comparing paths; None means unavailable metadata.
 async fn place_of(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     tokio::fs::metadata(path)
@@ -790,37 +527,17 @@ async fn place_of(path: &Path) -> Option<(u64, u64)> {
         .map(|m| (m.dev(), m.ino()))
 }
 
-/// What a download may cost before this node stops paying for it.
-///
-/// Astra finding S15, 2026-09-23: `fetch` ran `curl --fail --location
-/// --silent --show-error <url>` with no bound of any kind, and the node's
-/// whole command loop sits behind it — `pump` handles one controller command
-/// at a time, and the create that reaches here used to hold the global `ops`
-/// lock across the transfer. A url that answered its headers and then went
-/// quiet took the node with it for as long as the other end cared to hold the
-/// socket. These four numbers are what ends that wait.
-///
-/// Defaults rather than configuration: the cache is built from a directory
-/// and nothing else (`Cache::new`, called before the agent has a config to
-/// hand it), so the numbers live with the code that uses them and a caller
-/// that wants others says so with [`Cache::with_bounds`]. They are chosen to
-/// be far outside any honest download on this fleet — a 4 GiB cloud image
-/// over a 1 KiB/s link would still finish — and close enough to catch a dead
-/// one within a minute.
+/// Download limits. Defaults impose a 1 KiB/s floor for 60 seconds, a two-hour
+/// transfer deadline, and a 64 GiB byte ceiling.
 #[derive(Clone, Copy, Debug)]
 pub struct Bounds {
-    /// Slower than this for [`Bounds::idle`], and the transfer is over. The
-    /// cut-off that actually matters: what a stalled download looks like from
-    /// here is a socket that is open and says nothing, and no timeout on the
-    /// WHOLE transfer can tell that apart from a big file in time to help.
+    /// Minimum sustained transfer rate over the idle interval.
     pub floor_bytes_per_sec: u64,
     /// How long the transfer may stay under the floor before it is cut.
     pub idle: Duration,
-    /// The whole transfer, headers included.
+    /// Deadline for the entire transfer, including headers.
     pub deadline: Duration,
-    /// What the file may not grow past. A url that answers with a terabyte is
-    /// not a base image, and the node's disk is what pays for finding out —
-    /// the same disk the agent's database is on.
+    /// Maximum accepted bytes.
     pub max_bytes: u64,
 }
 
@@ -839,14 +556,7 @@ impl Default for Bounds {
 /// believing the bound is being kept. See the deadline in [`fetch`].
 const BOUND_GRACE: Duration = Duration::from_secs(30);
 
-/// The argv `fetch` runs, with every bound in it.
-///
-/// A function of its own so that the bounds can be read off a value in a test
-/// instead of off a process nobody can see. The four flags that were always
-/// there keep their reasons: `--fail` so a 404 is an error and not a file
-/// containing the words "not found", `--location` because cloud image urls
-/// redirect every time, `--silent --show-error` so nothing but the bytes goes
-/// to stdout and the reason goes to stderr.
+/// Build curl arguments for redirects, HTTP failure reporting and download limits.
 fn curl_argv(url: &str, bounds: &Bounds) -> Vec<String> {
     vec![
         "--fail".to_string(),
@@ -858,23 +568,18 @@ fn curl_argv(url: &str, bounds: &Bounds) -> Vec<String> {
         bounds.floor_bytes_per_sec.to_string(),
         "--speed-time".to_string(),
         bounds.idle.as_secs().to_string(),
-        // And the ceiling on the whole thing, connection included.
+        // Bound connection setup and transfer together.
         "--max-time".to_string(),
         bounds.deadline.as_secs().to_string(),
-        // Only ever a first line of defence: curl decides this from the
-        // length the SERVER declared, so a server that declares none walks
-        // past it. `drain` counts what arrives.
+        // Curl can only precheck a declared length; drain also enforces the limit
+        // against bytes actually received.
         "--max-filesize".to_string(),
         bounds.max_bytes.to_string(),
         url.to_string(),
     ]
 }
 
-/// A sha256 that is not one is refused before anything is downloaded.
-///
-/// Not tidiness: the digest names the cache entry, so a value with a slash in
-/// it would write outside the cache directory, and one in the wrong case
-/// would never match what was computed and would re-download for ever.
+/// Validate the checksum before using it as a cache path or downloading bytes.
 fn check_digest(sha256: &str) -> Result<()> {
     if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("sha256 {sha256:?} is not 64 hex characters");
@@ -885,12 +590,8 @@ fn check_digest(sha256: &str) -> Result<()> {
     Ok(())
 }
 
-/// A uid that is not one is refused before anything is downloaded.
-///
-/// The same reason `check_digest` exists and the same danger: the uid names
-/// the cache entry, so a value with a slash or a `..` in it would write
-/// outside the cache directory. What the cloud mints is a uuid; what is
-/// accepted here is the shape of one and nothing looser.
+/// Accept an empty legacy UID or up to 64 alphanumeric/hyphen characters.
+/// Reject path separators before using the UID in cache filenames.
 fn check_uid(uid: &str) -> Result<()> {
     if uid.is_empty() {
         // An image registered by a cluster with no cloud above it, or a
@@ -903,20 +604,8 @@ fn check_uid(uid: &str) -> Result<()> {
     Ok(())
 }
 
-/// Hash a file already on this node's disk, for a path image's first look.
-///
-/// Astra finding S02, 2026-09-23 (rest a). Streamed in fixed-size chunks
-/// exactly like [`drain`] hashes a download, so the whole file is never held
-/// in memory at once.
-///
-/// Under a deadline for the same reason [`fetch`]'s read loop is (Astra
-/// finding S15): a path image is, by its own definition, somebody else's
-/// file on SHARED storage, and a mount that has wedged would otherwise park
-/// this call on a `read` that never returns. `bounds.deadline` is reused
-/// rather than given a config key of its own — it is already the "how long
-/// may this node wait on bytes it did not ask a server for" number, and a
-/// second one next to it would be a second knob nobody has a reason to set
-/// differently.
+/// Hash a local file in fixed-size chunks, bounded by the transfer deadline
+/// plus grace. Timing out the future does not cancel kernel filesystem I/O.
 async fn hash_local_file(path: &Path, deadline: Duration) -> Result<String> {
     use tokio::io::AsyncReadExt;
 
@@ -948,19 +637,8 @@ async fn hash_local_file(path: &Path, deadline: Duration) -> Result<String> {
     }
 }
 
-/// Read the URL into `into`, hashing as it goes; the digest comes back.
-///
-/// Hashed while streaming rather than by reading the file back, because a
-/// cloud image is measured in gigabytes and reading it twice is the kind of
-/// cost that only shows up on a slow node.
-///
-/// `curl` rather than an HTTP client crate, and that is a deliberate trade
-/// stated where it is made: this agent already shells out to `nft`, `lvs`,
-/// `qemu-img` and `virtiofsd`, so a subprocess is the house pattern; and the
-/// alternative is a full TLS-and-redirects HTTP stack in a process whose job
-/// is running VMs. `curl` is in the agent's PATH list for the same reason
-/// those four are (nix/agent.nix), and its absence is a named error at the
-/// point of use.
+/// Stream curl output to a file while hashing, enforce byte/time bounds,
+/// and sync completed content before returning its digest.
 async fn fetch(url: &str, into: &Path, bounds: &Bounds) -> Result<String> {
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
@@ -979,13 +657,7 @@ async fn fetch(url: &str, into: &Path, bounds: &Bounds) -> Result<String> {
         .await
         .with_context(|| format!("creating {}", into.display()))?;
 
-    // Astra finding S15, 2026-09-23: the read loop is under a deadline of its
-    // own and not only under curl's. The three curl bounds are the right
-    // first line — they are what can see a slow socket — but they are bounds
-    // a DIFFERENT process keeps, and the thing being protected here is this
-    // one: a curl that was replaced, wedged in uninterruptible I/O, or stopped
-    // would otherwise park the agent's whole command loop on a `read` that
-    // never returns.
+    // Bound the agent's read loop independently of curl's own timeout flags.
     let drained = tokio::time::timeout(
         bounds.deadline.saturating_add(BOUND_GRACE),
         drain(&mut stdout, &mut file, into, bounds.max_bytes),
@@ -1015,9 +687,7 @@ async fn fetch(url: &str, into: &Path, bounds: &Bounds) -> Result<String> {
         .with_context(|| format!("syncing {}", into.display()))?;
     drop(file);
 
-    // Curl has written its last byte by here, so this is a wait for an exit
-    // status and not for a transfer — and it is still bounded, because the
-    // one thing this function may not do is wait for ever on anything.
+    // Bound process reaping even after curl has stopped producing bytes.
     let status = match tokio::time::timeout(BOUND_GRACE, child.wait()).await {
         Ok(status) => status.context("waiting for curl")?,
         Err(_) => {
@@ -1043,14 +713,7 @@ async fn fetch(url: &str, into: &Path, bounds: &Bounds) -> Result<String> {
     Ok(digest)
 }
 
-/// Read curl's stdout into the file, hashing as it goes, and stop at the byte
-/// budget.
-///
-/// The budget is counted HERE as well as handed to curl, and the two are not
-/// the same check: `--max-filesize` is a decision made from the length the
-/// server declared, so a server that declares none — or declares a small one
-/// and sends a large one — walks straight past it. This one counts what
-/// actually arrived.
+/// Enforce the byte ceiling on actual output, independently of curl's limits.
 async fn drain(
     stdout: &mut tokio::process::ChildStdout,
     file: &mut tokio::fs::File,
@@ -1082,14 +745,7 @@ async fn drain(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Signal the child and then WAIT for it, on every path out of a failed
-/// fetch.
-///
-/// Both halves, and the second is the one that gets forgotten: a killed
-/// process nobody waits for is a zombie until its parent exits, and this
-/// parent is an agent that runs for months. Neither error is worth more than
-/// a debug line — "the process is already gone" is exactly the outcome that
-/// was being asked for.
+/// Kill and reap curl on handled transfer failures. Reaping itself has no timeout.
 async fn kill_and_reap(child: &mut tokio::process::Child) {
     if let Err(e) = child.start_kill() {
         debug!(error = %e, "curl was already gone when the fetch was stopped");
@@ -1103,11 +759,7 @@ async fn kill_and_reap(child: &mut tokio::process::Child) {
 mod tests {
     use super::*;
 
-    /// A cache directory of this test's own, and the guard that removes it.
-    ///
-    /// The guard comes back first and the caller binds it: the directory used
-    /// to be named after the test alone, so two runs on one machine shared
-    /// it, and one that crashed left its half-written entries for the next.
+    /// Isolate each test cache in a temporary directory.
     fn scratch(name: &str) -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::Builder::new()
             .prefix(&format!("meister-image-{name}-"))
@@ -1121,10 +773,7 @@ mod tests {
         format!("{:x}", Sha256::digest(bytes))
     }
 
-    /// The digest names the cache entry, so a value that is not a digest is
-    /// refused before anything is downloaded. A slash would write outside the
-    /// cache directory; the wrong case would never match what is computed and
-    /// would re-fetch for ever.
+    /// Reject malformed checksums before downloading or constructing cache paths.
     #[test]
     fn a_checksum_that_is_not_one_is_refused_before_anything_is_fetched() {
         assert!(check_digest(&digest_of(b"hello")).is_ok());
@@ -1141,9 +790,7 @@ mod tests {
         );
     }
 
-    /// Whether anything on this machine is still running a curl that names
-    /// this port. Only the fetch under test can have started one, so this is
-    /// exactly "did the fetch leave its download behind".
+    /// Find curl processes naming this test server's port to detect abandoned downloads.
     fn a_curl_still_runs_for(port: u16) -> bool {
         let marker = format!("127.0.0.1:{port}");
         let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -1161,15 +808,7 @@ mod tests {
         false
     }
 
-    /// Every bound is on the command line, and the command line is what the
-    /// download actually runs with.
-    ///
-    /// Astra finding S15, 2026-09-23: this argv used to be `--fail
-    /// --location --silent --show-error <url>` and nothing else, so a url
-    /// that answered its headers and then went quiet held the node's command
-    /// loop for as long as the other end wanted. The test is on the argv
-    /// rather than on a transfer because that is where the bounds are: a
-    /// process nobody can see is not evidence.
+    /// Curl receives the idle, total-duration and byte limits used by the fetcher.
     #[test]
     fn the_download_argv_carries_every_bound() {
         let bounds = Bounds {
@@ -1191,8 +830,7 @@ mod tests {
         assert_eq!(after("--max-time"), Some("7200"), "the whole transfer");
         assert_eq!(after("--max-filesize"), Some("1073741824"), "the budget");
 
-        // And the four that were always there, for the reasons they were
-        // always there.
+        // Retain the standard HTTP failure, redirect and logging flags.
         for flag in ["--fail", "--location", "--silent", "--show-error"] {
             assert!(argv.iter().any(|a| a == flag), "{flag} is still passed");
         }
@@ -1203,14 +841,7 @@ mod tests {
         );
     }
 
-    /// A url that answers its headers and then says nothing: the fetch comes
-    /// back inside its bound, nothing usable is left, and the download it
-    /// started is not still running.
-    ///
-    /// Astra finding S15, 2026-09-23. The bound in the test is seconds rather
-    /// than the node's hours, which is the only difference between this and
-    /// the fleet: a stall is a stall at either scale, and a test that waited
-    /// for the real ceiling would be a test nobody runs.
+    /// Keep the response open after its headers to exercise the idle timeout, not EOF.
     #[tokio::test]
     async fn a_url_that_stalls_after_its_headers_is_cut_off_and_leaves_no_child() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1224,10 +855,8 @@ mod tests {
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let held = stop.clone();
         let server = std::thread::spawn(move || {
-            // The headers, and then nothing at all. The stream is KEPT so the
-            // socket stays open: dropping it would end the transfer with an
-            // error curl reports at once, which is the easy case and not this
-            // one.
+            // Keep connections open after sending headers to exercise a stalled transfer
+            // rather than an immediate connection-close error.
             listener.set_nonblocking(true).ok();
             let mut kept = Vec::new();
             while !held.load(Ordering::Relaxed) {
@@ -1287,13 +916,7 @@ mod tests {
         ));
     }
 
-    /// Bytes past the budget are not written out to the end and then judged.
-    ///
-    /// Astra finding S15, 2026-09-23. Two checks say this, and which of them
-    /// speaks depends on the other end: curl refuses a DECLARED length past
-    /// the ceiling before a byte moves, and `drain` refuses the bytes that
-    /// actually arrive when nobody declared a length. The same refusal either
-    /// way, and the second is the one that cannot be talked out of it.
+    /// Oversized downloads must leave neither a published image nor a partial file.
     #[tokio::test]
     async fn a_body_past_the_byte_budget_is_refused() {
         let (_temp, dir) = scratch("budget");
@@ -1327,10 +950,7 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
-    /// A URL that answers, byte for byte, and a second use that does not
-    /// fetch again. `file://` is a real fetch through the same code path a
-    /// http one takes — curl reads it the same way — so this exercises the
-    /// stream, the hash, the temp file, the rename and the link.
+    /// Exercise fetch, hashing, staging, publication and cache reuse through a `file://` URL.
     #[tokio::test]
     async fn an_image_is_fetched_once_and_then_found() {
         let (_temp, dir) = scratch("fetch-once");
@@ -1352,19 +972,14 @@ mod tests {
         // Where the volume drivers will look, with the right bytes in it.
         let placed = images.join("ubuntu.raw");
         assert_eq!(std::fs::read(&placed).unwrap(), payload);
-        // And in the cache under its own digest, which is what makes the
-        // second use free. The bare digest and not `<uid>-<digest>` because
-        // this source carries no uid: a cluster with no cloud above it mints
-        // none, and S02's key falls back to what it always was rather than
-        // making every node on such a fleet re-download everything.
+        // Sources without a catalogue UID retain the digest-only cache key.
         assert!(images.join(CACHE_DIR).join(&source.sha256).exists());
         assert_eq!(
             cache.report(),
             vec![("ubuntu.raw".to_string(), State::Ready, None)]
         );
 
-        // A second use with the origin GONE: nothing is fetched, because
-        // nothing needs to be.
+        // Cache reuse succeeds after the origin disappears.
         std::fs::remove_file(&origin).unwrap();
         cache.ensure(&source).await.expect("already here");
         assert_eq!(std::fs::read(&placed).unwrap(), payload);
@@ -1376,15 +991,7 @@ mod tests {
         assert_eq!((a.ino(), a.dev()), (b.ino(), b.dev()));
     }
 
-    /// Two registrations of one name are two images, and one node's cache
-    /// keeps them apart.
-    ///
-    /// Astra finding S02, 2026-09-23: the cache entry was the digest alone
-    /// and the catalogue name is global — one namespace for every tenant on
-    /// the fleet — while `delete_image` at the cloud removes the object and
-    /// nothing a node holds. So a name deregistered by one tenant and
-    /// registered by another was, on the node, the same entry. The uid is
-    /// what an image cannot share: it is minted once and never reused.
+    /// Registration UIDs separate cached content even when the catalogue name is reused.
     #[tokio::test]
     async fn two_images_of_one_name_do_not_share_a_cache_entry() {
         let (_temp, dir) = scratch("uid");
@@ -1426,10 +1033,10 @@ mod tests {
             !images.join(CACHE_DIR).join(&first.sha256).exists(),
             "and nothing under the bare digest, which is the namespace they shared"
         );
-        // The name follows the newest bytes, as it always has.
+        // The catalogue name resolves to the replacement content.
         assert_eq!(std::fs::read(images.join("ubuntu.raw")).unwrap(), mine);
 
-        // Same uid, same digest, same entry: asking twice is asking once.
+        // Repeated fetches reuse the same UID/digest cache entry.
         cache.ensure(&second).await.expect("already here");
         assert_eq!(
             std::fs::read_dir(images.join(CACHE_DIR))
@@ -1440,9 +1047,7 @@ mod tests {
         );
     }
 
-    /// A uid names a file in the cache directory, so a value that is not one
-    /// is refused before anything is downloaded — the same rule and the same
-    /// danger as `check_digest`.
+    /// Reject invalid UIDs before using them in cache paths or fetching bytes.
     #[test]
     fn a_uid_that_is_not_one_is_refused_before_anything_is_fetched() {
         assert!(check_uid("4f3c0000-0000-0000-0000-00000000000a").is_ok());
@@ -1502,8 +1107,7 @@ mod tests {
         }
     }
 
-    /// A URL nobody answers is a Failed with the reason, and again nothing
-    /// half-written survives it.
+    /// Failed connections produce a failure reason and no usable partial image.
     #[tokio::test]
     async fn a_url_that_does_not_answer_leaves_nothing_usable() {
         let (_temp, dir) = scratch("no-answer");
@@ -1527,11 +1131,7 @@ mod tests {
             }
         ));
 
-        // And the pass that looks at PATH images does not overwrite it. A
-        // volume record names its base image by catalogue name and carries no
-        // url, so that pass reaches this name too — and "it has no url, so
-        // nothing here fetches it" is the one sentence that is certainly
-        // wrong about an image this node tried to fetch. See `Entry::fetched`.
+        // Path verification must preserve an earlier fetch failure for the same catalogue name.
         cache.verify_path("ubuntu.raw").await;
         assert!(matches!(
             cache.report()[0].1,
@@ -1542,9 +1142,7 @@ mod tests {
         ));
     }
 
-    /// An image re-registered under the same name with new content: the name
-    /// follows the bytes, and the old ones stay in the cache under their own
-    /// digest where nothing points at them any more.
+    /// Re-registration updates the catalogue link while retaining older cached content.
     #[tokio::test]
     async fn the_name_follows_the_newest_bytes() {
         let (_temp, dir) = scratch("rebuild");
@@ -1581,21 +1179,8 @@ mod tests {
         assert!(images.join(CACHE_DIR).join(digest_of(&first)).exists());
         assert!(images.join(CACHE_DIR).join(digest_of(&second)).exists());
     }
-    /// The node says what it HAS, not only what it was asked about.
-    ///
-    /// F16's other half. A path image is somebody else's file, and this node
-    /// only ever heard of one through a record that named it — so an `Image`
-    /// object nothing on the fleet used was described by nobody, the cloud had
-    /// no evidence, and a catalogue entry pointing at nothing went on reading
-    /// `Ready`. Nothing can tell a node about such an image: `SyncState`
-    /// carries VMs and there is no image command. So the direction is turned
-    /// around — the node reads its directory and says the list is complete,
-    /// and the tier above may then read a missing name as a missing file.
-    ///
-    /// What must NOT happen is the inventory talking over a look: a checksum
-    /// that did not match and a directory under a catalogue name are things
-    /// only a look can say, and a bare `readdir` would flatten both into
-    /// `Ready`.
+
+    /// Directory inventory establishes presence; explicit verification retains richer failure evidence.
     #[tokio::test]
     async fn the_inventory_says_what_is_on_the_disk_and_a_look_still_wins() {
         let (_temp, images) = scratch("inventory");
@@ -1623,10 +1208,7 @@ mod tests {
              inventory only reads the directory, it never looks at a file's bytes"
         );
 
-        // A LOOK at one of them, and it disagrees with the file being there:
-        // the same name, re-registered under a url whose bytes did not match.
-        // The look wins, because it is the only one of the two that can say
-        // which of the four things is wrong.
+        // A remembered verification failure takes precedence over file presence.
         cache.remember(
             "ubuntu.raw",
             State::Failed {
@@ -1644,9 +1226,7 @@ mod tests {
         assert_eq!(said[1].1.reason(), Some(ImageReason::ChecksumMismatch));
         assert_eq!(said.len(), 2, "one line per name, whatever the sources");
 
-        // A name a record asked about and that is NOT in the directory: the
-        // look says why, and the inventory's completeness is what lets the
-        // tier above believe it about an image nobody named at all.
+        // An explicitly checked missing image carries its failure reason alongside inventory completeness.
         cache.verify_path("chaos-img-bad.raw").await;
         let said = cache.report();
         let bad = said
@@ -1655,39 +1235,23 @@ mod tests {
             .expect("a line");
         assert_eq!(bad.1.reason(), Some(ImageReason::NotFound));
 
-        // A second reading of an unchanged directory is free, and still
-        // answers the same.
+        // Reuse an unchanged directory inventory.
         assert!(cache.take_inventory().await);
         assert_eq!(cache.report().len(), 3);
 
-        // And a directory that is not there at all: no claim of completeness,
-        // and no `Ready` invented for anything. A directory that cannot be
-        // read must never become "the file is not there" — that would make
-        // F16 worse rather than better.
+        // An unreadable catalogue is incomplete; do not infer that its images are absent.
         let gone = Cache::new(images.join("nowhere"));
         assert!(!gone.take_inventory().await);
         assert!(gone.report().is_empty());
     }
 
-    /// A path image is registered like a fetched one, so the cloud stops
-    /// guessing.
-    ///
-    /// The missing first line of a chain that was otherwise complete. This
-    /// node registered only what it had to FETCH, so a path image — somebody
-    /// else's file on shared storage — was reported by nobody; the cloud had
-    /// no evidence and went on saying `Ready` about a catalogue entry
-    /// pointing at nothing. Unchanged on the fleet since 2026-08-29.
-    ///
-    /// And it is level: the same registry entry follows the file, so an image
-    /// restored on shared storage goes back to `Ready` without anybody
-    /// creating a VM to prove it.
+    /// Path-image status follows file presence without a fetch or a VM creation.
     #[tokio::test]
     async fn a_path_image_says_whether_its_bytes_are_here() {
         let (_temp, images) = scratch("path");
         let cache = Cache::new(images.clone());
 
-        // Nothing said about an image nobody has looked at. Silence is what
-        // an empty `Image.status.nodes[]` means, and it must stay available.
+        // Unobserved images produce no status entries.
         assert!(cache.report().is_empty());
 
         cache.verify_path("nixos.raw").await;
@@ -1711,10 +1275,7 @@ mod tests {
             "and says why nothing is going to fetch it: {why}"
         );
 
-        // Somebody puts the bytes there. The next look says so — no create,
-        // no restart, no second command — and Astra finding S02, 2026-09-23
-        // (rest a): this same first look is what binds the catalogue name to
-        // a digest for the first time.
+        // Restore the file and verify that a later check reports Ready with a digest.
         std::fs::write(images.join("nixos.raw"), b"an image").expect("the bytes");
         cache.verify_path("nixos.raw").await;
         assert_eq!(
@@ -1743,15 +1304,7 @@ mod tests {
         assert_eq!(reason, ImageReason::NotAFile);
     }
 
-    /// A path image's digest is hashed once and trusted afterwards — even
-    /// past a swap this process never re-reads for.
-    ///
-    /// Astra finding S02, 2026-09-23 (rest a). The cost this avoids is real:
-    /// `verify_path` runs on every status report and every reconcile pass,
-    /// and re-hashing a multi-gigabyte image on that schedule would be worse
-    /// than the problem it closes. The trade that buys is stated here rather
-    /// than left implicit — a file swapped on shared storage keeps the OLD
-    /// digest until this process restarts.
+    /// The cached path digest is intentionally stale after an in-place replacement until restart.
     #[tokio::test]
     async fn a_path_images_digest_is_bound_once_and_trusted_after_that() {
         let (_temp, images) = scratch("digest-once");
@@ -1780,15 +1333,7 @@ mod tests {
         assert_eq!(after_restart, Some(digest_of(b"different bytes now")));
     }
 
-    /// A dropped uid loses its cache file and its catalogue link; a
-    /// DIFFERENT uid under the same recycled name keeps both.
-    ///
-    /// Astra finding S02, 2026-09-23 (rest b). `delete_image` at the cloud
-    /// only ever removes the catalogue object, so this is the other half:
-    /// told a uid, a node removes exactly the bytes it fetched for that uid.
-    /// The name is deliberately reused here for a SECOND, later registration
-    /// — the shape `Cache::drop_uid`'s own doc comment calls out as the one a
-    /// name-keyed removal would get wrong.
+    /// A delayed drop for an old UID must preserve the replacement registration and its link.
     #[tokio::test]
     async fn drop_uid_removes_the_right_registrations_bytes_and_not_a_same_named_others() {
         let (_temp, dir) = scratch("drop-uid");
@@ -1810,10 +1355,7 @@ mod tests {
         let old_cache_file = images.join(CACHE_DIR).join(old_source.cache_key());
         assert!(old_cache_file.exists());
 
-        // The name is re-registered — a different tenant, or the same one
-        // registering again — before the drop for the OLD uid arrives. This
-        // node already fetched the new bytes too, so its link now points at
-        // them.
+        // Fetch a replacement registration before the delayed drop of the old UID.
         let new = b"a completely different image, same name".to_vec();
         std::fs::write(&origin, &new).unwrap();
         let new_uid = "9b210000-0000-0000-0000-00000000000b";
@@ -1857,9 +1399,7 @@ mod tests {
         assert!(cache.report().is_empty());
     }
 
-    /// An empty uid removes nothing. `check_uid` refuses one everywhere else
-    /// a `Source` carries it; this is the same refusal for the road that
-    /// does not build one.
+    /// An empty UID must not remove cached images.
     #[tokio::test]
     async fn dropping_an_empty_uid_is_a_no_op() {
         let (_temp, dir) = scratch("drop-uid-empty");
