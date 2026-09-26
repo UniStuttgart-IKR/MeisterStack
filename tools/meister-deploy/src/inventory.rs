@@ -62,8 +62,8 @@ pub struct HostSsh {
     pub user: Option<String>,
     #[serde(default)]
     pub port: Option<u16>,
-    /// `SHA256:…`, written by `keys enroll` and committed. Absent means the
-    /// host is not enrolled, which is a state and never a pass.
+    /// Trusted `SHA256:…` fingerprint, recorded here by the operator.
+    /// `keys enroll` writes known_hosts; a missing fingerprint means unenrolled.
     #[serde(default)]
     pub host_key: Option<String>,
 }

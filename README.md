@@ -15,7 +15,8 @@ Feature availability depends on the build, host and driver configuration.
 - [Documentation index](docs/README.md): mechanisms, operation and source map.
 - [Architecture](docs/ARCHITECTURE.md): ownership, data flow and component boundaries.
 - [Deployment](docs/DEPLOYMENT.md): runtime prerequisites and operating modes.
-- [CLI](docs/CLI.md) and [configuration](docs/CONFIGURATION.md).
+- [CLI walkthrough](docs/CLI.md), [command map](docs/CLI_COMMANDS.md) and [configuration](docs/CONFIGURATION.md).
+- [MeisterDeploy](tools/meister-deploy/README.md): NixOS single-node and multi-node deployment guides.
 - [Migration](docs/MIGRATION.md): recovery contract and known implementation gaps.
 - [Testing](docs/TESTING.md): what each test layer establishes.
 
@@ -43,8 +44,9 @@ failure, or production readiness. Documentation distinguishes implemented behavi
 design goals and unresolved limits; the migration receive path still has known
 timeout and restart gaps.
 
-`tools/meister-deploy` supplies deployment tooling. Its implementation is outside
-the current runtime review. No deployment was performed for this documentation.
+`tools/meister-deploy` supplies deployment tooling. Its guides cover installation,
+planning, credentials, upgrades and recovery, including known implementation limits.
+No live deployment was performed for this documentation.
 
 MeisterStack is developed as a master's thesis project at the University of
 Stuttgart, IKR. See [acknowledgements](docs/ACKNOWLEDGEMENT.md) and

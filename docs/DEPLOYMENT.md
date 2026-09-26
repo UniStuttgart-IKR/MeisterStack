@@ -13,8 +13,10 @@ SPDX-FileCopyrightText: 2026 Universität Stuttgart, IKR
 | NixOS fleet | Inventory-selected roles, generated configuration and external credentials |
 | Existing NixOS host | Imported modules; operator retains hardware, mounts and firewall policy |
 
-Deployment tooling under `tools/` is outside this review. No installation,
-deployment or rollback was executed. See [Nix](NIX.md) and
+For the deployment tool, follow the [MeisterDeploy walkthrough](../tools/meister-deploy/docs/DEPLOYMENT.md),
+[single-node guide](../tools/meister-deploy/docs/SINGLE_NODE.md), or
+[multi-node guide](../tools/meister-deploy/docs/MULTI_NODE.md).
+No live installation, deployment or rollback was executed for this review. See [Nix](NIX.md) and
 [configuration](CONFIGURATION.md) for rendering and field meanings.
 
 ## Prerequisites
@@ -78,7 +80,10 @@ For NixOS, start from [templates/operator](../templates/operator/):
 - Keep private keys outside Git and the Nix store; verify SSH host keys separately.
 - Evaluate configurations and inspect the manifest before building.
 - Workflow: `resolve → build → plan → apply`. Enrollment, installation and workload
-  checks are separate. Deployment-tool flags and rollback behavior were not reviewed.
+  checks are separate. See the [command map](../tools/meister-deploy/docs/COMMANDS.md)
+  and [recovery contracts](../tools/meister-deploy/docs/EXECUTION.md).
+- Standalone upgrades currently require ordinary NixOS activation: MeisterDeploy
+  incorrectly requires controller maintenance for changed standalone agents.
 
 | Boot/host mode | Configuration |
 | --- | --- |

@@ -557,7 +557,7 @@ pub struct DeploymentPlan {
     /// carry its facts cannot be argued with afterwards.
     pub observation: Observations,
     /// Local credential evidence at planning time, keyed by host and secret reference:
-    /// sha256:<hex> for public files, present for private files. Missing local files are
+    /// `sha256:<hex>` for public files, `present` for private files. Missing local files are
     /// omitted. This evidence participates in the plan ID.
     #[serde(default)]
     pub expected_credentials: BTreeMap<String, BTreeMap<String, String>>,

@@ -138,7 +138,7 @@ enum Verb {
         /// Replace the existing key for an intentional rotation or reinstall.
         #[arg(long)]
         replace: bool,
-        /// Write <kind>.key.<suffix>; next prepares a rotation without replacing the active key.
+        /// Write `<kind>.key.<suffix>`; next prepares a rotation without replacing the active key.
         #[arg(long)]
         suffix: Option<String>,
     },

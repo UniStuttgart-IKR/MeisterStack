@@ -66,8 +66,8 @@ pub struct JournalEvent {
     pub from: Option<String>,
     /// For `host.state`: the state it entered.
     pub to: Option<String>,
-    /// Everything else. An object, always — see [`ActionPayload`] and
-    /// [`StatePayload`] for the keys [`fold`] reads. A producer may put more
+    /// Object payload; `ActionPayload` and `StatePayload` define the keys
+    /// [`fold`] reads. A producer may put more
     /// in it; nothing here will drop a key it does not know.
     pub payload: serde_json::Value,
 }

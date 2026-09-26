@@ -601,7 +601,7 @@ fn a_guest_that_will_not_go_away_is_lost_and_named() {
     assert_eq!(code(&out), 2, "{}\n{}", stdout(&out), stderr(&out));
     let run = run_id(&out);
     let ledger = sandbox.ledger_of(&run);
-    // An unsupported listing shape must leave the resource recorded as lost.
+    // A guest still listed after the settle window remains recorded as lost.
     assert!(
         ledger
             .resources

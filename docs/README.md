@@ -15,7 +15,7 @@ Read [architecture](ARCHITECTURE.md) first, then follow the mechanism you need.
 | Local state and VM lifecycle | [Agent](AGENT.md) | `components/agent/` |
 | VMM, devices and backend contracts | [Drivers](DRIVERS.md) | `drivers/`, `shared/agent-api/` |
 | Discovery, objects and mutation | [API](API.md) | `shared/controller-api/`, `shared/proto/` |
-| Profiles, commands and output | [CLI](CLI.md) | `components/cli/` |
+| Profiles, examples and output | [CLI](CLI.md), [command map](CLI_COMMANDS.md) | `components/cli/` |
 | Identity, credentials and authorization | [Security](SECURITY.md) | `shared/pki/`, `shared/oidc/` |
 | Overlay, routed and provider networks | [Networking](NETWORKING.md) | `drivers/linux-network/` |
 | Volumes, images and snapshots | [Storage](STORAGE.md) | `drivers/{filesystem,lvm-thin,nfs,nvmeof,nvmeof-import}/` |
@@ -24,6 +24,7 @@ Read [architecture](ARCHITECTURE.md) first, then follow the mechanism you need.
 | Configuration and paths | [Configuration](CONFIGURATION.md) | `config/`, component config modules |
 | Nix packages, modules and inventory | [Nix](NIX.md) | `flake.nix`, `nix/` |
 | Installation and operation | [Deployment](DEPLOYMENT.md) | `templates/`, `examples/`, `scripts/` |
+| NixOS deployment tool and walkthroughs | [MeisterDeploy](../tools/meister-deploy/README.md) | `tools/meister-deploy/` |
 | Logs, traces and metrics | [Observability](OBSERVABILITY.md) | `shared/telemetry/` |
 | Test layers and evidence limits | [Testing](TESTING.md) | Rust tests, `nix/tests/`, `deploy/chaos/` |
 | Dependencies and their roles | [Technology stack](TECHSTACK.md) | `Cargo.toml`, `flake.lock` |
@@ -40,7 +41,8 @@ Read [architecture](ARCHITECTURE.md) first, then follow the mechanism you need.
 
 API discovery and generated schemas are the reference for accepted resource shapes.
 Configuration examples illustrate particular modes; they are not interchangeable
-production defaults. The deployment tool under `tools/` is outside this review.
+production defaults. MeisterDeploy has a separate guide and review; other tools
+are not covered by that review.
 
 Detailed review findings, coverage ledgers and experiment notes live in the sibling
 `MeisterStack-Journal` repository. Product guides retain operational limits where
